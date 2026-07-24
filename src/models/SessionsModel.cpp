@@ -98,6 +98,9 @@ QVariant SessionsModel::data(const QModelIndex &index, int role) const
             return true;
         case CollapsedRole:
             return group.collapsed;
+        case IdRole:
+        case GroupIdRole:
+            return group.id.value;
         default:
             return {};
         }
@@ -120,6 +123,10 @@ QVariant SessionsModel::data(const QModelIndex &index, int role) const
         return static_cast<int>(aggregateSessionState(session.terminals));
     case IsGroupRole:
         return false;
+        case IdRole:
+            return session.session.id.value;
+        case GroupIdRole:
+            return groupEntry.group.id.value;
     default:
         return {};
     }
@@ -133,6 +140,8 @@ QHash<int, QByteArray> SessionsModel::roleNames() const
         {RowStateRole, "rowState"},
         {IsGroupRole, "isGroup"},
         {CollapsedRole, "collapsed"},
+        {IdRole, "itemId"},
+        {GroupIdRole, "groupId"},
     };
 }
 

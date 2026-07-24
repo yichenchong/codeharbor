@@ -45,6 +45,8 @@ public:
         RowStateRole,                // aggregate SessionRowState (int), sessions only
         IsGroupRole,                 // true for group rows, false for session rows
         CollapsedRole,               // group collapsed flag, groups only
+        IdRole,                      // ch id string of the row (group or session)
+        GroupIdRole,                 // containing group's id (own id for groups)
     };
 
     explicit SessionsModel(QObject *parent = nullptr);

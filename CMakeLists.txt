@@ -27,6 +27,7 @@ find_package(Qt6 6.6 REQUIRED COMPONENTS
     Qml
     QuickControls2
     Sql
+    WebEngineCore
     WebEngineQuick
     WebChannel
     Network

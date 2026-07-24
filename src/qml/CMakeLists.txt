@@ -12,9 +12,18 @@ qt_add_qml_module(codeharbor_qml
     QML_FILES
         Main.qml
         SessionsSidebar.qml
-        ViewerRegion.qml
+        GroupHeader.qml
+        SessionRow.qml
         TerminalRegion.qml
         TerminalPaneView.qml
+        ViewerRegion.qml
+        ViewerPane.qml
+        ViewerWebView.qml
+        ViewerTextView.qml
+        ViewerImageView.qml
+        ViewerPdfView.qml
+        ViewerDirectoryView.qml
+        ViewerBinaryView.qml
 )
 
 target_link_libraries(codeharbor_qml PUBLIC

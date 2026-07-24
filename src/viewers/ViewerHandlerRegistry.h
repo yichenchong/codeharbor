@@ -1,6 +1,7 @@
 #pragma once
 
 #include <QString>
+#include <QUrl>
 
 namespace ch {
 
@@ -19,10 +20,25 @@ enum class ViewerResolution {
     Error,
 };
 
-// Bootstrap placeholder resolving by URL scheme only. Extension/MIME rules and
-// the registry data structure land in docs/PLAN.md workstream V.
+// The viewer handler registry (SPEC 7.5). Resolution is a pure function of the
+// URL: the scheme decides http/https vs. the privileged internal scheme, and
+// remote file:// URLs are classified by trailing-slash (directory) then file
+// extension. The table is intentionally data-driven and side-effect free so it
+// is exhaustively unit-testable without a live server or WebEngine.
 class ViewerHandlerRegistry {
 public:
+    // Full URL resolution. Scheme is consulted first (http/https ->
+    // DirectWebNavigation; codeharbor-internal -> InternalHtmlRenderer, or by
+    // extension when the internal URL carries a recognizable one), then for
+    // file:// URLs a trailing '/' means DirectoryViewer and everything else is
+    // classified by extension. Unknown schemes resolve to Error.
+    static ViewerResolution resolve(const QUrl &url);
+
+    // Classify a bare file extension (without the leading dot, case
+    // insensitive). Unknown / known-binary extensions resolve to Download.
+    static ViewerResolution resolveByExtension(const QString &ext);
+
+    // Back-compat scheme-only resolver retained for the bootstrap callers.
     static ViewerResolution resolveScheme(const QString &scheme);
 };
 
