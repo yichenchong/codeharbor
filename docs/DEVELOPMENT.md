@@ -1,0 +1,133 @@
+# Development Environment Setup
+
+How to provision a machine to build and run CodeHarbor. Covers the C++/Qt client
+and the Node/TypeScript remote workspace.
+
+> The client is a Qt 6 desktop app; the remote workspace (`remote/`) is Node with
+> zero runtime dependencies. You can work on the remote parts with only Node.
+
+## Verified toolchain
+
+This stack has been confirmed to configure, build, and link the full tree
+(`cmake --preset dev && cmake --build --preset dev` → `codeharbor` executable):
+
+| Component | Verified version | Minimum |
+|---|---|---|
+| OS | Ubuntu 26.04 LTS | — |
+| C++ compiler | GCC 15.2 | C++20 (GCC 12+/Clang 15+) |
+| CMake | 4.2.3 | 3.24 |
+| Ninja | 1.13.2 | any |
+| Qt 6 | 6.10.2 | 6.6 |
+| libssh | 0.11.3 | 0.10+ |
+| Node.js | 24.16 | 23.6 (native TS type-stripping) |
+
+The CMake floor is Qt **6.6**; newer (6.10 here) works unchanged.
+
+## Ubuntu / Debian (apt)
+
+### 1. Client build dependencies
+
+```bash
+sudo apt-get update && sudo apt-get install -y \
+  build-essential cmake ninja-build pkg-config libssh-dev \
+  qt6-base-dev qt6-base-dev-tools qt6-declarative-dev qt6-declarative-dev-tools \
+  qt6-webengine-dev qt6-webengine-dev-tools qt6-webchannel-dev \
+  qml6-module-qtquick qml6-module-qtquick-controls qml6-module-qtquick-window \
+  qml6-module-qtquick-layouts qml6-module-qtwebengine libqt6sql6-sqlite
+```
+
+What each group provides (maps 1:1 to the `find_package(Qt6 ... COMPONENTS ...)`
+in the top-level `CMakeLists.txt`):
+
+| Requirement | Package(s) |
+|---|---|
+| Compiler + make | `build-essential` |
+| CMake + Ninja generator | `cmake`, `ninja-build` |
+| `pkg_check_modules(libssh)` (`ch_ssh`) | `pkg-config`, `libssh-dev` |
+| Qt6 Core / Gui / Network / **Sql** | `qt6-base-dev` (+ `libqt6sql6-sqlite` runtime driver) |
+| Qt6 Qml / Quick / **QuickControls2** | `qt6-declarative-dev` |
+| Qt6 **WebEngineQuick** | `qt6-webengine-dev` |
+| Qt6 **WebChannel** | `qt6-webchannel-dev` |
+| `qt_add_qml_module` / `moc` / `qmltc` tooling | `qt6-base-dev-tools`, `qt6-declarative-dev-tools`, `qt6-webengine-dev-tools` |
+| Runtime QML imports for the three-region UI | `qml6-module-qtquick*`, `qml6-module-qtwebengine` |
+
+> `qt6-tools-dev` (Qt Linguist etc.) is **not** required.
+
+### 2. Node.js (remote workspace)
+
+Node **23.6+** is required — the remote tests run TypeScript directly via Node's
+native type stripping (no ts-node/tsx). If your distro's Node is older, install a
+current one (e.g. via [nodesource](https://github.com/nodesource/distributions)
+or `nvm`):
+
+```bash
+# nvm example
+curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh | bash
+nvm install 24
+```
+
+## Other platforms (reference)
+
+The package names differ but the component set is identical (Qt 6 base +
+declarative + webengine + webchannel, a C++20 compiler, CMake, Ninja, libssh,
+Node 23.6+).
+
+- **Fedora:** `sudo dnf install gcc-c++ cmake ninja-build pkgconf-pkg-config libssh-devel qt6-qtbase-devel qt6-qtdeclarative-devel qt6-qtwebengine-devel qt6-qtwebchannel-devel`
+- **Arch:** `sudo pacman -S base-devel cmake ninja libssh qt6-base qt6-declarative qt6-webengine qt6-webchannel`
+- **macOS (Homebrew):** `brew install cmake ninja libssh node` then install Qt 6
+  via `brew install qt` or the official Qt online installer; point CMake at it
+  with `-DCMAKE_PREFIX_PATH=$(brew --prefix qt)`.
+- **Cross-platform:** the official [Qt online installer](https://www.qt.io/download-qt-installer)
+  or [`aqtinstall`](https://github.com/miurahr/aqtinstall) (what CI uses) work on
+  all three OSes.
+
+CI provisions the same set — see [`.github/workflows/ci.yml`](../.github/workflows/ci.yml)
+(`client` job installs Qt via `jurplel/install-qt-action` + `apt` for libssh/ninja).
+
+## Build & run
+
+### Client (Qt / CMake)
+
+```bash
+cmake --preset dev            # configure (Debug, Ninja, build/dev/)
+cmake --build --preset dev    # build -> build/dev/src/app/codeharbor
+./build/dev/src/app/codeharbor
+```
+
+Presets are defined in [`CMakePresets.json`](../CMakePresets.json):
+`dev` (Debug + tests) and `release`.
+
+> Running the GUI needs a display. On a headless box use an X/Wayland session or
+> `xvfb-run ./build/dev/src/app/codeharbor`. WebEngine may need
+> `--no-sandbox` in constrained containers.
+
+### Remote workspace (Node)
+
+```bash
+cd remote
+npm install        # dev-only deps (typescript, @types/node); runtime has none
+npm test           # node --test -> 11 tests
+npm run typecheck  # tsc --noEmit
+npm run build      # tsc -> dist/ (codeharbord, codeharbor-bridge)
+```
+
+Smoke-test the services without a build:
+
+```bash
+# JSON-RPC over stdio
+echo '{"jsonrpc":"2.0","id":1,"method":"server.info"}' | node src/codeharbord.ts rpc --stdio
+
+# Agent-status bridge (listens on $XDG_RUNTIME_DIR/codeharbor.sock)
+node src/bridge.ts
+```
+
+## Notes & troubleshooting
+
+- **libssh is optional at configure time.** If `libssh-dev` is missing, CMake
+  prints a warning and defines `CH_HAVE_LIBSSH=0`; the tree still configures but
+  `ch_ssh` is non-functional. Install `libssh-dev` for a working build.
+- **`compile_commands.json`** is emitted into `build/dev/` for clangd/IDEs;
+  symlink it to the repo root if your tooling expects it there.
+- **Clean reconfigure:** `rm -rf build/dev && cmake --preset dev`.
+- **Qt not found:** pass `-DCMAKE_PREFIX_PATH=/path/to/qt/6.x/gcc_64` (or set
+  `CMAKE_PREFIX_PATH` in the environment) when Qt is not on the default path.

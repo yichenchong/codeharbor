@@ -47,22 +47,25 @@ docs/           SPEC.md, PLAN.md
 
 ## Build
 
+Full environment setup (all platforms, exact packages, troubleshooting) is in
+[`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md). Quick reference:
+
 ### Client (Qt / CMake)
 
-Requires Qt 6.6+, a C++20 compiler, CMake 3.24+, and libssh.
+Requires Qt 6.6+, a C++20 compiler, CMake 3.24+, Ninja, and libssh.
 
 ```bash
-cmake --preset dev
-cmake --build --preset dev
+cmake --preset dev            # configure
+cmake --build --preset dev    # -> build/dev/src/app/codeharbor
 ```
 
 ### Remote service (Node)
 
-Requires Node 20+.
+Requires Node 23.6+ (tests run TypeScript via native type stripping).
 
 ```bash
 cd remote
-npm install        # optional; runtime has zero deps
+npm install        # dev-only deps; runtime has zero deps
 npm test           # node --test
 npm run build      # tsc -> dist/
 ```
