@@ -155,7 +155,7 @@ graph TD
 - **Parallel with:** V, E (different regions).
 
 ### V — Viewers
-- **Start gate:** [x] Bootstrap · [ ] R-client (for `file://`).
+- **Start gate:** [x] Bootstrap · [x] R-client (for `file://`).
 - **TODO:**
   - [ ] `ViewerHandlerRegistry` by scheme + MIME + extension (SPEC 7.5 table).
   - [ ] Separate WebEngine profiles: external (no bridge) vs internal (SPEC 7.3).
@@ -167,7 +167,7 @@ graph TD
 - **Parallel with:** T.
 
 ### E — Remote editor
-- **Start gate:** [ ] R file methods (stat/read/write/watch) · [ ] V pane host · [ ] C3.
+- **Start gate:** [x] R file methods (stat/read/write/watch) · [ ] V pane host · [x] C3.
 - **TODO:**
   - [ ] Monaco bundle in `src/web/editor`; `RemoteEditorBridge` (C3).
   - [ ] File-state machine (SPEC 8.2), revision-guarded save, conflict UI
@@ -178,7 +178,7 @@ graph TD
 - **Parallel with:** T.
 
 ### A — Agent awareness
-- **Start gate:** [x] bridge+adapters DONE · [ ] S agent channel · [ ] U sidebar.
+- **Start gate:** [x] bridge+adapters DONE · [x] S agent channel (ChannelKind::AgentStatus) · [ ] U sidebar.
 - **TODO:**
   - [ ] `AgentStatusMonitor` (C++) consuming JSONL over the agent channel.
   - [ ] Map `AgentState` → sidebar badges/precedence; unseen-completion badges;
@@ -191,7 +191,7 @@ graph TD
 - **Parallel with:** V, E (after U).
 
 ### U — UI shell & persistence
-- **Start gate:** [ ] M models · [ ] P (for layout persistence).
+- **Start gate:** [x] M models · [x] P (for layout persistence).
 - **TODO:**
   - [ ] Sidebar: groups (collapse/reorder), session rows with aggregate status,
     all sidebar ops (SPEC 4.2).
