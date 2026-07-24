@@ -26,8 +26,9 @@ public:
         QString host;           // single hostname or address as stored
         QString keyType;        // e.g. "ssh-ed25519", "ssh-rsa"
         QByteArray key;         // raw key blob (base64-decoded)
-        bool supported = true;  // false for hashed |1| host entries
+        bool supported = true;  // false for hashed |1| and @marker entries
         QString comment;        // trailing comment, empty if none
+        QString marker;         // "@cert-authority"/"@revoked", empty if none
     };
 
     // Verify a presented host key. Returns Match iff host+keyType exists with an
@@ -46,7 +47,8 @@ public:
     QByteArray serialize() const;
 
     // Parse known_hosts-format text. Blank lines and #-comments are ignored;
-    // an optional leading @marker (e.g. @cert-authority) is skipped.
+    // a leading @marker (@cert-authority, @revoked) is captured: a @revoked key
+    // is refused (Mismatch) if presented and @cert-authority entries are opaque.
     static KnownHosts parse(const QString& text);
 
     const QList<Entry>& entries() const;

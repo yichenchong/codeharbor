@@ -1,5 +1,6 @@
 #include <QtTest/QtTest>
 
+#include <QAbstractItemModelTester>
 #include <QJsonArray>
 #include <QJsonObject>
 
@@ -30,6 +31,10 @@ private slots:
     void splitTreeRoundTripsNestedLayout();
     void splitTreeRejectsRatioMismatch();
     void splitTreeRejectsChildlessSplit();
+    void modelSatisfiesItemModelInvariants();
+    void splitTreeRejectsUnknownAndMissingType();
+    void splitTreeRejectsInvalidNestedChild();
+    void splitTreeRoundTripsSingleChildAndDeepNesting();
     void aggregateRowStatePrecedence();
 };
 
@@ -253,6 +258,132 @@ void TstModels::aggregateRowStatePrecedence()
     // A connection error is an error even when the agent is unremarkable.
     QCOMPARE(stateOf({terminal(TerminalState::Error, AgentState::Idle)}),
              static_cast<int>(SessionRowState::Error));
+}
+
+// QAbstractItemModelTester drives the model through Qt's own invariant checks
+// (index()/parent() inverse, rowCount/columnCount bounds, hasChildren coherence,
+// data() on valid+invalid indices). It runs a full recursive pass over the
+// populated tree on construction, catching model-protocol violations the
+// hand-written assertions above do not exercise.
+void TstModels::modelSatisfiesItemModelInvariants()
+{
+    SessionsModel model;
+
+    const auto makeSession = [](const QString &name, TerminalState conn, AgentState agent) {
+        SessionRow row;
+        row.session.id = DevSessionId{name};
+        row.session.name = name;
+        row.subtitle = name + QStringLiteral(" subtitle");
+        row.terminals = {terminal(conn, agent)};
+        return row;
+    };
+
+    GroupRow work;
+    work.group.id = GroupId{QStringLiteral("g-work")};
+    work.group.name = QStringLiteral("Work");
+    work.group.collapsed = false;
+    work.sessions = {makeSession(QStringLiteral("alpha"), TerminalState::Ready, AgentState::Running),
+                     makeSession(QStringLiteral("beta"), TerminalState::Error, AgentState::Idle)};
+
+    GroupRow empty;
+    empty.group.id = GroupId{QStringLiteral("g-empty")};
+    empty.group.name = QStringLiteral("Empty");
+    empty.group.collapsed = true;
+
+    GroupRow personal;
+    personal.group.id = GroupId{QStringLiteral("g-personal")};
+    personal.group.name = QStringLiteral("Personal");
+    personal.sessions = {makeSession(QStringLiteral("gamma"), TerminalState::Disconnected,
+                                     AgentState::Unknown)};
+
+    model.setGroups({work, empty, personal});
+
+    // Constructed after population so the tester validates the full tree. In
+    // QtTest reporting mode any invariant breach is raised as a test failure.
+    QAbstractItemModelTester tester(&model, QAbstractItemModelTester::FailureReportingMode::QtTest);
+    Q_UNUSED(tester);
+
+    // Sanity anchors independent of the tester's internal checks.
+    QCOMPARE(model.rowCount(), 3);
+    QCOMPARE(model.rowCount(model.index(0, 0)), 2);
+    QCOMPARE(model.rowCount(model.index(1, 0)), 0);
+}
+
+void TstModels::splitTreeRejectsUnknownAndMissingType()
+{
+    QJsonObject unknown;
+    unknown[QStringLiteral("type")] = QStringLiteral("gadget");
+    QVERIFY(SplitNode::fromJson(unknown) == SplitNode{});
+
+    QJsonObject missing;
+    missing[QStringLiteral("paneId")] = QStringLiteral("A");
+    QVERIFY(SplitNode::fromJson(missing) == SplitNode{});
+}
+
+// A well-formed split whose child is itself an invalid split must be rejected
+// wholesale, not silently repaired into a split with an empty-leaf child.
+void TstModels::splitTreeRejectsInvalidNestedChild()
+{
+    QJsonObject badChild;
+    badChild[QStringLiteral("type")] = QStringLiteral("split");
+    badChild[QStringLiteral("orientation")] = QStringLiteral("vertical");
+    badChild[QStringLiteral("children")] = QJsonArray{};
+    badChild[QStringLiteral("ratios")] = QJsonArray{};
+
+    QJsonObject leaf;
+    leaf[QStringLiteral("type")] = QStringLiteral("leaf");
+    leaf[QStringLiteral("paneId")] = QStringLiteral("A");
+
+    QJsonObject root;
+    root[QStringLiteral("type")] = QStringLiteral("split");
+    root[QStringLiteral("orientation")] = QStringLiteral("horizontal");
+    root[QStringLiteral("children")] = QJsonArray{leaf, badChild};
+    root[QStringLiteral("ratios")] = QJsonArray{0.5, 0.5};
+
+    QVERIFY(SplitNode::fromJson(root) == SplitNode{});
+}
+
+void TstModels::splitTreeRoundTripsSingleChildAndDeepNesting()
+{
+    // A split with a single child is structurally valid and must round-trip.
+    SplitNode onlyChild;
+    onlyChild.paneId = QStringLiteral("solo");
+    SplitNode single;
+    single.orientation = SplitOrientation::Vertical;
+    single.children = {onlyChild};
+    single.ratios = {1.0};
+    QVERIFY(SplitNode::fromJson(single.toJson()) == single);
+
+    // Deep nesting with a distinct orientation at each level must be preserved.
+    SplitNode d;
+    d.paneId = QStringLiteral("D");
+    SplitNode c;
+    c.paneId = QStringLiteral("C");
+    SplitNode level2;
+    level2.orientation = SplitOrientation::Horizontal;
+    level2.children = {c, d};
+    level2.ratios = {0.25, 0.75};
+
+    SplitNode b;
+    b.paneId = QStringLiteral("B");
+    SplitNode level1;
+    level1.orientation = SplitOrientation::Vertical;
+    level1.children = {b, level2};
+    level1.ratios = {0.4, 0.6};
+
+    SplitNode a;
+    a.paneId = QStringLiteral("A");
+    SplitNode root;
+    root.orientation = SplitOrientation::Horizontal;
+    root.children = {a, level1};
+    root.ratios = {0.5, 0.5};
+
+    const SplitNode restored = SplitNode::fromJson(root.toJson());
+    QVERIFY(restored == root);
+    QCOMPARE(restored.orientation, SplitOrientation::Horizontal);
+    QCOMPARE(restored.children.at(1).orientation, SplitOrientation::Vertical);
+    QCOMPARE(restored.children.at(1).children.at(1).orientation, SplitOrientation::Horizontal);
+    QCOMPARE(restored.children.at(1).children.at(1).children.at(1).paneId, QStringLiteral("D"));
 }
 
 QTEST_GUILESS_MAIN(TstModels)

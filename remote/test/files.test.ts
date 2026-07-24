@@ -221,3 +221,44 @@ test("internal helpers: listDirectory and getMimeType classify entries", async (
 
     await fs.rm(dir, { recursive: true, force: true });
 });
+
+test("writeFile rejects a non-empty revision when the file was deleted", async () => {
+    const dir = await tmpDir();
+    const file = path.join(dir, "gone.txt");
+    await fs.writeFile(file, "loaded");
+    const loaded = await stat({ path: file });
+    await fs.rm(file);
+
+    // A non-empty expectedRevision means the client loaded an existing file; if
+    // it is gone now, that is a conflict (SPEC 8.6), not a silent recreate.
+    await assert.rejects(
+        () => writeFile({ path: file, content: "recreated", expectedRevision: loaded.revision }),
+        (err: unknown) => isRevisionMismatch(err) && err.code === RPC_REVISION_MISMATCH,
+    );
+    // The file was NOT recreated behind the client's back.
+    assert.equal(await fs.access(file).then(() => true, () => false), false);
+
+    await fs.rm(dir, { recursive: true, force: true });
+});
+
+test("watch emits a deleted WatchEvent when the file is removed", async () => {
+    const dir = await tmpDir();
+    const file = path.join(dir, "vanish.txt");
+    await fs.writeFile(file, "here");
+
+    const service = new FileWatchService();
+    service.pollIntervalMs = 25;
+    const eventPromise = firstWatchEvent(service);
+
+    const { subscriptionId } = await service.watch({ path: file });
+    await fs.rm(file);
+
+    const event = await withTimeout(eventPromise, 5000);
+    service.unwatch({ subscriptionId });
+    service.closeAll();
+
+    assert.equal(event.event, "deleted");
+    assert.equal(event.revision, undefined);
+
+    await fs.rm(dir, { recursive: true, force: true });
+});

@@ -45,6 +45,9 @@ private slots:
     void serializeRoundTrips();
     void emptyStoreIsUnknown();
     void hashedEntryIsOpaqueButPreserved();
+    void bracketedHostPortMatches();
+    void revokedKeyRefused();
+    void certAuthorityIsOpaque();
 };
 
 void TstKnownHosts::parsesSampleStore()
@@ -162,6 +165,50 @@ void TstKnownHosts::hashedEntryIsOpaqueButPreserved()
              KnownHosts::Verdict::Unknown);
     // ...but it survives a serialize round-trip.
     QVERIFY(store.serialize().contains("|1|abc=|def="));
+}
+
+void TstKnownHosts::bracketedHostPortMatches()
+{
+    // OpenSSH stores non-default ports as "[host]:port"; the exact token is
+    // matched (and the bare host must NOT match a ported entry).
+    const KnownHosts store = KnownHosts::parse(QStringLiteral(
+        "[example.com]:2222 ssh-ed25519 ZWQyNTUxOS1rZXktYWxwaGEtMDAwMQ==\n"));
+    QCOMPARE(store.entries().size(), 1);
+    QCOMPARE(store.verify(QStringLiteral("[example.com]:2222"),
+                          QStringLiteral("ssh-ed25519"), kEd25519Alpha),
+             KnownHosts::Verdict::Match);
+    QCOMPARE(store.verify(QStringLiteral("example.com"),
+                          QStringLiteral("ssh-ed25519"), kEd25519Alpha),
+             KnownHosts::Verdict::Unknown);
+    // The bracketed token survives serialization.
+    QVERIFY(store.serialize().contains("[example.com]:2222 "));
+}
+
+void TstKnownHosts::revokedKeyRefused()
+{
+    const KnownHosts store = KnownHosts::parse(QStringLiteral(
+        "@revoked bad.host ssh-ed25519 ZWQyNTUxOS1rZXktYWxwaGEtMDAwMQ==\n"));
+    // Presenting the revoked key must be refused, never accepted.
+    QCOMPARE(store.verify(QStringLiteral("bad.host"),
+                          QStringLiteral("ssh-ed25519"), kEd25519Alpha),
+             KnownHosts::Verdict::Mismatch);
+    // A different key for that host is merely Unknown (no trusted entry).
+    QCOMPARE(store.verify(QStringLiteral("bad.host"),
+                          QStringLiteral("ssh-ed25519"), kEd25519Beta),
+             KnownHosts::Verdict::Unknown);
+    // The marker is preserved on serialize.
+    QVERIFY(store.serialize().contains("@revoked "));
+}
+
+void TstKnownHosts::certAuthorityIsOpaque()
+{
+    const KnownHosts store = KnownHosts::parse(QStringLiteral(
+        "@cert-authority ca.host ssh-ed25519 ZWQyNTUxOS1rZXktYWxwaGEtMDAwMQ==\n"));
+    // A CA entry is not a direct host key: never Match/Mismatch on blob compare.
+    QCOMPARE(store.verify(QStringLiteral("ca.host"),
+                          QStringLiteral("ssh-ed25519"), kEd25519Alpha),
+             KnownHosts::Verdict::Unknown);
+    QVERIFY(store.serialize().contains("@cert-authority "));
 }
 
 QTEST_MAIN(TstKnownHosts)

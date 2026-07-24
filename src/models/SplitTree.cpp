@@ -32,25 +32,33 @@ QJsonObject SplitNode::toJson() const
     return obj;
 }
 
-SplitNode SplitNode::fromJson(const QJsonObject &obj)
+namespace {
+
+// Parses obj into out, returning false on ANY structural violation, including a
+// malformed nested subtree. This lets fromJson reject an otherwise well-formed
+// split that contains an invalid child, rather than silently substituting an
+// empty leaf for the bad subtree. A leaf always parses successfully (an empty
+// paneId is a legitimate value), so failure is unambiguous and only ever
+// originates from a split.
+bool parseNode(const QJsonObject &obj, SplitNode &out)
 {
     const QString type = obj.value(QStringLiteral("type")).toString();
 
     if (type == QStringLiteral("leaf")) {
-        SplitNode node;
-        node.paneId = obj.value(QStringLiteral("paneId")).toString();
-        return node;
+        out = SplitNode{};
+        out.paneId = obj.value(QStringLiteral("paneId")).toString();
+        return true;
     }
 
     if (type != QStringLiteral("split"))
-        return {};
+        return false;
 
     const QJsonArray childArray = obj.value(QStringLiteral("children")).toArray();
     const QJsonArray ratioArray = obj.value(QStringLiteral("ratios")).toArray();
 
     // An internal node must have children, and exactly one ratio per child.
     if (childArray.isEmpty() || ratioArray.size() != childArray.size())
-        return {};
+        return false;
 
     SplitNode node;
     node.orientation = obj.value(QStringLiteral("orientation")).toString()
@@ -59,13 +67,33 @@ SplitNode SplitNode::fromJson(const QJsonObject &obj)
             : SplitOrientation::Horizontal;
 
     node.children.reserve(childArray.size());
-    for (const QJsonValue &value : childArray)
-        node.children.append(fromJson(value.toObject()));
+    for (const QJsonValue &value : childArray) {
+        if (!value.isObject())
+            return false;
+        SplitNode child;
+        if (!parseNode(value.toObject(), child))
+            return false;
+        node.children.append(child);
+    }
 
     node.ratios.reserve(ratioArray.size());
-    for (const QJsonValue &value : ratioArray)
+    for (const QJsonValue &value : ratioArray) {
+        if (!value.isDouble())
+            return false;
         node.ratios.append(value.toDouble());
+    }
 
+    out = node;
+    return true;
+}
+
+} // namespace
+
+SplitNode SplitNode::fromJson(const QJsonObject &obj)
+{
+    SplitNode node;
+    if (!parseNode(obj, node))
+        return {};
     return node;
 }
 

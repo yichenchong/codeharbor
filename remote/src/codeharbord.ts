@@ -12,14 +12,9 @@ import readline from "node:readline";
 // are re-exported so the wire names and error code stay linked to the transport.
 // The six file.* handlers are registered from files.ts (R-server workstream).
 import { fileMethods, fileWatchService, isRevisionMismatch } from "./files.ts";
-import { RPC_REVISION_MISMATCH } from "./rpc-types.ts";
+import { RPC_REVISION_MISMATCH, RPC_WATCH_EVENT_NOTIFICATION } from "./rpc-types.ts";
 export { RPC_METHODS } from "./rpc-types.ts";
-export { RPC_REVISION_MISMATCH };
-
-// Server -> client notification method for active file watches (SPEC 8.7). This
-// is a notification name, NOT a request method: it is intentionally absent from
-// the frozen RPC_METHODS catalog, which enumerates only the six request methods.
-export const RPC_WATCH_EVENT_METHOD = "file.watchEvent";
+export { RPC_REVISION_MISMATCH, RPC_WATCH_EVENT_NOTIFICATION };
 
 export const RPC_SERVER_NAME = "codeharbord";
 export const RPC_SERVER_VERSION = "0.1.0";
@@ -137,7 +132,7 @@ export function runStdio(): void {
     // Relay watch notifications to the client as id-less JSON-RPC messages.
     fileWatchService.onWatchEvent((event) => {
         process.stdout.write(
-            `${JSON.stringify({ jsonrpc: "2.0", method: RPC_WATCH_EVENT_METHOD, params: event })}\n`,
+            `${JSON.stringify({ jsonrpc: "2.0", method: RPC_WATCH_EVENT_NOTIFICATION, params: event })}\n`,
         );
     });
     rl.on("line", (line) => {

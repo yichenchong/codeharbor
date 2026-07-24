@@ -30,6 +30,12 @@ inline constexpr auto kMethodResolvePath = "file.resolvePath";
 inline constexpr auto kMethodWatch = "file.watch";
 inline constexpr auto kMethodUnwatch = "file.unwatch";
 
+// Server -> client notification method name for an active watch subscription
+// (SPEC 8.7). A NOTIFICATION name (no id, no response), deliberately NOT part
+// of the six request methods above. Mirrors RPC_WATCH_EVENT_NOTIFICATION in
+// remote/src/rpc-types.ts.
+inline constexpr auto kWatchEventNotification = "file.watchEvent";
+
 enum class Kind { File, Directory, Symlink, Other };
 enum class Encoding { Utf8, Base64 };
 enum class WatchEventKind { Created, Modified, Deleted, Renamed };

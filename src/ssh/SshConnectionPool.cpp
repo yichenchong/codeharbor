@@ -168,7 +168,12 @@ bool SshConnectionPool::verifyHostKey(const QString& host)
     ssh_string_free_char(b64Key);
     ssh_key_free(serverKey);
 
-    switch (m_knownHosts.verify(host, keyType, keyBlob)) {
+    // Non-default ports are stored OpenSSH-style as "[host]:port"; match that
+    // form so a ported entry is found (and persisted) correctly.
+    const QString lookupHost =
+        m_port == 22 ? host
+                     : QStringLiteral("[%1]:%2").arg(host).arg(m_port);
+    switch (m_knownHosts.verify(lookupHost, keyType, keyBlob)) {
     case KnownHosts::Verdict::Match:
         return true;
     case KnownHosts::Verdict::Mismatch:
@@ -183,7 +188,7 @@ bool SshConnectionPool::verifyHostKey(const QString& host)
         if (m_hostKeyCallback(host, keyType, keyBlob,
                               KnownHosts::Verdict::Unknown)
             == HostKeyDecision::Accept) {
-            m_knownHosts.add(host, keyType, keyBlob);
+            m_knownHosts.add(lookupHost, keyType, keyBlob);
             return true;
         }
         return false;
@@ -233,9 +238,14 @@ ssh_channel SshConnectionPool::openChannel(ChannelKind kind)
         return nullptr;
     }
 
-    // Terminal channels want a PTY; the caller drives shell/exec and I/O.
-    if (kind == ChannelKind::Pty)
-        ssh_channel_request_pty(channel);
+    // Terminal channels want a PTY; the caller drives shell/exec and I/O. A
+    // failed PTY request must not masquerade as a usable channel.
+    if (kind == ChannelKind::Pty
+        && ssh_channel_request_pty(channel) != SSH_OK) {
+        ssh_channel_close(channel);
+        ssh_channel_free(channel);
+        return nullptr;
+    }
 
     return channel;
 }

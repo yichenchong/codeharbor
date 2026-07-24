@@ -9,6 +9,7 @@
 
 import { promises as fsp, watch as fsWatch } from "node:fs";
 import type { FSWatcher, Stats } from "node:fs";
+import type { FileHandle } from "node:fs/promises";
 import { EventEmitter } from "node:events";
 import { randomBytes } from "node:crypto";
 import path from "node:path";
@@ -140,7 +141,15 @@ export async function writeFile(params: WriteFileParams): Promise<WriteFileResul
                 { path: params.path, revision: revisionFrom(existing) },
             );
         }
-    } else if (existing) {
+    } else if (!existing) {
+        // A non-empty expectedRevision means the client loaded an existing file;
+        // if it is now gone (deleted externally) that is a conflict, not a
+        // silent recreate (SPEC 8.6: never silently overwrite a changed file).
+        throw new RevisionMismatchError(
+            `File no longer exists: ${params.path}`,
+            { path: params.path, expected: params.expectedRevision, actual: null },
+        );
+    } else {
         const current = revisionFrom(existing);
         if (current !== params.expectedRevision) {
             throw new RevisionMismatchError(
@@ -153,23 +162,40 @@ export async function writeFile(params: WriteFileParams): Promise<WriteFileResul
     const buf = Buffer.from(params.content, encoding === "base64" ? "base64" : "utf-8");
 
     // Atomic save (SPEC 8.5): temp file in the same directory, flush, preserve
-    // mode when overwriting, then rename over the target.
-    const dir = path.dirname(params.path);
-    const tmp = path.join(dir, `.${path.basename(params.path)}.${randomBytes(6).toString("hex")}.tmp`);
+    // mode when overwriting, then rename over the target. When the target is an
+    // existing symlink, resolve it to its real path so the rename replaces the
+    // linked-to file rather than severing the link — this also keeps the write
+    // consistent with the revision guard above, which stat()'d through the link.
+    const target = existing ? await fsp.realpath(params.path) : params.path;
+    const dir = path.dirname(target);
+    const tmp = path.join(dir, `.${path.basename(target)}.${randomBytes(6).toString("hex")}.tmp`);
     const mode = existing ? existing.mode : 0o644;
-    const handle = await fsp.open(tmp, "wx", mode);
+    let handle: FileHandle | undefined = await fsp.open(tmp, "wx", mode);
     try {
         await handle.writeFile(buf);
         await handle.sync();
-    } finally {
         await handle.close();
-    }
-    try {
+        handle = undefined;
+        // open()'s mode is masked by umask; chmod pins the exact mode on overwrite.
         if (existing) await fsp.chmod(tmp, existing.mode);
-        await fsp.rename(tmp, params.path);
+        await fsp.rename(tmp, target);
     } catch (err) {
+        if (handle) await handle.close().catch(() => {});
         await fsp.rm(tmp, { force: true });
         throw err;
+    }
+
+    // fsync the containing directory so the rename itself is durable across a
+    // crash. Best-effort: some platforms (e.g. Windows) cannot fsync a directory.
+    try {
+        const dirHandle = await fsp.open(dir, "r");
+        try {
+            await dirHandle.sync();
+        } finally {
+            await dirHandle.close();
+        }
+    } catch {
+        // Directory fsync unsupported here; the file data was already flushed.
     }
 
     const written = await fsp.stat(params.path);
@@ -197,6 +223,9 @@ interface Subscription {
     watcher?: FSWatcher;
     poll?: NodeJS.Timeout;
     lastRevision?: string;
+    // Serializes reconcile() calls so overlapping fs.watch and poll signals
+    // dedupe against a single lastRevision instead of racing across awaits.
+    pending?: Promise<void>;
 }
 
 // File-watch service (SPEC 8.7). fs.watch is the primary signal; a polling
@@ -226,8 +255,8 @@ export class FileWatchService {
         };
 
         try {
-            sub.watcher = fsWatch(params.path, (eventType) => {
-                void this.reconcile(sub, eventType === "rename" ? "rename" : "change");
+            sub.watcher = fsWatch(params.path, () => {
+                void this.reconcile(sub);
             });
             sub.watcher.on("error", () => {
                 sub.watcher?.close();
@@ -238,7 +267,7 @@ export class FileWatchService {
         }
 
         sub.poll = setInterval(() => {
-            void this.reconcile(sub, "poll");
+            void this.reconcile(sub);
         }, this.pollIntervalMs);
         sub.poll.unref?.();
 
@@ -262,10 +291,21 @@ export class FileWatchService {
         }
     }
 
-    // Compare the current on-disk revision to the last one seen and emit a
-    // WatchEvent when it changed. Shared by fs.watch and the polling fallback so
-    // the two paths dedupe against a single lastRevision.
-    private async reconcile(sub: Subscription, cause: "rename" | "change" | "poll"): Promise<void> {
+    // Serialize reconcile calls per subscription and diff the on-disk revision
+    // against the last one seen. Chaining onto sub.pending closes the await race
+    // where an fs.watch signal and a poll tick both read the pre-change revision
+    // and emit twice for one change. Event kind is derived purely from the state
+    // transition (created/modified/deleted) so it is identical regardless of
+    // which signal — fs.watch or poll — observed the change first.
+    private reconcile(sub: Subscription): Promise<void> {
+        const next = (sub.pending ?? Promise.resolve())
+            .catch(() => {})
+            .then(() => this.diffAndEmit(sub));
+        sub.pending = next;
+        return next;
+    }
+
+    private async diffAndEmit(sub: Subscription): Promise<void> {
         const stats = await statOrUndefined(sub.path);
         if (!stats) {
             if (sub.lastRevision !== undefined) {
@@ -285,7 +325,7 @@ export class FileWatchService {
         this.emitter.emit("event", {
             subscriptionId: sub.id,
             path: sub.path,
-            event: created ? "created" : cause === "rename" ? "renamed" : "modified",
+            event: created ? "created" : "modified",
             revision,
         } satisfies WatchEvent);
     }

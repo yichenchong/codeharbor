@@ -11,7 +11,18 @@ KnownHosts::Verdict KnownHosts::verify(const QString& host,
 {
     bool sawType = false;
     for (const Entry& e : m_entries) {
-        if (!e.supported || e.host != host || e.keyType != keyType)
+        if (e.host != host || e.keyType != keyType)
+            continue;
+        // A @revoked entry refuses exactly the key it names; other keys for the
+        // same host stay Unknown (no trusted entry established them).
+        if (e.marker == QLatin1String("@revoked")) {
+            if (e.key == keyBlob)
+                return Verdict::Mismatch;
+            continue;
+        }
+        // Hashed (|1|) and @cert-authority entries are opaque to direct blob
+        // comparison: never a source of Match/Mismatch.
+        if (!e.supported)
             continue;
         sawType = true;
         if (e.key == keyBlob)
@@ -30,13 +41,17 @@ void KnownHosts::add(const QString& host, const QString& keyType,
             return;
         }
     }
-    m_entries.append(Entry{host, keyType, keyBlob, true, QString()});
+    m_entries.append(Entry{host, keyType, keyBlob, true, QString(), QString()});
 }
 
 QByteArray KnownHosts::serialize() const
 {
     QByteArray out;
     for (const Entry& e : m_entries) {
+        if (!e.marker.isEmpty()) {
+            out += e.marker.toUtf8();
+            out += ' ';
+        }
         out += e.host.toUtf8();
         out += ' ';
         out += e.keyType.toUtf8();
@@ -64,9 +79,12 @@ KnownHosts KnownHosts::parse(const QString& text)
             line.split(QRegularExpression(QStringLiteral("\\s+")),
                        Qt::SkipEmptyParts);
         int idx = 0;
-        // Skip an optional leading marker (@cert-authority, @revoked, ...).
-        if (idx < fields.size() && fields.at(idx).startsWith(QLatin1Char('@')))
+        // Capture an optional leading marker (@cert-authority, @revoked).
+        QString marker;
+        if (idx < fields.size() && fields.at(idx).startsWith(QLatin1Char('@'))) {
+            marker = fields.at(idx);
             ++idx;
+        }
         if (fields.size() - idx < 3)
             continue;
 
@@ -81,11 +99,13 @@ KnownHosts KnownHosts::parse(const QString& text)
             comment += fields.at(i);
         }
 
-        // Hashed host entries (|1|salt|hash) are opaque: recorded but never
-        // matchable, so they still round-trip through serialize().
+        // Hashed (|1|salt|hash) hosts and any @marker entry are opaque to the
+        // direct-blob match path (supported == false), but still round-trip.
+        // @revoked is additionally consulted by verify() to refuse its key.
+        const bool opaque = !marker.isEmpty();
         if (hostField.startsWith(QLatin1Char('|'))) {
             store.m_entries.append(
-                Entry{hostField, keyType, key, false, comment});
+                Entry{hostField, keyType, key, false, comment, marker});
             continue;
         }
 
@@ -93,7 +113,8 @@ KnownHosts KnownHosts::parse(const QString& text)
         const QStringList hosts =
             hostField.split(QLatin1Char(','), Qt::SkipEmptyParts);
         for (const QString& host : hosts)
-            store.m_entries.append(Entry{host, keyType, key, true, comment});
+            store.m_entries.append(
+                Entry{host, keyType, key, !opaque, comment, marker});
     }
     return store;
 }

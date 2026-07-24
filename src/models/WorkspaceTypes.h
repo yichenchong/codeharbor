@@ -4,15 +4,18 @@
 
 #include <QString>
 
-// Core data-model value types (SPEC 3.1-3.4, workstream M). These are plain
-// persisted-shape structs mirroring the columns in remote/sql/schema.sql; they
-// carry no runtime/connection state (that lives with the sidebar model). Ids use
-// the strongly-typed wrappers from Ids.h.
+// Core data-model value types (SPEC 3.1-3.4, workstream M). These carry the
+// identifying/domain columns of the corresponding remote/sql/schema.sql tables
+// plus server_id (SPEC 3.5, multi-server future-proofing); persistence-only
+// bookkeeping (created_at/updated_at) stays in the persistence layer, and
+// runtime/connection state lives with the sidebar model. Ids use the
+// strongly-typed wrappers from Ids.h.
 namespace ch {
 
 // A collapsible sidebar container (SPEC 3.1).
 struct Group {
     GroupId id;
+    ServerId serverId;
     QString name;
     int position = 0;
     bool collapsed = false;
@@ -24,6 +27,7 @@ struct Group {
 // or one task within a repository.
 struct DevSession {
     DevSessionId id;
+    ServerId serverId;
     GroupId groupId;
     QString name;
     QString repositoryRoot;
@@ -38,6 +42,7 @@ struct DevSession {
 // A viewer pane displaying one URL or remote resource (SPEC 3.3).
 struct ViewerPane {
     ViewerPaneId id;
+    ServerId serverId;
     DevSessionId devSessionId;
     QString url;
     QString handler;
@@ -51,6 +56,7 @@ struct ViewerPane {
 // and attention state are runtime concerns held elsewhere, not persisted here.
 struct TerminalPane {
     TerminalId id;
+    ServerId serverId;
     DevSessionId devSessionId;
     QString name;
     QString workingDirectory;

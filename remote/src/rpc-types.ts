@@ -99,6 +99,13 @@ export const RPC_METHODS = {
 export type RpcMethodKey = keyof typeof RPC_METHODS;
 export type RpcMethodName = (typeof RPC_METHODS)[RpcMethodKey];
 
+// Server -> client notification method name for an active watch subscription
+// (SPEC 8.7). This is a NOTIFICATION name (no id, no response), deliberately
+// absent from RPC_METHODS, which enumerates only the six request methods. It
+// lives here in the contract so the wire name stays shared between the server
+// (codeharbord.ts) and the C++ client (RpcTypes.h).
+export const RPC_WATCH_EVENT_NOTIFICATION = "file.watchEvent";
+
 // Implementation-defined server error code (JSON-RPC 2.0 reserves -32000..-32099
 // for such errors) for a writeFile whose expectedRevision no longer matches the
 // file's current revision. The server rejects the write rather than silently
