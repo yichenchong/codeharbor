@@ -52,6 +52,7 @@ private slots:
     void listParsesNestedTree();
     void createGroupSerializesParams();
     void errorResponseDeliversRpcError();
+    void getLayoutNullDeliversNullopt();
     void liveCreateAndListOverProcess();
 
 private:
@@ -289,6 +290,43 @@ void TstWorkspaceDb::errorResponseDeliversRpcError()
     QCOMPARE(got->code, -32602);
     QCOMPARE(got->message, QStringLiteral("bad params"));
     QVERIFY(!group.has_value()); // no partial result alongside an error
+}
+
+void TstWorkspaceDb::getLayoutNullDeliversNullopt()
+{
+    makePair();
+
+    bool hasLayout = true;
+    std::optional<RpcError> err;
+    bool fired = false;
+    m_db->getLayout(
+        ch::DevSessionId{QStringLiteral("s1")}, ch::Region::Viewer,
+        [&](std::optional<SplitNode> tree, std::optional<RpcError> e) {
+            hasLayout = tree.has_value();
+            err = e;
+            fired = true;
+        });
+
+    const QJsonObject req = readRequest();
+    QCOMPARE(req.value(QStringLiteral("method")).toString(),
+             QStringLiteral("workspace.getLayout"));
+    const QJsonObject params = req.value(QStringLiteral("params")).toObject();
+    QCOMPARE(params.value(QStringLiteral("devSessionId")).toString(),
+             QStringLiteral("s1"));
+    QCOMPARE(params.value(QStringLiteral("region")).toString(),
+             QStringLiteral("viewer"));
+    const int id = req.value(QStringLiteral("id")).toInt();
+
+    // The server returns JSON null when the region has no persisted layout;
+    // the client must decode that to std::nullopt, not a default-constructed
+    // (empty-leaf) SplitNode.
+    m_serverSide->write(jsonLine(
+        {{"jsonrpc", "2.0"}, {"id", id}, {"result", QJsonValue(QJsonValue::Null)}}));
+    m_serverSide->flush();
+
+    QTRY_VERIFY(fired);
+    QVERIFY(!err.has_value());
+    QVERIFY(!hasLayout);
 }
 
 void TstWorkspaceDb::liveCreateAndListOverProcess()

@@ -2,6 +2,20 @@
 
 #include <utility>
 
+namespace {
+// POSIX single-quote a value for safe interpolation into a shell command: wrap
+// it in single quotes and rewrite every embedded quote as the '\'' sequence, so
+// no quote, space, or metacharacter in a working directory or id can break out
+// of the quoting (SPEC 5.2). Without this a workingDir like /a'; rm -rf ~; ' or
+// an id carrying a quote would inject shell.
+QString shellSingleQuote(const QString &value)
+{
+    QString escaped = value;
+    escaped.replace(QLatin1Char('\''), QStringLiteral("'\\''"));
+    return QLatin1Char('\'') + escaped + QLatin1Char('\'');
+}
+} // namespace
+
 namespace ch {
 
 TerminalController::TerminalController(QObject *parent)
@@ -93,8 +107,8 @@ QString TerminalController::tmuxNewSessionCommand(const DevSessionId &devSession
                                                   const TerminalId &terminal,
                                                   const QString &workingDir)
 {
-    return QStringLiteral("tmux new-session -A -s '%1' -c '%2'")
-        .arg(tmuxTarget(devSession, terminal), workingDir);
+    return QStringLiteral("tmux new-session -A -s %1 -c %2")
+        .arg(shellSingleQuote(tmuxTarget(devSession, terminal)), shellSingleQuote(workingDir));
 }
 
 int TerminalController::reconnectDelaySeconds(int attempt)

@@ -251,3 +251,115 @@ test("update and move operations mutate persisted rows", async () => {
     ws.close();
     await cleanup(dbPath);
 });
+
+test("duplicateSession rolls back completely when a copy step fails (transaction atomicity)", async () => {
+    const dbPath = await tmpDbPath();
+    const ws = openWorkspace(dbPath);
+    const { group, session } = seed(ws);
+
+    // Corrupt one stored layout tree so duplicateSession's JSON.parse throws
+    // AFTER the new session and panes are inserted, forcing a full rollback.
+    ws.db
+        .prepare("UPDATE session_layouts SET tree = ? WHERE dev_session_id = ? AND region = ?")
+        .run("{ not valid json", session.id, "terminal");
+
+    assert.throws(() => ws.duplicateSession({ id: session.id }));
+
+    // Nothing partial survived: exactly the original session and its panes.
+    const count = (sql: string, ...args: string[]): number => {
+        const row = ws.db.prepare(sql).get(...args) as { n: number };
+        return row.n;
+    };
+    assert.equal(count("SELECT COUNT(*) AS n FROM dev_sessions WHERE group_id = ?", group.id), 1);
+    assert.equal(count("SELECT COUNT(*) AS n FROM viewer_panes"), 1);
+    assert.equal(count("SELECT COUNT(*) AS n FROM terminal_panes"), 1);
+
+    ws.close();
+    await cleanup(dbPath);
+});
+
+test("reorderSessions rewrites positions within a group", async () => {
+    const dbPath = await tmpDbPath();
+    const ws = openWorkspace(dbPath);
+    const group = ws.createGroup({ serverId: SERVER, name: "G" });
+    const mk = (name: string) =>
+        ws.createSession({ serverId: SERVER, groupId: group.id, name, repositoryRoot: "/r" });
+    const a = mk("A");
+    const b = mk("B");
+    const c = mk("C");
+    assert.deepEqual(
+        ws.list(SERVER)[0].sessions.map((s) => s.name),
+        ["A", "B", "C"],
+    );
+
+    ws.reorderSessions({ groupId: group.id, orderedIds: [c.id, a.id, b.id] });
+
+    assert.deepEqual(
+        ws.list(SERVER)[0].sessions.map((s) => s.name),
+        ["C", "A", "B"],
+    );
+
+    ws.close();
+    await cleanup(dbPath);
+});
+
+test("duplicateSession remaps a nested split layout to the copied panes (SPEC 4.5)", async () => {
+    const dbPath = await tmpDbPath();
+    const ws = openWorkspace(dbPath);
+    const group = ws.createGroup({ serverId: SERVER, name: "G" });
+    const session = ws.createSession({
+        serverId: SERVER,
+        groupId: group.id,
+        name: "S",
+        repositoryRoot: "/r",
+    });
+    const v1 = ws.createViewerPane({ serverId: SERVER, devSessionId: session.id, url: "http://a" });
+    const v2 = ws.createViewerPane({ serverId: SERVER, devSessionId: session.id, url: "http://b" });
+    ws.setLayout({
+        serverId: SERVER,
+        devSessionId: session.id,
+        region: "viewer",
+        tree: {
+            type: "split",
+            orientation: "horizontal",
+            ratios: [0.5, 0.5],
+            children: [
+                { type: "leaf", paneId: v1.id },
+                { type: "leaf", paneId: v2.id },
+            ],
+        },
+    });
+
+    const dup = ws.duplicateSession({ id: session.id });
+    const [dv1, dv2] = dup.viewerPanes;
+    assert.notEqual(dv1.id, v1.id);
+    assert.notEqual(dv2.id, v2.id);
+    // Both leaves reference the COPIED pane ids in order, never the originals.
+    assert.deepEqual(dup.layouts.viewer, {
+        type: "split",
+        orientation: "horizontal",
+        ratios: [0.5, 0.5],
+        children: [
+            { type: "leaf", paneId: dv1.id },
+            { type: "leaf", paneId: dv2.id },
+        ],
+    });
+
+    ws.close();
+    await cleanup(dbPath);
+});
+
+test("getLayout returns null for a region with no layout", async () => {
+    const dbPath = await tmpDbPath();
+    const ws = openWorkspace(dbPath);
+    const group = ws.createGroup({ serverId: SERVER, name: "G" });
+    const session = ws.createSession({
+        serverId: SERVER,
+        groupId: group.id,
+        name: "S",
+        repositoryRoot: "/r",
+    });
+    assert.equal(ws.getLayout({ devSessionId: session.id, region: "viewer" }), null);
+    ws.close();
+    await cleanup(dbPath);
+});

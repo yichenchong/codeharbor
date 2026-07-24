@@ -5,6 +5,8 @@
 #include <QJsonObject>
 #include <QMetaObject>
 
+#include <limits>
+
 namespace ch {
 
 namespace {
@@ -89,6 +91,8 @@ void CodeharbordClient::onReadyRead()
     while ((newline = m_readBuffer.indexOf('\n')) != -1) {
         QByteArray line = m_readBuffer.left(newline);
         m_readBuffer.remove(0, newline + 1);
+        if (line.endsWith('\r'))
+            line.chop(1); // tolerate CRLF framing (SPEC 10.3 is newline-delimited)
         if (line.trimmed().isEmpty())
             continue;
         processLine(line);
@@ -115,12 +119,27 @@ void CodeharbordClient::processLine(const QByteArray& line)
     }
 
     const QJsonValue idValue = obj.value(QStringLiteral("id"));
+    // Responses this client can route always carry the integer id it issued;
+    // the server echoes it verbatim. A missing/null/string id, or a fractional
+    // or out-of-range number, is unroutable (JSON-RPC 2.0 section 5).
     if (!idValue.isDouble()) {
         emit protocolWarning(QStringLiteral("RPC message with no routable id"));
         return;
     }
+    const double idNum = idValue.toDouble();
+    // Range-check before the float->int cast (out-of-range double->int is UB),
+    // then reject fractional ids so a bogus 1.5 can't truncate onto pending #1.
+    if (idNum < static_cast<double>(std::numeric_limits<int>::min()) ||
+        idNum > static_cast<double>(std::numeric_limits<int>::max())) {
+        emit protocolWarning(QStringLiteral("RPC response with out-of-range id"));
+        return;
+    }
+    const int id = static_cast<int>(idNum);
+    if (static_cast<double>(id) != idNum) {
+        emit protocolWarning(QStringLiteral("RPC response with non-integral id"));
+        return;
+    }
 
-    const int id = idValue.toInt();
     auto it = m_pending.find(id);
     if (it == m_pending.end()) {
         // Unknown or duplicate (already-dispatched) id — ignore with a warning.
@@ -129,15 +148,40 @@ void CodeharbordClient::processLine(const QByteArray& line)
         return;
     }
 
+    // Copy the callback out and erase the pending entry BEFORE invoking it, so a
+    // callback that re-enters call() (or otherwise mutates m_pending) never sees
+    // a half-cleared map or a dangling iterator.
     const ResponseCallback cb = it.value();
     m_pending.erase(it);
 
-    if (obj.contains(QStringLiteral("error"))) {
+    // JSON-RPC 2.0 section 5: a response carries exactly one of result/error.
+    const bool hasError = obj.contains(QStringLiteral("error"));
+    const bool hasResult = obj.contains(QStringLiteral("result"));
+
+    if (hasError) {
+        if (hasResult) {
+            emit protocolWarning(
+                QStringLiteral("response %1 carries both result and error; "
+                               "treating as error").arg(id));
+        }
         const QJsonObject errObj = obj.value(QStringLiteral("error")).toObject();
         RpcError error;
         error.code = errObj.value(QStringLiteral("code")).toInt();
         error.message = errObj.value(QStringLiteral("message")).toString();
         error.data = errObj.value(QStringLiteral("data"));
+        cb(QJsonValue(), error);
+        return;
+    }
+
+    if (!hasResult) {
+        // Neither field present: malformed. Fail the pending callback so the
+        // caller cannot hang, and flag the violation.
+        emit protocolWarning(
+            QStringLiteral("response %1 carries neither result nor error").arg(id));
+        RpcError error;
+        error.code = kInternalError;
+        error.message =
+            QStringLiteral("malformed response: neither result nor error");
         cb(QJsonValue(), error);
         return;
     }

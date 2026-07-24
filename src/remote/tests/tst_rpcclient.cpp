@@ -44,6 +44,14 @@ private slots:
     void notificationRouted();
     void unknownAndDuplicateIdWarn();
     void pendingFailOnClose();
+    void bothResultAndErrorTreatedAsError();
+    void neitherResultNorErrorFailsCallback();
+    void nonRoutableIdWarns();
+    void crlfAndWhitespaceFraming();
+    void utf8SplitAcrossChunkBoundary();
+    void reentrantCallFromCallback();
+    void paramsOmittedWhenNullPresentOtherwise();
+    void setTransportTwiceDetachesOld();
     void liveServerInfoOverProcess();
 
 private:
@@ -273,6 +281,252 @@ void TstRpcClient::pendingFailOnClose()
     QCOMPARE(closedSpy.count(), 1); // idempotent: exactly one close signal
     QVERIFY(last.has_value());
     QCOMPARE(last->code, -32603);
+}
+
+void TstRpcClient::bothResultAndErrorTreatedAsError()
+{
+    makePair();
+
+    QSignalSpy warnSpy(m_client, &CodeharbordClient::protocolWarning);
+    std::optional<RpcError> got;
+    bool fired = false;
+    const int id = m_client->call(
+        QStringLiteral("file.stat"), QJsonObject{{"path", "/a"}},
+        [&](QJsonValue, std::optional<RpcError> err) {
+            got = err;
+            fired = true;
+        });
+
+    // JSON-RPC 2.0 forbids both fields; the client warns but resolves as error.
+    m_serverSide->write(jsonLine({{"jsonrpc", "2.0"},
+                                  {"id", id},
+                                  {"result", QJsonObject{{"ok", true}}},
+                                  {"error", QJsonObject{{"code", -32000},
+                                                        {"message", "boom"}}}}));
+    m_serverSide->flush();
+
+    QTRY_VERIFY(fired);
+    QVERIFY(got.has_value());
+    QCOMPARE(got->code, -32000);
+    QCOMPARE(got->message, QStringLiteral("boom"));
+    QTRY_COMPARE(warnSpy.count(), 1);
+    QCOMPARE(m_client->pendingCount(), 0);
+}
+
+void TstRpcClient::neitherResultNorErrorFailsCallback()
+{
+    makePair();
+
+    QSignalSpy warnSpy(m_client, &CodeharbordClient::protocolWarning);
+    std::optional<RpcError> got;
+    bool fired = false;
+    const int id = m_client->call(
+        QStringLiteral("ping"), QJsonValue(),
+        [&](QJsonValue, std::optional<RpcError> err) {
+            got = err;
+            fired = true;
+        });
+
+    // A response with neither result nor error is malformed: the pending call
+    // must be failed (not left hanging) and the violation flagged.
+    m_serverSide->write(jsonLine({{"jsonrpc", "2.0"}, {"id", id}}));
+    m_serverSide->flush();
+
+    QTRY_VERIFY(fired);
+    QVERIFY(got.has_value());
+    QCOMPARE(got->code, -32603);
+    QTRY_COMPARE(warnSpy.count(), 1);
+    QCOMPARE(m_client->pendingCount(), 0);
+}
+
+void TstRpcClient::nonRoutableIdWarns()
+{
+    makePair();
+
+    QSignalSpy warnSpy(m_client, &CodeharbordClient::protocolWarning);
+    bool fired = false;
+    const int id = m_client->call(
+        QStringLiteral("ping"), QJsonValue(),
+        [&](QJsonValue, std::optional<RpcError>) { fired = true; });
+
+    // String id: unroutable (this client only issues integer ids).
+    m_serverSide->write(jsonLine(
+        {{"jsonrpc", "2.0"}, {"id", "abc"}, {"result", QJsonObject{}}}));
+    // Fractional id must NOT truncate and mis-route to the pending integer id.
+    m_serverSide->write(jsonLine({{"jsonrpc", "2.0"},
+                                  {"id", id + 0.5},
+                                  {"result", QJsonObject{}}}));
+    m_serverSide->flush();
+
+    QTRY_COMPARE(warnSpy.count(), 2);
+    QVERIFY(!fired);
+    QCOMPARE(m_client->pendingCount(), 1); // still awaiting the real response
+}
+
+void TstRpcClient::crlfAndWhitespaceFraming()
+{
+    makePair();
+
+    bool fired = false;
+    QJsonValue res;
+    const int id = m_client->call(
+        QStringLiteral("ping"), QJsonValue(),
+        [&](QJsonValue r, std::optional<RpcError> err) {
+            QVERIFY(!err.has_value());
+            res = r;
+            fired = true;
+        });
+
+    // Blank and whitespace-only lines are skipped; the frame uses CRLF.
+    QByteArray chunk = "\r\n   \r\n";
+    const QByteArray body =
+        QJsonDocument(QJsonObject{{"jsonrpc", "2.0"},
+                                  {"id", id},
+                                  {"result", QJsonObject{{"pong", true}}}})
+            .toJson(QJsonDocument::Compact);
+    chunk += body + "\r\n";
+    m_serverSide->write(chunk);
+    m_serverSide->flush();
+
+    QTRY_VERIFY(fired);
+    QVERIFY(res.toObject().value("pong").toBool());
+}
+
+void TstRpcClient::utf8SplitAcrossChunkBoundary()
+{
+    makePair();
+
+    bool fired = false;
+    QString content;
+    const int id = m_client->call(
+        QStringLiteral("file.readFile"), QJsonObject{{"path", "/u"}},
+        [&](QJsonValue r, std::optional<RpcError> err) {
+            QVERIFY(!err.has_value());
+            content = r.toObject().value("content").toString();
+            fired = true;
+        });
+
+    // "café ☕" — multibyte UTF-8; split the wire bytes mid-codepoint.
+    const QByteArray full = jsonLine(
+        {{"jsonrpc", "2.0"},
+         {"id", id},
+         {"result", QJsonObject{{"content", QString::fromUtf8("caf\xC3\xA9 \xE2\x98\x95")}}}});
+    // Find a split point inside a multibyte sequence (a continuation byte).
+    int split = full.indexOf('\xC3') + 1; // between the two bytes of é
+    QVERIFY(split > 0 && split < full.size());
+    m_serverSide->write(full.left(split));
+    m_serverSide->flush();
+    QTest::qWait(100);
+    QVERIFY(!fired);
+    m_serverSide->write(full.mid(split));
+    m_serverSide->flush();
+
+    QTRY_VERIFY(fired);
+    QCOMPARE(content, QString::fromUtf8("caf\xC3\xA9 \xE2\x98\x95"));
+}
+
+void TstRpcClient::reentrantCallFromCallback()
+{
+    makePair();
+
+    bool first = false;
+    bool second = false;
+    int secondId = -1;
+    const int firstId = m_client->call(
+        QStringLiteral("a"), QJsonValue(),
+        [&](QJsonValue, std::optional<RpcError>) {
+            first = true;
+            // Re-enter: issue a fresh call from inside the dispatch. The pending
+            // entry for firstId must already be erased (no iterator invalidation).
+            secondId = m_client->call(
+                QStringLiteral("b"), QJsonValue(),
+                [&](QJsonValue, std::optional<RpcError>) { second = true; });
+        });
+
+    m_serverSide->write(
+        jsonLine({{"jsonrpc", "2.0"}, {"id", firstId}, {"result", QJsonObject{}}}));
+    m_serverSide->flush();
+    QTRY_VERIFY(first);
+    QVERIFY(secondId > firstId);
+    QCOMPARE(m_client->pendingCount(), 1); // only the re-entrant call remains
+
+    m_serverSide->write(
+        jsonLine({{"jsonrpc", "2.0"}, {"id", secondId}, {"result", QJsonObject{}}}));
+    m_serverSide->flush();
+    QTRY_VERIFY(second);
+    QCOMPARE(m_client->pendingCount(), 0);
+}
+
+void TstRpcClient::paramsOmittedWhenNullPresentOtherwise()
+{
+    makePair();
+
+    // Null/undefined params must be omitted from the wire (JSON-RPC 2.0 params
+    // is a structured value or absent, never null).
+    m_client->call(QStringLiteral("ping"), QJsonValue(),
+                   [&](QJsonValue, std::optional<RpcError>) {});
+    m_clientSide->flush();
+    QVERIFY(m_serverSide->waitForReadyRead(2000));
+    QByteArray sent = m_serverSide->readAll();
+    QJsonObject req = QJsonDocument::fromJson(sent.trimmed()).object();
+    QVERIFY(!req.contains(QStringLiteral("params")));
+    QCOMPARE(req.value("jsonrpc").toString(), QStringLiteral("2.0"));
+    QVERIFY(req.value("id").isDouble());
+
+    // A real params object is carried through verbatim.
+    m_client->call(QStringLiteral("file.stat"), QJsonObject{{"path", "/z"}},
+                   [&](QJsonValue, std::optional<RpcError>) {});
+    m_clientSide->flush();
+    QVERIFY(m_serverSide->waitForReadyRead(2000));
+    sent = m_serverSide->readAll();
+    req = QJsonDocument::fromJson(sent.trimmed()).object();
+    QVERIFY(req.contains(QStringLiteral("params")));
+    QCOMPARE(req.value("params").toObject().value("path").toString(),
+             QStringLiteral("/z"));
+}
+
+void TstRpcClient::setTransportTwiceDetachesOld()
+{
+    makePair();
+
+    bool fired = false;
+    const int id = m_client->call(
+        QStringLiteral("ping"), QJsonValue(),
+        [&](QJsonValue, std::optional<RpcError>) { fired = true; });
+
+    // Rebind to a fresh transport; the old socket's frames must no longer route.
+    QLocalSocket* oldSide = m_serverSide;
+    QLocalServer server2;
+    const QString name = QStringLiteral("ch_rpc_test_%1_swap_%2")
+                             .arg(QCoreApplication::applicationPid())
+                             .arg(++s_seq);
+    QLocalServer::removeServer(name);
+    QVERIFY(server2.listen(name));
+    QLocalSocket newClient;
+    newClient.connectToServer(name);
+    QVERIFY(newClient.waitForConnected(2000));
+    QVERIFY(server2.waitForNewConnection(2000));
+    QLocalSocket* newServer = server2.nextPendingConnection();
+    QVERIFY(newServer != nullptr);
+
+    m_client->setTransport(&newClient);
+
+    // A frame on the OLD transport must be ignored (hooks disconnected).
+    QSignalSpy warnSpy(m_client, &CodeharbordClient::protocolWarning);
+    oldSide->write(
+        jsonLine({{"jsonrpc", "2.0"}, {"id", id}, {"result", QJsonObject{}}}));
+    oldSide->flush();
+    QTest::qWait(150);
+    QVERIFY(!fired);
+
+    // The matching frame on the NEW transport still routes the pending call.
+    newServer->write(
+        jsonLine({{"jsonrpc", "2.0"}, {"id", id}, {"result", QJsonObject{}}}));
+    newServer->flush();
+    QTRY_VERIFY(fired);
+    QCOMPARE(warnSpy.count(), 0);
+
+    m_client->setTransport(nullptr);
 }
 
 void TstRpcClient::liveServerInfoOverProcess()

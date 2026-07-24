@@ -23,6 +23,10 @@ export interface TerminalHost {
     setConnectionState(state: string): void;
     /** Called by C++ to clear the visible screen buffer (SPEC 5.1). */
     clear(): void;
+    /** Tear down the renderer: dispose xterm.js (and its addons) and disconnect
+     *  the resize/visibility observers so nothing leaks when the pane is closed
+     *  (SPEC 5.4). */
+    dispose(): void;
 }
 
 export function mountTerminal(element: HTMLElement, bridge: TerminalBridge): TerminalHost {
@@ -79,6 +83,12 @@ export function mountTerminal(element: HTMLElement, bridge: TerminalBridge): Ter
         },
         clear(): void {
             term.clear();
+        },
+        dispose(): void {
+            resizeObserver.disconnect();
+            visibilityObserver.disconnect();
+            // Disposing the terminal also disposes loaded addons (FitAddon).
+            term.dispose();
         },
     };
 }

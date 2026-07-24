@@ -14,6 +14,7 @@ class TstTerminalController : public QObject {
 
 private slots:
     void flushesOnSizeThreshold();
+    void sizeFlushCancelsTimerNoDoubleFlushPreservesOrder();
     void flushesOnTimeThreshold();
     void emptyOutputNeverFlushes();
     void hiddenDrainRetainsCapAndEvictsOldest();
@@ -22,6 +23,7 @@ private slots:
     void unchangedStateDoesNotEmit();
     void tmuxTargetFormat();
     void tmuxNewSessionCommandFormat();
+    void tmuxNewSessionCommandEscapesShellMetacharacters();
     void reconnectBackoffSchedule();
 };
 
@@ -36,6 +38,35 @@ void TstTerminalController::flushesOnSizeThreshold()
 
     QCOMPARE(spy.count(), 1);
     QCOMPARE(spy.at(0).at(0).toByteArray(), chunk);
+}
+
+// A size-triggered flush mid-stream must cancel the armed time-timer so no stale
+// timeout produces a second (empty) flush, and it must coalesce the earlier
+// buffered bytes with the size-crossing chunk in arrival order. A later ingest
+// re-arms the timer, proving it restarts cleanly after a flush (SPEC 5.5).
+void TstTerminalController::sizeFlushCancelsTimerNoDoubleFlushPreservesOrder()
+{
+    TerminalController controller;
+    QSignalSpy spy(&controller, &TerminalController::flushReady);
+
+    const QByteArray head("abc");
+    const QByteArray bulk(TerminalController::kFlushSizeBytes, 'x');
+    controller.ingestOutput(head); // sub-threshold: arms the time-timer
+    controller.ingestOutput(bulk); // crosses the size cap: flush now
+
+    QCOMPARE(spy.count(), 1);
+    QCOMPARE(spy.at(0).at(0).toByteArray(), head + bulk); // order preserved
+
+    // The armed timer was cancelled by the size flush: no empty second flush.
+    QVERIFY(!spy.wait(50));
+    QCOMPARE(spy.count(), 1);
+
+    // A fresh sub-threshold ingest re-arms and fires the timer independently.
+    const QByteArray tail("def");
+    controller.ingestOutput(tail);
+    QVERIFY(spy.wait(1000));
+    QCOMPARE(spy.count(), 2);
+    QCOMPARE(spy.at(1).at(0).toByteArray(), tail);
 }
 
 // Sub-threshold output flushes once the time window elapses (SPEC 5.5).
@@ -162,6 +193,19 @@ void TstTerminalController::tmuxNewSessionCommandFormat()
         QStringLiteral("/home/dev/project"));
     QCOMPARE(command,
              QStringLiteral("tmux new-session -A -s 'ch_dev1_term1' -c '/home/dev/project'"));
+}
+
+// A workingDir carrying a single quote and shell metacharacters must be safely
+// single-quoted (embedded quote rewritten as '\'') so nothing escapes the
+// quoting and injects shell (SPEC 5.2 hardening).
+void TstTerminalController::tmuxNewSessionCommandEscapesShellMetacharacters()
+{
+    const QString command = TerminalController::tmuxNewSessionCommand(
+        DevSessionId{QStringLiteral("dev1")}, TerminalId{QStringLiteral("term1")},
+        QStringLiteral("/home/dev/it's here; rm -rf /"));
+    QCOMPARE(command,
+             QStringLiteral("tmux new-session -A -s 'ch_dev1_term1' "
+                            "-c '/home/dev/it'\\''s here; rm -rf /'"));
 }
 
 // Reconnect backoff: 1, 2, 5, 10, 30, then 60 thereafter (SPEC 5.6).
