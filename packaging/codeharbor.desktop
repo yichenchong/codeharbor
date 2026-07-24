@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=CodeHarbor
+GenericName=Remote Development Workspace
+Comment=Manage persistent remote development workspaces
+Exec=codeharbor
+Icon=codeharbor
+Categories=Development;IDE;
+Terminal=false
+StartupWMClass=codeharbor

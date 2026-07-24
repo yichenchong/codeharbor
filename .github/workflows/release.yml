@@ -1,0 +1,152 @@
+name: Release
+
+# Cross-OS binaries are produced by building NATIVELY on each OS. Qt WebEngine
+# (Chromium) cannot be cross-compiled, so there is one runner per target OS.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git ref to build"
+        required: false
+
+env:
+  QT_VERSION: "6.8.1"
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, name: linux }
+          - { os: windows-latest, name: windows }
+          - { os: macos-latest, name: macos }
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Install Qt ${{ env.QT_VERSION }}
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: ${{ env.QT_VERSION }}
+          modules: qtwebengine qtwebchannel
+          cache: true
+
+      - name: Install CMake + Ninja
+        uses: lukka/get-cmake@latest
+
+      # --- libssh per platform -------------------------------------------------
+      - name: Install libssh (Linux)
+        if: matrix.name == 'linux'
+        run: sudo apt-get update && sudo apt-get install -y libssh-dev
+
+      - name: Install libssh (macOS)
+        if: matrix.name == 'macos'
+        run: brew install libssh
+
+      - name: Install libssh via vcpkg (Windows)
+        if: matrix.name == 'windows'
+        shell: pwsh
+        run: |
+          vcpkg install libssh:x64-windows
+          echo "CMAKE_TOOLCHAIN_FILE=$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" >> $env:GITHUB_ENV
+
+      # --- MSVC environment for the Ninja generator (Windows) ------------------
+      - name: Set up MSVC (Windows)
+        if: matrix.name == 'windows'
+        uses: ilammy/msvc-dev-cmd@v1
+
+      # --- configure + build ---------------------------------------------------
+      # CMake 3.21+ reads CMAKE_TOOLCHAIN_FILE from the environment (set by the
+      # vcpkg step on Windows), so one command works on every OS. On Windows the
+      # MSVC env from the previous step lets Ninja find cl.exe under bash.
+      - name: Configure
+        run: cmake --preset release
+        shell: bash
+
+      - name: Build
+        run: cmake --build --preset release
+        shell: bash
+
+      # --- package a runnable artifact per OS ----------------------------------
+      # Raw Qt/WebEngine executables are NOT runnable off the runner; each OS has
+      # its own deploy tool that bundles Qt libs, plugins, and WebEngine runtime.
+      - name: Deploy (Linux, AppImage)
+        if: matrix.name == 'linux'
+        env:
+          # Avoid depending on FUSE on the runner (ubuntu package naming varies).
+          APPIMAGE_EXTRACT_AND_RUN: "1"
+        run: |
+          curl -fsSLO https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage
+          curl -fsSLO https://github.com/linuxdeploy/linuxdeploy-plugin-qt/releases/download/continuous/linuxdeploy-plugin-qt-x86_64.AppImage
+          chmod +x linuxdeploy*.AppImage
+          export QML_SOURCES_PATHS=$PWD/src/qml
+          ./linuxdeploy-x86_64.AppImage \
+            --appdir AppDir \
+            --executable build/release/src/app/codeharbor \
+            --plugin qt \
+            --output appimage \
+            --desktop-file packaging/codeharbor.desktop \
+            --icon-file packaging/codeharbor.svg
+          mkdir -p artifact && mv CodeHarbor*.AppImage artifact/
+
+      - name: Deploy (Windows, windeployqt)
+        if: matrix.name == 'windows'
+        shell: pwsh
+        run: |
+          $dest = "artifact/codeharbor-windows"
+          New-Item -ItemType Directory -Force -Path $dest | Out-Null
+          Copy-Item build/release/src/app/codeharbor.exe $dest/
+          windeployqt --qmldir src/qml --release "$dest/codeharbor.exe"
+          # Bundle non-Qt runtime deps (libssh) next to the exe.
+          Get-ChildItem "$env:VCPKG_INSTALLATION_ROOT/installed/x64-windows/bin/*.dll" |
+            ForEach-Object { Copy-Item $_.FullName $dest/ }
+
+      - name: Deploy (macOS, macdeployqt)
+        if: matrix.name == 'macos'
+        run: |
+          APP=build/release/src/app/codeharbor.app
+          macdeployqt "$APP" -qmldir=src/qml -dmg
+          mkdir -p artifact && mv build/release/src/app/codeharbor.dmg artifact/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: codeharbor-${{ matrix.name }}
+          path: artifact/
+          if-no-files-found: error
+
+  # The remote service (codeharbord + bridge) is platform-independent JS: it
+  # runs on the SSH dev server under Node, so it is packaged once, not per OS.
+  remote:
+    name: remote
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - name: Build remote workspace
+        working-directory: remote
+        run: |
+          npm install
+          npm test
+          npm run build
+      - name: Package
+        working-directory: remote
+        run: |
+          mkdir -p ../artifact
+          tar -czf ../artifact/codeharbor-remote.tar.gz dist package.json
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: codeharbor-remote
+          path: artifact/
+          if-no-files-found: error

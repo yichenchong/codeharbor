@@ -121,6 +121,73 @@ echo '{"jsonrpc":"2.0","id":1,"method":"server.info"}' | node src/codeharbord.ts
 node src/bridge.ts
 ```
 
+## Cross-platform builds & releases
+
+### Why native, not cross-compiled
+
+The client embeds **Qt WebEngine (Chromium)**. Qt does not support
+cross-compiling WebEngine, and building Chromium's toolchain for a foreign OS is
+impractical. So CodeHarbor binaries are built **natively on each target OS** —
+the standard approach for Qt+WebEngine apps. There is no supported way to produce
+a Windows or macOS client from a Linux box (or vice versa).
+
+The remote service (`remote/`) is the exception: it is platform-independent JS
+and runs anywhere Node 23.6+ is installed, so it is packaged once.
+
+### Release pipeline
+
+[`.github/workflows/release.yml`](../.github/workflows/release.yml) builds all
+targets on GitHub-hosted runners. Trigger it by pushing a tag (`git tag v0.1.0 &&
+git push --tags`) or via the **Run workflow** button (manual `workflow_dispatch`).
+
+| Job | Runner | Output artifact | Deploy tool |
+|---|---|---|---|
+| `linux` | `ubuntu-latest` | `CodeHarbor-*.AppImage` | linuxdeploy + qt plugin |
+| `windows` | `windows-latest` | `codeharbor.exe` + Qt/libssh DLLs | `windeployqt` |
+| `macos` | `macos-latest` | `codeharbor.dmg` (bundled `.app`) | `macdeployqt` |
+| `remote` | `ubuntu-latest` | `codeharbor-remote.tar.gz` (`dist/` + `package.json`) | `tsc` + tar |
+
+A raw Qt/WebEngine executable is **not** runnable off the build machine; the
+deploy tools bundle the Qt libraries, plugins, and the WebEngine runtime so the
+artifact is self-contained. libssh is sourced per OS: `apt` (Linux), `brew`
+(macOS), and `vcpkg` (Windows, via the CMake CONFIG package — see the normalized
+`ch_libssh` target in the top-level `CMakeLists.txt`).
+
+### Building locally on each OS
+
+The commands are identical everywhere — only dependency install differs
+(§ *Other platforms*):
+
+```bash
+cmake --preset release
+cmake --build --preset release
+```
+
+On Windows, run from a Developer/MSVC shell (or after `ilammy/msvc-dev-cmd`) so
+the Ninja generator finds `cl.exe`, and configure with vcpkg's toolchain for
+libssh: `-DCMAKE_TOOLCHAIN_FILE=<vcpkg>/scripts/buildsystems/vcpkg.cmake` (or set
+`CMAKE_TOOLCHAIN_FILE` in the environment — CMake 3.21+ reads it automatically).
+
+### What a maintainer needs to provide
+
+- **Nothing to get unsigned artifacts.** GitHub-hosted runners cover all three
+  OSes; a public repo runs the matrix for free. Just enable Actions and push a
+  tag.
+- **Code signing (optional, for distribution):** not wired up. macOS needs an
+  Apple Developer ID cert + notarization; Windows needs an Authenticode cert.
+  Both are added later as encrypted repo secrets consumed by extra deploy steps.
+  Unsigned artifacts run fine for internal/dev use (with an OS "unidentified
+  developer" prompt).
+- **Self-hosted runners:** only needed if you cannot use GitHub-hosted runners
+  (e.g. Apple Silicon-specific builds); otherwise not required.
+
+### Local cross-OS (non-WebEngine parts only)
+
+If you ever split out a CLI/headless component with no WebEngine dependency, that
+*could* be cross-compiled (Linux→Windows via MinGW-w64, Linux→macOS via osxcross)
+or built for other Linux arches via `docker buildx` + QEMU. This does **not**
+apply to the GUI client and is out of scope today.
+
 ## Notes & troubleshooting
 
 - **libssh is optional at configure time.** If `libssh-dev` is missing, CMake

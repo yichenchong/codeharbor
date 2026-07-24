@@ -33,15 +33,40 @@ find_package(Qt6 6.6 REQUIRED COMPONENTS
 
 qt_standard_project_setup(REQUIRES 6.6)
 
-# libssh provides SSH connection/channel/PTY transport (see src/ssh).
-find_package(PkgConfig)
-if(PkgConfig_FOUND)
-    pkg_check_modules(LIBSSH IMPORTED_TARGET libssh)
+# libssh provides SSH connection/channel/PTY transport (see src/ssh). Discovery
+# is normalized behind the interface target `ch_libssh` so the ssh module does
+# not care how it was found:
+#   * CONFIG package  — vcpkg (Windows), Homebrew (macOS), or a CMake install.
+#   * pkg-config      — system libssh on Linux.
+find_package(libssh CONFIG QUIET)
+set(_ch_libssh_target "")
+if(libssh_FOUND)
+    if(TARGET ssh)
+        set(_ch_libssh_target ssh)
+    elseif(TARGET libssh::libssh)
+        set(_ch_libssh_target libssh::libssh)
+    endif()
 endif()
-if(NOT LIBSSH_FOUND)
+if(_ch_libssh_target)
+    add_library(ch_libssh INTERFACE)
+    target_link_libraries(ch_libssh INTERFACE ${_ch_libssh_target})
+    message(STATUS "libssh: found via CONFIG package (target ${_ch_libssh_target})")
+else()
+    find_package(PkgConfig QUIET)
+    if(PkgConfig_FOUND)
+        pkg_check_modules(LIBSSH IMPORTED_TARGET libssh)
+    endif()
+    if(LIBSSH_FOUND)
+        add_library(ch_libssh INTERFACE)
+        target_link_libraries(ch_libssh INTERFACE PkgConfig::LIBSSH)
+        message(STATUS "libssh: found via pkg-config ${LIBSSH_VERSION}")
+    endif()
+endif()
+if(NOT TARGET ch_libssh)
     message(WARNING
-        "libssh not found via pkg-config. The ssh module will fail to link "
-        "until libssh is installed (see docs/PLAN.md, workstream S).")
+        "libssh not found (tried CONFIG package and pkg-config). The ssh module "
+        "will build without it (CH_HAVE_LIBSSH=0) and be non-functional. See "
+        "docs/DEVELOPMENT.md for install instructions.")
 endif()
 
 add_subdirectory(src)
