@@ -1,6 +1,8 @@
 qt_add_library(ch_ssh STATIC
     SshConnectionPool.h
     SshConnectionPool.cpp
+    KnownHosts.h
+    KnownHosts.cpp
 )
 
 target_include_directories(ch_ssh PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
@@ -14,4 +16,8 @@ if(TARGET ch_libssh)
     target_compile_definitions(ch_ssh PUBLIC CH_HAVE_LIBSSH=1)
 else()
     target_compile_definitions(ch_ssh PUBLIC CH_HAVE_LIBSSH=0)
+endif()
+
+if(CODEHARBOR_BUILD_TESTS)
+    add_subdirectory(tests)
 endif()

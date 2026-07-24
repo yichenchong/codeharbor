@@ -29,7 +29,8 @@ find_package(Qt6 6.6 REQUIRED COMPONENTS
     Sql
     WebEngineQuick
     WebChannel
-    Network)
+    Network
+    Test)
 
 qt_standard_project_setup(REQUIRES 6.6)
 
@@ -69,8 +70,9 @@ if(NOT TARGET ch_libssh)
         "docs/DEVELOPMENT.md for install instructions.")
 endif()
 
-add_subdirectory(src)
-
+# Enable CTest before adding subdirectories so module test targets register.
 if(CODEHARBOR_BUILD_TESTS)
     enable_testing()
 endif()
+
+add_subdirectory(src)

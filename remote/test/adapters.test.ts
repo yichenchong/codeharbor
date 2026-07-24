@@ -57,23 +57,23 @@ test("processBridgeLine drops malformed, unknown-harness, and no-op lines", () =
     );
 });
 
-test("codeharbord dispatch answers introspection and rejects unknown methods", () => {
-    const info = dispatch({ jsonrpc: "2.0", id: 1, method: "server.info" });
+test("codeharbord dispatch answers introspection and rejects unknown methods", async () => {
+    const info = await dispatch({ jsonrpc: "2.0", id: 1, method: "server.info" });
     assert.deepEqual(info, {
         jsonrpc: "2.0",
         id: 1,
         result: { name: "codeharbord", version: "0.1.0", schemaVersion: RPC_SCHEMA_VERSION },
     });
 
-    const ping = dispatch({ jsonrpc: "2.0", id: "a", method: "ping" });
+    const ping = await dispatch({ jsonrpc: "2.0", id: "a", method: "ping" });
     assert.deepEqual(ping, { jsonrpc: "2.0", id: "a", result: { pong: true } });
 
-    const missing = dispatch({ jsonrpc: "2.0", id: 2, method: "does.not.exist" });
+    const missing = await dispatch({ jsonrpc: "2.0", id: 2, method: "does.not.exist" });
     assert.equal("error" in missing && missing.error.code, RPC_METHOD_NOT_FOUND);
 });
 
-test("codeharbord handleLine reports parse errors", () => {
-    const res = handleLine("{not valid");
+test("codeharbord handleLine reports parse errors", async () => {
+    const res = await handleLine("{not valid");
     assert.ok("error" in res);
     assert.equal(res.id, null);
 });
