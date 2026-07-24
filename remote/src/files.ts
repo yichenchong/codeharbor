@@ -102,62 +102,91 @@ export async function stat(params: StatParams): Promise<StatResult> {
 }
 
 export async function readFile(params: ReadFileParams): Promise<ReadFileResult> {
-    const stats = await fsp.stat(params.path);
-    const revision = revisionFrom(stats);
-    const buf = await fsp.readFile(params.path);
+    // Read the bytes and mint the revision from ONE open descriptor so both
+    // describe the same inode. With atomic saves (SPEC 8.5) the descriptor is
+    // pinned across a concurrent rename, so fstat + read cannot straddle two
+    // versions of the file the way two independent fsp.stat / fsp.readFile calls
+    // could (TOCTOU: revision minted from one version, bytes from another).
+    const handle = await fsp.open(params.path, "r");
+    try {
+        const stats = await handle.stat();
+        if (stats.isDirectory()) {
+            throw Object.assign(
+                new Error(`EISDIR: illegal operation on a directory, read '${params.path}'`),
+                { code: "EISDIR" },
+            );
+        }
+        const buf = await handle.readFile();
+        const revision = revisionFrom(stats);
 
-    const offset = params.offset ?? 0;
-    let slice: Buffer;
-    let truncated = false;
-    if (offset >= buf.length) {
-        slice = Buffer.alloc(0);
-    } else if (params.length !== undefined) {
-        const end = offset + params.length;
-        slice = buf.subarray(offset, Math.min(end, buf.length));
-        truncated = end < buf.length;
-    } else {
-        slice = buf.subarray(offset);
+        // offset/length are BYTE ranges. Normalize to non-negative integers: a
+        // negative offset would otherwise index from the end of the buffer
+        // (Buffer.subarray semantics) and silently return the wrong tail.
+        const offset = Math.max(0, Math.trunc(params.offset ?? 0));
+        let slice: Buffer;
+        let truncated = false;
+        if (offset >= buf.length) {
+            slice = Buffer.alloc(0);
+        } else if (params.length !== undefined) {
+            const length = Math.max(0, Math.trunc(params.length));
+            const end = offset + length;
+            slice = buf.subarray(offset, Math.min(end, buf.length));
+            truncated = end < buf.length;
+        } else {
+            slice = buf.subarray(offset);
+        }
+
+        // A byte range that cuts a multibyte codepoint is not valid UTF-8, so
+        // isBinary() flips encoding to base64 — the exact bytes round-trip
+        // losslessly rather than being mangled by a lossy UTF-8 decode.
+        const binary = isBinary(slice);
+        return {
+            path: params.path,
+            encoding: binary ? "base64" : "utf-8",
+            content: binary ? slice.toString("base64") : slice.toString("utf-8"),
+            revision,
+            truncated,
+        };
+    } finally {
+        await handle.close();
     }
+}
 
-    const binary = isBinary(slice);
-    return {
-        path: params.path,
-        encoding: binary ? "base64" : "utf-8",
-        content: binary ? slice.toString("base64") : slice.toString("utf-8"),
-        revision,
-        truncated,
-    };
+// Enforce the revision guard (SPEC 8.4 / 8.6). "" means create-only. Factored
+// out so the identical rule runs both at the start of a write and again just
+// before the rename, shrinking the window where a file changes mid-write.
+function assertRevisionMatches(filePath: string, expectedRevision: string, current: Stats | undefined): void {
+    if (expectedRevision === "") {
+        if (current) {
+            throw new RevisionMismatchError(
+                `File already exists: ${filePath}`,
+                { path: filePath, revision: revisionFrom(current) },
+            );
+        }
+    } else if (!current) {
+        // A non-empty expectedRevision means the client loaded an existing file;
+        // if it is now gone (deleted externally) that is a conflict, not a
+        // silent recreate (SPEC 8.6: never silently overwrite a changed file).
+        throw new RevisionMismatchError(
+            `File no longer exists: ${filePath}`,
+            { path: filePath, expected: expectedRevision, actual: null },
+        );
+    } else {
+        const rev = revisionFrom(current);
+        if (rev !== expectedRevision) {
+            throw new RevisionMismatchError(
+                `Revision mismatch for ${filePath}`,
+                { path: filePath, expected: expectedRevision, actual: rev },
+            );
+        }
+    }
 }
 
 export async function writeFile(params: WriteFileParams): Promise<WriteFileResult> {
     const encoding = params.encoding ?? "utf-8";
     const existing = await statOrUndefined(params.path);
 
-    // Revision guard (SPEC 8.4 / 8.6). "" means create-only.
-    if (params.expectedRevision === "") {
-        if (existing) {
-            throw new RevisionMismatchError(
-                `File already exists: ${params.path}`,
-                { path: params.path, revision: revisionFrom(existing) },
-            );
-        }
-    } else if (!existing) {
-        // A non-empty expectedRevision means the client loaded an existing file;
-        // if it is now gone (deleted externally) that is a conflict, not a
-        // silent recreate (SPEC 8.6: never silently overwrite a changed file).
-        throw new RevisionMismatchError(
-            `File no longer exists: ${params.path}`,
-            { path: params.path, expected: params.expectedRevision, actual: null },
-        );
-    } else {
-        const current = revisionFrom(existing);
-        if (current !== params.expectedRevision) {
-            throw new RevisionMismatchError(
-                `Revision mismatch for ${params.path}`,
-                { path: params.path, expected: params.expectedRevision, actual: current },
-            );
-        }
-    }
+    assertRevisionMatches(params.path, params.expectedRevision, existing);
 
     const buf = Buffer.from(params.content, encoding === "base64" ? "base64" : "utf-8");
 
@@ -178,6 +207,11 @@ export async function writeFile(params: WriteFileParams): Promise<WriteFileResul
         handle = undefined;
         // open()'s mode is masked by umask; chmod pins the exact mode on overwrite.
         if (existing) await fsp.chmod(tmp, existing.mode);
+        // Re-verify as late as possible — right before the atomic replace — so a
+        // file changed during the write + flush above is caught instead of being
+        // silently overwritten (SPEC 8.6). This shrinks but cannot fully close
+        // the window; POSIX offers no atomic compare-and-rename.
+        assertRevisionMatches(params.path, params.expectedRevision, await statOrUndefined(params.path));
         await fsp.rename(tmp, target);
     } catch (err) {
         if (handle) await handle.close().catch(() => {});

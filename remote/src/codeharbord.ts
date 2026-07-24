@@ -12,6 +12,9 @@ import readline from "node:readline";
 // are re-exported so the wire names and error code stay linked to the transport.
 // The six file.* handlers are registered from files.ts (R-server workstream).
 import { fileMethods, fileWatchService, isRevisionMismatch } from "./files.ts";
+// Workspace persistence method group (workstream P). `workspace.*` is P's own
+// method group and is deliberately absent from the frozen C1 file catalog.
+import { WORKSPACE_METHODS } from "./workspace.ts";
 import { RPC_REVISION_MISMATCH, RPC_WATCH_EVENT_NOTIFICATION } from "./rpc-types.ts";
 export { RPC_METHODS } from "./rpc-types.ts";
 export { RPC_REVISION_MISMATCH, RPC_WATCH_EVENT_NOTIFICATION };
@@ -58,6 +61,7 @@ const methods: Record<string, MethodHandler> = {
         schemaVersion: RPC_SCHEMA_VERSION,
     }),
     ...fileMethods,
+    ...WORKSPACE_METHODS,
 };
 
 function isRpcRequest(value: unknown): value is RpcRequest {

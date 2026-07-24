@@ -34,14 +34,25 @@ QJsonObject SplitNode::toJson() const
 
 namespace {
 
+// Hard cap on split-tree nesting depth. Split trees are persisted and may be
+// sourced from the remote server (SPEC 2.1 remote-first), so fromJson parses
+// data the client did not produce. Without a bound, adversarial or corrupt
+// deeply-nested JSON would recurse until the stack overflows and crashes the
+// process. Real layouts nest only a handful of levels; 256 is far beyond any
+// genuine use while still safely below the stack limit.
+constexpr int kMaxDepth = 256;
+
 // Parses obj into out, returning false on ANY structural violation, including a
-// malformed nested subtree. This lets fromJson reject an otherwise well-formed
-// split that contains an invalid child, rather than silently substituting an
-// empty leaf for the bad subtree. A leaf always parses successfully (an empty
-// paneId is a legitimate value), so failure is unambiguous and only ever
-// originates from a split.
-bool parseNode(const QJsonObject &obj, SplitNode &out)
+// malformed nested subtree or nesting deeper than kMaxDepth. This lets fromJson
+// reject an otherwise well-formed split that contains an invalid child, rather
+// than silently substituting an empty leaf for the bad subtree. A leaf always
+// parses successfully (an empty paneId is a legitimate value), so failure is
+// unambiguous and only ever originates from a split.
+bool parseNode(const QJsonObject &obj, SplitNode &out, int depth)
 {
+    if (depth > kMaxDepth)
+        return false;
+
     const QString type = obj.value(QStringLiteral("type")).toString();
 
     if (type == QStringLiteral("leaf")) {
@@ -71,7 +82,7 @@ bool parseNode(const QJsonObject &obj, SplitNode &out)
         if (!value.isObject())
             return false;
         SplitNode child;
-        if (!parseNode(value.toObject(), child))
+        if (!parseNode(value.toObject(), child, depth + 1))
             return false;
         node.children.append(child);
     }
@@ -92,9 +103,23 @@ bool parseNode(const QJsonObject &obj, SplitNode &out)
 SplitNode SplitNode::fromJson(const QJsonObject &obj)
 {
     SplitNode node;
-    if (!parseNode(obj, node))
+    if (!parseNode(obj, node, 1))
         return {};
     return node;
+}
+
+bool SplitNode::operator==(const SplitNode &other) const
+{
+    // Compare only the fields toJson() persists for each node kind, so equality
+    // agrees with the JSON round-trip (see the header). A leaf and a split are
+    // never equal; a leaf's identity is its paneId; a split's is its
+    // orientation, ratios, and children (recursively).
+    if (isLeaf() != other.isLeaf())
+        return false;
+    if (isLeaf())
+        return paneId == other.paneId;
+    return orientation == other.orientation && ratios == other.ratios
+            && children == other.children;
 }
 
 } // namespace ch

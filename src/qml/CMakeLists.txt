@@ -14,6 +14,7 @@ qt_add_qml_module(codeharbor_qml
         SessionsSidebar.qml
         ViewerRegion.qml
         TerminalRegion.qml
+        TerminalPaneView.qml
 )
 
 target_link_libraries(codeharbor_qml PUBLIC

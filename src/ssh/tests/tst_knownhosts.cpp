@@ -48,6 +48,10 @@ private slots:
     void bracketedHostPortMatches();
     void revokedKeyRefused();
     void certAuthorityIsOpaque();
+    void revocationWinsBeforeTrustedEntry();
+    void malformedBase64LineSkipped();
+    void crlfAndTabWhitespaceParsed();
+    void hostnamesAreCaseSensitive();
 };
 
 void TstKnownHosts::parsesSampleStore()
@@ -209,6 +213,65 @@ void TstKnownHosts::certAuthorityIsOpaque()
                           QStringLiteral("ssh-ed25519"), kEd25519Alpha),
              KnownHosts::Verdict::Unknown);
     QVERIFY(store.serialize().contains("@cert-authority "));
+}
+
+void TstKnownHosts::revocationWinsBeforeTrustedEntry()
+{
+    // A trusted entry precedes an @revoked entry for the SAME key. Revocation
+    // must win regardless of file order (OpenSSH semantics), so the earlier
+    // trusted line must not shadow the later revocation.
+    const KnownHosts store = KnownHosts::parse(QStringLiteral(
+        "host.example ssh-ed25519 ZWQyNTUxOS1rZXktYWxwaGEtMDAwMQ==\n"
+        "@revoked host.example ssh-ed25519 ZWQyNTUxOS1rZXktYWxwaGEtMDAwMQ==\n"));
+    QCOMPARE(store.verify(QStringLiteral("host.example"),
+                          QStringLiteral("ssh-ed25519"), kEd25519Alpha),
+             KnownHosts::Verdict::Mismatch);
+    // The surviving trusted entry still detects a changed (non-revoked) key.
+    QCOMPARE(store.verify(QStringLiteral("host.example"),
+                          QStringLiteral("ssh-ed25519"), kEd25519Beta),
+             KnownHosts::Verdict::Mismatch);
+}
+
+void TstKnownHosts::malformedBase64LineSkipped()
+{
+    // A line whose base64 key field is invalid is dropped entirely rather than
+    // stored as a bogus key that would poison verify() (Unknown -> Mismatch).
+    const KnownHosts store = KnownHosts::parse(QStringLiteral(
+        "good.host ssh-ed25519 ZWQyNTUxOS1rZXktYWxwaGEtMDAwMQ==\n"
+        "bad.host ssh-ed25519 ****not-valid-base64****\n"));
+    QCOMPARE(store.entries().size(), 1);
+    QCOMPARE(store.verify(QStringLiteral("good.host"),
+                          QStringLiteral("ssh-ed25519"), kEd25519Alpha),
+             KnownHosts::Verdict::Match);
+    // The dropped line must NOT turn an unknown host into a hard Mismatch.
+    QCOMPARE(store.verify(QStringLiteral("bad.host"),
+                          QStringLiteral("ssh-ed25519"), kEd25519Alpha),
+             KnownHosts::Verdict::Unknown);
+}
+
+void TstKnownHosts::crlfAndTabWhitespaceParsed()
+{
+    // Tabs as field separators and CRLF line endings must parse cleanly.
+    const KnownHosts store = KnownHosts::parse(QStringLiteral(
+        "host.crlf\tssh-ed25519\tZWQyNTUxOS1rZXktYWxwaGEtMDAwMQ==\r\n"));
+    QCOMPARE(store.entries().size(), 1);
+    QCOMPARE(store.verify(QStringLiteral("host.crlf"),
+                          QStringLiteral("ssh-ed25519"), kEd25519Alpha),
+             KnownHosts::Verdict::Match);
+}
+
+void TstKnownHosts::hostnamesAreCaseSensitive()
+{
+    // OpenSSH matches hostnames case-sensitively; the stored case is preserved
+    // and a differently-cased lookup must not match.
+    const KnownHosts store = KnownHosts::parse(QStringLiteral(
+        "Host.Example ssh-ed25519 ZWQyNTUxOS1rZXktYWxwaGEtMDAwMQ==\n"));
+    QCOMPARE(store.verify(QStringLiteral("Host.Example"),
+                          QStringLiteral("ssh-ed25519"), kEd25519Alpha),
+             KnownHosts::Verdict::Match);
+    QCOMPARE(store.verify(QStringLiteral("host.example"),
+                          QStringLiteral("ssh-ed25519"), kEd25519Alpha),
+             KnownHosts::Verdict::Unknown);
 }
 
 QTEST_MAIN(TstKnownHosts)

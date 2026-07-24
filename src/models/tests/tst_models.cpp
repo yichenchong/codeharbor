@@ -36,6 +36,15 @@ private slots:
     void splitTreeRejectsInvalidNestedChild();
     void splitTreeRoundTripsSingleChildAndDeepNesting();
     void aggregateRowStatePrecedence();
+    void splitTreeLeafOrientationRoundTrips();
+    void splitTreeSplitPaneIdIgnoredOnRoundTrip();
+    void splitTreeUnicodePaneIdRoundTrips();
+    void splitTreeRejectsPathologicalDepth();
+    void splitTreeAcceptsModerateDepth();
+    void sessionsModelRejectsNonZeroColumn();
+    void sessionsModelDataOnInvalidIndex();
+    void sessionsModelSetGroupsTwiceResets();
+    void aggregateRowStateAllFalseIsDisconnected();
 };
 
 // Group -> DevSession -> viewer + terminal panes tree.
@@ -384,6 +393,178 @@ void TstModels::splitTreeRoundTripsSingleChildAndDeepNesting()
     QCOMPARE(restored.children.at(1).orientation, SplitOrientation::Vertical);
     QCOMPARE(restored.children.at(1).children.at(1).orientation, SplitOrientation::Horizontal);
     QCOMPARE(restored.children.at(1).children.at(1).children.at(1).paneId, QStringLiteral("D"));
+}
+
+// A leaf's orientation/ratios are meaningless and dropped by toJson(); equality
+// must therefore ignore them so fromJson(toJson(leaf)) == leaf holds even when a
+// leaf carries a non-default orientation. A defaulted operator== would fail this.
+void TstModels::splitTreeLeafOrientationRoundTrips()
+{
+    SplitNode leaf;
+    leaf.paneId = QStringLiteral("solo");
+    leaf.orientation = SplitOrientation::Vertical; // dropped by toJson for leaves
+    leaf.ratios = {0.25};                          // dropped by toJson for leaves
+
+    const SplitNode restored = SplitNode::fromJson(leaf.toJson());
+    QVERIFY(restored.isLeaf());
+    QCOMPARE(restored.paneId, QStringLiteral("solo"));
+    QVERIFY(restored == leaf);
+
+    // Two leaves differing only in the dropped fields are equal.
+    SplitNode other = leaf;
+    other.orientation = SplitOrientation::Horizontal;
+    other.ratios.clear();
+    QVERIFY(other == leaf);
+
+    // A leaf and a split are never equal even with matching paneId.
+    SplitNode split;
+    split.paneId = QStringLiteral("solo");
+    split.children = {SplitNode{}};
+    split.ratios = {1.0};
+    QVERIFY(!(split == leaf));
+}
+
+// A split's paneId is meaningless and dropped by toJson(); equality must ignore
+// it so the round-trip is exact for a split that happens to carry a stray paneId.
+void TstModels::splitTreeSplitPaneIdIgnoredOnRoundTrip()
+{
+    SplitNode child;
+    child.paneId = QStringLiteral("A");
+
+    SplitNode split;
+    split.paneId = QStringLiteral("ignored-on-splits");
+    split.orientation = SplitOrientation::Vertical;
+    split.children = {child};
+    split.ratios = {1.0};
+
+    const SplitNode restored = SplitNode::fromJson(split.toJson());
+    QVERIFY(!restored.isLeaf());
+    QVERIFY(restored.paneId.isEmpty()); // toJson never persists a split's paneId
+    QVERIFY(restored == split);
+}
+
+void TstModels::splitTreeUnicodePaneIdRoundTrips()
+{
+    SplitNode leaf;
+    leaf.paneId = QStringLiteral("面板-\u00e9\u2603\U0001F680");
+
+    SplitNode split;
+    split.orientation = SplitOrientation::Horizontal;
+    split.children = {leaf, SplitNode{}};
+    split.ratios = {0.5, 0.5};
+
+    const SplitNode restored = SplitNode::fromJson(split.toJson());
+    QVERIFY(restored == split);
+    QCOMPARE(restored.children.at(0).paneId, leaf.paneId);
+}
+
+// Deeply-nested JSON (possibly from a remote/corrupt source) must be rejected
+// rather than recursing until the stack overflows.
+void TstModels::splitTreeRejectsPathologicalDepth()
+{
+    QJsonObject node;
+    node[QStringLiteral("type")] = QStringLiteral("leaf");
+    node[QStringLiteral("paneId")] = QStringLiteral("deep");
+    for (int i = 0; i < 400; ++i) {
+        QJsonObject split;
+        split[QStringLiteral("type")] = QStringLiteral("split");
+        split[QStringLiteral("orientation")] = QStringLiteral("horizontal");
+        split[QStringLiteral("children")] = QJsonArray{node};
+        split[QStringLiteral("ratios")] = QJsonArray{1.0};
+        node = split;
+    }
+    QVERIFY(SplitNode::fromJson(node) == SplitNode{});
+}
+
+// The depth guard must not reject a legitimately (if deeply) nested tree.
+void TstModels::splitTreeAcceptsModerateDepth()
+{
+    SplitNode node;
+    node.paneId = QStringLiteral("leaf");
+    for (int i = 0; i < 100; ++i) {
+        SplitNode split;
+        split.orientation = SplitOrientation::Vertical;
+        split.children = {node};
+        split.ratios = {1.0};
+        node = split;
+    }
+    QVERIFY(SplitNode::fromJson(node.toJson()) == node);
+}
+
+// index() must reject any column other than 0 (the model is single-column).
+void TstModels::sessionsModelRejectsNonZeroColumn()
+{
+    SessionsModel model;
+    SessionRow s;
+    s.session.name = QStringLiteral("s");
+    GroupRow g;
+    g.group.name = QStringLiteral("G");
+    g.sessions = {s};
+    model.setGroups({g});
+
+    QVERIFY(!model.index(0, 1).isValid());
+    QVERIFY(!model.index(0, -1).isValid());
+    const QModelIndex group = model.index(0, 0);
+    QVERIFY(group.isValid());
+    QVERIFY(!model.index(0, 1, group).isValid());
+}
+
+// data() on an invalid index yields an invalid QVariant for every role.
+void TstModels::sessionsModelDataOnInvalidIndex()
+{
+    SessionsModel model;
+    QVERIFY(!model.data(QModelIndex(), SessionsModel::NameRole).isValid());
+    QVERIFY(!model.data(QModelIndex(), Qt::DisplayRole).isValid());
+    QVERIFY(!model.data(QModelIndex(), SessionsModel::RowStateRole).isValid());
+}
+
+// setGroups() replaces the whole model: it must emit a model reset each call and
+// reflect the new contents, discarding the previous ones.
+void TstModels::sessionsModelSetGroupsTwiceResets()
+{
+    SessionsModel model;
+
+    GroupRow first;
+    first.group.name = QStringLiteral("First");
+    first.sessions = {SessionRow{}, SessionRow{}};
+    model.setGroups({first});
+    QCOMPARE(model.rowCount(), 1);
+    QCOMPARE(model.rowCount(model.index(0, 0)), 2);
+
+    QSignalSpy aboutTo(&model, &QAbstractItemModel::modelAboutToBeReset);
+    QSignalSpy done(&model, &QAbstractItemModel::modelReset);
+
+    GroupRow a;
+    a.group.name = QStringLiteral("A");
+    GroupRow b;
+    b.group.name = QStringLiteral("B");
+    b.sessions = {SessionRow{}};
+    model.setGroups({a, b});
+
+    QCOMPARE(aboutTo.count(), 1);
+    QCOMPARE(done.count(), 1);
+    QCOMPARE(model.rowCount(), 2);
+    QCOMPARE(model.data(model.index(0, 0), SessionsModel::NameRole).toString(),
+             QStringLiteral("A"));
+    QCOMPARE(model.rowCount(model.index(0, 0)), 0);
+    QCOMPARE(model.rowCount(model.index(1, 0)), 1);
+}
+
+// Terminals present but none in any notable state (e.g. unloaded/unknown) reduce
+// to Disconnected, matching the empty-set case (SPEC 4.2 lowest priority).
+void TstModels::aggregateRowStateAllFalseIsDisconnected()
+{
+    const QVector<TerminalStatus> terminals = {
+        terminal(TerminalState::Unloaded, AgentState::Unknown),
+        terminal(TerminalState::Connecting, AgentState::Stopped),
+    };
+    QCOMPARE(static_cast<int>(SessionsModel::aggregateSessionState(terminals)),
+             static_cast<int>(SessionRowState::Disconnected));
+
+    // anyWaitingInput without anyError still yields WaitingForInput.
+    QCOMPARE(static_cast<int>(SessionsModel::aggregateSessionState(
+                 {terminal(TerminalState::Disconnected, AgentState::WaitingInput)})),
+             static_cast<int>(SessionRowState::WaitingForInput));
 }
 
 QTEST_GUILESS_MAIN(TstModels)

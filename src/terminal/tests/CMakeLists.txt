@@ -1,0 +1,3 @@
+qt_add_executable(tst_terminalcontroller tst_terminalcontroller.cpp)
+target_link_libraries(tst_terminalcontroller PRIVATE Qt6::Test ch_terminal)
+add_test(NAME tst_terminalcontroller COMMAND tst_terminalcontroller)

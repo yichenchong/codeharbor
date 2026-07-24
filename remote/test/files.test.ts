@@ -262,3 +262,75 @@ test("watch emits a deleted WatchEvent when the file is removed", async () => {
 
     await fs.rm(dir, { recursive: true, force: true });
 });
+
+test("readFile clamps a negative offset to the start of the file", async () => {
+    const dir = await tmpDir();
+    const file = path.join(dir, "neg.txt");
+    await fs.writeFile(file, "0123456789");
+
+    // A negative offset must NOT index from the end of the buffer
+    // (Buffer.subarray semantics); it is clamped to 0 so the whole file reads.
+    const r = await readFile({ path: file, offset: -3 });
+    assert.equal(r.content, "0123456789");
+    assert.equal(r.truncated, false);
+
+    await fs.rm(dir, { recursive: true, force: true });
+});
+
+test("readFile returns lossless base64 when a byte range cuts a multibyte codepoint", async () => {
+    const dir = await tmpDir();
+    const file = path.join(dir, "utf8.txt");
+    await fs.writeFile(file, "café", "utf-8"); // 'é' is 0xC3 0xA9 (2 bytes)
+
+    // Bytes [0,4) split the 'é' in half -> not valid UTF-8 -> base64, byte-exact.
+    const r = await readFile({ path: file, offset: 0, length: 4 });
+    assert.equal(r.encoding, "base64");
+    assert.deepEqual(Buffer.from(r.content, "base64"), Buffer.from("café", "utf-8").subarray(0, 4));
+    assert.equal(r.truncated, true);
+
+    await fs.rm(dir, { recursive: true, force: true });
+});
+
+test("readFile handles an empty file", async () => {
+    const dir = await tmpDir();
+    const file = path.join(dir, "empty.txt");
+    await fs.writeFile(file, "");
+
+    const r = await readFile({ path: file });
+    assert.equal(r.content, "");
+    assert.equal(r.encoding, "utf-8");
+    assert.equal(r.truncated, false);
+
+    await fs.rm(dir, { recursive: true, force: true });
+});
+
+test("readFile rejects a directory with EISDIR", async () => {
+    const dir = await tmpDir();
+
+    await assert.rejects(
+        () => readFile({ path: dir }),
+        (err: unknown) => err instanceof Error && "code" in err && err.code === "EISDIR",
+    );
+
+    await fs.rm(dir, { recursive: true, force: true });
+});
+
+test("writeFile decodes base64 content and reads it back byte-exact", async () => {
+    const dir = await tmpDir();
+    const file = path.join(dir, "blob.bin");
+    const bytes = Buffer.from([0, 1, 2, 255, 254, 128]);
+
+    await writeFile({
+        path: file,
+        content: bytes.toString("base64"),
+        encoding: "base64",
+        expectedRevision: "",
+    });
+    assert.deepEqual(await fs.readFile(file), bytes);
+
+    const r = await readFile({ path: file });
+    assert.equal(r.encoding, "base64");
+    assert.deepEqual(Buffer.from(r.content, "base64"), bytes);
+
+    await fs.rm(dir, { recursive: true, force: true });
+});

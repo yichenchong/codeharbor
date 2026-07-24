@@ -1,0 +1,893 @@
+// Workstream P — server-side workspace persistence (SPEC 4.2, 11.1). Owns the
+// authoritative SQLite workspace database on the codeharbord host: opens the
+// DB, runs the idempotent schema.sql migration (C2), and provides CRUD over
+// groups, dev sessions, viewer/terminal panes, and per-region split layouts. It
+// also implements duplicate-session copy semantics (SPEC 4.2): every copied row
+// gets a fresh UUID, and every copied terminal pane gets a fresh tmux target.
+//
+// WORKSPACE_METHODS exposes the `workspace.*` RPC group. This is P's OWN method
+// group — deliberately NOT part of the frozen six-method C1 file catalog
+// (RPC_METHODS in rpc-types.ts, which stays exactly the file.* methods).
+
+import { DatabaseSync } from "node:sqlite";
+import { randomUUID } from "node:crypto";
+import { mkdirSync, readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import os from "node:os";
+import path from "node:path";
+
+// Current schema version. Mirrors schema_version in remote/sql/schema.sql and
+// WorkspaceDb::kSchemaVersion (bump all three together — see schema.sql header).
+export const WORKSPACE_SCHEMA_VERSION = 1;
+
+// The authoritative DDL (C2). Read relative to this module so it resolves the
+// same whether invoked from src/ or from a built dist/ alongside sql/.
+const schemaSql = readFileSync(
+    fileURLToPath(new URL("../sql/schema.sql", import.meta.url)),
+    "utf8",
+);
+
+// --- Public row shapes (camelCase mirror of the snake_case schema columns) ---
+
+export interface Group {
+    id: string;
+    serverId: string;
+    name: string;
+    position: number;
+    collapsed: boolean;
+    createdAt: number;
+    updatedAt: number;
+}
+
+export interface Session {
+    id: string;
+    serverId: string;
+    groupId: string;
+    name: string;
+    repositoryRoot: string;
+    defaultWorkingDirectory: string | null;
+    taskDescription: string | null;
+    position: number;
+    archived: boolean;
+    createdAt: number;
+    updatedAt: number;
+}
+
+export interface ViewerPane {
+    id: string;
+    serverId: string;
+    devSessionId: string;
+    url: string;
+    handler: string | null;
+    title: string | null;
+    position: number;
+    createdAt: number;
+    updatedAt: number;
+}
+
+export interface TerminalPane {
+    id: string;
+    serverId: string;
+    devSessionId: string;
+    name: string;
+    workingDirectory: string | null;
+    tmuxTarget: string | null;
+    startupCommand: string | null;
+    harness: string | null;
+    position: number;
+    createdAt: number;
+    updatedAt: number;
+}
+
+export type Region = "viewer" | "terminal";
+
+export interface SessionLayout {
+    id: string;
+    serverId: string;
+    devSessionId: string;
+    region: Region;
+    tree: unknown;
+    createdAt: number;
+    updatedAt: number;
+}
+
+// Per-session split trees, one slot per region. A missing region is null.
+export interface SessionLayouts {
+    viewer: unknown | null;
+    terminal: unknown | null;
+}
+
+export interface SessionNode extends Session {
+    viewerPanes: ViewerPane[];
+    terminalPanes: TerminalPane[];
+    layouts: SessionLayouts;
+}
+
+export interface GroupNode extends Group {
+    sessions: SessionNode[];
+}
+
+// --- Method parameter shapes ------------------------------------------------
+
+export interface CreateGroupParams {
+    serverId: string;
+    name: string;
+    position?: number;
+    collapsed?: boolean;
+}
+
+export interface UpdateGroupParams {
+    id: string;
+    name?: string;
+    position?: number;
+    collapsed?: boolean;
+}
+
+export interface CreateSessionParams {
+    serverId: string;
+    groupId: string;
+    name: string;
+    repositoryRoot: string;
+    defaultWorkingDirectory?: string | null;
+    taskDescription?: string | null;
+    position?: number;
+    archived?: boolean;
+}
+
+export interface UpdateSessionParams {
+    id: string;
+    name?: string;
+    repositoryRoot?: string;
+    defaultWorkingDirectory?: string | null;
+    taskDescription?: string | null;
+    position?: number;
+    archived?: boolean;
+}
+
+export interface MoveSessionParams {
+    id: string;
+    groupId: string;
+    position?: number;
+}
+
+export interface CreateViewerPaneParams {
+    serverId: string;
+    devSessionId: string;
+    url: string;
+    handler?: string | null;
+    title?: string | null;
+    position?: number;
+}
+
+export interface UpdateViewerPaneParams {
+    id: string;
+    url?: string;
+    handler?: string | null;
+    title?: string | null;
+    position?: number;
+}
+
+export interface CreateTerminalPaneParams {
+    serverId: string;
+    devSessionId: string;
+    name: string;
+    workingDirectory?: string | null;
+    tmuxTarget?: string | null;
+    startupCommand?: string | null;
+    harness?: string | null;
+    position?: number;
+}
+
+export interface UpdateTerminalPaneParams {
+    id: string;
+    name?: string;
+    workingDirectory?: string | null;
+    tmuxTarget?: string | null;
+    startupCommand?: string | null;
+    harness?: string | null;
+    position?: number;
+}
+
+export interface SetLayoutParams {
+    serverId: string;
+    devSessionId: string;
+    region: Region;
+    tree: unknown;
+}
+
+export interface GetLayoutParams {
+    devSessionId: string;
+    region: Region;
+}
+
+// --- Internal row shapes (raw column names as returned by node:sqlite) -------
+
+interface GroupRow {
+    id: string;
+    server_id: string;
+    name: string;
+    position: number;
+    collapsed: number;
+    created_at: number;
+    updated_at: number;
+}
+
+interface SessionRow {
+    id: string;
+    server_id: string;
+    group_id: string;
+    name: string;
+    repository_root: string;
+    default_working_directory: string | null;
+    task_description: string | null;
+    position: number;
+    archived: number;
+    created_at: number;
+    updated_at: number;
+}
+
+interface ViewerPaneRow {
+    id: string;
+    server_id: string;
+    dev_session_id: string;
+    url: string;
+    handler: string | null;
+    title: string | null;
+    position: number;
+    created_at: number;
+    updated_at: number;
+}
+
+interface TerminalPaneRow {
+    id: string;
+    server_id: string;
+    dev_session_id: string;
+    name: string;
+    working_directory: string | null;
+    tmux_target: string | null;
+    startup_command: string | null;
+    harness: string | null;
+    position: number;
+    created_at: number;
+    updated_at: number;
+}
+
+interface SessionLayoutRow {
+    id: string;
+    server_id: string;
+    dev_session_id: string;
+    region: Region;
+    tree: string;
+    created_at: number;
+    updated_at: number;
+}
+
+function toGroup(r: GroupRow): Group {
+    return {
+        id: r.id,
+        serverId: r.server_id,
+        name: r.name,
+        position: r.position,
+        collapsed: r.collapsed !== 0,
+        createdAt: r.created_at,
+        updatedAt: r.updated_at,
+    };
+}
+
+function toSession(r: SessionRow): Session {
+    return {
+        id: r.id,
+        serverId: r.server_id,
+        groupId: r.group_id,
+        name: r.name,
+        repositoryRoot: r.repository_root,
+        defaultWorkingDirectory: r.default_working_directory,
+        taskDescription: r.task_description,
+        position: r.position,
+        archived: r.archived !== 0,
+        createdAt: r.created_at,
+        updatedAt: r.updated_at,
+    };
+}
+
+function toViewerPane(r: ViewerPaneRow): ViewerPane {
+    return {
+        id: r.id,
+        serverId: r.server_id,
+        devSessionId: r.dev_session_id,
+        url: r.url,
+        handler: r.handler,
+        title: r.title,
+        position: r.position,
+        createdAt: r.created_at,
+        updatedAt: r.updated_at,
+    };
+}
+
+function toTerminalPane(r: TerminalPaneRow): TerminalPane {
+    return {
+        id: r.id,
+        serverId: r.server_id,
+        devSessionId: r.dev_session_id,
+        name: r.name,
+        workingDirectory: r.working_directory,
+        tmuxTarget: r.tmux_target,
+        startupCommand: r.startup_command,
+        harness: r.harness,
+        position: r.position,
+        createdAt: r.created_at,
+        updatedAt: r.updated_at,
+    };
+}
+
+// Rewrite the leaf paneIds of a split tree (SPEC 4.5) through an old->new id
+// map, leaving structure and any unmapped ids untouched. Used by
+// duplicateSession so a copied layout references the copied panes, not the
+// originals. Shape matches SplitNode::toJson in src/models/SplitTree.cpp:
+// leaves are { type: "leaf", paneId }, splits carry a children[] array.
+function remapPaneIds(node: unknown, idMap: Record<string, string>): unknown {
+    if (node === null || typeof node !== "object") return node;
+    const n = node as Record<string, unknown>;
+    if (n.type === "leaf") {
+        const paneId = typeof n.paneId === "string" ? n.paneId : "";
+        return { ...n, paneId: idMap[paneId] ?? paneId };
+    }
+    if (n.type === "split" && Array.isArray(n.children)) {
+        return { ...n, children: n.children.map((child) => remapPaneIds(child, idMap)) };
+    }
+    return node;
+}
+
+/**
+ * Open (creating if needed) the workspace database at `dbPath` and bring it up
+ * to WORKSPACE_SCHEMA_VERSION. The migration runner applies schema.sql only
+ * when the stored schema_version is absent or older; schema.sql is idempotent,
+ * so re-application is harmless. Pass ":memory:" for an ephemeral database.
+ */
+export function openWorkspace(dbPath: string): Workspace {
+    if (dbPath !== ":memory:") {
+        mkdirSync(path.dirname(dbPath), { recursive: true });
+    }
+    const db = new DatabaseSync(dbPath);
+    db.exec("PRAGMA foreign_keys = ON;");
+    migrate(db);
+    return new Workspace(db);
+}
+
+function migrate(db: DatabaseSync): void {
+    if (schemaVersion(db) < WORKSPACE_SCHEMA_VERSION) {
+        db.exec(schemaSql);
+    }
+}
+
+function schemaVersion(db: DatabaseSync): number {
+    try {
+        const row = db
+            .prepare("SELECT version FROM schema_version WHERE id = 1")
+            .get() as { version: number } | undefined;
+        return row?.version ?? 0;
+    } catch {
+        // schema_version table absent -> database is unmigrated (version 0).
+        return 0;
+    }
+}
+
+// A single workspace database connection with all CRUD operations (SPEC 4.2,
+// 11.1). Booleans are stored as 0/1 integers; deletes cascade manually because
+// the schema's foreign keys use the default NO ACTION (they reject, not
+// cascade). Every mutation carries server_id per SPEC 3.5.
+export class Workspace {
+    readonly db: DatabaseSync;
+
+    constructor(db: DatabaseSync) {
+        this.db = db;
+    }
+
+    close(): void {
+        this.db.close();
+    }
+
+    // --- Groups -------------------------------------------------------------
+
+    createGroup(params: CreateGroupParams): Group {
+        const id = randomUUID();
+        const ts = Date.now();
+        const position = params.position ?? this.nextPosition("groups", "server_id", params.serverId);
+        this.db
+            .prepare(
+                "INSERT INTO groups (id, server_id, name, position, collapsed, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            )
+            .run(id, params.serverId, params.name, position, params.collapsed ? 1 : 0, ts, ts);
+        return this.getGroup(id);
+    }
+
+    getGroup(id: string): Group {
+        const row = this.db.prepare("SELECT * FROM groups WHERE id = ?").get(id) as GroupRow | undefined;
+        if (!row) throw new Error(`group not found: ${id}`);
+        return toGroup(row);
+    }
+
+    updateGroup(params: UpdateGroupParams): Group {
+        const current = this.getGroup(params.id);
+        const name = params.name ?? current.name;
+        const position = params.position ?? current.position;
+        const collapsed = params.collapsed ?? current.collapsed;
+        this.db
+            .prepare("UPDATE groups SET name = ?, position = ?, collapsed = ?, updated_at = ? WHERE id = ?")
+            .run(name, position, collapsed ? 1 : 0, Date.now(), params.id);
+        return this.getGroup(params.id);
+    }
+
+    deleteGroup(params: { id: string }): { ok: true } {
+        return this.transaction(() => {
+            const sessions = this.db
+                .prepare("SELECT id FROM dev_sessions WHERE group_id = ?").all(params.id) as unknown as Array<{ id: string }>;
+            for (const s of sessions) this.deleteSessionRows(s.id);
+            this.db.prepare("DELETE FROM groups WHERE id = ?").run(params.id);
+            return { ok: true } as const;
+        });
+    }
+
+    reorderGroups(params: { serverId: string; orderedIds: string[] }): { ok: true } {
+        return this.transaction(() => {
+            const ts = Date.now();
+            const stmt = this.db.prepare(
+                "UPDATE groups SET position = ?, updated_at = ? WHERE id = ? AND server_id = ?",
+            );
+            params.orderedIds.forEach((id, index) => {
+                stmt.run(index, ts, id, params.serverId);
+            });
+            return { ok: true } as const;
+        });
+    }
+
+    // --- Sessions -----------------------------------------------------------
+
+    createSession(params: CreateSessionParams): Session {
+        const id = randomUUID();
+        const ts = Date.now();
+        const position = params.position ?? this.nextPosition("dev_sessions", "group_id", params.groupId);
+        this.db
+            .prepare(
+                "INSERT INTO dev_sessions (id, server_id, group_id, name, repository_root, default_working_directory, task_description, position, archived, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .run(
+                id,
+                params.serverId,
+                params.groupId,
+                params.name,
+                params.repositoryRoot,
+                params.defaultWorkingDirectory ?? null,
+                params.taskDescription ?? null,
+                position,
+                params.archived ? 1 : 0,
+                ts,
+                ts,
+            );
+        return this.getSession(id);
+    }
+
+    getSession(id: string): Session {
+        const row = this.db.prepare("SELECT * FROM dev_sessions WHERE id = ?").get(id) as SessionRow | undefined;
+        if (!row) throw new Error(`session not found: ${id}`);
+        return toSession(row);
+    }
+
+    updateSession(params: UpdateSessionParams): Session {
+        const current = this.getSession(params.id);
+        const name = params.name ?? current.name;
+        const repositoryRoot = params.repositoryRoot ?? current.repositoryRoot;
+        const defaultWorkingDirectory =
+            params.defaultWorkingDirectory !== undefined
+                ? params.defaultWorkingDirectory
+                : current.defaultWorkingDirectory;
+        const taskDescription =
+            params.taskDescription !== undefined ? params.taskDescription : current.taskDescription;
+        const position = params.position ?? current.position;
+        const archived = params.archived ?? current.archived;
+        this.db
+            .prepare(
+                "UPDATE dev_sessions SET name = ?, repository_root = ?, default_working_directory = ?, task_description = ?, position = ?, archived = ?, updated_at = ? WHERE id = ?",
+            )
+            .run(
+                name,
+                repositoryRoot,
+                defaultWorkingDirectory,
+                taskDescription,
+                position,
+                archived ? 1 : 0,
+                Date.now(),
+                params.id,
+            );
+        return this.getSession(params.id);
+    }
+
+    deleteSession(params: { id: string }): { ok: true } {
+        return this.transaction(() => {
+            this.deleteSessionRows(params.id);
+            return { ok: true } as const;
+        });
+    }
+
+    reorderSessions(params: { groupId: string; orderedIds: string[] }): { ok: true } {
+        return this.transaction(() => {
+            const ts = Date.now();
+            const stmt = this.db.prepare(
+                "UPDATE dev_sessions SET position = ?, updated_at = ? WHERE id = ? AND group_id = ?",
+            );
+            params.orderedIds.forEach((id, index) => {
+                stmt.run(index, ts, id, params.groupId);
+            });
+            return { ok: true } as const;
+        });
+    }
+
+    moveSessionToGroup(params: MoveSessionParams): Session {
+        this.getSession(params.id); // reject a move of an unknown session
+        const position = params.position ?? this.nextPosition("dev_sessions", "group_id", params.groupId);
+        this.db
+            .prepare("UPDATE dev_sessions SET group_id = ?, position = ?, updated_at = ? WHERE id = ?")
+            .run(params.groupId, position, Date.now(), params.id);
+        return this.getSession(params.id);
+    }
+
+    // Copy a Dev Session's viewer + terminal pane definitions, split layouts,
+    // repository root, and task metadata into a NEW session with fresh UUIDs,
+    // minting a fresh tmux target `ch_<newSessionId>_<newTerminalId>` for every
+    // copied terminal pane (SPEC 4.2). Layout leaf paneIds are remapped to the
+    // copied panes so the duplicate's split trees stay self-consistent.
+    duplicateSession(params: { id: string }): SessionNode {
+        return this.transaction(() => {
+            const source = this.db
+                .prepare("SELECT * FROM dev_sessions WHERE id = ?")
+                .get(params.id) as SessionRow | undefined;
+            if (!source) throw new Error(`session not found: ${params.id}`);
+
+            const newSessionId = randomUUID();
+            const ts = Date.now();
+            const position = this.nextPosition("dev_sessions", "group_id", source.group_id);
+            this.db
+                .prepare(
+                    "INSERT INTO dev_sessions (id, server_id, group_id, name, repository_root, default_working_directory, task_description, position, archived, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                )
+                .run(
+                    newSessionId,
+                    source.server_id,
+                    source.group_id,
+                    source.name,
+                    source.repository_root,
+                    source.default_working_directory,
+                    source.task_description,
+                    position,
+                    source.archived,
+                    ts,
+                    ts,
+                );
+
+            const viewerIdMap: Record<string, string> = {};
+            const viewerRows = this.db
+                .prepare("SELECT * FROM viewer_panes WHERE dev_session_id = ? ORDER BY position, id").all(params.id) as unknown as ViewerPaneRow[];
+            for (const v of viewerRows) {
+                const newId = randomUUID();
+                viewerIdMap[v.id] = newId;
+                this.db
+                    .prepare(
+                        "INSERT INTO viewer_panes (id, server_id, dev_session_id, url, handler, title, position, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    )
+                    .run(newId, v.server_id, newSessionId, v.url, v.handler, v.title, v.position, ts, ts);
+            }
+
+            const terminalIdMap: Record<string, string> = {};
+            const terminalRows = this.db
+                .prepare("SELECT * FROM terminal_panes WHERE dev_session_id = ? ORDER BY position, id").all(params.id) as unknown as TerminalPaneRow[];
+            for (const t of terminalRows) {
+                const newId = randomUUID();
+                terminalIdMap[t.id] = newId;
+                const tmuxTarget = `ch_${newSessionId}_${newId}`;
+                this.db
+                    .prepare(
+                        "INSERT INTO terminal_panes (id, server_id, dev_session_id, name, working_directory, tmux_target, startup_command, harness, position, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    )
+                    .run(
+                        newId,
+                        t.server_id,
+                        newSessionId,
+                        t.name,
+                        t.working_directory,
+                        tmuxTarget,
+                        t.startup_command,
+                        t.harness,
+                        t.position,
+                        ts,
+                        ts,
+                    );
+            }
+
+            const layoutRows = this.db
+                .prepare("SELECT * FROM session_layouts WHERE dev_session_id = ?").all(params.id) as unknown as SessionLayoutRow[];
+            for (const l of layoutRows) {
+                const idMap = l.region === "viewer" ? viewerIdMap : terminalIdMap;
+                const tree = JSON.stringify(remapPaneIds(JSON.parse(l.tree), idMap));
+                this.db
+                    .prepare(
+                        "INSERT INTO session_layouts (id, server_id, dev_session_id, region, tree, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    )
+                    .run(randomUUID(), l.server_id, newSessionId, l.region, tree, ts, ts);
+            }
+
+            return this.sessionNode(newSessionId);
+        });
+    }
+
+    // --- Viewer panes -------------------------------------------------------
+
+    createViewerPane(params: CreateViewerPaneParams): ViewerPane {
+        const id = randomUUID();
+        const ts = Date.now();
+        const position =
+            params.position ?? this.nextPosition("viewer_panes", "dev_session_id", params.devSessionId);
+        this.db
+            .prepare(
+                "INSERT INTO viewer_panes (id, server_id, dev_session_id, url, handler, title, position, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .run(
+                id,
+                params.serverId,
+                params.devSessionId,
+                params.url,
+                params.handler ?? null,
+                params.title ?? null,
+                position,
+                ts,
+                ts,
+            );
+        return this.getViewerPane(id);
+    }
+
+    getViewerPane(id: string): ViewerPane {
+        const row = this.db.prepare("SELECT * FROM viewer_panes WHERE id = ?").get(id) as
+            | ViewerPaneRow
+            | undefined;
+        if (!row) throw new Error(`viewer pane not found: ${id}`);
+        return toViewerPane(row);
+    }
+
+    updateViewerPane(params: UpdateViewerPaneParams): ViewerPane {
+        const current = this.getViewerPane(params.id);
+        const url = params.url ?? current.url;
+        const handler = params.handler !== undefined ? params.handler : current.handler;
+        const title = params.title !== undefined ? params.title : current.title;
+        const position = params.position ?? current.position;
+        this.db
+            .prepare("UPDATE viewer_panes SET url = ?, handler = ?, title = ?, position = ?, updated_at = ? WHERE id = ?")
+            .run(url, handler, title, position, Date.now(), params.id);
+        return this.getViewerPane(params.id);
+    }
+
+    deleteViewerPane(params: { id: string }): { ok: true } {
+        this.db.prepare("DELETE FROM viewer_panes WHERE id = ?").run(params.id);
+        return { ok: true };
+    }
+
+    // --- Terminal panes -----------------------------------------------------
+
+    createTerminalPane(params: CreateTerminalPaneParams): TerminalPane {
+        const id = randomUUID();
+        const ts = Date.now();
+        const position =
+            params.position ?? this.nextPosition("terminal_panes", "dev_session_id", params.devSessionId);
+        this.db
+            .prepare(
+                "INSERT INTO terminal_panes (id, server_id, dev_session_id, name, working_directory, tmux_target, startup_command, harness, position, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .run(
+                id,
+                params.serverId,
+                params.devSessionId,
+                params.name,
+                params.workingDirectory ?? null,
+                params.tmuxTarget ?? null,
+                params.startupCommand ?? null,
+                params.harness ?? null,
+                position,
+                ts,
+                ts,
+            );
+        return this.getTerminalPane(id);
+    }
+
+    getTerminalPane(id: string): TerminalPane {
+        const row = this.db.prepare("SELECT * FROM terminal_panes WHERE id = ?").get(id) as
+            | TerminalPaneRow
+            | undefined;
+        if (!row) throw new Error(`terminal pane not found: ${id}`);
+        return toTerminalPane(row);
+    }
+
+    updateTerminalPane(params: UpdateTerminalPaneParams): TerminalPane {
+        const current = this.getTerminalPane(params.id);
+        const name = params.name ?? current.name;
+        const workingDirectory =
+            params.workingDirectory !== undefined ? params.workingDirectory : current.workingDirectory;
+        const tmuxTarget = params.tmuxTarget !== undefined ? params.tmuxTarget : current.tmuxTarget;
+        const startupCommand =
+            params.startupCommand !== undefined ? params.startupCommand : current.startupCommand;
+        const harness = params.harness !== undefined ? params.harness : current.harness;
+        const position = params.position ?? current.position;
+        this.db
+            .prepare(
+                "UPDATE terminal_panes SET name = ?, working_directory = ?, tmux_target = ?, startup_command = ?, harness = ?, position = ?, updated_at = ? WHERE id = ?",
+            )
+            .run(name, workingDirectory, tmuxTarget, startupCommand, harness, position, Date.now(), params.id);
+        return this.getTerminalPane(params.id);
+    }
+
+    deleteTerminalPane(params: { id: string }): { ok: true } {
+        this.db.prepare("DELETE FROM terminal_panes WHERE id = ?").run(params.id);
+        return { ok: true };
+    }
+
+    // --- Split layouts ------------------------------------------------------
+
+    getLayout(params: GetLayoutParams): SessionLayout | null {
+        const row = this.db
+            .prepare("SELECT * FROM session_layouts WHERE dev_session_id = ? AND region = ?")
+            .get(params.devSessionId, params.region) as SessionLayoutRow | undefined;
+        if (!row) return null;
+        return {
+            id: row.id,
+            serverId: row.server_id,
+            devSessionId: row.dev_session_id,
+            region: row.region,
+            tree: JSON.parse(row.tree),
+            createdAt: row.created_at,
+            updatedAt: row.updated_at,
+        };
+    }
+
+    setLayout(params: SetLayoutParams): SessionLayout {
+        const existing = this.db
+            .prepare("SELECT id FROM session_layouts WHERE dev_session_id = ? AND region = ?")
+            .get(params.devSessionId, params.region) as { id: string } | undefined;
+        const ts = Date.now();
+        const tree = JSON.stringify(params.tree);
+        if (existing) {
+            this.db
+                .prepare("UPDATE session_layouts SET tree = ?, updated_at = ? WHERE id = ?")
+                .run(tree, ts, existing.id);
+        } else {
+            this.db
+                .prepare(
+                    "INSERT INTO session_layouts (id, server_id, dev_session_id, region, tree, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                )
+                .run(randomUUID(), params.serverId, params.devSessionId, params.region, tree, ts, ts);
+        }
+        // Guaranteed present after the upsert above.
+        return this.getLayout(params) as SessionLayout;
+    }
+
+    // --- Nested read --------------------------------------------------------
+
+    // The nested tree groups -> sessions -> {viewerPanes, terminalPanes,
+    // layouts}. Ordering is deterministic (position, then id) so a reopen of
+    // the same database yields byte-identical output.
+    list(serverId: string): GroupNode[] {
+        const rows = this.db
+            .prepare("SELECT * FROM groups WHERE server_id = ? ORDER BY position, id").all(serverId) as unknown as GroupRow[];
+        return rows.map((g) => ({ ...toGroup(g), sessions: this.listSessions(g.id) }));
+    }
+
+    private listSessions(groupId: string): SessionNode[] {
+        const rows = this.db
+            .prepare("SELECT * FROM dev_sessions WHERE group_id = ? ORDER BY position, id").all(groupId) as unknown as SessionRow[];
+        return rows.map((s) => this.sessionNode(s.id, s));
+    }
+
+    private sessionNode(sessionId: string, row?: SessionRow): SessionNode {
+        const session = row
+            ? toSession(row)
+            : this.getSession(sessionId);
+        return {
+            ...session,
+            viewerPanes: this.listViewerPanes(sessionId),
+            terminalPanes: this.listTerminalPanes(sessionId),
+            layouts: this.getLayouts(sessionId),
+        };
+    }
+
+    private listViewerPanes(sessionId: string): ViewerPane[] {
+        const rows = this.db
+            .prepare("SELECT * FROM viewer_panes WHERE dev_session_id = ? ORDER BY position, id").all(sessionId) as unknown as ViewerPaneRow[];
+        return rows.map(toViewerPane);
+    }
+
+    private listTerminalPanes(sessionId: string): TerminalPane[] {
+        const rows = this.db
+            .prepare("SELECT * FROM terminal_panes WHERE dev_session_id = ? ORDER BY position, id").all(sessionId) as unknown as TerminalPaneRow[];
+        return rows.map(toTerminalPane);
+    }
+
+    private getLayouts(sessionId: string): SessionLayouts {
+        const rows = this.db
+            .prepare("SELECT region, tree FROM session_layouts WHERE dev_session_id = ?").all(sessionId) as unknown as Array<{ region: Region; tree: string }>;
+        const layouts: SessionLayouts = { viewer: null, terminal: null };
+        for (const r of rows) layouts[r.region] = JSON.parse(r.tree);
+        return layouts;
+    }
+
+    // --- Internal helpers ---------------------------------------------------
+
+    // Delete a session and its dependent panes/layouts. Children go first
+    // because the schema's foreign keys reject (NO ACTION), not cascade.
+    private deleteSessionRows(id: string): void {
+        this.db.prepare("DELETE FROM viewer_panes WHERE dev_session_id = ?").run(id);
+        this.db.prepare("DELETE FROM terminal_panes WHERE dev_session_id = ?").run(id);
+        this.db.prepare("DELETE FROM session_layouts WHERE dev_session_id = ?").run(id);
+        this.db.prepare("DELETE FROM dev_sessions WHERE id = ?").run(id);
+    }
+
+    private nextPosition(table: string, scopeColumn: string, scopeValue: string): number {
+        const row = this.db
+            .prepare(`SELECT COALESCE(MAX(position), -1) AS m FROM ${table} WHERE ${scopeColumn} = ?`)
+            .get(scopeValue) as { m: number };
+        return row.m + 1;
+    }
+
+    private transaction<T>(fn: () => T): T {
+        this.db.exec("BEGIN");
+        try {
+            const result = fn();
+            this.db.exec("COMMIT");
+            return result;
+        } catch (err) {
+            this.db.exec("ROLLBACK");
+            throw err;
+        }
+    }
+}
+
+// Lazily opened default connection backing the RPC handlers. Opened on first
+// use (not at import) so importing the module has no filesystem side effects
+// beyond reading the schema. The location follows SPEC 11.1, overridable via
+// CODEHARBOR_DB for tests and alternate deployments.
+let defaultWorkspace: Workspace | undefined;
+
+function workspace(): Workspace {
+    if (defaultWorkspace === undefined) {
+        const dbPath =
+            process.env.CODEHARBOR_DB ??
+            path.join(os.homedir(), ".local", "share", "codeharbor", "codeharbor.sqlite");
+        defaultWorkspace = openWorkspace(dbPath);
+    }
+    return defaultWorkspace;
+}
+
+// RPC handler table for the `workspace.*` method group (P's own group; NOT part
+// of the frozen C1 file catalog). codeharbord spreads these into its method map
+// and awaits any returned value; a thrown DB error becomes a JSON-RPC error.
+export const WORKSPACE_METHODS: Record<string, (params: unknown) => unknown> = {
+    "workspace.list": (p) => {
+        if (typeof p !== "object" || p === null || !("serverId" in p) || typeof p.serverId !== "string") {
+            throw new Error("workspace.list requires a string serverId");
+        }
+        return workspace().list(p.serverId);
+    },
+    "workspace.createGroup": (p) => workspace().createGroup(p as CreateGroupParams),
+    "workspace.updateGroup": (p) => workspace().updateGroup(p as UpdateGroupParams),
+    "workspace.deleteGroup": (p) => workspace().deleteGroup(p as { id: string }),
+    "workspace.reorderGroups": (p) => workspace().reorderGroups(p as { serverId: string; orderedIds: string[] }),
+    "workspace.createSession": (p) => workspace().createSession(p as CreateSessionParams),
+    "workspace.updateSession": (p) => workspace().updateSession(p as UpdateSessionParams),
+    "workspace.deleteSession": (p) => workspace().deleteSession(p as { id: string }),
+    "workspace.reorderSessions": (p) => workspace().reorderSessions(p as { groupId: string; orderedIds: string[] }),
+    "workspace.moveSessionToGroup": (p) => workspace().moveSessionToGroup(p as MoveSessionParams),
+    "workspace.duplicateSession": (p) => workspace().duplicateSession(p as { id: string }),
+    "workspace.createViewerPane": (p) => workspace().createViewerPane(p as CreateViewerPaneParams),
+    "workspace.updateViewerPane": (p) => workspace().updateViewerPane(p as UpdateViewerPaneParams),
+    "workspace.deleteViewerPane": (p) => workspace().deleteViewerPane(p as { id: string }),
+    "workspace.createTerminalPane": (p) => workspace().createTerminalPane(p as CreateTerminalPaneParams),
+    "workspace.updateTerminalPane": (p) => workspace().updateTerminalPane(p as UpdateTerminalPaneParams),
+    "workspace.deleteTerminalPane": (p) => workspace().deleteTerminalPane(p as { id: string }),
+    "workspace.getLayout": (p) => workspace().getLayout(p as GetLayoutParams),
+    "workspace.setLayout": (p) => workspace().setLayout(p as SetLayoutParams),
+};

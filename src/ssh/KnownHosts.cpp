@@ -9,17 +9,23 @@ KnownHosts::Verdict KnownHosts::verify(const QString& host,
                                        const QString& keyType,
                                        const QByteArray& keyBlob) const
 {
+    // Revocation takes precedence regardless of entry order (OpenSSH semantics):
+    // if any @revoked entry names this exact host+keyType+blob, refuse it even
+    // when a trusted entry for the same key appears earlier in the file.
+    for (const Entry& e : m_entries) {
+        if (e.host == host && e.keyType == keyType
+            && e.marker == QLatin1String("@revoked") && e.key == keyBlob)
+            return Verdict::Mismatch;
+    }
+
     bool sawType = false;
     for (const Entry& e : m_entries) {
         if (e.host != host || e.keyType != keyType)
             continue;
-        // A @revoked entry refuses exactly the key it names; other keys for the
-        // same host stay Unknown (no trusted entry established them).
-        if (e.marker == QLatin1String("@revoked")) {
-            if (e.key == keyBlob)
-                return Verdict::Mismatch;
+        // @revoked entries were handled above; a revoked entry never establishes
+        // trust, so other keys for the same host stay Unknown through it.
+        if (e.marker == QLatin1String("@revoked"))
             continue;
-        }
         // Hashed (|1|) and @cert-authority entries are opaque to direct blob
         // comparison: never a source of Match/Mismatch.
         if (!e.supported)
@@ -90,8 +96,13 @@ KnownHosts KnownHosts::parse(const QString& text)
 
         const QString hostField = fields.at(idx);
         const QString keyType = fields.at(idx + 1);
-        const QByteArray key =
-            QByteArray::fromBase64(fields.at(idx + 2).toUtf8());
+        const auto decoded = QByteArray::fromBase64Encoding(
+            fields.at(idx + 2).toUtf8(),
+            QByteArray::Base64Encoding
+                | QByteArray::AbortOnBase64DecodingErrors);
+        if (!decoded)
+            continue;  // malformed base64: drop the line, don't store a bogus key
+        const QByteArray key = decoded.decoded;
         QString comment;
         for (int i = idx + 3; i < fields.size(); ++i) {
             if (!comment.isEmpty())

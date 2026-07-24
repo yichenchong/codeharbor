@@ -30,7 +30,12 @@ struct SplitNode {
     // including the case where ratios.size() != children.size().
     static SplitNode fromJson(const QJsonObject &obj);
 
-    bool operator==(const SplitNode &) const = default;
+    // Structural equality mirroring toJson(): leaf identity is its paneId only
+    // (orientation/ratios are meaningless and dropped for leaves), while a split
+    // is defined by orientation, ratios, and children (paneId is dropped). This
+    // keeps fromJson(toJson(x)) == x for any valid tree, which a defaulted
+    // operator== would break by comparing fields toJson() does not persist.
+    bool operator==(const SplitNode &other) const;
 };
 
 } // namespace ch
