@@ -85,8 +85,26 @@ export interface WatchEvent {
     revision?: string;
 }
 
-// Stable wire method names for the initial file set (SPEC 8.3). Handlers are
-// added in the R-server workstream; these string values are the frozen contract.
+// Directory listing (SPEC 7.5 / 8.3). Added to the catalog for the viewer
+// workstream's directory viewer; entries are unordered (the client sorts).
+export interface ListDirectoryParams {
+    path: string;
+}
+
+export interface DirectoryEntry {
+    name: string;
+    kind: StatResult["kind"];
+}
+
+export interface ListDirectoryResult {
+    path: string;
+    entries: DirectoryEntry[];
+}
+
+// Stable wire method names for the file set (SPEC 8.3, 7.5). Handlers are added
+// in the R-server workstream; these string values are the frozen contract.
+// listDirectory (SPEC 7.5) was added after the initial six for the viewer
+// workstream — bump RPC_SCHEMA_VERSION when this set changes.
 export const RPC_METHODS = {
     stat: "file.stat",
     readFile: "file.readFile",
@@ -94,6 +112,7 @@ export const RPC_METHODS = {
     resolvePath: "file.resolvePath",
     watch: "file.watch",
     unwatch: "file.unwatch",
+    listDirectory: "file.listDirectory",
 } as const;
 
 export type RpcMethodKey = keyof typeof RPC_METHODS;
@@ -101,7 +120,7 @@ export type RpcMethodName = (typeof RPC_METHODS)[RpcMethodKey];
 
 // Server -> client notification method name for an active watch subscription
 // (SPEC 8.7). This is a NOTIFICATION name (no id, no response), deliberately
-// absent from RPC_METHODS, which enumerates only the six request methods. It
+// absent from RPC_METHODS, which enumerates only request methods. It
 // lives here in the contract so the wire name stays shared between the server
 // (codeharbord.ts) and the C++ client (RpcTypes.h).
 export const RPC_WATCH_EVENT_NOTIFICATION = "file.watchEvent";

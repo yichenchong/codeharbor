@@ -201,14 +201,15 @@ test("watch emits a WatchEvent when the file changes", async () => {
     await fs.rm(dir, { recursive: true, force: true });
 });
 
-test("internal helpers: listDirectory and getMimeType classify entries", async () => {
+test("listDirectory (RPC) classifies entries; getMimeType maps extensions", async () => {
     const dir = await tmpDir();
     await fs.writeFile(path.join(dir, "readme.md"), "# hi");
     await fs.mkdir(path.join(dir, "sub"));
 
-    const entries = await listDirectory(dir);
+    const result = await listDirectory({ path: dir });
+    assert.equal(result.path, dir);
     const byName: Record<string, string> = {};
-    for (const entry of entries) byName[entry.name] = entry.kind;
+    for (const entry of result.entries) byName[entry.name] = entry.kind;
     assert.equal(byName["readme.md"], "file");
     assert.equal(byName["sub"], "directory");
 

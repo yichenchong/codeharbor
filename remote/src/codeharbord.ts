@@ -10,7 +10,7 @@ import readline from "node:readline";
 
 // Frozen file-method catalog (C1, docs/PLAN.md). RPC_METHODS/RPC_REVISION_MISMATCH
 // are re-exported so the wire names and error code stay linked to the transport.
-// The six file.* handlers are registered from files.ts (R-server workstream).
+// The file.* handlers (incl. listDirectory) are registered from files.ts.
 import { fileMethods, fileWatchService, isRevisionMismatch } from "./files.ts";
 // Workspace persistence method group (workstream P). `workspace.*` is P's own
 // method group and is deliberately absent from the frozen C1 file catalog.
@@ -21,7 +21,8 @@ export { RPC_REVISION_MISMATCH, RPC_WATCH_EVENT_NOTIFICATION };
 
 export const RPC_SERVER_NAME = "codeharbord";
 export const RPC_SERVER_VERSION = "0.1.0";
-export const RPC_SCHEMA_VERSION = 1;
+// Bumped 1 -> 2 when file.listDirectory joined the C1 catalog (SPEC 7.5).
+export const RPC_SCHEMA_VERSION = 2;
 
 export interface RpcRequest {
     jsonrpc: "2.0";

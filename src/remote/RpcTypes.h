@@ -1,6 +1,7 @@
 #pragma once
 
 #include <QString>
+#include <QVector>
 #include <optional>
 
 namespace ch::rpc {
@@ -29,10 +30,11 @@ inline constexpr auto kMethodWriteFile = "file.writeFile";
 inline constexpr auto kMethodResolvePath = "file.resolvePath";
 inline constexpr auto kMethodWatch = "file.watch";
 inline constexpr auto kMethodUnwatch = "file.unwatch";
+inline constexpr auto kMethodListDirectory = "file.listDirectory";
 
 // Server -> client notification method name for an active watch subscription
 // (SPEC 8.7). A NOTIFICATION name (no id, no response), deliberately NOT part
-// of the six request methods above. Mirrors RPC_WATCH_EVENT_NOTIFICATION in
+// of the request methods above. Mirrors RPC_WATCH_EVENT_NOTIFICATION in
 // remote/src/rpc-types.ts.
 inline constexpr auto kWatchEventNotification = "file.watchEvent";
 
@@ -112,6 +114,22 @@ struct WatchEvent {
     QString path;
     WatchEventKind event;
     std::optional<QString> revision;
+};
+
+struct ListDirectoryParams {
+    QString path;
+};
+
+// One entry in a directory listing (SPEC 7.5). Mirrors DirectoryEntry in
+// remote/src/rpc-types.ts; server order is unspecified, so the client sorts.
+struct DirectoryEntry {
+    QString name;
+    Kind kind;
+};
+
+struct ListDirectoryResult {
+    QString path;
+    QVector<DirectoryEntry> entries;
 };
 
 } // namespace ch::rpc

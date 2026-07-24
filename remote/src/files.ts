@@ -1,11 +1,11 @@
-// R-server file service (SPEC 8.3/8.4/8.5/8.7). Implements the six C1 file
+// R-server file service (SPEC 8.3/8.4/8.5/8.7, 7.5). Implements the C1 file
 // methods (RPC_METHODS) over node:fs/promises: stat, readFile, writeFile,
-// resolvePath, watch, unwatch. Revision tokens are opaque strings minted here
-// server-side; clients never parse them. Writes are revision-guarded (SPEC 8.4)
-// and atomic (SPEC 8.5). Watching uses fs.watch with a polling fallback and an
-// EventEmitter sink so codeharbord can relay WatchEvents as JSON-RPC
-// notifications. listDirectory/getMimeType are internal helpers for future use
-// and are deliberately NOT registered as RPC methods (C1 froze only six).
+// resolvePath, watch, unwatch, listDirectory. Revision tokens are opaque strings
+// minted here server-side; clients never parse them. Writes are revision-guarded
+// (SPEC 8.4) and atomic (SPEC 8.5). Watching uses fs.watch with a polling
+// fallback and an EventEmitter sink so codeharbord can relay WatchEvents as
+// JSON-RPC notifications. getMimeType stays an internal helper (the client
+// resolves viewer types by extension in ViewerHandlerRegistry).
 
 import { promises as fsp, watch as fsWatch } from "node:fs";
 import type { FSWatcher, Stats } from "node:fs";
@@ -29,6 +29,8 @@ import type {
     UnwatchParams,
     UnwatchResult,
     WatchEvent,
+    ListDirectoryParams,
+    ListDirectoryResult,
 } from "./rpc-types.ts";
 
 // Opaque revision token (SPEC 8.4). Derived from mtime + size; clients treat it
@@ -367,16 +369,17 @@ export class FileWatchService {
 
 export const fileWatchService = new FileWatchService();
 
-// --- Internal helpers (NOT RPC methods; C1 froze only the six above) ---------
+// listDirectory (SPEC 7.5) is a registered RPC method (added after the initial
+// six for the viewer workstream). getMimeType below stays an internal helper.
 
-export interface DirectoryEntry {
-    name: string;
-    kind: StatResult["kind"];
-}
-
-export async function listDirectory(dirPath: string): Promise<DirectoryEntry[]> {
-    const entries = await fsp.readdir(dirPath, { withFileTypes: true });
-    return entries.map((entry) => ({ name: entry.name, kind: nodeKind(entry) }));
+export async function listDirectory(
+    params: ListDirectoryParams,
+): Promise<ListDirectoryResult> {
+    const dirents = await fsp.readdir(params.path, { withFileTypes: true });
+    return {
+        path: params.path,
+        entries: dirents.map((entry) => ({ name: entry.name, kind: nodeKind(entry) })),
+    };
 }
 
 const MIME_TYPES: Record<string, string> = {
@@ -415,4 +418,5 @@ export const fileMethods: Record<string, (params: unknown) => unknown | Promise<
     [RPC_METHODS.resolvePath]: (params) => resolvePath(params as ResolvePathParams),
     [RPC_METHODS.watch]: (params) => fileWatchService.watch(params as WatchParams),
     [RPC_METHODS.unwatch]: (params) => fileWatchService.unwatch(params as UnwatchParams),
+    [RPC_METHODS.listDirectory]: (params) => listDirectory(params as ListDirectoryParams),
 };
