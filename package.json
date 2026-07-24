@@ -1,0 +1,19 @@
+{
+  "name": "codeharbor-workspace",
+  "version": "0.1.0",
+  "private": true,
+  "description": "JS/TS workspaces for CodeHarbor (remote service + web assets)",
+  "workspaces": [
+    "remote",
+    "src/web/terminal",
+    "src/web/editor"
+  ],
+  "scripts": {
+    "test": "npm run test --workspace remote",
+    "build": "npm run build --workspaces --if-present",
+    "typecheck": "npm run typecheck --workspaces --if-present"
+  },
+  "engines": {
+    "node": ">=23.6"
+  }
+}

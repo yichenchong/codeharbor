@@ -1,0 +1,19 @@
+{
+  "name": "@codeharbor/web-terminal",
+  "version": "0.1.0",
+  "private": true,
+  "description": "xterm.js renderer bundle bridged to the C++ TerminalController via Qt WebChannel",
+  "type": "module",
+  "scripts": {
+    "build": "esbuild src/index.ts --bundle --format=esm --outfile=dist/terminal.js",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@xterm/xterm": "^5.5.0",
+    "@xterm/addon-fit": "^0.10.0"
+  },
+  "devDependencies": {
+    "esbuild": "^0.23.0",
+    "typescript": "^5.5.0"
+  }
+}

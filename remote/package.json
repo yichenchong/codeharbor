@@ -1,0 +1,23 @@
+{
+  "name": "@codeharbor/remote",
+  "version": "0.1.0",
+  "private": true,
+  "description": "codeharbord RPC service, codeharbor-bridge agent relay, and harness adapters",
+  "type": "module",
+  "bin": {
+    "codeharbord": "dist/codeharbord.js",
+    "codeharbor-bridge": "dist/bridge.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "node --test \"test/**/*.test.ts\""
+  },
+  "devDependencies": {
+    "typescript": "^5.7.0",
+    "@types/node": "^20.14.0"
+  },
+  "engines": {
+    "node": ">=23.6"
+  }
+}

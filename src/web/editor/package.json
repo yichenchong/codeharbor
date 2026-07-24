@@ -1,0 +1,18 @@
+{
+  "name": "@codeharbor/web-editor",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Monaco editor bundle bridged to the remote file service via Qt WebChannel",
+  "type": "module",
+  "scripts": {
+    "build": "esbuild src/index.ts --bundle --format=esm --outfile=dist/editor.js",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "monaco-editor": "^0.52.0"
+  },
+  "devDependencies": {
+    "esbuild": "^0.23.0",
+    "typescript": "^5.5.0"
+  }
+}

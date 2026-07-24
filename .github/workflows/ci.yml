@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  remote:
+    name: remote (node)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - name: Install remote workspace deps
+        working-directory: remote
+        run: npm install
+      - name: Typecheck
+        working-directory: remote
+        run: npm run typecheck
+      - name: Test
+        working-directory: remote
+        run: npm test
+
+  client:
+    name: client (qt/cmake)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Qt 6
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: "6.6.*"
+          modules: qtwebengine qtwebchannel
+      - name: Install build tooling
+        run: sudo apt-get update && sudo apt-get install -y ninja-build libssh-dev
+      - name: Configure
+        run: cmake --preset dev
+      - name: Build
+        run: cmake --build --preset dev
