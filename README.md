@@ -72,8 +72,11 @@ npm run build      # tsc -> dist/
 
 ## Status
 
-Bootstrap scaffold. See [`docs/PLAN.md`](docs/PLAN.md) for the phased,
-parallelizable delivery plan and the current state of each workstream.
+Milestones **M2** (core workspace) and **M3** (remote viewers) reached — SSH
+transport, data model, remote file service, RPC client, persistence, terminal,
+UI shell, and viewers are implemented and unit-tested; live gates that need a
+display or SSH server are wired but deferred. See [`docs/PLAN.md`](docs/PLAN.md)
+for the phased, parallelizable delivery plan and the state of each workstream.
 
 ## License
 

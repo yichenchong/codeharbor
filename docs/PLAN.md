@@ -130,8 +130,8 @@ graph TD
   - **Start gate:** [x] Bootstrap · [x] C1 · [x] C2.
   - **TODO:** [x] file methods (`stat/readFile/writeFile/resolvePath`) with
     revision tokens (SPEC 8.4) + atomic save (SPEC 8.5); [x] `watch`/`unwatch`
-    (fs.watch + poll fallback); [x] `listDirectory`/`getMimeType` (internal
-    helpers, not RPC-exposed); [x] `workspace.*` (with P). tmux discovery: not yet.
+    (fs.watch + poll fallback); [x] `listDirectory` (RPC, schema v2, for viewers)
+    + `getMimeType` (internal helper); [x] `workspace.*` (with P). tmux: not yet.
   - **Stop gate:** [x] MET — `node --test` covers revision-mismatch rejection,
     atomic-save replace, watch-event emission.
 - **R-client (C++ `ch_remote`)**
@@ -154,20 +154,22 @@ graph TD
   reconnect wiring lands with the app shell (U).
 - **Parallel with:** V, E (different regions).
 
-### V — Viewers
+### V — Viewers — ✅ code complete (Wave 3); ⏳ live-display gate deferred
 - **Start gate:** [x] Bootstrap · [x] R-client (for `file://`).
 - **TODO:**
-  - [ ] `ViewerHandlerRegistry` by scheme + MIME + extension (SPEC 7.5 table).
-  - [ ] Separate WebEngine profiles: external (no bridge) vs internal (SPEC 7.3).
-  - [ ] `codeharbor-internal://` scheme handler resolving remote `file://`.
-  - [ ] Handlers: web, source/text, markdown, structured-data, image, PDF,
-    directory, binary; recursive viewer-region split tree.
-- **Stop gate:** open an HTTPS site (external profile, no bridge access asserted),
-  a remote text file, an image, and a directory in split panes.
+  - [x] `ViewerHandlerRegistry` by scheme + extension (SPEC 7.5 table).
+  - [x] Dual `QQuickWebEngineProfile`: external (no bridge) vs internal (SPEC 7.3), isolation asserted.
+  - [x] `codeharbor-internal://` scheme handler + bidirectional URL map (SPEC 7.4), served via file.readFile.
+  - [x] Views: web, source/text, markdown, structured-data, image, PDF,
+    directory, binary; recursive viewer-region split tree in QML.
+- **Stop gate:** ✅ testable parts MET — `tst_viewers` covers the SPEC 7.5 table,
+  URL round-trip, MIME, and profile isolation (external no-scheme / internal
+  privileged, M3). ⏳ The live "HTTPS + text + image + directory in split panes"
+  render needs a display + server; wired but unexercised headless.
 - **Parallel with:** T.
 
 ### E — Remote editor
-- **Start gate:** [x] R file methods (stat/read/write/watch) · [ ] V pane host · [x] C3.
+- **Start gate:** [x] R file methods (stat/read/write/watch) · [x] V pane host · [x] C3.
 - **TODO:**
   - [ ] Monaco bundle in `src/web/editor`; `RemoteEditorBridge` (C3).
   - [ ] File-state machine (SPEC 8.2), revision-guarded save, conflict UI
@@ -178,7 +180,7 @@ graph TD
 - **Parallel with:** T.
 
 ### A — Agent awareness
-- **Start gate:** [x] bridge+adapters DONE · [x] S agent channel (ChannelKind::AgentStatus) · [ ] U sidebar.
+- **Start gate:** [x] bridge+adapters DONE · [x] S agent channel (ChannelKind::AgentStatus) · [x] U sidebar.
 - **TODO:**
   - [ ] `AgentStatusMonitor` (C++) consuming JSONL over the agent channel.
   - [ ] Map `AgentState` → sidebar badges/precedence; unseen-completion badges;
@@ -190,48 +192,51 @@ graph TD
   running→waiting_input→idle_unseen; badge clears on "mark seen".
 - **Parallel with:** V, E (after U).
 
-### U — UI shell & persistence
+### U — UI shell & persistence — ✅ core landed (Wave 3); ⏳ live restart gate deferred
 - **Start gate:** [x] M models · [x] P (for layout persistence).
 - **TODO:**
-  - [ ] Sidebar: groups (collapse/reorder), session rows with aggregate status,
-    all sidebar ops (SPEC 4.2).
-  - [ ] Persist region widths, split ratios, selected pane per Dev Session.
+  - [x] Sidebar: groups (collapse), session rows with aggregate status, ops
+    create/rename/duplicate/move/delete (SPEC 4.2). Drag-reorder: invokables ready, DnD UI TBD.
+  - [x] Persist region widths + selected pane per client (QSettings, SPEC 4.1); split ratios persist server-side via P layouts.
   - [ ] Command palette + keyboard shortcuts (SPEC 15).
-- **Stop gate:** create/rename/duplicate/move sessions; layout + widths persist
-  across app restart (state read from server DB).
+- **Stop gate:** ✅ testable parts MET — `tst_appcontroller` covers GroupNode→row
+  mapping + UiStateStore persistence across a fresh instance ("restart"). ⏳ Live
+  CRUD against a running server + width-restore on app relaunch needs display + server.
 - **Parallel with:** V/T rendering (consumes their pane views).
 
 ## Milestones (integration barriers → SPEC §16)
 
 - **M0 — Bootstrap (DONE).** Repo, build wiring, remote core tested.
-- **M1 — Terminal vertical slice (SPEC Phase 0).** ⏳ Code complete (S + T), but
-  the stop gate (live attach/resize/reconnect) needs a test SSH server + display
-  and the app shell (U) to wire the PTY channel into the renderer. Transport +
-  controller are unit-tested.
-- **M2 — Core workspace (SPEC Phase 1).** Partially landed: M + P + R-client done;
-  needs **U** (app shell) + live **T** to be user-visible.
-- **M3 — Remote viewers (SPEC Phase 2).** Pending — workstream V.
+- **M1 — Terminal vertical slice (SPEC Phase 0).** ⏳ Code complete (S + T + U shell);
+  the live stop gate (attach/resize/reconnect) needs a test SSH server + display.
+  Transport + controller unit-tested.
+- **M2 — Core workspace (SPEC Phase 1).** ✅ Landed: M + P + R-client + U (sidebar,
+  CRUD, persistence). Live multi-terminal render + relaunch-restore deferred to a
+  display/server; logic unit-tested (`tst_appcontroller`).
+- **M3 — Remote viewers (SPEC Phase 2).** ✅ Landed: V handler registry + dual-profile
+  isolation + internal scheme + viewer split-tree. Live split-pane render deferred
+  to a display/server; registry/URL/MIME/isolation unit-tested (`tst_viewers`).
 - **M4 — Remote editing (SPEC Phase 3).** Pending — workstream E.
 - **M5 — Agent awareness (SPEC Phase 4).** Pending — workstream A; Oh My Pi first.
 
 ## Delivery progress
 
-**Wave 0 — contracts: ✅ DONE.** C1 (`rpc-types.ts`), C2 (`schema.sql`), C3
-(WebChannel interfaces) — landed + adversarially reviewed.
+**Wave 0 — contracts: ✅ DONE.** C1/C2/C3 landed + adversarially reviewed.
 
-**Wave 1 — ✅ DONE** (S, M, R-server), each with a parallel adversarial-review +
-bug-hunt pass. Live S gate deferred (needs test server).
+**Wave 1 — ✅ DONE** (S, M, R-server) + parallel adversarial review + bug-hunt. Live S gate deferred.
 
-**Wave 2 — ✅ DONE** (P server+client, R-client, T), with an adversarial-review
-wave. Live T gate deferred (needs server + display).
+**Wave 2 — ✅ DONE** (P server+client, R-client, T) + adversarial-review wave. Live T gate deferred.
 
-**Wave 3 — next (fan out; dependencies noted):**
-1. **U** — UI shell & sidebar + layout persistence. Needs M ✅ + P ✅. Unblocks
-   the live M1/M2 gates (wires S/T into the window).
-2. **V** — viewers (handler registry, WebEngine profiles). Needs R-client ✅ for `file://`.
-3. **E** — remote editor (Monaco). Needs R-server file methods ✅ + V pane host + C3 ✅.
-4. **A** — agent awareness client (AgentStatusMonitor). Needs S ✅ agent channel + U sidebar.
+**Wave 3 — ✅ DONE** (U shell, V viewers) → milestones **M2** and **M3** reached
+(logic verified; live display/server render gates deferred). Delivered with a
+concurrent Wave-2 bug-hunt (R-client null-error HIGH, P schema_version latent) and
+a Wave-3 adversarial review (U callback use-after-free + silent-no-op sidebar HIGHs,
+V profile-type M3 blocker). Contract C1 gained `file.listDirectory` (schema v2).
 
-> Closing the deferred **S** and **T** live stop gates (and milestone **M1**)
-> requires a reachable SSH server + a display — do those once **U** provides the
-> window to drive them.
+**Wave 4 — next (fan out; dependencies noted):**
+1. **E** — remote editor (Monaco). Needs R-server file methods ✅ + V pane host ✅ + C3 ✅.
+2. **A** — agent awareness client (AgentStatusMonitor). Needs S ✅ agent channel + U sidebar ✅.
+
+> Closing the deferred live stop gates (**S**, **T**, and the live render of
+> **U**/**V** for M1) needs a reachable SSH server + a display — the code paths are
+> wired and unit-tested; they just need an environment to exercise them.
