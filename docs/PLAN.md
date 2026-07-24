@@ -89,69 +89,69 @@ graph TD
 
 ## Workstreams
 
-### M — Core data model
-- **Start gate:** [x] Bootstrap done · [ ] C2 fields known.
+### M — Core data model — ✅ LANDED (Wave 1)
+- **Start gate:** [x] Bootstrap done · [x] C2 fields known.
 - **TODO:**
-  - [ ] `Group`, `DevSession`, `ViewerPane`, `TerminalPane` value types + a
+  - [x] `Group`, `DevSession`, `ViewerPane`, `TerminalPane` value types + a
     `SplitNode` recursive split-tree type (SPEC 4.5), all under `src/models`.
-  - [ ] QAbstractItemModel adapters for the sidebar and split trees.
-  - [ ] `aggregateRowState` wiring from per-terminal states (already unit-shaped).
-- **Contract exposed:** header types other libs bind to; QML-registered models.
-- **Stop gate:** a C++ unit test constructs a Group→DevSession→panes tree,
-  round-trips a split layout, and asserts sidebar precedence ordering.
-- **Parallel with:** S, R-server.
+  - [x] QAbstractItemModel adapter for the sidebar (`SessionsModel`).
+  - [x] `aggregateRowState` wiring from per-terminal states.
+- **Contract exposed:** header types other libs bind to (`WorkspaceTypes.h`,
+  `SplitTree.h`, `SessionsModel.h`). QML registration deferred to U.
+- **Stop gate:** [x] MET — `tst_models` (tree build, split round-trip,
+  precedence) + `QAbstractItemModelTester`.
 
-### P — Persistence
-- **Start gate:** [ ] C2 · [ ] M types exist.
+### P — Persistence — ✅ LANDED (Wave 2)
+- **Start gate:** [x] C2 · [x] M types exist.
 - **TODO:**
-  - [ ] `schema.sql` + migration runner (server-side, in codeharbord).
-  - [ ] CRUD for groups/sessions/panes/layouts; duplicate-session copy semantics
-    (SPEC 4.2) generating fresh tmux targets.
-  - [ ] Client mapping in `ch_persistence` over RPC (no direct client DB access).
-- **Contract exposed:** RPC methods `workspace.*` (list/create/update/reorder).
-- **Stop gate:** integration test creates a group + session with panes, restarts
-  codeharbord, and reloads identical state from SQLite.
-- **Parallel with:** S, T (after M).
+  - [x] `schema.sql` + migration runner (server-side, in codeharbord).
+  - [x] CRUD for groups/sessions/panes/layouts; duplicate-session copy semantics
+    (SPEC 4.2) generating fresh tmux targets + layout paneId remap.
+  - [x] Client mapping in `ch_persistence` over RPC (no direct client DB access).
+- **Contract exposed:** RPC methods `workspace.*` (list/create/update/reorder/…).
+- **Stop gate:** [x] MET — `workspace.test.ts` create→reopen→reload identical;
+  `tst_workspacedb` client parse/serialize + live round-trip.
 
-### S — SSH transport
-- **Start gate:** [x] Bootstrap · [ ] libssh available (`libssh-dev`).
+### S — SSH transport — ✅ code complete (Wave 1); ⏳ live gate deferred
+- **Start gate:** [x] Bootstrap · [x] libssh available (`libssh-dev`).
 - **TODO:**
-  - [ ] `SshConnectionPool`: one authenticated connection, N channels (SPEC 5.3).
-  - [ ] Host-key verify + known-hosts store + changed-key refusal (SPEC 12.1).
-  - [ ] Channel factory for PTY / RPC / agent-status channels.
-  - [ ] Credential handling via OS store / SSH agent (no secrets in DB).
+  - [x] `SshConnectionPool`: one authenticated connection, N channels (SPEC 5.3).
+  - [x] Host-key verify + known-hosts store + changed-key/@revoked refusal (SPEC 12.1).
+  - [x] Channel factory for PTY / RPC / agent-status channels.
+  - [x] Credential handling via SSH agent → key → password callback (no secrets stored).
 - **Contract exposed:** `openChannel(kind)`, host-key callback, state signals.
-- **Stop gate:** open a real SSH connection to a test server, verify host key,
-  open a PTY channel, run `echo` remotely, assert output round-trips.
+- **Stop gate:** ⏳ DEFERRED — the live SSH round-trip needs a test server (not
+  available in CI here). Host-key logic covered by `tst_knownhosts`; the
+  connect→verify→auth→openChannel path is implemented but unexercised live.
 - **Parallel with:** M, R-server, P.
 
-### R — Remote service + client
+### R — Remote service + client — ✅ LANDED (R-server Wave 1, R-client Wave 2)
 - **R-server (Node, codeharbord)**
-  - **Start gate:** [x] Bootstrap · [ ] C1 · [ ] C2.
-  - **TODO:** [ ] file methods (`stat/readFile/writeFile/resolvePath`) with
-    revision tokens (SPEC 8.4) + atomic save (SPEC 8.5); [ ] `watch`/`unwatch`
-    (fs.watch + poll fallback); [ ] `listDirectory` + `getMimeType`; [ ] tmux
-    discovery; [ ] wire `workspace.*` (with P).
-  - **Stop gate:** `node --test` covers revision-mismatch rejection, atomic-save
-    replace, and watch-event emission on external change.
+  - **Start gate:** [x] Bootstrap · [x] C1 · [x] C2.
+  - **TODO:** [x] file methods (`stat/readFile/writeFile/resolvePath`) with
+    revision tokens (SPEC 8.4) + atomic save (SPEC 8.5); [x] `watch`/`unwatch`
+    (fs.watch + poll fallback); [x] `listDirectory`/`getMimeType` (internal
+    helpers, not RPC-exposed); [x] `workspace.*` (with P). tmux discovery: not yet.
+  - **Stop gate:** [x] MET — `node --test` covers revision-mismatch rejection,
+    atomic-save replace, watch-event emission.
 - **R-client (C++ `ch_remote`)**
-  - **Start gate:** [ ] C1 · [ ] S channel factory.
-  - **TODO:** [ ] JSONL framing over the RPC channel; [ ] async request/response
-    with typed results; [ ] reconnect handling.
-  - **Stop gate:** C++ test issues `server.info`/`readFile` over a piped
-    codeharbord and decodes typed results.
-- **Parallel with:** each other once C1 is frozen; with S, M, P.
+  - **Start gate:** [x] C1 · [x] S channel factory.
+  - **TODO:** [x] JSONL framing over the RPC channel; [x] async request/response
+    with typed results; [x] teardown/notification routing (reconnect scheduling TBD).
+  - **Stop gate:** [x] MET — `tst_rpcclient` (framing, id-matching, errors,
+    teardown) + live `server.info` over a piped codeharbord.
 
-### T — Terminal
-- **Start gate:** [ ] S PTY channel · [ ] C3.
+### T — Terminal — ✅ code complete (Wave 2); ⏳ live gate deferred
+- **Start gate:** [x] S PTY channel · [x] C3.
 - **TODO:**
-  - [ ] `TerminalController`: buffering (SPEC 5.5), state machine (SPEC 5.6),
-    reconnect backoff (`reconnectDelaySeconds` shaped), hidden-drain.
-  - [ ] tmux attach/create with stable IDs (SPEC 5.2); kill/detach/reconnect.
-  - [ ] xterm.js bundle in `src/web/terminal` + WebChannel wiring (C3).
-  - [ ] Recursive terminal-region split tree in QML.
-- **Stop gate:** launch app, attach to a remote tmux session, type/see output,
-  resize, hide+show (buffer intact), kill client → tmux survives → reconnect.
+  - [x] `TerminalController`: buffering (SPEC 5.5), state machine (SPEC 5.6),
+    reconnect backoff, hidden-drain.
+  - [x] tmux target naming with stable IDs (SPEC 5.2) + shell-safe command.
+  - [x] xterm.js renderer in `src/web/terminal` + WebChannel bridge (C3).
+  - [x] Recursive terminal-region split tree in QML.
+- **Stop gate:** ⏳ DEFERRED — live attach/resize/reconnect needs a server +
+  display. Controller logic covered by `tst_terminalcontroller`; kill/detach/
+  reconnect wiring lands with the app shell (U).
 - **Parallel with:** V, E (different regions).
 
 ### V — Viewers
@@ -204,28 +204,34 @@ graph TD
 ## Milestones (integration barriers → SPEC §16)
 
 - **M0 — Bootstrap (DONE).** Repo, build wiring, remote core tested.
-- **M1 — Terminal vertical slice (SPEC Phase 0).** Gate: S + T stop gates + a
-  single-terminal window. First end-to-end remote interaction.
-- **M2 — Core workspace (SPEC Phase 1).** Gate: M + P + U + R-client + T (multi)
-  stop gates. Groups, sessions, splits, server-side state, status aggregation.
-- **M3 — Remote viewers (SPEC Phase 2).** Gate: V stop gate + isolation asserted.
-- **M4 — Remote editing (SPEC Phase 3).** Gate: E stop gate incl. conflict + recovery.
-- **M5 — Agent awareness (SPEC Phase 4).** Gate: A stop gate; Oh My Pi first.
+- **M1 — Terminal vertical slice (SPEC Phase 0).** ⏳ Code complete (S + T), but
+  the stop gate (live attach/resize/reconnect) needs a test SSH server + display
+  and the app shell (U) to wire the PTY channel into the renderer. Transport +
+  controller are unit-tested.
+- **M2 — Core workspace (SPEC Phase 1).** Partially landed: M + P + R-client done;
+  needs **U** (app shell) + live **T** to be user-visible.
+- **M3 — Remote viewers (SPEC Phase 2).** Pending — workstream V.
+- **M4 — Remote editing (SPEC Phase 3).** Pending — workstream E.
+- **M5 — Agent awareness (SPEC Phase 4).** Pending — workstream A; Oh My Pi first.
 
-## Immediate next steps (first two waves)
+## Delivery progress
 
-**Wave 0 — contracts (serial, 1 owner): DONE.**
-1. ~~Land **C1** (`rpc-types.ts`), **C2** (`schema.sql` + schema version), **C3**
-   (WebChannel interface freeze).~~
+**Wave 0 — contracts: ✅ DONE.** C1 (`rpc-types.ts`), C2 (`schema.sql`), C3
+(WebChannel interfaces) — landed + adversarially reviewed.
 
-**Wave 1 — fan out in parallel once Wave 0 lands (no edges between these):**
-1. **S** — libssh connection pool + host-key + channel factory → stop gate.
-2. **M** — data-model types + split-tree + QML models → stop gate.
-3. **R-server** — codeharbord file methods (revision + atomic save) + tests.
+**Wave 1 — ✅ DONE** (S, M, R-server), each with a parallel adversarial-review +
+bug-hunt pass. Live S gate deferred (needs test server).
 
-**Wave 2 (opens as Wave 1 gates clear):** P (needs M + R-server), R-client (needs
-S + C1), then T (needs S). T + a minimal window reaches **M1**.
+**Wave 2 — ✅ DONE** (P server+client, R-client, T), with an adversarial-review
+wave. Live T gate deferred (needs server + display).
 
-> Dispatch note: Wave 1's three items are genuinely independent and should be run
-> concurrently. P and R-client are the join points — do not start them before
-> their upstream stop gates are green.
+**Wave 3 — next (fan out; dependencies noted):**
+1. **U** — UI shell & sidebar + layout persistence. Needs M ✅ + P ✅. Unblocks
+   the live M1/M2 gates (wires S/T into the window).
+2. **V** — viewers (handler registry, WebEngine profiles). Needs R-client ✅ for `file://`.
+3. **E** — remote editor (Monaco). Needs R-server file methods ✅ + V pane host + C3 ✅.
+4. **A** — agent awareness client (AgentStatusMonitor). Needs S ✅ agent channel + U sidebar.
+
+> Closing the deferred **S** and **T** live stop gates (and milestone **M1**)
+> requires a reachable SSH server + a display — do those once **U** provides the
+> window to drive them.
