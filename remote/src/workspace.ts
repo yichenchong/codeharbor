@@ -357,6 +357,14 @@ export function openWorkspace(dbPath: string): Workspace {
 function migrate(db: DatabaseSync): void {
     if (schemaVersion(db) < WORKSPACE_SCHEMA_VERSION) {
         db.exec(schemaSql);
+        // schema.sql seeds the version row with INSERT OR IGNORE, which cannot
+        // advance an already-present row. Record the target version explicitly
+        // so a later WORKSPACE_SCHEMA_VERSION bump is persisted (and migrate
+        // stops re-running schema.sql on every open) rather than the stored
+        // version silently drifting from the DDL's hard-coded literal.
+        db.prepare("UPDATE schema_version SET version = ? WHERE id = 1").run(
+            WORKSPACE_SCHEMA_VERSION,
+        );
     }
 }
 

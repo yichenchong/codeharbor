@@ -363,3 +363,223 @@ test("getLayout returns null for a region with no layout", async () => {
     ws.close();
     await cleanup(dbPath);
 });
+
+test("updateSession keeps unset fields but clears explicit nulls (undefined vs null)", async () => {
+    const dbPath = await tmpDbPath();
+    const ws = openWorkspace(dbPath);
+    const { session } = seed(ws);
+
+    // Omitting a nullable field keeps the current value...
+    let s = ws.updateSession({ id: session.id, name: "renamed" });
+    assert.equal(s.name, "renamed");
+    assert.equal(s.defaultWorkingDirectory, "/home/dev/codeharbor/src");
+    assert.equal(s.taskDescription, "wave 2 persistence");
+
+    // ...while passing null explicitly clears it.
+    s = ws.updateSession({ id: session.id, defaultWorkingDirectory: null, taskDescription: null });
+    assert.equal(s.defaultWorkingDirectory, null);
+    assert.equal(s.taskDescription, null);
+
+    // archived:false is honored, not mistaken for "unset" (?? must not eat false).
+    s = ws.updateSession({ id: session.id, archived: true });
+    assert.equal(s.archived, true);
+    s = ws.updateSession({ id: session.id, archived: false });
+    assert.equal(s.archived, false);
+
+    ws.close();
+    await cleanup(dbPath);
+});
+
+test("updateViewerPane/updateTerminalPane clear nullable fields on null, keep on omit", async () => {
+    const dbPath = await tmpDbPath();
+    const ws = openWorkspace(dbPath);
+    const { viewer, terminal } = seed(ws);
+
+    let v = ws.updateViewerPane({ id: viewer.id, url: "https://changed" });
+    assert.equal(v.url, "https://changed");
+    assert.equal(v.handler, "web"); // omitted -> kept
+    assert.equal(v.title, "Docs");
+    v = ws.updateViewerPane({ id: viewer.id, handler: null, title: null });
+    assert.equal(v.handler, null);
+    assert.equal(v.title, null);
+
+    let t = ws.updateTerminalPane({ id: terminal.id, name: "sh2" });
+    assert.equal(t.name, "sh2");
+    assert.equal(t.workingDirectory, "/home/dev/codeharbor"); // kept
+    assert.equal(t.tmuxTarget, terminal.tmuxTarget); // kept
+    t = ws.updateTerminalPane({
+        id: terminal.id,
+        workingDirectory: null,
+        tmuxTarget: null,
+        startupCommand: null,
+        harness: null,
+    });
+    assert.equal(t.workingDirectory, null);
+    assert.equal(t.tmuxTarget, null);
+    assert.equal(t.startupCommand, null);
+    assert.equal(t.harness, null);
+
+    ws.close();
+    await cleanup(dbPath);
+});
+
+test("reorder is scoped: reorderGroups by server, reorderSessions by group", async () => {
+    const dbPath = await tmpDbPath();
+    const ws = openWorkspace(dbPath);
+    const OTHER = "srv-2";
+    const a1 = ws.createGroup({ serverId: SERVER, name: "A1" });
+    const a2 = ws.createGroup({ serverId: SERVER, name: "A2" });
+    ws.createGroup({ serverId: OTHER, name: "B1" });
+    ws.createGroup({ serverId: OTHER, name: "B2" });
+
+    ws.reorderGroups({ serverId: SERVER, orderedIds: [a2.id, a1.id] });
+    assert.deepEqual(ws.list(SERVER).map((g) => g.name), ["A2", "A1"]);
+    // A different server's ordering must be untouched by the scoped WHERE.
+    assert.deepEqual(ws.list(OTHER).map((g) => g.name), ["B1", "B2"]);
+
+    const s1 = ws.createSession({ serverId: SERVER, groupId: a1.id, name: "s1", repositoryRoot: "/r" });
+    const s2 = ws.createSession({ serverId: SERVER, groupId: a1.id, name: "s2", repositoryRoot: "/r" });
+    ws.createSession({ serverId: SERVER, groupId: a2.id, name: "o1", repositoryRoot: "/r" });
+    ws.createSession({ serverId: SERVER, groupId: a2.id, name: "o2", repositoryRoot: "/r" });
+
+    ws.reorderSessions({ groupId: a1.id, orderedIds: [s2.id, s1.id] });
+    const groups = ws.list(SERVER);
+    assert.deepEqual(groups.find((g) => g.id === a1.id)?.sessions.map((s) => s.name), ["s2", "s1"]);
+    // Sessions in the sibling group keep their order (scoped by group_id).
+    assert.deepEqual(groups.find((g) => g.id === a2.id)?.sessions.map((s) => s.name), ["o1", "o2"]);
+
+    ws.close();
+    await cleanup(dbPath);
+});
+
+test("setLayout upserts a single row and returns the updated tree", async () => {
+    const dbPath = await tmpDbPath();
+    const ws = openWorkspace(dbPath);
+    const g = ws.createGroup({ serverId: SERVER, name: "G" });
+    const s = ws.createSession({ serverId: SERVER, groupId: g.id, name: "S", repositoryRoot: "/r" });
+
+    ws.setLayout({ serverId: SERVER, devSessionId: s.id, region: "viewer", tree: { type: "leaf", paneId: "p1" } });
+    const updated = ws.setLayout({ serverId: SERVER, devSessionId: s.id, region: "viewer", tree: { type: "leaf", paneId: "p2" } });
+    assert.deepEqual(updated.tree, { type: "leaf", paneId: "p2" });
+    assert.deepEqual(ws.getLayout({ devSessionId: s.id, region: "viewer" })?.tree, { type: "leaf", paneId: "p2" });
+    const count = ws.db
+        .prepare("SELECT COUNT(*) AS n FROM session_layouts WHERE dev_session_id = ? AND region = ?")
+        .get(s.id, "viewer") as { n: number };
+    assert.equal(count.n, 1);
+
+    ws.close();
+    await cleanup(dbPath);
+});
+
+test("duplicateSession mints a fresh tmux target per terminal and remaps the terminal region (SPEC 4.2/4.5)", async () => {
+    const dbPath = await tmpDbPath();
+    const ws = openWorkspace(dbPath);
+    const g = ws.createGroup({ serverId: SERVER, name: "G" });
+    const s = ws.createSession({ serverId: SERVER, groupId: g.id, name: "S", repositoryRoot: "/r" });
+    const t1 = ws.createTerminalPane({ serverId: SERVER, devSessionId: s.id, name: "t1", tmuxTarget: "orig1" });
+    const t2 = ws.createTerminalPane({ serverId: SERVER, devSessionId: s.id, name: "t2", tmuxTarget: "orig2" });
+    ws.setLayout({
+        serverId: SERVER,
+        devSessionId: s.id,
+        region: "terminal",
+        tree: {
+            type: "split",
+            orientation: "vertical",
+            ratios: [0.4, 0.6],
+            children: [
+                { type: "leaf", paneId: t1.id },
+                { type: "leaf", paneId: t2.id },
+            ],
+        },
+    });
+
+    const dup = ws.duplicateSession({ id: s.id });
+    const [d1, d2] = dup.terminalPanes;
+    assert.notEqual(d1.id, t1.id);
+    assert.notEqual(d2.id, t2.id);
+    assert.equal(d1.tmuxTarget, `ch_${dup.id}_${d1.id}`);
+    assert.equal(d2.tmuxTarget, `ch_${dup.id}_${d2.id}`);
+    assert.notEqual(d1.tmuxTarget, d2.tmuxTarget);
+    assert.notEqual(d1.tmuxTarget, "orig1");
+    // The terminal-region tree remaps to the copied terminal panes, in order.
+    assert.deepEqual(dup.layouts.terminal, {
+        type: "split",
+        orientation: "vertical",
+        ratios: [0.4, 0.6],
+        children: [
+            { type: "leaf", paneId: d1.id },
+            { type: "leaf", paneId: d2.id },
+        ],
+    });
+    // The originals are untouched.
+    const orig = ws.list(SERVER)[0].sessions.find((x) => x.id === s.id);
+    assert.equal(orig?.terminalPanes[0].tmuxTarget, "orig1");
+    assert.equal(orig?.terminalPanes[1].tmuxTarget, "orig2");
+
+    ws.close();
+    await cleanup(dbPath);
+});
+
+test("duplicateSession of an empty session yields fresh id, no panes, null layouts", async () => {
+    const dbPath = await tmpDbPath();
+    const ws = openWorkspace(dbPath);
+    const g = ws.createGroup({ serverId: SERVER, name: "G" });
+    const s = ws.createSession({ serverId: SERVER, groupId: g.id, name: "S", repositoryRoot: "/r" });
+
+    const dup = ws.duplicateSession({ id: s.id });
+    assert.notEqual(dup.id, s.id);
+    assert.equal(dup.viewerPanes.length, 0);
+    assert.equal(dup.terminalPanes.length, 0);
+    assert.deepEqual(dup.layouts, { viewer: null, terminal: null });
+
+    ws.close();
+    await cleanup(dbPath);
+});
+
+test("a naive group delete is rejected by the foreign key (manual cascade is load-bearing)", async () => {
+    const dbPath = await tmpDbPath();
+    const ws = openWorkspace(dbPath);
+    const { group } = seed(ws);
+    // Bypassing deleteGroup's manual cascade must be rejected by the FK, proving
+    // a delete can never orphan child sessions/panes.
+    assert.throws(() => ws.db.prepare("DELETE FROM groups WHERE id = ?").run(group.id));
+    ws.close();
+    await cleanup(dbPath);
+});
+
+test("updateGroup toggles collapsed and preserves it when omitted", async () => {
+    const dbPath = await tmpDbPath();
+    const ws = openWorkspace(dbPath);
+    const g = ws.createGroup({ serverId: SERVER, name: "G", collapsed: true });
+    assert.equal(g.collapsed, true);
+    let u = ws.updateGroup({ id: g.id, collapsed: false });
+    assert.equal(u.collapsed, false);
+    // Omitting collapsed keeps the current false (?? must not fall back on false).
+    u = ws.updateGroup({ id: g.id, name: "G2" });
+    assert.equal(u.collapsed, false);
+    assert.equal(u.name, "G2");
+    ws.close();
+    await cleanup(dbPath);
+});
+
+test("migrate persists the target schema version even when the seeded row is stale", async () => {
+    const dbPath = await tmpDbPath();
+    const first = openWorkspace(dbPath);
+    // Simulate a database left by an older build whose stored version lags the
+    // code's target. schema.sql's INSERT OR IGNORE cannot advance an existing
+    // row, so migrate() must record the target version explicitly on next open;
+    // otherwise the version silently drifts and schema.sql re-runs every open.
+    first.db.prepare("UPDATE schema_version SET version = 0 WHERE id = 1").run();
+    first.close();
+
+    const second = openWorkspace(dbPath);
+    const row = second.db
+        .prepare("SELECT version FROM schema_version WHERE id = 1")
+        .get() as { version: number };
+    assert.equal(row.version, WORKSPACE_SCHEMA_VERSION);
+    const count = second.db.prepare("SELECT COUNT(*) AS n FROM schema_version").get() as { n: number };
+    assert.equal(count.n, 1);
+
+    second.close();
+    await cleanup(dbPath);
+});

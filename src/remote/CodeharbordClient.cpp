@@ -53,7 +53,12 @@ void CodeharbordClient::setTransport(QIODevice* transport)
 int CodeharbordClient::call(const QString& method, const QJsonValue& params,
                             ResponseCallback cb)
 {
-    const int id = m_nextId++;
+    // Assign a monotonically increasing id, wrapping to 1 before the increment
+    // would overflow INT_MAX (signed overflow is undefined behaviour). A wrap
+    // can only collide with a still-pending id after ~2^31 requests are
+    // outstanding at once, which the pending map never realistically reaches.
+    const int id = m_nextId;
+    m_nextId = (m_nextId == std::numeric_limits<int>::max()) ? 1 : m_nextId + 1;
 
     QJsonObject request;
     request.insert(QStringLiteral("jsonrpc"), QStringLiteral("2.0"));
@@ -155,7 +160,13 @@ void CodeharbordClient::processLine(const QByteArray& line)
     m_pending.erase(it);
 
     // JSON-RPC 2.0 section 5: a response carries exactly one of result/error.
-    const bool hasError = obj.contains(QStringLiteral("error"));
+    // `error` counts as present only when it is a non-null value: servers
+    // commonly spell a successful response {"result":…,"error":null}, and
+    // treating that null as a failure would mis-report every such success. A
+    // null `result`, by contrast, is a legitimate successful value, so `result`
+    // is detected with contains().
+    const QJsonValue errValue = obj.value(QStringLiteral("error"));
+    const bool hasError = !errValue.isUndefined() && !errValue.isNull();
     const bool hasResult = obj.contains(QStringLiteral("result"));
 
     if (hasError) {
@@ -164,11 +175,28 @@ void CodeharbordClient::processLine(const QByteArray& line)
                 QStringLiteral("response %1 carries both result and error; "
                                "treating as error").arg(id));
         }
-        const QJsonObject errObj = obj.value(QStringLiteral("error")).toObject();
         RpcError error;
-        error.code = errObj.value(QStringLiteral("code")).toInt();
-        error.message = errObj.value(QStringLiteral("message")).toString();
-        error.data = errObj.value(QStringLiteral("data"));
+        if (errValue.isObject()) {
+            const QJsonObject errObj = errValue.toObject();
+            // A well-formed error object has an integer code and string message
+            // (JSON-RPC 2.0 section 5.1). Surface the violation but still fail
+            // the callback with best-effort fields so the caller cannot hang.
+            if (!errObj.value(QStringLiteral("code")).isDouble() ||
+                !errObj.value(QStringLiteral("message")).isString()) {
+                emit protocolWarning(
+                    QStringLiteral("response %1 error object missing code/message")
+                        .arg(id));
+            }
+            error.code = errObj.value(QStringLiteral("code")).toInt();
+            error.message = errObj.value(QStringLiteral("message")).toString();
+            error.data = errObj.value(QStringLiteral("data"));
+        } else {
+            // `error` present but not an object at all (e.g. a bare string).
+            emit protocolWarning(
+                QStringLiteral("response %1 error is not an object").arg(id));
+            error.code = kInternalError;
+            error.message = QStringLiteral("malformed error: not an object");
+        }
         cb(QJsonValue(), error);
         return;
     }

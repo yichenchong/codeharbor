@@ -24,6 +24,9 @@ private slots:
     void tmuxTargetFormat();
     void tmuxNewSessionCommandFormat();
     void tmuxNewSessionCommandEscapesShellMetacharacters();
+    void tmuxNewSessionCommandEscapesSubstitutionBacktickNewline();
+    void tmuxCommandEscapesAdversarialIds();
+    void hiddenReplayPrecedesLaterVisibleOutput();
     void reconnectBackoffSchedule();
 };
 
@@ -220,6 +223,68 @@ void TstTerminalController::reconnectBackoffSchedule()
     QCOMPARE(TerminalController::reconnectDelaySeconds(5), 60);
     QCOMPARE(TerminalController::reconnectDelaySeconds(6), 60);
     QCOMPARE(TerminalController::reconnectDelaySeconds(100), 60);
+}
+
+// Command substitution, backticks, and embedded newlines in the working
+// directory are neutralized by single-quoting: inside single quotes the shell
+// treats $(...), `...`, and a literal newline as data, so nothing executes and
+// no argument splits on the newline (SPEC 5.2 hardening).
+void TstTerminalController::tmuxNewSessionCommandEscapesSubstitutionBacktickNewline()
+{
+    const QString command = TerminalController::tmuxNewSessionCommand(
+        DevSessionId{QStringLiteral("dev1")}, TerminalId{QStringLiteral("term1")},
+        QStringLiteral("/w/$(rm -rf ~)`whoami`\nnext"));
+    QCOMPARE(command,
+             QStringLiteral("tmux new-session -A -s 'ch_dev1_term1' "
+                            "-c '/w/$(rm -rf ~)`whoami`\nnext'"));
+}
+
+// Adversarial dev-session / terminal IDs carrying a quote and metacharacters
+// are embedded verbatim into the raw tmux target, then single-quote escaped as
+// a whole for the shell command, so a quote in an ID cannot break out of the
+// quoting and inject a command (SPEC 5.2 hardening).
+void TstTerminalController::tmuxCommandEscapesAdversarialIds()
+{
+    const DevSessionId dev{QStringLiteral("dev'; rm -rf / #")};
+    const TerminalId term{QStringLiteral("t`whoami`$(id)")};
+
+    // The identity helper keeps IDs verbatim; escaping is the command's job.
+    QCOMPARE(TerminalController::tmuxTarget(dev, term),
+             QStringLiteral("ch_dev'; rm -rf / #_t`whoami`$(id)"));
+
+    const QString command =
+        TerminalController::tmuxNewSessionCommand(dev, term, QStringLiteral("/w"));
+    QCOMPARE(command,
+             QStringLiteral("tmux new-session -A -s "
+                            "'ch_dev'\\''; rm -rf / #_t`whoami`$(id)' -c '/w'"));
+}
+
+// On becoming visible, the retained hidden buffer replays first and exactly
+// once; output that was still pending (sub-threshold, not yet flushed) is NOT
+// part of that replay and flushes afterwards, preserving order across the
+// suspend/resume boundary (SPEC 5.4/5.5).
+void TstTerminalController::hiddenReplayPrecedesLaterVisibleOutput()
+{
+    TerminalController controller;
+    controller.setViewVisible(false);
+
+    const QByteArray older(TerminalController::kFlushSizeBytes, 'A');
+    controller.ingestOutput(older); // >= size cap -> flushed into hidden buffer
+    QCOMPARE(controller.hiddenBuffer(), older);
+
+    QSignalSpy spy(&controller, &TerminalController::flushReady);
+    const QByteArray newer("B"); // sub-threshold: sits in m_pending, not hidden
+    controller.ingestOutput(newer);
+
+    controller.setViewVisible(true); // replays hidden 'A' immediately, once
+    QCOMPARE(spy.count(), 1);
+    QCOMPARE(spy.at(0).at(0).toByteArray(), older);
+    QVERIFY(controller.hiddenBuffer().isEmpty());
+
+    // The pending 'B' flushes on its own timer to the now-visible view, after A.
+    QVERIFY(spy.wait(1000));
+    QCOMPARE(spy.count(), 2);
+    QCOMPARE(spy.at(1).at(0).toByteArray(), newer);
 }
 
 QTEST_GUILESS_MAIN(TstTerminalController)

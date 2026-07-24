@@ -46,6 +46,9 @@ private slots:
     void pendingFailOnClose();
     void bothResultAndErrorTreatedAsError();
     void neitherResultNorErrorFailsCallback();
+    void errorNullFieldTreatedAsSuccess();
+    void malformedErrorObjectWarns();
+    void largeLineRoutes();
     void nonRoutableIdWarns();
     void crlfAndWhitespaceFraming();
     void utf8SplitAcrossChunkBoundary();
@@ -336,6 +339,111 @@ void TstRpcClient::neitherResultNorErrorFailsCallback()
     QVERIFY(got.has_value());
     QCOMPARE(got->code, -32603);
     QTRY_COMPARE(warnSpy.count(), 1);
+    QCOMPARE(m_client->pendingCount(), 0);
+}
+
+void TstRpcClient::errorNullFieldTreatedAsSuccess()
+{
+    makePair();
+
+    QSignalSpy warnSpy(m_client, &CodeharbordClient::protocolWarning);
+    std::optional<RpcError> got;
+    QJsonValue res;
+    bool fired = false;
+    const int id = m_client->call(
+        QStringLiteral("file.stat"), QJsonObject{{"path", "/a"}},
+        [&](QJsonValue r, std::optional<RpcError> err) {
+            res = r;
+            got = err;
+            fired = true;
+        });
+
+    // Many servers spell a success as {"result":…, "error": null}. The null
+    // error must NOT be reported as a failure, and must not warn about "both".
+    m_serverSide->write(jsonLine({{"jsonrpc", "2.0"},
+                                  {"id", id},
+                                  {"result", QJsonObject{{"size", 5}}},
+                                  {"error", QJsonValue(QJsonValue::Null)}}));
+    m_serverSide->flush();
+
+    QTRY_VERIFY(fired);
+    QVERIFY(!got.has_value());
+    QCOMPARE(res.toObject().value("size").toInt(), 5);
+    QCOMPARE(warnSpy.count(), 0);
+    QCOMPARE(m_client->pendingCount(), 0);
+}
+
+void TstRpcClient::malformedErrorObjectWarns()
+{
+    makePair();
+
+    QSignalSpy warnSpy(m_client, &CodeharbordClient::protocolWarning);
+    std::optional<RpcError> got;
+    bool fired = false;
+    const int id = m_client->call(
+        QStringLiteral("file.stat"), QJsonObject{{"path", "/a"}},
+        [&](QJsonValue, std::optional<RpcError> err) {
+            got = err;
+            fired = true;
+        });
+
+    // Error object without the required code/message: warn, but still fail the
+    // callback (best effort, code defaults to 0) so the caller cannot hang.
+    m_serverSide->write(jsonLine({{"jsonrpc", "2.0"},
+                                  {"id", id},
+                                  {"error", QJsonObject{{"reason", "nope"}}}}));
+    m_serverSide->flush();
+
+    QTRY_VERIFY(fired);
+    QVERIFY(got.has_value());
+    QCOMPARE(got->code, 0);
+    QTRY_COMPARE(warnSpy.count(), 1);
+
+    // A second response whose `error` is not even an object: warn and fail with
+    // the synthetic internal-error code.
+    std::optional<RpcError> got2;
+    bool fired2 = false;
+    const int id2 = m_client->call(
+        QStringLiteral("ping"), QJsonValue(),
+        [&](QJsonValue, std::optional<RpcError> err) {
+            got2 = err;
+            fired2 = true;
+        });
+    m_serverSide->write(jsonLine(
+        {{"jsonrpc", "2.0"}, {"id", id2}, {"error", QStringLiteral("boom")}}));
+    m_serverSide->flush();
+
+    QTRY_VERIFY(fired2);
+    QVERIFY(got2.has_value());
+    QCOMPARE(got2->code, -32603);
+    QTRY_COMPARE(warnSpy.count(), 2);
+    QCOMPARE(m_client->pendingCount(), 0);
+}
+
+void TstRpcClient::largeLineRoutes()
+{
+    makePair();
+
+    QJsonValue res;
+    bool fired = false;
+    const int id = m_client->call(
+        QStringLiteral("file.readFile"), QJsonObject{{"path", "/big"}},
+        [&](QJsonValue r, std::optional<RpcError> err) {
+            QVERIFY(!err.has_value());
+            res = r;
+            fired = true;
+        });
+
+    // A single very large frame (~2 MiB payload) must route correctly even when
+    // the transport delivers it across many separate reads.
+    const QString big(2 * 1024 * 1024, QChar('x'));
+    m_serverSide->write(jsonLine({{"jsonrpc", "2.0"},
+                                  {"id", id},
+                                  {"result", QJsonObject{{"content", big}}}}));
+    m_serverSide->flush();
+
+    QTRY_VERIFY_WITH_TIMEOUT(fired, 8000);
+    QCOMPARE(res.toObject().value("content").toString().size(), big.size());
     QCOMPARE(m_client->pendingCount(), 0);
 }
 
