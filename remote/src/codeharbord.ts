@@ -8,6 +8,11 @@
 
 import readline from "node:readline";
 
+// Frozen file-method catalog (C1, docs/PLAN.md). Re-exported so the wire method
+// names and revision-mismatch error code are linked to the transport. Handlers
+// for these methods land in the R-server workstream; dispatch is unchanged.
+export { RPC_METHODS, RPC_REVISION_MISMATCH } from "./rpc-types.ts";
+
 export const RPC_SERVER_NAME = "codeharbord";
 export const RPC_SERVER_VERSION = "0.1.0";
 export const RPC_SCHEMA_VERSION = 1;

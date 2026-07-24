@@ -47,20 +47,21 @@ contract so downstream work can build against it before it is fully implemented.
 These are the cross-workstream interfaces. Land them first; changing them later
 is a coordinated break.
 
-- [ ] **C1 — RPC method catalog.** Extend `codeharbord.ts` with typed
+- [x] **C1 — RPC method catalog.** Extend `codeharbord.ts` with typed
   request/result shapes for the SPEC 10.2 methods (start with the file set:
   `stat`, `readFile`, `writeFile`, `watch`, `resolvePath`). Publish as
   `remote/src/rpc-types.ts`; mirror in C++ `src/remote/`. Owner: R.
-- [ ] **C2 — Workspace DB schema.** Author `remote/sql/schema.sql` for the SPEC
+- [x] **C2 — Workspace DB schema.** Author `remote/sql/schema.sql` for the SPEC
   11.1 tables (`groups`, `dev_sessions`, `viewer_panes`, `terminal_panes`,
   `session_layouts`, `server_profiles`, `server_settings`, `app_settings`) with
   `server_id` columns (SPEC 3.5). Bump `WorkspaceDb::kSchemaVersion`. Owner: P.
-- [ ] **C3 — WebChannel bridge interfaces.** Freeze the JS↔C++ object shapes:
+- [x] **C3 — WebChannel bridge interfaces.** Freeze the JS↔C++ object shapes:
   `TerminalBridge`/`TerminalHost` (`src/web/terminal`) and
   `RemoteEditorBridge`/`EditorHost` (`src/web/editor`). Owners: T, E.
 
-Contracts are small and interdependent-free — one person can land C1–C3 in a day,
-then the waves below open.
+**Status: LANDED** — delegated to three parallel subagents,
+adversarially reviewed, and verified (remote typecheck + 15/15 tests; cmake
+configure+build+link). Wave 1 (S / M / R-server) is now unblocked.
 
 ## Dependency graph
 
@@ -213,9 +214,9 @@ graph TD
 
 ## Immediate next steps (first two waves)
 
-**Wave 0 — contracts (serial, 1 owner):**
-1. Land **C1** (`rpc-types.ts`), **C2** (`schema.sql` + schema version), **C3**
-   (WebChannel interface freeze).
+**Wave 0 — contracts (serial, 1 owner): DONE.**
+1. ~~Land **C1** (`rpc-types.ts`), **C2** (`schema.sql` + schema version), **C3**
+   (WebChannel interface freeze).~~
 
 **Wave 1 — fan out in parallel once Wave 0 lands (no edges between these):**
 1. **S** — libssh connection pool + host-key + channel factory → stop gate.

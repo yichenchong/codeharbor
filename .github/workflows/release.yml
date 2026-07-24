@@ -143,7 +143,7 @@ jobs:
         working-directory: remote
         run: |
           mkdir -p ../artifact
-          tar -czf ../artifact/codeharbor-remote.tar.gz dist package.json
+          tar -czf ../artifact/codeharbor-remote.tar.gz dist package.json sql
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:

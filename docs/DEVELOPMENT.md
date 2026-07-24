@@ -106,7 +106,7 @@ Presets are defined in [`CMakePresets.json`](../CMakePresets.json):
 ```bash
 cd remote
 npm install        # dev-only deps (typescript, @types/node); runtime has none
-npm test           # node --test -> 11 tests
+npm test           # node --test -> 15 tests
 npm run typecheck  # tsc --noEmit
 npm run build      # tsc -> dist/ (codeharbord, codeharbor-bridge)
 ```

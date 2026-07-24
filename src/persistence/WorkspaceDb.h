@@ -13,6 +13,7 @@ namespace ch {
 class WorkspaceDb {
 public:
     // Bump when the schema in schema.sql changes; migrations run server-side.
+    // remote/sql/schema.sql is the authoritative DDL for this version.
     static constexpr int kSchemaVersion = 1;
 
     static QString schemaVersionString();
