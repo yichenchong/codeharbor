@@ -101,6 +101,10 @@ Rectangle {
         standardButtons: Dialog.Ok | Dialog.Cancel
         anchors.centerIn: Overlay.overlay
 
+        // Reset the field each open so a cancelled edit doesn't resurface as
+        // stale text next time (imperative input breaks the initial binding).
+        onOpened: newGroupField.text = qsTr("New group")
+
         TextField {
             id: newGroupField
             width: 240

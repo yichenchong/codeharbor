@@ -15,6 +15,7 @@ target_link_libraries(ch_app PUBLIC
     ch_models
     ch_persistence
     ch_remote
+    ch_agent
 )
 
 qt_add_executable(codeharbor
@@ -38,6 +39,8 @@ target_link_libraries(codeharbor PRIVATE
     ch_terminal
     ch_viewers
     ch_remote
+    ch_editor
+    ch_agent
 )
 
 target_compile_definitions(codeharbor PRIVATE

@@ -7,6 +7,8 @@ add_subdirectory(ssh)
 add_subdirectory(terminal)
 add_subdirectory(viewers)
 add_subdirectory(remote)
+add_subdirectory(editor)
+add_subdirectory(agent)
 
 # QML UI module (src/qml) and the application executable that links everything.
 add_subdirectory(qml)

@@ -38,7 +38,7 @@ ViewerResolution ViewerHandlerRegistry::resolveByExtension(const QString &ext)
         QStringLiteral("hpp"),  QStringLiteral("py"),   QStringLiteral("rs"),
         QStringLiteral("go"),   QStringLiteral("sh"),   QStringLiteral("css"),
         QStringLiteral("html"), QStringLiteral("json"), QStringLiteral("yaml"),
-        QStringLiteral("yml"),  QStringLiteral("toml"),
+        QStringLiteral("yml"),  QStringLiteral("toml"), QStringLiteral("xml"),
     };
     if (kText.contains(e))
         return ViewerResolution::TextEditor;

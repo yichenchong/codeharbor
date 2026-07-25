@@ -1,6 +1,7 @@
 #pragma once
 
 #include "CodeharbordClient.h"
+#include "AgentStatusMonitor.h"
 #include "Ids.h"
 #include "SessionsModel.h"
 #include "WorkspaceDb.h"
@@ -43,6 +44,14 @@ public:
     QString serverId() const { return m_serverId.value; }
     void setServerId(const QString& serverId);
 
+    // Wire the live agent-status monitor (SPEC 6.4) whose per-terminal state is
+    // merged into the sidebar on every rebuild. Ownership stays with the caller
+    // (the orchestrator/main.cpp). Passing nullptr is safe and disables the
+    // merge. Connects the monitor's agentStateChanged/unseenChanged signals to
+    // rebuildRows() so a live agent event re-derives the badges from the last
+    // known workspace tree.
+    void setAgentMonitor(AgentStatusMonitor* monitor);
+
     // Pure mapping from the nested WorkspaceDb read shape to the flat sidebar
     // model rows. Subtitle is the basename of the session's repositoryRoot;
     // terminal status is left empty here (live terminal state is owned by the
@@ -76,6 +85,13 @@ private:
     // present (caller should not treat the op as successful).
     bool reportIfError(const std::optional<RpcError>& err);
 
+    // Re-derive the sidebar rows from the last successful list() result cached in
+    // m_lastNodes, merging live per-terminal agent state from m_agentMonitor
+    // (the source of truth). Called on every successful refresh AND on every
+    // agent event, so neither a workspace refresh nor an agent transition ever
+    // wipes the other's contribution to the badges.
+    void rebuildRows();
+
     // Build a WorkspaceDb callback that, once the async response arrives, is a
     // no-op if this controller was already destroyed (the shared client keeps
     // pending callbacks alive past our lifetime), emits `error` verbatim on
@@ -101,6 +117,16 @@ private:
     SessionsModel* m_sessionsModel = nullptr;
     UiStateStore* m_uiState = nullptr;
     ServerId m_serverId;
+    // Monotonic stamp so a stale (out-of-order) refresh result never overwrites
+    // a newer one; see refresh().
+    quint64 m_refreshGeneration = 0;
+    // Live agent-status monitor (SPEC 6.4), not owned; set via setAgentMonitor.
+    // When non-null its per-terminal state is merged into the sidebar rows.
+    AgentStatusMonitor* m_agentMonitor = nullptr;
+    // Cache of the most recent successful list() tree, so rebuildRows() can
+    // re-derive rows (and re-merge agent state) without another server round-
+    // trip when an agent event arrives.
+    QVector<GroupNode> m_lastNodes;
 };
 
 } // namespace ch

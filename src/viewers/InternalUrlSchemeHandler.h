@@ -94,6 +94,14 @@ public:
     // access). Falls back to application/octet-stream.
     static QByteArray mimeForPath(const QString &path);
 
+    // Whether a served MIME type is "active content": a type Chromium renders
+    // as a top-level document that can execute script or pull subresources —
+    // text/html, any XML document (application/xml, text/xml, and every "*+xml"
+    // such as SVG, XHTML, XSLT, RSS, Atom), standalone XSLT, and MHTML archives.
+    // Replies for such types are locked down with a restrictive CSP. Exposed so
+    // the security gate is unit-testable without a live WebEngine job.
+    static bool isActiveContentMime(const QByteArray &mime);
+
 private:
     CodeharbordClient *m_client;
     InternalUrlMap *m_map;

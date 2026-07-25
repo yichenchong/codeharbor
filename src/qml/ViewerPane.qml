@@ -26,11 +26,13 @@ Item {
             case "directory": return directoryComponent;
             case "binary": return binaryComponent;
             case "empty": return emptyComponent;
-            // Markdown is shown as read-only source for now; rich HTML rendering
-            // is a later increment.
+            // Source/text/markdown/structured open in the Monaco editor
+            // (SPEC 8.1/8.8). ViewerTextView remains a read-only fallback.
             case "text":
             case "markdown":
-            default: return textComponent;
+                return editorComponent;
+            default:
+                return textComponent;
             }
         }
     }
@@ -41,6 +43,7 @@ Item {
     Component { id: pdfComponent; ViewerPdfView { url: pane.url } }
     Component { id: directoryComponent; ViewerDirectoryView { url: pane.url } }
     Component { id: binaryComponent; ViewerBinaryView { url: pane.url } }
+    Component { id: editorComponent; EditorPaneView { fileUrl: pane.url } }
 
     Component {
         id: emptyComponent

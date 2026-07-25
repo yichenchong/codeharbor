@@ -2,6 +2,8 @@
 #include "CodeharbordClient.h"
 #include "ViewerModel.h"
 #include "ViewerProfiles.h"
+#include "AgentStatusMonitor.h"
+#include "EditorFactory.h"
 
 #include <QGuiApplication>
 #include <QQmlApplicationEngine>
@@ -30,17 +32,28 @@ int main(int argc, char *argv[])
     // S/U); until then calls fail gracefully with a synthetic transport error.
     ch::CodeharbordClient client;
 
+    // Client-side agent-status monitor (workstream A). Its transport is a
+    // dedicated SSH agent-status channel wired later; fed AgentEvent JSONL.
+    ch::AgentStatusMonitor agentMonitor;
+
     // UI shell (workstream U) and viewer subsystem (workstream V) share the one
     // client. ViewerModel and ViewerProfiles share the same profiles so QML
     // WebEngineViews and the internal scheme handler use one security context.
     ch::AppController appController(&client);
+    appController.setAgentMonitor(&agentMonitor);
     ch::ViewerProfiles profiles(&client);
     ch::ViewerModel viewers(&client);
     viewers.setProfiles(&profiles);
 
+    // Per-pane editor controllers (workstream E): each editor pane creates its
+    // own controller via this factory so split panes never clobber each other.
+    ch::EditorFactory editorFactory(&client);
+
     QQmlApplicationEngine engine;
     engine.rootContext()->setContextProperty(QStringLiteral("app"), &appController);
     engine.rootContext()->setContextProperty(QStringLiteral("viewers"), &viewers);
+    engine.rootContext()->setContextProperty(QStringLiteral("agentMonitor"), &agentMonitor);
+    engine.rootContext()->setContextProperty(QStringLiteral("editorFactory"), &editorFactory);
 
     QObject::connect(
         &engine,

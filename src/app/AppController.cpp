@@ -25,6 +25,13 @@ void AppController::setServerId(const QString& serverId)
         return;
     m_serverId.value = serverId;
     emit serverIdChanged();
+    // Switching the active server must reload the sidebar from that server's
+    // authoritative tree; nothing else re-drives refresh() on a server change,
+    // so without this a server switch would leave the previous server's rows
+    // (or, at startup before any server is set, empty) on screen. The stale-
+    // result guard in refresh() makes this safe to race with the initial
+    // Component.onCompleted refresh.
+    refresh();
 }
 
 QVector<GroupRow> AppController::toGroupRows(const QVector<GroupNode>& nodes)
@@ -63,16 +70,84 @@ bool AppController::reportIfError(const std::optional<RpcError>& err)
     return false;
 }
 
+void AppController::setAgentMonitor(AgentStatusMonitor* monitor)
+{
+    if (m_agentMonitor == monitor)
+        return;
+    // Drop any prior wiring so a re-set (or clear) never leaves a dangling
+    // connection firing rebuildRows() from a stale monitor.
+    if (m_agentMonitor)
+        disconnect(m_agentMonitor, nullptr, this, nullptr);
+    m_agentMonitor = monitor;
+    if (m_agentMonitor) {
+        // Any agent transition or unseen-flag flip re-derives the badges from
+        // the last known workspace tree. The QPointer-free lambda is safe: the
+        // connection is bound to `this` as the context object, so Qt severs it
+        // automatically when this controller is destroyed (no UAF), and the
+        // disconnect above severs it on re-set.
+        connect(m_agentMonitor, &AgentStatusMonitor::agentStateChanged, this,
+                [this](const QString&, const QString&, int) { rebuildRows(); });
+        connect(m_agentMonitor, &AgentStatusMonitor::unseenChanged, this,
+                [this](const QString&, bool) { rebuildRows(); });
+    }
+    // Re-merge immediately so a monitor set after the initial load reflects any
+    // state it already accumulated, and a clear drops back to bare rows.
+    rebuildRows();
+}
+
+void AppController::rebuildRows()
+{
+    // Start from the pure persisted mapping (terminals empty), then overlay the
+    // live agent state from the monitor (the source of truth). Deriving the
+    // terminals fresh from m_lastNodes on every call is what makes a workspace
+    // refresh and an agent event mutually non-destructive.
+    QVector<GroupRow> rows = toGroupRows(m_lastNodes);
+    if (m_agentMonitor) {
+        // toGroupRows preserves the node order 1:1, so the row tree lines up
+        // index-for-index with m_lastNodes; walk them in lockstep.
+        for (qsizetype gi = 0; gi < m_lastNodes.size(); ++gi) {
+            const GroupNode& groupNode = m_lastNodes.at(gi);
+            GroupRow& groupRow = rows[gi];
+            for (qsizetype si = 0; si < groupNode.sessions.size(); ++si) {
+                const SessionNode& sessionNode = groupNode.sessions.at(si);
+                SessionRow& sessionRow = groupRow.sessions[si];
+                const QString& devSessionId = sessionNode.session.id.value;
+                sessionRow.terminals.reserve(sessionNode.terminalPanes.size());
+                for (const TerminalPane& pane : sessionNode.terminalPanes) {
+                    TerminalStatus status;
+                    status.id = pane.id;
+                    status.agent = static_cast<AgentState>(
+                        m_agentMonitor->stateFor(devSessionId, pane.id.value));
+                    sessionRow.terminals.push_back(status);
+                }
+            }
+        }
+    }
+    m_sessionsModel->setGroups(std::move(rows));
+}
+
 void AppController::refresh()
 {
+    // Each refresh is a full-tree re-read; several can be in flight at once
+    // (every mutation chains one, plus the sidebar's initial load and any
+    // setServerId). The client routes responses by id, so replies may arrive
+    // out of order — without a guard an older list() result could overwrite a
+    // newer one, leaving the sidebar stale. Stamp each refresh with a monotonic
+    // generation and only let the most recent one mutate the model. Errors are
+    // still reported verbatim regardless of generation (a real server error is
+    // worth surfacing even if superseded).
+    const quint64 generation = ++m_refreshGeneration;
     QPointer<AppController> self(this);
-    m_db->list(m_serverId, [self](QVector<GroupNode> nodes,
-                                  std::optional<RpcError> err) {
+    m_db->list(m_serverId, [self, generation](QVector<GroupNode> nodes,
+                                              std::optional<RpcError> err) {
         if (!self)
             return;
         if (self->reportIfError(err))
             return;
-        self->m_sessionsModel->setGroups(toGroupRows(nodes));
+        if (generation != self->m_refreshGeneration)
+            return; // a newer refresh has superseded this result
+        self->m_lastNodes = std::move(nodes);
+        self->rebuildRows();
         emit self->refreshed();
     });
 }

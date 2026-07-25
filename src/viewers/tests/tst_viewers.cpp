@@ -36,6 +36,9 @@ private slots:
     void mimeForPathByExtension();
     void profileIsolation();
     void schemeFlags();
+    void activeContentMimeGate();
+    void activeContentMimeFromExtension();
+    void urlMappingRemintAfterEviction();
 };
 
 void TstViewers::resolveByExtensionTable()
@@ -54,7 +57,7 @@ void TstViewers::resolveByExtensionTable()
           QStringLiteral("hpp"), QStringLiteral("py"), QStringLiteral("rs"),
           QStringLiteral("go"), QStringLiteral("sh"), QStringLiteral("css"),
           QStringLiteral("html"), QStringLiteral("json"), QStringLiteral("yaml"),
-          QStringLiteral("yml"), QStringLiteral("toml")}) {
+          QStringLiteral("yml"), QStringLiteral("toml"), QStringLiteral("xml")}) {
         QCOMPARE(ViewerHandlerRegistry::resolveByExtension(ext),
                  ViewerResolution::TextEditor);
     }
@@ -110,6 +113,10 @@ void TstViewers::resolveUrlTable()
              ViewerResolution::TextEditor);
     QCOMPARE(ViewerHandlerRegistry::resolve(
                  QUrl(QStringLiteral("file:///home/yc/config.toml"))),
+             ViewerResolution::TextEditor);
+    // XML is source/structured data (not an unpreviewable binary download).
+    QCOMPARE(ViewerHandlerRegistry::resolve(
+                 QUrl(QStringLiteral("file:///home/yc/data.xml"))),
              ViewerResolution::TextEditor);
     QCOMPARE(ViewerHandlerRegistry::resolve(
                  QUrl(QStringLiteral("file:///home/yc/logo.svg"))),
@@ -305,6 +312,110 @@ void TstViewers::profileIsolation()
     // scheme handler; the external (arbitrary-site) profile must not.
     QCOMPARE(profiles.externalHasInternalScheme(), false);
     QCOMPARE(profiles.internalHasInternalScheme(), true);
+}
+
+void TstViewers::activeContentMimeGate()
+{
+    // The security gate deciding whether a scheme-handler reply is locked down
+    // with the restrictive CSP (default-src 'none'; sandbox). Untrusted file
+    // bytes served as any of these on the privileged internal origin can run
+    // script or pull subresources as a top-level document — a cross-file
+    // exfiltration vector (SPEC 7.2) — so EVERY active/scriptable type MUST be
+    // flagged, including the XML-family and MHTML edge types.
+    const QList<QByteArray> active = {
+        QByteArrayLiteral("text/html"),
+        QByteArrayLiteral("application/xhtml+xml"),
+        QByteArrayLiteral("image/svg+xml"),
+        QByteArrayLiteral("application/xml"),
+        QByteArrayLiteral("text/xml"),
+        QByteArrayLiteral("application/xslt+xml"),
+        QByteArrayLiteral("text/xsl"),
+        QByteArrayLiteral("application/rss+xml"),
+        QByteArrayLiteral("application/atom+xml"),
+        QByteArrayLiteral("multipart/related"),
+        QByteArrayLiteral("message/rfc822"),
+        QByteArrayLiteral("application/x-mimearchive"),
+    };
+    for (const QByteArray &m : active)
+        QVERIFY2(InternalUrlSchemeHandler::isActiveContentMime(m), m.constData());
+
+    // Case-insensitive and tolerant of a trailing charset parameter.
+    QVERIFY(InternalUrlSchemeHandler::isActiveContentMime(
+        QByteArrayLiteral("TEXT/HTML")));
+    QVERIFY(InternalUrlSchemeHandler::isActiveContentMime(
+        QByteArrayLiteral("text/html; charset=utf-8")));
+
+    // Passive, inert content that MUST render normally (never CSP-locked, or the
+    // image/pdf viewers would break).
+    const QList<QByteArray> passive = {
+        QByteArrayLiteral("image/png"),
+        QByteArrayLiteral("image/jpeg"),
+        QByteArrayLiteral("image/gif"),
+        QByteArrayLiteral("image/webp"),
+        QByteArrayLiteral("application/pdf"),
+        QByteArrayLiteral("text/plain"),
+        QByteArrayLiteral("application/json"),
+        QByteArrayLiteral("application/octet-stream"),
+    };
+    for (const QByteArray &m : passive)
+        QVERIFY2(!InternalUrlSchemeHandler::isActiveContentMime(m), m.constData());
+}
+
+void TstViewers::activeContentMimeFromExtension()
+{
+    // The gate keys off the DECLARED mime, which the handler derives from the
+    // extension (mimeForPath). These extensions can reach a rendered/navigated
+    // internal view (image view for .svg; the hidden download view navigates to
+    // the internal URL for Download-resolution files), so their derived mime
+    // MUST trip the active-content gate. Kept to the core, universally-present
+    // shared-mime-info mappings; exotic edge MIME strings (rss/atom/mhtml) are
+    // covered directly by activeContentMimeGate() without a DB dependency.
+    for (const QString &path : {
+             QStringLiteral("/a/logo.svg"), QStringLiteral("/a/page.xhtml"),
+             QStringLiteral("/a/data.xml"), QStringLiteral("/a/page.html"),
+         }) {
+        const QByteArray mime = InternalUrlSchemeHandler::mimeForPath(path);
+        QVERIFY2(InternalUrlSchemeHandler::isActiveContentMime(mime),
+                 qPrintable(QStringLiteral("%1 -> %2 not gated")
+                                .arg(path, QString::fromUtf8(mime))));
+    }
+    // Inert media must NOT be gated so the image/pdf/text viewers render it.
+    for (const QString &path : {
+             QStringLiteral("/a/logo.png"), QStringLiteral("/a/photo.jpg"),
+             QStringLiteral("/a/doc.pdf"), QStringLiteral("/a/notes.txt"),
+         }) {
+        const QByteArray mime = InternalUrlSchemeHandler::mimeForPath(path);
+        QVERIFY2(!InternalUrlSchemeHandler::isActiveContentMime(mime),
+                 qPrintable(QStringLiteral("%1 -> %2 wrongly gated")
+                                .arg(path, QString::fromUtf8(mime))));
+    }
+}
+
+void TstViewers::urlMappingRemintAfterEviction()
+{
+    // After LRU eviction drops an entry, the evicted id stays permanently dead
+    // (never resolves) and re-minting the SAME file yields a fresh, distinct,
+    // still-invertible id — the map never resurrects an id it has evicted, so a
+    // resolved id always maps to the currently-retained file.
+    const QUrl a(QStringLiteral("file:///a.txt"));
+    const QUrl b(QStringLiteral("file:///b.txt"));
+
+    InternalUrlMap map(1); // cap of 1 forces eviction on the next mint
+    const QString ia = map.internalUrlFor(a);
+    QCOMPARE(map.fileUrlFor(ia), a);
+
+    // Minting b evicts a (cap 1); a's old id must no longer resolve.
+    const QString ib = map.internalUrlFor(b);
+    QCOMPARE(map.size(), 1);
+    QVERIFY(!map.fileUrlFor(ia).isValid());
+    QCOMPARE(map.fileUrlFor(ib), b);
+
+    // Re-minting a produces a brand-new id (evicting b); the stale id stays
+    // dead and the new one resolves.
+    const QString ia2 = map.internalUrlFor(a);
+    QVERIFY(ia2 != ia);
+    QVERIFY(!map.fileUrlFor(ia).isValid());
+    QCOMPARE(map.fileUrlFor(ia2), a);
 }
 
 int main(int argc, char *argv[])

@@ -108,6 +108,11 @@ ItemDelegate {
         standardButtons: Dialog.Ok | Dialog.Cancel
         anchors.centerIn: Overlay.overlay
 
+        // Reset to the current name each open: imperative edits break the
+        // `text: row.name` binding, so without this a cancelled edit would
+        // resurface as stale text on the next open.
+        onOpened: renameField.text = row.name
+
         TextField {
             id: renameField
             width: 240

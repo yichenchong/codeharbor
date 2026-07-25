@@ -21,21 +21,6 @@ namespace {
 // this is failed (never truncated-and-served) so the RPC frame stays bounded
 // and WebEngine never receives partial content as if it were complete.
 constexpr int kMaxInlineReadBytes = 8 * 1024 * 1024;
-
-// Active-content MIME types can execute script or load subresources when a
-// browser renders them as a top-level document (SPEC 7.2). Serving untrusted
-// file bytes as one of these on the privileged internal origin is a
-// cross-file exfiltration vector, so replies for them are locked down with a
-// restrictive Content-Security-Policy.
-bool isActiveContentMime(const QByteArray &mime)
-{
-    const QByteArray m = mime.toLower();
-    return m == QByteArrayLiteral("image/svg+xml")
-        || m == QByteArrayLiteral("text/html")
-        || m == QByteArrayLiteral("application/xhtml+xml")
-        || m == QByteArrayLiteral("application/xml")
-        || m == QByteArrayLiteral("text/xml");
-}
 } // namespace
 
 QString InternalUrlMap::scheme()
@@ -155,6 +140,38 @@ QByteArray InternalUrlSchemeHandler::mimeForPath(const QString &path)
     return QByteArrayLiteral("application/octet-stream");
 }
 
+bool InternalUrlSchemeHandler::isActiveContentMime(const QByteArray &mime)
+{
+    // Active-content MIME types can execute script or load subresources when a
+    // browser renders them as a top-level document (SPEC 7.2). Serving
+    // untrusted file bytes as one of these on the privileged internal origin is
+    // a cross-file exfiltration vector, so such replies are locked down with a
+    // restrictive Content-Security-Policy.
+    QByteArray m = mime.toLower();
+    // Defensive: strip any "; charset=..." parameter (QMimeType::name never
+    // carries one today, but a future MIME source might).
+    const qsizetype semi = m.indexOf(';');
+    if (semi >= 0)
+        m = m.left(semi).trimmed();
+
+    // Any XML-family document renders as an active document and can carry inline
+    // script, an xml-stylesheet PI pulling an XSLT transform, or foreign HTML.
+    // Catches application/xml, text/xml, and every "*+xml" (SVG, XHTML, XSLT,
+    // RSS, Atom, ...).
+    if (m == QByteArrayLiteral("application/xml")
+        || m == QByteArrayLiteral("text/xml")
+        || m.endsWith(QByteArrayLiteral("+xml")))
+        return true;
+
+    return m == QByteArrayLiteral("text/html")
+        || m == QByteArrayLiteral("text/xsl") // standalone XSLT stylesheet
+        // MHTML archives reconstruct a whole page (scripts + subresources
+        // inlined) from a single file.
+        || m == QByteArrayLiteral("multipart/related")
+        || m == QByteArrayLiteral("message/rfc822")
+        || m == QByteArrayLiteral("application/x-mimearchive");
+}
+
 void InternalUrlSchemeHandler::requestStarted(QWebEngineUrlRequestJob *job)
 {
     if (!job)
@@ -215,17 +232,24 @@ void InternalUrlSchemeHandler::requestStarted(QWebEngineUrlRequestJob *job)
             buffer->open(QIODevice::ReadOnly);
 
             const QByteArray mime = InternalUrlSchemeHandler::mimeForPath(path);
-            if (isActiveContentMime(mime)) {
+            QMultiMap<QByteArray, QByteArray> headers;
+            // Pin the declared Content-Type: without nosniff, Chromium may
+            // content-sniff the untrusted bytes into a different type (e.g.
+            // HTML) and render them as an active document, dodging the
+            // active-content CSP gate below (which keys off the DECLARED mime).
+            headers.insert(QByteArrayLiteral("X-Content-Type-Options"),
+                           QByteArrayLiteral("nosniff"));
+            if (InternalUrlSchemeHandler::isActiveContentMime(mime)) {
                 // Defense-in-depth alongside the internal profile's JS-disabled
                 // WebEngineViews: fully sandbox the document and forbid every
-                // script/subresource/fetch so an .svg/.html served top-level on
-                // the privileged origin cannot read and exfiltrate other files.
-                QMultiMap<QByteArray, QByteArray> headers;
+                // script/subresource/fetch so an .svg/.html/.xml/MHTML served
+                // top-level on the privileged origin cannot read and exfiltrate
+                // other files.
                 headers.insert(
                     QByteArrayLiteral("Content-Security-Policy"),
                     QByteArrayLiteral("default-src 'none'; sandbox"));
-                guard->setAdditionalResponseHeaders(headers);
             }
+            guard->setAdditionalResponseHeaders(headers);
             guard->reply(mime, buffer);
         });
 }

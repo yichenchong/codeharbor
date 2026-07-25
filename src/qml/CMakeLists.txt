@@ -24,6 +24,7 @@ qt_add_qml_module(codeharbor_qml
         ViewerPdfView.qml
         ViewerDirectoryView.qml
         ViewerBinaryView.qml
+        EditorPaneView.qml
 )
 
 target_link_libraries(codeharbor_qml PUBLIC
