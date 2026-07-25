@@ -720,10 +720,10 @@ void TstRpcClient::oversizedNewlinelessInputIsBounded()
     m_client->call(QStringLiteral("ping"), QJsonValue(),
                    [&](QJsonValue, std::optional<RpcError> err) { got = err; });
 
-    // Stream >8 MiB with no newline: a malformed unframed line. The client must
+    // Stream >16 MiB with no newline: a malformed unframed line. The client must
     // bound its read buffer, warn, and tear the transport down (failing pending
     // callers) rather than grow memory without limit.
-    const QByteArray blob(9 * 1024 * 1024, 'x');
+    const QByteArray blob(17 * 1024 * 1024, 'x');
     m_serverSide->write(blob);
     m_serverSide->flush();
 

@@ -18,9 +18,10 @@ constexpr int kInternalError = -32603;
 
 // Hard cap on a single unframed line. A well-behaved server delimits every
 // message with '\n'; a peer that streams megabytes without one is malformed and
-// must not be allowed to grow m_readBuffer without bound. Comfortably above the
-// largest legitimate frame (multi-MiB file payloads).
-constexpr int kMaxLineBytes = 8 * 1024 * 1024;
+// must not grow m_readBuffer without bound. Set above the largest legitimate
+// frame: the internal scheme handler bounds inline file reads to 8 MiB raw
+// (~11 MiB base64), so 16 MiB leaves headroom for that plus JSON overhead.
+constexpr int kMaxLineBytes = 16 * 1024 * 1024;
 
 } // namespace
 

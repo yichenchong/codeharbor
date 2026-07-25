@@ -17,6 +17,11 @@
 namespace ch {
 
 namespace {
+// Cap the bytes fetched for a single inline viewer render. A file larger than
+// this is failed (never truncated-and-served) so the RPC frame stays bounded
+// and WebEngine never receives partial content as if it were complete.
+constexpr int kMaxInlineReadBytes = 8 * 1024 * 1024;
+
 // Active-content MIME types can execute script or load subresources when a
 // browser renders them as a top-level document (SPEC 7.2). Serving untrusted
 // file bytes as one of these on the privileged internal origin is a
@@ -177,7 +182,11 @@ void InternalUrlSchemeHandler::requestStarted(QWebEngineUrlRequestJob *job)
 
     // Guard against the job being destroyed before the async reply arrives.
     QPointer<QWebEngineUrlRequestJob> guard(job);
-    const QJsonObject params{{QStringLiteral("path"), path}};
+    const QJsonObject params{
+        {QStringLiteral("path"), path},
+        {QStringLiteral("offset"), 0},
+        {QStringLiteral("length"), kMaxInlineReadBytes},
+    };
     m_client->call(
         QString::fromLatin1(rpc::kMethodReadFile), params,
         [guard, path](QJsonValue result, std::optional<RpcError> error) {
@@ -188,6 +197,12 @@ void InternalUrlSchemeHandler::requestStarted(QWebEngineUrlRequestJob *job)
                 return;
             }
             const QJsonObject obj = result.toObject();
+            if (obj.value(QStringLiteral("truncated")).toBool()) {
+                // File exceeds the inline render cap; fail cleanly rather than
+                // serve partial bytes as a complete document.
+                guard->fail(QWebEngineUrlRequestJob::RequestFailed);
+                return;
+            }
             const QString encoding = obj.value(QStringLiteral("encoding")).toString();
             const QString content = obj.value(QStringLiteral("content")).toString();
             const QByteArray bytes =
