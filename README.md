@@ -72,11 +72,13 @@ npm run build      # tsc -> dist/
 
 ## Status
 
-Milestones **M2** (core workspace) and **M3** (remote viewers) reached — SSH
-transport, data model, remote file service, RPC client, persistence, terminal,
-UI shell, and viewers are implemented and unit-tested; live gates that need a
-display or SSH server are wired but deferred. See [`docs/PLAN.md`](docs/PLAN.md)
-for the phased, parallelizable delivery plan and the state of each workstream.
+Milestones **M2–M5** reached (core workspace, remote viewers, remote editing,
+agent awareness) atop M0/M1 — SSH transport, data model, remote file service, RPC
+client, persistence, terminal, UI shell, viewers, Monaco editor bridge, and agent
+monitor are implemented and unit-tested. Remaining work is live gates needing a
+display or SSH server (wired + unit-tested), plus two editor code refinements
+(JS-ready handshake, recovery-snapshot cleanup on save). See
+[`docs/PLAN.md`](docs/PLAN.md) for the phased plan and each workstream's state.
 
 ## License
 

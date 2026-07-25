@@ -168,28 +168,31 @@ graph TD
   render needs a display + server; wired but unexercised headless.
 - **Parallel with:** T.
 
-### E — Remote editor
+### E — Remote editor — ✅ core landed (Wave 4); ⏳ live editor gate deferred
 - **Start gate:** [x] R file methods (stat/read/write/watch) · [x] V pane host · [x] C3.
 - **TODO:**
-  - [ ] Monaco bundle in `src/web/editor`; `RemoteEditorBridge` (C3).
-  - [ ] File-state machine (SPEC 8.2), revision-guarded save, conflict UI
-    (SPEC 8.6 — never silent overwrite), external-change reload for clean buffers.
-  - [ ] Unsaved recovery snapshots on server (SPEC 11.3, mode 0600).
-- **Stop gate:** edit + save a remote file; concurrent external change triggers
-  conflict prompt (no data loss); kill client mid-edit → recover buffer.
+  - [x] Monaco bundle + WebChannel-native `EditorBridge` (C3, object "editor") in `src/web/editor`.
+  - [x] File-state machine (SPEC 8.2), revision-guarded save + conflict (SPEC 8.6 — never silent overwrite), external-change reload for clean buffers / no-clobber when dirty.
+  - [x] Unsaved recovery snapshots on the server (SPEC 11.3) via revision-guarded writeFile; per-pane EditorController (EditorFactory) with watch released on close.
+- **Stop gate:** ✅ testable core MET — `tst_editorcontroller` covers load→Clean,
+  revision-guarded save, conflict (no overwrite), external reload vs dirty
+  no-clobber, recovery snapshot+offer, and watch-unsubscribe on close/reopen.
+  ⏳ Live editing deferred to a display + packaged Monaco bundle; refinements: a
+  JS→C++ ready handshake (content can be missed before the page connects) and
+  clearing the recovery snapshot on a successful save.
 - **Parallel with:** T.
 
-### A — Agent awareness
+### A — Agent awareness — ✅ core landed (Wave 4); ⏳ live sidebar/notify deferred
 - **Start gate:** [x] bridge+adapters DONE · [x] S agent channel (ChannelKind::AgentStatus) · [x] U sidebar.
 - **TODO:**
-  - [ ] `AgentStatusMonitor` (C++) consuming JSONL over the agent channel.
-  - [ ] Map `AgentState` → sidebar badges/precedence; unseen-completion badges;
-    desktop notifications.
-  - [ ] Ship the `oh-my-pi` adapter as an installable hook (highest priority,
-    SPEC 6.2); then `pi`, `claude-code`.
-  - [ ] Fallback coarse activity detection (SPEC 6.6) when no adapter.
-- **Stop gate:** run Oh My Pi in a terminal; sidebar reflects
-  running→waiting_input→idle_unseen; badge clears on "mark seen".
+  - [x] `AgentStatusMonitor` (C++) consuming AgentEvent JSONL over the agent channel.
+  - [x] Map `AgentState` → sidebar row precedence + unseen-completion; markSeen clears the badge; notify() hook on waiting_input/idle_unseen (OS notification display-deferred).
+  - [x] `oh-my-pi` installable hook emitting BridgeMessage through the bridge (single mapping point); `pi`/`claude-code` adapters already registered server-side.
+  - [x] Fallback coarse activity detection (SPEC 6.6) for the adapterless `generic` harness.
+- **Stop gate:** ✅ testable core MET — `tst_agentmonitor` (parse/framing/state/unseen/markSeen),
+  the hook→bridge→AgentEvent end-to-end test, and `tst_appcontroller` (live agent state
+  merged into the sidebar, not wiped by refresh). ⏳ The live "run Oh My Pi → sidebar
+  reacts" gate needs a display + a running agent channel.
 - **Parallel with:** V, E (after U).
 
 ### U — UI shell & persistence — ✅ core landed (Wave 3); ⏳ live restart gate deferred
@@ -216,8 +219,14 @@ graph TD
 - **M3 — Remote viewers (SPEC Phase 2).** ✅ Landed: V handler registry + dual-profile
   isolation + internal scheme + viewer split-tree. Live split-pane render deferred
   to a display/server; registry/URL/MIME/isolation unit-tested (`tst_viewers`).
-- **M4 — Remote editing (SPEC Phase 3).** Pending — workstream E.
-- **M5 — Agent awareness (SPEC Phase 4).** Pending — workstream A; Oh My Pi first.
+- **M4 — Remote editing (SPEC Phase 3).** ✅ Landed: E editor state machine +
+  revision-guarded save/conflict + external reload + recovery snapshots + Monaco
+  bridge. Live in-pane editing deferred to a display + packaged bundle; core
+  unit-tested (`tst_editorcontroller`).
+- **M5 — Agent awareness (SPEC Phase 4).** ✅ Landed: A monitor + state/unseen
+  mapping + oh-my-pi hook + fallback; agent state merged into the sidebar. Live
+  agent-driven sidebar deferred to a display/agent channel; core unit-tested
+  (`tst_agentmonitor`, `tst_appcontroller`).
 
 ## Delivery progress
 
@@ -233,10 +242,16 @@ concurrent Wave-2 bug-hunt (R-client null-error HIGH, P schema_version latent) a
 a Wave-3 adversarial review (U callback use-after-free + silent-no-op sidebar HIGHs,
 V profile-type M3 blocker). Contract C1 gained `file.listDirectory` (schema v2).
 
-**Wave 4 — next (fan out; dependencies noted):**
-1. **E** — remote editor (Monaco). Needs R-server file methods ✅ + V pane host ✅ + C3 ✅.
-2. **A** — agent awareness client (AgentStatusMonitor). Needs S ✅ agent channel + U sidebar ✅.
+**Wave 4 — ✅ DONE** (E editor, A agent) → milestones **M4** and **M5** reached
+(logic verified; live editor / agent-sidebar render deferred). Delivered with a
+concurrent Wave-3 bug-hunt (U setServerId + stale-refresh ordering; V nosniff +
+active-MIME gate) and a Wave-4 adversarial review (E watch-subscription leak +
+read-only save; A markSeen badge-clear + version fidelity + transport UAF).
+Contract: the oh-my-pi hook emits BridgeMessage (the bridge stays the single mapping point).
 
-> Closing the deferred live stop gates (**S**, **T**, and the live render of
-> **U**/**V** for M1) needs a reachable SSH server + a display — the code paths are
-> wired and unit-tested; they just need an environment to exercise them.
+> All five feature milestones (M1–M5) are code-complete. Remaining work is almost
+> entirely LIVE gates — S/T attach, U/V/E in-pane render, live agent-driven
+> sidebar — each wired + unit-tested, needing a reachable SSH server + a display.
+> Two E code refinements also remain: a JS→C++ ready handshake (content can be
+> missed before the page connects) and clearing the recovery snapshot on a
+> successful save.
