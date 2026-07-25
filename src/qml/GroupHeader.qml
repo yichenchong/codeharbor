@@ -3,7 +3,9 @@ import QtQuick.Controls.Basic
 
 // Sidebar group header (SPEC 4.2): group name with a collapse chevron. Bound to
 // a SessionsModel group row via role names (name, collapsed, itemId). Clicking
-// the header toggles the collapse via app.setGroupCollapsed(itemId, ...).
+// the header toggles the collapse via app.setGroupCollapsed(itemId, ...) and
+// moves the sidebar's keyboard cursor here; dragging it reorders the groups
+// through the sidebar (`host`), which owns every app.* call.
 ItemDelegate {
     id: header
 
@@ -12,10 +14,26 @@ ItemDelegate {
     required property bool collapsed
     required property string itemId // group's ch id (SessionsModel itemId role)
 
+    // The SessionsSidebar that instantiated this header; null-guarded so the
+    // header stays usable standalone.
+    property var host: null
+
+    readonly property bool selected: host !== null && host.currentIsGroup
+                                     && host.currentId === header.itemId
+    readonly property bool dragging: host !== null && host.dragItem === header
+
+    objectName: "groupHeader:" + itemId
+
+    Component.onCompleted: if (host) host.registerHeader(header)
+    Component.onDestruction: if (host) host.unregisterHeader(header)
+
     width: ListView.view ? ListView.view.width : implicitWidth
     height: 32
 
-    background: Rectangle { color: "#181825" }
+    background: Rectangle {
+        color: header.selected ? "#2a2a40" : "#181825"
+        opacity: header.dragging ? 0.4 : 1.0
+    }
 
     contentItem: Row {
         spacing: 6
@@ -40,5 +58,30 @@ ItemDelegate {
         }
     }
 
-    onClicked: app.setGroupCollapsed(header.itemId, !header.collapsed)
+    onClicked: {
+        if (host)
+            host.selectGroup(header);
+        app.setGroupCollapsed(header.itemId, !header.collapsed);
+    }
+
+    // Vertical drag = reorder groups. Same grab discipline as SessionRow: the
+    // header stays put and the sidebar draws the insertion line.
+    DragHandler {
+        target: null
+        acceptedButtons: Qt.LeftButton
+        grabPermissions: PointerHandler.CanTakeOverFromItems
+                         | PointerHandler.CanTakeOverFromHandlersOfDifferentType
+
+        onActiveChanged: {
+            if (!header.host)
+                return;
+            if (active) {
+                header.host.beginDrag("group", header);
+                header.host.updateDrag(centroid.scenePosition);
+            } else {
+                header.host.endDrag();
+            }
+        }
+        onCentroidChanged: if (active && header.host) header.host.updateDrag(centroid.scenePosition)
+    }
 }

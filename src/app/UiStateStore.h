@@ -16,6 +16,7 @@ namespace ch {
 // Storage keys:
 //   layout/sidebarWidth, layout/viewerWidth, layout/terminalWidth
 //   selectedPane/<devSessionId>
+//   session/active
 class UiStateStore : public QObject {
     Q_OBJECT
 
@@ -36,6 +37,12 @@ public:
 
     Q_INVOKABLE void setSelectedPane(QString devSessionId, QString paneId);
     Q_INVOKABLE QString selectedPane(QString devSessionId) const;
+
+    // The Dev Session the user was last working in, so a relaunch reopens it
+    // instead of an empty shell. Client-local: which session is "current" is a
+    // per-client presentation choice, not authoritative workspace state.
+    Q_INVOKABLE void setActiveSession(QString devSessionId);
+    Q_INVOKABLE QString activeSession() const;
 
 private:
     std::unique_ptr<QSettings> m_settings;

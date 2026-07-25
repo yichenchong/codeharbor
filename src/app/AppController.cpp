@@ -2,8 +2,10 @@
 
 #include "UiStateStore.h"
 
+#include <QCryptographicHash>
 #include <QFileInfo>
 #include <QDir>
+#include <QJsonObject>
 #include <QPointer>
 
 namespace ch {
@@ -15,6 +17,10 @@ AppController::AppController(CodeharbordClient* client, QObject* parent)
     , m_sessionsModel(new SessionsModel(this))
     , m_uiState(new UiStateStore(QString(), this))
 {
+    // Once the sidebar has authoritative rows, reopen whatever Dev Session the
+    // user was last in (no-op if one is already active or none was remembered).
+    connect(this, &AppController::refreshed, this,
+            [this] { restoreActiveSession(); });
 }
 
 AppController::~AppController() = default;
@@ -93,6 +99,210 @@ void AppController::setAgentMonitor(AgentStatusMonitor* monitor)
     // Re-merge immediately so a monitor set after the initial load reflects any
     // state it already accumulated, and a clear drops back to bare rows.
     rebuildRows();
+}
+
+void AppController::setConnection(SshConnectionPool* pool,
+                                  SessionBootstrap* bootstrap,
+                                  ServerProfiles* profiles,
+                                  SessionLayouts* layouts)
+{
+    m_pool = pool;
+    m_bootstrap = bootstrap;
+    m_profiles = profiles;
+    m_layouts = layouts;
+
+    if (m_bootstrap) {
+        // The bootstrap reconnects on its own (backoff per SPEC 5.6); mirror its
+        // state so the UI can show "reconnecting" instead of going quietly dead,
+        // and re-adopt the server identity on every successful (re)wire.
+        connect(m_bootstrap, &SessionBootstrap::stateChanged, this,
+                [this](SessionBootstrap::State state) {
+                    switch (state) {
+                    case SessionBootstrap::State::Connecting:
+                        setConnectionState(QStringLiteral("connecting"));
+                        break;
+                    case SessionBootstrap::State::Wired:
+                        setConnectionState(QStringLiteral("connected"));
+                        break;
+                    case SessionBootstrap::State::Reconnecting:
+                        setConnectionState(QStringLiteral("reconnecting"));
+                        break;
+                    case SessionBootstrap::State::Failed:
+                        setConnectionState(QStringLiteral("failed"),
+                                           m_connectionError);
+                        break;
+                    case SessionBootstrap::State::Disconnected:
+                        setConnectionState(QStringLiteral("disconnected"));
+                        break;
+                    }
+                });
+        connect(m_bootstrap, &SessionBootstrap::wired, this,
+                [this] { adoptServerIdentity(); });
+        connect(m_bootstrap, &SessionBootstrap::error, this,
+                [this](const QString& message) {
+                    m_connectionError = message;
+                    emit error(message);
+                    emit connectionStateChanged();
+                });
+    }
+    emit connectionChanged();
+}
+
+void AppController::setConnectionState(const QString& state, const QString& err)
+{
+    if (m_connectionState == state && m_connectionError == err)
+        return;
+    m_connectionState = state;
+    m_connectionError = err;
+    emit connectionStateChanged();
+}
+
+void AppController::connectToProfile(QString profileId)
+{
+    if (!m_bootstrap || !m_profiles || !m_pool)
+        return;
+    // One handshake at a time: a second invocation while a connect is running -
+    // or while the user still owes us a host-key answer - would race two
+    // sessions onto one pool and could re-enter the host-key callback.
+    if (m_connecting)
+        return;
+
+    const QVariantMap profile = m_profiles->profile(profileId);
+    if (profile.isEmpty()) {
+        setConnectionState(QStringLiteral("failed"),
+                           tr("No such server profile."));
+        return;
+    }
+
+    m_connecting = true;
+    m_pendingProfileId = profileId;
+    m_pendingFingerprint.clear();
+    setConnectionState(QStringLiteral("connecting"));
+
+    // Unknown key: refuse THIS attempt, remember the fingerprint, and let the
+    // user decide. Accepting re-runs connectToProfile with the fingerprint
+    // pre-approved, so the decision never blocks inside the handshake.
+    QPointer<AppController> self(this);
+    m_pool->setHostKeyCallback(
+        [self](const QString& host, const QString& keyType,
+               const QByteArray& keyBlob, KnownHosts::Verdict) {
+            if (!self)
+                return SshConnectionPool::HostKeyDecision::Reject;
+            const QString fingerprint =
+                QString::fromLatin1(
+                    QCryptographicHash::hash(keyBlob, QCryptographicHash::Sha256)
+                        .toBase64(QByteArray::OmitTrailingEquals));
+            if (self->m_acceptedFingerprint == fingerprint) {
+                self->m_acceptedFingerprint.clear();
+                return SshConnectionPool::HostKeyDecision::Accept;
+            }
+            self->m_pendingFingerprint = fingerprint;
+            self->m_pendingHostKeyInfo = qMakePair(host, keyType);
+            return SshConnectionPool::HostKeyDecision::Reject;
+        });
+
+    const bool ok = m_bootstrap->connectAndWire(
+        profile.value(QStringLiteral("host")).toString(),
+        static_cast<quint16>(profile.value(QStringLiteral("port")).toInt()),
+        profile.value(QStringLiteral("user")).toString(),
+        profile.value(QStringLiteral("nodePath")).toString(),
+        profile.value(QStringLiteral("repoRoot")).toString());
+
+    m_connecting = false;
+    if (ok) {
+        m_profiles->setActiveId(profileId);
+        return;  // wired() -> adoptServerIdentity()
+    }
+    if (!m_pendingFingerprint.isEmpty()) {
+        setConnectionState(QStringLiteral("hostkey"));
+        emit hostKeyPrompt(m_pendingHostKeyInfo.first, m_pendingHostKeyInfo.second,
+                           m_pendingFingerprint);
+        return;
+    }
+    setConnectionState(QStringLiteral("failed"), m_connectionError);
+}
+
+void AppController::resolveHostKey(bool accept)
+{
+    const QString fingerprint = m_pendingFingerprint;
+    const QString profileId = m_pendingProfileId;
+    m_pendingFingerprint.clear();
+    if (!accept || fingerprint.isEmpty() || profileId.isEmpty()) {
+        setConnectionState(QStringLiteral("disconnected"));
+        return;
+    }
+    m_acceptedFingerprint = fingerprint;
+    connectToProfile(profileId);
+}
+
+void AppController::disconnectServer()
+{
+    if (!m_bootstrap)
+        return;
+    m_bootstrap->disconnectSession();
+    setConnectionState(QStringLiteral("disconnected"));
+}
+
+void AppController::adoptServerIdentity()
+{
+    if (!m_client)
+        return;
+    QPointer<AppController> self(this);
+    m_client->call(QStringLiteral("server.info"), QJsonObject{},
+                   [self](QJsonValue result, std::optional<RpcError> err) {
+                       if (!self)
+                           return;
+                       if (err) {
+                           emit self->error(err->message);
+                           return;
+                       }
+                       const QString id = result.toObject()
+                                              .value(QStringLiteral("serverId"))
+                                              .toString();
+                       if (id.isEmpty()) {
+                           emit self->error(
+                               tr("Server did not report an identity; refusing to "
+                                  "key this workspace to a client-side id."));
+                           return;
+                       }
+                       if (self->m_layouts)
+                           self->m_layouts->setServerId(id);
+                       // setServerId() refreshes the sidebar; restore the last
+                       // session once those rows arrive.
+                       self->setServerId(id);
+                   });
+}
+
+void AppController::restoreActiveSession()
+{
+    if (m_activeSessionId.isEmpty() && m_uiState) {
+        const QString remembered = m_uiState->activeSession();
+        if (!remembered.isEmpty())
+            activateSession(remembered);
+    }
+}
+
+void AppController::activateSession(QString devSessionId)
+{
+    if (devSessionId.isEmpty())
+        return;
+    m_activeSessionId = devSessionId;
+    if (m_uiState)
+        m_uiState->setActiveSession(devSessionId);
+    if (m_layouts) {
+        m_layouts->setServerId(m_serverId.value);
+        m_layouts->load(devSessionId);
+    }
+    emit activeSessionChanged();
+}
+
+QString AppController::activeSessionRepoRoot() const
+{
+    for (const GroupNode& group : m_lastNodes)
+        for (const SessionNode& session : group.sessions)
+            if (session.session.id.value == m_activeSessionId)
+                return session.session.repositoryRoot;
+    return {};
 }
 
 void AppController::rebuildRows()

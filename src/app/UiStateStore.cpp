@@ -70,4 +70,15 @@ QString UiStateStore::selectedPane(QString devSessionId) const
     return m_settings->value(selectedPaneKey(devSessionId)).toString();
 }
 
+void UiStateStore::setActiveSession(QString devSessionId)
+{
+    m_settings->setValue(QStringLiteral("session/active"), devSessionId);
+    m_settings->sync();
+}
+
+QString UiStateStore::activeSession() const
+{
+    return m_settings->value(QStringLiteral("session/active")).toString();
+}
+
 } // namespace ch

@@ -25,6 +25,8 @@ qt_add_qml_module(codeharbor_qml
         ViewerDirectoryView.qml
         ViewerBinaryView.qml
         EditorPaneView.qml
+        CommandPalette.qml
+        ConnectSheet.qml
 )
 
 target_link_libraries(codeharbor_qml PUBLIC
@@ -118,6 +120,83 @@ else()
         "    npm run build --workspace src/web/editor\n"
         "Or configure with -DCODEHARBOR_SKIP_WEB_BUNDLE=ON to build a client "
         "whose editor pane is intentionally inert.")
+endif()
+
+# Trusted xterm.js terminal page (src/web/terminal), embedded exactly like the
+# editor bundle above so TerminalPaneView.qml can navigate to ONE constant URL —
+# qrc:/codeharbor/web/terminal/index.html.
+#
+# Same reasoning as the editor block: the bundle is a gitignored esbuild artifact
+# and Qt reads resource files at CONFIGURE time, so a missing bundle would
+# silently ship a terminal pane with nothing to load. Build it on demand, refuse
+# to configure if we cannot, and offer -DCODEHARBOR_SKIP_WEB_BUNDLE=ON for
+# C++-only/offline work.
+set(_ch_terminal_src ${CMAKE_CURRENT_SOURCE_DIR}/../web/terminal)
+set(_ch_terminal_dist ${_ch_terminal_src}/dist)
+
+file(GLOB_RECURSE _ch_terminal_inputs ${_ch_terminal_src}/src/*.ts)
+list(APPEND _ch_terminal_inputs
+     ${_ch_terminal_src}/build.mjs
+     ${_ch_terminal_src}/index.html
+     ${_ch_terminal_src}/package.json)
+
+set(_ch_terminal_stale FALSE)
+if(NOT EXISTS ${_ch_terminal_dist}/index.html)
+    set(_ch_terminal_stale TRUE)
+else()
+    foreach(_ch_in IN LISTS _ch_terminal_inputs)
+        if(${_ch_in} IS_NEWER_THAN ${_ch_terminal_dist}/index.html)
+            set(_ch_terminal_stale TRUE)
+        endif()
+    endforeach()
+endif()
+
+if(_ch_terminal_stale AND NOT CODEHARBOR_SKIP_WEB_BUNDLE)
+    find_program(CODEHARBOR_NPM npm)
+    if(CODEHARBOR_NPM)
+        if(NOT EXISTS ${CMAKE_SOURCE_DIR}/node_modules)
+            message(STATUS "CodeHarbor: installing npm workspaces (first configure)")
+            execute_process(COMMAND ${CODEHARBOR_NPM} install
+                            WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+                            RESULT_VARIABLE _ch_npm_install_rc
+                            OUTPUT_QUIET ERROR_QUIET)
+        endif()
+        message(STATUS "CodeHarbor: building the xterm.js terminal bundle (missing or stale)")
+        execute_process(COMMAND ${CODEHARBOR_NPM} run build --workspace src/web/terminal
+                        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+                        RESULT_VARIABLE _ch_terminal_bundle_rc
+                        OUTPUT_VARIABLE _ch_terminal_bundle_out
+                        ERROR_VARIABLE _ch_terminal_bundle_out)
+        if(NOT _ch_terminal_bundle_rc EQUAL 0)
+            message(STATUS "CodeHarbor: terminal bundle build failed:\n${_ch_terminal_bundle_out}")
+        endif()
+    endif()
+endif()
+
+if(EXISTS ${_ch_terminal_dist}/index.html)
+    qt_add_resources(codeharbor_qml ch_terminal_bundle
+        PREFIX /codeharbor/web/terminal
+        BASE ${_ch_terminal_dist}
+        FILES
+            ${_ch_terminal_dist}/index.html
+            ${_ch_terminal_dist}/terminal.js
+            ${_ch_terminal_dist}/terminal.css
+    )
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+                 ${_ch_terminal_inputs})
+elseif(CODEHARBOR_SKIP_WEB_BUNDLE)
+    message(WARNING
+        "CODEHARBOR_SKIP_WEB_BUNDLE=ON: no xterm.js bundle is embedded, so the "
+        "terminal pane will load nothing. Do not ship this build.")
+else()
+    message(FATAL_ERROR
+        "The xterm.js terminal bundle (src/web/terminal/dist) is missing and could "
+        "not be built automatically.\n"
+        "Build it, then re-run CMake:\n"
+        "    npm install\n"
+        "    npm run build --workspace src/web/terminal\n"
+        "Or configure with -DCODEHARBOR_SKIP_WEB_BUNDLE=ON to build a client "
+        "whose terminal pane is intentionally inert.")
 endif()
 
 if(CODEHARBOR_BUILD_TESTS)

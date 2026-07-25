@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!--
+  CodeHarbor trusted terminal page (SPEC 5.1). Copied verbatim into dist/ by
+  build.mjs and embedded as qrc:/codeharbor/web/terminal/index.html (see
+  src/qml/CMakeLists.txt), which is what src/qml/TerminalPaneView.qml navigates
+  to.
+
+  SECURITY: the page runs on the PRIVILEGED internal WebEngine profile, so its
+  CSP is deliberately tight. Only same-origin (qrc:) scripts load — this bundle
+  plus Qt's own qwebchannel.js — and there is NO inline script at all (the
+  bundle boots itself on DOMContentLoaded). xterm.js injects its measured cell
+  geometry as a <style> element at runtime, hence 'unsafe-inline' for styles
+  only. Nothing here fetches: terminal bytes arrive over the WebChannel, never
+  over the network, so connect-src stays 'none'.
+-->
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' qrc:; style-src 'self' 'unsafe-inline'; font-src 'self' data:; img-src 'self' data:; connect-src 'none'">
+<title>CodeHarbor Terminal</title>
+<link rel="stylesheet" href="terminal.css">
+<style>
+    html, body { height: 100%; margin: 0; padding: 0; overflow: hidden; }
+    body { background: #11111b; color: #cdd6f4; }
+    /* Column layout: a status strip that only appears when the pane is NOT
+       live, above a surface that takes all remaining height. FitAddon measures
+       the surface, so it needs a definite height — hence flex:1 + min-height:0. */
+    #ch-terminal-root { height: 100%; width: 100%; display: flex; flex-direction: column; }
+    .ch-terminal-status {
+        flex: 0 0 auto;
+        padding: 2px 8px;
+        background: #181825;
+        border-bottom: 1px solid #313244;
+        color: #a6adc8;
+        font: 11px/1.6 monospace;
+    }
+    /* A live shell must not lose a row to chrome; every other state stays
+       visible so a failure shows as a message instead of a blank pane. */
+    .ch-terminal-status[data-state="ready"] { display: none; }
+    .ch-terminal-status[data-state="error"] { background: #45222c; color: #f38ba8; }
+    .ch-terminal-status[data-state="disconnected"],
+    .ch-terminal-status[data-state="reconnecting"] { background: #3a2f1e; color: #f9e2af; }
+    .ch-terminal-surface { flex: 1 1 auto; min-height: 0; }
+</style>
+</head>
+<body>
+<div id="ch-terminal-root"></div>
+<!-- Served by Qt WebChannel itself; provides the global QWebChannel ctor. -->
+<script src="qrc:///qtwebchannel/qwebchannel.js"></script>
+<script src="terminal.js"></script>
+</body>
+</html>

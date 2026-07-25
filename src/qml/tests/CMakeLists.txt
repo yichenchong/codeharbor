@@ -49,6 +49,28 @@ set_tests_properties(tst_qmlload PROPERTIES
     TIMEOUT 180
 )
 
+# Behavioural gate for the sidebar's drag-and-drop reordering and selection
+# affordances (SPEC 4.2). Loads the real qrc SessionsSidebar.qml over a stub
+# `app` and a real SessionsModel, and drives genuine mouse/key events.
+qt_add_executable(tst_sidebar tst_sidebar.cpp)
+
+target_link_libraries(tst_sidebar PRIVATE
+    Qt6::Test
+    Qt6::Core
+    Qt6::Gui
+    Qt6::Qml
+    Qt6::Quick
+    Qt6::QuickControls2
+    codeharbor_qmlplugin
+    ch_models
+)
+
+add_test(NAME tst_sidebar COMMAND tst_sidebar)
+set_tests_properties(tst_sidebar PROPERTIES
+    ENVIRONMENT "${CODEHARBOR_QML_TEST_ENV}"
+    TIMEOUT 180
+)
+
 # Environment probe: proves whether Qt WebEngine can actually load and script a
 # page under this box's headless recipe. Labelled `live` because it depends on
 # machine capabilities (QtWebEngineProcess, /dev/shm, sandbox permissions), and
@@ -69,4 +91,33 @@ set_tests_properties(tst_webengine_headless PROPERTIES
     LABELS live
     ENVIRONMENT "${CODEHARBOR_QML_TEST_ENV}"
     TIMEOUT 180
+)
+
+# Command palette + global shortcuts (SPEC 15). Loads the REAL
+# src/qml/CommandPalette.qml from this target's own qrc, so it exercises the
+# shipped component without depending on the CodeHarbor QML module (or on the
+# app context objects — the palette takes its command list from its host).
+get_filename_component(_ch_qml_src_dir "${CMAKE_CURRENT_SOURCE_DIR}/.." ABSOLUTE)
+
+qt_add_executable(tst_palette tst_palette.cpp)
+
+target_link_libraries(tst_palette PRIVATE
+    Qt6::Test
+    Qt6::Core
+    Qt6::Gui
+    Qt6::Qml
+    Qt6::Quick
+    Qt6::QuickControls2
+)
+
+qt_add_resources(tst_palette ch_palette_qml
+    PREFIX /chtest
+    BASE ${_ch_qml_src_dir}
+    FILES ${_ch_qml_src_dir}/CommandPalette.qml
+)
+
+add_test(NAME tst_palette COMMAND tst_palette)
+set_tests_properties(tst_palette PROPERTIES
+    ENVIRONMENT "${CODEHARBOR_QML_TEST_ENV}"
+    TIMEOUT 120
 )

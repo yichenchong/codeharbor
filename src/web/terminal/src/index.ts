@@ -4,6 +4,9 @@
 // resize events are forwarded back.
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
+// Side-effect import: esbuild pulls xterm's stylesheet out of the JS graph into
+// dist/terminal.css, which the packaged page links (see build.mjs).
+import "@xterm/xterm/css/xterm.css";
 
 export interface TerminalBridge {
     /** Forward user keystrokes to the remote PTY (SPEC 5.1). */
@@ -105,4 +108,97 @@ export function mountTerminal(element: HTMLElement, bridge: TerminalBridge): Ter
             term.dispose();
         },
     };
+}
+
+// ---- QWebChannel page-entry bootstrap ----
+// The QML host (QWebEngineView) injects `qt.webChannelTransport` and serves
+// qwebchannel.js, and registers the C++ ch::TerminalBridge under the object
+// name "terminal" (see src/qml/TerminalPaneView.qml). connectTerminal() opens
+// the channel and mounts xterm.js against it.
+
+/** Minimal QWebChannel signal shape (obj.signalName.connect(handler)). */
+export interface Signal<F extends (...args: never[]) => void> {
+    connect(handler: F): void;
+    disconnect(handler: F): void;
+}
+
+/**
+ * The QWebChannel proxy for the C++ ch::TerminalBridge. Its SLOTS are the
+ * frozen TerminalBridge half (JS -> C++); WebChannel cannot call a JS function,
+ * so the TerminalHost half (C++ -> JS) arrives as SIGNALS which this page wires
+ * onto the host returned by mountTerminal().
+ */
+export interface TerminalChannelObject extends TerminalBridge {
+    /** ch::TerminalState as a string (SPEC 5.6), cached by qwebchannel.js. */
+    connectionState: string;
+    /** A coalesced batch of terminal output, UTF-8 decoded by C++ -> host.write. */
+    write: Signal<(data: string) => void>;
+    /** Lifecycle transition -> host.setConnectionState. */
+    connectionStateChanged: Signal<(state: string) => void>;
+    /** The app asked for the visible screen buffer to be dropped -> host.clear. */
+    clearRequested: Signal<() => void>;
+    /** Optional handshake: the renderer is mounted, so the controller may stop
+     *  buffering and replay what the pane missed while the page was loading
+     *  (SPEC 5.4). Optional so an older host without the slot still works. */
+    ready?(): void;
+}
+
+/** Minimal ambient shape of the qwebchannel.js runtime injected by the host. */
+interface QWebChannelObjects {
+    [name: string]: unknown;
+}
+interface QWebChannelInstance {
+    objects: QWebChannelObjects;
+}
+type QWebChannelCtor = new (
+    transport: unknown,
+    callback: (channel: QWebChannelInstance) => void,
+) => QWebChannelInstance;
+
+declare const QWebChannel: QWebChannelCtor;
+declare const qt: { webChannelTransport: unknown };
+
+/**
+ * Page entry point: open the WebChannel injected by the QML host and mount the
+ * terminal against the "terminal" object (the C++ ch::TerminalBridge proxy).
+ */
+export function connectTerminal(element: HTMLElement): void {
+    new QWebChannel(qt.webChannelTransport, (channel: QWebChannelInstance) => {
+        const bridge = channel.objects.terminal as TerminalChannelObject | undefined;
+        if (!bridge) {
+            return; // host registered no bridge: leave the page inert
+        }
+        const host = mountTerminal(element, bridge);
+        bridge.write.connect((data: string) => host.write(data));
+        bridge.connectionStateChanged.connect((state: string) => host.setConnectionState(state));
+        bridge.clearRequested.connect(() => host.clear());
+        // The state reached before this page finished loading is already in the
+        // property cache, so the strip is correct without waiting for a signal.
+        if (typeof bridge.connectionState === "string") {
+            host.setConnectionState(bridge.connectionState);
+        }
+        // A navigated-away or destroyed pane must not leave a ResizeObserver and
+        // an IntersectionObserver firing into a dead terminal.
+        window.addEventListener("pagehide", () => host.dispose(), { once: true });
+        // Handshake LAST, once every host callback is connected: the controller
+        // has been buffering output since the channel opened and replays it into
+        // a renderer that is now listening (SPEC 5.4).
+        bridge.ready?.();
+    });
+}
+
+// The packaged page (dist/index.html) carries no inline script — its CSP
+// forbids one — so the bundle boots itself.
+function bootstrap(): void {
+    const root = document.getElementById("ch-terminal-root");
+    if (!root) {
+        return; // embedded by a host that mounts explicitly
+    }
+    connectTerminal(root);
+}
+
+if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", bootstrap, { once: true });
+} else {
+    bootstrap();
 }

@@ -38,6 +38,27 @@ inline constexpr auto kMethodListDirectory = "file.listDirectory";
 // remote/src/rpc-types.ts.
 inline constexpr auto kWatchEventNotification = "file.watchEvent";
 
+// --- Server introspection ---------------------------------------------------
+//
+// Mirrors the `server.info` handler in remote/src/codeharbord.ts.
+inline constexpr auto kMethodServerInfo = "server.info";
+
+// Result of `server.info`. `serverId` (SPEC 3.5) is the STABLE, SERVER-OWNED
+// identity of the workspace database on that host: minted by codeharbord on
+// first use and persisted, so it survives restarts and is the SAME for every
+// process sharing the database. It is the value the client must key a remote
+// workspace by — every stored row's server_id refers to it. The client NEVER
+// derives or substitutes it (a locally minted id would leave the user staring
+// at an empty workspace while their real rows sit orphaned on the server), and
+// it does NOT change when the host, port, user, or repository path changes:
+// those describe the route to the data, not the data.
+struct ServerInfoResult {
+    QString name;
+    QString version;
+    int schemaVersion;
+    QString serverId;
+};
+
 enum class Kind { File, Directory, Symlink, Other };
 enum class Encoding { Utf8, Base64 };
 enum class WatchEventKind { Created, Modified, Deleted, Renamed };
@@ -131,5 +152,45 @@ struct ListDirectoryResult {
     QString path;
     QVector<DirectoryEntry> entries;
 };
+
+// --- tmux session discovery (SPEC 10.2) -------------------------------------
+//
+// Mirrors the `tmux.*` group in remote/src/rpc-types.ts. It lets the client
+// list and ADOPT tmux sessions that already exist on the host instead of
+// assuming its own naming scheme. Absence is not failure: a host with no tmux
+// binary, or with no server running, returns an empty/false RESULT rather than
+// a JSON-RPC error, so the client must not treat emptiness as a fault.
+
+// Stable wire method names, mirroring RPC_TMUX_METHODS.
+inline constexpr auto kMethodListSessions = "tmux.listSessions";
+inline constexpr auto kMethodSessionExists = "tmux.sessionExists";
+inline constexpr auto kMethodKillSession = "tmux.killSession";
+
+// Mirrors TmuxSession. `created` is a UNIX timestamp in SECONDS (tmux's
+// session_created), not milliseconds like StatResult::mtimeMs.
+struct TmuxSession {
+    QString name;
+    int windows;
+    qint64 created;
+    bool attached;
+};
+
+// tmux.listSessions takes no parameters; the result IS the session array.
+using ListSessionsResult = QVector<TmuxSession>;
+
+struct SessionExistsParams {
+    QString name;
+};
+
+struct SessionExistsResult {
+    bool exists;
+};
+
+struct KillSessionParams {
+    QString name;
+};
+
+// kill-session is idempotent and reports no payload (mirrors the empty `{}`).
+struct KillSessionResult {};
 
 } // namespace ch::rpc

@@ -138,9 +138,13 @@ graph TD
 - **R-client (C++ `ch_remote`)**
   - **Start gate:** [x] C1 · [x] S channel factory.
   - **TODO:** [x] JSONL framing over the RPC channel; [x] async request/response
-    with typed results; [x] teardown/notification routing (reconnect scheduling TBD).
+    with typed results; [x] teardown/notification routing; [x] reconnect
+    scheduling (`SessionBootstrap` state machine + 1/2/5/10/30/60 s backoff,
+    capped at 10 attempts; SPEC 5.6).
   - **Stop gate:** [x] MET — `tst_rpcclient` (framing, id-matching, errors,
-    teardown) + live `server.info` over a piped codeharbord.
+    teardown) + live `server.info` over a piped codeharbord +
+    `tst_sessionbootstrap` / live `tst_livereconnect` (a real dropped SSH
+    connection recovers on its own).
 
 ### T — Terminal — ✅ LANDED (Wave 2); live gate MET (Wave 5)
 - **Start gate:** [x] S PTY channel · [x] C3.

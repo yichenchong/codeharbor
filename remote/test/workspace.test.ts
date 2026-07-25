@@ -816,3 +816,128 @@ test("session ordering stays tie-free and stable across repeated reads after mov
     ws.close();
     await cleanup(dbPath);
 });
+
+// --- Server identity (SPEC 3.5) ---------------------------------------------
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+
+test("serverId mints a UUID on first call, stores it, and repeats it", async () => {
+    const dbPath = await tmpDbPath();
+    const ws = openWorkspace(dbPath);
+
+    // Nothing is minted until asked: opening the DB must not write identity.
+    const before = ws.db.prepare("SELECT COUNT(*) AS n FROM server_identity").get() as { n: number };
+    assert.equal(before.n, 0);
+
+    const id = ws.serverId();
+    assert.match(id, UUID_RE);
+    // Same connection, repeated calls: one identity, one row.
+    assert.equal(ws.serverId(), id);
+    assert.equal(ws.serverId(), id);
+    const stored = ws.db
+        .prepare("SELECT id, server_id, created_at FROM server_identity")
+        .all() as unknown as Array<{ id: number; server_id: string; created_at: number }>;
+    assert.equal(stored.length, 1);
+    assert.equal(stored[0]?.id, 1);
+    assert.equal(stored[0]?.server_id, id);
+    assert.ok((stored[0]?.created_at ?? 0) > 0);
+
+    ws.close();
+    await cleanup(dbPath);
+});
+
+test("serverId survives a restart: reopening the same file returns the same id", async () => {
+    const dbPath = await tmpDbPath();
+    const first = openWorkspace(dbPath);
+    const id = first.serverId();
+    first.close();
+
+    // A fresh process would do exactly this: reopen the file and ask again.
+    const second = openWorkspace(dbPath);
+    assert.equal(second.serverId(), id);
+    const count = second.db.prepare("SELECT COUNT(*) AS n FROM server_identity").get() as { n: number };
+    assert.equal(count.n, 1);
+    second.close();
+    await cleanup(dbPath);
+});
+
+test("two databases mint different identities", async () => {
+    const a = await tmpDbPath();
+    const b = await tmpDbPath();
+    const wsA = openWorkspace(a);
+    const wsB = openWorkspace(b);
+    assert.notEqual(wsA.serverId(), wsB.serverId());
+    wsA.close();
+    wsB.close();
+    await cleanup(a);
+    await cleanup(b);
+});
+
+test("concurrent mints from two connections converge on one id", async () => {
+    const dbPath = await tmpDbPath();
+    // BOTH connections are opened before either mints — the exact race two
+    // codeharbord processes hit against a shared file (tst_liveshell starts a
+    // second server). Each sees an empty server_identity and tries to insert.
+    const first = openWorkspace(dbPath);
+    const second = openWorkspace(dbPath);
+
+    const a = first.serverId();
+    const b = second.serverId();
+    assert.match(a, UUID_RE);
+    assert.equal(b, a);
+
+    // The loser's INSERT OR IGNORE left no second row and no stale value: a
+    // third opener sees the same single winner.
+    const rows = second.db
+        .prepare("SELECT server_id FROM server_identity")
+        .all() as unknown as Array<{ server_id: string }>;
+    assert.deepEqual(rows.map((r) => r.server_id), [a]);
+    first.close();
+    second.close();
+
+    const third = openWorkspace(dbPath);
+    assert.equal(third.serverId(), a);
+    third.close();
+    await cleanup(dbPath);
+});
+
+test("the v2 migration adds server_identity to a v1 database without losing rows", async () => {
+    const dbPath = await tmpDbPath();
+    // Simulate a database written before server_identity existed: drop the
+    // table and rewind the stored version so migrate() has real work to do.
+    const legacy = openWorkspace(dbPath);
+    const { group, session } = seed(legacy);
+    legacy.db.exec("DROP TABLE server_identity");
+    legacy.db.prepare("UPDATE schema_version SET version = 1 WHERE id = 1").run();
+    legacy.close();
+
+    const upgraded = openWorkspace(dbPath);
+    const version = upgraded.db
+        .prepare("SELECT version FROM schema_version WHERE id = 1")
+        .get() as { version: number };
+    assert.equal(version.version, WORKSPACE_SCHEMA_VERSION);
+    assert.match(upgraded.serverId(), UUID_RE);
+    // The pre-existing rows are untouched by the upgrade.
+    assert.deepEqual(upgraded.getGroup(group.id), group);
+    assert.deepEqual(upgraded.getSession(session.id), session);
+    upgraded.close();
+    await cleanup(dbPath);
+});
+
+test("serverId is independent of the database's path", async () => {
+    const dbPath = await tmpDbPath();
+    const ws = openWorkspace(dbPath);
+    const id = ws.serverId();
+    ws.close();
+
+    // Moving the file (a relocated deployment, a renamed home directory) must
+    // not change the identity: it names the DATA, not the route to it.
+    const movedDir = await fs.mkdtemp(path.join(os.tmpdir(), "codeharbord-moved-"));
+    const moved = path.join(movedDir, "elsewhere.sqlite");
+    await fs.rename(dbPath, moved);
+    const reopened = openWorkspace(moved);
+    assert.equal(reopened.serverId(), id);
+    reopened.close();
+    await fs.rm(movedDir, { recursive: true, force: true });
+    await cleanup(dbPath);
+});

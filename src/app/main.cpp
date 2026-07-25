@@ -1,11 +1,15 @@
 #include "AppController.h"
 #include "CodeharbordClient.h"
 #include "SessionBootstrap.h"
+#include "SessionLayouts.h"
+#include "ServerProfiles.h"
 #include "SshConnectionPool.h"
 #include "ViewerModel.h"
 #include "ViewerProfiles.h"
 #include "AgentStatusMonitor.h"
 #include "EditorFactory.h"
+#include "TerminalFactory.h"
+#include "Notifier.h"
 
 #include <QGuiApplication>
 #include <QQmlApplicationEngine>
@@ -61,15 +65,34 @@ int main(int argc, char *argv[])
     ch::ViewerModel viewers(&client);
     viewers.setProfiles(&profiles);
 
-    // Per-pane editor controllers (workstream E): each editor pane creates its
-    // own controller via this factory so split panes never clobber each other.
+    // Connection spine the UI drives: stored server profiles (client-local, the
+    // only way to reach a server before one is reachable) and the per-session
+    // split layouts read back from that server. The workspace is keyed by the
+    // SERVER's own id, taken from server.info once wired.
+    ch::ServerProfiles serverProfiles;
+    ch::SessionLayouts sessionLayouts(appController.workspaceDb());
+    appController.setConnection(&sshPool, &sessionBootstrap, &serverProfiles,
+                                &sessionLayouts);
+
+    // Per-pane factories (workstreams E and T): each pane owns its controller so
+    // split panes never clobber each other.
     ch::EditorFactory editorFactory(&client);
+    ch::TerminalFactory terminalFactory(&sshPool);
+
+    // Agent attention -> OS notification (SPEC 6.2). A box with no notification
+    // daemon degrades to a silent no-op.
+    ch::Notifier notifier;
+    QObject::connect(&agentMonitor, &ch::AgentStatusMonitor::notify, &notifier,
+                     &ch::Notifier::notify);
 
     QQmlApplicationEngine engine;
     engine.rootContext()->setContextProperty(QStringLiteral("app"), &appController);
     engine.rootContext()->setContextProperty(QStringLiteral("viewers"), &viewers);
     engine.rootContext()->setContextProperty(QStringLiteral("agentMonitor"), &agentMonitor);
     engine.rootContext()->setContextProperty(QStringLiteral("editorFactory"), &editorFactory);
+    engine.rootContext()->setContextProperty(QStringLiteral("terminalFactory"), &terminalFactory);
+    engine.rootContext()->setContextProperty(QStringLiteral("notifier"), &notifier);
+    engine.rootContext()->setContextProperty(QStringLiteral("layouts"), &sessionLayouts);
 
     QObject::connect(
         &engine,

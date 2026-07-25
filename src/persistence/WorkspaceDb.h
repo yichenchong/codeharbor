@@ -130,7 +130,7 @@ public:
     // Informational only: the client runs no migrations (SPEC 11.2). Kept in
     // lockstep with remote/sql/schema.sql and WORKSPACE_SCHEMA_VERSION so the
     // three move together.
-    static constexpr int kSchemaVersion = 1;
+    static constexpr int kSchemaVersion = 2;
 
     using ListCallback =
         std::function<void(QVector<GroupNode>, std::optional<RpcError>)>;

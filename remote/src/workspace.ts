@@ -18,7 +18,8 @@ import path from "node:path";
 
 // Current schema version. Mirrors schema_version in remote/sql/schema.sql and
 // WorkspaceDb::kSchemaVersion (bump all three together — see schema.sql header).
-export const WORKSPACE_SCHEMA_VERSION = 1;
+// Bumped 1 -> 2 for the server_identity singleton (SPEC 3.5).
+export const WORKSPACE_SCHEMA_VERSION = 2;
 
 // The authoritative DDL (C2). Read relative to this module so it resolves the
 // same whether invoked from src/ or from a built dist/ alongside sql/.
@@ -364,7 +365,15 @@ export function openWorkspace(dbPath: string): Workspace {
 const MIGRATIONS: ReadonlyArray<{
     version: number;
     apply: (db: DatabaseSync) => void;
-}> = [{ version: 1, apply: (db) => db.exec(schemaSql) }];
+}> = [
+    { version: 1, apply: (db) => db.exec(schemaSql) },
+    // v2 adds the server_identity singleton and nothing else. The whole change
+    // is one CREATE TABLE IF NOT EXISTS, so re-running the authoritative DDL IS
+    // the migration — an existing v1 database gains the table and keeps every
+    // row. (A future step that alters an existing table cannot do this: CREATE
+    // TABLE IF NOT EXISTS never adds a column, so it must spell out its ALTERs.)
+    { version: 2, apply: (db) => db.exec(schemaSql) },
+];
 
 function migrate(db: DatabaseSync): void {
     const from = schemaVersion(db);
@@ -402,6 +411,8 @@ function schemaVersion(db: DatabaseSync): number {
 // cascade). Every mutation carries server_id per SPEC 3.5.
 export class Workspace {
     readonly db: DatabaseSync;
+    // Memoized server_identity row (see serverId()); the row never changes.
+    private cachedServerId: string | undefined;
 
     constructor(db: DatabaseSync) {
         this.db = db;
@@ -409,6 +420,46 @@ export class Workspace {
 
     close(): void {
         this.db.close();
+    }
+
+    // --- Server identity ----------------------------------------------------
+
+    /**
+     * The stable, server-owned id of THIS database (SPEC 3.5), minted on first
+     * call and returned unchanged forever after — including across restarts and
+     * from other processes sharing the file. It is what `server.info` reports as
+     * `serverId` and what every domain row's `server_id` refers to, so a client
+     * can key its view of the remote workspace by it: dropping and re-adding a
+     * connection profile, or connecting from a second machine, still resolves to
+     * the same rows instead of an empty workspace beside orphaned data.
+     *
+     * Deliberately NOT derived from the hostname, port, user, repository path,
+     * or anything else a client supplies: those describe the ROUTE to the data,
+     * and all of them can change while the data stays put.
+     *
+     * Race-safe without a transaction: several codeharbord processes may open
+     * the same file at once (tst_liveshell starts a second server), so minting
+     * is INSERT OR IGNORE against the `id = 1` primary key followed by a read.
+     * Whoever inserts first wins; every loser's insert is a no-op and every
+     * caller then reads the one committed row. Both statements run in SQLite's
+     * implicit per-statement transaction, and the row is never updated or
+     * deleted, so there is no read-modify-write window to protect.
+     */
+    serverId(): string {
+        if (this.cachedServerId !== undefined) return this.cachedServerId;
+        this.db
+            .prepare(
+                "INSERT OR IGNORE INTO server_identity (id, server_id, created_at) VALUES (1, ?, ?)",
+            )
+            .run(randomUUID(), Date.now());
+        const row = this.db
+            .prepare("SELECT server_id FROM server_identity WHERE id = 1")
+            .get() as { server_id: string } | undefined;
+        if (!row) throw new Error("server identity missing after mint");
+        // Immutable once written, so caching it is safe for this connection's
+        // lifetime; every later server.info answers without touching the DB.
+        this.cachedServerId = row.server_id;
+        return this.cachedServerId;
     }
 
     // --- Groups -------------------------------------------------------------
@@ -953,6 +1004,14 @@ function workspace(): Workspace {
         defaultWorkspace = openWorkspace(dbPath);
     }
     return defaultWorkspace;
+}
+
+// This server's stable identity, from the same default database the
+// `workspace.*` handlers write to — `server.info` reports it as `serverId`.
+// Any failure to open or mint propagates: answering with a placeholder would
+// invite the client to key its workspace by an id the rows do not carry.
+export function serverIdentity(): string {
+    return workspace().serverId();
 }
 
 // RPC handler table for the `workspace.*` method group (P's own group; NOT part

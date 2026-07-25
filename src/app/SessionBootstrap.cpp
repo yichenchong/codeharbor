@@ -7,7 +7,11 @@
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
+#include <QScopeGuard>
 #include <QStandardPaths>
+#include <QTimer>
+
+#include <cmath>
 
 namespace ch {
 
@@ -36,17 +40,56 @@ QString remoteJoin(const QString& root, const QString& relative)
 SessionBootstrap::SessionBootstrap(SshConnectionPool* pool,
                                    CodeharbordClient* client,
                                    AgentStatusMonitor* monitor, QObject* parent)
-    : QObject(parent), m_pool(pool), m_client(client), m_monitor(monitor)
+    : QObject(parent), m_pool(pool), m_client(client), m_monitor(monitor),
+      m_reconnectTimer(new QTimer(this))
 {
     m_knownHostsPath =
         QDir(QStandardPaths::writableLocation(QStandardPaths::AppConfigLocation))
             .filePath(QStringLiteral("known_hosts"));
+
+    m_reconnectTimer->setSingleShot(true);
+    connect(m_reconnectTimer, &QTimer::timeout, this, [this] {
+        if (m_state != State::Reconnecting)
+            return;
+        ++m_attempt;
+        if (!attemptWire())
+            scheduleReconnect();
+    });
+
+    if (m_pool) {
+        // Session-level death. Only Disconnected/Error matter: the transient
+        // Connecting/HostKeyCheck/Authenticating hops belong to a connect we
+        // are driving ourselves, and handleConnectionLost() ignores anything
+        // that is not a loss from State::Wired anyway.
+        //
+        // A user-driven teardown MUST go through disconnectSession(), not
+        // pool->disconnectFromHost(): SshConnectionPool::closeSession() frees
+        // every channel it handed out, so a device that is still alive when the
+        // pool drops the session holds a dangling ssh_channel (the device
+        // destructor dereferences it — a hazard that predates this handler and
+        // lives in the frozen src/ssh ownership model). disconnectSession()
+        // closes the devices first, which is the correct order.
+        connect(m_pool, &SshConnectionPool::stateChanged, this,
+                [this](SshConnectionPool::State state) {
+                    if (state == SshConnectionPool::State::Disconnected
+                        || state == SshConnectionPool::State::Error)
+                        handleConnectionLost(
+                            QStringLiteral("SSH session went down"));
+                });
+        connect(m_pool, &SshConnectionPool::errorOccurred, this,
+                [this](const QString& message) {
+                    handleConnectionLost(QStringLiteral("SSH session error: ")
+                                         + message.trimmed());
+                });
+    }
 }
 
 SessionBootstrap::~SessionBootstrap()
 {
     // Detach before ~QObject destroys the channel devices, so neither consumer
     // is left holding a pointer to a device that is about to disappear.
+    m_tearingDown = true;
+    cancelReconnect();
     unwire();
 }
 
@@ -92,6 +135,125 @@ QString SessionBootstrap::bridgeCommand(const QString& nodePath,
     return QStringLiteral("sh -c ") + shellQuote(relay);
 }
 
+int SessionBootstrap::reconnectDelaySeconds(int attempt)
+{
+    // Same ladder as TerminalController::reconnectDelaySeconds() (SPEC 5.6),
+    // mirrored rather than called: ch_app does not link ch_terminal, and adding
+    // that edge for one arithmetic helper would couple the app library to the
+    // terminal subsystem. tst_sessionbootstrap pins the identical vector as
+    // tst_terminalcontroller so the two cannot silently drift.
+    static constexpr int schedule[] = {1, 2, 5, 10, 30};
+    constexpr int count = static_cast<int>(sizeof(schedule) / sizeof(schedule[0]));
+    if (attempt < 0)
+        return schedule[0];
+    if (attempt < count)
+        return schedule[attempt];
+    return 60;
+}
+
+void SessionBootstrap::setState(State next)
+{
+    if (m_state == next)
+        return;
+    m_state = next;
+    emit stateChanged(m_state);
+}
+
+bool SessionBootstrap::reconnectPending() const
+{
+    return m_reconnectTimer->isActive();
+}
+
+int SessionBootstrap::nextReconnectDelaySeconds() const
+{
+    return reconnectPending() ? reconnectDelaySeconds(m_attempt) : 0;
+}
+
+void SessionBootstrap::setReconnectEnabled(bool enabled)
+{
+    if (m_reconnectEnabled == enabled)
+        return;
+    m_reconnectEnabled = enabled;
+    if (enabled)
+        return;
+    // Switching off mid-ladder must actually stop the ladder, otherwise the
+    // already-armed retry would fire once more behind the user's back.
+    cancelReconnect();
+    if (m_state == State::Reconnecting)
+        setState(State::Disconnected);
+}
+
+void SessionBootstrap::setMaxReconnectAttempts(int attempts)
+{
+    m_maxAttempts = attempts;
+}
+
+void SessionBootstrap::setReconnectTimeScale(double scale)
+{
+    if (scale > 0.0)
+        m_timeScale = scale;
+}
+
+void SessionBootstrap::cancelReconnect()
+{
+    m_reconnectTimer->stop();
+}
+
+void SessionBootstrap::scheduleReconnect()
+{
+    if (!m_reconnectEnabled) {
+        setState(State::Disconnected);
+        return;
+    }
+    if (m_maxAttempts > 0 && m_attempt >= m_maxAttempts) {
+        emit error(QStringLiteral("giving up on the session after %1 reconnect "
+                                  "attempts")
+                       .arg(m_attempt));
+        setState(State::Failed);
+        return;
+    }
+
+    const int delaySeconds = reconnectDelaySeconds(m_attempt);
+    // qMax(1, ...) keeps a scaled-down test interval a real timer tick rather
+    // than a 0 ms spin.
+    const int delayMs = qMax<int>(
+        1, static_cast<int>(std::llround(delaySeconds * 1000.0 * m_timeScale)));
+    setState(State::Reconnecting);
+    m_reconnectTimer->start(delayMs);
+    emit reconnectScheduled(m_attempt + 1, delaySeconds);
+}
+
+void SessionBootstrap::handleConnectionLost(const QString& reason)
+{
+    // Our own connect/teardown steps make the pool and the devices emit; those
+    // are not losses. Neither is anything that arrives when there is no live
+    // session to lose.
+    if (m_attempting || m_tearingDown || m_state != State::Wired)
+        return;
+
+    unwire();
+    emit error(reason);
+
+    if (!m_reconnectEnabled) {
+        setState(State::Disconnected);
+        return;
+    }
+    m_attempt = 0;
+    scheduleReconnect();
+}
+
+void SessionBootstrap::disconnectSession()
+{
+    m_tearingDown = true;
+    cancelReconnect();
+    unwire();
+    if (m_pool)
+        m_pool->disconnectFromHost();
+    m_tearingDown = false;
+    m_attempt = 0;
+    setState(State::Disconnected);
+}
+
 void SessionBootstrap::fail(const QString& message)
 {
     unwire();
@@ -100,17 +262,51 @@ void SessionBootstrap::fail(const QString& message)
 
 void SessionBootstrap::unwire()
 {
-    if (m_client && m_client->transport()
-        && (m_client->transport() == m_rpcDevice))
+    const bool wasTearingDown = m_tearingDown;
+    m_tearingDown = true;
+    const auto restore = qScopeGuard([this, wasTearingDown] {
+        m_tearingDown = wasTearingDown;
+    });
+
+    SshChannelDevice* rpc = m_rpcDevice;
+    SshChannelDevice* agent = m_agentDevice;
+    m_rpcDevice = nullptr;
+    m_agentDevice = nullptr;
+
+    // Close BEFORE detaching. closeChannel() emits readChannelFinished(), which
+    // is the only thing that drives CodeharbordClient::onTransportClosed() and
+    // therefore failAllPending(): every in-flight call gets its synthetic
+    // "transport closed with request pending" error instead of hanging forever.
+    // Detaching first (the original order) silently orphaned them.
+    // Our own connections go first so this teardown is not re-entered as a
+    // fresh loss.
+    if (rpc) {
+        rpc->disconnect(this);
+        rpc->closeChannel();
+    }
+    if (agent) {
+        agent->disconnect(this);
+        agent->closeChannel();
+    }
+
+    if (rpc && m_client && m_client->transport() == rpc)
         m_client->setTransport(nullptr);
-    if (m_monitor && m_monitor->transport()
-        && (m_monitor->transport() == m_agentDevice))
+    if (agent && m_monitor && m_monitor->transport() == agent)
         m_monitor->setTransport(nullptr);
 
-    delete m_rpcDevice;
-    m_rpcDevice = nullptr;
-    delete m_agentDevice;
-    m_agentDevice = nullptr;
+    // deleteLater, not delete: unwire() runs from inside a device's own
+    // readChannelFinished() emission on the loss path, and deleting the sender
+    // there is a use-after-free the moment the signal returns.
+    if (rpc)
+        rpc->deleteLater();
+    if (agent)
+        agent->deleteLater();
+}
+
+bool SessionBootstrap::connectPool(const QString& host, quint16 port,
+                                   const QString& user)
+{
+    return m_pool && m_pool->connectToHost(host, port, user);
 }
 
 SshChannelDevice* SessionBootstrap::openChannelDevice(
@@ -122,6 +318,8 @@ SshChannelDevice* SessionBootstrap::openChannelDevice(
             [this, role](const QString& text) {
                 // Remote diagnostics (stderr, libssh faults) are surfaced but
                 // never fatal on their own: the bridge banner arrives this way.
+                // A fault that really killed the channel also reaches
+                // readChannelFinished(), which is what triggers a reconnect.
                 emit error(role + QStringLiteral(": ") + text.trimmed());
             });
     if (!device->startExec(command)) {
@@ -131,15 +329,30 @@ SshChannelDevice* SessionBootstrap::openChannelDevice(
     return device;
 }
 
-bool SessionBootstrap::connectAndWire(const QString& host, quint16 port,
-                                      const QString& user,
-                                      const QString& nodePath,
-                                      const QString& repoRoot)
+void SessionBootstrap::wireLossDetection(SshChannelDevice* device,
+                                         const QString& role)
+{
+    // EOF on a channel means the remote end of this session is gone: the peer
+    // process exited, the session dropped, or libssh faulted (SshChannelDevice
+    // emits readChannelFinished() for all three). channelError() alone is NOT a
+    // loss — it also carries plain remote stderr, e.g. the bridge banner.
+    connect(device, &SshChannelDevice::readChannelFinished, this,
+            [this, role] {
+                handleConnectionLost(role + QStringLiteral(" channel closed"));
+            });
+}
+
+bool SessionBootstrap::attemptWire()
 {
     if (!m_pool) {
         emit error(QStringLiteral("no SSH connection pool"));
         return false;
     }
+
+    // Everything below provokes pool and device signals of its own; none of
+    // them is a loss of a live session.
+    m_attempting = true;
+    const auto clearAttempting = qScopeGuard([this] { m_attempting = false; });
 
     unwire();
 
@@ -158,10 +371,10 @@ bool SessionBootstrap::connectAndWire(const QString& host, quint16 port,
         return SshConnectionPool::HostKeyDecision::Accept;
     });
 
-    if (!m_pool->connectToHost(host, port, user)) {
+    if (!connectPool(m_host, m_port, m_user)) {
         emit error(QStringLiteral("SSH connection to %1:%2 failed")
-                       .arg(host)
-                       .arg(port));
+                       .arg(m_host)
+                       .arg(m_port));
         return false;
     }
 
@@ -174,27 +387,58 @@ bool SessionBootstrap::connectAndWire(const QString& host, quint16 port,
     }
 
     m_rpcDevice = openChannelDevice(SshConnectionPool::ChannelKind::Rpc,
-                                    rpcCommand(nodePath, repoRoot),
+                                    rpcCommand(m_nodePath, m_repoRoot),
                                     QStringLiteral("codeharbord"));
     if (!m_rpcDevice) {
         fail(QStringLiteral("could not start codeharbord over SSH"));
         return false;
     }
+    wireLossDetection(m_rpcDevice, QStringLiteral("codeharbord"));
     if (m_client)
         m_client->setTransport(m_rpcDevice);
 
     m_agentDevice = openChannelDevice(SshConnectionPool::ChannelKind::AgentStatus,
-                                      bridgeCommand(nodePath, repoRoot),
+                                      bridgeCommand(m_nodePath, m_repoRoot),
                                       QStringLiteral("codeharbor-bridge"));
     if (!m_agentDevice) {
         fail(QStringLiteral("could not start codeharbor-bridge over SSH"));
         return false;
     }
+    wireLossDetection(m_agentDevice, QStringLiteral("codeharbor-bridge"));
     if (m_monitor)
         m_monitor->setTransport(m_agentDevice);
 
+    m_attempt = 0;
+    setState(State::Wired);
     emit wired();
     return true;
+}
+
+bool SessionBootstrap::connectAndWire(const QString& host, quint16 port,
+                                      const QString& user,
+                                      const QString& nodePath,
+                                      const QString& repoRoot)
+{
+    // Remember the target: every automatic retry replays exactly this call.
+    m_host = host;
+    m_port = port;
+    m_user = user;
+    m_nodePath = nodePath;
+    m_repoRoot = repoRoot;
+
+    cancelReconnect();
+    m_attempt = 0;
+    setState(State::Connecting);
+
+    if (attemptWire())
+        return true;
+
+    // A user-initiated connect that never came up is reported to its caller
+    // (which returns false all the way to the UI) rather than retried behind
+    // its back: there is no established session to survive yet. Only a loss
+    // from State::Wired arms the ladder.
+    setState(State::Failed);
+    return false;
 }
 
 bool SessionBootstrap::connectAndWireFromEnvironment()

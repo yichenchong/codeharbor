@@ -7,6 +7,10 @@
 #include "WorkspaceDb.h"
 #include "WorkspaceTypes.h"
 #include "UiStateStore.h"
+#include "ServerProfiles.h"
+#include "SessionLayouts.h"
+#include "SessionBootstrap.h"
+#include "SshConnectionPool.h"
 
 #include <QObject>
 #include <QPointer>
@@ -33,6 +37,15 @@ class AppController : public QObject {
     Q_PROPERTY(ch::SessionsModel* sessionsModel READ sessionsModel CONSTANT)
     Q_PROPERTY(ch::UiStateStore* uiState READ uiState CONSTANT)
     Q_PROPERTY(QString serverId READ serverId WRITE setServerId NOTIFY serverIdChanged)
+    // Connection surface (workstream U integration). These are null until
+    // setConnection() injects them, so a test constructing a bare AppController
+    // keeps working exactly as before.
+    Q_PROPERTY(ch::ServerProfiles* serverProfiles READ serverProfiles NOTIFY connectionChanged)
+    Q_PROPERTY(ch::SessionLayouts* layouts READ layouts NOTIFY connectionChanged)
+    Q_PROPERTY(QString connectionState READ connectionState NOTIFY connectionStateChanged)
+    Q_PROPERTY(QString connectionError READ connectionError NOTIFY connectionStateChanged)
+    Q_PROPERTY(QString activeSessionId READ activeSessionId NOTIFY activeSessionChanged)
+    Q_PROPERTY(QString activeSessionRepoRoot READ activeSessionRepoRoot NOTIFY activeSessionChanged)
 
 public:
     explicit AppController(CodeharbordClient* client, QObject* parent = nullptr);
@@ -51,6 +64,40 @@ public:
     // rebuildRows() so a live agent event re-derives the badges from the last
     // known workspace tree.
     void setAgentMonitor(AgentStatusMonitor* monitor);
+
+    // Inject the connection spine. Ownership stays with main.cpp; any of these
+    // may be null (tests). Mirrors setAgentMonitor's injection style rather than
+    // widening the constructor, so existing construction sites are untouched.
+    void setConnection(SshConnectionPool* pool, SessionBootstrap* bootstrap,
+                       ServerProfiles* profiles, SessionLayouts* layouts);
+
+    ServerProfiles* serverProfiles() const { return m_profiles; }
+    SessionLayouts* layouts() const { return m_layouts; }
+    QString connectionState() const { return m_connectionState; }
+    QString connectionError() const { return m_connectionError; }
+    QString activeSessionId() const { return m_activeSessionId; }
+    QString activeSessionRepoRoot() const;
+
+    // The repository the client talks to; SessionLayouts is built over this.
+    WorkspaceDb* workspaceDb() const { return m_db.get(); }
+
+    // Connect to a stored profile. The serverId is then taken from the SERVER
+    // (server.info), never from the local profile id: workspace rows are keyed
+    // by it on the remote side, so a client-minted id would orphan the user's
+    // real groups/sessions whenever a profile was re-added or a second machine
+    // connected.
+    Q_INVOKABLE void connectToProfile(QString profileId);
+    Q_INVOKABLE void disconnectServer();
+
+    // Answer a hostKeyPrompt. Accepting trusts the key and retries the connect;
+    // there is no nested event loop anywhere in this flow (the first attempt is
+    // refused, the user decides, and we reconnect), so the UI can never be
+    // re-entered mid-handshake.
+    Q_INVOKABLE void resolveHostKey(bool accept);
+
+    // Make a Dev Session current: loads both region layouts and remembers it so
+    // the next launch reopens the same session.
+    Q_INVOKABLE void activateSession(QString devSessionId);
 
     // Pure mapping from the nested WorkspaceDb read shape to the flat sidebar
     // model rows. Subtitle is the basename of the session's repositoryRoot;
@@ -79,6 +126,12 @@ signals:
     void serverIdChanged();
     void error(QString message);
     void refreshed();
+    void connectionChanged();
+    void connectionStateChanged();
+    void activeSessionChanged();
+    // An UNKNOWN host key was presented (a CHANGED key is refused outright by
+    // the pool and never reaches here — SPEC 12.1). Answer with resolveHostKey().
+    void hostKeyPrompt(QString host, QString keyType, QString fingerprint);
 
 private:
     // Emit `error` from an optional RpcError; returns true when an error was
@@ -127,6 +180,32 @@ private:
     // re-derive rows (and re-merge agent state) without another server round-
     // trip when an agent event arrives.
     QVector<GroupNode> m_lastNodes;
+
+    // --- connection spine (injected, not owned) ---
+    SshConnectionPool* m_pool = nullptr;
+    SessionBootstrap* m_bootstrap = nullptr;
+    ServerProfiles* m_profiles = nullptr;
+    SessionLayouts* m_layouts = nullptr;
+
+    void setConnectionState(const QString& state, const QString& error = QString());
+    // Ask the SERVER for its identity and adopt it as serverId (see
+    // connectToProfile), then restore the last active session.
+    void adoptServerIdentity();
+    void restoreActiveSession();
+
+    QString m_connectionState = QStringLiteral("disconnected");
+    QString m_connectionError;
+    QString m_activeSessionId;
+    // Guards against a second connect being started while one is in flight or a
+    // host-key decision is pending.
+    bool m_connecting = false;
+    QString m_pendingProfileId;
+    // Fingerprint the user accepted for the in-flight connect; the retry turns
+    // the pool's refusal into an Accept exactly once, for exactly that key.
+    QString m_pendingFingerprint;
+    QString m_acceptedFingerprint;
+    // (host, keyType) captured alongside m_pendingFingerprint for the prompt.
+    QPair<QString, QString> m_pendingHostKeyInfo;
 };
 
 } // namespace ch

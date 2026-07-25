@@ -20,6 +20,12 @@ Rectangle {
     // supplies the SPEC 4.5 "always one pane" default (see Main.qml).
     property var node: null
 
+    // Session context every leaf pane needs to attach a real shell. Propagated
+    // down the recursion so a nested pane is as attachable as a root one; a pane
+    // stays detached while devSessionId is empty.
+    property string devSessionId: ""
+    property string workingDir: ""
+
     function isLeaf(n) {
         return !n || !n.children || n.children.length === 0;
     }
@@ -35,6 +41,8 @@ Rectangle {
         id: leafComponent
         TerminalPaneView {
             paneId: region.node && region.node.paneId ? region.node.paneId : ""
+            devSessionId: region.devSessionId
+            workingDir: region.workingDir
         }
     }
 
@@ -119,7 +127,9 @@ Rectangle {
                     // node first, transiently building a stray TerminalPaneView
                     // (and its controller) bound to paneId "terminal-1".
                     Component.onCompleted: setSource("TerminalRegion.qml",
-                                                     { node: childLoader.modelData })
+                                                     { node: childLoader.modelData,
+                                                       devSessionId: Qt.binding(() => region.devSessionId),
+                                                       workingDir: Qt.binding(() => region.workingDir) })
                     onModelDataChanged: if (item) item.node = childLoader.modelData
                 }
             }

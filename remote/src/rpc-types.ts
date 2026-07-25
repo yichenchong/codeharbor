@@ -130,3 +130,53 @@ export const RPC_WATCH_EVENT_NOTIFICATION = "file.watchEvent";
 // file's current revision. The server rejects the write rather than silently
 // overwriting concurrent changes (SPEC 8.4 / 8.6).
 export const RPC_REVISION_MISMATCH = -32001;
+
+// --- tmux session discovery (SPEC 10.2, docs/PLAN.md R-server) ---------------
+//
+// The client must be able to LIST and ADOPT tmux sessions that already exist on
+// the host rather than assuming its own naming scheme. These methods are their
+// own `tmux.*` group: RPC_METHODS above stays exactly the file.* catalog.
+//
+// Environment, not error: a host with no tmux binary, or with tmux installed
+// but no server running, is the NORMAL state of a fresh box. Those cases yield
+// an empty/false RESULT, never a JSON-RPC error.
+
+export interface TmuxSession {
+    name: string;
+    // Number of windows in the session (tmux `session_windows`).
+    windows: number;
+    // Session creation time as a UNIX timestamp in SECONDS (tmux
+    // `session_created`), which is what tmux reports — not milliseconds.
+    created: number;
+    attached: boolean;
+}
+
+// tmux.listSessions takes no parameters and resolves to the session array
+// directly (empty when tmux is absent or no server is running).
+export type ListSessionsResult = TmuxSession[];
+
+export interface SessionExistsParams {
+    name: string;
+}
+
+export interface SessionExistsResult {
+    exists: boolean;
+}
+
+export interface KillSessionParams {
+    name: string;
+}
+
+// Deliberately empty: kill-session is idempotent and reports no payload.
+export type KillSessionResult = Record<string, never>;
+
+// Stable wire method names for the tmux group. Mirrored in C++ at
+// src/remote/RpcTypes.h — bump RPC_SCHEMA_VERSION when this set changes.
+export const RPC_TMUX_METHODS = {
+    listSessions: "tmux.listSessions",
+    sessionExists: "tmux.sessionExists",
+    killSession: "tmux.killSession",
+} as const;
+
+export type RpcTmuxMethodKey = keyof typeof RPC_TMUX_METHODS;
+export type RpcTmuxMethodName = (typeof RPC_TMUX_METHODS)[RpcTmuxMethodKey];

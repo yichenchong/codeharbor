@@ -4,6 +4,8 @@ import QtQuick.Controls.Basic
 // A Dev Session sidebar row (SPEC 4.2): name + repository subtitle + a status
 // dot colored by the aggregate rowState. Right-click opens a context menu of
 // workspace mutations wired to app.* invokables, addressed by the row's ch id.
+// Left click selects and activates the session; dragging the row hands the
+// drop resolution to the sidebar (`host`), which is what talks to app.*.
 // Role names consumed: name, subtitle, rowState, itemId, groupId.
 ItemDelegate {
     id: row
@@ -14,6 +16,20 @@ ItemDelegate {
     required property int rowState
     required property string itemId  // this session's ch id (SessionsModel role)
     required property string groupId // containing group's ch id (for moves)
+
+    // The SessionsSidebar that instantiated this row: registry, drag state and
+    // selection cursor all live there. Null-guarded everywhere so the row stays
+    // usable standalone.
+    property var host: null
+
+    readonly property bool selected: host !== null && !host.currentIsGroup
+                                     && host.currentId === row.itemId
+    readonly property bool dragging: host !== null && host.dragItem === row
+
+    objectName: "sessionRow:" + itemId
+
+    Component.onCompleted: if (host) host.registerRow(row)
+    Component.onDestruction: if (host) host.unregisterRow(row)
 
     // Width is assigned by the instantiating parent (SessionsSidebar sets it to
     // the sessions column width); fall back to the parent's width otherwise.
@@ -37,8 +53,20 @@ ItemDelegate {
         }
     }
 
+    // Selection wins over hover; the source row of a live drag dims so the
+    // floating proxy reads as the thing being moved.
     background: Rectangle {
-        color: row.hovered ? "#232338" : "transparent"
+        color: row.selected ? "#45475a" : (row.hovered ? "#232338" : "transparent")
+        opacity: row.dragging ? 0.4 : 1.0
+
+        Rectangle {
+            anchors.left: parent.left
+            anchors.top: parent.top
+            anchors.bottom: parent.bottom
+            width: 3
+            color: "#89b4fa"
+            visible: row.selected
+        }
     }
 
     contentItem: Row {
@@ -77,6 +105,33 @@ ItemDelegate {
     TapHandler {
         acceptedButtons: Qt.RightButton
         onTapped: contextMenu.popup()
+    }
+
+    // Left click selects AND activates: the sidebar emits sessionActivated for
+    // the host to load the session's layout.
+    onClicked: if (host) host.selectSession(row)
+
+    // Vertical drag = reorder. `target: null` keeps the row in place (the
+    // sidebar draws a proxy and an insertion line instead), and the restricted
+    // grab permissions stop the enclosing ListView's Flickable from stealing
+    // the gesture and turning a reorder into a scroll.
+    DragHandler {
+        target: null
+        acceptedButtons: Qt.LeftButton
+        grabPermissions: PointerHandler.CanTakeOverFromItems
+                         | PointerHandler.CanTakeOverFromHandlersOfDifferentType
+
+        onActiveChanged: {
+            if (!row.host)
+                return;
+            if (active) {
+                row.host.beginDrag("session", row);
+                row.host.updateDrag(centroid.scenePosition);
+            } else {
+                row.host.endDrag();
+            }
+        }
+        onCentroidChanged: if (active && row.host) row.host.updateDrag(centroid.scenePosition)
     }
 
     Menu {

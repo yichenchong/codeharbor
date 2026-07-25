@@ -1,6 +1,10 @@
 qt_add_library(ch_terminal STATIC
     TerminalController.h
     TerminalController.cpp
+    TerminalBridge.h
+    TerminalBridge.cpp
+    TerminalFactory.h
+    TerminalFactory.cpp
 )
 
 target_include_directories(ch_terminal PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})

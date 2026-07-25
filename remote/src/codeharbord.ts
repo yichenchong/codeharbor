@@ -14,7 +14,11 @@ import readline from "node:readline";
 import { fileMethods, fileWatchService, isRevisionMismatch } from "./files.ts";
 // Workspace persistence method group (workstream P). `workspace.*` is P's own
 // method group and is deliberately absent from the frozen C1 file catalog.
-import { WORKSPACE_METHODS } from "./workspace.ts";
+// serverIdentity() is this host's stable, persisted id, reported by server.info.
+import { serverIdentity, WORKSPACE_METHODS } from "./workspace.ts";
+// tmux session discovery (SPEC 10.2). Its own `tmux.*` method group, likewise
+// outside the frozen C1 file catalog.
+import { TMUX_METHODS } from "./tmux.ts";
 import { RPC_REVISION_MISMATCH, RPC_WATCH_EVENT_NOTIFICATION } from "./rpc-types.ts";
 export { RPC_METHODS } from "./rpc-types.ts";
 export { RPC_REVISION_MISMATCH, RPC_WATCH_EVENT_NOTIFICATION };
@@ -22,7 +26,9 @@ export { RPC_REVISION_MISMATCH, RPC_WATCH_EVENT_NOTIFICATION };
 export const RPC_SERVER_NAME = "codeharbord";
 export const RPC_SERVER_VERSION = "0.1.0";
 // Bumped 1 -> 2 when file.listDirectory joined the C1 catalog (SPEC 7.5).
-export const RPC_SCHEMA_VERSION = 2;
+// Bumped 2 -> 3 when the tmux.* discovery group joined the catalog (SPEC 10.2).
+// Bumped 3 -> 4 when server.info gained `serverId` (SPEC 3.5).
+export const RPC_SCHEMA_VERSION = 4;
 
 export interface RpcRequest {
     jsonrpc: "2.0";
@@ -57,13 +63,20 @@ type MethodHandler = (params: unknown) => unknown | Promise<unknown>;
 // Static method table (SPEC 10.2 methods are added here as they land).
 const methods: Record<string, MethodHandler> = {
     ping: () => ({ pong: true }),
+    // `name`, `version` and `schemaVersion` are frozen; `serverId` (SPEC 3.5)
+    // is the stable identity of the workspace database on THIS host, minted on
+    // first read and unchanged thereafter. Clients key their view of the remote
+    // workspace by it, so it is read from the DB rather than synthesized: an
+    // id that changed per process or per route would orphan every stored row.
     "server.info": () => ({
         name: RPC_SERVER_NAME,
         version: RPC_SERVER_VERSION,
         schemaVersion: RPC_SCHEMA_VERSION,
+        serverId: serverIdentity(),
     }),
     ...fileMethods,
     ...WORKSPACE_METHODS,
+    ...TMUX_METHODS,
 };
 
 function isRpcRequest(value: unknown): value is RpcRequest {
