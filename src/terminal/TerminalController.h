@@ -5,8 +5,13 @@
 
 #include <QByteArray>
 #include <QObject>
+#include <QPointer>
 #include <QString>
 #include <QTimer>
+
+QT_BEGIN_NAMESPACE
+class QIODevice;
+QT_END_NAMESPACE
 
 namespace ch {
 
@@ -39,6 +44,35 @@ public:
     // are coalesced and released via flushReady() per the SPEC 5.5 policy.
     void ingestOutput(const QByteArray &bytes);
 
+    // Attach the PTY byte transport for this pane (SPEC 5.1/5.3), mirroring
+    // CodeharbordClient::setTransport()/AgentStatusMonitor::setTransport(). In
+    // production this is a ch::SshChannelDevice opened with ChannelKind::Pty;
+    // the parameter stays a plain QIODevice so the controller is exercisable
+    // against a QBuffer/QLocalSocket with no SSH session in sight.
+    //
+    // Everything the transport emits is fed through ingestOutput(), so the
+    // SPEC 5.5 coalescing and the SPEC 5.4 hidden buffer apply unchanged.
+    // Ownership stays with the caller; the pointer is weak, so a transport
+    // destroyed under a live controller detaches instead of dangling. Passing
+    // nullptr detaches without touching the pending/hidden buffers, so a
+    // reconnect resumes into the same pane.
+    void setTransport(QIODevice *transport);
+    QIODevice *transport() const;
+
+    // Forward renderer keystrokes to the remote PTY (SPEC 5.1). False when no
+    // writable transport is attached or the write was short.
+    bool sendInput(const QByteArray &bytes);
+
+    // Record the renderer geometry and push it to the remote PTY (SPEC 5.1).
+    // Returns true only when the window-change actually reached a real PTY
+    // channel; a non-PTY transport (or none) records the size and returns
+    // false. The recorded size is re-applied by setTransport(), so the PTY
+    // opened by a reconnect inherits the current pane geometry.
+    bool resize(int cols, int rows);
+    // Last geometry passed to resize(); 0 until it is called.
+    int columns() const;
+    int rows() const;
+
     // Bytes retained while hidden and not yet replayed to the view.
     const QByteArray &hiddenBuffer() const;
 
@@ -68,12 +102,23 @@ signals:
 private:
     void flush();
     void appendHidden(const QByteArray &batch);
+    void onTransportReadyRead();
+    void onTransportFinished();
+    // Narrow the transport to the only thing that can carry a window-change and
+    // push `cols` x `rows` to it.
+    bool applyPtySize(int cols, int rows);
 
     TerminalState m_state = TerminalState::Unloaded;
     bool m_viewVisible = true;
     QByteArray m_pending;   // coalesced output awaiting the next flush
     QByteArray m_hidden;    // rolling buffer retained while hidden
     QTimer m_flushTimer;
+    // QPointer, not a raw pointer: a caller-owned transport may be destroyed
+    // while the controller outlives it, and setTransport()'s disconnect() on
+    // the stale pointer would then be a use-after-free.
+    QPointer<QIODevice> m_transport = nullptr;
+    int m_columns = 0;      // last renderer geometry; 0 = never reported
+    int m_rows = 0;
 };
 
 } // namespace ch

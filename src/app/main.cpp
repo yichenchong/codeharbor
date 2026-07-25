@@ -1,5 +1,7 @@
 #include "AppController.h"
 #include "CodeharbordClient.h"
+#include "SessionBootstrap.h"
+#include "SshConnectionPool.h"
 #include "ViewerModel.h"
 #include "ViewerProfiles.h"
 #include "AgentStatusMonitor.h"
@@ -35,6 +37,20 @@ int main(int argc, char *argv[])
     // Client-side agent-status monitor (workstream A). Its transport is a
     // dedicated SSH agent-status channel wired later; fed AgentEvent JSONL.
     ch::AgentStatusMonitor agentMonitor;
+
+    // Remote session spine (workstream S): the SSH connection pool plus the
+    // bootstrap that opens the RPC and agent-status channels and hands each one
+    // to the consumer above as a QIODevice.
+    //
+    // A normal desktop launch stays server-less: connectAndWireFromEnvironment()
+    // returns immediately unless CH_LIVE_SSH is set (with CH_LIVE_HOST/PORT/
+    // USER/NODE/REPO), so the UI still comes up with no session and RPC calls
+    // fail gracefully with a synthetic transport error. The pool is declared
+    // before the bootstrap so it is destroyed after it: the channel devices the
+    // bootstrap owns must not outlive the session they were opened on.
+    ch::SshConnectionPool sshPool;
+    ch::SessionBootstrap sessionBootstrap(&sshPool, &client, &agentMonitor);
+    sessionBootstrap.connectAndWireFromEnvironment();
 
     // UI shell (workstream U) and viewer subsystem (workstream V) share the one
     // client. ViewerModel and ViewerProfiles share the same profiles so QML

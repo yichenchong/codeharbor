@@ -31,6 +31,9 @@ ui_*.h
 
 # Node / web
 node_modules/
+# Bundler/tsc output for every JS workspace (remote/dist, src/web/*/dist).
+# Multi-megabyte generated artifacts: rebuilt with `npm run build`, never committed.
+dist/
 *.tsbuildinfo
 .npm/
 .cache/
@@ -46,4 +49,8 @@ node_modules/
 *.local
 *.sqlite
 *.sqlite-journal
+
+# Live-gate test fixture: generated sshd host/client keypairs + runtime state.
+# NEVER commit these - they are real private keys, regenerated on demand.
+tests/live/.fixture/
 .env

@@ -89,10 +89,23 @@ CI provisions the same set — see [`.github/workflows/ci.yml`](../.github/workf
 ### Client (Qt / CMake)
 
 ```bash
+npm install                                      # once: web-asset workspaces
+npm run build --workspace src/web/editor         # Monaco bundle -> src/web/editor/dist/
 cmake --preset dev            # configure (Debug, Ninja, build/dev/)
 cmake --build --preset dev    # build -> build/dev/src/app/codeharbor
 ./build/dev/src/app/codeharbor
 ```
+
+The Monaco bundle is a gitignored build artifact that CMake embeds as
+`qrc:/codeharbor/web/editor/index.html` (see `src/qml/CMakeLists.txt`). CMake builds
+it for you at **configure** time when it is missing or older than its sources — so
+`npm install` above is the only prerequisite, and editing `src/web/editor/**`
+re-triggers it on the next configure.
+
+If the bundle is missing and cannot be built (no `npm` on `PATH`), configure
+**fails** with the command to run: a client whose editor pane silently loads nothing
+is never the default. Pass `-DCODEHARBOR_SKIP_WEB_BUNDLE=ON` to deliberately build
+an editor-less client.
 
 Presets are defined in [`CMakePresets.json`](../CMakePresets.json):
 `dev` (Debug + tests) and `release`.
@@ -106,7 +119,7 @@ Presets are defined in [`CMakePresets.json`](../CMakePresets.json):
 ```bash
 cd remote
 npm install        # dev-only deps (typescript, @types/node); runtime has none
-npm test           # node --test -> 15 tests
+npm test           # node --test -> 72 tests
 npm run typecheck  # tsc --noEmit
 npm run build      # tsc -> dist/ (codeharbord, codeharbor-bridge)
 ```
@@ -120,6 +133,69 @@ echo '{"jsonrpc":"2.0","id":1,"method":"server.info"}' | node src/codeharbord.ts
 # Agent-status bridge (listens on $XDG_RUNTIME_DIR/codeharbor.sock)
 node src/bridge.ts
 ```
+
+## Test suites
+
+```bash
+ctest --preset dev                 # default: unit + integration, no external deps
+ctest --preset dev -L live         # live gates (need a real SSH server, see below)
+```
+
+### Live gates
+
+The `live`-labelled targets (`tst_livessh`, `tst_liveterminal`, `tst_liveshell`,
+`tst_liveviewers`, `tst_liveeditor`, `tst_liveagent`) exercise the real thing: a real
+`sshd`, a real `codeharbord` over an SSH channel, real `tmux`, the real Monaco page,
+and the real agent hook. They **QSKIP** unless `CH_LIVE_SSH` is set, so the default
+suite stays portable.
+
+Requirements on the remote side: `tmux`, Node 23.6+, and this repository checked out
+at the path given by `CH_LIVE_REPO`. Pointing the fixture at `127.0.0.1` (your own
+machine as its own "remote") is the normal way to run them.
+
+Environment contract:
+
+| Variable | Meaning |
+|---|---|
+| `CH_LIVE_SSH` | Set to `1` to enable the gates; unset means QSKIP |
+| `CH_LIVE_HOST` / `CH_LIVE_PORT` | SSH endpoint (e.g. `127.0.0.1` / `2222`) |
+| `CH_LIVE_USER` | SSH login user |
+| `CH_LIVE_NODE` | **Absolute** path to `node` on the remote side (a non-interactive SSH session usually has no version-manager `PATH`) |
+| `CH_LIVE_REPO` | Absolute path to this repo on the remote side |
+| `CH_LIVE_KNOWN_HOSTS` | Scratch known-hosts file; the first-use host key is persisted here |
+| `SSH_AUTH_SOCK` | Agent socket holding the key — the pool authenticates via ssh-agent first |
+
+Standing up a throwaway `sshd` fixture (no root, no changes to your `~/.ssh`):
+
+```bash
+D=tests/live/.fixture && mkdir -p $D          # gitignored: it holds real private keys
+ssh-keygen -q -t ed25519 -f $D/hostkey -N ''
+ssh-keygen -q -t ed25519 -f $D/id -N ''
+cat $D/id.pub > $D/authorized_keys && chmod 600 $D/authorized_keys $D/id
+printf 'Port 2222\nListenAddress 127.0.0.1\nHostKey %s/hostkey\nAuthorizedKeysFile %s/authorized_keys\nPidFile %s/sshd.pid\nUsePAM no\nStrictModes no\nPasswordAuthentication no\nAllowUsers %s\nSubsystem sftp internal-sftp\n' \
+  "$PWD/$D" "$PWD/$D" "$PWD/$D" "$(whoami)" > $D/sshd_config
+
+/usr/sbin/sshd -D -e -f $PWD/$D/sshd_config &   # unprivileged; logs to stderr
+ssh-agent -a $PWD/$D/agent.sock &
+SSH_AUTH_SOCK=$PWD/$D/agent.sock ssh-add $D/id
+```
+
+Then run them:
+
+```bash
+export CH_LIVE_SSH=1 CH_LIVE_HOST=127.0.0.1 CH_LIVE_PORT=2222 CH_LIVE_USER=$(whoami)
+export CH_LIVE_NODE=$(command -v node) CH_LIVE_REPO=$PWD
+export SSH_AUTH_SOCK=$PWD/tests/live/.fixture/agent.sock
+export CH_LIVE_KNOWN_HOSTS=$(mktemp -u /tmp/ch_kh_XXXX)
+ctest --preset dev -L live --output-on-failure
+```
+
+> These tests render QML and Chromium headlessly; each target pins its own
+> environment (`QT_QPA_PLATFORM=offscreen`, `QT_QUICK_BACKEND=software`,
+> `QTWEBENGINE_CHROMIUM_FLAGS=--disable-gpu --no-sandbox --disable-dev-shm-usage`),
+> so no display is needed. Do **not** add `--single-process`: Chromium aborts with
+> "Single mode supports only single profile" as soon as a second
+> `QWebEngineProfile` exists, and the viewer stack creates two by design (SPEC 7.2).
 
 ## Cross-platform builds & releases
 

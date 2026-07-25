@@ -540,24 +540,47 @@ export class Workspace {
 
     reorderSessions(params: { groupId: string; orderedIds: string[] }): { ok: true } {
         return this.transaction(() => {
-            const ts = Date.now();
-            const stmt = this.db.prepare(
-                "UPDATE dev_sessions SET position = ?, updated_at = ? WHERE id = ? AND group_id = ?",
-            );
-            params.orderedIds.forEach((id, index) => {
-                stmt.run(index, ts, id, params.groupId);
-            });
+            this.packSessions(params.groupId, params.orderedIds, Date.now());
             return { ok: true } as const;
         });
     }
 
+    // Move a session into `groupId` at `position`, re-packing BOTH affected
+    // groups to contiguous 0..n-1. Storing the requested position verbatim used
+    // to leave the target group with two rows sharing it, and every listing
+    // query orders by `position, id` — so a tie was broken by UUID, i.e. at
+    // random (a drag to the top could land second). The target order is
+    // therefore rebuilt explicitly: read the group's current order, drop the
+    // moved row if it is already there, splice it back in at the clamped index,
+    // and renumber. The source group is renumbered from its own fresh read so
+    // the vacated slot leaves no hole. All of it inside one transaction, the
+    // same idiom reorderSessions/reorderGroups use.
     moveSessionToGroup(params: MoveSessionParams): Session {
-        this.getSession(params.id); // reject a move of an unknown session
-        const position = params.position ?? this.nextPosition("dev_sessions", "group_id", params.groupId);
-        this.db
-            .prepare("UPDATE dev_sessions SET group_id = ?, position = ?, updated_at = ? WHERE id = ?")
-            .run(params.groupId, position, Date.now(), params.id);
-        return this.getSession(params.id);
+        return this.transaction(() => {
+            const sourceGroupId = this.getSession(params.id).groupId; // also rejects an unknown session
+            const ts = Date.now();
+
+            // Target order as it will be AFTER the move, moved row excluded so a
+            // same-group move is a pure reorder rather than a duplicate entry.
+            const ordered = this.orderedSessionIds(params.groupId).filter((id) => id !== params.id);
+            const requested = params.position;
+            const index =
+                requested === undefined || !Number.isFinite(requested)
+                    ? ordered.length
+                    : Math.min(Math.max(Math.trunc(requested), 0), ordered.length);
+            ordered.splice(index, 0, params.id);
+
+            this.db
+                .prepare("UPDATE dev_sessions SET group_id = ?, updated_at = ? WHERE id = ?")
+                .run(params.groupId, ts, params.id);
+
+            this.packSessions(params.groupId, ordered, ts);
+            if (sourceGroupId !== params.groupId) {
+                // Fresh read: the moved row already belongs to the target group.
+                this.packSessions(sourceGroupId, this.orderedSessionIds(sourceGroupId), ts);
+            }
+            return this.getSession(params.id);
+        });
     }
 
     // Copy a Dev Session's viewer + terminal pane definitions, split layouts,
@@ -860,6 +883,27 @@ export class Workspace {
         this.db.prepare("DELETE FROM terminal_panes WHERE dev_session_id = ?").run(id);
         this.db.prepare("DELETE FROM session_layouts WHERE dev_session_id = ?").run(id);
         this.db.prepare("DELETE FROM dev_sessions WHERE id = ?").run(id);
+    }
+
+    // A group's session ids in listing order — the same `position, id` ordering
+    // every read path uses, so a re-pack built from it preserves what the client
+    // last saw.
+    private orderedSessionIds(groupId: string): string[] {
+        const rows = this.db
+            .prepare("SELECT id FROM dev_sessions WHERE group_id = ? ORDER BY position, id").all(groupId) as unknown as Array<{ id: string }>;
+        return rows.map((r) => r.id);
+    }
+
+    // Assign contiguous positions 0..n-1 to `orderedIds` within one group. The
+    // group_id guard keeps a stale id from renumbering a row that has since
+    // moved elsewhere. Callers must already be inside a transaction.
+    private packSessions(groupId: string, orderedIds: readonly string[], ts: number): void {
+        const stmt = this.db.prepare(
+            "UPDATE dev_sessions SET position = ?, updated_at = ? WHERE id = ? AND group_id = ?",
+        );
+        orderedIds.forEach((id, index) => {
+            stmt.run(index, ts, id, groupId);
+        });
     }
 
     private nextPosition(table: string, scopeColumn: string, scopeValue: string): number {

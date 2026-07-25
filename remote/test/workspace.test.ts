@@ -675,3 +675,144 @@ test("migrate applies cleanly to a fresh database and is idempotent across reope
 
     await cleanup(dbPath);
 });
+
+// --- moveSessionToGroup ordering (drag-to-position) -------------------------
+
+// A bare session in `groupId`, named so ordering assertions read as a sequence.
+function mkSession(ws: Workspace, groupId: string, name: string) {
+    return ws.createSession({ serverId: SERVER, groupId, name, repositoryRoot: "/repo" });
+}
+
+// The group's sessions exactly as a client sees them: listing order (which is
+// `ORDER BY position, id`) plus the stored positions.
+function ordered(ws: Workspace, groupId: string): { names: string[]; positions: number[] } {
+    const group = ws.list(SERVER).find((g) => g.id === groupId);
+    assert.ok(group, `group not listed: ${groupId}`);
+    return {
+        names: group.sessions.map((s) => s.name),
+        positions: group.sessions.map((s) => s.position),
+    };
+}
+
+test("moveSessionToGroup at position 0 lands on top of a group that already has a row at 0", async () => {
+    const dbPath = await tmpDbPath();
+    const ws = openWorkspace(dbPath);
+    const alpha = ws.createGroup({ serverId: SERVER, name: "Alpha" });
+    const beta = ws.createGroup({ serverId: SERVER, name: "Beta" });
+    mkSession(ws, alpha.id, "A0"); // already occupies position 0
+    mkSession(ws, alpha.id, "A1");
+    const moved = mkSession(ws, beta.id, "X");
+
+    // The live failure: the moved row used to keep the raw position 0, tying with
+    // A0, and the `position, id` tiebreak dropped it wherever its UUID sorted.
+    const result = ws.moveSessionToGroup({ id: moved.id, groupId: alpha.id, position: 0 });
+
+    assert.equal(result.position, 0);
+    assert.deepEqual(ordered(ws, alpha.id), { names: ["X", "A0", "A1"], positions: [0, 1, 2] });
+    assert.deepEqual(ordered(ws, beta.id), { names: [], positions: [] });
+
+    ws.close();
+    await cleanup(dbPath);
+});
+
+test("moveSessionToGroup re-packs both the source and the target group to 0..n-1", async () => {
+    const dbPath = await tmpDbPath();
+    const ws = openWorkspace(dbPath);
+    const alpha = ws.createGroup({ serverId: SERVER, name: "Alpha" });
+    const beta = ws.createGroup({ serverId: SERVER, name: "Beta" });
+    mkSession(ws, alpha.id, "A0");
+    const a1 = mkSession(ws, alpha.id, "A1"); // middle row: removing it leaves a hole
+    mkSession(ws, alpha.id, "A2");
+    mkSession(ws, beta.id, "B0");
+    mkSession(ws, beta.id, "B1");
+
+    ws.moveSessionToGroup({ id: a1.id, groupId: beta.id, position: 1 });
+
+    assert.deepEqual(ordered(ws, alpha.id), { names: ["A0", "A2"], positions: [0, 1] });
+    assert.deepEqual(ordered(ws, beta.id), { names: ["B0", "A1", "B1"], positions: [0, 1, 2] });
+
+    ws.close();
+    await cleanup(dbPath);
+});
+
+test("moveSessionToGroup reorders within the same group and appends at position n", async () => {
+    const dbPath = await tmpDbPath();
+    const ws = openWorkspace(dbPath);
+    const group = ws.createGroup({ serverId: SERVER, name: "Alpha" });
+    mkSession(ws, group.id, "A0");
+    mkSession(ws, group.id, "A1");
+    const a2 = mkSession(ws, group.id, "A2");
+
+    // Last -> first: a same-group move is a reorder, never a duplicate position.
+    ws.moveSessionToGroup({ id: a2.id, groupId: group.id, position: 0 });
+    assert.deepEqual(ordered(ws, group.id), { names: ["A2", "A0", "A1"], positions: [0, 1, 2] });
+
+    // P = n (the count after removing the moved row) means "the end".
+    ws.moveSessionToGroup({ id: a2.id, groupId: group.id, position: 2 });
+    assert.deepEqual(ordered(ws, group.id), { names: ["A0", "A1", "A2"], positions: [0, 1, 2] });
+
+    // An omitted position also appends, and still leaves the group packed.
+    const a0 = ws.list(SERVER).find((g) => g.id === group.id)!.sessions[0];
+    ws.moveSessionToGroup({ id: a0.id, groupId: group.id });
+    assert.deepEqual(ordered(ws, group.id), { names: ["A1", "A2", "A0"], positions: [0, 1, 2] });
+
+    ws.close();
+    await cleanup(dbPath);
+});
+
+test("moveSessionToGroup clamps an out-of-range position instead of storing it raw", async () => {
+    const dbPath = await tmpDbPath();
+    const ws = openWorkspace(dbPath);
+    const alpha = ws.createGroup({ serverId: SERVER, name: "Alpha" });
+    const beta = ws.createGroup({ serverId: SERVER, name: "Beta" });
+    mkSession(ws, alpha.id, "A0");
+    mkSession(ws, alpha.id, "A1");
+    const x = mkSession(ws, beta.id, "X");
+    const y = mkSession(ws, beta.id, "Y");
+
+    const far = ws.moveSessionToGroup({ id: x.id, groupId: alpha.id, position: 99 });
+    assert.equal(far.position, 2);
+    assert.deepEqual(ordered(ws, alpha.id), { names: ["A0", "A1", "X"], positions: [0, 1, 2] });
+
+    const negative = ws.moveSessionToGroup({ id: y.id, groupId: alpha.id, position: -5 });
+    assert.equal(negative.position, 0);
+    assert.deepEqual(ordered(ws, alpha.id), { names: ["Y", "A0", "A1", "X"], positions: [0, 1, 2, 3] });
+
+    ws.close();
+    await cleanup(dbPath);
+});
+
+test("session ordering stays tie-free and stable across repeated reads after moves", async () => {
+    const dbPath = await tmpDbPath();
+    const ws = openWorkspace(dbPath);
+    const alpha = ws.createGroup({ serverId: SERVER, name: "Alpha" });
+    const beta = ws.createGroup({ serverId: SERVER, name: "Beta" });
+    const ids: string[] = [];
+    for (let i = 0; i < 6; i++) ids.push(mkSession(ws, i % 2 === 0 ? alpha.id : beta.id, `S${i}`).id);
+
+    // A pile of cross-group and same-group drags, always at the contested top.
+    for (const id of ids) {
+        ws.moveSessionToGroup({ id, groupId: alpha.id, position: 0 });
+        ws.moveSessionToGroup({ id, groupId: beta.id, position: 1 });
+    }
+
+    for (const groupId of [alpha.id, beta.id]) {
+        const rows = ws.db
+            .prepare("SELECT position FROM dev_sessions WHERE group_id = ?").all(groupId) as unknown as Array<{ position: number }>;
+        const positions = rows.map((r) => r.position);
+        // No two rows in a group share a position, so no read depends on the
+        // UUID tiebreak in `ORDER BY position, id`.
+        assert.equal(new Set(positions).size, positions.length);
+        assert.deepEqual(
+            [...positions].sort((a, b) => a - b),
+            positions.map((_, i) => i),
+        );
+        // Repeated reads return the identical sequence.
+        const first = ordered(ws, groupId);
+        assert.deepEqual(ordered(ws, groupId), first);
+        assert.deepEqual(ordered(ws, groupId), first);
+    }
+
+    ws.close();
+    await cleanup(dbPath);
+});

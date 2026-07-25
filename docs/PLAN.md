@@ -38,9 +38,9 @@ contract so downstream work can build against it before it is fully implemented.
   - **Verified:** `npm test` → 11/11 pass; RPC stdio + bridge socket smoke-tested.
 - CI: `remote` job (install/typecheck/test) and `client` job (Qt+CMake build).
 
-> Everything below is **not yet built**. No stubs are presented as complete; the
-> `throw new Error("not implemented")` seams in `src/web/*` and the thin `ch_*`
-> libs are explicitly bootstrap placeholders scoped to the workstreams here.
+> The bootstrap seams described above are all filled in by later waves; see
+> "Delivery progress" for what actually landed and the corrections found when the
+> live gates were first exercised.
 
 ## Contracts (freeze before fan-out)
 
@@ -112,7 +112,7 @@ graph TD
 - **Stop gate:** [x] MET — `workspace.test.ts` create→reopen→reload identical;
   `tst_workspacedb` client parse/serialize + live round-trip.
 
-### S — SSH transport — ✅ code complete (Wave 1); ⏳ live gate deferred
+### S — SSH transport — ✅ LANDED (Wave 1); live gate MET (Wave 5)
 - **Start gate:** [x] Bootstrap · [x] libssh available (`libssh-dev`).
 - **TODO:**
   - [x] `SshConnectionPool`: one authenticated connection, N channels (SPEC 5.3).
@@ -120,9 +120,10 @@ graph TD
   - [x] Channel factory for PTY / RPC / agent-status channels.
   - [x] Credential handling via SSH agent → key → password callback (no secrets stored).
 - **Contract exposed:** `openChannel(kind)`, host-key callback, state signals.
-- **Stop gate:** ⏳ DEFERRED — the live SSH round-trip needs a test server (not
-  available in CI here). Host-key logic covered by `tst_knownhosts`; the
-  connect→verify→auth→openChannel path is implemented but unexercised live.
+- **Stop gate:** ✅ MET — `tst_livessh` (label `live`) connects to a real sshd via
+  ssh-agent auth, persists the first-use host key, runs an Exec channel, and drives
+  JSON-RPC to a real `codeharbord` over an SSH channel; `tst_knownhosts` covers the
+  host-key/@revoked logic. Reconnect scheduling on the RPC channel is still TBD.
 - **Parallel with:** M, R-server, P.
 
 ### R — Remote service + client — ✅ LANDED (R-server Wave 1, R-client Wave 2)
@@ -141,7 +142,7 @@ graph TD
   - **Stop gate:** [x] MET — `tst_rpcclient` (framing, id-matching, errors,
     teardown) + live `server.info` over a piped codeharbord.
 
-### T — Terminal — ✅ code complete (Wave 2); ⏳ live gate deferred
+### T — Terminal — ✅ LANDED (Wave 2); live gate MET (Wave 5)
 - **Start gate:** [x] S PTY channel · [x] C3.
 - **TODO:**
   - [x] `TerminalController`: buffering (SPEC 5.5), state machine (SPEC 5.6),
@@ -149,12 +150,17 @@ graph TD
   - [x] tmux target naming with stable IDs (SPEC 5.2) + shell-safe command.
   - [x] xterm.js renderer in `src/web/terminal` + WebChannel bridge (C3).
   - [x] Recursive terminal-region split tree in QML.
-- **Stop gate:** ⏳ DEFERRED — live attach/resize/reconnect needs a server +
-  display. Controller logic covered by `tst_terminalcontroller`; kill/detach/
-  reconnect wiring lands with the app shell (U).
+- **Stop gate:** ✅ MET — `tst_liveterminal` attaches to a real tmux session over a
+  real SSH PTY, and the remote side confirms each step: the marker is produced by
+  remote execution, `tmux display-message` reports 80x24 → 100x30 after
+  `TerminalController::resize`, and after dropping the channel a fresh PTY re-attach
+  finds the same pane (identical shell pid, scrollback intact). Controller logic is
+  covered by `tst_terminalcontroller`. Wave 5 added the missing production seam:
+  `TerminalController::setTransport(QIODevice*)`, with resize reaching
+  `SshChannelDevice::resizePty`. Kill/detach UI still lands with U.
 - **Parallel with:** V, E (different regions).
 
-### V — Viewers — ✅ code complete (Wave 3); ⏳ live-display gate deferred
+### V — Viewers — ✅ LANDED (Wave 3); live gate MET (Wave 5)
 - **Start gate:** [x] Bootstrap · [x] R-client (for `file://`).
 - **TODO:**
   - [x] `ViewerHandlerRegistry` by scheme + extension (SPEC 7.5 table).
@@ -162,71 +168,93 @@ graph TD
   - [x] `codeharbor-internal://` scheme handler + bidirectional URL map (SPEC 7.4), served via file.readFile.
   - [x] Views: web, source/text, markdown, structured-data, image, PDF,
     directory, binary; recursive viewer-region split tree in QML.
-- **Stop gate:** ✅ testable parts MET — `tst_viewers` covers the SPEC 7.5 table,
-  URL round-trip, MIME, and profile isolation (external no-scheme / internal
-  privileged, M3). ⏳ The live "HTTPS + text + image + directory in split panes"
-  render needs a display + server; wired but unexercised headless.
+- **Stop gate:** ✅ MET — `tst_liveviewers` loads real remote file bytes through
+  `codeharbor-internal://` into a WebEngineView headless and reads them back out of
+  the page via `runJavaScript`; live `file.listDirectory` populates a directory view
+  per pane; the split tree is measured in 6 cases (even, 3-way, explicit ratios,
+  pane added after first layout) with extents summing to the parent within 1px; and
+  `grabWindow()` frame proofs are saved as PNGs. `tst_viewers` still covers the
+  SPEC 7.5 table, URL round-trip, MIME and profile isolation.
+  Wave 5 fixed a real defect this gate exposed: every branch child set
+  `SplitView.fillWidth/fillHeight`, but SplitView stretches only the FIRST fill
+  item, so a 2-pane split rendered as one full pane plus a zero-extent sibling.
+  Splits now size from the node's persisted `ratios`.
 - **Parallel with:** T.
 
-### E — Remote editor — ✅ core landed (Wave 4); ⏳ live editor gate deferred
+### E — Remote editor — ✅ LANDED (Wave 4); live gate MET (Wave 5)
 - **Start gate:** [x] R file methods (stat/read/write/watch) · [x] V pane host · [x] C3.
 - **TODO:**
   - [x] Monaco bundle + WebChannel-native `EditorBridge` (C3, object "editor") in `src/web/editor`.
   - [x] File-state machine (SPEC 8.2), revision-guarded save + conflict (SPEC 8.6 — never silent overwrite), external-change reload for clean buffers / no-clobber when dirty.
   - [x] Unsaved recovery snapshots on the server (SPEC 11.3) via revision-guarded writeFile; per-pane EditorController (EditorFactory) with watch released on close.
-- **Stop gate:** ✅ testable core MET — `tst_editorcontroller` covers load→Clean,
-  revision-guarded save, conflict (no overwrite), external reload vs dirty
-  no-clobber, recovery snapshot+offer, and watch-unsubscribe on close/reopen.
-  ⏳ Live editing deferred to a display + packaged Monaco bundle; refinements: a
-  JS→C++ ready handshake (content can be missed before the page connects) and
-  clearing the recovery snapshot on a successful save.
+- **Stop gate:** ✅ MET — `tst_liveeditor` drives the real packaged Monaco page in
+  the real `EditorPaneView` over a real SSH connection: the load assertion is read
+  from INSIDE the page (`monaco.editor.getModels()[0].getValue()`), the edit is made
+  with Monaco's own type command, a real DOM Ctrl+S triggers the revision-guarded
+  save, and the REMOTE DISK bytes are re-read out of band to confirm it landed.
+  SPEC 8.6 is proven live: an external change makes the stale-revision save conflict,
+  the doomed edit is absent from disk, and the page's own Reload path then adopts the
+  server revision so the next save succeeds. `tst_editorcontroller` covers the state
+  machine. Both previously-deferred refinements are DONE: the JS→C++ `ready()`
+  handshake (content pushed before the page connects is buffered and replayed) and
+  clearing the recovery snapshot on a successful save. The Monaco bundle is now
+  really packaged (esbuild → qrc), built automatically at configure time.
 - **Parallel with:** T.
 
-### A — Agent awareness — ✅ core landed (Wave 4); ⏳ live sidebar/notify deferred
+### A — Agent awareness — ✅ LANDED (Wave 4); live gate MET (Wave 5)
 - **Start gate:** [x] bridge+adapters DONE · [x] S agent channel (ChannelKind::AgentStatus) · [x] U sidebar.
 - **TODO:**
   - [x] `AgentStatusMonitor` (C++) consuming AgentEvent JSONL over the agent channel.
   - [x] Map `AgentState` → sidebar row precedence + unseen-completion; markSeen clears the badge; notify() hook on waiting_input/idle_unseen (OS notification display-deferred).
   - [x] `oh-my-pi` installable hook emitting BridgeMessage through the bridge (single mapping point); `pi`/`claude-code` adapters already registered server-side.
   - [x] Fallback coarse activity detection (SPEC 6.6) for the adapterless `generic` harness.
-- **Stop gate:** ✅ testable core MET — `tst_agentmonitor` (parse/framing/state/unseen/markSeen),
-  the hook→bridge→AgentEvent end-to-end test, and `tst_appcontroller` (live agent state
-  merged into the sidebar, not wiped by refresh). ⏳ The live "run Oh My Pi → sidebar
-  reacts" gate needs a display + a running agent channel.
+- **Stop gate:** ✅ MET — `tst_liveagent` runs the REAL hook on the remote side
+  (one node process per firing) into the REAL bridge, over an SSH AgentStatus
+  channel, and observes the ordered transitions
+  `starting → running → waiting_input → running → idle_unseen`, with the summary
+  surviving the whole chain, `markSeen` clearing the badge idempotently, and the
+  sidebar row going FinishedUnseen → Idle. Remote bridge pids are asserted reaped
+  (an SSH exec channel sends no SIGHUP). OS desktop notifications remain
+  display-deferred: `notify()` fires and is asserted, but nothing renders headless.
 - **Parallel with:** V, E (after U).
 
-### U — UI shell & persistence — ✅ core landed (Wave 3); ⏳ live restart gate deferred
+### U — UI shell & persistence — ✅ LANDED (Wave 3); live gate MET (Wave 5)
 - **Start gate:** [x] M models · [x] P (for layout persistence).
 - **TODO:**
   - [x] Sidebar: groups (collapse), session rows with aggregate status, ops
     create/rename/duplicate/move/delete (SPEC 4.2). Drag-reorder: invokables ready, DnD UI TBD.
   - [x] Persist region widths + selected pane per client (QSettings, SPEC 4.1); split ratios persist server-side via P layouts.
   - [ ] Command palette + keyboard shortcuts (SPEC 15).
-- **Stop gate:** ✅ testable parts MET — `tst_appcontroller` covers GroupNode→row
-  mapping + UiStateStore persistence across a fresh instance ("restart"). ⏳ Live
-  CRUD against a running server + width-restore on app relaunch needs display + server.
+- **Stop gate:** ✅ MET — `tst_liveshell` performs live CRUD through AppController's
+  invokables against a real `codeharbord`, then re-reads every mutation through a
+  SECOND independent codeharbord process (so a local-only mutation fails), and
+  proves width persistence three ways: the real `Main.qml` restores stored widths
+  in-process, a real-binary launch does NOT rewrite them (even when the window is
+  too narrow to honour them), and a real handle drag DOES persist to disk.
+  Wave 5 fixed a defect this gate exposed: persistence fired on every width change,
+  so a restored width that did not fit was clamped and the clamped value overwrote
+  the user's preference permanently. Writes now happen only on drag end.
+  Command palette + shortcuts (SPEC 15) remain unimplemented.
 - **Parallel with:** V/T rendering (consumes their pane views).
 
 ## Milestones (integration barriers → SPEC §16)
 
 - **M0 — Bootstrap (DONE).** Repo, build wiring, remote core tested.
-- **M1 — Terminal vertical slice (SPEC Phase 0).** ⏳ Code complete (S + T + U shell);
-  the live stop gate (attach/resize/reconnect) needs a test SSH server + display.
-  Transport + controller unit-tested.
-- **M2 — Core workspace (SPEC Phase 1).** ✅ Landed: M + P + R-client + U (sidebar,
-  CRUD, persistence). Live multi-terminal render + relaunch-restore deferred to a
-  display/server; logic unit-tested (`tst_appcontroller`).
-- **M3 — Remote viewers (SPEC Phase 2).** ✅ Landed: V handler registry + dual-profile
-  isolation + internal scheme + viewer split-tree. Live split-pane render deferred
-  to a display/server; registry/URL/MIME/isolation unit-tested (`tst_viewers`).
-- **M4 — Remote editing (SPEC Phase 3).** ✅ Landed: E editor state machine +
-  revision-guarded save/conflict + external reload + recovery snapshots + Monaco
-  bridge. Live in-pane editing deferred to a display + packaged bundle; core
-  unit-tested (`tst_editorcontroller`).
-- **M5 — Agent awareness (SPEC Phase 4).** ✅ Landed: A monitor + state/unseen
-  mapping + oh-my-pi hook + fallback; agent state merged into the sidebar. Live
-  agent-driven sidebar deferred to a display/agent channel; core unit-tested
-  (`tst_agentmonitor`, `tst_appcontroller`).
+- **M1 — Terminal vertical slice (SPEC Phase 0).** ✅ REACHED (live, Wave 5) — real
+  SSH attach to a real tmux session, remote-confirmed resize, and reconnect onto the
+  same pane (`tst_livessh`, `tst_liveterminal`).
+- **M2 — Core workspace (SPEC Phase 1).** ✅ REACHED (live, Wave 5) — live CRUD
+  against a real `codeharbord`, verified through a second independent server process,
+  plus width restore and drag-persistence (`tst_liveshell`).
+- **M3 — Remote viewers (SPEC Phase 2).** ✅ REACHED (live, Wave 5) — real remote
+  bytes rendered through `codeharbor-internal://`, live directory listings, measured
+  split geometry, frame proofs (`tst_liveviewers`).
+- **M4 — Remote editing (SPEC Phase 3).** ✅ REACHED (live, Wave 5) — real Monaco
+  editing a real remote file over SSH, save landing on remote disk, live conflict
+  refusal + reload (`tst_liveeditor`).
+- **M5 — Agent awareness (SPEC Phase 4).** ✅ REACHED (live, Wave 5) — the real hook
+  on the remote side driving ordered sidebar transitions and badge clearing
+  (`tst_liveagent`). OS desktop notifications remain display-deferred.
 
 ## Delivery progress
 
@@ -249,9 +277,49 @@ active-MIME gate) and a Wave-4 adversarial review (E watch-subscription leak +
 read-only save; A markSeen badge-clear + version fidelity + transport UAF).
 Contract: the oh-my-pi hook emits BridgeMessage (the bridge stays the single mapping point).
 
-> All five feature milestones (M1–M5) are code-complete. Remaining work is almost
-> entirely LIVE gates — S/T attach, U/V/E in-pane render, live agent-driven
-> sidebar — each wired + unit-tested, needing a reachable SSH server + a display.
-> Two E code refinements also remain: a JS→C++ ready handshake (content can be
-> missed before the page connects) and clearing the recovery snapshot on a
-> successful save.
+> **Correction (found when the live gates were first exercised — Wave 5).** The
+> M1–M5 claim above described unit-tested logic, and two things it implied were
+> false:
+>
+> 1. **No transport spine.** `CodeharbordClient::setTransport` and
+>    `AgentStatusMonitor::setTransport` existed and were unit-tested, but there was
+>    no `QIODevice` over an `ssh_channel` and `main.cpp` never called either. The
+>    shipped app could not reach a remote server at all — the client subsystems
+>    were only ever driven by test doubles.
+> 2. **The app could not start.** `ViewerRegion.qml`/`TerminalRegion.qml`
+>    instantiated their own type recursively, which QML rejects, so `Main.qml`
+>    failed to load. No test instantiated the real QML tree, so a green 9/9 suite
+>    coexisted with an app that could not launch.
+>
+> Both were fixed in Wave 5 (`SshChannelDevice` + `SessionBootstrap`; url-sourced
+> `Loader` recursion + a permanent `tst_qmlload` gate). Treat "code complete" as
+> "unit-tested logic" unless a workstream's live gate is explicitly marked MET.
+
+**Wave 5 — ✅ DONE (live gates).** Every deferred live gate is now MET against a real
+sshd + real `codeharbord`: S, T, U, V, E, A (`tst_livessh`, `tst_liveterminal`,
+`tst_liveshell`, `tst_liveviewers`, `tst_liveeditor`, `tst_liveagent`, all labelled
+`live` and QSKIPped when `CH_LIVE_SSH` is unset, so the default suite stays portable).
+Milestones M1–M5 are reached LIVE, not just unit-tested.
+
+Wave 5 built the missing production spine (`SshChannelDevice` — a `QIODevice` over an
+`ssh_channel`; `SessionBootstrap` wiring RPC + agent channels in `main.cpp`;
+`TerminalController::setTransport`) and packaged the real Monaco bundle (esbuild → qrc,
+auto-built at configure time, with CMake refusing to configure a silently editor-less
+client). Defects the live gates exposed — none of which the headless suite could see:
+
+- **QML could not load at all** — recursive self-instantiation in both region types.
+- **Zero-extent split panes** — `SplitView` stretches only the first fill item, so a
+  2-pane split showed one pane plus an invisible sibling.
+- **Region widths destroyed on launch** — persistence fired on clamped layout changes,
+  overwriting the user's stored preference permanently.
+- **Non-deterministic sidebar ordering** — `moveSessionToGroup` left rows tied on
+  `position`, so `ORDER BY position, id` fell back to UUID order.
+- **Orphaned remote process per launch** — an SSH exec channel sends no SIGHUP, so the
+  agent bridge outlived the app.
+- **Fatal Chromium flag** — `--single-process` aborts once a second `QWebEngineProfile`
+  exists, which the viewer stack creates by design.
+
+> Remaining known gaps (not live-gate blocked): command palette + keyboard shortcuts
+> (SPEC 15), sidebar drag-and-drop UI (invokables exist), RPC-channel reconnect
+> scheduling, tmux session discovery over RPC, OS desktop notifications, and writing
+> drag-adjusted split ratios back to the server.

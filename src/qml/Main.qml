@@ -21,13 +21,21 @@ ApplicationWindow {
                                     Math.round(terminalRegion.width));
     }
 
-    // Debounce persistence: a handle drag fires onWidthChanged rapidly, so
-    // coalesce into a single write shortly after the drag settles rather than
-    // writing on every pixel change.
-    Timer {
-        id: persistTimer
-        interval: 300
-        onTriggered: window.persistRegionWidths()
+    // Persist ONLY user-driven handle drags, never layout-driven width changes.
+    // Writing back on every onWidthChanged destroyed stored widths: a restored
+    // width that does not fit the current window is clamped by SplitView (against
+    // the neighbouring region's minimumWidth), and persisting that clamped value
+    // overwrote the user's real preference permanently - open the app once on a
+    // narrower screen and the stored width was gone for good.
+    //
+    // SplitView.resizing is true only while a handle is being dragged, so the
+    // write happens exactly once, when a drag finishes.
+    Connections {
+        target: outer
+        function onResizingChanged() {
+            if (!outer.resizing)
+                window.persistRegionWidths();
+        }
     }
 
     SplitView {
@@ -48,19 +56,22 @@ ApplicationWindow {
             id: sidebarRegion
             SplitView.preferredWidth: 260
             SplitView.minimumWidth: 180
-            onWidthChanged: persistTimer.restart()
         }
 
+        // The regions are recursive split trees and start out empty; the app
+        // owns the SPEC 4.5 "always at least one pane" default so the recursive
+        // type never instantiates a pane for a placeholder node.
         ViewerRegion {
+            node: ({ paneId: "viewer-1", url: "", children: [] })
             SplitView.fillWidth: true
             SplitView.minimumWidth: 320
         }
 
         TerminalRegion {
             id: terminalRegion
+            node: ({ paneId: "terminal-1", children: [] })
             SplitView.preferredWidth: 520
             SplitView.minimumWidth: 280
-            onWidthChanged: persistTimer.restart()
         }
     }
 

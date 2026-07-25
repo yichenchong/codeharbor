@@ -89,6 +89,8 @@ private slots:
     void recoverySnapshotWrittenAndOfferedOnReopen();
     void unwatchIssuedOnDestruction();
     void reopenUnwatchesPreviousSubscription();
+    void contentBufferedUntilPageReportsReady();
+    void successfulSaveClearsRecoverySnapshot();
 
 private:
     void makePair();
@@ -99,6 +101,7 @@ private:
     void sendNotification(const QString& m, const QJsonObject& params);
     // Drain the watch subscription + (absent) recovery stat that follow a load.
     void serveWatchThenNoRecovery();
+    // ready() (the page is connected, so content flows straight through) then
     // open(path) -> readFile(content,rev) -> Clean, plus watch + empty recovery.
     void openClean(const QString& path, const QString& content, const QString& rev);
 
@@ -219,6 +222,10 @@ void TstEditorController::serveWatchThenNoRecovery()
 void TstEditorController::openClean(const QString& path, const QString& content,
                                     const QString& rev)
 {
+    // Stand in for the WebChannel editor page finishing its handshake. Without
+    // it contentLoaded is HELD (see contentBufferedUntilPageReportsReady), which
+    // is exactly the first-buffer loss the handshake exists to prevent.
+    m_controller->ready();
     m_controller->open(path);
     const QJsonObject read = nextRequest();
     QCOMPARE(method(read), kReadFile);
@@ -523,6 +530,139 @@ void TstEditorController::reopenUnwatchesPreviousSubscription()
     const QJsonObject finalUnwatch = nextRequest();
     QCOMPARE(method(finalUnwatch), kUnwatch);
     QCOMPARE(reqSubscriptionId(finalUnwatch), QStringLiteral("sub2"));
+}
+
+// A load that completes BEFORE the WebChannel page connects must not be lost:
+// EditorController holds it and replays it exactly once from ready().
+void TstEditorController::contentBufferedUntilPageReportsReady()
+{
+    makePair(); // deliberately NO ready(): the page has not connected yet
+
+    QSignalSpy contentSpy(m_controller, &EditorController::contentLoaded);
+
+    m_controller->open(QStringLiteral("/foo/f.txt"));
+    const QJsonObject read = nextRequest();
+    QCOMPARE(method(read), kReadFile);
+    respondResult(reqId(read), {{"path", "/foo/f.txt"},
+                                {"encoding", "utf8"},
+                                {"content", "loaded before the page"},
+                                {"revision", "r1"},
+                                {"truncated", false}});
+    serveWatchThenNoRecovery();
+
+    // The load completed — state and baseline revision advanced — but the page
+    // is not listening, so nothing was pushed to it.
+    QTRY_COMPARE(m_controller->fileState(), QStringLiteral("clean"));
+    QCOMPARE(m_controller->revision(), QStringLiteral("r1"));
+    QCOMPARE(contentSpy.count(), 0);
+
+    // Page connects: the held buffer is delivered, intact and exactly once.
+    m_controller->ready();
+    QTRY_COMPARE(contentSpy.count(), 1);
+    QCOMPARE(contentSpy.at(0).at(0).toString(),
+             QStringLiteral("loaded before the page"));
+    QCOMPARE(contentSpy.at(0).at(1).toString(), QStringLiteral("r1"));
+
+    // A second ready() is a page RELOAD. It must NOT replay the consumed
+    // buffer (that would be a duplicate); it re-fetches instead.
+    m_controller->ready();
+    const QJsonObject refetch = nextRequest();
+    QCOMPARE(method(refetch), kReadFile);
+    QCOMPARE(reqPath(refetch), QStringLiteral("/foo/f.txt"));
+    QCOMPARE(contentSpy.count(), 1);
+
+    // ...and the re-fetched content lands once, not twice.
+    respondResult(reqId(refetch), {{"path", "/foo/f.txt"},
+                                   {"encoding", "utf8"},
+                                   {"content", "loaded before the page"},
+                                   {"revision", "r1"},
+                                   {"truncated", false}});
+    QTRY_COMPARE(contentSpy.count(), 2);
+    QTest::qWait(100);
+    QCOMPARE(contentSpy.count(), 2);
+}
+
+// SPEC 11.3: once a save succeeds the recovery snapshot is obsolete. It MUST be
+// cleared, or reopening the file offers a stale "unsaved changes" buffer that
+// the user already committed.
+void TstEditorController::successfulSaveClearsRecoverySnapshot()
+{
+    makePair();
+    openClean(QStringLiteral("/foo/f.txt"), QStringLiteral("orig"),
+              QStringLiteral("r1"));
+
+    // Unsaved edit -> snapshot written (create-only, adopts revision "rec1").
+    m_controller->reportContent(QStringLiteral("edited"));
+    const QJsonObject snapshot = nextRequest();
+    QCOMPARE(method(snapshot), kWriteFile);
+    const QString recoveryPath = reqPath(snapshot);
+    QVERIFY(recoveryPath.contains(QStringLiteral(".codeharbor-recovery")));
+    QCOMPARE(reqContent(snapshot), QStringLiteral("edited"));
+    respondResult(reqId(snapshot), {{"path", recoveryPath}, {"revision", "rec1"}});
+
+    // Save the buffer for real.
+    QSignalSpy savedSpy(m_controller, &EditorController::saved);
+    m_controller->save(QStringLiteral("edited"), QStringLiteral("r1"));
+    const QJsonObject write = nextRequest();
+    QCOMPARE(method(write), kWriteFile);
+    QCOMPARE(reqPath(write), QStringLiteral("/foo/f.txt"));
+    respondResult(reqId(write), {{"path", "/foo/f.txt"}, {"revision", "r2"}});
+    QTRY_COMPARE(savedSpy.count(), 1);
+
+    // The snapshot is truncated: a zero-length, revision-GUARDED write (the C1
+    // catalog has no delete). Guarding on "rec1" means a snapshot another
+    // session replaced would be refused rather than destroyed.
+    const QJsonObject clear = nextRequest();
+    QCOMPARE(method(clear), kWriteFile);
+    QCOMPARE(reqPath(clear), recoveryPath);
+    QCOMPARE(reqContent(clear), QString());
+    QCOMPARE(reqExpectedRevision(clear), QStringLiteral("rec1"));
+    respondResult(reqId(clear), {{"path", recoveryPath}, {"revision", "rec2"}});
+
+    // Reopen: the emptied snapshot still EXISTS on the server, so stat+read
+    // both succeed — but zero length means "nothing to recover".
+    QSignalSpy recoverySpy(m_controller, &EditorController::recoveryAvailable);
+
+    m_controller->open(QStringLiteral("/foo/f.txt"));
+    const QJsonObject unwatch = nextRequest();
+    QCOMPARE(method(unwatch), kUnwatch);
+    const QJsonObject read = nextRequest();
+    QCOMPARE(method(read), kReadFile);
+    respondResult(reqId(read), {{"path", "/foo/f.txt"},
+                                {"encoding", "utf8"},
+                                {"content", "edited"},
+                                {"revision", "r2"},
+                                {"truncated", false}});
+    const QJsonObject watch = nextRequest();
+    QCOMPARE(method(watch), kWatch);
+    respondResult(reqId(watch), {{"subscriptionId", "sub2"}});
+
+    const QJsonObject stat = nextRequest();
+    QCOMPARE(method(stat), kStat);
+    QCOMPARE(reqPath(stat), recoveryPath);
+    respondResult(reqId(stat), {{"path", recoveryPath}, {"revision", "rec2"}});
+
+    const QJsonObject recRead = nextRequest();
+    QCOMPARE(method(recRead), kReadFile);
+    QCOMPARE(reqPath(recRead), recoveryPath);
+    respondResult(reqId(recRead), {{"path", recoveryPath},
+                                   {"encoding", "utf8"},
+                                   {"content", ""},
+                                   {"revision", "rec2"},
+                                   {"truncated", false}});
+
+    QTRY_COMPARE(m_controller->fileState(), QStringLiteral("clean"));
+    QTest::qWait(100);
+    QCOMPARE(recoverySpy.count(), 0);
+
+    // A second save must not burn another round trip truncating an already
+    // empty snapshot: the only request is the file write itself.
+    m_controller->save(QStringLiteral("edited again"), QStringLiteral("r2"));
+    const QJsonObject write2 = nextRequest();
+    QCOMPARE(method(write2), kWriteFile);
+    QCOMPARE(reqPath(write2), QStringLiteral("/foo/f.txt"));
+    respondResult(reqId(write2), {{"path", "/foo/f.txt"}, {"revision", "r3"}});
+    QVERIFY(nextRequest(300).isEmpty());
 }
 
 QTEST_GUILESS_MAIN(TstEditorController)

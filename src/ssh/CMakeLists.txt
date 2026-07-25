@@ -1,6 +1,8 @@
 qt_add_library(ch_ssh STATIC
     SshConnectionPool.h
     SshConnectionPool.cpp
+    SshChannelDevice.h
+    SshChannelDevice.cpp
     KnownHosts.h
     KnownHosts.cpp
 )

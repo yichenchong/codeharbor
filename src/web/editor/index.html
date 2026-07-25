@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!--
+  CodeHarbor trusted editor page (SPEC 8.1). Copied verbatim into dist/ by
+  build.mjs and embedded as qrc:/codeharbor/web/editor/index.html (see
+  src/qml/CMakeLists.txt), which is what src/qml/EditorPaneView.qml navigates to.
+
+  SECURITY: the page runs on the PRIVILEGED internal WebEngine profile, so its
+  CSP is deliberately tight. Only same-origin (qrc:) scripts load — that is this
+  bundle plus Qt's own qwebchannel.js — and there is NO inline script at all
+  (the bundle boots itself on DOMContentLoaded). Monaco injects theme rules as
+  <style> elements at runtime, hence 'unsafe-inline' for styles only; the
+  codicon font is inlined as a data: URI by the build. Monaco's editor worker is
+  a same-origin sibling script, hence worker-src 'self'.
+-->
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' qrc:; worker-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self' data:; img-src 'self' data:; connect-src 'none'">
+<title>CodeHarbor Editor</title>
+<link rel="stylesheet" href="editor.css">
+<style>
+    html, body { height: 100%; margin: 0; padding: 0; overflow: hidden; }
+    body { background: #1e1e1e; color: #d4d4d4; }
+    #ch-editor-root { height: 100%; width: 100%; }
+    .ch-editor-status { background: #252526; border-bottom: 1px solid #333; color: #cccccc; }
+    .ch-editor-notice button { margin-left: 6px; }
+</style>
+</head>
+<body>
+<div id="ch-editor-root"></div>
+<!-- Served by Qt WebChannel itself; provides the global QWebChannel ctor. -->
+<script src="qrc:///qtwebchannel/qwebchannel.js"></script>
+<script src="editor.js"></script>
+</body>
+</html>

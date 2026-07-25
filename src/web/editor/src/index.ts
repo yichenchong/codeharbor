@@ -11,7 +11,33 @@
 // push state to the editor (host callbacks) and its SLOTS receive editor actions
 // (the bridge). Save results arrive as signals, never as a return value.
 
-import * as monaco from "monaco-editor";
+// The typed standalone API surface (monaco-editor/esm/vs/editor/editor.api) is
+// the only entry that ships .d.ts. The two side-effect imports below add the
+// runtime that entry deliberately omits:
+//   * edcore.main            — every standalone editor contribution (find,
+//                              suggest, context menu, quick access, ...).
+//   * basic-languages        — Monarch tokenizers for ~80 languages. These run
+//                              on the MAIN THREAD.
+// The heavy monaco-editor root entry (editor.main) is deliberately NOT used: it
+// also pulls the css/html/json/typescript LANGUAGE SERVICES, which are Web
+// Worker based. This page is served from a local (qrc) origin where Chromium
+// refuses to construct workers, so those services would never work; excluding
+// them halves the bundle instead of shipping dead weight.
+import * as monaco from "monaco-editor/esm/vs/editor/editor.api";
+import "monaco-editor/esm/vs/editor/edcore.main";
+import "monaco-editor/esm/vs/basic-languages/monaco.contribution";
+
+// Monaco's editor worker (diff, link detection, word-based suggestions,
+// unicode highlighting). It is bundled to a sibling script and spawned
+// SAME-ORIGIN: a blob: worker is refused by this page's CSP, and there is no
+// remote origin to load from. Without this Monaco silently degrades to running
+// the worker's code on the UI thread, which stalls the editor on large files.
+// A construction failure still lands in that fallback, so this is an
+// optimisation, never a hard dependency.
+// monaco-editor declares `Window.MonacoEnvironment` globally, so no cast.
+window.MonacoEnvironment = {
+    getWorker: () => new Worker(new URL("editor.worker.js", document.baseURI)),
+};
 
 /** Minimal QWebChannel signal shape (obj.signalName.connect(handler)). */
 export interface Signal<F extends (...args: never[]) => void> {
@@ -45,6 +71,42 @@ export interface EditorBridge {
     reportContent(content: string): void;
     /** Ask the host to re-fetch the file from the server (SPEC 8.7). */
     requestReload(): void;
+
+    // ---- ADDITIVE (backwards compatible), NOT part of the frozen shapes above.
+    /** Tell the host this page is live and every signal handler above is
+     *  attached. The host buffers a load that completed before the WebChannel
+     *  page connected and replays it here, so the first buffer is never lost.
+     *  OPTIONAL so this bundle still runs against an older C++ host that does
+     *  not expose the slot (the proxy simply has no `ready` property). */
+    ready?(): void;
+}
+
+/** Extra, host-supplied context that is NOT carried by the frozen bridge. */
+export interface MountOptions {
+    /** Remote path of the file this pane shows, used only to pick a Monaco
+     *  language for syntax highlighting. Never opened, never read. */
+    path?: string;
+}
+
+/**
+ * Resolve a Monaco language id from a remote path by matching the registered
+ * language contributions (extension first, then exact filename). Falls back to
+ * "plaintext" — the editor must render even for an unknown file type.
+ */
+export function languageForPath(path: string): string {
+    const slash = Math.max(path.lastIndexOf("/"), path.lastIndexOf("\\"));
+    const name = path.slice(slash + 1);
+    const dot = name.lastIndexOf(".");
+    const ext = dot > 0 ? name.slice(dot).toLowerCase() : "";
+    for (const lang of monaco.languages.getLanguages()) {
+        if (lang.filenames?.some((f) => f === name)) {
+            return lang.id;
+        }
+        if (ext && lang.extensions?.some((e) => e.toLowerCase() === ext)) {
+            return lang.id;
+        }
+    }
+    return "plaintext";
 }
 
 /**
@@ -53,7 +115,11 @@ export interface EditorBridge {
  * workstream E-web against the frozen contract above; the C++ half implements
  * the matching signals/slots under the object name "editor".
  */
-export function mountEditor(element: HTMLElement, bridge: EditorBridge): void {
+export function mountEditor(
+    element: HTMLElement,
+    bridge: EditorBridge,
+    options: MountOptions = {},
+): void {
     // ---- DOM scaffold: a thin status bar above the editor surface. ----
     element.style.display = "flex";
     element.style.flexDirection = "column";
@@ -89,12 +155,14 @@ export function mountEditor(element: HTMLElement, bridge: EditorBridge): void {
 
     const editor = monaco.editor.create(editorEl, {
         value: "",
-        // The host drives content; default to plaintext and let callers pick a
-        // language later if desired. No client-side file access is implied.
-        language: "plaintext",
+        // The host drives content; the language comes from the pane's remote
+        // path (highlighting only). No client-side file access is implied.
+        language: options.path ? languageForPath(options.path) : "plaintext",
+        theme: "vs-dark",
         readOnly: false,
         automaticLayout: true,
         minimap: { enabled: false },
+        scrollBeyondLastLine: false,
     });
 
     // The revision the current buffer was loaded (or last saved) at; every save
@@ -233,6 +301,13 @@ export function mountEditor(element: HTMLElement, bridge: EditorBridge): void {
     editor.onDidDispose(() => {
         clearTimeout(reportTimer);
     });
+
+    // READY HANDSHAKE — MUST be the last thing mountEditor does. Every signal
+    // handler above is now attached, so the host may safely replay a load that
+    // completed before this page connected (otherwise the first contentLoaded
+    // is emitted into the void and the pane stays empty). Optional-called so an
+    // older host without the slot is a no-op rather than a TypeError.
+    bridge.ready?.();
 }
 
 // ---- QWebChannel page-entry bootstrap ----
@@ -259,8 +334,27 @@ declare const qt: { webChannelTransport: unknown };
  * Page entry point: open the WebChannel injected by the QML host and mount the
  * editor against the "editor" object (the C++ EditorController proxy).
  */
-export function connectEditor(element: HTMLElement): void {
+export function connectEditor(element: HTMLElement, options: MountOptions = {}): void {
     new QWebChannel(qt.webChannelTransport, (channel: QWebChannelInstance) => {
-        mountEditor(element, channel.objects.editor as EditorBridge);
+        mountEditor(element, channel.objects.editor as EditorBridge, options);
     });
+}
+
+// The packaged page (dist/index.html) carries no inline script — its CSP
+// forbids one — so the bundle boots itself. The pane's remote path arrives as
+// the `path` query parameter on the bundle URL (see src/qml/EditorPaneView.qml);
+// it is used ONLY to choose a syntax-highlighting language.
+function bootstrap(): void {
+    const root = document.getElementById("ch-editor-root");
+    if (!root) {
+        return; // embedded by a host that mounts explicitly
+    }
+    const path = new URLSearchParams(window.location.search).get("path");
+    connectEditor(root, path ? { path } : {});
+}
+
+if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", bootstrap, { once: true });
+} else {
+    bootstrap();
 }

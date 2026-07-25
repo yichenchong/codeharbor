@@ -74,6 +74,48 @@ void EditorController::setReadOnly(bool readOnly)
     emit readOnlyChanged(readOnly);
 }
 
+void EditorController::deliverContent(const QString& content, const QString& revision)
+{
+    if (!m_ready) {
+        // The WebChannel page has not attached its handlers yet. Emitting now
+        // would drop the buffer on the floor and leave the pane blank forever,
+        // so hold the LATEST load and replay it from ready().
+        m_pendingContent = content;
+        m_pendingRevision = revision;
+        return;
+    }
+    emit contentLoaded(content, revision);
+}
+
+void EditorController::ready()
+{
+    const bool reconnected = m_ready;
+    m_ready = true;
+
+    if (m_pendingContent.has_value()) {
+        const QString content = *m_pendingContent;
+        const QString revision = m_pendingRevision;
+        // Consume BEFORE emitting: a handler that re-enters (e.g. requestReload)
+        // must not see the buffer a second time.
+        m_pendingContent.reset();
+        m_pendingRevision.clear();
+        // A read-only buffer would otherwise render editable until the next
+        // toggle; the default (false) needs no signal.
+        if (m_readOnly)
+            emit readOnlyChanged(true);
+        emit contentLoaded(content, revision);
+        return;
+    }
+
+    if (m_readOnly)
+        emit readOnlyChanged(true);
+
+    // Nothing held. A repeat ready() is a page RELOAD that lost its buffer:
+    // re-fetch rather than replay, so the fresh page cannot show stale bytes.
+    if (reconnected && !m_path.isEmpty())
+        reload(FileState::Loading);
+}
+
 QString EditorController::recoveryPathFor(const QString& path)
 {
     // POSIX path semantics regardless of the host OS: the recovery snapshot is a
@@ -98,6 +140,11 @@ void EditorController::open(QString path)
     m_path = path;
     m_dirty = false;
     m_recoveryRevision.clear();
+    m_recoveryHasContent = false;
+    // A load for the PREVIOUS file must never be replayed into the page after
+    // a switch; the new load supersedes it.
+    m_pendingContent.reset();
+    m_pendingRevision.clear();
     setFileState(FileState::Loading);
 
     QPointer<EditorController> self(this);
@@ -115,7 +162,7 @@ void EditorController::open(QString path)
                        const QString revision =
                            obj.value(QStringLiteral("revision")).toString();
                        self->m_revision = revision;
-                       emit self->contentLoaded(content, revision);
+                       self->deliverContent(content, revision);
                        self->setFileState(FileState::Clean);
 
                        // Subscribe to external-change notifications (SPEC 8.7).
@@ -184,7 +231,14 @@ void EditorController::checkRecovery(const QString& loadedContent)
                     const QString recovered =
                         readRes.toObject().value(QStringLiteral("content")).toString();
                     self->m_recoveryRevision = snapshotRevision;
-                    if (recovered != loadedContent)
+                    // An EMPTY snapshot is the tombstone clearRecovery() leaves
+                    // behind after a successful save: the frozen C1 catalog has
+                    // no delete, so "saved, nothing to recover" is encoded as a
+                    // zero-length file. Adopt its revision (the next snapshot is
+                    // then a guarded overwrite) but never offer it — that is the
+                    // stale "unsaved changes" prompt this exists to prevent.
+                    self->m_recoveryHasContent = !recovered.isEmpty();
+                    if (!recovered.isEmpty() && recovered != loadedContent)
                         emit self->recoveryAvailable(recovered);
                 });
         });
@@ -210,6 +264,10 @@ void EditorController::save(QString content, QString expectedRevision)
                     result.toObject().value(QStringLiteral("revision")).toString();
                 self->m_revision = newRevision;
                 self->m_dirty = false;
+                // The file on the server now IS the buffer, so the recovery
+                // snapshot is obsolete: drop it before anything can reopen the
+                // file and be offered a stale "unsaved changes" copy (SPEC 11.3).
+                self->clearRecovery();
                 emit self->saved(newRevision);
                 self->setFileState(FileState::Saved);
                 self->setFileState(FileState::Clean);
@@ -277,6 +335,7 @@ void EditorController::writeRecovery(const QString& content, bool retryOnMismatc
                 // overwrite rather than a create.
                 self->m_recoveryRevision =
                     result.toObject().value(QStringLiteral("revision")).toString();
+                self->m_recoveryHasContent = !content.isEmpty();
                 return;
             }
             // A stale create-only guard means a snapshot survives from a prior
@@ -297,6 +356,36 @@ void EditorController::writeRecovery(const QString& content, bool retryOnMismatc
                         self->writeRecovery(content, /*retryOnMismatch=*/false);
                     });
             }
+        });
+}
+
+void EditorController::clearRecovery()
+{
+    // Nothing was ever snapshotted (or it is already the empty tombstone):
+    // writing again would only burn a round trip.
+    if (!m_client || m_path.isEmpty() || !m_recoveryHasContent)
+        return;
+
+    // The frozen C1 catalog (src/remote/RpcTypes.h) has NO delete method, so
+    // clearing is expressed with the write it does have: a zero-length,
+    // revision-guarded file.writeFile. Guarding on the snapshot's own revision
+    // keeps the SPEC 8.4/8.6 rule intact — if another pane or session wrote the
+    // snapshot after us the truncate is REFUSED rather than destroying their
+    // buffer. checkRecovery() reads a zero-length snapshot as "nothing to
+    // recover", so the tombstone is equivalent to deletion for every consumer.
+    const QString recoveryPath = recoveryPathFor(m_path);
+    const QString guard = m_recoveryRevision;
+
+    QPointer<EditorController> self(this);
+    m_client->call(
+        QString::fromLatin1(rpc::kMethodWriteFile),
+        writeParams(recoveryPath, QString(), guard),
+        [self](QJsonValue result, std::optional<RpcError> error) {
+            if (!self || error.has_value())
+                return; // best-effort: a stale snapshot is a prompt, not data loss
+            self->m_recoveryRevision =
+                result.toObject().value(QStringLiteral("revision")).toString();
+            self->m_recoveryHasContent = false;
         });
 }
 
@@ -328,7 +417,7 @@ void EditorController::reload(FileState transitional)
             const QString revision = obj.value(QStringLiteral("revision")).toString();
             self->m_revision = revision;
             self->m_dirty = false;
-            emit self->contentLoaded(content, revision);
+            self->deliverContent(content, revision);
             self->setFileState(FileState::Clean);
         });
 }

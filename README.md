@@ -72,13 +72,26 @@ npm run build      # tsc -> dist/
 
 ## Status
 
-Milestones **M2–M5** reached (core workspace, remote viewers, remote editing,
-agent awareness) atop M0/M1 — SSH transport, data model, remote file service, RPC
-client, persistence, terminal, UI shell, viewers, Monaco editor bridge, and agent
-monitor are implemented and unit-tested. Remaining work is live gates needing a
-display or SSH server (wired + unit-tested), plus two editor code refinements
-(JS-ready handshake, recovery-snapshot cleanup on save). See
-[`docs/PLAN.md`](docs/PLAN.md) for the phased plan and each workstream's state.
+Milestones **M1–M5 are reached LIVE**, not merely unit-tested: every workstream's
+live gate now runs against a real `sshd` and a real `codeharbord`, covering SSH
+transport, terminal (tmux attach / remote-confirmed resize / reconnect), workspace
+CRUD + persistence, remote viewers, remote editing in real Monaco, and agent
+awareness driven by the real hook.
+
+Those gates are QTest targets labelled `live`; they **QSKIP** unless `CH_LIVE_SSH`
+is set, so `ctest --preset dev` stays portable. To run them you need a reachable SSH
+server, `tmux`, and Node on the remote side — see
+[`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md).
+
+Exercising them for the first time paid for itself: it exposed a missing transport
+spine (nothing carried RPC over SSH), QML that could not load at all, split panes
+rendering at zero width, stored region widths being destroyed on launch, and
+non-deterministic sidebar ordering. See the Wave 5 entry and correction note in
+[`docs/PLAN.md`](docs/PLAN.md) for the full list and what remains.
+
+**Building requires Node** — the Monaco editor bundle is a build artifact embedded
+as a Qt resource, and CMake builds it at configure time (it refuses to configure a
+silently editor-less client; `-DCODEHARBOR_SKIP_WEB_BUNDLE=ON` opts out).
 
 ## License
 

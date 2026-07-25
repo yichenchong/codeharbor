@@ -63,6 +63,16 @@ jobs:
         if: matrix.name == 'windows'
         uses: ilammy/msvc-dev-cmd@v1
 
+      # The Monaco bundle is a gitignored artifact embedded as a Qt resource at
+      # CMake CONFIGURE time, so it must exist before the configure step below or
+      # the shipped binary's editor pane has no page to load.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - name: Build web bundles (must precede CMake configure)
+        run: npm install && npm run build --workspace src/web/editor
+        shell: bash
+
       # --- configure + build ---------------------------------------------------
       # CMake 3.21+ reads CMAKE_TOOLCHAIN_FILE from the environment (set by the
       # vcpkg step on Windows), so one command works on every OS. On Windows the

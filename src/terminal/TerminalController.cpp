@@ -1,5 +1,9 @@
 #include "TerminalController.h"
 
+#include "SshChannelDevice.h"
+
+#include <QIODevice>
+
 #include <utility>
 
 namespace {
@@ -61,6 +65,109 @@ void TerminalController::ingestOutput(const QByteArray &bytes)
     } else if (!m_flushTimer.isActive()) {
         m_flushTimer.start(); // arm the time threshold from the first buffered byte
     }
+}
+
+void TerminalController::setTransport(QIODevice *transport)
+{
+    if (m_transport == transport)
+        return;
+
+    if (m_transport)
+        m_transport->disconnect(this);
+
+    m_transport = transport;
+    // m_pending/m_hidden survive on purpose: a reconnect swaps the channel
+    // underneath the same pane and must not drop buffered scrollback.
+
+    if (!m_transport)
+        return;
+
+    connect(m_transport, &QIODevice::readyRead, this,
+            &TerminalController::onTransportReadyRead);
+    connect(m_transport, &QIODevice::readChannelFinished, this,
+            &TerminalController::onTransportFinished);
+
+    // A reconnect opens a fresh PTY at the channel's default size; re-assert the
+    // geometry the renderer last reported so the pane does not snap back.
+    if (m_columns > 0 && m_rows > 0)
+        applyPtySize(m_columns, m_rows);
+
+    // Drain whatever the transport buffered before we subscribed.
+    if (m_transport->bytesAvailable() > 0)
+        onTransportReadyRead();
+}
+
+QIODevice *TerminalController::transport() const
+{
+    return m_transport.data();
+}
+
+void TerminalController::onTransportReadyRead()
+{
+    // isReadable(), not just non-null: closeChannel() fires readChannelFinished()
+    // on an already-closed device, and QIODevice::readAll() on one is a warning
+    // plus a guaranteed empty result.
+    if (!m_transport || !m_transport->isReadable())
+        return;
+    ingestOutput(m_transport->readAll());
+}
+
+void TerminalController::onTransportFinished()
+{
+    // The final payload precedes readChannelFinished(); claim it before
+    // reporting the drop so the last remote bytes still reach the pane.
+    onTransportReadyRead();
+
+    // A channel that ends under a live pane is a dropped connection (SPEC 5.6).
+    // Only live states transition: an already Disconnected/Error pane must not
+    // be walked backwards, and a pane that never came up keeps its state.
+    switch (m_state) {
+    case TerminalState::OpeningChannel:
+    case TerminalState::AttachingTmux:
+    case TerminalState::Ready:
+        setState(TerminalState::Disconnected);
+        break;
+    default:
+        break;
+    }
+}
+
+bool TerminalController::sendInput(const QByteArray &bytes)
+{
+    if (!m_transport || !m_transport->isOpen() || !m_transport->isWritable())
+        return false;
+    if (bytes.isEmpty())
+        return true; // nothing to send, but the pane is writable
+    return m_transport->write(bytes) == bytes.size();
+}
+
+bool TerminalController::resize(int cols, int rows)
+{
+    if (cols <= 0 || rows <= 0)
+        return false;
+    m_columns = cols;
+    m_rows = rows;
+    return applyPtySize(cols, rows);
+}
+
+int TerminalController::columns() const
+{
+    return m_columns;
+}
+
+int TerminalController::rows() const
+{
+    return m_rows;
+}
+
+bool TerminalController::applyPtySize(int cols, int rows)
+{
+    // The seam is a plain QIODevice, but a window-change is not a byte stream:
+    // it is an out-of-band SSH channel request. Narrow to the one transport
+    // that can carry it; every other transport records the size and no more.
+    if (auto *pty = qobject_cast<SshChannelDevice *>(m_transport.data()))
+        return pty->resizePty(cols, rows);
+    return false;
 }
 
 const QByteArray &TerminalController::hiddenBuffer() const

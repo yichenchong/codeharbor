@@ -3,6 +3,8 @@
 qt_add_library(ch_app STATIC
     AppController.h
     AppController.cpp
+    SessionBootstrap.h
+    SessionBootstrap.cpp
     UiStateStore.h
     UiStateStore.cpp
 )
@@ -15,6 +17,7 @@ target_link_libraries(ch_app PUBLIC
     ch_models
     ch_persistence
     ch_remote
+    ch_ssh
     ch_agent
 )
 

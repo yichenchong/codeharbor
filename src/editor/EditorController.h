@@ -6,6 +6,8 @@
 #include <QObject>
 #include <QString>
 
+#include <optional>
+
 namespace ch {
 
 class CodeharbordClient;
@@ -64,6 +66,19 @@ public slots:
     Q_INVOKABLE void reportContent(QString content);
     // Re-fetch the file from the server (SPEC 8.7).
     Q_INVOKABLE void requestReload();
+    // The WebChannel editor page is live and has attached its signal handlers.
+    //
+    // WebChannel connects asynchronously and long AFTER this controller exists,
+    // so a load that finishes first would emit contentLoaded into the void and
+    // leave the pane empty. contentLoaded is therefore HELD until this arrives
+    // and replayed exactly once. Additive to the frozen C3 contract (the JS
+    // half declares it optional), so an older bundle that never calls it still
+    // works — it simply never receives content, as before.
+    //
+    // A second ready() means the page RELOADED and lost its buffer: there is
+    // nothing held to replay, so the file is re-fetched instead of re-emitting
+    // a stale copy.
+    Q_INVOKABLE void ready();
 
 signals:
     // ---- C++ -> JS bridge signals (MUST match EditorBridge exactly) ----
@@ -85,8 +100,16 @@ private slots:
 private:
     void setFileState(FileState state);
     void reload(FileState transitional);
+    // Emit contentLoaded, or hold it until the page reports ready() (see the
+    // ready() slot). The held buffer is overwritten by a newer load, so a
+    // reconnecting page always sees the LATEST content exactly once.
+    void deliverContent(const QString& content, const QString& revision);
     void checkRecovery(const QString& loadedContent);
     void writeRecovery(const QString& content, bool retryOnMismatch);
+    // Discard the server-side recovery snapshot after a successful save
+    // (SPEC 11.3): the saved file IS the buffer now, so a later reopen must not
+    // offer a stale "unsaved changes" copy. No-op when no snapshot holds content.
+    void clearRecovery();
     // Release the active file.watch subscription (if any) and forget it, so a
     // pane close / file switch never leaks or duplicates a server-side watcher.
     void unwatchCurrent();
@@ -105,8 +128,17 @@ private:
     QString m_watchSubscriptionId;
 
     // Recovery snapshot bookkeeping (SPEC 11.3). Empty revision => the next
-    // write is create-only (expectedRevision "").
+    // write is create-only (expectedRevision ""). m_recoveryHasContent tracks
+    // whether the snapshot currently holds a buffer worth offering, so a save
+    // truncates it at most once and an already-empty snapshot is never rewritten.
     QString m_recoveryRevision;
+    bool m_recoveryHasContent = false;
+
+    // Ready handshake (see the ready() slot). m_pendingContent holds a load that
+    // completed before the page connected; std::nullopt means nothing is held.
+    bool m_ready = false;
+    std::optional<QString> m_pendingContent;
+    QString m_pendingRevision;
 };
 
 } // namespace ch
