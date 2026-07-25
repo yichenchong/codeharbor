@@ -3,6 +3,7 @@
 #include "SessionState.h"
 
 #include <QCoreApplication>
+#include <QBuffer>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QLocalServer>
@@ -61,6 +62,7 @@ private slots:
     void lineSplitAcrossReadsIsBuffered();
     void unknownStateStringMapsToUnknown();
     void perTerminalStateIsIndependent();
+    void transportDestroyedThenRebindIsSafe();
 
 private:
     void makePair();
@@ -147,6 +149,34 @@ void TstAgentMonitor::parseRejectsMalformed()
     // Wrong version.
     {
         QJsonObject o{{"version", 2},
+                      {"timestamp", "x"},
+                      {"harness", "generic"},
+                      {"devSessionId", "d"},
+                      {"terminalId", "t"},
+                      {"state", "idle"},
+                      {"event", "e"}};
+        QVERIFY(!ch::parseAgentEventLine(
+                     QJsonDocument(o).toJson(QJsonDocument::Compact))
+                     .has_value());
+    }
+    // Non-integer version: strict equality with CH_EVENT_VERSION must reject a
+    // fractional 1.5 (events.ts uses `===`; a truncating toInt() would wrongly
+    // accept it).
+    {
+        QJsonObject o{{"version", 1.5},
+                      {"timestamp", "x"},
+                      {"harness", "generic"},
+                      {"devSessionId", "d"},
+                      {"terminalId", "t"},
+                      {"state", "idle"},
+                      {"event", "e"}};
+        QVERIFY(!ch::parseAgentEventLine(
+                     QJsonDocument(o).toJson(QJsonDocument::Compact))
+                     .has_value());
+    }
+    // version as a string is not the JSON number 1.
+    {
+        QJsonObject o{{"version", "1"},
                       {"timestamp", "x"},
                       {"harness", "generic"},
                       {"devSessionId", "d"},
@@ -374,6 +404,28 @@ void TstAgentMonitor::perTerminalStateIsIndependent()
     feed(eventLine("idle_unseen", "d1", "t2"));
     QTRY_COMPARE(unseenSpy.count(), 1);
     QVERIFY(m_monitor->hasUnseen("d1"));
+}
+
+// The transport is caller-owned; if it is destroyed while the monitor lives,
+// m_transport must not dangle. A QPointer auto-nulls on the transport's death,
+// so a later setTransport() does not call disconnect() on freed memory (a raw
+// pointer would UAF here). Reaching the end without a crash is the assertion.
+void TstAgentMonitor::transportDestroyedThenRebindIsSafe()
+{
+    auto* first = new QBuffer;
+    QVERIFY(first->open(QIODevice::ReadWrite));
+    m_monitor->setTransport(first);
+    QCOMPARE(m_monitor->transport(), static_cast<QIODevice*>(first));
+
+    delete first; // caller destroys the transport out from under the monitor
+
+    QBuffer second;
+    QVERIFY(second.open(QIODevice::ReadWrite));
+    m_monitor->setTransport(&second); // must not disconnect() the destroyed one
+    QCOMPARE(m_monitor->transport(), static_cast<QIODevice*>(&second));
+
+    // Clear before `second` goes out of scope so the monitor drops its pointer.
+    m_monitor->setTransport(nullptr);
 }
 
 QTEST_MAIN(TstAgentMonitor)

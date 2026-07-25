@@ -24,6 +24,11 @@ QJsonObject writeParams(const QString& path, const QString& content,
                        {QStringLiteral("expectedRevision"), expectedRevision}};
 }
 
+QJsonObject unwatchParams(const QString& subscriptionId)
+{
+    return QJsonObject{{QStringLiteral("subscriptionId"), subscriptionId}};
+}
+
 } // namespace
 
 EditorController::EditorController(CodeharbordClient* client, QObject* parent)
@@ -33,6 +38,24 @@ EditorController::EditorController(CodeharbordClient* client, QObject* parent)
         connect(m_client, &CodeharbordClient::notificationReceived, this,
                 &EditorController::onNotification);
     }
+}
+
+EditorController::~EditorController()
+{
+    // Release the server-side watcher subscribed in open() (SPEC 8.7). The
+    // client is borrowed and outlives us; the response is irrelevant (we are
+    // gone), so the callback is a no-op that touches no members.
+    unwatchCurrent();
+}
+
+void EditorController::unwatchCurrent()
+{
+    if (!m_client || m_watchSubscriptionId.isEmpty())
+        return;
+    m_client->call(QString::fromLatin1(rpc::kMethodUnwatch),
+                   unwatchParams(m_watchSubscriptionId),
+                   [](QJsonValue, std::optional<RpcError>) {});
+    m_watchSubscriptionId.clear();
 }
 
 void EditorController::setFileState(FileState state)
@@ -69,6 +92,9 @@ void EditorController::open(QString path)
     if (!m_client)
         return;
 
+    // Switching files (or re-opening the same one): release the previous file's
+    // watcher first so subscriptions are never leaked or duplicated (SPEC 8.7).
+    unwatchCurrent();
     m_path = path;
     m_dirty = false;
     m_recoveryRevision.clear();
@@ -96,13 +122,29 @@ void EditorController::open(QString path)
                        self->m_client->call(
                            QString::fromLatin1(rpc::kMethodWatch),
                            readParams(path),
-                           [self](QJsonValue watchRes, std::optional<RpcError> watchErr) {
-                               if (!self || watchErr.has_value())
-                                   return;
-                               self->m_watchSubscriptionId =
+                           [self, client = self->m_client, path](QJsonValue watchRes, std::optional<RpcError> watchErr) {
+                               if (watchErr.has_value())
+                                   return; // no subscription was created
+                               const QString subId =
                                    watchRes.toObject()
                                        .value(QStringLiteral("subscriptionId"))
                                        .toString();
+                               // If the controller was destroyed (pane closed)
+                               // or switched files before this watch resolved,
+                               // the server created a subscription for a path we
+                               // no longer track. Release it through the BORROWED
+                               // client (it outlives the controller per the ctor
+                               // contract) so a server-side watcher is NEVER
+                               // leaked (SPEC 8.7) — even when `self` is gone.
+                               if (!self || self->m_path != path) {
+                                   if (!subId.isEmpty())
+                                       client->call(
+                                           QString::fromLatin1(rpc::kMethodUnwatch),
+                                           unwatchParams(subId),
+                                           [](QJsonValue, std::optional<RpcError>) {});
+                                   return;
+                               }
+                               self->m_watchSubscriptionId = subId;
                            });
 
                        // Offer a crash-recovery snapshot if one exists and

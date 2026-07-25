@@ -33,6 +33,9 @@ class EditorController : public QObject {
     Q_PROPERTY(bool readOnly READ readOnly NOTIFY readOnlyChanged)
 public:
     explicit EditorController(CodeharbordClient* client, QObject* parent = nullptr);
+    // Releases the active file.watch subscription (SPEC 8.7) so closing an
+    // editor pane never leaks a server-side watcher.
+    ~EditorController() override;
 
     QString fileState() const { return toString(m_fileState); }
     bool readOnly() const { return m_readOnly; }
@@ -84,6 +87,9 @@ private:
     void reload(FileState transitional);
     void checkRecovery(const QString& loadedContent);
     void writeRecovery(const QString& content, bool retryOnMismatch);
+    // Release the active file.watch subscription (if any) and forget it, so a
+    // pane close / file switch never leaks or duplicates a server-side watcher.
+    void unwatchCurrent();
     static QString recoveryPathFor(const QString& path);
 
     CodeharbordClient* m_client = nullptr;

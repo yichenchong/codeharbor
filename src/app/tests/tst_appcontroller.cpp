@@ -164,6 +164,7 @@ private slots:
     void refreshResultAfterControllerDestroyedIsNoop();
     void agentMonitorMergesStateIntoSidebar();
     void refreshDoesNotWipeAgentDerivedState();
+    void markSeenClearsFinishedUnseenBadge();
 };
 
 // Two GroupNodes with sessions map to GroupRows preserving order, with the
@@ -576,6 +577,63 @@ void TstAppController::refreshDoesNotWipeAgentDerivedState()
 
     QCOMPARE(sessionState(),
              static_cast<int>(SessionRowState::WaitingForInput));
+}
+
+// MANDATORY (markSeen semantics): a terminal reaching idle_unseen puts the row
+// in FinishedUnseen (the blue "unseen completion" badge). Once the user views
+// the session, markSeen(dev) clears the monitor's per-session unseen flag and
+// its unseenChanged signal re-drives rebuildRows(). The monitor still reports
+// the terminal's raw agent state as IdleUnseen, so without the AppController
+// downgrade the row would stay stuck in FinishedUnseen and the badge would
+// never clear. rebuildRows() must downgrade IdleUnseen -> Idle for the row when
+// hasUnseen(dev) is false, so the FinishedUnseen badge is cleared. (The row
+// falls to Disconnected here because the terminal's connection state — owned by
+// the terminal workstream and merged separately — is Unloaded in this harness;
+// the point under test is that the FinishedUnseen badge is gone.)
+void TstAppController::markSeenClearsFinishedUnseenBadge()
+{
+    FakeTransport transport;
+    CodeharbordClient client;
+    AppController controller(&client);
+    client.setTransport(&transport);
+
+    FakeTransport agentTransport;
+    AgentStatusMonitor monitor;
+    monitor.setTransport(&agentTransport);
+    controller.setAgentMonitor(&monitor);
+
+    controller.refresh();
+    transport.deliver(listWithTerminalFrame(
+        takeRequest(transport).value(QStringLiteral("id")).toInt(),
+        QStringLiteral("G"), QStringLiteral("sess-1"), QStringLiteral("term-1")));
+
+    SessionsModel* model = controller.sessionsModel();
+    auto sessionState = [model]() {
+        const QModelIndex group = model->index(0, 0);
+        const QModelIndex session = model->index(0, 0, group);
+        return model->data(session, SessionsModel::RowStateRole).toInt();
+    };
+
+    // idle_unseen -> row FinishedUnseen (badge shown), session flagged unseen.
+    agentTransport.deliver(agentEventLine(QStringLiteral("idle_unseen"),
+                                          QStringLiteral("sess-1"),
+                                          QStringLiteral("term-1")));
+    QCOMPARE(sessionState(),
+             static_cast<int>(SessionRowState::FinishedUnseen));
+    QVERIFY(monitor.hasUnseen(QStringLiteral("sess-1")));
+
+    // markSeen(dev) -> rebuild -> badge cleared. The monitor still holds the
+    // terminal at IdleUnseen, but the row must no longer be FinishedUnseen.
+    monitor.markSeen(QStringLiteral("sess-1"));
+    QVERIFY(!monitor.hasUnseen(QStringLiteral("sess-1")));
+    QVERIFY(sessionState() != static_cast<int>(SessionRowState::FinishedUnseen));
+    QCOMPARE(sessionState(),
+             static_cast<int>(SessionRowState::Disconnected));
+    // The monitor's per-terminal raw state is unchanged (only the row is
+    // downgraded); this is what proves the fix lives in rebuildRows, not the
+    // monitor.
+    QCOMPARE(monitor.stateFor(QStringLiteral("sess-1"), QStringLiteral("term-1")),
+             static_cast<int>(AgentState::IdleUnseen));
 }
 
 QTEST_GUILESS_MAIN(TstAppController)

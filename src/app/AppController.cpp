@@ -116,8 +116,19 @@ void AppController::rebuildRows()
                 for (const TerminalPane& pane : sessionNode.terminalPanes) {
                     TerminalStatus status;
                     status.id = pane.id;
-                    status.agent = static_cast<AgentState>(
+                    AgentState agent = static_cast<AgentState>(
                         m_agentMonitor->stateFor(devSessionId, pane.id.value));
+                    // The monitor keeps a terminal at IdleUnseen even after the
+                    // Dev Session's completion has been marked seen (markSeen
+                    // clears only the per-session unseen flag, not the terminal's
+                    // raw agent state). If we copied IdleUnseen through,
+                    // aggregateSessionState would keep the row FinishedUnseen and
+                    // the badge would never clear. Downgrade IdleUnseen -> Idle
+                    // for the row once the session is no longer flagged unseen.
+                    if (agent == AgentState::IdleUnseen
+                        && !m_agentMonitor->hasUnseen(devSessionId))
+                        agent = AgentState::Idle;
+                    status.agent = agent;
                     sessionRow.terminals.push_back(status);
                 }
             }

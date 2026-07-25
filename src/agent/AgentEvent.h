@@ -98,8 +98,12 @@ inline std::optional<AgentEvent> parseAgentEventLine(const QByteArray& line)
     const QJsonValue vSummary = o.value(QStringLiteral("summary"));
     const QJsonValue vMeta = o.value(QStringLiteral("metadata"));
 
-    // version === CH_EVENT_VERSION (must be the JSON number 1, not "1").
-    if (!vVersion.isDouble() || vVersion.toInt() != kAgentEventVersion)
+    // version === CH_EVENT_VERSION (must be the JSON number 1, not "1"). Compare
+    // as a double so a non-integer like 1.5 is rejected the way events.ts's
+    // strict `===` rejects it (QJsonValue::toInt() would truncate 1.5 -> 1 and
+    // wrongly accept it).
+    if (!vVersion.isDouble()
+        || vVersion.toDouble() != static_cast<double>(kAgentEventVersion))
         return std::nullopt;
     if (!vTimestamp.isString())
         return std::nullopt;

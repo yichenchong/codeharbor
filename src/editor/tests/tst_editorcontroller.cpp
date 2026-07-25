@@ -53,9 +53,18 @@ QString reqContent(const QJsonObject& req)
     return req.value(QStringLiteral("params")).toObject().value(QStringLiteral("content")).toString();
 }
 
+QString reqSubscriptionId(const QJsonObject& req)
+{
+    return req.value(QStringLiteral("params"))
+        .toObject()
+        .value(QStringLiteral("subscriptionId"))
+        .toString();
+}
+
 const auto kReadFile = QString::fromLatin1(ch::rpc::kMethodReadFile);
 const auto kWriteFile = QString::fromLatin1(ch::rpc::kMethodWriteFile);
 const auto kWatch = QString::fromLatin1(ch::rpc::kMethodWatch);
+const auto kUnwatch = QString::fromLatin1(ch::rpc::kMethodUnwatch);
 const auto kStat = QString::fromLatin1(ch::rpc::kMethodStat);
 const auto kWatchEvent = QString::fromLatin1(ch::rpc::kWatchEventNotification);
 
@@ -78,6 +87,8 @@ private slots:
     void externalChangeWhileCleanReloads();
     void externalChangeWhileDirtyDoesNotReload();
     void recoverySnapshotWrittenAndOfferedOnReopen();
+    void unwatchIssuedOnDestruction();
+    void reopenUnwatchesPreviousSubscription();
 
 private:
     void makePair();
@@ -147,6 +158,13 @@ QJsonObject TstEditorController::nextRequest(int timeoutMs)
 {
     QDeadlineTimer deadline(timeoutMs);
     forever {
+        // Pump the event loop FIRST, every iteration. This lets the client both
+        // flush its outgoing requests AND process any responses the server has
+        // already written since the last call (e.g. the file.watch reply that
+        // records the subscription id). Returning buffered requests without a
+        // pump would strand those responses unprocessed, so a subscribe issued
+        // just before a teardown/reopen would never be recorded (SPEC 8.7).
+        QTest::qWait(5);
         if (m_serverSide)
             m_serverBuf += m_serverSide->readAll();
         const int nl = m_serverBuf.indexOf('\n');
@@ -157,7 +175,6 @@ QJsonObject TstEditorController::nextRequest(int timeoutMs)
         }
         if (deadline.hasExpired())
             break;
-        QTest::qWait(5); // pump the event loop so the client can flush + read
     }
     return {};
 }
@@ -411,6 +428,11 @@ void TstEditorController::recoverySnapshotWrittenAndOfferedOnReopen()
     QSignalSpy recoverySpy(m_controller, &EditorController::recoveryAvailable);
 
     m_controller->open(QStringLiteral("/foo/f.txt"));
+    // Re-open unwatches the previous file's subscription first (SPEC 8.7): no
+    // leaked/duplicated watcher across the switch.
+    const QJsonObject unwatch = nextRequest();
+    QCOMPARE(method(unwatch), kUnwatch);
+    QCOMPARE(reqSubscriptionId(unwatch), QStringLiteral("sub1"));
     const QJsonObject read = nextRequest();
     QCOMPARE(method(read), kReadFile);
     respondResult(reqId(read), {{"path", "/foo/f.txt"},
@@ -441,6 +463,66 @@ void TstEditorController::recoverySnapshotWrittenAndOfferedOnReopen()
 
     QTRY_COMPARE(recoverySpy.count(), 1);
     QCOMPARE(recoverySpy.at(0).at(0).toString(), QStringLiteral("recovered edits"));
+}
+
+void TstEditorController::unwatchIssuedOnDestruction()
+{
+    makePair();
+    openClean(QStringLiteral("/foo/f.txt"), QStringLiteral("hello"),
+              QStringLiteral("r1"));
+    // The load subscribed a watcher ("sub1"). Destroying the controller (as a
+    // pane close would) MUST release it — otherwise the server-side watch leaks.
+    delete m_controller;
+    m_controller = nullptr;
+
+    const QJsonObject unwatch = nextRequest();
+    QCOMPARE(method(unwatch), kUnwatch);
+    QCOMPARE(reqSubscriptionId(unwatch), QStringLiteral("sub1"));
+}
+
+void TstEditorController::reopenUnwatchesPreviousSubscription()
+{
+    makePair();
+    openClean(QStringLiteral("/foo/a.txt"), QStringLiteral("A"),
+              QStringLiteral("r1")); // subscribes "sub1"
+
+    // Switch to a different file: the previous file's watcher is released first
+    // (before the new read) so subscriptions are never leaked or duplicated.
+    m_controller->open(QStringLiteral("/foo/b.txt"));
+
+    const QJsonObject unwatch = nextRequest();
+    QCOMPARE(method(unwatch), kUnwatch);
+    QCOMPARE(reqSubscriptionId(unwatch), QStringLiteral("sub1"));
+
+    const QJsonObject read = nextRequest();
+    QCOMPARE(method(read), kReadFile);
+    QCOMPARE(reqPath(read), QStringLiteral("/foo/b.txt"));
+    respondResult(reqId(read), {{"path", "/foo/b.txt"},
+                                {"encoding", "utf8"},
+                                {"content", "B"},
+                                {"revision", "r2"},
+                                {"truncated", false}});
+
+    // The new file subscribes its own watcher ("sub2").
+    const QJsonObject watch = nextRequest();
+    QCOMPARE(method(watch), kWatch);
+    QCOMPARE(reqPath(watch), QStringLiteral("/foo/b.txt"));
+    respondResult(reqId(watch), {{"subscriptionId", "sub2"}});
+
+    const QJsonObject stat = nextRequest();
+    QCOMPARE(method(stat), kStat);
+    respondError(reqId(stat), -32002, QStringLiteral("ENOENT")); // no snapshot
+
+    QTRY_COMPARE(m_controller->fileState(), QStringLiteral("clean"));
+    QCOMPARE(m_controller->path(), QStringLiteral("/foo/b.txt"));
+
+    // Destroying now releases the NEW subscription ("sub2"), proving the switch
+    // adopted it rather than clinging to the stale "sub1".
+    delete m_controller;
+    m_controller = nullptr;
+    const QJsonObject finalUnwatch = nextRequest();
+    QCOMPARE(method(finalUnwatch), kUnwatch);
+    QCOMPARE(reqSubscriptionId(finalUnwatch), QStringLiteral("sub2"));
 }
 
 QTEST_GUILESS_MAIN(TstEditorController)

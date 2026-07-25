@@ -5,13 +5,11 @@
 
 #include <QByteArray>
 #include <QHash>
+#include <QIODevice>
 #include <QObject>
+#include <QPointer>
 #include <QSet>
 #include <QString>
-
-QT_BEGIN_NAMESPACE
-class QIODevice;
-QT_END_NAMESPACE
 
 namespace ch {
 
@@ -65,7 +63,10 @@ private:
     void processLine(const QByteArray& line);
     void applyEvent(const AgentEvent& ev);
 
-    QIODevice* m_transport = nullptr;
+    // QPointer so it auto-nulls if a caller-owned transport is destroyed while
+    // the monitor outlives it; a raw pointer would dangle and setTransport()'s
+    // disconnect() on the old transport would be a use-after-free.
+    QPointer<QIODevice> m_transport = nullptr;
     QByteArray m_readBuffer;
     // devSessionId -> (terminalId -> current AgentState).
     QHash<QString, QHash<QString, AgentState>> m_states;

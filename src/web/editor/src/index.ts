@@ -105,6 +105,9 @@ export function mountEditor(element: HTMLElement, bridge: EditorBridge): void {
     let applyingHostEdit = false;
     // Whether the buffer diverges from loadedRevision (unsaved user edits).
     let dirty = false;
+    // Mirror of the host readOnly toggle (SPEC 8.2). A read-only buffer must
+    // never issue a save, even via the Ctrl/Cmd+S command binding.
+    let readOnly = false;
 
     function clearNotice(): void {
         notice.style.display = "none";
@@ -144,8 +147,9 @@ export function mountEditor(element: HTMLElement, bridge: EditorBridge): void {
         renderState();
     });
 
-    bridge.readOnlyChanged.connect((readOnly: boolean) => {
-        editor.updateOptions({ readOnly });
+    bridge.readOnlyChanged.connect((ro: boolean) => {
+        readOnly = ro;
+        editor.updateOptions({ readOnly: ro });
     });
 
     bridge.saved.connect((revision: string) => {
@@ -201,6 +205,9 @@ export function mountEditor(element: HTMLElement, bridge: EditorBridge): void {
     // ---- slots: JS -> C++ ----
     // Ctrl/Cmd+S persists the buffer guarded by the loaded revision (SPEC 8.4).
     editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, () => {
+        if (readOnly) {
+            return;
+        }
         bridge.save(editor.getValue(), loadedRevision);
     });
 
