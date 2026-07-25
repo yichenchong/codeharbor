@@ -35,10 +35,13 @@ UiStateStore::~UiStateStore() = default;
 
 void UiStateStore::setRegionWidths(int sidebar, int viewer, int terminal)
 {
+    // No sync() here: this is called on every width change during a handle
+    // drag, and a synchronous disk write per change causes jank. QSettings
+    // flushes periodically and on destruction (see ~UiStateStore), so a fresh
+    // instance still reads back the last written values.
     m_settings->setValue(kSidebarKey, sidebar);
     m_settings->setValue(kViewerKey, viewer);
     m_settings->setValue(kTerminalKey, terminal);
-    m_settings->sync();
 }
 
 int UiStateStore::sidebarWidth() const

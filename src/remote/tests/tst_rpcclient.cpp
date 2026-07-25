@@ -55,6 +55,10 @@ private slots:
     void reentrantCallFromCallback();
     void paramsOmittedWhenNullPresentOtherwise();
     void setTransportTwiceDetachesOld();
+    void callWithNoTransportFailsCallbackOnce();
+    void callAfterTransportClosedFailsOnce();
+    void callbackDeletingClientMidDispatchIsSafe();
+    void oversizedNewlinelessInputIsBounded();
     void liveServerInfoOverProcess();
 
 private:
@@ -635,6 +639,99 @@ void TstRpcClient::setTransportTwiceDetachesOld()
     QCOMPARE(warnSpy.count(), 0);
 
     m_client->setTransport(nullptr);
+}
+
+void TstRpcClient::callWithNoTransportFailsCallbackOnce()
+{
+    // No transport was ever bound (init() creates a bare client). call() must
+    // deliver a synthetic error exactly once, synchronously, and register
+    // nothing — never orphan a callback that could not otherwise fire.
+    int fired = 0;
+    std::optional<RpcError> got;
+    m_client->call(QStringLiteral("file.stat"), QJsonObject{{"path", "/a"}},
+                   [&](QJsonValue, std::optional<RpcError> err) {
+                       ++fired;
+                       got = err;
+                   });
+
+    QCOMPARE(fired, 1);
+    QVERIFY(got.has_value());
+    QCOMPARE(got->code, -32603);
+    QCOMPARE(m_client->pendingCount(), 0); // nothing registered => no leak
+}
+
+void TstRpcClient::callAfterTransportClosedFailsOnce()
+{
+    makePair();
+
+    // Latch the transport closed.
+    QSignalSpy closedSpy(m_client, &CodeharbordClient::transportClosed);
+    m_serverSide->disconnectFromServer();
+    QTRY_COMPARE(closedSpy.count(), 1);
+    QCOMPARE(m_client->pendingCount(), 0);
+
+    // A fresh call on a latched-closed transport must fail the callback exactly
+    // once and register no pending entry.
+    int fired = 0;
+    std::optional<RpcError> got;
+    m_client->call(QStringLiteral("ping"), QJsonValue(),
+                   [&](QJsonValue, std::optional<RpcError> err) {
+                       ++fired;
+                       got = err;
+                   });
+
+    QCOMPARE(fired, 1);
+    QVERIFY(got.has_value());
+    QCOMPARE(got->code, -32603);
+    QCOMPARE(m_client->pendingCount(), 0);
+}
+
+void TstRpcClient::callbackDeletingClientMidDispatchIsSafe()
+{
+    makePair();
+
+    // A callback that deletes the client from inside the dispatch loop must not
+    // trigger a use-after-free when onReadyRead() resumes.
+    bool fired = false;
+    const int id = m_client->call(
+        QStringLiteral("ping"), QJsonValue(),
+        [&](QJsonValue, std::optional<RpcError>) {
+            fired = true;
+            delete m_client;   // reentrant self-delete mid-dispatch
+            m_client = nullptr;
+        });
+
+    m_serverSide->write(
+        jsonLine({{"jsonrpc", "2.0"}, {"id", id}, {"result", QJsonObject{}}}));
+    m_serverSide->flush();
+
+    QTRY_VERIFY(fired);
+    QVERIFY(m_client == nullptr); // deleted cleanly; no crash / UAF
+}
+
+void TstRpcClient::oversizedNewlinelessInputIsBounded()
+{
+    makePair();
+
+    QSignalSpy warnSpy(m_client, &CodeharbordClient::protocolWarning);
+    QSignalSpy closedSpy(m_client, &CodeharbordClient::transportClosed);
+
+    std::optional<RpcError> got;
+    m_client->call(QStringLiteral("ping"), QJsonValue(),
+                   [&](QJsonValue, std::optional<RpcError> err) { got = err; });
+
+    // Stream >8 MiB with no newline: a malformed unframed line. The client must
+    // bound its read buffer, warn, and tear the transport down (failing pending
+    // callers) rather than grow memory without limit.
+    const QByteArray blob(9 * 1024 * 1024, 'x');
+    m_serverSide->write(blob);
+    m_serverSide->flush();
+
+    QTRY_VERIFY_WITH_TIMEOUT(closedSpy.count() >= 1, 10000);
+    QVERIFY(warnSpy.count() >= 1);
+    QVERIFY(got.has_value()); // the pending call was failed on the reset
+    QCOMPARE(got->code, -32603);
+    QCOMPARE(m_client->pendingCount(), 0);
 }
 
 void TstRpcClient::liveServerInfoOverProcess()

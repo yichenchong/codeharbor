@@ -50,8 +50,11 @@ public:
     QIODevice* transport() const { return m_transport; }
 
     // Issue an async request. Returns the monotonically increasing JSON-RPC id
-    // assigned to it; the callback fires once when the matching response
-    // arrives, or with a synthetic error if the transport closes first.
+    // assigned to it. The callback fires exactly once: either when the matching
+    // response arrives, with a synthetic error if the transport closes while the
+    // request is pending, or — if no writable transport is bound (or the write
+    // fails) — synchronously with a synthetic transport error before returning.
+    // No callback is ever registered that cannot fire.
     int call(const QString& method, const QJsonValue& params, ResponseCallback cb);
 
     // Number of requests awaiting a response.

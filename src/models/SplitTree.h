@@ -16,6 +16,12 @@ enum class SplitOrientation { Horizontal, Vertical };
 //     per child (ratios.size() == children.size()).
 // A default-constructed node is an empty leaf and is used as the "invalid"
 // sentinel returned by fromJson() when the input fails validation.
+//
+// Depth invariant: every in-memory SplitNode tree is kept within the same
+// nesting bound (kMaxDepth in SplitTree.cpp) that fromJson() enforces on parse.
+// fromJson() rejects deeper input, and layouts constructed in-memory nest only a
+// handful of levels, so toJson() and operator==, which recurse WITHOUT their own
+// depth guard, are safe: they only ever walk trees that already honor the bound.
 struct SplitNode {
     QString paneId;
     SplitOrientation orientation = SplitOrientation::Horizontal;

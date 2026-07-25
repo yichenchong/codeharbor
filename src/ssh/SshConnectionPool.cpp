@@ -138,6 +138,16 @@ void SshConnectionPool::closeSession()
 {
     if (!m_session)
         return;
+    // Channels are attached to the session; ssh_free() would free them too, so
+    // free them explicitly FIRST to keep a clear ownership boundary and avoid a
+    // double-free/UAF if a caller still holds a (now-invalid) handle.
+    for (ssh_channel channel : m_channels) {
+        if (!channel)
+            continue;
+        ssh_channel_close(channel);
+        ssh_channel_free(channel);
+    }
+    m_channels.clear();
     if (ssh_is_connected(m_session))
         ssh_disconnect(m_session);
     ssh_free(m_session);
@@ -247,6 +257,9 @@ ssh_channel SshConnectionPool::openChannel(ChannelKind kind)
         return nullptr;
     }
 
+    // The pool owns the channel: track it so closeSession() frees it before the
+    // session, preventing a double-free through ssh_free()'s channel teardown.
+    m_channels.append(channel);
     return channel;
 }
 

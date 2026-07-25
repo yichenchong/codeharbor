@@ -354,18 +354,34 @@ export function openWorkspace(dbPath: string): Workspace {
     return new Workspace(db);
 }
 
+// Ordered schema migrations, one entry per version. migrate() applies every
+// step whose version is above the stored version and at or below the target,
+// in order, then records the target. Shipping a future structural change means
+// appending a new entry here (and bumping WORKSPACE_SCHEMA_VERSION) rather than
+// only advancing the version literal while tables stay un-migrated. v1 is the
+// baseline: it applies the idempotent schema.sql DDL (C2), so re-running it on
+// an already-current database is harmless.
+const MIGRATIONS: ReadonlyArray<{
+    version: number;
+    apply: (db: DatabaseSync) => void;
+}> = [{ version: 1, apply: (db) => db.exec(schemaSql) }];
+
 function migrate(db: DatabaseSync): void {
-    if (schemaVersion(db) < WORKSPACE_SCHEMA_VERSION) {
-        db.exec(schemaSql);
-        // schema.sql seeds the version row with INSERT OR IGNORE, which cannot
-        // advance an already-present row. Record the target version explicitly
-        // so a later WORKSPACE_SCHEMA_VERSION bump is persisted (and migrate
-        // stops re-running schema.sql on every open) rather than the stored
-        // version silently drifting from the DDL's hard-coded literal.
-        db.prepare("UPDATE schema_version SET version = ? WHERE id = 1").run(
-            WORKSPACE_SCHEMA_VERSION,
-        );
+    const from = schemaVersion(db);
+    if (from >= WORKSPACE_SCHEMA_VERSION) return;
+    for (const step of MIGRATIONS) {
+        if (step.version > from && step.version <= WORKSPACE_SCHEMA_VERSION) {
+            step.apply(db);
+        }
     }
+    // schema.sql seeds the version row with INSERT OR IGNORE, which cannot
+    // advance an already-present row. Record the target version explicitly so a
+    // WORKSPACE_SCHEMA_VERSION bump is persisted (and migrate stops re-running
+    // steps on every open) rather than the stored version silently drifting
+    // from the DDL's hard-coded literal.
+    db.prepare("UPDATE schema_version SET version = ? WHERE id = 1").run(
+        WORKSPACE_SCHEMA_VERSION,
+    );
 }
 
 function schemaVersion(db: DatabaseSync): number {
@@ -454,6 +470,11 @@ export class Workspace {
     createSession(params: CreateSessionParams): Session {
         const id = randomUUID();
         const ts = Date.now();
+        // SPEC 3.5: a child's server_id is authoritative from its parent row,
+        // never the client-supplied param — otherwise a mismatched serverId
+        // could surface this session under a foreign server's group. The wire
+        // param is still accepted (C1) but overridden here.
+        const serverId = this.parentServerId("groups", params.groupId);
         const position = params.position ?? this.nextPosition("dev_sessions", "group_id", params.groupId);
         this.db
             .prepare(
@@ -461,7 +482,7 @@ export class Workspace {
             )
             .run(
                 id,
-                params.serverId,
+                serverId,
                 params.groupId,
                 params.name,
                 params.repositoryRoot,
@@ -632,6 +653,10 @@ export class Workspace {
     createViewerPane(params: CreateViewerPaneParams): ViewerPane {
         const id = randomUUID();
         const ts = Date.now();
+        // SPEC 3.5: server_id is derived from the parent session, not trusted
+        // from the param, so a mismatched serverId cannot detach this pane from
+        // its session's server.
+        const serverId = this.parentServerId("dev_sessions", params.devSessionId);
         const position =
             params.position ?? this.nextPosition("viewer_panes", "dev_session_id", params.devSessionId);
         this.db
@@ -640,7 +665,7 @@ export class Workspace {
             )
             .run(
                 id,
-                params.serverId,
+                serverId,
                 params.devSessionId,
                 params.url,
                 params.handler ?? null,
@@ -682,6 +707,9 @@ export class Workspace {
     createTerminalPane(params: CreateTerminalPaneParams): TerminalPane {
         const id = randomUUID();
         const ts = Date.now();
+        // SPEC 3.5: server_id derived from the parent session (see
+        // createViewerPane); the client-sent serverId is overridden.
+        const serverId = this.parentServerId("dev_sessions", params.devSessionId);
         const position =
             params.position ?? this.nextPosition("terminal_panes", "dev_session_id", params.devSessionId);
         this.db
@@ -690,7 +718,7 @@ export class Workspace {
             )
             .run(
                 id,
-                params.serverId,
+                serverId,
                 params.devSessionId,
                 params.name,
                 params.workingDirectory ?? null,
@@ -839,6 +867,19 @@ export class Workspace {
             .prepare(`SELECT COALESCE(MAX(position), -1) AS m FROM ${table} WHERE ${scopeColumn} = ?`)
             .get(scopeValue) as { m: number };
         return row.m + 1;
+    }
+
+    // Authoritative server_id of a parent row (SPEC 3.5). Children inherit their
+    // parent's server_id rather than trusting the client-supplied param, keeping
+    // the multi-server invariant that a row and its ancestors share one server.
+    // Throws if the parent is missing (the FK would reject the insert anyway,
+    // but this yields a clearer error and runs before the child id is minted).
+    private parentServerId(table: "groups" | "dev_sessions", id: string): string {
+        const row = this.db
+            .prepare(`SELECT server_id FROM ${table} WHERE id = ?`)
+            .get(id) as { server_id: string } | undefined;
+        if (!row) throw new Error(`${table} not found: ${id}`);
+        return row.server_id;
     }
 
     private transaction<T>(fn: () => T): T {

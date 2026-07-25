@@ -4,6 +4,7 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QMetaObject>
+#include <QPointer>
 
 #include <limits>
 
@@ -14,6 +15,12 @@ namespace {
 // JSON-RPC 2.0 reserved code for an internal/transport error. Reused for the
 // synthetic failure delivered to pending callbacks when the transport dies.
 constexpr int kInternalError = -32603;
+
+// Hard cap on a single unframed line. A well-behaved server delimits every
+// message with '\n'; a peer that streams megabytes without one is malformed and
+// must not be allowed to grow m_readBuffer without bound. Comfortably above the
+// largest legitimate frame (multi-MiB file payloads).
+constexpr int kMaxLineBytes = 8 * 1024 * 1024;
 
 } // namespace
 
@@ -67,28 +74,56 @@ int CodeharbordClient::call(const QString& method, const QJsonValue& params,
     if (!params.isUndefined() && !params.isNull())
         request.insert(QStringLiteral("params"), params);
 
-    m_pending.insert(id, std::move(cb));
+    // Decide whether we can actually transmit BEFORE registering the pending
+    // callback. If we cannot, the callback would otherwise be orphaned forever
+    // (leak + caller hangs, never learning it failed). Instead we fail it once
+    // with a synthetic transport error and register nothing. The single
+    // acceptance rule: call() either (a) writes the request and registers the
+    // pending callback, or (b) invokes the callback exactly once with an error.
+    QString failReason;
+    if (m_closed)
+        failReason = QStringLiteral("transport closed");
+    else if (!m_transport)
+        failReason = QStringLiteral("no transport bound");
+    else if (!m_transport->isOpen() || !m_transport->isWritable())
+        failReason = QStringLiteral("transport not writable");
 
-    if (!m_transport || !m_transport->isWritable()) {
+    if (failReason.isEmpty()) {
+        QByteArray line = QJsonDocument(request).toJson(QJsonDocument::Compact);
+        line.append('\n');
+        if (m_transport->write(line) != line.size())
+            failReason = QStringLiteral("transport write failed");
+    }
+
+    if (!failReason.isEmpty()) {
         emit protocolWarning(
-            QStringLiteral("call(%1): no writable transport").arg(method));
-        // The pending entry will be failed by onTransportClosed(), or the caller
-        // may retry after binding a transport; leave it registered.
+            QStringLiteral("call(%1): %2").arg(method, failReason));
+        RpcError error;
+        error.code = kInternalError;
+        error.message = QStringLiteral("call failed: %1").arg(failReason);
+        // Deliver the failure exactly once and register nothing. The callback
+        // may delete this client, so touch no members after invoking it; `id`
+        // is a local copy and is safe to return.
+        if (cb)
+            cb(QJsonValue(), error);
         return id;
     }
 
-    QByteArray line = QJsonDocument(request).toJson(QJsonDocument::Compact);
-    line.append('\n');
-    m_transport->write(line);
+    m_pending.insert(id, std::move(cb));
     return id;
 }
 
 void CodeharbordClient::onReadyRead()
 {
-    if (!m_transport)
+    if (!m_transport || m_closed)
         return;
 
     m_readBuffer.append(m_transport->readAll());
+
+    // processLine() invokes a user callback that may delete this client. Watch
+    // for that with a QPointer and stop touching members the instant it fires,
+    // otherwise the loop's next m_readBuffer access is a use-after-free.
+    QPointer<CodeharbordClient> self(this);
 
     // Consume every complete line; a trailing partial line stays buffered until
     // the rest arrives on a later readyRead (partial-line-mid-JSON handling).
@@ -101,6 +136,19 @@ void CodeharbordClient::onReadyRead()
         if (line.trimmed().isEmpty())
             continue;
         processLine(line);
+        if (!self)
+            return; // a callback deleted us; touch no members
+    }
+
+    // Guard against an unterminated line growing the buffer without bound: a
+    // peer streaming megabytes with no '\n' is malformed. Surface it and tear
+    // the transport down (failing pending callers) rather than leak memory.
+    if (m_readBuffer.size() > kMaxLineBytes) {
+        emit protocolWarning(
+            QStringLiteral("RPC line exceeded %1 bytes without a newline; "
+                           "resetting transport").arg(kMaxLineBytes));
+        m_readBuffer.clear();
+        onTransportClosed();
     }
 }
 
@@ -226,7 +274,13 @@ void CodeharbordClient::onTransportClosed()
     RpcError error;
     error.code = kInternalError;
     error.message = QStringLiteral("transport closed with request pending");
+    // A failed callback may delete this client during failAllPending(); guard
+    // the trailing emit so it never touches a destroyed object. m_closed was
+    // latched above, so any reentrant onTransportClosed() already returned.
+    QPointer<CodeharbordClient> self(this);
     failAllPending(error);
+    if (!self)
+        return;
 
     emit transportClosed();
 }

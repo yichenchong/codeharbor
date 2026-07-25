@@ -1,9 +1,44 @@
 #include "KnownHosts.h"
 
+#include <QCryptographicHash>
+#include <QMessageAuthenticationCode>
 #include <QRegularExpression>
 #include <QStringList>
 
 namespace ch {
+
+namespace {
+
+// OpenSSH hashes a known_hosts hostname as "|1|<base64 salt>|<base64 hash>",
+// where hash = HMAC-SHA1(key = salt, message = hostname). Return true iff the
+// stored hashed token names this host. Malformed tokens never match.
+bool hashedHostMatches(const QString& hostField, const QString& host)
+{
+    const QStringList parts = hostField.split(QLatin1Char('|'));
+    // Well-formed token splits to ["", "1", salt, hash].
+    if (parts.size() != 4 || !parts.at(0).isEmpty()
+        || parts.at(1) != QLatin1String("1"))
+        return false;
+    const QByteArray salt = QByteArray::fromBase64(parts.at(2).toUtf8());
+    const QByteArray expected = QByteArray::fromBase64(parts.at(3).toUtf8());
+    if (salt.isEmpty() || expected.isEmpty())
+        return false;
+    QMessageAuthenticationCode mac(QCryptographicHash::Sha1);
+    mac.setKey(salt);
+    mac.addData(host.toUtf8());
+    return mac.result() == expected;
+}
+
+// A stored entry names `host` if it matches the plaintext token or, for a
+// hashed |1| token, the HMAC-SHA1 salted hash of the hostname.
+bool entryHostMatches(const QString& storedHost, const QString& host)
+{
+    if (storedHost.startsWith(QLatin1Char('|')))
+        return hashedHostMatches(storedHost, host);
+    return storedHost == host;
+}
+
+} // namespace
 
 KnownHosts::Verdict KnownHosts::verify(const QString& host,
                                        const QString& keyType,
@@ -13,22 +48,23 @@ KnownHosts::Verdict KnownHosts::verify(const QString& host,
     // if any @revoked entry names this exact host+keyType+blob, refuse it even
     // when a trusted entry for the same key appears earlier in the file.
     for (const Entry& e : m_entries) {
-        if (e.host == host && e.keyType == keyType
-            && e.marker == QLatin1String("@revoked") && e.key == keyBlob)
+        if (e.marker == QLatin1String("@revoked") && e.keyType == keyType
+            && e.key == keyBlob && entryHostMatches(e.host, host))
             return Verdict::Mismatch;
     }
 
     bool sawType = false;
     for (const Entry& e : m_entries) {
-        if (e.host != host || e.keyType != keyType)
+        if (e.keyType != keyType || !entryHostMatches(e.host, host))
             continue;
         // @revoked entries were handled above; a revoked entry never establishes
         // trust, so other keys for the same host stay Unknown through it.
         if (e.marker == QLatin1String("@revoked"))
             continue;
-        // Hashed (|1|) and @cert-authority entries are opaque to direct blob
-        // comparison: never a source of Match/Mismatch.
-        if (!e.supported)
+        // @cert-authority entries are not direct host keys: never a source of
+        // Match/Mismatch. Hashed (|1|) entries DO participate — entryHostMatches
+        // resolves them via HMAC-SHA1 above.
+        if (e.marker == QLatin1String("@cert-authority"))
             continue;
         sawType = true;
         if (e.key == keyBlob)
@@ -110,9 +146,10 @@ KnownHosts KnownHosts::parse(const QString& text)
             comment += fields.at(i);
         }
 
-        // Hashed (|1|salt|hash) hosts and any @marker entry are opaque to the
-        // direct-blob match path (supported == false), but still round-trip.
-        // @revoked is additionally consulted by verify() to refuse its key.
+        // @marker entries are excluded from add()/replace (supported == false)
+        // but still round-trip and are consulted by verify(). Hashed (|1|) hosts
+        // are likewise supported == false for add(), yet verify() resolves them
+        // by HMAC-SHA1, so they DO produce Match/Mismatch (and honor @revoked).
         const bool opaque = !marker.isEmpty();
         if (hostField.startsWith(QLatin1Char('|'))) {
             store.m_entries.append(

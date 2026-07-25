@@ -8,11 +8,30 @@
 #include <QJsonObject>
 #include <QMimeDatabase>
 #include <QMimeType>
+#include <QMultiMap>
 #include <QMutexLocker>
 #include <QPointer>
+#include <QUuid>
 #include <QWebEngineUrlRequestJob>
 
 namespace ch {
+
+namespace {
+// Active-content MIME types can execute script or load subresources when a
+// browser renders them as a top-level document (SPEC 7.2). Serving untrusted
+// file bytes as one of these on the privileged internal origin is a
+// cross-file exfiltration vector, so replies for them are locked down with a
+// restrictive Content-Security-Policy.
+bool isActiveContentMime(const QByteArray &mime)
+{
+    const QByteArray m = mime.toLower();
+    return m == QByteArrayLiteral("image/svg+xml")
+        || m == QByteArrayLiteral("text/html")
+        || m == QByteArrayLiteral("application/xhtml+xml")
+        || m == QByteArrayLiteral("application/xml")
+        || m == QByteArrayLiteral("text/xml");
+}
+} // namespace
 
 QString InternalUrlMap::scheme()
 {
@@ -30,17 +49,33 @@ InternalUrlMap &InternalUrlMap::shared()
     return instance;
 }
 
+InternalUrlMap::InternalUrlMap(int maxEntries)
+    : m_maxEntries(maxEntries < 1 ? 1 : maxEntries)
+{
+}
+
 QString InternalUrlMap::internalUrlFor(const QUrl &fileUrl)
 {
     const QString key = fileUrl.toString();
     QMutexLocker lock(&m_mutex);
     const auto it = m_fileToId.constFind(key);
-    if (it != m_fileToId.constEnd())
+    if (it != m_fileToId.constEnd()) {
+        touch(it.value());
         return prefix() + it.value();
+    }
 
-    const QString id = QStringLiteral("f%1").arg(++m_counter);
+    // Mint an unguessable, non-sequential id (a random 128-bit token) so a
+    // compromised page cannot enumerate other opened files by walking a counter
+    // (SPEC 7.4). QUuid draws from the platform CSPRNG. Retry on the
+    // astronomically unlikely collision.
+    QString id;
+    do {
+        id = QUuid::createUuid().toString(QUuid::Id128);
+    } while (m_idToFile.contains(id));
     m_fileToId.insert(key, id);
     m_idToFile.insert(id, fileUrl);
+    m_lru.append(id);
+    evictIfNeeded();
     return prefix() + id;
 }
 
@@ -63,7 +98,38 @@ QUrl InternalUrlMap::fileUrlFor(const QString &internalUrl) const
 QUrl InternalUrlMap::fileUrlForId(const QString &id) const
 {
     QMutexLocker lock(&m_mutex);
-    return m_idToFile.value(id);
+    const auto it = m_idToFile.constFind(id);
+    if (it == m_idToFile.constEnd())
+        return QUrl();
+    // Mark as recently used so an actively-displayed file survives eviction.
+    touch(id);
+    return it.value();
+}
+
+int InternalUrlMap::size() const
+{
+    QMutexLocker lock(&m_mutex);
+    return m_idToFile.size();
+}
+
+void InternalUrlMap::touch(const QString &id) const
+{
+    // m_mutex is held by the caller. Move id to the MRU (back) end.
+    const qsizetype idx = m_lru.indexOf(id);
+    if (idx >= 0)
+        m_lru.removeAt(idx);
+    m_lru.append(id);
+}
+
+void InternalUrlMap::evictIfNeeded()
+{
+    // m_mutex is held by the caller. Drop least-recently-used entries so the
+    // map stays bounded and never grows without limit.
+    while (m_lru.size() > m_maxEntries) {
+        const QString victim = m_lru.takeFirst();
+        const QUrl file = m_idToFile.take(victim);
+        m_fileToId.remove(file.toString());
+    }
 }
 
 InternalUrlSchemeHandler::InternalUrlSchemeHandler(CodeharbordClient *client,
@@ -132,7 +198,20 @@ void InternalUrlSchemeHandler::requestStarted(QWebEngineUrlRequestJob *job)
             auto *buffer = new QBuffer(guard);
             buffer->setData(bytes);
             buffer->open(QIODevice::ReadOnly);
-            guard->reply(InternalUrlSchemeHandler::mimeForPath(path), buffer);
+
+            const QByteArray mime = InternalUrlSchemeHandler::mimeForPath(path);
+            if (isActiveContentMime(mime)) {
+                // Defense-in-depth alongside the internal profile's JS-disabled
+                // WebEngineViews: fully sandbox the document and forbid every
+                // script/subresource/fetch so an .svg/.html served top-level on
+                // the privileged origin cannot read and exfiltrate other files.
+                QMultiMap<QByteArray, QByteArray> headers;
+                headers.insert(
+                    QByteArrayLiteral("Content-Security-Policy"),
+                    QByteArrayLiteral("default-src 'none'; sandbox"));
+                guard->setAdditionalResponseHeaders(headers);
+            }
+            guard->reply(mime, buffer);
         });
 }
 

@@ -7,6 +7,10 @@
 #include <QGuiApplication>
 #include <QString>
 #include <QUrl>
+#include <QList>
+#include <QRegularExpression>
+#include <QSet>
+#include <QWebEngineUrlScheme>
 #include <QtTest/QtTest>
 #include <QtWebEngineQuick/QtWebEngineQuick>
 
@@ -27,8 +31,11 @@ private slots:
     void resolveUrlTable();
     void urlMappingRoundTrip();
     void urlMappingStableAndDistinct();
+    void urlMappingIdsUnguessable();
+    void urlMappingLruEviction();
     void mimeForPathByExtension();
     void profileIsolation();
+    void schemeFlags();
 };
 
 void TstViewers::resolveByExtensionTable()
@@ -169,6 +176,85 @@ void TstViewers::urlMappingStableAndDistinct()
     QCOMPARE(map.fileUrlFor(b1), b);
 }
 
+void TstViewers::urlMappingIdsUnguessable()
+{
+    // Ids must be unguessable, high-entropy tokens (not the old sequential
+    // f1,f2,... counter) so a compromised page cannot enumerate other opened
+    // files by walking ids (SPEC 7.4). They remain injective and invertible.
+    InternalUrlMap map;
+    const QString prefix = InternalUrlMap::prefix();
+    const QRegularExpression sequential(QStringLiteral("^f\\d+$"));
+    const QRegularExpression token128(QStringLiteral("^[0-9a-f]{32}$"));
+    QList<QString> ids;
+    for (int i = 0; i < 8; ++i) {
+        const QUrl f(QStringLiteral("file:///dir/file%1.bin").arg(i));
+        const QString internal = map.internalUrlFor(f);
+        QVERIFY(internal.startsWith(prefix));
+        const QString id = internal.mid(prefix.size());
+        // Never the guessable sequential scheme.
+        QVERIFY2(!sequential.match(id).hasMatch(),
+                 qPrintable(QStringLiteral("sequential id leaked: %1").arg(id)));
+        // A 128-bit random token (QUuid::Id128 -> 32 lowercase hex chars).
+        QVERIFY2(token128.match(id).hasMatch(),
+                 qPrintable(QStringLiteral("id not a 128-bit token: %1").arg(id)));
+        // Still invertible.
+        QCOMPARE(map.fileUrlFor(internal), f);
+        ids.append(id);
+    }
+    // Injective: every id is distinct.
+    QCOMPARE(QSet<QString>(ids.cbegin(), ids.cend()).size(), ids.size());
+}
+
+void TstViewers::urlMappingLruEviction()
+{
+    // The map is LRU-bounded so it never grows without limit; minting past the
+    // cap evicts the least-recently-used entry (SPEC 7.4 follow-up).
+    const QUrl a(QStringLiteral("file:///a.txt"));
+    const QUrl b(QStringLiteral("file:///b.txt"));
+    const QUrl c(QStringLiteral("file:///c.txt"));
+    const QUrl d(QStringLiteral("file:///d.txt"));
+
+    InternalUrlMap map(3);
+    QCOMPARE(map.maxEntries(), 3);
+    const QString ia = map.internalUrlFor(a);
+    const QString ib = map.internalUrlFor(b);
+    const QString ic = map.internalUrlFor(c);
+    QCOMPARE(map.size(), 3);
+
+    // A fourth mint pushes over the cap: the least-recently-used (a) is evicted.
+    const QString id = map.internalUrlFor(d);
+    QCOMPARE(map.size(), 3); // still bounded
+    QVERIFY(!map.fileUrlFor(ia).isValid());
+    QCOMPARE(map.fileUrlFor(ib), b);
+    QCOMPARE(map.fileUrlFor(ic), c);
+    QCOMPARE(map.fileUrlFor(id), d);
+
+    // Accessing an entry marks it recently-used, so it survives the next
+    // eviction while a stale neighbour is dropped instead.
+    InternalUrlMap map2(3);
+    const QString ja = map2.internalUrlFor(a);
+    const QString jb = map2.internalUrlFor(b);
+    const QString jc = map2.internalUrlFor(c);
+    QCOMPARE(map2.fileUrlFor(ja), a); // bump a to most-recently-used
+    map2.internalUrlFor(d);           // evicts LRU (b), not a
+    QVERIFY(!map2.fileUrlFor(jb).isValid());
+    QCOMPARE(map2.fileUrlFor(ja), a);
+    QCOMPARE(map2.fileUrlFor(jc), c);
+}
+
+void TstViewers::schemeFlags()
+{
+    // The internal scheme is registered in main() before WebEngine init. It
+    // must NOT carry LocalAccessAllowed: the privileged origin serves every
+    // resource via CodeharbordClient/readFile and must never reach client
+    // file:// resources (SPEC 2.4/7). It stays a secure origin.
+    const QWebEngineUrlScheme s =
+        QWebEngineUrlScheme::schemeByName(QByteArrayLiteral("codeharbor-internal"));
+    QCOMPARE(s.name(), QByteArrayLiteral("codeharbor-internal"));
+    QVERIFY(!s.flags().testFlag(QWebEngineUrlScheme::LocalAccessAllowed));
+    QVERIFY(s.flags().testFlag(QWebEngineUrlScheme::SecureScheme));
+}
+
 void TstViewers::mimeForPathByExtension()
 {
     // MIME is derived from the extension only (no filesystem access), so these
@@ -227,6 +313,10 @@ int main(int argc, char *argv[])
     // by WebEngine) starts without a display in CI.
     if (qEnvironmentVariableIsEmpty("QT_QPA_PLATFORM"))
         qputenv("QT_QPA_PLATFORM", QByteArrayLiteral("offscreen"));
+
+    // Custom schemes must be registered before WebEngine init (as in main.cpp),
+    // so schemeFlags() can inspect the registered flags.
+    ViewerProfiles::registerUrlScheme();
 
     QtWebEngineQuick::initialize();
     QGuiApplication app(argc, argv);

@@ -38,8 +38,9 @@ Rectangle {
             if (path === root.remotePath(root.url))
                 root.content = text;
         }
-        function onTextFileError(message) {
-            root.errorText = message;
+        function onTextFileError(path, message) {
+            if (path === root.remotePath(root.url))
+                root.errorText = message;
         }
     }
 

@@ -37,10 +37,11 @@ void ViewerProfiles::registerUrlScheme()
     scheme.setSyntax(QWebEngineUrlScheme::Syntax::Host);
     scheme.setDefaultPort(QWebEngineUrlScheme::PortUnspecified);
     // Treated as a secure origin (HTTPS-like) so pages served from it run in a
-    // secure context; allowed to interoperate with local content and to satisfy
-    // CORS/fetch from the privileged viewers.
+    // secure context, and CORS-enabled so the privileged viewers can fetch
+    // internal-scheme subresources. LocalAccessAllowed is deliberately NOT set:
+    // everything is served via CodeharbordClient/readFile, never file://, so the
+    // internal origin must not be granted client file:// reach (SPEC 2.4/7).
     scheme.setFlags(QWebEngineUrlScheme::SecureScheme
-                    | QWebEngineUrlScheme::LocalAccessAllowed
                     | QWebEngineUrlScheme::CorsEnabled);
     QWebEngineUrlScheme::registerScheme(scheme);
 }

@@ -62,9 +62,9 @@ public:
 
 signals:
     void textFileRead(const QString &path, const QString &content);
-    void textFileError(const QString &message);
+    void textFileError(const QString &path, const QString &message);
     void directoryListed(const QString &path, const QVariantList &entries);
-    void directoryError(const QString &message);
+    void directoryError(const QString &path, const QString &message);
 
 private:
     ViewerProfiles *profiles();

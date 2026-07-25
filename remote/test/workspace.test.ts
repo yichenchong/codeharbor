@@ -583,3 +583,95 @@ test("migrate persists the target schema version even when the seeded row is sta
     second.close();
     await cleanup(dbPath);
 });
+
+test("child rows inherit the parent's server_id, overriding a mismatched param (SPEC 3.5)", async () => {
+    const dbPath = await tmpDbPath();
+    const ws = openWorkspace(dbPath);
+
+    const group = ws.createGroup({ serverId: SERVER, name: "Work" });
+
+    // A caller sends a serverId that does NOT match the parent group. The
+    // authoritative value must come from the parent row, not the param, so the
+    // session cannot surface under a foreign server's group.
+    const session = ws.createSession({
+        serverId: "srv-EVIL",
+        groupId: group.id,
+        name: "s",
+        repositoryRoot: "/r",
+    });
+    assert.equal(session.serverId, SERVER);
+
+    const viewer = ws.createViewerPane({
+        serverId: "srv-EVIL",
+        devSessionId: session.id,
+        url: "http://x",
+    });
+    assert.equal(viewer.serverId, SERVER);
+
+    const terminal = ws.createTerminalPane({
+        serverId: "srv-EVIL",
+        devSessionId: session.id,
+        name: "sh",
+    });
+    assert.equal(terminal.serverId, SERVER);
+
+    // The mismatched server sees nothing; the real parent server sees it all.
+    assert.deepEqual(ws.list("srv-EVIL"), []);
+    const listed = ws.list(SERVER);
+    assert.equal(listed.length, 1);
+    assert.equal(listed[0].sessions.length, 1);
+    assert.equal(listed[0].sessions[0].serverId, SERVER);
+    assert.equal(listed[0].sessions[0].viewerPanes[0].serverId, SERVER);
+    assert.equal(listed[0].sessions[0].terminalPanes[0].serverId, SERVER);
+
+    ws.close();
+    await cleanup(dbPath);
+});
+
+test("createSession/createViewerPane reject an unknown parent before minting a row", async () => {
+    const dbPath = await tmpDbPath();
+    const ws = openWorkspace(dbPath);
+
+    assert.throws(
+        () => ws.createSession({ serverId: SERVER, groupId: "nope", name: "s", repositoryRoot: "/r" }),
+        /groups not found: nope/,
+    );
+    assert.throws(
+        () => ws.createViewerPane({ serverId: SERVER, devSessionId: "nope", url: "http://x" }),
+        /dev_sessions not found: nope/,
+    );
+
+    ws.close();
+    await cleanup(dbPath);
+});
+
+test("migrate applies cleanly to a fresh database and is idempotent across reopens", async () => {
+    const dbPath = await tmpDbPath();
+
+    // Fresh open: migrate must create every table and record the target version.
+    const first = openWorkspace(dbPath);
+    const freshVersion = first.db
+        .prepare("SELECT version FROM schema_version WHERE id = 1")
+        .get() as { version: number };
+    assert.equal(freshVersion.version, WORKSPACE_SCHEMA_VERSION);
+    const group = first.createGroup({ serverId: SERVER, name: "Work" });
+    first.close();
+
+    // Reopen repeatedly: each migrate() is a no-op (stored >= target), leaves a
+    // single version row at the target, and never disturbs existing data.
+    for (let i = 0; i < 3; i++) {
+        const ws = openWorkspace(dbPath);
+        const version = ws.db
+            .prepare("SELECT version FROM schema_version WHERE id = 1")
+            .get() as { version: number };
+        assert.equal(version.version, WORKSPACE_SCHEMA_VERSION);
+        const count = ws.db
+            .prepare("SELECT COUNT(*) AS n FROM schema_version")
+            .get() as { n: number };
+        assert.equal(count.n, 1);
+        assert.deepEqual(ws.getGroup(group.id), group);
+        ws.close();
+    }
+
+    await cleanup(dbPath);
+});

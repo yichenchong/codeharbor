@@ -33,10 +33,13 @@ import type {
     ListDirectoryResult,
 } from "./rpc-types.ts";
 
-// Opaque revision token (SPEC 8.4). Derived from mtime + size; clients treat it
-// as bytes. Reused by every read/write/watch path, so it earns its name.
-export function revisionFrom(stats: Pick<Stats, "mtimeMs" | "size">): string {
-    return `${stats.mtimeMs}-${stats.size}`;
+// Opaque revision token (SPEC 8.4/8.6). Clients treat it as bytes and never
+// parse it. It must change whenever the file changes, so it folds in a
+// change-monotonic component (ctimeMs) and the inode alongside mtime + size:
+// a same-size external edit within a single mtime tick would otherwise mint an
+// identical token, bypassing the save guard and dropping watch modify events.
+export function revisionFrom(stats: Pick<Stats, "mtimeMs" | "ctimeMs" | "ino" | "size">): string {
+    return `${stats.mtimeMs}-${stats.ctimeMs}-${stats.ino}-${stats.size}`;
 }
 
 // Tagged error carrying the JSON-RPC revision-mismatch code (SPEC 8.6). The
@@ -118,24 +121,35 @@ export async function readFile(params: ReadFileParams): Promise<ReadFileResult> 
                 { code: "EISDIR" },
             );
         }
-        const buf = await handle.readFile();
         const revision = revisionFrom(stats);
+        const size = stats.size;
 
         // offset/length are BYTE ranges. Normalize to non-negative integers: a
-        // negative offset would otherwise index from the end of the buffer
-        // (Buffer.subarray semantics) and silently return the wrong tail.
+        // negative offset would otherwise index from the end of the file and
+        // silently return the wrong tail.
         const offset = Math.max(0, Math.trunc(params.offset ?? 0));
         let slice: Buffer;
         let truncated = false;
-        if (offset >= buf.length) {
-            slice = Buffer.alloc(0);
-        } else if (params.length !== undefined) {
-            const length = Math.max(0, Math.trunc(params.length));
-            const end = offset + length;
-            slice = buf.subarray(offset, Math.min(end, buf.length));
-            truncated = end < buf.length;
+        if (params.offset !== undefined || params.length !== undefined) {
+            // Ranged read: pull ONLY the requested window into memory via a
+            // positioned read, so a multi-GiB file never loads whole (which
+            // would also exceed Buffer's max length).
+            if (offset >= size) {
+                slice = Buffer.alloc(0);
+            } else {
+                const want =
+                    params.length !== undefined
+                        ? Math.min(Math.max(0, Math.trunc(params.length)), size - offset)
+                        : size - offset;
+                const dest = Buffer.alloc(want);
+                const { bytesRead } = await handle.read(dest, 0, want, offset);
+                slice = bytesRead === want ? dest : dest.subarray(0, bytesRead);
+                if (params.length !== undefined) {
+                    truncated = offset + Math.max(0, Math.trunc(params.length)) < size;
+                }
+            }
         } else {
-            slice = buf.subarray(offset);
+            slice = await handle.readFile();
         }
 
         // A byte range that cuts a multibyte codepoint is not valid UTF-8, so
@@ -184,7 +198,46 @@ function assertRevisionMatches(filePath: string, expectedRevision: string, curre
     }
 }
 
+// Per-resolved-path write lock (SPEC 8.6). codeharbord dispatches request lines
+// concurrently, so two writeFile calls carrying the SAME expectedRevision can
+// both pass the guard and then race the rename — the second silently
+// overwriting the first (lost update). Chaining each write onto the previous
+// one for the SAME resolved target makes the revision re-check + rename atomic
+// per path, without globally serializing writes to unrelated files.
+const writeLocks = new Map<string, Promise<void>>();
+
+async function resolveWriteKey(p: string): Promise<string> {
+    try {
+        return await fsp.realpath(p);
+    } catch {
+        // Create-only (file absent) or a missing component: key on the real
+        // directory + basename so concurrent creates of the same new path still
+        // serialize; fall back to a lexically resolved path if even that fails.
+        try {
+            return path.join(await fsp.realpath(path.dirname(p)), path.basename(p));
+        } catch {
+            return path.resolve(p);
+        }
+    }
+}
+
+async function withWriteLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
+    const prev = writeLocks.get(key) ?? Promise.resolve();
+    const run = prev.then(fn, fn);
+    const settled = run.then(() => {}, () => {});
+    writeLocks.set(key, settled);
+    void settled.finally(() => {
+        if (writeLocks.get(key) === settled) writeLocks.delete(key);
+    });
+    return run;
+}
+
 export async function writeFile(params: WriteFileParams): Promise<WriteFileResult> {
+    const key = await resolveWriteKey(params.path);
+    return withWriteLock(key, () => writeFileLocked(params));
+}
+
+async function writeFileLocked(params: WriteFileParams): Promise<WriteFileResult> {
     const encoding = params.encoding ?? "utf-8";
     const existing = await statOrUndefined(params.path);
 
@@ -247,7 +300,11 @@ export function resolvePath(params: ResolvePathParams): ResolvePathResult {
         ? path.resolve(params.path)
         : path.resolve(base, params.path);
     const rel = path.relative(base, resolved);
-    const inside = rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel));
+    // A leading ".." segment (rel === ".." or "../…") escapes the base; an
+    // in-repo name that merely STARTS with ".." (e.g. "..config") does not.
+    const inside =
+        rel === "" ||
+        (rel !== ".." && !rel.startsWith(".." + path.sep) && !path.isAbsolute(rel));
     return { path: resolved, insideRepositoryRoot: inside };
 }
 
@@ -262,6 +319,9 @@ interface Subscription {
     // Serializes reconcile() calls so overlapping fs.watch and poll signals
     // dedupe against a single lastRevision instead of racing across awaits.
     pending?: Promise<void>;
+    // Set on unwatch/closeAll so an in-flight diffAndEmit that is awaiting stat
+    // bails instead of emitting a WatchEvent for a released subscription.
+    closed?: boolean;
 }
 
 // File-watch service (SPEC 8.7). fs.watch is the primary signal; a polling
@@ -314,6 +374,7 @@ export class FileWatchService {
     unwatch(params: UnwatchParams): UnwatchResult {
         const sub = this.subscriptions.get(params.subscriptionId);
         if (sub) {
+            sub.closed = true;
             sub.watcher?.close();
             clearInterval(sub.poll);
             this.subscriptions.delete(params.subscriptionId);
@@ -343,6 +404,9 @@ export class FileWatchService {
 
     private async diffAndEmit(sub: Subscription): Promise<void> {
         const stats = await statOrUndefined(sub.path);
+        // The subscription may have been unwatched while we awaited stat above;
+        // emitting now would deliver an event for a released subscription.
+        if (sub.closed || !this.subscriptions.has(sub.id)) return;
         if (!stats) {
             if (sub.lastRevision !== undefined) {
                 sub.lastRevision = undefined;

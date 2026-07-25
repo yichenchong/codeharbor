@@ -98,7 +98,7 @@ QQuickWebEngineProfile *ViewerModel::internalProfile()
 void ViewerModel::readTextFile(const QString &path)
 {
     if (!m_client) {
-        emit textFileError(QStringLiteral("no remote client is connected"));
+        emit textFileError(path, QStringLiteral("no remote client is connected"));
         return;
     }
 
@@ -110,7 +110,7 @@ void ViewerModel::readTextFile(const QString &path)
             if (!guard)
                 return;
             if (error) {
-                emit guard->textFileError(error->message);
+                emit guard->textFileError(path, error->message);
                 return;
             }
             const QJsonObject obj = result.toObject();
@@ -131,7 +131,7 @@ void ViewerModel::readTextFile(const QString &path)
 void ViewerModel::listDirectory(const QString &path)
 {
     if (!m_client) {
-        emit directoryError(QStringLiteral("no remote client is connected"));
+        emit directoryError(path, QStringLiteral("no remote client is connected"));
         return;
     }
 
@@ -143,7 +143,7 @@ void ViewerModel::listDirectory(const QString &path)
             if (!guard)
                 return;
             if (error) {
-                emit guard->directoryError(error->message);
+                emit guard->directoryError(path, error->message);
                 return;
             }
             const QJsonArray array =

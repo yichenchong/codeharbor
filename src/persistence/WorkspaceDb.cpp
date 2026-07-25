@@ -14,8 +14,24 @@ namespace {
 // The remote returns camelCase result objects (workspace.ts toGroup/toSession/
 // toViewerPane/toTerminalPane already rename server_id -> serverId etc.), so the
 // wire keys are camelCase here. Bare id strings are lifted into their
-// strongly-typed wrappers, and null string columns decode to an empty QString
-// via QJsonValue::toString().
+// strongly-typed wrappers.
+//
+// INTENTIONAL NARROWING (nullable text): the schema's nullable-text columns —
+// dev_sessions.default_working_directory / task_description, viewer_panes.handler
+// / title, terminal_panes.working_directory / tmux_target / startup_command /
+// harness — arrive as either a JSON string or JSON null. The ch:: model types
+// them as plain QString (WorkspaceTypes.h, workstream M), NOT
+// std::optional<QString>, so QJsonValue::toString() collapses BOTH SQL NULL and
+// the empty string to an empty QString: the two are indistinguishable on the
+// client, and the server's null-clear path (updateSession/update*Pane sending an
+// explicit null) round-trips back to "" here rather than a distinct "unset".
+// This is deliberate: representing null faithfully would require widening those
+// QString members to std::optional across WorkspaceTypes.h and every consumer
+// (ViewerModel, the sidebar model, equality/serialization), an invasive
+// cross-workstream model change out of proportion to a display value that is
+// empty either way. We keep the narrowing and document it rather than reach into
+// the shared model. If a future feature must distinguish cleared-vs-empty, widen
+// the model types first, then decode via QJsonValue::isNull() here.
 
 Group parseGroup(const QJsonObject& obj)
 {

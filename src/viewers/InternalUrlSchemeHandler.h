@@ -1,6 +1,7 @@
 #pragma once
 
 #include <QHash>
+#include <QList>
 #include <QMutex>
 #include <QObject>
 #include <QString>
@@ -17,12 +18,19 @@ class CodeharbordClient;
 // Remote file:// URLs must never reach Chromium directly (it would treat them
 // as client-machine paths), so a privileged internal viewer references remote
 // resources through an opaque internal URL. The mapping is:
-//   * stable  — the same file URL always maps to the same id;
+//   * unguessable — ids are random 128-bit tokens, never sequential, so a
+//     compromised page cannot enumerate other opened files by guessing ids;
+//   * stable  — a live file URL always maps back to the same id (until evicted);
 //   * injective — distinct file URLs map to distinct ids;
-//   * invertible — fileUrlFor(internalUrlFor(u)) == u for any file URL u.
-// It holds no WebEngine state, so it is unit-testable on its own.
+//   * invertible — fileUrlFor(internalUrlFor(u)) == u while u is retained.
+// The map is LRU-bounded (maxEntries): minting past the cap evicts the
+// least-recently-used entry so it never grows without bound. It holds no
+// WebEngine state, so it is unit-testable on its own.
 class InternalUrlMap {
 public:
+    // Default upper bound on retained entries before LRU eviction kicks in.
+    static constexpr int kDefaultMaxEntries = 1024;
+
     // Scheme name and the fixed "codeharbor-internal://file/" URL prefix.
     static QString scheme();
     static QString prefix();
@@ -32,21 +40,38 @@ public:
     // URLs) agree on the same id space without explicit wiring.
     static InternalUrlMap &shared();
 
-    // Mint (or reuse) the opaque internal URL for a remote file URL.
+    // `maxEntries` bounds the number of retained mappings (LRU-evicted beyond
+    // it). Values < 1 are clamped to 1.
+    explicit InternalUrlMap(int maxEntries = kDefaultMaxEntries);
+
+    // Mint (or reuse) the opaque internal URL for a remote file URL. Minting a
+    // new entry may evict the least-recently-used one when over the cap.
     QString internalUrlFor(const QUrl &fileUrl);
 
     // Inverse of internalUrlFor. Accepts either a full internal URL or a bare
-    // id; returns an invalid QUrl when the id is unknown.
+    // id; returns an invalid QUrl when the id is unknown. Marks the entry as
+    // recently used so actively-displayed files resist eviction.
     QUrl fileUrlFor(const QString &internalUrl) const;
 
-    // Resolve just the opaque id component back to its file URL.
+    // Resolve just the opaque id component back to its file URL. Marks the entry
+    // as recently used.
     QUrl fileUrlForId(const QString &id) const;
 
+    // Number of currently retained mappings, and the configured cap. For tests.
+    int size() const;
+    int maxEntries() const { return m_maxEntries; }
+
 private:
+    // Move `id` to the most-recently-used end. Requires m_mutex held.
+    void touch(const QString &id) const;
+    // Evict least-recently-used entries while over the cap. Requires m_mutex.
+    void evictIfNeeded();
+
     mutable QMutex m_mutex;
     QHash<QString, QString> m_fileToId; // file url string -> id
     QHash<QString, QUrl> m_idToFile;    // id -> original file url
-    quint64 m_counter = 0;
+    mutable QList<QString> m_lru;       // ids, front = LRU, back = MRU
+    int m_maxEntries;
 };
 
 // Custom URL scheme handler for the privileged internal profile (SPEC 7.4).

@@ -15,7 +15,11 @@ ItemDelegate {
     required property string itemId  // this session's ch id (SessionsModel role)
     required property string groupId // containing group's ch id (for moves)
 
-    width: ListView.view ? ListView.view.width : implicitWidth
+    // Width is assigned by the instantiating parent (SessionsSidebar sets it to
+    // the sessions column width); fall back to the parent's width otherwise.
+    // This is a Repeater/Column delegate, never a ListView delegate, so there
+    // is no ListView.view to size against.
+    width: parent ? parent.width : implicitWidth
     height: 44
 
     // SPEC 4.2 precedence: Error red > WaitingForInput amber > Running green >

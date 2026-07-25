@@ -12,6 +12,13 @@ Item {
     WebEngineView {
         anchors.fill: parent
         profile: viewers.internalProfile()
+        // SECURITY (SPEC 7.2): these bytes are untrusted remote file content.
+        // An .svg/.html served top-level could run JS and exfiltrate other
+        // files, so disable scripting and any local/remote URL reach. The
+        // scheme handler additionally sends a locked-down CSP for such types.
+        settings.javascriptEnabled: false
+        settings.localContentCanAccessFileUrls: false
+        settings.localContentCanAccessRemoteUrls: false
         url: root.url.toString().length > 0
              ? viewers.internalUrlFor(root.url)
              : ""

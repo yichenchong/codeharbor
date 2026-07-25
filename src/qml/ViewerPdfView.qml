@@ -10,6 +10,13 @@ Item {
     WebEngineView {
         anchors.fill: parent
         profile: viewers.internalProfile()
+        // SECURITY (SPEC 7.2): untrusted remote bytes. Disable page scripting
+        // and any local/remote URL reach so a malicious document cannot run JS
+        // to exfiltrate other files. The built-in PDF viewer renders in its own
+        // internal context and is unaffected by disabling page JavaScript.
+        settings.javascriptEnabled: false
+        settings.localContentCanAccessFileUrls: false
+        settings.localContentCanAccessRemoteUrls: false
         settings.pdfViewerEnabled: true
         settings.pluginsEnabled: true
         url: root.url.toString().length > 0

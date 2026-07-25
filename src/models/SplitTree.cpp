@@ -3,6 +3,8 @@
 #include <QJsonArray>
 #include <QJsonValue>
 
+#include <cmath>
+
 namespace ch {
 
 QJsonObject SplitNode::toJson() const
@@ -91,7 +93,17 @@ bool parseNode(const QJsonObject &obj, SplitNode &out, int depth)
     for (const QJsonValue &value : ratioArray) {
         if (!value.isDouble())
             return false;
-        node.ratios.append(value.toDouble());
+        const double ratio = value.toDouble();
+        // Ratios drive pane geometry (a child's extent is ratio / sum of the
+        // parent's ratios). A non-finite (NaN/Inf) or non-positive ratio would
+        // yield NaN/negative pane sizes, and an all-zero array a divide-by-zero.
+        // Reject such malformed input outright, consistent with the count and
+        // structural rejections above, rather than silently persisting a tree
+        // that produces broken geometry downstream. Requiring every ratio to be
+        // finite and > 0 also guarantees their sum is > 0.
+        if (!std::isfinite(ratio) || ratio <= 0.0)
+            return false;
+        node.ratios.append(ratio);
     }
 
     out = node;

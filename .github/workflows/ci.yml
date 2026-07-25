@@ -40,3 +40,7 @@ jobs:
         run: cmake --preset dev
       - name: Build
         run: cmake --build --preset dev
+      - name: Test
+        run: ctest --preset dev --output-on-failure
+      - name: Configure + build (release preset)
+        run: cmake --preset release && cmake --build --preset release

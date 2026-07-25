@@ -3,6 +3,7 @@
 #include "KnownHosts.h"
 
 #include <QByteArray>
+#include <QList>
 #include <QObject>
 #include <QString>
 
@@ -84,8 +85,10 @@ public:
 
 #if CH_HAVE_LIBSSH
     // Open an independent channel on the shared session. Returns nullptr if not
-    // connected or the channel could not be opened. Ownership transfers to the
-    // caller (free with ssh_channel_free / ssh_channel_close).
+    // connected or the channel could not be opened. The pool RETAINS ownership:
+    // channels MUST NOT outlive the session — disconnectFromHost()/closeSession()
+    // closes and frees every opened channel before freeing the session. Callers
+    // must not ssh_channel_free() a returned channel themselves.
     ssh_channel openChannel(ChannelKind kind);
 #endif
 
@@ -112,6 +115,7 @@ private:
     QString m_user;
 #if CH_HAVE_LIBSSH
     ssh_session m_session = nullptr;
+    QList<ssh_channel> m_channels;
 #endif
 };
 

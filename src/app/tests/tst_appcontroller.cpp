@@ -20,6 +20,7 @@ private slots:
     void uiStateStoreDocumentedDefaults();
     void toGroupRowsSubtitleHandlesTrailingSlashAndEmpty();
     void uiStateStoreDistinctAndSpecialIds();
+    void uiStateStoreRegionWidthsPersistWithoutPerCallSync();
 };
 
 // Two GroupNodes with sessions map to GroupRows preserving order, with the
@@ -74,7 +75,8 @@ void TstAppController::toGroupRowsEmptyIsEmpty()
 }
 
 // A fresh store over the same .ini file reads back exactly what a previous
-// instance wrote — proving persistence and QSettings::sync() on writes.
+// instance wrote — proving persistence via QSettings' flush on destruction
+// (setRegionWidths no longer sync()s per call, to avoid handle-drag jank).
 void TstAppController::uiStateStorePersistsAcrossInstances()
 {
     QTemporaryDir dir;
@@ -161,6 +163,32 @@ void TstAppController::uiStateStoreDistinctAndSpecialIds()
     QCOMPARE(reopened.selectedPane(QStringLiteral("s2")), QStringLiteral("terminal"));
     QCOMPARE(reopened.selectedPane(QStringLiteral("srv/grp:has space")),
              QStringLiteral("editor"));
+}
+
+// setRegionWidths no longer calls QSettings::sync() on every invocation (a
+// handle drag fires it repeatedly; a synchronous disk write per pixel caused
+// jank). Simulate a drag with many writes, then prove the final values still
+// persist to a fresh instance via the destructor flush — no explicit sync.
+void TstAppController::uiStateStoreRegionWidthsPersistWithoutPerCallSync()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QString iniPath = dir.filePath(QStringLiteral("drag.ini"));
+
+    {
+        UiStateStore store(iniPath);
+        // Rapid intermediate writes, as during a handle drag.
+        for (int w = 180; w <= 300; ++w)
+            store.setRegionWidths(w, 0, 640 - w);
+        // Final settled widths.
+        store.setRegionWidths(300, 0, 340);
+        // No explicit sync() here: the destructor at end of scope flushes.
+    }
+
+    UiStateStore reopened(iniPath);
+    QCOMPARE(reopened.sidebarWidth(), 300);
+    QCOMPARE(reopened.viewerWidth(), 0);
+    QCOMPARE(reopened.terminalWidth(), 340);
 }
 
 QTEST_GUILESS_MAIN(TstAppController)

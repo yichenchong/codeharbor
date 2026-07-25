@@ -47,7 +47,9 @@ jobs:
 
       - name: Install libssh (macOS)
         if: matrix.name == 'macos'
-        run: brew install libssh
+        run: |
+          brew install libssh
+          echo "CMAKE_PREFIX_PATH=$(brew --prefix libssh):${CMAKE_PREFIX_PATH:-}" >> "$GITHUB_ENV"
 
       - name: Install libssh via vcpkg (Windows)
         if: matrix.name == 'windows'

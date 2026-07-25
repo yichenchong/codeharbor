@@ -11,6 +11,11 @@ Rectangle {
     id: root
     property url url
 
+    // True only between an explicit Download click and the profile handing back
+    // its download request. The internal profile is SHARED across panes, so the
+    // handler must accept ONLY downloads this pane deliberately started.
+    property bool downloadRequested: false
+
     color: "#1e1e2e"
 
     function baseName(u) {
@@ -51,8 +56,13 @@ Rectangle {
         Button {
             Layout.alignment: Qt.AlignHCenter
             text: qsTr("Download")
-            enabled: root.url.toString().length > 0
-            onClicked: downloader.url = viewers.internalUrlFor(root.url)
+            // Disabled while a download this pane started is still pending, so a
+            // single click cannot fan out into multiple accepted downloads.
+            enabled: root.url.toString().length > 0 && !root.downloadRequested
+            onClicked: {
+                root.downloadRequested = true;
+                downloader.url = viewers.internalUrlFor(root.url);
+            }
         }
     }
 
@@ -63,11 +73,27 @@ Rectangle {
         width: 0
         height: 0
         profile: viewers.internalProfile()
+        // Untrusted bytes: never let this hidden view execute scripts.
+        settings.javascriptEnabled: false
+        settings.localContentCanAccessFileUrls: false
+        settings.localContentCanAccessRemoteUrls: false
     }
 
     Connections {
         target: viewers.internalProfile()
         function onDownloadRequested(download) {
+            // Require an explicit user action from THIS pane: the profile is
+            // shared, so without this guard every pane would auto-accept every
+            // download triggered anywhere (including page-initiated ones).
+            if (!root.downloadRequested)
+                return;
+            // Scope to this pane's file and only handle the initial request,
+            // guarding against accepting the same download more than once.
+            if (download.state !== WebEngineDownloadRequest.DownloadRequested
+                || download.url.toString()
+                   !== viewers.internalUrlFor(root.url).toString())
+                return;
+            root.downloadRequested = false;
             download.accept();
         }
     }

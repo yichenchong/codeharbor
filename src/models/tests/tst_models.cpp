@@ -4,6 +4,9 @@
 #include <QJsonArray>
 #include <QJsonObject>
 
+#include <cmath>
+#include <limits>
+
 #include "SessionState.h"
 #include "SessionsModel.h"
 #include "SplitTree.h"
@@ -31,6 +34,7 @@ private slots:
     void splitTreeRoundTripsNestedLayout();
     void splitTreeRejectsRatioMismatch();
     void splitTreeRejectsChildlessSplit();
+    void splitTreeRejectsInvalidRatioValues();
     void modelSatisfiesItemModelInvariants();
     void splitTreeRejectsUnknownAndMissingType();
     void splitTreeRejectsInvalidNestedChild();
@@ -228,6 +232,49 @@ void TstModels::splitTreeRejectsChildlessSplit()
     obj[QStringLiteral("ratios")] = QJsonArray{};
 
     QVERIFY(SplitNode::fromJson(obj) == SplitNode{});
+}
+
+// Ratios drive pane geometry, so fromJson must reject non-finite (NaN/Inf) or
+// non-positive ratio values (and all-zero arrays, whose sum is not > 0) from
+// untrusted remote/persisted input, rather than accepting them and producing
+// NaN/negative sizes or a divide-by-zero downstream. A valid ratio set must
+// still round-trip unharmed.
+void TstModels::splitTreeRejectsInvalidRatioValues()
+{
+    // Build a two-child split whose ratios array is supplied by the caller.
+    const auto splitWithRatios = [](const QJsonArray &ratios) {
+        QJsonObject leafA;
+        leafA[QStringLiteral("type")] = QStringLiteral("leaf");
+        leafA[QStringLiteral("paneId")] = QStringLiteral("A");
+        QJsonObject leafB;
+        leafB[QStringLiteral("type")] = QStringLiteral("leaf");
+        leafB[QStringLiteral("paneId")] = QStringLiteral("B");
+
+        QJsonObject obj;
+        obj[QStringLiteral("type")] = QStringLiteral("split");
+        obj[QStringLiteral("orientation")] = QStringLiteral("horizontal");
+        obj[QStringLiteral("children")] = QJsonArray{leafA, leafB};
+        obj[QStringLiteral("ratios")] = ratios;
+        return obj;
+    };
+
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    const double inf = std::numeric_limits<double>::infinity();
+
+    // Each of these is malformed and must collapse to the empty-leaf sentinel.
+    QVERIFY(SplitNode::fromJson(splitWithRatios(QJsonArray{-0.5, 1.5})) == SplitNode{}); // negative
+    QVERIFY(SplitNode::fromJson(splitWithRatios(QJsonArray{0.0, 1.0})) == SplitNode{});  // zero
+    QVERIFY(SplitNode::fromJson(splitWithRatios(QJsonArray{0.0, 0.0})) == SplitNode{});  // all-zero
+    QVERIFY(SplitNode::fromJson(splitWithRatios(QJsonArray{nan, 0.5})) == SplitNode{});  // NaN
+    QVERIFY(SplitNode::fromJson(splitWithRatios(QJsonArray{inf, 0.5})) == SplitNode{});  // +Inf
+    QVERIFY(SplitNode::fromJson(splitWithRatios(QJsonArray{-inf, 0.5})) == SplitNode{}); // -Inf
+
+    // A valid, strictly-positive finite ratio set is preserved exactly.
+    const SplitNode restored = SplitNode::fromJson(splitWithRatios(QJsonArray{0.3, 0.7}));
+    QVERIFY(!restored.isLeaf());
+    QCOMPARE(restored.ratios.size(), 2);
+    QCOMPARE(restored.ratios.at(0), 0.3);
+    QCOMPARE(restored.ratios.at(1), 0.7);
 }
 
 // SPEC 4.2 precedence: Error > WaitingForInput > Running > FinishedUnseen > Idle

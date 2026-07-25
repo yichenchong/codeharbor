@@ -37,8 +37,9 @@ Rectangle {
             if (path === root.remotePath(root.url))
                 root.entries = list;
         }
-        function onDirectoryError(message) {
-            root.errorText = message;
+        function onDirectoryError(path, message) {
+            if (path === root.remotePath(root.url))
+                root.errorText = message;
         }
     }
 

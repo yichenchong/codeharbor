@@ -26,7 +26,8 @@ export const RPC_SCHEMA_VERSION = 2;
 
 export interface RpcRequest {
     jsonrpc: "2.0";
-    id: string | number | null;
+    // Absent (undefined) marks a JSON-RPC notification: no response is returned.
+    id?: string | number | null;
     method: string;
     params?: unknown;
 }
@@ -71,7 +72,7 @@ function isRpcRequest(value: unknown): value is RpcRequest {
     return (
         r.jsonrpc === "2.0" &&
         typeof r.method === "string" &&
-        (typeof r.id === "string" || typeof r.id === "number" || r.id === null)
+        (r.id === undefined || typeof r.id === "string" || typeof r.id === "number" || r.id === null)
     );
 }
 
@@ -79,7 +80,7 @@ function isRpcRequest(value: unknown): value is RpcRequest {
  * Dispatch one already-decoded request object. Pure and total: unknown methods
  * and malformed requests produce JSON-RPC error responses rather than throwing.
  */
-export async function dispatch(value: unknown): Promise<RpcResponse> {
+export async function dispatch(value: unknown): Promise<RpcResponse | null> {
     if (!isRpcRequest(value)) {
         return {
             jsonrpc: "2.0",
@@ -88,27 +89,41 @@ export async function dispatch(value: unknown): Promise<RpcResponse> {
         };
     }
     const handler = methods[value.method];
+    // A request with no id is a JSON-RPC notification: dispatch it for its side
+    // effects and return NO response, regardless of outcome. Narrowing on
+    // `value.id` here also lets the response branches below type `id` as present.
+    if (value.id === undefined) {
+        if (handler) {
+            try {
+                await handler(value.params);
+            } catch {
+                // Notifications get no response, so swallow handler errors.
+            }
+        }
+        return null;
+    }
+    const id = value.id;
     if (!handler) {
         return {
             jsonrpc: "2.0",
-            id: value.id,
+            id,
             error: { code: RPC_METHOD_NOT_FOUND, message: `Method not found: ${value.method}` },
         };
     }
     try {
         const result = await handler(value.params);
-        return { jsonrpc: "2.0", id: value.id, result };
+        return { jsonrpc: "2.0", id, result };
     } catch (err) {
         if (isRevisionMismatch(err)) {
             return {
                 jsonrpc: "2.0",
-                id: value.id,
+                id,
                 error: { code: RPC_REVISION_MISMATCH, message: err.message, data: err.data },
             };
         }
         return {
             jsonrpc: "2.0",
-            id: value.id,
+            id,
             error: {
                 code: RPC_INTERNAL_ERROR,
                 message: err instanceof Error ? err.message : String(err),
@@ -118,7 +133,7 @@ export async function dispatch(value: unknown): Promise<RpcResponse> {
 }
 
 /** Handle one raw JSONL request line, returning the response to serialize. */
-export async function handleLine(line: string): Promise<RpcResponse> {
+export async function handleLine(line: string): Promise<RpcResponse | null> {
     let decoded: unknown;
     try {
         decoded = JSON.parse(line);
@@ -143,7 +158,7 @@ export function runStdio(): void {
     rl.on("line", (line) => {
         if (line.trim().length === 0) return;
         void handleLine(line).then((response) => {
-            process.stdout.write(`${JSON.stringify(response)}\n`);
+            if (response) process.stdout.write(`${JSON.stringify(response)}\n`);
         });
     });
 }

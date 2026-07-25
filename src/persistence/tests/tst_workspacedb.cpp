@@ -529,6 +529,18 @@ void TstWorkspaceDb::duplicateSessionParsesNestedNode()
     QCOMPARE(node->viewerLayout->paneId, QStringLiteral("v2"));
     QVERIFY(node->terminalLayout.has_value());
     QCOMPARE(node->terminalLayout->paneId, QStringLiteral("t2"));
+
+    // Documented intentional narrowing (WorkspaceDb.cpp): the fixture's null
+    // nullable-text columns decode to an empty QString, since the ch:: model
+    // types them as plain QString, not std::optional. Null and "" are
+    // indistinguishable on the client by design.
+    QVERIFY(node->session.defaultWorkingDirectory.isEmpty());
+    QVERIFY(node->session.taskDescription.isEmpty());
+    QVERIFY(node->viewerPanes[0].handler.isEmpty());
+    QVERIFY(node->viewerPanes[0].title.isEmpty());
+    QVERIFY(node->terminalPanes[0].workingDirectory.isEmpty());
+    QVERIFY(node->terminalPanes[0].startupCommand.isEmpty());
+    QVERIFY(node->terminalPanes[0].harness.isEmpty());
 }
 
 void TstWorkspaceDb::reorderGroupsSerializesIdArray()

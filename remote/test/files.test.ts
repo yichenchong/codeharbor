@@ -16,6 +16,7 @@ import {
     FileWatchService,
 } from "../src/files.ts";
 import { RPC_REVISION_MISMATCH } from "../src/rpc-types.ts";
+import { dispatch } from "../src/codeharbord.ts";
 import type { WatchEvent } from "../src/rpc-types.ts";
 
 async function tmpDir(): Promise<string> {
@@ -217,8 +218,12 @@ test("listDirectory (RPC) classifies entries; getMimeType maps extensions", asyn
     assert.equal(getMimeType("photo.PNG"), "image/png");
     assert.equal(getMimeType("mystery.xyz"), "application/octet-stream");
 
-    // revisionFrom is deterministic from mtime + size.
-    assert.equal(revisionFrom({ mtimeMs: 12.5, size: 7 }), "12.5-7");
+    // revisionFrom folds mtime, ctime, inode, and size so a same-size edit
+    // within one mtime tick still changes the token (SPEC 8.6).
+    assert.equal(
+        revisionFrom({ mtimeMs: 12.5, ctimeMs: 13.5, ino: 42, size: 7 }),
+        "12.5-13.5-42-7",
+    );
 
     await fs.rm(dir, { recursive: true, force: true });
 });
@@ -334,4 +339,145 @@ test("writeFile decodes base64 content and reads it back byte-exact", async () =
     assert.deepEqual(Buffer.from(r.content, "base64"), bytes);
 
     await fs.rm(dir, { recursive: true, force: true });
+});
+
+test("concurrent writeFile with the same revision: exactly one wins", async () => {
+    const dir = await tmpDir();
+    const file = path.join(dir, "race.txt");
+    const created = await writeFile({ path: file, content: "seed", expectedRevision: "" });
+
+    // Both writes carry the SAME expectedRevision. The per-path lock must let
+    // only the first commit; the second re-checks against the now-changed
+    // revision and fails with RPC_REVISION_MISMATCH — no silent lost update.
+    const results = await Promise.allSettled([
+        writeFile({ path: file, content: "AAAA", expectedRevision: created.revision }),
+        writeFile({ path: file, content: "BBBB", expectedRevision: created.revision }),
+    ]);
+
+    const fulfilled = results.filter((r) => r.status === "fulfilled");
+    const rejected = results.filter((r) => r.status === "rejected");
+    assert.equal(fulfilled.length, 1);
+    assert.equal(rejected.length, 1);
+    const reason = (rejected[0] as PromiseRejectedResult).reason;
+    assert.ok(isRevisionMismatch(reason) && reason.code === RPC_REVISION_MISMATCH);
+
+    // The surviving content is one writer's, intact — never a torn interleave.
+    const final = (await readFile({ path: file })).content;
+    assert.ok(final === "AAAA" || final === "BBBB");
+
+    await fs.rm(dir, { recursive: true, force: true });
+});
+
+test("writeFile rejects an old revision after a same-size external edit", async () => {
+    const dir = await tmpDir();
+    const file = path.join(dir, "samesize.txt");
+
+    // Whole-second timestamp so utimes round-trips losslessly through mtimeMs.
+    const t = new Date(Math.floor(Date.now() / 1000) * 1000);
+    await fs.writeFile(file, "AAAA");
+    await fs.utimes(file, t, t);
+    const loaded = await stat({ path: file });
+
+    // An external editor rewrites the SAME number of bytes, then mtime is forced
+    // back to the original so an mtime+size token would ALIAS. Only ctime (which
+    // utimes cannot rewind) still distinguishes the versions.
+    await fs.writeFile(file, "BBBB");
+    await fs.utimes(file, t, t);
+    const after = await stat({ path: file });
+
+    assert.equal(after.size, loaded.size); // same size
+    assert.equal(after.mtimeMs, loaded.mtimeMs); // same mtime -> old token aliases
+    assert.notEqual(after.revision, loaded.revision); // new token distinguishes
+
+    await assert.rejects(
+        () => writeFile({ path: file, content: "CCCC", expectedRevision: loaded.revision }),
+        (err: unknown) => isRevisionMismatch(err) && err.code === RPC_REVISION_MISMATCH,
+    );
+    // The external edit survived; the stale save did not clobber it.
+    assert.equal((await readFile({ path: file })).content, "BBBB");
+
+    await fs.rm(dir, { recursive: true, force: true });
+});
+
+test("dispatch returns no response for a JSON-RPC notification (no id)", async () => {
+    // Absent id -> notification: dispatched for side effects, no response line.
+    assert.equal(await dispatch({ jsonrpc: "2.0", method: "ping" }), null);
+    // Unknown-method notifications are also silent.
+    assert.equal(await dispatch({ jsonrpc: "2.0", method: "nope.nope" }), null);
+
+    // A normal request (id present) still gets a response.
+    const response = await dispatch({ jsonrpc: "2.0", id: 1, method: "ping" });
+    assert.ok(response !== null);
+    assert.ok("result" in response);
+    assert.equal(response.id, 1);
+});
+
+test("ranged readFile returns only the window of a huge (sparse) file", async () => {
+    const dir = await tmpDir();
+    const big = path.join(dir, "big.bin");
+
+    // 3 GiB sparse file: exceeds the ~2 GiB whole-buffer read limit, so a
+    // full-file read would throw. The ranged path must read ONLY the window.
+    const size = 3 * 1024 * 1024 * 1024;
+    const marker = Buffer.from("HELLO-WINDOW");
+    const offset = 1_000_000;
+    const handle = await fs.open(big, "w");
+    try {
+        await handle.truncate(size);
+        await handle.write(marker, 0, marker.length, offset);
+    } finally {
+        await handle.close();
+    }
+
+    const win = await readFile({ path: big, offset, length: marker.length });
+    assert.equal(win.encoding, "utf-8");
+    assert.equal(win.content, "HELLO-WINDOW");
+    assert.equal(win.truncated, true); // the file extends well past the window
+
+    await fs.rm(dir, { recursive: true, force: true });
+});
+
+test("watch emits no WatchEvent for a subscription after unwatch", async () => {
+    const dir = await tmpDir();
+    const file = path.join(dir, "unwatched.txt");
+    await fs.writeFile(file, "one");
+
+    const service = new FileWatchService();
+    service.pollIntervalMs = 25;
+    const seen: WatchEvent[] = [];
+    service.onWatchEvent((event) => seen.push(event));
+
+    const first = await service.watch({ path: file });
+    // Release the first subscription, then open a fresh one on the same file.
+    // Awaiting the FRESH subscription's event (a real signal, no sleep) gives
+    // the released one every chance to wrongly fire — including the in-flight
+    // diffAndEmit-after-unwatch race the closed guard must swallow.
+    service.unwatch({ subscriptionId: first.subscriptionId });
+    const second = await service.watch({ path: file });
+
+    const next = firstWatchEvent(service);
+    await fs.writeFile(file, "two — a clearly different length");
+    const event = await withTimeout(next, 5000);
+    service.closeAll();
+
+    assert.equal(event.subscriptionId, second.subscriptionId);
+    // The released subscription never emitted for anyone.
+    assert.ok(seen.every((e) => e.subscriptionId !== first.subscriptionId));
+
+    await fs.rm(dir, { recursive: true, force: true });
+});
+
+test("resolvePath treats an in-repo name starting with '..' as inside", async () => {
+    const base = path.resolve("/repo/project");
+
+    // "..config" is a real in-repo filename, NOT a parent-directory escape.
+    const dotName = resolvePath({ path: "..config", base });
+    assert.equal(dotName.insideRepositoryRoot, true);
+    assert.equal(dotName.path, path.join(base, "..config"));
+
+    // A genuine parent escape ("..") is still flagged outside.
+    assert.equal(resolvePath({ path: "..", base }).insideRepositoryRoot, false);
+    assert.equal(resolvePath({ path: "../x", base }).insideRepositoryRoot, false);
+
+    await Promise.resolve();
 });

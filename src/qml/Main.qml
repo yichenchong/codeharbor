@@ -21,6 +21,15 @@ ApplicationWindow {
                                     Math.round(terminalRegion.width));
     }
 
+    // Debounce persistence: a handle drag fires onWidthChanged rapidly, so
+    // coalesce into a single write shortly after the drag settles rather than
+    // writing on every pixel change.
+    Timer {
+        id: persistTimer
+        interval: 300
+        onTriggered: window.persistRegionWidths()
+    }
+
     SplitView {
         id: outer
         anchors.fill: parent
@@ -39,7 +48,7 @@ ApplicationWindow {
             id: sidebarRegion
             SplitView.preferredWidth: 260
             SplitView.minimumWidth: 180
-            onWidthChanged: window.persistRegionWidths()
+            onWidthChanged: persistTimer.restart()
         }
 
         ViewerRegion {
@@ -51,7 +60,56 @@ ApplicationWindow {
             id: terminalRegion
             SplitView.preferredWidth: 520
             SplitView.minimumWidth: 280
-            onWidthChanged: window.persistRegionWidths()
+            onWidthChanged: persistTimer.restart()
+        }
+    }
+
+    // Non-blocking error banner: surfaces app.error (RPC failures forwarded
+    // verbatim, SPEC 10.3) as a transient toast so shell-level failures are
+    // visible instead of silently swallowed.
+    Rectangle {
+        id: errorBanner
+        z: 1000
+        visible: opacity > 0
+        opacity: 0
+        anchors.top: parent.top
+        anchors.horizontalCenter: parent.horizontalCenter
+        anchors.topMargin: 12
+        width: Math.min(errorLabel.implicitWidth + 32, parent.width - 24)
+        height: errorLabel.implicitHeight + 20
+        radius: 6
+        color: "#f38ba8"
+
+        Behavior on opacity { NumberAnimation { duration: 200 } }
+
+        Label {
+            id: errorLabel
+            anchors.centerIn: parent
+            width: parent.width - 32
+            color: "#11111b"
+            font.pixelSize: 13
+            wrapMode: Text.WordWrap
+            horizontalAlignment: Text.AlignHCenter
+        }
+
+        MouseArea {
+            anchors.fill: parent
+            onClicked: errorBanner.opacity = 0
+        }
+
+        Timer {
+            id: errorHideTimer
+            interval: 6000
+            onTriggered: errorBanner.opacity = 0
+        }
+    }
+
+    Connections {
+        target: app
+        function onError(message) {
+            errorLabel.text = message;
+            errorBanner.opacity = 0.97;
+            errorHideTimer.restart();
         }
     }
 }

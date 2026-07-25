@@ -1,6 +1,8 @@
 #include "KnownHosts.h"
 
 #include <QByteArray>
+#include <QCryptographicHash>
+#include <QMessageAuthenticationCode>
 #include <QString>
 #include <QtTest/QtTest>
 
@@ -30,6 +32,17 @@ QString sampleText()
         "|1|abc=|def= ssh-ed25519 ZWQyNTUxOS1rZXktYmV0YS0wMDAy\n");
 }
 
+// Build an OpenSSH hashed-host token "|1|<b64 salt>|<b64 hmac-sha1(host)>" the
+// same way ssh-keygen -H does, so tests exercise the real hashed match path.
+QString hashedHost(const QString& host, const QByteArray& salt)
+{
+    const QByteArray mac = QMessageAuthenticationCode::hash(
+        host.toUtf8(), salt, QCryptographicHash::Sha1);
+    return QStringLiteral("|1|%1|%2")
+        .arg(QString::fromUtf8(salt.toBase64()),
+             QString::fromUtf8(mac.toBase64()));
+}
+
 } // namespace
 
 class TstKnownHosts : public QObject {
@@ -45,6 +58,8 @@ private slots:
     void serializeRoundTrips();
     void emptyStoreIsUnknown();
     void hashedEntryIsOpaqueButPreserved();
+    void hashedHostMatchesAndMismatches();
+    void hashedRevokedKeyRefused();
     void bracketedHostPortMatches();
     void revokedKeyRefused();
     void certAuthorityIsOpaque();
@@ -163,12 +178,54 @@ void TstKnownHosts::emptyStoreIsUnknown()
 void TstKnownHosts::hashedEntryIsOpaqueButPreserved()
 {
     const KnownHosts store = KnownHosts::parse(sampleText());
-    // A hashed |1| entry never matches (its host is opaque)...
+    // A hashed |1| entry with an unrelated/bogus salt+hash resolves to no host,
+    // so a lookup keyed by the literal token yields Unknown...
     QCOMPARE(store.verify(QStringLiteral("|1|abc=|def="),
                           QStringLiteral("ssh-ed25519"), kEd25519Beta),
              KnownHosts::Verdict::Unknown);
     // ...but it survives a serialize round-trip.
     QVERIFY(store.serialize().contains("|1|abc=|def="));
+}
+
+void TstKnownHosts::hashedHostMatchesAndMismatches()
+{
+    // A store with ONLY a hashed entry must still detect a changed key: the
+    // hostname is recovered via HMAC-SHA1 so a different blob => Mismatch, never
+    // a first-use Unknown prompt (SPEC 12.1).
+    const QByteArray salt = QByteArrayLiteral("codeharbor-hash-salt");
+    const KnownHosts store = KnownHosts::parse(
+        hashedHost(QStringLiteral("secret.host"), salt)
+        + QStringLiteral(" ssh-ed25519 ZWQyNTUxOS1rZXktYWxwaGEtMDAwMQ==\n"));
+    // The stored key matches the hashed host.
+    QCOMPARE(store.verify(QStringLiteral("secret.host"),
+                          QStringLiteral("ssh-ed25519"), kEd25519Alpha),
+             KnownHosts::Verdict::Match);
+    // A changed key at that hashed host is refused.
+    QCOMPARE(store.verify(QStringLiteral("secret.host"),
+                          QStringLiteral("ssh-ed25519"), kEd25519Beta),
+             KnownHosts::Verdict::Mismatch);
+    // An unrelated host does not collide with the hash.
+    QCOMPARE(store.verify(QStringLiteral("other.host"),
+                          QStringLiteral("ssh-ed25519"), kEd25519Alpha),
+             KnownHosts::Verdict::Unknown);
+}
+
+void TstKnownHosts::hashedRevokedKeyRefused()
+{
+    // A hashed @revoked entry must participate in the revocation precedence loop:
+    // presenting the revoked key at the hashed host is refused (Mismatch).
+    const QByteArray salt = QByteArrayLiteral("codeharbor-hash-salt");
+    const KnownHosts store = KnownHosts::parse(
+        QStringLiteral("@revoked ")
+        + hashedHost(QStringLiteral("revoked.host"), salt)
+        + QStringLiteral(" ssh-ed25519 ZWQyNTUxOS1rZXktYWxwaGEtMDAwMQ==\n"));
+    QCOMPARE(store.verify(QStringLiteral("revoked.host"),
+                          QStringLiteral("ssh-ed25519"), kEd25519Alpha),
+             KnownHosts::Verdict::Mismatch);
+    // A different key at that host is merely Unknown (revocation grants no trust).
+    QCOMPARE(store.verify(QStringLiteral("revoked.host"),
+                          QStringLiteral("ssh-ed25519"), kEd25519Beta),
+             KnownHosts::Verdict::Unknown);
 }
 
 void TstKnownHosts::bracketedHostPortMatches()

@@ -69,11 +69,13 @@ test("codeharbord dispatch answers introspection and rejects unknown methods", a
     assert.deepEqual(ping, { jsonrpc: "2.0", id: "a", result: { pong: true } });
 
     const missing = await dispatch({ jsonrpc: "2.0", id: 2, method: "does.not.exist" });
+    assert.ok(missing);
     assert.equal("error" in missing && missing.error.code, RPC_METHOD_NOT_FOUND);
 });
 
 test("codeharbord handleLine reports parse errors", async () => {
     const res = await handleLine("{not valid");
+    assert.ok(res);
     assert.ok("error" in res);
     assert.equal(res.id, null);
 });

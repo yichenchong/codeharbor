@@ -87,7 +87,7 @@ Rectangle {
                     model: DelegateModel {
                         model: app.sessionsModel
                         rootIndex: groupsDelegateModel.modelIndex(groupBlock.index)
-                        delegate: SessionRow {}
+                        delegate: SessionRow { width: sessionsColumn.width }
                     }
                 }
             }

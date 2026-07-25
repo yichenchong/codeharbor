@@ -54,12 +54,26 @@ export function mountTerminal(element: HTMLElement, bridge: TerminalBridge): Ter
     element.appendChild(surface);
 
     term.open(surface);
-    fit.fit();
 
-    // Forward user keystrokes to the remote PTY (SPEC 5.1).
+    // Forward user keystrokes to the remote PTY (SPEC 5.1). fit() never emits
+    // onData, so this listener's ordering is independent of the size handshake.
     term.onData((data) => bridge.sendInput(data));
+
+    // Initial-size ordering invariant: fit() FIRST (with no onResize listener
+    // attached), THEN attach onResize, THEN send the fitted size exactly once.
+    //   - Fitting before term.open()'s listener is wired avoids relying on fit()
+    //     to emit the initial resize: FitAddon only emits onResize when the
+    //     fitted dims differ from xterm's 80x24 default, so an onResize-before-fit
+    //     approach silently drops the handshake whenever the surface happens to
+    //     fit exactly 80x24, leaving the remote PTY stuck at its default size.
+    //   - The single explicit bridge.resize() below forwards the real size to
+    //     the remote PTY unconditionally, so the initial size is sent EXACTLY
+    //     ONCE. The ResizeObserver's first fit() then re-fits to already-correct
+    //     dims (a no-op that emits no onResize), so there is no double-send.
+    fit.fit();
     // Report renderer size changes so C++ can resize the remote PTY (SPEC 5.1).
     term.onResize(({ cols, rows }) => bridge.resize(cols, rows));
+    bridge.resize(term.cols, term.rows);
 
     // Re-fit on container resize; fit() emits onResize only when dims change.
     const resizeObserver = new ResizeObserver(() => fit.fit());
