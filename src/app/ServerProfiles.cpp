@@ -1,5 +1,7 @@
 #include "ServerProfiles.h"
 
+#include <QFile>
+#include <QFileInfo>
 #include <QList>
 #include <QMetaType>
 #include <QSettings>
@@ -90,7 +92,7 @@ std::optional<QVariantMap> sanitize(const QVariantMap& in)
 } // namespace
 
 ServerProfiles::ServerProfiles(QString iniPath, QObject* parent)
-    : QObject(parent)
+    : QObject(parent), m_ownsDirectory(iniPath.isEmpty())
 {
     if (iniPath.isEmpty()) {
         m_settings = std::make_unique<QSettings>(
@@ -99,6 +101,9 @@ ServerProfiles::ServerProfiles(QString iniPath, QObject* parent)
         m_settings =
             std::make_unique<QSettings>(iniPath, QSettings::IniFormat);
     }
+    // A store written before this rule existed keeps its old, looser mode until
+    // something happens to save it; narrow it on the way in instead.
+    restrictPermissions();
     load();
 }
 
@@ -193,6 +198,35 @@ void ServerProfiles::persist()
     // Profile edits are rare and user-driven (unlike drag-resize state), and a
     // half-written server list is exactly what a crash must not leave behind.
     m_settings->sync();
+    restrictPermissions();
+}
+
+// The store holds no secret — authentication is ssh-agent/keys and nothing here
+// ever writes a password or a key (see sanitize(): six whitelisted fields, and
+// anything else in the caller's map is dropped on the floor). It is still not
+// world business: it names every machine you reach, the account you reach it
+// as, and where your checkout lives. Qt leaves it at the umask default, which
+// on a typical box is 0644 — and 0664 wherever the user's primary group is
+// shared, which makes it WRITABLE by another account. That last case is the
+// real one: an attacker who can edit this file redirects `host` at a machine
+// they own, and the app connects there on its next launch.
+//
+// So: owner-only. Best effort by design — a store on a filesystem with no POSIX
+// permissions is not a reason to refuse to save. The containing DIRECTORY is
+// only narrowed for the native store, which is ours (~/.config/CodeHarbor); an
+// explicit ini path is the caller's business and its parent may well be a
+// directory we have no right to relock.
+void ServerProfiles::restrictPermissions() const
+{
+    const QString path = m_settings->fileName();
+    if (path.isEmpty())
+        return;
+    QFile::setPermissions(path, QFile::ReadOwner | QFile::WriteOwner);
+    if (!m_ownsDirectory)
+        return;
+    const QString dir = QFileInfo(path).absolutePath();
+    if (!dir.isEmpty())
+        QFile::setPermissions(dir, QFile::ReadOwner | QFile::WriteOwner | QFile::ExeOwner);
 }
 
 void ServerProfiles::setActiveId(QString id)

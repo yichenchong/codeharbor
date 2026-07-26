@@ -33,11 +33,24 @@ ItemDelegate {
     background: Rectangle {
         color: header.selected ? "#2a2a40" : "#181825"
         opacity: header.dragging ? 0.4 : 1.0
+
+        // Keyboard focus ring. The selected wash alone is a 10% lightness step
+        // against #181825 — invisible on a dim screen, and the only thing that
+        // told a keyboard user where the cursor was.
+        Rectangle {
+            anchors.fill: parent
+            anchors.margins: 1
+            color: "transparent"
+            border.width: 2
+            border.color: "#89b4fa"
+            visible: header.selected && header.host !== null && header.host.activeFocus
+        }
     }
 
     contentItem: Row {
         spacing: 6
         leftPadding: 8
+        opacity: (header.host !== null && header.host.stale === true) ? 0.55 : 1.0
 
         Label {
             id: chevron
@@ -54,6 +67,15 @@ ItemDelegate {
             font.bold: true
             font.pixelSize: 13
             elide: Text.ElideRight
+            anchors.verticalCenter: parent.verticalCenter
+        }
+        // Collapsed groups hide their rows, so the header is the only thing
+        // left saying there is anything in there at all.
+        Label {
+            text: qsTr("collapsed")
+            visible: header.collapsed
+            color: "#6c7086"
+            font.pixelSize: 10
             anchors.verticalCenter: parent.verticalCenter
         }
     }

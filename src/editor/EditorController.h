@@ -96,6 +96,18 @@ signals:
 
 private slots:
     void onNotification(const QString& method, const QJsonValue& params);
+    // A NEW codeharbord is on the other end of the RPC client (SPEC 5.6
+    // reconnect). Its FileWatchService registry is empty — subscriptions live
+    // in the remote PROCESS, not in the wire (remote/src/files.ts) — so the
+    // watch this controller established is gone and external-change reload has
+    // silently stopped. Re-subscribe and reconcile whatever changed while the
+    // session was down. Never touches the buffer's dirty state.
+    void onTransportBound();
+    // The old transport hit EOF: that codeharbord is unreachable forever, so
+    // the subscription id it minted is dead. Forget it WITHOUT an unwatch RPC —
+    // the only peer that could receive one is its replacement, which never
+    // created it.
+    void onTransportClosed();
 
 private:
     void setFileState(FileState state);
@@ -113,6 +125,18 @@ private:
     // Release the active file.watch subscription (if any) and forget it, so a
     // pane close / file switch never leaks or duplicates a server-side watcher.
     void unwatchCurrent();
+    // Establish the file.watch subscription for the current path (SPEC 8.7).
+    // Idempotent: a watch already in flight wins, and an id we still hold is
+    // released first so the same path can never end up with two watchers
+    // double-delivering every change.
+    void subscribeWatch();
+    // Close the hole a reconnect leaves: changes made while the transport was
+    // down produced no watchEvent anywhere (the old codeharbord was dead, and
+    // the replacement's fresh subscription baselines at whatever is on disk
+    // when it is created). One file.stat decides whether the buffer is stale;
+    // a clean buffer is reloaded, a dirty one is only FLAGGED, exactly as
+    // onNotification() treats a live watch event.
+    void reconcileAfterReconnect();
     static QString recoveryPathFor(const QString& path);
 
     CodeharbordClient* m_client = nullptr;
@@ -126,6 +150,15 @@ private:
     bool m_dirty = false;
 
     QString m_watchSubscriptionId;
+    // Generation of the watch this controller WANTS, bumped by every open() and
+    // every transport swap. A file.watch response that names a superseded
+    // generation must not install its (now meaningless) subscription id, nor
+    // clear the in-flight guard belonging to a newer attempt — the transport can
+    // be replaced with an open() or a save() still in flight.
+    quint64 m_watchGeneration = 0;
+    // A file.watch request is outstanding. Guards against double-subscribing
+    // when a reconnect lands on top of a subscribe that has not answered yet.
+    bool m_watchPending = false;
 
     // Recovery snapshot bookkeeping (SPEC 11.3). Empty revision => the next
     // write is create-only (expectedRevision ""). m_recoveryHasContent tracks

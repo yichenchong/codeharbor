@@ -20,6 +20,7 @@
 // the live suite.
 
 import { execFile } from "node:child_process";
+import { randomBytes } from "node:crypto";
 
 import { RPC_TMUX_METHODS } from "./rpc-types.ts";
 import type {
@@ -54,6 +55,20 @@ const TMUX_BINARY = process.env.CODEHARBOR_TMUX ?? "tmux";
 export const LIST_SESSIONS_FORMAT =
     "#{session_windows}\t#{session_created}\t#{?session_attached,1,0}\t#{session_name}";
 
+// SECURITY: a session name is REMOTE-CONTROLLED data that is echoed back inside
+// the listing, so "one line = one record" is an assumption an attacker gets to
+// attack. tmux 3.6 does escape a newline in a name to the two characters \ and
+// n (session_check_name() vis-encodes VIS_NL|VIS_TAB), which is what stops a
+// name like "x\n9\t0\t1\tforged" from injecting a whole extra record today —
+// but that is the SERVER's normalization, not an invariant this parser may rest
+// on. So every record is prefixed with a per-call, unguessable marker that tmux
+// emits as literal format text: a line that does not start with the marker is
+// not a record tmux produced for THIS call, and is dropped. A name cannot carry
+// a marker it cannot predict, so forging a record is impossible rather than
+// merely unlikely.
+//
+// base64url so the marker can never contain a tab (the field delimiter) or `#`
+// (which tmux would read as a format directive).
 export const execFileRunner: CommandRunner = (argv) =>
     new Promise<CommandResult>((resolve) => {
         execFile(
@@ -90,11 +105,22 @@ async function run(runner: CommandRunner, argv: string[]): Promise<CommandResult
  * Parse the tab-separated output of `tmux list-sessions -F LIST_SESSIONS_FORMAT`.
  * Unparseable lines are skipped rather than throwing: one odd line must not cost
  * the client the whole listing.
+ *
+ * `marker` is the per-call record anchor described above. When it is non-empty
+ * a line MUST begin with `<marker>\t` to count as a record, which is what makes
+ * a session name unable to forge one. It defaults to empty only so a test (or a
+ * caller holding raw tmux output) can parse an unmarked listing; `listSessions`
+ * always supplies one.
  */
-export function parseSessions(stdout: string): TmuxSession[] {
+export function parseSessions(stdout: string, marker = ""): TmuxSession[] {
+    const anchor = marker === "" ? "" : marker + "\t";
     const sessions: TmuxSession[] = [];
     for (const raw of stdout.split("\n")) {
-        const line = raw.endsWith("\r") ? raw.slice(0, -1) : raw;
+        let line = raw.endsWith("\r") ? raw.slice(0, -1) : raw;
+        if (anchor !== "") {
+            if (!line.startsWith(anchor)) continue;
+            line = line.slice(anchor.length);
+        }
         if (line === "") continue;
         const fields = line.split("\t");
         if (fields.length < 4) continue;
@@ -118,9 +144,10 @@ export function parseSessions(stdout: string): TmuxSession[] {
  * a fresh box, not an error).
  */
 export async function listSessions(runner: CommandRunner = execFileRunner): Promise<ListSessionsResult> {
-    const result = await run(runner, ["list-sessions", "-F", LIST_SESSIONS_FORMAT]);
+    const marker = randomBytes(12).toString("base64url");
+    const result = await run(runner, ["list-sessions", "-F", marker + "\t" + LIST_SESSIONS_FORMAT]);
     if (result.code !== 0) return [];
-    return parseSessions(result.stdout);
+    return parseSessions(result.stdout, marker);
 }
 
 // Validates the one parameter shared by sessionExists and killSession. A blank

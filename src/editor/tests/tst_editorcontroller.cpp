@@ -92,6 +92,14 @@ private slots:
     void contentBufferedUntilPageReportsReady();
     void successfulSaveClearsRecoverySnapshot();
 
+    // SPEC 5.6 reconnect: the transport is swapped for a channel onto a BRAND
+    // NEW codeharbord whose file.watch registry has never heard of us.
+    void detachingTransportNeverResubscribes();
+    void reconnectResubscribesAndReconcilesCleanBuffer();
+    void reconnectLeavesADirtyBufferAloneAndFlagsIt();
+    void reconnectOverAnUnansweredWatchSubscribesExactlyOnce();
+    void reconcileLosesToASaveThatSettledFirst();
+
 private:
     void makePair();
     QJsonObject nextRequest(int timeoutMs = 3000);
@@ -104,6 +112,10 @@ private:
     // ready() (the page is connected, so content flows straight through) then
     // open(path) -> readFile(content,rev) -> Clean, plus watch + empty recovery.
     void openClean(const QString& path, const QString& content, const QString& rev);
+    // Swap the transport the way SessionBootstrap does on a SPEC 5.6 reconnect:
+    // EOF on the dying channel while the consumer is STILL attached, then
+    // detach, then bind a fresh pair standing in for the replacement server.
+    void reconnectTransport();
 
     QLocalServer* m_server = nullptr;
     QLocalSocket* m_clientSide = nullptr;
@@ -663,6 +675,273 @@ void TstEditorController::successfulSaveClearsRecoverySnapshot()
     QCOMPARE(reqPath(write2), QStringLiteral("/foo/f.txt"));
     respondResult(reqId(write2), {{"path", "/foo/f.txt"}, {"revision", "r3"}});
     QVERIFY(nextRequest(300).isEmpty());
+}
+
+// ---------------------------------------------------------------------------
+// SPEC 5.6 reconnect.
+//
+// A file.watch subscription does not live in the wire, it lives in the
+// codeharbord PROCESS: remote/src/files.ts keeps FileWatchService's
+// subscriptions in a plain per-process Map. A reconnect therefore hands the
+// client a DIFFERENT server whose registry is empty and which has never heard
+// of the id we are holding. An editor that does not re-establish its watch goes
+// silently blind to external changes for the rest of the session.
+//
+// tst_liveeditorreconnect proves this end to end against a real dropped SSH
+// session; these cases pin the same contract on the default suite, where the
+// exact request stream can be inspected and adversarial interleavings can be
+// produced on demand.
+// ---------------------------------------------------------------------------
+
+void TstEditorController::reconnectTransport()
+{
+    QSignalSpy closedSpy(m_client, &CodeharbordClient::transportClosed);
+
+    // 1. EOF on the dying channel while the consumer is STILL attached. This
+    //    ordering is not incidental: SessionBootstrap::unwire() closes before
+    //    it detaches precisely so pending calls get their synthetic failure and
+    //    EditorController learns its subscription id died with the process.
+    m_clientSide->disconnectFromServer();
+    QTRY_COMPARE(closedSpy.count(), 1);
+
+    // 2. Detach. This must NOT read as "a new server is available" — see
+    //    detachingTransportNeverResubscribes().
+    m_client->setTransport(nullptr);
+    delete m_serverSide;
+    m_serverSide = nullptr;
+    delete m_clientSide;
+    m_clientSide = nullptr;
+    delete m_server;
+    m_server = nullptr;
+    m_serverBuf.clear();
+
+    // 3. Bind the replacement. makePair() ends in setTransport(), which is what
+    //    emits transportBound() and drives the re-subscribe.
+    makePair();
+}
+
+// Teardown is not a reconnect. setTransport(nullptr) deliberately announces
+// nothing, because a consumer that "re-established" there would only write into
+// a client with no transport bound — every such call fails synchronously and
+// the subscription it thinks it holds does not exist.
+void TstEditorController::detachingTransportNeverResubscribes()
+{
+    makePair();
+    openClean(QStringLiteral("/foo/f.txt"), QStringLiteral("hello"),
+              QStringLiteral("r1"));
+
+    QSignalSpy boundSpy(m_client, &CodeharbordClient::transportBound);
+    // Every call() that cannot transmit announces itself here, so a resubscribe
+    // fired against a detached client cannot hide.
+    QSignalSpy warningSpy(m_client, &CodeharbordClient::protocolWarning);
+
+    m_client->setTransport(nullptr);
+    QTest::qWait(100);
+
+    QCOMPARE(boundSpy.count(), 0);
+    QVERIFY2(warningSpy.isEmpty(),
+             qPrintable(QStringLiteral("a detach provoked RPC traffic: %1")
+                            .arg(warningSpy.value(0).value(0).toString())));
+    // The buffer is the user's and survives a teardown untouched.
+    QCOMPARE(m_controller->revision(), QStringLiteral("r1"));
+    QCOMPARE(m_controller->fileState(), QStringLiteral("clean"));
+}
+
+// The load-bearing case. After the swap the controller must, on the NEW server:
+// subscribe again (its old id is a dead token), and then close the hole the
+// outage left — a change made while the client was down produced no watchEvent
+// anywhere, so only an explicit stat can discover it.
+void TstEditorController::reconnectResubscribesAndReconcilesCleanBuffer()
+{
+    makePair();
+    openClean(QStringLiteral("/foo/f.txt"), QStringLiteral("hello"),
+              QStringLiteral("r1"));
+
+    QSignalSpy contentSpy(m_controller, &EditorController::contentLoaded);
+    reconnectTransport();
+
+    // FIRST request on the new transport is the re-subscribe. Emphatically not
+    // file.unwatch: the only peer that could receive a cancellation for "sub1"
+    // is the replacement, which never minted it — and whose own ids start over
+    // from scratch, so such a request could even cancel a stranger's watcher.
+    const QJsonObject watch = nextRequest();
+    QCOMPARE(method(watch), kWatch);
+    QCOMPARE(reqPath(watch), QStringLiteral("/foo/f.txt"));
+    respondResult(reqId(watch), {{"subscriptionId", "sub2"}});
+
+    // Then the reconciliation stat, on the MAIN file (not the recovery path).
+    const QJsonObject stat = nextRequest();
+    QCOMPARE(method(stat), kStat);
+    QCOMPARE(reqPath(stat), QStringLiteral("/foo/f.txt"));
+    respondResult(reqId(stat), {{"path", "/foo/f.txt"}, {"revision", "r2"}});
+
+    // The revision moved and the buffer is clean, so the bytes written during
+    // the outage are fetched. Without this the user stares at stale content
+    // whose next save is refused for a revision they never saw change.
+    const QJsonObject read = nextRequest();
+    QCOMPARE(method(read), kReadFile);
+    QCOMPARE(reqPath(read), QStringLiteral("/foo/f.txt"));
+    respondResult(reqId(read), {{"path", "/foo/f.txt"},
+                                {"encoding", "utf8"},
+                                {"content", "changed while away"},
+                                {"revision", "r2"},
+                                {"truncated", false}});
+
+    QTRY_COMPARE(contentSpy.count(), 1);
+    QCOMPARE(contentSpy.at(0).at(0).toString(),
+             QStringLiteral("changed while away"));
+    QCOMPARE(contentSpy.at(0).at(1).toString(), QStringLiteral("r2"));
+    QCOMPARE(m_controller->revision(), QStringLiteral("r2"));
+    QTRY_COMPARE(m_controller->fileState(), QStringLiteral("clean"));
+
+    // And the new subscription is the only one: a watchEvent on the new server
+    // reloads exactly once.
+    sendNotification(kWatchEvent, {{"subscriptionId", "sub2"},
+                                   {"path", "/foo/f.txt"},
+                                   {"type", "modified"},
+                                   {"revision", "r3"}});
+    const QJsonObject reread = nextRequest();
+    QCOMPARE(method(reread), kReadFile);
+    respondResult(reqId(reread), {{"path", "/foo/f.txt"},
+                                  {"encoding", "utf8"},
+                                  {"content", "later"},
+                                  {"revision", "r3"},
+                                  {"truncated", false}});
+    QTRY_COMPARE(contentSpy.count(), 2);
+    QVERIFY2(nextRequest(300).isEmpty(),
+             "a second watcher double-delivered the change");
+}
+
+// Same round trip with unsaved edits in the buffer: reconciliation may FLAG the
+// divergence but must never apply it (SPEC 8.7). Re-subscribing is not licence
+// to overwrite the user's work.
+void TstEditorController::reconnectLeavesADirtyBufferAloneAndFlagsIt()
+{
+    makePair();
+    openClean(QStringLiteral("/foo/f.txt"), QStringLiteral("hello"),
+              QStringLiteral("r1"));
+
+    // Unsaved edits, exactly as the page reports them; the SPEC 11.3 snapshot
+    // it triggers is served so it cannot be confused with later traffic.
+    m_controller->reportContent(QStringLiteral("the user's unsaved work"));
+    const QJsonObject snapshot = nextRequest();
+    QCOMPARE(method(snapshot), kWriteFile);
+    QVERIFY(reqPath(snapshot).contains(QStringLiteral(".codeharbor-recovery")));
+    respondResult(reqId(snapshot),
+                  {{"path", reqPath(snapshot)}, {"revision", "rec1"}});
+    QCOMPARE(m_controller->fileState(), QStringLiteral("modified"));
+
+    QSignalSpy contentSpy(m_controller, &EditorController::contentLoaded);
+    reconnectTransport();
+
+    const QJsonObject watch = nextRequest();
+    QCOMPARE(method(watch), kWatch);
+    respondResult(reqId(watch), {{"subscriptionId", "sub2"}});
+
+    const QJsonObject stat = nextRequest();
+    QCOMPARE(method(stat), kStat);
+    QCOMPARE(reqPath(stat), QStringLiteral("/foo/f.txt"));
+    respondResult(reqId(stat), {{"path", "/foo/f.txt"}, {"revision", "r2"}});
+
+    QTRY_COMPARE(m_controller->fileState(),
+                 QStringLiteral("externally_modified"));
+    // No reload was issued, no content was delivered, and the guarded revision
+    // is still the one the buffer was loaded at.
+    QVERIFY2(nextRequest(300).isEmpty(),
+             "a dirty buffer was re-read: the user's edits were clobbered");
+    QCOMPARE(contentSpy.count(), 0);
+    QCOMPARE(m_controller->revision(), QStringLiteral("r1"));
+}
+
+// A reconnect landing on top of a file.watch that never got an answer. The dead
+// request is failed synchronously by the transport teardown, so the in-flight
+// guard must be released and the generation superseded: exactly ONE subscribe
+// may go out on the new server — not zero (guard stuck raised, the pane is
+// blind), not two (two live watchers double-delivering every change).
+void TstEditorController::reconnectOverAnUnansweredWatchSubscribesExactlyOnce()
+{
+    makePair();
+
+    m_controller->ready();
+    m_controller->open(QStringLiteral("/foo/f.txt"));
+    const QJsonObject read = nextRequest();
+    QCOMPARE(method(read), kReadFile);
+    respondResult(reqId(read), {{"path", "/foo/f.txt"},
+                                {"encoding", "utf8"},
+                                {"content", "hello"},
+                                {"revision", "r1"},
+                                {"truncated", false}});
+
+    // Both follow-ups are read off the wire and deliberately LEFT UNANSWERED:
+    // the session dies with them outstanding.
+    const QJsonObject deadWatch = nextRequest();
+    QCOMPARE(method(deadWatch), kWatch);
+    const QJsonObject deadRecoveryStat = nextRequest();
+    QCOMPARE(method(deadRecoveryStat), kStat);
+    QVERIFY(reqPath(deadRecoveryStat).contains(QStringLiteral(".codeharbor-recovery")));
+
+    reconnectTransport();
+
+    const QJsonObject watch = nextRequest();
+    QCOMPARE(method(watch), kWatch);
+    QCOMPARE(reqPath(watch), QStringLiteral("/foo/f.txt"));
+    respondResult(reqId(watch), {{"subscriptionId", "sub2"}});
+
+    const QJsonObject stat = nextRequest();
+    QCOMPARE(method(stat), kStat);
+    QCOMPARE(reqPath(stat), QStringLiteral("/foo/f.txt"));
+    // Nothing moved while we were away, so there is nothing to reconcile.
+    respondResult(reqId(stat), {{"path", "/foo/f.txt"}, {"revision", "r1"}});
+
+    QVERIFY2(nextRequest(300).isEmpty(),
+             "the reconnect issued a second subscribe or an unwanted reload");
+    QCOMPARE(m_controller->fileState(), QStringLiteral("clean"));
+    QCOMPARE(m_controller->revision(), QStringLiteral("r1"));
+}
+
+// The reconciliation stat is a SNAPSHOT question — "did the file move while we
+// were away?" — asked against the revision the buffer held when it was issued.
+// If a save settles before the answer arrives, that answer is stale and the
+// save is authoritative. Acting on it anyway would reload the file over a write
+// the user just made, one round trip after telling them it succeeded.
+void TstEditorController::reconcileLosesToASaveThatSettledFirst()
+{
+    makePair();
+    openClean(QStringLiteral("/foo/f.txt"), QStringLiteral("hello"),
+              QStringLiteral("r1"));
+
+    QSignalSpy contentSpy(m_controller, &EditorController::contentLoaded);
+    QSignalSpy savedSpy(m_controller, &EditorController::saved);
+    reconnectTransport();
+
+    const QJsonObject watch = nextRequest();
+    QCOMPARE(method(watch), kWatch);
+    respondResult(reqId(watch), {{"subscriptionId", "sub2"}});
+
+    // Read the stat off the wire but HOLD its answer: the round trip is now
+    // open, which is the window this case is about.
+    const QJsonObject stat = nextRequest();
+    QCOMPARE(method(stat), kStat);
+    QCOMPARE(reqPath(stat), QStringLiteral("/foo/f.txt"));
+
+    // The page saves while the stat is still in flight and the save wins the
+    // race, adopting r3.
+    m_controller->save(QStringLiteral("the user's write"), QStringLiteral("r1"));
+    const QJsonObject write = nextRequest();
+    QCOMPARE(method(write), kWriteFile);
+    QCOMPARE(reqPath(write), QStringLiteral("/foo/f.txt"));
+    respondResult(reqId(write), {{"path", "/foo/f.txt"}, {"revision", "r3"}});
+    QTRY_COMPARE(savedSpy.count(), 1);
+    QCOMPARE(m_controller->revision(), QStringLiteral("r3"));
+
+    // ...and only NOW the stale snapshot lands, reporting the pre-save world.
+    respondResult(reqId(stat), {{"path", "/foo/f.txt"}, {"revision", "r2"}});
+
+    QVERIFY2(nextRequest(300).isEmpty(),
+             "the stale reconcile re-read the file over a completed save");
+    QCOMPARE(contentSpy.count(), 0);
+    QCOMPARE(m_controller->revision(), QStringLiteral("r3"));
+    QCOMPARE(m_controller->fileState(), QStringLiteral("clean"));
 }
 
 QTEST_GUILESS_MAIN(TstEditorController)

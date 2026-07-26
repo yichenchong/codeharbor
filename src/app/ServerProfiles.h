@@ -100,11 +100,19 @@ private:
     // Rewrite the whole `servers` group from m_profiles/m_activeId, so removed
     // profiles leave no orphan keys behind, and flush it to disk.
     void persist();
+    // Narrow the on-disk store to owner-only. No secret is stored here, but the
+    // record of which hosts you reach — and, where the umask leaves the file
+    // group-writable, the ability to REDIRECT one — is not other accounts'
+    // business. Best effort; a filesystem that cannot express it is not an error.
+    void restrictPermissions() const;
 
     std::unique_ptr<QSettings> m_settings;
     // Ordered list of QVariantMaps, each holding id + the six profile fields.
     QVariantList m_profiles;
     QString m_activeId;
+    // True for the native per-user store, whose containing directory is ours to
+    // lock down; false for a caller-supplied ini path, where only the file is.
+    bool m_ownsDirectory = false;
 };
 
 } // namespace ch

@@ -25,6 +25,12 @@ ItemDelegate {
     readonly property bool selected: host !== null && !host.currentIsGroup
                                      && host.currentId === row.itemId
     readonly property bool dragging: host !== null && host.dragItem === row
+    // The session the host actually has loaded, as opposed to the row the
+    // keyboard cursor happens to be sitting on.
+    readonly property bool active: host !== null && host.hostActiveSessionId === row.itemId
+                                   && row.itemId !== ""
+    // The link is down, so every status on screen predates the outage.
+    readonly property bool stale: host !== null && host.stale === true
 
     objectName: "sessionRow:" + itemId
 
@@ -41,6 +47,10 @@ ItemDelegate {
     // SPEC 4.2 precedence: Error red > WaitingForInput amber > Running green >
     // FinishedUnseen blue > Idle gray > Disconnected dark. rowState is the int
     // value of ch::SessionRowState.
+    //
+    // Colour is never the only carrier: the badge also has a glyph and a
+    // silhouette, and the row's tooltip spells the state out. Six shades of
+    // 10px dot is exactly the encoding a red-green-blind user cannot read.
     function stateColor(state) {
         switch (state) {
         case 0: return "#f38ba8"; // Error - red
@@ -48,10 +58,45 @@ ItemDelegate {
         case 2: return "#a6e3a1"; // Running - green
         case 3: return "#89b4fa"; // FinishedUnseen - blue
         case 4: return "#6c7086"; // Idle - gray
-        case 5: return "#313244"; // Disconnected - dark
+        case 5: return "#45475a"; // Disconnected - dark
         default: return "#6c7086";
         }
     }
+
+    function stateGlyph(state) {
+        switch (state) {
+        case 0: return "!";        // Error
+        case 1: return "?";        // WaitingForInput - the agent wants you
+        case 2: return "\u25b8";   // Running
+        case 3: return "\u2713";   // FinishedUnseen
+        case 4: return "\u2219";   // Idle
+        case 5: return "\u2013";   // Disconnected
+        default: return "\u2219";
+        }
+    }
+
+    // Squared off for the two states that are waiting on a human.
+    function stateRadius(state) {
+        return (state === 0 || state === 1) ? 3 : 7;
+    }
+
+    function stateWords(state) {
+        switch (state) {
+        case 0: return qsTr("Error");
+        case 1: return qsTr("Waiting for your input");
+        case 2: return qsTr("Agent running");
+        case 3: return qsTr("Finished \u2014 output unseen");
+        case 4: return qsTr("Idle");
+        case 5: return qsTr("Disconnected");
+        default: return qsTr("Idle");
+        }
+    }
+
+    ToolTip.visible: row.hovered
+    ToolTip.delay: 600
+    ToolTip.text: row.stale
+                  ? qsTr("%1 (last known \u2014 the link is down)").arg(row.stateWords(row.rowState))
+                  : row.stateWords(row.rowState)
 
     // Selection wins over hover; the source row of a live drag dims so the
     // floating proxy reads as the thing being moved.
@@ -59,27 +104,53 @@ ItemDelegate {
         color: row.selected ? "#45475a" : (row.hovered ? "#232338" : "transparent")
         opacity: row.dragging ? 0.4 : 1.0
 
+        // Loaded session: a solid rail. The keyboard cursor is a separate
+        // thing, and conflating the two is why "which session am I actually
+        // looking at?" used to be unanswerable.
         Rectangle {
             anchors.left: parent.left
             anchors.top: parent.top
             anchors.bottom: parent.bottom
             width: 3
-            color: "#89b4fa"
-            visible: row.selected
+            color: row.active ? "#89b4fa" : "#585b70"
+            visible: row.active || row.selected
+        }
+
+        // Keyboard focus ring, drawn only while the sidebar really owns the
+        // keyboard — otherwise it claims a focus the user does not have.
+        Rectangle {
+            anchors.fill: parent
+            anchors.margins: 1
+            radius: 3
+            color: "transparent"
+            border.width: 2
+            border.color: "#89b4fa"
+            visible: row.selected && row.host !== null && row.host.activeFocus
         }
     }
 
     contentItem: Row {
         spacing: 8
         leftPadding: 24
+        // Stale rows are dimmed as a block: the status they show is the last
+        // one the server managed to report, not the current one.
+        opacity: row.stale ? 0.55 : 1.0
 
         Rectangle {
             id: dot
-            width: 10
-            height: 10
-            radius: 5
+            width: 14
+            height: 14
+            radius: row.stateRadius(row.rowState)
             color: row.stateColor(row.rowState)
             anchors.verticalCenter: parent.verticalCenter
+
+            Label {
+                anchors.centerIn: parent
+                text: row.stateGlyph(row.rowState)
+                color: "#11111b"
+                font.pixelSize: 10
+                font.bold: true
+            }
         }
 
         Column {

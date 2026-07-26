@@ -64,3 +64,34 @@ set_tests_properties(tst_liveeditor PROPERTIES
     ENVIRONMENT "${CODEHARBOR_LIVE_EDITOR_TEST_ENV}"
     TIMEOUT 900
 )
+
+# LIVE gate for an OPEN EDITOR across a dropped-and-restored SSH session
+# (SPEC 5.6 + 8.7). file.watch subscriptions live inside the codeharbord
+# PROCESS (remote/src/files.ts FileWatchService), so a reconnect replaces them
+# with nothing; this gate kills a real session and requires the editor to come
+# back seeing external changes. No WebEngine here — the controller is driven
+# directly, so the failure it reports is a reconnect failure and not a page
+# failure — hence no Chromium flags and a much smaller timeout than
+# tst_liveeditor. QSKIPs without CH_LIVE_SSH.
+qt_add_executable(tst_liveeditorreconnect tst_liveeditorreconnect.cpp)
+
+target_link_libraries(tst_liveeditorreconnect PRIVATE
+    Qt6::Test
+    Qt6::Core
+    # ch_app links Qt6::Gui.
+    Qt6::Gui
+    ch_editor
+    # SessionBootstrap: the production pool -> channel -> RPC-client wiring,
+    # and the reconnect ladder this gate drops the session through.
+    ch_app
+    ch_ssh
+    ch_remote
+    ch_agent
+    ch_models
+)
+
+add_test(NAME tst_liveeditorreconnect COMMAND tst_liveeditorreconnect)
+set_tests_properties(tst_liveeditorreconnect PROPERTIES
+    LABELS live
+    TIMEOUT 600
+)

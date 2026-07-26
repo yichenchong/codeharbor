@@ -63,7 +63,10 @@ Rectangle {
     property bool attached: false
     property bool pageLoaded: false
     // Human-readable reason the pane is not live; shown instead of a blank pane.
-    property string statusText: pane.factory ? qsTr("not connected") : qsTr("no terminal service")
+    // Whole sentences, because this is the only thing on screen when a terminal
+    // fails to come up — "notconnected" is a state name, not an explanation.
+    property string statusText: pane.factory ? qsTr("Not attached to a shell yet.")
+                                             : qsTr("No terminal service in this window.")
     // Live means: a PTY is attached AND the renderer is showing it.
     readonly property bool live: pane.attached && pane.pageLoaded
                                  && pane.connectionState === "ready"
@@ -80,11 +83,11 @@ Rectangle {
         if (pane.attached || !pane.factory || !pane.controller)
             return
         if (pane.devSessionId.length === 0 || pane.terminalId.length === 0) {
-            pane.statusText = qsTr("no session selected")
+            pane.statusText = qsTr("No Dev Session selected for this pane.")
             return
         }
         if (!pane.factory.connected()) {
-            pane.statusText = qsTr("not connected")
+            pane.statusText = qsTr("Not connected to a server.")
             return
         }
         // The renderer's fitted size when it has already mounted; 0 lets the
@@ -109,7 +112,7 @@ Rectangle {
         if (pane.factory && pane.controller)
             pane.factory.kill(pane.controller)
         pane.attached = false
-        pane.statusText = qsTr("session killed")
+        pane.statusText = qsTr("Session killed. Connect to start a new one.")
     }
 
     // A pane retargeted at another session/terminal must follow it: drop the
@@ -166,6 +169,12 @@ Rectangle {
         active: false
         sourceComponent: Component {
             WebEngineView {
+                // The one URL this view may ever hold. Compared as a STRING:
+                // `request.url` arrives as a QUrl and `terminalBundleUrl` as a
+                // QML url, and only their normalized text is guaranteed to line
+                // up across the two conversions.
+                readonly property string pinnedUrl: String(pane.terminalBundleUrl)
+
                 anchors.fill: parent
                 url: pane.terminalBundleUrl
 
@@ -176,15 +185,46 @@ Rectangle {
                 settings.javascriptEnabled: true
                 settings.localContentCanAccessFileUrls: false
                 settings.localContentCanAccessRemoteUrls: false
+                // SECURITY: window.open() is the one navigation primitive that
+                // does not pass through onNavigationRequested below, and xterm's
+                // built-in OSC 8 handler reaches for exactly it. Nothing in this
+                // page has any reason to open a window.
+                settings.javascriptCanOpenWindows: false
 
                 webChannel: terminalChannel
+
+                // SECURITY (SPEC 7.2): this view carries the WebChannel, and Qt
+                // injects qt.webChannelTransport into EVERY document it loads —
+                // so a document loaded here gets ch::TerminalBridge, i.e. a
+                // direct line into the C++ process. The page's CSP does not help:
+                // CSP constrains subresources, not top-level navigation. The
+                // bytes rendered in this pane come off a remote PTY and are
+                // wholly attacker-controlled, so the view must be pinned to the
+                // one URL it was created for. Anything else — remote, file:,
+                // data:, another qrc page — is refused outright rather than
+                // being allowed to inherit the bridge.
+                onNavigationRequested: function(request) {
+                    if (String(request.url) === pinnedUrl)
+                        return
+                    request.action = WebEngineNavigationRequest.IgnoreRequest
+                    console.warn("TerminalPaneView: refused navigation to", request.url)
+                }
+
+                // Belt and braces for the same rule: a new window would be a
+                // fresh view outside the pinning above. Handling the signal and
+                // never calling openIn() is what denies it.
+                onNewWindowRequested: function(request) {
+                    console.warn("TerminalPaneView: refused a new window for",
+                                 request.requestedUrl)
+                }
 
                 onLoadingChanged: function(request) {
                     if (request.status === WebEngineView.LoadSucceededStatus) {
                         pane.pageLoaded = true
                     } else if (request.status === WebEngineView.LoadFailedStatus) {
                         pane.pageLoaded = false
-                        pane.statusText = qsTr("renderer failed to load: %1").arg(request.errorString)
+                        pane.statusText = qsTr("The terminal renderer failed to load: %1")
+                                          .arg(request.errorString)
                     }
                 }
             }
@@ -192,7 +232,8 @@ Rectangle {
     }
 
     // Full-pane placeholder while there is no renderer to look at: never a blank
-    // rectangle, always the pane's identity plus why it is not live.
+    // rectangle, always what this pane IS, why it is not live, and the one
+    // action that might fix it.
     Rectangle {
         anchors.fill: parent
         anchors.margins: pane.border.width
@@ -201,24 +242,76 @@ Rectangle {
 
         Column {
             anchors.centerIn: parent
+            width: Math.min(parent.width - 48, 340)
             spacing: 8
 
             Label {
                 anchors.horizontalCenter: parent.horizontalCenter
-                text: pane.terminalId.length > 0 ? pane.terminalId : qsTr("Terminal")
-                color: "#cdd6f4"
-                font.pixelSize: 13
+                text: "\u25ae"
+                color: "#45475a"
+                font.pixelSize: 26
+                font.family: "Monospace"
             }
             Label {
-                anchors.horizontalCenter: parent.horizontalCenter
+                objectName: "paneTitle"
+                width: parent.width
+                horizontalAlignment: Text.AlignHCenter
+                // The headline is what this pane IS. The id it is keyed by is
+                // plumbing and belongs in the small print below.
+                text: qsTr("Terminal")
+                color: "#cdd6f4"
+                font.pixelSize: 14
+            }
+            Label {
+                objectName: "paneReason"
+                width: parent.width
+                horizontalAlignment: Text.AlignHCenter
+                wrapMode: Text.WordWrap
+                // SECURITY: a Label defaults to Text.AutoText, which promotes
+                // any string that merely LOOKS like markup to StyledText — and
+                // StyledText renders <img src="http://..."> by fetching it.
+                // statusText carries libssh/WebEngine failure text, which a
+                // hostile server has a hand in. It is data, so it is drawn as
+                // data.
+                textFormat: Text.PlainText
                 text: pane.statusText.length > 0 ? pane.statusText : pane.connectionState
                 color: "#6c7086"
-                font.pixelSize: 11
+                font.pixelSize: 12
+            }
+            Label {
+                objectName: "paneIdentityLabel"
+                anchors.horizontalCenter: parent.horizontalCenter
+                // Same rule: terminalId comes from server data.
+                textFormat: Text.PlainText
+                text: pane.terminalId
+                visible: pane.terminalId.length > 0
+                color: "#45475a"
+                font.pixelSize: 10
+                font.family: "Monospace"
             }
             Button {
+                id: attachButton
                 anchors.horizontalCenter: parent.horizontalCenter
                 visible: pane.factory !== null && !pane.attached
                 text: qsTr("Connect")
+                implicitHeight: 30
+                leftPadding: 14
+                rightPadding: 14
+                focusPolicy: Qt.StrongFocus
+                contentItem: Label {
+                    text: attachButton.text
+                    color: "#cdd6f4"
+                    font.pixelSize: 12
+                    horizontalAlignment: Text.AlignHCenter
+                    verticalAlignment: Text.AlignVCenter
+                }
+                background: Rectangle {
+                    radius: 4
+                    color: attachButton.down ? "#45475a"
+                         : attachButton.hovered ? "#3a3a52" : "#313244"
+                    border.width: attachButton.visualFocus ? 2 : 1
+                    border.color: attachButton.visualFocus ? "#89b4fa" : "#45475a"
+                }
                 onClicked: pane.attachNow()
             }
         }
@@ -242,7 +335,10 @@ Rectangle {
             spacing: 8
 
             Label {
+                objectName: "paneBannerLabel"
                 anchors.verticalCenter: parent.verticalCenter
+                // Same rule as the placeholder chrome above: never markup.
+                textFormat: Text.PlainText
                 text: pane.statusText.length > 0
                       ? pane.statusText
                       : qsTr("terminal %1").arg(pane.connectionState)

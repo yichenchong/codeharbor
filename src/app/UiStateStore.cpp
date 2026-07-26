@@ -17,6 +17,11 @@ QString selectedPaneKey(const QString& devSessionId)
 {
     return QStringLiteral("selectedPane/") + devSessionId;
 }
+
+QString activeSessionKey(const QString& serverId)
+{
+    return QStringLiteral("session/") + serverId + QStringLiteral("/active");
+}
 } // namespace
 
 UiStateStore::UiStateStore(QString iniPath, QObject* parent)
@@ -70,15 +75,21 @@ QString UiStateStore::selectedPane(QString devSessionId) const
     return m_settings->value(selectedPaneKey(devSessionId)).toString();
 }
 
-void UiStateStore::setActiveSession(QString devSessionId)
+void UiStateStore::setActiveSession(QString serverId, QString devSessionId)
 {
-    m_settings->setValue(QStringLiteral("session/active"), devSessionId);
+    // No server, no meaningful "active session": refuse to park a value under a
+    // placeholder key that the next connected server would then read back.
+    if (serverId.isEmpty())
+        return;
+    m_settings->setValue(activeSessionKey(serverId), devSessionId);
     m_settings->sync();
 }
 
-QString UiStateStore::activeSession() const
+QString UiStateStore::activeSession(QString serverId) const
 {
-    return m_settings->value(QStringLiteral("session/active")).toString();
+    if (serverId.isEmpty())
+        return {};
+    return m_settings->value(activeSessionKey(serverId)).toString();
 }
 
 } // namespace ch

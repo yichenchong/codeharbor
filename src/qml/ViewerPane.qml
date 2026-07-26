@@ -45,15 +45,56 @@ Item {
     Component { id: binaryComponent; ViewerBinaryView { url: pane.url } }
     Component { id: editorComponent; EditorPaneView { fileUrl: pane.url } }
 
+    // Nothing open. A pane a user can land on must say what it is and how to
+    // fill it — the internal pane id is plumbing, and printing it as the
+    // headline (which this used to do) tells nobody anything.
     Component {
         id: emptyComponent
         Rectangle {
             color: "#181825"
-            Label {
+
+            Column {
                 anchors.centerIn: parent
-                text: pane.paneId.length > 0 ? pane.paneId : qsTr("Empty pane")
-                color: "#6c7086"
-                font.pixelSize: 13
+                width: Math.min(parent.width - 48, 340)
+                spacing: 8
+
+                Label {
+                    anchors.horizontalCenter: parent.horizontalCenter
+                    text: "\u25a7"
+                    color: "#45475a"
+                    font.pixelSize: 30
+                }
+                Label {
+                    objectName: "emptyTitle"
+                    width: parent.width
+                    horizontalAlignment: Text.AlignHCenter
+                    text: qsTr("Nothing open in this pane")
+                    color: "#cdd6f4"
+                    font.pixelSize: 14
+                }
+                Label {
+                    objectName: "emptyHint"
+                    width: parent.width
+                    horizontalAlignment: Text.AlignHCenter
+                    wrapMode: Text.WordWrap
+                    text: qsTr("Open a file from the sessions sidebar, or split and close panes "
+                               + "from the command palette (Ctrl+Shift+P).")
+                    color: "#6c7086"
+                    font.pixelSize: 12
+                }
+                Label {
+                    objectName: "emptyPaneId"
+                    anchors.horizontalCenter: parent.horizontalCenter
+                    // The id still has to be reachable for a bug report; it is
+                    // just no longer the message. Never markup: pane ids are
+                    // built from server-supplied session ids.
+                    textFormat: Text.PlainText
+                    text: pane.paneId
+                    visible: pane.paneId.length > 0
+                    color: "#45475a"
+                    font.pixelSize: 10
+                    font.family: "Monospace"
+                }
             }
         }
     }

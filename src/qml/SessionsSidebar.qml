@@ -37,6 +37,58 @@ Rectangle {
 
     activeFocusOnTab: true
 
+    // ---------------------------------------------------------------------
+    // Link state
+    //
+    // The sidebar is where a user notices the server is gone: the rows keep
+    // showing whatever the last refresh reported, and nothing else on screen
+    // says otherwise. It therefore reads the host's connection surface
+    // directly. Guarded, because a host that publishes none (a bare sidebar
+    // harness) must keep working — it then simply has nothing to report and
+    // the footer takes no space.
+    // ---------------------------------------------------------------------
+    readonly property string linkState: (app && app.connectionState !== undefined)
+                                        ? String(app.connectionState) : ""
+    // Rows on screen are known to predate the current reality.
+    readonly property bool stale: linkState === "reconnecting" || linkState === "failed"
+                                  || linkState === "disconnected"
+    // The session the host considers loaded, which is not the same thing as the
+    // keyboard cursor or the last row clicked.
+    readonly property string hostActiveSessionId: (app && app.activeSessionId !== undefined)
+                                                  ? String(app.activeSessionId) : ""
+
+    // Same three-way encoding as ConnectSheet's chip: colour, glyph and word.
+    function linkColor(state) {
+        switch (state) {
+        case "connected": return "#a6e3a1";
+        case "connecting":
+        case "hostkey": return "#f9e2af";
+        case "reconnecting": return "#fab387";
+        case "failed": return "#f38ba8";
+        default: return "#6c7086";
+        }
+    }
+    function linkGlyph(state) {
+        switch (state) {
+        case "connected": return "\u2713";
+        case "connecting": return "\u2219";
+        case "hostkey": return "?";
+        case "reconnecting": return "\u21bb";
+        case "failed": return "\u2715";
+        default: return "\u2013";
+        }
+    }
+    function linkWords(state) {
+        switch (state) {
+        case "connected": return qsTr("Connected");
+        case "connecting": return qsTr("Connecting\u2026");
+        case "hostkey": return qsTr("Host key needs approval");
+        case "reconnecting": return qsTr("Reconnecting\u2026 rows may be stale");
+        case "failed": return qsTr("Connection failed");
+        default: return qsTr("Not connected");
+        }
+    }
+
     Component.onCompleted: app.refresh()
 
     // ---------------------------------------------------------------------
@@ -468,6 +520,24 @@ Rectangle {
             anchors.right: parent.right
             anchors.rightMargin: 8
             anchors.verticalCenter: parent.verticalCenter
+            implicitHeight: 28
+            leftPadding: 10
+            rightPadding: 10
+            focusPolicy: Qt.StrongFocus
+            contentItem: Label {
+                text: newGroupButton.text
+                color: "#cdd6f4"
+                font.pixelSize: 11
+                horizontalAlignment: Text.AlignHCenter
+                verticalAlignment: Text.AlignVCenter
+            }
+            background: Rectangle {
+                radius: 4
+                color: newGroupButton.down ? "#45475a"
+                     : newGroupButton.hovered ? "#3a3a52" : "#313244"
+                border.width: newGroupButton.visualFocus ? 2 : 1
+                border.color: newGroupButton.visualFocus ? "#89b4fa" : "#45475a"
+            }
             onClicked: newGroupDialog.open()
         }
     }
@@ -478,11 +548,108 @@ Rectangle {
         anchors.top: headerBar.bottom
         anchors.left: parent.left
         anchors.right: parent.right
-        anchors.bottom: parent.bottom
+        anchors.bottom: statusFooter.top
         clip: true
         model: groupsDelegateModel
 
         ScrollBar.vertical: ScrollBar {}
+    }
+
+    // Nothing to show. WHICH nothing matters: a fresh install has no server to
+    // ask, while a connected one may simply have no groups yet, and the two
+    // need different next steps.
+    Column {
+        id: sidebarEmptyState
+        objectName: "sidebarEmptyState"
+        anchors.centerIn: sessionsList
+        width: sidebar.width - 40
+        spacing: 8
+        visible: groupsDelegateModel.count === 0
+
+        readonly property bool serverReachable: sidebar.linkState === ""
+                                                || sidebar.linkState === "connected"
+
+        Label {
+            anchors.horizontalCenter: parent.horizontalCenter
+            text: sidebarEmptyState.serverReachable ? "\u2637" : "\u26a0"
+            color: "#45475a"
+            font.pixelSize: 26
+        }
+        Label {
+            objectName: "sidebarEmptyTitle"
+            width: parent.width
+            horizontalAlignment: Text.AlignHCenter
+            text: sidebarEmptyState.serverReachable ? qsTr("No sessions yet")
+                                                    : qsTr("No server")
+            color: "#cdd6f4"
+            font.pixelSize: 13
+        }
+        Label {
+            objectName: "sidebarEmptyHint"
+            width: parent.width
+            horizontalAlignment: Text.AlignHCenter
+            wrapMode: Text.WordWrap
+            text: sidebarEmptyState.serverReachable
+                  ? qsTr("Press \u201c+ New group\u201d above, then add a Dev Session to it.")
+                  : qsTr("Connect to the machine that holds your checkout, and its groups and Dev Sessions appear here.")
+            color: "#6c7086"
+            font.pixelSize: 11
+        }
+    }
+
+    // Link status. Zero-height (and absent) when the host publishes no
+    // connection surface, so a sidebar driven by a bare model is laid out
+    // exactly as before.
+    Rectangle {
+        id: statusFooter
+        objectName: "statusFooter"
+        anchors.left: parent.left
+        anchors.right: parent.right
+        anchors.bottom: parent.bottom
+        visible: sidebar.linkState !== ""
+        height: visible ? 26 : 0
+        color: "#181825"
+
+        Rectangle {
+            anchors.left: parent.left
+            anchors.right: parent.right
+            anchors.top: parent.top
+            height: 1
+            color: "#313244"
+        }
+
+        Row {
+            anchors.left: parent.left
+            anchors.leftMargin: 12
+            anchors.right: parent.right
+            anchors.rightMargin: 12
+            anchors.verticalCenter: parent.verticalCenter
+            spacing: 6
+
+            Rectangle {
+                anchors.verticalCenter: parent.verticalCenter
+                width: 12
+                height: 12
+                radius: sidebar.linkState === "hostkey" || sidebar.linkState === "failed" ? 2 : 6
+                color: sidebar.linkColor(sidebar.linkState)
+
+                Label {
+                    anchors.centerIn: parent
+                    text: sidebar.linkGlyph(sidebar.linkState)
+                    color: "#11111b"
+                    font.pixelSize: 9
+                    font.bold: true
+                }
+            }
+            Label {
+                objectName: "linkStatusLabel"
+                anchors.verticalCenter: parent.verticalCenter
+                text: sidebar.linkWords(sidebar.linkState)
+                color: sidebar.stale ? "#f9e2af" : "#a6adc8"
+                font.pixelSize: 11
+                elide: Text.ElideRight
+            }
+        }
     }
 
     DelegateModel {

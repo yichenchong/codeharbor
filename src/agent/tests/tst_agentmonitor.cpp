@@ -63,9 +63,13 @@ private slots:
     void unknownStateStringMapsToUnknown();
     void perTerminalStateIsIndependent();
     void transportDestroyedThenRebindIsSafe();
+    void accumulatedStateSurvivesAReconnect();
 
 private:
     void makePair();
+    // Swap the transport the way SessionBootstrap does on a SPEC 5.6 reconnect:
+    // detach the dead channel, then bind one onto the REPLACEMENT bridge.
+    void swapPair();
     void feed(const QByteArray& bytes);
 
     QLocalServer* m_server = nullptr;
@@ -112,6 +116,18 @@ void TstAgentMonitor::makePair()
     QVERIFY(m_writerSide != nullptr);
 
     m_monitor->setTransport(m_monitorSide);
+}
+
+void TstAgentMonitor::swapPair()
+{
+    m_monitor->setTransport(nullptr);
+    delete m_writerSide;
+    m_writerSide = nullptr;
+    delete m_monitorSide;
+    m_monitorSide = nullptr;
+    delete m_server;
+    m_server = nullptr;
+    makePair();
 }
 
 void TstAgentMonitor::feed(const QByteArray& bytes)
@@ -426,6 +442,73 @@ void TstAgentMonitor::transportDestroyedThenRebindIsSafe()
 
     // Clear before `second` goes out of scope so the monitor drops its pointer.
     m_monitor->setTransport(nullptr);
+}
+
+// SPEC 5.6 reconnect. A dropped session is re-wired onto a BRAND NEW
+// codeharbor-bridge process, and SessionBootstrap hands the monitor a channel
+// onto it (setTransport(nullptr), then setTransport(newDevice)).
+//
+// The question this case answers is "does the monitor need anything REPLAYED
+// across that swap?", and the answer is no — but only because of two
+// properties that would otherwise be nobody's job to keep:
+//
+//   * The monitor holds NO server-side state. Unlike EditorController, which
+//     mints a file.watch subscription that lives in the codeharbord process
+//     and dies with it, the monitor never subscribes to anything: the bridge
+//     pushes AgentEvent JSONL at whoever is on the socket. There is no token
+//     to re-establish, so there is nothing to re-request.
+//   * Everything it accumulated is the USER's, not the wire's — which
+//     terminals are running, which Dev Sessions have an unseen completion.
+//     setTransport() must therefore preserve it. A swap that reset it would
+//     silently clear an unseen-completion badge for a result the user never
+//     saw, which is precisely the notification this subsystem exists to keep.
+//
+// And the byte stream itself must not be spliced: a frame the dying bridge only
+// got halfway through is an unrelated byte sequence from the new one's first
+// frame, so the partial MUST be discarded rather than concatenated. Fusing them
+// destroys BOTH — the join is not valid JSON, so the real event that follows is
+// dropped with it.
+void TstAgentMonitor::accumulatedStateSurvivesAReconnect()
+{
+    makePair();
+    QSignalSpy stateSpy(m_monitor, &AgentStatusMonitor::agentStateChanged);
+    QSignalSpy unseenSpy(m_monitor, &AgentStatusMonitor::unseenChanged);
+
+    feed(eventLine("running", "d1", "t1"));
+    feed(eventLine("idle_unseen", "d1", "t2"));
+    QTRY_COMPARE(stateSpy.count(), 2);
+    QTRY_VERIFY(m_monitor->hasUnseen("d1"));
+
+    // The bridge dies mid-frame. lineSplitAcrossReadsIsBuffered() pins that a
+    // partial line really is held in the read buffer rather than dropped, so
+    // after this wait the monitor is genuinely carrying these bytes.
+    feed(eventLine("error", "d1", "t1").left(20));
+    QTest::qWait(150);
+    QCOMPARE(stateSpy.count(), 2);
+
+    swapPair();
+
+    // Nothing was replayed, and nothing was lost.
+    QCOMPARE(stateSpy.count(), 2);
+    QCOMPARE(unseenSpy.count(), 1);
+    QCOMPARE(m_monitor->stateFor("d1", "t1"), asInt(AgentState::Running));
+    QCOMPARE(m_monitor->stateFor("d1", "t2"), asInt(AgentState::IdleUnseen));
+    QVERIFY(m_monitor->hasUnseen("d1"));
+
+    // The replacement's stream is live AND is read as itself: had the orphaned
+    // half-frame survived the swap it would have been glued to the front of
+    // this event, and the fused line — invalid JSON — would have taken the real
+    // event down with it, leaving the terminal stuck on Running forever.
+    feed(eventLine("waiting_input", "d1", "t1"));
+    QTRY_COMPARE(stateSpy.count(), 3);
+    QCOMPARE(stateSpy.at(2).at(2).toInt(), asInt(AgentState::WaitingInput));
+    QCOMPARE(m_monitor->stateFor("d1", "t1"), asInt(AgentState::WaitingInput));
+
+    // The user's pending completion is still pending, and still clearable.
+    QVERIFY(m_monitor->hasUnseen("d1"));
+    m_monitor->markSeen(QStringLiteral("d1"));
+    QCOMPARE(unseenSpy.count(), 2);
+    QCOMPARE(unseenSpy.at(1).at(1).toBool(), false);
 }
 
 QTEST_MAIN(TstAgentMonitor)

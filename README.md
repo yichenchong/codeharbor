@@ -72,26 +72,35 @@ npm run build      # tsc -> dist/
 
 ## Status
 
-Milestones **M1–M5 are reached LIVE**, not merely unit-tested: every workstream's
-live gate now runs against a real `sshd` and a real `codeharbord`, covering SSH
-transport, terminal (tmux attach / remote-confirmed resize / reconnect), workspace
-CRUD + persistence, remote viewers, remote editing in real Monaco, and agent
-awareness driven by the real hook.
+CodeHarbor is **usable end to end**: launch it with no configuration, add a server
+in the connect sheet, accept its host key, pick a Dev Session, and you get live
+remote shells in terminal panes, remote files in Monaco with revision-guarded
+saves, and your layout back where you left it on the next launch. That whole
+walkthrough is a test (`tst_coldstart`) that runs against a real `sshd` and a real
+`codeharbord` on every live run — not a description of what should happen.
+
+Milestones **M1–M5 are reached LIVE**: SSH transport, terminal (tmux attach /
+remote-confirmed resize / reconnect), workspace CRUD + persistence, remote viewers,
+remote editing, and agent awareness driven by the real hook each have a gate that
+exercises the real thing.
 
 Those gates are QTest targets labelled `live`; they **QSKIP** unless `CH_LIVE_SSH`
 is set, so `ctest --preset dev` stays portable. To run them you need a reachable SSH
 server, `tmux`, and Node on the remote side — see
 [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md).
 
-Exercising them for the first time paid for itself: it exposed a missing transport
+Exercising real paths has repeatedly paid for itself. It exposed a missing transport
 spine (nothing carried RPC over SSH), QML that could not load at all, split panes
-rendering at zero width, stored region widths being destroyed on launch, and
-non-deterministic sidebar ordering. See the Wave 5 entry and correction note in
-[`docs/PLAN.md`](docs/PLAN.md) for the full list and what remains.
+rendering at zero width, stored region widths destroyed on launch, splitting a pane
+killing the terminal you were working in, and — worst — unknown SSH host keys being
+trusted silently, which made the whole host-key prompt dead code. The corrections
+note in [`docs/PLAN.md`](docs/PLAN.md) records each one, and is honest about what is
+still owed: a fresh security review, pane focus tracking, and moving the blocking
+SSH handshake off the GUI thread.
 
-**Building requires Node** — the Monaco editor bundle is a build artifact embedded
-as a Qt resource, and CMake builds it at configure time (it refuses to configure a
-silently editor-less client; `-DCODEHARBOR_SKIP_WEB_BUNDLE=ON` opts out).
+**Building requires Node** — the Monaco and xterm.js bundles are build artifacts
+embedded as Qt resources, and CMake builds them at configure time (it refuses to
+configure a silently editor-less client; `-DCODEHARBOR_SKIP_WEB_BUNDLE=ON` opts out).
 
 ## License
 

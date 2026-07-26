@@ -54,8 +54,18 @@ void CodeharbordClient::setTransport(QIODevice* transport)
     }
 
     // Drain anything already buffered on the transport before we subscribed.
+    // A response delivered by that drain may delete this client, so the
+    // announcement below is guarded exactly like onTransportClosed()'s.
+    QPointer<CodeharbordClient> self(this);
     if (m_transport->bytesAvailable() > 0)
         onReadyRead();
+    if (!self)
+        return;
+
+    // Announce LAST: a consumer re-establishing server-side state (a
+    // file.watch subscription, say) must find the client fully bound and
+    // drained so its very first call goes out on the new transport.
+    emit transportBound();
 }
 
 int CodeharbordClient::call(const QString& method, const QJsonValue& params,

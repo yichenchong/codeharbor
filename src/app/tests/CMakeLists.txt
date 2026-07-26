@@ -49,10 +49,13 @@ target_link_libraries(tst_sessionlayouts PRIVATE
 add_test(NAME tst_sessionlayouts COMMAND tst_sessionlayouts)
 set_tests_properties(tst_sessionlayouts PROPERTIES LABELS live TIMEOUT 120)
 
-# SessionBootstrap's connection-state machine and reconnect ladder (SPEC 5.6).
-# Drives channel loss through overridden test seams, so it needs no SSH server
-# and no fixture; the backoff is time-scaled down and the whole target runs in
-# well under a second.
+# SessionBootstrap's connection-state machine and reconnect ladder (SPEC 5.6),
+# plus the bounded connect pre-flight and the GUI-responsiveness cases that
+# came out of the connect-stall hunt. Channel loss is driven through overridden
+# test seams, so it needs no SSH server and no fixture; the backoff is
+# time-scaled down and the pre-flight cases run against loopback QTcpServers on
+# a 300 ms budget, so the whole target still runs in a couple of seconds.
+# Qt6::Network is what QTcpServer/QTcpSocket come from.
 qt_add_executable(tst_sessionbootstrap tst_sessionbootstrap.cpp)
 target_link_libraries(tst_sessionbootstrap PRIVATE
     ch_app
@@ -61,6 +64,7 @@ target_link_libraries(tst_sessionbootstrap PRIVATE
     ch_agent
     Qt6::Test
     Qt6::Core
+    Qt6::Network
 )
 add_test(NAME tst_sessionbootstrap COMMAND tst_sessionbootstrap)
 
@@ -137,4 +141,47 @@ set_tests_properties(tst_liveshell PROPERTIES
     LABELS live
     ENVIRONMENT "QT_QPA_PLATFORM=offscreen;QT_QUICK_BACKEND=software;QTWEBENGINE_CHROMIUM_FLAGS=--disable-gpu --no-sandbox --disable-dev-shm-usage"
     TIMEOUT 300
+)
+
+# THE COLD-START ACCEPTANCE GATE (tst_coldstart.cpp): a fresh config dir, the
+# real qrc Main.qml on top of main.cpp's exact object graph, and the whole
+# walkthrough — connect sheet, host key, workspace, live terminal pane, remote
+# file save, relaunch — driven through the UI objects.
+#
+# It links everything the shipped binary links (codeharbor_qmlplugin registers
+# the CodeHarbor QML module; ch_terminal/ch_editor/ch_viewers provide the pane
+# factories the QML instantiates) and needs the same headless WebEngine recipe
+# as the other WebEngine-touching targets. NEVER add --single-process: Chromium
+# aborts as soon as a second QWebEngineProfile exists, and step 7 builds a
+# second graph — hence a second profile — on purpose.
+#
+# LABELS live: initTestCase QSKIPs the whole gate without CH_LIVE_SSH. The
+# timeout covers two cold `node` starts, two SSH handshakes, a cold tmux server
+# and two full QML/WebEngine launches.
+qt_add_executable(tst_coldstart tst_coldstart.cpp)
+target_link_libraries(tst_coldstart PRIVATE
+    ch_app
+    ch_agent
+    ch_editor
+    ch_models
+    ch_persistence
+    ch_remote
+    ch_ssh
+    ch_terminal
+    ch_viewers
+    codeharbor_qmlplugin
+    Qt6::Test
+    Qt6::Core
+    Qt6::Gui
+    Qt6::Qml
+    Qt6::Quick
+    Qt6::QuickControls2
+    Qt6::WebChannel
+    Qt6::WebEngineQuick
+)
+add_test(NAME tst_coldstart COMMAND tst_coldstart)
+set_tests_properties(tst_coldstart PROPERTIES
+    LABELS live
+    ENVIRONMENT "QT_QPA_PLATFORM=offscreen;QT_QUICK_BACKEND=software;QTWEBENGINE_CHROMIUM_FLAGS=--disable-gpu --no-sandbox --disable-dev-shm-usage"
+    TIMEOUT 900
 )

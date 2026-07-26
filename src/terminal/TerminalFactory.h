@@ -69,10 +69,12 @@ public:
     Q_INVOKABLE QString targetFor(ch::TerminalController* controller) const;
 
     // The command kill() runs on its own Exec channel:
-    // tmux kill-session -t '<target>'. The target is interpolated with the same
-    // POSIX single-quote rule as TerminalController's attach command (SPEC 5.2),
-    // so an id carrying shell metacharacters cannot escape into the remote
-    // shell. Static and public because that guarantee deserves its own test.
+    // tmux kill-session -t '=<target>'. Two independent hardenings, both
+    // load-bearing: the POSIX single-quote rule keeps an id carrying shell
+    // metacharacters from escaping into the remote shell (SPEC 5.2, the same
+    // rule as TerminalController's attach command), and tmux's `=` exact-match
+    // sigil keeps a glob- or prefix-shaped id from resolving to somebody else's
+    // session. Static and public because both guarantees deserve their own test.
     static QString tmuxKillSessionCommand(const QString& target);
 
 signals:

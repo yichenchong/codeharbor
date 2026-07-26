@@ -65,9 +65,19 @@ QQuickWebEngineProfile *ViewerProfiles::internalProfile()
 {
     if (!m_internal) {
         // Off-the-record: the privileged profile serves ephemeral, app-minted
-        // opaque content and needs no on-disk persistence. The default ctor
-        // yields an off-the-record profile.
-        m_internal = new QQuickWebEngineProfile(this);
+        // opaque content and needs no on-disk persistence.
+        //
+        // Constructed through the storage-name overload with an EMPTY name
+        // rather than the default ctor. Both build the same off-the-record
+        // ProfileAdapter, but QQuickWebEngineProfile(QObject *) additionally
+        // emits, from 6.9 on, "Please use WebEngineProfilePrototype for profile
+        // creation ... will be deprecated in the future releases". An empty
+        // storage name is precisely what WebEngineProfilePrototype{} feeds its
+        // adapter when no storageName is set, so this IS the prototype's
+        // off-the-record path — and the prototype type itself
+        // (QQuickWebEngineProfilePrototype) is QML-only private API whose header
+        // is not installed, so C++ cannot use it directly.
+        m_internal = new QQuickWebEngineProfile(QString(), this);
         if (!m_handler)
             m_handler = new InternalUrlSchemeHandler(m_client, nullptr, this);
         m_internal->installUrlSchemeHandler(internalSchemeName(), m_handler);

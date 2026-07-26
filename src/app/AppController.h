@@ -92,7 +92,8 @@ public:
     // Answer a hostKeyPrompt. Accepting trusts the key and retries the connect;
     // there is no nested event loop anywhere in this flow (the first attempt is
     // refused, the user decides, and we reconnect), so the UI can never be
-    // re-entered mid-handshake.
+    // re-entered mid-handshake. A call with no prompt outstanding is ignored:
+    // a stale sheet must not be able to declare a live connection disconnected.
     Q_INVOKABLE void resolveHostKey(bool accept);
 
     // Make a Dev Session current: loads both region layouts and remembers it so
@@ -182,29 +183,51 @@ private:
     QVector<GroupNode> m_lastNodes;
 
     // --- connection spine (injected, not owned) ---
-    SshConnectionPool* m_pool = nullptr;
-    SessionBootstrap* m_bootstrap = nullptr;
-    ServerProfiles* m_profiles = nullptr;
-    SessionLayouts* m_layouts = nullptr;
+    //
+    // QPointer, not raw: main.cpp declares SessionLayouts and ServerProfiles
+    // AFTER this controller (SessionLayouts is built over our WorkspaceDb), so
+    // they are destroyed BEFORE it. Nothing dereferences them during that
+    // window today, but a raw pointer makes that a property of the exact
+    // declaration order in main() rather than of this class; a QPointer reads
+    // back null instead of dangling, which is what the `if (m_layouts)` guards
+    // everywhere already assume.
+    QPointer<SshConnectionPool> m_pool;
+    QPointer<SessionBootstrap> m_bootstrap;
+    QPointer<ServerProfiles> m_profiles;
+    QPointer<SessionLayouts> m_layouts;
 
     void setConnectionState(const QString& state, const QString& error = QString());
     // Ask the SERVER for its identity and adopt it as serverId (see
     // connectToProfile), then restore the last active session.
     void adoptServerIdentity();
     void restoreActiveSession();
+    // Is `devSessionId` present in the last authoritative tree we read?
+    bool sessionExists(const QString& devSessionId) const;
+    // The whole connect attempt. `acceptedFingerprint` is the single host key
+    // the user approved for THIS attempt (empty for a first attempt); it is
+    // captured by value into the pool callback and consumed exactly once, so no
+    // approval can survive on the controller and silently trust a later,
+    // unrelated host.
+    void startConnect(const QString& profileId, QString acceptedFingerprint);
 
     QString m_connectionState = QStringLiteral("disconnected");
     QString m_connectionError;
+    // A connect-time failure held back while an attempt is in flight, because it
+    // may turn out to be the EXPECTED host-key refusal rather than a fault.
+    QString m_heldConnectError;
     QString m_activeSessionId;
     // Guards against a second connect being started while one is in flight or a
-    // host-key decision is pending.
+    // host-key decision is pending. Stays set across the prompt: the attempt is
+    // not over until resolveHostKey() answers it.
     bool m_connecting = false;
+    // True only while WE are tearing the session down, so the pending-call
+    // failures that teardown necessarily causes are not painted as faults.
+    bool m_tearingDown = false;
     QString m_pendingProfileId;
-    // Fingerprint the user accepted for the in-flight connect; the retry turns
-    // the pool's refusal into an Accept exactly once, for exactly that key.
+    // Fingerprint of the unknown key the CURRENT attempt was refused over; the
+    // pair below is the (host, keyType) shown alongside it. Non-empty together
+    // with m_connecting means "a prompt we raised is outstanding".
     QString m_pendingFingerprint;
-    QString m_acceptedFingerprint;
-    // (host, keyType) captured alongside m_pendingFingerprint for the prompt.
     QPair<QString, QString> m_pendingHostKeyInfo;
 };
 

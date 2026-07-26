@@ -36,6 +36,18 @@ class TerminalController;
 // in the SPEC 5.4 hidden state at construction: everything the pane emits
 // meanwhile accumulates in the controller's rolling buffer and is replayed as a
 // single batch by ready(), the page's mount handshake.
+//
+// SECURITY (the bridge is the page's ONLY reach into C++): every slot below is
+// callable by whatever is running in that WebEngineView, so the surface is
+// deliberately tiny and target-free. There is no attach, no kill, no
+// tmux-target or working-directory argument anywhere on it — a pane's remote
+// target is chosen by the QML host through ch::TerminalFactory, which the page
+// cannot see. What is left is the renderer's own view state (input bytes into
+// THIS pane's PTY, its geometry, its visibility, its mount handshake), so the
+// worst a compromised page can do is drive the terminal its user is already
+// looking at. The one value that leaves the process is the geometry, and it is
+// bounded below.
+
 class TerminalBridge : public QObject {
     Q_OBJECT
     // Current ch::TerminalState as a string, so the page can render the status
@@ -46,6 +58,13 @@ class TerminalBridge : public QObject {
     Q_PROPERTY(int columns READ columns NOTIFY geometryChanged)
     Q_PROPERTY(int rows READ rows NOTIFY geometryChanged)
 public:
+    // Upper bound on a renderer-reported dimension. The value crosses the wire
+    // as an SSH window-change and sizes a grid on the remote host, so it may
+    // not be whatever a page felt like sending. 2048 is far past any real
+    // display (an 8K panel at a 5 px cell is ~1536 columns) and still bounds
+    // the remote allocation.
+    static constexpr int kMaxDimension = 2048;
+
     explicit TerminalBridge(TerminalController* controller, QObject* parent = nullptr);
 
     TerminalController* controller() const;
@@ -62,6 +81,9 @@ public:
 public slots:
     // ---- the frozen TerminalBridge contract (called by the page) ----
     void sendInput(const QString& data);
+    // Bounded: see kMaxDimension. Anything at or below it is passed through
+    // untouched, including the non-positive values an unmounted renderer
+    // reports (the controller rejects those).
     void resize(int cols, int rows);
     void notifyViewVisible(bool visible);
     // Mount handshake; optional on the JS side (`ready?()`).

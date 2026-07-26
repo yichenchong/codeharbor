@@ -46,6 +46,7 @@ public:
     // Bind the transport carrying the JSONL RPC stream. Ownership stays with the
     // caller. Passing a new transport rewires the readyRead/close hooks; the
     // read buffer is reset but in-flight pending callbacks are preserved.
+    // Binding a non-null transport emits transportBound() once it is usable.
     void setTransport(QIODevice* transport);
     QIODevice* transport() const { return m_transport; }
 
@@ -72,6 +73,22 @@ signals:
     // The transport closed/disconnected. Emitted after all pending callbacks
     // have been failed with a synthetic error and the pending map cleared.
     void transportClosed();
+    // A NEW, non-null transport is bound and ready to carry requests.
+    //
+    // Consumers that hold state living inside the PROCESS on the other end
+    // MUST re-establish it here. A file.watch subscription is the case that
+    // forced this signal: remote/src/files.ts keeps FileWatchService's
+    // subscriptions in a plain per-process Map, so a transport swap (SPEC 5.6
+    // reconnect) hands us a different `codeharbord` whose registry is empty and
+    // whose replacement never heard of the ids we are holding.
+    //
+    // Fires ONLY for a non-null transport, and only after the new one is fully
+    // wired and drained, so a handler may issue calls immediately. Detaching —
+    // setTransport(nullptr) during teardown — deliberately emits nothing: a
+    // consumer that re-established there would only write into a client with
+    // nothing bound. The matching "the old one went away" edge is
+    // transportClosed().
+    void transportBound();
 
 private slots:
     void onReadyRead();

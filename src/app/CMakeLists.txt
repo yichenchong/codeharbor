@@ -19,6 +19,8 @@ target_include_directories(ch_app PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(ch_app PUBLIC
     Qt6::Core
     Qt6::Gui
+    # QTcpSocket backs SessionBootstrap's bounded connect pre-flight.
+    Qt6::Network
     Qt6::Quick
     ch_models
     ch_persistence

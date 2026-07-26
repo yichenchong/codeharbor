@@ -5,10 +5,13 @@
 #include "SshChannelDevice.h"
 
 #include <QDir>
+#include <QElapsedTimer>
+#include <QEventLoop>
 #include <QFile>
 #include <QFileInfo>
 #include <QScopeGuard>
 #include <QStandardPaths>
+#include <QTcpSocket>
 #include <QTimer>
 
 #include <cmath>
@@ -49,7 +52,11 @@ SessionBootstrap::SessionBootstrap(SshConnectionPool* pool,
 
     m_reconnectTimer->setSingleShot(true);
     connect(m_reconnectTimer, &QTimer::timeout, this, [this] {
-        if (m_state != State::Reconnecting)
+        // m_attempting: probeEndpoint() spins a nested event loop, so this
+        // timer really can fire while an attempt is already in flight. Firing
+        // then would re-enter attemptWire() and unwire the session the outer
+        // attempt is halfway through building.
+        if (m_state != State::Reconnecting || m_attempting)
             return;
         ++m_attempt;
         if (!attemptWire())
@@ -177,8 +184,11 @@ void SessionBootstrap::setReconnectEnabled(bool enabled)
     if (enabled)
         return;
     // Switching off mid-ladder must actually stop the ladder, otherwise the
-    // already-armed retry would fire once more behind the user's back.
+    // already-armed retry would fire once more behind the user's back — and a
+    // retry that is already inside its connect pre-flight must unwind rather
+    // than finish wiring a session the user just opted out of.
     cancelReconnect();
+    abortAttempt();
     if (m_state == State::Reconnecting)
         setState(State::Disconnected);
 }
@@ -194,13 +204,31 @@ void SessionBootstrap::setReconnectTimeScale(double scale)
         m_timeScale = scale;
 }
 
+void SessionBootstrap::setConnectTimeoutMs(int ms)
+{
+    m_connectTimeoutMs = qMax(0, ms);
+}
+
 void SessionBootstrap::cancelReconnect()
 {
     m_reconnectTimer->stop();
 }
 
+void SessionBootstrap::abortAttempt()
+{
+    if (!m_attempting)
+        return;
+    m_cancelRequested = true;
+    if (m_probeLoop)
+        m_probeLoop->quit();
+}
+
 void SessionBootstrap::scheduleReconnect()
 {
+    // The attempt whose failure got us here was cancelled, not lost: the user
+    // has already been put into Disconnected and must stay there.
+    if (m_cancelRequested)
+        return;
     if (!m_reconnectEnabled) {
         setState(State::Disconnected);
         return;
@@ -244,6 +272,11 @@ void SessionBootstrap::handleConnectionLost(const QString& reason)
 
 void SessionBootstrap::disconnectSession()
 {
+    // An attempt parked in the connect pre-flight is interrupted first, so the
+    // user's "disconnect" is honoured now rather than after the remaining
+    // connect budget — and so the unwinding attempt does not go on to wire the
+    // very session that is being torn down here.
+    abortAttempt();
     m_tearingDown = true;
     cancelReconnect();
     unwire();
@@ -309,33 +342,145 @@ bool SessionBootstrap::connectPool(const QString& host, quint16 port,
     return m_pool && m_pool->connectToHost(host, port, user);
 }
 
+bool SessionBootstrap::probeEndpoint(const QString& host, quint16 port,
+                                     QString* error)
+{
+    // Everything here is stack-local and event-loop driven; waitForConnected()
+    // and friends would block the GUI thread exactly as hard as libssh does,
+    // which is the thing being fixed.
+    QTcpSocket socket;
+    QEventLoop loop;
+    QTimer deadline;
+    deadline.setSingleShot(true);
+    // A connect budget that a coarse timer may fire up to 5% early on is not a
+    // budget. This one is asserted against, so it is honoured exactly.
+    deadline.setTimerType(Qt::PreciseTimer);
+
+    bool spoke = false;
+    bool timedOut = false;
+
+    // The server's identification string (RFC 4253 §4.2) is sent as soon as the
+    // TCP connection is up, so the first byte is a sufficient liveness proof —
+    // and it is a far more robust one than parsing for "SSH-", which a server
+    // may legally precede with arbitrary lines. The bytes are left unread; the
+    // socket is a throwaway and libssh opens its own.
+    connect(&socket, &QIODevice::readyRead, &loop, [&] {
+        spoke = true;
+        loop.quit();
+    });
+    // A peer that hangs up without speaking is dead for our purposes, and so is
+    // any resolve/connect failure.
+    connect(&socket, &QAbstractSocket::errorOccurred, &loop,
+            [&loop](QAbstractSocket::SocketError) { loop.quit(); });
+    connect(&socket, &QAbstractSocket::disconnected, &loop, [&loop] {
+        loop.quit();
+    });
+    connect(&deadline, &QTimer::timeout, &loop, [&] {
+        timedOut = true;
+        loop.quit();
+    });
+
+    socket.connectToHost(host, port, QIODevice::ReadOnly);
+    deadline.start(m_connectTimeoutMs);
+    // Published so abortAttempt() can cut the wait short; cleared on every exit
+    // path, including the exceptional one.
+    m_probeLoop = &loop;
+    const auto clearLoop = qScopeGuard([this] { m_probeLoop = nullptr; });
+    // ExcludeUserInputEvents: repaints, timers and sockets keep running so the
+    // shell stays alive on screen, but a second click cannot re-enter connect.
+    loop.exec(QEventLoop::ExcludeUserInputEvents);
+
+    if (spoke && !m_cancelRequested)
+        return true;
+
+    if (error) {
+        if (m_cancelRequested)
+            *error = QStringLiteral("connection attempt cancelled");
+        else if (timedOut)
+            *error = QStringLiteral("%1:%2 did not answer within %3 ms")
+                         .arg(host)
+                         .arg(port)
+                         .arg(m_connectTimeoutMs);
+        else
+            *error = QStringLiteral("cannot reach %1:%2 — %3")
+                         .arg(host)
+                         .arg(port)
+                         .arg(socket.errorString());
+    }
+    socket.abort();
+    return false;
+}
+
 SshChannelDevice* SessionBootstrap::openChannelDevice(
     SshConnectionPool::ChannelKind kind, const QString& command,
     const QString& role)
 {
+    // `role` only labels the long-lived diagnostics stream, which is wired by
+    // wireChannelSignals() rather than here.
+    Q_UNUSED(role);
+
     auto* device = new SshChannelDevice(m_pool, kind, this);
-    connect(device, &SshChannelDevice::channelError, this,
-            [this, role](const QString& text) {
-                // Remote diagnostics (stderr, libssh faults) are surfaced but
-                // never fatal on their own: the bridge banner arrives this way.
-                // A fault that really killed the channel also reaches
-                // readChannelFinished(), which is what triggers a reconnect.
-                emit error(role + QStringLiteral(": ") + text.trimmed());
-            });
-    if (!device->startExec(command)) {
+    // Scoped to the exec request and nothing else. startExec() reports failure
+    // as a bare false and explains itself through channelError() a moment
+    // earlier, so the explanation is captured here or lost. The long-lived
+    // diagnostics hook is wireChannelSignals(), applied by attemptWire() once
+    // the device exists — deliberately NOT here, so it also covers the devices
+    // handed back by the openChannelDevice() test seam.
+    m_lastDiagnostic.clear();
+    const QMetaObject::Connection capture =
+        connect(device, &SshChannelDevice::channelError, this,
+                [this](const QString& text) {
+                    const QString trimmed = text.trimmed();
+                    if (!trimmed.isEmpty())
+                        m_lastDiagnostic = trimmed;
+                });
+    const bool started = device->startExec(command);
+    disconnect(capture);
+    if (!started) {
         delete device;
         return nullptr;
     }
     return device;
 }
 
-void SessionBootstrap::wireLossDetection(SshChannelDevice* device,
-                                         const QString& role)
+QString SessionBootstrap::withLastDiagnostic(const QString& message) const
 {
-    // EOF on a channel means the remote end of this session is gone: the peer
-    // process exited, the session dropped, or libssh faulted (SshChannelDevice
-    // emits readChannelFinished() for all three). channelError() alone is NOT a
-    // loss — it also carries plain remote stderr, e.g. the bridge banner.
+    // startExec() reports failure as a bare false and explains itself through
+    // channelError() a moment earlier, so the explanation has to be carried
+    // over by hand or the user gets "could not start codeharbord over SSH" with
+    // no hint that the real answer was "could not open SSH channel".
+    if (m_lastDiagnostic.isEmpty())
+        return message;
+    return message + QStringLiteral(": ") + m_lastDiagnostic;
+}
+
+void SessionBootstrap::wireChannelSignals(SshChannelDevice* device,
+                                          const QString& role)
+{
+    // The two things a channel can tell us, and the whole reason they are wired
+    // side by side: they are NOT the same news, and conflating them has burned
+    // this code twice in opposite directions.
+    //
+    // channelError() is the remote process's STDERR plus libssh channel faults.
+    // An SSH exec channel has exactly one stderr and the process writes
+    // whatever it likes to it, so this stream is mostly chatter —
+    // codeharbor-bridge announces "listening on /run/user/<uid>/codeharbor.sock"
+    // on every launch. Treating it as a loss would tear down healthy sessions;
+    // treating it as an error() put "codeharbor-bridge: codeharbor-bridge
+    // listening on ..." in front of the user as a failure toast. It is
+    // DIAGNOSTICS: republished for logs and the UI's own use, never a verdict.
+    connect(device, &SshChannelDevice::channelError, this,
+            [this, role](const QString& text) {
+                const QString trimmed = text.trimmed();
+                if (trimmed.isEmpty())
+                    return;
+                emit channelDiagnostic(role, trimmed);
+            });
+
+    // readChannelFinished() is EOF, and EOF is the one thing that actually
+    // proves the far end is gone: the peer exited, the session dropped, or
+    // libssh faulted (SshChannelDevice emits it for all three). This, and only
+    // this, is a loss.
     connect(device, &SshChannelDevice::readChannelFinished, this,
             [this, role] {
                 handleConnectionLost(role + QStringLiteral(" channel closed"));
@@ -350,15 +495,42 @@ bool SessionBootstrap::attemptWire()
     }
 
     // Everything below provokes pool and device signals of its own; none of
-    // them is a loss of a live session.
+    // them is a loss of a live session. It also guards re-entry: probeEndpoint()
+    // runs a nested event loop, so the reconnect timer and connectAndWire() can
+    // both come back round while we are still in here.
     m_attempting = true;
-    const auto clearAttempting = qScopeGuard([this] { m_attempting = false; });
+    m_cancelRequested = false;
+    QElapsedTimer clock;
+    clock.start();
+    const auto clearAttempting = qScopeGuard([this, &clock] {
+        m_lastAttemptMs = clock.elapsed();
+        m_attempting = false;
+    });
 
     unwire();
 
-    // First-use trust: load whatever we already trust, accept an UNKNOWN key
-    // once and persist it. Verdict::Mismatch never reaches this callback — the
-    // pool refuses a changed key outright (SPEC 12.1) and that stays untouched.
+    // Bounded liveness check BEFORE the blocking libssh handshake, so an
+    // unreachable or mute endpoint costs connectTimeoutMs() of responsive UI
+    if (m_connectTimeoutMs > 0) {
+        QString reason;
+        if (!probeEndpoint(m_host, m_port, &reason)) {
+            // A cancellation is the user's own doing, not a fault to report.
+            if (!m_cancelRequested)
+                emit error(reason);
+            return false;
+        }
+    }
+
+    // Trust policy. Load whatever we already trust; Verdict::Mismatch never
+    // reaches a callback at all — the pool refuses a changed key outright
+    // (SPEC 12.1) and that stays untouched.
+    //
+    // The accept-an-unknown-key-once default is ONLY for headless/unattended use
+    // (the CH_LIVE_* env path and tests), where there is nobody to ask. If a
+    // caller has already installed its own policy — AppController installs a
+    // prompting callback that refuses the key and asks the user — we MUST NOT
+    // replace it: doing so silently trusted and persisted unknown host keys with
+    // no consent and made the whole host-key prompt dead code.
     KnownHosts hosts;
     QFile store(m_knownHostsPath);
     if (store.open(QIODevice::ReadOnly | QIODevice::Text))
@@ -366,10 +538,12 @@ bool SessionBootstrap::attemptWire()
     store.close();
     const int knownBefore = hosts.entries().size();
     m_pool->setKnownHosts(hosts);
-    m_pool->setHostKeyCallback([](const QString&, const QString&,
-                                  const QByteArray&, KnownHosts::Verdict) {
-        return SshConnectionPool::HostKeyDecision::Accept;
-    });
+    if (!m_pool->hostKeyCallback()) {
+        m_pool->setHostKeyCallback([](const QString&, const QString&,
+                                      const QByteArray&, KnownHosts::Verdict) {
+            return SshConnectionPool::HostKeyDecision::Accept;
+        });
+    }
 
     if (!connectPool(m_host, m_port, m_user)) {
         emit error(QStringLiteral("SSH connection to %1:%2 failed")
@@ -390,10 +564,11 @@ bool SessionBootstrap::attemptWire()
                                     rpcCommand(m_nodePath, m_repoRoot),
                                     QStringLiteral("codeharbord"));
     if (!m_rpcDevice) {
-        fail(QStringLiteral("could not start codeharbord over SSH"));
+        fail(withLastDiagnostic(
+            QStringLiteral("could not start codeharbord over SSH")));
         return false;
     }
-    wireLossDetection(m_rpcDevice, QStringLiteral("codeharbord"));
+    wireChannelSignals(m_rpcDevice, QStringLiteral("codeharbord"));
     if (m_client)
         m_client->setTransport(m_rpcDevice);
 
@@ -401,10 +576,11 @@ bool SessionBootstrap::attemptWire()
                                       bridgeCommand(m_nodePath, m_repoRoot),
                                       QStringLiteral("codeharbor-bridge"));
     if (!m_agentDevice) {
-        fail(QStringLiteral("could not start codeharbor-bridge over SSH"));
+        fail(withLastDiagnostic(
+            QStringLiteral("could not start codeharbor-bridge over SSH")));
         return false;
     }
-    wireLossDetection(m_agentDevice, QStringLiteral("codeharbor-bridge"));
+    wireChannelSignals(m_agentDevice, QStringLiteral("codeharbor-bridge"));
     if (m_monitor)
         m_monitor->setTransport(m_agentDevice);
 
@@ -419,6 +595,15 @@ bool SessionBootstrap::connectAndWire(const QString& host, quint16 port,
                                       const QString& nodePath,
                                       const QString& repoRoot)
 {
+    // A connect already in flight owns m_host/m_port and is parked in
+    // probeEndpoint()'s nested event loop. Overwriting the target underneath it
+    // would wire a session to one host and report it as another, so a second
+    // request is refused rather than interleaved.
+    if (m_attempting) {
+        emit error(QStringLiteral("a connection attempt is already in progress"));
+        return false;
+    }
+
     // Remember the target: every automatic retry replays exactly this call.
     m_host = host;
     m_port = port;
@@ -432,6 +617,12 @@ bool SessionBootstrap::connectAndWire(const QString& host, quint16 port,
 
     if (attemptWire())
         return true;
+
+    // A connect the user cancelled mid-flight already ended in Disconnected via
+    // disconnectSession(); relabelling it Failed would put an error banner on
+    // an action the user took deliberately.
+    if (m_cancelRequested)
+        return false;
 
     // A user-initiated connect that never came up is reported to its caller
     // (which returns false all the way to the UI) rather than retried behind

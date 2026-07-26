@@ -11,9 +11,15 @@
 
 #include <QBuffer>
 #include <QByteArray>
+#include <QMetaMethod>
+#include <QMetaObject>
+#include <QMetaProperty>
 #include <QPointer>
 #include <QSignalSpy>
 #include <QString>
+#include <QStringList>
+
+#include <limits>
 
 #include "SessionState.h"
 #include "SshConnectionPool.h"
@@ -43,6 +49,9 @@ private slots:
     void attachWithoutAConnectionFailsAndReportsWhy();
     void detachAndKillWithoutAnAttachmentAreNoOps();
     void killCommandQuotesAdversarialTargets();
+    void attachCommandQuotesAdversarialIdsAndWorkingDir();
+    void bridgeClampsAbsurdGeometryFromThePage();
+    void bridgeExposesNoRemoteTargetingSlots();
     void bridgeForwardsInputResizeAndVisibility();
     void bridgeHoldsOutputUntilTheRendererIsReady();
     void bridgeDecodesUtf8SplitAcrossFlushes();
@@ -158,26 +167,188 @@ void TstTerminalFactory::detachAndKillWithoutAnAttachmentAreNoOps()
     QCOMPARE(errors.count(), 0);
 }
 
-// kill() hands a command to the remote user's shell. A pane id carrying shell
-// metacharacters must stay data (SPEC 5.2, same rule as the attach command).
+// kill() hands a command to the remote user's shell, built out of ids that came
+// from SERVER data. Two separate escapes have to be closed and each is checked
+// on its own here, because passing one proves nothing about the other:
+//
+//   * the SHELL escape — an id carrying quotes/`$(...)`/backticks/newlines must
+//     stay one inert argument (SPEC 5.2, same rule as the attach command), and
+//   * the tmux TARGET escape — `-t <name>` is a target expression, and tmux
+//     resolves it exact -> prefix -> fnmatch, so a perfectly shell-safe id can
+//     still name somebody else's session.
 void TstTerminalFactory::killCommandQuotesAdversarialTargets()
 {
+    // The `=` is tmux's exact-match sigil and lives INSIDE the quotes: it is
+    // tmux syntax, not shell syntax.
     QCOMPARE(TerminalFactory::tmuxKillSessionCommand(QStringLiteral("ch_dev_term")),
-             QStringLiteral("tmux kill-session -t 'ch_dev_term'"));
+             QStringLiteral("tmux kill-session -t '=ch_dev_term'"));
 
     // A quote-escape attempt: the injected quote is rewritten as '\'' so the
     // rm never leaves the quoted argument.
     QCOMPARE(TerminalFactory::tmuxKillSessionCommand(
                  QStringLiteral("ch_a'; rm -rf ~; '")),
-             QStringLiteral("tmux kill-session -t 'ch_a'\\''; rm -rf ~; '\\'''"));
+             QStringLiteral("tmux kill-session -t '=ch_a'\\''; rm -rf ~; '\\'''"));
 
     // Substitution, backticks and a newline are inert inside single quotes and
     // must be passed through verbatim rather than stripped.
     const QString nasty = QStringLiteral("ch_$(id)`whoami`\nX");
     const QString command = TerminalFactory::tmuxKillSessionCommand(nasty);
-    QCOMPARE(command, QStringLiteral("tmux kill-session -t '") + nasty + QLatin1Char('\''));
-    QVERIFY(command.startsWith(QStringLiteral("tmux kill-session -t '")));
+    QCOMPARE(command, QStringLiteral("tmux kill-session -t '=") + nasty + QLatin1Char('\''));
+    QVERIFY(command.startsWith(QStringLiteral("tmux kill-session -t '=")));
     QVERIFY(command.endsWith(QLatin1Char('\'')));
+
+    // Every id that is shell-inert but still a tmux PATTERN. Verified against
+    // tmux 3.6 by hand: with a live `ch_victim_t1`, `kill-session -t 'ch_*_t1'`
+    // killed it and `kill-session -t 'ch_long'` killed `ch_longname_t1`, while
+    // both refused with "can't find session" once the `=` was present.
+    for (const QString& target : {QStringLiteral("ch_*_t1"),
+                                  QStringLiteral("ch_?_t1"),
+                                  QStringLiteral("ch_[abc]_t1"),
+                                  QStringLiteral("ch_a_t1")}) {
+        const QString pinned = TerminalFactory::tmuxKillSessionCommand(target);
+        QVERIFY2(pinned == QStringLiteral("tmux kill-session -t '=") + target
+                               + QLatin1Char('\''),
+                 qPrintable(pinned));
+    }
+
+    // A target that already looks like an option cannot become one: the sigil is
+    // the first character inside the quotes, so tmux's getopt never sees a `-`.
+    QCOMPARE(TerminalFactory::tmuxKillSessionCommand(QStringLiteral("-a")),
+             QStringLiteral("tmux kill-session -t '=-a'"));
+
+    // The real minted target is what actually reaches this function, so run one
+    // through the same helper the factory uses: hostile ids stay inside the
+    // quoted, exact-matched argument.
+    const QString minted = TerminalController::tmuxTarget(
+        DevSessionId{QStringLiteral("*")}, TerminalId{QStringLiteral("t1'; id; '")});
+    QCOMPARE(TerminalFactory::tmuxKillSessionCommand(minted),
+             QStringLiteral("tmux kill-session -t '=ch_*_t1'\\''; id; '\\'''"));
+}
+
+// The attach command is the other half of the same rule, and it is built by
+// TerminalController for the factory. It must be shell-inert AND unable to
+// resolve to another session — but note the different mechanism: `-s` on
+// new-session is a NAME, not a target, so tmux matches it exactly. Verified
+// against tmux 3.6: with `ch_exact_t1` live, `new-session -A -s ch_exa` created
+// a SECOND session rather than attaching to the first, so no `=` is needed (and
+// tmux would take one as a literal character of the new name).
+void TstTerminalFactory::attachCommandQuotesAdversarialIdsAndWorkingDir()
+{
+    QCOMPARE(TerminalController::tmuxNewSessionCommand(
+                 DevSessionId{QStringLiteral("dev")}, TerminalId{QStringLiteral("t1")},
+                 QStringLiteral("/srv/repo")),
+             QStringLiteral("tmux new-session -A -s 'ch_dev_t1' -c '/srv/repo'"));
+
+    // A working directory is the field most likely to carry a real quote, and
+    // the one a user can type. Breaking out of it would run `id` on the host.
+    QCOMPARE(TerminalController::tmuxNewSessionCommand(
+                 DevSessionId{QStringLiteral("dev")}, TerminalId{QStringLiteral("t1")},
+                 QStringLiteral("/tmp/x'; id; echo '")),
+             QStringLiteral("tmux new-session -A -s 'ch_dev_t1' "
+                            "-c '/tmp/x'\\''; id; echo '\\'''"));
+
+    // Ids arrive from server data: a quote in either one must not escape, and
+    // the two must not be able to merge into one another's field.
+    QCOMPARE(TerminalController::tmuxNewSessionCommand(
+                 DevSessionId{QStringLiteral("d'; rm -rf ~; '")},
+                 TerminalId{QStringLiteral("t`whoami`")}, QStringLiteral("/w")),
+             QStringLiteral("tmux new-session -A -s 'ch_d'\\''; rm -rf ~; '\\''_t`whoami`' "
+                            "-c '/w'"));
+
+    // A leading `-` in the working directory is consumed as the value of -c by
+    // getopt, and a newline is inert inside the quotes: neither adds a word to
+    // the command.
+    const QString command = TerminalController::tmuxNewSessionCommand(
+        DevSessionId{QStringLiteral("dev")}, TerminalId{QStringLiteral("t1")},
+        QStringLiteral("-rf /\nrm -rf ~"));
+    QCOMPARE(command,
+             QStringLiteral("tmux new-session -A -s 'ch_dev_t1' -c '-rf /\nrm -rf ~'"));
+    // Exactly two quoted arguments, so nothing became a third word.
+    QCOMPARE(command.count(QLatin1Char('\'')), 4);
+}
+
+// The bridge is reachable from the WebEngine page, so `cols`/`rows` are values
+// an ATTACKER supplies once the renderer is compromised — and they do not stop
+// at this process: resize() becomes an SSH window-change and sizes a grid on
+// the remote host. An unbounded value is a remote allocation primitive.
+void TstTerminalFactory::bridgeClampsAbsurdGeometryFromThePage()
+{
+    QObject pane;
+    TerminalFactory factory(nullptr);
+    TerminalController* controller = factory.create(&pane);
+    TerminalBridge* bridge = factory.createBridge(controller, &pane);
+
+    // A real renderer's size passes through untouched, whatever else happens.
+    bridge->resize(120, 40);
+    QCOMPARE(controller->columns(), 120);
+    QCOMPARE(controller->rows(), 40);
+
+    bridge->resize(std::numeric_limits<int>::max(), std::numeric_limits<int>::max());
+    QCOMPARE(controller->columns(), TerminalBridge::kMaxDimension);
+    QCOMPARE(controller->rows(), TerminalBridge::kMaxDimension);
+
+    // One dimension at a time, so a clamp applied to only one is caught.
+    bridge->resize(90, 1'000'000);
+    QCOMPARE(controller->columns(), 90);
+    QCOMPARE(controller->rows(), TerminalBridge::kMaxDimension);
+    bridge->resize(1'000'000, 30);
+    QCOMPARE(controller->columns(), TerminalBridge::kMaxDimension);
+    QCOMPARE(controller->rows(), 30);
+
+    // The bound is an upper bound only: a renderer that has not been laid out
+    // reports 0, and clamping that UP to 1 would resize a live PTY to one cell.
+    bridge->resize(0, 0);
+    QCOMPARE(controller->columns(), TerminalBridge::kMaxDimension);
+    QCOMPARE(controller->rows(), 30);
+    bridge->resize(-2'000'000'000, -1);
+    QCOMPARE(controller->columns(), TerminalBridge::kMaxDimension);
+    QCOMPARE(controller->rows(), 30);
+
+    // Exactly at the bound is a legitimate size, not something to clamp away.
+    bridge->resize(TerminalBridge::kMaxDimension, TerminalBridge::kMaxDimension);
+    QCOMPARE(controller->columns(), TerminalBridge::kMaxDimension);
+    QCOMPARE(controller->rows(), TerminalBridge::kMaxDimension);
+}
+
+// Everything the WebChannel publishes is callable by the page, so the shape of
+// this object IS the security boundary. The page may drive the pane it is
+// already rendering; it must not be able to name a DIFFERENT remote target.
+// This asserts the published surface directly through the meta-object, which is
+// exactly what qwebchannel.js enumerates.
+void TstTerminalFactory::bridgeExposesNoRemoteTargetingSlots()
+{
+    QObject pane;
+    TerminalFactory factory(nullptr);
+    TerminalBridge* bridge = factory.createBridge(factory.create(&pane), &pane);
+
+    const QMetaObject* meta = bridge->metaObject();
+    QStringList callable;
+    for (int i = meta->methodOffset(); i < meta->methodCount(); ++i) {
+        const QMetaMethod method = meta->method(i);
+        if (method.methodType() == QMetaMethod::Slot
+            || method.methodType() == QMetaMethod::Method)
+            callable << QString::fromLatin1(method.name());
+    }
+    callable.sort();
+
+    // The frozen contract, and nothing else. requestClear() is Q_INVOKABLE for
+    // the app side and is a view-only operation; the rest is this pane's own
+    // input, geometry, visibility and mount handshake. No attach, no kill, no
+    // detach, no tmux target, no working directory, no session id.
+    QCOMPARE(callable,
+             QStringList({QStringLiteral("notifyViewVisible"), QStringLiteral("ready"),
+                          QStringLiteral("requestClear"), QStringLiteral("resize"),
+                          QStringLiteral("sendInput")}));
+
+    // Nor can the page read one back out and act on it: the properties are the
+    // renderer's own view state.
+    QStringList properties;
+    for (int i = meta->propertyOffset(); i < meta->propertyCount(); ++i)
+        properties << QString::fromLatin1(meta->property(i).name());
+    properties.sort();
+    QCOMPARE(properties,
+             QStringList({QStringLiteral("columns"), QStringLiteral("connectionState"),
+                          QStringLiteral("rows")}));
 }
 
 // The three frozen TerminalBridge slots the page calls, each landing on the

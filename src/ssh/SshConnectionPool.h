@@ -73,6 +73,12 @@ public:
     const KnownHosts& knownHosts() const;
 
     void setHostKeyCallback(HostKeyCallback callback);
+    // The installed decision callback. Read-only, and the only way to exercise
+    // an unknown-key decision without a live handshake: verifyHostKey() is the
+    // sole caller and it only runs inside connectToHost(). Used by
+    // tst_appcontroller to prove the retry after a host-key prompt accepts ONLY
+    // the exact key the user was shown.
+    const HostKeyCallback& hostKeyCallback() const { return m_hostKeyCallback; }
     void setCredentialCallback(CredentialCallback callback);
 
     // Establish the single authenticated session: connect, verify the host key

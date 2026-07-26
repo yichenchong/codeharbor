@@ -66,7 +66,16 @@ void TerminalBridge::resize(int cols, int rows)
     const int wasRows = m_controller->rows();
     // Rejected sizes (a renderer that has not been laid out yet reports 0)
     // leave the recorded geometry untouched, hence the before/after compare.
-    m_controller->resize(cols, rows);
+    //
+    // SECURITY: cols/rows arrive from the PAGE. A renderer that has been taken
+    // over (or simply broken) could ask for 2^31-1 columns, and the value is
+    // not merely recorded — it becomes an SSH window-change request, and tmux
+    // on the far side sizes its grid from it. Only the UPPER end is clamped:
+    // a non-positive value must stay non-positive so the controller keeps
+    // rejecting it outright (clamping 0 up to 1 would resize a live PTY to a
+    // single cell every time an unmounted renderer reported its size).
+    m_controller->resize(cols > kMaxDimension ? kMaxDimension : cols,
+                         rows > kMaxDimension ? kMaxDimension : rows);
     if (m_controller->columns() != wasColumns || m_controller->rows() != wasRows)
         emit geometryChanged();
 }

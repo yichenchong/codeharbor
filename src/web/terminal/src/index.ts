@@ -40,6 +40,23 @@ export function mountTerminal(element: HTMLElement, bridge: TerminalBridge): Ter
         fontSize: 13,
         scrollback: 5000,
         theme: { background: "#11111b", foreground: "#cdd6f4" },
+        // SECURITY: terminal output is fully attacker-controlled — every byte
+        // here came off the remote PTY. xterm.js parses OSC 8 hyperlinks out of
+        // that stream, and with NO linkHandler configured its built-in default
+        // takes over on click: confirm() and then `window.open()` +
+        // `location.href = <the URI from the stream>`. That URI is unvalidated
+        // (javascript:, file:, https://attacker/...), and this page is the
+        // PRIVILEGED one — it carries the WebChannel bridge to C++. So a remote
+        // process printing one escape sequence gets a navigation primitive
+        // behind a single dialog.
+        //
+        // This page has no business opening anything: it is a terminal, not a
+        // browser. An explicit handler that does nothing removes the default
+        // entirely, so an OSC 8 link renders as ordinary underlined text and
+        // clicking it is inert. (TerminalPaneView.qml independently refuses the
+        // navigation and disables window.open — this is the layer that stops
+        // the dialog from ever being shown.)
+        linkHandler: { activate: () => {} },
     });
     const fit = new FitAddon();
     term.loadAddon(fit);

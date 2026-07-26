@@ -46,15 +46,12 @@ int main(int argc, char *argv[])
     // bootstrap that opens the RPC and agent-status channels and hands each one
     // to the consumer above as a QIODevice.
     //
-    // A normal desktop launch stays server-less: connectAndWireFromEnvironment()
-    // returns immediately unless CH_LIVE_SSH is set (with CH_LIVE_HOST/PORT/
-    // USER/NODE/REPO), so the UI still comes up with no session and RPC calls
-    // fail gracefully with a synthetic transport error. The pool is declared
-    // before the bootstrap so it is destroyed after it: the channel devices the
-    // bootstrap owns must not outlive the session they were opened on.
+    // The pool is declared before the bootstrap so it is destroyed AFTER it: the
+    // channel devices the bootstrap owns must not outlive the session they were
+    // opened on. connectAndWireFromEnvironment() is deliberately NOT called here
+    // — see below, after appController.setConnection().
     ch::SshConnectionPool sshPool;
     ch::SessionBootstrap sessionBootstrap(&sshPool, &client, &agentMonitor);
-    sessionBootstrap.connectAndWireFromEnvironment();
 
     // UI shell (workstream U) and viewer subsystem (workstream V) share the one
     // client. ViewerModel and ViewerProfiles share the same profiles so QML
@@ -74,6 +71,18 @@ int main(int argc, char *argv[])
     appController.setConnection(&sshPool, &sessionBootstrap, &serverProfiles,
                                 &sessionLayouts);
 
+    // A normal desktop launch stays server-less: this returns immediately unless
+    // CH_LIVE_SSH is set (with CH_LIVE_HOST/PORT/USER/NODE/REPO), so the UI still
+    // comes up with no session and RPC calls fail gracefully with a synthetic
+    // transport error.
+    //
+    // It MUST run after setConnection(): connectAndWire() emits wired()
+    // SYNCHRONOUSLY from inside attemptWire(). Wired before the controller is
+    // listening meant nobody ran adoptServerIdentity(), so the serverId stayed
+    // empty, workspace.list was issued for "" and the whole shell came up with
+    // an empty sidebar on top of a perfectly good SSH session.
+    sessionBootstrap.connectAndWireFromEnvironment();
+
     // Per-pane factories (workstreams E and T): each pane owns its controller so
     // split panes never clobber each other.
     ch::EditorFactory editorFactory(&client);
@@ -85,6 +94,15 @@ int main(int argc, char *argv[])
     QObject::connect(&agentMonitor, &ch::AgentStatusMonitor::notify, &notifier,
                      &ch::Notifier::notify);
 
+    // The engine is declared LAST, so it is destroyed FIRST. That is load
+    // bearing, not stylistic: every context property below is a stack object in
+    // this scope, and a QML binding re-evaluated against one of them after it
+    // had been destroyed is a crash on exit. Anything new that QML can see must
+    // therefore be declared ABOVE this line. The rest of the scope unwinds in
+    // reverse declaration order, which is already the safe order: panes and
+    // their controllers (owned by the engine) before the factories, the
+    // factories before the pool, the bootstrap before the pool it opened
+    // channels on, and the client/monitor the bootstrap points at last of all.
     QQmlApplicationEngine engine;
     engine.rootContext()->setContextProperty(QStringLiteral("app"), &appController);
     engine.rootContext()->setContextProperty(QStringLiteral("viewers"), &viewers);

@@ -76,7 +76,25 @@ QString TerminalFactory::targetFor(TerminalController* controller) const
 
 QString TerminalFactory::tmuxKillSessionCommand(const QString& target)
 {
-    return QStringLiteral("tmux kill-session -t %1").arg(shellSingleQuote(target));
+    // Two layers, and BOTH are needed.
+    //
+    //  1. Shell quoting stops the target breaking out of the command string.
+    //
+    //  2. tmux's own `=` exact-match sigil stops it hitting the wrong SESSION.
+    //     A bare `-t <name>` is a tmux TARGET, and tmux's target grammar falls
+    //     back from an exact match to a prefix match and then to fnmatch — so
+    //     `-t 'ch_a_t1'` happily kills `ch_a_t10` once `ch_a_t1` is gone, and a
+    //     devSessionId of `*` (the ids come from server data) makes
+    //     `-t 'ch_*_t1'` destroy whatever session it lands on. Verified against
+    //     tmux 3.6: `kill-session -t 'ch_*_t1'` killed `ch_victim_t1`, while
+    //     `-t '=ch_*_t1'` refused with "can't find session". The remote
+    //     `tmux.*` RPC group already pins its targets this way
+    //     (remote/src/tmux.ts killSession); this is the same rule for the
+    //     client-side command.
+    //
+    // The sigil goes INSIDE the quotes: it is tmux syntax, not shell syntax.
+    return QStringLiteral("tmux kill-session -t %1")
+        .arg(shellSingleQuote(QLatin1Char('=') + target));
 }
 
 bool TerminalFactory::attach(TerminalController* controller,

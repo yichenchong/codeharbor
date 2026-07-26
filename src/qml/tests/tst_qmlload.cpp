@@ -64,10 +64,68 @@ QUrl moduleUrl(const QString &file)
 // Two independent nets, because neither alone is complete:
 //   * QQmlEngine::warnings  — every QML binding/type/runtime warning the engine
 //     raises, including ones produced long after load() returned.
-//   * a message handler filtered to our own qrc prefix — catches anything the
-//     engine logs directly (e.g. from a different QQmlEngine or the Quick
-//     scenegraph) that mentions a CodeHarbor QML file.
+//   * a message handler that fails the gate on EVERY warning-or-worse message
+//     the process logs, minus a closed allowlist of known-environmental noise.
+//
+// The handler deliberately does NOT filter on the CodeHarbor qrc prefix. It used
+// to, and that hole is precisely why the Qt 6.9 WebEngine profile deprecation
+//
+//   <Unknown File>: QML WebEngineProfile: Please use WebEngineProfilePrototype
+//   for profile creation from 6.9, ...
+//
+// sailed past a green suite: qmlWarning() raised from a C++-constructed object
+// has no QML file to blame, so the text never mentions our module path and the
+// prefix filter never saw it. The polarity is therefore inverted — anything
+// logged at warning level while OUR tree is being built is our problem until
+// proven otherwise: fail by default, allowlist by exception.
 // ---------------------------------------------------------------------------
+
+// Messages this box unavoidably emits under the headless recipe pinned by
+// CMakeLists.txt (QT_QPA_PLATFORM=offscreen, QT_QUICK_BACKEND=software,
+// QTWEBENGINE_CHROMIUM_FLAGS=--disable-gpu --no-sandbox --disable-dev-shm-usage).
+// Each entry is matched as a SUBSTRING, and each is here because the PLATFORM
+// produces it, never CodeHarbor:
+//
+//   * "QRhiGles2: Failed to create temporary context" /
+//     "QRhiGles2: Failed to create context"
+//         Qt RHI probes for an OpenGL context at QQuickWindow setup. The
+//         offscreen QPA plugin has no GL, so the probe fails and Quick falls
+//         back to the software renderer we asked for. Emitted before any
+//         CodeHarbor object exists.
+//   * "does not support createPlatformVulkanInstance" /
+//     "QVulkanInstance: Failed to initialize Vulkan"
+//         The same probe, one rung down: after GL fails, Qt tries Vulkan. The
+//         offscreen plugin implements no Vulkan entry point either.
+//   * "Unable to detect GPU vendor"
+//         Tail of the same probe — with neither GL nor Vulkan there is no
+//         driver string to read.
+//   * "GPU process isn't usable" / "Failed to create GLES3 context" /
+//     "Passthrough is not supported" / "Fontconfig error"
+//         Chromium's own GPU/font bring-up under --disable-gpu in a container.
+//         Emitted from Chromium threads, entirely outside our control.
+//
+// NOTHING may be added here that a CodeHarbor change could ever produce. An
+// entry that could mask our own defect belongs nowhere near this array.
+constexpr const char *kEnvironmentalNoise[] = {
+    "QRhiGles2: Failed to create temporary context",
+    "QRhiGles2: Failed to create context",
+    "does not support createPlatformVulkanInstance",
+    "QVulkanInstance: Failed to initialize Vulkan",
+    "Unable to detect GPU vendor",
+    "GPU process isn't usable",
+    "Failed to create GLES3 context",
+    "Passthrough is not supported",
+    "Fontconfig error",
+};
+
+bool isEnvironmentalNoise(const QString &msg)
+{
+    for (const char *known : kEnvironmentalNoise) {
+        if (msg.contains(QLatin1String(known)))
+            return true;
+    }
+    return false;
+}
 
 QMutex g_logMutex;
 QStringList g_loggedQmlWarnings;
@@ -75,7 +133,9 @@ QtMessageHandler g_previousHandler = nullptr;
 
 void qmlWarningMessageHandler(QtMsgType type, const QMessageLogContext &context, const QString &msg)
 {
-    if (type != QtDebugMsg && type != QtInfoMsg && msg.contains(QLatin1String(kModuleRoot))) {
+    // QtDebugMsg/QtInfoMsg are chatter by design. QtFatalMsg never returns, so
+    // warning and critical are the levels a gate can actually act on.
+    if ((type == QtWarningMsg || type == QtCriticalMsg) && !isEnvironmentalNoise(msg)) {
         QMutexLocker locker(&g_logMutex);
         g_loggedQmlWarnings.append(msg);
     }
@@ -323,11 +383,46 @@ public:
                          });
     }
 
+    // Build the two WebEngine security contexts through the very accessors QML
+    // binds to (`WebEngineView.profile: viewers.internalProfile()`).
+    //
+    // Loading Main.qml is NOT enough to reach them, and that is the hole this
+    // exists to close. Every WebEngineView in the tree lives behind an inactive
+    // Loader — TerminalPaneView's is a `sourceComponent: Component {}` that only
+    // instantiates once a terminal controller exists, EditorPaneView's only once
+    // a file is opened — so a bare shell load never evaluates a single
+    // `viewers.*Profile()` binding and the profiles are never constructed at
+    // all. The Qt 6.9 "use WebEngineProfilePrototype" deprecation is emitted
+    // from QQuickWebEngineProfile's CONSTRUCTOR, so the gate that was tightened
+    // to catch exactly that class of warning could not see it: the shipped
+    // binary logged it on every launch while this test stayed green.
+    //
+    // Returns false if either accessor yields nothing, so a null profile cannot
+    // turn the assertion that follows into a no-op.
+    bool buildViewerProfiles()
+    {
+        return m_viewers.internalProfile() != nullptr
+               && m_viewers.externalProfile() != nullptr;
+    }
+
     // Every warning seen so far, from both nets, de-duplicated in order.
+    //
+    // NON-DESTRUCTIVE, and that is load-bearing rather than tidy. The log net's
+    // queue is drained by takeLoggedQmlWarnings(), so what was taken has to be
+    // latched here or the second caller sees an empty list. QVERIFY2 evaluates
+    // its condition and its message as ordinary function arguments: the
+    // condition `allWarnings().isEmpty()` drained the queue, and the report
+    // built from the message argument then had nothing left to name. The gate
+    // duly failed on the Qt 6.9 WebEngine deprecation and printed
+    // "0 QML warning(s):" — caught the regression, told the maintainer nothing.
     QStringList allWarnings()
     {
-        QStringList combined = engineWarnings;
         for (const QString &logged : takeLoggedQmlWarnings()) {
+            if (!m_logged.contains(logged))
+                m_logged.append(logged);
+        }
+        QStringList combined = engineWarnings;
+        for (const QString &logged : m_logged) {
             if (!combined.contains(logged))
                 combined.append(logged);
         }
@@ -342,6 +437,11 @@ public:
             report += QStringLiteral("\n  * ") + warning;
         return report;
     }
+
+private:
+    // Everything drained out of the log net so far, so allWarnings() can be
+    // asked twice and answer the same both times.
+    QStringList m_logged;
 };
 
 // Create a region component with `node` supplied up front, with `recorder`
@@ -450,6 +550,14 @@ void TstQmlLoad::loadsRealApplicationTreeWithoutWarnings()
                      == (QStringList{QStringLiteral("terminal-1"), QStringLiteral("viewer-1")}),
              qPrintable(QStringLiteral("Main.qml did not supply the SPEC 4.5 default panes; found: %1\n%2")
                             .arg(describePanes(panes), treeReport(root))));
+
+    // Bring up the two WebEngine security contexts the shipped panes bind to.
+    // They are part of the shell coming up, so a warning raised while building
+    // them is a warning the user sees on every launch — and until this call
+    // existed the gate never reached them at all (see buildViewerProfiles()).
+    QVERIFY2(fixture.buildViewerProfiles(),
+             "ViewerModel did not hand back both WebEngine profiles");
+    settle(200);
 
     QVERIFY2(fixture.allWarnings().isEmpty(), qPrintable(fixture.warningReport()));
 }

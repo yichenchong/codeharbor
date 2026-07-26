@@ -264,12 +264,18 @@ Item {
 
             objectName: "filterField"
             placeholderText: qsTr("Type a command\u2026")
+            placeholderTextColor: "#585b70"
             color: "#cdd6f4"
             selectByMouse: true
+            leftPadding: 12
+            rightPadding: 12
             background: Rectangle {
                 color: "#181825"
-                border.color: "#45475a"
-                border.width: 1
+                // The palette opens with the field focused, so the ring is the
+                // resting state rather than an exception; without it the field
+                // and the popup body are the same slab of dark grey.
+                border.color: filterField.activeFocus ? "#89b4fa" : "#45475a"
+                border.width: filterField.activeFocus ? 2 : 1
             }
 
             onTextChanged: root._rebuild()
@@ -319,9 +325,21 @@ Item {
                 required property var modelData
 
                 width: ListView.view.width
-                height: 34
+                height: 36
                 color: index === root.highlightedIndex ? "#313244"
                                                        : (rowHover.hovered ? "#232338" : "transparent")
+
+                // The row Enter will run. A wash of #313244 on #1e1e2e is a
+                // faint one, and it is the only thing distinguishing "this is
+                // what the next keystroke does" from every other row.
+                Rectangle {
+                    anchors.left: parent.left
+                    anchors.top: parent.top
+                    anchors.bottom: parent.bottom
+                    width: 3
+                    color: "#89b4fa"
+                    visible: resultRow.index === root.highlightedIndex
+                }
 
                 Label {
                     anchors.left: parent.left
@@ -361,18 +379,32 @@ Item {
             }
         }
 
-        Label {
-            objectName: "emptyLabel"
+        Column {
+            id: emptyState
             anchors.top: filterField.bottom
             anchors.left: parent.left
             anchors.right: parent.right
             anchors.margins: 16
+            spacing: 6
             visible: root.matches.length === 0
-            horizontalAlignment: Text.AlignHCenter
-            color: "#6c7086"
-            font.pixelSize: 12
-            text: (Array.isArray(root.commands) ? root.commands.length : 0) === 0
-                  ? qsTr("No commands available") : qsTr("No matching commands")
+
+            Label {
+                objectName: "emptyLabel"
+                width: parent.width
+                horizontalAlignment: Text.AlignHCenter
+                color: "#6c7086"
+                font.pixelSize: 12
+                text: (Array.isArray(root.commands) ? root.commands.length : 0) === 0
+                      ? qsTr("No commands available") : qsTr("No matching commands")
+            }
+            Label {
+                width: parent.width
+                horizontalAlignment: Text.AlignHCenter
+                color: "#45475a"
+                font.pixelSize: 11
+                visible: (Array.isArray(root.commands) ? root.commands.length : 0) > 0
+                text: qsTr("Esc closes \u2014 %1 reopens").arg(root.activationHint)
+            }
         }
     }
 }

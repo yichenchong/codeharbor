@@ -195,15 +195,80 @@ Rectangle {
             root.profileRemoved(root.editingId);
     }
 
-    function stateColor(state) {
+    // ---- connection status vocabulary -------------------------------------
+    //
+    // `connectionState` is free-form text from the host. These map it onto the
+    // six states ch::AppController::setConnectionState() actually publishes
+    // (disconnected / connecting / hostkey / connected / reconnecting / failed),
+    // keeping the older libssh-level words the pool can still surface.
+    //
+    // Every state is encoded THREE ways — colour, glyph and word — because a
+    // colour-only dot is unreadable to a colour-blind user and vanishes in a
+    // greyscale screenshot.
+    function stateKey(state) {
         switch (String(state).toLowerCase()) {
-        case "connected": return "#a6e3a1";
+        case "connected": return "connected";
         case "connecting":
-        case "hostkeycheck":
-        case "authenticating": return "#f9e2af";
+        case "authenticating": return "connecting";
+        case "hostkey":
+        case "hostkeycheck": return "hostkey";
+        case "reconnecting": return "reconnecting";
+        case "failed":
         case "error":
-        case "notavailable": return "#f38ba8";
+        case "notavailable": return "failed";
+        default: return "disconnected";
+        }
+    }
+
+    function stateColor(state) {
+        switch (root.stateKey(state)) {
+        case "connected": return "#a6e3a1";
+        case "connecting": return "#f9e2af";
+        case "hostkey": return "#f9e2af";
+        case "reconnecting": return "#fab387";
+        case "failed": return "#f38ba8";
         default: return "#6c7086";
+        }
+    }
+
+    // Drawn inside the dot. connecting and hostkey share a colour, so the glyph
+    // is the only thing that separates "dialling" from "answer me".
+    function stateGlyph(state) {
+        switch (root.stateKey(state)) {
+        case "connected": return "\u2713";    // check
+        case "connecting": return "\u2219";   // bullet operator
+        case "hostkey": return "?";
+        case "reconnecting": return "\u21bb"; // clockwise open circle arrow
+        case "failed": return "\u2715";       // multiplication x
+        default: return "\u2013";             // en dash: nothing is running
+        }
+    }
+
+    // Round while the link is fine or merely idle; squared off for the two
+    // states that are waiting on the user. Silhouette, not hue.
+    function stateRadius(state) {
+        switch (root.stateKey(state)) {
+        case "hostkey":
+        case "failed": return 3;
+        default: return 7;
+        }
+    }
+
+    function stateBusy(state) {
+        const key = root.stateKey(state);
+        return key === "connecting" || key === "hostkey" || key === "reconnecting";
+    }
+
+    // One sentence saying what the state means for the person looking at it;
+    // `stateLabel` itself echoes the host's own word verbatim.
+    function stateExplanation(state) {
+        switch (root.stateKey(state)) {
+        case "connected": return qsTr("Linked to the server.");
+        case "connecting": return qsTr("Opening the SSH connection\u2026");
+        case "hostkey": return qsTr("Waiting for you to accept this server's host key.");
+        case "reconnecting": return qsTr("The link dropped; trying to restore it\u2026");
+        case "failed": return qsTr("The last attempt failed. See the message below.");
+        default: return qsTr("Not connected to any server.");
         }
     }
 
@@ -270,6 +335,42 @@ Rectangle {
         }
     }
 
+    // ---- one action button ------------------------------------------------
+    // The Basic style ships a deliberately plain button: a 22px box with no
+    // focus ring worth the name. Both are usability problems here — this sheet
+    // is reachable before any pointer device is configured, so a keyboard user
+    // must be able to SEE where they are, and Connect/Remove are consequential
+    // enough to deserve a real hit target.
+    component SheetButton: Button {
+        id: button
+        property color accent: "#45475a"
+
+        implicitHeight: 30
+        leftPadding: 14
+        rightPadding: 14
+        focusPolicy: Qt.StrongFocus
+
+        contentItem: Label {
+            text: button.text
+            color: button.enabled ? "#cdd6f4" : "#585b70"
+            font.pixelSize: 12
+            horizontalAlignment: Text.AlignHCenter
+            verticalAlignment: Text.AlignVCenter
+        }
+
+        background: Rectangle {
+            radius: 4
+            color: !button.enabled ? "#232338"
+                 : button.down ? "#45475a"
+                 : button.hovered ? "#3a3a52" : "#313244"
+            // Two pixels and a bright edge: the focus ring has to be legible at
+            // a glance, not a one-pixel difference against #45475a.
+            border.width: button.visualFocus ? 2 : 1
+            border.color: button.visualFocus ? "#89b4fa"
+                        : button.enabled ? button.accent : "#313244"
+        }
+    }
+
     // ---- header -----------------------------------------------------------
     Rectangle {
         id: header
@@ -299,41 +400,118 @@ Rectangle {
             anchors.verticalCenter: parent.verticalCenter
         }
 
+        // Connection status chip. Colour, glyph and word all carry the state,
+        // so it survives a greyscale screenshot and a colour-blind reader; the
+        // spinner only distinguishes "something is happening" from "settled".
         Row {
             anchors.right: parent.right
             anchors.rightMargin: 10
             anchors.verticalCenter: parent.verticalCenter
             spacing: 8
 
-            BusyIndicator {
-                objectName: "connectingIndicator"
-                width: 18
-                height: 18
-                anchors.verticalCenter: parent.verticalCenter
-                running: String(root.connectionState).toLowerCase() === "connecting"
-                         || String(root.connectionState).toLowerCase() === "authenticating"
-                         || String(root.connectionState).toLowerCase() === "hostkeycheck"
-                visible: running
-            }
-
             Rectangle {
-                width: 8
-                height: 8
-                radius: 4
+                id: statusChip
+                objectName: "statusChip"
                 anchors.verticalCenter: parent.verticalCenter
-                color: root.stateColor(root.connectionState)
+                width: chipRow.implicitWidth + 20
+                height: 26
+                radius: 13
+                color: "#11111b"
+                border.width: 1
+                border.color: root.stateColor(root.connectionState)
+
+                HoverHandler { id: chipHover }
+                ToolTip.visible: chipHover.hovered
+                ToolTip.text: root.stateExplanation(root.connectionState)
+
+                Row {
+                    id: chipRow
+                    anchors.centerIn: parent
+                    spacing: 6
+
+                    // The Basic style draws its indicator as a 48px grid of
+                    // dots; scaled into a 26px chip that is literally nothing on
+                    // screen. Same semantics (`running` is still the property
+                    // everything reads), drawn at a size that shows up.
+                    BusyIndicator {
+                        id: connectingIndicator
+                        objectName: "connectingIndicator"
+                        anchors.verticalCenter: parent.verticalCenter
+                        width: 14
+                        height: 14
+                        padding: 0
+                        running: root.stateBusy(root.connectionState)
+                        visible: running
+
+                        contentItem: Item {
+                            implicitWidth: 14
+                            implicitHeight: 14
+
+                            Rectangle { // track
+                                anchors.fill: parent
+                                radius: width / 2
+                                color: "transparent"
+                                border.width: 2
+                                border.color: root.stateColor(root.connectionState)
+                                opacity: 0.3
+                            }
+
+                            Item { // orbiting pip
+                                anchors.fill: parent
+                                transformOrigin: Item.Center
+
+                                Rectangle {
+                                    x: parent.width / 2 - 2
+                                    y: 0
+                                    width: 4
+                                    height: 4
+                                    radius: 2
+                                    color: root.stateColor(root.connectionState)
+                                }
+
+                                RotationAnimator on rotation {
+                                    running: connectingIndicator.running
+                                    loops: Animation.Infinite
+                                    from: 0
+                                    to: 360
+                                    duration: 900
+                                }
+                            }
+                        }
+                    }
+
+                    Rectangle {
+                        objectName: "stateDot"
+                        anchors.verticalCenter: parent.verticalCenter
+                        width: 14
+                        height: 14
+                        radius: root.stateRadius(root.connectionState)
+                        color: root.stateColor(root.connectionState)
+
+                        Label {
+                            anchors.centerIn: parent
+                            text: root.stateGlyph(root.connectionState)
+                            color: "#11111b"
+                            font.pixelSize: 10
+                            font.bold: true
+                        }
+                    }
+
+                    Label {
+                        objectName: "stateLabel"
+                        anchors.verticalCenter: parent.verticalCenter
+                        // SECURITY: see errorLabel below — connectionState is
+                        // free-form text from the host, not a literal.
+                        textFormat: Text.PlainText
+                        color: "#cdd6f4"
+                        font.pixelSize: 12
+                        text: root.connectionState.length > 0 ? root.connectionState
+                                                              : qsTr("disconnected")
+                    }
+                }
             }
 
-            Label {
-                objectName: "stateLabel"
-                anchors.verticalCenter: parent.verticalCenter
-                color: "#a6adc8"
-                font.pixelSize: 12
-                text: root.connectionState.length > 0 ? root.connectionState
-                                                      : qsTr("disconnected")
-            }
-
-            Button {
+            SheetButton {
                 objectName: "closeButton"
                 anchors.verticalCenter: parent.verticalCenter
                 text: qsTr("Close")
@@ -342,7 +520,14 @@ Rectangle {
         }
     }
 
-    // ---- error banner (non-blocking: it never steals focus or input) ------
+    // ---- error banner -----------------------------------------------------
+    // Non-blocking: it never steals focus or input. Dismissing it is a per-
+    // MESSAGE acknowledgement, not a permanent mute — the flag is cleared the
+    // moment the host reports a different failure, so the next one is never
+    // swallowed by an earlier dismissal.
+    property bool errorDismissed: false
+    onErrorTextChanged: root.errorDismissed = false
+
     Rectangle {
         id: errorBanner
         objectName: "errorBanner"
@@ -350,20 +535,66 @@ Rectangle {
         anchors.right: parent.right
         anchors.bottom: parent.bottom
         anchors.margins: 1
-        height: root.errorText.length > 0 ? 40 : 0
-        visible: height > 0
+        visible: root.errorText.length > 0 && !root.errorDismissed
+        // Grows to fit: an ssh failure is a whole sentence naming a host, a
+        // port and a reason, and one elided line of it tells nobody anything.
+        height: visible ? Math.max(40, errorLabel.implicitHeight + 20) : 0
         color: "#3a1d28"
 
+        // A red wash is the only thing separating this from the rest of the
+        // sheet; the rule and the glyph say "error" without relying on hue.
+        Rectangle {
+            anchors.left: parent.left
+            anchors.top: parent.top
+            anchors.bottom: parent.bottom
+            width: 3
+            color: "#f38ba8"
+        }
+
         Label {
-            objectName: "errorLabel"
-            anchors.fill: parent
+            id: errorGlyph
+            anchors.left: parent.left
             anchors.leftMargin: 14
-            anchors.rightMargin: 14
-            verticalAlignment: Text.AlignVCenter
-            elide: Text.ElideRight
+            anchors.top: parent.top
+            anchors.topMargin: 10
+            text: "\u2715"
+            color: "#f38ba8"
+            font.pixelSize: 12
+            font.bold: true
+        }
+
+        Label {
+            id: errorLabel
+            objectName: "errorLabel"
+            anchors.left: errorGlyph.right
+            anchors.leftMargin: 8
+            anchors.right: errorDismissButton.left
+            anchors.rightMargin: 10
+            anchors.verticalCenter: parent.verticalCenter
+            wrapMode: Text.WordWrap
+            // SECURITY: a Label defaults to Text.AutoText, which silently
+            // promotes anything that LOOKS like markup to StyledText — and
+            // StyledText honours <img src="http://..."> by fetching the URL and
+            // <a href> by making the text a live link. errorText is the last
+            // failure string, which on this path comes from libssh and therefore
+            // carries text the SERVER chose (a banner, a disconnect reason). A
+            // hostile server must not be able to turn the error banner into a
+            // network callback. It is data: draw it as data.
+            textFormat: Text.PlainText
             color: "#f38ba8"
             font.pixelSize: 12
             text: root.errorText
+        }
+
+        SheetButton {
+            id: errorDismissButton
+            objectName: "errorDismissButton"
+            anchors.right: parent.right
+            anchors.rightMargin: 10
+            anchors.verticalCenter: parent.verticalCenter
+            accent: "#f38ba8"
+            text: qsTr("Dismiss")
+            onClicked: root.errorDismissed = true
         }
     }
 
@@ -444,6 +675,20 @@ Rectangle {
                             color: "#89b4fa"
                             visible: root.textOf(profileDelegate.modelData, "id") === root.activeId
                         }
+
+                        // Keyboard cursor. The selection wash alone cannot show
+                        // it: moving the cursor with Up/Down also moves the
+                        // selection, so without a ring a keyboard user has no
+                        // idea the list is what their arrow keys are driving.
+                        Rectangle {
+                            anchors.fill: parent
+                            radius: 3
+                            color: "transparent"
+                            border.width: 2
+                            border.color: "#89b4fa"
+                            visible: profileSelector.activeFocus
+                                     && profileDelegate.index === profileSelector.currentIndex
+                        }
                     }
 
                     contentItem: Column {
@@ -452,6 +697,11 @@ Rectangle {
                         Row {
                             spacing: 6
                             Label {
+                                objectName: "profileName" + profileDelegate.index
+                                // Same rule as errorLabel: a stored profile is
+                                // data (it can also arrive hand-edited from
+                                // disk), never markup.
+                                textFormat: Text.PlainText
                                 text: root.textOf(profileDelegate.modelData, "name")
                                 color: "#cdd6f4"
                                 font.pixelSize: 13
@@ -467,6 +717,8 @@ Rectangle {
                             }
                         }
                         Label {
+                            objectName: "profileEndpoint" + profileDelegate.index
+                            textFormat: Text.PlainText
                             text: root.textOf(profileDelegate.modelData, "user") + "@"
                                   + root.textOf(profileDelegate.modelData, "host") + ":"
                                   + root.textOf(profileDelegate.modelData, "port")
@@ -478,16 +730,28 @@ Rectangle {
                 }
             }
 
-            Label {
-                objectName: "emptyHint"
+            Column {
+                id: listEmptyState
                 anchors.centerIn: profileSelector
                 width: profileSelector.width - 24
-                horizontalAlignment: Text.AlignHCenter
-                wrapMode: Text.WordWrap
-                color: "#6c7086"
-                font.pixelSize: 12
-                text: qsTr("No servers yet.\nFill in the form and press Save.")
+                spacing: 6
                 visible: root.profileList().length === 0
+
+                Label {
+                    anchors.horizontalCenter: parent.horizontalCenter
+                    text: "\u2601"
+                    color: "#45475a"
+                    font.pixelSize: 28
+                }
+                Label {
+                    objectName: "emptyHint"
+                    width: parent.width
+                    horizontalAlignment: Text.AlignHCenter
+                    wrapMode: Text.WordWrap
+                    color: "#6c7086"
+                    font.pixelSize: 12
+                    text: qsTr("No servers yet.\nFill in the form and press Save.")
+                }
             }
 
             Row {
@@ -497,13 +761,14 @@ Rectangle {
                 anchors.margins: 6
                 spacing: 6
 
-                Button {
+                SheetButton {
                     objectName: "addButton"
                     text: qsTr("Add")
                     onClicked: root.beginNew()
                 }
-                Button {
+                SheetButton {
                     objectName: "removeButton"
+                    accent: "#f38ba8"
                     text: qsTr("Remove")
                     enabled: root.editingId !== ""
                     onClicked: root.removeSelected()
@@ -526,6 +791,21 @@ Rectangle {
                 anchors.right: parent.right
                 anchors.margins: 14
                 spacing: 8
+
+                // First run: an empty list and an empty form say nothing about
+                // what CodeHarbor wants from you. It goes away the moment there
+                // is a server to pick, so it never becomes chrome to scroll past.
+                Label {
+                    objectName: "coldStartIntro"
+                    width: form.width
+                    visible: root.profileList().length === 0
+                    wrapMode: Text.WordWrap
+                    color: "#a6adc8"
+                    font.pixelSize: 12
+                    text: qsTr("CodeHarbor edits a checkout that lives on another machine, over SSH. "
+                               + "Describe that machine below — its address, your login, and the "
+                               + "absolute path to node on it — then Save it and press Connect.")
+                }
 
                 Label {
                     objectName: "formTitle"
@@ -612,19 +892,20 @@ Rectangle {
                     visible: !root.formValid()
                     text: qsTr("Host, user and a port in 1-65535 are required.")
                 }
-                Button {
+                SheetButton {
                     objectName: "cancelButton"
                     text: qsTr("Cancel")
                     onClicked: root.dismissed()
                 }
-                Button {
+                SheetButton {
                     objectName: "saveButton"
                     text: qsTr("Save")
                     enabled: root.formValid()
                     onClicked: root.save()
                 }
-                Button {
+                SheetButton {
                     objectName: "connectButton"
+                    accent: "#89b4fa"
                     text: qsTr("Connect")
                     enabled: root.editingId !== ""
                     onClicked: root.connectNow()
@@ -684,6 +965,15 @@ Rectangle {
                     objectName: "hostKeyHost"
                     width: parent.width
                     wrapMode: Text.WordWrap
+                    // SECURITY: this is the ONE panel whose whole job is to show
+                    // the user something they must read literally before they
+                    // trust a server. keyType and fingerprint are what the
+                    // UNVERIFIED peer presented. Markup here could restyle or
+                    // hide part of the fingerprint (StyledText honours <font
+                    // color>, and Text.AutoText opts into StyledText all by
+                    // itself), so the decision must be made on the exact
+                    // characters, never on a rendering of them.
+                    textFormat: Text.PlainText
                     color: "#cdd6f4"
                     font.pixelSize: 12
                     text: qsTr("%1 presented a %2 key that is not in known_hosts.")
@@ -694,6 +984,7 @@ Rectangle {
                     objectName: "hostKeyFingerprint"
                     width: parent.width
                     wrapMode: Text.WrapAnywhere
+                    textFormat: Text.PlainText
                     color: "#a6e3a1"
                     font.pixelSize: 12
                     font.family: "Monospace"
@@ -711,15 +1002,17 @@ Rectangle {
                     anchors.right: parent.right
                     spacing: 8
 
-                    Button {
+                    SheetButton {
                         id: hostKeyReject
                         objectName: "hostKeyRejectButton"
+                        accent: "#89b4fa"
                         text: qsTr("Reject")
                         onClicked: root.hostKeyDecision(false)
                     }
-                    Button {
+                    SheetButton {
                         objectName: "hostKeyAcceptButton"
-                        text: qsTr("Accept")
+                        accent: "#f9e2af"
+                        text: qsTr("Accept and remember")
                         onClicked: root.hostKeyDecision(true)
                     }
                 }

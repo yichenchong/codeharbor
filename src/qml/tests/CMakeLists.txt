@@ -49,6 +49,37 @@ set_tests_properties(tst_qmlload PROPERTIES
     TIMEOUT 180
 )
 
+# Identity gate for the split tree (SPEC 4.5): splitting a region must RE-HOME
+# the panes already in it, never rebuild them. Counting panes cannot see the
+# difference — a rebuilt terminal even re-attaches to the same tmux session —
+# so this drives the REAL region components and compares object identity plus
+# the page state only the surviving pane can hold.
+qt_add_executable(tst_paneidentity tst_paneidentity.cpp)
+
+target_link_libraries(tst_paneidentity PRIVATE
+    Qt6::Test
+    Qt6::Core
+    Qt6::Gui
+    Qt6::Qml
+    Qt6::Quick
+    Qt6::QuickControls2
+    Qt6::WebEngineQuick
+    Qt6::WebChannel
+    codeharbor_qmlplugin
+    ch_editor
+    ch_terminal
+    ch_viewers
+    ch_remote
+    ch_models
+    ch_ssh
+)
+
+add_test(NAME tst_paneidentity COMMAND tst_paneidentity)
+set_tests_properties(tst_paneidentity PROPERTIES
+    ENVIRONMENT "${CODEHARBOR_QML_TEST_ENV}"
+    TIMEOUT 300
+)
+
 # Behavioural gate for the sidebar's drag-and-drop reordering and selection
 # affordances (SPEC 4.2). Loads the real qrc SessionsSidebar.qml over a stub
 # `app` and a real SessionsModel, and drives genuine mouse/key events.
@@ -120,4 +151,30 @@ add_test(NAME tst_palette COMMAND tst_palette)
 set_tests_properties(tst_palette PROPERTIES
     ENVIRONMENT "${CODEHARBOR_QML_TEST_ENV}"
     TIMEOUT 120
+)
+
+# Cold-start usability gate for the shell surfaces a first-time user lands on,
+# and the frame grabber behind the design review (`tst_uxshell -shots` writes
+# PNGs of every surface under <build>/src/qml/tests/ux-shots/$CH_UX_PHASE).
+# Loads the REAL qrc components: ConnectSheet, SessionsSidebar, CommandPalette,
+# TerminalPaneView and ViewerPane, over a stub `app`.
+qt_add_executable(tst_uxshell tst_uxshell.cpp)
+
+target_link_libraries(tst_uxshell PRIVATE
+    Qt6::Test
+    Qt6::Core
+    Qt6::Gui
+    Qt6::Qml
+    Qt6::Quick
+    Qt6::QuickControls2
+    Qt6::WebEngineQuick
+    Qt6::WebChannel
+    codeharbor_qmlplugin
+    ch_models
+)
+
+add_test(NAME tst_uxshell COMMAND tst_uxshell)
+set_tests_properties(tst_uxshell PROPERTIES
+    ENVIRONMENT "${CODEHARBOR_QML_TEST_ENV}"
+    TIMEOUT 180
 )

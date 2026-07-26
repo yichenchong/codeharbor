@@ -281,23 +281,36 @@ active-MIME gate) and a Wave-4 adversarial review (E watch-subscription leak +
 read-only save; A markSeen badge-clear + version fidelity + transport UAF).
 Contract: the oh-my-pi hook emits BridgeMessage (the bridge stays the single mapping point).
 
-> **Correction (found when the live gates were first exercised — Wave 5).** The
-> M1–M5 claim above described unit-tested logic, and two things it implied were
-> false:
+> **Corrections (each found only when something real was exercised).** Three
+> times now a green suite has coexisted with a product that did not work. Each
+> entry is here because the suite said "fine" and the truth was otherwise.
 >
-> 1. **No transport spine.** `CodeharbordClient::setTransport` and
+> 1. **No transport spine** (Wave 5). `CodeharbordClient::setTransport` and
 >    `AgentStatusMonitor::setTransport` existed and were unit-tested, but there was
 >    no `QIODevice` over an `ssh_channel` and `main.cpp` never called either. The
 >    shipped app could not reach a remote server at all — the client subsystems
->    were only ever driven by test doubles.
-> 2. **The app could not start.** `ViewerRegion.qml`/`TerminalRegion.qml`
+>    were only ever driven by test doubles. Fixed by `SshChannelDevice` +
+>    `SessionBootstrap`.
+> 2. **The app could not start** (Wave 5). `ViewerRegion.qml`/`TerminalRegion.qml`
 >    instantiated their own type recursively, which QML rejects, so `Main.qml`
 >    failed to load. No test instantiated the real QML tree, so a green 9/9 suite
->    coexisted with an app that could not launch.
+>    coexisted with an app that could not launch. Fixed by url-sourced `Loader`
+>    recursion plus a permanent `tst_qmlload` gate.
+> 3. **Unknown SSH host keys were trusted silently** (Wave 7, SECURITY).
+>    `SessionBootstrap::attemptWire` unconditionally installed an accept-all
+>    host-key callback, overwriting the prompting callback `AppController` had
+>    just installed. Every unknown key was therefore accepted and written to
+>    `known_hosts` with no consent, and the entire host-key prompt UI —
+>    `hostKeyPrompt`, `resolveHostKey`, the ConnectSheet fingerprint view — was
+>    dead code. This deviates from SPEC 12.1, and it is the sharpest example of
+>    the pattern: the Wave-5 and Wave-6 cold-start walkthroughs "succeeded"
+>    PARTLY BECAUSE of this bug, since nothing ever had to answer a prompt. Fixed
+>    by installing the accept-all default only when no policy is set
+>    (headless/unattended use), and now defended end to end by `tst_coldstart`.
 >
-> Both were fixed in Wave 5 (`SshChannelDevice` + `SessionBootstrap`; url-sourced
-> `Loader` recursion + a permanent `tst_qmlload` gate). Treat "code complete" as
-> "unit-tested logic" unless a workstream's live gate is explicitly marked MET.
+> Treat "code complete" as "unit-tested logic" unless a workstream's live gate is
+> explicitly marked MET — and treat a gate that has never failed with suspicion
+> until you have watched it fail.
 
 **Wave 5 — ✅ DONE (live gates).** Every deferred live gate is now MET against a real
 sshd + real `codeharbord`: S, T, U, V, E, A (`tst_livessh`, `tst_liveterminal`,
@@ -323,7 +336,45 @@ client). Defects the live gates exposed — none of which the headless suite cou
 - **Fatal Chromium flag** — `--single-process` aborts once a second `QWebEngineProfile`
   exists, which the viewer stack creates by design.
 
-> Remaining known gaps (not live-gate blocked): command palette + keyboard shortcuts
-> (SPEC 15), sidebar drag-and-drop UI (invokables exist), RPC-channel reconnect
-> scheduling, tmux session discovery over RPC, OS desktop notifications, and writing
-> drag-adjusted split ratios back to the server.
+**Wave 6 — ✅ DONE (usability).** The live gates passed but a person still could not
+use the app: nothing could reach a server, selecting a session did nothing, and there
+was no terminal in the UI at all. Wave 6 added stored connection profiles + a connect
+/host-key sheet, a real packaged xterm.js bundle with a per-pane `TerminalFactory`
+(live remote shells in panes), `SessionLayouts` (a session's split trees load from and
+persist to the server), sidebar drag-and-drop, the SPEC 15 command palette with global
+shortcuts, reconnect with the SPEC 5.6 backoff ladder, OS notifications, and `tmux.*`
+discovery RPC. The workspace is now keyed by a SERVER-OWNED id (`server.info.serverId`,
+persisted in `server_identity`) — a client-local id would have orphaned the user's real
+groups and sessions whenever a profile was re-added or a second machine connected.
+
+**Wave 7 — ⚠️ PARTIALLY COMPLETED (adversarial round).** Be precise about this one: the
+eight-reviewer wave was **cut short by a harness limit and every reviewer was killed
+mid-flight**. Their code changes were already on disk, so the round was salvaged by
+re-dispatching finishers scoped to the failing tests each had left behind, and by the
+orchestrator finishing the rest. What that means:
+
+- **Swept and completed:** the cold-start acceptance gate (`tst_coldstart`, 9/9 —
+  first run → add server → key prompt/accept/persist → session → live tmux pane →
+  edit+save a remote file → relaunch restores), pane identity across splits, the UI/UX
+  pass, and a verification pass over the interrupted fixes.
+- **Salvaged, NOT completed:** the security and integration reviews. Their FIXES
+  landed and are tested, but each reviewer died before writing its findings list, so
+  any defect it had noticed and not yet written down was lost with it. The host-key
+  hole below survived only because that reviewer happened to report it over IRC first.
+  **A fresh security review is still owed** — treat Wave 7 as evidence that the
+  reviewed areas contain bugs, not as evidence that they are now clean.
+
+Defects Wave 7 found and fixed: unknown SSH host keys silently trusted (see correction
+3 — security); splitting a region **destroyed the pane the user was working in**, and a
+republished tree rebuilt every delegate because the Repeater was keyed on the children
+array; `file.watch` was never re-established after a reconnect, so external-change
+reload silently died for every open editor; deliberate teardown and the deliberate
+host-key refusal were painted as red error toasts; three "fixed" items were green only
+because no test exercised the path at all.
+
+> Remaining known gaps: a fresh security review (see above); pane focus is not tracked,
+> so palette split commands act on a region's first pane rather than the focused one;
+> drag-adjusted split ratios persist but pane FOCUS/selection does not; `tmux.*`
+> discovery is server-side only and no client code consumes it yet; connect is a
+> synchronous libssh handshake on the GUI thread (bounded by a timeout, but it briefly
+> blocks the UI — moving the session to a worker thread is the real fix).

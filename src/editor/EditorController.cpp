@@ -37,6 +37,13 @@ EditorController::EditorController(CodeharbordClient* client, QObject* parent)
     if (m_client) {
         connect(m_client, &CodeharbordClient::notificationReceived, this,
                 &EditorController::onNotification);
+        // SPEC 5.6: the session can be dropped and re-wired underneath us. Both
+        // edges matter — the close tells us the subscription we hold died with
+        // its process, the bind tells us there is a new process to subscribe on.
+        connect(m_client, &CodeharbordClient::transportClosed, this,
+                &EditorController::onTransportClosed);
+        connect(m_client, &CodeharbordClient::transportBound, this,
+                &EditorController::onTransportBound);
     }
 }
 
@@ -56,6 +63,124 @@ void EditorController::unwatchCurrent()
                    unwatchParams(m_watchSubscriptionId),
                    [](QJsonValue, std::optional<RpcError>) {});
     m_watchSubscriptionId.clear();
+}
+
+void EditorController::subscribeWatch()
+{
+    if (!m_client || m_path.isEmpty())
+        return;
+    // A subscribe is already outstanding for this generation; a second one
+    // would create a duplicate watcher and double every watchEvent.
+    if (m_watchPending)
+        return;
+    // An id we still hold means no EOF was seen on the way here, so the server
+    // that minted it may well be the one we are about to ask. Release it first:
+    // that is the only way a rebind can never leave two live watchers on the
+    // same path (SPEC 8.7). After a real reconnect the id was already dropped
+    // by onTransportClosed(), so this costs nothing on that path.
+    unwatchCurrent();
+
+    const quint64 generation = ++m_watchGeneration;
+    const QString path = m_path;
+    m_watchPending = true;
+
+    QPointer<EditorController> self(this);
+    m_client->call(
+        QString::fromLatin1(rpc::kMethodWatch), readParams(path),
+        [self, client = m_client, path, generation](
+            QJsonValue watchRes, std::optional<RpcError> watchErr) {
+            const QString subId =
+                watchErr.has_value()
+                    ? QString()
+                    : watchRes.toObject()
+                          .value(QStringLiteral("subscriptionId"))
+                          .toString();
+
+            // Superseded: the controller was destroyed (pane closed), the file
+            // was switched, or the transport was replaced while this was in
+            // flight. The server may have created a subscription nobody tracks,
+            // so release it through the BORROWED client — it outlives the
+            // controller per the ctor contract — and NEVER touch m_watchPending,
+            // which now belongs to a newer attempt.
+            if (!self || generation != self->m_watchGeneration
+                || self->m_path != path) {
+                if (!subId.isEmpty())
+                    client->call(QString::fromLatin1(rpc::kMethodUnwatch),
+                                 unwatchParams(subId),
+                                 [](QJsonValue, std::optional<RpcError>) {});
+                return;
+            }
+
+            self->m_watchPending = false;
+            if (subId.isEmpty())
+                return;  // no subscription was created
+            self->m_watchSubscriptionId = subId;
+        });
+}
+
+void EditorController::onTransportClosed()
+{
+    // That codeharbord is unreachable for good, and its subscription registry
+    // died with the process (remote/src/files.ts). Forget the id in silence: an
+    // unwatch issued later would be addressed to the REPLACEMENT server, which
+    // never created it. The buffer, its revision and its dirty flag are the
+    // user's and are deliberately left alone.
+    m_watchSubscriptionId.clear();
+}
+
+void EditorController::onTransportBound()
+{
+    // Whatever was in flight belonged to the previous process and can never be
+    // answered by this one; supersede it before issuing anything new so a late
+    // reply cannot install a dead subscription id or clear the guard below.
+    ++m_watchGeneration;
+    m_watchPending = false;
+
+    if (m_path.isEmpty())
+        return;  // nothing open in this pane
+
+    // Order matters: subscribe FIRST so a change landing during the
+    // reconciliation round trip is still announced, then close the window the
+    // outage opened.
+    subscribeWatch();
+    reconcileAfterReconnect();
+}
+
+void EditorController::reconcileAfterReconnect()
+{
+    if (!m_client || m_path.isEmpty())
+        return;
+
+    const QString path = m_path;
+    // Only act if the world still looks the way it does right now: an open(),
+    // save() or reload() that settles before this stat answers is authoritative
+    // and must not be undone by a snapshot taken before it ran.
+    const QString baseline = m_revision;
+
+    QPointer<EditorController> self(this);
+    m_client->call(
+        QString::fromLatin1(rpc::kMethodStat), readParams(path),
+        [self, path, baseline](QJsonValue statRes, std::optional<RpcError> statErr) {
+            if (!self || statErr.has_value())
+                return;  // gone, or the file cannot be stat'd: nothing to claim
+            if (self->m_path != path || self->m_revision != baseline)
+                return;  // superseded
+            if (self->m_fileState == FileState::Saving)
+                return;  // the in-flight write decides this file's next state
+
+            const QString revision =
+                statRes.toObject().value(QStringLiteral("revision")).toString();
+            if (revision.isEmpty() || revision == baseline)
+                return;  // nothing changed while we were away
+
+            if (self->m_dirty) {
+                // Unsaved edits: NEVER clobber them (SPEC 8.7). Same rule
+                // onNotification() applies to a live watch event.
+                self->setFileState(FileState::ExternallyModified);
+                return;
+            }
+            self->reload(FileState::ExternallyModified);
+        });
 }
 
 void EditorController::setFileState(FileState state)
@@ -135,8 +260,13 @@ void EditorController::open(QString path)
         return;
 
     // Switching files (or re-opening the same one): release the previous file's
-    // watcher first so subscriptions are never leaked or duplicated (SPEC 8.7).
+    // watcher first so subscriptions are never leaked or duplicated (SPEC 8.7),
+    // and supersede a subscribe still in flight for the OLD path — otherwise
+    // its late reply would keep the in-flight guard raised forever and the new
+    // file would never get a watcher at all.
     unwatchCurrent();
+    ++m_watchGeneration;
+    m_watchPending = false;
     m_path = path;
     m_dirty = false;
     m_recoveryRevision.clear();
@@ -166,33 +296,7 @@ void EditorController::open(QString path)
                        self->setFileState(FileState::Clean);
 
                        // Subscribe to external-change notifications (SPEC 8.7).
-                       self->m_client->call(
-                           QString::fromLatin1(rpc::kMethodWatch),
-                           readParams(path),
-                           [self, client = self->m_client, path](QJsonValue watchRes, std::optional<RpcError> watchErr) {
-                               if (watchErr.has_value())
-                                   return; // no subscription was created
-                               const QString subId =
-                                   watchRes.toObject()
-                                       .value(QStringLiteral("subscriptionId"))
-                                       .toString();
-                               // If the controller was destroyed (pane closed)
-                               // or switched files before this watch resolved,
-                               // the server created a subscription for a path we
-                               // no longer track. Release it through the BORROWED
-                               // client (it outlives the controller per the ctor
-                               // contract) so a server-side watcher is NEVER
-                               // leaked (SPEC 8.7) — even when `self` is gone.
-                               if (!self || self->m_path != path) {
-                                   if (!subId.isEmpty())
-                                       client->call(
-                                           QString::fromLatin1(rpc::kMethodUnwatch),
-                                           unwatchParams(subId),
-                                           [](QJsonValue, std::optional<RpcError>) {});
-                                   return;
-                               }
-                               self->m_watchSubscriptionId = subId;
-                           });
+                       self->subscribeWatch();
 
                        // Offer a crash-recovery snapshot if one exists and
                        // differs from the freshly loaded file (SPEC 11.3).

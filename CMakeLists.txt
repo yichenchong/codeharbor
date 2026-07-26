@@ -74,6 +74,15 @@ endif()
 # Enable CTest before adding subdirectories so module test targets register.
 if(CODEHARBOR_BUILD_TESTS)
     enable_testing()
+
+    # Fails if review/debug scaffolding (e.g. a deliberate MUTATION-TEST line
+    # left behind while proving a gate can fail) reaches the tree. Cheap, and it
+    # closes a hole that convention alone did not.
+    if(UNIX)
+        add_test(NAME tst_no_scaffolding
+                 COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/no_scaffolding.sh
+                         ${CMAKE_CURRENT_SOURCE_DIR})
+    endif()
 endif()
 
 add_subdirectory(src)

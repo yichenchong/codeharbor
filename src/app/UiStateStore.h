@@ -16,7 +16,7 @@ namespace ch {
 // Storage keys:
 //   layout/sidebarWidth, layout/viewerWidth, layout/terminalWidth
 //   selectedPane/<devSessionId>
-//   session/active
+//   session/<serverId>/active
 class UiStateStore : public QObject {
     Q_OBJECT
 
@@ -38,11 +38,22 @@ public:
     Q_INVOKABLE void setSelectedPane(QString devSessionId, QString paneId);
     Q_INVOKABLE QString selectedPane(QString devSessionId) const;
 
-    // The Dev Session the user was last working in, so a relaunch reopens it
-    // instead of an empty shell. Client-local: which session is "current" is a
-    // per-client presentation choice, not authoritative workspace state.
-    Q_INVOKABLE void setActiveSession(QString devSessionId);
-    Q_INVOKABLE QString activeSession() const;
+    // The Dev Session the user was last working in ON A GIVEN SERVER, so a
+    // relaunch reopens it instead of an empty shell. Client-local: which
+    // session is "current" is a per-client presentation choice, not
+    // authoritative workspace state.
+    //
+    // Scoped by serverId because a Dev Session belongs to exactly one server: a
+    // single global key meant that connecting to server B and relaunching tried
+    // to reopen server A's session id, which does not exist on B — a phantom
+    // restore (dead layout fetches, a terminal pane bound to nothing) on every
+    // launch after a server switch.
+    //
+    // An empty serverId is not a server: reads return empty and writes are
+    // dropped, so nothing is ever stored under a placeholder key during the
+    // window before server.info has answered.
+    Q_INVOKABLE void setActiveSession(QString serverId, QString devSessionId);
+    Q_INVOKABLE QString activeSession(QString serverId) const;
 
 private:
     std::unique_ptr<QSettings> m_settings;

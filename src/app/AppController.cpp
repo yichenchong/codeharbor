@@ -3,6 +3,7 @@
 #include "UiStateStore.h"
 
 #include <QCryptographicHash>
+#include <QScopeGuard>
 #include <QFileInfo>
 #include <QDir>
 #include <QJsonObject>
@@ -30,6 +31,23 @@ void AppController::setServerId(const QString& serverId)
     if (m_serverId.value == serverId)
         return;
     m_serverId.value = serverId;
+    // The layouts repository is keyed by the same id. Keeping it in lockstep
+    // HERE, rather than at each call site, is what stops a setLayout write
+    // landing under the previous server's key after a switch.
+    if (m_layouts)
+        m_layouts->setServerId(serverId);
+    // A Dev Session belongs to exactly one server. Carrying the previous
+    // server's active session across a switch would show its panes against the
+    // new server's workspace and make the next layout write pair the OLD
+    // devSessionId with the NEW serverId. Drop it (and its cached trees);
+    // restoreActiveSession() reinstates whatever THIS server remembers as soon
+    // as its rows arrive.
+    if (!m_activeSessionId.isEmpty()) {
+        m_activeSessionId.clear();
+        if (m_layouts)
+            m_layouts->load(QString());  // clears both region trees
+        emit activeSessionChanged();
+    }
     emit serverIdChanged();
     // Switching the active server must reload the sidebar from that server's
     // authoritative tree; nothing else re-drives refresh() on a server change,
@@ -70,6 +88,13 @@ QVector<GroupRow> AppController::toGroupRows(const QVector<GroupNode>& nodes)
 bool AppController::reportIfError(const std::optional<RpcError>& err)
 {
     if (err) {
+        // A teardown WE initiated fails every in-flight call by design (the
+        // client synthesises "transport closed with request pending"). That is
+        // the expected consequence of the user clicking Disconnect, not a fault
+        // to paint red. Errors outside this window - including a transport that
+        // dies on its own mid-session - are still reported verbatim (SPEC 10.3).
+        if (m_tearingDown)
+            return true;
         emit error(err->message);
         return true;
     }
@@ -106,10 +131,20 @@ void AppController::setConnection(SshConnectionPool* pool,
                                   ServerProfiles* profiles,
                                   SessionLayouts* layouts)
 {
+    // Re-injection must not stack duplicate connections onto a second
+    // bootstrap's signals (and must not leave the first one still driving us).
+    if (m_bootstrap && m_bootstrap != bootstrap)
+        disconnect(m_bootstrap, nullptr, this, nullptr);
+
     m_pool = pool;
     m_bootstrap = bootstrap;
     m_profiles = profiles;
     m_layouts = layouts;
+
+    // setConnection may land after a serverId is already known (test order, or
+    // a re-injection); seed the layouts key so it is never one server behind.
+    if (m_layouts)
+        m_layouts->setServerId(m_serverId.value);
 
     if (m_bootstrap) {
         // The bootstrap reconnects on its own (backoff per SPEC 5.6); mirror its
@@ -141,7 +176,17 @@ void AppController::setConnection(SshConnectionPool* pool,
         connect(m_bootstrap, &SessionBootstrap::error, this,
                 [this](const QString& message) {
                     m_connectionError = message;
-                    emit error(message);
+                    // While a connect attempt is in flight the failure may be
+                    // EXPECTED: an unknown host key is deliberately refused so
+                    // the user can be asked. Surfacing "SSH connection failed"
+                    // for that would tell the user something went wrong when the
+                    // app is simply waiting on their answer. Hold it until the
+                    // attempt resolves, then either drop it (prompt raised) or
+                    // report it (genuine failure).
+                    if (m_connecting)
+                        m_heldConnectError = message;
+                    else
+                        emit error(message);
                     emit connectionStateChanged();
                 });
     }
@@ -159,11 +204,18 @@ void AppController::setConnectionState(const QString& state, const QString& err)
 
 void AppController::connectToProfile(QString profileId)
 {
+    startConnect(profileId, QString());
+}
+
+void AppController::startConnect(const QString& profileId,
+                                 QString acceptedFingerprint)
+{
     if (!m_bootstrap || !m_profiles || !m_pool)
         return;
     // One handshake at a time: a second invocation while a connect is running -
     // or while the user still owes us a host-key answer - would race two
-    // sessions onto one pool and could re-enter the host-key callback.
+    // sessions onto one pool and could re-enter the host-key callback. The flag
+    // therefore stays set across the prompt and is cleared by resolveHostKey().
     if (m_connecting)
         return;
 
@@ -177,23 +229,33 @@ void AppController::connectToProfile(QString profileId)
     m_connecting = true;
     m_pendingProfileId = profileId;
     m_pendingFingerprint.clear();
+    m_pendingHostKeyInfo = {};
     setConnectionState(QStringLiteral("connecting"));
 
     // Unknown key: refuse THIS attempt, remember the fingerprint, and let the
-    // user decide. Accepting re-runs connectToProfile with the fingerprint
+    // user decide. Accepting re-runs the connect with the fingerprint
     // pre-approved, so the decision never blocks inside the handshake.
+    //
+    // The approval is captured BY VALUE and consumed exactly once. It used to
+    // live on the controller and was cleared only on the accept path, so every
+    // other exit (profile deleted while the prompt was up, TCP/auth failure
+    // before the key check, a key that turned out to be already known) left an
+    // approval armed for the next connect to any host. It never had teeth -
+    // acceptance still requires an exact SHA-256 match - but "a stale approval
+    // is only saved by a hash collision" is not an invariant worth keeping.
     QPointer<AppController> self(this);
     m_pool->setHostKeyCallback(
-        [self](const QString& host, const QString& keyType,
-               const QByteArray& keyBlob, KnownHosts::Verdict) {
+        [self, accepted = std::move(acceptedFingerprint)](
+            const QString& host, const QString& keyType,
+            const QByteArray& keyBlob, KnownHosts::Verdict) mutable {
             if (!self)
                 return SshConnectionPool::HostKeyDecision::Reject;
             const QString fingerprint =
                 QString::fromLatin1(
                     QCryptographicHash::hash(keyBlob, QCryptographicHash::Sha256)
                         .toBase64(QByteArray::OmitTrailingEquals));
-            if (self->m_acceptedFingerprint == fingerprint) {
-                self->m_acceptedFingerprint.clear();
+            if (!accepted.isEmpty() && accepted == fingerprint) {
+                accepted.clear();  // one shot, for this key only
                 return SshConnectionPool::HostKeyDecision::Accept;
             }
             self->m_pendingFingerprint = fingerprint;
@@ -208,37 +270,74 @@ void AppController::connectToProfile(QString profileId)
         profile.value(QStringLiteral("nodePath")).toString(),
         profile.value(QStringLiteral("repoRoot")).toString());
 
-    m_connecting = false;
     if (ok) {
+        m_connecting = false;
+        m_heldConnectError.clear();
+        m_pendingFingerprint.clear();
+        m_pendingHostKeyInfo = {};
         m_profiles->setActiveId(profileId);
         return;  // wired() -> adoptServerIdentity()
     }
     if (!m_pendingFingerprint.isEmpty()) {
+        // The attempt is NOT over: it is parked on the user's answer, and
+        // m_connecting stays set so nothing can start a second one underneath
+        // it and swap m_pendingProfileId/m_pendingFingerprint out from under
+        // resolveHostKey(). The refusal that got us here is expected, so its
+        // error is dropped rather than shown.
+        m_heldConnectError.clear();
         setConnectionState(QStringLiteral("hostkey"));
         emit hostKeyPrompt(m_pendingHostKeyInfo.first, m_pendingHostKeyInfo.second,
                            m_pendingFingerprint);
         return;
+    }
+    m_connecting = false;
+    // A genuine failure: report it now that we know it was not the host-key path.
+    if (!m_heldConnectError.isEmpty()) {
+        const QString held = m_heldConnectError;
+        m_heldConnectError.clear();
+        emit error(held);
     }
     setConnectionState(QStringLiteral("failed"), m_connectionError);
 }
 
 void AppController::resolveHostKey(bool accept)
 {
+    // Only meaningful while a prompt WE raised is outstanding. Without this a
+    // stray answer (a sheet left open behind a live session, a double click on
+    // Reject, or a fingerprint stashed by an automatic reconnect's key check)
+    // would drop a connected shell to "disconnected", or worse, hand a
+    // fingerprint nobody was ever shown to a fresh connect.
+    if (!m_connecting || m_pendingFingerprint.isEmpty())
+        return;
+
     const QString fingerprint = m_pendingFingerprint;
     const QString profileId = m_pendingProfileId;
     m_pendingFingerprint.clear();
-    if (!accept || fingerprint.isEmpty() || profileId.isEmpty()) {
+    m_pendingHostKeyInfo = {};
+    m_connecting = false;  // the parked attempt ends here, either way
+
+    if (!accept || profileId.isEmpty()) {
         setConnectionState(QStringLiteral("disconnected"));
         return;
     }
-    m_acceptedFingerprint = fingerprint;
-    connectToProfile(profileId);
+    startConnect(profileId, fingerprint);
 }
 
 void AppController::disconnectServer()
 {
     if (!m_bootstrap)
         return;
+    // A disconnect while a host-key prompt is parked also abandons that
+    // attempt; leaving m_connecting set would wedge every later connect.
+    m_connecting = false;
+    m_pendingFingerprint.clear();
+    m_pendingHostKeyInfo = {};
+
+    // Scope-guarded so an early return or a throw inside the teardown cannot
+    // leave errors permanently muted; belt-and-braces, startConnect() clears it
+    // too in case a failure ever arrives queued rather than synchronously.
+    m_tearingDown = true;
+    const auto restore = qScopeGuard([this] { m_tearingDown = false; });
     m_bootstrap->disconnectSession();
     setConnectionState(QStringLiteral("disconnected"));
 }
@@ -265,21 +364,53 @@ void AppController::adoptServerIdentity()
                                   "key this workspace to a client-side id."));
                            return;
                        }
-                       if (self->m_layouts)
-                           self->m_layouts->setServerId(id);
-                       // setServerId() refreshes the sidebar; restore the last
-                       // session once those rows arrive.
+                       if (self->m_serverId.value == id) {
+                           // Same server - the common case, since this runs on
+                           // EVERY successful wire including every automatic
+                           // reconnect. setServerId() would early-out and
+                           // nothing else re-reads the workspace afterwards, so
+                           // the sidebar would silently freeze on whatever it
+                           // held when the link dropped (and `refreshed`, which
+                           // drives restoreActiveSession, would never fire
+                           // again). Exactly one list() per wire, not a storm.
+                           self->refresh();
+                           return;
+                       }
+                       // Different server behind this profile: setServerId()
+                       // re-keys the layouts, drops the previous server's
+                       // active session and refreshes.
                        self->setServerId(id);
                    });
 }
 
+bool AppController::sessionExists(const QString& devSessionId) const
+{
+    for (const GroupNode& group : m_lastNodes)
+        for (const SessionNode& session : group.sessions)
+            if (session.session.id.value == devSessionId)
+                return true;
+    return false;
+}
+
 void AppController::restoreActiveSession()
 {
-    if (m_activeSessionId.isEmpty() && m_uiState) {
-        const QString remembered = m_uiState->activeSession();
-        if (!remembered.isEmpty())
-            activateSession(remembered);
+    // Never fight the user: once anything is active, the remembered id has
+    // already done its job.
+    if (!m_activeSessionId.isEmpty() || !m_uiState)
+        return;
+    const QString remembered = m_uiState->activeSession(m_serverId.value);
+    if (remembered.isEmpty())
+        return;
+    // The remembered session may be gone (deleted here before the id was
+    // forgotten, or from another client). Activating it would load a phantom:
+    // both getLayout calls error, the toast fires on every launch, and the
+    // terminal region attaches panes to a Dev Session the server has never
+    // heard of. Forget it instead of reopening it.
+    if (!sessionExists(remembered)) {
+        m_uiState->setActiveSession(m_serverId.value, QString());
+        return;
     }
+    activateSession(remembered);
 }
 
 void AppController::activateSession(QString devSessionId)
@@ -288,11 +419,11 @@ void AppController::activateSession(QString devSessionId)
         return;
     m_activeSessionId = devSessionId;
     if (m_uiState)
-        m_uiState->setActiveSession(devSessionId);
-    if (m_layouts) {
-        m_layouts->setServerId(m_serverId.value);
+        m_uiState->setActiveSession(m_serverId.value, devSessionId);
+    // Deliberately NOT short-circuited when the id is unchanged: re-picking the
+    // current session is the user's natural retry after a layout load failed.
+    if (m_layouts)
         m_layouts->load(devSessionId);
-    }
     emit activeSessionChanged();
 }
 
@@ -349,6 +480,14 @@ void AppController::rebuildRows()
 
 void AppController::refresh()
 {
+    // Nothing to ask when no transport is bound: the call would fail instantly
+    // with "no transport bound" and surface as a user-facing error toast, which
+    // is exactly what a user sees on a cold start before they have connected.
+    // This is a capability check, NOT a filter on the error text - a transport
+    // that exists and then dies mid-session still reports its failure verbatim.
+    if (m_client && !m_client->transport())
+        return;
+
     // Each refresh is a full-tree re-read; several can be in flight at once
     // (every mutation chains one, plus the sidebar's initial load and any
     // setServerId). The client routes responses by id, so replies may arrive
@@ -367,8 +506,15 @@ void AppController::refresh()
             return;
         if (generation != self->m_refreshGeneration)
             return; // a newer refresh has superseded this result
+        // activeSessionRepoRoot is derived from these rows but notified by
+        // activeSessionChanged, which a refresh does not otherwise emit. A repo
+        // root edited on the server would leave the terminal region bound to
+        // the stale working directory forever.
+        const QString repoRootBefore = self->activeSessionRepoRoot();
         self->m_lastNodes = std::move(nodes);
         self->rebuildRows();
+        if (self->activeSessionRepoRoot() != repoRootBefore)
+            emit self->activeSessionChanged();
         emit self->refreshed();
     });
 }
