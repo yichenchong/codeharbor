@@ -248,6 +248,7 @@ private slots:
     // Which channel news is a FAILURE and which is chatter.
     void remoteStderrIsDiagnosticNotError();
     void genuineChannelSetupFailureStillErrors();
+    void channelLossCarriesThatChannelsLastRemoteWords();
 
     // Connect-stall bound and GUI responsiveness (this round's hunt).
     void refusedEndpointFailsFastAndCleanly();
@@ -262,6 +263,7 @@ private slots:
 
     // Remote command construction from attacker-influenced profile fields.
     void remoteCommandsQuoteHostileProfileFields();
+    void remoteEntryPointsSupportBothReleaseAndCheckoutLayouts();
 };
 
 // A cold wire walks Disconnected -> Connecting -> Wired exactly once and hands
@@ -1018,6 +1020,66 @@ void TstSessionBootstrap::disconnectMidBackoffStopsImmediately()
     QCOMPARE(h.boot.connectCalls, 1);
     QCOMPARE(h.boot.probeCalls, 1);
 }
+namespace {
+
+// A stand-in for the remote `node`: an executable that echoes its argv as
+// [arg][arg]..., so a test can observe both the exact split the remote login
+// shell performed and which entry point it selected. A real interpreter path
+// beats rewriting the generated command after the fact — the string under test
+// stays byte-for-byte the one SessionBootstrap emits, quoting included.
+void writeArgvEcho(const QString& path)
+{
+    QDir().mkpath(QFileInfo(path).absolutePath());
+    QFile script(path);
+    if (!script.open(QIODevice::WriteOnly))
+        return;
+    script.write("#!/bin/sh\nfor a in \"$@\"; do printf '[%s]' \"$a\"; done\n");
+    script.close();
+    script.setPermissions(QFileDevice::ReadOwner | QFileDevice::WriteOwner
+                          | QFileDevice::ExeOwner);
+}
+
+} // namespace
+
+
+// A remote process that execs fine and THEN explains itself before exiting is
+// the shape of every "the server side is not installed" failure — `sh` printing
+// which codeharbord entry points it looked for, node printing that a module is
+// missing. That explanation used to go only to channelDiagnostic(), which has
+// no consumer, so the user was handed "codeharbord channel closed" and nothing
+// else. error() is the only channel that reaches them, so the loss must carry
+// it — and must carry the DYING channel's words, not the other channel's
+// routine startup banner.
+void TstSessionBootstrap::channelLossCarriesThatChannelsLastRemoteWords()
+{
+    Harness h;
+    QVERIFY(h.wire());
+    QCOMPARE(h.boot.channels.size(), 2);
+
+    QSignalSpy errorSpy(&h.boot, &SessionBootstrap::error);
+    // The bridge greets every launch on stderr; that is chatter, not a verdict.
+    h.boot.channels.at(1)->writeStderr(
+        QStringLiteral("codeharbor-bridge listening on /run/user/1000/ch.sock"));
+    QCOMPARE(errorSpy.count(), 0);
+
+    // codeharbord's own last words, then EOF.
+    const QString complaint = QStringLiteral(
+        "codeharbor: no codeharbord entry point on this server. Tried: "
+        "/srv/codeharbor/dist/codeharbord.js, "
+        "/srv/codeharbor/remote/dist/codeharbord.js, "
+        "/srv/codeharbor/remote/src/codeharbord.ts");
+    h.boot.channels.at(0)->writeStderr(complaint);
+    h.boot.channels.at(0)->dropRemote();
+
+    QCOMPARE(errorSpy.count(), 1);
+    const QString reported = errorSpy.at(0).at(0).toString();
+    QVERIFY2(reported.contains(QStringLiteral("codeharbord channel closed")),
+             qPrintable(reported));
+    QVERIFY2(reported.contains(complaint), qPrintable(reported));
+    // The other channel's banner is NOT dragged into codeharbord's death.
+    QVERIFY2(!reported.contains(QStringLiteral("listening on")),
+             qPrintable(reported));
+}
 
 // SessionBootstrap::rpcCommand()/bridgeCommand() splice two ServerProfiles
 // fields — nodePath and repoRoot — into a string that an SSH exec request hands
@@ -1088,21 +1150,106 @@ void TstSessionBootstrap::remoteCommandsQuoteHostileProfileFields()
     }
 
     // ...and the quoting is not achieved by mangling honest values: a path with
-    // spaces still reaches the shell as ONE argument.
-    const QString spaced =
-        SessionBootstrap::rpcCommand(QStringLiteral("/opt/my node/bin/node"),
-                                     QStringLiteral("/srv/my repo"));
+    // spaces still reaches the shell as ONE argument — in the interpreter AND
+    // in the entry point it selects. The entry has to exist on disk now,
+    // because the command picks it ON THE SERVER; see
+    // remoteEntryPointsSupportBothReleaseAndCheckoutLayouts().
+    const QString spacedNode = dir.filePath(QStringLiteral("my node/bin/node"));
+    writeArgvEcho(spacedNode);
+    const QString spacedRoot = dir.filePath(QStringLiteral("my repo"));
+    const QString spacedEntry =
+        spacedRoot + QStringLiteral("/remote/src/codeharbord.ts");
+    QVERIFY(QDir().mkpath(QFileInfo(spacedEntry).absolutePath()));
+    QFile spacedFile(spacedEntry);
+    QVERIFY(spacedFile.open(QIODevice::WriteOnly));
+    spacedFile.close();
+
     QProcess argv;
     argv.setWorkingDirectory(dir.path());
-    // Replace the interpreter with a printf that echoes its argv, so the test
-    // observes the SPLIT the shell actually performed.
     argv.start(QStringLiteral("/bin/sh"),
                {QStringLiteral("-c"),
-                QString(spaced).replace(QStringLiteral("'/opt/my node/bin/node'"),
-                                        QStringLiteral("printf '[%s]'"))});
+                SessionBootstrap::rpcCommand(spacedNode, spacedRoot)});
     QVERIFY(argv.waitForFinished(15000));
     QCOMPARE(QString::fromUtf8(argv.readAllStandardOutput()),
-             QStringLiteral("[/srv/my repo/remote/src/codeharbord.ts][rpc][--stdio]"));
+             QStringLiteral("[%1][rpc][--stdio]").arg(spacedEntry));
+}
+
+// The client must be able to launch BOTH remote layouts, because it is the only
+// thing that gets to decide which one it can talk to. rpcCommand()/
+// bridgeCommand() used to hardcode <root>/remote/src/*.ts, so the client
+// required a full git checkout AND remote node >= 23.6 type-stripping — and the
+// release artifact codeharbor-remote.tar.gz (dist + package.json + sql,
+// .github/workflows/release.yml) was something nothing could consume.
+//
+// Selection happens ON THE SERVER, inside the exec we were issuing anyway: no
+// extra round trip per connect, no per-profile field for the user to answer,
+// and no window in which a client-side probe result goes stale before launch.
+// Driven here through a real /bin/sh against real files, so what is asserted is
+// the choice the remote login shell would actually make.
+void TstSessionBootstrap::remoteEntryPointsSupportBothReleaseAndCheckoutLayouts()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QString root = dir.path();
+    // The interpreter lives outside the candidate tree, so placing entry points
+    // never disturbs it.
+    const QString node = dir.filePath(QStringLiteral("bin/node"));
+    writeArgvEcho(node);
+
+    const auto place = [&root](const QString& relative) {
+        const QString path = root + QLatin1Char('/') + relative;
+        QDir().mkpath(QFileInfo(path).absolutePath());
+        QFile file(path);
+        file.open(QIODevice::WriteOnly);
+        file.close();
+        return path;
+    };
+
+    // Run one command exactly as the remote login shell would — no rewriting.
+    // `node` is the argv echo, so the entry the shell SELECTED is observable.
+    // Returns {stdout, stderr}.
+    const auto choose = [&root](const QString& command) {
+        QProcess sh;
+        sh.setWorkingDirectory(root);
+        sh.start(QStringLiteral("/bin/sh"), {QStringLiteral("-c"), command});
+        sh.closeWriteChannel();  // releases bridgeCommand's `cat` watchdog
+        sh.waitForFinished(15000);
+        return QStringList{QString::fromUtf8(sh.readAllStandardOutput()),
+                           QString::fromUtf8(sh.readAllStandardError())};
+    };
+
+    // (1) Nothing installed. The failure must NAME every path it tried, or
+    // "it doesn't launch" is unanswerable without an SSH session of your own.
+    const QStringList missing = choose(SessionBootstrap::rpcCommand(node, root));
+    QVERIFY2(missing.at(0).isEmpty(), qPrintable(missing.at(0)));
+    for (const QString& candidate :
+         SessionBootstrap::entryCandidates(root, QStringLiteral("codeharbord"))) {
+        QVERIFY2(missing.at(1).contains(candidate),
+                 qPrintable(QStringLiteral("stderr did not name %1:\n%2")
+                                .arg(candidate, missing.at(1))));
+    }
+
+    // (2) A plain dev checkout: TypeScript source, type-stripped by node.
+    const QString src = place(QStringLiteral("remote/src/codeharbord.ts"));
+    QCOMPARE(choose(SessionBootstrap::rpcCommand(node, root)).at(0),
+             QStringLiteral("[%1][rpc][--stdio]").arg(src));
+
+    // (3) That checkout, built: dist wins over src. It is what package.json bin
+    // points at, and it drops the node >= 23.6 requirement.
+    const QString built = place(QStringLiteral("remote/dist/codeharbord.js"));
+    QCOMPARE(choose(SessionBootstrap::rpcCommand(node, root)).at(0),
+             QStringLiteral("[%1][rpc][--stdio]").arg(built));
+
+    // (4) codeharbor-remote.tar.gz unpacked: dist/ beside package.json and
+    // sql/. THE RELEASE ARTIFACT — the layout a normal user actually installs.
+    const QString release = place(QStringLiteral("dist/codeharbord.js"));
+    QCOMPARE(choose(SessionBootstrap::rpcCommand(node, root)).at(0),
+             QStringLiteral("[%1][rpc][--stdio]").arg(release));
+
+    // The bridge resolves through the same ladder and keeps its stdin watchdog.
+    const QString bridge = place(QStringLiteral("dist/bridge.js"));
+    QCOMPARE(choose(SessionBootstrap::bridgeCommand(node, root)).at(0),
+             QStringLiteral("[%1]").arg(bridge));
 }
 
 // Guiless: nothing here needs a display, and QTEST_MAIN would pull in

@@ -25,12 +25,14 @@ import QtQuick.Controls.Basic
 //                    additionally recognised for colouring (case-insensitive)
 //   errorText        last failure; shown as a non-blocking banner while non-empty
 //   pendingHostKey   null, or {host, keyType, fingerprint} to prompt about
+//   pendingCredential null, or {user, host, prompt} to ask a secret for
 //
 // Outputs
 //   connectRequested(profileId)  connect using that stored profile
 //   profileSaved(fields)         create (fields.id === "") or update a profile
 //   profileRemoved(id)           delete that profile
 //   hostKeyDecision(accept)      answer for the pending host key
+//   credentialSubmitted(secret)  answer for the pending credential; "" cancels
 //   dismissed()                  user closed the sheet (Esc / Close / Cancel)
 Rectangle {
     id: root
@@ -41,11 +43,13 @@ Rectangle {
     property string connectionState: ""
     property string errorText: ""
     property var pendingHostKey: null
+    property var pendingCredential: null
 
     signal connectRequested(string profileId)
     signal profileSaved(var fields)
     signal profileRemoved(string id)
     signal hostKeyDecision(bool accept)
+    signal credentialSubmitted(string secret)
     signal dismissed()
 
     // ---- internal state ---------------------------------------------------
@@ -195,6 +199,20 @@ Rectangle {
             root.profileRemoved(root.editingId);
     }
 
+    // Hand the typed secret up and wipe it here in the same turn. This file
+    // keeps no copy of it and never routes it through the profile form, so it
+    // cannot reach profileSaved() and therefore cannot reach QSettings.
+    function submitSecret() {
+        var secret = secretField.text;
+        secretField.clear();
+        root.credentialSubmitted(secret);
+    }
+
+    function cancelSecret() {
+        secretField.clear();
+        root.credentialSubmitted("");   // empty == cancel, nothing is retried
+    }
+
     // ---- connection status vocabulary -------------------------------------
     //
     // `connectionState` is free-form text from the host. These map it onto the
@@ -212,6 +230,7 @@ Rectangle {
         case "authenticating": return "connecting";
         case "hostkey":
         case "hostkeycheck": return "hostkey";
+        case "credential": return "credential";
         case "reconnecting": return "reconnecting";
         case "failed":
         case "error":
@@ -225,6 +244,7 @@ Rectangle {
         case "connected": return "#a6e3a1";
         case "connecting": return "#f9e2af";
         case "hostkey": return "#f9e2af";
+        case "credential": return "#f9e2af";
         case "reconnecting": return "#fab387";
         case "failed": return "#f38ba8";
         default: return "#6c7086";
@@ -238,6 +258,7 @@ Rectangle {
         case "connected": return "\u2713";    // check
         case "connecting": return "\u2219";   // bullet operator
         case "hostkey": return "?";
+        case "credential": return "*";        // the password mask
         case "reconnecting": return "\u21bb"; // clockwise open circle arrow
         case "failed": return "\u2715";       // multiplication x
         default: return "\u2013";             // en dash: nothing is running
@@ -249,6 +270,7 @@ Rectangle {
     function stateRadius(state) {
         switch (root.stateKey(state)) {
         case "hostkey":
+        case "credential":
         case "failed": return 3;
         default: return 7;
         }
@@ -256,7 +278,8 @@ Rectangle {
 
     function stateBusy(state) {
         const key = root.stateKey(state);
-        return key === "connecting" || key === "hostkey" || key === "reconnecting";
+        return key === "connecting" || key === "hostkey" || key === "credential"
+            || key === "reconnecting";
     }
 
     // One sentence saying what the state means for the person looking at it;
@@ -266,6 +289,7 @@ Rectangle {
         case "connected": return qsTr("Linked to the server.");
         case "connecting": return qsTr("Opening the SSH connection\u2026");
         case "hostkey": return qsTr("Waiting for you to accept this server's host key.");
+        case "credential": return qsTr("Waiting for a password or key passphrase.");
         case "reconnecting": return qsTr("The link dropped; trying to restore it\u2026");
         case "failed": return qsTr("The last attempt failed. See the message below.");
         default: return qsTr("Not connected to any server.");
@@ -284,10 +308,22 @@ Rectangle {
         else if (root.visible)
             profileSelector.forceActiveFocus();
     }
+    onPendingCredentialChanged: {
+        // Cleared on BOTH edges: on open so a previous attempt's keystrokes can
+        // never be resubmitted, and on close so the secret is not left sitting
+        // in a live QML item (and its undo stack) after it has been spent.
+        secretField.clear();
+        if (root.pendingCredential)
+            secretField.forceActiveFocus();
+        else if (root.visible)
+            profileSelector.forceActiveFocus();
+    }
     Component.onCompleted: root.syncFromModel()
 
     Keys.onEscapePressed: (event) => {
-        if (root.pendingHostKey)
+        if (root.pendingCredential)
+            root.cancelSecret();
+        else if (root.pendingHostKey)
             root.hostKeyDecision(false);
         else
             root.dismissed();
@@ -1014,6 +1050,131 @@ Rectangle {
                         accent: "#f9e2af"
                         text: qsTr("Accept and remember")
                         onClicked: root.hostKeyDecision(true)
+                    }
+                }
+            }
+        }
+    }
+
+    // ---- password / key passphrase prompt ----------------------------------
+    // Raised when the SSH pool asked for a credential and the attempt was
+    // deliberately refused so the user could be asked (AppController's
+    // credentialPrompt). Covers the sheet for the same reason the host-key
+    // panel does: the connection everything else here is about is parked on
+    // this one answer.
+    //
+    // The secret exists in `secretField` and nowhere else in this file.
+    Rectangle {
+        id: credentialPrompt
+        objectName: "credentialPrompt"
+        anchors.fill: parent
+        anchors.margins: 1
+        radius: 6
+        color: "#e61e1e2e"
+        visible: root.pendingCredential ? true : false
+
+        // Swallow every click so the sheet underneath stays untouchable while
+        // the prompt is up.
+        MouseArea {
+            anchors.fill: parent
+            acceptedButtons: Qt.AllButtons
+            hoverEnabled: true
+        }
+
+        Rectangle {
+            id: credentialPanel
+            anchors.centerIn: parent
+            width: Math.min(520, credentialPrompt.width - 48)
+            height: credentialColumn.implicitHeight + 32
+            radius: 6
+            color: "#181825"
+            border.width: 1
+            border.color: "#89b4fa"
+
+            Column {
+                id: credentialColumn
+                anchors.centerIn: parent
+                width: credentialPanel.width - 32
+                spacing: 8
+
+                Label {
+                    text: qsTr("Authentication required")
+                    color: "#89b4fa"
+                    font.bold: true
+                    font.pixelSize: 14
+                }
+                Label {
+                    objectName: "credentialTarget"
+                    width: parent.width
+                    wrapMode: Text.WordWrap
+                    // PlainText for the same reason as the host-key panel: the
+                    // user and host are echoed back from configuration the app
+                    // does not control, and markup must not be able to restyle
+                    // or hide which account is about to be authenticated.
+                    textFormat: Text.PlainText
+                    color: "#cdd6f4"
+                    font.pixelSize: 12
+                    text: qsTr("ssh-agent and the default keys could not authenticate %1@%2.")
+                          .arg(root.textOf(root.pendingCredential, "user"))
+                          .arg(root.textOf(root.pendingCredential, "host"))
+                }
+                TextField {
+                    id: secretField
+                    objectName: "credentialField"
+                    width: parent.width
+                    // The masked field this whole item exists for.
+                    echoMode: TextInput.Password
+                    passwordCharacter: "\u2022"
+                    // A masked field must not offer to complete or correct what
+                    // was typed into it, and must not be copyable by mouse.
+                    selectByMouse: false
+                    inputMethodHints: Qt.ImhHiddenText | Qt.ImhSensitiveData
+                                      | Qt.ImhNoAutoUppercase | Qt.ImhNoPredictiveText
+                    color: "#cdd6f4"
+                    placeholderTextColor: "#585b70"
+                    placeholderText: root.textOf(root.pendingCredential, "prompt") === ""
+                                     ? qsTr("Password or key passphrase")
+                                     : root.textOf(root.pendingCredential, "prompt")
+                    font.pixelSize: 13
+                    background: Rectangle {
+                        color: "#11111b"
+                        radius: 3
+                        border.width: 1
+                        border.color: secretField.activeFocus ? "#89b4fa" : "#313244"
+                    }
+                    onAccepted: {
+                        if (secretField.text.length > 0)
+                            root.submitSecret();
+                    }
+                    Keys.onEscapePressed: (event) => {
+                        root.cancelSecret();
+                        event.accepted = true;
+                    }
+                }
+                Label {
+                    width: parent.width
+                    wrapMode: Text.WordWrap
+                    color: "#6c7086"
+                    font.pixelSize: 11
+                    text: qsTr("Used for this one connection and then discarded. CodeHarbor never stores it.")
+                }
+
+                Row {
+                    anchors.right: parent.right
+                    spacing: 8
+
+                    SheetButton {
+                        objectName: "credentialCancelButton"
+                        accent: "#89b4fa"
+                        text: qsTr("Cancel")
+                        onClicked: root.cancelSecret()
+                    }
+                    SheetButton {
+                        objectName: "credentialSubmitButton"
+                        accent: "#a6e3a1"
+                        text: qsTr("Authenticate")
+                        enabled: secretField.text.length > 0
+                        onClicked: root.submitSecret()
                     }
                 }
             }

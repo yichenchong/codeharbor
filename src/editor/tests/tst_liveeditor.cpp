@@ -314,6 +314,18 @@ constexpr auto kJsClickReload = R"JS(
 })()
 )JS";
 
+// Monaco's OWN read-only option, read off the editor instance the bundle
+// created. This is the thing that actually decides whether keystrokes mutate
+// the model, so it is the only page-side answer worth asserting.
+constexpr auto kJsReadReadOnly = R"JS(
+(function () {
+    try {
+        var editor = window.monaco.editor.getEditors()[0];
+        return "RO:" + editor.getOption(window.monaco.editor.EditorOption.readOnly);
+    } catch (e) { return "ERR:" + e; }
+})()
+)JS";
+
 // Insert text at the end of the buffer through Monaco's own type handler — the
 // same command path a keystroke takes — so the PAGE is the source of the edit.
 QString jsTypeAtEnd(const QString &text)
@@ -374,6 +386,9 @@ private slots:
     void pageEditSavesToRemoteDisk();
     // (4) SPEC 8.6 live: stale revision refused, page's Reload recovers.
     void staleRevisionIsRejectedAndReloadRecovers();
+    // (5) SPEC 8.2 live: a real chmod 444 remote file is read-only in Monaco,
+    //     refuses to save, and becomes editable again when the mode is restored.
+    void unwritableRemoteFileIsReadOnlyInMonaco();
 
 private:
     // Start the ONE out-of-band shell channel every remoteExec() rides on.
@@ -984,6 +999,150 @@ void TstLiveEditor::staleRevisionIsRejectedAndReloadRecovers()
     qInfo("remote bytes after recovery save = \"%s\"", qPrintable(oneLine(finalBytes)));
 
     m_loadedRevision = finalRevision;
+}
+
+// ---------------------------------------------------------------------------
+// (5) SPEC 8.2, live: a file the session user genuinely cannot write.
+//
+// Read-only used to be a setter nobody called, so an unwritable file opened
+// freely editable, accepted keystrokes, snapshotted them for crash recovery and
+// only failed at save time. Everything here is real: a chmod 444 file on the
+// fixture host, the production pane, Monaco's own readOnly option, and the
+// bytes on the remote disk read back on an independent ssh channel.
+// ---------------------------------------------------------------------------
+void TstLiveEditor::unwritableRemoteFileIsReadOnlyInMonaco()
+{
+    QVERIFY2(m_controller != nullptr, "the pane never came up; see the load case");
+
+    QByteArray out;
+    QString err;
+
+    // Mode bits mean nothing to root, and the derivation deliberately declines
+    // to guess at a euid it cannot see. Say so out loud rather than passing
+    // vacuously on a root fixture.
+    QVERIFY(remoteExec(QStringLiteral("id -u"), &out, &err));
+    if (QString::fromUtf8(out).trimmed() == QLatin1String("0"))
+        QSKIP("the fixture user is root, for whom 0444 is still writable");
+
+    const QString lockedPath = m_remoteDir + QStringLiteral("/locked.txt");
+    const QString lockedContent =
+        QStringLiteral("read-only fixture %1\n").arg(m_marker);
+    const QString recoveryPath =
+        m_remoteDir + QStringLiteral("/.codeharbor-recovery/locked.txt");
+
+    QVERIFY2(remoteExec(QStringLiteral("printf '%s\\n' ")
+                            + sq(QStringLiteral("read-only fixture ") + m_marker)
+                            + QStringLiteral(" > ") + sq(lockedPath)
+                            + QStringLiteral(" && chmod 444 ") + sq(lockedPath)
+                            + QStringLiteral(" && test ! -w ") + sq(lockedPath)
+                            + QStringLiteral(" && echo LOCKED_OK"),
+                        &out, &err),
+             qPrintable(QStringLiteral("locking the fixture file timed out: %1").arg(err)));
+    QVERIFY2(out.contains("LOCKED_OK"),
+             qPrintable(QStringLiteral("could not create an unwritable file: out=%1 err=%2")
+                            .arg(QString::fromUtf8(out), err)));
+
+    // Open it in the SAME controller the page is bridged to, so every signal
+    // below crosses the real WebChannel into the real bundle.
+    QSignalSpy contentSpy(m_controller, &EditorController::contentLoaded);
+    m_controller->open(lockedPath);
+    QVERIFY2(waitFor([&] { return contentSpy.count() >= 1; }, kSignalTimeoutMs),
+             qPrintable(QStringLiteral("the locked file never loaded; fileState=%1")
+                            .arg(m_controller->fileState())));
+    QCOMPARE(contentSpy.at(0).at(0).toString(), lockedContent);
+
+    // C++ derived it from the server's own file.stat — nothing told it.
+    QVERIFY2(waitFor([&] { return m_controller->readOnly(); }, kSignalTimeoutMs),
+             "an unwritable remote file was not derived as read-only");
+
+    // ...and it REACHED the page: Monaco's own option, not a mirror of ours.
+    QString ro;
+    QVERIFY2(waitFor([&] {
+                 ro = runJs(QString::fromLatin1(kJsReadReadOnly));
+                 return ro == QLatin1String("RO:true");
+             }, kSignalTimeoutMs),
+             qPrintable(QStringLiteral("monaco is still editable: %1").arg(ro)));
+
+    // The option is not decoration: a type command through Monaco's own handler
+    // — the path a keystroke takes — leaves the model untouched.
+    QVERIFY2(waitFor([&] { return monacoValue() == lockedContent; }, kSignalTimeoutMs),
+             "monaco never adopted the locked file's bytes");
+    typeInPage(QStringLiteral("this must not appear\n"));
+    QCOMPARE(monacoValue(), lockedContent);
+
+    // Ctrl+S is a no-op the page swallows: mountEditor()'s binding checks
+    // readOnly before it ever calls bridge.save(). Dispatched at every input
+    // surface, then given a window in which ANY save outcome would show up.
+    QSignalSpy savedSpy(m_controller, &EditorController::saved);
+    QSignalSpy conflictSpy(m_controller, &EditorController::saveConflict);
+    QSignalSpy errorSpy(m_controller, &EditorController::saveError);
+    for (const QString &target :
+         QStringList{QStringLiteral(R"(document.querySelector(".monaco-editor textarea.inputarea"))"),
+                     QStringLiteral(R"(document.querySelector(".monaco-editor .native-edit-context"))"),
+                     QStringLiteral(R"(window.monaco.editor.getEditors()[0].getContainerDomNode())")}) {
+        runJs(jsCtrlS(target));
+    }
+    QTest::qWait(3000);
+    QCOMPARE(savedSpy.count(), 0);
+    QCOMPARE(conflictSpy.count(), 0);
+
+    // The other half of the guard, and the one that matters for the page's own
+    // conflict/error notices: they call bridge.save() DIRECTLY, past the key
+    // binding's check. The controller refuses with a reason instead of issuing a
+    // write that dies as EACCES.
+    m_controller->save(QStringLiteral("this must not reach the disk\n"),
+                       m_controller->revision());
+    QVERIFY2(waitFor([&] { return errorSpy.count() == 1; }, kSignalTimeoutMs),
+             "a read-only save produced no explanation");
+    QVERIFY2(errorSpy.at(0).at(0).toString().contains(QStringLiteral("read-only"),
+                                                      Qt::CaseInsensitive),
+             qPrintable(errorSpy.at(0).at(0).toString()));
+    QCOMPARE(savedSpy.count(), 0);
+
+    // Nothing was written, and nothing was left behind: no crash-recovery
+    // snapshot can accumulate for a buffer that could never be saved (SPEC 11.3).
+    m_controller->reportContent(QStringLiteral("not a snapshot\n"));
+    QTest::qWait(1000);
+    QVERIFY(remoteExec(QStringLiteral("cat -- ") + sq(lockedPath), &out, &err));
+    QCOMPARE(QString::fromUtf8(out), lockedContent);
+    QVERIFY(remoteExec(QStringLiteral("test -e ") + sq(recoveryPath)
+                           + QStringLiteral(" && echo SNAPSHOT || echo NO_SNAPSHOT"),
+                       &out, &err));
+    QVERIFY2(out.contains("NO_SNAPSHOT"),
+             "a read-only buffer left a recovery snapshot that could never be applied");
+
+    qInfo("chmod 444 %s -> monaco readOnly=%s, save refused, disk untouched",
+          qPrintable(lockedPath), qPrintable(ro));
+
+    // Restore the mode: read-only is DERIVED, not latched, so a reload must give
+    // the file back. A verdict that never lifts is its own bug.
+    QVERIFY(remoteExec(QStringLiteral("chmod 644 ") + sq(lockedPath)
+                           + QStringLiteral(" && echo UNLOCK_OK"),
+                       &out, &err));
+    QVERIFY2(out.contains("UNLOCK_OK"), qPrintable(QString::fromUtf8(out) + err));
+
+    m_controller->requestReload();
+    QVERIFY2(waitFor([&] { return !m_controller->readOnly(); }, kSignalTimeoutMs),
+             "a re-writable file stayed read-only: the verdict was latched");
+    QVERIFY2(waitFor([&] {
+                 ro = runJs(QString::fromLatin1(kJsReadReadOnly));
+                 return ro == QLatin1String("RO:false");
+             }, kSignalTimeoutMs),
+             qPrintable(QStringLiteral("monaco stayed locked: %1").arg(ro)));
+
+    // And the buffer is genuinely usable again, all the way to the disk.
+    typeInPage(QStringLiteral("editable again\n"));
+    const QString expected = monacoValue();
+    QVERIFY(expected.contains(QStringLiteral("editable again")));
+    m_controller->save(expected, m_controller->revision());
+    QVERIFY2(waitFor([&] { return savedSpy.count() == 1; }, kSignalTimeoutMs),
+             qPrintable(QStringLiteral("the unlocked file would not save. errors=%1 state=%2")
+                            .arg(errorSpy.count())
+                            .arg(m_controller->fileState())));
+    QVERIFY(remoteExec(QStringLiteral("cat -- ") + sq(lockedPath), &out, &err));
+    QCOMPARE(QString::fromUtf8(out), expected);
+
+    qInfo("chmod 644 + reload -> monaco readOnly=false, save landed on disk");
 }
 
 // QTEST_MAIN cannot be used: the internal URL scheme must be registered and

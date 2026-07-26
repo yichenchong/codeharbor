@@ -8,6 +8,7 @@
 #include <QDir>
 #include <QJsonObject>
 #include <QPointer>
+#include <QTimer>
 
 namespace ch {
 
@@ -204,11 +205,11 @@ void AppController::setConnectionState(const QString& state, const QString& err)
 
 void AppController::connectToProfile(QString profileId)
 {
-    startConnect(profileId, QString());
+    startConnect(profileId, QString(), QString());
 }
 
 void AppController::startConnect(const QString& profileId,
-                                 QString acceptedFingerprint)
+                                 QString acceptedFingerprint, QString secret)
 {
     if (!m_bootstrap || !m_profiles || !m_pool)
         return;
@@ -230,6 +231,14 @@ void AppController::startConnect(const QString& profileId,
     m_pendingProfileId = profileId;
     m_pendingFingerprint.clear();
     m_pendingHostKeyInfo = {};
+    // Remembered for the whole chain, so a credential retry re-pins the key the
+    // user already approved rather than asking about it all over again: a
+    // connect refused at the AUTH stage never reached the code that persists a
+    // newly trusted key, so the next attempt would meet it as Unknown again.
+    m_approvedFingerprint = acceptedFingerprint;
+    m_credentialRequested = false;
+    m_credentialUser.clear();
+    m_credentialLabel.clear();
     setConnectionState(QStringLiteral("connecting"));
 
     // Unknown key: refuse THIS attempt, remember the fingerprint, and let the
@@ -274,6 +283,48 @@ void AppController::startConnect(const QString& profileId,
             return SshConnectionPool::HostKeyDecision::Reject;
         });
 
+    // Credentials: same shape as the host key above, and for the same reason.
+    // SshConnectionPool::authenticate() calls this from INSIDE the blocking
+    // libssh handshake (agent -> default key -> here), on the GUI thread. A
+    // dialog raised there would re-enter the UI mid-authentication — precisely
+    // the hazard the host-key flow was rewritten to avoid. So the first attempt
+    // is REFUSED (an empty return aborts auth), the user is asked, and
+    // submitCredential() re-runs the whole connect with the answer in hand.
+    //
+    // Until this existed, setCredentialCallback() had no caller outside tests:
+    // the pool could ask for a password and the product had no way to answer,
+    // so a passphrase-protected key or a desktop with no loaded agent — the
+    // stock case on Windows and macOS — dead-ended at "authentication failed"
+    // with no prompt.
+    //
+    // The secret is captured BY VALUE and consumed exactly once: it is cleared
+    // out of the capture the instant it is handed over, so the reconnect ladder
+    // running through this same installed callback can never replay a password
+    // at whatever host it happens to be dialling. It is never assigned to a
+    // member, never reaches a ServerProfiles field or QSettings, and is never
+    // logged.
+    m_pool->setCredentialCallback(
+        [self, secret = std::move(secret)](const QString& user,
+                                           const QString& prompt) mutable {
+            if (!self)
+                return QString();
+            if (!secret.isEmpty()) {
+                const QString once = secret;
+                secret.clear();  // one shot, for this attempt only
+                return once;
+            }
+            // Only an attempt WE started may arm a prompt, for the same reason
+            // the host-key callback checks this: an automatic reconnect has
+            // nobody waiting on an answer, and arming a prompt from one would
+            // park a dialog nothing ever resolves.
+            if (!self->m_connecting)
+                return QString();
+            self->m_credentialRequested = true;
+            self->m_credentialUser = user;
+            self->m_credentialLabel = prompt;
+            return QString();
+        });
+
     const bool ok = m_bootstrap->connectAndWire(
         profile.value(QStringLiteral("host")).toString(),
         static_cast<quint16>(profile.value(QStringLiteral("port")).toInt()),
@@ -286,6 +337,10 @@ void AppController::startConnect(const QString& profileId,
         m_heldConnectError.clear();
         m_pendingFingerprint.clear();
         m_pendingHostKeyInfo = {};
+        m_approvedFingerprint.clear();
+        m_credentialRequested = false;
+        m_credentialUser.clear();
+        m_credentialLabel.clear();
         m_profiles->setActiveId(profileId);
         return;  // wired() -> adoptServerIdentity()
     }
@@ -301,7 +356,22 @@ void AppController::startConnect(const QString& profileId,
                            m_pendingFingerprint);
         return;
     }
+    if (m_credentialRequested) {
+        // The server wants a password or a key passphrase, and neither the
+        // agent nor a default identity could supply one. Like the host-key
+        // refusal above this is EXPECTED, not a fault: the attempt is parked on
+        // the user's answer with m_connecting still set, so nothing can start a
+        // second one underneath it and swap m_pendingProfileId out from under
+        // submitCredential().
+        m_heldConnectError.clear();
+        setConnectionState(QStringLiteral("credential"));
+        emit credentialPrompt(m_credentialUser,
+                              profile.value(QStringLiteral("host")).toString(),
+                              m_credentialLabel);
+        return;
+    }
     m_connecting = false;
+    m_approvedFingerprint.clear();
     // A genuine failure: report it now that we know it was not the host-key path.
     if (!m_heldConnectError.isEmpty()) {
         const QString held = m_heldConnectError;
@@ -325,13 +395,45 @@ void AppController::resolveHostKey(bool accept)
     const QString profileId = m_pendingProfileId;
     m_pendingFingerprint.clear();
     m_pendingHostKeyInfo = {};
+    m_approvedFingerprint.clear();
     m_connecting = false;  // the parked attempt ends here, either way
 
     if (!accept || profileId.isEmpty()) {
         setConnectionState(QStringLiteral("disconnected"));
         return;
     }
-    startConnect(profileId, fingerprint);
+    startConnect(profileId, fingerprint, QString());
+}
+
+void AppController::submitCredential(QString secret)
+{
+    // Only meaningful while a prompt WE raised is outstanding — the same guard
+    // resolveHostKey() carries, and for the same reason: a sheet left open
+    // behind a live session must not be able to redial it.
+    if (!m_connecting || !m_credentialRequested)
+        return;
+
+    const QString profileId = m_pendingProfileId;
+    // The key the user approved earlier in THIS chain, re-pinned for the retry
+    // so the host-key prompt does not reappear behind the password prompt.
+    const QString fingerprint = m_approvedFingerprint;
+    m_credentialRequested = false;
+    m_credentialUser.clear();
+    m_credentialLabel.clear();
+    m_approvedFingerprint.clear();
+    m_connecting = false;  // the parked attempt ends here, either way
+
+    if (secret.isEmpty() || profileId.isEmpty()) {
+        // Cancelled. Nothing is retried and nothing is kept.
+        setConnectionState(QStringLiteral("disconnected"));
+        return;
+    }
+    // Moved, not copied: this frame keeps no second reference to the secret,
+    // and startConnect() moves it straight into the pool callback that spends
+    // it. A WRONG secret simply fails the one attempt it was given (the pool
+    // never asks twice for the same handshake), so the state machine lands in
+    // "failed" with the auth error rather than looping or wedging.
+    startConnect(profileId, fingerprint, std::move(secret));
 }
 
 void AppController::disconnectServer()
@@ -343,6 +445,10 @@ void AppController::disconnectServer()
     m_connecting = false;
     m_pendingFingerprint.clear();
     m_pendingHostKeyInfo = {};
+    m_approvedFingerprint.clear();
+    m_credentialRequested = false;
+    m_credentialUser.clear();
+    m_credentialLabel.clear();
 
     // Scope-guarded so an early return or a throw inside the teardown cannot
     // leave errors permanently muted. The guard is the ONLY thing bounding the
@@ -395,9 +501,46 @@ void AppController::adoptServerIdentity()
                            emit self->error(err->message);
                            return;
                        }
-                       const QString id = result.toObject()
-                                              .value(QStringLiteral("serverId"))
-                                              .toString();
+                       const QJsonObject info = result.toObject();
+                       // Compatibility gate, BEFORE anything is adopted.
+                       // `schemaVersion` was parsed and then never checked, so
+                       // a client one release ahead of its codeharbord keyed
+                       // the whole workspace to the empty serverId an older
+                       // server does not report — a healthy SSH session with a
+                       // permanently empty sidebar and nothing on screen saying
+                       // why. Version skew is the DEFAULT state under manual
+                       // deployment, so it gets a real message.
+                       const int schema =
+                           info.value(QStringLiteral("schemaVersion")).toInt(0);
+                       if (schema < kMinimumServerSchemaVersion) {
+                           const QString remoteVersion =
+                               info.value(QStringLiteral("version")).toString();
+                           const QString message =
+                               tr("Server too old: codeharbord %1 speaks "
+                                  "workspace schema %2, but this client needs "
+                                  "schema %3 or newer. Update the CodeHarbor "
+                                  "remote on that host and reconnect.")
+                                   .arg(remoteVersion.isEmpty()
+                                            ? tr("(version not reported)")
+                                            : remoteVersion)
+                                   .arg(schema)
+                                   .arg(kMinimumServerSchemaVersion);
+                           emit self->error(message);
+                           // Refuse rather than limp on. Deferred by one event-
+                           // loop turn because we are INSIDE a
+                           // CodeharbordClient response callback and the
+                           // teardown drops that very client's transport.
+                           QTimer::singleShot(0, self, [self, message] {
+                               if (!self)
+                                   return;
+                               self->disconnectServer();
+                               self->setConnectionState(
+                                   QStringLiteral("failed"), message);
+                           });
+                           return;
+                       }
+                       const QString id =
+                           info.value(QStringLiteral("serverId")).toString();
                        if (id.isEmpty()) {
                            emit self->error(
                                tr("Server did not report an identity; refusing to "

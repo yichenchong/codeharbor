@@ -44,6 +44,7 @@
 #include <QQmlContext>
 #include <QQmlEngine>
 #include <QQuickItem>
+#include <QQuickWindow>
 #include <QSet>
 #include <QStandardPaths>
 #include <QString>
@@ -277,6 +278,18 @@ private slots:
     void terminalScrollbackSurvivesASplit();
     void unsavedEditorBufferSurvivesASplit();
 
+    // FOCUS (SPEC 4.5). The region must be able to say WHICH pane the user is
+    // working in, or every split command lands on the region's first leaf.
+    void regionReportsNoFocusUntilAPaneIsUsed();
+    void clickingAPaneReportsItsPaneId();
+    void focusSurvivesASplit();
+    void closingTheFocusedPaneClearsTheFocus();
+    void nestedPaneFocusReachesTheRootRegion();
+    void terminalPaneReportsFocusThroughItsChrome();
+    // The one that decides whether any of the above is worth wiring: a click
+    // INSIDE the live web page, not on the pane's chrome.
+    void aClickInsideTheLivePageReportsFocusAndStillReachesThePage();
+
 private:
     QObject *openRegion(const QString &file, const QVariantMap &node, bool terminal);
     void setNode(const QVariantMap &node);
@@ -285,6 +298,8 @@ private:
     // Wait until the pane's page has loaded; false means Chromium never got
     // there (a machine property — callers QSKIP rather than fail).
     bool waitForPage(QObject *paneItem, const QString &readyProbe, const QString &needle);
+    // Click the middle of a pane, the way a user selects it.
+    void clickPane(QObject *paneObject);
 
     ch::CodeharbordClient m_client;
     ch::ViewerProfiles m_profiles{&m_client};
@@ -665,6 +680,212 @@ void TstPaneIdentity::unsavedEditorBufferSurvivesASplit()
                                            "shows: %1")
                                 .arg(text.left(400))));
     }
+}
+
+// ---------------------------------------------------------------------------
+// (6) FOCUS. Splitting is "give me a pane next to the one I am working in", so
+// the command needs to know which pane that IS. Only the pane can say: its
+// content is usually a WebEngine page, and focus inside a page is Chromium's
+// own state which never surfaces as QML activeFocus. Each pane therefore
+// reports the click that put focus there, and the ROOT region republishes it as
+// `focusedPaneId` — the property the host persists as selectedPane.
+//
+// Untested, this is invisible: the region still lays out correctly, the split
+// still produces the right number of panes, and the only symptom is that the
+// new pane appears next to the WRONG one.
+// ---------------------------------------------------------------------------
+void TstPaneIdentity::clickPane(QObject *paneObject)
+{
+    auto *item = qobject_cast<QQuickItem *>(paneObject);
+    QVERIFY2(item != nullptr, "no such pane to click");
+    auto *window = qobject_cast<QQuickWindow *>(m_shell.get());
+    QVERIFY2(window != nullptr, "the test shell is not a window");
+    // A zero-extent pane would make every click below a false pass: the event
+    // would land on whatever else occupies that point.
+    QVERIFY2(item->width() > 4 && item->height() > 4,
+             qPrintable(QStringLiteral("the pane has no area to click: %1x%2")
+                            .arg(item->width())
+                            .arg(item->height())));
+    const QPointF centre = item->mapToScene(QPointF(item->width() / 2, item->height() / 2));
+    QTest::mouseClick(window, Qt::LeftButton, Qt::NoModifier, centre.toPoint());
+}
+
+void TstPaneIdentity::regionReportsNoFocusUntilAPaneIsUsed()
+{
+    QVERIFY(openRegion(QStringLiteral("ViewerRegion.qml"), leafNode(QStringLiteral("viewer-1")),
+                       /*terminal=*/false));
+    const auto panes = [this] { return collect(m_region, isLeafPane); };
+    QTRY_VERIFY(panes().size() == 1);
+    QTest::qWait(kSettleMs);
+
+    QVERIFY2(m_region->property("focusedPaneId").toString().isEmpty(),
+             "a region nobody has touched claims a focused pane; the host would persist a "
+             "selection the user never made");
+}
+
+void TstPaneIdentity::clickingAPaneReportsItsPaneId()
+{
+    QVERIFY(openRegion(QStringLiteral("ViewerRegion.qml"),
+                       branchNode(QStringLiteral("horizontal"),
+                                  QVariantList{leafNode(QStringLiteral("viewer-1")),
+                                               leafNode(QStringLiteral("viewer-2"))}),
+                       /*terminal=*/false));
+    const auto panes = [this] { return collect(m_region, isLeafPane); };
+    QTRY_VERIFY(panes().size() == 2);
+    QTest::qWait(kSettleMs);
+
+    clickPane(paneWithId(m_region, QStringLiteral("viewer-2")));
+    QTRY_COMPARE(m_region->property("focusedPaneId").toString(), QStringLiteral("viewer-2"));
+
+    // And it FOLLOWS the user, rather than latching onto the first pane ever
+    // clicked — a "focus" that only ever moves one way is no better than the
+    // first-leaf guess it replaces.
+    clickPane(paneWithId(m_region, QStringLiteral("viewer-1")));
+    QTRY_COMPARE(m_region->property("focusedPaneId").toString(), QStringLiteral("viewer-1"));
+}
+
+void TstPaneIdentity::focusSurvivesASplit()
+{
+    QVERIFY(openRegion(QStringLiteral("ViewerRegion.qml"), leafNode(QStringLiteral("viewer-1")),
+                       /*terminal=*/false));
+    const auto panes = [this] { return collect(m_region, isLeafPane); };
+    QTRY_VERIFY(panes().size() == 1);
+    QTest::qWait(kSettleMs);
+
+    clickPane(panes().constFirst());
+    QTRY_COMPARE(m_region->property("focusedPaneId").toString(), QStringLiteral("viewer-1"));
+
+    setNode(branchNode(QStringLiteral("horizontal"),
+                       QVariantList{leafNode(QStringLiteral("viewer-1")),
+                                    leafNode(QStringLiteral("viewer-2"))}));
+    QTRY_VERIFY(panes().size() == 2);
+    QTest::qWait(kSettleMs);
+
+    // The split the user just asked for must not lose the answer to "which pane
+    // did they ask it FROM" — the very next command needs it too.
+    QCOMPARE(m_region->property("focusedPaneId").toString(), QStringLiteral("viewer-1"));
+
+    // ...and the re-homed pane is still WIRED. A pane that kept its id but lost
+    // its focus connection across the re-parent would go quiet, and the region
+    // would be stuck reporting a stale pane forever.
+    clickPane(paneWithId(m_region, QStringLiteral("viewer-2")));
+    QTRY_COMPARE(m_region->property("focusedPaneId").toString(), QStringLiteral("viewer-2"));
+    clickPane(paneWithId(m_region, QStringLiteral("viewer-1")));
+    QTRY_COMPARE(m_region->property("focusedPaneId").toString(), QStringLiteral("viewer-1"));
+}
+
+void TstPaneIdentity::closingTheFocusedPaneClearsTheFocus()
+{
+    QVERIFY(openRegion(QStringLiteral("ViewerRegion.qml"),
+                       branchNode(QStringLiteral("horizontal"),
+                                  QVariantList{leafNode(QStringLiteral("viewer-1")),
+                                               leafNode(QStringLiteral("viewer-2"))}),
+                       /*terminal=*/false));
+    const auto panes = [this] { return collect(m_region, isLeafPane); };
+    QTRY_VERIFY(panes().size() == 2);
+    QTest::qWait(kSettleMs);
+
+    clickPane(paneWithId(m_region, QStringLiteral("viewer-2")));
+    QTRY_COMPARE(m_region->property("focusedPaneId").toString(), QStringLiteral("viewer-2"));
+
+    // Exactly what "close this pane" publishes: the survivor, alone.
+    setNode(leafNode(QStringLiteral("viewer-1")));
+    QTRY_VERIFY(panes().size() == 1);
+    QTest::qWait(kSettleMs);
+
+    // Keeping the closed pane's id would aim the next split at a pane that does
+    // not exist, and the host would go on persisting it.
+    QCOMPARE(m_region->property("focusedPaneId").toString(), QString());
+}
+
+void TstPaneIdentity::nestedPaneFocusReachesTheRootRegion()
+{
+    QVERIFY(openRegion(
+        QStringLiteral("ViewerRegion.qml"),
+        branchNode(QStringLiteral("horizontal"),
+                   QVariantList{leafNode(QStringLiteral("viewer-1")),
+                                branchNode(QStringLiteral("vertical"),
+                                           QVariantList{leafNode(QStringLiteral("viewer-2")),
+                                                        leafNode(QStringLiteral("viewer-3"))})}),
+        /*terminal=*/false));
+    const auto panes = [this] { return collect(m_region, isLeafPane); };
+    QTRY_VERIFY(panes().size() == 3);
+    QTest::qWait(kSettleMs);
+
+    // A pane two levels down reports to the ROOT, which is the region the host
+    // holds: focus that only reached the intervening region would be invisible.
+    clickPane(paneWithId(m_region, QStringLiteral("viewer-3")));
+    QTRY_COMPARE(m_region->property("focusedPaneId").toString(), QStringLiteral("viewer-3"));
+
+    clickPane(paneWithId(m_region, QStringLiteral("viewer-2")));
+    QTRY_COMPARE(m_region->property("focusedPaneId").toString(), QStringLiteral("viewer-2"));
+}
+
+void TstPaneIdentity::terminalPaneReportsFocusThroughItsChrome()
+{
+    QVERIFY(openRegion(QStringLiteral("TerminalRegion.qml"), leafNode(QStringLiteral("terminal-1")),
+                       /*terminal=*/true));
+    const auto panes = [this] { return collect(m_region, isLeafPane); };
+    QTRY_VERIFY(panes().size() == 1);
+    QTest::qWait(kSettleMs);
+
+    // A terminal pane is layered — renderer, full-pane placeholder, banner — and
+    // the click sniffer has to sit above ALL of it, or a pane that has not come
+    // up yet (or one showing a drop banner) would be unfocusable.
+    clickPane(panes().constFirst());
+    QTRY_COMPARE(m_region->property("focusedPaneId").toString(), QStringLiteral("terminal-1"));
+}
+
+// ---------------------------------------------------------------------------
+// (7) The claim the whole mechanism rests on. "Focus follows the pane you are
+// working in" is only true if a click that lands in the LIVE page — the xterm
+// screen the user is typing at, not the placeholder chrome around it — is what
+// updates the region. If it were not, focus would only move when the user
+// clicked pane furniture, which almost never happens, and the tracking would
+// be a decoration.
+//
+// Two halves, and BOTH are required:
+//   * the region learns the pane (the sniffer is above the WebEngineView, so it
+//     sees the press first), and
+//   * the page still gets its mousedown (the sniffer DECLINES the press, so it
+//     falls through). A sniffer that only satisfied the first half would report
+//     focus perfectly while making the terminal untypeable.
+// ---------------------------------------------------------------------------
+void TstPaneIdentity::aClickInsideTheLivePageReportsFocusAndStillReachesThePage()
+{
+    QVERIFY(openRegion(QStringLiteral("TerminalRegion.qml"), leafNode(QStringLiteral("terminal-1")),
+                       /*terminal=*/true));
+    const auto panes = [this] { return collect(m_region, isLeafPane); };
+    QTRY_VERIFY(panes().size() == 1);
+    QObject *const pane = panes().constFirst();
+
+    QElapsedTimer clock;
+    clock.start();
+    while (clock.elapsed() < kPageLoadTimeoutMs && !pane->property("pageLoaded").toBool())
+        QTest::qWait(100);
+    if (!pane->property("pageLoaded").toBool())
+        QSKIP("the terminal page never loaded; WebEngine cannot run under this recipe");
+    QVERIFY2(waitForPage(pane, QString::fromLatin1(kJsScreen), QStringLiteral("")),
+             "the xterm renderer never mounted");
+    QTest::qWait(kSettleMs);
+
+    // Counted in the page's own capture phase, so it records the press whatever
+    // xterm does with it afterwards.
+    QCOMPARE(evalJs(pane, QStringLiteral(
+                              "(function(){window.__chPresses=0;"
+                              "document.addEventListener('mousedown',"
+                              "function(){window.__chPresses++;},true);return 'OK';})()")),
+             QStringLiteral("OK"));
+
+    // The pane is loaded, so its full-pane placeholder is invisible and this
+    // point is over the live page, not over chrome.
+    clickPane(pane);
+
+    QTRY_COMPARE(m_region->property("focusedPaneId").toString(), QStringLiteral("terminal-1"));
+    QVERIFY2(waitForJs(pane, QStringLiteral("String(window.__chPresses > 0)"),
+                       QStringLiteral("true"), kProbeTimeoutMs),
+             "the focus sniffer SWALLOWED the click: the region learned which pane the user is "
+             "in, but the terminal page never saw the press");
 }
 
 // QTEST_MAIN cannot be used: registerUrlScheme() and QtWebEngineQuick::initialize()

@@ -2,9 +2,11 @@
 
 #include "SshConnectionPool.h"
 
+#include <QHash>
 #include <QObject>
 #include <QPointer>
 #include <QString>
+#include <QStringList>
 
 QT_BEGIN_NAMESPACE
 class QEventLoop;
@@ -79,7 +81,8 @@ public:
     qint64 lastAttemptMs() const { return m_lastAttemptMs; }
 
     // `nodePath` is the remote node binary (it need not be on the login PATH)
-    // and `repoRoot` the remote CodeHarbor checkout holding remote/src.
+    // and `repoRoot` the remote CodeHarbor installation: either an unpacked
+    // codeharbor-remote.tar.gz or a git checkout — see entryCandidates().
     bool connectAndWire(const QString& host, quint16 port, const QString& user,
                         const QString& nodePath, const QString& repoRoot);
 
@@ -149,6 +152,14 @@ public:
     static QString rpcCommand(const QString& nodePath, const QString& repoRoot);
     static QString bridgeCommand(const QString& nodePath,
                                  const QString& repoRoot);
+
+    // Every path, most-preferred first, that a remote entry point named `stem`
+    // ("codeharbord" or "bridge") may live at under `repoRoot`. The commands
+    // above pick the first that exists ON THE SERVER and, when none does, name
+    // exactly this list on stderr, so "it does not launch" is answerable
+    // without an SSH session of your own.
+    static QStringList entryCandidates(const QString& repoRoot,
+                                       const QString& stem);
 
 signals:
     void wired();
@@ -245,6 +256,15 @@ private:
     // Most recent channelDiagnostic() text of the exec attempt in progress.
     // Cleared per attempt; only read by withLastDiagnostic().
     QString m_lastDiagnostic;
+    // Last stderr line each live channel produced, keyed by role. A channel
+    // that dies takes its own last words with it otherwise: the exec-scoped
+    // m_lastDiagnostic above is disconnected the moment startExec() returns, so
+    // a remote process that starts fine and THEN complains before exiting —
+    // `sh` reporting that no codeharbord entry point exists under repoRoot, for
+    // one — used to reach only channelDiagnostic(), which nothing consumes. The
+    // user got "codeharbord channel closed" and no reason. Per role, so the
+    // bridge's routine startup banner is never appended to codeharbord's death.
+    QHash<QString, QString> m_channelDiagnostics;
 
     State m_state = State::Disconnected;
     QTimer* m_reconnectTimer = nullptr;

@@ -193,4 +193,44 @@ struct KillSessionParams {
 // kill-session is idempotent and reports no payload (mirrors the empty `{}`).
 struct KillSessionResult {};
 
+// --- workspace persistence (SPEC 4.2, 11.1) ---------------------------------
+//
+// Mirrors the `workspace.*` group in remote/src/rpc-types.ts. This is the
+// client's CRUD surface over the server-owned workspace database; the data
+// shapes live in src/persistence/WorkspaceDb.h, only the wire names belong to
+// the contract.
+//
+// Stable wire method names, mirroring RPC_WORKSPACE_METHODS. Keep this block in
+// the same order as the TypeScript table: remote/test/rpc-mirror.test.ts parses
+// these `kMethodWorkspace*` definitions out of this header and fails if the two
+// sides' method-name sets diverge.
+inline constexpr auto kMethodWorkspaceList = "workspace.list";
+inline constexpr auto kMethodWorkspaceCreateGroup = "workspace.createGroup";
+inline constexpr auto kMethodWorkspaceUpdateGroup = "workspace.updateGroup";
+inline constexpr auto kMethodWorkspaceDeleteGroup = "workspace.deleteGroup";
+inline constexpr auto kMethodWorkspaceReorderGroups = "workspace.reorderGroups";
+inline constexpr auto kMethodWorkspaceCreateSession = "workspace.createSession";
+inline constexpr auto kMethodWorkspaceUpdateSession = "workspace.updateSession";
+inline constexpr auto kMethodWorkspaceDeleteSession = "workspace.deleteSession";
+inline constexpr auto kMethodWorkspaceReorderSessions =
+    "workspace.reorderSessions";
+inline constexpr auto kMethodWorkspaceMoveSessionToGroup =
+    "workspace.moveSessionToGroup";
+inline constexpr auto kMethodWorkspaceDuplicateSession =
+    "workspace.duplicateSession";
+inline constexpr auto kMethodWorkspaceCreateViewerPane =
+    "workspace.createViewerPane";
+inline constexpr auto kMethodWorkspaceUpdateViewerPane =
+    "workspace.updateViewerPane";
+inline constexpr auto kMethodWorkspaceDeleteViewerPane =
+    "workspace.deleteViewerPane";
+inline constexpr auto kMethodWorkspaceCreateTerminalPane =
+    "workspace.createTerminalPane";
+inline constexpr auto kMethodWorkspaceUpdateTerminalPane =
+    "workspace.updateTerminalPane";
+inline constexpr auto kMethodWorkspaceDeleteTerminalPane =
+    "workspace.deleteTerminalPane";
+inline constexpr auto kMethodWorkspaceGetLayout = "workspace.getLayout";
+inline constexpr auto kMethodWorkspaceSetLayout = "workspace.setLayout";
+
 } // namespace ch::rpc

@@ -80,6 +80,15 @@ public:
     // the exact key the user was shown.
     const HostKeyCallback& hostKeyCallback() const { return m_hostKeyCallback; }
     void setCredentialCallback(CredentialCallback callback);
+    // The installed credential callback, read-only, and the exact counterpart
+    // of hostKeyCallback() above: authenticate() is its only caller and it only
+    // runs inside connectToHost(), so this is the sole way a test can prove
+    // that AppController's password/passphrase prompt is really installed and
+    // really hands the secret over exactly once. Nothing in production reads it.
+    const CredentialCallback& credentialCallback() const
+    {
+        return m_credentialCallback;
+    }
 
     // Establish the single authenticated session: connect, verify the host key
     // through KnownHosts, then authenticate (agent -> default key -> callback).

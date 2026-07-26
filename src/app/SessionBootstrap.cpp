@@ -38,6 +38,33 @@ QString remoteJoin(const QString& root, const QString& relative)
     return base + QLatin1Char('/') + relative;
 }
 
+// POSIX sh that leaves the first existing candidate in $__ch_entry, or names
+// every path it tried on stderr and exits 127. The selection happens on the
+// SERVER, inside the exec we were going to issue anyway: a client-side probe
+// would cost an extra round trip on every connect and would still be a guess
+// (the probe and the exec are two different moments), and a per-profile
+// "layout" field would make every user answer a question about our build
+// system. `stem` is the entry name and doubles as the label in the error.
+QString selectEntry(const QString& repoRoot, const QString& stem)
+{
+    const QStringList candidates =
+        SessionBootstrap::entryCandidates(repoRoot, stem);
+    QStringList quoted;
+    quoted.reserve(candidates.size());
+    for (const QString& candidate : candidates)
+        quoted << shellQuote(candidate);
+
+    return QStringLiteral("__ch_entry=; for __ch_c in ")
+           + quoted.join(QLatin1Char(' '))
+           + QStringLiteral("; do if [ -f \"$__ch_c\" ]; then "
+                            "__ch_entry=\"$__ch_c\"; break; fi; done; "
+                            "if [ -z \"$__ch_entry\" ]; then echo ")
+           + shellQuote(QStringLiteral("codeharbor: no %1 entry point on this "
+                                       "server. Tried: %2")
+                            .arg(stem, candidates.join(QStringLiteral(", "))))
+           + QStringLiteral(" >&2; exit 127; fi; ");
+}
+
 } // namespace
 
 SessionBootstrap::SessionBootstrap(SshConnectionPool* pool,
@@ -105,16 +132,42 @@ void SessionBootstrap::setKnownHostsPath(const QString& path)
     m_knownHostsPath = path;
 }
 
+QStringList SessionBootstrap::entryCandidates(const QString& repoRoot,
+                                              const QString& stem)
+{
+    // Most-built first. Two layouts have to work, because the client is the
+    // only thing that decides which one it can talk to:
+    //
+    //   <root>/dist/<stem>.js         codeharbor-remote.tar.gz unpacked — the
+    //                                 RELEASE artifact, which is `dist`,
+    //                                 `package.json` and `sql` side by side
+    //                                 (.github/workflows/release.yml). This is
+    //                                 what a normal user installs, and until it
+    //                                 was listed here nothing could launch it.
+    //   <root>/remote/dist/<stem>.js  a dev checkout that has been built.
+    //   <root>/remote/src/<stem>.ts   a dev checkout, source, type-stripped by
+    //                                 node >= 23.6.
+    //
+    // Built output is preferred over source: it is what `package.json` bin
+    // points at, and it drops the node >= 23.6 requirement.
+    return {
+        remoteJoin(repoRoot, QStringLiteral("dist/") + stem + QStringLiteral(".js")),
+        remoteJoin(repoRoot, QStringLiteral("remote/dist/") + stem + QStringLiteral(".js")),
+        remoteJoin(repoRoot, QStringLiteral("remote/src/") + stem + QStringLiteral(".ts")),
+    };
+}
+
 QString SessionBootstrap::rpcCommand(const QString& nodePath,
                                      const QString& repoRoot)
 {
-    // The packaged entry point is `codeharbord rpc --stdio` (SPEC 10.1); over a
-    // dev checkout we run the TypeScript source directly, which node >= 23.6
-    // strips natively, so no build step is required on the remote side.
-    return shellQuote(nodePath) + QLatin1Char(' ')
-           + shellQuote(remoteJoin(repoRoot,
-                                   QStringLiteral("remote/src/codeharbord.ts")))
-           + QStringLiteral(" rpc --stdio");
+    // The packaged entry point is `codeharbord rpc --stdio` (SPEC 10.1).
+    // `exec` replaces the selecting shell with node, so codeharbord keeps the
+    // channel's stdin (its JSON-RPC request stream) and still exits on EOF
+    // without an extra process sitting in between.
+    const QString script = selectEntry(repoRoot, QStringLiteral("codeharbord"))
+                           + QStringLiteral("exec ") + shellQuote(nodePath)
+                           + QStringLiteral(" \"$__ch_entry\" rpc --stdio");
+    return QStringLiteral("sh -c ") + shellQuote(script);
 }
 
 QString SessionBootstrap::bridgeCommand(const QString& nodePath,
@@ -132,14 +185,14 @@ QString SessionBootstrap::bridgeCommand(const QString& nodePath,
     // forever, leaking one orphan per app launch. `cat` reaching EOF is the
     // channel-closed signal; it then kills the relay. Only the bridge gets this
     // — codeharbord needs its stdin for the JSON-RPC request stream.
-    const QString relay =
-        shellQuote(nodePath) + QLatin1Char(' ')
-        + shellQuote(remoteJoin(repoRoot, QStringLiteral("remote/src/bridge.ts")))
-        + QStringLiteral(
-            " & __ch_bridge=$!; cat >/dev/null; kill $__ch_bridge 2>/dev/null");
+    const QString script =
+        selectEntry(repoRoot, QStringLiteral("bridge")) + shellQuote(nodePath)
+        + QStringLiteral(" \"$__ch_entry\""
+                         " & __ch_bridge=$!; cat >/dev/null;"
+                         " kill $__ch_bridge 2>/dev/null");
     // Quoted as one argument to `sh -c` so the script only relies on POSIX sh,
     // whatever login shell the remote account happens to use.
-    return QStringLiteral("sh -c ") + shellQuote(relay);
+    return QStringLiteral("sh -c ") + shellQuote(script);
 }
 
 int SessionBootstrap::reconnectDelaySeconds(int attempt)
@@ -334,6 +387,10 @@ void SessionBootstrap::unwire()
         rpc->deleteLater();
     if (agent)
         agent->deleteLater();
+
+    // Scoped to the session that just ended: the next attempt's loss must carry
+    // ITS remote's words, never the previous one's.
+    m_channelDiagnostics.clear();
 }
 
 bool SessionBootstrap::connectPool(const QString& host, quint16 port,
@@ -474,6 +531,14 @@ void SessionBootstrap::wireChannelSignals(SshChannelDevice* device,
                 const QString trimmed = text.trimmed();
                 if (trimmed.isEmpty())
                     return;
+                // Remembered per role so that when this channel dies its own
+                // last words go with the loss. Without it a remote process that
+                // execs fine and THEN explains itself before exiting — `sh`
+                // reporting that repoRoot holds no codeharbord entry point, for
+                // one — reached only channelDiagnostic(), which nothing
+                // consumes, and the user was told "codeharbord channel closed"
+                // with no reason at all.
+                m_channelDiagnostics[role] = trimmed;
                 emit channelDiagnostic(role, trimmed);
             });
 
@@ -483,7 +548,11 @@ void SessionBootstrap::wireChannelSignals(SshChannelDevice* device,
     // this, is a loss.
     connect(device, &SshChannelDevice::readChannelFinished, this,
             [this, role] {
-                handleConnectionLost(role + QStringLiteral(" channel closed"));
+                QString reason = role + QStringLiteral(" channel closed");
+                const QString last = m_channelDiagnostics.value(role);
+                if (!last.isEmpty())
+                    reason += QStringLiteral(": ") + last;
+                handleConnectionLost(reason);
             });
 }
 

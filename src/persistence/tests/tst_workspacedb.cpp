@@ -1,4 +1,5 @@
 #include "CodeharbordClient.h"
+#include "RpcTypes.h"
 #include "WorkspaceDb.h"
 
 #include <QByteArray>
@@ -30,6 +31,22 @@ using ch::SplitNode;
 using ch::WorkspaceDb;
 
 namespace {
+
+// Wire method names come from the shared contract (src/remote/RpcTypes.h,
+// mirrored in remote/src/rpc-types.ts and gated by remote/test/rpc-mirror.test.ts)
+// rather than being retyped here, so this suite cannot pass against a name the
+// server no longer serves.
+const auto kList = QString::fromLatin1(ch::rpc::kMethodWorkspaceList);
+const auto kCreateGroup =
+    QString::fromLatin1(ch::rpc::kMethodWorkspaceCreateGroup);
+const auto kReorderGroups =
+    QString::fromLatin1(ch::rpc::kMethodWorkspaceReorderGroups);
+const auto kUpdateSession =
+    QString::fromLatin1(ch::rpc::kMethodWorkspaceUpdateSession);
+const auto kDuplicateSession =
+    QString::fromLatin1(ch::rpc::kMethodWorkspaceDuplicateSession);
+const auto kGetLayout = QString::fromLatin1(ch::rpc::kMethodWorkspaceGetLayout);
+const auto kSetLayout = QString::fromLatin1(ch::rpc::kMethodWorkspaceSetLayout);
 
 // Serialize a JSON-RPC object as one framed (newline-terminated) wire line.
 QByteArray jsonLine(const QJsonObject& obj)
@@ -148,7 +165,7 @@ void TstWorkspaceDb::listParsesNestedTree()
 
     const QJsonObject req = readRequest();
     QCOMPARE(req.value(QStringLiteral("method")).toString(),
-             QStringLiteral("workspace.list"));
+             kList);
     QCOMPARE(req.value(QStringLiteral("params")).toObject()
                  .value(QStringLiteral("serverId")).toString(),
              QStringLiteral("srv-1"));
@@ -240,7 +257,7 @@ void TstWorkspaceDb::createGroupSerializesParams()
     QCOMPARE(req.value(QStringLiteral("jsonrpc")).toString(),
              QStringLiteral("2.0"));
     QCOMPARE(req.value(QStringLiteral("method")).toString(),
-             QStringLiteral("workspace.createGroup"));
+             kCreateGroup);
     QVERIFY(req.contains(QStringLiteral("id")));
 
     const QJsonObject params = req.value(QStringLiteral("params")).toObject();
@@ -314,7 +331,7 @@ void TstWorkspaceDb::getLayoutNullDeliversNullopt()
 
     const QJsonObject req = readRequest();
     QCOMPARE(req.value(QStringLiteral("method")).toString(),
-             QStringLiteral("workspace.getLayout"));
+             kGetLayout);
     const QJsonObject params = req.value(QStringLiteral("params")).toObject();
     QCOMPARE(params.value(QStringLiteral("devSessionId")).toString(),
              QStringLiteral("s1"));
@@ -378,7 +395,7 @@ void TstWorkspaceDb::updateSessionSerializesPartialWithFalse()
 
     const QJsonObject req = readRequest();
     QCOMPARE(req.value(QStringLiteral("method")).toString(),
-             QStringLiteral("workspace.updateSession"));
+             kUpdateSession);
     const QJsonObject params = req.value(QStringLiteral("params")).toObject();
     QCOMPARE(params.value(QStringLiteral("id")).toString(),
              QStringLiteral("s1"));
@@ -433,7 +450,7 @@ void TstWorkspaceDb::setLayoutSerializesInlineTree()
 
     const QJsonObject req = readRequest();
     QCOMPARE(req.value(QStringLiteral("method")).toString(),
-             QStringLiteral("workspace.setLayout"));
+             kSetLayout);
     const QJsonObject params = req.value(QStringLiteral("params")).toObject();
     QCOMPARE(params.value(QStringLiteral("serverId")).toString(),
              QStringLiteral("srv-1"));
@@ -483,7 +500,7 @@ void TstWorkspaceDb::duplicateSessionParsesNestedNode()
 
     const QJsonObject req = readRequest();
     QCOMPARE(req.value(QStringLiteral("method")).toString(),
-             QStringLiteral("workspace.duplicateSession"));
+             kDuplicateSession);
     QCOMPARE(req.value(QStringLiteral("params")).toObject()
                  .value(QStringLiteral("id")).toString(),
              QStringLiteral("s1"));
@@ -556,7 +573,7 @@ void TstWorkspaceDb::reorderGroupsSerializesIdArray()
 
     const QJsonObject req = readRequest();
     QCOMPARE(req.value(QStringLiteral("method")).toString(),
-             QStringLiteral("workspace.reorderGroups"));
+             kReorderGroups);
     const QJsonObject params = req.value(QStringLiteral("params")).toObject();
     QCOMPARE(params.value(QStringLiteral("serverId")).toString(),
              QStringLiteral("srv-1"));

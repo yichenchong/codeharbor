@@ -1,5 +1,7 @@
 #include "WorkspaceDb.h"
 
+#include "RpcTypes.h"
+
 #include <QJsonArray>
 #include <QJsonObject>
 #include <QJsonValue>
@@ -327,7 +329,7 @@ void WorkspaceDb::list(const ServerId& serverId, ListCallback cb)
 {
     const QJsonObject params{{QStringLiteral("serverId"), serverId.value}};
     m_client->call(
-        QStringLiteral("workspace.list"), params,
+        QString::fromLatin1(rpc::kMethodWorkspaceList), params,
         [cb = std::move(cb)](QJsonValue result, std::optional<RpcError> error) {
             if (error) {
                 cb({}, error);
@@ -340,7 +342,8 @@ void WorkspaceDb::list(const ServerId& serverId, ListCallback cb)
 void WorkspaceDb::createGroup(const CreateGroupParams& params, GroupCallback cb)
 {
     m_client->call(
-        QStringLiteral("workspace.createGroup"), serializeCreateGroup(params),
+        QString::fromLatin1(rpc::kMethodWorkspaceCreateGroup),
+        serializeCreateGroup(params),
         [cb = std::move(cb)](QJsonValue result, std::optional<RpcError> error) {
             if (error) {
                 cb(std::nullopt, error);
@@ -353,7 +356,8 @@ void WorkspaceDb::createGroup(const CreateGroupParams& params, GroupCallback cb)
 void WorkspaceDb::updateGroup(const UpdateGroupParams& params, GroupCallback cb)
 {
     m_client->call(
-        QStringLiteral("workspace.updateGroup"), serializeUpdateGroup(params),
+        QString::fromLatin1(rpc::kMethodWorkspaceUpdateGroup),
+        serializeUpdateGroup(params),
         [cb = std::move(cb)](QJsonValue result, std::optional<RpcError> error) {
             if (error) {
                 cb(std::nullopt, error);
@@ -366,11 +370,11 @@ void WorkspaceDb::updateGroup(const UpdateGroupParams& params, GroupCallback cb)
 void WorkspaceDb::deleteGroup(const GroupId& id, OkCallback cb)
 {
     const QJsonObject params{{QStringLiteral("id"), id.value}};
-    m_client->call(QStringLiteral("workspace.deleteGroup"), params,
-                   [cb = std::move(cb)](QJsonValue,
-                                        std::optional<RpcError> error) {
-                       cb(error);
-                   });
+    m_client->call(
+        QString::fromLatin1(rpc::kMethodWorkspaceDeleteGroup), params,
+        [cb = std::move(cb)](QJsonValue, std::optional<RpcError> error) {
+            cb(error);
+        });
 }
 
 void WorkspaceDb::reorderGroups(const ServerId& serverId,
@@ -381,18 +385,18 @@ void WorkspaceDb::reorderGroups(const ServerId& serverId,
         {QStringLiteral("serverId"), serverId.value},
         {QStringLiteral("orderedIds"), serializeIds(orderedIds)},
     };
-    m_client->call(QStringLiteral("workspace.reorderGroups"), params,
-                   [cb = std::move(cb)](QJsonValue,
-                                        std::optional<RpcError> error) {
-                       cb(error);
-                   });
+    m_client->call(
+        QString::fromLatin1(rpc::kMethodWorkspaceReorderGroups), params,
+        [cb = std::move(cb)](QJsonValue, std::optional<RpcError> error) {
+            cb(error);
+        });
 }
 
 void WorkspaceDb::createSession(const CreateSessionParams& params,
                                 SessionCallback cb)
 {
     m_client->call(
-        QStringLiteral("workspace.createSession"),
+        QString::fromLatin1(rpc::kMethodWorkspaceCreateSession),
         serializeCreateSession(params),
         [cb = std::move(cb)](QJsonValue result, std::optional<RpcError> error) {
             if (error) {
@@ -407,7 +411,7 @@ void WorkspaceDb::updateSession(const UpdateSessionParams& params,
                                 SessionCallback cb)
 {
     m_client->call(
-        QStringLiteral("workspace.updateSession"),
+        QString::fromLatin1(rpc::kMethodWorkspaceUpdateSession),
         serializeUpdateSession(params),
         [cb = std::move(cb)](QJsonValue result, std::optional<RpcError> error) {
             if (error) {
@@ -421,11 +425,11 @@ void WorkspaceDb::updateSession(const UpdateSessionParams& params,
 void WorkspaceDb::deleteSession(const DevSessionId& id, OkCallback cb)
 {
     const QJsonObject params{{QStringLiteral("id"), id.value}};
-    m_client->call(QStringLiteral("workspace.deleteSession"), params,
-                   [cb = std::move(cb)](QJsonValue,
-                                        std::optional<RpcError> error) {
-                       cb(error);
-                   });
+    m_client->call(
+        QString::fromLatin1(rpc::kMethodWorkspaceDeleteSession), params,
+        [cb = std::move(cb)](QJsonValue, std::optional<RpcError> error) {
+            cb(error);
+        });
 }
 
 void WorkspaceDb::reorderSessions(const GroupId& groupId,
@@ -436,18 +440,18 @@ void WorkspaceDb::reorderSessions(const GroupId& groupId,
         {QStringLiteral("groupId"), groupId.value},
         {QStringLiteral("orderedIds"), serializeIds(orderedIds)},
     };
-    m_client->call(QStringLiteral("workspace.reorderSessions"), params,
-                   [cb = std::move(cb)](QJsonValue,
-                                        std::optional<RpcError> error) {
-                       cb(error);
-                   });
+    m_client->call(
+        QString::fromLatin1(rpc::kMethodWorkspaceReorderSessions), params,
+        [cb = std::move(cb)](QJsonValue, std::optional<RpcError> error) {
+            cb(error);
+        });
 }
 
 void WorkspaceDb::moveSessionToGroup(const MoveSessionParams& params,
                                      SessionCallback cb)
 {
     m_client->call(
-        QStringLiteral("workspace.moveSessionToGroup"),
+        QString::fromLatin1(rpc::kMethodWorkspaceMoveSessionToGroup),
         serializeMoveSession(params),
         [cb = std::move(cb)](QJsonValue result, std::optional<RpcError> error) {
             if (error) {
@@ -463,7 +467,7 @@ void WorkspaceDb::duplicateSession(const DevSessionId& id,
 {
     const QJsonObject params{{QStringLiteral("id"), id.value}};
     m_client->call(
-        QStringLiteral("workspace.duplicateSession"), params,
+        QString::fromLatin1(rpc::kMethodWorkspaceDuplicateSession), params,
         [cb = std::move(cb)](QJsonValue result, std::optional<RpcError> error) {
             if (error) {
                 cb(std::nullopt, error);
@@ -477,7 +481,7 @@ void WorkspaceDb::createViewerPane(const CreateViewerPaneParams& params,
                                    ViewerPaneCallback cb)
 {
     m_client->call(
-        QStringLiteral("workspace.createViewerPane"),
+        QString::fromLatin1(rpc::kMethodWorkspaceCreateViewerPane),
         serializeCreateViewerPane(params),
         [cb = std::move(cb)](QJsonValue result, std::optional<RpcError> error) {
             if (error) {
@@ -492,7 +496,7 @@ void WorkspaceDb::updateViewerPane(const UpdateViewerPaneParams& params,
                                    ViewerPaneCallback cb)
 {
     m_client->call(
-        QStringLiteral("workspace.updateViewerPane"),
+        QString::fromLatin1(rpc::kMethodWorkspaceUpdateViewerPane),
         serializeUpdateViewerPane(params),
         [cb = std::move(cb)](QJsonValue result, std::optional<RpcError> error) {
             if (error) {
@@ -506,18 +510,18 @@ void WorkspaceDb::updateViewerPane(const UpdateViewerPaneParams& params,
 void WorkspaceDb::deleteViewerPane(const ViewerPaneId& id, OkCallback cb)
 {
     const QJsonObject params{{QStringLiteral("id"), id.value}};
-    m_client->call(QStringLiteral("workspace.deleteViewerPane"), params,
-                   [cb = std::move(cb)](QJsonValue,
-                                        std::optional<RpcError> error) {
-                       cb(error);
-                   });
+    m_client->call(
+        QString::fromLatin1(rpc::kMethodWorkspaceDeleteViewerPane), params,
+        [cb = std::move(cb)](QJsonValue, std::optional<RpcError> error) {
+            cb(error);
+        });
 }
 
 void WorkspaceDb::createTerminalPane(const CreateTerminalPaneParams& params,
                                      TerminalPaneCallback cb)
 {
     m_client->call(
-        QStringLiteral("workspace.createTerminalPane"),
+        QString::fromLatin1(rpc::kMethodWorkspaceCreateTerminalPane),
         serializeCreateTerminalPane(params),
         [cb = std::move(cb)](QJsonValue result, std::optional<RpcError> error) {
             if (error) {
@@ -532,7 +536,7 @@ void WorkspaceDb::updateTerminalPane(const UpdateTerminalPaneParams& params,
                                      TerminalPaneCallback cb)
 {
     m_client->call(
-        QStringLiteral("workspace.updateTerminalPane"),
+        QString::fromLatin1(rpc::kMethodWorkspaceUpdateTerminalPane),
         serializeUpdateTerminalPane(params),
         [cb = std::move(cb)](QJsonValue result, std::optional<RpcError> error) {
             if (error) {
@@ -546,11 +550,11 @@ void WorkspaceDb::updateTerminalPane(const UpdateTerminalPaneParams& params,
 void WorkspaceDb::deleteTerminalPane(const TerminalId& id, OkCallback cb)
 {
     const QJsonObject params{{QStringLiteral("id"), id.value}};
-    m_client->call(QStringLiteral("workspace.deleteTerminalPane"), params,
-                   [cb = std::move(cb)](QJsonValue,
-                                        std::optional<RpcError> error) {
-                       cb(error);
-                   });
+    m_client->call(
+        QString::fromLatin1(rpc::kMethodWorkspaceDeleteTerminalPane), params,
+        [cb = std::move(cb)](QJsonValue, std::optional<RpcError> error) {
+            cb(error);
+        });
 }
 
 void WorkspaceDb::getLayout(const DevSessionId& devSessionId, Region region,
@@ -561,7 +565,7 @@ void WorkspaceDb::getLayout(const DevSessionId& devSessionId, Region region,
         {QStringLiteral("region"), regionKey(region)},
     };
     m_client->call(
-        QStringLiteral("workspace.getLayout"), params,
+        QString::fromLatin1(rpc::kMethodWorkspaceGetLayout), params,
         [cb = std::move(cb)](QJsonValue result, std::optional<RpcError> error) {
             if (error) {
                 cb(std::nullopt, error);
@@ -582,7 +586,7 @@ void WorkspaceDb::setLayout(const ServerId& serverId,
         {QStringLiteral("tree"), tree.toJson()},
     };
     m_client->call(
-        QStringLiteral("workspace.setLayout"), params,
+        QString::fromLatin1(rpc::kMethodWorkspaceSetLayout), params,
         [cb = std::move(cb)](QJsonValue result, std::optional<RpcError> error) {
             if (error) {
                 cb(std::nullopt, error);

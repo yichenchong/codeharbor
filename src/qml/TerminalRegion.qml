@@ -98,6 +98,12 @@ Rectangle {
                 return null;
             region.paneCache[paneId] = pane;
             pane.paneId = paneId;
+            // The owner mints EVERY pane in the tree, so this is the one place
+            // a pane's focus report has to be wired — and it is wired for the
+            // pane's whole life. That is what carries focus across a split: the
+            // Item is re-parented, never rebuilt, so the connection (and the id
+            // it reports) outlive the republish that moved it.
+            pane.paneActivated.connect(region.noteFocus);
         }
         if (pane.parent !== host) {
             pane.anchors.fill = null;
@@ -144,6 +150,12 @@ Rectangle {
             const pane = cache[key];
             delete cache[key];
             pane.destroy();
+            // The pane the user was working in has been CLOSED. Leaving its id
+            // as the focus would aim the next split/close command at a pane
+            // that no longer exists; "" is "nothing focused", which sends the
+            // host back to its fallback.
+            if (region.focusedPaneId === key)
+                region.focusedPaneId = "";
         }
     }
 
@@ -158,6 +170,36 @@ Rectangle {
             delete cache[key];
             pane.destroy();
         }
+    }
+
+    // ---- focused pane (SPEC 4.5) -------------------------------------------
+
+    // paneId of the pane the user last interacted with: "" when none has been
+    // touched yet, or when the focused pane has left the tree. Like the cache
+    // above, the OWNER's copy is the live one — it is the only region that
+    // outlives every republish, so focus set before a split is still set after
+    // it. A nested region's own copy stays empty and means nothing; read this
+    // on the region you created.
+    //
+    // HOST CONTRACT: handle `onFocusedPaneIdChanged` on that region and persist
+    // the value (Main.qml -> app.uiState.setSelectedPane(devSessionId, id)),
+    // which is what makes a split command act on the pane the user is in. Do
+    // not filter the empty value: it is a real "selection cleared", not a
+    // missing reading.
+    //
+    // The empty-paneId PLACEHOLDER leaf (SessionLayouts::closePane) reports ""
+    // like everything else, so clicking it is indistinguishable from "nothing
+    // focused". That is the right answer rather than a lost case: a tree whose
+    // only leaf is the placeholder has nothing else a command could target, so
+    // the host's first-leaf fallback picks that very pane.
+    property string focusedPaneId: ""
+
+    // A pane reporting that the user is working in it. Only ever reached on the
+    // owner, because takePane() — where it is connected — is only ever called
+    // on the owner. Re-focusing the focused pane assigns the same string, which
+    // QML does not report as a change, so the host is not woken for a no-op.
+    function noteFocus(paneId) {
+        region.focusedPaneId = paneId;
     }
 
     // ---- this region's own leaf --------------------------------------------

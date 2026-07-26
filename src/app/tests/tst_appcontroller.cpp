@@ -1,6 +1,11 @@
 #include <QtTest/QtTest>
 
 #include <QTemporaryDir>
+#include <QDir>
+#include <QDirIterator>
+#include <QFile>
+#include <QScopeGuard>
+#include <QVariantMap>
 #include <QPair>
 #include <QByteArray>
 #include <QIODevice>
@@ -12,6 +17,7 @@
 #include <QStandardPaths>
 
 #include <cstring>
+#include <functional>
 
 #include "AppController.h"
 #include "SessionLayouts.h"
@@ -172,6 +178,88 @@ QByteArray layoutLeafFrame(int id, const QString& paneId)
     return QJsonDocument(resp).toJson(QJsonDocument::Compact) + '\n';
 }
 
+// A `server.info` success frame.
+QByteArray serverInfoFrame(int id, int schemaVersion, const QString& serverId,
+                           const QString& version)
+{
+    QJsonObject info{{"name", "codeharbord"},
+                     {"version", version},
+                     {"schemaVersion", schemaVersion}};
+    if (!serverId.isEmpty())
+        info.insert(QStringLiteral("serverId"), serverId);
+    const QJsonObject resp{{"jsonrpc", "2.0"}, {"id", id}, {"result", info}};
+    return QJsonDocument(resp).toJson(QJsonDocument::Compact) + '\n';
+}
+
+// A bootstrap whose handshake never leaves the process. connectPool() is where
+// libssh would run the auth ladder, so `duringConnect` is the seam a test uses
+// to be the pool: it fires exactly where SshConnectionPool::authenticate()
+// would reach the credential callback AppController installed.
+class FakeBootstrap : public SessionBootstrap {
+public:
+    using SessionBootstrap::SessionBootstrap;
+
+    bool connectOk = false;
+    int connectCalls = 0;
+    std::function<void()> duringConnect;
+
+    // adoptServerIdentity() hangs off wired(); a subclass may emit its own.
+    void fireWired() { emit wired(); }
+
+protected:
+    bool probeEndpoint(const QString&, quint16, QString*) override
+    {
+        return true;
+    }
+
+    bool connectPool(const QString&, quint16, const QString&) override
+    {
+        ++connectCalls;
+        if (duringConnect)
+            duringConnect();
+        return connectOk;
+    }
+};
+
+// Everything AppController's connection surface needs, over throwaway paths.
+struct ConnectFixture {
+    QTemporaryDir dir;
+    SshConnectionPool pool;
+    CodeharbordClient client;
+    AgentStatusMonitor monitor;
+    FakeBootstrap boot{&pool, &client, &monitor};
+    ServerProfiles profiles{dir.filePath(QStringLiteral("servers.ini"))};
+    AppController controller{&client};
+    QString profileId;
+
+    ConnectFixture()
+    {
+        boot.setKnownHostsPath(dir.filePath(QStringLiteral("known_hosts")));
+        controller.setConnection(&pool, &boot, &profiles, nullptr);
+        profileId = profiles.addProfile(
+            {{QStringLiteral("name"), QStringLiteral("box")},
+             {QStringLiteral("host"), QStringLiteral("127.0.0.1")},
+             {QStringLiteral("port"), 22},
+             {QStringLiteral("user"), QStringLiteral("yichen")},
+             {QStringLiteral("nodePath"), QStringLiteral("/usr/bin/node")},
+             {QStringLiteral("repoRoot"), QStringLiteral("/srv/codeharbor")}});
+    }
+
+    // Every byte this fixture persists. The credential tests assert a secret
+    // appears in none of it.
+    QByteArray allPersistedBytes() const
+    {
+        QByteArray blob;
+        QDirIterator it(dir.path(), QDir::Files, QDirIterator::Subdirectories);
+        while (it.hasNext()) {
+            QFile file(it.next());
+            if (file.open(QIODevice::ReadOnly))
+                blob += file.readAll();
+        }
+        return blob;
+    }
+};
+
 } // namespace
 
 class TstAppController : public QObject {
@@ -200,6 +288,14 @@ private slots:
     void staleOrFailedRefreshNeverRetiresActiveSession();
     void deletingActiveSessionRetiresItThroughChainedRefresh();
     void disconnectRetiresActiveSessionButStillRemembersIt();
+
+    // Reaching a real server: the credential prompt (the pool's third auth rung
+    // had no product-side answer) and the server-compatibility gate.
+    void credentialCallbackIsInstalledAndParksInsteadOfBlocking();
+    void submittedSecretIsSpentOnceAndNeverPersistedOrLogged();
+    void cancellingTheCredentialPromptAbandonsTheAttemptCleanly();
+    void serverOlderThanTheSchemaFloorIsRefusedWithBothVersions();
+    void serverAtTheSchemaFloorIsAdoptedNormally();
 };
 
 // Two GroupNodes with sessions map to GroupRows preserving order, with the
@@ -909,6 +1005,209 @@ void TstAppController::disconnectRetiresActiveSessionButStillRemembersIt()
     QCOMPARE(f.controller.activeSessionId(), QStringLiteral("s1"));
     QCOMPARE(f.layouts.devSessionId(), QStringLiteral("s1"));
     QCOMPARE(takeRequestIds(f.transport).size(), 2); // one getLayout per region
+}
+
+// SshConnectionPool authenticates agent -> default key -> credential callback,
+// but setCredentialCallback() had NO non-test caller: a user with a
+// passphrase-protected key, or no loaded agent (the stock desktop on Windows and
+// macOS), dead-ended at "authentication failed" with nothing ever asking them
+// for anything. This is that wiring, and it must not block: the pool calls the
+// callback from inside the blocking libssh handshake on the GUI thread, so the
+// attempt is REFUSED and the user asked afterwards — the same shape the
+// host-key flow was rewritten into.
+void TstAppController::credentialCallbackIsInstalledAndParksInsteadOfBlocking()
+{
+    ConnectFixture f;
+    QVERIFY(!f.profileId.isEmpty());
+
+    QVERIFY2(!f.pool.credentialCallback(),
+             "nothing should be installed before a connect is started");
+
+    bool asked = false;
+    f.boot.duringConnect = [&f, &asked] {
+        // Stand where SshConnectionPool::authenticate() stands.
+        QVERIFY(f.pool.credentialCallback());
+        asked = true;
+        // An empty answer aborts THIS attempt, which is the whole point: the
+        // handshake unwinds instead of a dialog being raised inside it.
+        QCOMPARE(f.pool.credentialCallback()(QStringLiteral("yichen"),
+                                             QStringLiteral("Password")),
+                 QString());
+    };
+
+    QSignalSpy promptSpy(&f.controller, &AppController::credentialPrompt);
+    QSignalSpy errorSpy(&f.controller, &AppController::error);
+    f.controller.connectToProfile(f.profileId);
+
+    QVERIFY(asked);
+    QCOMPARE(promptSpy.count(), 1);
+    QCOMPARE(promptSpy.at(0).at(0).toString(), QStringLiteral("yichen"));
+    QCOMPARE(promptSpy.at(0).at(1).toString(), QStringLiteral("127.0.0.1"));
+    QCOMPARE(promptSpy.at(0).at(2).toString(), QStringLiteral("Password"));
+    QCOMPARE(f.controller.connectionState(), QStringLiteral("credential"));
+    // Being asked for a password is not a fault; an error toast here would tell
+    // the user something broke while the app is simply waiting on them.
+    QCOMPARE(errorSpy.count(), 0);
+}
+
+// The secret is spent on exactly one attempt and then gone: not replayed by the
+// reconnect ladder running through the same installed callback, not written to
+// any file the app owns, and not logged. A passphrase landing in the config
+// file would be a worse defect than the bug this fixes.
+void TstAppController::submittedSecretIsSpentOnceAndNeverPersistedOrLogged()
+{
+    static const QString kSecret = QStringLiteral("correct-horse-battery-42");
+    static QStringList captured;
+    captured.clear();
+    QtMessageHandler previous = qInstallMessageHandler(
+        [](QtMsgType, const QMessageLogContext&, const QString& text) {
+            captured << text;
+        });
+    const auto restoreHandler =
+        qScopeGuard([previous] { qInstallMessageHandler(previous); });
+
+    ConnectFixture f;
+    f.boot.duringConnect = [&f] {
+        f.pool.credentialCallback()(QStringLiteral("yichen"),
+                                    QStringLiteral("Password"));
+    };
+    QSignalSpy promptSpy(&f.controller, &AppController::credentialPrompt);
+    f.controller.connectToProfile(f.profileId);
+    QCOMPARE(promptSpy.count(), 1);
+
+    // The retry: this time the callback has the answer in hand.
+    QStringList handedOver;
+    f.boot.duringConnect = [&f, &handedOver] {
+        handedOver << f.pool.credentialCallback()(QStringLiteral("yichen"),
+                                                  QStringLiteral("Password"));
+    };
+    QSignalSpy errorSpy(&f.controller, &AppController::error);
+    f.controller.submitCredential(kSecret);
+
+    QCOMPARE(handedOver, QStringList{kSecret});
+
+    // ONE SHOT. The callback outlives the attempt (SessionBootstrap's reconnect
+    // ladder re-handshakes through it with nobody waiting), so a secret still
+    // sitting in the capture would be replayed at whatever host it dials next.
+    QCOMPARE(f.pool.credentialCallback()(QStringLiteral("yichen"),
+                                         QStringLiteral("Password")),
+             QString());
+    // ...and that replay attempt must not arm a prompt nobody would answer.
+    QCOMPARE(promptSpy.count(), 1);
+
+    // A WRONG secret (connectOk stayed false) fails cleanly and says so, rather
+    // than wedging the state machine or silently re-asking forever.
+    QCOMPARE(f.controller.connectionState(), QStringLiteral("failed"));
+    QCOMPARE(errorSpy.count(), 1);
+    // Not wedged: the next connect really starts a new handshake.
+    f.boot.duringConnect = {};
+    f.boot.connectCalls = 0;
+    f.controller.connectToProfile(f.profileId);
+    QCOMPARE(f.boot.connectCalls, 1);
+
+    // Nothing the app persisted contains it — servers.ini above all, which is
+    // the file a profile field would have landed in.
+    const QByteArray persisted = f.allPersistedBytes();
+    QVERIFY(!persisted.isEmpty());  // the profile store really was written
+    QVERIFY2(!persisted.contains(kSecret.toUtf8()),
+             "the secret reached a file on disk");
+    // ...and no profile field carries it either, whatever the store looks like.
+    const QVariantMap stored = f.profiles.profile(f.profileId);
+    for (const QVariant& value : stored)
+        QVERIFY(value.toString() != kSecret);
+
+    for (const QString& line : captured)
+        QVERIFY2(!line.contains(kSecret), qPrintable(line));
+}
+
+// Cancelling is an answer too: the parked attempt ends, nothing is retried, and
+// the controller is left able to connect again.
+void TstAppController::cancellingTheCredentialPromptAbandonsTheAttemptCleanly()
+{
+    ConnectFixture f;
+    f.boot.duringConnect = [&f] {
+        f.pool.credentialCallback()(QStringLiteral("yichen"),
+                                    QStringLiteral("Password"));
+    };
+    QSignalSpy promptSpy(&f.controller, &AppController::credentialPrompt);
+    f.controller.connectToProfile(f.profileId);
+    QCOMPARE(promptSpy.count(), 1);
+
+    const int callsBefore = f.boot.connectCalls;
+    f.controller.submitCredential(QString());
+    QCOMPARE(f.boot.connectCalls, callsBefore);  // no retry
+    QCOMPARE(f.controller.connectionState(), QStringLiteral("disconnected"));
+
+    // A stale sheet answering twice must not redial anything.
+    f.controller.submitCredential(QStringLiteral("too-late"));
+    QCOMPARE(f.boot.connectCalls, callsBefore);
+
+    // And the next real connect is unaffected.
+    f.boot.duringConnect = {};
+    f.controller.connectToProfile(f.profileId);
+    QCOMPARE(f.boot.connectCalls, callsBefore + 1);
+}
+
+// ServerInfoResult::schemaVersion was parsed and never checked. A client one
+// release ahead of its codeharbord got an empty serverId, keyed the workspace to
+// "", and showed an EMPTY SIDEBAR over a healthy SSH session with no
+// explanation. Version skew is the default state under manual deployment.
+void TstAppController::serverOlderThanTheSchemaFloorIsRefusedWithBothVersions()
+{
+    ConnectFixture f;
+    FakeTransport transport;
+    f.client.setTransport(&transport);
+    QSignalSpy errorSpy(&f.controller, &AppController::error);
+
+    f.boot.fireWired();
+    const QJsonObject request = takeRequest(transport);
+    QCOMPARE(request.value(QStringLiteral("method")).toString(),
+             QStringLiteral("server.info"));
+
+    // schema 3: the release before serverId existed, so it reports none.
+    transport.deliver(serverInfoFrame(request.value(QStringLiteral("id")).toInt(),
+                                      3, QString(), QStringLiteral("0.0.9")));
+
+    QCOMPARE(errorSpy.count(), 1);
+    const QString message = errorSpy.at(0).at(0).toString();
+    QVERIFY2(message.contains(QStringLiteral("3")), qPrintable(message));
+    QVERIFY2(message.contains(QString::number(
+                 AppController::kMinimumServerSchemaVersion)),
+             qPrintable(message));
+    QVERIFY2(message.contains(QStringLiteral("0.0.9")), qPrintable(message));
+
+    // Refused, not silently continued: no identity adopted, and crucially no
+    // workspace.list for the empty serverId — that call IS the empty sidebar.
+    QCOMPARE(f.controller.serverId(), QString());
+    QVERIFY(takeRequestIds(transport).isEmpty());
+
+    // The link is dropped rather than left half-alive, one event-loop turn
+    // later (we were inside the client's own response callback).
+    QTRY_COMPARE(f.controller.connectionState(), QStringLiteral("failed"));
+    QCOMPARE(f.controller.connectionError(), message);
+}
+
+// Control: a server AT the floor is adopted and drives the sidebar as before,
+// so the gate refuses old servers rather than all of them.
+void TstAppController::serverAtTheSchemaFloorIsAdoptedNormally()
+{
+    ConnectFixture f;
+    FakeTransport transport;
+    f.client.setTransport(&transport);
+    QSignalSpy errorSpy(&f.controller, &AppController::error);
+
+    f.boot.fireWired();
+    const QJsonObject request = takeRequest(transport);
+    transport.deliver(
+        serverInfoFrame(request.value(QStringLiteral("id")).toInt(),
+                        AppController::kMinimumServerSchemaVersion,
+                        QStringLiteral("srv-1"), QStringLiteral("1.0.0")));
+
+    QCOMPARE(errorSpy.count(), 0);
+    QCOMPARE(f.controller.serverId(), QStringLiteral("srv-1"));
+    const QJsonObject listRequest = takeRequest(transport);
+    QCOMPARE(listRequest.value(QStringLiteral("method")).toString(),
+             QStringLiteral("workspace.list"));
 }
 
 QTEST_GUILESS_MAIN(TstAppController)

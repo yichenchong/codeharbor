@@ -92,6 +92,16 @@ private slots:
     void contentBufferedUntilPageReportsReady();
     void successfulSaveClearsRecoverySnapshot();
 
+    // SPEC 8.2 read-only. Nothing in the tree used to DERIVE read-only-ness, so
+    // a file the user cannot write opened freely editable and only failed at
+    // save time. These pin the derivation, its two inputs, and the fact that it
+    // is re-asked rather than latched.
+    void unwritableFileOpensReadOnlyAndRefusesSave();
+    void binaryFileOpensReadOnly();
+    void readOnlyIsRederivedOnReloadAndNotLatched();
+    void reconnectRederivesReadOnlyFromTheReconcileStat();
+    void readOnlyReachesAPageThatConnectsLate();
+
     // SPEC 5.6 reconnect: the transport is swapped for a channel onto a BRAND
     // NEW codeharbord whose file.watch registry has never heard of us.
     void detachingTransportNeverResubscribes();
@@ -109,6 +119,9 @@ private:
     void sendNotification(const QString& m, const QJsonObject& params);
     // Drain the watch subscription + (absent) recovery stat that follow a load.
     void serveWatchThenNoRecovery();
+    // Answer the file.stat every load issues to derive read-only-ness (SPEC
+    // 8.2). Defaults to a plainly writable regular file.
+    void servePermissionStat(int mode = 0644);
     // ready() (the page is connected, so content flows straight through) then
     // open(path) -> readFile(content,rev) -> Clean, plus watch + empty recovery.
     void openClean(const QString& path, const QString& content, const QString& rev);
@@ -219,11 +232,29 @@ void TstEditorController::sendNotification(const QString& m, const QJsonObject& 
     m_serverSide->flush();
 }
 
+void TstEditorController::servePermissionStat(int mode)
+{
+    const QJsonObject stat = nextRequest();
+    QCOMPARE(method(stat), kStat);
+    QVERIFY2(!reqPath(stat).contains(QStringLiteral(".codeharbor-recovery")),
+             "the permission stat must target the file itself");
+    respondResult(reqId(stat), {{"path", reqPath(stat)},
+                                {"kind", "file"},
+                                {"size", 0},
+                                {"mtimeMs", 0},
+                                {"mode", mode},
+                                {"revision", "rperm"}});
+}
+
 void TstEditorController::serveWatchThenNoRecovery()
 {
     const QJsonObject watch = nextRequest();
     QCOMPARE(method(watch), kWatch);
     respondResult(reqId(watch), {{"subscriptionId", "sub1"}});
+
+    // Every load re-derives read-only from the server's view of the file
+    // (SPEC 8.2); the recovery probe is chained BEHIND it.
+    servePermissionStat();
 
     const QJsonObject stat = nextRequest();
     QCOMPARE(method(stat), kStat);
@@ -382,6 +413,7 @@ void TstEditorController::externalChangeWhileCleanReloads()
                                 {"content", "externally edited"},
                                 {"revision", "r5"},
                                 {"truncated", false}});
+    servePermissionStat();
 
     QTRY_COMPARE(contentSpy.count(), 1);
     QCOMPARE(contentSpy.at(0).at(0).toString(), QStringLiteral("externally edited"));
@@ -464,6 +496,9 @@ void TstEditorController::recoverySnapshotWrittenAndOfferedOnReopen()
     QCOMPARE(method(watch), kWatch);
     respondResult(reqId(watch), {{"subscriptionId", "sub2"}});
 
+    // Writable, so the recovery probe behind it goes ahead.
+    servePermissionStat();
+
     // Recovery stat: snapshot present this time.
     const QJsonObject stat = nextRequest();
     QCOMPARE(method(stat), kStat);
@@ -528,8 +563,11 @@ void TstEditorController::reopenUnwatchesPreviousSubscription()
     QCOMPARE(reqPath(watch), QStringLiteral("/foo/b.txt"));
     respondResult(reqId(watch), {{"subscriptionId", "sub2"}});
 
+    servePermissionStat();
+
     const QJsonObject stat = nextRequest();
     QCOMPARE(method(stat), kStat);
+    QVERIFY(reqPath(stat).contains(QStringLiteral(".codeharbor-recovery")));
     respondError(reqId(stat), -32002, QStringLiteral("ENOENT")); // no snapshot
 
     QTRY_COMPARE(m_controller->fileState(), QStringLiteral("clean"));
@@ -590,6 +628,7 @@ void TstEditorController::contentBufferedUntilPageReportsReady()
                                    {"revision", "r1"},
                                    {"truncated", false}});
     QTRY_COMPARE(contentSpy.count(), 2);
+    servePermissionStat();
     QTest::qWait(100);
     QCOMPARE(contentSpy.count(), 2);
 }
@@ -648,6 +687,8 @@ void TstEditorController::successfulSaveClearsRecoverySnapshot()
     const QJsonObject watch = nextRequest();
     QCOMPARE(method(watch), kWatch);
     respondResult(reqId(watch), {{"subscriptionId", "sub2"}});
+
+    servePermissionStat();
 
     const QJsonObject stat = nextRequest();
     QCOMPARE(method(stat), kStat);
@@ -786,6 +827,7 @@ void TstEditorController::reconnectResubscribesAndReconcilesCleanBuffer()
                                 {"content", "changed while away"},
                                 {"revision", "r2"},
                                 {"truncated", false}});
+    servePermissionStat();
 
     QTRY_COMPARE(contentSpy.count(), 1);
     QCOMPARE(contentSpy.at(0).at(0).toString(),
@@ -807,6 +849,7 @@ void TstEditorController::reconnectResubscribesAndReconcilesCleanBuffer()
                                   {"content", "later"},
                                   {"revision", "r3"},
                                   {"truncated", false}});
+    servePermissionStat();
     QTRY_COMPARE(contentSpy.count(), 2);
     QVERIFY2(nextRequest(300).isEmpty(),
              "a second watcher double-delivered the change");
@@ -873,12 +916,13 @@ void TstEditorController::reconnectOverAnUnansweredWatchSubscribesExactlyOnce()
                                 {"truncated", false}});
 
     // Both follow-ups are read off the wire and deliberately LEFT UNANSWERED:
-    // the session dies with them outstanding.
+    // the session dies with them outstanding. The recovery probe is chained
+    // behind the permission stat, so it is never even issued.
     const QJsonObject deadWatch = nextRequest();
     QCOMPARE(method(deadWatch), kWatch);
-    const QJsonObject deadRecoveryStat = nextRequest();
-    QCOMPARE(method(deadRecoveryStat), kStat);
-    QVERIFY(reqPath(deadRecoveryStat).contains(QStringLiteral(".codeharbor-recovery")));
+    const QJsonObject deadPermissionStat = nextRequest();
+    QCOMPARE(method(deadPermissionStat), kStat);
+    QCOMPARE(reqPath(deadPermissionStat), QStringLiteral("/foo/f.txt"));
 
     reconnectTransport();
 
@@ -942,6 +986,220 @@ void TstEditorController::reconcileLosesToASaveThatSettledFirst()
     QCOMPARE(contentSpy.count(), 0);
     QCOMPARE(m_controller->revision(), QStringLiteral("r3"));
     QCOMPARE(m_controller->fileState(), QStringLiteral("clean"));
+}
+
+// ---------------------------------------------------------------------------
+// SPEC 8.2 read-only.
+//
+// Read-only used to be a setter nobody called: a file the session user could
+// not write opened freely editable, let the user type into it, and only failed
+// at save time — after the recovery machinery had already snapshotted work that
+// could never be written back.
+//
+// The derivation is deliberately CONSERVATIVE. StatResult (remote/src/files.ts)
+// carries `mode` and `kind` but no uid/gid, and the client does not know the
+// remote euid, so a set write bit proves nothing about US. The provable case is
+// the negative — no write bit set anywhere — and that is what is claimed here.
+// ---------------------------------------------------------------------------
+
+void TstEditorController::unwritableFileOpensReadOnlyAndRefusesSave()
+{
+    makePair();
+
+    QSignalSpy readOnlySpy(m_controller, &EditorController::readOnlyChanged);
+    QSignalSpy saveErrorSpy(m_controller, &EditorController::saveError);
+
+    m_controller->ready();
+    m_controller->open(QStringLiteral("/foo/ro.txt"));
+    const QJsonObject read = nextRequest();
+    QCOMPARE(method(read), kReadFile);
+    respondResult(reqId(read), {{"path", "/foo/ro.txt"},
+                                {"encoding", "utf8"},
+                                {"content", "locked"},
+                                {"revision", "r1"},
+                                {"truncated", false}});
+    const QJsonObject watch = nextRequest();
+    QCOMPARE(method(watch), kWatch);
+    respondResult(reqId(watch), {{"subscriptionId", "sub1"}});
+
+    // 0444 — readable by everyone, writable by nobody.
+    servePermissionStat(0444);
+
+    QTRY_COMPARE(m_controller->readOnly(), true);
+    QCOMPARE(readOnlySpy.count(), 1);
+    QCOMPARE(readOnlySpy.at(0).at(0).toBool(), true);
+
+    // A buffer that can never be saved is never offered unsaved changes it
+    // could not apply (SPEC 11.3): the recovery probe is not even issued.
+    QVERIFY2(nextRequest(300).isEmpty(),
+             "a read-only open went looking for a recovery snapshot");
+
+    // ...and a debounced report racing the derivation writes no snapshot.
+    m_controller->reportContent(QStringLiteral("typed anyway"));
+    QVERIFY2(nextRequest(300).isEmpty(),
+             "a read-only buffer accumulated recovery state");
+    QCOMPARE(m_controller->fileState(), QStringLiteral("clean"));
+
+    // Ctrl+S is refused HERE, with a reason, instead of going out as a write
+    // that fails. The page guards its own key binding the same way, but its
+    // conflict/error notices call save() directly and bypass that guard.
+    m_controller->save(QStringLiteral("typed anyway"), QStringLiteral("r1"));
+    QTRY_COMPARE(saveErrorSpy.count(), 1);
+    QVERIFY(saveErrorSpy.at(0).at(0).toString().contains(
+        QStringLiteral("read-only"), Qt::CaseInsensitive));
+    QVERIFY2(nextRequest(300).isEmpty(), "a read-only save reached the server");
+    // Nothing failed and nothing moved: the buffer is still a clean r1.
+    QCOMPARE(m_controller->fileState(), QStringLiteral("clean"));
+    QCOMPARE(m_controller->revision(), QStringLiteral("r1"));
+}
+
+// A base64 read means the bytes on screen are NOT the file's bytes. save()
+// sends utf-8, so writing that buffer back would destroy the file — the buffer
+// is read-only even though the file itself is perfectly writable.
+void TstEditorController::binaryFileOpensReadOnly()
+{
+    makePair();
+
+    m_controller->ready();
+    m_controller->open(QStringLiteral("/foo/logo.png"));
+    const QJsonObject read = nextRequest();
+    QCOMPARE(method(read), kReadFile);
+    respondResult(reqId(read), {{"path", "/foo/logo.png"},
+                                {"encoding", "base64"},
+                                {"content", "iVBORw0KGgo="},
+                                {"revision", "r1"},
+                                {"truncated", false}});
+    QTRY_COMPARE(m_controller->readOnly(), true);
+
+    const QJsonObject watch = nextRequest();
+    QCOMPARE(method(watch), kWatch);
+    respondResult(reqId(watch), {{"subscriptionId", "sub1"}});
+    servePermissionStat(0644); // the FILE is writable; the BUFFER still is not
+
+    QTest::qWait(100);
+    QCOMPARE(m_controller->readOnly(), true);
+}
+
+// Read-only is DERIVED on every load, never latched at open. A chmod bumps
+// ctime, so it bumps the revision (revisionFrom in remote/src/files.ts), so it
+// arrives as an ordinary external change — and the reload behind it must re-ask
+// the server, in BOTH directions.
+void TstEditorController::readOnlyIsRederivedOnReloadAndNotLatched()
+{
+    makePair();
+    openClean(QStringLiteral("/foo/f.txt"), QStringLiteral("hello"),
+              QStringLiteral("r1"));
+    QCOMPARE(m_controller->readOnly(), false);
+
+    QSignalSpy readOnlySpy(m_controller, &EditorController::readOnlyChanged);
+
+    // chmod 444 on a clean buffer -> watch event -> reload -> re-derive.
+    sendNotification(kWatchEvent, {{"subscriptionId", "sub1"},
+                                   {"path", "/foo/f.txt"},
+                                   {"event", "modified"},
+                                   {"revision", "r2"}});
+    QJsonObject read = nextRequest();
+    QCOMPARE(method(read), kReadFile);
+    respondResult(reqId(read), {{"path", "/foo/f.txt"},
+                                {"encoding", "utf8"},
+                                {"content", "hello"},
+                                {"revision", "r2"},
+                                {"truncated", false}});
+    servePermissionStat(0444);
+    QTRY_COMPARE(m_controller->readOnly(), true);
+
+    // chmod 644 back: the pane must become editable again, or a latched verdict
+    // leaves the user staring at a file they are allowed to write.
+    sendNotification(kWatchEvent, {{"subscriptionId", "sub1"},
+                                   {"path", "/foo/f.txt"},
+                                   {"event", "modified"},
+                                   {"revision", "r3"}});
+    read = nextRequest();
+    QCOMPARE(method(read), kReadFile);
+    respondResult(reqId(read), {{"path", "/foo/f.txt"},
+                                {"encoding", "utf8"},
+                                {"content", "hello"},
+                                {"revision", "r3"},
+                                {"truncated", false}});
+    servePermissionStat(0644);
+    QTRY_COMPARE(m_controller->readOnly(), false);
+
+    QCOMPARE(readOnlySpy.count(), 2);
+    QCOMPARE(readOnlySpy.at(0).at(0).toBool(), true);
+    QCOMPARE(readOnlySpy.at(1).at(0).toBool(), false);
+}
+
+// A chmod during an outage produces no watch event anywhere, and a buffer that
+// is not reloaded has no other chance to re-derive. The reconciliation stat the
+// reconnect already makes carries the answer, so it is used.
+void TstEditorController::reconnectRederivesReadOnlyFromTheReconcileStat()
+{
+    makePair();
+    openClean(QStringLiteral("/foo/f.txt"), QStringLiteral("hello"),
+              QStringLiteral("r1"));
+    QCOMPARE(m_controller->readOnly(), false);
+
+    reconnectTransport();
+
+    const QJsonObject watch = nextRequest();
+    QCOMPARE(method(watch), kWatch);
+    respondResult(reqId(watch), {{"subscriptionId", "sub2"}});
+
+    // The CONTENT did not move (same revision), so nothing reloads — but the
+    // file was chmod'd 444 while we were down and the pane must learn it.
+    const QJsonObject stat = nextRequest();
+    QCOMPARE(method(stat), kStat);
+    QCOMPARE(reqPath(stat), QStringLiteral("/foo/f.txt"));
+    respondResult(reqId(stat), {{"path", "/foo/f.txt"},
+                                {"kind", "file"},
+                                {"mode", 0444},
+                                {"revision", "r1"}});
+
+    QTRY_COMPARE(m_controller->readOnly(), true);
+    QVERIFY2(nextRequest(300).isEmpty(), "an unchanged file was re-read");
+}
+
+// The WebChannel page attaches long after the load (see
+// contentBufferedUntilPageReportsReady). A read-only verdict reached while it
+// was absent must be replayed to it, and AHEAD of the buffer it applies to —
+// otherwise Monaco renders an unwritable file as freely editable.
+void TstEditorController::readOnlyReachesAPageThatConnectsLate()
+{
+    makePair(); // deliberately NO ready(): the page has not connected yet
+
+    QStringList order;
+    connect(m_controller, &EditorController::readOnlyChanged, m_controller,
+            [&order](bool ro) {
+                order << (ro ? QStringLiteral("readOnly=true")
+                             : QStringLiteral("readOnly=false"));
+            });
+    connect(m_controller, &EditorController::contentLoaded, m_controller,
+            [&order](const QString&, const QString&) {
+                order << QStringLiteral("content");
+            });
+
+    m_controller->open(QStringLiteral("/foo/ro.txt"));
+    const QJsonObject read = nextRequest();
+    QCOMPARE(method(read), kReadFile);
+    respondResult(reqId(read), {{"path", "/foo/ro.txt"},
+                                {"encoding", "utf8"},
+                                {"content", "locked"},
+                                {"revision", "r1"},
+                                {"truncated", false}});
+    const QJsonObject watch = nextRequest();
+    QCOMPARE(method(watch), kWatch);
+    respondResult(reqId(watch), {{"subscriptionId", "sub1"}});
+    servePermissionStat(0444);
+
+    QTRY_COMPARE(m_controller->readOnly(), true);
+    QVERIFY2(!order.contains(QStringLiteral("content")),
+             "content was pushed at a page that has not connected");
+
+    m_controller->ready();
+    QTRY_VERIFY(order.contains(QStringLiteral("content")));
+    QCOMPARE(order, QStringList({QStringLiteral("readOnly=true"),
+                                 QStringLiteral("readOnly=true"),
+                                 QStringLiteral("content")}));
 }
 
 QTEST_GUILESS_MAIN(TstEditorController)

@@ -180,3 +180,40 @@ export const RPC_TMUX_METHODS = {
 
 export type RpcTmuxMethodKey = keyof typeof RPC_TMUX_METHODS;
 export type RpcTmuxMethodName = (typeof RPC_TMUX_METHODS)[RpcTmuxMethodKey];
+
+// --- workspace persistence (SPEC 4.2, 11.1, docs/PLAN.md workstream P) -------
+//
+// The `workspace.*` group is the client's CRUD surface over the server-owned
+// workspace database. Like the file.* and tmux.* groups above it is its own
+// namespace: RPC_METHODS stays exactly the file.* catalog.
+//
+// Stable wire method names for the workspace group. Mirrored in C++ at
+// src/remote/RpcTypes.h — bump RPC_SCHEMA_VERSION when this set changes.
+// remote/test/rpc-mirror.test.ts parses that header and fails if the two sides
+// disagree, so a rename here without the matching C++ edit is caught at test
+// time rather than at runtime as a method-not-found against a live server.
+export const RPC_WORKSPACE_METHODS = {
+    list: "workspace.list",
+    createGroup: "workspace.createGroup",
+    updateGroup: "workspace.updateGroup",
+    deleteGroup: "workspace.deleteGroup",
+    reorderGroups: "workspace.reorderGroups",
+    createSession: "workspace.createSession",
+    updateSession: "workspace.updateSession",
+    deleteSession: "workspace.deleteSession",
+    reorderSessions: "workspace.reorderSessions",
+    moveSessionToGroup: "workspace.moveSessionToGroup",
+    duplicateSession: "workspace.duplicateSession",
+    createViewerPane: "workspace.createViewerPane",
+    updateViewerPane: "workspace.updateViewerPane",
+    deleteViewerPane: "workspace.deleteViewerPane",
+    createTerminalPane: "workspace.createTerminalPane",
+    updateTerminalPane: "workspace.updateTerminalPane",
+    deleteTerminalPane: "workspace.deleteTerminalPane",
+    getLayout: "workspace.getLayout",
+    setLayout: "workspace.setLayout",
+} as const;
+
+export type RpcWorkspaceMethodKey = keyof typeof RPC_WORKSPACE_METHODS;
+export type RpcWorkspaceMethodName =
+    (typeof RPC_WORKSPACE_METHODS)[RpcWorkspaceMethodKey];

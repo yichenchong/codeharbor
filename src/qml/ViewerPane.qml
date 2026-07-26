@@ -10,6 +10,13 @@ Item {
     property url url
     property string paneId: ""
 
+    // ---- focus reporting (SPEC 4.5) ----------------------------------------
+    // The user is working in THIS pane. ViewerRegion connects this when it
+    // mints the pane (takePane) and republishes it as the root region's
+    // `focusedPaneId`; that is what the palette's split/close commands target,
+    // instead of guessing at the region's first leaf.
+    signal paneActivated(string paneId)
+
     // View kind for the current URL: "web" | "markdown" | "text" | "image" |
     // "pdf" | "directory" | "binary" (empty URL -> a neutral placeholder).
     property string kind: pane.url.toString().length === 0
@@ -34,6 +41,27 @@ Item {
             default:
                 return textComponent;
             }
+        }
+    }
+
+    // A CLICK is the only reliable evidence that the user is working here. Most
+    // of the sub-views above are WebEngineViews, and focus inside a page is
+    // Chromium's own state: it never surfaces as QML activeFocus, so watching
+    // activeFocus would see nothing for exactly the panes that matter most (an
+    // editor buffer being typed into). A click, by contrast, is what PUT the
+    // focus in that page, and it is delivered as a real Qt press first.
+    //
+    // The press is observed and then DECLINED, so it goes on to whatever is
+    // underneath — the web view, a button, a text view — and this stays a
+    // sniffer rather than an input-eating overlay. Declared after the content
+    // Loader because delivery is topmost-first: a sniffer underneath the
+    // content would never be reached.
+    MouseArea {
+        anchors.fill: parent
+        acceptedButtons: Qt.AllButtons
+        onPressed: function(mouse) {
+            pane.paneActivated(pane.paneId);
+            mouse.accepted = false;
         }
     }
 

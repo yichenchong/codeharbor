@@ -139,7 +139,14 @@ node src/bridge.ts
 ```bash
 ctest --preset dev                 # default: unit + integration, no external deps
 ctest --preset dev -L live         # live gates (need a real SSH server, see below)
+ctest --preset dev -L desktop      # desktop-only proofs (need a session bus)
 ```
+
+`-L desktop` currently holds one target, `tst_notifierlive`, which delivers a real
+notification through `org.freedesktop.Notifications`. It needs a session bus AND a
+running notification daemon; without them it reports **Skipped**, never Passed, and
+says so loudly — so a green run can never be mistaken for "notifications proven".
+It is deliberately NOT in `-L live`, whose prerequisite is the SSH fixture instead.
 
 ### Live gates
 

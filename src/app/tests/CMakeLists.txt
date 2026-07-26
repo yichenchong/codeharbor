@@ -84,15 +84,30 @@ set_tests_properties(tst_livereconnect PROPERTIES LABELS live TIMEOUT 300)
 
 # Notifier (SPEC 6.2). tst_notifier forces a bus-less environment in its own
 # main() so it exercises the headless no-op path everywhere; tst_notifierlive
-# needs a real notification daemon and QSKIPs without one.
+# is the only proof that a notification reaches a real display.
 qt_add_executable(tst_notifier tst_notifier.cpp)
 target_link_libraries(tst_notifier PRIVATE ch_app Qt6::Test Qt6::Core)
 add_test(NAME tst_notifier COMMAND tst_notifier)
 
+# tst_notifierlive needs a session bus with an org.freedesktop.Notifications
+# daemon. Two properties keep a missing daemon from reading as a proof:
+#
+#  * LABELS desktop, NOT live. Every `live` target needs the SSH fixture; this
+#    one needs a desktop session and nothing else, so `ctest -L live` must not
+#    imply notifications were exercised. Demand the proof with `-L desktop`.
+#    (Unlabelled runs such as `ctest --preset dev` still include it.)
+#  * SKIP_REGULAR_EXPRESSION on the banner the test prints when no daemon is
+#    present, so ctest reports Skipped instead of Passed. Failing outright
+#    would be worse — a daemon-less box is legitimate — but a silent pass is
+#    how unproven capability ships. Keep this string identical to
+#    kNotVerifiedToken in tst_notifierlive.cpp.
 qt_add_executable(tst_notifierlive tst_notifierlive.cpp)
 target_link_libraries(tst_notifierlive PRIVATE ch_app Qt6::Test Qt6::Core)
 add_test(NAME tst_notifierlive COMMAND tst_notifierlive)
-set_tests_properties(tst_notifierlive PROPERTIES LABELS live)
+set_tests_properties(tst_notifierlive PROPERTIES
+    LABELS desktop
+    SKIP_REGULAR_EXPRESSION "NOTIFICATION DELIVERY NOT VERIFIED"
+)
 
 # LIVE gate (docs/PLAN.md U): the real shell against a real codeharbord over a
 # real SSH session, plus two launches of the real GUI binary. The SSH cases

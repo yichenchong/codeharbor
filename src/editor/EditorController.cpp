@@ -29,6 +29,35 @@ QJsonObject unwatchParams(const QString& subscriptionId)
     return QJsonObject{{QStringLiteral("subscriptionId"), subscriptionId}};
 }
 
+// POSIX write bits (owner|group|other) of StatResult.mode, which
+// remote/src/files.ts mints straight from fs.lstat().
+constexpr int kWriteBits = 0222;
+
+// Does the server's stat PROVE the open file cannot be written?
+//
+// StatResult (remote/src/rpc-types.ts) carries `mode`, but no uid/gid — and the
+// client does not know the remote process's euid either. So "some write bit is
+// set" proves nothing: those bits may belong to a user we are not. The one
+// thing mode alone does prove is the negative — with NO write bit set anywhere,
+// no user but root can write the file. Read-only is therefore claimed on that
+// proof only, and every ambiguous case stays editable so the SPEC 8.6 write
+// path can report the real errno. Deliberately conservative: a false read-only
+// takes the file away from a user who could have edited it.
+//
+// A directory (or a socket/fifo) is never a writable text buffer regardless.
+// Note lstat reports the LINK for a symlink, whose 0777 mode hides an
+// unwritable target; that case falls through to the save-time error.
+bool statSaysUnwritable(const QJsonObject& stat)
+{
+    const QString kind = stat.value(QStringLiteral("kind")).toString();
+    if (kind == QLatin1String("directory") || kind == QLatin1String("other"))
+        return true;
+    const QJsonValue mode = stat.value(QStringLiteral("mode"));
+    if (!mode.isDouble())
+        return false;  // field absent: unknown, which is not the same as unwritable
+    return (mode.toInt() & kWriteBits) == 0;
+}
+
 } // namespace
 
 EditorController::EditorController(CodeharbordClient* client, QObject* parent)
@@ -165,6 +194,14 @@ void EditorController::reconcileAfterReconnect()
                 return;  // gone, or the file cannot be stat'd: nothing to claim
             if (self->m_path != path || self->m_revision != baseline)
                 return;  // superseded
+
+            // This stat is also the reconnect's permission refresh: the file
+            // may have been chmod'd while the session was down, and no watch
+            // event exists to tell us. Free — the round trip is already made —
+            // and it covers the dirty-buffer branch below, which never reloads
+            // and so would otherwise keep the pre-outage verdict forever.
+            self->applyStatPermissions(statRes.toObject());
+
             if (self->m_fileState == FileState::Saving)
                 return;  // the in-flight write decides this file's next state
 
@@ -197,6 +234,50 @@ void EditorController::setReadOnly(bool readOnly)
         return;
     m_readOnly = readOnly;
     emit readOnlyChanged(readOnly);
+
+    // Becoming read-only retires any recovery snapshot we are still holding
+    // (SPEC 11.3). A snapshot only pays off if it can be SAVED back one day;
+    // for a file the user can no longer write it is dead weight that re-prompts
+    // "unsaved changes" on every reopen and can never be applied. This normally
+    // has nothing to do — the snapshot is written by reportContent(), which the
+    // guard below refuses once read-only — but a debounced report from the page
+    // can land in the round trip before the derivation completes.
+    if (readOnly)
+        clearRecovery();
+}
+
+void EditorController::applyStatPermissions(const QJsonObject& stat)
+{
+    m_pathReadOnly = statSaysUnwritable(stat);
+    updateReadOnly();
+}
+
+void EditorController::refreshPermissions(std::function<void()> then)
+{
+    if (!m_client || m_path.isEmpty()) {
+        if (then)
+            then();
+        return;
+    }
+
+    const QString path = m_path;
+    QPointer<EditorController> self(this);
+    m_client->call(
+        QString::fromLatin1(rpc::kMethodStat), readParams(path),
+        [self, path, then](QJsonValue res, std::optional<RpcError> err) {
+            if (!self)
+                return;
+            // Superseded by a file switch: this answer describes the old file
+            // and must not decide the new one's editability.
+            if (self->m_path != path)
+                return;
+            // A stat that failed says nothing; keep the last derivation rather
+            // than guessing in either direction.
+            if (!err.has_value())
+                self->applyStatPermissions(res.toObject());
+            if (then)
+                then();
+        });
 }
 
 void EditorController::deliverContent(const QString& content, const QString& revision)
@@ -271,6 +352,12 @@ void EditorController::open(QString path)
     m_dirty = false;
     m_recoveryRevision.clear();
     m_recoveryHasContent = false;
+    // Read-only is per-FILE and re-derived below; carrying the previous file's
+    // verdict over would either lock an editable file or, worse, leave an
+    // unwritable one editable.
+    m_pathReadOnly = false;
+    m_bufferReadOnly = false;
+    updateReadOnly();
     // A load for the PREVIOUS file must never be replayed into the page after
     // a switch; the new load supersedes it.
     m_pendingContent.reset();
@@ -292,15 +379,29 @@ void EditorController::open(QString path)
                        const QString revision =
                            obj.value(QStringLiteral("revision")).toString();
                        self->m_revision = revision;
+                       // A base64 read means the file is binary: the buffer the
+                       // page shows is NOT the file's bytes, so writing it back
+                       // (save sends utf-8) would destroy it.
+                       self->m_bufferReadOnly =
+                           obj.value(QStringLiteral("encoding")).toString()
+                           == QLatin1String("base64");
+                       self->updateReadOnly();
                        self->deliverContent(content, revision);
                        self->setFileState(FileState::Clean);
 
                        // Subscribe to external-change notifications (SPEC 8.7).
                        self->subscribeWatch();
 
-                       // Offer a crash-recovery snapshot if one exists and
-                       // differs from the freshly loaded file (SPEC 11.3).
-                       self->checkRecovery(content);
+                       // Ask whether the file is writable, and only THEN look
+                       // for a crash-recovery snapshot: a file the user can
+                       // never save must not be offered unsaved changes it
+                       // could never apply (SPEC 11.3). Chaining also makes the
+                       // order deterministic — the alternative, a parallel
+                       // stat, races the recovery prompt it is meant to gate.
+                       self->refreshPermissions([self, content]() {
+                           if (self && !self->m_readOnly)
+                               self->checkRecovery(content);
+                       });
                    });
 }
 
@@ -352,6 +453,21 @@ void EditorController::save(QString content, QString expectedRevision)
 {
     if (!m_client || m_path.isEmpty())
         return;
+
+    // The buffer is not writable (SPEC 8.2), so this write can only end as an
+    // EACCES from the server or as a UTF-8 overwrite of a binary file. Refuse it
+    // here, with a reason the page can show, and leave FileState alone: nothing
+    // failed and nothing changed — the save simply never happened.
+    //
+    // The editor page guards Ctrl/Cmd+S the same way and the two must agree
+    // (src/web/editor/src/index.ts). This is the AUTHORITATIVE half: the page's
+    // conflict/error notices call bridge.save() directly, bypassing its own
+    // guard, and any host can invoke this slot.
+    if (m_readOnly) {
+        emit saveError(QStringLiteral(
+            "File is read-only; the buffer was not written."));
+        return;
+    }
 
     setFileState(FileState::Saving);
     const QString path = m_path;
@@ -414,6 +530,16 @@ void EditorController::save(QString content, QString expectedRevision)
 
 void EditorController::reportContent(QString content)
 {
+    // A read-only buffer can never be saved, so a recovery snapshot of it could
+    // never be applied — it would only pile up on the server and re-offer
+    // "unsaved changes" on every reopen (SPEC 11.3). Monaco stops producing the
+    // edits that drive this call once readOnlyChanged lands, but the bridge is
+    // fire-and-forget and the page debounces by 500ms, so a report from just
+    // before the derivation can still arrive. Drop it whole: the buffer is not
+    // dirty in any sense the user can act on.
+    if (m_readOnly)
+        return;
+
     m_dirty = true;
     if (m_fileState == FileState::Clean)
         setFileState(FileState::Modified);
@@ -521,8 +647,18 @@ void EditorController::reload(FileState transitional)
             const QString revision = obj.value(QStringLiteral("revision")).toString();
             self->m_revision = revision;
             self->m_dirty = false;
+            self->m_bufferReadOnly =
+                obj.value(QStringLiteral("encoding")).toString()
+                == QLatin1String("base64");
+            self->updateReadOnly();
             self->deliverContent(content, revision);
             self->setFileState(FileState::Clean);
+            // A chmod changes ctime, so it changes the revision, so it arrives
+            // here as an ordinary external change (SPEC 8.7). Re-derive rather
+            // than latch the verdict taken at open: a file made read-only under
+            // the user must stop being editable, and one made writable again
+            // must stop being refused.
+            self->refreshPermissions();
         });
 }
 

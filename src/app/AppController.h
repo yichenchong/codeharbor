@@ -96,6 +96,23 @@ public:
     // a stale sheet must not be able to declare a live connection disconnected.
     Q_INVOKABLE void resolveHostKey(bool accept);
 
+    // Answer a credentialPrompt with the password or key passphrase the user
+    // typed. An EMPTY secret is "cancel": the parked attempt is abandoned and
+    // nothing is retried. Same shape as resolveHostKey() and for the same
+    // reason — the pool asks for the credential from INSIDE the blocking
+    // libssh handshake, so the attempt is refused, the user is asked, and the
+    // connect is re-run with the answer. Nothing here ever spins a nested event
+    // loop, and the secret is used for exactly one attempt and then dropped: it
+    // is never stored in a ServerProfiles field, never written to QSettings and
+    // never logged.
+    Q_INVOKABLE void submitCredential(QString secret);
+
+    // Oldest codeharbord this client can drive. 4 is where `server.info` began
+    // reporting `serverId` (SPEC 3.5); against anything older the id comes back
+    // empty, every workspace row is keyed to "" and the user gets a healthy SSH
+    // session with a permanently empty sidebar. See adoptServerIdentity().
+    static constexpr int kMinimumServerSchemaVersion = 4;
+
     // Make a Dev Session current: loads both region layouts and remembers it so
     // the next launch reopens the same session.
     Q_INVOKABLE void activateSession(QString devSessionId);
@@ -133,6 +150,10 @@ signals:
     // An UNKNOWN host key was presented (a CHANGED key is refused outright by
     // the pool and never reaches here — SPEC 12.1). Answer with resolveHostKey().
     void hostKeyPrompt(QString host, QString keyType, QString fingerprint);
+    // The server asked for a password or a key passphrase: ssh-agent and the
+    // default keys could not authenticate `user` on `host`. `prompt` is the
+    // pool's own label for what it wants. Answer with submitCredential().
+    void credentialPrompt(QString user, QString host, QString prompt);
 
 private:
     // Emit `error` from an optional RpcError; returns true when an error was
@@ -216,11 +237,14 @@ private:
     // Deliberately does NOT emit; callers coalesce activeSessionChanged.
     void clearActiveSession(bool forget);
     // The whole connect attempt. `acceptedFingerprint` is the single host key
-    // the user approved for THIS attempt (empty for a first attempt); it is
-    // captured by value into the pool callback and consumed exactly once, so no
-    // approval can survive on the controller and silently trust a later,
+    // the user approved for THIS attempt (empty for a first attempt) and
+    // `secret` the single password/passphrase they typed (empty unless a
+    // credentialPrompt was just answered); both are captured by value into the
+    // pool callbacks and consumed exactly once, so neither an approval nor a
+    // secret can survive on the controller and be replayed at a later,
     // unrelated host.
-    void startConnect(const QString& profileId, QString acceptedFingerprint);
+    void startConnect(const QString& profileId, QString acceptedFingerprint,
+                      QString secret);
 
     QString m_connectionState = QStringLiteral("disconnected");
     QString m_connectionError;
@@ -241,6 +265,21 @@ private:
     // with m_connecting means "a prompt we raised is outstanding".
     QString m_pendingFingerprint;
     QPair<QString, QString> m_pendingHostKeyInfo;
+    // The host key the user approved for the attempt CHAIN in flight. A chain
+    // is one m_connecting window: refuse -> ask -> retry, possibly twice (host
+    // key, then credential). The approval has to outlive the single retry that
+    // consumed it, because a connect refused at the AUTH stage never got as far
+    // as persisting the key it just accepted — without this the user would be
+    // asked to re-approve the same host key after typing their password.
+    // Cleared with m_connecting, so it never spans two user-initiated connects.
+    QString m_approvedFingerprint;
+    // The in-flight attempt asked for a password/passphrase and was refused so
+    // the user could be prompted. The two strings are what the prompt says; the
+    // SECRET is never held here, only passed through startConnect() into the
+    // pool callback that consumes it.
+    bool m_credentialRequested = false;
+    QString m_credentialUser;
+    QString m_credentialLabel;
 };
 
 } // namespace ch

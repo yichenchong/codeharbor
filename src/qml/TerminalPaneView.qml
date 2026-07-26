@@ -45,6 +45,13 @@ Rectangle {
     property string terminalId: pane.paneId
     property string workingDir: ""
 
+    // ---- focus reporting (SPEC 4.5) ----
+    // The user is working in THIS pane. TerminalRegion connects this when it
+    // mints the pane (takePane) and republishes it as the root region's
+    // `focusedPaneId`; that is what the palette's split/close commands target,
+    // instead of guessing at the region's first leaf.
+    signal paneActivated(string paneId)
+
     // The `terminalFactory` context property, resolved once. Guarded so a host
     // that does not install it (a bare QML load) gets inert chrome rather than
     // a ReferenceError; also the seam a test injects a stub through.
@@ -351,6 +358,29 @@ Rectangle {
                 text: qsTr("Retry")
                 onClicked: pane.attachNow()
             }
+        }
+    }
+
+    // A CLICK is the only reliable evidence that the user is working here. The
+    // terminal the user types into is an xterm.js page inside a WebEngineView,
+    // and focus in that page is Chromium's own state: it never surfaces as QML
+    // activeFocus, so watching activeFocus would see nothing for a pane being
+    // typed into all day. The click is what PUT the focus in the page, and it
+    // is delivered as a real Qt press first. The page's own focus events are
+    // deliberately NOT used: routing them here would mean a new slot on
+    // ch::TerminalBridge, whose contract with the bundle is frozen.
+    //
+    // The press is observed and then DECLINED, so it goes on to whatever is
+    // underneath — the renderer, the Connect button, the banner's Retry — and
+    // this stays a sniffer rather than an input-eating overlay. Declared last
+    // because delivery is topmost-first: a sniffer under the placeholder chrome
+    // would never see a click on a pane that has not come up yet.
+    MouseArea {
+        anchors.fill: parent
+        acceptedButtons: Qt.AllButtons
+        onPressed: function(mouse) {
+            pane.paneActivated(pane.paneId)
+            mouse.accepted = false
         }
     }
 

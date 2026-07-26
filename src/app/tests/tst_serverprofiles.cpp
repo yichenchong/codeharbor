@@ -210,6 +210,7 @@ private slots:
     void sheetEmitsConnectAndRemoveForTheSelection();
     void sheetSavesANewProfileThenEditsIt();
     void sheetHostKeyPromptDecidesBothWays();
+    void sheetCredentialPromptMasksSubmitsAndKeepsTheSecretOffDisk();
     void sheetSurfacesErrorTextWithoutBlocking();
     void sheetIsUsableFromTheKeyboardAlone();
 
@@ -719,6 +720,7 @@ void TstServerProfiles::sheetLoadsSilentlyAndExposesItsApi()
         {QByteArrayLiteral("connectionState"), QMetaType::QString},
         {QByteArrayLiteral("errorText"), QMetaType::QString},
         {QByteArrayLiteral("pendingHostKey"), QMetaType::QVariant},
+        {QByteArrayLiteral("pendingCredential"), QMetaType::QVariant},
     };
     for (const auto& expected : expectedProperties) {
         const int index = mo->indexOfProperty(expected.first.constData());
@@ -731,6 +733,7 @@ void TstServerProfiles::sheetLoadsSilentlyAndExposesItsApi()
         QByteArrayLiteral("profileSaved(QVariant)"),
         QByteArrayLiteral("profileRemoved(QString)"),
         QByteArrayLiteral("hostKeyDecision(bool)"),
+        QByteArrayLiteral("credentialSubmitted(QString)"),
         QByteArrayLiteral("dismissed()"),
     };
     for (const QByteArray& signature : expectedSignals) {
@@ -745,6 +748,7 @@ void TstServerProfiles::sheetLoadsSilentlyAndExposesItsApi()
             || !root->property("pendingHostKey").toBool());
     QVERIFY(root->findChild<QObject*>(QStringLiteral("emptyHint"))->property("visible").toBool());
     QVERIFY(!root->findChild<QObject*>(QStringLiteral("hostKeyPrompt"))->property("visible").toBool());
+    QVERIFY(!root->findChild<QObject*>(QStringLiteral("credentialPrompt"))->property("visible").toBool());
     QVERIFY(!root->findChild<QObject*>(QStringLiteral("errorBanner"))->property("visible").toBool());
     QCOMPARE(stringOf(root->findChild<QObject*>(QStringLiteral("stateLabel")), "text"),
              QStringLiteral("disconnected"));
@@ -984,6 +988,113 @@ void TstServerProfiles::sheetHostKeyPromptDecidesBothWays()
     // Clearing the pending key puts the sheet back.
     root->setProperty("pendingHostKey", QVariant::fromValue(nullptr));
     QVERIFY(!prompt->property("visible").toBool());
+
+    CH_ASSERT_SILENT();
+}
+
+// The masked secret field. SshConnectionPool's third auth rung asks for a
+// password or key passphrase, and until this existed the sheet collected no
+// secret at all, so the rung was unreachable from the product.
+//
+// What is gated here is not the pixels but the two properties that make it safe
+// to type into: the field is MASKED, and the secret leaves only through
+// credentialSubmitted() — never through profileSaved(), which is the one signal
+// that reaches ServerProfiles and therefore the ini file on disk.
+void TstServerProfiles::sheetCredentialPromptMasksSubmitsAndKeepsTheSecretOffDisk()
+{
+    CH_LOAD_SHEET(view, root);
+    const QString secret = QStringLiteral("correct-horse-battery-42");
+
+    // A REAL store, fed exactly the way Main.qml feeds it: whatever the sheet
+    // emits on profileSaved() is what reaches ServerProfiles, and therefore the
+    // ini file on disk.
+    const QString ini = iniPath(QStringLiteral("credential.ini"));
+    ServerProfiles store(ini);
+
+    QSignalSpy submitSpy(root, SIGNAL(credentialSubmitted(QString)));
+    QSignalSpy savedSpy(root, SIGNAL(profileSaved(QVariant)));
+    QSignalSpy dismissSpy(root, SIGNAL(dismissed()));
+    QObject* const prompt = root->findChild<QObject*>(QStringLiteral("credentialPrompt"));
+    QVERIFY(prompt);
+    QVERIFY(!prompt->property("visible").toBool());
+
+    root->setProperty("pendingCredential",
+                      QVariantMap{{QStringLiteral("user"), QStringLiteral("yichen")},
+                                  {QStringLiteral("host"), QStringLiteral("box.local")},
+                                  {QStringLiteral("prompt"), QStringLiteral("Password")}});
+    QVERIFY(prompt->property("visible").toBool());
+
+    const QString target =
+        stringOf(root->findChild<QObject*>(QStringLiteral("credentialTarget")), "text");
+    QVERIFY2(target.contains(QStringLiteral("yichen")), qPrintable(target));
+    QVERIFY2(target.contains(QStringLiteral("box.local")), qPrintable(target));
+
+    QObject* const field = root->findChild<QObject*>(QStringLiteral("credentialField"));
+    QVERIFY(field);
+    // MASKED. TextInput.Password == 2; a plain-text password box would be the
+    // whole point of this field missed.
+    QCOMPARE(field->property("echoMode").toInt(), 2);
+    // Nothing can be submitted until something is typed.
+    QVERIFY(!root->findChild<QObject*>(QStringLiteral("credentialSubmitButton"))
+                 ->property("enabled").toBool());
+
+    field->setProperty("text", secret);
+    QMetaObject::invokeMethod(
+        root->findChild<QObject*>(QStringLiteral("credentialSubmitButton")), "clicked");
+
+    QCOMPARE(submitSpy.count(), 1);
+    QCOMPARE(submitSpy.at(0).at(0).toString(), secret);
+    // Wiped from the field in the same turn it was handed up, so it is not left
+    // living in a QML item (and its undo stack) after being spent.
+    QCOMPARE(stringOf(field, "text"), QString());
+
+    // Cancel is an empty answer, and Escape is a cancel — never an accidental
+    // submit of whatever happens to be typed.
+    root->setProperty("pendingCredential",
+                      QVariantMap{{QStringLiteral("user"), QStringLiteral("yichen")},
+                                  {QStringLiteral("host"), QStringLiteral("box.local")}});
+    field->setProperty("text", secret);
+    QMetaObject::invokeMethod(
+        root->findChild<QObject*>(QStringLiteral("credentialCancelButton")), "clicked");
+    QCOMPARE(submitSpy.count(), 2);
+    QCOMPARE(submitSpy.at(1).at(0).toString(), QString());
+    QCOMPARE(stringOf(field, "text"), QString());
+
+    field->setProperty("text", secret);
+    QKeyEvent escape(QEvent::KeyPress, Qt::Key_Escape, Qt::NoModifier);
+    QCoreApplication::sendEvent(root, &escape);
+    QCOMPARE(submitSpy.count(), 3);
+    QCOMPARE(submitSpy.at(2).at(0).toString(), QString());
+    QCOMPARE(dismissSpy.count(), 0);
+
+    // Clearing the prompt puts the sheet back and leaves nothing behind.
+    root->setProperty("pendingCredential", QVariant::fromValue(nullptr));
+    QVERIFY(!prompt->property("visible").toBool());
+    QCOMPARE(stringOf(field, "text"), QString());
+
+    // Now save a profile through the very path that DOES persist, and prove the
+    // secret is nowhere in the resulting store. A passphrase in the config file
+    // would be a worse defect than the missing prompt this fixes.
+    root->findChild<QObject*>(QStringLiteral("hostField"))
+        ->setProperty("text", QStringLiteral("box.local"));
+    root->findChild<QObject*>(QStringLiteral("userField"))
+        ->setProperty("text", QStringLiteral("yichen"));
+    QMetaObject::invokeMethod(
+        root->findChild<QObject*>(QStringLiteral("saveButton")), "clicked");
+    QCOMPARE(savedSpy.count(), 1);
+
+    // Whatever the sheet chose to publish is ALL that can ever be persisted.
+    const QVariantMap fields = savedSpy.at(0).at(0).toMap();
+    for (const QVariant& value : fields)
+        QVERIFY2(value.toString() != secret, qPrintable(fields.key(value)));
+    QVERIFY(!store.addProfile(fields).isEmpty());
+    QCOMPARE(store.profiles().size(), 1);
+
+    QFile file(ini);
+    QVERIFY(file.open(QIODevice::ReadOnly));
+    const QByteArray onDisk = file.readAll();
+    QVERIFY(!onDisk.isEmpty());
+    QVERIFY2(!onDisk.contains(secret.toUtf8()), onDisk.constData());
 
     CH_ASSERT_SILENT();
 }

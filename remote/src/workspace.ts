@@ -7,7 +7,9 @@
 //
 // WORKSPACE_METHODS exposes the `workspace.*` RPC group. This is P's OWN method
 // group — deliberately NOT part of the frozen six-method C1 file catalog
-// (RPC_METHODS in rpc-types.ts, which stays exactly the file.* methods).
+// (RPC_METHODS in rpc-types.ts, which stays exactly the file.* methods). Its
+// wire names live in RPC_WORKSPACE_METHODS in rpc-types.ts, mirrored in C++ at
+// src/remote/RpcTypes.h.
 
 import { DatabaseSync } from "node:sqlite";
 import { randomUUID } from "node:crypto";
@@ -15,6 +17,9 @@ import { mkdirSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import os from "node:os";
 import path from "node:path";
+
+import { RPC_WORKSPACE_METHODS as M } from "./rpc-types.ts";
+import type { RpcWorkspaceMethodName } from "./rpc-types.ts";
 
 // Current schema version. Mirrors schema_version in remote/sql/schema.sql and
 // WorkspaceDb::kSchemaVersion (bump all three together — see schema.sql header).
@@ -1017,29 +1022,32 @@ export function serverIdentity(): string {
 // RPC handler table for the `workspace.*` method group (P's own group; NOT part
 // of the frozen C1 file catalog). codeharbord spreads these into its method map
 // and awaits any returned value; a thrown DB error becomes a JSON-RPC error.
-export const WORKSPACE_METHODS: Record<string, (params: unknown) => unknown> = {
-    "workspace.list": (p) => {
+// The keys come from the shared RPC_WORKSPACE_METHODS contract, so a wire-name
+// change is a one-place edit here and in its C++ mirror — never a retyped
+// literal that can drift apart silently.
+export const WORKSPACE_METHODS: Record<RpcWorkspaceMethodName, (params: unknown) => unknown> = {
+    [M.list]: (p) => {
         if (typeof p !== "object" || p === null || !("serverId" in p) || typeof p.serverId !== "string") {
-            throw new Error("workspace.list requires a string serverId");
+            throw new Error(`${M.list} requires a string serverId`);
         }
         return workspace().list(p.serverId);
     },
-    "workspace.createGroup": (p) => workspace().createGroup(p as CreateGroupParams),
-    "workspace.updateGroup": (p) => workspace().updateGroup(p as UpdateGroupParams),
-    "workspace.deleteGroup": (p) => workspace().deleteGroup(p as { id: string }),
-    "workspace.reorderGroups": (p) => workspace().reorderGroups(p as { serverId: string; orderedIds: string[] }),
-    "workspace.createSession": (p) => workspace().createSession(p as CreateSessionParams),
-    "workspace.updateSession": (p) => workspace().updateSession(p as UpdateSessionParams),
-    "workspace.deleteSession": (p) => workspace().deleteSession(p as { id: string }),
-    "workspace.reorderSessions": (p) => workspace().reorderSessions(p as { groupId: string; orderedIds: string[] }),
-    "workspace.moveSessionToGroup": (p) => workspace().moveSessionToGroup(p as MoveSessionParams),
-    "workspace.duplicateSession": (p) => workspace().duplicateSession(p as { id: string }),
-    "workspace.createViewerPane": (p) => workspace().createViewerPane(p as CreateViewerPaneParams),
-    "workspace.updateViewerPane": (p) => workspace().updateViewerPane(p as UpdateViewerPaneParams),
-    "workspace.deleteViewerPane": (p) => workspace().deleteViewerPane(p as { id: string }),
-    "workspace.createTerminalPane": (p) => workspace().createTerminalPane(p as CreateTerminalPaneParams),
-    "workspace.updateTerminalPane": (p) => workspace().updateTerminalPane(p as UpdateTerminalPaneParams),
-    "workspace.deleteTerminalPane": (p) => workspace().deleteTerminalPane(p as { id: string }),
-    "workspace.getLayout": (p) => workspace().getLayout(p as GetLayoutParams),
-    "workspace.setLayout": (p) => workspace().setLayout(p as SetLayoutParams),
+    [M.createGroup]: (p) => workspace().createGroup(p as CreateGroupParams),
+    [M.updateGroup]: (p) => workspace().updateGroup(p as UpdateGroupParams),
+    [M.deleteGroup]: (p) => workspace().deleteGroup(p as { id: string }),
+    [M.reorderGroups]: (p) => workspace().reorderGroups(p as { serverId: string; orderedIds: string[] }),
+    [M.createSession]: (p) => workspace().createSession(p as CreateSessionParams),
+    [M.updateSession]: (p) => workspace().updateSession(p as UpdateSessionParams),
+    [M.deleteSession]: (p) => workspace().deleteSession(p as { id: string }),
+    [M.reorderSessions]: (p) => workspace().reorderSessions(p as { groupId: string; orderedIds: string[] }),
+    [M.moveSessionToGroup]: (p) => workspace().moveSessionToGroup(p as MoveSessionParams),
+    [M.duplicateSession]: (p) => workspace().duplicateSession(p as { id: string }),
+    [M.createViewerPane]: (p) => workspace().createViewerPane(p as CreateViewerPaneParams),
+    [M.updateViewerPane]: (p) => workspace().updateViewerPane(p as UpdateViewerPaneParams),
+    [M.deleteViewerPane]: (p) => workspace().deleteViewerPane(p as { id: string }),
+    [M.createTerminalPane]: (p) => workspace().createTerminalPane(p as CreateTerminalPaneParams),
+    [M.updateTerminalPane]: (p) => workspace().updateTerminalPane(p as UpdateTerminalPaneParams),
+    [M.deleteTerminalPane]: (p) => workspace().deleteTerminalPane(p as { id: string }),
+    [M.getLayout]: (p) => workspace().getLayout(p as GetLayoutParams),
+    [M.setLayout]: (p) => workspace().setLayout(p as SetLayoutParams),
 };

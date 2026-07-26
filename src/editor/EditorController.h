@@ -2,10 +2,12 @@
 
 #include "SessionState.h"
 
+#include <QJsonObject>
 #include <QJsonValue>
 #include <QObject>
 #include <QString>
 
+#include <functional>
 #include <optional>
 
 namespace ch {
@@ -31,7 +33,8 @@ class EditorController : public QObject {
     Q_OBJECT
     // SPEC 8.2 file lifecycle as a ch::FileState string (see toString(FileState)).
     Q_PROPERTY(QString fileState READ fileState NOTIFY fileStateChanged)
-    // Editor read-only toggle (SPEC 8.2).
+    // Editor read-only state (SPEC 8.2). DERIVED, never set from outside: see
+    // refreshPermissions() / applyStatPermissions() below.
     Q_PROPERTY(bool readOnly READ readOnly NOTIFY readOnlyChanged)
 public:
     explicit EditorController(CodeharbordClient* client, QObject* parent = nullptr);
@@ -46,11 +49,6 @@ public:
     // Exposed for host/tests; not part of the JS bridge surface.
     QString path() const { return m_path; }
     QString revision() const { return m_revision; }
-
-    // Toggle read-only mode (e.g. when a stat/permission check says the file
-    // cannot be written). Emits readOnlyChanged on transition. Not Q_INVOKABLE:
-    // the JS bridge only observes readOnly via readOnlyChanged.
-    void setReadOnly(bool readOnly);
 
 public slots:
     // ---- JS -> C++ bridge slots (fire-and-forget; results via signals) ----
@@ -111,6 +109,18 @@ private slots:
 
 private:
     void setFileState(FileState state);
+    // Publish m_pathReadOnly || m_bufferReadOnly, emitting readOnlyChanged on a
+    // transition. The ONLY writer of m_readOnly.
+    void setReadOnly(bool readOnly);
+    void updateReadOnly() { setReadOnly(m_pathReadOnly || m_bufferReadOnly); }
+    // Ask the server what the current path looks like and re-derive
+    // m_pathReadOnly from the answer, then run `then` (whether the stat
+    // succeeded or not, so a caller can chain work behind it). Read-only-ness is
+    // DERIVED on every load and every reconnect, never latched from the first
+    // open: a chmod is an ordinary external change.
+    void refreshPermissions(std::function<void()> then = {});
+    // Fold a file.stat result (RpcTypes StatResult) into m_pathReadOnly.
+    void applyStatPermissions(const QJsonObject& stat);
     void reload(FileState transitional);
     // Emit contentLoaded, or hold it until the page reports ready() (see the
     // ready() slot). The held buffer is overwritten by a newer load, so a
@@ -145,6 +155,13 @@ private:
     QString m_revision;      // baseline expectedRevision for the main file
     FileState m_fileState = FileState::Disconnected;
     bool m_readOnly = false;
+    // Two independent reasons a buffer cannot be written back, OR-ed into
+    // m_readOnly by updateReadOnly():
+    //   m_pathReadOnly   — file.stat says the file itself is not writable.
+    //   m_bufferReadOnly — the bytes we hold are not the file's bytes (a base64
+    //                      binary read), so saving them would corrupt it.
+    bool m_pathReadOnly = false;
+    bool m_bufferReadOnly = false;
     // True once reportContent has been seen since the last load/save: the buffer
     // holds unsaved edits, so external changes must NOT auto-reload (SPEC 8.7).
     bool m_dirty = false;

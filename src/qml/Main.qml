@@ -113,6 +113,14 @@ ApplicationWindow {
                   : window.viewerFallbackNode
             SplitView.fillWidth: true
             SplitView.minimumWidth: 320
+            // The region reports the pane the user last interacted with; record
+            // it so pane commands act on THAT pane instead of the region's first
+            // leaf. The empty value is deliberately NOT filtered: a focused pane
+            // that was closed must clear the selection rather than leave a
+            // command pointing at a pane that no longer exists.
+            onFocusedPaneIdChanged: if (app.uiState && app.activeSessionId.length > 0)
+                                        app.uiState.setSelectedPane(app.activeSessionId,
+                                                                    focusedPaneId)
         }
 
         TerminalRegion {
@@ -124,6 +132,9 @@ ApplicationWindow {
             // window.retargetTerminals(), not bound here; see that function.
             SplitView.preferredWidth: 520
             SplitView.minimumWidth: 280
+            onFocusedPaneIdChanged: if (app.uiState && app.activeSessionId.length > 0)
+                                        app.uiState.setSelectedPane(app.activeSessionId,
+                                                                    focusedPaneId)
         }
     }
 
@@ -202,6 +213,12 @@ ApplicationWindow {
         }
         onProfileRemoved: (id) => { if (app.serverProfiles) app.serverProfiles.removeProfile(id); }
         onHostKeyDecision: (accept) => { pendingHostKey = null; app.resolveHostKey(accept); }
+        onCredentialSubmitted: (secret) => {
+            // Cleared here BEFORE the secret is handed over, so the sheet is
+            // never left holding a prompt for an answer already spent.
+            pendingCredential = null;
+            app.submitCredential(secret);
+        }
         onDismissed: shown = false
 
         Component.onCompleted: {
@@ -236,6 +253,12 @@ ApplicationWindow {
             connectSheet.pendingHostKey = { host: host, keyType: keyType, fingerprint: fingerprint };
             connectSheet.shown = true;
         }
+        // ssh-agent and the default keys could not authenticate; the connect was
+        // refused so we could ask instead of blocking inside the handshake.
+        function onCredentialPrompt(user, host, prompt) {
+            connectSheet.pendingCredential = { user: user, host: host, prompt: prompt };
+            connectSheet.shown = true;
+        }
         // A successful connect is the sheet's exit condition. It fills the
         // window at z 900, so leaving it up after the workspace is reachable
         // hides the very thing the user just connected to behind a dialog they
@@ -243,6 +266,7 @@ ApplicationWindow {
         function onConnectionStateChanged() {
             if (app.connectionState === "connected") {
                 connectSheet.pendingHostKey = null;
+                connectSheet.pendingCredential = null;
                 connectSheet.shown = false;
             }
         }
@@ -329,21 +353,43 @@ ApplicationWindow {
             notifyUser(qsTr("Select a Dev Session before splitting a pane."));
             return;
         }
-        // Snapshot BEFORE the split: splitPane republishes the tree, and what
-        // we want to know is whether the command was ambiguous going in.
-        const before = window.regionTree(region);
-        const target = window.targetPaneId(region);
-        const created = app.layouts.splitPane(region, target, orientation);
-        // Pane focus is NOT tracked, and cannot be with what exists today:
-        // nothing in the app writes UiStateStore.selectedPane (grep - only the
-        // unit test does), and neither ViewerRegion nor TerminalRegion exposes a
-        // focus signal to wire it to, so targetPaneId()'s selected-pane branch
-        // is unreachable and every region command lands on the region's FIRST
-        // pane. With one pane that is the only answer and saying so is noise;
-        // with several it is a guess, and a guess the user must be told about
-        // rather than left to discover by watching the wrong pane divide.
-        if (created && created.length > 0 && window.paneCount(before) > 1)
-            notifyUser(qsTr("Split \"%1\": pane focus is not tracked yet, so pane commands always act on this region's first pane.").arg(target));
+        // Pane focus IS tracked now: each region reports the pane the user last
+        // clicked (ViewerRegion/TerminalRegion.focusedPaneId), and the handlers on
+        // those regions record it via UiStateStore.setSelectedPane, so
+        // targetPaneId()'s selected-pane branch is live and a split lands on the
+        // pane the user was working in. Detection is click-based: focus moved
+        // purely by keyboard does not report, so a future "focus next pane"
+        // command must tell the region directly rather than rely on this.
+        app.layouts.splitPane(region, window.targetPaneId(region), orientation);
+    }
+
+    // Close the pane the user last worked in. SessionLayouts collapses the parent
+    // branch and leaves an empty leaf behind if the region ends up bare, so a
+    // region is never left with nothing to show.
+    function closeActivePane(region) {
+        if (!app.layouts || app.activeSessionId.length === 0) {
+            notifyUser(qsTr("Select a Dev Session before closing a pane."));
+            return;
+        }
+        app.layouts.closePane(region, window.targetPaneId(region));
+    }
+
+    // End the focused terminal's REMOTE tmux session. Closing or detaching a pane
+    // deliberately leaves the remote shell running - that is what tmux is for - so
+    // this is the only way to actually stop it, and it is destructive.
+    function killActiveTerminal() {
+        if (app.activeSessionId.length === 0) {
+            notifyUser(qsTr("No active Dev Session."));
+            return;
+        }
+        const paneId = window.targetPaneId("terminal");
+        const pane = terminalRegion.paneCache ? terminalRegion.paneCache[paneId] : null;
+        if (!pane) {
+            notifyUser(qsTr("No live terminal pane to kill."));
+            return;
+        }
+        pane.killSession();
+        notifyUser(qsTr("Killed the remote tmux session for \"%1\".").arg(paneId));
     }
 
     readonly property var paletteCommands: [
@@ -361,6 +407,15 @@ ApplicationWindow {
           invoke: () => window.splitActivePane("terminal", "horizontal") },
         { id: "terminal.split.v", title: qsTr("Split Terminal Pane Vertically"),
           invoke: () => window.splitActivePane("terminal", "vertical") },
+        { id: "pane.close.viewer", title: qsTr("Close Focused Viewer Pane"),
+          invoke: () => window.closeActivePane("viewer") },
+        { id: "pane.close.terminal", title: qsTr("Close Focused Terminal Pane"),
+          invoke: () => window.closeActivePane("terminal") },
+        // Detaching leaves the remote tmux session running (that is the point of
+        // tmux); killing it is the only way to actually end the remote shell, and
+        // until now nothing in the UI could reach TerminalPaneView.killSession().
+        { id: "terminal.kill", title: qsTr("Kill Focused Terminal's Remote Session"),
+          invoke: () => window.killActiveTerminal() },
         { id: "agent.markSeen", title: qsTr("Mark Agent Output Seen"),
           invoke: () => {
               if (app.activeSessionId.length === 0)
