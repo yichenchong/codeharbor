@@ -53,25 +53,44 @@ KnownHosts::Verdict KnownHosts::verify(const QString& host,
             return Verdict::Mismatch;
     }
 
-    bool sawType = false;
+    // Does this host have ANY trusted entry? That question, not "any entry of
+    // this key TYPE", is what separates first use from a changed key. Keying
+    // the refusal on host+keyType let a MITM pick the type: a host trusted for
+    // ssh-ed25519 that suddenly presents ssh-rsa read as Unknown, and the user
+    // was shown the reassuring first-use prompt instead of the hard refusal.
+    bool sawTrustedHost = false;
     for (const Entry& e : m_entries) {
-        if (e.keyType != keyType || !entryHostMatches(e.host, host))
+        if (!entryHostMatches(e.host, host))
             continue;
-        // @revoked entries were handled above; a revoked entry never establishes
-        // trust, so other keys for the same host stay Unknown through it.
-        if (e.marker == QLatin1String("@revoked"))
+        // Neither marker is a host key we would ever accept, so neither may
+        // establish the trust that turns an unrelated key into a Mismatch:
+        // @revoked entries were handled above, and @cert-authority entries are
+        // opaque (a CA is not a direct host key).
+        if (e.marker == QLatin1String("@revoked")
+            || e.marker == QLatin1String("@cert-authority"))
             continue;
-        // @cert-authority entries are not direct host keys: never a source of
-        // Match/Mismatch. Hashed (|1|) entries DO participate — entryHostMatches
-        // resolves them via HMAC-SHA1 above.
-        if (e.marker == QLatin1String("@cert-authority"))
-            continue;
-        sawType = true;
-        if (e.key == keyBlob)
+        sawTrustedHost = true;
+        if (e.keyType == keyType && e.key == keyBlob)
             return Verdict::Match;
     }
-    // Same host+keyType seen but no blob matched: the key changed -> refuse.
-    return sawType ? Verdict::Mismatch : Verdict::Unknown;
+    // The host is trusted, but not with this key: the key changed, or the
+    // server switched to a type we never trusted. Both are refusals.
+    return sawTrustedHost ? Verdict::Mismatch : Verdict::Unknown;
+}
+
+QStringList KnownHosts::keyTypesFor(const QString& host) const
+{
+    QStringList types;
+    for (const Entry& e : m_entries) {
+        if (e.marker == QLatin1String("@revoked")
+            || e.marker == QLatin1String("@cert-authority"))
+            continue;
+        if (e.keyType.isEmpty() || !entryHostMatches(e.host, host))
+            continue;
+        if (!types.contains(e.keyType))
+            types.append(e.keyType);
+    }
+    return types;
 }
 
 void KnownHosts::add(const QString& host, const QString& keyType,

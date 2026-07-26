@@ -203,6 +203,18 @@ private:
     void restoreActiveSession();
     // Is `devSessionId` present in the last authoritative tree we read?
     bool sessionExists(const QString& devSessionId) const;
+    // The active Dev Session vanished from the authoritative tree (deleted
+    // here, or by another client): forget it everywhere it is remembered.
+    // Returns true when it actually dropped one, so the caller can emit
+    // activeSessionChanged exactly ONCE for the whole refresh rather than
+    // thrashing it. Deliberately does NOT emit anything itself.
+    bool dropActiveSessionIfGone();
+    // Tear down the active-session context: the id and both SessionLayouts
+    // region trees. `forget` also drops the remembered session for THIS server,
+    // which is right when the session is GONE and wrong when it is merely
+    // unreachable (a disconnect must still reopen it on the next connect).
+    // Deliberately does NOT emit; callers coalesce activeSessionChanged.
+    void clearActiveSession(bool forget);
     // The whole connect attempt. `acceptedFingerprint` is the single host key
     // the user approved for THIS attempt (empty for a first attempt); it is
     // captured by value into the pool callback and consumed exactly once, so no

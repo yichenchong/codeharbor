@@ -226,9 +226,12 @@ graph TD
 - **Start gate:** [x] M models · [x] P (for layout persistence).
 - **TODO:**
   - [x] Sidebar: groups (collapse), session rows with aggregate status, ops
-    create/rename/duplicate/move/delete (SPEC 4.2). Drag-reorder: invokables ready, DnD UI TBD.
+    create/rename/duplicate/move/delete (SPEC 4.2), and drag-and-drop reorder /
+    cross-group move / group reorder with keyboard selection (Wave 6, covered by
+    `tst_sidebar` driving real QTest drags).
   - [x] Persist region widths + selected pane per client (QSettings, SPEC 4.1); split ratios persist server-side via P layouts.
-  - [ ] Command palette + keyboard shortcuts (SPEC 15).
+  - [x] Command palette + keyboard shortcuts (SPEC 15) — `CommandPalette.qml`,
+    hosted in Main.qml, with per-command global `Shortcut`s (Wave 6).
 - **Stop gate:** ✅ MET — `tst_liveshell` performs live CRUD through AppController's
   invokables against a real `codeharbord`, then re-reads every mutation through a
   SECOND independent codeharbord process (so a local-only mutation fails), and
@@ -238,7 +241,8 @@ graph TD
   Wave 5 fixed a defect this gate exposed: persistence fired on every width change,
   so a restored width that did not fit was clamped and the clamped value overwrote
   the user's preference permanently. Writes now happen only on drag end.
-  Command palette + shortcuts (SPEC 15) remain unimplemented.
+  Pane FOCUS is not tracked, so palette split commands act on a region's first
+  pane rather than the focused one (see the Wave 7 gap list).
 - **Parallel with:** V/T rendering (consumes their pane views).
 
 ## Milestones (integration barriers → SPEC §16)

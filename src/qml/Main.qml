@@ -311,12 +311,39 @@ ApplicationWindow {
         return window.firstPaneId(tree, region === "viewer" ? "viewer-1" : "terminal-1");
     }
 
+    // Leaf count of a split tree: how many panes a region command could have
+    // meant.
+    function paneCount(tree) {
+        if (!tree)
+            return 0;
+        if (!tree.children || tree.children.length === 0)
+            return 1;
+        var n = 0;
+        for (var i = 0; i < tree.children.length; ++i)
+            n += window.paneCount(tree.children[i]);
+        return n;
+    }
+
     function splitActivePane(region, orientation) {
         if (!app.layouts || app.activeSessionId.length === 0) {
             notifyUser(qsTr("Select a Dev Session before splitting a pane."));
             return;
         }
-        app.layouts.splitPane(region, targetPaneId(region), orientation);
+        // Snapshot BEFORE the split: splitPane republishes the tree, and what
+        // we want to know is whether the command was ambiguous going in.
+        const before = window.regionTree(region);
+        const target = window.targetPaneId(region);
+        const created = app.layouts.splitPane(region, target, orientation);
+        // Pane focus is NOT tracked, and cannot be with what exists today:
+        // nothing in the app writes UiStateStore.selectedPane (grep - only the
+        // unit test does), and neither ViewerRegion nor TerminalRegion exposes a
+        // focus signal to wire it to, so targetPaneId()'s selected-pane branch
+        // is unreachable and every region command lands on the region's FIRST
+        // pane. With one pane that is the only answer and saying so is noise;
+        // with several it is a guess, and a guess the user must be told about
+        // rather than left to discover by watching the wrong pane divide.
+        if (created && created.length > 0 && window.paneCount(before) > 1)
+            notifyUser(qsTr("Split \"%1\": pane focus is not tracked yet, so pane commands always act on this region's first pane.").arg(target));
     }
 
     readonly property var paletteCommands: [

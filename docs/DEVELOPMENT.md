@@ -119,7 +119,7 @@ Presets are defined in [`CMakePresets.json`](../CMakePresets.json):
 ```bash
 cd remote
 npm install        # dev-only deps (typescript, @types/node); runtime has none
-npm test           # node --test -> 72 tests
+npm test           # node --test -> 99 tests
 npm run typecheck  # tsc --noEmit
 npm run build      # tsc -> dist/ (codeharbord, codeharbor-bridge)
 ```
@@ -143,11 +143,13 @@ ctest --preset dev -L live         # live gates (need a real SSH server, see bel
 
 ### Live gates
 
-The `live`-labelled targets (`tst_livessh`, `tst_liveterminal`, `tst_liveshell`,
-`tst_liveviewers`, `tst_liveeditor`, `tst_liveagent`) exercise the real thing: a real
-`sshd`, a real `codeharbord` over an SSH channel, real `tmux`, the real Monaco page,
+The `live`-labelled targets exercise the real thing: a real `sshd`, a real
+`codeharbord` over an SSH channel, real `tmux`, the real Monaco and xterm.js pages,
 and the real agent hook. They **QSKIP** unless `CH_LIVE_SSH` is set, so the default
-suite stays portable.
+suite stays portable. List them with `ctest --preset dev -L live -N`; the headline
+one is **`tst_coldstart`**, the whole first-run walkthrough (add a server, accept its
+host key, create and open a session, get a live shell, edit and save a remote file,
+relaunch and find it restored).
 
 Requirements on the remote side: `tmux`, Node 23.6+, and this repository checked out
 at the path given by `CH_LIVE_REPO`. Pointing the fixture at `127.0.0.1` (your own

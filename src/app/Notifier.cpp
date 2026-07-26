@@ -20,8 +20,9 @@ const QString kPath = QStringLiteral("/org/freedesktop/Notifications");
 const QString kIface = QStringLiteral("org.freedesktop.Notifications");
 const QString kAppName = QStringLiteral("CodeHarbor");
 const QString kAppIcon = QStringLiteral("utilities-terminal");
-// Let the daemon pick its own default expiry rather than pinning one; agent
-// attention is informational, not modal.
+// Pin a bounded expiry rather than passing -1 ("daemon default"): agent
+// attention is informational, not modal, and a daemon whose default is "never
+// expire" would otherwise leave a bubble on screen until it is clicked.
 constexpr int kExpireTimeoutMs = 8000;
 } // namespace
 

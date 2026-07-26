@@ -87,6 +87,28 @@ public:
     bool connectToHost(const QString& host, quint16 port, const QString& user);
     void disconnectFromHost();
 
+    // The known_hosts lookup token for an endpoint: the bare host on the default
+    // port, OpenSSH's "[host]:port" form otherwise. Static and public because
+    // both the algorithm pin (before the handshake) and the verdict (during it)
+    // must key off the SAME token.
+    static QString lookupHostFor(const QString& host, quint16 port);
+
+    // SSH_OPTIONS_HOSTKEYS value pinning the handshake to the algorithms we
+    // already trust for a host, or empty when nothing is trusted yet (first use
+    // must still work, so an untrusted host keeps libssh's default ordering).
+    //
+    // SPEC 12.1's hard refusal is only hard if the SERVER cannot choose which
+    // key it is challenged on. libssh reorders host-key algorithms from
+    // ~/.ssh/known_hosts, which is not our store, so without this pin a MITM
+    // presenting an ssh-rsa key for a host trusted as ssh-ed25519 downgraded a
+    // refusal into a first-use prompt.
+    //
+    // "ssh-rsa" expands to the SHA-2 signature algorithms first: OpenSSH 8.8+
+    // disables the SHA-1 "ssh-rsa" algorithm by default, and libssh reports all
+    // three under the single key type "ssh-rsa", so pinning the literal string
+    // alone would lock the user out of their own RSA host.
+    static QByteArray hostKeyAlgorithms(const QStringList& trustedKeyTypes);
+
     State state() const;
 
 #if CH_HAVE_LIBSSH

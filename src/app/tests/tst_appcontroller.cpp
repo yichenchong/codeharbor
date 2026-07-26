@@ -9,10 +9,12 @@
 #include <QJsonObject>
 #include <QJsonValue>
 #include <QSignalSpy>
+#include <QStandardPaths>
 
 #include <cstring>
 
 #include "AppController.h"
+#include "SessionLayouts.h"
 #include "UiStateStore.h"
 #include "WorkspaceDb.h"
 #include "WorkspaceTypes.h"
@@ -142,12 +144,41 @@ QByteArray errorFrame(int id, int code, const QString& message)
     return QJsonDocument(resp).toJson(QJsonDocument::Compact) + '\n';
 }
 
+// Every JSON-RPC request id the client has written since the last call, in
+// order. activateSession() fires TWO getLayout requests through SessionLayouts,
+// so takeRequest()'s first-line-only parse is not enough on its own.
+QVector<int> takeRequestIds(FakeTransport& transport)
+{
+    QVector<int> ids;
+    const QList<QByteArray> lines = transport.takeSent().split('\n');
+    for (const QByteArray& line : lines) {
+        if (line.trimmed().isEmpty())
+            continue;
+        ids.push_back(QJsonDocument::fromJson(line)
+                          .object()
+                          .value(QStringLiteral("id"))
+                          .toInt());
+    }
+    return ids;
+}
+
+// A workspace.getLayout/setLayout success frame: a SessionLayout row whose tree
+// is a single leaf (only "tree" is read back).
+QByteArray layoutLeafFrame(int id, const QString& paneId)
+{
+    const QJsonObject tree{{"type", "leaf"}, {"paneId", paneId}};
+    const QJsonObject row{{"id", "layout-1"}, {"tree", tree}};
+    const QJsonObject resp{{"jsonrpc", "2.0"}, {"id", id}, {"result", row}};
+    return QJsonDocument(resp).toJson(QJsonDocument::Compact) + '\n';
+}
+
 } // namespace
 
 class TstAppController : public QObject {
     Q_OBJECT
 
 private slots:
+    void initTestCase();
     void toGroupRowsMapsNestedNodes();
     void toGroupRowsEmptyIsEmpty();
     void uiStateStorePersistsAcrossInstances();
@@ -165,6 +196,10 @@ private slots:
     void agentMonitorMergesStateIntoSidebar();
     void refreshDoesNotWipeAgentDerivedState();
     void markSeenClearsFinishedUnseenBadge();
+    void vanishedActiveSessionIsRetiredEverywhere();
+    void staleOrFailedRefreshNeverRetiresActiveSession();
+    void deletingActiveSessionRetiresItThroughChainedRefresh();
+    void disconnectRetiresActiveSessionButStillRemembersIt();
 };
 
 // Two GroupNodes with sessions map to GroupRows preserving order, with the
@@ -634,6 +669,246 @@ void TstAppController::markSeenClearsFinishedUnseenBadge()
     // monitor.
     QCOMPARE(monitor.stateFor(QStringLiteral("sess-1"), QStringLiteral("term-1")),
              static_cast<int>(AgentState::IdleUnseen));
+}
+
+// AppController's own UiStateStore is the REAL per-user QSettings (it is
+// constructed with an empty ini path, exactly as main.cpp leaves it). The
+// active-session cases below drive it for real, so redirect QSettings at the
+// process level rather than writing into the developer's actual config.
+void TstAppController::initTestCase()
+{
+    QStandardPaths::setTestModeEnabled(true);
+}
+
+namespace {
+
+// Shared setup for the active-session cases: a controller wired to a real
+// SessionLayouts over its own WorkspaceDb (the main.cpp shape), serverId set
+// BEFORE the transport so the setter's refresh() no-ops, with session "s1"
+// active and BOTH region layouts loaded and editable.
+struct ActiveSessionFixture {
+    FakeTransport transport;
+    CodeharbordClient client;
+    AppController controller{&client};
+    SessionLayouts layouts{controller.workspaceDb()};
+
+    ActiveSessionFixture()
+    {
+        controller.setConnection(nullptr, nullptr, nullptr, &layouts);
+        controller.setServerId(QStringLiteral("srv"));
+        // Hermetic: a previous run must not leave a remembered session behind.
+        controller.uiState()->setActiveSession(QStringLiteral("srv"), QString());
+        client.setTransport(&transport);
+        transport.takeSent();
+    }
+
+    // Answer one workspace.list with a tree that holds group "g" + session "s1".
+    void deliverTreeWithS1()
+    {
+        controller.refresh();
+        transport.deliver(listWithTerminalFrame(
+            takeRequest(transport).value(QStringLiteral("id")).toInt(),
+            QStringLiteral("g"), QStringLiteral("s1"), QStringLiteral("t1")));
+    }
+
+    // Answer one workspace.list with group "g" and NO sessions: s1 is gone.
+    void deliverTreeWithoutS1()
+    {
+        controller.refresh();
+        transport.deliver(listResultFrame(
+            takeRequest(transport).value(QStringLiteral("id")).toInt(),
+            QStringLiteral("g")));
+    }
+
+    // Make s1 current and resolve both of its getLayout requests, so the
+    // layouts are genuinely loaded (valid trees, canEdit() satisfied).
+    void activateAndLoadS1()
+    {
+        controller.activateSession(QStringLiteral("s1"));
+        const QVector<int> layoutIds = takeRequestIds(transport);
+        for (int id : layoutIds)
+            transport.deliver(layoutLeafFrame(id, QStringLiteral("viewer-1")));
+    }
+};
+
+} // namespace
+
+// The active Dev Session can be deleted out from under the shell by ANOTHER
+// client: it simply stops appearing in the authoritative tree. Nothing else in
+// the controller ever clears m_activeSessionId (restoreActiveSession only ever
+// fills it in, and early-returns while it is non-empty), so before this it
+// stayed "active" forever: the terminal region kept its dead devSessionId,
+// SessionLayouts kept passing canEdit() and would keep writing
+// workspace.setLayout rows for a Dev Session the server had deleted, and
+// UiStateStore kept offering it to the next launch.
+void TstAppController::vanishedActiveSessionIsRetiredEverywhere()
+{
+    ActiveSessionFixture f;
+    f.deliverTreeWithS1();
+    f.activateAndLoadS1();
+
+    // Precondition: fully live. Layout edits for s1 are accepted and persisted.
+    QCOMPARE(f.controller.activeSessionId(), QStringLiteral("s1"));
+    QCOMPARE(f.layouts.devSessionId(), QStringLiteral("s1"));
+    QVERIFY(!f.layouts.viewerTree().isNull());
+    QVERIFY(!f.layouts.terminalTree().isNull());
+    QCOMPARE(f.controller.uiState()->activeSession(QStringLiteral("srv")),
+             QStringLiteral("s1"));
+    f.transport.takeSent();
+
+    QSignalSpy activeSpy(&f.controller, &AppController::activeSessionChanged);
+    f.deliverTreeWithoutS1();
+
+    // Retired everywhere, and exactly once - not thrashed per refresh.
+    QCOMPARE(f.controller.activeSessionId(), QString());
+    QCOMPARE(activeSpy.count(), 1);
+    QCOMPARE(f.layouts.devSessionId(), QString());
+    QVERIFY(f.layouts.viewerTree().isNull());
+    QVERIFY(f.layouts.terminalTree().isNull());
+    // Forgotten for THIS server only, so the next launch does not restore a
+    // phantom; another server's memory is untouched.
+    QCOMPARE(f.controller.uiState()->activeSession(QStringLiteral("srv")),
+             QString());
+
+    // The corruption this guards: with no Dev Session selected, SessionLayouts
+    // refuses the edit instead of writing setLayout under the dead id.
+    QSignalSpy layoutErrorSpy(&f.layouts, &SessionLayouts::error);
+    f.transport.takeSent();
+    f.layouts.splitPane(QStringLiteral("viewer"), QStringLiteral("viewer-1"),
+                        QStringLiteral("horizontal"));
+    QCOMPARE(layoutErrorSpy.count(), 1);
+    QVERIFY(f.transport.takeSent().isEmpty());
+
+    // Idempotent: a second identical refresh is a no-op, no further signal.
+    f.deliverTreeWithoutS1();
+    QCOMPARE(activeSpy.count(), 1);
+}
+
+// The retirement above must fire ONLY on an authoritative answer. A superseded
+// (stale-generation) list that happens to lack the session, and an RpcError -
+// which means "we do not know", not "it is gone" - must both leave the active
+// session completely alone. Getting this wrong turns a transient server hiccup
+// into a silently closed Dev Session.
+void TstAppController::staleOrFailedRefreshNeverRetiresActiveSession()
+{
+    ActiveSessionFixture f;
+    f.deliverTreeWithS1();
+    f.activateAndLoadS1();
+    QCOMPARE(f.controller.activeSessionId(), QStringLiteral("s1"));
+    f.transport.takeSent();
+
+    QSignalSpy activeSpy(&f.controller, &AppController::activeSessionChanged);
+
+    // Two refreshes in flight; the OLDER one comes back without s1, after the
+    // newer one already re-affirmed it. The generation guard must drop it
+    // before it can retire anything.
+    f.controller.refresh();
+    const int staleId = takeRequest(f.transport).value(QStringLiteral("id")).toInt();
+    f.controller.refresh();
+    const int freshId = takeRequest(f.transport).value(QStringLiteral("id")).toInt();
+    QVERIFY(staleId != freshId);
+    f.transport.deliver(listWithTerminalFrame(freshId, QStringLiteral("g"),
+                                              QStringLiteral("s1"),
+                                              QStringLiteral("t1")));
+    f.transport.deliver(listResultFrame(staleId, QStringLiteral("g")));
+
+    QCOMPARE(f.controller.activeSessionId(), QStringLiteral("s1"));
+    QCOMPARE(f.layouts.devSessionId(), QStringLiteral("s1"));
+    QCOMPARE(activeSpy.count(), 0);
+
+    // An outright RPC failure is not evidence of deletion either.
+    f.transport.takeSent();
+    f.controller.refresh();
+    f.transport.deliver(errorFrame(
+        takeRequest(f.transport).value(QStringLiteral("id")).toInt(), -32000,
+        QStringLiteral("workspace unavailable")));
+
+    QCOMPARE(f.controller.activeSessionId(), QStringLiteral("s1"));
+    QCOMPARE(f.layouts.devSessionId(), QStringLiteral("s1"));
+    QCOMPARE(activeSpy.count(), 0);
+    QCOMPARE(f.controller.uiState()->activeSession(QStringLiteral("srv")),
+             QStringLiteral("s1"));
+}
+
+// The same retirement must happen on THIS client's own deletion, which reaches
+// it by a different route: deleteSession chains refreshOnSuccess -> refresh(),
+// so the tree that no longer holds the session is the chained one.
+void TstAppController::deletingActiveSessionRetiresItThroughChainedRefresh()
+{
+    ActiveSessionFixture f;
+    f.deliverTreeWithS1();
+    f.activateAndLoadS1();
+    QCOMPARE(f.controller.activeSessionId(), QStringLiteral("s1"));
+    f.transport.takeSent();
+
+    f.controller.deleteSession(QStringLiteral("s1"));
+    const int deleteId =
+        takeRequest(f.transport).value(QStringLiteral("id")).toInt();
+    const QJsonObject ack{{"jsonrpc", "2.0"}, {"id", deleteId}, {"result", true}};
+    f.transport.deliver(QJsonDocument(ack).toJson(QJsonDocument::Compact) + '\n');
+
+    // The success chained a refresh; answer it with the post-delete tree.
+    f.transport.deliver(listResultFrame(
+        takeRequest(f.transport).value(QStringLiteral("id")).toInt(),
+        QStringLiteral("g")));
+
+    QCOMPARE(f.controller.activeSessionId(), QString());
+    QCOMPARE(f.layouts.devSessionId(), QString());
+    QCOMPARE(f.controller.uiState()->activeSession(QStringLiteral("srv")),
+             QString());
+}
+
+// Disconnect must land on a clear empty state, not a half-live shell still
+// pointing at a Dev Session it can no longer reach. Leaving it active is not
+// cosmetic: SessionLayouts keeps the devSessionId, keeps passing canEdit(),
+// and a Split command after Disconnect mutates and republishes a tree whose
+// setLayout fails - and since a reconnect never reloads a session that is
+// still active, the next edit that DOES land writes that divergent tree over
+// the real one. The session is unreachable, NOT gone, so unlike a deletion the
+// remembered id must survive and be reopened by the reconnect.
+void TstAppController::disconnectRetiresActiveSessionButStillRemembersIt()
+{
+    ActiveSessionFixture f;
+    SshConnectionPool pool;
+    AgentStatusMonitor monitor;
+    SessionBootstrap bootstrap(&pool, &f.client, &monitor);
+    f.controller.setConnection(&pool, &bootstrap, nullptr, &f.layouts);
+
+    f.deliverTreeWithS1();
+    f.activateAndLoadS1();
+    QCOMPARE(f.controller.activeSessionId(), QStringLiteral("s1"));
+    QVERIFY(!f.layouts.viewerTree().isNull());
+    f.transport.takeSent();
+
+    QSignalSpy activeSpy(&f.controller, &AppController::activeSessionChanged);
+    f.controller.disconnectServer();
+
+    QCOMPARE(f.controller.activeSessionId(), QString());
+    QCOMPARE(activeSpy.count(), 1);
+    QCOMPARE(f.layouts.devSessionId(), QString());
+    QVERIFY(f.layouts.viewerTree().isNull());
+    QVERIFY(f.layouts.terminalTree().isNull());
+    // The distinction from a deletion: the server still HAS this session, so
+    // the next connect must reopen it.
+    QCOMPARE(f.controller.uiState()->activeSession(QStringLiteral("srv")),
+             QStringLiteral("s1"));
+
+    // A layout edit is now refused outright instead of diverging locally.
+    QSignalSpy layoutErrorSpy(&f.layouts, &SessionLayouts::error);
+    f.transport.takeSent();
+    f.layouts.splitPane(QStringLiteral("viewer"), QStringLiteral("viewer-1"),
+                        QStringLiteral("horizontal"));
+    QCOMPARE(layoutErrorSpy.count(), 1);
+    QVERIFY(f.transport.takeSent().isEmpty());
+
+    // Reconnect: adoptServerIdentity re-drives refresh(), whose `refreshed`
+    // runs restoreActiveSession. Because the id was cleared, it reopens s1 -
+    // and reopening reloads BOTH regions from the server rather than reusing
+    // the tree we were holding when the link went down.
+    f.deliverTreeWithS1();
+    QCOMPARE(f.controller.activeSessionId(), QStringLiteral("s1"));
+    QCOMPARE(f.layouts.devSessionId(), QStringLiteral("s1"));
+    QCOMPARE(takeRequestIds(f.transport).size(), 2); // one getLayout per region
 }
 
 QTEST_GUILESS_MAIN(TstAppController)

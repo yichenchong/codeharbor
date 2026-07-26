@@ -57,6 +57,29 @@ Item {
     // property change during initial binding evaluation cannot navigate early.
     property bool started: false
 
+    // The ONE document this view may ever hold (the navigation guard below).
+    // Compared as a STRING: `request.url` arrives as a QUrl and
+    // `editorBundleUrl` as a QML url, and only their normalized text is
+    // guaranteed to line up across the two conversions.
+    //
+    // Query and fragment are cut from BOTH sides before comparing. Our own
+    // navigation carries a `?path=` language hint, and a percent-encoded path
+    // does not survive QUrl's pretty-decoded round trip byte for byte, so an
+    // exact-string pin would refuse the pane's own page. Ignoring the query
+    // costs nothing: it selects no document — the bytes loaded are the trusted
+    // qrc bundle either way — while remote, file:, data: and every other qrc
+    // page still fail the comparison.
+    function pinnedDocument(candidate) {
+        let text = String(candidate)
+        const query = text.indexOf("?")
+        if (query >= 0)
+            text = text.substring(0, query)
+        const fragment = text.indexOf("#")
+        if (fragment >= 0)
+            text = text.substring(0, fragment)
+        return text
+    }
+
     WebChannel {
         id: editorChannel
     }
@@ -74,6 +97,38 @@ Item {
         settings.localContentCanAccessRemoteUrls: false
 
         webChannel: editorChannel
+        // SECURITY: window.open() is the one navigation primitive that does not
+        // pass through onNavigationRequested below. Nothing in the editor bundle
+        // has any reason to open a window, and Monaco's built-in link opener
+        // reaches for exactly it on a URL found in remote file text.
+        settings.javascriptCanOpenWindows: false
+
+        // SECURITY (SPEC 7.2): this view carries the WebChannel, and Qt injects
+        // qt.webChannelTransport into EVERY document it loads — so a document
+        // loaded here gets ch::EditorController, i.e. open()/save() against any
+        // path on the remote host. The document rendered here is our own bundle,
+        // but the CONTENT it displays is attacker-controlled remote bytes, so
+        // the view is pinned to the bundle document. Anything else — remote,
+        // file:, data:, another qrc page — is refused outright rather than
+        // being allowed to inherit the bridge. Identical rule to
+        // TerminalPaneView.qml.
+        onNavigationRequested: function(request) {
+            const allowed = root.pinnedDocument(root.editorBundleUrl)
+            if (allowed.length > 0
+                && root.pinnedDocument(request.url) === allowed)
+                return
+            request.action = WebEngineNavigationRequest.IgnoreRequest
+            console.warn("EditorPaneView: refused navigation to", request.url)
+        }
+
+        // Belt and braces for the same rule: a new window would be a fresh view
+        // outside the pinning above. Handling the signal and never calling
+        // openIn() is what denies it.
+        onNewWindowRequested: function(request) {
+            console.warn("EditorPaneView: refused a new window for",
+                         request.requestedUrl)
+        }
+
         // NOT bound to editorBundleUrl: navigation is driven by navigate()
         // below so it can never start before registerObject("editor").
     }

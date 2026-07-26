@@ -258,6 +258,17 @@ void AppController::startConnect(const QString& profileId,
                 accepted.clear();  // one shot, for this key only
                 return SshConnectionPool::HostKeyDecision::Accept;
             }
+            // This callback outlives the attempt that installed it: it stays on
+            // the pool, and SessionBootstrap's own reconnect ladder (SPEC 5.6)
+            // re-handshakes through it with nobody waiting on an answer. Only an
+            // attempt WE started may arm a prompt; otherwise a reconnect that
+            // meets an Unknown key would overwrite the very fingerprint the user
+            // is being asked about, and resolveHostKey() would then retry the
+            // original profile pinned to a fingerprint that was never shown.
+            // Outside an attempt the key is simply refused - the same answer the
+            // pool gives when no callback is installed at all.
+            if (!self->m_connecting)
+                return SshConnectionPool::HostKeyDecision::Reject;
             self->m_pendingFingerprint = fingerprint;
             self->m_pendingHostKeyInfo = qMakePair(host, keyType);
             return SshConnectionPool::HostKeyDecision::Reject;
@@ -334,11 +345,40 @@ void AppController::disconnectServer()
     m_pendingHostKeyInfo = {};
 
     // Scope-guarded so an early return or a throw inside the teardown cannot
-    // leave errors permanently muted; belt-and-braces, startConnect() clears it
-    // too in case a failure ever arrives queued rather than synchronously.
+    // leave errors permanently muted. The guard is the ONLY thing bounding the
+    // mute window, and that is sound because the failures are synchronous:
+    // disconnectSession() -> unwire() -> CodeharbordClient::failAllPending()
+    // runs every pending callback inline before returning, so they all land
+    // inside this scope. A client that ever deferred them would need this flag
+    // cleared by the arrival of the LAST failure instead.
     m_tearingDown = true;
     const auto restore = qScopeGuard([this] { m_tearingDown = false; });
     m_bootstrap->disconnectSession();
+
+    // Land on a clear empty state instead of a half-live shell. The Dev
+    // Session context is unreachable now, and leaving it "active" is not
+    // cosmetic: SessionLayouts would still hold the devSessionId and still
+    // pass canEdit(), so a Split command after Disconnect mutates and
+    // republishes a tree whose setLayout fails - the UI shows a split the
+    // server does not have, and because a reconnect never reloads a session
+    // that is still active, the first edit that DOES land writes that
+    // divergent tree back over the real one.
+    //
+    // forget=false: the session is unreachable, not gone. UiStateStore keeps
+    // remembering it, so the reconnect's refresh -> restoreActiveSession
+    // reopens it and reloads BOTH region trees from the server - which also
+    // picks up any layout another client changed while we were down. The
+    // reload is free of pane churn when nothing changed: applyLoadedTree only
+    // republishes a region whose tree actually differs.
+    //
+    // This is the explicit user Disconnect only. The bootstrap's automatic
+    // reconnect ladder never comes through here, so a dropped link still
+    // leaves the panes exactly where they were.
+    if (!m_activeSessionId.isEmpty()) {
+        clearActiveSession(/*forget=*/false);
+        emit activeSessionChanged();
+    }
+
     setConnectionState(QStringLiteral("disconnected"));
 }
 
@@ -390,6 +430,35 @@ bool AppController::sessionExists(const QString& devSessionId) const
             if (session.session.id.value == devSessionId)
                 return true;
     return false;
+}
+
+bool AppController::dropActiveSessionIfGone()
+{
+    // Empty is the resting state, not a loss; and a session still in the tree
+    // is simply fine. Both make this a no-op, so the transition below happens
+    // exactly once and never thrashes on subsequent refreshes.
+    if (m_activeSessionId.isEmpty() || sessionExists(m_activeSessionId))
+        return false;
+
+    clearActiveSession(/*forget=*/true);
+    return true;
+}
+
+void AppController::clearActiveSession(bool forget)
+{
+    m_activeSessionId.clear();
+    // Forget it for THIS server only: the key is per-server, and clearing it
+    // wholesale would throw away another server's perfectly good session.
+    if (forget && m_uiState)
+        m_uiState->setActiveSession(m_serverId.value, QString());
+    // Dropping the layout trees is the part that matters beyond cosmetics: a
+    // SessionLayouts still holding the devSessionId keeps passing canEdit(), so
+    // the next splitPane/closePane/setRatios mutates and republishes a tree it
+    // cannot persist - the UI then shows a split the server does not have, and
+    // the first edit that DOES land writes that divergent tree back.
+    // load(QString()) clears both regions and deselects.
+    if (m_layouts)
+        m_layouts->load(QString());
 }
 
 void AppController::restoreActiveSession()
@@ -512,8 +581,12 @@ void AppController::refresh()
         // the stale working directory forever.
         const QString repoRootBefore = self->activeSessionRepoRoot();
         self->m_lastNodes = std::move(nodes);
+        // Only HERE: past the error return (an RpcError means "we do not know",
+        // not "it is gone") and past the generation guard, so a stale list()
+        // can never retire a session the newest tree still has.
+        const bool droppedActive = self->dropActiveSessionIfGone();
         self->rebuildRows();
-        if (self->activeSessionRepoRoot() != repoRootBefore)
+        if (droppedActive || self->activeSessionRepoRoot() != repoRootBefore)
             emit self->activeSessionChanged();
         emit self->refreshed();
     });

@@ -1,11 +1,16 @@
 #include "Notifier.h"
+#include "AgentStatusMonitor.h"
 
 #include <QCoreApplication>
+#include <QIODevice>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QSignalSpy>
 #include <QTest>
 #include <QtGlobal>
 
 #include <atomic>
+#include <cstring>
 
 namespace {
 // Counts qWarning/qCritical/qFatal emitted while installed. The no-bus path
@@ -21,6 +26,56 @@ void countingHandler(QtMsgType type, const QMessageLogContext& ctx,
         g_warnings.fetch_add(1);
     if (g_previous)
         g_previous(type, ctx, msg);
+}
+
+// Minimal read-only QIODevice standing in for the agent-status channel: the
+// monitor reads AgentEvent JSONL off whatever QIODevice it is given.
+class AgentFeed : public QIODevice {
+public:
+    AgentFeed() { open(QIODevice::ReadOnly | QIODevice::Unbuffered); }
+
+    bool isSequential() const override { return true; }
+
+    qint64 bytesAvailable() const override
+    {
+        return m_buf.size() + QIODevice::bytesAvailable();
+    }
+
+    void deliver(const QByteArray& line)
+    {
+        m_buf.append(line);
+        emit readyRead();
+    }
+
+protected:
+    qint64 readData(char* data, qint64 maxSize) override
+    {
+        const qint64 n = qMin<qint64>(maxSize, m_buf.size());
+        if (n > 0) {
+            std::memcpy(data, m_buf.constData(), static_cast<size_t>(n));
+            m_buf.remove(0, n);
+        }
+        return n;
+    }
+
+    qint64 writeData(const char*, qint64) override { return -1; }
+
+private:
+    QByteArray m_buf;
+};
+
+// One framed AgentEvent JSONL line, exactly as codeharbord emits it.
+QByteArray agentEventLine(const QString& state, const QString& dev,
+                          const QString& term)
+{
+    const QJsonObject o{{"version", 1},
+                        {"timestamp", "2026-07-26T00:00:00.000Z"},
+                        {"harness", "generic"},
+                        {"devSessionId", dev},
+                        {"terminalId", term},
+                        {"state", state},
+                        {"event", "tick"}};
+    return QJsonDocument(o).toJson(QJsonDocument::Compact) + '\n';
 }
 } // namespace
 
@@ -41,6 +96,7 @@ private slots:
     void distinctNotificationsAreNotCoalesced();
     void coalescingExpiresWithTheWindow();
     void zeroWindowDisablesCoalescing();
+    void agentEventRaisesNotificationEndToEnd();
 };
 
 void TestNotifier::availableIsFalseAndNotifyIsSilent()
@@ -160,6 +216,53 @@ void TestNotifier::zeroWindowDisablesCoalescing()
     notifier.notify(QStringLiteral("A"), QStringLiteral("b"));
     QCOMPARE(raised.count(), 2);
     QCOMPARE(coalesced.count(), 0);
+}
+
+// SPEC 6.2 end to end, over the ONE connection that makes the feature exist:
+// main.cpp's `connect(&agentMonitor, &AgentStatusMonitor::notify, &notifier,
+// &Notifier::notify)`. Both sides are covered in isolation and neither test
+// touches the join, so deleting that line would leave the whole suite green
+// and every agent silent. Drive real AgentEvent JSONL in one end and assert a
+// notification comes out the other.
+void TestNotifier::agentEventRaisesNotificationEndToEnd()
+{
+    AgentFeed feed;
+    ch::AgentStatusMonitor monitor;
+    ch::Notifier notifier;
+    QObject::connect(&monitor, &ch::AgentStatusMonitor::notify, &notifier,
+                     &ch::Notifier::notify);
+    monitor.setTransport(&feed);
+
+    QSignalSpy raised(&notifier, &ch::Notifier::notificationRaised);
+
+    // A terminal asking for input is attention-worthy: one bubble.
+    feed.deliver(agentEventLine(QStringLiteral("waiting_input"),
+                                QStringLiteral("dev-1"),
+                                QStringLiteral("term-1")));
+    QCOMPARE(raised.count(), 1);
+    QVERIFY(!raised.at(0).at(0).toString().isEmpty());
+    QVERIFY(!raised.at(0).at(1).toString().isEmpty());
+
+    // The monitor's own transition gate is the first line of rate limiting and
+    // it is what keeps a chatty agent from becoming a bubble storm: a repeat of
+    // the SAME state is not a transition, so nothing reaches the Notifier at
+    // all (this is stronger than coalescing - it never even gets counted).
+    feed.deliver(agentEventLine(QStringLiteral("waiting_input"),
+                                QStringLiteral("dev-1"),
+                                QStringLiteral("term-1")));
+    QCOMPARE(raised.count(), 1);
+
+    // A genuine transition into the other attention state gets through.
+    feed.deliver(agentEventLine(QStringLiteral("idle_unseen"),
+                                QStringLiteral("dev-1"),
+                                QStringLiteral("term-1")));
+    QCOMPARE(raised.count(), 2);
+
+    // A state nobody needs to be told about raises nothing.
+    feed.deliver(agentEventLine(QStringLiteral("running"),
+                                QStringLiteral("dev-1"),
+                                QStringLiteral("term-1")));
+    QCOMPARE(raised.count(), 2);
 }
 
 int main(int argc, char** argv)

