@@ -13,6 +13,11 @@ QJsonObject SplitNode::toJson() const
     if (isLeaf()) {
         obj[QStringLiteral("type")] = QStringLiteral("leaf");
         obj[QStringLiteral("paneId")] = paneId;
+        // Omitted when empty: an "open nothing" leaf must serialize exactly as
+        // it did before this field existed, so upgrading the app does not
+        // rewrite every stored layout and a downgrade still reads them.
+        if (!url.isEmpty())
+            obj[QStringLiteral("url")] = url;
         return obj;
     }
 
@@ -60,6 +65,10 @@ bool parseNode(const QJsonObject &obj, SplitNode &out, int depth)
     if (type == QStringLiteral("leaf")) {
         out = SplitNode{};
         out.paneId = obj.value(QStringLiteral("paneId")).toString();
+        // Absent (an older tree) or non-string (corrupt) both yield an empty
+        // url, the same tolerance paneId gets: a leaf's content is not worth
+        // rejecting a whole layout over.
+        out.url = obj.value(QStringLiteral("url")).toString();
         return true;
     }
 
@@ -129,7 +138,7 @@ bool SplitNode::operator==(const SplitNode &other) const
     if (isLeaf() != other.isLeaf())
         return false;
     if (isLeaf())
-        return paneId == other.paneId;
+        return paneId == other.paneId && url == other.url;
     return orientation == other.orientation && ratios == other.ratios
             && children == other.children;
 }

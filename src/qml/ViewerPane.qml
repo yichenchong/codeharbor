@@ -17,6 +17,31 @@ Item {
     // instead of guessing at the region's first leaf.
     signal paneActivated(string paneId)
 
+    // ---- content reporting (SPEC 4.5) --------------------------------------
+    // What this pane has open. The host records it in this pane's split-tree
+    // leaf (SessionLayouts::setPaneUrl), which is what makes reopening a Dev
+    // Session restore the FILES the user had open and not just the geometry.
+    //
+    // Reported on a paneId change too, because a pane is born before it has a
+    // name: ViewerRegion.takePane() creates the Item WITH its url and assigns
+    // paneId immediately afterwards, so a url-only report would arrive
+    // anonymous. That extra report is an echo of what is already stored, and
+    // SessionLayouts drops an unchanged url without writing.
+    signal urlOpened(string paneId, string url)
+
+    function reportUrl() {
+        // An unnamed pane is not addressable. The empty paneId is also a real
+        // key (the placeholder leaf of an emptied region), but the two are
+        // indistinguishable here, and reporting a url against a tree that has
+        // no empty leaf would only raise a spurious host error.
+        if (pane.paneId.length === 0)
+            return;
+        pane.urlOpened(pane.paneId, pane.url.toString());
+    }
+
+    onUrlChanged: pane.reportUrl()
+    onPaneIdChanged: pane.reportUrl()
+
     // View kind for the current URL: "web" | "markdown" | "text" | "image" |
     // "pdf" | "directory" | "binary" (empty URL -> a neutral placeholder).
     property string kind: pane.url.toString().length === 0

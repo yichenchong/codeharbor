@@ -121,6 +121,14 @@ ApplicationWindow {
             onFocusedPaneIdChanged: if (app.uiState && app.activeSessionId.length > 0)
                                         app.uiState.setSelectedPane(app.activeSessionId,
                                                                     focusedPaneId)
+            // Persist WHAT a pane is showing, so reopening a Dev Session restores
+            // the files the user had open instead of a set of blank panes.
+            // setPaneUrl deliberately does not re-publish the tree, so recording
+            // this cannot rebuild the very pane that just opened the file.
+            onPaneUrlReported: (paneId, url) => {
+                if (app.layouts && app.activeSessionId.length > 0)
+                    app.layouts.setPaneUrl("viewer", paneId, url);
+            }
         }
 
         TerminalRegion {
@@ -184,6 +192,17 @@ ApplicationWindow {
             errorLabel.text = message;
             errorBanner.opacity = 0.97;
             errorHideTimer.restart();
+        }
+    }
+
+    // Layout failures reach the user too. Without this every SessionLayouts
+    // error is silent - "layout not loaded", "no pane X to close", a failed
+    // persist - so Close Pane or Split Pane would simply appear to do nothing.
+    Connections {
+        target: app.layouts
+        enabled: app.layouts !== null
+        function onError(message) {
+            window.notifyUser(message);
         }
     }
 

@@ -433,4 +433,43 @@ void SessionLayouts::closePane(QString region, QString paneId)
     persist(index);
 }
 
+void SessionLayouts::setPaneUrl(QString region, QString paneId, QString url)
+{
+    const int index = regionIndex(region);
+    if (index < 0)
+        return;
+    RegionState& state = m_regions[index];
+    if (!state.valid) {
+        emit error(QStringLiteral(
+            "SessionLayouts: %1 layout not loaded; pane url ignored").arg(region));
+        return;
+    }
+
+    SplitNode* leaf = nullptr;
+    SplitNode* parent = nullptr;
+    int childIndex = -1;
+    if (!locateLeaf(state.tree, nullptr, -1, paneId, leaf, parent, childIndex)) {
+        emit error(QStringLiteral("SessionLayouts: no %1 pane \"%2\" to record a url for")
+                       .arg(region, paneId));
+        return;
+    }
+
+    // Checked BEFORE canEdit(): every pane the regions mint re-asserts the url
+    // it was restored with, so an unchanged url is the normal case, not an edit.
+    // Treating it as one would spend an RPC per pane on every session open, and
+    // would report a spurious "no server selected" for a pane merely echoing
+    // what is already stored.
+    if (leaf->url == url)
+        return;
+    if (!canEdit())
+        return;
+
+    leaf->url = std::move(url);
+    // Quiet: the pane is ALREADY showing this url. Re-publishing the tree would
+    // rebuild the region's delegates and destroy the very pane that just opened
+    // the file - the write would undo what it recorded.
+    setTreeQuietly(index, state.tree);
+    persist(index);
+}
+
 } // namespace ch

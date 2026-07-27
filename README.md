@@ -92,11 +92,17 @@ server, `tmux`, and Node on the remote side — see
 Exercising real paths has repeatedly paid for itself. It exposed a missing transport
 spine (nothing carried RPC over SSH), QML that could not load at all, split panes
 rendering at zero width, stored region widths destroyed on launch, splitting a pane
-killing the terminal you were working in, and — worst — unknown SSH host keys being
-trusted silently, which made the whole host-key prompt dead code. The corrections
-note in [`docs/PLAN.md`](docs/PLAN.md) records each one, and is honest about what is
-still owed: a fresh security review, pane focus tracking, and moving the blocking
-SSH handshake off the GUI thread.
+killing the terminal you were working in, password authentication that no UI could
+ever reach, a client that could not launch its own released server tarball, and —
+worst — two ways an attacker's SSH host key could be accepted: one where unknown keys
+were trusted silently, and one where presenting a different key ALGORITHM downgraded
+a hard refusal into a friendly "trust this new host?" prompt.
+
+The corrections note in [`docs/PLAN.md`](docs/PLAN.md) records each one, and the gap
+list beside it is deliberately honest about what is still missing: no UI for creating,
+renaming or deleting a group; crash-recovery snapshots that are taken but never
+offered back; a reconnect that cannot prompt for a newly-unknown host key; and a
+connect that briefly blocks the GUI thread.
 
 **Building requires Node** — the Monaco and xterm.js bundles are build artifacts
 embedded as Qt resources, and CMake builds them at configure time (it refuses to

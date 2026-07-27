@@ -87,6 +87,7 @@ private slots:
     void closeCollapsesBranchIntoSurvivor();
     void closeLastPaneYieldsEmptyLeaf();
     void ratiosPersistedAtNestedPath();
+    void paneUrlPersistsWithoutRebuildingPanes();
     void staleLoadReplyIsDropped();
     void rpcErrorSurfacesWithoutCorruptingTree();
     void invalidSavedTreeIsRejected();
@@ -484,6 +485,53 @@ void TstSessionLayouts::ratiosPersistedAtNestedPath()
                       {0.0, 1.0}); // non-positive
     QCOMPARE(errorSpy.count(), 3);
     QVERIFY(noMoreRequests()); // no rejected edit reached the server
+}
+
+// Opening a file must be REMEMBERED, or a reopened session restores the right
+// panes and every one of them blank. The write must also stay quiet: publishing
+// a new tree would rebuild the region's delegates and destroy the very pane that
+// just opened the file, so the record would undo what it recorded.
+void TstSessionLayouts::paneUrlPersistsWithoutRebuildingPanes()
+{
+    makePair();
+    SessionLayouts layouts(m_db);
+    layouts.setServerId(QStringLiteral("srv-1"));
+
+    const QJsonObject root = split(QStringLiteral("horizontal"),
+                                   {leaf(QStringLiteral("viewer-1")),
+                                    leaf(QStringLiteral("viewer-2"))},
+                                   {1, 1});
+    completeLoad(layouts, QStringLiteral("s1"), layoutRow(root),
+                 QJsonValue(QJsonValue::Null));
+
+    QSignalSpy viewerSpy(&layouts, &SessionLayouts::viewerTreeChanged);
+    QSignalSpy errorSpy(&layouts, &SessionLayouts::error);
+
+    const QString url = QStringLiteral("codeharbor-internal://file/notes.md");
+    layouts.setPaneUrl(QStringLiteral("viewer"), QStringLiteral("viewer-2"), url);
+    QCOMPARE(errorSpy.count(), 0);
+    QCOMPARE(viewerSpy.count(), 0);  // the pane showing it must survive
+
+    const QJsonObject req = nextRequest();
+    QCOMPARE(req.value(QStringLiteral("method")).toString(),
+             QStringLiteral("workspace.setLayout"));
+    const QJsonObject sent = req.value(QStringLiteral("params")).toObject()
+                                 .value(QStringLiteral("tree")).toObject();
+    QCOMPARE(sent.value(QStringLiteral("children")).toArray().at(1).toObject()
+                 .value(QStringLiteral("url")).toString(), url);
+    // The cache QML re-reads carries it too, so a reload restores the file.
+    QCOMPARE(asObject(layouts.viewerTree()).value(QStringLiteral("children"))
+                 .toArray().at(1).toObject().value(QStringLiteral("url")).toString(),
+             url);
+
+    // Every restored pane re-announces the url it was given. That echo is the
+    // normal case and must not spend an RPC per pane on every session open.
+    layouts.setPaneUrl(QStringLiteral("viewer"), QStringLiteral("viewer-2"), url);
+    QVERIFY(noMoreRequests());
+
+    // An unknown pane is reported, not silently dropped.
+    layouts.setPaneUrl(QStringLiteral("viewer"), QStringLiteral("nope"), url);
+    QCOMPARE(errorSpy.count(), 1);
 }
 
 void TstSessionLayouts::staleLoadReplyIsDropped()

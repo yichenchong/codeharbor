@@ -42,9 +42,11 @@ namespace ch {
 // therefore destroy and recreate live panes, whenever the tree object changes):
 //   * load(), splitPane() and closePane() DO emit viewerTreeChanged /
 //     terminalTreeChanged - the structure genuinely changed.
-//   * setRatios() and saveTree() do NOT. Their input already came from QML, so
-//     re-publishing an identical tree would only churn panes (a terminal would
-//     be killed and respawned on every splitter drag).
+//   * setRatios(), setPaneUrl() and saveTree() do NOT. Their input already came
+//     from QML, so re-publishing an identical tree would only churn panes (a
+//     terminal would be killed and respawned on every splitter drag, and the
+//     pane that just opened a file would be destroyed by the very write that
+//     recorded it).
 class SessionLayouts : public QObject {
     Q_OBJECT
     Q_PROPERTY(QString devSessionId READ devSessionId WRITE setDevSessionId
@@ -109,6 +111,16 @@ public:
     // child into that child. Closing the last pane of a region leaves a single
     // EMPTY leaf (paneId ""), never an empty tree.
     Q_INVOKABLE void closePane(QString region, QString paneId);
+
+    // Record what the leaf holding `paneId` currently has open, so reopening
+    // the Dev Session restores the pane's CONTENT and not just its geometry.
+    // The url rides in the split-tree leaf and is persisted by the same
+    // workspace.setLayout write the ratios use (see SplitNode::url).
+    //
+    // Deliberately silent when the url is unchanged: the regions re-assert a
+    // restored url onto every pane they mint, so the common call is an echo of
+    // what is already stored and must cost neither an RPC nor an error.
+    Q_INVOKABLE void setPaneUrl(QString region, QString paneId, QString url);
 
 signals:
     void devSessionIdChanged();

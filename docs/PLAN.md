@@ -376,9 +376,39 @@ reload silently died for every open editor; deliberate teardown and the delibera
 host-key refusal were painted as red error toasts; three "fixed" items were green only
 because no test exercised the path at all.
 
-> Remaining known gaps: a fresh security review (see above); pane focus is not tracked,
-> so palette split commands act on a region's first pane rather than the focused one;
-> drag-adjusted split ratios persist but pane FOCUS/selection does not; `tmux.*`
-> discovery is server-side only and no client code consumes it yet; connect is a
-> synchronous libssh handshake on the GUI thread (bounded by a timeout, but it briefly
-> blocks the UI — moving the session to a worker thread is the real fix).
+**Wave 8 — ✅ DONE (the review that was owed) + ⚠️ one slice cut short.** The Wave-7
+security and integration reviewers died before filing findings, so that review was
+re-run with agents streaming findings over IRC as they worked — which is the only
+reason the analysis survived two further terminations. It found and fixed a HIGH
+host-key TYPE downgrade (correction 3's neighbour: a MITM presenting a different
+ALGORITHM turned the hard refusal into a friendly first-use prompt, and the defect was
+CODIFIED as expected behaviour by an existing test), an unpinned privileged editor
+WebEngineView, a never-retired active Dev Session, unreachable password/passphrase
+auth, a client that could only launch a dev checkout (the released tarball was
+unlaunchable), a missing schema-compatibility gate, unwritable pane focus, dead
+read-only derivation, and the workspace.* contract drift hole. A final slice
+(group operations UI, crash-recovery prompt) was killed at ~4 minutes with its
+features written but essentially untested; the untested destructive half
+(`deleteGroup` cascades through every session in the group) was REVERTED rather than
+shipped, and the contained half (pane URL persistence) was completed and tested here.
+
+> **Remaining known gaps — honest list.**
+> - **No group operations UI.** `WorkspaceDb::deleteGroup` and `AppController::createGroup`
+>   /`renameGroup` have no reachable affordance, so a group created by mistake is
+>   permanent. Implemented once and reverted for lack of tests; deleting a group
+>   cascades to its sessions, so it needs a confirmation that states the real cost.
+> - **Crash-recovery is written but never offered.** `EditorController::recoveryAvailable`
+>   has no consumer, so SPEC 11.3 snapshots are taken, found on reopen, and ignored.
+>   The fix belongs in `EditorPaneView.qml`.
+> - **`viewer_panes`/`terminal_panes` CRUD is unused.** Pane URLs ride in the layout
+>   tree instead (atomic with the structure, no extra RPC); those six methods and the
+>   two tables stay dead until per-pane metadata needs a home.
+> - **A reconnect that meets a NEW unknown host key cannot prompt** — `hostKeyPrompt`
+>   is only raised from an interactive connect, so the ladder dead-ends on an opaque
+>   failure. Needs a design call about prompting outside a user-initiated attempt.
+> - **Connect blocks the GUI thread** — a bounded, timed-out libssh handshake, but the
+>   real fix is moving the session to a worker thread.
+> - **Pane focus is click-based**; focus moved purely by keyboard does not report, so a
+>   future "focus next pane" command must tell the region directly.
+> - **`tmux.*` discovery has no client consumer** — the RPC group exists and is tested
+>   server-side, and nothing calls it.

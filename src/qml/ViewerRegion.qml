@@ -93,6 +93,9 @@ Rectangle {
             // Item is re-parented, never rebuilt, so the connection (and the id
             // it reports) outlive the republish that moved it.
             pane.paneActivated.connect(region.noteFocus);
+            // Same reasoning for what the pane is SHOWING: wired once, at mint
+            // time, so the report survives the re-parenting a split performs.
+            pane.urlOpened.connect(region.notePaneUrl);
         }
         if (pane.parent !== host) {
             pane.anchors.fill = null;
@@ -189,6 +192,17 @@ Rectangle {
     // QML does not report as a change, so the host is not woken for a no-op.
     function noteFocus(paneId) {
         region.focusedPaneId = paneId;
+    }
+
+    // A pane reporting WHAT IT IS SHOWING, so the host can persist it and the
+    // session reopens on the same files instead of a set of blank panes. Carried
+    // as a signal rather than a property pair because the host writes it through
+    // and holds no state of its own; like noteFocus this only ever fires on the
+    // owner, since that is where takePane() connects it.
+    signal paneUrlReported(string paneId, string url)
+
+    function notePaneUrl(paneId, url) {
+        region.paneUrlReported(paneId, url);
     }
 
     // ---- this region's own leaf --------------------------------------------

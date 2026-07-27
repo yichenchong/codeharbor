@@ -41,6 +41,8 @@ private slots:
     void splitTreeRoundTripsSingleChildAndDeepNesting();
     void aggregateRowStatePrecedence();
     void splitTreeLeafOrientationRoundTrips();
+    void splitTreeRoundTripsLeafUrl();
+    void splitTreeWithoutUrlIsUnchangedByTheField();
     void splitTreeSplitPaneIdIgnoredOnRoundTrip();
     void splitTreeUnicodePaneIdRoundTrips();
     void splitTreeRejectsPathologicalDepth();
@@ -469,6 +471,54 @@ void TstModels::splitTreeLeafOrientationRoundTrips()
     split.children = {SplitNode{}};
     split.ratios = {1.0};
     QVERIFY(!(split == leaf));
+}
+
+// A leaf remembers WHAT IT SHOWS, not just that it exists. Without this the
+// layout reopens with the right panes and every one of them blank, so the user
+// re-finds their files on every launch.
+void TstModels::splitTreeRoundTripsLeafUrl()
+{
+    SplitNode leaf;
+    leaf.paneId = QStringLiteral("viewer-1");
+    leaf.url = QStringLiteral("codeharbor-internal://file/a b/c%20d.txt#frag?q=1");
+
+    const SplitNode restored = SplitNode::fromJson(leaf.toJson());
+    QVERIFY(restored.isLeaf());
+    QCOMPARE(restored.url, leaf.url);
+    QVERIFY(restored == leaf);
+
+    // The url is part of a leaf's identity: two panes showing different files
+    // are not the same pane, or a reload could silently adopt the wrong one.
+    SplitNode other = leaf;
+    other.url = QStringLiteral("codeharbor-internal://file/other.txt");
+    QVERIFY(!(other == leaf));
+
+    // It survives nesting, which is where a split puts it.
+    SplitNode split;
+    split.children = {leaf, SplitNode{}};
+    split.ratios = {0.5, 0.5};
+    const SplitNode deep = SplitNode::fromJson(split.toJson());
+    QCOMPARE(deep.children.at(0).url, leaf.url);
+}
+
+// Backwards compatibility: every layout already stored on a server predates the
+// url field. Reading one must not invent a url, and re-writing it must not
+// change the bytes - otherwise the first launch after an upgrade rewrites every
+// saved layout.
+void TstModels::splitTreeWithoutUrlIsUnchangedByTheField()
+{
+    const QJsonObject legacy = QJsonDocument::fromJson(R"({
+        "type": "split", "orientation": "horizontal", "ratios": [0.5, 0.5],
+        "children": [
+            {"type": "leaf", "paneId": "viewer-1"},
+            {"type": "leaf", "paneId": "viewer-2"}
+        ]
+    })").object();
+
+    const SplitNode parsed = SplitNode::fromJson(legacy);
+    QVERIFY(parsed.children.at(0).url.isEmpty());
+    QCOMPARE(QJsonDocument(parsed.toJson()).toJson(QJsonDocument::Compact),
+             QJsonDocument(legacy).toJson(QJsonDocument::Compact));
 }
 
 // A split's paneId is meaningless and dropped by toJson(); equality must ignore
