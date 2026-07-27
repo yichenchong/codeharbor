@@ -423,3 +423,13 @@ drag-reorder regression it briefly introduced caught by `tst_sidebar` and fixed.
 >   future "focus next pane" command must tell the region directly.
 > - **`tmux.*` discovery has no client consumer** — the RPC group exists and is tested
 >   server-side, and nothing calls it.
+> - **The DEFAULT trust-store path is never exercised by a test.** In production the
+>   known-hosts file lives at `QStandardPaths::AppConfigLocation + "/known_hosts"`,
+>   which on Linux is `<config>/CodeHarbor/CodeHarbor/known_hosts` — org AND app, a
+>   nested directory beside `CodeHarbor.conf`, not next to it. Every live test
+>   overrides it with `CH_LIVE_KNOWN_HOSTS`, so the path a real user actually gets is
+>   the one path no gate covers. This cost real debugging time: a launch smoke seeded
+>   `known_hosts` one level up, the app correctly saw an empty trust store, treated
+>   the key as unknown, and parked awaiting a prompt nobody could answer headlessly —
+>   which reads exactly like a broken auto-reconnect. The product was right; the
+>   coverage is not.
