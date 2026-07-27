@@ -73,11 +73,17 @@ npm run build      # tsc -> dist/
 ## Status
 
 CodeHarbor is **usable end to end**: launch it with no configuration, add a server
-in the connect sheet, accept its host key, pick a Dev Session, and you get live
-remote shells in terminal panes, remote files in Monaco with revision-guarded
-saves, and your layout back where you left it on the next launch. That whole
-walkthrough is a test (`tst_coldstart`) that runs against a real `sshd` and a real
-`codeharbord` on every live run — not a description of what should happen.
+in the connect sheet, accept its host key, create a group and a Dev Session in it,
+and you get live remote shells in terminal panes, remote files in Monaco with
+revision-guarded saves, and your layout — including which files were open — back
+where you left it on the next launch.
+
+That walkthrough is covered by `tst_coldstart`, which runs against a real `sshd` and
+a real `codeharbord` on every live run. One honest caveat: `tst_coldstart` creates
+its Dev Session over raw RPC rather than through the sidebar, so the UI path for
+that one step is covered separately by `tst_sidebar` against a fake controller. A
+gate that exercises what the user cannot is exactly the mistake this project has
+made before, so it is called out rather than papered over.
 
 Milestones **M1–M5 are reached LIVE**: SSH transport, terminal (tmux attach /
 remote-confirmed resize / reconnect), workspace CRUD + persistence, remote viewers,

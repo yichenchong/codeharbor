@@ -1,6 +1,7 @@
 import QtQuick
 import QtQuick.Controls.Basic
 import QtQml.Models
+import QtQuick.Layouts
 
 // Sessions sidebar region (SPEC 4.2): collapsible groups, Dev Session rows with
 // aggregate status, drag-and-drop reordering and keyboard navigation. Bound to
@@ -782,5 +783,69 @@ Rectangle {
             app.createGroup(groupName);
             newGroupField.text = qsTr("New group");
         }
+    }
+
+    // Which group the pending session belongs to. Captured when the action is
+    // invoked rather than read back from the selection, so a click elsewhere
+    // while the dialog is open cannot retarget the creation.
+    property string pendingSessionGroupId: ""
+
+    function requestNewSession(groupId) {
+        sidebar.pendingSessionGroupId = groupId;
+        newSessionDialog.open();
+    }
+
+    Dialog {
+        id: newSessionDialog
+        objectName: "newSessionDialog"
+        title: qsTr("New Dev Session")
+        modal: true
+        standardButtons: Dialog.Ok | Dialog.Cancel
+        anchors.centerIn: Overlay.overlay
+
+        onOpened: {
+            newSessionField.text = qsTr("New session");
+            newSessionRepoField.text = "";
+            newSessionField.forceActiveFocus();
+        }
+
+        ColumnLayout {
+            spacing: 8
+
+            TextField {
+                id: newSessionField
+                objectName: "newSessionField"
+                Layout.preferredWidth: 300
+                placeholderText: qsTr("Session name")
+            }
+
+            // The repository root is not decoration: it becomes the working
+            // directory of every terminal in the session and the root the
+            // viewers browse, so a session without one opens in the remote
+            // home directory instead of the project.
+            TextField {
+                id: newSessionRepoField
+                objectName: "newSessionRepoField"
+                Layout.preferredWidth: 300
+                placeholderText: qsTr("Repository path on the server, e.g. /srv/repos/app")
+            }
+
+            Label {
+                Layout.preferredWidth: 300
+                text: qsTr("Terminals in this session start in the repository path.")
+                color: "#6c7086"
+                font.pixelSize: 10
+                wrapMode: Text.WordWrap
+            }
+        }
+
+        onAccepted: {
+            const name = newSessionField.text.length > 0
+                       ? newSessionField.text : qsTr("New session");
+            app.createSession(sidebar.pendingSessionGroupId, name,
+                              newSessionRepoField.text);
+            sidebar.pendingSessionGroupId = "";
+        }
+        onRejected: sidebar.pendingSessionGroupId = ""
     }
 }

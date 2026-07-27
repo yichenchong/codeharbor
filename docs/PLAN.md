@@ -392,11 +392,22 @@ features written but essentially untested; the untested destructive half
 (`deleteGroup` cascades through every session in the group) was REVERTED rather than
 shipped, and the contained half (pane URL persistence) was completed and tested here.
 
+One more finding closed at the end, and it is the sharpest example of the pattern
+this document keeps recording: **`createSession` had no production caller at all**, so
+a user could add a server, accept its host key and create a group — and then hit a
+dead end, unable to create a Dev Session and therefore unable to reach a terminal, an
+editor, or anything else the product is for. The sidebar's own empty state told them
+to "add a Dev Session to it", which the UI could not do. `tst_coldstart` passed 9/9
+throughout, because it creates its session over RawRpc: a gate doing what the USER
+cannot. Now wired (group header "+ Session" → dialog → `app.createSession`), with the
+drag-reorder regression it briefly introduced caught by `tst_sidebar` and fixed.
+
 > **Remaining known gaps — honest list.**
-> - **No group operations UI.** `WorkspaceDb::deleteGroup` and `AppController::createGroup`
->   /`renameGroup` have no reachable affordance, so a group created by mistake is
->   permanent. Implemented once and reverted for lack of tests; deleting a group
->   cascades to its sessions, so it needs a confirmation that states the real cost.
+> - **No rename or delete for groups.** `renameGroup` and `deleteGroup` have no
+>   reachable affordance, so a group created by mistake is permanent. Creating groups
+>   and Dev Sessions IS wired ("+ New group", "+ Session"); delete was implemented once
+>   and reverted for lack of tests, and it cascades to every session in the group, so
+>   it needs a confirmation that states the real cost.
 > - **Crash-recovery is written but never offered.** `EditorController::recoveryAvailable`
 >   has no consumer, so SPEC 11.3 snapshots are taken, found on reopen, and ignored.
 >   The fix belongs in `EditorPaneView.qml`.

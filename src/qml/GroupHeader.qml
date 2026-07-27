@@ -80,6 +80,34 @@ ItemDelegate {
         }
     }
 
+    // Creating a Dev Session is the ONLY way into the product's actual work - a
+    // terminal, an editor, a repository - so it needs a visible home. The group
+    // header is that home: a session always belongs to a group, so the action
+    // carries its group with it and needs no separate picker.
+    //
+    // Deliberately OUTSIDE contentItem and pinned to the right edge: inside the
+    // Row it sat in the middle of the header and swallowed the press that starts
+    // a group-reorder drag (tst_sidebar::reordersGroups caught exactly that).
+    // The draggable expanse of the header stays draggable.
+    Button {
+        objectName: "newSessionButton:" + header.itemId
+        text: qsTr("+ Session")
+        visible: !header.collapsed
+        implicitHeight: 22
+        padding: 4
+        font.pixelSize: 10
+        anchors.right: parent.right
+        anchors.rightMargin: 8
+        anchors.verticalCenter: parent.verticalCenter
+        // The Button consumes the press, so the parent ItemDelegate's onClicked
+        // (which toggles collapse) never sees it - creating a session must not
+        // also fold the group away. Asserted by
+        // tst_sidebar::newSessionButtonTargetsItsGroupWithoutCollapsing.
+        onClicked: if (header.host) header.host.requestNewSession(header.itemId)
+        ToolTip.visible: hovered
+        ToolTip.text: qsTr("Create a Dev Session in \u201c%1\u201d").arg(header.name)
+    }
+
     onClicked: {
         if (host)
             host.selectGroup(header);

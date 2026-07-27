@@ -327,6 +327,7 @@ private slots:
     void clickSelectsAndActivatesSession();
     void keyboardSelectionActivatesSession();
     void spaceTogglesGroupCollapse();
+    void newSessionButtonTargetsItsGroupWithoutCollapsing();
 
 private:
     // Two expanded groups: Alpha[s1,s2,s3], Beta[s4,s5].
@@ -584,6 +585,47 @@ void TstSidebar::keyboardSelectionActivatesSession()
     QCOMPARE(activated.first().first().toString(), QStringLiteral("s2"));
 
     QVERIFY2(fixture.warnings().isEmpty(), qPrintable(fixture.warnings().join(QLatin1Char('\n'))));
+}
+
+// The only route into a Dev Session, so it must exist, target the right group,
+// and not fold that group away as a side effect of being clicked.
+void TstSidebar::newSessionButtonTargetsItsGroupWithoutCollapsing()
+{
+    SidebarFixture fixture(twoGroups());
+    expose(fixture);
+
+    QQuickItem* button = findByName(fixture.root(),
+                                    QStringLiteral("newSessionButton:g1"));
+    QVERIFY2(button, "the group header offers no way to create a Dev Session");
+
+    fixture.app.clearCalls();
+    const QPointF centre = button->mapToScene(
+        QPointF(button->width() / 2, button->height() / 2));
+    QTest::mouseClick(&fixture.view, Qt::LeftButton, Qt::NoModifier,
+                      centre.toPoint());
+    // Creating a session must not fold the group away underneath the click: the
+    // Button has to consume the press before the header's collapse handler runs.
+    QCOMPARE(fixture.app.calls(), QStringList{});
+    // ...and it must target the group whose header was clicked.
+    QCOMPARE(fixture.root()->property("pendingSessionGroupId").toString(),
+             QStringLiteral("g1"));
+
+    // Opening a dialog that creates nothing would be the same dead affordance
+    // this test exists to kill, so drive the accept and check what was sent.
+    QObject* dialog = fixture.root()->findChild<QObject*>(QStringLiteral("newSessionDialog"));
+    QVERIFY2(dialog, "no new-session dialog to accept");
+    // Distinct values: an argument-order swap must not be able to hide.
+    QObject* nameField = fixture.root()->findChild<QObject*>(QStringLiteral("newSessionField"));
+    QObject* repoField = fixture.root()->findChild<QObject*>(QStringLiteral("newSessionRepoField"));
+    QVERIFY(nameField && repoField);
+    nameField->setProperty("text", QStringLiteral("api"));
+    repoField->setProperty("text", QStringLiteral("/srv/repos/api"));
+    QMetaObject::invokeMethod(dialog, "accept");
+
+    QCOMPARE(fixture.app.calls(),
+             (QStringList{QStringLiteral("createSession(g1,api,/srv/repos/api)")}));
+    QVERIFY2(fixture.warnings().isEmpty(),
+             qPrintable(fixture.warnings().join(QLatin1Char('\n'))));
 }
 
 // Space on a group header asks the server to toggle its collapsed flag.
