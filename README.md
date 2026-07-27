@@ -45,6 +45,58 @@ remote/         server-side service, agent bridge, harness adapters
 docs/           SPEC.md, PLAN.md
 ```
 
+## Install
+
+CodeHarbor has two halves: a **client** on your desktop and a small **service**
+on the dev server. Both ship in every
+[release](https://github.com/yichenchong/codeharbor/releases).
+
+### 1. The server
+
+Needs SSH access, `tmux`, and Node 23.6+. Unpack the tarball anywhere you like:
+
+```bash
+mkdir -p ~/codeharbor
+curl -fsSL https://github.com/yichenchong/codeharbor/releases/latest/download/codeharbor-remote.tar.gz \
+  | tar -xz -C ~/codeharbor
+```
+
+That is the whole install: the service has **zero runtime dependencies**, so
+there is no `npm install` and no `node_modules`. You get `dist/`, `sql/` and
+`package.json`, and nothing needs to be running — the client starts
+`codeharbord` over SSH on demand and it exits when you disconnect.
+
+### 2. The client
+
+| Platform | Asset | Notes |
+|---|---|---|
+| Linux | `CodeHarbor-x86_64.AppImage` | `chmod +x` then run. Needs FUSE and an X11/XWayland display. |
+| macOS | `codeharbor.dmg` | Unsigned: right-click → **Open**, or `xattr -d com.apple.quarantine`. |
+| Windows | `codeharbor-windows.zip` | Extract, run `codeharbor.exe`. SmartScreen will warn (unsigned). |
+
+### 3. Connect
+
+Launch it, add a server in the connect sheet, and fill in:
+
+- **Host / Port / User** — your SSH details.
+- **Node path** — absolute path to `node` on the server (`ssh <host> command -v node`).
+  It is not looked up on `PATH`, because a non-interactive SSH session often
+  does not have the one you expect.
+- **Repository root** — where you unpacked the tarball (`~/codeharbor` above).
+  A git checkout of this repo works too.
+
+Authentication uses your SSH agent or default key; if the key needs a
+passphrase, or the server wants a password, CodeHarbor prompts for it. The first
+connection shows the host's fingerprint and refuses to continue until you accept
+it — an unknown key is never trusted silently.
+
+Then create a group, add a Dev Session pointing at a project directory on the
+server, and you have terminals, an editor, and viewers against that project.
+
+> Verified for `v0.1.0` by installing the published artifacts: the downloaded
+> AppImage, pointed at an unpacked `codeharbor-remote.tar.gz`, connected over SSH
+> and launched both remote services from `dist/`. No source checkout involved.
+
 ## Build
 
 Full environment setup (all platforms, exact packages, troubleshooting) is in

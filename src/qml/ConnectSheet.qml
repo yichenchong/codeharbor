@@ -908,7 +908,7 @@ Rectangle {
                     width: form.width
                     label: qsTr("Repository root")
                     placeholder: qsTr("/srv/codeharbor")
-                    hint: qsTr("Remote CodeHarbor checkout that provides codeharbord.")
+                    hint: qsTr("Remote CodeHarbor install providing codeharbord: an unpacked release tarball or a git checkout.")
                     onAccepted: root.save()
                 }
             }
