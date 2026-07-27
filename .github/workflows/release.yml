@@ -166,3 +166,42 @@ jobs:
           name: codeharbor-remote
           path: artifact/
           if-no-files-found: error
+
+  # The build/remote jobs only upload workflow ARTIFACTS, which expire and are
+  # invisible to logged-out users. This job is what actually puts binaries on the
+  # Releases page, and it runs for tag builds only - a manual workflow_dispatch
+  # stays a dry run that exercises the cross-OS builds without publishing.
+  publish:
+    name: publish release
+    needs: [build, remote]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      # The Windows deploy step produces a DIRECTORY (exe + Qt runtime + libssh
+      # DLLs); `gh release create` only accepts files, so fold it into one zip.
+      - name: Normalise assets
+        run: |
+          cd dist
+          for d in */; do
+            [ -d "$d" ] || continue
+            zip -r "${d%/}.zip" "$d"
+            rm -rf "$d"
+          done
+          ls -la
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "CodeHarbor $GITHUB_REF_NAME" \
+            --generate-notes \
+            dist/*
