@@ -33,7 +33,10 @@ jobs:
         uses: jurplel/install-qt-action@v4
         with:
           version: "6.6.*"
-          modules: qtwebengine qtwebchannel
+          # qtpositioning is NOT optional: Qt6WebEngineCore hard-depends on it, and
+          # without it find_package(Qt6 COMPONENTS WebEngineCore) fails at configure
+          # even though Qt6WebEngineCoreConfig.cmake is present.
+          modules: qtwebengine qtwebchannel qtpositioning
       - name: Install build tooling
         run: sudo apt-get update && sudo apt-get install -y ninja-build libssh-dev
       # The Monaco bundle is a gitignored build artifact that src/qml/CMakeLists.txt

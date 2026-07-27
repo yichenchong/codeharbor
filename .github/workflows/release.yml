@@ -34,7 +34,9 @@ jobs:
         uses: jurplel/install-qt-action@v4
         with:
           version: ${{ env.QT_VERSION }}
-          modules: qtwebengine qtwebchannel
+          # qtpositioning is a hard dependency of Qt6WebEngineCore; omitting it
+          # fails find_package(Qt6 COMPONENTS WebEngineCore) at configure time.
+          modules: qtwebengine qtwebchannel qtpositioning
           cache: true
 
       - name: Install CMake + Ninja
