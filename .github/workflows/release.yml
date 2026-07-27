@@ -65,6 +65,12 @@ jobs:
       # deterministic for a given triplet, so cache it; a hit turns the install
       # below into a no-op.
       #
+      # SCOPING: a run can only restore a cache written by its own ref or by the
+      # DEFAULT BRANCH. A tag build therefore cannot use a cache that another tag
+      # build wrote - it must have been seeded on main. That is automatic if the
+      # release drill is followed: dispatch this workflow on main as a dry run
+      # (which seeds), then push the tag (which restores). See docs/DEVELOPMENT.md.
+      #
       # The key carries the runner IMAGE version, not just the triplet: MSVC and
       # the bundled vcpkg both ship with the image, so a static key would keep
       # restoring a tree built by an older toolchain after an image bump and fail

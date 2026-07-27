@@ -240,6 +240,27 @@ artifact is self-contained. libssh is sourced per OS: `apt` (Linux), `brew`
 (macOS), and `vcpkg` (Windows, via the CMake CONFIG package — see the normalized
 `ch_libssh` target in the top-level `CMakeLists.txt`).
 
+### The release drill (do not skip the dry run)
+
+1. **Dispatch `release.yml` on `main`** ("Run workflow"). The `publish` job is
+   gated on `refs/tags/v*`, so this is a genuine dry run: it exercises all three
+   OS builders and publishes nothing.
+2. **Then push the tag.** `bash .omp/skills/bump-version/bump.sh --set X.Y.Z`.
+
+This ordering is not ceremony, for two reasons.
+
+The workflow's first real execution failed on **each** platform for a different
+reason — Linux could not resolve `libQt6SerialPort.so.6` while packaging, and
+Windows both failed to build the web bundle and looked for the executable in the
+wrong directory. A tag that fails leaves a permanent public tag with no release
+attached; a dispatch costs nothing.
+
+The dry run also **seeds the Windows vcpkg cache**. GitHub only lets a run
+restore a cache written by its own ref or by the default branch, so a cache
+written by a tag build is unreachable from every later tag. Seeding happens on
+`main` or not at all — which is why `v0.1.0` paid the full ~9.8 min to rebuild
+libssh from source.
+
 ### Building locally on each OS
 
 The commands are identical everywhere — only dependency install differs
