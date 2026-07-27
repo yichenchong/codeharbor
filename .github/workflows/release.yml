@@ -60,6 +60,17 @@ jobs:
           brew install libssh
           echo "CMAKE_PREFIX_PATH=$(brew --prefix libssh):${CMAKE_PREFIX_PATH:-}" >> "$GITHUB_ENV"
 
+      # libssh is built FROM SOURCE by vcpkg and dominated this job at ~9.8 min
+      # of a 13.7 min run (the compile itself is ~1.6 min). The built tree is
+      # deterministic for a given triplet, so cache it; a hit turns the install
+      # below into a no-op.
+      - name: Cache vcpkg libssh (Windows)
+        if: matrix.name == 'windows'
+        uses: actions/cache@v4
+        with:
+          path: C:\vcpkg\installed
+          key: vcpkg-libssh-x64-windows-v1
+
       - name: Install libssh via vcpkg (Windows)
         if: matrix.name == 'windows'
         shell: pwsh
@@ -125,7 +136,14 @@ jobs:
         run: |
           $dest = "artifact/codeharbor-windows"
           New-Item -ItemType Directory -Force -Path $dest | Out-Null
-          Copy-Item build/release/src/app/codeharbor.exe $dest/
+          # Qt's qt_standard_project_setup redirects RUNTIME_OUTPUT_DIRECTORY to
+          # the build root on Windows so the exe sits beside its DLLs, so it is
+          # NOT under src/app/ as it is on Linux/macOS. Locate it rather than
+          # assume a layout that varies by platform.
+          $exe = Get-ChildItem -Path build/release -Recurse -Filter codeharbor.exe |
+                 Select-Object -First 1
+          if (-not $exe) { throw "codeharbor.exe not found under build/release" }
+          Copy-Item $exe.FullName $dest/
           windeployqt --qmldir src/qml --release "$dest/codeharbor.exe"
           # Bundle non-Qt runtime deps (libssh) next to the exe.
           Get-ChildItem "$env:VCPKG_INSTALLATION_ROOT/installed/x64-windows/bin/*.dll" |
