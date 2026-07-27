@@ -46,8 +46,11 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "24"
+      # BOTH bundles, via the root workspaces script. Naming only the editor left
+      # the terminal bundle to CMake's npm fallback, which is a convenience for
+      # local dev and is not portable - it failed outright on the Windows runner.
       - name: Build web bundles (must precede CMake configure)
-        run: npm install && npm run build --workspace src/web/editor
+        run: npm install && npm run build
       - name: Configure
         run: cmake --preset dev
       - name: Build

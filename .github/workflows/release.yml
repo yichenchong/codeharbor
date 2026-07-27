@@ -38,7 +38,12 @@ jobs:
           version: ${{ env.QT_VERSION }}
           # qtpositioning is a hard dependency of Qt6WebEngineCore; omitting it
           # fails find_package(Qt6 COMPONENTS WebEngineCore) at configure time.
-          modules: qtwebengine qtwebchannel qtpositioning
+          #
+          # qtserialport is needed only to PACKAGE, not to build: installing
+          # qtpositioning makes linuxdeploy's qt plugin bundle the position
+          # plugins, and libqtposition_nmea.so links libQt6SerialPort.so.6.
+          # Without it the AppImage step dies on an unresolved dependency.
+          modules: qtwebengine qtwebchannel qtpositioning qtserialport
           cache: true
 
       - name: Install CMake + Ninja
@@ -73,8 +78,11 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "24"
+      # BOTH bundles, via the root workspaces script: the terminal bundle is as
+      # load-bearing as the editor one, and CMake's npm fallback that used to
+      # cover it does not work on Windows.
       - name: Build web bundles (must precede CMake configure)
-        run: npm install && npm run build --workspace src/web/editor
+        run: npm install && npm run build
         shell: bash
 
       # --- configure + build ---------------------------------------------------

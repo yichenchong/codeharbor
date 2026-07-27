@@ -72,7 +72,10 @@ else()
 endif()
 
 if(_ch_bundle_stale AND NOT CODEHARBOR_SKIP_WEB_BUNDLE)
-    find_program(CODEHARBOR_NPM npm)
+    # npm.cmd FIRST: on Windows find_program only auto-appends .com/.exe, so a
+    # bare `npm` resolves the extensionless shell script, which execute_process
+    # cannot launch - and the failure surfaces as an EMPTY error string.
+    find_program(CODEHARBOR_NPM NAMES npm.cmd npm)
     if(CODEHARBOR_NPM)
         if(NOT EXISTS ${CMAKE_SOURCE_DIR}/node_modules)
             message(STATUS "CodeHarbor: installing npm workspaces (first configure)")
@@ -88,7 +91,7 @@ if(_ch_bundle_stale AND NOT CODEHARBOR_SKIP_WEB_BUNDLE)
                         OUTPUT_VARIABLE _ch_bundle_out
                         ERROR_VARIABLE _ch_bundle_out)
         if(NOT _ch_bundle_rc EQUAL 0)
-            message(STATUS "CodeHarbor: bundle build failed:\n${_ch_bundle_out}")
+            message(STATUS "CodeHarbor: bundle build failed (${_ch_bundle_rc}):\n${_ch_bundle_out}")
         endif()
     endif()
 endif()
@@ -152,7 +155,7 @@ else()
 endif()
 
 if(_ch_terminal_stale AND NOT CODEHARBOR_SKIP_WEB_BUNDLE)
-    find_program(CODEHARBOR_NPM npm)
+    find_program(CODEHARBOR_NPM NAMES npm.cmd npm)
     if(CODEHARBOR_NPM)
         if(NOT EXISTS ${CMAKE_SOURCE_DIR}/node_modules)
             message(STATUS "CodeHarbor: installing npm workspaces (first configure)")
@@ -168,7 +171,7 @@ if(_ch_terminal_stale AND NOT CODEHARBOR_SKIP_WEB_BUNDLE)
                         OUTPUT_VARIABLE _ch_terminal_bundle_out
                         ERROR_VARIABLE _ch_terminal_bundle_out)
         if(NOT _ch_terminal_bundle_rc EQUAL 0)
-            message(STATUS "CodeHarbor: terminal bundle build failed:\n${_ch_terminal_bundle_out}")
+            message(STATUS "CodeHarbor: terminal bundle build failed (${_ch_terminal_bundle_rc}):\n${_ch_terminal_bundle_out}")
         endif()
     endif()
 endif()
