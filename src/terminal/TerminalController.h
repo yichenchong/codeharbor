@@ -4,14 +4,15 @@
 #include "SessionState.h"
 
 #include <QByteArray>
+// QIODevice must be COMPLETE, not forward-declared: QPointer<T> instantiates
+// QWeakPointer<QObject>(T*, bool), which is constrained on
+// is_convertible<T*, QObject*> and silently fails for an incomplete T. Qt 6.10
+// happens to accept the forward declaration; 6.6 does not.
+#include <QIODevice>
 #include <QObject>
 #include <QPointer>
 #include <QString>
 #include <QTimer>
-
-QT_BEGIN_NAMESPACE
-class QIODevice;
-QT_END_NAMESPACE
 
 namespace ch {
 

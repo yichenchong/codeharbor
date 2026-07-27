@@ -1,5 +1,11 @@
 #pragma once
 
+// AgentStatusMonitor and CodeharbordClient are INCLUDED, not forward-declared:
+// both are held in QPointer members below, and QPointer needs a complete type
+// to prove convertibility to QObject* (Qt 6.6 rejects the incomplete form that
+// 6.10 accepts).
+#include "AgentStatusMonitor.h"
+#include "CodeharbordClient.h"
 #include "SshConnectionPool.h"
 
 #include <QHash>
@@ -15,8 +21,6 @@ QT_END_NAMESPACE
 
 namespace ch {
 
-class AgentStatusMonitor;
-class CodeharbordClient;
 class SshChannelDevice;
 class SshConnectionPool;
 
