@@ -433,3 +433,12 @@ drag-reorder regression it briefly introduced caught by `tst_sidebar` and fixed.
 >   the key as unknown, and parked awaiting a prompt nobody could answer headlessly —
 >   which reads exactly like a broken auto-reconnect. The product was right; the
 >   coverage is not.
+> - **Two live gates hardcode the dev layout.** `tst_livessh:183` and
+>   `tst_liveagent:355` build their remote command from
+>   `<CH_LIVE_REPO>/remote/src/*.ts` instead of going through
+>   `SessionBootstrap::entryCandidates()`, so they only pass against a git
+>   checkout and fail against an unpacked release tarball. Not a product defect —
+>   `tst_coldstart` drives the real path and passes against the tarball — but it
+>   means the live suite is not a check on the layout a normal user installs.
+>   Found by installing the published v0.1.0 artifacts and running the suite
+>   against them, which is the only reason it is known at all.
