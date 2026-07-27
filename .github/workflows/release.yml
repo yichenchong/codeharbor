@@ -64,12 +64,25 @@ jobs:
       # of a 13.7 min run (the compile itself is ~1.6 min). The built tree is
       # deterministic for a given triplet, so cache it; a hit turns the install
       # below into a no-op.
+      #
+      # The key carries the runner IMAGE version, not just the triplet: MSVC and
+      # the bundled vcpkg both ship with the image, so a static key would keep
+      # restoring a tree built by an older toolchain after an image bump and fail
+      # at link time - or, worse, subtly at runtime. ImageVersion is an OS env
+      # var on the image, not part of the `env` expression context, so it has to
+      # be captured in a step first.
+      - name: Resolve cache key (Windows)
+        if: matrix.name == 'windows'
+        id: imgver
+        shell: pwsh
+        run: echo "v=$env:ImageVersion" >> $env:GITHUB_OUTPUT
+
       - name: Cache vcpkg libssh (Windows)
         if: matrix.name == 'windows'
         uses: actions/cache@v4
         with:
           path: C:\vcpkg\installed
-          key: vcpkg-libssh-x64-windows-v1
+          key: vcpkg-libssh-x64-windows-${{ steps.imgver.outputs.v }}
 
       - name: Install libssh via vcpkg (Windows)
         if: matrix.name == 'windows'
