@@ -96,8 +96,16 @@ export function startBridge(
         process.stderr.write(`codeharbor-bridge: ${err.message}\n`);
     });
     // Ensure the socket's parent directory exists (the ~/.cache fallback may
-    // not, SPEC 6.3) and clear a stale socket left by a previous run.
-    fs.mkdirSync(path.dirname(socketPath), { recursive: true });
+    // not, SPEC 6.3) and clear a stale socket left by a previous run. The
+    // directory is private (0700) so an unrelated user cannot connect to the
+    // socket even before the post-listen chmod tightens the socket itself.
+    fs.mkdirSync(path.dirname(socketPath), { recursive: true, mode: 0o700 });
+    try {
+        fs.chmodSync(path.dirname(socketPath), 0o700);
+    } catch {
+        // Directory already existed with other perms we cannot change; the
+        // 0600 socket chmod below is still the primary guard.
+    }
     // Only remove a stale entry if it is actually a socket, so a mistyped path
     // pointing at a regular file is never clobbered (listen() will then fail).
     try {
@@ -107,7 +115,15 @@ export function startBridge(
     } catch {
         // Nothing at socketPath (ENOENT); nothing to clear.
     }
-    server.listen(socketPath);
+    server.listen(socketPath, () => {
+        // Restrict the socket to the owning user (0600); the default net.Server
+        // socket honours only umask, which may leave it group/world-accessible.
+        try {
+            fs.chmodSync(socketPath, 0o600);
+        } catch {
+            // Best-effort: some platforms ignore socket permissions.
+        }
+    });
     return server;
 }
 

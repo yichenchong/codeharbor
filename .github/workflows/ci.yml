@@ -36,7 +36,20 @@ jobs:
           modules: qtwebengine qtwebchannel
       - name: Install build tooling
         run: sudo apt-get update && sudo apt-get install -y ninja-build libssh-dev
+      # The Monaco bundle is a gitignored build artifact that src/qml/CMakeLists.txt
+      # embeds as a Qt resource AT CONFIGURE TIME. It must exist before `cmake
+      # --preset dev` or CMake only warns and produces a client whose editor pane
+      # has nothing to load - a silently broken editor, not a build failure.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - name: Build web bundles (must precede CMake configure)
+        run: npm install && npm run build --workspace src/web/editor
       - name: Configure
         run: cmake --preset dev
       - name: Build
         run: cmake --build --preset dev
+      - name: Test
+        run: ctest --preset dev --output-on-failure
+      - name: Configure + build (release preset)
+        run: cmake --preset release && cmake --build --preset release

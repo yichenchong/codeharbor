@@ -8,13 +8,32 @@
 
 import readline from "node:readline";
 
+// Frozen file-method catalog (C1, docs/PLAN.md). RPC_METHODS/RPC_REVISION_MISMATCH
+// are re-exported so the wire names and error code stay linked to the transport.
+// The file.* handlers (incl. listDirectory) are registered from files.ts.
+import { fileMethods, fileWatchService, isRevisionMismatch } from "./files.ts";
+// Workspace persistence method group (workstream P). `workspace.*` is P's own
+// method group and is deliberately absent from the frozen C1 file catalog.
+// serverIdentity() is this host's stable, persisted id, reported by server.info.
+import { serverIdentity, WORKSPACE_METHODS } from "./workspace.ts";
+// tmux session discovery (SPEC 10.2). Its own `tmux.*` method group, likewise
+// outside the frozen C1 file catalog.
+import { TMUX_METHODS } from "./tmux.ts";
+import { RPC_REVISION_MISMATCH, RPC_WATCH_EVENT_NOTIFICATION } from "./rpc-types.ts";
+export { RPC_METHODS } from "./rpc-types.ts";
+export { RPC_REVISION_MISMATCH, RPC_WATCH_EVENT_NOTIFICATION };
+
 export const RPC_SERVER_NAME = "codeharbord";
 export const RPC_SERVER_VERSION = "0.1.0";
-export const RPC_SCHEMA_VERSION = 1;
+// Bumped 1 -> 2 when file.listDirectory joined the C1 catalog (SPEC 7.5).
+// Bumped 2 -> 3 when the tmux.* discovery group joined the catalog (SPEC 10.2).
+// Bumped 3 -> 4 when server.info gained `serverId` (SPEC 3.5).
+export const RPC_SCHEMA_VERSION = 4;
 
 export interface RpcRequest {
     jsonrpc: "2.0";
-    id: string | number | null;
+    // Absent (undefined) marks a JSON-RPC notification: no response is returned.
+    id?: string | number | null;
     method: string;
     params?: unknown;
 }
@@ -37,17 +56,27 @@ export type RpcResponse = RpcSuccess | RpcError;
 export const RPC_PARSE_ERROR = -32700;
 export const RPC_INVALID_REQUEST = -32600;
 export const RPC_METHOD_NOT_FOUND = -32601;
+export const RPC_INTERNAL_ERROR = -32603;
 
-type MethodHandler = (params: unknown) => unknown;
+type MethodHandler = (params: unknown) => unknown | Promise<unknown>;
 
 // Static method table (SPEC 10.2 methods are added here as they land).
 const methods: Record<string, MethodHandler> = {
     ping: () => ({ pong: true }),
+    // `name`, `version` and `schemaVersion` are frozen; `serverId` (SPEC 3.5)
+    // is the stable identity of the workspace database on THIS host, minted on
+    // first read and unchanged thereafter. Clients key their view of the remote
+    // workspace by it, so it is read from the DB rather than synthesized: an
+    // id that changed per process or per route would orphan every stored row.
     "server.info": () => ({
         name: RPC_SERVER_NAME,
         version: RPC_SERVER_VERSION,
         schemaVersion: RPC_SCHEMA_VERSION,
+        serverId: serverIdentity(),
     }),
+    ...fileMethods,
+    ...WORKSPACE_METHODS,
+    ...TMUX_METHODS,
 };
 
 function isRpcRequest(value: unknown): value is RpcRequest {
@@ -56,7 +85,7 @@ function isRpcRequest(value: unknown): value is RpcRequest {
     return (
         r.jsonrpc === "2.0" &&
         typeof r.method === "string" &&
-        (typeof r.id === "string" || typeof r.id === "number" || r.id === null)
+        (r.id === undefined || typeof r.id === "string" || typeof r.id === "number" || r.id === null)
     );
 }
 
@@ -64,7 +93,7 @@ function isRpcRequest(value: unknown): value is RpcRequest {
  * Dispatch one already-decoded request object. Pure and total: unknown methods
  * and malformed requests produce JSON-RPC error responses rather than throwing.
  */
-export function dispatch(value: unknown): RpcResponse {
+export async function dispatch(value: unknown): Promise<RpcResponse | null> {
     if (!isRpcRequest(value)) {
         return {
             jsonrpc: "2.0",
@@ -73,18 +102,51 @@ export function dispatch(value: unknown): RpcResponse {
         };
     }
     const handler = methods[value.method];
+    // A request with no id is a JSON-RPC notification: dispatch it for its side
+    // effects and return NO response, regardless of outcome. Narrowing on
+    // `value.id` here also lets the response branches below type `id` as present.
+    if (value.id === undefined) {
+        if (handler) {
+            try {
+                await handler(value.params);
+            } catch {
+                // Notifications get no response, so swallow handler errors.
+            }
+        }
+        return null;
+    }
+    const id = value.id;
     if (!handler) {
         return {
             jsonrpc: "2.0",
-            id: value.id,
+            id,
             error: { code: RPC_METHOD_NOT_FOUND, message: `Method not found: ${value.method}` },
         };
     }
-    return { jsonrpc: "2.0", id: value.id, result: handler(value.params) };
+    try {
+        const result = await handler(value.params);
+        return { jsonrpc: "2.0", id, result };
+    } catch (err) {
+        if (isRevisionMismatch(err)) {
+            return {
+                jsonrpc: "2.0",
+                id,
+                error: { code: RPC_REVISION_MISMATCH, message: err.message, data: err.data },
+            };
+        }
+        return {
+            jsonrpc: "2.0",
+            id,
+            error: {
+                code: RPC_INTERNAL_ERROR,
+                message: err instanceof Error ? err.message : String(err),
+            },
+        };
+    }
 }
 
 /** Handle one raw JSONL request line, returning the response to serialize. */
-export function handleLine(line: string): RpcResponse {
+export async function handleLine(line: string): Promise<RpcResponse | null> {
     let decoded: unknown;
     try {
         decoded = JSON.parse(line);
@@ -100,9 +162,17 @@ export function handleLine(line: string): RpcResponse {
 
 export function runStdio(): void {
     const rl = readline.createInterface({ input: process.stdin });
+    // Relay watch notifications to the client as id-less JSON-RPC messages.
+    fileWatchService.onWatchEvent((event) => {
+        process.stdout.write(
+            `${JSON.stringify({ jsonrpc: "2.0", method: RPC_WATCH_EVENT_NOTIFICATION, params: event })}\n`,
+        );
+    });
     rl.on("line", (line) => {
         if (line.trim().length === 0) return;
-        process.stdout.write(`${JSON.stringify(handleLine(line))}\n`);
+        void handleLine(line).then((response) => {
+            if (response) process.stdout.write(`${JSON.stringify(response)}\n`);
+        });
     });
 }
 

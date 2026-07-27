@@ -5,7 +5,7 @@
   "description": "Monaco editor bundle bridged to the remote file service via Qt WebChannel",
   "type": "module",
   "scripts": {
-    "build": "esbuild src/index.ts --bundle --format=esm --outfile=dist/editor.js",
+    "build": "node build.mjs",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

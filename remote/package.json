@@ -11,11 +11,12 @@
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "node --test \"test/**/*.test.ts\""
+    "test": "node --test \"test/**/*.test.ts\"",
+    "test:schema": "node --test \"test/schema.test.ts\""
   },
   "devDependencies": {
     "typescript": "^5.7.0",
-    "@types/node": "^20.14.0"
+    "@types/node": "^24.0.0"
   },
   "engines": {
     "node": ">=23.6"
