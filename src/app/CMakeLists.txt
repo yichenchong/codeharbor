@@ -33,7 +33,7 @@ target_link_libraries(ch_app PUBLIC
 # optional at configure time exactly like libssh in src/ssh: without it the
 # module still builds (CH_HAVE_DBUS=0) and Notifier::available() is false, so
 # notify() degrades to a silent no-op.
-find_package(Qt6 6.6 QUIET COMPONENTS DBus)
+find_package(Qt6 6.9 QUIET COMPONENTS DBus)
 if(Qt6DBus_FOUND)
     target_link_libraries(ch_app PUBLIC Qt6::DBus)
     target_compile_definitions(ch_app PUBLIC CH_HAVE_DBUS=1)

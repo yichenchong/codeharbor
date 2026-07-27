@@ -19,8 +19,11 @@ endif()
 
 option(CODEHARBOR_BUILD_TESTS "Build C++ unit tests" ON)
 
-# Qt 6.6+ is required for the QML modules and WebEngine/WebChannel integration.
-find_package(Qt6 6.6 REQUIRED COMPONENTS
+# Qt 6.9+ is required: QQuickWebEngineProfile's (storageName, parent) constructor
+# arrived in 6.9, and it is the only profile-creation form that does not emit the
+# "use WebEngineProfilePrototype" deprecation warning that tst_qmlload treats as a
+# failure. 6.6/6.8 do not compile (see src/viewers/ViewerProfiles.cpp).
+find_package(Qt6 6.9 REQUIRED COMPONENTS
     Core
     Gui
     Quick
@@ -33,7 +36,7 @@ find_package(Qt6 6.6 REQUIRED COMPONENTS
     Network
     Test)
 
-qt_standard_project_setup(REQUIRES 6.6)
+qt_standard_project_setup(REQUIRES 6.9)
 
 # libssh provides SSH connection/channel/PTY transport (see src/ssh). Discovery
 # is normalized behind the interface target `ch_libssh` so the ssh module does

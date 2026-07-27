@@ -12,7 +12,9 @@ on:
         required: false
 
 env:
-  QT_VERSION: "6.8.1"
+  # Must be >= the CMake floor (6.9). 6.8.1 predates
+  # QQuickWebEngineProfile(storageName, parent) and does not compile.
+  QT_VERSION: "6.9.*"
 
 jobs:
   build:

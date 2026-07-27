@@ -17,11 +17,13 @@ This stack has been confirmed to configure, build, and link the full tree
 | C++ compiler | GCC 15.2 | C++20 (GCC 12+/Clang 15+) |
 | CMake | 4.2.3 | 3.24 |
 | Ninja | 1.13.2 | any |
-| Qt 6 | 6.10.2 | 6.6 |
+| Qt 6 | 6.10.2 | 6.9 |
 | libssh | 0.11.3 | 0.10+ |
 | Node.js | 24.16 | 23.6 (native TS type-stripping) |
 
-The CMake floor is Qt **6.6**; newer (6.10 here) works unchanged.
+The CMake floor is Qt **6.9**; newer (6.10 here) works unchanged. 6.9 is not a
+guess: it is the first release with `QQuickWebEngineProfile(storageName, parent)`,
+and CI builds and runs the portable suite on 6.9 to keep the claim honest.
 
 ## Ubuntu / Debian (apt)
 

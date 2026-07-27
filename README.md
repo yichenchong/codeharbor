@@ -52,7 +52,7 @@ Full environment setup (all platforms, exact packages, troubleshooting) is in
 
 ### Client (Qt / CMake)
 
-Requires Qt 6.6+, a C++20 compiler, CMake 3.24+, Ninja, and libssh.
+Requires Qt 6.9+, a C++20 compiler, CMake 3.24+, Ninja, and libssh.
 
 ```bash
 cmake --preset dev            # configure
