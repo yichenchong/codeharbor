@@ -176,14 +176,19 @@ QStringList identityFileCandidates(ssh_session session,
         ssh_string_free_char(configuredIdentity);
     }
 
-    const QDir sshDirectory(
-        QDir::home().filePath(QStringLiteral(".ssh")));
-    for (const QString& fileName : {QStringLiteral("id_ed25519"),
-                                    QStringLiteral("id_ecdsa"),
-                                    QStringLiteral("id_rsa")}) {
-        const QString candidate = sshDirectory.filePath(fileName);
-        if (QFileInfo::exists(candidate))
-            add(candidate);
+    // With a profile or config identity, stop there: each rejected key spends
+    // one server authentication attempt. Scan defaults only when neither
+    // source named a key, leaving room for a later passphrase retry.
+    if (candidates.isEmpty()) {
+        const QDir sshDirectory(
+            QDir::home().filePath(QStringLiteral(".ssh")));
+        for (const QString& fileName : {QStringLiteral("id_ed25519"),
+                                        QStringLiteral("id_ecdsa"),
+                                        QStringLiteral("id_rsa")}) {
+            const QString candidate = sshDirectory.filePath(fileName);
+            if (QFileInfo::exists(candidate))
+                add(candidate);
+        }
     }
     return candidates;
 }
