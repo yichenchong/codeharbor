@@ -72,6 +72,7 @@ private slots:
     void markerOnlyHostStaysUnknownForOtherTypes();
     void keyTypesForListsTrustedTypesOnly();
     void hostKeyAlgorithmsPinTrustedTypes();
+    void recognizesWindowsNamedPipeAgentSocket();
 };
 
 void TstKnownHosts::parsesSampleStore()
@@ -471,6 +472,21 @@ void TstKnownHosts::hostKeyAlgorithmsPinTrustedTypes()
                  SshConnectionPool::lookupHostFor(QStringLiteral("victim.example"),
                                                   2222))),
              QByteArrayLiteral("ssh-ed25519"));
+}
+
+void TstKnownHosts::recognizesWindowsNamedPipeAgentSocket()
+{
+    using ch::SshConnectionPool;
+
+    QVERIFY(SshConnectionPool::isWindowsNamedPipeAgentSocket(
+        QStringLiteral("\\\\.\\pipe\\openssh-ssh-agent")));
+    QVERIFY(SshConnectionPool::isWindowsNamedPipeAgentSocket(
+        QStringLiteral("\\\\.\\PIPE\\agent")));
+    QVERIFY(!SshConnectionPool::isWindowsNamedPipeAgentSocket(
+        QStringLiteral("/tmp/ssh-xxxx/agent.42")));
+    QVERIFY(!SshConnectionPool::isWindowsNamedPipeAgentSocket(
+        QStringLiteral("C:/Users/alice/.ssh/agent.sock")));
+    QVERIFY(!SshConnectionPool::isWindowsNamedPipeAgentSocket(QString()));
 }
 
 QTEST_MAIN(TstKnownHosts)

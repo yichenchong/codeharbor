@@ -73,6 +73,7 @@ private slots:
     void stderrStaysOutOfReadStream();
     void encryptedIdentityUsesPassphraseFromCallback();
     void missingAgentAndKeyExplainAuthenticationFailure();
+    void windowsNamedPipeAgentFallsBackToIdentityFile();
 
 private:
     void ensureConnected();
@@ -397,6 +398,42 @@ void TstLiveSsh::encryptedIdentityUsesPassphraseFromCallback()
              "Profile Private key file beginning with ~/ did not authenticate");
     QCOMPARE(tildePassphraseRequests, 1);
     tildePool.disconnectFromHost();
+}
+
+// Windows' built-in ssh-agent uses \\.\pipe\openssh-ssh-agent rather than an
+// AF_UNIX socket. Native libssh cannot talk to that pipe, but it must still
+// authenticate an explicitly configured key without surfacing the agent error.
+void TstLiveSsh::windowsNamedPipeAgentFallsBackToIdentityFile()
+{
+#ifndef Q_OS_WIN
+    QSKIP("Windows named-pipe regression case");
+#else
+    if (m_identityFile.isEmpty())
+        QSKIP("CH_LIVE_IDENTITY is not set; named-pipe regression case skipped");
+
+    const QByteArray oldAgent = qgetenv("SSH_AUTH_SOCK");
+    qputenv("SSH_AUTH_SOCK", R"(\\.\pipe\openssh-ssh-agent)");
+    const auto restoreAgent = qScopeGuard([oldAgent] {
+        if (oldAgent.isEmpty())
+            qunsetenv("SSH_AUTH_SOCK");
+        else
+            qputenv("SSH_AUTH_SOCK", oldAgent);
+    });
+
+    SshConnectionPool pool;
+    pool.setKnownHosts(KnownHosts{});
+    pool.setHostKeyCallback([](const QString&, const QString&,
+                               const QByteArray&, KnownHosts::Verdict) {
+        return SshConnectionPool::HostKeyDecision::Accept;
+    });
+    QString failure;
+    QObject::connect(&pool, &SshConnectionPool::errorOccurred, &pool,
+                     [&failure](const QString& message) { failure = message; });
+
+    QVERIFY2(pool.connectToHost(m_host, m_port, m_user, m_identityFile),
+             qPrintable(failure));
+    pool.disconnectFromHost();
+#endif
 }
 
 // A desktop-launched client may not inherit SSH_AUTH_SOCK. The failure must

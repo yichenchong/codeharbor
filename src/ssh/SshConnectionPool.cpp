@@ -3,6 +3,7 @@
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
+#include <QStringList>
 
 namespace ch {
 
@@ -32,6 +33,12 @@ QByteArray SshConnectionPool::hostKeyAlgorithms(const QStringList& trustedKeyTyp
         }
     }
     return algorithms.join(QLatin1Char(',')).toUtf8();
+}
+
+bool SshConnectionPool::isWindowsNamedPipeAgentSocket(const QString& socket)
+{
+    return socket.startsWith(QStringLiteral("\\\\.\\pipe\\"),
+                             Qt::CaseInsensitive);
 }
 
 SshConnectionPool::SshConnectionPool(QObject* parent)
@@ -123,6 +130,91 @@ QString resolveIdentityFilePath(QString identityFile)
         return QDir::home().filePath(identityFile.sliced(2));
     }
     return QDir::cleanPath(identityFile);
+}
+
+bool usesUnsupportedWindowsAgent()
+{
+#ifdef Q_OS_WIN
+    // Windows' built-in OpenSSH agent exposes a named pipe, whereas libssh's
+    // agent implementation opens SSH_AUTH_SOCK as an AF_UNIX socket. Trying
+    // the pipe poisons libssh's public-key auth state before local key fallback
+    // can run. AF_UNIX sockets remain supported on current Windows, so bypass
+    // only the named-pipe spelling.
+    return SshConnectionPool::isWindowsNamedPipeAgentSocket(
+        qEnvironmentVariable("SSH_AUTH_SOCK"));
+#else
+    return false;
+#endif
+}
+
+int declineLibsshPassphrase(const char*, char*, size_t, int, int, void*)
+{
+    // CodeHarbor owns passphrase prompts. libssh must never fall back to a
+    // controlling-terminal prompt inside the desktop client.
+    return -1;
+}
+
+QStringList identityFileCandidates(ssh_session session,
+                                   const QString& profileIdentityFile)
+{
+    QStringList candidates;
+    const auto add = [&candidates](const QString& file) {
+        if (!file.isEmpty() && !candidates.contains(file))
+            candidates.append(file);
+    };
+
+    add(profileIdentityFile);
+
+    // The public API exposes the first identity parsed from ~/.ssh/config.
+    // Keep it after the explicitly saved profile value, which deliberately has
+    // precedence over broader OpenSSH defaults.
+    char* configuredIdentity = nullptr;
+    if (ssh_options_get(session, SSH_OPTIONS_IDENTITY, &configuredIdentity)
+        == SSH_OK) {
+        add(QFile::decodeName(configuredIdentity));
+        ssh_string_free_char(configuredIdentity);
+    }
+
+    const QDir sshDirectory(
+        QDir::home().filePath(QStringLiteral(".ssh")));
+    for (const QString& fileName : {QStringLiteral("id_ed25519"),
+                                    QStringLiteral("id_ecdsa"),
+                                    QStringLiteral("id_rsa")}) {
+        const QString candidate = sshDirectory.filePath(fileName);
+        if (QFileInfo::exists(candidate))
+            add(candidate);
+    }
+    return candidates;
+}
+
+bool authenticateIdentityFile(ssh_session session, const QString& identityFile,
+                              const QString& passphrase)
+{
+    const QByteArray fileName = QFile::encodeName(identityFile);
+    const QByteArray passphraseUtf8 = passphrase.toUtf8();
+    ssh_key privateKey = nullptr;
+    const int importResult = ssh_pki_import_privkey_file(
+        fileName.constData(),
+        passphrase.isEmpty() ? nullptr : passphraseUtf8.constData(),
+        declineLibsshPassphrase, nullptr, &privateKey);
+    if (importResult != SSH_OK || !privateKey)
+        return false;
+
+    const int authenticationResult =
+        ssh_userauth_publickey(session, nullptr, privateKey);
+    ssh_key_free(privateKey);
+    return authenticationResult == SSH_AUTH_SUCCESS;
+}
+
+bool authenticateIdentityFiles(ssh_session session,
+                               const QStringList& identityFiles,
+                               const QString& passphrase)
+{
+    for (const QString& identityFile : identityFiles) {
+        if (authenticateIdentityFile(session, identityFile, passphrase))
+            return true;
+    }
+    return false;
 }
 
 } // namespace
@@ -304,33 +396,47 @@ bool SshConnectionPool::authenticate(const QString& user)
         return true;
     const int methods = ssh_userauth_list(m_session, nullptr);
 
-    // 1. Prefer a running ssh-agent. This is best effort: a platform-specific
-    // agent (notably Windows' named-pipe OpenSSH agent) may be unavailable to
-    // libssh even while the user has keys loaded.
-    if (ssh_userauth_agent(m_session, nullptr) == SSH_AUTH_SUCCESS)
+    // Windows' built-in OpenSSH agent is a named pipe, but libssh expects an
+    // AF_UNIX socket. Avoid every libssh auto-auth call in that case: it
+    // retries the agent internally and leaves public-key fallback unusable.
+    const bool unsupportedWindowsAgent = usesUnsupportedWindowsAgent();
+    const QStringList identityFiles =
+        identityFileCandidates(m_session, m_identityFile);
+    if (!unsupportedWindowsAgent
+        && ssh_userauth_agent(m_session, nullptr) == SSH_AUTH_SUCCESS) {
         return true;
+    }
 
-    // 2. Try identities from the parsed OpenSSH config, an explicit
-    // SSH_OPTIONS_IDENTITY, and libssh's defaults without a passphrase first.
-    if (ssh_userauth_publickey_auto(m_session, nullptr, nullptr)
-        == SSH_AUTH_SUCCESS)
+    if (unsupportedWindowsAgent) {
+        if (authenticateIdentityFiles(m_session, identityFiles, QString()))
+            return true;
+    } else if (ssh_userauth_publickey_auto(m_session, nullptr, nullptr)
+               == SSH_AUTH_SUCCESS) {
         return true;
+    }
 
-    // 3. If public-key auth is offered, ask separately for a key passphrase.
     // A passphrase is used ONLY for public-key authentication: falling through
     // to ssh_userauth_password() with it would disclose a local key secret to
     // the remote server and makes the two credential classes indistinguishable.
-    if (m_credentialCallback && (methods & SSH_AUTH_METHOD_PUBLICKEY)) {
+    if (m_credentialCallback && (methods & SSH_AUTH_METHOD_PUBLICKEY)
+        && (!unsupportedWindowsAgent || !identityFiles.isEmpty())) {
         CredentialReply passphrase =
             m_credentialCallback(user, CredentialKind::KeyPassphrase);
         if (passphrase.promptRequested)
             return false;
         if (!passphrase.secret.isEmpty()) {
-            const QByteArray secretUtf8 = passphrase.secret.toUtf8();
-            if (ssh_userauth_publickey_auto(m_session, nullptr,
-                                            secretUtf8.constData())
-                == SSH_AUTH_SUCCESS) {
-                return true;
+            if (unsupportedWindowsAgent) {
+                if (authenticateIdentityFiles(m_session, identityFiles,
+                                              passphrase.secret)) {
+                    return true;
+                }
+            } else {
+                const QByteArray secretUtf8 = passphrase.secret.toUtf8();
+                if (ssh_userauth_publickey_auto(m_session, nullptr,
+                                                secretUtf8.constData())
+                    == SSH_AUTH_SUCCESS) {
+                    return true;
+                }
             }
         }
     }
@@ -358,7 +464,12 @@ QString SshConnectionPool::authenticationFailure() const
 {
     QStringList details;
     details << QStringLiteral("Authentication failed.");
-    if (qEnvironmentVariableIsEmpty("SSH_AUTH_SOCK")) {
+    if (usesUnsupportedWindowsAgent()) {
+        details << QStringLiteral(
+            "Windows OpenSSH's named-pipe ssh-agent cannot be used by this "
+            "libssh build. Set Servers > Private key file to a local key; "
+            "CodeHarbor will ask for its passphrase when needed.");
+    } else if (qEnvironmentVariableIsEmpty("SSH_AUTH_SOCK")) {
         details << QStringLiteral(
             "SSH_AUTH_SOCK is not available to this CodeHarbor process, so "
             "ssh-agent keys cannot be used.");
@@ -369,11 +480,16 @@ QString SshConnectionPool::authenticationFailure() const
     }
 
     if (m_identityFile.isEmpty()) {
-        details << QStringLiteral(
-            "No private key file is configured for this server profile; "
-            "CodeHarbor also tried ~/.ssh/config and libssh defaults. Set "
-            "Servers > Private key file, or launch CodeHarbor from an "
-            "environment that exports SSH_AUTH_SOCK.");
+        if (usesUnsupportedWindowsAgent()) {
+            details << QStringLiteral(
+                "No private key file is configured for this server profile.");
+        } else {
+            details << QStringLiteral(
+                "No private key file is configured for this server profile; "
+                "CodeHarbor also tried ~/.ssh/config and libssh defaults. Set "
+                "Servers > Private key file, or launch CodeHarbor from an "
+                "environment that exports SSH_AUTH_SOCK.");
+        }
     } else if (!QFileInfo(m_identityFile).isFile()) {
         details << QStringLiteral("Private key file does not exist: %1.")
                        .arg(m_identityFile);

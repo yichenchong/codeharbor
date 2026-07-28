@@ -137,6 +137,10 @@ public:
     // alone would lock the user out of their own RSA host.
     static QByteArray hostKeyAlgorithms(const QStringList& trustedKeyTypes);
 
+    // True only for the Windows OpenSSH named-pipe spelling. This is a pure
+    // classifier so platform-specific SSH setup remains testable everywhere.
+    static bool isWindowsNamedPipeAgentSocket(const QString& socket);
+
     State state() const;
 
 #if CH_HAVE_LIBSSH

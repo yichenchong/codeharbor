@@ -87,19 +87,22 @@ Launch it, add a server in the connect sheet, and fill in:
 - **Repository root** — where you unpacked the tarball (`~/codeharbor` above).
   A git checkout of this repo works too.
 
-Authentication tries your SSH agent, then configured/default keys. An encrypted
-key prompts for its **private-key passphrase** and supplies it only to key
-authentication; it is never sent as the server account password. Choose **Use
-password** to authenticate with the server password instead. Neither secret is
-stored. The first connection shows the host's fingerprint and refuses to
-continue until you accept it — an unknown key is never trusted silently.
+Authentication tries a libssh-readable SSH agent, then configured/default keys.
+On Windows, the built-in OpenSSH agent is a named pipe that libssh cannot use:
+set **Private key file** to the local private key for that profile instead of
+relying only on `ssh-add`. An encrypted key prompts for its **private-key
+passphrase** and supplies it only to key authentication; it is never sent as
+the server account password. Choose **Use password** to authenticate with the
+server password instead. Neither secret is stored. The first connection shows
+the host's fingerprint and refuses to continue until you accept it — an unknown
+key is never trusted silently.
 
 **Diagnose an SSH failure:** reopen **Servers** and read the connection error
 banner. It reports whether `SSH_AUTH_SOCK` reached the CodeHarbor process,
-whether a profile key path was found, and libssh's final error. A desktop launcher
-often does not inherit the agent socket from a terminal; set **Private key file**
-to the local key (absolute paths and `~/…` are accepted) to bypass that
-environment boundary. Do not paste a passphrase into logs or bug reports.
+whether a profile key path was found, and libssh's final error. A desktop
+launcher often does not inherit the agent socket from a terminal; set **Private
+key file** to the local key (absolute paths and `~/…` are accepted) to bypass
+that environment boundary. Do not paste a passphrase into logs or bug reports.
 
 Then create a group, add a Dev Session pointing at a project directory on the
 server, and you have terminals, an editor, and viewers against that project.
