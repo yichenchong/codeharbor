@@ -91,6 +91,9 @@ ApplicationWindow {
             // Clicking (or Enter-ing) a session makes it current: AppController
             // loads both region layouts and remembers it for the next launch.
             onSessionActivated: (devSessionId) => app.activateSession(devSessionId)
+            // The status footer exposes this control at every connection state.
+            // Reopen the sheet so saved servers can be edited or selected again.
+            onServerSettingsRequested: connectSheet.shown = true
         }
 
         // The regions are recursive split trees, inert until given a node. The

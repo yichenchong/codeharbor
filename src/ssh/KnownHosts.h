@@ -3,7 +3,6 @@
 #include <QByteArray>
 #include <QList>
 #include <QString>
-#include <QStringList>
 
 namespace ch {
 
@@ -50,14 +49,6 @@ public:
     Verdict verify(const QString& host, const QString& keyType,
                    const QByteArray& keyBlob) const;
 
-    // Key types (e.g. "ssh-ed25519") already trusted for `host`, in file order,
-    // deduplicated. Empty for a host with no trusted entry. @revoked and
-    // @cert-authority entries are excluded: neither is a host key we would
-    // accept, so neither may pin the algorithm negotiation.
-    //
-    // SshConnectionPool feeds this to SSH_OPTIONS_HOSTKEYS so the SERVER cannot
-    // choose which key type it is challenged on (SPEC 12.1).
-    QStringList keyTypesFor(const QString& host) const;
 
     // Record (or replace) a host key. A subsequent verify() with the same triple
     // returns Match. Distinct key types for one host are kept independently.

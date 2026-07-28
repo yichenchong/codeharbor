@@ -13,27 +13,6 @@ QString SshConnectionPool::lookupHostFor(const QString& host, quint16 port)
     return port == 22 ? host : QStringLiteral("[%1]:%2").arg(host).arg(port);
 }
 
-QByteArray SshConnectionPool::hostKeyAlgorithms(const QStringList& trustedKeyTypes)
-{
-    QStringList algorithms;
-    for (const QString& type : trustedKeyTypes) {
-        // One stored key TYPE can correspond to several negotiated host-key
-        // ALGORITHMS. RSA is the case that matters: libssh reports rsa-sha2-512,
-        // rsa-sha2-256 and the legacy SHA-1 ssh-rsa all as key type "ssh-rsa",
-        // and modern servers offer only the first two.
-        const QStringList expanded =
-            type == QLatin1String("ssh-rsa")
-                ? QStringList{QStringLiteral("rsa-sha2-512"),
-                              QStringLiteral("rsa-sha2-256"),
-                              QStringLiteral("ssh-rsa")}
-                : QStringList{type};
-        for (const QString& algorithm : expanded) {
-            if (!algorithms.contains(algorithm))
-                algorithms.append(algorithm);
-        }
-    }
-    return algorithms.join(QLatin1Char(',')).toUtf8();
-}
 
 bool SshConnectionPool::isWindowsNamedPipeAgentSocket(const QString& socket)
 {
@@ -275,19 +254,6 @@ bool SshConnectionPool::connectToHost(const QString& host, quint16 port,
                         identityUtf8.constData());
     }
 
-    // Pin the host-key algorithms to what this host is ALREADY trusted for, so
-    // the server cannot pick a type our store has no opinion on and turn a
-    // Verdict::Mismatch refusal into a Verdict::Unknown first-use prompt. Only
-    // when something is trusted: a fresh host must still negotiate freely.
-    //
-    // A rejected list (a stored type this libssh build cannot speak) leaves the
-    // default ordering in place rather than making the host unreachable —
-    // verifyHostKey() is still the authority, and it now refuses an untrusted
-    // key type for a trusted host on its own.
-    const QByteArray algorithms =
-        hostKeyAlgorithms(m_knownHosts.keyTypesFor(lookupHostFor(host, port)));
-    if (!algorithms.isEmpty())
-        ssh_options_set(m_session, SSH_OPTIONS_HOSTKEYS, algorithms.constData());
 
     if (ssh_connect(m_session) != SSH_OK) {
         emit errorOccurred(QString::fromUtf8(ssh_get_error(m_session)));
@@ -473,7 +439,7 @@ QString SshConnectionPool::authenticationFailure() const
     if (usesUnsupportedWindowsAgent()) {
         details << QStringLiteral(
             "Windows OpenSSH's named-pipe ssh-agent cannot be used by this "
-            "libssh build. Set Servers > Private key file to a local key; "
+            "libssh build. Open Server… and set Private key file to a local key; "
             "CodeHarbor will ask for its passphrase when needed.");
     } else if (qEnvironmentVariableIsEmpty("SSH_AUTH_SOCK")) {
         details << QStringLiteral(
@@ -492,8 +458,8 @@ QString SshConnectionPool::authenticationFailure() const
         } else {
             details << QStringLiteral(
                 "No private key file is configured for this server profile; "
-                "CodeHarbor also tried ~/.ssh/config and libssh defaults. Set "
-                "Servers > Private key file, or launch CodeHarbor from an "
+                "CodeHarbor also tried ~/.ssh/config and libssh defaults. Open "
+                "Server… and set Private key file, or launch CodeHarbor from an "
                 "environment that exports SSH_AUTH_SOCK.");
         }
     } else if (!QFileInfo(m_identityFile).isFile()) {

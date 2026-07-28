@@ -97,7 +97,7 @@ server password instead. Neither secret is stored. The first connection shows
 the host's fingerprint and refuses to continue until you accept it — an unknown
 key is never trusted silently.
 
-**Diagnose an SSH failure:** reopen **Servers** and read the connection error
+**Diagnose an SSH failure:** open **Server…** in the sessions sidebar and read the connection error
 banner. It reports whether `SSH_AUTH_SOCK` reached the CodeHarbor process,
 whether a profile key path was found, and libssh's final error. A desktop
 launcher often does not inherit the agent socket from a terminal; set **Private

@@ -23,6 +23,10 @@ Rectangle {
     // keyboard cursor). The host wires this to layout loading; the sidebar
     // itself owns no navigation.
     signal sessionActivated(string devSessionId)
+    // Emitted by the always-visible server control. The window owns the
+    // connection sheet, keeping server-profile editing outside the sidebar.
+    signal serverSettingsRequested()
+
 
     // Keyboard/selection cursor. Groups and sessions have independent id
     // spaces, so the kind flag is part of the cursor.
@@ -619,12 +623,40 @@ Rectangle {
             color: "#313244"
         }
 
+        Button {
+            id: serverSettingsButton
+            objectName: "serverSettingsButton"
+            anchors.right: parent.right
+            anchors.rightMargin: 6
+            anchors.verticalCenter: parent.verticalCenter
+            text: qsTr("Server…")
+            font.pixelSize: 11
+            leftPadding: 6
+            rightPadding: 6
+
+            contentItem: Label {
+                text: serverSettingsButton.text
+                color: "#cdd6f4"
+                font: serverSettingsButton.font
+                horizontalAlignment: Text.AlignHCenter
+                verticalAlignment: Text.AlignVCenter
+            }
+            background: Rectangle {
+                color: serverSettingsButton.down ? "#45475a"
+                                                  : (serverSettingsButton.hovered ? "#313244"
+                                                                                  : "transparent")
+                radius: 3
+            }
+            onClicked: sidebar.serverSettingsRequested()
+        }
+
         Row {
             anchors.left: parent.left
             anchors.leftMargin: 12
-            anchors.right: parent.right
-            anchors.rightMargin: 12
+            anchors.right: serverSettingsButton.left
+            anchors.rightMargin: 6
             anchors.verticalCenter: parent.verticalCenter
+            clip: true
             spacing: 6
 
             Rectangle {
@@ -645,6 +677,7 @@ Rectangle {
             Label {
                 objectName: "linkStatusLabel"
                 anchors.verticalCenter: parent.verticalCenter
+                width: Math.max(0, parent.width - 18)
                 text: sidebar.linkWords(sidebar.linkState)
                 color: sidebar.stale ? "#f9e2af" : "#a6adc8"
                 font.pixelSize: 11

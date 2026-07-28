@@ -210,6 +210,8 @@ class StubApp : public QObject
 {
     Q_OBJECT
     Q_PROPERTY(QAbstractItemModel *sessionsModel READ sessionsModel CONSTANT)
+    Q_PROPERTY(QString connectionState READ connectionState CONSTANT)
+
 
 public:
     explicit StubApp(QAbstractItemModel *model, QObject *parent = nullptr)
@@ -218,6 +220,7 @@ public:
     }
 
     QAbstractItemModel *sessionsModel() const { return m_model; }
+    QString connectionState() const { return QStringLiteral("disconnected"); }
 
     const QStringList &calls() const { return m_calls; }
     void clearCalls() { m_calls.clear(); }
@@ -328,6 +331,7 @@ private slots:
     void keyboardSelectionActivatesSession();
     void spaceTogglesGroupCollapse();
     void newSessionButtonTargetsItsGroupWithoutCollapsing();
+    void serverSettingsButtonEmitsRequest();
 
 private:
     // Two expanded groups: Alpha[s1,s2,s3], Beta[s4,s5].
@@ -626,6 +630,24 @@ void TstSidebar::newSessionButtonTargetsItsGroupWithoutCollapsing()
              (QStringList{QStringLiteral("createSession(g1,api,/srv/repos/api)")}));
     QVERIFY2(fixture.warnings().isEmpty(),
              qPrintable(fixture.warnings().join(QLatin1Char('\n'))));
+}
+
+// The server profile sheet must remain reachable after a failed/disconnected
+// start, not only through an undocumented command-palette shortcut.
+void TstSidebar::serverSettingsButtonEmitsRequest()
+{
+    SidebarFixture fixture(twoGroups());
+    expose(fixture);
+
+    QSignalSpy requested(fixture.root(), SIGNAL(serverSettingsRequested()));
+    QVERIFY(requested.isValid());
+
+    QQuickItem *button = findByName(fixture.root(), QStringLiteral("serverSettingsButton"));
+    QVERIFY2(button, "the connection status footer offers no server settings control");
+    QTest::mouseClick(&fixture.view, Qt::LeftButton, Qt::NoModifier, centerOf(button));
+
+    QCOMPARE(requested.size(), 1);
+    QVERIFY2(fixture.warnings().isEmpty(), qPrintable(fixture.warnings().join(QLatin1Char('\n'))));
 }
 
 // Space on a group header asks the server to toggle its collapsed flag.

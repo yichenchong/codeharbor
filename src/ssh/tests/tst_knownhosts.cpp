@@ -70,8 +70,6 @@ private slots:
     void hostnamesAreCaseSensitive();
     void trustedHostRefusesUnknownKeyType();
     void markerOnlyHostStaysUnknownForOtherTypes();
-    void keyTypesForListsTrustedTypesOnly();
-    void hostKeyAlgorithmsPinTrustedTypes();
     void recognizesWindowsNamedPipeAgentSocket();
 };
 
@@ -402,76 +400,6 @@ void TstKnownHosts::markerOnlyHostStaysUnknownForOtherTypes()
     QCOMPARE(ca.verify(QStringLiteral("ca.host"), QStringLiteral("ssh-rsa"),
                        kRsaGamma),
              KnownHosts::Verdict::Unknown);
-}
-
-void TstKnownHosts::keyTypesForListsTrustedTypesOnly()
-{
-    const KnownHosts store = KnownHosts::parse(sampleText());
-    // File order, deduplicated, both types for the multi-key host.
-    QCOMPARE(store.keyTypesFor(QStringLiteral("example.com")),
-             (QStringList{QStringLiteral("ssh-ed25519"), QStringLiteral("ssh-rsa")}));
-    // A comma-expanded alias carries the same trust as its sibling.
-    QCOMPARE(store.keyTypesFor(QStringLiteral("10.0.0.5")),
-             (QStringList{QStringLiteral("ssh-ed25519")}));
-    // Nothing trusted -> nothing to pin, so first use negotiates freely.
-    QVERIFY(store.keyTypesFor(QStringLiteral("absent.example")).isEmpty());
-
-    // Markers are not trust and must never pin the negotiation: pinning to a
-    // revoked key's type would hand the attacker the choice back.
-    const KnownHosts markers = KnownHosts::parse(QStringLiteral(
-        "@revoked m.host ssh-ed25519 ZWQyNTUxOS1rZXktYWxwaGEtMDAwMQ==\n"
-        "@cert-authority m.host ssh-rsa cnNhLWtleS1nYW1tYS0wMDAz\n"));
-    QVERIFY(markers.keyTypesFor(QStringLiteral("m.host")).isEmpty());
-
-    // Hashed hosts resolve through the HMAC here too, so a hashed known_hosts
-    // still gets its algorithms pinned.
-    const QByteArray salt = QByteArrayLiteral("codeharbor-hash-salt");
-    const KnownHosts hashed = KnownHosts::parse(
-        hashedHost(QStringLiteral("secret.host"), salt)
-        + QStringLiteral(" ssh-ed25519 ZWQyNTUxOS1rZXktYWxwaGEtMDAwMQ==\n"));
-    QCOMPARE(hashed.keyTypesFor(QStringLiteral("secret.host")),
-             (QStringList{QStringLiteral("ssh-ed25519")}));
-}
-
-void TstKnownHosts::hostKeyAlgorithmsPinTrustedTypes()
-{
-    using ch::SshConnectionPool;
-
-    // Nothing trusted -> empty, and connectToHost() then leaves libssh's
-    // default ordering alone so a fresh host still connects.
-    QVERIFY(SshConnectionPool::hostKeyAlgorithms({}).isEmpty());
-
-    QCOMPARE(SshConnectionPool::hostKeyAlgorithms({QStringLiteral("ssh-ed25519")}),
-             QByteArrayLiteral("ssh-ed25519"));
-
-    // "ssh-rsa" is a key TYPE covering three host-key ALGORITHMS. Pinning the
-    // literal string alone would offer only the SHA-1 algorithm, which OpenSSH
-    // 8.8+ disables by default — the pin would lock the user out of their own
-    // RSA host. SHA-2 first so the modern algorithm is preferred.
-    QCOMPARE(SshConnectionPool::hostKeyAlgorithms({QStringLiteral("ssh-rsa")}),
-             QByteArrayLiteral("rsa-sha2-512,rsa-sha2-256,ssh-rsa"));
-
-    // Several trusted types keep file order; nothing is duplicated.
-    QCOMPARE(SshConnectionPool::hostKeyAlgorithms(
-                 {QStringLiteral("ssh-ed25519"), QStringLiteral("ssh-rsa"),
-                  QStringLiteral("ssh-ed25519")}),
-             QByteArrayLiteral("ssh-ed25519,rsa-sha2-512,rsa-sha2-256,ssh-rsa"));
-
-    // The pin is derived from the SAME token the verdict uses, or a ported host
-    // would be pinned from an entry that does not govern it.
-    QCOMPARE(SshConnectionPool::lookupHostFor(QStringLiteral("h.example"), 22),
-             QStringLiteral("h.example"));
-    QCOMPARE(SshConnectionPool::lookupHostFor(QStringLiteral("h.example"), 2222),
-             QStringLiteral("[h.example]:2222"));
-
-    // End to end on the store: a host trusted only for ed25519 pins exactly
-    // that, so a server offering RSA cannot even reach the verdict.
-    const KnownHosts store = KnownHosts::parse(QStringLiteral(
-        "[victim.example]:2222 ssh-ed25519 ZWQyNTUxOS1rZXktYWxwaGEtMDAwMQ==\n"));
-    QCOMPARE(SshConnectionPool::hostKeyAlgorithms(store.keyTypesFor(
-                 SshConnectionPool::lookupHostFor(QStringLiteral("victim.example"),
-                                                  2222))),
-             QByteArrayLiteral("ssh-ed25519"));
 }
 
 void TstKnownHosts::recognizesWindowsNamedPipeAgentSocket()

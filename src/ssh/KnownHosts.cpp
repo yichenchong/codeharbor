@@ -78,20 +78,6 @@ KnownHosts::Verdict KnownHosts::verify(const QString& host,
     return sawTrustedHost ? Verdict::Mismatch : Verdict::Unknown;
 }
 
-QStringList KnownHosts::keyTypesFor(const QString& host) const
-{
-    QStringList types;
-    for (const Entry& e : m_entries) {
-        if (e.marker == QLatin1String("@revoked")
-            || e.marker == QLatin1String("@cert-authority"))
-            continue;
-        if (e.keyType.isEmpty() || !entryHostMatches(e.host, host))
-            continue;
-        if (!types.contains(e.keyType))
-            types.append(e.keyType);
-    }
-    return types;
-}
 
 void KnownHosts::add(const QString& host, const QString& keyType,
                      const QByteArray& keyBlob)

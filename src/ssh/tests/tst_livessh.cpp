@@ -74,6 +74,7 @@ private slots:
     void encryptedIdentityUsesPassphraseFromCallback();
     void missingAgentAndKeyExplainAuthenticationFailure();
     void windowsNamedPipeAgentFallsBackToIdentityFile();
+    void unavailableTrustedAlgorithmStillReachesHostVerification();
 
 private:
     void ensureConnected();
@@ -473,6 +474,31 @@ void TstLiveSsh::missingAgentAndKeyExplainAuthenticationFailure()
              qPrintable(failure));
     QVERIFY2(failure.contains(
                  QStringLiteral("Private key file does not exist: %1").arg(missingKey)),
+             qPrintable(failure));
+}
+
+// A stored key type may be disabled in the libssh build used by the desktop
+// client. It must not be passed back as SSH_OPTIONS_HOSTKEYS: connecting then
+// dies during KEXINIT, before verification can reject the mismatched key.
+void TstLiveSsh::unavailableTrustedAlgorithmStillReachesHostVerification()
+{
+    SshConnectionPool pool;
+    KnownHosts hosts;
+    hosts.add(SshConnectionPool::lookupHostFor(m_host, m_port),
+              QStringLiteral("ssh-dss"), QByteArrayLiteral("obsolete-dsa-key"));
+    pool.setKnownHosts(hosts);
+
+    QSignalSpy mismatch(&pool, &SshConnectionPool::hostKeyMismatch);
+    QString failure;
+    QObject::connect(&pool, &SshConnectionPool::errorOccurred, &pool,
+                     [&failure](const QString& message) { failure = message; });
+
+    QVERIFY(!pool.connectToHost(m_host, m_port, m_user));
+    QCOMPARE(mismatch.size(), 1);
+    QVERIFY2(failure.contains(QStringLiteral("Host key changed")),
+             qPrintable(failure));
+    QVERIFY2(!failure.contains(QStringLiteral("client init buffer"),
+                               Qt::CaseInsensitive),
              qPrintable(failure));
 }
 
