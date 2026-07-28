@@ -72,6 +72,7 @@ private slots:
     void rpcServerInfoOverSshChannel();
     void stderrStaysOutOfReadStream();
     void encryptedIdentityUsesPassphraseFromCallback();
+    void missingAgentAndKeyExplainAuthenticationFailure();
 
 private:
     void ensureConnected();
@@ -370,6 +371,69 @@ void TstLiveSsh::encryptedIdentityUsesPassphraseFromCallback()
              "OpenSSH config IdentityFile did not authenticate through the passphrase callback");
     QCOMPARE(configPassphraseRequests, 1);
     configuredPool.disconnectFromHost();
+    QVERIFY(QFile::remove(config.fileName()));
+
+    // Profile paths are allowed to use the shell spelling people type in the
+    // connect sheet. SSH_OPTIONS_IDENTITY does not expand `~` itself, so this
+    // verifies CodeHarbor resolves it before handing the value to libssh.
+    SshConnectionPool tildePool;
+    tildePool.setKnownHosts(KnownHosts{});
+    tildePool.setHostKeyCallback([](const QString&, const QString&,
+                                    const QByteArray&, KnownHosts::Verdict) {
+        return SshConnectionPool::HostKeyDecision::Accept;
+    });
+    int tildePassphraseRequests = 0;
+    tildePool.setCredentialCallback(
+        [&tildePassphraseRequests](const QString&,
+                                   SshConnectionPool::CredentialKind kind) {
+            if (kind == SshConnectionPool::CredentialKind::KeyPassphrase) {
+                ++tildePassphraseRequests;
+                return SshConnectionPool::CredentialReply{kPassphrase, false};
+            }
+            return SshConnectionPool::CredentialReply{};
+        });
+    QVERIFY2(tildePool.connectToHost(m_host, m_port, m_user,
+                                     QStringLiteral("~/id")),
+             "Profile Private key file beginning with ~/ did not authenticate");
+    QCOMPARE(tildePassphraseRequests, 1);
+    tildePool.disconnectFromHost();
+}
+
+// A desktop-launched client may not inherit SSH_AUTH_SOCK. The failure must
+// name that fact and an invalid profile key path, rather than collapsing both
+// into libssh's unhelpful "Access denied".
+void TstLiveSsh::missingAgentAndKeyExplainAuthenticationFailure()
+{
+    const QByteArray oldAgent = qgetenv("SSH_AUTH_SOCK");
+    qunsetenv("SSH_AUTH_SOCK");
+    const auto restoreAgent = qScopeGuard([oldAgent] {
+        if (oldAgent.isEmpty())
+            qunsetenv("SSH_AUTH_SOCK");
+        else
+            qputenv("SSH_AUTH_SOCK", oldAgent);
+    });
+
+    QTemporaryDir missingKeyDir;
+    QVERIFY(missingKeyDir.isValid());
+    const QString missingKey = missingKeyDir.filePath(QStringLiteral("id"));
+
+    SshConnectionPool pool;
+    pool.setKnownHosts(KnownHosts{});
+    pool.setHostKeyCallback([](const QString&, const QString&,
+                               const QByteArray&, KnownHosts::Verdict) {
+        return SshConnectionPool::HostKeyDecision::Accept;
+    });
+    QString failure;
+    QObject::connect(&pool, &SshConnectionPool::errorOccurred, &pool,
+                     [&failure](const QString& message) { failure = message; });
+
+    QVERIFY(!pool.connectToHost(m_host, m_port, m_user, missingKey));
+    QVERIFY2(failure.contains(
+                 QStringLiteral("SSH_AUTH_SOCK is not available to this CodeHarbor process")),
+             qPrintable(failure));
+    QVERIFY2(failure.contains(
+                 QStringLiteral("Private key file does not exist: %1").arg(missingKey)),
+             qPrintable(failure));
 }
 
 QTEST_GUILESS_MAIN(TstLiveSsh)

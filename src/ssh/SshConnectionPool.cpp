@@ -6,6 +6,7 @@
 
 namespace ch {
 
+
 QString SshConnectionPool::lookupHostFor(const QString& host, quint16 port)
 {
     return port == 22 ? host : QStringLiteral("[%1]:%2").arg(host).arg(port);
@@ -110,6 +111,22 @@ void SshConnectionPool::disconnectFromHost()
 
 #else
 
+namespace {
+
+QString resolveIdentityFilePath(QString identityFile)
+{
+    identityFile = identityFile.trimmed();
+    if (identityFile == QLatin1String("~"))
+        return QDir::homePath();
+    if (identityFile.startsWith(QLatin1String("~/"))
+        || identityFile.startsWith(QLatin1String("~\\"))) {
+        return QDir::home().filePath(identityFile.sliced(2));
+    }
+    return QDir::cleanPath(identityFile);
+}
+
+} // namespace
+
 bool SshConnectionPool::connectToHost(const QString& host, quint16 port,
                                       const QString& user,
                                       const QString& identityFile)
@@ -118,7 +135,7 @@ bool SshConnectionPool::connectToHost(const QString& host, quint16 port,
     m_host = host;
     m_port = port;
     m_user = user;
-    m_identityFile = identityFile;
+    m_identityFile = resolveIdentityFilePath(identityFile);
 
     setState(State::Connecting);
     m_session = ssh_new();
@@ -154,8 +171,8 @@ bool SshConnectionPool::connectToHost(const QString& host, quint16 port,
 
     ssh_options_set(m_session, SSH_OPTIONS_PORT, &portValue);
     ssh_options_set(m_session, SSH_OPTIONS_USER, userUtf8.constData());
-    if (!identityFile.isEmpty()) {
-        const QByteArray identityUtf8 = QFile::encodeName(identityFile);
+    if (!m_identityFile.isEmpty()) {
+        const QByteArray identityUtf8 = QFile::encodeName(m_identityFile);
         ssh_options_set(m_session, SSH_OPTIONS_IDENTITY,
                         identityUtf8.constData());
     }
@@ -190,7 +207,7 @@ bool SshConnectionPool::connectToHost(const QString& host, quint16 port,
 
     setState(State::Authenticating);
     if (!authenticate(user)) {
-        emit errorOccurred(QStringLiteral("Authentication failed"));
+        emit errorOccurred(authenticationFailure());
         closeSession();
         setState(State::Error);
         return false;
@@ -335,6 +352,42 @@ bool SshConnectionPool::authenticate(const QString& user)
         }
     }
     return false;
+}
+
+QString SshConnectionPool::authenticationFailure() const
+{
+    QStringList details;
+    details << QStringLiteral("Authentication failed.");
+    if (qEnvironmentVariableIsEmpty("SSH_AUTH_SOCK")) {
+        details << QStringLiteral(
+            "SSH_AUTH_SOCK is not available to this CodeHarbor process, so "
+            "ssh-agent keys cannot be used.");
+    } else {
+        details << QStringLiteral(
+            "ssh-agent was available to CodeHarbor but did not authenticate "
+            "a key accepted by the server.");
+    }
+
+    if (m_identityFile.isEmpty()) {
+        details << QStringLiteral(
+            "No private key file is configured for this server profile; "
+            "CodeHarbor also tried ~/.ssh/config and libssh defaults. Set "
+            "Servers > Private key file, or launch CodeHarbor from an "
+            "environment that exports SSH_AUTH_SOCK.");
+    } else if (!QFileInfo(m_identityFile).isFile()) {
+        details << QStringLiteral("Private key file does not exist: %1.")
+                       .arg(m_identityFile);
+    } else {
+        details << QStringLiteral("Private key file was tried: %1.")
+                       .arg(m_identityFile);
+    }
+
+    const QString libsshError =
+        m_session ? QString::fromUtf8(ssh_get_error(m_session)).trimmed()
+                  : QString();
+    if (!libsshError.isEmpty())
+        details << QStringLiteral("libssh: %1.").arg(libsshError);
+    return details.join(QLatin1Char(' '));
 }
 
 ssh_channel SshConnectionPool::openChannel(ChannelKind kind)

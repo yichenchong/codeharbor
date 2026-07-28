@@ -112,8 +112,9 @@ SessionBootstrap::SessionBootstrap(SshConnectionPool* pool,
                 });
         connect(m_pool, &SshConnectionPool::errorOccurred, this,
                 [this](const QString& message) {
+                    m_lastPoolError = message.trimmed();
                     handleConnectionLost(QStringLiteral("SSH session error: ")
-                                         + message.trimmed());
+                                         + m_lastPoolError);
                 });
     }
 }
@@ -512,6 +513,13 @@ QString SessionBootstrap::withLastDiagnostic(const QString& message) const
     return message + QStringLiteral(": ") + m_lastDiagnostic;
 }
 
+QString SessionBootstrap::withLastPoolError(const QString& message) const
+{
+    if (m_lastPoolError.isEmpty())
+        return message;
+    return message + QStringLiteral(": ") + m_lastPoolError;
+}
+
 void SessionBootstrap::wireChannelSignals(SshChannelDevice* device,
                                           const QString& role)
 {
@@ -615,10 +623,12 @@ bool SessionBootstrap::attemptWire()
         });
     }
 
+    m_lastPoolError.clear();
     if (!connectPool(m_host, m_port, m_user, m_identityFile)) {
-        emit error(QStringLiteral("SSH connection to %1:%2 failed")
-                       .arg(m_host)
-                       .arg(m_port));
+        emit error(withLastPoolError(
+            QStringLiteral("SSH connection to %1:%2 failed")
+                .arg(m_host)
+                .arg(m_port)));
         return false;
     }
 

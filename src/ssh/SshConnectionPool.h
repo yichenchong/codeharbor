@@ -159,6 +159,7 @@ private:
 #if CH_HAVE_LIBSSH
     bool verifyHostKey(const QString& host);
     bool authenticate(const QString& user);
+    QString authenticationFailure() const;
     void closeSession();
 #endif
 

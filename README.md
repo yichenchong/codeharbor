@@ -94,6 +94,13 @@ password** to authenticate with the server password instead. Neither secret is
 stored. The first connection shows the host's fingerprint and refuses to
 continue until you accept it — an unknown key is never trusted silently.
 
+**Diagnose an SSH failure:** reopen **Servers** and read the connection error
+banner. It reports whether `SSH_AUTH_SOCK` reached the CodeHarbor process,
+whether a profile key path was found, and libssh's final error. A desktop launcher
+often does not inherit the agent socket from a terminal; set **Private key file**
+to the local key (absolute paths and `~/…` are accepted) to bypass that
+environment boundary. Do not paste a passphrase into logs or bug reports.
+
 Then create a group, add a Dev Session pointing at a project directory on the
 server, and you have terminals, an editor, and viewers against that project.
 

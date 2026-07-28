@@ -253,6 +253,10 @@ private:
     // `message` with the most recent channelDiagnostic() of the exec attempt
     // appended, so a setup failure carries the remote side's own explanation.
     QString withLastDiagnostic(const QString& message) const;
+    // A synchronous pool-handshake failure reaches errorOccurred() before
+    // connectPool() returns false. Preserve it so the generic endpoint failure
+    // includes the authentication diagnosis shown by the connection sheet.
+    QString withLastPoolError(const QString& message) const;
     void setState(State next);
 
     SshConnectionPool* m_pool = nullptr;
@@ -264,6 +268,9 @@ private:
     // Most recent channelDiagnostic() text of the exec attempt in progress.
     // Cleared per attempt; only read by withLastDiagnostic().
     QString m_lastDiagnostic;
+    // Most recent pool error from the currently executing handshake. Cleared
+    // immediately before connectPool() and never reused for reconnects.
+    QString m_lastPoolError;
     // Last stderr line each live channel produced, keyed by role. A channel
     // that dies takes its own last words with it otherwise: the exec-scoped
     // m_lastDiagnostic above is disconnected the moment startExec() returns, so
