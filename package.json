@@ -1,6 +1,6 @@
 {
   "name": "codeharbor-workspace",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "private": true,
   "description": "JS/TS workspaces for CodeHarbor (remote service + web assets)",
   "workspaces": [
