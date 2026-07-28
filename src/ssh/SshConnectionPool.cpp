@@ -135,16 +135,17 @@ QString resolveIdentityFilePath(QString identityFile)
 bool usesUnsupportedWindowsAgent()
 {
 #ifdef Q_OS_WIN
+    constexpr bool onWindows = true;
+#else
+    constexpr bool onWindows = false;
+#endif
     // Windows' built-in OpenSSH agent exposes a named pipe, whereas libssh's
     // agent implementation opens SSH_AUTH_SOCK as an AF_UNIX socket. Trying
     // the pipe poisons libssh's public-key auth state before local key fallback
     // can run. AF_UNIX sockets remain supported on current Windows, so bypass
     // only the named-pipe spelling.
-    return SshConnectionPool::isWindowsNamedPipeAgentSocket(
+    return onWindows && SshConnectionPool::isWindowsNamedPipeAgentSocket(
         qEnvironmentVariable("SSH_AUTH_SOCK"));
-#else
-    return false;
-#endif
 }
 
 int declineLibsshPassphrase(const char*, char*, size_t, int, int, void*)

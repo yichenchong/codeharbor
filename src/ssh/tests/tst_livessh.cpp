@@ -405,9 +405,13 @@ void TstLiveSsh::encryptedIdentityUsesPassphraseFromCallback()
 // authenticate an explicitly configured key without surfacing the agent error.
 void TstLiveSsh::windowsNamedPipeAgentFallsBackToIdentityFile()
 {
-#ifndef Q_OS_WIN
-    QSKIP("Windows named-pipe regression case");
+#ifdef Q_OS_WIN
+    constexpr bool onWindows = true;
 #else
+    constexpr bool onWindows = false;
+#endif
+    if (!onWindows)
+        QSKIP("Windows named-pipe regression case");
     if (m_identityFile.isEmpty())
         QSKIP("CH_LIVE_IDENTITY is not set; named-pipe regression case skipped");
 
@@ -433,7 +437,6 @@ void TstLiveSsh::windowsNamedPipeAgentFallsBackToIdentityFile()
     QVERIFY2(pool.connectToHost(m_host, m_port, m_user, m_identityFile),
              qPrintable(failure));
     pool.disconnectFromHost();
-#endif
 }
 
 // A desktop-launched client may not inherit SSH_AUTH_SOCK. The failure must
