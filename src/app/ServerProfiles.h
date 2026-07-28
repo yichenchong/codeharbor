@@ -28,6 +28,7 @@ namespace ch {
 //   <id>\host=10.0.0.4
 //   <id>\port=22                 ; int, 1..65535
 //   <id>\user=yichen
+//   <id>\identityFile=~/.ssh/id_ed25519 ; optional local private key
 //   <id>\nodePath=/usr/bin/node  ; absolute path to the remote node binary
 //   <id>\repoRoot=/srv/codeharbor
 //   <id>\ordinal=0               ; internal: preserves insertion order across
@@ -57,7 +58,7 @@ public:
     ~ServerProfiles() override;
 
     // Insertion-ordered; each entry is {id, name, host, port (int), user,
-    // nodePath, repoRoot}.
+    // identityFile, nodePath, repoRoot}.
     QVariantList profiles() const { return m_profiles; }
 
     // Either empty or the id of a profile that currently exists — a dangling

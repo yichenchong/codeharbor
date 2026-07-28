@@ -1,5 +1,9 @@
 #include "SshConnectionPool.h"
 
+#include <QDir>
+#include <QFile>
+#include <QFileInfo>
+
 namespace ch {
 
 QString SshConnectionPool::lookupHostFor(const QString& host, quint16 port)
@@ -87,12 +91,13 @@ void SshConnectionPool::setState(State next)
 #if !CH_HAVE_LIBSSH
 
 bool SshConnectionPool::connectToHost(const QString& host, quint16 port,
-                                      const QString& user)
+                                      const QString& user,
+                                      const QString& identityFile)
 {
     Q_UNUSED(host);
     Q_UNUSED(port);
     Q_UNUSED(user);
-    setState(State::NotAvailable);
+    Q_UNUSED(identityFile);
     emit errorOccurred(
         QStringLiteral("SSH support unavailable: built without libssh"));
     return false;
@@ -106,12 +111,14 @@ void SshConnectionPool::disconnectFromHost()
 #else
 
 bool SshConnectionPool::connectToHost(const QString& host, quint16 port,
-                                      const QString& user)
+                                      const QString& user,
+                                      const QString& identityFile)
 {
     disconnectFromHost();
     m_host = host;
     m_port = port;
     m_user = user;
+    m_identityFile = identityFile;
 
     setState(State::Connecting);
     m_session = ssh_new();
@@ -125,8 +132,33 @@ bool SshConnectionPool::connectToHost(const QString& host, quint16 port,
     const QByteArray userUtf8 = user.toUtf8();
     unsigned int portValue = port;
     ssh_options_set(m_session, SSH_OPTIONS_HOST, hostUtf8.constData());
+
+    // libssh only learns IdentityFile, ProxyJump and the rest of the user's
+    // OpenSSH configuration when asked to parse it. Set Host first so its
+    // `Host` blocks match, then re-apply the explicitly saved user/port below:
+    // profile values deliberately win over broad config defaults.
+    const QString configPath =
+        QDir::home().filePath(QStringLiteral(".ssh/config"));
+    if (QFileInfo(configPath).isFile()) {
+        const QByteArray configUtf8 = QFile::encodeName(configPath);
+        if (ssh_options_parse_config(m_session, configUtf8.constData())
+            != SSH_OK) {
+            emit errorOccurred(
+                QStringLiteral("Could not parse SSH config %1: %2")
+                    .arg(configPath, QString::fromUtf8(ssh_get_error(m_session))));
+            closeSession();
+            setState(State::Error);
+            return false;
+        }
+    }
+
     ssh_options_set(m_session, SSH_OPTIONS_PORT, &portValue);
     ssh_options_set(m_session, SSH_OPTIONS_USER, userUtf8.constData());
+    if (!identityFile.isEmpty()) {
+        const QByteArray identityUtf8 = QFile::encodeName(identityFile);
+        ssh_options_set(m_session, SSH_OPTIONS_IDENTITY,
+                        identityUtf8.constData());
+    }
 
     // Pin the host-key algorithms to what this host is ALREADY trusted for, so
     // the server cannot pick a type our store has no opinion on and turn a
@@ -248,27 +280,58 @@ bool SshConnectionPool::verifyHostKey(const QString& host)
 
 bool SshConnectionPool::authenticate(const QString& user)
 {
-    // 1. Prefer a running ssh-agent.
+    // ssh_userauth_list() is only defined after a "none" request. It is not
+    // enough to query it after an auto-key failure: some libssh builds then
+    // report no methods at all, silently skipping the passphrase callback.
+    if (ssh_userauth_none(m_session, nullptr) == SSH_AUTH_SUCCESS)
+        return true;
+    const int methods = ssh_userauth_list(m_session, nullptr);
+
+    // 1. Prefer a running ssh-agent. This is best effort: a platform-specific
+    // agent (notably Windows' named-pipe OpenSSH agent) may be unavailable to
+    // libssh even while the user has keys loaded.
     if (ssh_userauth_agent(m_session, nullptr) == SSH_AUTH_SUCCESS)
         return true;
 
-    // 2. Fall back to default identity files (may consult the agent/passphrase).
+    // 2. Try identities from the parsed OpenSSH config, an explicit
+    // SSH_OPTIONS_IDENTITY, and libssh's defaults without a passphrase first.
     if (ssh_userauth_publickey_auto(m_session, nullptr, nullptr)
         == SSH_AUTH_SUCCESS)
         return true;
 
-    // 3. Last resort: a password/passphrase supplied by the OS credential store
-    //    via the caller's callback. No secret is ever cached here (SPEC 12.1).
-    if (m_credentialCallback) {
-        const QString secret =
-            m_credentialCallback(user, QStringLiteral("Password"));
-        if (!secret.isEmpty()) {
-            const QByteArray secretUtf8 = secret.toUtf8();
-            const bool ok = ssh_userauth_password(m_session, nullptr,
-                                                  secretUtf8.constData())
-                            == SSH_AUTH_SUCCESS;
-            if (ok)
+    // 3. If public-key auth is offered, ask separately for a key passphrase.
+    // A passphrase is used ONLY for public-key authentication: falling through
+    // to ssh_userauth_password() with it would disclose a local key secret to
+    // the remote server and makes the two credential classes indistinguishable.
+    if (m_credentialCallback && (methods & SSH_AUTH_METHOD_PUBLICKEY)) {
+        CredentialReply passphrase =
+            m_credentialCallback(user, CredentialKind::KeyPassphrase);
+        if (passphrase.promptRequested)
+            return false;
+        if (!passphrase.secret.isEmpty()) {
+            const QByteArray secretUtf8 = passphrase.secret.toUtf8();
+            if (ssh_userauth_publickey_auto(m_session, nullptr,
+                                            secretUtf8.constData())
+                == SSH_AUTH_SUCCESS) {
                 return true;
+            }
+        }
+    }
+
+    // 4. Password authentication is an independent, opt-in credential. A GUI
+    // that is parked on this request must not be overwritten by another prompt.
+    if (m_credentialCallback && (methods & SSH_AUTH_METHOD_PASSWORD)) {
+        CredentialReply password =
+            m_credentialCallback(user, CredentialKind::Password);
+        if (password.promptRequested)
+            return false;
+        if (!password.secret.isEmpty()) {
+            const QByteArray secretUtf8 = password.secret.toUtf8();
+            if (ssh_userauth_password(m_session, nullptr,
+                                      secretUtf8.constData())
+                == SSH_AUTH_SUCCESS) {
+                return true;
+            }
         }
     }
     return false;

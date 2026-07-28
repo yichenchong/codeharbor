@@ -9,6 +9,10 @@
 #include <QFileInfo>
 #include <QJsonObject>
 #include <QJsonValue>
+#include <QProcess>
+#include <QScopeGuard>
+#include <QStandardPaths>
+#include <QTemporaryDir>
 #include <QString>
 #include <QStringList>
 #include <QtTest/QtTest>
@@ -67,6 +71,7 @@ private slots:
     void execChannelDeliversStdout();
     void rpcServerInfoOverSshChannel();
     void stderrStaysOutOfReadStream();
+    void encryptedIdentityUsesPassphraseFromCallback();
 
 private:
     void ensureConnected();
@@ -78,6 +83,7 @@ private:
     QString m_node;
     QString m_repo;
     QString m_knownHostsPath;
+    QString m_identityFile;
 };
 
 void TstLiveSsh::initTestCase()
@@ -93,6 +99,7 @@ void TstLiveSsh::initTestCase()
     m_node = env("CH_LIVE_NODE");
     m_repo = env("CH_LIVE_REPO");
     m_knownHostsPath = env("CH_LIVE_KNOWN_HOSTS");
+    m_identityFile = env("CH_LIVE_IDENTITY");
     if (m_knownHostsPath.isEmpty()) {
         m_knownHostsPath =
             QDir::temp().filePath(QStringLiteral("ch_live_known_hosts"));
@@ -241,6 +248,128 @@ void TstLiveSsh::stderrStaysOutOfReadStream()
     QVERIFY(!sink.out.contains("ERR"));
     QCOMPARE(sink.err.trimmed(), QStringLiteral("ERR"));
     device.closeChannel();
+}
+
+// Full key-unlock path against a real sshd. The fixture's unencrypted key is
+// copied and encrypted at runtime, so no private material or passphrase enters
+// the repository. CH_LIVE_IDENTITY identifies the fixture key; live runs that
+// do not provide it still exercise the normal agent path and skip this case.
+void TstLiveSsh::encryptedIdentityUsesPassphraseFromCallback()
+{
+    if (m_identityFile.isEmpty())
+        QSKIP("CH_LIVE_IDENTITY is not set; encrypted-key live gate skipped");
+    const QString keygen = QStandardPaths::findExecutable(
+        QStringLiteral("ssh-keygen"));
+    if (keygen.isEmpty())
+        QSKIP("ssh-keygen is unavailable; encrypted-key live gate skipped");
+
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QString encryptedKey = dir.filePath(QStringLiteral("id"));
+    QVERIFY(QFile::copy(m_identityFile, encryptedKey));
+    QVERIFY(QFile::setPermissions(
+        encryptedKey, QFile::ReadOwner | QFile::WriteOwner));
+    const QString publicKey = m_identityFile + QStringLiteral(".pub");
+    if (QFileInfo(publicKey).isFile())
+        QVERIFY(QFile::copy(publicKey, encryptedKey + QStringLiteral(".pub")));
+
+    static const QString kPassphrase = QStringLiteral("codeharbor-live-passphrase");
+    QProcess encrypt;
+    encrypt.start(keygen, {QStringLiteral("-p"), QStringLiteral("-P"),
+                           QString(), QStringLiteral("-N"), kPassphrase,
+                           QStringLiteral("-f"), encryptedKey});
+    QVERIFY2(encrypt.waitForFinished(kExecTimeoutMs),
+             qPrintable(encrypt.errorString()));
+    QCOMPARE(encrypt.exitCode(), 0);
+
+    // Do not let the loaded fixture agent prove the wrong rung. libssh reads
+    // SSH_AUTH_SOCK when ssh_userauth_agent() runs; restore it immediately
+    // after this assertion so other live tests keep their ordinary setup.
+    const QByteArray oldAgent = qgetenv("SSH_AUTH_SOCK");
+    qunsetenv("SSH_AUTH_SOCK");
+    const auto restoreAgent = qScopeGuard([oldAgent] {
+        if (oldAgent.isEmpty())
+            qunsetenv("SSH_AUTH_SOCK");
+        else
+            qputenv("SSH_AUTH_SOCK", oldAgent);
+    });
+
+    SshConnectionPool pool;
+    KnownHosts hosts;
+    pool.setKnownHosts(hosts);
+    pool.setHostKeyCallback([](const QString&, const QString&,
+                               const QByteArray&, KnownHosts::Verdict) {
+        return SshConnectionPool::HostKeyDecision::Accept;
+    });
+
+    int passphraseRequests = 0;
+    bool passwordRequested = false;
+    pool.setCredentialCallback(
+        [&passphraseRequests, &passwordRequested](const QString&,
+                                                   SshConnectionPool::CredentialKind kind) {
+            if (kind == SshConnectionPool::CredentialKind::KeyPassphrase) {
+                ++passphraseRequests;
+                return SshConnectionPool::CredentialReply{kPassphrase, false};
+            }
+            passwordRequested = true;
+            return SshConnectionPool::CredentialReply{};
+        });
+    QString failure;
+    QObject::connect(&pool, &SshConnectionPool::errorOccurred, &pool,
+                     [&failure](const QString& message) { failure = message; });
+
+    const bool connected =
+        pool.connectToHost(m_host, m_port, m_user, encryptedKey);
+    QVERIFY2(connected,
+             qPrintable(QStringLiteral("encrypted key auth failed; passphrase requests=%1, "
+                                       "password requested=%2, error=%3")
+                            .arg(passphraseRequests)
+                            .arg(passwordRequested)
+                            .arg(failure)));
+    QCOMPARE(passphraseRequests, 1);
+    QVERIFY(!passwordRequested);
+    pool.disconnectFromHost();
+
+    // The same encrypted key through a real ~/.ssh/config IdentityFile entry.
+    // This exercises ssh_options_parse_config(), not only the profile's
+    // SSH_OPTIONS_IDENTITY path above.
+    const QByteArray oldHome = qgetenv("HOME");
+    qputenv("HOME", dir.path().toUtf8());
+    const auto restoreHome = qScopeGuard([oldHome] {
+        if (oldHome.isEmpty())
+            qunsetenv("HOME");
+        else
+            qputenv("HOME", oldHome);
+    });
+    const QString sshDir = dir.filePath(QStringLiteral(".ssh"));
+    QVERIFY(QDir().mkpath(sshDir));
+    QFile config(sshDir + QStringLiteral("/config"));
+    QVERIFY(config.open(QIODevice::WriteOnly | QIODevice::Text));
+    config.write("Host 127.0.0.1\n  IdentityFile ");
+    config.write(QFile::encodeName(encryptedKey));
+    config.write("\n");
+    config.close();
+
+    SshConnectionPool configuredPool;
+    configuredPool.setKnownHosts(KnownHosts{});
+    configuredPool.setHostKeyCallback([](const QString&, const QString&,
+                                         const QByteArray&, KnownHosts::Verdict) {
+        return SshConnectionPool::HostKeyDecision::Accept;
+    });
+    int configPassphraseRequests = 0;
+    configuredPool.setCredentialCallback(
+        [&configPassphraseRequests](const QString&,
+                                    SshConnectionPool::CredentialKind kind) {
+            if (kind == SshConnectionPool::CredentialKind::KeyPassphrase) {
+                ++configPassphraseRequests;
+                return SshConnectionPool::CredentialReply{kPassphrase, false};
+            }
+            return SshConnectionPool::CredentialReply{};
+        });
+    QVERIFY2(configuredPool.connectToHost(m_host, m_port, m_user),
+             "OpenSSH config IdentityFile did not authenticate through the passphrase callback");
+    QCOMPARE(configPassphraseRequests, 1);
+    configuredPool.disconnectFromHost();
 }
 
 QTEST_GUILESS_MAIN(TstLiveSsh)

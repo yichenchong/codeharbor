@@ -84,17 +84,20 @@ public:
     // reimplementation of it.
     qint64 lastAttemptMs() const { return m_lastAttemptMs; }
 
-    // `nodePath` is the remote node binary (it need not be on the login PATH)
-    // and `repoRoot` the remote CodeHarbor installation: either an unpacked
-    // codeharbor-remote.tar.gz or a git checkout — see entryCandidates().
+    // `identityFile` is an optional local private-key path. Before connecting,
+    // the pool also parses the user's ~/.ssh/config, so IdentityFile entries
+    // work without duplicating them here. `nodePath` is the remote node binary
+    // (it need not be on the login PATH) and `repoRoot` the remote CodeHarbor
+    // installation: either an unpacked codeharbor-remote.tar.gz or a git
+    // checkout — see entryCandidates().
     bool connectAndWire(const QString& host, quint16 port, const QString& user,
-                        const QString& nodePath, const QString& repoRoot);
+                        const QString& nodePath, const QString& repoRoot,
+                        const QString& identityFile = QString());
 
-    // Env-driven variant used by the live gate and by main.cpp so a normal
-    // desktop launch stays server-less. Reads CH_LIVE_SSH (must be set),
-    // CH_LIVE_HOST, CH_LIVE_PORT, CH_LIVE_USER, CH_LIVE_NODE, CH_LIVE_REPO and
-    // the optional CH_LIVE_KNOWN_HOSTS override. Returns false WITHOUT emitting
-    // error() when CH_LIVE_SSH is unset; that is the normal desktop path.
+    // CH_LIVE_HOST, CH_LIVE_PORT, CH_LIVE_USER, CH_LIVE_NODE, CH_LIVE_REPO,
+    // optional CH_LIVE_IDENTITY, and optional CH_LIVE_KNOWN_HOSTS overrides.
+    // Returns false WITHOUT emitting error() when CH_LIVE_SSH is unset; that is
+    // the normal desktop path.
     bool connectAndWireFromEnvironment();
 
     SshChannelDevice* rpcDevice() const { return m_rpcDevice; }
@@ -199,7 +202,8 @@ protected:
     // channel loss, the retry ladder) with no SSH server in reach. Production
     // behaviour lives in these base implementations; nothing else overrides.
     virtual bool connectPool(const QString& host, quint16 port,
-                             const QString& user);
+                             const QString& user,
+                             const QString& identityFile);
     virtual SshChannelDevice* openChannelDevice(
         SshConnectionPool::ChannelKind kind, const QString& command,
         const QString& role);
@@ -278,6 +282,7 @@ private:
     QString m_user;
     QString m_nodePath;
     QString m_repoRoot;
+    QString m_identityFile;
     int m_attempt = 0;
     int m_maxAttempts = kDefaultMaxReconnectAttempts;
     double m_timeScale = 1.0;

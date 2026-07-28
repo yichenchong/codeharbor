@@ -17,8 +17,7 @@ import QtQuick.Controls.Basic
 // known-hosts store, and this file can be instantiated and driven in isolation
 // by a test.
 //
-// Inputs
-//   profiles         array of {id, name, host, port, user, nodePath, repoRoot}
+//   profiles         array of {id, name, host, port, user, identityFile, nodePath, repoRoot}
 //   activeId         id of the profile the host considers current ("" = none)
 //   connectionState  free-form status text; "connecting"/"authenticating"/
 //                    "hostkeycheck"/"connected"/"error"/"notavailable" are
@@ -31,8 +30,7 @@ import QtQuick.Controls.Basic
 //   connectRequested(profileId)  connect using that stored profile
 //   profileSaved(fields)         create (fields.id === "") or update a profile
 //   profileRemoved(id)           delete that profile
-//   hostKeyDecision(accept)      answer for the pending host key
-//   credentialSubmitted(secret)  answer for the pending credential; "" cancels
+//   credentialSubmitted(secret, kind) answer pending credential; "" cancels
 //   dismissed()                  user closed the sheet (Esc / Close / Cancel)
 Rectangle {
     id: root
@@ -49,7 +47,7 @@ Rectangle {
     signal profileSaved(var fields)
     signal profileRemoved(string id)
     signal hostKeyDecision(bool accept)
-    signal credentialSubmitted(string secret)
+    signal credentialSubmitted(string secret, string kind)
     signal dismissed()
 
     // ---- internal state ---------------------------------------------------
@@ -98,6 +96,7 @@ Rectangle {
         hostField.text = root.textOf(entry, "host");
         portField.text = root.textOf(entry, "port") === "" ? "22" : root.textOf(entry, "port");
         userField.text = root.textOf(entry, "user");
+        identityFileField.text = root.textOf(entry, "identityFile");
         nodePathField.text = root.textOf(entry, "nodePath");
         repoRootField.text = root.textOf(entry, "repoRoot");
     }
@@ -184,6 +183,7 @@ Rectangle {
             "host": hostField.text.trim(),
             "port": root.portValue(),
             "user": userField.text.trim(),
+            "identityFile": identityFileField.text.trim(),
             "nodePath": nodePathField.text.trim(),
             "repoRoot": repoRootField.text.trim()
         });
@@ -202,15 +202,20 @@ Rectangle {
     // Hand the typed secret up and wipe it here in the same turn. This file
     // keeps no copy of it and never routes it through the profile form, so it
     // cannot reach profileSaved() and therefore cannot reach QSettings.
-    function submitSecret() {
+    function credentialKind() {
+        var kind = root.textOf(root.pendingCredential, "kind");
+        return kind === "password" ? "password" : "keyPassphrase";
+    }
+
+    function submitSecret(kind) {
         var secret = secretField.text;
         secretField.clear();
-        root.credentialSubmitted(secret);
+        root.credentialSubmitted(secret, kind || root.credentialKind());
     }
 
     function cancelSecret() {
         secretField.clear();
-        root.credentialSubmitted("");   // empty == cancel, nothing is retried
+        root.credentialSubmitted("", root.credentialKind());
     }
 
     // ---- connection status vocabulary -------------------------------------
@@ -893,6 +898,16 @@ Rectangle {
                 }
 
                 LabeledField {
+                    id: identityFileField
+                    objectName: "identityFileField"
+                    width: form.width
+                    label: qsTr("Private key file")
+                    placeholder: qsTr("Optional; ~/.ssh/config is also read")
+                    hint: qsTr("Local path. Its passphrase is requested separately and never stored.")
+                    onAccepted: root.save()
+                }
+
+                LabeledField {
                     id: nodePathField
                     objectName: "nodePathField"
                     width: form.width
@@ -1170,9 +1185,18 @@ Rectangle {
                         onClicked: root.cancelSecret()
                     }
                     SheetButton {
+                        objectName: "credentialPasswordButton"
+                        visible: root.credentialKind() === "keyPassphrase"
+                        accent: "#f9e2af"
+                        text: qsTr("Use password")
+                        enabled: secretField.text.length > 0
+                        onClicked: root.submitSecret("password")
+                    }
+                    SheetButton {
                         objectName: "credentialSubmitButton"
                         accent: "#a6e3a1"
-                        text: qsTr("Authenticate")
+                        text: root.credentialKind() === "keyPassphrase"
+                              ? qsTr("Unlock key") : qsTr("Authenticate")
                         enabled: secretField.text.length > 0
                         onClicked: root.submitSecret()
                     }

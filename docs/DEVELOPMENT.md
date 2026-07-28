@@ -173,6 +173,7 @@ Environment contract:
 | `CH_LIVE_USER` | SSH login user |
 | `CH_LIVE_NODE` | **Absolute** path to `node` on the remote side (a non-interactive SSH session usually has no version-manager `PATH`) |
 | `CH_LIVE_REPO` | Absolute path to this repo on the remote side |
+| `CH_LIVE_IDENTITY` | Optional private key used by `tst_livessh` to encrypt a temporary copy and prove the passphrase callback; never committed |
 | `CH_LIVE_KNOWN_HOSTS` | Scratch known-hosts file; the first-use host key is persisted here |
 | `SSH_AUTH_SOCK` | Agent socket holding the key — the pool authenticates via ssh-agent first |
 
@@ -194,8 +195,7 @@ SSH_AUTH_SOCK=$PWD/$D/agent.sock ssh-add $D/id
 Then run them:
 
 ```bash
-export CH_LIVE_SSH=1 CH_LIVE_HOST=127.0.0.1 CH_LIVE_PORT=2222 CH_LIVE_USER=$(whoami)
-export CH_LIVE_NODE=$(command -v node) CH_LIVE_REPO=$PWD
+export CH_LIVE_NODE=$(command -v node) CH_LIVE_REPO=$PWD CH_LIVE_IDENTITY=$PWD/$D/id
 export SSH_AUTH_SOCK=$PWD/tests/live/.fixture/agent.sock
 export CH_LIVE_KNOWN_HOSTS=$(mktemp -u /tmp/ch_kh_XXXX)
 ctest --preset dev -L live --output-on-failure

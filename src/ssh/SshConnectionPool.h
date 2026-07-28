@@ -57,10 +57,29 @@ public:
         const QString& host, const QString& keyType, const QByteArray& keyBlob,
         KnownHosts::Verdict verdict)>;
 
-    // Credential callback used only when ssh-agent and default-key auth fail.
-    // Returns a password or key passphrase for the user; empty aborts auth.
+    // An authentication method whose secret cannot safely be interchanged with
+    // the other one: a private-key passphrase must never be sent to a server as
+    // its account password.
+    enum class CredentialKind {
+        KeyPassphrase,
+        Password,
+    };
+    Q_ENUM(CredentialKind)
+
+    // A callback may deliberately park the handshake while the GUI asks for a
+    // secret. `promptRequested` distinguishes that from "this callback has no
+    // credential for this method", so authenticate() cannot overwrite a
+    // passphrase prompt with a password prompt.
+    struct CredentialReply {
+        QString secret;
+        bool promptRequested = false;
+    };
+
+    // Called after non-interactive agent/key authentication fails. The callback
+    // returns a secret only for `kind`, or parks the attempt for user input.
+    // Empty secrets are never cached by the pool.
     using CredentialCallback =
-        std::function<QString(const QString& user, const QString& prompt)>;
+        std::function<CredentialReply(const QString& user, CredentialKind kind)>;
 
     explicit SshConnectionPool(QObject* parent = nullptr);
     ~SshConnectionPool() override;
@@ -80,20 +99,20 @@ public:
     // the exact key the user was shown.
     const HostKeyCallback& hostKeyCallback() const { return m_hostKeyCallback; }
     void setCredentialCallback(CredentialCallback callback);
-    // The installed credential callback, read-only, and the exact counterpart
-    // of hostKeyCallback() above: authenticate() is its only caller and it only
-    // runs inside connectToHost(), so this is the sole way a test can prove
-    // that AppController's password/passphrase prompt is really installed and
-    // really hands the secret over exactly once. Nothing in production reads it.
+    // The installed callback, read-only, and the exact counterpart of
+    // hostKeyCallback() above: authenticate() is its only caller. Tests use
+    // this seam to prove the controller requests the right credential type and
+    // consumes a supplied secret exactly once.
     const CredentialCallback& credentialCallback() const
     {
         return m_credentialCallback;
     }
 
-    // Establish the single authenticated session: connect, verify the host key
-    // through KnownHosts, then authenticate (agent -> default key -> callback).
-    // Returns true on success; otherwise sets State::Error (or NotAvailable).
-    bool connectToHost(const QString& host, quint16 port, const QString& user);
+    // through KnownHosts, then authenticate (agent -> configured/default key
+    // -> requested key passphrase or password). `identityFile` is a local
+    // private key; empty leaves OpenSSH config and libssh defaults in charge.
+    bool connectToHost(const QString& host, quint16 port, const QString& user,
+                       const QString& identityFile = QString());
     void disconnectFromHost();
 
     // The known_hosts lookup token for an endpoint: the bare host on the default
@@ -150,6 +169,7 @@ private:
     QString m_host;
     quint16 m_port = 22;
     QString m_user;
+    QString m_identityFile;
 #if CH_HAVE_LIBSSH
     ssh_session m_session = nullptr;
     QList<ssh_channel> m_channels;

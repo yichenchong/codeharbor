@@ -12,6 +12,26 @@
 
 namespace ch {
 
+namespace {
+
+using CredentialKind = SshConnectionPool::CredentialKind;
+
+QString credentialLabel(CredentialKind kind)
+{
+    return kind == CredentialKind::KeyPassphrase
+               ? QStringLiteral("Private-key passphrase")
+               : QStringLiteral("Password");
+}
+
+QString credentialKindName(CredentialKind kind)
+{
+    return kind == CredentialKind::KeyPassphrase
+               ? QStringLiteral("keyPassphrase")
+               : QStringLiteral("password");
+}
+
+} // namespace
+
 AppController::AppController(CodeharbordClient* client, QObject* parent)
     : QObject(parent)
     , m_client(client)
@@ -205,11 +225,13 @@ void AppController::setConnectionState(const QString& state, const QString& err)
 
 void AppController::connectToProfile(QString profileId)
 {
-    startConnect(profileId, QString(), QString());
+    startConnect(profileId, QString(), QString(),
+                 CredentialKind::KeyPassphrase);
 }
 
 void AppController::startConnect(const QString& profileId,
-                                 QString acceptedFingerprint, QString secret)
+                                 QString acceptedFingerprint, QString secret,
+                                 CredentialKind secretKind)
 {
     if (!m_bootstrap || !m_profiles || !m_pool)
         return;
@@ -239,6 +261,7 @@ void AppController::startConnect(const QString& profileId,
     m_credentialRequested = false;
     m_credentialUser.clear();
     m_credentialLabel.clear();
+    m_credentialKind = CredentialKind::KeyPassphrase;
     setConnectionState(QStringLiteral("connecting"));
 
     // Unknown key: refuse THIS attempt, remember the fingerprint, and let the
@@ -283,46 +306,40 @@ void AppController::startConnect(const QString& profileId,
             return SshConnectionPool::HostKeyDecision::Reject;
         });
 
-    // Credentials: same shape as the host key above, and for the same reason.
-    // SshConnectionPool::authenticate() calls this from INSIDE the blocking
-    // libssh handshake (agent -> default key -> here), on the GUI thread. A
-    // dialog raised there would re-enter the UI mid-authentication — precisely
-    // the hazard the host-key flow was rewritten to avoid. So the first attempt
-    // is REFUSED (an empty return aborts auth), the user is asked, and
-    // submitCredential() re-runs the whole connect with the answer in hand.
+    // Credentials follow the same park-and-retry shape as host keys. libssh
+    // calls this while its handshake is active, so a dialog here would re-enter
+    // the UI. The first request is refused, the sheet asks, and
+    // submitCredential() starts one fresh handshake with the secret in hand.
     //
-    // Until this existed, setCredentialCallback() had no caller outside tests:
-    // the pool could ask for a password and the product had no way to answer,
-    // so a passphrase-protected key or a desktop with no loaded agent — the
-    // stock case on Windows and macOS — dead-ended at "authentication failed"
-    // with no prompt.
+    // A passphrase and a server password have different security boundaries:
+    // a failed key unlock must not silently send the local key passphrase to a
+    // remote host's password-auth endpoint. `CredentialReply::promptRequested`
+    // lets authenticate() stop at the first outstanding prompt instead of
+    // overwriting it with the next auth method.
     //
-    // The secret is captured BY VALUE and consumed exactly once: it is cleared
-    // out of the capture the instant it is handed over, so the reconnect ladder
-    // running through this same installed callback can never replay a password
-    // at whatever host it happens to be dialling. It is never assigned to a
-    // member, never reaches a ServerProfiles field or QSettings, and is never
-    // logged.
+    // The secret is captured BY VALUE and consumed exactly once. It is never a
+    // member, never reaches ServerProfiles/QSettings, and is never logged.
     m_pool->setCredentialCallback(
-        [self, secret = std::move(secret)](const QString& user,
-                                           const QString& prompt) mutable {
+        [self, secret = std::move(secret), secretKind](
+            const QString& user, CredentialKind kind) mutable {
             if (!self)
-                return QString();
-            if (!secret.isEmpty()) {
+                return SshConnectionPool::CredentialReply{};
+            if (!secret.isEmpty() && kind == secretKind) {
                 const QString once = secret;
-                secret.clear();  // one shot, for this attempt only
-                return once;
+                secret.clear();
+                return SshConnectionPool::CredentialReply{once, false};
             }
-            // Only an attempt WE started may arm a prompt, for the same reason
-            // the host-key callback checks this: an automatic reconnect has
-            // nobody waiting on an answer, and arming a prompt from one would
-            // park a dialog nothing ever resolves.
-            if (!self->m_connecting)
-                return QString();
+            // A supplied credential for the other auth method must not cause a
+            // second prompt. This is how an explicit "Use password" choice
+            // skips the passphrase rung.
+            if (!secret.isEmpty() || !self->m_connecting)
+                return SshConnectionPool::CredentialReply{};
+
             self->m_credentialRequested = true;
             self->m_credentialUser = user;
-            self->m_credentialLabel = prompt;
-            return QString();
+            self->m_credentialLabel = credentialLabel(kind);
+            self->m_credentialKind = kind;
+            return SshConnectionPool::CredentialReply{{}, true};
         });
 
     const bool ok = m_bootstrap->connectAndWire(
@@ -330,7 +347,8 @@ void AppController::startConnect(const QString& profileId,
         static_cast<quint16>(profile.value(QStringLiteral("port")).toInt()),
         profile.value(QStringLiteral("user")).toString(),
         profile.value(QStringLiteral("nodePath")).toString(),
-        profile.value(QStringLiteral("repoRoot")).toString());
+        profile.value(QStringLiteral("repoRoot")).toString(),
+        profile.value(QStringLiteral("identityFile")).toString());
 
     if (ok) {
         m_connecting = false;
@@ -341,6 +359,7 @@ void AppController::startConnect(const QString& profileId,
         m_credentialRequested = false;
         m_credentialUser.clear();
         m_credentialLabel.clear();
+        m_credentialKind = CredentialKind::KeyPassphrase;
         m_profiles->setActiveId(profileId);
         return;  // wired() -> adoptServerIdentity()
     }
@@ -357,17 +376,15 @@ void AppController::startConnect(const QString& profileId,
         return;
     }
     if (m_credentialRequested) {
-        // The server wants a password or a key passphrase, and neither the
-        // agent nor a default identity could supply one. Like the host-key
-        // refusal above this is EXPECTED, not a fault: the attempt is parked on
-        // the user's answer with m_connecting still set, so nothing can start a
-        // second one underneath it and swap m_pendingProfileId out from under
-        // submitCredential().
+        // The connection is parked on exactly one credential method. The kind
+        // accompanies the prompt so QML can offer "Use password" without ever
+        // reclassifying a private-key passphrase.
         m_heldConnectError.clear();
         setConnectionState(QStringLiteral("credential"));
         emit credentialPrompt(m_credentialUser,
                               profile.value(QStringLiteral("host")).toString(),
-                              m_credentialLabel);
+                              m_credentialLabel,
+                              credentialKindName(m_credentialKind));
         return;
     }
     m_connecting = false;
@@ -402,10 +419,16 @@ void AppController::resolveHostKey(bool accept)
         setConnectionState(QStringLiteral("disconnected"));
         return;
     }
-    startConnect(profileId, fingerprint, QString());
+    startConnect(profileId, fingerprint, QString(),
+                 CredentialKind::KeyPassphrase);
 }
 
 void AppController::submitCredential(QString secret)
+{
+    submitCredential(std::move(secret), credentialKindName(m_credentialKind));
+}
+
+void AppController::submitCredential(QString secret, QString kind)
 {
     // Only meaningful while a prompt WE raised is outstanding — the same guard
     // resolveHostKey() carries, and for the same reason: a sheet left open
@@ -413,9 +436,17 @@ void AppController::submitCredential(QString secret)
     if (!m_connecting || !m_credentialRequested)
         return;
 
+    const CredentialKind submittedKind =
+        kind == QLatin1String("password") ? CredentialKind::Password
+                                          : CredentialKind::KeyPassphrase;
+    if (kind != QLatin1String("password")
+        && kind != QLatin1String("keyPassphrase")) {
+        return;
+    }
+
     const QString profileId = m_pendingProfileId;
     // The key the user approved earlier in THIS chain, re-pinned for the retry
-    // so the host-key prompt does not reappear behind the password prompt.
+    // so the host-key prompt does not reappear behind the credential prompt.
     const QString fingerprint = m_approvedFingerprint;
     m_credentialRequested = false;
     m_credentialUser.clear();
@@ -430,10 +461,9 @@ void AppController::submitCredential(QString secret)
     }
     // Moved, not copied: this frame keeps no second reference to the secret,
     // and startConnect() moves it straight into the pool callback that spends
-    // it. A WRONG secret simply fails the one attempt it was given (the pool
-    // never asks twice for the same handshake), so the state machine lands in
-    // "failed" with the auth error rather than looping or wedging.
-    startConnect(profileId, fingerprint, std::move(secret));
+    // it. A wrong credential fails one attempt; a failed passphrase may then
+    // ask separately for a password, but is never used as one.
+    startConnect(profileId, fingerprint, std::move(secret), submittedKind);
 }
 
 void AppController::disconnectServer()

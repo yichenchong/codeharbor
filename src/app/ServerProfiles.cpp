@@ -31,6 +31,7 @@ const QString kName = QStringLiteral("name");
 const QString kHost = QStringLiteral("host");
 const QString kPort = QStringLiteral("port");
 const QString kUser = QStringLiteral("user");
+const QString kIdentityFile = QStringLiteral("identityFile");
 const QString kNodePath = QStringLiteral("nodePath");
 const QString kRepoRoot = QStringLiteral("repoRoot");
 
@@ -59,8 +60,9 @@ std::optional<int> parsePort(const QVariant& raw)
 // Trim, default, and validate one field set. Returns nullopt for a profile that
 // could never connect: SshConnectionPool::connectToHost(host, port, user) needs
 // all three, so storing a record missing any of them is storing garbage.
-// nodePath/repoRoot may legitimately be filled in later, so they are only
-// trimmed. Unknown keys (including a caller-supplied "id") are dropped.
+// identityFile/nodePath/repoRoot may legitimately be filled in later, so they
+// are only trimmed. Unknown keys (including a caller-supplied "id") are
+// dropped.
 std::optional<QVariantMap> sanitize(const QVariantMap& in)
 {
     const QString host = in.value(kHost).toString().trimmed();
@@ -84,6 +86,7 @@ std::optional<QVariantMap> sanitize(const QVariantMap& in)
     out.insert(kHost, host);
     out.insert(kPort, *port);
     out.insert(kUser, user);
+    out.insert(kIdentityFile, in.value(kIdentityFile).toString().trimmed());
     out.insert(kNodePath, in.value(kNodePath).toString().trimmed());
     out.insert(kRepoRoot, in.value(kRepoRoot).toString().trimmed());
     return out;
@@ -149,6 +152,8 @@ void ServerProfiles::load()
         fields.insert(kHost, m_settings->value(prefix + kHost).toString());
         fields.insert(kPort, portUsable ? storedPort : kDefaultPort);
         fields.insert(kUser, m_settings->value(prefix + kUser).toString());
+        fields.insert(kIdentityFile,
+                      m_settings->value(prefix + kIdentityFile).toString());
         fields.insert(kNodePath, m_settings->value(prefix + kNodePath).toString());
         fields.insert(kRepoRoot, m_settings->value(prefix + kRepoRoot).toString());
 
@@ -190,6 +195,8 @@ void ServerProfiles::persist()
         m_settings->setValue(entryKey(id, kHost), fields.value(kHost));
         m_settings->setValue(entryKey(id, kPort), fields.value(kPort).toInt());
         m_settings->setValue(entryKey(id, kUser), fields.value(kUser));
+        m_settings->setValue(entryKey(id, kIdentityFile),
+                             fields.value(kIdentityFile));
         m_settings->setValue(entryKey(id, kNodePath), fields.value(kNodePath));
         m_settings->setValue(entryKey(id, kRepoRoot), fields.value(kRepoRoot));
         m_settings->setValue(entryKey(id, kOrdinalField), static_cast<int>(i));

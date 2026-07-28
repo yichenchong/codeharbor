@@ -95,17 +95,12 @@ public:
     // re-entered mid-handshake. A call with no prompt outstanding is ignored:
     // a stale sheet must not be able to declare a live connection disconnected.
     Q_INVOKABLE void resolveHostKey(bool accept);
-
-    // Answer a credentialPrompt with the password or key passphrase the user
-    // typed. An EMPTY secret is "cancel": the parked attempt is abandoned and
-    // nothing is retried. Same shape as resolveHostKey() and for the same
-    // reason — the pool asks for the credential from INSIDE the blocking
-    // libssh handshake, so the attempt is refused, the user is asked, and the
-    // connect is re-run with the answer. Nothing here ever spins a nested event
-    // loop, and the secret is used for exactly one attempt and then dropped: it
-    // is never stored in a ServerProfiles field, never written to QSettings and
-    // never logged.
-    Q_INVOKABLE void submitCredential(QString secret);
+    // Answer a credentialPrompt with the secret the user typed. `kind` keeps a
+    // private-key passphrase separate from a server password, so the former is
+    // never accidentally offered to password authentication. Empty cancels;
+    // the secret is used for exactly one attempt and never logged.
+    Q_INVOKABLE void submitCredential(QString secret, QString kind);
+    void submitCredential(QString secret);
 
     // Oldest codeharbord this client can drive. 4 is where `server.info` began
     // reporting `serverId` (SPEC 3.5); against anything older the id comes back
@@ -150,10 +145,11 @@ signals:
     // An UNKNOWN host key was presented (a CHANGED key is refused outright by
     // the pool and never reaches here — SPEC 12.1). Answer with resolveHostKey().
     void hostKeyPrompt(QString host, QString keyType, QString fingerprint);
-    // The server asked for a password or a key passphrase: ssh-agent and the
-    // default keys could not authenticate `user` on `host`. `prompt` is the
-    // pool's own label for what it wants. Answer with submitCredential().
-    void credentialPrompt(QString user, QString host, QString prompt);
+    // default keys could not authenticate `user` on `host`. `prompt` names the
+    // requested credential and `kind` is `keyPassphrase` or `password`.
+    // Answer with submitCredential().
+    void credentialPrompt(QString user, QString host, QString prompt,
+                          QString kind);
 
 private:
     // Emit `error` from an optional RpcError; returns true when an error was
@@ -237,14 +233,13 @@ private:
     // Deliberately does NOT emit; callers coalesce activeSessionChanged.
     void clearActiveSession(bool forget);
     // The whole connect attempt. `acceptedFingerprint` is the single host key
-    // the user approved for THIS attempt (empty for a first attempt) and
-    // `secret` the single password/passphrase they typed (empty unless a
-    // credentialPrompt was just answered); both are captured by value into the
-    // pool callbacks and consumed exactly once, so neither an approval nor a
-    // secret can survive on the controller and be replayed at a later,
-    // unrelated host.
+    // the user approved for THIS attempt (empty for a first attempt); `secret`
+    // is the one password or private-key passphrase typed after a prompt.
+    // Both are captured by value and consumed once, so neither can survive to
+    // an unrelated host.
     void startConnect(const QString& profileId, QString acceptedFingerprint,
-                      QString secret);
+                      QString secret,
+                      SshConnectionPool::CredentialKind secretKind);
 
     QString m_connectionState = QStringLiteral("disconnected");
     QString m_connectionError;
@@ -274,12 +269,14 @@ private:
     // Cleared with m_connecting, so it never spans two user-initiated connects.
     QString m_approvedFingerprint;
     // The in-flight attempt asked for a password/passphrase and was refused so
-    // the user could be prompted. The two strings are what the prompt says; the
-    // SECRET is never held here, only passed through startConnect() into the
-    // pool callback that consumes it.
+    // the user could be prompted. The strings describe it; the SECRET is never
+    // held here, only passed through startConnect() into the pool callback that
+    // consumes it.
     bool m_credentialRequested = false;
     QString m_credentialUser;
     QString m_credentialLabel;
+    SshConnectionPool::CredentialKind m_credentialKind =
+        SshConnectionPool::CredentialKind::KeyPassphrase;
 };
 
 } // namespace ch

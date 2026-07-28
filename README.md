@@ -79,16 +79,20 @@ there is no `npm install` and no `node_modules`. You get `dist/`, `sql/` and
 Launch it, add a server in the connect sheet, and fill in:
 
 - **Host / Port / User** — your SSH details.
+- **Private key file** — optional local path to the key you want this profile to
+  use. CodeHarbor also reads `~/.ssh/config`, including `IdentityFile` entries.
 - **Node path** — absolute path to `node` on the server (`ssh <host> command -v node`).
   It is not looked up on `PATH`, because a non-interactive SSH session often
   does not have the one you expect.
 - **Repository root** — where you unpacked the tarball (`~/codeharbor` above).
   A git checkout of this repo works too.
 
-Authentication uses your SSH agent or default key; if the key needs a
-passphrase, or the server wants a password, CodeHarbor prompts for it. The first
-connection shows the host's fingerprint and refuses to continue until you accept
-it — an unknown key is never trusted silently.
+Authentication tries your SSH agent, then configured/default keys. An encrypted
+key prompts for its **private-key passphrase** and supplies it only to key
+authentication; it is never sent as the server account password. Choose **Use
+password** to authenticate with the server password instead. Neither secret is
+stored. The first connection shows the host's fingerprint and refuses to
+continue until you accept it — an unknown key is never trusted silently.
 
 Then create a group, add a Dev Session pointing at a project directory on the
 server, and you have terminals, an editor, and viewers against that project.

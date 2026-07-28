@@ -68,12 +68,14 @@ QStringList takeLoggedWarnings()
 
 QVariantMap profileFields(const QString& name, const QString& host, const QVariant& port,
                           const QString& user, const QString& nodePath = QString(),
-                          const QString& repoRoot = QString())
+                          const QString& repoRoot = QString(),
+                          const QString& identityFile = QString())
 {
     return QVariantMap{{QStringLiteral("name"), name},
                        {QStringLiteral("host"), host},
                        {QStringLiteral("port"), port},
                        {QStringLiteral("user"), user},
+                       {QStringLiteral("identityFile"), identityFile},
                        {QStringLiteral("nodePath"), nodePath},
                        {QStringLiteral("repoRoot"), repoRoot}};
 }
@@ -559,11 +561,14 @@ void TstServerProfiles::unicodeAndSpacesSurviveTheIniRoundTrip()
     const QString user = QStringLiteral("user.name-42");
     const QString nodePath = QStringLiteral("/home/user name/.local/bin (x86)/node");
     const QString repoRoot = QStringLiteral(u"/srv/my repo/ünicode dir/");
+    const QString identityFile =
+        QStringLiteral(u"/home/user name/.ssh/秘密 key");
 
     QString id;
     {
         ServerProfiles store(path);
-        id = store.addProfile(profileFields(name, host, 22222, user, nodePath, repoRoot));
+        id = store.addProfile(profileFields(name, host, 22222, user, nodePath,
+                                            repoRoot, identityFile));
         QVERIFY(!id.isEmpty());
         QCOMPARE(store.profile(id).value(QStringLiteral("name")).toString(), name);
     }
@@ -573,6 +578,7 @@ void TstServerProfiles::unicodeAndSpacesSurviveTheIniRoundTrip()
     QCOMPARE(stored.value(QStringLiteral("name")).toString(), name);
     QCOMPARE(stored.value(QStringLiteral("host")).toString(), host);
     QCOMPARE(stored.value(QStringLiteral("user")).toString(), user);
+    QCOMPARE(stored.value(QStringLiteral("identityFile")).toString(), identityFile);
     QCOMPARE(stored.value(QStringLiteral("nodePath")).toString(), nodePath);
     QCOMPARE(stored.value(QStringLiteral("repoRoot")).toString(), repoRoot);
     QCOMPARE(stored.value(QStringLiteral("port")).toInt(), 22222);
@@ -583,6 +589,8 @@ void TstServerProfiles::unicodeAndSpacesSurviveTheIniRoundTrip()
     reopened.updateProfile(id, QVariantMap{{QStringLiteral("port"), 2022}});
     ServerProfiles third(path);
     QCOMPARE(third.profile(id).value(QStringLiteral("name")).toString(), name);
+    QCOMPARE(third.profile(id).value(QStringLiteral("identityFile")).toString(),
+             identityFile);
     QCOMPARE(third.profile(id).value(QStringLiteral("repoRoot")).toString(), repoRoot);
     QCOMPARE(third.profile(id).value(QStringLiteral("port")).toInt(), 2022);
 }
@@ -733,7 +741,7 @@ void TstServerProfiles::sheetLoadsSilentlyAndExposesItsApi()
         QByteArrayLiteral("profileSaved(QVariant)"),
         QByteArrayLiteral("profileRemoved(QString)"),
         QByteArrayLiteral("hostKeyDecision(bool)"),
-        QByteArrayLiteral("credentialSubmitted(QString)"),
+        QByteArrayLiteral("credentialSubmitted(QString,QString)"),
         QByteArrayLiteral("dismissed()"),
     };
     for (const QByteArray& signature : expectedSignals) {
@@ -866,6 +874,8 @@ void TstServerProfiles::sheetSavesANewProfileThenEditsIt()
     QObject* const hostField = root->findChild<QObject*>(QStringLiteral("hostField"));
     QObject* const portField = root->findChild<QObject*>(QStringLiteral("portField"));
     QObject* const userField = root->findChild<QObject*>(QStringLiteral("userField"));
+    QObject* const identityField =
+        root->findChild<QObject*>(QStringLiteral("identityFileField"));
     QObject* const nodeField = root->findChild<QObject*>(QStringLiteral("nodePathField"));
     QObject* const repoField = root->findChild<QObject*>(QStringLiteral("repoRootField"));
     QObject* const saveButton = root->findChild<QObject*>(QStringLiteral("saveButton"));
@@ -889,6 +899,7 @@ void TstServerProfiles::sheetSavesANewProfileThenEditsIt()
     QVERIFY(saveButton->property("enabled").toBool());
 
     nameField->setProperty("text", QStringLiteral("  Prod box  "));
+    identityField->setProperty("text", QStringLiteral("~/.ssh/prod key"));
     nodeField->setProperty("text", QStringLiteral("/home/user name/.local/bin/node"));
     repoField->setProperty("text", QStringLiteral("/srv/my repo"));
 
@@ -900,6 +911,8 @@ void TstServerProfiles::sheetSavesANewProfileThenEditsIt()
     QCOMPARE(fields.value(QStringLiteral("host")).toString(), QStringLiteral("box.local"));
     QCOMPARE(fields.value(QStringLiteral("port")).toInt(), 2222);
     QCOMPARE(fields.value(QStringLiteral("user")).toString(), QStringLiteral("yichen"));
+    QCOMPARE(fields.value(QStringLiteral("identityFile")).toString(),
+             QStringLiteral("~/.ssh/prod key"));
     QCOMPARE(fields.value(QStringLiteral("nodePath")).toString(),
              QStringLiteral("/home/user name/.local/bin/node"));
     QCOMPARE(fields.value(QStringLiteral("repoRoot")).toString(), QStringLiteral("/srv/my repo"));
@@ -912,6 +925,7 @@ void TstServerProfiles::sheetSavesANewProfileThenEditsIt()
                     {QStringLiteral("host"), QStringLiteral("box.local")},
                     {QStringLiteral("port"), 2222},
                     {QStringLiteral("user"), QStringLiteral("yichen")},
+                    {QStringLiteral("identityFile"), QStringLiteral("~/.ssh/prod key")},
                     {QStringLiteral("nodePath"), QStringLiteral("/home/user name/.local/bin/node")},
                     {QStringLiteral("repoRoot"), QStringLiteral("/srv/my repo")}},
     };
@@ -1011,7 +1025,7 @@ void TstServerProfiles::sheetCredentialPromptMasksSubmitsAndKeepsTheSecretOffDis
     const QString ini = iniPath(QStringLiteral("credential.ini"));
     ServerProfiles store(ini);
 
-    QSignalSpy submitSpy(root, SIGNAL(credentialSubmitted(QString)));
+    QSignalSpy submitSpy(root, SIGNAL(credentialSubmitted(QString,QString)));
     QSignalSpy savedSpy(root, SIGNAL(profileSaved(QVariant)));
     QSignalSpy dismissSpy(root, SIGNAL(dismissed()));
     QObject* const prompt = root->findChild<QObject*>(QStringLiteral("credentialPrompt"));
@@ -1021,7 +1035,8 @@ void TstServerProfiles::sheetCredentialPromptMasksSubmitsAndKeepsTheSecretOffDis
     root->setProperty("pendingCredential",
                       QVariantMap{{QStringLiteral("user"), QStringLiteral("yichen")},
                                   {QStringLiteral("host"), QStringLiteral("box.local")},
-                                  {QStringLiteral("prompt"), QStringLiteral("Password")}});
+                                  {QStringLiteral("prompt"), QStringLiteral("Password")},
+                                  {QStringLiteral("kind"), QStringLiteral("password")}});
     QVERIFY(prompt->property("visible").toBool());
 
     const QString target =
@@ -1044,27 +1059,42 @@ void TstServerProfiles::sheetCredentialPromptMasksSubmitsAndKeepsTheSecretOffDis
 
     QCOMPARE(submitSpy.count(), 1);
     QCOMPARE(submitSpy.at(0).at(0).toString(), secret);
+    QCOMPARE(submitSpy.at(0).at(1).toString(), QStringLiteral("password"));
     // Wiped from the field in the same turn it was handed up, so it is not left
     // living in a QML item (and its undo stack) after being spent.
     QCOMPARE(stringOf(field, "text"), QString());
 
-    // Cancel is an empty answer, and Escape is a cancel — never an accidental
-    // submit of whatever happens to be typed.
+    // When the pool asks for a key passphrase, users may explicitly choose
+    // password auth; the field stays masked and the selection is carried in the
+    // second signal argument rather than inferred from its contents.
     root->setProperty("pendingCredential",
                       QVariantMap{{QStringLiteral("user"), QStringLiteral("yichen")},
-                                  {QStringLiteral("host"), QStringLiteral("box.local")}});
+                                  {QStringLiteral("host"), QStringLiteral("box.local")},
+                                  {QStringLiteral("kind"),
+                                   QStringLiteral("keyPassphrase")}});
+    field->setProperty("text", secret);
+    QMetaObject::invokeMethod(
+        root->findChild<QObject*>(QStringLiteral("credentialPasswordButton")), "clicked");
+    QCOMPARE(submitSpy.count(), 2);
+    QCOMPARE(submitSpy.at(1).at(0).toString(), secret);
+    QCOMPARE(submitSpy.at(1).at(1).toString(), QStringLiteral("password"));
+
+    // Cancel is an empty answer, and Escape is a cancel — never an accidental
+    // submit of whatever happens to be typed.
     field->setProperty("text", secret);
     QMetaObject::invokeMethod(
         root->findChild<QObject*>(QStringLiteral("credentialCancelButton")), "clicked");
-    QCOMPARE(submitSpy.count(), 2);
-    QCOMPARE(submitSpy.at(1).at(0).toString(), QString());
+    QCOMPARE(submitSpy.count(), 3);
+    QCOMPARE(submitSpy.at(2).at(0).toString(), QString());
+    QCOMPARE(submitSpy.at(2).at(1).toString(), QStringLiteral("keyPassphrase"));
     QCOMPARE(stringOf(field, "text"), QString());
 
     field->setProperty("text", secret);
     QKeyEvent escape(QEvent::KeyPress, Qt::Key_Escape, Qt::NoModifier);
     QCoreApplication::sendEvent(root, &escape);
-    QCOMPARE(submitSpy.count(), 3);
-    QCOMPARE(submitSpy.at(2).at(0).toString(), QString());
+    QCOMPARE(submitSpy.count(), 4);
+    QCOMPARE(submitSpy.at(3).at(0).toString(), QString());
+    QCOMPARE(submitSpy.at(3).at(1).toString(), QStringLiteral("keyPassphrase"));
     QCOMPARE(dismissSpy.count(), 0);
 
     // Clearing the prompt puts the sheet back and leaves nothing behind.

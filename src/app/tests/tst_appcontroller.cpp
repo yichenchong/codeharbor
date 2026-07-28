@@ -201,8 +201,8 @@ public:
 
     bool connectOk = false;
     int connectCalls = 0;
+    QString identityFile;
     std::function<void()> duringConnect;
-
     // adoptServerIdentity() hangs off wired(); a subclass may emit its own.
     void fireWired() { emit wired(); }
 
@@ -212,8 +212,10 @@ protected:
         return true;
     }
 
-    bool connectPool(const QString&, quint16, const QString&) override
+    bool connectPool(const QString&, quint16, const QString&,
+                     const QString& identity) override
     {
+        identityFile = identity;
         ++connectCalls;
         if (duringConnect)
             duringConnect();
@@ -241,6 +243,8 @@ struct ConnectFixture {
              {QStringLiteral("host"), QStringLiteral("127.0.0.1")},
              {QStringLiteral("port"), 22},
              {QStringLiteral("user"), QStringLiteral("yichen")},
+             {QStringLiteral("identityFile"),
+              QStringLiteral("/home/yichen/.ssh/id_ed25519")},
              {QStringLiteral("nodePath"), QStringLiteral("/usr/bin/node")},
              {QStringLiteral("repoRoot"), QStringLiteral("/srv/codeharbor")}});
     }
@@ -289,9 +293,10 @@ private slots:
     void deletingActiveSessionRetiresItThroughChainedRefresh();
     void disconnectRetiresActiveSessionButStillRemembersIt();
 
-    // Reaching a real server: the credential prompt (the pool's third auth rung
-    // had no product-side answer) and the server-compatibility gate.
+    // Authentication prompts must distinguish a private-key passphrase from a
+    // server password; neither can be retried as the other.
     void credentialCallbackIsInstalledAndParksInsteadOfBlocking();
+    void passphraseIsNeverOfferedAsServerPassword();
     void submittedSecretIsSpentOnceAndNeverPersistedOrLogged();
     void cancellingTheCredentialPromptAbandonsTheAttemptCleanly();
     void serverOlderThanTheSchemaFloorIsRefusedWithBothVersions();
@@ -1007,14 +1012,9 @@ void TstAppController::disconnectRetiresActiveSessionButStillRemembersIt()
     QCOMPARE(takeRequestIds(f.transport).size(), 2); // one getLayout per region
 }
 
-// SshConnectionPool authenticates agent -> default key -> credential callback,
-// but setCredentialCallback() had NO non-test caller: a user with a
-// passphrase-protected key, or no loaded agent (the stock desktop on Windows and
-// macOS), dead-ended at "authentication failed" with nothing ever asking them
-// for anything. This is that wiring, and it must not block: the pool calls the
-// callback from inside the blocking libssh handshake on the GUI thread, so the
-// attempt is REFUSED and the user asked afterwards — the same shape the
-// host-key flow was rewritten into.
+// SshConnectionPool authenticates agent -> configured/default key -> requested
+// credential. The controller must park the blocking libssh handshake and ask
+// afterwards, with private-key passphrases and server passwords kept separate.
 void TstAppController::credentialCallbackIsInstalledAndParksInsteadOfBlocking()
 {
     ConnectFixture f;
@@ -1025,14 +1025,14 @@ void TstAppController::credentialCallbackIsInstalledAndParksInsteadOfBlocking()
 
     bool asked = false;
     f.boot.duringConnect = [&f, &asked] {
-        // Stand where SshConnectionPool::authenticate() stands.
+        // Stand where SshConnectionPool::authenticate() requests a key unlock.
         QVERIFY(f.pool.credentialCallback());
         asked = true;
-        // An empty answer aborts THIS attempt, which is the whole point: the
-        // handshake unwinds instead of a dialog being raised inside it.
-        QCOMPARE(f.pool.credentialCallback()(QStringLiteral("yichen"),
-                                             QStringLiteral("Password")),
-                 QString());
+        const auto reply = f.pool.credentialCallback()(
+            QStringLiteral("yichen"),
+            SshConnectionPool::CredentialKind::KeyPassphrase);
+        QVERIFY(reply.secret.isEmpty());
+        QVERIFY(reply.promptRequested);
     };
 
     QSignalSpy promptSpy(&f.controller, &AppController::credentialPrompt);
@@ -1043,11 +1043,58 @@ void TstAppController::credentialCallbackIsInstalledAndParksInsteadOfBlocking()
     QCOMPARE(promptSpy.count(), 1);
     QCOMPARE(promptSpy.at(0).at(0).toString(), QStringLiteral("yichen"));
     QCOMPARE(promptSpy.at(0).at(1).toString(), QStringLiteral("127.0.0.1"));
-    QCOMPARE(promptSpy.at(0).at(2).toString(), QStringLiteral("Password"));
+    QCOMPARE(promptSpy.at(0).at(2).toString(),
+             QStringLiteral("Private-key passphrase"));
+    QCOMPARE(promptSpy.at(0).at(3).toString(),
+             QStringLiteral("keyPassphrase"));
     QCOMPARE(f.controller.connectionState(), QStringLiteral("credential"));
+    QCOMPARE(f.boot.identityFile, QStringLiteral("/home/yichen/.ssh/id_ed25519"));
     // Being asked for a password is not a fault; an error toast here would tell
     // the user something broke while the app is simply waiting on them.
     QCOMPARE(errorSpy.count(), 0);
+}
+
+// A private-key passphrase has a local security boundary. If it cannot unlock
+// the configured/default key, a later password attempt needs a second prompt;
+// the original passphrase MUST NOT be sent to the SSH server as a password.
+void TstAppController::passphraseIsNeverOfferedAsServerPassword()
+{
+    static const QString kPassphrase = QStringLiteral("private-key-only");
+    ConnectFixture f;
+    f.boot.duringConnect = [&f] {
+        f.pool.credentialCallback()(
+            QStringLiteral("yichen"),
+            SshConnectionPool::CredentialKind::KeyPassphrase);
+    };
+    QSignalSpy promptSpy(&f.controller, &AppController::credentialPrompt);
+    f.controller.connectToProfile(f.profileId);
+    QCOMPARE(promptSpy.count(), 1);
+
+    QString keySecret;
+    bool passwordPrompted = false;
+    f.boot.duringConnect = [&f, &keySecret, &passwordPrompted] {
+        const auto keyReply = f.pool.credentialCallback()(
+            QStringLiteral("yichen"),
+            SshConnectionPool::CredentialKind::KeyPassphrase);
+        keySecret = keyReply.secret;
+        QVERIFY(!keyReply.promptRequested);
+
+        // Simulate a rejected key unlock. The only legal next step is a fresh
+        // password prompt, never a replay of keySecret as a server password.
+        const auto passwordReply = f.pool.credentialCallback()(
+            QStringLiteral("yichen"),
+            SshConnectionPool::CredentialKind::Password);
+        QVERIFY(passwordReply.secret.isEmpty());
+        passwordPrompted = passwordReply.promptRequested;
+    };
+    f.controller.submitCredential(kPassphrase, QStringLiteral("keyPassphrase"));
+
+    QCOMPARE(keySecret, kPassphrase);
+    QVERIFY(passwordPrompted);
+    QCOMPARE(promptSpy.count(), 2);
+    QCOMPARE(promptSpy.at(1).at(2).toString(), QStringLiteral("Password"));
+    QCOMPARE(promptSpy.at(1).at(3).toString(), QStringLiteral("password"));
+    QCOMPARE(f.controller.connectionState(), QStringLiteral("credential"));
 }
 
 // The secret is spent on exactly one attempt and then gone: not replayed by the
@@ -1068,8 +1115,9 @@ void TstAppController::submittedSecretIsSpentOnceAndNeverPersistedOrLogged()
 
     ConnectFixture f;
     f.boot.duringConnect = [&f] {
-        f.pool.credentialCallback()(QStringLiteral("yichen"),
-                                    QStringLiteral("Password"));
+        f.pool.credentialCallback()(
+            QStringLiteral("yichen"),
+            SshConnectionPool::CredentialKind::KeyPassphrase);
     };
     QSignalSpy promptSpy(&f.controller, &AppController::credentialPrompt);
     f.controller.connectToProfile(f.profileId);
@@ -1078,20 +1126,28 @@ void TstAppController::submittedSecretIsSpentOnceAndNeverPersistedOrLogged()
     // The retry: this time the callback has the answer in hand.
     QStringList handedOver;
     f.boot.duringConnect = [&f, &handedOver] {
-        handedOver << f.pool.credentialCallback()(QStringLiteral("yichen"),
-                                                  QStringLiteral("Password"));
+        const auto keyReply = f.pool.credentialCallback()(
+            QStringLiteral("yichen"),
+            SshConnectionPool::CredentialKind::KeyPassphrase);
+        QVERIFY(keyReply.secret.isEmpty());
+        QVERIFY(!keyReply.promptRequested);
+        handedOver << f.pool.credentialCallback()(
+                          QStringLiteral("yichen"),
+                          SshConnectionPool::CredentialKind::Password)
+                          .secret;
     };
     QSignalSpy errorSpy(&f.controller, &AppController::error);
-    f.controller.submitCredential(kSecret);
+    f.controller.submitCredential(kSecret, QStringLiteral("password"));
 
     QCOMPARE(handedOver, QStringList{kSecret});
 
     // ONE SHOT. The callback outlives the attempt (SessionBootstrap's reconnect
     // ladder re-handshakes through it with nobody waiting), so a secret still
     // sitting in the capture would be replayed at whatever host it dials next.
-    QCOMPARE(f.pool.credentialCallback()(QStringLiteral("yichen"),
-                                         QStringLiteral("Password")),
-             QString());
+    const auto spent = f.pool.credentialCallback()(
+        QStringLiteral("yichen"), SshConnectionPool::CredentialKind::Password);
+    QVERIFY(spent.secret.isEmpty());
+    QVERIFY(!spent.promptRequested);
     // ...and that replay attempt must not arm a prompt nobody would answer.
     QCOMPARE(promptSpy.count(), 1);
 
@@ -1126,8 +1182,9 @@ void TstAppController::cancellingTheCredentialPromptAbandonsTheAttemptCleanly()
 {
     ConnectFixture f;
     f.boot.duringConnect = [&f] {
-        f.pool.credentialCallback()(QStringLiteral("yichen"),
-                                    QStringLiteral("Password"));
+        f.pool.credentialCallback()(
+            QStringLiteral("yichen"),
+            SshConnectionPool::CredentialKind::KeyPassphrase);
     };
     QSignalSpy promptSpy(&f.controller, &AppController::credentialPrompt);
     f.controller.connectToProfile(f.profileId);

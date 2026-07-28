@@ -142,7 +142,8 @@ public:
     }
 
 protected:
-    bool connectPool(const QString&, quint16, const QString&) override
+    bool connectPool(const QString&, quint16, const QString&,
+                     const QString&) override
     {
         ++connectCalls;
         return connectOk;

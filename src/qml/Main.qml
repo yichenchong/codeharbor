@@ -232,11 +232,11 @@ ApplicationWindow {
         }
         onProfileRemoved: (id) => { if (app.serverProfiles) app.serverProfiles.removeProfile(id); }
         onHostKeyDecision: (accept) => { pendingHostKey = null; app.resolveHostKey(accept); }
-        onCredentialSubmitted: (secret) => {
+        onCredentialSubmitted: (secret, kind) => {
             // Cleared here BEFORE the secret is handed over, so the sheet is
             // never left holding a prompt for an answer already spent.
             pendingCredential = null;
-            app.submitCredential(secret);
+            app.submitCredential(secret, kind);
         }
         onDismissed: shown = false
 
@@ -274,9 +274,10 @@ ApplicationWindow {
         }
         // ssh-agent and the default keys could not authenticate; the connect was
         // refused so we could ask instead of blocking inside the handshake.
-        function onCredentialPrompt(user, host, prompt) {
-            connectSheet.pendingCredential = { user: user, host: host, prompt: prompt };
-            connectSheet.shown = true;
+        function onCredentialPrompt(user, host, prompt, kind) {
+            connectSheet.pendingCredential = {
+                user: user, host: host, prompt: prompt, kind: kind
+            };
         }
         // A successful connect is the sheet's exit condition. It fills the
         // window at z 900, so leaving it up after the workspace is reachable

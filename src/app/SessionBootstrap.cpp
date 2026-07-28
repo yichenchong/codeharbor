@@ -394,9 +394,10 @@ void SessionBootstrap::unwire()
 }
 
 bool SessionBootstrap::connectPool(const QString& host, quint16 port,
-                                   const QString& user)
+                                   const QString& user,
+                                   const QString& identityFile)
 {
-    return m_pool && m_pool->connectToHost(host, port, user);
+    return m_pool && m_pool->connectToHost(host, port, user, identityFile);
 }
 
 bool SessionBootstrap::probeEndpoint(const QString& host, quint16 port,
@@ -614,7 +615,7 @@ bool SessionBootstrap::attemptWire()
         });
     }
 
-    if (!connectPool(m_host, m_port, m_user)) {
+    if (!connectPool(m_host, m_port, m_user, m_identityFile)) {
         emit error(QStringLiteral("SSH connection to %1:%2 failed")
                        .arg(m_host)
                        .arg(m_port));
@@ -662,7 +663,8 @@ bool SessionBootstrap::attemptWire()
 bool SessionBootstrap::connectAndWire(const QString& host, quint16 port,
                                       const QString& user,
                                       const QString& nodePath,
-                                      const QString& repoRoot)
+                                      const QString& repoRoot,
+                                      const QString& identityFile)
 {
     // A connect already in flight owns m_host/m_port and is parked in
     // probeEndpoint()'s nested event loop. Overwriting the target underneath it
@@ -679,6 +681,7 @@ bool SessionBootstrap::connectAndWire(const QString& host, quint16 port,
     m_user = user;
     m_nodePath = nodePath;
     m_repoRoot = repoRoot;
+    m_identityFile = identityFile;
 
     cancelReconnect();
     m_attempt = 0;
@@ -710,6 +713,7 @@ bool SessionBootstrap::connectAndWireFromEnvironment()
     const QString user = qEnvironmentVariable("CH_LIVE_USER");
     const QString nodePath = qEnvironmentVariable("CH_LIVE_NODE");
     const QString repoRoot = qEnvironmentVariable("CH_LIVE_REPO");
+    const QString identityFile = qEnvironmentVariable("CH_LIVE_IDENTITY");
     bool portOk = false;
     const uint port = qEnvironmentVariable("CH_LIVE_PORT").toUInt(&portOk);
 
@@ -726,7 +730,7 @@ bool SessionBootstrap::connectAndWireFromEnvironment()
         setKnownHostsPath(knownHosts);
 
     return connectAndWire(host, static_cast<quint16>(port), user, nodePath,
-                          repoRoot);
+                          repoRoot, identityFile);
 }
 
 } // namespace ch

@@ -118,12 +118,16 @@ graph TD
   - [x] `SshConnectionPool`: one authenticated connection, N channels (SPEC 5.3).
   - [x] Host-key verify + known-hosts store + changed-key/@revoked refusal (SPEC 12.1).
   - [x] Channel factory for PTY / RPC / agent-status channels.
-  - [x] Credential handling via SSH agent → key → password callback (no secrets stored).
+  - [x] Credential handling: agent → configured/default key → typed key
+    passphrase or server password, with the methods kept separate and no secret
+    stored. `~/.ssh/config` (`IdentityFile`) and an explicit profile key path
+    both feed libssh.
 - **Contract exposed:** `openChannel(kind)`, host-key callback, state signals.
 - **Stop gate:** ✅ MET — `tst_livessh` (label `live`) connects to a real sshd via
-  ssh-agent auth, persists the first-use host key, runs an Exec channel, and drives
-  JSON-RPC to a real `codeharbord` over an SSH channel; `tst_knownhosts` covers the
-  host-key/@revoked logic. Reconnect scheduling on the RPC channel is still TBD.
+  ssh-agent auth, persists the first-use host key, runs an Exec channel, drives
+  JSON-RPC to a real `codeharbord`, and encrypts a disposable fixture key to
+  verify both explicit and OpenSSH-configured identity paths consume the UI
+  passphrase callback. `tst_knownhosts` covers changed-key/@revoked refusal.
 - **Parallel with:** M, R-server, P.
 
 ### R — Remote service + client — ✅ LANDED (R-server Wave 1, R-client Wave 2)
