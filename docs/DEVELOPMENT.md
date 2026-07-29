@@ -18,12 +18,27 @@ This stack has been confirmed to configure, build, and link the full tree
 | CMake | 4.2.3 | 3.24 |
 | Ninja | 1.13.2 | any |
 | Qt 6 | 6.10.2 | 6.9 |
-| libssh | 0.11.3 | 0.10+ |
+| libssh | 0.11.3 | 0.10+, **except 0.12.0** |
 | Node.js | 24.16 | 23.6 (native TS type-stripping) |
 
 The CMake floor is Qt **6.9**; newer (6.10 here) works unchanged. 6.9 is not a
 guess: it is the first release with `QQuickWebEngineProfile(storageName, parent)`,
 and CI builds and runs the portable suite on 6.9 to keep the claim honest.
+
+**libssh 0.12.0 cannot complete a handshake against a modern sshd.** Its hybrid
+ML-KEM key exchange (`mlkem768x25519-sha256`, first in libssh's own default list)
+hands `ssh_buffer_pack()` an un-cast `int` where it reads a `size_t`, so the
+client KEX init fails to pack — `Failed to construct client init buffer`, before
+any host key is seen. Upstream fixed the cast in 0.12.1. Two consequences:
+
+- Windows release artifacts take libssh from the in-tree overlay port
+  ([`packaging/vcpkg-ports/libssh`](../packaging/vcpkg-ports/libssh)) pinned to
+  0.12.2, because vcpkg's registry port is still 0.12.0. Bumping that pin also
+  changes the release workflow's vcpkg cache key, which embeds the version.
+- If the *runtime* libssh is 0.12.0 anyway (a distro or Homebrew build),
+  `SshConnectionPool` drops just that one algorithm from libssh's defaults for
+  the attempt and records it in the connection log, so post-quantum KEX stays
+  available through `mlkem768nistp256-sha256`.
 
 ## Ubuntu / Debian (apt)
 
@@ -238,7 +253,9 @@ A raw Qt/WebEngine executable is **not** runnable off the build machine; the
 deploy tools bundle the Qt libraries, plugins, and the WebEngine runtime so the
 artifact is self-contained. libssh is sourced per OS: `apt` (Linux), `brew`
 (macOS), and `vcpkg` (Windows, via the CMake CONFIG package — see the normalized
-`ch_libssh` target in the top-level `CMakeLists.txt`).
+`ch_libssh` target in the top-level `CMakeLists.txt`). The Windows job installs
+it from the in-tree overlay port pinned to 0.12.2 and FAILS the build if any
+other version lands, because vcpkg's registry port is the unusable 0.12.0.
 
 ### The release drill (do not skip the dry run)
 

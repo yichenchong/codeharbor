@@ -99,7 +99,10 @@ key is never trusted silently.
 
 **Diagnose an SSH failure:** open **Server…** in the sessions sidebar and read the connection error
 banner. It reports whether `SSH_AUTH_SOCK` reached the CodeHarbor process,
-whether a profile key path was found, and libssh's final error. A desktop
+whether a profile key path was found, and libssh's final error. **Details…** on
+that banner opens the full connection log for the attempt — the libssh version in
+use, which SSH config was parsed, every handshake stage, and libssh's own trace —
+selectable so it can go into a bug report. A desktop
 launcher often does not inherit the agent socket from a terminal; set **Private
 key file** to the local key (absolute paths and `~/…` are accepted) to bypass
 that environment boundary. Do not paste a passphrase into logs or bug reports.

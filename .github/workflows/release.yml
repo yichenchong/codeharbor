@@ -77,25 +77,59 @@ jobs:
       # at link time - or, worse, subtly at runtime. ImageVersion is an OS env
       # var on the image, not part of the `env` expression context, so it has to
       # be captured in a step first.
+      #
+      # It also carries the PINNED libssh version. vcpkg's registry port is
+      # 0.12.0, whose hybrid ML-KEM key exchange cannot pack its own client KEX
+      # init ("Failed to construct client init buffer"), so the build takes
+      # libssh from the in-tree overlay port instead. Without the version in the
+      # key, an entry written before the pin would restore 0.12.0 and defeat it.
       - name: Resolve cache key (Windows)
         if: matrix.name == 'windows'
         id: imgver
         shell: pwsh
-        run: echo "v=$env:ImageVersion" >> $env:GITHUB_OUTPUT
+        run: |
+          echo "v=$env:ImageVersion" >> $env:GITHUB_OUTPUT
+          $pin = (Get-Content packaging/vcpkg-ports/libssh/vcpkg.json | ConvertFrom-Json).version
+          echo "libssh=$pin" >> $env:GITHUB_OUTPUT
 
       - name: Cache vcpkg libssh (Windows)
         if: matrix.name == 'windows'
         uses: actions/cache@v4
         with:
           path: C:\vcpkg\installed
-          key: vcpkg-libssh-x64-windows-${{ steps.imgver.outputs.v }}
+          key: vcpkg-libssh-${{ steps.imgver.outputs.libssh }}-x64-windows-${{ steps.imgver.outputs.v }}
 
       - name: Install libssh via vcpkg (Windows)
         if: matrix.name == 'windows'
         shell: pwsh
+        env:
+          LIBSSH_PIN: ${{ steps.imgver.outputs.libssh }}
         run: |
-          vcpkg install libssh:x64-windows
-          echo "CMAKE_TOOLCHAIN_FILE=$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" >> $env:GITHUB_ENV
+          $ErrorActionPreference = "Stop"
+          $root = $env:VCPKG_INSTALLATION_ROOT
+          $header = "$root/installed/x64-windows/include/libssh/libssh_version.h"
+          function Get-InstalledLibssh {
+            if (-not (Test-Path $header)) { return $null }
+            $text = Get-Content $header -Raw
+            $parts = "MAJOR", "MINOR", "MICRO" | ForEach-Object {
+              [regex]::Match($text, "LIBSSH_VERSION_$_\s+(\d+)").Groups[1].Value
+            }
+            return ($parts -join ".")
+          }
+          # A cache entry from before the pin (or a port bump) must not survive as
+          # an already-installed tree that `vcpkg install` would treat as a no-op.
+          $present = Get-InstalledLibssh
+          if ($present -and $present -ne $env:LIBSSH_PIN) {
+            Write-Host "Removing cached libssh $present (pin is $env:LIBSSH_PIN)"
+            vcpkg remove libssh:x64-windows --recurse
+          }
+          vcpkg install libssh:x64-windows "--overlay-ports=$(Resolve-Path packaging/vcpkg-ports)"
+          $installed = Get-InstalledLibssh
+          if ($installed -ne $env:LIBSSH_PIN) {
+            throw "libssh $installed installed, expected $env:LIBSSH_PIN; 0.12.0 cannot complete an SSH handshake."
+          }
+          Write-Host "libssh $installed"
+          echo "CMAKE_TOOLCHAIN_FILE=$root/scripts/buildsystems/vcpkg.cmake" >> $env:GITHUB_ENV
 
       # --- MSVC environment for the Ninja generator (Windows) ------------------
       - name: Set up MSVC (Windows)

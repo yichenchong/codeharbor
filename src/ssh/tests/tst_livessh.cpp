@@ -68,6 +68,7 @@ private slots:
     void cleanupTestCase();
 
     void connectsToFixture();
+    void connectionLogRecordsLibsshTrace();
     void execChannelDeliversStdout();
     void rpcServerInfoOverSshChannel();
     void stderrStaysOutOfReadStream();
@@ -229,6 +230,24 @@ void TstLiveSsh::rpcServerInfoOverSshChannel()
     device.closeChannel();
 }
 
+// The connection log is the only surface that can explain a handshake that dies
+// inside libssh, so a real handshake must leave both CodeHarbor's stage markers
+// and libssh's own trace in it - and must name the runtime version, which is
+// what distinguishes a defective libssh from a server-side refusal.
+void TstLiveSsh::connectionLogRecordsLibsshTrace()
+{
+    ensureConnected();
+
+    const QString log = m_pool.diagnosticLog();
+    QVERIFY2(log.contains(QStringLiteral("libssh runtime: ")), qPrintable(log));
+    QVERIFY2(log.contains(QStringLiteral("Beginning SSH handshake.")),
+             qPrintable(log));
+    QVERIFY2(log.contains(QStringLiteral("SSH authentication succeeded.")),
+             qPrintable(log));
+    // A libssh-emitted line, i.e. proof the log callback is really installed.
+    QVERIFY2(log.contains(QStringLiteral("libssh[")), qPrintable(log));
+}
+
 // (d) stderr must never be spliced into the read stream: a single stray
 // non-JSON line would desynchronise the JSON-RPC/JSONL framing on that channel.
 void TstLiveSsh::stderrStaysOutOfReadStream()
@@ -331,6 +350,10 @@ void TstLiveSsh::encryptedIdentityUsesPassphraseFromCallback()
                             .arg(failure)));
     QCOMPARE(passphraseRequests, 1);
     QVERIFY(!passwordRequested);
+    // The diagnostic transcript is user-visible and copy-pasteable, so the
+    // passphrase this attempt supplied must not appear anywhere in it.
+    QVERIFY2(!pool.diagnosticLog().contains(kPassphrase),
+             qPrintable(pool.diagnosticLog()));
     pool.disconnectFromHost();
 
     // The same encrypted key through a real ~/.ssh/config IdentityFile entry.

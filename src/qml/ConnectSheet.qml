@@ -40,6 +40,9 @@ Rectangle {
     property string activeId: ""
     property string connectionState: ""
     property string errorText: ""
+    // In-memory libssh trace from the current/most recent handshake. It is
+    // supplied by AppController and is never written to profile settings.
+    property string diagnosticText: ""
     property var pendingHostKey: null
     property var pendingCredential: null
 
@@ -609,7 +612,8 @@ Rectangle {
             objectName: "errorLabel"
             anchors.left: errorGlyph.right
             anchors.leftMargin: 8
-            anchors.right: errorDismissButton.left
+            anchors.right: errorDetailsButton.visible
+                           ? errorDetailsButton.left : errorDismissButton.left
             anchors.rightMargin: 10
             anchors.verticalCenter: parent.verticalCenter
             wrapMode: Text.WordWrap
@@ -636,6 +640,45 @@ Rectangle {
             accent: "#f38ba8"
             text: qsTr("Dismiss")
             onClicked: root.errorDismissed = true
+        }
+
+        SheetButton {
+            id: errorDetailsButton
+            objectName: "sshDetailsButton"
+            anchors.right: errorDismissButton.left
+            anchors.rightMargin: 6
+            anchors.verticalCenter: parent.verticalCenter
+            visible: root.diagnosticText.length > 0
+            width: visible ? implicitWidth : 0
+            accent: "#f9e2af"
+            text: qsTr("Details…")
+            onClicked: sshDiagnosticsDialog.open()
+        }
+    }
+
+    Dialog {
+        id: sshDiagnosticsDialog
+        objectName: "sshDiagnosticsDialog"
+        title: qsTr("SSH connection details")
+        modal: true
+        standardButtons: Dialog.Close
+        anchors.centerIn: Overlay.overlay
+        width: Math.min(root.width - 40, 900)
+        height: Math.min(root.height - 40, 620)
+
+        contentItem: ScrollView {
+            clip: true
+            TextArea {
+                id: sshDiagnosticsText
+                objectName: "sshDiagnosticsText"
+                readOnly: true
+                selectByMouse: true
+                wrapMode: TextArea.NoWrap
+                textFormat: Text.PlainText
+                text: root.diagnosticText
+                font.family: "monospace"
+                font.pixelSize: 12
+            }
         }
     }
 

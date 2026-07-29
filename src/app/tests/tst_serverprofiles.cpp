@@ -214,6 +214,7 @@ private slots:
     void sheetHostKeyPromptDecidesBothWays();
     void sheetCredentialPromptMasksSubmitsAndKeepsTheSecretOffDisk();
     void sheetSurfacesErrorTextWithoutBlocking();
+    void sheetOpensSshDiagnostics();
     void sheetIsUsableFromTheKeyboardAlone();
 
     // ---- both halves together ----
@@ -1160,6 +1161,27 @@ void TstServerProfiles::sheetSurfacesErrorTextWithoutBlocking()
     root->setProperty("errorText", QString());
     QVERIFY(!banner->property("visible").toBool());
 
+    CH_ASSERT_SILENT();
+}
+
+void TstServerProfiles::sheetOpensSshDiagnostics()
+{
+    CH_LOAD_SHEET(view, root);
+    const QString diagnostic = QStringLiteral(
+        "Starting SSH connection to alpha.example:22.\n"
+        "libssh[4] ssh_set_client_kex: kex algorithms: curve25519-sha256");
+    root->setProperty("errorText", QStringLiteral("SSH connection failed."));
+    root->setProperty("diagnosticText", diagnostic);
+
+    QObject* const details = root->findChild<QObject*>(QStringLiteral("sshDetailsButton"));
+    QObject* const dialog = root->findChild<QObject*>(QStringLiteral("sshDiagnosticsDialog"));
+    QObject* const text = root->findChild<QObject*>(QStringLiteral("sshDiagnosticsText"));
+    QVERIFY(details && dialog && text);
+    QVERIFY(details->property("visible").toBool());
+    QCOMPARE(stringOf(text, "text"), diagnostic);
+
+    QMetaObject::invokeMethod(details, "clicked");
+    QVERIFY(dialog->property("visible").toBool());
     CH_ASSERT_SILENT();
 }
 

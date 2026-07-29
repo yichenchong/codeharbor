@@ -4,6 +4,11 @@
 #include <QFile>
 #include <QFileInfo>
 #include <QStringList>
+#include <QScopeGuard>
+#if CH_HAVE_LIBSSH
+#include <libssh/callbacks.h>
+#endif
+
 
 namespace ch {
 
@@ -16,8 +21,18 @@ QString SshConnectionPool::lookupHostFor(const QString& host, quint16 port)
 
 bool SshConnectionPool::isWindowsNamedPipeAgentSocket(const QString& socket)
 {
+
     return socket.startsWith(QStringLiteral("\\\\.\\pipe\\"),
                              Qt::CaseInsensitive);
+}
+
+bool SshConnectionPool::hasBrokenHybridKex(const QString& runtimeVersion)
+{
+    // ssh_version() appends the crypto/compression backends after the release,
+    // so compare the leading version token rather than the whole string.
+    const QString release =
+        runtimeVersion.section(QLatin1Char('/'), 0, 0).trimmed();
+    return release == QLatin1String("0.12.0");
 }
 
 SshConnectionPool::SshConnectionPool(QObject* parent)
@@ -73,6 +88,45 @@ void SshConnectionPool::setState(State next)
         return;
     m_state = next;
     emit stateChanged(next);
+}
+
+void SshConnectionPool::clearDiagnostics()
+{
+    if (m_diagnosticLog.isEmpty())
+        return;
+    m_diagnosticLog.clear();
+    emit diagnosticLogChanged();
+}
+
+void SshConnectionPool::appendDiagnostic(const QString& message)
+{
+    constexpr qsizetype maximumCharacters = 64 * 1024;
+    const QString line = message.trimmed();
+    if (line.isEmpty())
+        return;
+
+    if (!m_diagnosticLog.isEmpty())
+        m_diagnosticLog += QLatin1Char('\n');
+    m_diagnosticLog += line;
+    if (m_diagnosticLog.size() > maximumCharacters) {
+        m_diagnosticLog.remove(0, m_diagnosticLog.size() - maximumCharacters);
+        m_diagnosticLog.prepend(
+            QStringLiteral("… earlier SSH diagnostics discarded …\n"));
+    }
+    emit diagnosticLogChanged();
+}
+
+void SshConnectionPool::libsshLog(int priority, const char* function,
+                                  const char* buffer, void* userdata)
+{
+    auto* const pool = static_cast<SshConnectionPool*>(userdata);
+    if (!pool || !buffer)
+        return;
+    pool->appendDiagnostic(
+        QStringLiteral("libssh[%1] %2: %3")
+            .arg(priority)
+            .arg(QString::fromUtf8(function ? function : "unknown"),
+                 QString::fromUtf8(buffer)));
 }
 
 #if !CH_HAVE_LIBSSH
@@ -208,6 +262,11 @@ bool SshConnectionPool::connectToHost(const QString& host, quint16 port,
                                       const QString& user,
                                       const QString& identityFile)
 {
+    clearDiagnostics();
+    appendDiagnostic(QStringLiteral("Starting SSH connection to %1:%2.")
+                         .arg(host)
+                         .arg(port));
+
     disconnectFromHost();
     m_host = host;
     m_port = port;
@@ -217,11 +276,32 @@ bool SshConnectionPool::connectToHost(const QString& host, quint16 port,
     setState(State::Connecting);
     m_session = ssh_new();
     if (!m_session) {
+        appendDiagnostic(QStringLiteral("libssh could not allocate a session."));
         emit errorOccurred(QStringLiteral("ssh_new() failed"));
         setState(State::Error);
         return false;
     }
 
+    // libssh exposes only a process-global logging callback. SSH handshakes
+    // here are synchronous, so restore the pre-existing callback and level
+    // before this attempt returns.
+    const ssh_logging_callback previousLogCallback = ssh_get_log_callback();
+    void* const previousLogUserdata = ssh_get_log_userdata();
+    const int previousLogLevel = ssh_get_log_level();
+    ssh_set_log_callback(&SshConnectionPool::libsshLog);
+    ssh_set_log_userdata(this);
+    ssh_set_log_level(SSH_LOG_FUNCTIONS);
+    const auto restoreLibsshLogging = qScopeGuard([previousLogCallback,
+                                                    previousLogUserdata,
+                                                    previousLogLevel] {
+        ssh_set_log_level(previousLogLevel);
+        ssh_set_log_userdata(previousLogUserdata);
+        ssh_set_log_callback(previousLogCallback);
+    });
+
+    const QString runtimeVersion = QString::fromUtf8(ssh_version(0));
+    appendDiagnostic(
+        QStringLiteral("libssh runtime: %1").arg(runtimeVersion));
     const QByteArray hostUtf8 = host.toUtf8();
     const QByteArray userUtf8 = user.toUtf8();
     unsigned int portValue = port;
@@ -234,12 +314,18 @@ bool SshConnectionPool::connectToHost(const QString& host, quint16 port,
     const QString configPath =
         QDir::home().filePath(QStringLiteral(".ssh/config"));
     if (QFileInfo(configPath).isFile()) {
+        appendDiagnostic(
+            QStringLiteral("Parsing SSH configuration: %1").arg(configPath));
         const QByteArray configUtf8 = QFile::encodeName(configPath);
         if (ssh_options_parse_config(m_session, configUtf8.constData())
             != SSH_OK) {
+            const QString error = QString::fromUtf8(ssh_get_error(m_session));
+            appendDiagnostic(
+                QStringLiteral("SSH configuration parsing failed: %1")
+                    .arg(error));
             emit errorOccurred(
                 QStringLiteral("Could not parse SSH config %1: %2")
-                    .arg(configPath, QString::fromUtf8(ssh_get_error(m_session))));
+                    .arg(configPath, error));
             closeSession();
             setState(State::Error);
             return false;
@@ -254,29 +340,76 @@ bool SshConnectionPool::connectToHost(const QString& host, quint16 port,
                         identityUtf8.constData());
     }
 
+    // libssh 0.12.0's mlkem768x25519-sha256 branch hands ssh_buffer_pack() an
+    // un-cast `int` where it reads a `size_t`, so packing the client KEX init
+    // can fail on "Failed to construct client init buffer" before a host key is
+    // ever seen. That algorithm leads libssh's DEFAULT_KEY_EXCHANGE and modern
+    // sshd prefers it too, so the very first attempt hits it. Upstream fixed
+    // the cast in 0.12.1. Remove ONLY that algorithm: libssh's `-` modifier
+    // subtracts from its OWN DEFAULT_KEY_EXCHANGE, so no list is frozen here and
+    // the NIST hybrid keeps post-quantum key exchange available. It does replace
+    // (not filter) any KexAlgorithms parsed from ~/.ssh/config above - an
+    // acceptable trade against a handshake that cannot complete at all.
+    if (hasBrokenHybridKex(runtimeVersion)) {
+        const bool applied = ssh_options_set(m_session,
+                                             SSH_OPTIONS_KEY_EXCHANGE,
+                                             "-mlkem768x25519-sha256")
+                             == SSH_OK;
+        appendDiagnostic(
+            applied
+                ? QStringLiteral("Disabled mlkem768x25519-sha256: libssh %1 "
+                                 "cannot pack its client KEX init.")
+                      .arg(runtimeVersion)
+                : QStringLiteral("Could not disable mlkem768x25519-sha256 on "
+                                 "libssh %1: %2")
+                      .arg(runtimeVersion,
+                           QString::fromUtf8(ssh_get_error(m_session))));
+    }
 
+    appendDiagnostic(QStringLiteral("Beginning SSH handshake."));
     if (ssh_connect(m_session) != SSH_OK) {
-        emit errorOccurred(QString::fromUtf8(ssh_get_error(m_session)));
+        const QString error = QString::fromUtf8(ssh_get_error(m_session));
+        appendDiagnostic(QStringLiteral("SSH handshake failed: %1").arg(error));
+        if (hasBrokenHybridKex(runtimeVersion)
+            && error.contains(
+                QStringLiteral("Failed to construct client init buffer"),
+                Qt::CaseInsensitive)) {
+            appendDiagnostic(
+                QStringLiteral("Remediation: libssh %1 cannot pack a hybrid "
+                               "ML-KEM client KEX init. Use a CodeHarbor build "
+                               "linked with libssh 0.12.1 or newer.")
+                    .arg(runtimeVersion));
+        }
+        emit errorOccurred(error);
         closeSession();
         setState(State::Error);
         return false;
     }
 
+    appendDiagnostic(
+        QStringLiteral("SSH handshake completed; verifying host key."));
     setState(State::HostKeyCheck);
     if (!verifyHostKey(host)) {
+        appendDiagnostic(QStringLiteral("Host-key verification failed: %1")
+                             .arg(QString::fromUtf8(ssh_get_error(m_session))));
         closeSession();
         setState(State::Error);
         return false;
     }
 
+    appendDiagnostic(QStringLiteral("Host key accepted; authenticating."));
     setState(State::Authenticating);
     if (!authenticate(user)) {
-        emit errorOccurred(authenticationFailure());
+        const QString error = authenticationFailure();
+        appendDiagnostic(QStringLiteral("SSH authentication failed: %1")
+                             .arg(error));
+        emit errorOccurred(error);
         closeSession();
         setState(State::Error);
         return false;
     }
 
+    appendDiagnostic(QStringLiteral("SSH authentication succeeded."));
     setState(State::Connected);
     return true;
 }

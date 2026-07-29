@@ -25,6 +25,7 @@ namespace ch {
 // belong to TerminalController and the remote client.
 class SshConnectionPool : public QObject {
     Q_OBJECT
+    Q_PROPERTY(QString diagnosticLog READ diagnosticLog NOTIFY diagnosticLogChanged)
 public:
     enum class State {
         Disconnected,
@@ -125,7 +126,17 @@ public:
     // classifier so platform-specific SSH setup remains testable everywhere.
     static bool isWindowsNamedPipeAgentSocket(const QString& socket);
 
+    // True for the libssh releases whose hybrid ML-KEM key exchange cannot pack
+    // its own client KEX init (0.12.0 only; fixed upstream in 0.12.1). Takes the
+    // ssh_version() string, e.g. "0.12.0/openssl/zlib". Pure, so the mitigation
+    // is testable against a build linked with any libssh.
+    static bool hasBrokenHybridKex(const QString& runtimeVersion);
+
     State state() const;
+    // In-memory libssh and connection-stage diagnostics for the most recent
+    // handshake. It is never persisted and excludes supplied credentials.
+    QString diagnosticLog() const { return m_diagnosticLog; }
+
 
 #if CH_HAVE_LIBSSH
     // Open an independent channel on the shared session. Returns nullptr if not
@@ -138,11 +149,16 @@ public:
 
 signals:
     void stateChanged(ch::SshConnectionPool::State state);
+    void diagnosticLogChanged();
     void errorOccurred(const QString& message);
     // Emitted on a Verdict::Mismatch refusal so the UI can surface a warning.
     void hostKeyMismatch(const QString& host);
 
 private:
+    void clearDiagnostics();
+    static void libsshLog(int priority, const char* function,
+                          const char* buffer, void* userdata);
+    void appendDiagnostic(const QString& message);
     void setState(State next);
 #if CH_HAVE_LIBSSH
     bool verifyHostKey(const QString& host);
@@ -159,6 +175,7 @@ private:
     quint16 m_port = 22;
     QString m_user;
     QString m_identityFile;
+    QString m_diagnosticLog;
 #if CH_HAVE_LIBSSH
     ssh_session m_session = nullptr;
     QList<ssh_channel> m_channels;

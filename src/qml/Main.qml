@@ -223,6 +223,7 @@ ApplicationWindow {
         activeId: app.serverProfiles ? app.serverProfiles.activeId : ""
         connectionState: app.connectionState
         errorText: app.connectionError
+        diagnosticText: app.sshDiagnostics
 
         onConnectRequested: (profileId) => app.connectToProfile(profileId)
         onProfileSaved: (fields) => {

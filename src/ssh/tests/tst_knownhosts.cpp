@@ -71,6 +71,7 @@ private slots:
     void trustedHostRefusesUnknownKeyType();
     void markerOnlyHostStaysUnknownForOtherTypes();
     void recognizesWindowsNamedPipeAgentSocket();
+    void recognizesLibsshVersionsWithBrokenHybridKex();
 };
 
 void TstKnownHosts::parsesSampleStore()
@@ -415,6 +416,27 @@ void TstKnownHosts::recognizesWindowsNamedPipeAgentSocket()
     QVERIFY(!SshConnectionPool::isWindowsNamedPipeAgentSocket(
         QStringLiteral("C:/Users/alice/.ssh/agent.sock")));
     QVERIFY(!SshConnectionPool::isWindowsNamedPipeAgentSocket(QString()));
+}
+
+void TstKnownHosts::recognizesLibsshVersionsWithBrokenHybridKex()
+{
+    using ch::SshConnectionPool;
+
+    // Only 0.12.0 packs its hybrid ML-KEM client KEX init wrongly. ssh_version()
+    // appends the crypto/compression backends, so the release token is what
+    // decides - a bare prefix match would also catch 0.12.0x releases.
+    QVERIFY(SshConnectionPool::hasBrokenHybridKex(
+        QStringLiteral("0.12.0/openssl/zlib")));
+    QVERIFY(SshConnectionPool::hasBrokenHybridKex(QStringLiteral("0.12.0")));
+    QVERIFY(!SshConnectionPool::hasBrokenHybridKex(
+        QStringLiteral("0.12.1/openssl/zlib")));
+    QVERIFY(!SshConnectionPool::hasBrokenHybridKex(
+        QStringLiteral("0.12.2/openssl/zlib")));
+    QVERIFY(!SshConnectionPool::hasBrokenHybridKex(
+        QStringLiteral("0.11.3/openssl/zlib")));
+    QVERIFY(!SshConnectionPool::hasBrokenHybridKex(
+        QStringLiteral("0.12.10/openssl")));
+    QVERIFY(!SshConnectionPool::hasBrokenHybridKex(QString()));
 }
 
 QTEST_MAIN(TstKnownHosts)

@@ -156,6 +156,8 @@ void AppController::setConnection(SshConnectionPool* pool,
     // bootstrap's signals (and must not leave the first one still driving us).
     if (m_bootstrap && m_bootstrap != bootstrap)
         disconnect(m_bootstrap, nullptr, this, nullptr);
+    if (m_pool && m_pool != pool)
+        disconnect(m_pool, nullptr, this, nullptr);
 
     m_pool = pool;
     m_bootstrap = bootstrap;
@@ -167,6 +169,10 @@ void AppController::setConnection(SshConnectionPool* pool,
     if (m_layouts)
         m_layouts->setServerId(m_serverId.value);
 
+    if (m_pool) {
+        connect(m_pool, &SshConnectionPool::diagnosticLogChanged, this,
+                &AppController::connectionDiagnosticsChanged);
+    }
     if (m_bootstrap) {
         // The bootstrap reconnects on its own (backoff per SPEC 5.6); mirror its
         // state so the UI can show "reconnecting" instead of going quietly dead,
@@ -212,6 +218,12 @@ void AppController::setConnection(SshConnectionPool* pool,
                 });
     }
     emit connectionChanged();
+    emit connectionDiagnosticsChanged();
+}
+
+QString AppController::sshDiagnostics() const
+{
+    return m_pool ? m_pool->diagnosticLog() : QString();
 }
 
 void AppController::setConnectionState(const QString& state, const QString& err)

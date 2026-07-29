@@ -44,6 +44,7 @@ class AppController : public QObject {
     Q_PROPERTY(ch::SessionLayouts* layouts READ layouts NOTIFY connectionChanged)
     Q_PROPERTY(QString connectionState READ connectionState NOTIFY connectionStateChanged)
     Q_PROPERTY(QString connectionError READ connectionError NOTIFY connectionStateChanged)
+    Q_PROPERTY(QString sshDiagnostics READ sshDiagnostics NOTIFY connectionDiagnosticsChanged)
     Q_PROPERTY(QString activeSessionId READ activeSessionId NOTIFY activeSessionChanged)
     Q_PROPERTY(QString activeSessionRepoRoot READ activeSessionRepoRoot NOTIFY activeSessionChanged)
 
@@ -75,6 +76,7 @@ public:
     SessionLayouts* layouts() const { return m_layouts; }
     QString connectionState() const { return m_connectionState; }
     QString connectionError() const { return m_connectionError; }
+    QString sshDiagnostics() const;
     QString activeSessionId() const { return m_activeSessionId; }
     QString activeSessionRepoRoot() const;
 
@@ -141,6 +143,7 @@ signals:
     void refreshed();
     void connectionChanged();
     void connectionStateChanged();
+    void connectionDiagnosticsChanged();
     void activeSessionChanged();
     // An UNKNOWN host key was presented (a CHANGED key is refused outright by
     // the pool and never reaches here — SPEC 12.1). Answer with resolveHostKey().
