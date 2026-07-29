@@ -1,6 +1,6 @@
 {
   "name": "@codeharbor/remote",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "private": true,
   "description": "codeharbord RPC service, codeharbor-bridge agent relay, and harness adapters",
   "type": "module",
