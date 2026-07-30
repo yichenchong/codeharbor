@@ -23,6 +23,14 @@
 // Built as a MODULE library used only as an LD_PRELOAD by the live gate; it is
 // not linked into any shipped artifact.
 
+// LD_PRELOAD, program_invocation_short_name and __attribute__((constructor)) are
+// all Linux/glibc facilities (MSVC rejects the constructor attribute outright),
+// so the shim is Linux-only. Off Linux this file compiles to an empty module:
+// the ch_headlessquit target still exists, so the live gate's
+// $<TARGET_FILE:ch_headlessquit> reference keeps configuring, and the relaunch
+// path that would inject it QSKIPs without CH_LIVE_SSH anyway.
+#ifdef __linux__
+
 #include <QCoreApplication>
 #include <QMetaObject>
 #include <Qt>
@@ -71,3 +79,5 @@ __attribute__((constructor)) void install()
 }
 
 } // namespace
+
+#endif // __linux__
