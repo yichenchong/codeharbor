@@ -282,8 +282,39 @@ QString TerminalController::tmuxNewSessionCommand(const DevSessionId &devSession
                                                   const TerminalId &terminal,
                                                   const QString &workingDir)
 {
-    return QStringLiteral("tmux new-session -A -s %1 -c %2")
-        .arg(shellSingleQuote(tmuxTarget(devSession, terminal)), shellSingleQuote(workingDir));
+    const QString target = tmuxTarget(devSession, terminal);
+
+    // TWO tmux commands in ONE invocation, separated by an escaped semicolon:
+    // the shell unescapes `\;` into a literal `;` argument, which is tmux's own
+    // command separator (a bare `;` would end the shell command instead).
+    //
+    // The second command exists to fix the mouse wheel. tmux runs on the
+    // terminal's ALTERNATE screen, and an alternate screen has no scrollback of
+    // its own, so xterm.js falls back to "alternate scroll": with no application
+    // asking for mouse events it translates each wheel notch into a cursor-up /
+    // cursor-down key press (verified in @xterm/xterm's wheel handler, which
+    // sends ESC [ A / ESC [ B when `buffer.hasScrollback` is false). Those keys
+    // reach whatever runs inside tmux, so a wheel turn walked back through shell
+    // history instead of scrolling. tmux DOES own a scrollback; it just never
+    // sees the wheel until mouse reporting is on. Switching it on makes the
+    // wheel a mouse event, which tmux turns into its own copy-mode scroll.
+    //
+    // The option is set on THIS SESSION ONLY. `set -g mouse on` would be wrong:
+    // this command carries no `-L`/`-S`, so the session lives on the user's
+    // default tmux server, and a global option would silently change the
+    // behaviour of every tmux session that user started by hand.
+    //
+    // set-option's `-t` is a target-PANE expression, so the session is named as
+    // the window target `<session>:`; and, exactly as in
+    // TerminalFactory::tmuxKillSessionCommand(), tmux's exact-match `=` sigil
+    // goes INSIDE the quotes because it is tmux syntax, not shell syntax —
+    // without it a target such as `ch_*_t1:` resolves by fnmatch and would
+    // reconfigure somebody else's session. Verified against tmux 3.6: with
+    // `ch_victim_t1` live, `set-option -t 'ch_*_t1:' mouse on` set the option on
+    // it, while `-t '=ch_*_t1:'` refused with "no such session" (SPEC 5.2).
+    return QStringLiteral("tmux new-session -A -s %1 -c %2 \\; set-option -t %3 mouse on")
+        .arg(shellSingleQuote(target), shellSingleQuote(workingDir),
+             shellSingleQuote(QLatin1Char('=') + target + QLatin1Char(':')));
 }
 
 int TerminalController::reconnectDelaySeconds(int attempt)

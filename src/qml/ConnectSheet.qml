@@ -5,6 +5,7 @@ pragma ComponentBehavior: Bound
 
 import QtQuick
 import QtQuick.Controls.Basic
+import CodeHarbor
 
 // Server connection sheet (SPEC 4.1, 12.1): the one piece of UI that lets a
 // user with a fresh config reach a server at all — list saved connection
@@ -82,10 +83,10 @@ Rectangle {
 
     implicitWidth: 760
     implicitHeight: 480
-    color: "#1e1e2e"
-    radius: 6
+    color: Theme.surface
+    radius: Theme.radiusMedium
     border.width: 1
-    border.color: "#313244"
+    border.color: Theme.borderSubtle
     focus: true
 
     // ---- helpers ----------------------------------------------------------
@@ -229,6 +230,23 @@ Rectangle {
         return kind === "password" ? "password" : "keyPassphrase";
     }
 
+    // One sentence saying why this secret is being asked for. A server may
+    // require SEVERAL methods (OpenSSH's `AuthenticationMethods
+    // publickey,password`), so a password request does NOT imply the key was
+    // rejected — it is often the second half of an accepted key. Saying
+    // otherwise sends the user off to debug a key that is working fine.
+    function credentialExplanation() {
+        var target = root.textOf(root.pendingCredential, "user") + "@"
+                     + root.textOf(root.pendingCredential, "host");
+        if (root.credentialKind() === "password") {
+            return qsTr("%1 is asking for an account password. Servers that "
+                        + "require more than one authentication method ask for "
+                        + "this in addition to your key.").arg(target);
+        }
+        return qsTr("ssh-agent and the default keys could not authenticate %1. "
+                    + "Unlock a private key to continue.").arg(target);
+    }
+
     // Hand the typed secret up and wipe it here in the same turn. This file
     // keeps no copy of it and never routes it through the profile form, so it
     // cannot reach profileSaved() and therefore cannot reach QSettings.
@@ -262,6 +280,7 @@ Rectangle {
         case "hostkey":
         case "hostkeycheck": return "hostkey";
         case "credential": return "credential";
+        case "provisioning": return "provisioning";
         case "reconnecting": return "reconnecting";
         case "failed":
         case "error":
@@ -272,13 +291,14 @@ Rectangle {
 
     function stateColor(state) {
         switch (root.stateKey(state)) {
-        case "connected": return "#a6e3a1";
-        case "connecting": return "#f9e2af";
-        case "hostkey": return "#f9e2af";
-        case "credential": return "#f9e2af";
+        case "connected": return Theme.success;
+        case "connecting": return Theme.warning;
+        case "hostkey": return Theme.warning;
+        case "credential": return Theme.warning;
+        case "provisioning": return Theme.warning;
         case "reconnecting": return "#fab387";
-        case "failed": return "#f38ba8";
-        default: return "#6c7086";
+        case "failed": return Theme.danger;
+        default: return Theme.textDim;
         }
     }
 
@@ -290,6 +310,7 @@ Rectangle {
         case "connecting": return "\u2219";   // bullet operator
         case "hostkey": return "?";
         case "credential": return "*";        // the password mask
+        case "provisioning": return "\u2193"; // downloading onto the server
         case "reconnecting": return "\u21bb"; // clockwise open circle arrow
         case "failed": return "\u2715";       // multiplication x
         default: return "\u2013";             // en dash: nothing is running
@@ -310,7 +331,7 @@ Rectangle {
     function stateBusy(state) {
         const key = root.stateKey(state);
         return key === "connecting" || key === "hostkey" || key === "credential"
-            || key === "reconnecting";
+            || key === "reconnecting" || key === "provisioning";
     }
 
     // One sentence saying what the state means for the person looking at it;
@@ -321,6 +342,7 @@ Rectangle {
         case "connecting": return qsTr("Opening the SSH connection\u2026");
         case "hostkey": return qsTr("Waiting for you to accept this server's host key.");
         case "credential": return qsTr("Waiting for a password or key passphrase.");
+        case "provisioning": return qsTr("Installing the CodeHarbor service on the server\u2026");
         case "reconnecting": return qsTr("The link dropped; trying to restore it\u2026");
         case "failed": return qsTr("The last attempt failed. See the message below.");
         default: return qsTr("Not connected to any server.");
@@ -382,22 +404,22 @@ Rectangle {
         TextField {
             id: fieldInput
             width: field.width
-            color: "#cdd6f4"
+            color: Theme.text
             placeholderTextColor: "#585b70"
             selectByMouse: true
-            font.pixelSize: 13
+            font.pixelSize: Theme.fontSizeLabel
             background: Rectangle {
-                color: "#11111b"
+                color: Theme.surfaceSunken
                 radius: 3
                 border.width: 1
-                border.color: fieldInput.activeFocus ? "#89b4fa" : "#313244"
+                border.color: fieldInput.activeFocus ? Theme.accent : Theme.borderSubtle
             }
             onAccepted: field.accepted()
         }
         Label {
             id: fieldHint
-            color: "#6c7086"
-            font.pixelSize: 10
+            color: Theme.textDim
+            font.pixelSize: Theme.fontSizeSmall
             visible: text.length > 0
         }
     }
@@ -410,7 +432,7 @@ Rectangle {
     // enough to deserve a real hit target.
     component SheetButton: Button {
         id: button
-        property color accent: "#45475a"
+        property color accent: Theme.border
 
         implicitHeight: 30
         leftPadding: 14
@@ -419,22 +441,22 @@ Rectangle {
 
         contentItem: Label {
             text: button.text
-            color: button.enabled ? "#cdd6f4" : "#585b70"
-            font.pixelSize: 12
+            color: button.enabled ? Theme.text : "#585b70"
+            font.pixelSize: Theme.fontSizeBody
             horizontalAlignment: Text.AlignHCenter
             verticalAlignment: Text.AlignVCenter
         }
 
         background: Rectangle {
-            radius: 4
-            color: !button.enabled ? "#232338"
-                 : button.down ? "#45475a"
-                 : button.hovered ? "#3a3a52" : "#313244"
+            radius: Theme.radiusSmall
+            color: !button.enabled ? Theme.surfaceHover
+                 : button.down ? Theme.border
+                 : button.hovered ? "#3a3a52" : Theme.surfaceRaised
             // Two pixels and a bright edge: the focus ring has to be legible at
             // a glance, not a one-pixel difference against #45475a.
             border.width: button.visualFocus ? 2 : 1
-            border.color: button.visualFocus ? "#89b4fa"
-                        : button.enabled ? button.accent : "#313244"
+            border.color: button.visualFocus ? Theme.accent
+                        : button.enabled ? button.accent : Theme.borderSubtle
         }
     }
 
@@ -448,8 +470,8 @@ Rectangle {
         anchors.left: parent.left
         anchors.right: parent.right
         height: 44
-        color: "#181825"
-        radius: 6
+        color: Theme.surfaceDeep
+        radius: Theme.radiusMedium
 
         // Square off the bottom corners the rounded rectangle would leave.
         Rectangle {
@@ -462,9 +484,9 @@ Rectangle {
 
         Label {
             text: qsTr("Servers")
-            color: "#cdd6f4"
+            color: Theme.text
             font.bold: true
-            font.pixelSize: 14
+            font.pixelSize: Theme.fontSizeTitle
             anchors.left: parent.left
             anchors.leftMargin: 14
             anchors.verticalCenter: parent.verticalCenter
@@ -486,7 +508,7 @@ Rectangle {
                 width: chipRow.implicitWidth + 20
                 height: 26
                 radius: 13
-                color: "#11111b"
+                color: Theme.surfaceSunken
                 border.width: 1
                 border.color: root.stateColor(root.connectionState)
 
@@ -561,8 +583,8 @@ Rectangle {
                         Label {
                             anchors.centerIn: parent
                             text: root.stateGlyph(root.connectionState)
-                            color: "#11111b"
-                            font.pixelSize: 10
+                            color: Theme.textOnAccent
+                            font.pixelSize: Theme.fontSizeSmall
                             font.bold: true
                         }
                     }
@@ -573,8 +595,8 @@ Rectangle {
                         // SECURITY: see errorLabel below — connectionState is
                         // free-form text from the host, not a literal.
                         textFormat: Text.PlainText
-                        color: "#cdd6f4"
-                        font.pixelSize: 12
+                        color: Theme.text
+                        font.pixelSize: Theme.fontSizeBody
                         text: root.connectionState.length > 0 ? root.connectionState
                                                               : qsTr("disconnected")
                     }
@@ -619,7 +641,7 @@ Rectangle {
             anchors.top: parent.top
             anchors.bottom: parent.bottom
             width: 3
-            color: "#f38ba8"
+            color: Theme.danger
         }
 
         Label {
@@ -629,8 +651,8 @@ Rectangle {
             anchors.top: parent.top
             anchors.topMargin: 10
             text: "\u2715"
-            color: "#f38ba8"
-            font.pixelSize: 12
+            color: Theme.danger
+            font.pixelSize: Theme.fontSizeBody
             font.bold: true
         }
 
@@ -653,8 +675,8 @@ Rectangle {
             // hostile server must not be able to turn the error banner into a
             // network callback. It is data: draw it as data.
             textFormat: Text.PlainText
-            color: "#f38ba8"
-            font.pixelSize: 12
+            color: Theme.danger
+            font.pixelSize: Theme.fontSizeBody
             text: root.errorText
         }
 
@@ -664,7 +686,7 @@ Rectangle {
             anchors.right: parent.right
             anchors.rightMargin: 10
             anchors.verticalCenter: parent.verticalCenter
-            accent: "#f38ba8"
+            accent: Theme.danger
             text: qsTr("Dismiss")
             onClicked: root.errorDismissed = true
         }
@@ -677,7 +699,7 @@ Rectangle {
             anchors.verticalCenter: parent.verticalCenter
             visible: root.diagnosticText.length > 0
             width: visible ? implicitWidth : 0
-            accent: "#f9e2af"
+            accent: Theme.warning
             text: qsTr("Details…")
             onClicked: sshDiagnosticsDialog.open()
         }
@@ -703,8 +725,8 @@ Rectangle {
                 wrapMode: TextArea.NoWrap
                 textFormat: Text.PlainText
                 text: root.diagnosticText
-                font.family: "monospace"
-                font.pixelSize: 12
+                font.family: Theme.monoFamily
+                font.pixelSize: Theme.fontSizeBody
             }
         }
     }
@@ -725,7 +747,7 @@ Rectangle {
             anchors.left: parent.left
             anchors.bottom: parent.bottom
             width: 240
-            color: "#181825"
+            color: Theme.surfaceDeep
 
             ListView {
                 id: profileSelector
@@ -741,7 +763,7 @@ Rectangle {
                 keyNavigationEnabled: true
                 model: root.profileList()
 
-                ScrollBar.vertical: ScrollBar {}
+                ScrollBar.vertical: AppScrollBar {}
 
                 Keys.onReturnPressed: (event) => {
                     root.connectNow();
@@ -775,7 +797,7 @@ Rectangle {
 
                     background: Rectangle {
                         color: root.textOf(profileDelegate.modelData, "id") === root.editingId
-                               ? "#313244" : (profileDelegate.hovered ? "#232338" : "transparent")
+                               ? Theme.surfaceSelected : (profileDelegate.hovered ? Theme.surfaceHover : "transparent")
                         radius: 3
 
                         Rectangle {
@@ -784,7 +806,7 @@ Rectangle {
                             anchors.bottom: parent.bottom
                             width: 3
                             radius: 3
-                            color: "#89b4fa"
+                            color: Theme.accent
                             visible: root.textOf(profileDelegate.modelData, "id") === root.activeId
                         }
 
@@ -797,7 +819,7 @@ Rectangle {
                             radius: 3
                             color: "transparent"
                             border.width: 2
-                            border.color: "#89b4fa"
+                            border.color: Theme.accent
                             visible: profileSelector.activeFocus
                                      && profileDelegate.index === profileSelector.currentIndex
                         }
@@ -815,15 +837,15 @@ Rectangle {
                                 // disk), never markup.
                                 textFormat: Text.PlainText
                                 text: root.textOf(profileDelegate.modelData, "name")
-                                color: "#cdd6f4"
-                                font.pixelSize: 13
+                                color: Theme.text
+                                font.pixelSize: Theme.fontSizeLabel
                                 elide: Text.ElideRight
                             }
                             Label {
                                 objectName: "activeBadge" + profileDelegate.index
                                 text: qsTr("active")
-                                color: "#89b4fa"
-                                font.pixelSize: 10
+                                color: Theme.accent
+                                font.pixelSize: Theme.fontSizeSmall
                                 anchors.verticalCenter: parent.verticalCenter
                                 visible: root.textOf(profileDelegate.modelData, "id") === root.activeId
                             }
@@ -834,7 +856,7 @@ Rectangle {
                             text: root.textOf(profileDelegate.modelData, "user") + "@"
                                   + root.textOf(profileDelegate.modelData, "host") + ":"
                                   + root.textOf(profileDelegate.modelData, "port")
-                            color: "#6c7086"
+                            color: Theme.textDim
                             font.pixelSize: 11
                             elide: Text.ElideRight
                         }
@@ -852,7 +874,7 @@ Rectangle {
                 Label {
                     anchors.horizontalCenter: parent.horizontalCenter
                     text: "\u2601"
-                    color: "#45475a"
+                    color: Theme.textFaint
                     font.pixelSize: 28
                 }
                 Label {
@@ -860,8 +882,8 @@ Rectangle {
                     width: parent.width
                     horizontalAlignment: Text.AlignHCenter
                     wrapMode: Text.WordWrap
-                    color: "#6c7086"
-                    font.pixelSize: 12
+                    color: Theme.textDim
+                    font.pixelSize: Theme.fontSizeBody
                     text: qsTr("No servers yet.\nFill in the form and press Save.")
                 }
             }
@@ -880,7 +902,7 @@ Rectangle {
                 }
                 SheetButton {
                     objectName: "removeButton"
-                    accent: "#f38ba8"
+                    accent: Theme.danger
                     text: qsTr("Remove")
                     enabled: root.editingId !== ""
                     onClicked: root.removeSelected()
@@ -913,7 +935,7 @@ Rectangle {
                     visible: root.profileList().length === 0
                     wrapMode: Text.WordWrap
                     color: "#a6adc8"
-                    font.pixelSize: 12
+                    font.pixelSize: Theme.fontSizeBody
                     text: qsTr("CodeHarbor edits a checkout that lives on another machine, over SSH. "
                                + "Describe that machine below — its address, your login, and the "
                                + "absolute path to node on it — then Save it and press Connect.")
@@ -922,8 +944,8 @@ Rectangle {
                 Label {
                     objectName: "formTitle"
                     text: root.editingId === "" ? qsTr("New server") : qsTr("Edit server")
-                    color: "#cdd6f4"
-                    font.pixelSize: 13
+                    color: Theme.text
+                    font.pixelSize: Theme.fontSizeLabel
                     font.bold: true
                 }
 
@@ -1009,7 +1031,7 @@ Rectangle {
                 Label {
                     objectName: "validationHint"
                     anchors.verticalCenter: parent.verticalCenter
-                    color: "#f9e2af"
+                    color: Theme.warning
                     font.pixelSize: 11
                     visible: !root.formValid()
                     text: qsTr("Host, user and a port in 1-65535 are required.")
@@ -1027,7 +1049,7 @@ Rectangle {
                 }
                 SheetButton {
                     objectName: "connectButton"
-                    accent: "#89b4fa"
+                    accent: Theme.accent
                     text: qsTr("Connect")
                     enabled: root.editingId !== ""
                     onClicked: root.connectNow()
@@ -1044,7 +1066,7 @@ Rectangle {
         objectName: "hostKeyPrompt"
         anchors.fill: parent
         anchors.margins: 1
-        radius: 6
+        radius: Theme.radiusMedium
         color: "#e61e1e2e"
         visible: root.pendingHostKey ? true : false
 
@@ -1061,10 +1083,10 @@ Rectangle {
             anchors.centerIn: parent
             width: Math.min(520, hostKeyPrompt.width - 48)
             height: hostKeyColumn.implicitHeight + 32
-            radius: 6
-            color: "#181825"
+            radius: Theme.radiusMedium
+            color: Theme.surfaceDeep
             border.width: 1
-            border.color: "#f9e2af"
+            border.color: Theme.warning
 
             Keys.onEscapePressed: (event) => {
                 root.hostKeyDecision(false);
@@ -1079,9 +1101,9 @@ Rectangle {
 
                 Label {
                     text: qsTr("Unknown host key")
-                    color: "#f9e2af"
+                    color: Theme.warning
                     font.bold: true
-                    font.pixelSize: 14
+                    font.pixelSize: Theme.fontSizeTitle
                 }
                 Label {
                     objectName: "hostKeyHost"
@@ -1096,8 +1118,8 @@ Rectangle {
                     // itself), so the decision must be made on the exact
                     // characters, never on a rendering of them.
                     textFormat: Text.PlainText
-                    color: "#cdd6f4"
-                    font.pixelSize: 12
+                    color: Theme.text
+                    font.pixelSize: Theme.fontSizeBody
                     text: qsTr("%1 presented a %2 key that is not in known_hosts.")
                           .arg(root.textOf(root.pendingHostKey, "host"))
                           .arg(root.textOf(root.pendingHostKey, "keyType"))
@@ -1107,15 +1129,15 @@ Rectangle {
                     width: parent.width
                     wrapMode: Text.WrapAnywhere
                     textFormat: Text.PlainText
-                    color: "#a6e3a1"
-                    font.pixelSize: 12
-                    font.family: "Monospace"
+                    color: Theme.success
+                    font.pixelSize: Theme.fontSizeBody
+                    font.family: Theme.monoFamily
                     text: root.textOf(root.pendingHostKey, "fingerprint")
                 }
                 Label {
                     width: parent.width
                     wrapMode: Text.WordWrap
-                    color: "#6c7086"
+                    color: Theme.textDim
                     font.pixelSize: 11
                     text: qsTr("Accept only if this fingerprint matches the server. Accepting stores the key in known_hosts.")
                 }
@@ -1127,13 +1149,13 @@ Rectangle {
                     SheetButton {
                         id: hostKeyReject
                         objectName: "hostKeyRejectButton"
-                        accent: "#89b4fa"
+                        accent: Theme.accent
                         text: qsTr("Reject")
                         onClicked: root.hostKeyDecision(false)
                     }
                     SheetButton {
                         objectName: "hostKeyAcceptButton"
-                        accent: "#f9e2af"
+                        accent: Theme.warning
                         text: qsTr("Accept and remember")
                         onClicked: root.hostKeyDecision(true)
                     }
@@ -1155,7 +1177,7 @@ Rectangle {
         objectName: "credentialPrompt"
         anchors.fill: parent
         anchors.margins: 1
-        radius: 6
+        radius: Theme.radiusMedium
         color: "#e61e1e2e"
         visible: root.pendingCredential ? true : false
 
@@ -1172,10 +1194,10 @@ Rectangle {
             anchors.centerIn: parent
             width: Math.min(520, credentialPrompt.width - 48)
             height: credentialColumn.implicitHeight + 32
-            radius: 6
-            color: "#181825"
+            radius: Theme.radiusMedium
+            color: Theme.surfaceDeep
             border.width: 1
-            border.color: "#89b4fa"
+            border.color: Theme.accent
 
             Column {
                 id: credentialColumn
@@ -1184,10 +1206,11 @@ Rectangle {
                 spacing: 8
 
                 Label {
-                    text: qsTr("Authentication required")
-                    color: "#89b4fa"
+                    text: root.credentialKind() === "password"
+                          ? qsTr("Password required") : qsTr("Unlock your key")
+                    color: Theme.accent
                     font.bold: true
-                    font.pixelSize: 14
+                    font.pixelSize: Theme.fontSizeTitle
                 }
                 Label {
                     objectName: "credentialTarget"
@@ -1198,11 +1221,9 @@ Rectangle {
                     // does not control, and markup must not be able to restyle
                     // or hide which account is about to be authenticated.
                     textFormat: Text.PlainText
-                    color: "#cdd6f4"
-                    font.pixelSize: 12
-                    text: qsTr("ssh-agent and the default keys could not authenticate %1@%2.")
-                          .arg(root.textOf(root.pendingCredential, "user"))
-                          .arg(root.textOf(root.pendingCredential, "host"))
+                    color: Theme.text
+                    font.pixelSize: Theme.fontSizeBody
+                    text: root.credentialExplanation()
                 }
                 TextField {
                     id: secretField
@@ -1216,17 +1237,17 @@ Rectangle {
                     selectByMouse: false
                     inputMethodHints: Qt.ImhHiddenText | Qt.ImhSensitiveData
                                       | Qt.ImhNoAutoUppercase | Qt.ImhNoPredictiveText
-                    color: "#cdd6f4"
+                    color: Theme.text
                     placeholderTextColor: "#585b70"
                     placeholderText: root.textOf(root.pendingCredential, "prompt") === ""
                                      ? qsTr("Password or key passphrase")
                                      : root.textOf(root.pendingCredential, "prompt")
-                    font.pixelSize: 13
+                    font.pixelSize: Theme.fontSizeLabel
                     background: Rectangle {
-                        color: "#11111b"
+                        color: Theme.surfaceSunken
                         radius: 3
                         border.width: 1
-                        border.color: secretField.activeFocus ? "#89b4fa" : "#313244"
+                        border.color: secretField.activeFocus ? Theme.accent : Theme.borderSubtle
                     }
                     onAccepted: {
                         if (secretField.text.length > 0)
@@ -1240,7 +1261,7 @@ Rectangle {
                 Label {
                     width: parent.width
                     wrapMode: Text.WordWrap
-                    color: "#6c7086"
+                    color: Theme.textDim
                     font.pixelSize: 11
                     text: qsTr("Used for this one connection and then discarded. CodeHarbor never stores it.")
                 }
@@ -1251,21 +1272,21 @@ Rectangle {
 
                     SheetButton {
                         objectName: "credentialCancelButton"
-                        accent: "#89b4fa"
+                        accent: Theme.accent
                         text: qsTr("Cancel")
                         onClicked: root.cancelSecret()
                     }
                     SheetButton {
                         objectName: "credentialPasswordButton"
                         visible: root.credentialKind() === "keyPassphrase"
-                        accent: "#f9e2af"
+                        accent: Theme.warning
                         text: qsTr("Use password")
                         enabled: secretField.text.length > 0
                         onClicked: root.submitSecret("password")
                     }
                     SheetButton {
                         objectName: "credentialSubmitButton"
-                        accent: "#a6e3a1"
+                        accent: Theme.success
                         text: root.credentialKind() === "keyPassphrase"
                               ? qsTr("Unlock key") : qsTr("Authenticate")
                         enabled: secretField.text.length > 0

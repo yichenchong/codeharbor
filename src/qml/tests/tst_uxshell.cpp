@@ -14,9 +14,14 @@
 //
 // The assertions cover the surfaces nothing else gates: ConnectSheet's status
 // vocabulary (it has to agree with the states ch::AppController actually
-// publishes), its dismissible error banner, and the two "nothing here yet"
-// panes — a terminal that cannot attach and a viewer with no file — which must
-// explain themselves instead of showing a raw pane id.
+// publishes), its dismissible error banner, the two "nothing here yet" panes — a
+// terminal that cannot attach and a viewer with no file — which must explain
+// themselves instead of showing a raw pane id, and the window's own title bar.
+//
+// The title bar is here because the window is FRAMELESS on the platforms with
+// custom chrome (see Main.qml), so that bar is the only maximise and the only
+// close the pointer can reach. It is driven against a StubWindow rather than the
+// offscreen QQuickView, whose platform plugin does not model window states.
 //
 // Runs headless; the ctest registration pins the offscreen QPA, the software
 // Quick backend and Chromium's no-GPU flags (see CMakeLists.txt).
@@ -29,6 +34,8 @@
 #include <QByteArray>
 #include <QColor>
 #include <QDir>
+#include <QFile>
+#include <QHash>
 #include <QGuiApplication>
 #include <QImage>
 #include <QQmlComponent>
@@ -37,6 +44,7 @@
 #include <QQmlError>
 #include <QQuickItem>
 #include <QQuickView>
+#include <QRegularExpression>
 #include <QString>
 #include <QStringList>
 #include <QUrl>
@@ -44,6 +52,7 @@
 #include <QVariantList>
 #include <QVariantMap>
 #include <QVector>
+#include <QWindow>
 #include <QtQuickControls2/QQuickStyle>
 #include <QtWebEngineQuick/QtWebEngineQuick>
 
@@ -199,6 +208,45 @@ private:
     QString m_activeSessionId;
 };
 
+// A stand-in for the window AppTitleBar drives. The bar's whole job is to do
+// what the window manager used to do, so what a test can observe is the STATE it
+// asks the window for: `visibility` (QWindow::Visibility values, which is what
+// QML's Window.Maximized / Window.Windowed are) and close().
+//
+// A real window would be the more faithful host, but the offscreen platform
+// plugin the suite runs under does not model maximise/minimise, so a click would
+// leave `visibility` untouched and the assertion would pass or fail on the
+// platform plugin rather than on the bar.
+class StubWindow : public QObject
+{
+    Q_OBJECT
+    Q_PROPERTY(int visibility READ visibility WRITE setVisibility NOTIFY visibilityChanged)
+
+public:
+    int visibility() const { return m_visibility; }
+    void setVisibility(int visibility)
+    {
+        if (visibility == m_visibility)
+            return;
+        m_visibility = visibility;
+        emit visibilityChanged();
+    }
+
+    Q_INVOKABLE void close() { ++m_closeCalls; }
+    // The bar calls this on a drag; it must exist or the drag would raise a
+    // TypeError the warning net would then report.
+    Q_INVOKABLE bool startSystemMove() { return true; }
+
+    int closeCalls() const { return m_closeCalls; }
+
+signals:
+    void visibilityChanged();
+
+private:
+    int m_visibility = int(QWindow::Windowed);
+    int m_closeCalls = 0;
+};
+
 namespace {
 
 // A shown QQuickView over one component, with the QML warning net attached.
@@ -210,11 +258,7 @@ public:
 
     Surface(const QUrl &url, const QSize &size, QObject *app = nullptr)
     {
-        QObject::connect(view.engine(), &QQmlEngine::warnings, view.engine(),
-                         [this](const QList<QQmlError> &list) {
-                             for (const QQmlError &error : list)
-                                 warnings.append(error.toString());
-                         });
+        catchWarnings();
         if (app)
             view.rootContext()->setContextProperty(QStringLiteral("app"), app);
         view.setResizeMode(QQuickView::SizeRootObjectToView);
@@ -222,7 +266,32 @@ public:
         view.setSource(url);
     }
 
+    // The same, over an INLINE document. Some shipped components need a host:
+    // AppTitleBar drives the window it is shown in, so a test has to hand it a
+    // window it can observe rather than the offscreen QQuickView itself, whose
+    // maximise/minimise states the offscreen platform plugin does not model.
+    // `contextObject` is exposed to the document under `contextName`.
+    Surface(const QByteArray &document, const QSize &size, const QString &contextName,
+            QObject *contextObject)
+    {
+        catchWarnings();
+        if (contextObject)
+            view.rootContext()->setContextProperty(contextName, contextObject);
+        view.setResizeMode(QQuickView::SizeRootObjectToView);
+        view.resize(size);
+
+        // Parented to the engine: QQuickView keeps the raw pointer for status().
+        auto *component = new QQmlComponent(view.engine(), view.engine());
+        const QUrl url(QStringLiteral("qrc:/qt/qml/CodeHarbor/UxHarness.qml"));
+        component->setData(document, url);
+        m_componentError = component->errorString();
+        if (QObject *root = component->create(view.rootContext()))
+            view.setContent(url, component, root);
+    }
+
     QQuickItem *root() const { return view.rootObject(); }
+
+    QString componentError() const { return m_componentError; }
 
     bool expose()
     {
@@ -237,6 +306,18 @@ public:
         return QStringLiteral("%1 QML warning(s):\n  * ").arg(warnings.size())
                 + warnings.join(QStringLiteral("\n  * "));
     }
+
+private:
+    void catchWarnings()
+    {
+        QObject::connect(view.engine(), &QQmlEngine::warnings, view.engine(),
+                         [this](const QList<QQmlError> &list) {
+                             for (const QQmlError &error : list)
+                                 warnings.append(error.toString());
+                         });
+    }
+
+    QString m_componentError;
 };
 
 void settle(int ms = 120)
@@ -298,7 +379,7 @@ Item {
     width: 900
     height: 560
 
-    Rectangle { anchors.fill: parent; color: "#1e1e2e" }
+    Rectangle { anchors.fill: parent; color: Theme.surface }
 
     CommandPalette {
         id: palette
@@ -322,6 +403,54 @@ Item {
     function openPalette() { palette.open(); }
 }
 )QML";
+}
+
+// The title bar drives a window, so it gets one: `stubWindow` is the C++
+// StubWindow, exposed as a context property by Surface's inline-document
+// constructor. accessibleName() exists because Accessible.name is an attached
+// QML property with no reachable C++ accessor — the assertion has to be made
+// from inside the document.
+QByteArray titleBarHarness()
+{
+    return R"QML(
+import QtQuick
+import CodeHarbor
+
+Item {
+    id: harness
+    width: 640
+    height: 120
+
+    Rectangle { anchors.fill: parent; color: Theme.surface }
+
+    function accessibleName(item) { return item ? String(item.Accessible.name) : ""; }
+
+    AppTitleBar {
+        id: bar
+        objectName: "titleBar"
+        anchors.left: parent.left
+        anchors.right: parent.right
+        anchors.top: parent.top
+        // Rectangle does not adopt its own implicitHeight, exactly as Main.qml
+        // has to spell out too.
+        height: bar.implicitHeight
+        win: stubWindow
+        title: "CodeHarbor"
+        sessionLabel: "codeharbor"
+    }
+}
+)QML";
+}
+
+// Accessible.name of an item in the document above.
+QString accessibleName(QObject *harness, QObject *item)
+{
+    QVariant name;
+    if (!harness || !item
+        || !QMetaObject::invokeMethod(harness, "accessibleName", Q_RETURN_ARG(QVariant, name),
+                                      Q_ARG(QVariant, QVariant::fromValue(item))))
+        return QString();
+    return name.toString();
 }
 
 // ---------------------------------------------------------------------------
@@ -397,6 +526,14 @@ int renderShots()
                             {QStringLiteral("fingerprint"),
                              QStringLiteral("SHA256:6dGRJ0mCkQeAxQ0nQ0mm2b3xk0e3iF0jnq0oO3pP1qQ")}});
         ok &= grab(surface.view, dir, QStringLiteral("connect-hostkey"));
+    }
+    { // The window's own title bar, windowed and maximised.
+        StubWindow stub;
+        Surface surface(titleBarHarness(), QSize(900, 120), QStringLiteral("stubWindow"), &stub);
+        ok &= surface.expose();
+        ok &= grab(surface.view, dir, QStringLiteral("titlebar-windowed"));
+        stub.setVisibility(int(QWindow::Maximized));
+        ok &= grab(surface.view, dir, QStringLiteral("titlebar-maximised"));
     }
     { // Sidebar with nothing in it and no server.
         ch::SessionsModel model;
@@ -476,6 +613,7 @@ private slots:
     // actually publishes, or a failed/reconnecting link reads as "idle".
     void sheetStatusMatchesTheStatesTheAppPublishes_data();
     void sheetStatusMatchesTheStatesTheAppPublishes();
+    void everyPublishedStateHasASheetRowAndAGlyph();
 
     // The sheet's own chrome must be unreachable — by pointer AND by keyboard —
     // while a host-key or credential prompt is waiting on the user.
@@ -497,7 +635,80 @@ private slots:
     // A pane with nothing behind it explains itself instead of showing an id.
     void inertTerminalPaneExplainsItself();
     void emptyViewerPaneExplainsItself();
+
+    // The window is frameless on the platforms with custom chrome, so the title
+    // bar IS the window controls: if its maximise button does not change the
+    // window state, or its close button is invisible to a screen reader, the
+    // window has become unusable in a way no other test would notice.
+    void titleBarMaximiseButtonTogglesTheWindowState();
+    void titleBarButtonsAreNamedAndCloseIsWired();
 };
+
+// The states ch::AppController publishes, read out of the SOURCE rather than
+// listed here by hand.
+//
+// The hand-written list this replaces was stale by convention: it silently
+// passed while the newest state ("provisioning") had no wording in either
+// surface, which is the exact defect these tests exist to catch. A scan of the
+// one function that publishes them cannot go stale. Same mechanism as
+// src/models/tests/tst_models.cpp, which reads the agent-state words out of the
+// TypeScript that defines them.
+//
+// Fails loudly rather than returning an empty set: a test that quietly checks
+// nothing is worse than no test.
+static QStringList publishedConnectionStates()
+{
+    const QString path = QStringLiteral(CH_REPO_ROOT "/src/app/AppController.cpp");
+    QFile source(path);
+    if (!source.open(QIODevice::ReadOnly | QIODevice::Text)) {
+        qFatal("cannot open %s: %s", qUtf8Printable(path),
+               qUtf8Printable(source.errorString()));
+    }
+    const QString text = QString::fromUtf8(source.readAll());
+
+    // Escaped rather than a raw string literal: moc's own preprocessor cannot
+    // parse a raw string used as a macro argument.
+    static const QRegularExpression re(
+            QStringLiteral("setConnectionState\\(QStringLiteral\\(\"([a-z]+)\"\\)"));
+    QStringList states;
+    QRegularExpressionMatchIterator it = re.globalMatch(text);
+    while (it.hasNext()) {
+        const QString state = it.next().captured(1);
+        if (!states.contains(state))
+            states << state;
+    }
+    if (states.isEmpty())
+        qFatal("no setConnectionState literals found in %s", qUtf8Printable(path));
+    states.sort();
+    return states;
+}
+
+// Expected status-chip rendering per connection state. A colour is a design
+// decision, so it cannot be scanned out of the source the way the state NAMES
+// can — but the two halves are joined here rather than listed twice: the data
+// function walks publishedConnectionStates() and looks each one up in this map,
+// so a state added to ch::AppController with no entry here fails the test with a
+// message telling you to add one, instead of quietly never being exercised.
+struct ChipExpectation {
+    const char *colour = nullptr;
+    bool busy = false;
+};
+
+static QHash<QString, ChipExpectation> chipExpectations()
+{
+    return {
+        {QStringLiteral("disconnected"), {"#6c7086", false}},
+        {QStringLiteral("connecting"), {"#f9e2af", true}},
+        {QStringLiteral("hostkey"), {"#f9e2af", true}},
+        {QStringLiteral("credential"), {"#f9e2af", true}},
+        // Installing the remote service on first connect: in progress, so it
+        // reads like connecting rather than like a fault.
+        {QStringLiteral("provisioning"), {"#f9e2af", true}},
+        {QStringLiteral("connected"), {"#a6e3a1", false}},
+        {QStringLiteral("reconnecting"), {"#fab387", true}},
+        {QStringLiteral("failed"), {"#f38ba8", false}},
+    };
+}
 
 void TstUxShell::sheetStatusMatchesTheStatesTheAppPublishes_data()
 {
@@ -505,16 +716,16 @@ void TstUxShell::sheetStatusMatchesTheStatesTheAppPublishes_data()
     QTest::addColumn<QString>("colour");
     QTest::addColumn<bool>("busy");
 
-    // The exact strings ch::AppController::setConnectionState() emits — all
-    // SEVEN of them. "credential" was missing here while the sheet grew a case
-    // for it, which is exactly the drift this table exists to catch.
-    QTest::newRow("disconnected") << "disconnected" << "#6c7086" << false;
-    QTest::newRow("connecting") << "connecting" << "#f9e2af" << true;
-    QTest::newRow("hostkey") << "hostkey" << "#f9e2af" << true;
-    QTest::newRow("credential") << "credential" << "#f9e2af" << true;
-    QTest::newRow("connected") << "connected" << "#a6e3a1" << false;
-    QTest::newRow("reconnecting") << "reconnecting" << "#fab387" << true;
-    QTest::newRow("failed") << "failed" << "#f38ba8" << false;
+    const QHash<QString, ChipExpectation> expected = chipExpectations();
+    for (const QString &state : publishedConnectionStates()) {
+        const ChipExpectation e = expected.value(state);
+        // An unknown state yields an EMPTY expected colour, which the test body
+        // turns into a clear failure naming the state.
+        QTest::newRow(qUtf8Printable(state))
+                << state
+                << QString::fromUtf8(e.colour ? e.colour : "")
+                << e.busy;
+    }
 }
 
 void TstUxShell::sheetStatusMatchesTheStatesTheAppPublishes()
@@ -522,6 +733,12 @@ void TstUxShell::sheetStatusMatchesTheStatesTheAppPublishes()
     QFETCH(QString, state);
     QFETCH(QString, colour);
     QFETCH(bool, busy);
+
+    QVERIFY2(!colour.isEmpty(),
+             qPrintable(QStringLiteral("ch::AppController publishes the connection state "
+                                       "\"%1\" but chipExpectations() in this file has no "
+                                       "entry for it, so nothing checks how it is drawn")
+                                .arg(state)));
 
     Surface surface(moduleUrl(QStringLiteral("ConnectSheet.qml")), QSize(900, 560));
     QVERIFY(surface.expose());
@@ -542,6 +759,45 @@ void TstUxShell::sheetStatusMatchesTheStatesTheAppPublishes()
     // Whatever the colour says, the state is also spelled out in words.
     QVERIFY2(!textOf(surface.child(QStringLiteral("stateLabel"))).isEmpty(),
              "the connection state is conveyed by colour alone");
+
+    QVERIFY2(surface.warnings.isEmpty(), qPrintable(surface.warningReport()));
+}
+
+// The table above cannot be derived (a colour is a design decision, not
+// something a scan can read), so this is what stops it going stale: every state
+// the application actually publishes must have a row there, and the sheet must
+// give it a glyph of its own rather than falling through to the "nothing is
+// running" en dash. Both halves matter — a state missing from the table is
+// untested, and a state the sheet does not recognise is drawn as if the
+// application were idle.
+void TstUxShell::everyPublishedStateHasASheetRowAndAGlyph()
+{
+    const QStringList published = publishedConnectionStates();
+    QVERIFY(!published.isEmpty());
+
+    Surface surface(moduleUrl(QStringLiteral("ConnectSheet.qml")), QSize(900, 560));
+    QVERIFY(surface.expose());
+    QQuickItem *root = surface.root();
+    QVERIFY(root);
+
+    // "disconnected" IS the fall-through, so it is the one state allowed to
+    // render as the idle dash; every other one needs its own glyph.
+    root->setProperty("connectionState", QStringLiteral("disconnected"));
+    settle(40);
+    QObject *dot = surface.child(QStringLiteral("stateDot"));
+    QVERIFY2(dot, "the connection status chip has no stateDot");
+    const QColor idleColour = dot->property("color").value<QColor>();
+
+    for (const QString &state : published) {
+        if (state == QStringLiteral("disconnected"))
+            continue;
+        root->setProperty("connectionState", state);
+        settle(40);
+        QVERIFY2(dot->property("color").value<QColor>() != idleColour,
+                 qPrintable(QStringLiteral("the sheet paints \"%1\" exactly as it paints "
+                                           "\"disconnected\", so it has no case for it")
+                                    .arg(state)));
+    }
 
     QVERIFY2(surface.warnings.isEmpty(), qPrintable(surface.warningReport()));
 }
@@ -610,14 +866,11 @@ void TstUxShell::sidebarFooterNamesEveryConnectionState_data()
 {
     QTest::addColumn<QString>("state");
 
-    // Every word ch::AppController::setConnectionState() publishes.
-    QTest::newRow("disconnected") << "disconnected";
-    QTest::newRow("connecting") << "connecting";
-    QTest::newRow("hostkey") << "hostkey";
-    QTest::newRow("credential") << "credential";
-    QTest::newRow("connected") << "connected";
-    QTest::newRow("reconnecting") << "reconnecting";
-    QTest::newRow("failed") << "failed";
+    // Derived from the source, never listed here: a state added to
+    // AppController with no wording in the footer must fail this test rather
+    // than wait for somebody to remember to add a row.
+    for (const QString &state : publishedConnectionStates())
+        QTest::newRow(qUtf8Printable(state)) << state;
 }
 
 // Once the connection sheet is closed the sidebar footer is the ONLY thing on
@@ -766,6 +1019,80 @@ void TstUxShell::emptyViewerPaneExplainsItself()
     QObject *hint = surface.child(QStringLiteral("emptyHint"));
     QVERIFY2(hint, "an empty viewer pane does not say how to fill it");
     QVERIFY(textOf(hint).length() > 10);
+
+    QVERIFY2(surface.warnings.isEmpty(), qPrintable(surface.warningReport()));
+}
+
+void TstUxShell::titleBarMaximiseButtonTogglesTheWindowState()
+{
+    StubWindow stub;
+    Surface surface(titleBarHarness(), QSize(640, 120), QStringLiteral("stubWindow"), &stub);
+    QVERIFY2(surface.root(), qPrintable(surface.componentError()));
+    QVERIFY(surface.expose());
+    settle(60);
+
+    QObject *maximise = surface.child(QStringLiteral("maximiseButton"));
+    QVERIFY2(maximise, "the title bar has no maximise button");
+    QCOMPARE(stub.visibility(), int(QWindow::Windowed));
+
+    // The button's own name is the ACTION it will perform, so it has to change
+    // with the state: "Maximise window" on a window that is already maximised is
+    // what a screen-reader user would act on.
+    QCOMPARE(accessibleName(surface.root(), maximise), QStringLiteral("Maximise window"));
+
+    QMetaObject::invokeMethod(maximise, "clicked");
+    settle(60);
+    QCOMPARE(stub.visibility(), int(QWindow::Maximized));
+    QCOMPARE(accessibleName(surface.root(), maximise), QStringLiteral("Restore window"));
+
+    QMetaObject::invokeMethod(maximise, "clicked");
+    settle(60);
+    QCOMPARE(stub.visibility(), int(QWindow::Windowed));
+
+    // The bar's own double-click handler calls exactly this, so the gesture and
+    // the button cannot drift apart.
+    QObject *bar = surface.child(QStringLiteral("titleBar"));
+    QVERIFY(bar);
+    QVERIFY(QMetaObject::invokeMethod(bar, "toggleMaximised"));
+    settle(60);
+    QCOMPARE(stub.visibility(), int(QWindow::Maximized));
+
+    QVERIFY2(surface.warnings.isEmpty(), qPrintable(surface.warningReport()));
+}
+
+void TstUxShell::titleBarButtonsAreNamedAndCloseIsWired()
+{
+    StubWindow stub;
+    Surface surface(titleBarHarness(), QSize(640, 120), QStringLiteral("stubWindow"), &stub);
+    QVERIFY2(surface.root(), qPrintable(surface.componentError()));
+    QVERIFY(surface.expose());
+    settle(60);
+
+    // Every window control is a glyph with no text, so Accessible.name is the
+    // ONLY thing that says what it does.
+    const QStringList buttons{QStringLiteral("minimiseButton"), QStringLiteral("maximiseButton"),
+                              QStringLiteral("closeButton")};
+    for (const QString &name : buttons) {
+        QObject *button = surface.child(name);
+        QVERIFY2(button, qPrintable(QStringLiteral("the title bar has no %1").arg(name)));
+        QVERIFY2(!accessibleName(surface.root(), button).isEmpty(),
+                 qPrintable(QStringLiteral("%1 has no Accessible.name, so a screen reader "
+                                           "announces an unlabelled button")
+                                    .arg(name)));
+    }
+
+    // ...and the destructive one actually closes the window it was handed. A
+    // frameless window has no other pointer route out.
+    QCOMPARE(stub.closeCalls(), 0);
+    QMetaObject::invokeMethod(surface.child(QStringLiteral("closeButton")), "clicked");
+    settle(60);
+    QCOMPARE(stub.closeCalls(), 1);
+
+    // The session in front of the user is named beside the window title, not left
+    // to the pane headers alone.
+    QCOMPARE(textOf(surface.child(QStringLiteral("windowTitleLabel"))),
+             QStringLiteral("CodeHarbor"));
+    QCOMPARE(textOf(surface.child(QStringLiteral("sessionLabel"))), QStringLiteral("codeharbor"));
 
     QVERIFY2(surface.warnings.isEmpty(), qPrintable(surface.warningReport()));
 }

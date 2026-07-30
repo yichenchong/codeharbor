@@ -21,6 +21,7 @@
 
 #include <QtTest>
 
+#include <QColor>
 #include <QCoreApplication>
 #include <QDebug>
 #include <QGuiApplication>
@@ -491,6 +492,10 @@ private slots:
 
     // 4. The contract that makes (2) possible: no node -> no instantiation.
     void regionWithoutNodeCreatesNothing();
+
+    // 5. The Theme singleton must actually RESOLVE. A mis-registered QML
+    //    singleton is silent, not loud: see the test body.
+    void themeSingletonResolves();
 };
 
 void TstQmlLoad::init()
@@ -506,6 +511,47 @@ void TstQmlLoad::cleanup()
 {
     qInstallMessageHandler(g_previousHandler);
     g_previousHandler = nullptr;
+}
+
+// Every colour and metric in the module comes from the `Theme` singleton, and a
+// broken singleton registration is the one QML defect this file's warning nets
+// cannot see. `import CodeHarbor` still succeeds without the
+// QT_QML_SINGLETON_TYPE source property (or without `pragma Singleton`), and
+// `Theme.surface` then evaluates to undefined — which a `color` property reads
+// back as an INVALID colour, i.e. black, with nothing logged. The whole window
+// would come up in the Basic style's light defaults and every other test here
+// would stay green, so the value is asserted rather than merely the resolution.
+void TstQmlLoad::themeSingletonResolves()
+{
+    ShellFixture fixture;
+
+    QQmlComponent component(&fixture.engine);
+    component.setData(QByteArrayLiteral("import QtQuick\n"
+                                        "import CodeHarbor\n"
+                                        "QtObject {\n"
+                                        "    readonly property color surface: Theme.surface\n"
+                                        "    readonly property int headerHeight: Theme.headerHeight\n"
+                                        "    readonly property string monoFamily: Theme.monoFamily\n"
+                                        "}\n"),
+                      moduleUrl(QStringLiteral("ThemeProbe.qml")));
+    QVERIFY2(!component.isError(), qPrintable(component.errorString()));
+
+    const std::unique_ptr<QObject> probe(component.create(fixture.engine.rootContext()));
+    QVERIFY2(probe != nullptr, qPrintable(component.errorString()));
+
+    const QColor surface = probe->property("surface").value<QColor>();
+    QVERIFY2(surface.isValid(),
+             "Theme.surface did not resolve to a colour: the QML singleton registration in "
+             "src/qml/CMakeLists.txt and the `pragma Singleton` in src/qml/Theme.qml disagree");
+    QCOMPARE(surface, QColor(QStringLiteral("#1e1e2e")));
+
+    // A metric and a string role too, so the check covers more than one property
+    // type reading back a plausible-looking default.
+    QVERIFY2(probe->property("headerHeight").toInt() > 0, "Theme.headerHeight resolved to 0");
+    QVERIFY2(!probe->property("monoFamily").toString().isEmpty(),
+             "Theme.monoFamily resolved to an empty string");
+
+    QVERIFY2(fixture.allWarnings().isEmpty(), qPrintable(fixture.warningReport()));
 }
 
 void TstQmlLoad::loadsRealApplicationTreeWithoutWarnings()
@@ -541,15 +587,30 @@ void TstQmlLoad::loadsRealApplicationTreeWithoutWarnings()
     settle();
 
     // SPEC 4.5: the recursive region types start out empty on purpose, so the
-    // "always at least one pane" guarantee is now Main.qml's job. Prove Main
-    // actually discharges it — one viewer pane and one terminal pane, carrying
-    // the documented default ids.
+    // "always at least one pane" guarantee is Main.qml's job. Prove Main actually
+    // discharges it — and with the layout the application now defaults to: ONE
+    // viewer pane, and TWO terminal panes (one above the other), which is what a
+    // terminal region is for.
     QList<PaneInfo> panes;
     collectPanes(root, panes);
-    QVERIFY2(paneIds(panes)
-                     == (QStringList{QStringLiteral("terminal-1"), QStringLiteral("viewer-1")}),
+    const QStringList expectedPanes{QStringLiteral("terminal-1"), QStringLiteral("terminal-2"),
+                                    QStringLiteral("viewer-1")};
+    QVERIFY2(paneIds(panes) == expectedPanes,
              qPrintable(QStringLiteral("Main.qml did not supply the SPEC 4.5 default panes; found: %1\n%2")
                             .arg(describePanes(panes), treeReport(root))));
+
+    // ...and the terminal default is a VERTICAL split, i.e. the two panes are
+    // stacked, not side by side. The pane list above cannot tell those apart.
+    const QVariantMap terminalFallback = root->property("terminalFallbackNode").toMap();
+    QCOMPARE(terminalFallback.value(QStringLiteral("orientation")).toString(),
+             QStringLiteral("vertical"));
+    const QVariantList fallbackChildren =
+            terminalFallback.value(QStringLiteral("children")).toList();
+    QCOMPARE(fallbackChildren.size(), 2);
+    QCOMPARE(fallbackChildren.at(0).toMap().value(QStringLiteral("paneId")).toString(),
+             QStringLiteral("terminal-1"));
+    QCOMPARE(fallbackChildren.at(1).toMap().value(QStringLiteral("paneId")).toString(),
+             QStringLiteral("terminal-2"));
 
     // Bring up the two WebEngine security contexts the shipped panes bind to.
     // They are part of the shell coming up, so a warning raised while building

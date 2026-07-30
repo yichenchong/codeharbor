@@ -24,8 +24,14 @@
 <title>CodeHarbor Terminal</title>
 <link rel="stylesheet" href="terminal.css">
 <style>
+    /* COLOUR MIRROR: every colour in this stylesheet is a copy of a role in
+       src/qml/Theme.qml, which is the application's one colour vocabulary. There
+       is no import path from QML into a web page, so the two must be edited
+       TOGETHER — a change to Theme.qml that is not reflected here leaves this
+       page in the old palette. The role each literal stands for is named beside
+       it. */
     html, body { height: 100%; margin: 0; padding: 0; overflow: hidden; }
-    body { background: #11111b; color: #cdd6f4; }
+    body { background: #11111b; color: #cdd6f4; } /* surfaceSunken, text */
     /* Column layout: a status strip that only appears when the pane is NOT
        live, above a surface that takes all remaining height. FitAddon measures
        the surface, so it needs a definite height — hence flex:1 + min-height:0. */
@@ -33,18 +39,45 @@
     .ch-terminal-status {
         flex: 0 0 auto;
         padding: 2px 8px;
-        background: #181825;
-        border-bottom: 1px solid #313244;
-        color: #a6adc8;
+        background: #181825;              /* surfaceDeep */
+        border-bottom: 1px solid #313244; /* borderSubtle */
+        color: #a6adc8;                   /* no Theme role: one step brighter
+                                             than textDim, kept as it was */
         font: 11px/1.6 monospace;
     }
     /* A live shell must not lose a row to chrome; every other state stays
        visible so a failure shows as a message instead of a blank pane. */
     .ch-terminal-status[data-state="ready"] { display: none; }
+    /* The two alert backgrounds are darkened blends with no Theme role of their
+       own; the foregrounds are Theme.danger and Theme.warning. */
     .ch-terminal-status[data-state="error"] { background: #45222c; color: #f38ba8; }
     .ch-terminal-status[data-state="disconnected"],
     .ch-terminal-status[data-state="reconnecting"] { background: #3a2f1e; color: #f9e2af; }
     .ch-terminal-surface { flex: 1 1 auto; min-height: 0; }
+
+    /* ---- scrollbars ----------------------------------------------------
+       xterm.js scrolls its viewport with a NATIVE browser scrollbar, so
+       without these rules the one scrollbar inside a terminal pane is
+       Chromium's platform default: wide, light, and visibly foreign on a dark
+       pane next to the application's own styled scrollbars.
+
+       The ::-webkit-scrollbar family is used rather than the standard
+       `scrollbar-color`/`scrollbar-width` pair, and the choice is exclusive:
+       Chromium ignores the legacy pseudo-elements on any element that also
+       specifies a standard property, so the two cannot be combined. The
+       pseudo-elements are what can express the design — an exact 10px width
+       (Theme.scrollBarThickness), a fully transparent track, a rounded thumb —
+       whereas `scrollbar-width` offers only `auto`/`thin` and would leave the
+       width at the platform's choice. Both pages here run only inside Qt
+       WebEngine (Chromium), so the vendor prefix costs no portability. */
+    ::-webkit-scrollbar { width: 10px; height: 10px; }   /* scrollBarThickness */
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-corner { background: transparent; }
+    ::-webkit-scrollbar-thumb {
+        background: #45475a;  /* border */
+        border-radius: 4px;   /* radiusSmall */
+    }
+    ::-webkit-scrollbar-thumb:hover { background: #6c7086; } /* textDim */
 </style>
 </head>
 <body>

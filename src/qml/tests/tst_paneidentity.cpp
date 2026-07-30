@@ -179,6 +179,24 @@ bool isEditorPane(const QObject *object)
     return object->metaObject()->indexOfProperty("remotePath") >= 0;
 }
 
+// AppPaneHeader: the only component carrying this exact set. It is what makes a
+// pane say which file or terminal it holds and whether it is the focused one,
+// and — because it lives INSIDE the pane — it is also the thing a split could
+// most easily take down with it.
+bool isPaneHeader(const QObject *object)
+{
+    const QMetaObject *mo = object->metaObject();
+    return mo->indexOfProperty("subtitle") >= 0 && mo->indexOfProperty("busy") >= 0
+           && mo->indexOfProperty("actions") >= 0 && mo->indexOfProperty("title") >= 0;
+}
+
+// The region's own SplitView, identified by the one-shot sizing latch it and
+// nothing else carries.
+bool isRegionSplitView(const QObject *object)
+{
+    return object->metaObject()->indexOfProperty("ratiosApplied") >= 0;
+}
+
 using Predicate = std::function<bool(QObject *)>;
 
 // Walks BOTH the QObject child list and the QQuickItem visual child list: QML
@@ -228,6 +246,16 @@ QObject *paneWithId(QObject *root, const QString &paneId)
         return isLeafPane(object) && object->property("paneId").toString() == paneId;
     });
     return panes.size() == 1 ? panes.constFirst() : nullptr;
+}
+
+// The one descendant carrying `name`. Returns null when there is not exactly
+// one, so an ambiguous match fails the test rather than picking arbitrarily.
+QObject *childNamed(QObject *root, const QString &name)
+{
+    const QList<QObject *> found = collect(root, [&name](QObject *object) {
+        return object->objectName() == name;
+    });
+    return found.size() == 1 ? found.constFirst() : nullptr;
 }
 
 // A QML `var` property holding a QObject comes back either as a direct pointer
@@ -296,6 +324,28 @@ private slots:
     // session brings back the right split with a set of blank panes in it.
     void openingAFileInAPaneIsReportedToTheHost();
 
+    // HEADERS (SPEC 4.3/4.4). Both regions now put an AppPaneHeader INSIDE every
+    // pane, which is the one place a header could break the invariant this file
+    // exists to defend: a header the region owned would have to be rebuilt to
+    // follow a pane across a split, and rebuilding is what destroys the pane.
+    void paneHeaderTravelsWithThePaneAcrossASplit();
+    // The header is also the pane's focus indicator, so the region's focus has to
+    // reach it or the mark is decoration.
+    void theFocusedPaneIsTheOnlyOneMarkedActive();
+
+    // ADDRESS BAR (SPEC 7.5). The one way a user can put anything into a viewer
+    // pane. Untested it is invisible: the pane still lays out, still reports
+    // focus, and simply never opens what was typed into it.
+    void theAddressBarOpensARemotePath();
+    void theAddressBarOpensAUrlAsGiven();
+    void theAddressBarPercentEncodesADelimiterInAFileName();
+
+    // DEFAULT TERMINAL LAYOUT (SPEC 4.4/4.5). A Dev Session opens with two
+    // stacked terminal panes, so both have to come up sized and attachable from
+    // the FIRST frame — the case the one-shot sizing latch gets wrong most
+    // easily, and one a single-pane region can never exercise.
+    void twoStackedTerminalPanesComeUpFromTheFirstFrame();
+
 private:
     QObject *openRegion(const QString &file, const QVariantMap &node, bool terminal);
     void setNode(const QVariantMap &node);
@@ -306,6 +356,11 @@ private:
     bool waitForPage(QObject *paneItem, const QString &readyProbe, const QString &needle);
     // Click the middle of a pane, the way a user selects it.
     void clickPane(QObject *paneObject);
+    // Put `text` in the viewer pane's address field and press Enter on it, the
+    // way a user opens something. Driven through the FIELD rather than by calling
+    // the pane's function directly, so the field's own Enter wiring is part of
+    // what is under test.
+    void enterAddress(QObject *paneObject, const QString &text);
 
     ch::CodeharbordClient m_client;
     ch::ViewerProfiles m_profiles{&m_client};
@@ -921,6 +976,293 @@ void TstPaneIdentity::aClickInsideTheLivePageReportsFocusAndStillReachesThePage(
                        QStringLiteral("true"), kProbeTimeoutMs),
              "the focus sniffer SWALLOWED the click: the region learned which pane the user is "
              "in, but the terminal page never saw the press");
+}
+
+// ---------------------------------------------------------------------------
+// (8) The per-pane header. It lives inside the pane, so it is subject to the
+// same rule as the pane's web page: the split must RE-HOME it, never rebuild it.
+// A rebuilt header would be invisible in a screenshot and would mean the pane
+// itself had been rebuilt — the exact failure the rest of this file guards, now
+// reachable through a new object.
+// ---------------------------------------------------------------------------
+void TstPaneIdentity::paneHeaderTravelsWithThePaneAcrossASplit()
+{
+    QVERIFY(openRegion(QStringLiteral("TerminalRegion.qml"), leafNode(QStringLiteral("terminal-1")),
+                       /*terminal=*/true));
+
+    const auto panes = [this] { return collect(m_region, isLeafPane); };
+    QTRY_VERIFY(panes().size() == 1);
+    QTest::qWait(kSettleMs);
+
+    QObject *const original = panes().constFirst();
+    const QList<QObject *> headers = collect(original, isPaneHeader);
+    QVERIFY2(headers.size() == 1,
+             qPrintable(QStringLiteral("a terminal pane has %1 headers, expected exactly one; "
+                                       "without it the pane's name, state and close action are "
+                                       "only reachable from the command palette")
+                            .arg(headers.size())));
+    QObject *const header = headers.constFirst();
+    QPointer<QObject> headerGuard(header);
+
+    // The header must actually be SAYING something, or it is a blank strip that
+    // satisfies the identity check while telling the user nothing.
+    QCOMPARE(header->property("title").toString(), QStringLiteral("terminal-1"));
+    QVERIFY2(!header->property("subtitle").toString().isEmpty(),
+             "the terminal pane header does not report its connection state");
+
+    setNode(branchNode(QStringLiteral("vertical"),
+                       QVariantList{leafNode(QStringLiteral("terminal-1")),
+                                    leafNode(QStringLiteral("terminal-2"))}));
+    QTRY_VERIFY(panes().size() == 2);
+    QTest::qWait(kSettleMs);
+
+    QVERIFY2(!headerGuard.isNull(), "the split destroyed the pane's header");
+    QObject *const survivor = paneWithId(m_region, QStringLiteral("terminal-1"));
+    QCOMPARE(survivor, original);
+    const QList<QObject *> after = collect(survivor, isPaneHeader);
+    QCOMPARE(after.size(), 1);
+    QVERIFY2(after.constFirst() == header,
+             "\"terminal-1\" came out of the split with a DIFFERENT header object, so the pane "
+             "around it was rebuilt too");
+
+    // The new pane has its own header, not a share of the survivor's.
+    QObject *const fresh = paneWithId(m_region, QStringLiteral("terminal-2"));
+    QVERIFY(fresh != nullptr);
+    const QList<QObject *> freshHeaders = collect(fresh, isPaneHeader);
+    QCOMPARE(freshHeaders.size(), 1);
+    QVERIFY(freshHeaders.constFirst() != header);
+    QCOMPARE(freshHeaders.constFirst()->property("title").toString(),
+             QStringLiteral("terminal-2"));
+}
+
+// The header's `active` mark is the only thing on screen that answers "where
+// will the next split land". It is pushed from the region (applyFocusFlags), so
+// a broken push leaves every pane looking equally focused — which is worse than
+// no mark, because it is confidently wrong.
+void TstPaneIdentity::theFocusedPaneIsTheOnlyOneMarkedActive()
+{
+    QVERIFY(openRegion(QStringLiteral("ViewerRegion.qml"),
+                       branchNode(QStringLiteral("horizontal"),
+                                  QVariantList{leafNode(QStringLiteral("viewer-1")),
+                                               leafNode(QStringLiteral("viewer-2"))}),
+                       /*terminal=*/false));
+    const auto panes = [this] { return collect(m_region, isLeafPane); };
+    QTRY_VERIFY(panes().size() == 2);
+    QTest::qWait(kSettleMs);
+
+    QObject *const first = paneWithId(m_region, QStringLiteral("viewer-1"));
+    QObject *const second = paneWithId(m_region, QStringLiteral("viewer-2"));
+    QVERIFY(first && second);
+
+    // Nothing touched yet: no pane may claim the mark.
+    QVERIFY2(!first->property("paneActive").toBool() && !second->property("paneActive").toBool(),
+             "a pane nobody has touched already shows itself as focused");
+
+    clickPane(second);
+    QTRY_VERIFY(second->property("paneActive").toBool());
+    QVERIFY2(!first->property("paneActive").toBool(),
+             "both panes show as focused, so the mark says nothing");
+
+    clickPane(first);
+    QTRY_VERIFY(first->property("paneActive").toBool());
+    QVERIFY2(!second->property("paneActive").toBool(),
+             "the mark did not leave the pane the user moved away from");
+
+    // The mark reaches the header, not just the pane: a flag no header reads is
+    // invisible to the user.
+    const QList<QObject *> headers = collect(first, isPaneHeader);
+    QCOMPARE(headers.size(), 1);
+    QVERIFY2(headers.constFirst()->property("active").toBool(),
+             "the focused pane's header does not show the focus mark");
+}
+
+// ---------------------------------------------------------------------------
+// (9) The address bar. Before it there was NO path from a running client to a
+// file in a viewer pane at all: the sidebar lists Dev Sessions, and the palette
+// only splits and closes panes. So this is the feature, not a convenience.
+// ---------------------------------------------------------------------------
+void TstPaneIdentity::enterAddress(QObject *paneObject, const QString &text)
+{
+    QObject *const field = childNamed(paneObject, QStringLiteral("viewerAddressField"));
+    QVERIFY2(field != nullptr, "the viewer pane has no address field, so nothing can be opened "
+                               "in it");
+    auto *window = qobject_cast<QQuickWindow *>(m_shell.get());
+    QVERIFY2(window != nullptr, "the test shell is not a window");
+
+    // CLICKED, not focused programmatically. The pane lays a full-size click
+    // sniffer over everything it contains (it is how focus is detected inside a
+    // WebEngine page) and that sniffer DECLINES the press so it falls through. If
+    // it ever stopped declining, the address bar would be unfocusable by mouse —
+    // i.e. unusable — while every other assertion here still passed.
+    auto *item = qobject_cast<QQuickItem *>(field);
+    QVERIFY(item != nullptr);
+    QVERIFY2(item->width() > 4 && item->height() > 4,
+             qPrintable(QStringLiteral("the address field has no area: %1x%2")
+                            .arg(item->width())
+                            .arg(item->height())));
+    field->setProperty("text", text);
+    const QPointF centre = item->mapToScene(QPointF(item->width() / 2, item->height() / 2));
+    QTest::mouseClick(window, Qt::LeftButton, Qt::NoModifier, centre.toPoint());
+    QTRY_VERIFY2(field->property("activeFocus").toBool(),
+                 "clicking the address field did not give it the keyboard, so nothing can be "
+                 "typed into it");
+    QTest::keyClick(window, Qt::Key_Return);
+}
+
+void TstPaneIdentity::theAddressBarOpensARemotePath()
+{
+    QVERIFY(openRegion(QStringLiteral("ViewerRegion.qml"), leafNode(QStringLiteral("viewer-1")),
+                       /*terminal=*/false));
+    const auto panes = [this] { return collect(m_region, isLeafPane); };
+    QTRY_VERIFY(panes().size() == 1);
+    QTest::qWait(kSettleMs);
+    QObject *const pane = panes().constFirst();
+
+    // The host is told too, or the Dev Session reopens blank however well the
+    // pane itself behaved.
+    QSignalSpy reported(m_region, SIGNAL(paneUrlReported(QString, QString)));
+    QVERIFY(reported.isValid());
+
+    // A path with no trailing slash is probed with file.listDirectory first (only
+    // the server knows whether it is a directory). This ViewerModel has no
+    // client, so the probe fails immediately and the path is opened as a file —
+    // which is exactly the branch a hand-typed file path takes against a real
+    // server too.
+    enterAddress(pane, QStringLiteral("/srv/repos/app/README.md"));
+
+    QTRY_COMPARE(pane->property("url").toUrl(),
+                 QUrl(QStringLiteral("file:///srv/repos/app/README.md")));
+    // file:// inside CodeHarbor always means the REMOTE server, so the pane must
+    // have resolved a bare path to that spelling and not to a local one.
+    QCOMPARE(pane->property("kind").toString(), QStringLiteral("markdown"));
+
+    QTRY_VERIFY2(reported.size() >= 1,
+                 "the pane opened the address but never told the host, so the Dev Session would "
+                 "reopen without it");
+    const QList<QVariant> arguments = reported.constLast();
+    QCOMPARE(arguments.at(0).toString(), QStringLiteral("viewer-1"));
+    QCOMPARE(arguments.at(1).toString(), QStringLiteral("file:///srv/repos/app/README.md"));
+}
+
+void TstPaneIdentity::theAddressBarOpensAUrlAsGiven()
+{
+    QVERIFY(openRegion(QStringLiteral("ViewerRegion.qml"), leafNode(QStringLiteral("viewer-1")),
+                       /*terminal=*/false));
+    const auto panes = [this] { return collect(m_region, isLeafPane); };
+    QTRY_VERIFY(panes().size() == 1);
+    QTest::qWait(kSettleMs);
+    QObject *const pane = panes().constFirst();
+
+    // An address that already carries a scheme is NOT a remote path and must not
+    // be turned into one — "file:///https://example.com/" would be a nonsense
+    // remote read, and the sandboxed external profile is what such a page belongs
+    // on (SPEC 7.2).
+    enterAddress(pane, QStringLiteral("https://example.com/docs"));
+
+    QTRY_COMPARE(pane->property("url").toUrl(),
+                 QUrl(QStringLiteral("https://example.com/docs")));
+    QCOMPARE(pane->property("kind").toString(), QStringLiteral("web"));
+}
+
+void TstPaneIdentity::theAddressBarPercentEncodesADelimiterInAFileName()
+{
+    QVERIFY(openRegion(QStringLiteral("ViewerRegion.qml"), leafNode(QStringLiteral("viewer-1")),
+                       /*terminal=*/false));
+    const auto panes = [this] { return collect(m_region, isLeafPane); };
+    QTRY_VERIFY(panes().size() == 1);
+    QTest::qWait(kSettleMs);
+    QObject *const pane = panes().constFirst();
+
+    // "#" is a URL delimiter, so a remote file whose name contains one only
+    // survives the round trip if every path SEGMENT is percent-encoded — which is
+    // what makes fileUrlFor() the exact inverse of the remotePath() decoding the
+    // views do. encodeURI() would leave the "#" alone and silently turn the rest
+    // of the name into a fragment, i.e. read the wrong file.
+    enterAddress(pane, QStringLiteral("/tmp/notes#1.txt"));
+
+    QTRY_COMPARE(pane->property("url").toUrl().toString(QUrl::FullyEncoded),
+                 QStringLiteral("file:///tmp/notes%231.txt"));
+    // ...and it decodes back to the path the user typed, which is what the RPC
+    // layer is handed.
+    QCOMPARE(pane->property("url").toUrl().toLocalFile(), QStringLiteral("/tmp/notes#1.txt"));
+}
+
+// ---------------------------------------------------------------------------
+// (10) The default terminal layout: two panes, one above the other, present
+// from the very first frame. That is the case the one-shot sizing latch gets
+// wrong most easily — SplitView stretches only its FIRST fill item, so a latch
+// that never fires leaves the second pane at a Loader's implicit size of zero,
+// and a zero-height terminal is invisible AND unclickable while the region still
+// reports two panes with the right ids.
+// ---------------------------------------------------------------------------
+void TstPaneIdentity::twoStackedTerminalPanesComeUpFromTheFirstFrame()
+{
+    // Exactly Main.qml's terminal fallback tree: terminal-1 above terminal-2.
+    QVERIFY(openRegion(QStringLiteral("TerminalRegion.qml"),
+                       branchNode(QStringLiteral("vertical"),
+                                  QVariantList{leafNode(QStringLiteral("terminal-1")),
+                                               leafNode(QStringLiteral("terminal-2"))}),
+                       /*terminal=*/true));
+
+    const auto panes = [this] { return collect(m_region, isLeafPane); };
+    QTRY_VERIFY2(panes().size() == 2,
+                 qPrintable(QStringLiteral("the default two-pane layout produced %1 panes: %2")
+                                .arg(panes().size())
+                                .arg(describePanes(panes()))));
+    QTest::qWait(kSettleMs);
+
+    const QList<QObject *> splitViews = collect(m_region, isRegionSplitView);
+    QCOMPARE(splitViews.size(), 1);
+    QVERIFY2(splitViews.constFirst()->property("ratiosApplied").toBool(),
+             "the one-shot sizing latch never fired for a region that started with two panes, so "
+             "the second pane has no preferred size");
+
+    auto *top = qobject_cast<QQuickItem *>(paneWithId(m_region, QStringLiteral("terminal-1")));
+    auto *bottom = qobject_cast<QQuickItem *>(paneWithId(m_region, QStringLiteral("terminal-2")));
+    QVERIFY(top && bottom);
+
+    // Both are real panes with area, not one pane and one sliver.
+    for (QQuickItem *pane : {top, bottom}) {
+        QVERIFY2(pane->width() > 4 && pane->height() > 4,
+                 qPrintable(QStringLiteral("pane \"%1\" came up %2x%3")
+                                .arg(pane->property("paneId").toString())
+                                .arg(pane->width())
+                                .arg(pane->height())));
+    }
+
+    // One UP and one DOWN, in the order the tree names them.
+    const QPointF topAt = top->mapToItem(nullptr, QPointF(0, 0));
+    const QPointF bottomAt = bottom->mapToItem(nullptr, QPointF(0, 0));
+    QVERIFY2(topAt.y() + top->height() <= bottomAt.y() + 1,
+             qPrintable(QStringLiteral("terminal-1 is not above terminal-2: %1 vs %2")
+                            .arg(topAt.y())
+                            .arg(bottomAt.y())));
+
+    // Equal shares, modulo the drag handle SplitView takes out of one of them.
+    // An unapplied latch fails this by the whole region height, not by a pixel.
+    QVERIFY2(qAbs(top->height() - bottom->height()) <= 12,
+             qPrintable(QStringLiteral("the two default panes are %1 and %2 high, which is not "
+                                       "an even split")
+                            .arg(top->height())
+                            .arg(bottom->height())));
+
+    // Each pane drives its OWN terminal. Two panes sharing a controller would
+    // show the same shell twice and close one PTY when either went away.
+    QObject *const topController = asObject(top->property("controller"));
+    QObject *const bottomController = asObject(bottom->property("controller"));
+    QVERIFY2(topController != nullptr && bottomController != nullptr,
+             "a default pane never minted its controller, so it can never attach a shell");
+    QVERIFY2(topController != bottomController,
+             "both default panes share one TerminalController");
+    QCOMPARE(top->property("terminalId").toString(), QStringLiteral("terminal-1"));
+    QCOMPARE(bottom->property("terminalId").toString(), QStringLiteral("terminal-2"));
+
+    // And both are reachable: a pane that is present but unclickable cannot be
+    // the target of a split or close.
+    clickPane(bottom);
+    QTRY_COMPARE(m_region->property("focusedPaneId").toString(), QStringLiteral("terminal-2"));
+    clickPane(top);
+    QTRY_COMPARE(m_region->property("focusedPaneId").toString(), QStringLiteral("terminal-1"));
 }
 
 // QTEST_MAIN cannot be used: registerUrlScheme() and QtWebEngineQuick::initialize()

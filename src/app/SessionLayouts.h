@@ -38,6 +38,13 @@ namespace ch {
 // fabricated single-pane layout would invite the user to edit it and overwrite
 // their real one.
 //
+// A region the server has NO row for is a different case from a failed one: the
+// region default (see defaultTree()) is adopted AND written back, so a brand
+// new Dev Session's layout - two stacked terminal panes and one viewer pane -
+// is in the database from the first time the session is opened rather than
+// re-derived on every load. That write is idempotent: it creates the row, so
+// the next load reads it and seeds nothing.
+//
 // Signal discipline (matters: the QML regions rebuild their delegates, and
 // therefore destroy and recreate live panes, whenever the tree object changes):
 //   * load(), splitPane() and closePane() DO emit viewerTreeChanged /
@@ -155,11 +162,22 @@ private:
     // anything else.
     int regionIndex(const QString& region);
     static Region regionEnum(int index);
-    // "viewer-1" / "terminal-1": the deterministic single-pane fallback for a
-    // region with no persisted layout. Matches the paneIds Main.qml used while
-    // layouts were hardcoded, so a fresh Dev Session opens with the very same
-    // panes it had before layouts were persisted.
-    static QString defaultPaneId(int index);
+    // The layout a region starts with when the server has no row for it.
+    //
+    // Viewer: one leaf, "viewer-1".
+    // Terminal: TWO leaves, "terminal-1" above "terminal-2", evenly split — a
+    // "vertical" branch stacks its children top to bottom (SplitTree.cpp, and
+    // TerminalRegion.qml maps "vertical" to Qt.Vertical). A single terminal was
+    // never a considered default, only the smallest thing that rendered: real
+    // work on a remote box is one shell running something and a second to look
+    // at it, and reaching the second one meant finding "Split Terminal Pane" in
+    // the command palette.
+    //
+    // The pane ids stay "<region>-<n>" with n starting at 1, so splitPane()'s
+    // collectMaxPaneSuffix() hands out "terminal-3" next, and a Dev Session
+    // created before this change keeps the panes it already has (its layout row
+    // exists and is loaded verbatim).
+    static SplitNode defaultTree(int index);
 
     void applyLoadedTree(quint64 generation, int index,
                          std::optional<SplitNode> tree,

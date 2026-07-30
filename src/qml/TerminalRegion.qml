@@ -24,7 +24,7 @@ import QtQuick.Controls.Basic
 // in a position to tell "this pane moved" from "this pane was closed".
 Rectangle {
     id: region
-    color: "#11111b"
+    color: Theme.surfaceSunken
 
     // Split-tree node. A leaf carries `paneId`; a branch carries `orientation`
     // ("horizontal" | "vertical") and `children`.
@@ -52,6 +52,35 @@ Rectangle {
     // its way out asks "is my owner still there?" during a teardown that may
     // already have taken the owner with it.
     readonly property bool regionAlive: true
+
+    // This region is the one the host created, i.e. the whole column. Only it
+    // draws the REGION HEADER: a nested region is a subtree, and a header on one
+    // would be a second title strip in the middle of the column.
+    readonly property bool isRootRegion: !region.rootRegion
+
+    // ---- region actions (SPEC 4.4/4.5) -------------------------------------
+    //
+    // The region header exposes the pane commands that used to be reachable ONLY
+    // through the command palette. The logic behind them is the host's — it owns
+    // ch::SessionLayouts, and a region cannot publish a tree — so the header
+    // raises a request per action and the host (Main.qml) runs it:
+    //
+    //   splitRequested("horizontal" | "vertical") -> splitActivePane("terminal", …)
+    //   closePaneRequested(paneId)                -> closeActivePane("terminal")
+    //   killTerminalRequested()                   -> killActiveTerminal()
+    //
+    // `paneId` is the pane the request is ABOUT: a pane's own header close button
+    // names itself, while the region header passes the focused pane (which is ""
+    // when nothing has been touched, meaning "whichever pane the host would pick
+    // anyway"). All three are emitted by the ROOT region only, because that is
+    // where takePane() wires the panes and where `focusedPaneId` lives.
+    //
+    // Killing is destructive and deliberately NOT done here: ending the remote
+    // tmux session is TerminalPaneView.killSession(), which the host already
+    // reaches through the pane cache, and it also warns the user afterwards.
+    signal splitRequested(string orientation)
+    signal closePaneRequested(string paneId)
+    signal killTerminalRequested()
 
     function isLeaf(n) {
         return !n || !n.children || n.children.length === 0;
@@ -104,12 +133,20 @@ Rectangle {
             // Item is re-parented, never rebuilt, so the connection (and the id
             // it reports) outlive the republish that moved it.
             pane.paneActivated.connect(region.noteFocus);
+            // The pane's own header close button. Wired here for the same reason
+            // as the focus report above: the pane outlives every republish, so
+            // the wire has to be made once, at mint time, on the object that
+            // survives.
+            pane.closeRequested.connect(region.notePaneClose);
         }
         if (pane.parent !== host) {
             pane.anchors.fill = null;
             pane.parent = host;
             pane.anchors.fill = host;
         }
+        // A pane the user is already focused on (a re-homed one) must come back
+        // wearing that mark, and a brand-new one must not wear it.
+        region.applyFocusFlags();
         return pane;
     }
 
@@ -157,6 +194,7 @@ Rectangle {
             if (region.focusedPaneId === key)
                 region.focusedPaneId = "";
         }
+        region.applyFocusFlags();
     }
 
     // The owner is going away, so nothing outlives it. Explicit rather than
@@ -200,6 +238,26 @@ Rectangle {
     // QML does not report as a change, so the host is not woken for a no-op.
     function noteFocus(paneId) {
         region.focusedPaneId = paneId;
+        region.applyFocusFlags();
+    }
+
+    // Push the focus mark onto the panes themselves, so each pane's header can
+    // show whether it is the one the next command will act on. Done here rather
+    // than by a binding inside the pane, because "am I focused" is a property of
+    // the REGION: exactly one pane has it, and a pane cannot see its siblings.
+    // Every pane in the cache is visited, including parked ones, so a pane that
+    // comes back into the tree cannot arrive wearing a stale mark.
+    function applyFocusFlags() {
+        const cache = region.paneCache;
+        for (const key in cache)
+            cache[key].paneActive = (key === region.focusedPaneId);
+    }
+
+    // A pane asking to be closed from its own header. Relayed rather than acted
+    // on: closing a pane is a layout change only the host can publish, and it
+    // deliberately leaves the remote tmux session running.
+    function notePaneClose(paneId) {
+        region.closePaneRequested(paneId);
     }
 
     // ---- this region's own leaf --------------------------------------------
@@ -223,7 +281,7 @@ Rectangle {
             region.releasePane();
         if (!leaf)
             return;
-        const pane = region.paneOwner.takePane(key, region,
+        const pane = region.paneOwner.takePane(key, paneHost,
                                                { devSessionId: region.devSessionId,
                                                  workingDir: region.workingDir });
         if (!pane)
@@ -251,7 +309,7 @@ Rectangle {
     function releasePane() {
         const owner = region.paneOwner;
         if (owner.regionAlive === true)
-            owner.parkPane(region.shownPaneId, region);
+            owner.parkPane(region.shownPaneId, paneHost);
         region.showingPane = false;
         region.shownPaneId = "";
     }
@@ -285,14 +343,104 @@ Rectangle {
         TerminalPaneView {}
     }
 
-    Loader {
-        anchors.fill: parent
-        // Branches only. Leaves are not built here — their pane Items outlive
-        // any Loader, so syncPane() borrows them from the cache instead. A null
-        // node still keeps this inert, which is what stops a recursive child
-        // from building anything at all before its real node arrives.
-        sourceComponent: region.node && !region.isLeaf(region.node)
-                         ? branchComponent : null
+    // The region header (SPEC 4.4): the column's own title strip, carrying the
+    // pane commands that were previously reachable only from the command palette.
+    // Root region ONLY — see `isRootRegion`.
+    //
+    // PANE IDENTITY: this is a child of the REGION, not of a pane, and it is
+    // never re-parented. It is therefore on the safe side of the line drawn in
+    // the comment at the top of this file: the panes below it are re-homed
+    // between layout positions and this strip is not part of what moves. The
+    // per-pane header is the opposite case and lives inside TerminalPaneView, so
+    // it travels WITH the pane and its live PTY.
+    Rectangle {
+        id: regionHeader
+        anchors.left: parent.left
+        anchors.right: parent.right
+        anchors.top: parent.top
+        height: Theme.headerHeight
+        visible: region.isRootRegion
+        color: Theme.surface
+
+        Rectangle {
+            anchors.left: parent.left
+            anchors.right: parent.right
+            anchors.bottom: parent.bottom
+            height: 1
+            color: Theme.border
+        }
+
+        Label {
+            anchors.left: parent.left
+            anchors.leftMargin: 10
+            anchors.verticalCenter: parent.verticalCenter
+            text: qsTr("Terminals")
+            color: Theme.text
+            font.pixelSize: Theme.fontSizeBody
+            font.bold: true
+        }
+
+        Row {
+            anchors.right: parent.right
+            anchors.rightMargin: 6
+            anchors.verticalCenter: parent.verticalCenter
+            spacing: 2
+
+            AppPaneHeader.Action {
+                text: qsTr("Split the focused pane side by side")
+                glyph: "\u25eb"
+                onClicked: region.splitRequested("horizontal")
+            }
+            AppPaneHeader.Action {
+                text: qsTr("Split the focused pane top and bottom")
+                glyph: "\u229f"
+                onClicked: region.splitRequested("vertical")
+            }
+            AppPaneHeader.Action {
+                text: qsTr("Close the focused pane")
+                glyph: "\u00d7"
+                onClicked: region.closePaneRequested(region.focusedPaneId)
+            }
+            // Spelled out rather than given a glyph: this ends the remote shell
+            // and everything running in it, and a one-character button is the
+            // wrong affordance for something irreversible.
+            AppPaneHeader.Action {
+                id: killAction
+                text: qsTr("End the focused terminal's remote session")
+                onClicked: region.killTerminalRequested()
+
+                contentItem: Label {
+                    textFormat: Text.PlainText
+                    text: qsTr("Kill")
+                    color: killAction.hovered ? Theme.danger : Theme.textDim
+                    font.pixelSize: Theme.fontSizeSmall
+                    horizontalAlignment: Text.AlignHCenter
+                    verticalAlignment: Text.AlignVCenter
+                }
+            }
+        }
+    }
+
+    // Everything the region header does NOT occupy, and the one parent every
+    // pane in this region is re-homed into (see syncPane/releasePane). Panes are
+    // parented HERE rather than to the region itself so the header cannot end up
+    // underneath a pane that fills its whole region.
+    Item {
+        id: paneHost
+        anchors.left: parent.left
+        anchors.right: parent.right
+        anchors.top: regionHeader.visible ? regionHeader.bottom : parent.top
+        anchors.bottom: parent.bottom
+
+        Loader {
+            anchors.fill: parent
+            // Branches only. Leaves are not built here — their pane Items outlive
+            // any Loader, so syncPane() borrows them from the cache instead. A null
+            // node still keeps this inert, which is what stops a recursive child
+            // from building anything at all before its real node arrives.
+            sourceComponent: region.node && !region.isLeaf(region.node)
+                             ? branchComponent : null
+        }
     }
 
     // Fraction of the split this child should occupy. Prefers the node's
@@ -319,6 +467,11 @@ Rectangle {
             id: split
             orientation: region.node && region.node.orientation === "vertical"
                          ? Qt.Vertical : Qt.Horizontal
+
+            // The application's one divider (SPEC 4.1). Without it the Basic
+            // style draws a filled plate in its own light palette, which is the
+            // pale gutter that made this window look unfinished.
+            handle: AppSplitHandle {}
 
             // SplitView stretches only the FIRST fillWidth/fillHeight item, so
             // every later child would fall back to a Loader's implicit size of 0

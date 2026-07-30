@@ -19,6 +19,8 @@
 #include "SshChannelDevice.h"
 #include "SshConnectionPool.h"
 
+#include <QCoreApplication>
+#include <QDir>
 #include <QElapsedTimer>
 #include <QFile>
 #include <QFileInfo>
@@ -26,7 +28,9 @@
 #include <QList>
 #include <QPointer>
 #include <QProcess>
+#include <QScopeGuard>
 #include <QSignalSpy>
+#include <QStringList>
 #include <QTcpServer>
 #include <QTcpSocket>
 #include <QTemporaryDir>
@@ -174,6 +178,62 @@ protected:
         channels.append(channel);
         return channel;
     }
+
+public:
+    // ---- provisioning (SessionBootstrap::ensureRemoteService) --------------
+    //
+    // Canned runRemoteScript() answers, consumed in order. There is no other
+    // way to say "this server runs node 22 and has nothing installed" without
+    // a fleet of servers, and the decision tree those answers drive is the
+    // whole feature.
+    //
+    // Left EMPTY by default, and that matters: every case written before
+    // provisioning existed then runs the PRODUCTION implementation, which fails
+    // at once (this harness's pool never handshakes, so no channel opens) and
+    // therefore exercises the fail-soft path — connect anyway. So those cases
+    // keep asserting exactly what they asserted before.
+    struct ScriptReply {
+        bool ok = true;
+        QString output;
+        QString error;
+    };
+    QList<ScriptReply> scriptReplies;
+    bool scriptsFaked = false;
+    // Every script handed to runRemoteScript(), in order, so a case can assert
+    // on the exact text that would have run on someone else's machine.
+    QStringList scriptsRun;
+
+    void fakeScript(bool ok, const QString& output,
+                    const QString& error = QString())
+    {
+        scriptsFaked = true;
+        scriptReplies.append(ScriptReply{ok, output, error});
+    }
+
+protected:
+    bool runRemoteScript(const QString& script, int timeoutMs, QString* output,
+                         QString* error) override
+    {
+        scriptsRun.append(script);
+        if (!scriptsFaked) {
+            return SessionBootstrap::runRemoteScript(script, timeoutMs, output,
+                                                     error);
+        }
+        if (scriptReplies.isEmpty()) {
+            // A case that armed fewer answers than the decision tree asked for
+            // has a bug in the case, not in the product — say so rather than
+            // silently taking a fail-soft branch.
+            if (error)
+                *error = QStringLiteral("tst: no canned remote answer left");
+            return false;
+        }
+        const ScriptReply reply = scriptReplies.takeFirst();
+        if (output)
+            *output = reply.output;
+        if (error)
+            *error = reply.error;
+        return reply.ok;
+    }
 };
 
 // One self-contained set of collaborators per test case.
@@ -224,6 +284,41 @@ quint16 refusedPort()
     return port;
 }
 
+// One prerequisite report exactly as remoteInspectScript() prints it. The
+// defaults describe a healthy but EMPTY server: current node, nothing
+// installed, curl and tar present.
+QString inspectionReport(const QString& node = QStringLiteral("v24.16.0"),
+                         const QString& entry = QString(),
+                         const QString& marker = QString(),
+                         const QString& fetch = QStringLiteral("curl"),
+                         const QString& tar = QStringLiteral("yes"))
+{
+    return QStringLiteral("CH_NODE=%1\nCH_ENTRY=%2\nCH_MARKER=%3\n"
+                          "CH_FETCH=%4\nCH_TAR=%5\n")
+        .arg(node, entry, marker, fetch, tar);
+}
+
+QString artifactUrl()
+{
+    return QStringLiteral("https://example.invalid/v9/codeharbor-remote.tar.gz");
+}
+
+QString installedEntry()
+{
+    return QStringLiteral("/srv/codeharbor/dist/codeharbord.js");
+}
+
+// What a successful remoteProvisionScript() run prints: progress lines, then
+// the "installed" verdict it only reaches after proving an entry point exists.
+QString installLog()
+{
+    return QStringLiteral("codeharbor: preparing /srv/codeharbor\n"
+                          "codeharbor: fetching %1\n"
+                          "codeharbor: unpacking codeharbor-remote\n"
+                          "codeharbor: installed %2\n")
+        .arg(artifactUrl(), installedEntry());
+}
+
 QList<State> states(const QSignalSpy& spy)
 {
     QList<State> out;
@@ -271,6 +366,22 @@ private slots:
     // Remote command construction from attacker-influenced profile fields.
     void remoteCommandsQuoteHostileProfileFields();
     void remoteEntryPointsSupportBothReleaseAndCheckoutLayouts();
+
+    // Provisioning a bare server on first connect.
+    void anExistingInstallIsLeftAlone();
+    void aBareServerIsProvisionedThenWired();
+    void aStaleInstallOfOursIsReplaced();
+    void anInstallWeDidNotMakeIsNeverOverwritten();
+    void missingRemoteNodeFailsWithSomethingToActOn();
+    void tooOldRemoteNodeBlocksProvisioningButNotAnExistingInstall();
+    void noRemoteDownloadToolFailsWithSomethingToActOn();
+    void aStagedTarballNeedsNoDownloadTool();
+    void anInstallThatDidNotLandFailsLoudly();
+    void anInspectionThatCannotRunStillConnects();
+    void nodeVersionFloorMatchesTheRemotePackageEngine();
+    void theInstalledReleaseIsTiedToTheClientVersion();
+    void provisioningStaysInsideTheChosenDirectory();
+    void theReportIsReadBackFieldForField();
 };
 
 // A cold wire walks Disconnected -> Connecting -> Wired exactly once and hands
@@ -1297,6 +1408,398 @@ void TstSessionBootstrap::remoteEntryPointsSupportBothReleaseAndCheckoutLayouts(
     const QString bridge = place(QStringLiteral("dist/bridge.js"));
     QCOMPARE(choose(SessionBootstrap::bridgeCommand(node, root)).at(0),
              QStringLiteral("[%1]").arg(bridge));
+}
+
+// ---------------------------------------------------------------------------
+// PROVISIONING (SessionBootstrap::ensureRemoteService).
+//
+// Until this existed the remote side had to be installed BY HAND before the
+// client could reach a server at all, and getting it wrong produced
+// "codeharbord channel closed" — a sentence naming nothing anyone can act on.
+// These cases pin the two halves of the fix: install exactly when there is
+// nothing usable there, and when it cannot be done, say what to do about it.
+// ---------------------------------------------------------------------------
+
+// A server that already has a service is inspected once and otherwise left
+// completely alone. This is the common case — every connect after the first —
+// so it must cost one round trip and change nothing.
+void TstSessionBootstrap::anExistingInstallIsLeftAlone()
+{
+    Harness h;
+    h.boot.setRemoteArtifactUrl(artifactUrl());
+    h.boot.fakeScript(true, inspectionReport(QStringLiteral("v24.16.0"),
+                                             installedEntry(), artifactUrl()));
+    QSignalSpy errorSpy(&h.boot, &SessionBootstrap::error);
+    QSignalSpy progressSpy(&h.boot, &SessionBootstrap::provisioning);
+
+    QVERIFY(h.wire());
+    QCOMPARE(h.boot.state(), State::Wired);
+    QCOMPARE(h.boot.scriptsRun.size(), 1); // the report, and nothing else
+    QVERIFY(h.boot.scriptsRun.at(0).contains(QStringLiteral("CH_ENTRY=")));
+    QVERIFY(progressSpy.isEmpty());
+    QVERIFY(errorSpy.isEmpty());
+}
+
+// The feature itself: nothing installed, so the client installs it and then
+// wires the session it just made possible.
+void TstSessionBootstrap::aBareServerIsProvisionedThenWired()
+{
+    Harness h;
+    h.boot.setRemoteArtifactUrl(artifactUrl());
+    h.boot.fakeScript(true, inspectionReport());          // 1. nothing there
+    h.boot.fakeScript(true, installLog());                // 2. the install
+    h.boot.fakeScript(true, inspectionReport(QStringLiteral("v24.16.0"),
+                                             installedEntry(), artifactUrl()));
+                                                          // 3. confirmation
+    QSignalSpy errorSpy(&h.boot, &SessionBootstrap::error);
+    QSignalSpy progressSpy(&h.boot, &SessionBootstrap::provisioning);
+    QSignalSpy stateSpy(&h.boot, &SessionBootstrap::stateChanged);
+
+    QVERIFY(h.wire());
+    QCOMPARE(h.boot.state(), State::Wired);
+    QVERIFY2(errorSpy.isEmpty(),
+             qPrintable(errorSpy.value(0).value(0).toString()));
+    QCOMPARE(h.boot.scriptsRun.size(), 3);
+
+    // The middle script really is a download-and-unpack of the artifact THIS
+    // client would install, not of "some release".
+    const QString install = h.boot.scriptsRun.at(1);
+    QVERIFY2(install.contains(artifactUrl()), qPrintable(install));
+    QVERIFY2(install.contains(QStringLiteral("curl -fsSL")), qPrintable(install));
+    QVERIFY2(install.contains(QStringLiteral("tar -xzf")), qPrintable(install));
+
+    // The user was told it was happening — a first connect that silently spends
+    // a minute downloading is indistinguishable from a hung application — and
+    // the shell had a state to render while it did.
+    QVERIFY2(progressSpy.size() >= 2,
+             qPrintable(QStringLiteral("only %1 progress reports")
+                            .arg(progressSpy.size())));
+    // Provisioning is a detour, not a destination: the attempt goes back to
+    // exactly the state it interrupted.
+    QCOMPARE(states(stateSpy),
+             (QList<State>{State::Connecting, State::Provisioning,
+                           State::Connecting, State::Wired}));
+}
+
+// A copy WE installed from an older release is replaced. Driving a service from
+// a different release than the client is the failure this whole feature could
+// otherwise introduce, so it is neither ignored nor merely reported.
+void TstSessionBootstrap::aStaleInstallOfOursIsReplaced()
+{
+    Harness h;
+    h.boot.setRemoteArtifactUrl(artifactUrl());
+    h.boot.fakeScript(
+        true,
+        inspectionReport(
+            QStringLiteral("v24.16.0"), installedEntry(),
+            QStringLiteral("https://example.invalid/v8/codeharbor-remote.tar.gz")));
+    h.boot.fakeScript(true, installLog());
+    h.boot.fakeScript(true, inspectionReport(QStringLiteral("v24.16.0"),
+                                             installedEntry(), artifactUrl()));
+    QSignalSpy errorSpy(&h.boot, &SessionBootstrap::error);
+
+    QVERIFY(h.wire());
+    QCOMPARE(h.boot.scriptsRun.size(), 3);
+    QVERIFY2(h.boot.scriptsRun.at(1).contains(artifactUrl()),
+             qPrintable(h.boot.scriptsRun.at(1)));
+    QVERIFY(errorSpy.isEmpty());
+}
+
+// The other side of that coin, and the one that would hurt: a directory a
+// PERSON manages (a git checkout, a hand-unpacked tarball) has no release
+// marker, and is never written over. Someone else's tree is not ours to
+// replace, and an incompatible one is still caught by AppController's
+// kMinimumServerSchemaVersion check against server.info.
+void TstSessionBootstrap::anInstallWeDidNotMakeIsNeverOverwritten()
+{
+    Harness h;
+    h.boot.setRemoteArtifactUrl(artifactUrl());
+    h.boot.fakeScript(
+        true, inspectionReport(
+                  QStringLiteral("v24.16.0"),
+                  QStringLiteral("/srv/codeharbor/remote/src/codeharbord.ts")));
+    QSignalSpy errorSpy(&h.boot, &SessionBootstrap::error);
+
+    QVERIFY(h.wire());
+    QCOMPARE(h.boot.scriptsRun.size(), 1);
+    QVERIFY(errorSpy.isEmpty());
+}
+
+// Node is a prerequisite this client cannot install. Missing, it is named — the
+// path that is wrong, the version to install, and the host — instead of
+// surfacing three steps later as a dead channel.
+void TstSessionBootstrap::missingRemoteNodeFailsWithSomethingToActOn()
+{
+    Harness h;
+    h.boot.fakeScript(true, inspectionReport(QString(), installedEntry()));
+    QSignalSpy errorSpy(&h.boot, &SessionBootstrap::error);
+
+    QVERIFY(!h.wire());
+    QCOMPARE(h.boot.state(), State::Failed);
+    QCOMPARE(errorSpy.size(), 1);
+    const QString message = errorSpy.at(0).at(0).toString();
+    QVERIFY2(message.contains(QStringLiteral("/usr/bin/node")), qPrintable(message));
+    QVERIFY2(message.contains(QStringLiteral("23.6")), qPrintable(message));
+    QVERIFY2(message.contains(h.host), qPrintable(message));
+    // Nothing was launched and nothing was installed.
+    QCOMPARE(h.boot.scriptsRun.size(), 1);
+    QVERIFY(h.boot.rpcDevice() == nullptr);
+}
+
+void TstSessionBootstrap::tooOldRemoteNodeBlocksProvisioningButNotAnExistingInstall()
+{
+    { // Something is already installed: an old node is a warning, not a wall.
+      // entryCandidates() prefers built dist/*.js, which node 22 runs fine, so
+      // a server that works today has to keep working.
+        Harness h;
+        h.boot.fakeScript(true, inspectionReport(QStringLiteral("v22.11.0"),
+                                                 installedEntry()));
+        QSignalSpy errorSpy(&h.boot, &SessionBootstrap::error);
+        QSignalSpy diagSpy(&h.boot, &SessionBootstrap::channelDiagnostic);
+
+        QVERIFY(h.wire());
+        QCOMPARE(h.boot.state(), State::Wired);
+        QVERIFY(errorSpy.isEmpty());
+        QCOMPARE(diagSpy.size(), 1);
+        QVERIFY2(diagSpy.at(0).at(1).toString().contains(QStringLiteral("22.11.0")),
+                 qPrintable(diagSpy.at(0).at(1).toString()));
+    }
+    { // Nothing installed: installing onto a node that cannot run the result
+      // only moves the failure later, so it is refused now, by name.
+        Harness h;
+        h.boot.setRemoteArtifactUrl(artifactUrl());
+        h.boot.fakeScript(true, inspectionReport(QStringLiteral("v22.11.0")));
+        QSignalSpy errorSpy(&h.boot, &SessionBootstrap::error);
+
+        QVERIFY(!h.wire());
+        QCOMPARE(errorSpy.size(), 1);
+        const QString message = errorSpy.at(0).at(0).toString();
+        QVERIFY2(message.contains(QStringLiteral("23.6")), qPrintable(message));
+        QVERIFY2(message.contains(QStringLiteral("22.11.0")), qPrintable(message));
+        // Refused BEFORE anything was written to somebody else's machine.
+        QCOMPARE(h.boot.scriptsRun.size(), 1);
+    }
+}
+
+// The cost of having the SERVER download the release: it needs a download tool.
+// When it has none, the message names both tools, the directory, and the way
+// out that needs no network at all.
+void TstSessionBootstrap::noRemoteDownloadToolFailsWithSomethingToActOn()
+{
+    Harness h;
+    h.boot.setRemoteArtifactUrl(artifactUrl());
+    h.boot.fakeScript(true, inspectionReport(QStringLiteral("v24.16.0"), QString(),
+                                             QString(), QStringLiteral("none")));
+    QSignalSpy errorSpy(&h.boot, &SessionBootstrap::error);
+
+    QVERIFY(!h.wire());
+    QCOMPARE(errorSpy.size(), 1);
+    const QString message = errorSpy.at(0).at(0).toString();
+    QVERIFY2(message.contains(QStringLiteral("curl")), qPrintable(message));
+    QVERIFY2(message.contains(QStringLiteral("wget")), qPrintable(message));
+    QVERIFY2(message.contains(QStringLiteral("CH_REMOTE_ARTIFACT_URL")),
+             qPrintable(message));
+    QCOMPARE(h.boot.scriptsRun.size(), 1);
+}
+
+// ...and that way out works: a tarball already staged on the server is copied,
+// so an air-gapped machine with neither curl nor wget still provisions.
+void TstSessionBootstrap::aStagedTarballNeedsNoDownloadTool()
+{
+    Harness h;
+    const QString staged = QStringLiteral("/srv/stage/codeharbor-remote.tar.gz");
+    h.boot.setRemoteArtifactUrl(staged);
+    h.boot.fakeScript(true, inspectionReport(QStringLiteral("v24.16.0"), QString(),
+                                             QString(), QStringLiteral("none")));
+    h.boot.fakeScript(true, installLog());
+    h.boot.fakeScript(true, inspectionReport(QStringLiteral("v24.16.0"),
+                                             installedEntry(), staged));
+    QSignalSpy errorSpy(&h.boot, &SessionBootstrap::error);
+
+    QVERIFY(h.wire());
+    QVERIFY2(errorSpy.isEmpty(),
+             qPrintable(errorSpy.value(0).value(0).toString()));
+    const QString install = h.boot.scriptsRun.at(1);
+    QVERIFY2(install.contains(QStringLiteral("cp '") + staged + QLatin1Char('\'')),
+             qPrintable(install));
+    QVERIFY2(!install.contains(QStringLiteral("curl")), qPrintable(install));
+    QVERIFY2(!install.contains(QStringLiteral("wget")), qPrintable(install));
+}
+
+// An install that reports success but leaves nothing behind must fail HERE. The
+// alternative is believing it and handing the user "codeharbord channel closed"
+// a moment later, which is the exact failure this feature exists to remove.
+void TstSessionBootstrap::anInstallThatDidNotLandFailsLoudly()
+{
+    Harness h;
+    h.boot.setRemoteArtifactUrl(artifactUrl());
+    h.boot.fakeScript(true, inspectionReport());
+    h.boot.fakeScript(true, installLog());
+    // The confirming re-inspection still finds no entry point.
+    h.boot.fakeScript(true, inspectionReport(QStringLiteral("v24.16.0")));
+    QSignalSpy errorSpy(&h.boot, &SessionBootstrap::error);
+
+    QVERIFY(!h.wire());
+    QCOMPARE(h.boot.state(), State::Failed);
+    QCOMPARE(errorSpy.size(), 1);
+    QVERIFY2(errorSpy.at(0).at(0).toString().contains(
+                 QStringLiteral("no codeharbord entry point")),
+             qPrintable(errorSpy.at(0).at(0).toString()));
+    QVERIFY(h.boot.rpcDevice() == nullptr);
+}
+
+// The inspection is a DIAGNOSTIC, and a failed diagnostic is not a failed
+// connect. Refusing here would turn every server whose sh, channel limit or
+// login banner defeats the report into an unreachable one, including servers
+// that worked before this code existed.
+void TstSessionBootstrap::anInspectionThatCannotRunStillConnects()
+{
+    Harness h;
+    h.boot.fakeScript(false, QString(),
+                      QStringLiteral("could not open an SSH channel"));
+    QSignalSpy errorSpy(&h.boot, &SessionBootstrap::error);
+    QSignalSpy diagSpy(&h.boot, &SessionBootstrap::channelDiagnostic);
+
+    QVERIFY(h.wire());
+    QCOMPARE(h.boot.state(), State::Wired);
+    QVERIFY(errorSpy.isEmpty());
+    QCOMPARE(diagSpy.size(), 1);
+    QVERIFY2(diagSpy.at(0).at(1).toString().contains(
+                 QStringLiteral("without provisioning")),
+             qPrintable(diagSpy.at(0).at(1).toString()));
+    QCOMPARE(h.boot.scriptsRun.size(), 1);
+}
+
+// remote/package.json declares "engines": { "node": ">=23.6" }, and 23.6 is the
+// first Node that runs TypeScript directly. The comparison has to be a version
+// comparison, not a string one.
+void TstSessionBootstrap::nodeVersionFloorMatchesTheRemotePackageEngine()
+{
+    QVERIFY(!SessionBootstrap::nodeVersionIsSupported(QString()));
+    QVERIFY(!SessionBootstrap::nodeVersionIsSupported(QStringLiteral("v22.11.0")));
+    QVERIFY(!SessionBootstrap::nodeVersionIsSupported(QStringLiteral("v23.5.9")));
+    QVERIFY(!SessionBootstrap::nodeVersionIsSupported(QStringLiteral("23")));
+    QVERIFY(!SessionBootstrap::nodeVersionIsSupported(QStringLiteral("banana")));
+    QVERIFY(SessionBootstrap::nodeVersionIsSupported(QStringLiteral("v23.6.0")));
+    QVERIFY(SessionBootstrap::nodeVersionIsSupported(QStringLiteral("23.6")));
+    QVERIFY(SessionBootstrap::nodeVersionIsSupported(QStringLiteral("v24.16.0")));
+    // A string comparison would call 30 older than 4.
+    QVERIFY(SessionBootstrap::nodeVersionIsSupported(QStringLiteral("v30.0.0")));
+}
+
+// "Versions must match" without a second version constant to keep in sync: the
+// URL the client installs FROM carries the client's own version.
+void TstSessionBootstrap::theInstalledReleaseIsTiedToTheClientVersion()
+{
+    if (!qEnvironmentVariableIsEmpty("CH_REMOTE_ARTIFACT_URL"))
+        QSKIP("CH_REMOTE_ARTIFACT_URL is set; it overrides the default URL");
+
+    const QString saved = QCoreApplication::applicationVersion();
+    const auto restore = qScopeGuard(
+        [saved] { QCoreApplication::setApplicationVersion(saved); });
+
+    QCoreApplication::setApplicationVersion(QStringLiteral("9.9.9"));
+    const QString url = SessionBootstrap::defaultRemoteArtifactUrl();
+    QVERIFY2(url.contains(QStringLiteral("/v9.9.9/")), qPrintable(url));
+    QVERIFY2(url.endsWith(QStringLiteral("/codeharbor-remote.tar.gz")),
+             qPrintable(url));
+
+    // A host that does not know its own version must not GUESS a release: it
+    // says so, and the failure message tells the user what to do instead.
+    QCoreApplication::setApplicationVersion(QString());
+    QVERIFY(SessionBootstrap::defaultRemoteArtifactUrl().isEmpty());
+}
+
+// Provisioning writes to somebody else's machine, so two properties are
+// non-negotiable: every interpolated path is quoted, and nothing is created
+// outside the directory the user chose. The root here carries both a space and
+// a single quote.
+void TstSessionBootstrap::provisioningStaysInsideTheChosenDirectory()
+{
+    const QString root = QStringLiteral("/srv/co de'harbor");
+    const QString script = SessionBootstrap::remoteProvisionScript(
+        root, QStringLiteral("https://example.invalid/a.tar.gz"),
+        QStringLiteral("curl"));
+
+    // The hostile root is quoted, so its embedded quote cannot end the argument
+    // and start a command of the attacker's choosing.
+    QVERIFY2(script.contains(QStringLiteral("mkdir -p '/srv/co de'\\''harbor'")),
+             qPrintable(script));
+    // Scratch space and the release marker both live UNDER that root.
+    QVERIFY2(script.contains(
+                 QStringLiteral("'/srv/co de'\\''harbor/.codeharbor-provision'")),
+             qPrintable(script));
+    QVERIFY2(script.contains(
+                 QStringLiteral("'/srv/co de'\\''harbor/.codeharbor-release'")),
+             qPrintable(script));
+    // Nothing is put in a shared temporary directory.
+    QVERIFY2(!script.contains(QStringLiteral("/tmp")), qPrintable(script));
+    // The marker is written only AFTER the entry-point check, so an install
+    // that died halfway is retried instead of being mistaken for a current one.
+    QVERIFY(script.indexOf(QStringLiteral("tar -xzf"))
+            < script.indexOf(QStringLiteral("exit 1")));
+    QVERIFY(script.indexOf(QStringLiteral("exit 1"))
+            < script.indexOf(QStringLiteral(".codeharbor-release'")));
+
+    // Same rule for the inspection, which interpolates the node path too.
+    const QString inspect = SessionBootstrap::remoteInspectScript(
+        QStringLiteral("/opt/no de/bin/node"), root);
+    QVERIFY2(inspect.contains(QStringLiteral("command -v '/opt/no de/bin/node'")),
+             qPrintable(inspect));
+    QVERIFY2(inspect.contains(
+                 QStringLiteral("'/srv/co de'\\''harbor/.codeharbor-release'")),
+             qPrintable(inspect));
+    // A report, never a write: the inspection must not be able to change the
+    // server it is describing.
+    QVERIFY2(!inspect.contains(QStringLiteral("mkdir")), qPrintable(inspect));
+    QVERIFY2(!inspect.contains(QStringLiteral("rm ")), qPrintable(inspect));
+    QVERIFY2(!inspect.contains(QStringLiteral("printf")), qPrintable(inspect));
+}
+
+void TstSessionBootstrap::theReportIsReadBackFieldForField()
+{
+    const SessionBootstrap::RemoteInspection info =
+        SessionBootstrap::parseInspection(
+            // A login banner ahead of the report is normal and must be ignored.
+            QStringLiteral("Welcome to the fixture!\n"
+                           "CH_NODE=v24.16.0\n"
+                           "CH_ENTRY=/srv/codeharbor/dist/codeharbord.js\n"
+                           "CH_MARKER=https://example.invalid/a.tar.gz\n"
+                           "CH_FETCH=wget\n"
+                           "CH_TAR=yes\n"));
+    QVERIFY(info.reported);
+    QVERIFY(info.nodePresent);
+    QCOMPARE(info.nodeVersion, QStringLiteral("v24.16.0"));
+    QCOMPARE(info.entry, QStringLiteral("/srv/codeharbor/dist/codeharbord.js"));
+    QCOMPARE(info.marker, QStringLiteral("https://example.invalid/a.tar.gz"));
+    QCOMPARE(info.fetcher, QStringLiteral("wget"));
+    QVERIFY(info.tar);
+
+    const SessionBootstrap::RemoteInspection empty =
+        SessionBootstrap::parseInspection(
+            QStringLiteral("CH_NODE=v24.16.0\nCH_ENTRY=\nCH_MARKER=\n"
+                           "CH_FETCH=none\nCH_TAR=no\n"));
+    QVERIFY(empty.reported);
+    QVERIFY(empty.nodePresent);
+    QVERIFY(empty.entry.isEmpty());
+    QVERIFY(empty.marker.isEmpty());
+    QVERIFY(!empty.tar);
+
+    // No report at all reads as "cannot tell", never as "everything is
+    // missing" — the difference between connecting anyway and refusing.
+    QVERIFY(!SessionBootstrap::parseInspection(
+                 QStringLiteral("sh: syntax error near unexpected token"))
+                 .reported);
+
+    // A staged tarball is recognised in both spellings; a network URL is not.
+    QCOMPARE(SessionBootstrap::stagedArtifactPath(QStringLiteral("/srv/a.tar.gz")),
+             QStringLiteral("/srv/a.tar.gz"));
+    QCOMPARE(
+        SessionBootstrap::stagedArtifactPath(QStringLiteral("file:///srv/a.tar.gz")),
+        QStringLiteral("/srv/a.tar.gz"));
+    QVERIFY(SessionBootstrap::stagedArtifactPath(
+                QStringLiteral("https://example.invalid/a.tar.gz"))
+                .isEmpty());
 }
 
 // Guiless: nothing here needs a display, and QTEST_MAIN would pull in

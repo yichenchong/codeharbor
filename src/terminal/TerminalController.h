@@ -129,7 +129,14 @@ public:
     // Stable IDs are used rather than user-facing display names.
     static QString tmuxTarget(const DevSessionId &devSession, const TerminalId &terminal);
     // Attach-or-create command for the pane's tmux target rooted at workingDir
-    // (SPEC 5.2): tmux new-session -A -s '<target>' -c '<workingDir>'.
+    // (SPEC 5.2):
+    //   tmux new-session -A -s '<target>' -c '<workingDir>' \; \
+    //       set-option -t '=<target>:' mouse on
+    // The second tmux command switches mouse reporting on for THIS SESSION ONLY
+    // (never `-g`, which would reconfigure every tmux session the user owns), so
+    // a wheel turn reaches tmux's own scrollback instead of being translated
+    // into cursor keys by the renderer. See the implementation for the full
+    // reasoning and the tmux 3.6 verification.
     static QString tmuxNewSessionCommand(const DevSessionId &devSession,
                                          const TerminalId &terminal,
                                          const QString &workingDir);

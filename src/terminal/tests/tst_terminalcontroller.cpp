@@ -93,6 +93,7 @@ private slots:
     void unchangedStateDoesNotEmit();
     void tmuxTargetFormat();
     void tmuxNewSessionCommandFormat();
+    void tmuxNewSessionCommandEnablesMouseForThisSessionOnly();
     void tmuxNewSessionCommandEscapesShellMetacharacters();
     void tmuxNewSessionCommandEscapesSubstitutionBacktickNewline();
     void tmuxCommandEscapesAdversarialIds();
@@ -268,14 +269,41 @@ void TstTerminalController::tmuxTargetFormat()
     QCOMPARE(target, QStringLiteral("ch_dev1_term1"));
 }
 
-// Attach-or-create command formatting (SPEC 5.2).
+// Attach-or-create command formatting (SPEC 5.2). The invocation carries TWO
+// tmux commands separated by an escaped semicolon: the attach itself, and the
+// mouse-reporting option that makes the wheel scroll tmux's history.
 void TstTerminalController::tmuxNewSessionCommandFormat()
 {
     const QString command = TerminalController::tmuxNewSessionCommand(
         DevSessionId{QStringLiteral("dev1")}, TerminalId{QStringLiteral("term1")},
         QStringLiteral("/home/dev/project"));
     QCOMPARE(command,
-             QStringLiteral("tmux new-session -A -s 'ch_dev1_term1' -c '/home/dev/project'"));
+             QStringLiteral("tmux new-session -A -s 'ch_dev1_term1' -c '/home/dev/project'"
+                            " \\; set-option -t '=ch_dev1_term1:' mouse on"));
+}
+
+// Mouse reporting is what routes a wheel turn into tmux's own scrollback instead
+// of letting the renderer translate it into cursor keys — but it must reach ONLY
+// the session this command creates. `-g` would write the user's global tmux
+// option (this command names no socket, so the session lives on their default
+// server), and an unpinned target would resolve by fnmatch onto a session
+// somebody else created (SPEC 5.2 hardening).
+void TstTerminalController::tmuxNewSessionCommandEnablesMouseForThisSessionOnly()
+{
+    const QString command = TerminalController::tmuxNewSessionCommand(
+        DevSessionId{QStringLiteral("dev1")}, TerminalId{QStringLiteral("term1")},
+        QStringLiteral("/w"));
+
+    // The option is set, and it is set on this session's target.
+    QVERIFY(command.contains(QStringLiteral("set-option -t '=ch_dev1_term1:' mouse on")));
+    // No global scope, in either spelling tmux accepts.
+    QVERIFY(!command.contains(QStringLiteral("-g")));
+    QVERIFY(!command.contains(QStringLiteral("--global")));
+    // One tmux invocation, two tmux commands: the separator is an ESCAPED
+    // semicolon, so the remote shell hands tmux a literal `;` argument instead
+    // of ending the shell command there.
+    QVERIFY(command.contains(QStringLiteral(" \\; ")));
+    QCOMPARE(command.count(QLatin1Char(';')), 1);
 }
 
 // A workingDir carrying a single quote and shell metacharacters must be safely
@@ -288,7 +316,8 @@ void TstTerminalController::tmuxNewSessionCommandEscapesShellMetacharacters()
         QStringLiteral("/home/dev/it's here; rm -rf /"));
     QCOMPARE(command,
              QStringLiteral("tmux new-session -A -s 'ch_dev1_term1' "
-                            "-c '/home/dev/it'\\''s here; rm -rf /'"));
+                            "-c '/home/dev/it'\\''s here; rm -rf /'"
+                            " \\; set-option -t '=ch_dev1_term1:' mouse on"));
 }
 
 // Reconnect backoff: 1, 2, 5, 10, 30, then 60 thereafter (SPEC 5.6).
@@ -316,7 +345,8 @@ void TstTerminalController::tmuxNewSessionCommandEscapesSubstitutionBacktickNewl
         QStringLiteral("/w/$(rm -rf ~)`whoami`\nnext"));
     QCOMPARE(command,
              QStringLiteral("tmux new-session -A -s 'ch_dev1_term1' "
-                            "-c '/w/$(rm -rf ~)`whoami`\nnext'"));
+                            "-c '/w/$(rm -rf ~)`whoami`\nnext'"
+                            " \\; set-option -t '=ch_dev1_term1:' mouse on"));
 }
 
 // Adversarial dev-session / terminal IDs carrying a quote and metacharacters
@@ -336,7 +366,9 @@ void TstTerminalController::tmuxCommandEscapesAdversarialIds()
         TerminalController::tmuxNewSessionCommand(dev, term, QStringLiteral("/w"));
     QCOMPARE(command,
              QStringLiteral("tmux new-session -A -s "
-                            "'ch_dev'\\''; rm -rf / #_t`whoami`$(id)' -c '/w'"));
+                            "'ch_dev'\\''; rm -rf / #_t`whoami`$(id)' -c '/w'"
+                            " \\; set-option -t "
+                            "'=ch_dev'\\''; rm -rf / #_t`whoami`$(id):' mouse on"));
 }
 
 // On becoming visible, the retained hidden buffer replays first and exactly

@@ -75,6 +75,7 @@ private slots:
     void stderrStaysOutOfReadStream();
     void encryptedIdentityUsesPassphraseFromCallback();
     void missingAgentAndKeyExplainAuthenticationFailure();
+    void multiStepServerAcceptsKeyThenPassword();
     void windowsNamedPipeAgentFallsBackToIdentityFile();
     void unavailableTrustedAlgorithmStillReachesHostVerification();
     void deviceOutlivingItsSessionStopsCleanly();
@@ -534,6 +535,73 @@ void TstLiveSsh::missingAgentAndKeyExplainAuthenticationFailure()
     QVERIFY2(failure.contains(
                  QStringLiteral("Private key file does not exist: %1").arg(missingKey)),
              qPrintable(failure));
+}
+
+// A server configured with `AuthenticationMethods publickey,password` accepts
+// the key, answers SSH_AUTH_PARTIAL, and then insists on a password too. That
+// answer used to be read as failure, so such a server could not be used at all.
+//
+// This needs a capability the fixture in docs/DEVELOPMENT.md cannot provide: its
+// sshd runs unprivileged with `PasswordAuthentication no`, and an unprivileged
+// sshd cannot verify an account password in the first place. So the case is
+// gated on the operator pointing CH_LIVE_PASSWORD at a server that really does
+// require both, and it QSKIPs with that explanation otherwise rather than
+// pretending to have tested something.
+void TstLiveSsh::multiStepServerAcceptsKeyThenPassword()
+{
+    const QString password = env("CH_LIVE_PASSWORD");
+    if (password.isEmpty()) {
+        QSKIP("CH_LIVE_PASSWORD is not set; the multi-step gate needs an sshd "
+              "with `AuthenticationMethods publickey,password` and a real "
+              "account password, which the unprivileged fixture sshd cannot "
+              "provide");
+    }
+
+    SshConnectionPool pool;
+    KnownHosts hosts;
+    QFile store(m_knownHostsPath);
+    if (store.open(QIODevice::ReadOnly | QIODevice::Text))
+        hosts = KnownHosts::parse(QString::fromUtf8(store.readAll()));
+    store.close();
+    pool.setKnownHosts(hosts);
+    pool.setHostKeyCallback([](const QString&, const QString&,
+                               const QByteArray&, KnownHosts::Verdict) {
+        return SshConnectionPool::HostKeyDecision::Accept;
+    });
+
+    // Stand where AppController stands on the LAST attempt of a credential
+    // chain, with the secret already gathered: the pool has to satisfy the key
+    // method and the password method inside ONE handshake.
+    QList<SshConnectionPool::CredentialKind> asked;
+    pool.setCredentialCallback(
+        [&asked, &password](const QString&,
+                            SshConnectionPool::CredentialKind kind) {
+            asked.append(kind);
+            if (kind == SshConnectionPool::CredentialKind::Password)
+                return SshConnectionPool::CredentialReply{password, false};
+            return SshConnectionPool::CredentialReply{};
+        });
+
+    QString failure;
+    const auto conn =
+        QObject::connect(&pool, &SshConnectionPool::errorOccurred,
+                         [&failure](const QString& text) { failure += text; });
+    const bool ok = pool.connectToHost(m_host, m_port, m_user, m_identityFile);
+    QObject::disconnect(conn);
+    QVERIFY2(ok, qPrintable(failure));
+    QCOMPARE(pool.state(), SshConnectionPool::State::Connected);
+
+    // Proof that this really was the multi-step path and not an ordinary
+    // single-method connect that would have succeeded without any of it.
+    QVERIFY2(asked.contains(SshConnectionPool::CredentialKind::Password),
+             "the password rung was never reached: this server does not "
+             "require a second method, so nothing was exercised");
+    QVERIFY2(pool.diagnosticLog().contains(
+                 QStringLiteral("requires a further authentication method")),
+             qPrintable(pool.diagnosticLog()));
+    // The log is shown to the user from the connection sheet.
+    QVERIFY(!pool.diagnosticLog().contains(password));
+    pool.disconnectFromHost();
 }
 
 // A stored key type may be disabled in the libssh build used by the desktop

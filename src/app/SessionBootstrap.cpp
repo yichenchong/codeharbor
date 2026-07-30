@@ -4,11 +4,14 @@
 #include "CodeharbordClient.h"
 #include "SshChannelDevice.h"
 
+#include <QByteArray>
+#include <QCoreApplication>
 #include <QDir>
 #include <QElapsedTimer>
 #include <QEventLoop>
 #include <QFile>
 #include <QFileInfo>
+#include <QLatin1String>
 #include <QScopeGuard>
 #include <QStandardPaths>
 #include <QTcpSocket>
@@ -63,6 +66,22 @@ QString selectEntry(const QString& repoRoot, const QString& stem)
                                        "server. Tried: %2")
                             .arg(stem, candidates.join(QStringLiteral(", "))))
            + QStringLiteral(" >&2; exit 127; fi; ");
+}
+
+// Marker that turns one line of a provisioning script's stdout into user-facing
+// progress. Everything a remote script prints without it (the inspection
+// report's CH_<KEY>=<value> lines, a fetch tool's own chatter) stays internal.
+QString progressPrefix()
+{
+    return QStringLiteral("codeharbor: ");
+}
+
+// The one line remoteProvisionScript() prints only after the archive is
+// unpacked AND a codeharbord entry point has been proven to exist, so its
+// presence is the script's success verdict.
+QString installedMarker()
+{
+    return QStringLiteral("codeharbor: installed");
 }
 
 } // namespace
@@ -196,6 +215,233 @@ QString SessionBootstrap::bridgeCommand(const QString& nodePath,
     return QStringLiteral("sh -c ") + shellQuote(script);
 }
 
+void SessionBootstrap::setRemoteArtifactUrl(const QString& url)
+{
+    m_artifactUrl = url;
+}
+
+QString SessionBootstrap::remoteArtifactUrl() const
+{
+    return m_artifactUrl.isEmpty() ? defaultRemoteArtifactUrl() : m_artifactUrl;
+}
+
+QString SessionBootstrap::defaultRemoteArtifactUrl()
+{
+    // An operator override wins outright. It is what makes an air-gapped or
+    // mirrored deployment work: point it at an internal mirror, or at a plain
+    // path where the tarball has already been staged ON the server, and no
+    // outbound access is needed at all (see stagedArtifactPath()).
+    const QString configured = qEnvironmentVariable("CH_REMOTE_ARTIFACT_URL");
+    if (!configured.isEmpty())
+        return configured;
+
+    // main.cpp sets this from CODEHARBOR_VERSION, i.e. the CMake project
+    // version, i.e. the version the release tag carries. Deliberately read at
+    // run time instead of compiled in here: ch_app has no CODEHARBOR_VERSION
+    // define, and inventing a second version constant in this file is exactly
+    // the drift this feature must not introduce.
+    const QString version = QCoreApplication::applicationVersion();
+    if (version.isEmpty())
+        return {};
+    return QStringLiteral("https://github.com/yichenchong/codeharbor/releases/"
+                          "download/v%1/codeharbor-remote.tar.gz")
+        .arg(version);
+}
+
+QString SessionBootstrap::releaseMarkerPath(const QString& repoRoot)
+{
+    return remoteJoin(repoRoot, QStringLiteral(".codeharbor-release"));
+}
+
+QString SessionBootstrap::stagedArtifactPath(const QString& url)
+{
+    if (url.startsWith(QLatin1String("file://")))
+        return url.mid(QLatin1String("file://").size());
+    // A bare absolute path is the natural thing to type for "the tarball is
+    // already sitting on the server", and no network URL can start with '/'.
+    if (url.startsWith(QLatin1Char('/')))
+        return url;
+    return {};
+}
+
+bool SessionBootstrap::nodeVersionIsSupported(const QString& version)
+{
+    QString text = version.trimmed();
+    if (text.startsWith(QLatin1Char('v')))
+        text.remove(0, 1);
+    const QStringList parts = text.split(QLatin1Char('.'));
+    if (parts.isEmpty())
+        return false;
+    bool ok = false;
+    const int major = parts.at(0).toInt(&ok);
+    if (!ok)
+        return false;
+    if (major != kMinimumRemoteNodeMajor)
+        return major > kMinimumRemoteNodeMajor;
+    // Same major: the minor decides. A version string of just "23" is 23.0,
+    // which is below the floor.
+    int minor = 0;
+    if (parts.size() > 1)
+        minor = parts.at(1).toInt();
+    return minor >= kMinimumRemoteNodeMinor;
+}
+
+QString SessionBootstrap::remoteInspectScript(const QString& nodePath,
+                                              const QString& repoRoot)
+{
+    const QStringList candidates =
+        entryCandidates(repoRoot, QStringLiteral("codeharbord"));
+    QStringList quoted;
+    quoted.reserve(candidates.size());
+    for (const QString& candidate : candidates)
+        quoted << shellQuote(candidate);
+    const QString marker = shellQuote(releaseMarkerPath(repoRoot));
+
+    // One CH_<KEY>=<value> line per RemoteInspection field, always in this
+    // order, CH_NODE first — parseInspection() treats that first line as proof
+    // that a report arrived at all.
+    //
+    // `command -v` rather than `[ -x ... ]`: it answers identically for the
+    // absolute path a profile normally stores and for a bare name found on the
+    // login PATH, and a profile may legitimately carry either.
+    return QStringLiteral("__ch_node=; if command -v ") + shellQuote(nodePath)
+           + QStringLiteral(" >/dev/null 2>&1; then __ch_node=$(")
+           + shellQuote(nodePath)
+           + QStringLiteral(" --version 2>/dev/null); fi; "
+                            "echo \"CH_NODE=$__ch_node\"; "
+                            "__ch_entry=; for __ch_c in ")
+           + quoted.join(QLatin1Char(' '))
+           + QStringLiteral("; do if [ -f \"$__ch_c\" ]; then "
+                            "__ch_entry=\"$__ch_c\"; break; fi; done; "
+                            "echo \"CH_ENTRY=$__ch_entry\"; "
+                            "__ch_marker=; if [ -f ")
+           + marker + QStringLiteral(" ]; then __ch_marker=$(head -n 1 ")
+           + marker
+           + QStringLiteral(" 2>/dev/null); fi; "
+                            "echo \"CH_MARKER=$__ch_marker\"; "
+                            "__ch_fetch=none; "
+                            "if command -v curl >/dev/null 2>&1; then "
+                            "__ch_fetch=curl; "
+                            "elif command -v wget >/dev/null 2>&1; then "
+                            "__ch_fetch=wget; fi; "
+                            "echo \"CH_FETCH=$__ch_fetch\"; "
+                            "__ch_tar=no; "
+                            "if command -v tar >/dev/null 2>&1; then "
+                            "__ch_tar=yes; fi; "
+                            "echo \"CH_TAR=$__ch_tar\"");
+}
+
+QString SessionBootstrap::remoteProvisionScript(const QString& repoRoot,
+                                                const QString& artifactUrl,
+                                                const QString& fetcher)
+{
+    const QString root = shellQuote(repoRoot);
+    // Scratch space INSIDE the directory the user chose. Nothing this script
+    // touches — not the download, not a temporary — lives anywhere else, so a
+    // failed install cannot leave litter on a machine that is not ours.
+    const QString scratch = shellQuote(
+        remoteJoin(repoRoot, QStringLiteral(".codeharbor-provision")));
+    const QString tarball = shellQuote(remoteJoin(
+        repoRoot,
+        QStringLiteral(".codeharbor-provision/codeharbor-remote.tar.gz")));
+    const QString marker = shellQuote(releaseMarkerPath(repoRoot));
+
+    const QString staged = stagedArtifactPath(artifactUrl);
+    QString fetch;
+    if (!staged.isEmpty()) {
+        fetch = QStringLiteral("cp ") + shellQuote(staged) + QLatin1Char(' ')
+                + tarball;
+    } else if (fetcher == QLatin1String("wget")) {
+        fetch = QStringLiteral("wget -q -O ") + tarball + QLatin1Char(' ')
+                + shellQuote(artifactUrl);
+    } else {
+        // -f so an HTML error page is a failure rather than a "tarball" that
+        // tar then rejects with something unreadable.
+        fetch = QStringLiteral("curl -fsSL -o ") + tarball + QLatin1Char(' ')
+                + shellQuote(artifactUrl);
+    }
+
+    QStringList quoted;
+    const QStringList candidates =
+        entryCandidates(repoRoot, QStringLiteral("codeharbord"));
+    quoted.reserve(candidates.size());
+    for (const QString& candidate : candidates)
+        quoted << shellQuote(candidate);
+
+    // `set -e`: every step is load-bearing and a half-unpacked directory is
+    // worse than an untouched one. Each "codeharbor: " line is republished to
+    // the user by runRemoteScript() as it lands, which is what keeps a
+    // multi-megabyte download from looking like a hung application.
+    return QStringLiteral("set -e; echo ")
+           + shellQuote(progressPrefix()
+                        + QStringLiteral("preparing %1").arg(repoRoot))
+           + QStringLiteral("; mkdir -p ") + root + QStringLiteral("; rm -rf ")
+           + scratch + QStringLiteral("; mkdir -p ") + scratch
+           + QStringLiteral("; echo ")
+           + shellQuote(progressPrefix()
+                        + QStringLiteral("fetching %1").arg(artifactUrl))
+           + QStringLiteral("; ") + fetch + QStringLiteral("; echo ")
+           + shellQuote(progressPrefix()
+                        + QStringLiteral("unpacking codeharbor-remote"))
+           + QStringLiteral("; tar -xzf ") + tarball + QStringLiteral(" -C ")
+           + root + QStringLiteral("; rm -rf ") + scratch
+           + QStringLiteral("; __ch_entry=; for __ch_c in ")
+           + quoted.join(QLatin1Char(' '))
+           + QStringLiteral("; do if [ -f \"$__ch_c\" ]; then "
+                            "__ch_entry=\"$__ch_c\"; break; fi; done; "
+                            "if [ -z \"$__ch_entry\" ]; then echo ")
+           + shellQuote(QStringLiteral(
+                 "codeharbor: the archive unpacked but holds no codeharbord "
+                 "entry point; it is not a codeharbor-remote release"))
+           + QStringLiteral(" >&2; exit 1; fi; "
+                            // The marker is the LAST thing written and only on
+                            // success, so an install that died halfway is
+                            // retried on the next connect instead of being
+                            // mistaken for a current one.
+                            "printf ")
+           + shellQuote(QStringLiteral("%s\\n")) + QLatin1Char(' ')
+           + shellQuote(artifactUrl) + QStringLiteral(" > ") + marker
+           // $__ch_entry is deliberately OUTSIDE the quoted literal: it is the
+           // entry point the install produced, and echo joins its two arguments
+           // with a space.
+           + QStringLiteral("; echo ") + shellQuote(installedMarker())
+           + QStringLiteral(" \"$__ch_entry\"");
+}
+
+SessionBootstrap::RemoteInspection
+SessionBootstrap::parseInspection(const QString& output)
+{
+    RemoteInspection info;
+    const QStringList lines =
+        output.split(QLatin1Char('\n'), Qt::SkipEmptyParts);
+    for (const QString& raw : lines) {
+        const QString line = raw.trimmed();
+        if (!line.startsWith(QLatin1String("CH_")))
+            continue;
+        const qsizetype equals = line.indexOf(QLatin1Char('='));
+        if (equals < 0)
+            continue;
+        const QString key = line.left(equals);
+        const QString value = line.mid(equals + 1).trimmed();
+        if (key == QLatin1String("CH_NODE")) {
+            // The first line the script prints, so this is also what proves a
+            // report came back rather than, say, a login banner.
+            info.reported = true;
+            info.nodeVersion = value;
+            info.nodePresent = !value.isEmpty();
+        } else if (key == QLatin1String("CH_ENTRY")) {
+            info.entry = value;
+        } else if (key == QLatin1String("CH_MARKER")) {
+            info.marker = value;
+        } else if (key == QLatin1String("CH_FETCH")) {
+            info.fetcher = value;
+        } else if (key == QLatin1String("CH_TAR")) {
+            info.tar = value == QLatin1String("yes");
+        }
+    }
+    return info;
+}
+
 int SessionBootstrap::reconnectDelaySeconds(int attempt)
 {
     // Same ladder as TerminalController::reconnectDelaySeconds() (SPEC 5.6),
@@ -278,8 +524,8 @@ void SessionBootstrap::abortAttempt()
     if (!m_attempting)
         return;
     m_cancelRequested = true;
-    if (m_probeLoop)
-        m_probeLoop->quit();
+    if (m_nestedLoop)
+        m_nestedLoop->quit();
 }
 
 void SessionBootstrap::scheduleReconnect()
@@ -461,8 +707,8 @@ bool SessionBootstrap::probeEndpoint(const QString& host, quint16 port,
     deadline.start(m_connectTimeoutMs);
     // Published so abortAttempt() can cut the wait short; cleared on every exit
     // path, including the exceptional one.
-    m_probeLoop = &loop;
-    const auto clearLoop = qScopeGuard([this] { m_probeLoop = nullptr; });
+    m_nestedLoop = &loop;
+    const auto clearLoop = qScopeGuard([this] { m_nestedLoop = nullptr; });
     // ExcludeUserInputEvents: repaints, timers and sockets keep running so the
     // shell stays alive on screen, but a second click cannot re-enter connect.
     if (!settled)
@@ -519,6 +765,325 @@ SshChannelDevice* SessionBootstrap::openChannelDevice(
         return nullptr;
     }
     return device;
+}
+
+bool SessionBootstrap::runRemoteScript(const QString& script, int timeoutMs,
+                                       QString* output, QString* error)
+{
+    const QString role = QStringLiteral("codeharbor-provision");
+    if (!m_pool) {
+        if (error)
+            *error = QStringLiteral("no SSH connection pool");
+        return false;
+    }
+
+    // Stack-owned, and handed back to the pool by closeChannel() below rather
+    // than left for the destructor: an SSH server caps concurrent channels per
+    // connection, and this runs up to three times per connect.
+    SshChannelDevice device(m_pool, SshConnectionPool::ChannelKind::Exec);
+    QString diagnostics;
+    connect(&device, &SshChannelDevice::channelError, &device,
+            [this, &diagnostics, role](const QString& text) {
+                const QString trimmed = text.trimmed();
+                if (trimmed.isEmpty())
+                    return;
+                if (!diagnostics.isEmpty())
+                    diagnostics += QStringLiteral("; ");
+                diagnostics += trimmed;
+                emit channelDiagnostic(role, trimmed);
+            });
+
+    // Quoted as one argument to `sh -c` so the script only relies on POSIX sh,
+    // whatever login shell the remote account happens to use — the same rule
+    // rpcCommand()/bridgeCommand() follow.
+    if (!device.startExec(QStringLiteral("sh -c ") + shellQuote(script))) {
+        if (error)
+            *error = diagnostics.isEmpty()
+                         ? QStringLiteral("could not open an SSH channel")
+                         : diagnostics;
+        return false;
+    }
+
+    QEventLoop loop;
+    QByteArray collected;
+    qsizetype published = 0;
+    bool finished = false;
+    bool timedOut = false;
+
+    // Drain whatever has arrived and republish every COMPLETE progress line.
+    // `published` is how far the republishing has got, so a line split across
+    // two reads is emitted once and whole.
+    const auto drain = [this, &device, &collected, &published] {
+        collected += device.readAll();
+        qsizetype newline = collected.indexOf('\n', published);
+        while (newline >= 0) {
+            const QString line =
+                QString::fromUtf8(collected.mid(published, newline - published))
+                    .trimmed();
+            published = newline + 1;
+            if (line.startsWith(progressPrefix()))
+                emit provisioning(line.mid(progressPrefix().size()));
+            newline = collected.indexOf('\n', published);
+        }
+    };
+
+    QTimer poll;
+    poll.setInterval(20);
+    QTimer deadline;
+    deadline.setSingleShot(true);
+    deadline.setTimerType(Qt::PreciseTimer);
+
+    connect(&device, &QIODevice::readyRead, &loop, drain);
+    // Belt and braces beside readyRead: SshChannelDevice's own read pump is a
+    // timer, so a poll of the same order costs nothing and means this wait
+    // cannot hang on a missed signal edge.
+    connect(&poll, &QTimer::timeout, &loop, drain);
+    connect(&device, &SshChannelDevice::readChannelFinished, &loop, [&] {
+        finished = true;
+        loop.quit();
+    });
+    connect(&deadline, &QTimer::timeout, &loop, [&] {
+        timedOut = true;
+        loop.quit();
+    });
+
+    poll.start();
+    if (timeoutMs > 0)
+        deadline.start(timeoutMs);
+    // Published so abortAttempt() can cut a multi-minute download short the
+    // moment the user asks to disconnect; cleared on every exit path.
+    m_nestedLoop = &loop;
+    const auto clearLoop = qScopeGuard([this] { m_nestedLoop = nullptr; });
+    // ExcludeUserInputEvents, exactly as probeEndpoint() does it: the shell
+    // keeps repainting (which is the whole point of reporting progress) but a
+    // second click cannot re-enter the connect path.
+    loop.exec(QEventLoop::ExcludeUserInputEvents);
+    poll.stop();
+    // Whatever landed together with the EOF that ended the loop.
+    drain();
+    collected += device.readAll();
+    device.closeChannel();
+
+    if (output)
+        *output = QString::fromUtf8(collected);
+
+    if (m_cancelRequested) {
+        if (error)
+            *error = QStringLiteral("cancelled");
+        return false;
+    }
+    if (timedOut) {
+        if (error) {
+            *error = QStringLiteral("the remote command did not finish within "
+                                    "%1 ms").arg(timeoutMs);
+            if (!diagnostics.isEmpty())
+                *error += QStringLiteral(": ") + diagnostics;
+        }
+        return false;
+    }
+    if (!finished) {
+        if (error)
+            *error = diagnostics.isEmpty()
+                         ? QStringLiteral("the remote command produced nothing")
+                         : diagnostics;
+        return false;
+    }
+    // EOF happened, so the remote command RAN — but an SSH exec channel does not
+    // hand its exit status to SshChannelDevice, so "ran" is not "succeeded".
+    // Callers decide from the output; the stderr comes back either way, because
+    // it is the only explanation a failed script leaves behind.
+    if (error)
+        *error = diagnostics;
+    return true;
+}
+
+bool SessionBootstrap::ensureRemoteService()
+{
+    const QString role = QStringLiteral("codeharbor-provision");
+    // Whatever the connect was doing before: Connecting for a user-initiated
+    // attempt, Reconnecting for a rung of the ladder. Restored on every exit so
+    // provisioning never relabels the attempt it interrupted.
+    const State resume = m_state;
+
+    QString report;
+    QString reportError;
+    const bool asked = runRemoteScript(remoteInspectScript(m_nodePath, m_repoRoot),
+                                       kInspectTimeoutMs, &report, &reportError);
+    if (!asked && m_cancelRequested)
+        return false;
+    const RemoteInspection info = asked ? parseInspection(report)
+                                        : RemoteInspection{};
+    if (!info.reported) {
+        // FAIL-SOFT, and this is the important design decision in this
+        // function. The inspection is a DIAGNOSTIC: it exists so a missing
+        // prerequisite is named instead of surfacing as "codeharbord channel
+        // closed". If the diagnostic itself cannot run — the server caps
+        // channels, a login banner ate the report, sh is something exotic — the
+        // only defensible answer is to carry on down the exec path that worked
+        // before this feature existed. Refusing to connect because a probe
+        // failed would turn servers that work today into unreachable ones.
+        emit channelDiagnostic(
+            role, QStringLiteral("could not read the server's prerequisites "
+                                 "(%1); connecting without provisioning")
+                      .arg(reportError.isEmpty()
+                               ? QStringLiteral("no report came back")
+                               : reportError));
+        return true;
+    }
+
+    if (!info.nodePresent) {
+        // Not a soft warning even when something is installed: without node
+        // nothing under repoRoot can start, and "sh: node: not found" on a dead
+        // channel is precisely the unactionable failure this replaces.
+        fail(tr("\"%1\" is not a runnable Node.js on %2. The CodeHarbor remote "
+                "service needs Node %3.%4 or newer there. Install it (nodesource "
+                "or nvm) and set the profile's node path to its ABSOLUTE "
+                "location — a non-interactive SSH session has none of a version "
+                "manager's PATH.")
+                .arg(m_nodePath, m_host)
+                .arg(kMinimumRemoteNodeMajor)
+                .arg(kMinimumRemoteNodeMinor));
+        return false;
+    }
+
+    const QString url = remoteArtifactUrl();
+    const bool nodeOk = nodeVersionIsSupported(info.nodeVersion);
+
+    // Two reasons to install, and only two:
+    //   * nothing usable is there at all; or
+    //   * the copy WE installed is not the one this client would install now,
+    //     which is how a client upgrade drags the remote side along instead of
+    //     driving a service from another release.
+    // An install with NO marker belongs to a human — a git checkout, a
+    // hand-unpacked tarball — and is never overwritten. An incompatible one of
+    // those is still caught, by AppController's kMinimumServerSchemaVersion
+    // check against server.info, which reports it without destroying the tree.
+    const bool needsInstall =
+        info.entry.isEmpty() || (!info.marker.isEmpty() && info.marker != url);
+
+    if (!needsInstall) {
+        if (!nodeOk) {
+            // Deliberately not a refusal: entryCandidates() prefers built
+            // dist/*.js, which an older node runs fine, so a server that works
+            // today must keep working. Only PROVISIONING demands the floor.
+            emit channelDiagnostic(
+                role, QStringLiteral("node %1 on %2 is older than the %3.%4 the "
+                                     "remote service declares; using the "
+                                     "existing installation at %5 unchanged")
+                          .arg(info.nodeVersion, m_host)
+                          .arg(kMinimumRemoteNodeMajor)
+                          .arg(kMinimumRemoteNodeMinor)
+                          .arg(info.entry));
+        }
+        return true;
+    }
+
+    // ---- everything below writes to somebody else's machine ---------------
+
+    if (!nodeOk) {
+        fail(tr("Node %1 on %2 is too old to run the CodeHarbor remote service, "
+                "which needs %3.%4 or newer. Install a current Node.js there and "
+                "point the profile's node path at it. Nothing was written to "
+                "\"%5\".")
+                .arg(info.nodeVersion, m_host)
+                .arg(kMinimumRemoteNodeMajor)
+                .arg(kMinimumRemoteNodeMinor)
+                .arg(m_repoRoot));
+        return false;
+    }
+    if (m_repoRoot.isEmpty() || m_repoRoot == QLatin1String("/")
+        || m_repoRoot.startsWith(QLatin1Char('~'))) {
+        // "~" is refused rather than expanded: every path this client sends is
+        // shell-quoted (it must be — repoRoot is user input), so an unexpanded
+        // tilde would create a directory literally named "~" and install into
+        // it. Reading such a path merely fails; WRITING to it makes a mess in
+        // the user's home.
+        fail(tr("Cannot install the CodeHarbor remote service into \"%1\". Give "
+                "the profile an absolute directory of its own on %2, for example "
+                "/home/<user>/codeharbor; \"~\" is not expanded because every "
+                "path sent to the server is quoted.")
+                .arg(m_repoRoot, m_host));
+        return false;
+    }
+    if (url.isEmpty()) {
+        fail(tr("%1 has no CodeHarbor remote service under \"%2\", and this build "
+                "cannot tell which release matches it (it reports no version). "
+                "Unpack codeharbor-remote.tar.gz there yourself, or set "
+                "CH_REMOTE_ARTIFACT_URL to the tarball to install.")
+                .arg(m_host, m_repoRoot));
+        return false;
+    }
+    const QString staged = stagedArtifactPath(url);
+    if (staged.isEmpty() && info.fetcher == QLatin1String("none")) {
+        fail(tr("%1 has no CodeHarbor remote service under \"%2\", and neither "
+                "curl nor wget is installed there to download %3. Install one of "
+                "them, or unpack codeharbor-remote.tar.gz into \"%2\" by hand, or "
+                "stage the tarball on the server and set CH_REMOTE_ARTIFACT_URL "
+                "to its path.")
+                .arg(m_host, m_repoRoot, url));
+        return false;
+    }
+    if (!info.tar) {
+        fail(tr("%1 has no CodeHarbor remote service under \"%2\" and no `tar` to "
+                "unpack one. Install tar there, or unpack "
+                "codeharbor-remote.tar.gz into \"%2\" by hand.")
+                .arg(m_host, m_repoRoot));
+        return false;
+    }
+
+    setState(State::Provisioning);
+    emit provisioning(tr("Installing the CodeHarbor remote service into %1 on %2")
+                          .arg(m_repoRoot, m_host));
+
+    QString installLog;
+    QString installError;
+    const bool ran =
+        runRemoteScript(remoteProvisionScript(m_repoRoot, url, info.fetcher),
+                        kProvisionTimeoutMs, &installLog, &installError);
+    // Cancel is checked BEFORE the state is restored: disconnectSession() runs
+    // from inside runRemoteScript()'s nested loop and has already put us in
+    // Disconnected, so restoring `resume` here would resurrect Connecting on an
+    // attempt the user just abandoned.
+    if (!ran && m_cancelRequested)
+        return false;
+    setState(resume);
+    if (!ran || !installLog.contains(installedMarker())) {
+        fail(tr("Could not install the CodeHarbor remote service into \"%1\" on "
+                "%2 from %3: %4")
+                .arg(m_repoRoot, m_host, url,
+                     installError.isEmpty()
+                         ? tr("the install did not report success")
+                         : installError));
+        return false;
+    }
+
+    // Ask the SERVER again rather than believing the script's own verdict. This
+    // is the difference between "the install said it worked" and "there is now
+    // something here that this client can launch", and it is what makes a
+    // silently empty install loud.
+    QString verifyReport;
+    QString verifyError;
+    if (!runRemoteScript(remoteInspectScript(m_nodePath, m_repoRoot),
+                         kInspectTimeoutMs, &verifyReport, &verifyError)) {
+        if (m_cancelRequested)
+            return false;
+        fail(tr("Installed the CodeHarbor remote service into \"%1\" on %2 but "
+                "could not confirm it: %3")
+                .arg(m_repoRoot, m_host, verifyError));
+        return false;
+    }
+    const RemoteInspection after = parseInspection(verifyReport);
+    if (after.entry.isEmpty()) {
+        fail(tr("Unpacked %1 into \"%2\" on %3, but there is no codeharbord entry "
+                "point there afterwards, so the archive is not a "
+                "codeharbor-remote release.")
+                .arg(url, m_repoRoot, m_host));
+        return false;
+    }
+
+    emit provisioning(tr("Installed the CodeHarbor remote service at %1")
+                          .arg(after.entry));
+    return true;
 }
 
 QString SessionBootstrap::withLastDiagnostic(const QString& message) const
@@ -673,6 +1238,14 @@ bool SessionBootstrap::attemptWire()
         if (out.open(QIODevice::WriteOnly | QIODevice::Truncate))
             out.write(m_pool->knownHosts().serialize());
     }
+
+    // The session is authenticated; before anything is exec'd on it, make sure
+    // there is something at the configured location TO exec. Only a failure the
+    // user has to act on (no node, no download tool, an install that did not
+    // land) stops the attempt here, and ensureRemoteService() has already
+    // reported it. See its comment for why a failed INSPECTION does not.
+    if (!ensureRemoteService())
+        return false;
 
     m_rpcDevice = openChannelDevice(SshConnectionPool::ChannelKind::Rpc,
                                     rpcCommand(m_nodePath, m_repoRoot),

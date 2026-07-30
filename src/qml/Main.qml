@@ -11,14 +11,70 @@ ApplicationWindow {
     width: 1440
     height: 900
     visible: true
-    title: qsTr("CodeHarbor")
+    color: Theme.surface
+
+    // --- window chrome (SPEC 4.1) -------------------------------------------
+    //
+    // The window paints its own title bar (AppTitleBar) and its own resize
+    // edges, so the desktop environment's bar — the one light strip left on an
+    // otherwise fully dark, hand-painted window — is gone. That means going
+    // frameless, which hands this file everything the window manager used to do:
+    // moving, maximise/restore and resizing. All three are delegated to the
+    // platform (ApplicationWindow.startSystemMove() / startSystemResize()), never
+    // re-implemented from mouse deltas — a hand-rolled move fights the
+    // compositor's own pointer grab and drifts, and on Wayland there are no
+    // global window coordinates to add a delta to at all.
+    //
+    // EXCEPT on macOS. Qt's Cocoa plugin implements startSystemMove() but NOT
+    // startSystemResize() (QCocoaWindow declares only the former), so a frameless
+    // window there could be dragged around and then never resized again — far
+    // worse than a plain native bar. macOS therefore keeps its native frame,
+    // which follows the system's dark appearance anyway, and gets the Dev Session
+    // in the window TITLE rather than in a bar of our own.
+    readonly property bool customChrome: Qt.platform.os !== "osx"
+    flags: window.customChrome ? (Qt.Window | Qt.FramelessWindowHint) : Qt.Window
+
+    // The human label for the Dev Session in front of the user. AppController
+    // publishes the session's ID (a server-minted UUID) and its repository root,
+    // but not its name, so the repository directory's own name is the label —
+    // the same string the sidebar shows as a row subtitle.
+    readonly property string sessionLabel: app.activeSessionId.length > 0
+                                           ? window.baseName(app.activeSessionRepoRoot)
+                                           : ""
+
+    // One application name, used by the window title AND by the title bar the
+    // window draws for itself. The window title additionally carries the Dev
+    // Session, because that is the string the desktop's task switcher shows.
+    readonly property string appName: qsTr("CodeHarbor")
+
+    title: window.sessionLabel.length > 0
+           ? qsTr("%1 — %2").arg(window.sessionLabel).arg(window.appName)
+           : window.appName
+
+    // Last segment of a remote POSIX path, trailing slashes ignored.
+    function baseName(path) {
+        const trimmed = String(path).replace(/\/+$/, "");
+        const cut = trimmed.lastIndexOf("/");
+        return cut < 0 ? trimmed : trimmed.substring(cut + 1);
+    }
 
     // SPEC 4.5 fallback trees for a region with no server tree yet. Declared as
     // properties with dependency-free bindings so each is constructed EXACTLY
     // ONCE and keeps a stable identity for the whole run; see the ViewerRegion /
     // TerminalRegion comment below for why identity matters.
     readonly property var viewerFallbackNode: ({ paneId: "viewer-1", url: "", children: [] })
-    readonly property var terminalFallbackNode: ({ paneId: "terminal-1", children: [] })
+    // TWO terminal panes, stacked one above the other, because that is what a
+    // terminal region is FOR: something long-running above, something being
+    // typed below. "vertical" stacks children top-to-bottom (TerminalRegion maps
+    // it to SplitView's Qt.Vertical), and the even `ratios` split the height.
+    // Still ONE object, constructed once: handing a region a new `node` identity
+    // rebuilds its panes, which kills a live terminal.
+    readonly property var terminalFallbackNode: ({
+        orientation: "vertical",
+        children: [{ paneId: "terminal-1", children: [] },
+                   { paneId: "terminal-2", children: [] }],
+        ratios: [0.5, 0.5]
+    })
 
     // Point the terminal region at the active Dev Session, WORKING DIRECTORY
     // FIRST.
@@ -70,10 +126,29 @@ ApplicationWindow {
         }
     }
 
+    // The self-drawn title bar. Hidden (and the native frame kept) where
+    // frameless is the wrong trade — see `customChrome` above.
+    AppTitleBar {
+        id: titleBar
+        objectName: "titleBar"
+        anchors.top: parent.top
+        anchors.left: parent.left
+        anchors.right: parent.right
+        visible: window.customChrome
+        height: titleBar.visible ? titleBar.implicitHeight : 0
+        win: window
+        title: window.appName
+        sessionLabel: window.sessionLabel
+    }
+
     SplitView {
         id: outer
-        anchors.fill: parent
+        anchors.top: titleBar.bottom
+        anchors.left: parent.left
+        anchors.right: parent.right
+        anchors.bottom: parent.bottom
         orientation: Qt.Horizontal
+        handle: AppSplitHandle {}
 
         Component.onCompleted: {
             var sidebar = app.uiState.sidebarWidth();
@@ -149,6 +224,62 @@ ApplicationWindow {
         }
     }
 
+    // --- resize edges (SPEC 4.1) --------------------------------------------
+    //
+    // A frameless window has no resize border, so the eight grab strips a window
+    // manager would have drawn are declared here, over everything else. Each one
+    // hands the drag straight to the platform via startSystemResize(edges); the
+    // corners pass BOTH of their edges, which is what makes a corner resize two
+    // axes at once.
+    //
+    // Declared AFTER the regions so they hit-test above them (Quick tries the
+    // last sibling first), and the four corners come after the four edges for the
+    // same reason: at a corner the corner strip must win.
+    //
+    // Off entirely when the window is not resizable by dragging: while maximised,
+    // and on the platforms that keep their native frame.
+    Repeater {
+        model: [
+            // h/v: -1 = the left/top edge, 1 = the right/bottom edge, 0 = spans.
+            { h: 0, v: -1, edges: Qt.TopEdge, cursor: Qt.SizeVerCursor },
+            { h: 0, v: 1, edges: Qt.BottomEdge, cursor: Qt.SizeVerCursor },
+            { h: -1, v: 0, edges: Qt.LeftEdge, cursor: Qt.SizeHorCursor },
+            { h: 1, v: 0, edges: Qt.RightEdge, cursor: Qt.SizeHorCursor },
+            { h: -1, v: -1, edges: Qt.LeftEdge | Qt.TopEdge, cursor: Qt.SizeFDiagCursor },
+            { h: 1, v: 1, edges: Qt.RightEdge | Qt.BottomEdge, cursor: Qt.SizeFDiagCursor },
+            { h: 1, v: -1, edges: Qt.RightEdge | Qt.TopEdge, cursor: Qt.SizeBDiagCursor },
+            { h: -1, v: 1, edges: Qt.LeftEdge | Qt.BottomEdge, cursor: Qt.SizeBDiagCursor }
+        ]
+
+        delegate: MouseArea {
+            id: resizeGrip
+            required property var modelData
+
+            // A corner needs a bigger target than an edge: it is aimed at, and it
+            // is the only way to change both dimensions in one drag.
+            readonly property int extent: (resizeGrip.modelData.h !== 0
+                                           && resizeGrip.modelData.v !== 0)
+                                          ? Theme.splitHandleThickness * 2
+                                          : Theme.splitHandleThickness
+
+            z: 2000
+            enabled: window.customChrome && window.visibility === Window.Windowed
+            cursorShape: resizeGrip.modelData.cursor
+            acceptedButtons: Qt.LeftButton
+
+            x: resizeGrip.modelData.h < 0
+               ? 0
+               : (resizeGrip.modelData.h > 0 ? parent.width - resizeGrip.extent : 0)
+            y: resizeGrip.modelData.v < 0
+               ? 0
+               : (resizeGrip.modelData.v > 0 ? parent.height - resizeGrip.extent : 0)
+            width: resizeGrip.modelData.h === 0 ? parent.width : resizeGrip.extent
+            height: resizeGrip.modelData.v === 0 ? parent.height : resizeGrip.extent
+
+            onPressed: window.startSystemResize(resizeGrip.modelData.edges)
+        }
+    }
+
     // Non-blocking error banner: surfaces app.error (RPC failures forwarded
     // verbatim, SPEC 10.3) as a transient toast so shell-level failures are
     // visible instead of silently swallowed.
@@ -162,8 +293,8 @@ ApplicationWindow {
         anchors.topMargin: 12
         width: Math.min(errorLabel.implicitWidth + 32, parent.width - 24)
         height: errorLabel.implicitHeight + 20
-        radius: 6
-        color: "#f38ba8"
+        radius: Theme.radiusMedium
+        color: Theme.danger
 
         Behavior on opacity { NumberAnimation { duration: 200 } }
 
@@ -171,8 +302,8 @@ ApplicationWindow {
             id: errorLabel
             anchors.centerIn: parent
             width: parent.width - 32
-            color: "#11111b"
-            font.pixelSize: 13
+            color: Theme.textOnAccent
+            font.pixelSize: Theme.fontSizeLabel
             wrapMode: Text.WordWrap
             horizontalAlignment: Text.AlignHCenter
         }
@@ -446,7 +577,15 @@ ApplicationWindow {
                   window.notifyUser(qsTr("No active Dev Session."));
               else
                   agentMonitor.markSeen(app.activeSessionId);
-          } }
+          } },
+        // A frameless window has no window-manager menu of its own, so maximise
+        // and close must be reachable without the pointer too. Ctrl+Shift+W
+        // rather than the platform's Ctrl+W: every terminal pane is a real
+        // shell, and Ctrl+W is delete-word in all of them.
+        { id: "window.maximise", title: qsTr("Toggle Maximised Window"),
+          invoke: () => titleBar.toggleMaximised() },
+        { id: "window.close", title: qsTr("Close Window"), shortcut: "Ctrl+Shift+W",
+          invoke: () => window.close() }
     ]
 
     CommandPalette {

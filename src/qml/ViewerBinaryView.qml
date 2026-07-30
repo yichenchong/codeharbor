@@ -26,7 +26,7 @@ Rectangle {
     // pane's file for no reason.
     property string pendingDownloadUrl: ""
 
-    color: "#1e1e2e"
+    color: Theme.surface
 
     function baseName(u) {
         var s = u.toString();
@@ -48,7 +48,7 @@ Rectangle {
             // ViewerDirectoryView's entries and TerminalPaneView's chrome.
             textFormat: Text.PlainText
             text: root.baseName(root.url)
-            color: "#cdd6f4"
+            color: Theme.text
             font.pixelSize: 15
             font.bold: true
             elide: Text.ElideMiddle
@@ -57,14 +57,17 @@ Rectangle {
         }
         Label {
             text: qsTr("Binary file — preview not available")
-            color: "#6c7086"
-            font.pixelSize: 12
+            color: Theme.textDim
+            font.pixelSize: Theme.fontSizeBody
             Layout.alignment: Qt.AlignHCenter
         }
         Label {
             // Same rule: the remote path is data.
             textFormat: Text.PlainText
             text: root.url
+            // #585b70 is a step between Theme.textDim and Theme.textFaint and
+            // has no Theme role; kept so the path stays quieter than the caption
+            // above it.
             color: "#585b70"
             font.pixelSize: 11
             elide: Text.ElideMiddle
@@ -72,8 +75,30 @@ Rectangle {
             horizontalAlignment: Text.AlignHCenter
         }
         Button {
+            id: downloadButton
             Layout.alignment: Qt.AlignHCenter
             text: qsTr("Download")
+            implicitHeight: 30
+            leftPadding: 14
+            rightPadding: 14
+            // The Basic style draws a button in the STYLE's own light palette,
+            // which on this dark pane is a white slab with near-black text — the
+            // borrowed-chrome look. Same treatment as TerminalPaneView's Connect
+            // button.
+            contentItem: Label {
+                text: downloadButton.text
+                color: downloadButton.enabled ? Theme.text : Theme.textFaint
+                font.pixelSize: Theme.fontSizeBody
+                horizontalAlignment: Text.AlignHCenter
+                verticalAlignment: Text.AlignVCenter
+            }
+            background: Rectangle {
+                radius: Theme.radiusSmall
+                color: downloadButton.down ? Theme.border
+                     : downloadButton.hovered ? "#3a3a52" : Theme.surfaceRaised
+                border.width: downloadButton.visualFocus ? 2 : 1
+                border.color: downloadButton.visualFocus ? Theme.accent : Theme.border
+            }
             // Disabled while a download this pane started is still pending, so a
             // single click cannot fan out into multiple accepted downloads.
             enabled: root.url.toString().length > 0 && !root.downloadRequested

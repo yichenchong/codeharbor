@@ -217,6 +217,99 @@ jobs:
           Get-ChildItem "$env:VCPKG_INSTALLATION_ROOT/installed/x64-windows/bin/*.dll" |
             ForEach-Object { Copy-Item $_.FullName $dest/ }
 
+      # --- Windows installer (Inno Setup) --------------------------------------
+      # The step above leaves a portable extract-and-run tree. That stays exactly
+      # as it was - it is the `codeharbor-windows` artifact other tooling already
+      # points at, and some users want a no-install copy. This step packages the
+      # SAME tree into a per-user installer so a normal Windows user gets
+      # shortcuts, an "Installed apps" entry, and upgrade-in-place instead of
+      # "extract a zip somewhere and delete the old folder by hand".
+      #
+      # Why the script carries no version: packaging/windows/codeharbor.iss reads
+      # it from /DAppVersion, and the value is parsed here out of the top-level
+      # CMakeLists.txt - the single source of truth that
+      # .omp/skills/bump-version/bump.sh rewrites. Nothing about the installer has
+      # to be bumped separately, which is deliberate: a version the bump script
+      # misses has already bitten this project once.
+      - name: Build installer (Windows, Inno Setup)
+        if: matrix.name == 'windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $cmake = Get-Content CMakeLists.txt -Raw
+          $m = [regex]::Match($cmake, 'project\(CodeHarbor[\s\S]*?VERSION\s+(\d+\.\d+\.\d+)')
+          if (-not $m.Success) {
+            throw "could not parse the project() VERSION out of CMakeLists.txt; the installer refuses to guess a version."
+          }
+          $version = $m.Groups[1].Value
+          Write-Host "Installer version (from CMakeLists.txt): $version"
+
+          # ISCC is the Inno Setup command-line compiler. The runner image ships
+          # Inno Setup (6.7.1 at the time of writing) but it has been absent from
+          # some windows-2025 image revisions and is not always on PATH, so
+          # resolve it, and install it if it is genuinely missing rather than
+          # skipping the installer and producing a green run with nothing in it.
+          function Resolve-Iscc {
+            $cmd = Get-Command ISCC.exe -ErrorAction SilentlyContinue
+            if ($cmd) { return $cmd.Source }
+            foreach ($p in @("${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
+                             "$env:ProgramFiles\Inno Setup 6\ISCC.exe")) {
+              if (Test-Path $p) { return $p }
+            }
+            return $null
+          }
+          $iscc = Resolve-Iscc
+          if (-not $iscc) {
+            Write-Host "Inno Setup not present on this image; installing it."
+            choco install innosetup --no-progress -y
+            if ($LASTEXITCODE -ne 0) { throw "choco install innosetup failed with exit code $LASTEXITCODE" }
+            $iscc = Resolve-Iscc
+          }
+          if (-not $iscc) { throw "ISCC.exe not found after installing Inno Setup" }
+
+          # Same spirit as the libssh pin below: refuse a toolchain that is not
+          # what the script was written against. ArchitecturesAllowed=x64compatible
+          # in codeharbor.iss needs Inno Setup 6.3 or newer; on 6.2 it is an
+          # unknown value, which is exactly the kind of thing that would otherwise
+          # surface as a broken installer rather than a failed build.
+          $isccVersion = (Get-Item $iscc).VersionInfo.FileVersionRaw
+          if (-not $isccVersion) { throw "could not read a file version from $iscc" }
+          Write-Host "ISCC $isccVersion ($iscc)"
+          if ($isccVersion -lt [version]"6.3") {
+            throw "Inno Setup $isccVersion is too old; codeharbor.iss requires 6.3 or newer."
+          }
+
+          $src = (Resolve-Path "artifact/codeharbor-windows").Path
+          $out = Join-Path (Get-Location).Path "installer"
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+
+          & $iscc "/DAppVersion=$version" "/DSourceDir=$src" "/DOutputDir=$out" `
+                  "packaging/windows/codeharbor.iss"
+          # $ErrorActionPreference does not apply to a native process's exit code,
+          # so check it explicitly or a failed compile would pass silently.
+          if ($LASTEXITCODE -ne 0) {
+            throw "ISCC failed with exit code $LASTEXITCODE; no Windows installer was produced."
+          }
+
+          $setup = @(Get-ChildItem $out -Filter "*.exe")
+          if ($setup.Count -ne 1) {
+            throw "expected exactly one installer in $out, found $($setup.Count)"
+          }
+          Write-Host ("Built {0} ({1:N1} MB)" -f $setup[0].Name, ($setup[0].Length / 1MB))
+
+      # Uploaded as its own artifact so the `codeharbor-windows` artifact above
+      # keeps exactly the contents (and path) it has always had. `publish` pulls
+      # every artifact into one directory with merge-multiple, so both end up
+      # attached to the release.
+      - name: Upload installer artifact (Windows)
+        if: matrix.name == 'windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: codeharbor-windows-installer
+          path: installer/
+          if-no-files-found: error
+
       - name: Deploy (macOS, macdeployqt)
         if: matrix.name == 'macos'
         run: |
@@ -280,6 +373,7 @@ jobs:
 
       # The Windows deploy step produces a DIRECTORY (exe + Qt runtime + libssh
       # DLLs); `gh release create` only accepts files, so fold it into one zip.
+      # The Windows installer is already a single .exe and passes through as-is.
       - name: Normalise assets
         run: |
           cd dist
@@ -289,6 +383,20 @@ jobs:
             rm -rf "$d"
           done
           ls -la
+
+      # A release missing the Windows installer is a release most Windows users
+      # cannot install, and a silently absent asset is worse than a red run: the
+      # tag is permanent. Assert both Windows assets before anything is published.
+      - name: Verify Windows assets are present
+        run: |
+          set -eu
+          for pattern in 'codeharbor-windows.zip' 'CodeHarbor-*-windows-x64-setup.exe'; do
+            matches=$(find dist -maxdepth 1 -name "$pattern" | wc -l)
+            [ "$matches" -eq 1 ] || {
+              echo "expected exactly one dist/$pattern, found $matches" >&2
+              exit 1
+            }
+          done
 
       - name: Create GitHub Release
         env:

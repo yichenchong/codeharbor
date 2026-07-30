@@ -240,12 +240,18 @@ void TstTerminalFactory::killCommandQuotesAdversarialTargets()
 // against tmux 3.6: with `ch_exact_t1` live, `new-session -A -s ch_exa` created
 // a SECOND session rather than attaching to the first, so no `=` is needed (and
 // tmux would take one as a literal character of the new name).
+//
+// The attach invocation carries a SECOND tmux command (`set-option ... mouse
+// on`, which gives tmux the wheel), and that one takes a real target, so both
+// mechanisms appear side by side in one string: the `-s` name without a sigil,
+// and the `-t` target with one.
 void TstTerminalFactory::attachCommandQuotesAdversarialIdsAndWorkingDir()
 {
     QCOMPARE(TerminalController::tmuxNewSessionCommand(
                  DevSessionId{QStringLiteral("dev")}, TerminalId{QStringLiteral("t1")},
                  QStringLiteral("/srv/repo")),
-             QStringLiteral("tmux new-session -A -s 'ch_dev_t1' -c '/srv/repo'"));
+             QStringLiteral("tmux new-session -A -s 'ch_dev_t1' -c '/srv/repo'"
+                            " \\; set-option -t '=ch_dev_t1:' mouse on"));
 
     // A working directory is the field most likely to carry a real quote, and
     // the one a user can type. Breaking out of it would run `id` on the host.
@@ -253,15 +259,20 @@ void TstTerminalFactory::attachCommandQuotesAdversarialIdsAndWorkingDir()
                  DevSessionId{QStringLiteral("dev")}, TerminalId{QStringLiteral("t1")},
                  QStringLiteral("/tmp/x'; id; echo '")),
              QStringLiteral("tmux new-session -A -s 'ch_dev_t1' "
-                            "-c '/tmp/x'\\''; id; echo '\\'''"));
+                            "-c '/tmp/x'\\''; id; echo '\\'''"
+                            " \\; set-option -t '=ch_dev_t1:' mouse on"));
 
     // Ids arrive from server data: a quote in either one must not escape, and
-    // the two must not be able to merge into one another's field.
+    // the two must not be able to merge into one another's field. The id reaches
+    // the command TWICE now — as the new session's name and as the target of the
+    // mouse option — so both copies are checked.
     QCOMPARE(TerminalController::tmuxNewSessionCommand(
                  DevSessionId{QStringLiteral("d'; rm -rf ~; '")},
                  TerminalId{QStringLiteral("t`whoami`")}, QStringLiteral("/w")),
              QStringLiteral("tmux new-session -A -s 'ch_d'\\''; rm -rf ~; '\\''_t`whoami`' "
-                            "-c '/w'"));
+                            "-c '/w'"
+                            " \\; set-option -t "
+                            "'=ch_d'\\''; rm -rf ~; '\\''_t`whoami`:' mouse on"));
 
     // A leading `-` in the working directory is consumed as the value of -c by
     // getopt, and a newline is inert inside the quotes: neither adds a word to
@@ -270,9 +281,15 @@ void TstTerminalFactory::attachCommandQuotesAdversarialIdsAndWorkingDir()
         DevSessionId{QStringLiteral("dev")}, TerminalId{QStringLiteral("t1")},
         QStringLiteral("-rf /\nrm -rf ~"));
     QCOMPARE(command,
-             QStringLiteral("tmux new-session -A -s 'ch_dev_t1' -c '-rf /\nrm -rf ~'"));
-    // Exactly two quoted arguments, so nothing became a third word.
-    QCOMPARE(command.count(QLatin1Char('\'')), 4);
+             QStringLiteral("tmux new-session -A -s 'ch_dev_t1' -c '-rf /\nrm -rf ~'"
+                            " \\; set-option -t '=ch_dev_t1:' mouse on"));
+    // Exactly three quoted arguments — the session name, the working directory
+    // and the mouse option's target — so nothing became a fourth word.
+    QCOMPARE(command.count(QLatin1Char('\'')), 6);
+    // The option's target is tmux-pinned with the `=` sigil INSIDE the quotes,
+    // so it cannot fnmatch onto another session; the sigil is tmux syntax, not
+    // shell syntax (the same rule as the kill command above).
+    QVERIFY(command.contains(QStringLiteral("-t '=ch_dev_t1:'")));
 }
 
 // The bridge is reachable from the WebEngine page, so `cols`/`rows` are values

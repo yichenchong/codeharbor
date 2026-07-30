@@ -191,6 +191,9 @@ Item {
         // Red for the state that puts the user's edits at risk, amber for the
         // one that merely suspends them — the same split, and the same two
         // colours, TerminalPaneView uses for "error" versus a plain drop.
+        // #45222c / #3a2f1e are dim FILLS behind danger/warning text and have no
+        // Theme role (Theme.danger and Theme.warning are the text colours, far
+        // too bright to fill with). Same pair TerminalPaneView's banner uses.
         color: root.conflicted ? "#45222c" : "#3a2f1e"
 
         Label {
@@ -206,7 +209,7 @@ Item {
             text: root.conflicted
                   ? qsTr("This file changed on the server since it was opened, so the last save was refused. Reload to take the server's copy, or save again to overwrite it.")
                   : qsTr("The connection to the server is down. This file cannot be saved or reloaded until it comes back.")
-            color: "#f9e2af"
+            color: Theme.warning
             font.pixelSize: 11
         }
     }

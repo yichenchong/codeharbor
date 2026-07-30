@@ -1,11 +1,24 @@
-// Command palette + global keyboard shortcuts (SPEC 15).
+// Command palette + global keyboard shortcuts (SPEC 15), plus the colour-
+// vocabulary gate for the whole QML module (SPEC 4.1).
 //
-// Drives the REAL src/qml/CommandPalette.qml — embedded in this test's own qrc,
-// so the component is exercised exactly as shipped and the test does not depend
-// on the CodeHarbor QML module registration. A tiny inline harness document
-// hosts it the way Main.qml will (one Loader, one `commands` assignment), and
-// every command's `invoke` is a plain JS closure that bumps a counter on an
-// injected C++ probe — the documented {id,title,shortcut,invoke} shape.
+// Drives the REAL CommandPalette.qml, loaded from the CodeHarbor QML module this
+// target links (qrc:/qt/qml/CodeHarbor/CommandPalette.qml). It used to be
+// embedded in this test's own qrc instead, deliberately, so the test did not
+// depend on the module registration — but a component in this module now reaches
+// the `Theme` singleton for its colours, and a singleton only exists where the
+// module is registered. Loading it out of a bare qrc path left `Theme` undefined,
+// which in QML is a blank colour and not an error. A tiny inline harness document
+// hosts the palette the way Main.qml does (one Loader, one `commands`
+// assignment), and every command's `invoke` is a plain JS closure that bumps a
+// counter on an injected C++ probe — the documented {id,title,shortcut,invoke}
+// shape.
+//
+// The second half of the file is about colour rather than the palette: it reads
+// every `color` role out of the live Theme singleton and then refuses to let any
+// QML file in src/qml spell one of those colours out as a hex literal. That is
+// the check that stops the module drifting back into two hundred copies of the
+// same eight shades. It lives here because this is the one QML test that already
+// holds a plain QQmlEngine with the module registered and no window to set up.
 //
 // Everything runs headless (offscreen QPA + software Quick backend, pinned by
 // the ctest registration). Key events are posted to the QQuickView itself, so
@@ -15,8 +28,15 @@
 #include <QtTest>
 
 #include <QByteArray>
+#include <QColor>
+#include <QDir>
+#include <QFile>
 #include <QGuiApplication>
+#include <QList>
 #include <QMap>
+#include <QMetaObject>
+#include <QMetaProperty>
+#include <QMetaType>
 #include <QPoint>
 #include <QQmlComponent>
 #include <QQmlContext>
@@ -24,11 +44,15 @@
 #include <QQmlError>
 #include <QQuickItem>
 #include <QQuickView>
+#include <QRegularExpression>
+#include <QRegularExpressionMatchIterator>
 #include <QString>
 #include <QStringList>
 #include <QUrl>
 #include <QVariant>
 #include <QtQuickControls2/QQuickStyle>
+
+#include <memory>
 
 // ---------------------------------------------------------------------------
 // Injected counter. Every fake command's invoke() closure calls probe.hit(id),
@@ -104,7 +128,8 @@ Item {
     Loader {
         id: paletteLoader
         objectName: "paletteLoader"
-        source: "qrc:/chtest/CommandPalette.qml"
+        // The shipped module copy, so the palette's `Theme` colours resolve.
+        source: "qrc:/qt/qml/CodeHarbor/CommandPalette.qml"
         onLoaded: {
             item.objectName = "palette";
             item.commands = @COMMANDS@;
@@ -214,6 +239,113 @@ void settle(int ms = 60)
     QCoreApplication::processEvents();
 }
 
+// ---------------------------------------------------------------------------
+// Theme vocabulary (SPEC 4.1)
+// ---------------------------------------------------------------------------
+
+// Every `color` role the live Theme singleton publishes, role name -> value.
+// Empty (with `why` filled in) when the singleton does not resolve, which is the
+// failure mode a broken QML singleton registration produces: `Theme.surface`
+// silently evaluates to undefined instead of raising anything.
+QMap<QString, QColor> themeColours(QString *why)
+{
+    QQmlEngine engine;
+    QQmlComponent component(&engine);
+    component.setData(QByteArrayLiteral("import QtQuick\n"
+                                        "import CodeHarbor\n"
+                                        "QtObject { readonly property var theme: Theme }\n"),
+                      QUrl(QStringLiteral("qrc:/chtest/ThemeProbe.qml")));
+    const std::unique_ptr<QObject> probe(component.create());
+    if (!probe) {
+        *why = QStringLiteral("the Theme probe document did not load: ") + component.errorString();
+        return {};
+    }
+    QObject *theme = probe->property("theme").value<QObject *>();
+    if (!theme) {
+        *why = QStringLiteral("`Theme` did not resolve to an object, so the QML singleton "
+                              "registration in src/qml/CMakeLists.txt is broken");
+        return {};
+    }
+
+    QMap<QString, QColor> roles;
+    const QMetaObject *mo = theme->metaObject();
+    for (int i = 0; i < mo->propertyCount(); ++i) {
+        const QMetaProperty property = mo->property(i);
+        if (property.metaType().id() != QMetaType::QColor)
+            continue;
+        roles.insert(QString::fromLatin1(property.name()),
+                     property.read(theme).value<QColor>());
+    }
+    return roles;
+}
+
+struct HexHit {
+    QString file;
+    int line = 0;
+    QString literal;
+    QString role;
+};
+
+// Is this line nothing but a comment? Hex literals are quoted and discussed in
+// the module's comments (Theme.qml names the palette it came from), and a comment
+// is documentation rather than a colour anybody paints with.
+bool isCommentLine(const QString &line)
+{
+    const QString trimmed = line.trimmed();
+    return trimmed.startsWith(QLatin1String("//")) || trimmed.startsWith(QLatin1Char('*'))
+           || trimmed.startsWith(QLatin1String("/*"));
+}
+
+// Every hex literal in src/qml that spells out a colour Theme already has a name
+// for. Theme.qml itself is where those literals are DEFINED, so it is skipped.
+QList<HexHit> themeColoursWrittenAsHex(const QMap<QString, QColor> &roles, QString *why)
+{
+    static const QRegularExpression hexLiteral(QStringLiteral("#[0-9A-Fa-f]{3,8}"));
+
+    QDir dir(QStringLiteral(CODEHARBOR_QML_SOURCE_DIR));
+    const QStringList files =
+            dir.entryList(QStringList{QStringLiteral("*.qml")}, QDir::Files, QDir::Name);
+    if (files.isEmpty()) {
+        *why = QStringLiteral("no .qml files found under ") + dir.absolutePath();
+        return {};
+    }
+
+    QList<HexHit> hits;
+    for (const QString &name : files) {
+        if (name == QStringLiteral("Theme.qml"))
+            continue;
+        QFile file(dir.filePath(name));
+        if (!file.open(QIODevice::ReadOnly | QIODevice::Text)) {
+            *why = QStringLiteral("could not read ") + file.fileName();
+            return {};
+        }
+        const QStringList lines =
+                QString::fromUtf8(file.readAll()).split(QLatin1Char('\n'));
+        for (int i = 0; i < lines.size(); ++i) {
+            if (isCommentLine(lines.at(i)))
+                continue;
+            QRegularExpressionMatchIterator matches = hexLiteral.globalMatch(lines.at(i));
+            while (matches.hasNext()) {
+                const QString literal = matches.next().captured();
+                const QColor colour(literal);
+                if (!colour.isValid())
+                    continue;
+                // Several roles can legitimately share one shade (a selected row
+                // and a raised control are the same grey), so the message names
+                // every role that would do rather than picking one arbitrarily.
+                QStringList named;
+                for (auto role = roles.cbegin(); role != roles.cend(); ++role) {
+                    if (role.value() == colour)
+                        named.append(role.key());
+                }
+                if (!named.isEmpty())
+                    hits.append({name, i + 1, literal, named.join(QStringLiteral(" / "))});
+            }
+        }
+    }
+    return hits;
+}
+
 } // namespace
 
 class TstPalette : public QObject
@@ -233,13 +365,19 @@ private slots:
     void activationShortcutOpensPalette();
     void noMatchIsSafeAndEnterDoesNothing();
     void emptyCommandListIsSafe();
+
+    // The module's colour vocabulary. Both of these fail for the same underlying
+    // reason a mis-registered singleton would, which is why they live together.
+    void themeSingletonPublishesEveryColourRole();
+    void noQmlFileSpellsOutAThemeColour();
 };
 
 void TstPalette::harnessLoadsPalette()
 {
     Fixture fixture;
     QVERIFY2(fixture.harness != nullptr, qPrintable(fixture.componentError()));
-    QVERIFY2(fixture.palette != nullptr, "CommandPalette.qml did not load from qrc:/chtest");
+    QVERIFY2(fixture.palette != nullptr,
+             "CommandPalette.qml did not load from the CodeHarbor module");
     QVERIFY(!fixture.opened()); // starts closed
     QVERIFY2(fixture.warnings.isEmpty(), qPrintable(fixture.warningReport()));
 }
@@ -532,6 +670,64 @@ void TstPalette::emptyCommandListIsSafe()
     settle();
     QVERIFY(!fixture.opened());
     QVERIFY2(fixture.warnings.isEmpty(), qPrintable(fixture.warningReport()));
+}
+
+// The registration check the rest of the module depends on. A QML singleton that
+// is declared `pragma Singleton` but not marked QT_QML_SINGLETON_TYPE (or the
+// other way round) still lets `import CodeHarbor` succeed, and every `Theme.x`
+// then evaluates to undefined — a blank colour, no warning, no error. Nothing
+// else in the suite can tell that apart from a working theme.
+void TstPalette::themeSingletonPublishesEveryColourRole()
+{
+    QString why;
+    const QMap<QString, QColor> roles = themeColours(&why);
+    QVERIFY2(!roles.isEmpty(), qPrintable(why));
+
+    // The roles every file in the module binds to. A rename here without a rename
+    // there is a silently blank colour, so the names are pinned.
+    const QStringList required{QStringLiteral("surface"),      QStringLiteral("surfaceDeep"),
+                               QStringLiteral("surfaceSunken"), QStringLiteral("surfaceRaised"),
+                               QStringLiteral("surfaceHover"), QStringLiteral("surfaceSelected"),
+                               QStringLiteral("border"),       QStringLiteral("borderSubtle"),
+                               QStringLiteral("text"),         QStringLiteral("textDim"),
+                               QStringLiteral("textOnAccent"), QStringLiteral("textFaint"),
+                               QStringLiteral("accent"),       QStringLiteral("success"),
+                               QStringLiteral("warning"),      QStringLiteral("danger"),
+                               QStringLiteral("busy")};
+    for (const QString &role : required) {
+        QVERIFY2(roles.contains(role),
+                 qPrintable(QStringLiteral("Theme has no colour role \"%1\"; it publishes: %2")
+                                    .arg(role, QStringList(roles.keys()).join(QStringLiteral(", ")))));
+        QVERIFY2(roles.value(role).isValid(),
+                 qPrintable(QStringLiteral("Theme.%1 is not a valid colour").arg(role)));
+    }
+}
+
+// Colour drift gate. A hex literal that spells out a colour Theme already names is
+// a copy of the vocabulary: it is what let the four modal dialogs and a scrollbar
+// drift out of the palette unnoticed, because nothing tied them to it. A literal
+// Theme has NO name for is a different thing — a colour the vocabulary is missing
+// — and is deliberately left alone here rather than guessed at.
+void TstPalette::noQmlFileSpellsOutAThemeColour()
+{
+    QString why;
+    const QMap<QString, QColor> roles = themeColours(&why);
+    QVERIFY2(!roles.isEmpty(), qPrintable(why));
+
+    const QList<HexHit> hits = themeColoursWrittenAsHex(roles, &why);
+    QVERIFY2(why.isEmpty(), qPrintable(why));
+
+    QStringList report;
+    for (const HexHit &hit : hits) {
+        report.append(QStringLiteral("  %1:%2 writes %3 — use Theme.%4")
+                              .arg(hit.file)
+                              .arg(hit.line)
+                              .arg(hit.literal, hit.role));
+    }
+    QVERIFY2(hits.isEmpty(),
+             qPrintable(QStringLiteral("%1 hard-coded colour(s) that Theme already names:\n%2")
+                                .arg(hits.size())
+                                .arg(report.join(QLatin1Char('\n')))));
 }
 
 int main(int argc, char *argv[])

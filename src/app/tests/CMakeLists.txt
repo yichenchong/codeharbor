@@ -21,6 +21,10 @@ target_link_libraries(tst_serverprofiles PRIVATE
     Qt6::Qml
     Qt6::Quick
     Qt6::QuickControls2
+    # ConnectSheet imports the CodeHarbor module for the shared Theme singleton.
+    # Linking the generated plugin registers that module for this source-loaded
+    # test just as it is registered for the shipped application.
+    codeharbor_qmlplugin
 )
 target_compile_definitions(tst_serverprofiles PRIVATE
     CH_CONNECTSHEET_QML="${CMAKE_CURRENT_SOURCE_DIR}/../../qml/ConnectSheet.qml"

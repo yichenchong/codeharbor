@@ -8,7 +8,7 @@ Rectangle {
     id: root
     property url url
 
-    color: "#1e1e2e"
+    color: Theme.surface
 
     property string content: ""
     property string errorText: ""
@@ -65,13 +65,21 @@ Rectangle {
         anchors.fill: parent
         clip: true
 
+        // The application's own scrollbars. The Basic style's are a light plate
+        // sized for arrow buttons this application does not draw, which is what
+        // made a dark text pane look like it had borrowed someone else's chrome.
+        // Both axes: the text is deliberately NOT wrapped, so a long line is
+        // reached by scrolling sideways.
+        ScrollBar.vertical: AppScrollBar {}
+        ScrollBar.horizontal: AppScrollBar {}
+
         TextArea {
             readOnly: true
             wrapMode: TextArea.NoWrap
             selectByMouse: true
-            font.family: "monospace"
-            font.pixelSize: 13
-            color: "#cdd6f4"
+            font.family: Theme.monoFamily
+            font.pixelSize: Theme.fontSizeLabel
+            color: Theme.text
             background: null
             // Content ONLY. A failure used to be rendered in here, in the same
             // monospace face as the file, where it is indistinguishable from a
@@ -97,7 +105,7 @@ Rectangle {
               : root.loading ? qsTr("Loading\u2026")
               : root.content.length === 0 && root.url.toString().length > 0
                 ? qsTr("This file is empty.") : ""
-        color: root.errorText.length > 0 ? "#f38ba8" : "#6c7086"
-        font.pixelSize: 13
+        color: root.errorText.length > 0 ? Theme.danger : Theme.textDim
+        font.pixelSize: Theme.fontSizeLabel
     }
 }

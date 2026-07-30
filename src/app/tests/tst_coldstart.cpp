@@ -534,16 +534,24 @@ void TstColdStart::cleanupTestCase()
     if (m_graph->pool.state() == ch::SshConnectionPool::State::Connected) {
         if (m_terminalController)
             m_graph->terminalFactory.kill(m_terminalController);
+        // BOTH default panes: a new Dev Session now comes up with terminal-1
+        // above terminal-2 (SessionLayouts::defaultTree), so a single-target
+        // kill would leave the lower pane's tmux session running on the shared
+        // fixture forever.
         if (!m_sessionId.isEmpty()) {
-            const QString target = ch::TerminalController::tmuxTarget(
-                ch::DevSessionId{m_sessionId}, ch::TerminalId{QStringLiteral("terminal-1")});
-            qInfo().noquote()
-                << "cleanup tmux:"
-                << runExec(QStringLiteral("tmux kill-session -t '%1' >/dev/null 2>&1; "
-                                          "tmux has-session -t '%1' >/dev/null 2>&1 "
-                                          "&& echo ALIVE || echo GONE")
-                               .arg(target))
-                       .trimmed();
+            const QStringList paneIds{QStringLiteral("terminal-1"),
+                                      QStringLiteral("terminal-2")};
+            for (const QString& paneId : paneIds) {
+                const QString target = ch::TerminalController::tmuxTarget(
+                    ch::DevSessionId{m_sessionId}, ch::TerminalId{paneId});
+                qInfo().noquote()
+                    << "cleanup tmux:" << paneId
+                    << runExec(QStringLiteral("tmux kill-session -t '%1' >/dev/null 2>&1; "
+                                              "tmux has-session -t '%1' >/dev/null 2>&1 "
+                                              "&& echo ALIVE || echo GONE")
+                                   .arg(target))
+                           .trimmed();
+            }
         }
         if (!m_remoteFile.isEmpty()) {
             runExec(QStringLiteral("rm -f '%1'; rm -rf /tmp/.codeharbor-recovery")

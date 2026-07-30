@@ -6,6 +6,7 @@
 #include <QList>
 #include <QObject>
 #include <QString>
+#include <QStringList>
 
 #include <functional>
 
@@ -82,6 +83,101 @@ public:
     using CredentialCallback =
         std::function<CredentialReply(const QString& user, CredentialKind kind)>;
 
+    // ---- multi-step authentication (SPEC 12.1) -----------------------------
+    //
+    // An SSH server may require SEVERAL methods before it grants access
+    // (OpenSSH's `AuthenticationMethods publickey,password`). libssh reports
+    // that with SSH_AUTH_PARTIAL: the method WAS accepted, and the server now
+    // expects a further one. Treating that as failure is why a server wanting
+    // both a key and a password could not be used at all.
+    enum class AuthOutcome {
+        Granted,  // access granted; the handshake is authenticated
+        Partial,  // accepted, but the server requires a further method
+        Refused,  // this method did not succeed
+    };
+    Q_ENUM(AuthOutcome)
+
+    // The authentication methods the server offers RIGHT NOW. Re-read after
+    // every step: the set shrinks (and can grow) after a partial success.
+    struct AuthMethods {
+        bool publicKey = false;
+        bool password = false;
+    };
+
+    // One step of this client's authentication ladder.
+    enum class AuthRung {
+        Agent,          // ssh-agent
+        KeyFile,        // configured/default private key, no passphrase
+        KeyPassphrase,  // the same keys, with a passphrase asked of the user
+        Password,       // the account password asked of the user
+        Exhausted,      // nothing left to try
+    };
+    Q_ENUM(AuthRung)
+
+    // Which rungs this handshake has already spent. A rung is climbed at most
+    // once, and that is what bounds the multi-step loop: a server that keeps
+    // answering SSH_AUTH_PARTIAL without ever granting access runs out of rungs
+    // after four steps instead of looping forever.
+    struct AuthRungsTried {
+        bool agent = false;
+        bool keyFile = false;
+        bool keyPassphrase = false;
+        bool password = false;
+
+        bool contains(AuthRung rung) const
+        {
+            switch (rung) {
+            case AuthRung::Agent: return agent;
+            case AuthRung::KeyFile: return keyFile;
+            case AuthRung::KeyPassphrase: return keyPassphrase;
+            case AuthRung::Password: return password;
+            case AuthRung::Exhausted: return true;
+            }
+            return true;
+        }
+
+        void add(AuthRung rung)
+        {
+            switch (rung) {
+            case AuthRung::Agent: agent = true; return;
+            case AuthRung::KeyFile: keyFile = true; return;
+            case AuthRung::KeyPassphrase: keyPassphrase = true; return;
+            case AuthRung::Password: password = true; return;
+            case AuthRung::Exhausted: return;
+            }
+        }
+    };
+
+    // The next rung to climb: the first in this client's fixed order (agent ->
+    // key file -> key file with a passphrase -> password) that the server still
+    // offers and that has not been climbed yet, or Exhausted. `canPrompt` is
+    // false when no credential callback is installed, so the two rungs that
+    // need a secret from the user are unreachable.
+    //
+    // Pure, and deliberately driven by the CURRENT offer rather than by a fixed
+    // sequence: it is re-evaluated after every step, so a partial success that
+    // changes the offered set (publickey drops out, password appears) routes
+    // the ladder onto the method the server is now asking for — in whichever
+    // order the server chose to require them.
+    static AuthRung nextAuthRung(const AuthRungsTried& tried,
+                                 AuthMethods offered, bool canPrompt);
+
+#if CH_HAVE_LIBSSH
+    // Split an ssh_userauth_list() bitmask into the methods this client can
+    // climb. A zero mask means the server did not tell us (the "none" request
+    // errored), and is treated as "try both" — which is what this client did
+    // unconditionally before multi-step support existed. Guarded because the
+    // bit values it decodes are libssh's SSH_AUTH_METHOD_* macros; the mask is
+    // never redefined here, so the two cannot drift apart.
+    static AuthMethods methodsFromMask(int userauthListMask);
+
+    // Classify one ssh_userauth_*() return code. SSH_AUTH_SUCCESS is Granted,
+    // SSH_AUTH_PARTIAL is Partial, and every other code (denied, error, again,
+    // info) is Refused. Public so the multi-step decision is testable against
+    // the real libssh constants without a server.
+    static AuthOutcome classifyAuthResult(int libsshResult);
+#endif
+
     explicit SshConnectionPool(QObject* parent = nullptr);
     ~SshConnectionPool() override;
 
@@ -109,9 +205,13 @@ public:
         return m_credentialCallback;
     }
 
-    // through KnownHosts, then authenticate (agent -> configured/default key
-    // -> requested key passphrase or password). `identityFile` is a local
-    // private key; empty leaves OpenSSH config and libssh defaults in charge.
+    // Connect, verify the host key through KnownHosts, then authenticate. The
+    // ladder is agent -> configured/default key -> that key with a passphrase
+    // asked of the user -> the account password, restricted at every step to
+    // the methods the server still offers, so a server that requires SEVERAL
+    // methods (`AuthenticationMethods publickey,password`) is satisfied one
+    // step at a time. `identityFile` is a local private key; empty leaves
+    // OpenSSH config and libssh defaults in charge.
     bool connectToHost(const QString& host, quint16 port, const QString& user,
                        const QString& identityFile = QString());
     void disconnectFromHost();
@@ -193,6 +293,16 @@ private:
 #if CH_HAVE_LIBSSH
     ssh_session m_session = nullptr;
     QList<ssh_channel> m_channels;
+    // Names of the methods the server accepted with SSH_AUTH_PARTIAL during the
+    // most recent handshake, so authenticationFailure() can say "your key was
+    // accepted, the server also wants X" instead of a flat "authentication
+    // failed". Method NAMES only: no secret is ever recorded here.
+    QStringList m_partialMethods;
+    // Whether the server of the most recent handshake offered public-key
+    // authentication at all. Without it authenticationFailure() would lecture the
+    // user about ssh-agent and identity files on a password-only server, where no
+    // key was ever sent.
+    bool m_publicKeyOffered = false;
 #endif
 };
 

@@ -49,12 +49,24 @@ public:
     // after disconnectSession() or a loss with reconnect disabled; Failed means
     // "not wired and not retrying" (a user-initiated connect that failed, or
     // the reconnect ladder exhausted).
+    //
+    // Provisioning is APPENDED rather than slotted in beside Connecting, where
+    // it belongs chronologically, on purpose: the enumerator values are what
+    // QSignalSpy records and what every existing switch over this enum was
+    // compiled against, so inserting in the middle renumbers three states that
+    // other code already reads. A consumer that has not yet learned about
+    // Provisioning simply keeps showing whatever it showed for Connecting,
+    // which is the truthful fallback rather than a wrong label.
     enum class State {
         Disconnected,
         Connecting,
         Wired,
         Reconnecting,
         Failed,
+        // First connect to a server with no usable remote service: the client
+        // is installing codeharbor-remote into the configured location before
+        // it can exec anything there. See ensureRemoteService().
+        Provisioning,
     };
     Q_ENUM(State)
 
@@ -106,6 +118,11 @@ public:
     // (it need not be on the login PATH) and `repoRoot` the remote CodeHarbor
     // installation: either an unpacked codeharbor-remote.tar.gz or a git
     // checkout — see entryCandidates().
+    //
+    // `repoRoot` no longer has to EXIST: when it holds no usable service, the
+    // client installs one there before wiring anything (see
+    // ensureRemoteService()). Node.js on the server is still a prerequisite
+    // nothing here can install.
     bool connectAndWire(const QString& host, quint16 port, const QString& user,
                         const QString& nodePath, const QString& repoRoot,
                         const QString& identityFile = QString());
@@ -184,6 +201,123 @@ public:
     static QStringList entryCandidates(const QString& repoRoot,
                                        const QString& stem);
 
+    // ---- remote provisioning (first connect to a bare server) --------------
+    //
+    // Until this existed, `repoRoot` had to be populated BY HAND before the
+    // client could talk to a server at all: the user checked this repository
+    // out (or unpacked codeharbor-remote.tar.gz) on the far side, then typed
+    // the path into the connection profile. Get either wrong and the connect
+    // died with "codeharbord channel closed", which names nothing the user can
+    // act on. ensureRemoteService() closes that gap: on every connect the
+    // server is asked what it already has, and only when there is nothing
+    // usable is codeharbor-remote installed into the configured location.
+    //
+    // WHERE THE CODE COMES FROM, and why. The SERVER downloads the release
+    // artifact; the client does not upload it. Two things rule the upload out
+    // rather than merely making it less attractive:
+    //   * The client has no copy to send. `remote/` is not embedded in the
+    //     binary (no qt_add_resources covers it - see src/qml/CMakeLists.txt,
+    //     which embeds only the two web bundles), and the shipped AppImage /
+    //     zip / dmg contain Qt runtime and one executable.
+    //   * An SSH exec channel here cannot be half-closed. SshChannelDevice
+    //     exposes write() and closeChannel() and nothing in between, so there
+    //     is no way to send a tarball and then give `tar -xzf -` the EOF it
+    //     waits for; the remote extractor would hang forever.
+    // Downloading is also what README.md already documents as the manual
+    // install ("curl -fsSL .../codeharbor-remote.tar.gz | tar -xz -C ..."), so
+    // this automates the published procedure instead of inventing a second one.
+    //
+    // The cost of that choice is a server with outbound network access and
+    // either curl or wget. When that does not hold, provisioning fails with a
+    // message naming the URL and the tools it looked for, and the escape hatch
+    // is remoteArtifactUrl(): point it at a tarball already staged on the
+    // server (a plain path or a file:// URL, copied with `cp` and needing no
+    // network at all).
+
+    // The codeharbor-remote tarball provisioning installs. Defaults to
+    // defaultRemoteArtifactUrl(); setting it empty restores that default.
+    void setRemoteArtifactUrl(const QString& url);
+    QString remoteArtifactUrl() const;
+
+    // The release asset matching THIS client, or an empty string when the
+    // client does not know its own version (QCoreApplication::applicationVersion
+    // is unset - true of a test host, never of the shipped binary, which
+    // main.cpp sets from CODEHARBOR_VERSION).
+    //
+    // This is how "versions must match" is enforced without a second version
+    // constant to keep in sync: the URL carries the client's own version, so a
+    // client can only ever install its own release, and the marker file below
+    // records the exact URL that was installed. Upgrade the client and the URL
+    // changes, the marker no longer matches, and the next connect REPLACES the
+    // remote copy instead of driving a service it was never tested against.
+    // CH_REMOTE_ARTIFACT_URL overrides it for operators who mirror releases
+    // internally or stage the tarball on the server themselves.
+    static QString defaultRemoteArtifactUrl();
+
+    // File provisioning writes inside `repoRoot` recording the artifact URL it
+    // installed. Its presence means "this install is ours"; its absence means a
+    // human manages this directory and provisioning MUST NOT overwrite it.
+    static QString releaseMarkerPath(const QString& repoRoot);
+
+    // What the server answered when asked about its prerequisites. `reported`
+    // is false when no report came back at all, which is treated as "cannot
+    // tell" rather than as a fault (see ensureRemoteService()).
+    struct RemoteInspection {
+        bool reported = false;
+        // `node --version` output, e.g. "v24.16.0"; empty when node is absent.
+        QString nodeVersion;
+        bool nodePresent = false;
+        // First entryCandidates() path that exists, or empty when none does.
+        QString entry;
+        // releaseMarkerPath() contents, or empty when the file is absent.
+        QString marker;
+        // "curl", "wget" or "none".
+        QString fetcher;
+        bool tar = false;
+    };
+
+    // POSIX sh printing one CH_<KEY>=<value> line per RemoteInspection field.
+    // Exposed, like rpcCommand() above, so tests assert the exact script that
+    // runs on someone else's machine rather than a reconstruction of it.
+    static QString remoteInspectScript(const QString& nodePath,
+                                       const QString& repoRoot);
+
+    // POSIX sh that fetches `artifactUrl`, unpacks it into `repoRoot`, proves a
+    // codeharbord entry point exists afterwards and only then writes the
+    // release marker. `fetcher` is the RemoteInspection::fetcher value. Every
+    // scratch file lives under `repoRoot`, so provisioning never writes outside
+    // the directory the user chose.
+    static QString remoteProvisionScript(const QString& repoRoot,
+                                         const QString& artifactUrl,
+                                         const QString& fetcher);
+
+    static RemoteInspection parseInspection(const QString& output);
+
+    // Does `version` ("v24.16.0", "23.6.1", ...) satisfy remote/package.json's
+    // declared engine floor? Pure, so the comparison is testable without a
+    // server.
+    static bool nodeVersionIsSupported(const QString& version);
+
+    // The bare path when `url` names a tarball already present on the server (a
+    // plain absolute path, or file://): it is copied with `cp`, needing neither
+    // network access nor a download tool. Empty for a network URL. This is the
+    // escape hatch for an air-gapped or curl-less server.
+    static QString stagedArtifactPath(const QString& url);
+
+    // remote/package.json: "engines": { "node": ">=23.6" }. The remote service
+    // is run straight from TypeScript by Node's native type stripping, which
+    // 23.6 is the first release to provide.
+    static constexpr int kMinimumRemoteNodeMajor = 23;
+    static constexpr int kMinimumRemoteNodeMinor = 6;
+
+    // Budget for the prerequisite report: one round trip on a session that is
+    // already authenticated, so this only has to cover a slow link.
+    static constexpr int kInspectTimeoutMs = 15000;
+    // Budget for the install: several megabytes over whatever link the server
+    // has, plus tar. Generous on purpose — a first connect that gives up on a
+    // slow line leaves a half-populated directory nobody asked for.
+    static constexpr int kProvisionTimeoutMs = 180000;
+
 signals:
     void wired();
     // A FAILURE the user needs to see. AppController surfaces this verbatim in
@@ -211,6 +345,12 @@ signals:
     // live channel (handleConnectionLost()). stderr on its own proves nothing —
     // which is exactly why readChannelFinished(), not this, drives reconnect.
     void channelDiagnostic(const QString& role, const QString& text);
+    // Progress of a provisioning install, one line per step ("fetching ...",
+    // "unpacking ...", "installed ..."). NOT a failure: this is what stops a
+    // first connect that spends a minute downloading several megabytes from
+    // being indistinguishable, on screen, from a hung application. A
+    // provisioning FAILURE goes to error() like every other failure.
+    void provisioning(const QString& message);
 
 protected:
     // Test seams. The two side-effecting steps of one wire attempt, isolated so
@@ -250,6 +390,24 @@ protected:
     virtual bool probeEndpoint(const QString& host, quint16 port,
                                QString* error);
 
+    // Run `script` under POSIX sh on a throwaway Exec channel of the session
+    // that is already up, collecting its stdout until the remote closes the
+    // channel or `timeoutMs` elapses. Returns false when the channel could not
+    // be opened, the remote exited without EOF inside the budget, or the
+    // attempt was cancelled; `error` then carries the reason and the remote's
+    // stderr. stdout lines beginning "codeharbor: " are republished through
+    // provisioning() AS THEY ARRIVE, which is the only reason this waits on an
+    // event loop instead of blocking.
+    //
+    // A test seam for the same reason connectPool() is one: the provisioning
+    // decision tree has to be drivable with canned server answers, and there is
+    // no other way to fake "this server has node 22 and nothing installed".
+    // Deliberately NOT routed through openChannelDevice(): that seam's fakes
+    // never reach EOF, so reusing it would park every existing test in this
+    // nested wait for the full budget.
+    virtual bool runRemoteScript(const QString& script, int timeoutMs,
+                                 QString* output, QString* error);
+
 private:
     bool attemptWire();
     // Ask an attempt that is parked in probeEndpoint()'s nested event loop to
@@ -274,6 +432,17 @@ private:
     // includes the authentication diagnosis shown by the connection sheet.
     QString withLastPoolError(const QString& message) const;
     void setState(State next);
+    // Make sure the configured location holds a remote service this client can
+    // launch, installing one when it does not. Called by attemptWire() after
+    // the handshake and before the first exec.
+    //
+    // Returns false ONLY for a failure the user must act on (no node, no
+    // fetcher, a download that did not land), having already called fail().
+    // Everything else returns true and lets the ordinary exec path proceed —
+    // including the case where the inspection itself could not run, because
+    // refusing to connect over a failed DIAGNOSTIC would turn servers that work
+    // today into unreachable ones.
+    bool ensureRemoteService();
 
     SshConnectionPool* m_pool = nullptr;
     QPointer<CodeharbordClient> m_client;
@@ -306,6 +475,9 @@ private:
     QString m_nodePath;
     QString m_repoRoot;
     QString m_identityFile;
+    // Explicit remoteArtifactUrl() override; empty means "use
+    // defaultRemoteArtifactUrl()".
+    QString m_artifactUrl;
     int m_attempt = 0;
     int m_maxAttempts = kDefaultMaxReconnectAttempts;
     double m_timeScale = 1.0;
@@ -319,9 +491,12 @@ private:
     // signals those steps provoke are not mistaken for a fresh loss.
     bool m_attempting = false;
     bool m_tearingDown = false;
-    // Non-owning: valid only for the duration of probeEndpoint()'s nested event
-    // loop, which is what abortAttempt() interrupts.
-    QEventLoop* m_probeLoop = nullptr;
+    // Non-owning: valid only for the duration of the nested event loop an
+    // attempt is currently parked in — probeEndpoint()'s connect pre-flight or
+    // runRemoteScript()'s wait on a provisioning step. Either way it is what
+    // abortAttempt() interrupts, so "disconnect" is honoured during a
+    // multi-minute download as well as during a five-second probe.
+    QEventLoop* m_nestedLoop = nullptr;
     // The in-flight attempt was cancelled from inside its own nested loop; it
     // must unwind without wiring anything, failing, or arming a retry.
     bool m_cancelRequested = false;

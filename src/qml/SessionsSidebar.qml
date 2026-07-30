@@ -17,7 +17,7 @@ import QtQuick.Layouts
 // visible order exactly as the server last reported it.
 Rectangle {
     id: sidebar
-    color: "#1e1e2e"
+    color: Theme.surface
 
     // Emitted when the user picks a Dev Session (click, or Enter on the
     // keyboard cursor). The host wires this to layout loading; the sidebar
@@ -70,19 +70,26 @@ Rectangle {
     // anything to answer while the sheet was asking for it.
     function linkColor(state) {
         switch (state) {
-        case "connected": return "#a6e3a1";
+        case "connected": return Theme.success;
         case "connecting":
         case "credential":
-        case "hostkey": return "#f9e2af";
+        // Installing the remote service on first connect. Same "in progress,
+        // nothing is wrong" reading as connecting.
+        case "provisioning":
+        case "hostkey": return Theme.warning;
+        // "Reconnecting" needs to read as worse than "connecting" but not as
+        // final as "failed". The theme has no role for that middle step yet, so
+        // this one stays a literal.
         case "reconnecting": return "#fab387";
-        case "failed": return "#f38ba8";
-        default: return "#6c7086";
+        case "failed": return Theme.danger;
+        default: return Theme.textDim;
         }
     }
     function linkGlyph(state) {
         switch (state) {
         case "connected": return "\u2713";
         case "connecting": return "\u2219";
+        case "provisioning": return "\u2193"; // downloading onto the server
         case "hostkey": return "?";
         case "credential": return "*"; // the password mask
         case "reconnecting": return "\u21bb";
@@ -94,6 +101,7 @@ Rectangle {
         switch (state) {
         case "connected": return qsTr("Connected");
         case "connecting": return qsTr("Connecting\u2026");
+        case "provisioning": return qsTr("Installing the remote service\u2026");
         case "hostkey": return qsTr("Host key needs approval");
         case "credential": return qsTr("Password or passphrase needed");
         case "reconnecting": return qsTr("Reconnecting\u2026 rows may be stale");
@@ -509,47 +517,70 @@ Rectangle {
         }
     }
 
-    // Header bar with the '+ New group' action.
+    // Header bar with the compact '+' add-group action.
     Rectangle {
         id: headerBar
         anchors.top: parent.top
         anchors.left: parent.left
         anchors.right: parent.right
         height: 40
-        color: "#181825"
+        color: Theme.surfaceDeep
 
         Label {
             text: qsTr("Sessions")
-            color: "#cdd6f4"
+            color: Theme.text
             font.bold: true
-            font.pixelSize: 14
+            font.pixelSize: Theme.fontSizeTitle
             anchors.left: parent.left
             anchors.leftMargin: 12
             anchors.verticalCenter: parent.verticalCenter
         }
         Button {
             id: newGroupButton
-            text: qsTr("+ New group")
+            objectName: "newGroupButton"
+            text: "+"
             anchors.right: parent.right
             anchors.rightMargin: 8
             anchors.verticalCenter: parent.verticalCenter
-            implicitHeight: 28
-            leftPadding: 10
-            rightPadding: 10
+            // A compact square rather than the old "+ New group" words: this bar
+            // is 320 pixels wide at most and the words took a fifth of it. 24
+            // logical pixels is the floor for a reliable pointer target on a
+            // high-density display, so the box stays 24 even though the glyph in
+            // it is smaller.
+            implicitWidth: 24
+            implicitHeight: 24
+            padding: 0
+            // Reachable without a pointer: Tab lands here, and the accessible
+            // name below is what a screen reader announces.
             focusPolicy: Qt.StrongFocus
+
+            // A bare "+" says nothing about what it adds, so this sentence is
+            // the button's real name. The tooltip is a pointer-only hint, so the
+            // SAME sentence is also the accessible name — a tooltip is never the
+            // only label a control has.
+            readonly property string actionText: qsTr("Add a group")
+
+            Accessible.role: Accessible.Button
+            Accessible.name: newGroupButton.actionText
+            ToolTip.text: newGroupButton.actionText
+            ToolTip.visible: newGroupButton.hovered
+            // Long enough that crossing the bar on the way somewhere else does
+            // not flash it, matching the row tooltip in SessionRow.qml.
+            ToolTip.delay: 600
+
             contentItem: Label {
                 text: newGroupButton.text
-                color: "#cdd6f4"
-                font.pixelSize: 11
+                color: newGroupButton.down ? Theme.textOnAccent : Theme.text
+                font.pixelSize: Theme.fontSizeTitle
                 horizontalAlignment: Text.AlignHCenter
                 verticalAlignment: Text.AlignVCenter
             }
             background: Rectangle {
-                radius: 4
-                color: newGroupButton.down ? "#45475a"
-                     : newGroupButton.hovered ? "#3a3a52" : "#313244"
+                radius: Theme.radiusSmall
+                color: newGroupButton.down ? Theme.accent
+                     : newGroupButton.hovered ? Theme.border : Theme.surfaceRaised
                 border.width: newGroupButton.visualFocus ? 2 : 1
-                border.color: newGroupButton.visualFocus ? "#89b4fa" : "#45475a"
+                border.color: newGroupButton.visualFocus ? Theme.accent : Theme.border
             }
             onClicked: newGroupDialog.open()
         }
@@ -565,7 +596,7 @@ Rectangle {
         clip: true
         model: groupsDelegateModel
 
-        ScrollBar.vertical: ScrollBar {}
+        ScrollBar.vertical: AppScrollBar {}
     }
 
     // Nothing to show. WHICH nothing matters: a fresh install has no server to
@@ -585,7 +616,7 @@ Rectangle {
         Label {
             anchors.horizontalCenter: parent.horizontalCenter
             text: sidebarEmptyState.serverReachable ? "\u2637" : "\u26a0"
-            color: "#45475a"
+            color: Theme.textFaint
             font.pixelSize: 26
         }
         Label {
@@ -594,8 +625,8 @@ Rectangle {
             horizontalAlignment: Text.AlignHCenter
             text: sidebarEmptyState.serverReachable ? qsTr("No sessions yet")
                                                     : qsTr("No server")
-            color: "#cdd6f4"
-            font.pixelSize: 13
+            color: Theme.text
+            font.pixelSize: Theme.fontSizeLabel
         }
         Label {
             objectName: "sidebarEmptyHint"
@@ -603,9 +634,9 @@ Rectangle {
             horizontalAlignment: Text.AlignHCenter
             wrapMode: Text.WordWrap
             text: sidebarEmptyState.serverReachable
-                  ? qsTr("Press \u201c+ New group\u201d above, then add a Dev Session to it.")
+                  ? qsTr("Press the \u201c+\u201d at the top of this panel to add a group, then add a Dev Session to it.")
                   : qsTr("Connect to the machine that holds your checkout, and its groups and Dev Sessions appear here.")
-            color: "#6c7086"
+            color: Theme.textDim
             font.pixelSize: 11
         }
     }
@@ -621,14 +652,14 @@ Rectangle {
         anchors.bottom: parent.bottom
         visible: sidebar.linkState !== ""
         height: visible ? 26 : 0
-        color: "#181825"
+        color: Theme.surfaceDeep
 
         Rectangle {
             anchors.left: parent.left
             anchors.right: parent.right
             anchors.top: parent.top
             height: 1
-            color: "#313244"
+            color: Theme.borderSubtle
         }
 
         Button {
@@ -644,16 +675,16 @@ Rectangle {
 
             contentItem: Label {
                 text: serverSettingsButton.text
-                color: "#cdd6f4"
+                color: Theme.text
                 font: serverSettingsButton.font
                 horizontalAlignment: Text.AlignHCenter
                 verticalAlignment: Text.AlignVCenter
             }
             background: Rectangle {
-                color: serverSettingsButton.down ? "#45475a"
-                                                  : (serverSettingsButton.hovered ? "#313244"
+                color: serverSettingsButton.down ? Theme.border
+                                                  : (serverSettingsButton.hovered ? Theme.surfaceRaised
                                                                                   : "transparent")
-                radius: 3
+                radius: Theme.radiusSmall
             }
             onClicked: sidebar.serverSettingsRequested()
         }
@@ -680,7 +711,7 @@ Rectangle {
                 Label {
                     anchors.centerIn: parent
                     text: sidebar.linkGlyph(sidebar.linkState)
-                    color: "#11111b"
+                    color: Theme.textOnAccent
                     font.pixelSize: 9
                     font.bold: true
                 }
@@ -690,7 +721,10 @@ Rectangle {
                 anchors.verticalCenter: parent.verticalCenter
                 width: Math.max(0, parent.width - 18)
                 text: sidebar.linkWords(sidebar.linkState)
-                color: sidebar.stale ? "#f9e2af" : "#a6adc8"
+                // The resting colour of this line is a step brighter than
+                // Theme.textDim and a step below Theme.text; the theme has no
+                // role for it yet, so it stays a literal.
+                color: sidebar.stale ? Theme.warning : "#a6adc8"
                 font.pixelSize: 11
                 elide: Text.ElideRight
             }
@@ -758,8 +792,10 @@ Rectangle {
             y: sidebar.dropHighlightY - dropOverlay.y
             width: dropOverlay.width
             height: sidebar.dropHighlightHeight
+            // A violet-tinted wash used nowhere else; the theme has no role for
+            // it yet, so it stays a literal.
             color: "#302a4a"
-            border.color: "#89b4fa"
+            border.color: Theme.accent
             border.width: 1
         }
 
@@ -771,7 +807,7 @@ Rectangle {
             y: sidebar.dropLineY - dropOverlay.y - height / 2
             width: dropOverlay.width
             height: 2
-            color: "#89b4fa"
+            color: Theme.accent
         }
     }
 
@@ -785,9 +821,9 @@ Rectangle {
         y: sidebar.dragProxyY
         width: Math.min(sidebar.width - 24, dragProxyLabel.implicitWidth + 16)
         height: dragProxyLabel.implicitHeight + 8
-        radius: 4
-        color: "#313244"
-        border.color: "#89b4fa"
+        radius: Theme.radiusSmall
+        color: Theme.surfaceRaised
+        border.color: Theme.accent
         border.width: 1
         opacity: 0.9
         z: 7
@@ -796,8 +832,8 @@ Rectangle {
             id: dragProxyLabel
             anchors.centerIn: parent
             width: parent.width - 16
-            color: "#cdd6f4"
-            font.pixelSize: 12
+            color: Theme.text
+            font.pixelSize: Theme.fontSizeBody
             elide: Text.ElideRight
             text: sidebar.dragItem ? sidebar.dragItem.name : ""
         }
@@ -810,6 +846,9 @@ Rectangle {
         modal: true
         standardButtons: Dialog.Ok | Dialog.Cancel
         anchors.centerIn: Overlay.overlay
+        // `Dialog` defaults to a 320-pixel frame, but this 300-pixel field
+        // needs the 12-pixel padding on both sides too.
+        width: newGroupField.Layout.preferredWidth + leftPadding + rightPadding
 
         // Reset the field each open so a cancelled edit doesn't resurface as
         // stale text next time (imperative input breaks the initial binding),
@@ -823,12 +862,25 @@ Rectangle {
             newGroupField.selectAll();
         }
 
-        TextField {
-            id: newGroupField
-            objectName: "newGroupField"
-            width: 240
-            placeholderText: qsTr("Group name")
-            text: qsTr("New group")
+        // A Dialog sizes itself from its content item's IMPLICIT width, and a
+        // bare TextField with an explicit `width` still reports a much smaller
+        // implicit width — so the field used to spill out past the dialog's
+        // edge. A ColumnLayout does report the preferred widths of its children,
+        // which is the convention newSessionDialog below already uses.
+        ColumnLayout {
+            // Layout.preferredWidth sizes the child only; Dialog measures this
+            // layout's implicit width. Keep both values explicit so the frame
+            // includes its 12-pixel padding on either side.
+            implicitWidth: 300
+            spacing: 8
+
+            TextField {
+                id: newGroupField
+                objectName: "newGroupField"
+                Layout.preferredWidth: 300
+                placeholderText: qsTr("Group name")
+                text: qsTr("New group")
+            }
         }
 
         onAccepted: {
@@ -851,6 +903,9 @@ Rectangle {
     AppDialog {
         id: newSessionDialog
         objectName: "newSessionDialog"
+        // Size the frame around the fixed-width content rather than letting the
+        // Basic-style 320-pixel default clip its horizontal padding.
+        width: newSessionField.Layout.preferredWidth + leftPadding + rightPadding
         title: qsTr("New Dev Session")
         modal: true
         standardButtons: Dialog.Ok | Dialog.Cancel
@@ -866,6 +921,9 @@ Rectangle {
         }
 
         ColumnLayout {
+            // See the group dialog above: Dialog uses the content layout's
+            // implicit width, not the children's Layout.preferredWidth.
+            implicitWidth: 300
             spacing: 8
 
             TextField {
@@ -889,8 +947,8 @@ Rectangle {
             Label {
                 Layout.preferredWidth: 300
                 text: qsTr("Terminals in this session start in the repository path.")
-                color: "#6c7086"
-                font.pixelSize: 10
+                color: Theme.textDim
+                font.pixelSize: Theme.fontSizeSmall
                 wrapMode: Text.WordWrap
             }
         }

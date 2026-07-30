@@ -124,10 +124,17 @@ set_tests_properties(tst_webengine_headless PROPERTIES
     TIMEOUT 180
 )
 
-# Command palette + global shortcuts (SPEC 15). Loads the REAL
-# src/qml/CommandPalette.qml from this target's own qrc, so it exercises the
-# shipped component without depending on the CodeHarbor QML module (or on the
-# app context objects — the palette takes its command list from its host).
+# Command palette + global shortcuts (SPEC 15), and the module's colour gate.
+#
+# Loads the REAL CommandPalette.qml out of the CodeHarbor module's own qrc
+# (qrc:/qt/qml/CodeHarbor/CommandPalette.qml), which is why this target links
+# codeharbor_qmlplugin: the palette reaches the `Theme` singleton, and a
+# singleton only exists where the module is registered. The earlier arrangement
+# embedded a copy of the file in this target's own qrc precisely to avoid that
+# dependency, but with no module registered `Theme.x` resolved to undefined —
+# blank colours, no warning.
+#
+# CODEHARBOR_QML_SOURCE_DIR points the colour gate at the QML sources it scans.
 get_filename_component(_ch_qml_src_dir "${CMAKE_CURRENT_SOURCE_DIR}/.." ABSOLUTE)
 
 qt_add_executable(tst_palette tst_palette.cpp)
@@ -139,12 +146,11 @@ target_link_libraries(tst_palette PRIVATE
     Qt6::Qml
     Qt6::Quick
     Qt6::QuickControls2
+    codeharbor_qmlplugin
 )
 
-qt_add_resources(tst_palette ch_palette_qml
-    PREFIX /chtest
-    BASE ${_ch_qml_src_dir}
-    FILES ${_ch_qml_src_dir}/CommandPalette.qml
+target_compile_definitions(tst_palette PRIVATE
+    CODEHARBOR_QML_SOURCE_DIR="${_ch_qml_src_dir}"
 )
 
 add_test(NAME tst_palette COMMAND tst_palette)
@@ -171,6 +177,14 @@ target_link_libraries(tst_uxshell PRIVATE
     Qt6::WebChannel
     codeharbor_qmlplugin
     ch_models
+)
+
+# The connection-state tests DERIVE the set of states from the source of truth
+# (a scan of src/app/AppController.cpp for setConnectionState literals) instead
+# of hand-listing them, so a newly published state cannot ship with no wording
+# in the sidebar footer. Same mechanism as src/models/tests.
+target_compile_definitions(tst_uxshell PRIVATE
+    CH_REPO_ROOT="${CMAKE_SOURCE_DIR}"
 )
 
 add_test(NAME tst_uxshell COMMAND tst_uxshell)

@@ -1,5 +1,6 @@
 import QtQuick
 import QtQuick.Controls.Basic
+import QtQuick.Layouts
 
 // A Dev Session sidebar row (SPEC 4.2): name + repository subtitle + a status
 // dot colored by the aggregate rowState. Right-click opens a context menu of
@@ -53,13 +54,13 @@ ItemDelegate {
     // 10px dot is exactly the encoding a red-green-blind user cannot read.
     function stateColor(state) {
         switch (state) {
-        case 0: return "#f38ba8"; // Error - red
-        case 1: return "#f9e2af"; // WaitingForInput - amber
-        case 2: return "#a6e3a1"; // Running - green
-        case 3: return "#89b4fa"; // FinishedUnseen - blue
-        case 4: return "#6c7086"; // Idle - gray
-        case 5: return "#45475a"; // Disconnected - dark
-        default: return "#6c7086";
+        case 0: return Theme.danger;   // Error
+        case 1: return Theme.warning;  // WaitingForInput
+        case 2: return Theme.success;  // Running
+        case 3: return Theme.accent;   // FinishedUnseen
+        case 4: return Theme.textDim;  // Idle
+        case 5: return Theme.textFaint; // Disconnected
+        default: return Theme.textDim;
         }
     }
 
@@ -112,7 +113,7 @@ ItemDelegate {
     // Selection wins over hover; the source row of a live drag dims so the
     // floating proxy reads as the thing being moved.
     background: Rectangle {
-        color: row.selected ? "#45475a" : (row.hovered ? "#232338" : "transparent")
+        color: row.selected ? Theme.border : (row.hovered ? Theme.surfaceHover : "transparent")
         opacity: row.dragging ? 0.4 : 1.0
 
         // Loaded session: a solid rail. The keyboard cursor is a separate
@@ -123,7 +124,9 @@ ItemDelegate {
             anchors.top: parent.top
             anchors.bottom: parent.bottom
             width: 3
-            color: row.active ? "#89b4fa" : "#585b70"
+            // The inactive rail is a mid-grey the theme has no role for yet, so
+            // it stays a literal.
+            color: row.active ? Theme.accent : "#585b70"
             visible: row.active || row.selected
         }
 
@@ -135,7 +138,7 @@ ItemDelegate {
             radius: 3
             color: "transparent"
             border.width: 2
-            border.color: "#89b4fa"
+            border.color: Theme.accent
             visible: row.selected && row.host !== null && row.host.activeFocus
         }
     }
@@ -158,8 +161,8 @@ ItemDelegate {
             Label {
                 anchors.centerIn: parent
                 text: row.stateGlyph(row.rowState)
-                color: "#11111b"
-                font.pixelSize: 10
+                color: Theme.textOnAccent
+                font.pixelSize: Theme.fontSizeSmall
                 font.bold: true
             }
         }
@@ -170,13 +173,13 @@ ItemDelegate {
 
             Label {
                 text: row.name
-                color: "#cdd6f4"
-                font.pixelSize: 13
+                color: Theme.text
+                font.pixelSize: Theme.fontSizeLabel
                 elide: Text.ElideRight
             }
             Label {
                 text: row.subtitle
-                color: "#6c7086"
+                color: Theme.textDim
                 font.pixelSize: 11
                 elide: Text.ElideRight
                 visible: text.length > 0
@@ -240,10 +243,14 @@ ItemDelegate {
 
     AppDialog {
         id: renameDialog
+        objectName: "renameDialog:" + row.itemId
         title: qsTr("Rename session")
         modal: true
         standardButtons: Dialog.Ok | Dialog.Cancel
         anchors.centerIn: Overlay.overlay
+        // Account for the dialog's horizontal padding around the fixed-width
+        // field; the Basic-style default is four pixels too narrow.
+        width: renameField.Layout.preferredWidth + leftPadding + rightPadding
 
         // Reset to the current name each open: imperative edits break the
         // `text: row.name` binding, so without this a cancelled edit would
@@ -256,11 +263,24 @@ ItemDelegate {
             renameField.selectAll();
         }
 
-        TextField {
-            id: renameField
-            width: 240
-            text: row.name
-            placeholderText: qsTr("Session name")
+        // Same reason as the two dialogs in SessionsSidebar.qml: a Dialog sizes
+        // itself from its content item's IMPLICIT width, which a bare TextField
+        // under-reports even when given an explicit `width`, so the field spills
+        // out past the dialog's edge. A ColumnLayout reports its children's
+        // preferred widths, so the dialog grows to hold the field.
+        ColumnLayout {
+            // Dialog measures this layout's implicit width, not a child's
+            // Layout.preferredWidth; include the field in that measurement.
+            implicitWidth: 300
+            spacing: 8
+
+            TextField {
+                id: renameField
+                objectName: "renameField:" + row.itemId
+                Layout.preferredWidth: 300
+                text: row.name
+                placeholderText: qsTr("Session name")
+            }
         }
 
         onAccepted: {

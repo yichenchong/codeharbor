@@ -133,10 +133,24 @@ Region SessionLayouts::regionEnum(int index)
     return index == kTerminal ? Region::Terminal : Region::Viewer;
 }
 
-QString SessionLayouts::defaultPaneId(int index)
+SplitNode SessionLayouts::defaultTree(int index)
 {
-    return index == kTerminal ? QStringLiteral("terminal-1")
-                              : QStringLiteral("viewer-1");
+    if (index != kTerminal) {
+        SplitNode only;
+        only.paneId = QStringLiteral("viewer-1");
+        return only;
+    }
+
+    SplitNode top;
+    top.paneId = QStringLiteral("terminal-1");
+    SplitNode bottom;
+    bottom.paneId = QStringLiteral("terminal-2");
+    SplitNode stacked;
+    // "vertical" stacks children top to bottom, so terminal-1 is the upper pane.
+    stacked.orientation = SplitOrientation::Vertical;
+    stacked.children = {top, bottom};
+    stacked.ratios = {1.0, 1.0};
+    return stacked;
 }
 
 void SessionLayouts::setTree(int index, SplitNode tree)
@@ -217,15 +231,33 @@ void SessionLayouts::applyLoadedTree(quint64 generation, int index,
         return; // a newer load() has taken over; drop this reply entirely
 
     if (!err) {
-        // No persisted layout for this region -> the SPEC 4.5 "always one pane"
-        // default, held only in memory: a plain selection must not write to the
-        // server. It is persisted by the first real edit.
-        SplitNode next = tree ? std::move(*tree) : SplitNode{};
-        if (!tree)
-            next.paneId = defaultPaneId(index);
+        // No persisted layout for this region: adopt the default AND write it
+        // back, so it becomes the session's real layout instead of a shape that
+        // is re-derived on every load and lost the moment anything saves a tree.
+        //
+        // This is a deliberate reversal. The default used to be memory-only,
+        // reasoning that "a plain selection must not write to the server". That
+        // held while the default was one leaf, because one leaf is also what a
+        // region collapses to and what QML falls back to, so nothing could
+        // disagree with it. It does not hold for a MULTI-pane default: the QML
+        // fallback node is a single pane, and the first setRatios/setPaneUrl
+        // would persist whatever tree the region happened to be showing. The
+        // two stacked terminals have to be in the database to survive a restart,
+        // and the only moment we know a session has no layout is right here.
+        //
+        // Idempotent by construction: the write creates the row, so the next
+        // load for this session takes the `tree` branch and seeds nothing. Two
+        // clients racing both write the identical default.
+        const bool seeding = !tree;
+        SplitNode next = tree ? std::move(*tree) : defaultTree(index);
         RegionState& state = m_regions[index];
         if (!state.valid || !(state.tree == next))
             setTree(index, std::move(next));
+        // Not canEdit(): a load with no server selected yet is not a misuse and
+        // must not raise an error. The in-memory default still stands, and the
+        // first real edit persists it as before.
+        if (seeding && !m_devSessionId.isEmpty() && !m_serverId.isEmpty())
+            persist(index);
     }
 
     if (m_pendingLoads > 0 && --m_pendingLoads == 0)

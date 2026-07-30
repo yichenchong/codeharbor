@@ -8,6 +8,18 @@ target_link_libraries(tst_knownhosts PRIVATE
 
 add_test(NAME tst_knownhosts COMMAND tst_knownhosts)
 
+# Multi-step authentication decisions (SPEC 12.1), driven as pure functions so
+# every order a server can require its methods in is covered without a network.
+qt_add_executable(tst_sshauth tst_sshauth.cpp)
+
+target_link_libraries(tst_sshauth PRIVATE
+    Qt6::Core
+    Qt6::Test
+    ch_ssh
+)
+
+add_test(NAME tst_sshauth COMMAND tst_sshauth)
+
 # LIVE gate (docs/PLAN.md S): exercises the real SSH spine against a real sshd.
 # Registered unconditionally and labelled `live`; the test QSKIPs when
 # CH_LIVE_SSH is unset so the default `ctest` run stays green everywhere.

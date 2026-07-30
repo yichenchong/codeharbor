@@ -33,12 +33,42 @@ export interface TerminalHost {
 }
 
 export function mountTerminal(element: HTMLElement, bridge: TerminalBridge): TerminalHost {
+    // MOUSE REPORTING: the tmux session this pane attaches to is created with
+    // `mouse on` scoped to that session (see
+    // ch::TerminalController::tmuxNewSessionCommand), so tmux asks this page to
+    // report mouse events and a wheel turn becomes a tmux scroll. Without that
+    // request xterm.js falls back to "alternate scroll" and sends cursor-up /
+    // cursor-down keys instead, because tmux occupies the alternate screen and
+    // an alternate screen has no scrollback of its own — which is exactly the
+    // bug where the wheel walked back through shell history.
+    //
+    // Nothing below may suppress that: no custom wheel handler is registered and
+    // no mouse opt-out is passed, so xterm.js forwards the reports itself.
+    //
+    // The known cost of mouse reporting is that a plain drag selects inside tmux
+    // instead of selecting the page's text. xterm.js already answers this with
+    // the terminal-emulator convention — holding SHIFT while dragging forces its
+    // own selection — so no override is added here. Paste is unaffected: it
+    // arrives as a browser paste event on xterm.js's hidden textarea, never as a
+    // mouse report.
     const term = new Terminal({
         allowProposedApi: true,
         cursorBlink: true,
         fontFamily: "monospace",
         fontSize: 13,
-        scrollback: 5000,
+        // The pane's own scrollback is NOT the history the user scrolls. Every
+        // pane attaches tmux (see ch::TerminalController::tmuxNewSessionCommand),
+        // tmux runs on the ALTERNATE screen, and the alternate screen has no
+        // scrollback at all — the wheel is reported to tmux, which scrolls its
+        // own history. What is left for this buffer is the NORMAL screen: the
+        // few lines printed before tmux takes over, and whatever a user sees if
+        // tmux exits. A few hundred lines cover both, so this is deliberately
+        // small rather than the 5000 it held while xterm.js was believed to own
+        // the history: every line costs memory per pane, and there can be many
+        // panes.
+        scrollback: 500,
+        // Mirrors Theme.surfaceSunken / Theme.text in src/qml/Theme.qml, which
+        // has no import path into this page: change both together.
         theme: { background: "#11111b", foreground: "#cdd6f4" },
         // SECURITY: terminal output is fully attacker-controlled — every byte
         // here came off the remote PTY. xterm.js parses OSC 8 hyperlinks out of

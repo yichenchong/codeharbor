@@ -1,15 +1,24 @@
-// LIVE gate for SessionBootstrap's reconnect ladder (SPEC 5.6): a real SSH
-// session is really dropped, and the app really comes back.
+// LIVE gates for SessionBootstrap against the real fixture (SPEC 5.6, 10.1).
 //
-// The unit gate (tst_sessionbootstrap) drives the state machine through test
-// seams. This one drives nothing: it wires the production bootstrap against the
-// fixture, kills the connection from the remote end, and then requires a fresh
-// handshake, a fresh codeharbord, and a working RPC round-trip on the other
-// side of the backoff — none of which the seam-driven test can prove.
+// 1. survivesADroppedConnection: a real SSH session is really dropped, and the
+//    app really comes back. The unit gate (tst_sessionbootstrap) drives the
+//    state machine through test seams; this one drives nothing. It wires the
+//    production bootstrap against the fixture, kills the connection from the
+//    remote end, and then requires a fresh handshake, a fresh codeharbord and a
+//    working RPC round-trip on the other side of the backoff — none of which the
+//    seam-driven test can prove.
 //
-// How the drop is made, and why it is safe next to other live tests: the kill
-// runs on an Exec channel of OUR OWN session and targets that channel's parent,
-// which is the per-connection `sshd-session: <user>@notty` process. It is
+// 2. provisionsAnEmptyLocationThenWires: a server with NOTHING installed at the
+//    configured location is brought up by the client itself. The unit gate can
+//    prove the decision tree with canned answers, but only a real server proves
+//    that the scripts this client sends actually run under its sh, that the
+//    archive unpacks into something launchable, and that codeharbord then
+//    answers over the channel. It installs into a throwaway directory and
+//    removes it again.
+//
+// How the drop in (1) is made, and why it is safe next to other live tests: the
+// kill runs on an Exec channel of OUR OWN session and targets that channel's
+// parent, which is the per-connection `sshd-session: <user>@notty` process. It is
 // therefore scoped to this test's TCP connection — never the shared fixture
 // listener, never another test's session — and the target's command line is
 // checked to contain "sshd" before any signal is sent. Killing remote
@@ -22,10 +31,13 @@
 #include "SshChannelDevice.h"
 #include "SshConnectionPool.h"
 
+#include <QCoreApplication>
 #include <QDeadlineTimer>
 #include <QElapsedTimer>
 #include <QJsonObject>
 #include <QJsonValue>
+#include <QRandomGenerator>
+#include <QScopeGuard>
 #include <QString>
 #include <QStringList>
 #include <QtTest/QtTest>
@@ -48,6 +60,11 @@ namespace {
 // (once per wire), plus the 1 s first backoff rung and a full re-handshake.
 constexpr int kRpcTimeoutMs = 60000;
 constexpr int kReconnectTimeoutMs = 90000;
+// A one-shot out-of-band exec channel: mkdir, tar, cat, rm.
+constexpr int kExecTimeoutMs = 30000;
+// Staging a tarball on the server, copying it into place, unpacking it and
+// confirming the result — four remote round trips plus a tar of the source tree.
+constexpr int kProvisionTimeoutMs = 120000;
 
 // Kill this exec channel's parent — the per-connection sshd-session — so the
 // whole SSH connection drops underneath libssh, exactly as a yanked network
@@ -65,6 +82,44 @@ QString env(const char* key)
     return qEnvironmentVariable(key);
 }
 
+// Quote one argv element for the remote login shell. Same rule
+// SessionBootstrap uses: CH_LIVE_REPO and the throwaway paths below are
+// interpolated into remote commands, so they are quoted rather than trusted.
+QString sq(const QString& value)
+{
+    QString escaped = value;
+    escaped.replace(QLatin1Char('\''), QLatin1String("'\\''"));
+    return QLatin1Char('\'') + escaped + QLatin1Char('\'');
+}
+
+// One out-of-band remote command on `pool`'s live session, stdout collected and
+// trimmed. Out of band on purpose: what provisioning did to the server is
+// verified over a plain exec channel, never through the same code path that
+// produced it. `ok` reports whether the command ran to end-of-stream.
+QString runExec(SshConnectionPool& pool, const QString& command, bool* ok)
+{
+    SshChannelDevice device(&pool, SshConnectionPool::ChannelKind::Exec);
+    if (!device.startExec(command)) {
+        if (ok)
+            *ok = false;
+        return {};
+    }
+    bool finished = false;
+    QObject::connect(&device, &SshChannelDevice::readChannelFinished, &device,
+                     [&finished] { finished = true; });
+    QByteArray out;
+    QDeadlineTimer deadline(kExecTimeoutMs);
+    while (!finished && !deadline.hasExpired()) {
+        QCoreApplication::processEvents(QEventLoop::AllEvents, 20);
+        out += device.readAll();
+    }
+    out += device.readAll();
+    device.closeChannel();
+    if (ok)
+        *ok = finished;
+    return QString::fromUtf8(out).trimmed();
+}
+
 } // namespace
 
 class TstLiveReconnect : public QObject {
@@ -74,6 +129,7 @@ private slots:
     void cleanupTestCase();
 
     void survivesADroppedConnection();
+    void provisionsAnEmptyLocationThenWires();
 
 private:
     bool serverInfoAnswers(QString* detail);
@@ -84,6 +140,10 @@ private:
     AgentStatusMonitor m_monitor;
     std::unique_ptr<SessionBootstrap> m_bootstrap;
     QStringList m_bootstrapErrors;
+    // Members rather than locals in the case body: both are appended to from
+    // lambdas whose connection lives as long as m_bootstrap, which outlives the
+    // slot that made it, so a captured local would dangle.
+    QStringList m_provisioningReports;
     bool m_live = false;
 };
 
@@ -240,6 +300,180 @@ void TstLiveReconnect::survivesADroppedConnection()
 
     // The only claim that matters: RPC works again over the new transport.
     QVERIFY2(serverInfoAnswers(&detail), qPrintable(detail));
+}
+
+// THE PROVISIONING GATE. A first connect to a location with nothing in it has
+// to bring up a working remote service by itself; the whole point of the feature
+// is that the user no longer checks this repository out on the server by hand.
+//
+// The artifact is STAGED ON THE SERVER (tarred out of the checkout the fixture
+// already has) and installed through a file:// URL rather than downloaded from
+// the releases page. That is deliberate and it does not weaken the gate: the
+// fetch step is the only line that differs (`cp` instead of `curl`), while
+// everything this case exists to prove — that the inspection script runs under
+// the server's real sh, that the archive unpacks into something
+// entryCandidates() finds, that the marker makes a second connect a no-op, and
+// that codeharbord then answers JSON-RPC over the channel — is exercised for
+// real. It also keeps the gate off the network and independent of which release
+// happens to be published, and it is exactly the air-gapped install path a user
+// with no outbound access would take.
+void TstLiveReconnect::provisionsAnEmptyLocationThenWires()
+{
+    if (!m_live)
+        QSKIP("live gate not armed");
+
+    // The reconnect case above leaves a wired session on the shared pool; this
+    // case drives its own connects, so start from nothing.
+    m_bootstrap.reset();
+    m_pool.disconnectFromHost();
+    m_bootstrapErrors.clear();
+
+    const QString host = env("CH_LIVE_HOST");
+    const quint16 port = static_cast<quint16>(env("CH_LIVE_PORT").toUInt());
+    const QString user = env("CH_LIVE_USER");
+    const QString node = env("CH_LIVE_NODE");
+    const QString repo = env("CH_LIVE_REPO");
+    const QString identity = env("CH_LIVE_IDENTITY");
+
+    // A throwaway base on the server, stamped with this process so two runs (or
+    // a run beside another live target) cannot collide. EVERYTHING this case
+    // creates lives under it and is removed at the end.
+    const QString base =
+        QStringLiteral("/tmp/ch-provision-%1-%2")
+            .arg(QCoreApplication::applicationPid())
+            .arg(QRandomGenerator::global()->generate(), 8, 16, QLatin1Char('0'));
+    const QString target = base + QStringLiteral("/root");
+    const QString tarball = base + QStringLiteral("/codeharbor-remote.tar.gz");
+    const QString artifactUrl = QStringLiteral("file://") + tarball;
+
+    m_bootstrap =
+        std::make_unique<SessionBootstrap>(&m_pool, &m_client, &m_monitor);
+    // Nobody to raise a host-key prompt in this gate, and the fixture key is
+    // usually unknown to a fresh known_hosts store.
+    m_bootstrap->setTrustUnknownHostKeys(true);
+    // connectAndWireFromEnvironment() honours this override; connectAndWire()
+    // cannot see it, so the fixture's own store is respected here by hand rather
+    // than writing the fixture key into the developer's ~/.config.
+    const QString knownHosts = env("CH_LIVE_KNOWN_HOSTS");
+    if (!knownHosts.isEmpty())
+        m_bootstrap->setKnownHostsPath(knownHosts);
+    // Reconnect would fight the deliberate disconnects below.
+    m_bootstrap->setReconnectEnabled(false);
+    connect(m_bootstrap.get(), &SessionBootstrap::error, this,
+            [this](const QString& message) { m_bootstrapErrors.append(message); });
+    m_provisioningReports.clear();
+    connect(m_bootstrap.get(), &SessionBootstrap::provisioning, this,
+            [this](const QString& message) {
+                m_provisioningReports.append(message);
+            });
+
+    const auto why = [this] { return m_bootstrapErrors.join(QStringLiteral(" | ")); };
+
+    // ---- phase 1: the fixture's own checkout, which must be left alone ------
+    QVERIFY2(m_bootstrap->connectAndWire(host, port, user, node, repo, identity),
+             qPrintable(why()));
+    QCOMPARE(m_bootstrap->state(), State::Wired);
+    // A directory a person manages has no release marker, so nothing was
+    // installed over it and the user was told nothing about provisioning.
+    QVERIFY2(m_provisioningReports.isEmpty(),
+             qPrintable(QStringLiteral("the fixture checkout was provisioned "
+                                       "over: %1")
+                            .arg(m_provisioningReports.join(
+                                QStringLiteral(" | ")))));
+
+    // Stage the artifact. `remote/src`, `remote/sql` and `remote/package.json`
+    // are everything the service needs: it has no runtime dependencies, and
+    // workspace.ts reads ../sql/schema.sql relative to itself.
+    bool execOk = false;
+    const QString staged = runExec(
+        m_pool,
+        QStringLiteral("mkdir -p %1 && tar -czf %2 -C %3 remote/src remote/sql "
+                       "remote/package.json && echo STAGED")
+            .arg(sq(base), sq(tarball), sq(repo)),
+        &execOk);
+    QVERIFY2(execOk && staged.contains(QStringLiteral("STAGED")),
+             qPrintable(QStringLiteral("could not stage %1 from %2: %3")
+                            .arg(tarball, repo, staged)));
+
+    // Whatever happens below, the server does not keep our litter. The session
+    // is deliberately dropped and remade between phases, so the sweep opens the
+    // channel on whatever session is live at the end; if there is none, it says
+    // where the directory is instead of leaving it unmentioned.
+    const auto sweep = qScopeGuard([this, base] {
+        if (m_pool.state() != SshConnectionPool::State::Connected) {
+            qWarning().noquote()
+                << "provisioning gate: no live session to clean up with; remove"
+                << base << "on the fixture by hand";
+            return;
+        }
+        bool ok = false;
+        const QString left =
+            runExec(m_pool,
+                    QStringLiteral("rm -rf %1; [ -e %1 ] && echo LEFTOVER")
+                        .arg(sq(base)),
+                    &ok);
+        if (!ok || left.contains(QStringLiteral("LEFTOVER")))
+            qWarning().noquote() << "provisioning gate: could not remove" << base;
+    });
+
+    m_bootstrap->disconnectSession();
+
+    // ---- phase 2: an EMPTY location, which must be provisioned -------------
+    m_bootstrap->setRemoteArtifactUrl(artifactUrl);
+    QElapsedTimer install;
+    install.start();
+    QVERIFY2(m_bootstrap->connectAndWire(host, port, user, node, target, identity),
+             qPrintable(QStringLiteral("provisioning connect failed: %1")
+                            .arg(why())));
+    QCOMPARE(m_bootstrap->state(), State::Wired);
+    QVERIFY2(install.elapsed() < kProvisionTimeoutMs,
+             qPrintable(QStringLiteral("provisioning took %1 ms")
+                            .arg(install.elapsed())));
+
+    // The user was told what was happening, from BOTH layers: the client's own
+    // "Installing ..." announcement and the remote script's per-step lines,
+    // republished as they landed. A first connect that silently spends a minute
+    // installing is indistinguishable from a hung application.
+    const QString reported = m_provisioningReports.join(QStringLiteral(" | "));
+    QVERIFY2(reported.contains(QStringLiteral("Installing")), qPrintable(reported));
+    QVERIFY2(reported.contains(QStringLiteral("fetching")), qPrintable(reported));
+    QVERIFY2(reported.contains(QStringLiteral("unpacking")), qPrintable(reported));
+    QVERIFY2(reported.contains(QStringLiteral("Installed")), qPrintable(reported));
+
+    // The claim that matters: the service the client installed actually answers.
+    QString detail;
+    QVERIFY2(serverInfoAnswers(&detail), qPrintable(detail));
+
+    // Verified OUT OF BAND, over a plain exec channel rather than the RPC path
+    // that produced it: the entry point is really on disk, the release marker
+    // records the artifact, and the scratch directory was cleaned up.
+    execOk = false;
+    const QString landed = runExec(
+        m_pool,
+        QStringLiteral("[ -f %1 ] && echo ENTRY_OK; [ -d %2 ] && echo "
+                       "SCRATCH_LEFT; cat %3")
+            .arg(sq(target + QStringLiteral("/remote/src/codeharbord.ts")),
+                 sq(target + QStringLiteral("/.codeharbor-provision")),
+                 sq(SessionBootstrap::releaseMarkerPath(target))),
+        &execOk);
+    QVERIFY(execOk);
+    QVERIFY2(landed.contains(QStringLiteral("ENTRY_OK")), qPrintable(landed));
+    QVERIFY2(!landed.contains(QStringLiteral("SCRATCH_LEFT")), qPrintable(landed));
+    QVERIFY2(landed.contains(artifactUrl), qPrintable(landed));
+
+    // ---- phase 3: connecting again must not reinstall ----------------------
+    m_bootstrap->disconnectSession();
+    m_provisioningReports.clear();
+    QVERIFY2(m_bootstrap->connectAndWire(host, port, user, node, target, identity),
+             qPrintable(why()));
+    QCOMPARE(m_bootstrap->state(), State::Wired);
+    QVERIFY2(m_provisioningReports.isEmpty(),
+             qPrintable(QStringLiteral("a second connect reinstalled: %1")
+                            .arg(m_provisioningReports.join(
+                                QStringLiteral(" | ")))));
+    QVERIFY2(serverInfoAnswers(&detail), qPrintable(detail));
+
+    QVERIFY2(m_bootstrapErrors.isEmpty(), qPrintable(why()));
 }
 
 // Guiless: no display anywhere in this gate, and ch_app links Qt6::Gui.

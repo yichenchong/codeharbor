@@ -170,12 +170,42 @@ export function mountEditor(
     element.appendChild(statusEl);
     element.appendChild(editorEl);
 
+    // Monaco does NOT use browser scrollbars for the editor: it draws its own,
+    // sized by these options and coloured by the theme's scrollbarSlider colours
+    // (defined in "codeharbor-dark" below). The page's stylesheet
+    // (../index.html) covers only the scrollbars Chromium draws, so both halves
+    // are needed for a pane with no foreign-looking scrollbar left in it.
+    monaco.editor.defineTheme("codeharbor-dark", {
+        // Inherit vs-dark's ~hundreds of syntax rules and widget colours; only
+        // the surfaces and the scrollbar are restated, so the editor stops being
+        // a lighter grey rectangle inside a Catppuccin window.
+        base: "vs-dark",
+        inherit: true,
+        rules: [],
+        // COLOUR MIRROR: these are copies of roles in src/qml/Theme.qml, which
+        // cannot be imported into a web page. Keep them in step by hand, together
+        // with the stylesheet in ../index.html.
+        colors: {
+            "editor.background": "#11111b",                  // surfaceSunken
+            "editorGutter.background": "#11111b",             // surfaceSunken
+            "editorLineNumber.foreground": "#45475a",         // textFaint
+            "editorLineNumber.activeForeground": "#cdd6f4",   // text
+            "minimap.background": "#11111b",                  // surfaceSunken
+            "scrollbarSlider.background": "#45475a",          // border
+            "scrollbarSlider.hoverBackground": "#6c7086",     // textDim
+            "scrollbarSlider.activeBackground": "#89b4fa",    // accent
+            "minimapSlider.background": "#313244",            // borderSubtle
+            "minimapSlider.hoverBackground": "#45475a",       // border
+            "minimapSlider.activeBackground": "#6c7086",      // textDim
+        },
+    });
+
     const editor = monaco.editor.create(editorEl, {
         value: "",
         // The host drives content; the language comes from the pane's remote
         // path (highlighting only). No client-side file access is implied.
         language: options.path ? languageForPath(options.path) : "plaintext",
-        theme: "vs-dark",
+        theme: "codeharbor-dark",
         readOnly: false,
         automaticLayout: true,
         // SPEC 8.1 lists the minimap among the things the embedded editor is
@@ -183,6 +213,17 @@ export function mountEditor(
         // folding and bracket matching (all Monaco defaults).
         minimap: { enabled: true },
         scrollBeyondLastLine: false,
+        scrollbar: {
+            // Theme.scrollBarThickness, and no arrow buttons — the same shape as
+            // the application's own scrollbars.
+            verticalScrollbarSize: 10,
+            horizontalScrollbarSize: 10,
+            verticalHasArrows: false,
+            horizontalHasArrows: false,
+            // The drop shadow Monaco draws where content scrolls under the
+            // chrome belongs to its own visual language, not this one.
+            useShadows: false,
+        },
     });
 
     // The revision the current buffer was loaded (or last saved) at; every save

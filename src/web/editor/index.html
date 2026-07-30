@@ -22,8 +22,18 @@
 <title>CodeHarbor Editor</title>
 <link rel="stylesheet" href="editor.css">
 <style>
+    /* COLOUR MIRROR: every colour in this stylesheet is a copy of a role in
+       src/qml/Theme.qml, which is the application's one colour vocabulary. There
+       is no import path from QML into a web page, so the two must be edited
+       TOGETHER — a change to Theme.qml that is not reflected here leaves this
+       page in the old palette. The role each literal stands for is named beside
+       it. The same values appear once more in src/web/terminal/index.html and in
+       the "codeharbor-dark" Monaco theme in src/index.ts. */
     html, body { height: 100%; margin: 0; padding: 0; overflow: hidden; }
-    body { background: #1e1e1e; color: #d4d4d4; }
+    /* surfaceSunken / text: the same pair the terminal page uses, so an editor
+       pane and a terminal pane read as the same application rather than as a
+       terminal beside a transplanted VS Code. */
+    body { background: #11111b; color: #cdd6f4; }
     /* Column layout: a thin status strip above a surface that takes all
        remaining height. Monaco lays itself out from the surface's box, so that
        box needs a definite height — hence flex:1 + min-height:0. The script
@@ -36,14 +46,41 @@
         align-items: center;
         gap: 8px;
         padding: 2px 8px;
-        background: #252526;
-        border-bottom: 1px solid #333;
-        color: #cccccc;
+        background: #181825;              /* surfaceDeep */
+        border-bottom: 1px solid #313244; /* borderSubtle */
+        color: #cdd6f4;                   /* text */
         font: 12px/1.6 system-ui, sans-serif;
     }
     /* Pushed to the far end of the strip; shown by the script as display:flex. */
     .ch-editor-notice { margin-left: auto; gap: 6px; }
     .ch-editor-surface { flex: 1 1 auto; min-height: 0; }
+
+    /* ---- scrollbars ----------------------------------------------------
+       These rules reach the PAGE's scrollbars (the status strip, and any
+       overflowing Monaco widget that scrolls natively such as the suggestion
+       list). Monaco's own editor scrollbars are NOT browser scrollbars: it
+       draws them itself, so they are configured in src/index.ts through the
+       editor's `scrollbar` options and the "codeharbor-dark" theme's
+       scrollbarSlider colours. Both halves have to be set or the pane still
+       shows a foreign-looking bar somewhere.
+
+       The ::-webkit-scrollbar family is used rather than the standard
+       `scrollbar-color`/`scrollbar-width` pair, and the choice is exclusive:
+       Chromium ignores the legacy pseudo-elements on any element that also
+       specifies a standard property, so the two cannot be combined. The
+       pseudo-elements are what can express the design — an exact 10px width
+       (Theme.scrollBarThickness), a fully transparent track, a rounded thumb —
+       whereas `scrollbar-width` offers only `auto`/`thin`. This page runs only
+       inside Qt WebEngine (Chromium), so the vendor prefix costs no
+       portability. */
+    ::-webkit-scrollbar { width: 10px; height: 10px; }   /* scrollBarThickness */
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-corner { background: transparent; }
+    ::-webkit-scrollbar-thumb {
+        background: #45475a;  /* border */
+        border-radius: 4px;   /* radiusSmall */
+    }
+    ::-webkit-scrollbar-thumb:hover { background: #6c7086; } /* textDim */
 </style>
 </head>
 <body>

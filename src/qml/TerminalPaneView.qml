@@ -52,6 +52,19 @@ Rectangle {
     // instead of guessing at the region's first leaf.
     signal paneActivated(string paneId)
 
+    // This is the pane the user is working in. Written by the region that owns
+    // the pane cache (TerminalRegion.applyFocusFlags) rather than derived here:
+    // focus is a property of the REGION — exactly one of its panes has it — and
+    // a pane cannot see its siblings.
+    property bool paneActive: false
+
+    // The user asked to close this pane, from its own header. Closing a pane is
+    // a LAYOUT change (SessionLayouts::closePane collapses the parent branch),
+    // which only the host can make, so the pane asks rather than acts. The region
+    // relays it as `closePaneRequested`. Note this is NOT killSession(): closing
+    // a pane deliberately leaves the remote tmux session running.
+    signal closeRequested(string paneId)
+
     // The `terminalFactory` context property, resolved once. Guarded so a host
     // that does not install it (a bare QML load) gets inert chrome rather than
     // a ReferenceError; also the seam a test injects a stub through.
@@ -78,8 +91,20 @@ Rectangle {
     readonly property bool live: pane.attached && pane.pageLoaded
                                  && pane.connectionState === "ready"
 
-    color: "#11111b"
-    border.color: "#313244"
+    // The pane's state in ONE word, for the header. Deliberately not
+    // `connectionState` verbatim: that publishes machine words ("notconnected",
+    // "unloaded") which mean nothing beside a terminal's name. The whole
+    // sentence still exists — `statusText`, drawn in the placeholder and the
+    // banner below — and this is the glance version of it.
+    readonly property string stateLabel: pane.live ? qsTr("live")
+        : pane.attaching ? qsTr("attaching\u2026")
+        : pane.attached ? qsTr("starting\u2026")
+        : pane.connectionState === "error" ? qsTr("error")
+        : pane.connectionState === "disconnected" ? qsTr("disconnected")
+        : qsTr("not attached")
+
+    color: Theme.surfaceSunken
+    border.color: Theme.borderSubtle
     border.width: 1
     implicitWidth: 160
     implicitHeight: 100
@@ -183,6 +208,43 @@ Rectangle {
             pane.attached = false
     }
 
+    // The per-pane header (SPEC 4.4). The SAME component the viewer panes use,
+    // so the two columns line up rather than each inventing its own strip. It
+    // lives INSIDE the pane, which is what makes it travel with the pane when a
+    // split re-parents it: a header owned by the region would have to be rebuilt
+    // to follow, and rebuilding a terminal pane closes its PTY and throws away
+    // the scrollback (see the PANE IDENTITY comment in TerminalRegion.qml).
+    AppPaneHeader {
+        id: paneHeader
+        anchors.left: parent.left
+        anchors.right: parent.right
+        anchors.top: parent.top
+        anchors.leftMargin: pane.border.width
+        anchors.rightMargin: pane.border.width
+        anchors.topMargin: pane.border.width
+
+        // terminalId is server-derived data; AppPaneHeader draws it as plain
+        // text. A pane with no id yet says what it IS instead of nothing.
+        title: pane.terminalId.length > 0 ? pane.terminalId : qsTr("Terminal")
+        subtitle: pane.stateLabel
+        active: pane.paneActive
+        busy: pane.attaching
+
+        actions: [
+            AppPaneHeader.Action {
+                text: qsTr("Close this pane")
+                glyph: "\u00d7"
+                onClicked: {
+                    // Report focus first: the host closes the pane the user is
+                    // in, so this pane has to BE that pane by the time the
+                    // request arrives.
+                    pane.paneActivated(pane.paneId)
+                    pane.closeRequested(pane.paneId)
+                }
+            }
+        ]
+    }
+
     WebChannel {
         id: terminalChannel
     }
@@ -192,7 +254,16 @@ Rectangle {
     // exists — and a host without the factory spawns no renderer at all.
     Loader {
         id: viewLoader
-        anchors.fill: parent
+        // Below the header, not over it. The renderer is a web page: covering it
+        // with chrome would work visually and then eat the clicks the terminal
+        // needs.
+        anchors.left: parent.left
+        anchors.right: parent.right
+        anchors.top: paneHeader.bottom
+        anchors.bottom: parent.bottom
+        anchors.leftMargin: pane.border.width
+        anchors.rightMargin: pane.border.width
+        anchors.bottomMargin: pane.border.width
         active: false
         sourceComponent: Component {
             WebEngineView {
@@ -262,9 +333,14 @@ Rectangle {
     // rectangle, always what this pane IS, why it is not live, and the one
     // action that might fix it.
     Rectangle {
-        anchors.fill: parent
-        anchors.margins: pane.border.width
-        color: "#11111b"
+        anchors.left: parent.left
+        anchors.right: parent.right
+        anchors.top: paneHeader.bottom
+        anchors.bottom: parent.bottom
+        anchors.leftMargin: pane.border.width
+        anchors.rightMargin: pane.border.width
+        anchors.bottomMargin: pane.border.width
+        color: Theme.surfaceSunken
         visible: !pane.pageLoaded
 
         Column {
@@ -275,9 +351,9 @@ Rectangle {
             Label {
                 anchors.horizontalCenter: parent.horizontalCenter
                 text: "\u25ae"
-                color: "#45475a"
+                color: Theme.textFaint
                 font.pixelSize: 26
-                font.family: "Monospace"
+                font.family: Theme.monoFamily
             }
             Label {
                 objectName: "paneTitle"
@@ -286,8 +362,8 @@ Rectangle {
                 // The headline is what this pane IS. The id it is keyed by is
                 // plumbing and belongs in the small print below.
                 text: qsTr("Terminal")
-                color: "#cdd6f4"
-                font.pixelSize: 14
+                color: Theme.text
+                font.pixelSize: Theme.fontSizeTitle
             }
             Label {
                 objectName: "paneReason"
@@ -302,8 +378,8 @@ Rectangle {
                 // data.
                 textFormat: Text.PlainText
                 text: pane.statusText.length > 0 ? pane.statusText : pane.connectionState
-                color: "#6c7086"
-                font.pixelSize: 12
+                color: Theme.textDim
+                font.pixelSize: Theme.fontSizeBody
             }
             Label {
                 objectName: "paneIdentityLabel"
@@ -312,9 +388,9 @@ Rectangle {
                 textFormat: Text.PlainText
                 text: pane.terminalId
                 visible: pane.terminalId.length > 0
-                color: "#45475a"
-                font.pixelSize: 10
-                font.family: "Monospace"
+                color: Theme.textFaint
+                font.pixelSize: Theme.fontSizeSmall
+                font.family: Theme.monoFamily
             }
             Button {
                 id: attachButton
@@ -327,17 +403,20 @@ Rectangle {
                 focusPolicy: Qt.StrongFocus
                 contentItem: Label {
                     text: attachButton.text
-                    color: "#cdd6f4"
-                    font.pixelSize: 12
+                    color: Theme.text
+                    font.pixelSize: Theme.fontSizeBody
                     horizontalAlignment: Text.AlignHCenter
                     verticalAlignment: Text.AlignVCenter
                 }
                 background: Rectangle {
-                    radius: 4
-                    color: attachButton.down ? "#45475a"
-                         : attachButton.hovered ? "#3a3a52" : "#313244"
+                    radius: Theme.radiusSmall
+                    // #3a3a52 is a lighter hover step ON Theme.surfaceRaised and
+                    // has no Theme role; Theme.surfaceHover is the DARKER row
+                    // hover, so substituting it here would invert the state.
+                    color: attachButton.down ? Theme.border
+                         : attachButton.hovered ? "#3a3a52" : Theme.surfaceRaised
                     border.width: attachButton.visualFocus ? 2 : 1
-                    border.color: attachButton.visualFocus ? "#89b4fa" : "#45475a"
+                    border.color: attachButton.visualFocus ? Theme.accent : Theme.border
                 }
                 onClicked: pane.attachNow()
             }
@@ -349,9 +428,13 @@ Rectangle {
     Rectangle {
         anchors.left: parent.left
         anchors.right: parent.right
-        anchors.top: parent.top
-        anchors.margins: pane.border.width
+        anchors.top: paneHeader.bottom
+        anchors.leftMargin: pane.border.width
+        anchors.rightMargin: pane.border.width
         height: 22
+        // #45222c / #3a2f1e are dim FILLS behind danger/warning text and have no
+        // Theme role (Theme.danger and Theme.warning are the text colours, far
+        // too bright to fill with).
         color: pane.connectionState === "error" ? "#45222c" : "#3a2f1e"
         visible: pane.pageLoaded && !pane.live
 
@@ -369,10 +452,13 @@ Rectangle {
                 text: pane.statusText.length > 0
                       ? pane.statusText
                       : qsTr("terminal %1").arg(pane.connectionState)
-                color: "#f9e2af"
+                color: Theme.warning
                 font.pixelSize: 11
             }
-            Button {
+            // Sized and coloured to sit INSIDE a 22-pixel banner. The Basic
+            // style's default is a light plate at its own metrics, which both
+            // overflowed the banner and read as somebody else's chrome.
+            AppPaneHeader.Action {
                 anchors.verticalCenter: parent.verticalCenter
                 visible: pane.factory !== null && !pane.attached
                 text: qsTr("Retry")

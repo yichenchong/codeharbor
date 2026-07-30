@@ -81,7 +81,8 @@ private slots:
     void init();
     void cleanup();
 
-    void loadWithoutPersistedLayoutYieldsDefaultLeaves();
+    void loadWithoutPersistedLayoutSeedsTheRegionDefaults();
+    void terminalDefaultIsTwoStackedPanesAndIsPersisted();
     void splitSerializesExactSetLayoutParams();
     void splitPersistsAndReloadsByteIdentical();
     void closeCollapsesBranchIntoSurvivor();
@@ -103,8 +104,10 @@ private:
     // True when the bridge wrote nothing more (used to prove load() never
     // writes to the server).
     bool noMoreRequests();
-    // Drive load(sessionId) to completion, answering both getLayout requests.
-    // A null QJsonValue means "this region has no persisted layout".
+    // Drive load(sessionId) to completion, answering both getLayout requests
+    // AND the workspace.setLayout seed each region answered with null then
+    // writes back (see applyLoadedTree), so every case starts from a quiet
+    // socket.
     void completeLoad(SessionLayouts& layouts, const QString& sessionId,
                       const QJsonValue& viewerTree,
                       const QJsonValue& terminalTree);
@@ -231,9 +234,28 @@ void TstSessionLayouts::completeLoad(SessionLayouts& layouts,
     respondResult(second.value(QStringLiteral("id")).toInt(), terminalTree);
     QTRY_COMPARE(loadedSpy.count(), 1);
     QCOMPARE(loadedSpy.at(0).at(0).toString(), sessionId);
+
+    // A region the server had no row for is SEEDED: applyLoadedTree adopts the
+    // region default and immediately persists it, so two stacked terminals
+    // survive a restart instead of being re-derived until something else saves a
+    // tree. Answer those writes here; the case that asserts on them is
+    // terminalDefaultIsTwoStackedPanesAndIsPersisted().
+    int seeds = 0;
+    if (viewerTree.isNull())
+        ++seeds;
+    if (terminalTree.isNull())
+        ++seeds;
+    for (int i = 0; i < seeds; ++i) {
+        const QJsonObject seed = nextRequest();
+        QCOMPARE(seed.value(QStringLiteral("method")).toString(),
+                 QStringLiteral("workspace.setLayout"));
+        const QJsonObject params = seed.value(QStringLiteral("params")).toObject();
+        respondResult(seed.value(QStringLiteral("id")).toInt(),
+                      layoutRow(params.value(QStringLiteral("tree")).toObject()));
+    }
 }
 
-void TstSessionLayouts::loadWithoutPersistedLayoutYieldsDefaultLeaves()
+void TstSessionLayouts::loadWithoutPersistedLayoutSeedsTheRegionDefaults()
 {
     makePair();
     SessionLayouts layouts(m_db);
@@ -255,13 +277,91 @@ void TstSessionLayouts::loadWithoutPersistedLayoutYieldsDefaultLeaves()
     QCOMPARE(compact(asObject(layouts.viewerTree())),
              compact(leaf(QStringLiteral("viewer-1"))));
     QCOMPARE(compact(asObject(layouts.terminalTree())),
-             compact(leaf(QStringLiteral("terminal-1"))));
+             compact(split(QStringLiteral("vertical"),
+                           {leaf(QStringLiteral("terminal-1")),
+                            leaf(QStringLiteral("terminal-2"))},
+                           {1, 1})));
     QCOMPARE(viewerSpy.count(), 1);
     QCOMPARE(terminalSpy.count(), 1);
 
-    // The default leaf lives in memory only: merely selecting a session must
-    // never write a layout row.
+    // completeLoad() already consumed one seed write per region; nothing else
+    // reaches the server on a plain selection.
     QVERIFY(noMoreRequests());
+}
+
+// A new Dev Session comes up with TWO terminals, one above the other, and they
+// are in the database rather than re-derived on every load: a single terminal
+// was only ever the smallest thing that rendered, and reaching a second one
+// meant hunting for "Split Terminal Pane" in the command palette.
+void TstSessionLayouts::terminalDefaultIsTwoStackedPanesAndIsPersisted()
+{
+    makePair();
+    SessionLayouts layouts(m_db);
+    layouts.setServerId(QStringLiteral("srv-1"));
+
+    QSignalSpy loadedSpy(&layouts, &SessionLayouts::loaded);
+    QSignalSpy errorSpy(&layouts, &SessionLayouts::error);
+
+    // Driven by hand rather than through completeLoad(), because the seed writes
+    // ARE what this case is about.
+    layouts.load(QStringLiteral("s1"));
+    const QJsonObject viewerGet = nextRequest();
+    const QJsonObject terminalGet = nextRequest();
+    respondResult(viewerGet.value(QStringLiteral("id")).toInt(),
+                  QJsonValue(QJsonValue::Null));
+    respondResult(terminalGet.value(QStringLiteral("id")).toInt(),
+                  QJsonValue(QJsonValue::Null));
+    QTRY_COMPARE(loadedSpy.count(), 1);
+
+    // "vertical" stacks children top to bottom, so terminal-1 is the upper pane.
+    const QJsonObject stacked = split(QStringLiteral("vertical"),
+                                      {leaf(QStringLiteral("terminal-1")),
+                                       leaf(QStringLiteral("terminal-2"))},
+                                      {1, 1});
+    QCOMPARE(compact(asObject(layouts.terminalTree())), compact(stacked));
+
+    // Both defaults are WRITTEN, not merely held in memory. This is the whole
+    // point: without the write, the first thing that saves a tree (a QML
+    // fallback node, a ratio drag on the other region) decides what the session
+    // looks like after a restart.
+    QJsonObject terminalSeed;
+    int seedCount = 0;
+    for (int i = 0; i < 2; ++i) {
+        const QJsonObject seed = nextRequest();
+        QCOMPARE(seed.value(QStringLiteral("method")).toString(),
+                 QStringLiteral("workspace.setLayout"));
+        const QJsonObject params = seed.value(QStringLiteral("params")).toObject();
+        QCOMPARE(params.value(QStringLiteral("serverId")).toString(),
+                 QStringLiteral("srv-1"));
+        QCOMPARE(params.value(QStringLiteral("devSessionId")).toString(),
+                 QStringLiteral("s1"));
+        if (params.value(QStringLiteral("region")).toString()
+            == QStringLiteral("terminal"))
+            terminalSeed = params.value(QStringLiteral("tree")).toObject();
+        ++seedCount;
+        respondResult(seed.value(QStringLiteral("id")).toInt(),
+                      layoutRow(params.value(QStringLiteral("tree")).toObject()));
+    }
+    QCOMPARE(seedCount, 2);
+    QCOMPARE(compact(terminalSeed), compact(stacked));
+    QCOMPARE(errorSpy.count(), 0);
+
+    // Idempotent: the seed created the row, so reopening the session loads it
+    // and writes nothing at all.
+    SessionLayouts reopened(m_db);
+    reopened.setServerId(QStringLiteral("srv-1"));
+    completeLoad(reopened, QStringLiteral("s1"),
+                 layoutRow(leaf(QStringLiteral("viewer-1"))),
+                 layoutRow(stacked));
+    QCOMPARE(compact(asObject(reopened.terminalTree())), compact(stacked));
+    QVERIFY(noMoreRequests());
+
+    // Pane numbering continues past the second default pane instead of minting
+    // a "terminal-2" that already exists.
+    QCOMPARE(reopened.splitPane(QStringLiteral("terminal"),
+                                QStringLiteral("terminal-2"),
+                                QStringLiteral("horizontal")),
+             QStringLiteral("terminal-3"));
 }
 
 void TstSessionLayouts::splitSerializesExactSetLayoutParams()
@@ -626,7 +726,10 @@ void TstSessionLayouts::rpcErrorSurfacesWithoutCorruptingTree()
              QStringLiteral("no such dev session"));
     QVERIFY(layouts.viewerTree().isNull());
     QCOMPARE(compact(asObject(layouts.terminalTree())),
-             compact(leaf(QStringLiteral("terminal-1"))));
+             compact(split(QStringLiteral("vertical"),
+                           {leaf(QStringLiteral("terminal-1")),
+                            leaf(QStringLiteral("terminal-2"))},
+                           {1, 1})));
 }
 
 void TstSessionLayouts::invalidSavedTreeIsRejected()
@@ -760,12 +863,16 @@ QtObject {
              QStringLiteral("viewer-3"));
     QVERIFY(qFuzzyCompare(probe->property("firstRatio").toDouble(), 2.0 / 7.0));
 
-    // The other region's in-memory default leaf reads as a leaf pane.
+    // The other region's seeded default reads as the two stacked terminals.
     probe->setProperty("node", layouts.terminalTree());
-    QCOMPARE(probe->property("rootIsLeaf").toBool(), true);
-    QCOMPARE(probe->property("rootPaneId").toString(),
+    QCOMPARE(probe->property("rootIsLeaf").toBool(), false);
+    QCOMPARE(probe->property("orientation").toString(),
+             QStringLiteral("vertical"));
+    QCOMPARE(probe->property("childCount").toInt(), 2);
+    QCOMPARE(probe->property("firstChildPaneId").toString(),
              QStringLiteral("terminal-1"));
-    QCOMPARE(probe->property("childCount").toInt(), 0);
+    QCOMPARE(probe->property("secondChildIsLeaf").toBool(), true);
+    QVERIFY(qFuzzyCompare(probe->property("firstRatio").toDouble(), 0.5));
 
     // A not-yet-loaded region hands QML a null node, which keeps it inert.
     SessionLayouts empty(m_db);
@@ -833,24 +940,39 @@ void TstSessionLayouts::liveLayoutRoundTripOverSsh()
     QSignalSpy errorSpy(&layouts, &SessionLayouts::error);
     QSignalSpy loadedSpy(&layouts, &SessionLayouts::loaded);
 
-    // A brand new Dev Session has no persisted layout: the in-memory defaults.
+    // A brand new Dev Session has no persisted layout: the region defaults,
+    // which the load SEEDS into the server's database.
     layouts.load(sessionId);
     QTRY_VERIFY_WITH_TIMEOUT(loadedSpy.count() == 1, 15000);
     QCOMPARE(errorSpy.count(), 0);
+    const QJsonObject stacked = split(QStringLiteral("vertical"),
+                                      {leaf(QStringLiteral("terminal-1")),
+                                       leaf(QStringLiteral("terminal-2"))},
+                                      {1, 1});
     QCOMPARE(compact(asObject(layouts.viewerTree())),
              compact(leaf(QStringLiteral("viewer-1"))));
-    QCOMPARE(compact(asObject(layouts.terminalTree())),
-             compact(leaf(QStringLiteral("terminal-1"))));
+    QCOMPARE(compact(asObject(layouts.terminalTree())), compact(stacked));
+
+    // The seeded default really landed in the server's SQLite: a fresh bridge
+    // (which is what a relaunched app is) reads the two stacked terminals back
+    // instead of re-deriving them.
+    SessionLayouts afterSeed(&db);
+    afterSeed.setServerId(serverId);
+    QSignalSpy afterSeedSpy(&afterSeed, &SessionLayouts::loaded);
+    afterSeed.load(sessionId);
+    QTRY_VERIFY_WITH_TIMEOUT(afterSeedSpy.count() == 1, 15000);
+    QCOMPARE(compact(asObject(afterSeed.terminalTree())), compact(stacked));
 
     // Split both regions; each split is a real workspace.setLayout write.
     QCOMPARE(layouts.splitPane(QStringLiteral("viewer"),
                                QStringLiteral("viewer-1"),
                                QStringLiteral("vertical")),
              QStringLiteral("viewer-2"));
+    // terminal-1 and terminal-2 are the default panes, so the new one is 3.
     QCOMPARE(layouts.splitPane(QStringLiteral("terminal"),
                                QStringLiteral("terminal-1"),
                                QStringLiteral("horizontal")),
-             QStringLiteral("terminal-2"));
+             QStringLiteral("terminal-3"));
     layouts.setRatios(QStringLiteral("viewer"), {}, {2.0, 3.0});
     const QByteArray viewerBefore = compact(asObject(layouts.viewerTree()));
     const QByteArray terminalBefore = compact(asObject(layouts.terminalTree()));

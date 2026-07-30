@@ -10,6 +10,12 @@
 *.dll
 *.exe
 
+# Release packaging output, produced by .github/workflows/release.yml and by the
+# same commands run by hand: `artifact/` is the deployed per-OS tree that the
+# deploy tools fill in, `installer/` is where ISCC writes the Windows setup exe.
+/artifact/
+/installer/
+
 # CMake
 CMakeCache.txt
 CMakeFiles/

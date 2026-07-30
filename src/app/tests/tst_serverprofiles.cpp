@@ -4,20 +4,25 @@
 //   * the store — CRUD, persistence across instances against an explicit .ini
 //     path (never the developer's real settings), the activeId invariant, and
 //     refusal of input that could never connect;
-//   * ConnectSheet.qml — loaded straight from the source tree (it is not in the
-//     QML module yet, the orchestrator wires that) and driven through every
-//     signal it exposes, failing on ANY QML warning so it cannot poison
-//     tst_qmlload once it is wired into Main.qml.
+//   * ConnectSheet.qml — loaded straight from the source tree (by file path, not
+//     through the CodeHarbor QML module this target does not link) and driven
+//     through every signal it exposes, failing on ANY QML warning so it cannot
+//     poison tst_qmlload. Loading it outside its module means the module's
+//     `Theme` singleton is not there, so loadSheet() registers the real
+//     src/qml/Theme.qml and exposes its one instance under the same name.
 
 #include <QtTest/QtTest>
 
+#include <QDir>
 #include <QFile>
+#include <QFileInfo>
 #include <QJSValue>
 #include <QMetaMethod>
 #include <QMetaObject>
 #include <QMetaProperty>
 #include <QMutex>
 #include <QMutexLocker>
+#include <QQmlContext>
 #include <QQmlEngine>
 #include <QQmlError>
 #include <QQuickItem>
@@ -686,6 +691,28 @@ std::unique_ptr<QQuickView> TstServerProfiles::loadSheet()
                              m_engineWarnings.append(warning.toString());
                      });
 
+    // Inside the CodeHarbor QML module, `Theme` is a registered singleton and
+    // every colour and metric in the sheet comes from it. This target loads the
+    // sheet by file path, outside that module, where the name would not resolve
+    // and every binding that reads it would warn. Register the REAL
+    // src/qml/Theme.qml (found next to the sheet, so the two can never drift)
+    // and expose its single instance under the same name: the sheet under test
+    // is then drawing from the same vocabulary the application ships.
+    static const int themeTypeId = qmlRegisterSingletonType(
+        QUrl::fromLocalFile(
+            QFileInfo(QStringLiteral(CH_CONNECTSHEET_QML))
+                .absoluteDir()
+                .filePath(QStringLiteral("Theme.qml"))),
+        "CodeHarborThemeForTest", 1, 0, "Theme");
+    QObject* const theme =
+        view->engine()->singletonInstance<QObject*>(themeTypeId);
+    if (!theme) {
+        qWarning("ConnectSheet.qml: src/qml/Theme.qml could not be instantiated");
+        return nullptr;
+    }
+    view->engine()->rootContext()->setContextProperty(QStringLiteral("Theme"),
+                                                      theme);
+
     view->setSource(QUrl::fromLocalFile(QStringLiteral(CH_CONNECTSHEET_QML)));
     if (view->status() != QQuickView::Ready) {
         QStringList errors;
@@ -1044,6 +1071,13 @@ void TstServerProfiles::sheetCredentialPromptMasksSubmitsAndKeepsTheSecretOffDis
         stringOf(root->findChild<QObject*>(QStringLiteral("credentialTarget")), "text");
     QVERIFY2(target.contains(QStringLiteral("yichen")), qPrintable(target));
     QVERIFY2(target.contains(QStringLiteral("box.local")), qPrintable(target));
+    // A server with `AuthenticationMethods publickey,password` asks for the
+    // password AFTER accepting the key, so a password request must not tell the
+    // user their key could not authenticate: that sends them off debugging a key
+    // that is working perfectly.
+    QVERIFY2(!target.contains(QStringLiteral("could not authenticate")),
+             qPrintable(target));
+    QVERIFY2(target.contains(QStringLiteral("password")), qPrintable(target));
 
     QObject* const field = root->findChild<QObject*>(QStringLiteral("credentialField"));
     QVERIFY(field);

@@ -27,6 +27,7 @@
 #include <QQmlContext>
 #include <QQmlEngine>
 #include <QQmlError>
+#include <QQmlProperty>
 #include <QQuickItem>
 #include <QQuickView>
 #include <QSet>
@@ -129,6 +130,48 @@ QQuickItem *findByName(QQuickItem *root, const QString &objectName)
             return item;
     }
     return nullptr;
+}
+
+// Reads an ATTACHED property such as `Accessible.name` or `ToolTip.text`. The
+// attached type ("Accessible", "ToolTip") is resolved through the imports of the
+// QML file that declared it, so the item's own QML context has to be handed to
+// QQmlProperty; the two-argument constructor has no context and would silently
+// yield an invalid property instead.
+QString attachedString(QQuickItem *item, const QString &name)
+{
+    const QQmlProperty property(item, name, QQmlEngine::contextForObject(item));
+    if (!property.isValid())
+        return QString();
+    return property.read().toString();
+}
+
+// A QtQuick.Controls Dialog sizes itself from its content item's IMPLICIT width.
+// A content item that under-reports that width therefore produces a dialog
+// narrower than the field drawn inside it, and the field hangs out past the
+// frame. The invariant that catches it: the visible field plus the dialog's own
+// horizontal padding has to fit within the dialog's width.
+void verifyContentFits(QObject *dialog, QQuickItem *field, const QString &what)
+{
+    QVERIFY2(dialog->property("visible").toBool(),
+             qPrintable(QStringLiteral("%1 dialog did not open").arg(what)));
+
+    const qreal dialogWidth = dialog->property("width").toReal();
+    const qreal padding = dialog->property("leftPadding").toReal()
+                          + dialog->property("rightPadding").toReal();
+
+    // Guard against a vacuous pass: a field collapsed to nothing would "fit".
+    QVERIFY2(field->width() >= 200,
+             qPrintable(QStringLiteral("%1 field is only %2 wide")
+                                .arg(what)
+                                .arg(field->width())));
+    QVERIFY2(field->width() + padding <= dialogWidth + 0.5,
+             qPrintable(QStringLiteral("%1 field (%2) plus padding (%3) exceeds the "
+                                       "dialog width (%4): the field is drawn outside "
+                                       "the dialog")
+                                .arg(what)
+                                .arg(field->width())
+                                .arg(padding)
+                                .arg(dialogWidth)));
 }
 
 // Every session row currently in the tree, in visual (top-to-bottom) order.
@@ -332,6 +375,8 @@ private slots:
     void spaceTogglesGroupCollapse();
     void newSessionButtonTargetsItsGroupWithoutCollapsing();
     void serverSettingsButtonEmitsRequest();
+    void dialogContentFitsInsideItsDialog();
+    void addButtonsAreLabelledWithoutAPointer();
 
 private:
     // Two expanded groups: Alpha[s1,s2,s3], Beta[s4,s5].
@@ -664,6 +709,112 @@ void TstSidebar::spaceTogglesGroupCollapse()
     fixture.app.clearCalls();
     QTest::keyClick(&fixture.view, Qt::Key_Space);
     QCOMPARE(fixture.app.calls(), (QStringList{QStringLiteral("setGroupCollapsed(g1,true)")}));
+    QVERIFY2(fixture.warnings().isEmpty(), qPrintable(fixture.warnings().join(QLatin1Char('\n'))));
+}
+
+// The reported defect: the new-group dialog's field was a bare TextField with an
+// explicit width, which a Dialog does not size itself to, so the field spilled
+// out past the dialog's edge. Every dialog the sidebar owns is checked against
+// the same invariant, including the new-session dialog that already got it right
+// — if the mechanism ever changes, all three must move together.
+void TstSidebar::dialogContentFitsInsideItsDialog()
+{
+    SidebarFixture fixture(twoGroups());
+    expose(fixture);
+    fixture.app.clearCalls();
+
+    struct Case
+    {
+        // The item the dialog is declared inside. Empty means the sidebar root;
+        // the rename dialog is declared per row, and a row is parented visually
+        // rather than as a QObject child, so it has to be found by objectName
+        // first.
+        QString ownerName;
+        QString dialogName;
+        QString fieldName;
+        QString label;
+    };
+    const QList<Case> cases{
+        {QString(), QStringLiteral("newGroupDialog"), QStringLiteral("newGroupField"),
+         QStringLiteral("new-group")},
+        {QString(), QStringLiteral("newSessionDialog"), QStringLiteral("newSessionField"),
+         QStringLiteral("new-session")},
+        {QStringLiteral("sessionRow:s1"), QStringLiteral("renameDialog:s1"),
+         QStringLiteral("renameField:s1"), QStringLiteral("rename-session")},
+    };
+
+    for (const Case &testCase : cases) {
+        QQuickItem *owner = fixture.root();
+        if (!testCase.ownerName.isEmpty()) {
+            owner = findByName(fixture.root(), testCase.ownerName);
+            QVERIFY2(owner, qPrintable(QStringLiteral("no %1").arg(testCase.ownerName)));
+        }
+
+        QObject *dialog = owner->findChild<QObject *>(testCase.dialogName);
+        QVERIFY2(dialog, qPrintable(QStringLiteral("no %1").arg(testCase.dialogName)));
+        QQuickItem *field = owner->findChild<QQuickItem *>(testCase.fieldName);
+        QVERIFY2(field, qPrintable(QStringLiteral("no %1").arg(testCase.fieldName)));
+
+        QMetaObject::invokeMethod(dialog, "open");
+        QTest::qWait(100);
+        verifyContentFits(dialog, field, testCase.label);
+        // Reject rather than accept: accepting would create a group or a session.
+        QMetaObject::invokeMethod(dialog, "reject");
+        QTest::qWait(50);
+    }
+
+    // Measuring a dialog must not have mutated the workspace.
+    QVERIFY2(fixture.app.calls().isEmpty(), qPrintable(fixture.app.calls().join(QLatin1Char(','))));
+    QVERIFY2(fixture.warnings().isEmpty(), qPrintable(fixture.warnings().join(QLatin1Char('\n'))));
+}
+
+// Both add actions are a bare "+" glyph. A glyph that small says nothing on its
+// own, so each one must carry a sentence naming exactly what it adds — as its
+// accessible name, not only as a pointer-only tooltip — must stay a target big
+// enough to hit, and must stay reachable by keyboard.
+void TstSidebar::addButtonsAreLabelledWithoutAPointer()
+{
+    SidebarFixture fixture(twoGroups());
+    expose(fixture);
+
+    QQuickItem *addGroup = findByName(fixture.root(), QStringLiteral("newGroupButton"));
+    QVERIFY2(addGroup, "the sidebar header offers no way to add a group");
+    QQuickItem *addToAlpha = findByName(fixture.root(), QStringLiteral("newSessionButton:g1"));
+    QQuickItem *addToBeta = findByName(fixture.root(), QStringLiteral("newSessionButton:g2"));
+    QVERIFY(addToAlpha && addToBeta);
+
+    const QString groupName = attachedString(addGroup, QStringLiteral("Accessible.name"));
+    const QString alphaName = attachedString(addToAlpha, QStringLiteral("Accessible.name"));
+    const QString betaName = attachedString(addToBeta, QStringLiteral("Accessible.name"));
+
+    QVERIFY2(!groupName.isEmpty(), "the add-group button exposes no Accessible.name");
+    QCOMPARE(groupName, QStringLiteral("Add a group"));
+    QVERIFY2(!alphaName.isEmpty(), "the add-session button exposes no Accessible.name");
+
+    // There is one add-session button per group, so the name has to say WHICH
+    // group: two buttons announcing the same sentence would be unusable.
+    QVERIFY2(alphaName.contains(QStringLiteral("Alpha")), qPrintable(alphaName));
+    QVERIFY2(betaName.contains(QStringLiteral("Beta")), qPrintable(betaName));
+    QVERIFY(alphaName != betaName);
+
+    // The tooltip is a hint that repeats the name; it must never be the only
+    // place the sentence exists.
+    QCOMPARE(attachedString(addGroup, QStringLiteral("ToolTip.text")), groupName);
+    QCOMPARE(attachedString(addToAlpha, QStringLiteral("ToolTip.text")), alphaName);
+
+    // Compact, but not smaller than a reliable pointer target.
+    for (QQuickItem *button : {addGroup, addToAlpha}) {
+        QVERIFY2(button->width() >= 24 && button->height() >= 24,
+                 qPrintable(QStringLiteral("%1 is %2x%3, below the 24x24 hit-area floor")
+                                    .arg(button->objectName())
+                                    .arg(button->width())
+                                    .arg(button->height())));
+        // Keyboard focus must still be able to land here.
+        QVERIFY2((button->property("focusPolicy").toInt() & Qt::TabFocus) != 0,
+                 qPrintable(QStringLiteral("%1 is not reachable by Tab")
+                                    .arg(button->objectName())));
+    }
+
     QVERIFY2(fixture.warnings().isEmpty(), qPrintable(fixture.warnings().join(QLatin1Char('\n'))));
 }
 

@@ -3,6 +3,13 @@
 # executable links against.
 qt_add_library(codeharbor_qml STATIC)
 
+# Theme.qml is the module's single colour/metric vocabulary. It must be marked a
+# QML singleton BEFORE qt_add_qml_module() reads the file list, and the property
+# here must agree with the `pragma Singleton` at the top of the file — if either
+# side is missing, `import CodeHarbor` still succeeds and `Theme.x` silently
+# resolves to undefined, which in QML is a blank colour rather than an error.
+set_source_files_properties(Theme.qml PROPERTIES QT_QML_SINGLETON_TYPE TRUE)
+
 qt_add_qml_module(codeharbor_qml
     URI CodeHarbor
     VERSION 1.0
@@ -10,7 +17,12 @@ qt_add_qml_module(codeharbor_qml
     # tooling resolves the module correctly.
     OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/CodeHarbor
     QML_FILES
+        Theme.qml
         Main.qml
+        AppTitleBar.qml
+        AppSplitHandle.qml
+        AppScrollBar.qml
+        AppPaneHeader.qml
         SessionsSidebar.qml
         GroupHeader.qml
         SessionRow.qml

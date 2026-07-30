@@ -240,24 +240,55 @@ private:
     // Deliberately does NOT emit; callers coalesce activeSessionChanged.
     void clearActiveSession(bool forget);
     // The whole connect attempt. `acceptedFingerprint` is the single host key
-    // the user approved for THIS attempt (empty for a first attempt); `secret`
-    // is the one password or private-key passphrase typed after a prompt.
-    // Both are captured by value and consumed once, so neither can survive to
-    // an unrelated host.
-    void startConnect(const QString& profileId, QString acceptedFingerprint,
-                      QString secret,
-                      SshConnectionPool::CredentialKind secretKind);
+    // the user approved for THIS attempt (empty for a first attempt); the
+    // secrets for the attempt come from m_credentials, the chain's store.
+    void startConnect(const QString& profileId, QString acceptedFingerprint);
     // Install the pool's host-key and credential policies for ONE attempt.
-    // `acceptedFingerprint` and `secret` are captured by value inside the two
-    // callbacks, so they are spendable exactly once and cannot outlive the
-    // attempt: startConnect() re-installs the same pair with both arguments
+    // `acceptedFingerprint` and the two secrets are captured by value inside the
+    // two callbacks, so each is spendable exactly once and cannot outlive the
+    // attempt: startConnect() re-installs the same pair with every argument
     // EMPTY as soon as connectAndWire() returns. That re-install is what stops
     // a secret libssh never asked for (a passphrase offered to a host that only
     // does password auth, say) from sitting in the pool's callback for the rest
     // of the process, and stops an approval the attempt never reached the key
     // check to spend from arming the next connect to an unrelated host.
-    void installPoolCallbacks(QString acceptedFingerprint, QString secret,
-                              SshConnectionPool::CredentialKind secretKind);
+    //
+    // The two secrets are separate parameters, never one value with a "kind":
+    // the callback picks by the kind libssh asked for, so a private-key
+    // passphrase has no path to password authentication.
+    void installPoolCallbacks(QString acceptedFingerprint,
+                              QString keyPassphrase, QString password);
+
+    // Everything the user has supplied for the connect chain in flight.
+    //
+    // A chain used to carry ONE secret, which cannot satisfy a server that
+    // requires a key AND a password (OpenSSH `AuthenticationMethods
+    // publickey,password`): the passphrase is spent on the very attempt that
+    // discovers a password is also wanted, so the retry carrying the password
+    // would arrive with the key locked again and the chain could never
+    // complete. Both secrets therefore live here for the length of the chain —
+    // and only that long: clear() runs on success, on outright failure, on
+    // cancellation and on disconnect. They are never written anywhere, never
+    // reach ServerProfiles/QSettings, and never enter the SSH diagnostic log.
+    //
+    // The `asked` flags are what bound the prompt chain: a kind is put to the
+    // user at most once, so answering the passphrase request with "use
+    // password" cannot be met with the passphrase request all over again, and a
+    // chain is at most two credential prompts long.
+    struct CredentialChain {
+        QString keyPassphrase;
+        QString password;
+        bool askedKeyPassphrase = false;
+        bool askedPassword = false;
+
+        void clear()
+        {
+            keyPassphrase.clear();
+            password.clear();
+            askedKeyPassphrase = false;
+            askedPassword = false;
+        }
+    };
 
     QString m_connectionState = QStringLiteral("disconnected");
     QString m_connectionError;
@@ -287,14 +318,15 @@ private:
     // Cleared with m_connecting, so it never spans two user-initiated connects.
     QString m_approvedFingerprint;
     // The in-flight attempt asked for a password/passphrase and was refused so
-    // the user could be prompted. The strings describe it; the SECRET is never
-    // held here, only passed through startConnect() into the pool callback that
-    // consumes it.
+    // the user could be prompted. These four describe the OUTSTANDING request
+    // only; the secrets themselves live in m_credentials.
     bool m_credentialRequested = false;
     QString m_credentialUser;
     QString m_credentialLabel;
     SshConnectionPool::CredentialKind m_credentialKind =
         SshConnectionPool::CredentialKind::KeyPassphrase;
+    // Secrets gathered so far in the chain in flight; see CredentialChain.
+    CredentialChain m_credentials;
 };
 
 } // namespace ch

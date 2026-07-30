@@ -45,18 +45,21 @@ ItemDelegate {
                                              : qsTr("Expanded group")
 
     background: Rectangle {
-        color: header.selected ? "#2a2a40" : "#181825"
+        // The selected wash is a shade between Theme.surfaceDeep and
+        // Theme.surfaceRaised that the theme has no role for yet, so it stays a
+        // literal here rather than becoming a silent colour change.
+        color: header.selected ? "#2a2a40" : Theme.surfaceDeep
         opacity: header.dragging ? 0.4 : 1.0
 
         // Keyboard focus ring. The selected wash alone is a 10% lightness step
-        // against #181825 — invisible on a dim screen, and the only thing that
-        // told a keyboard user where the cursor was.
+        // against Theme.surfaceDeep — invisible on a dim screen, and the only
+        // thing that told a keyboard user where the cursor was.
         Rectangle {
             anchors.fill: parent
             anchors.margins: 1
             color: "transparent"
             border.width: 2
-            border.color: "#89b4fa"
+            border.color: Theme.accent
             visible: header.selected && header.host !== null && header.host.activeFocus
         }
     }
@@ -70,16 +73,16 @@ ItemDelegate {
             id: chevron
             width: 16
             text: header.collapsed ? "\u25B8" : "\u25BE" // ▸ / ▾
-            color: "#cdd6f4"
-            font.pixelSize: 12
+            color: Theme.text
+            font.pixelSize: Theme.fontSizeBody
             verticalAlignment: Text.AlignVCenter
             anchors.verticalCenter: parent.verticalCenter
         }
         Label {
             text: header.name
-            color: "#cdd6f4"
+            color: Theme.text
             font.bold: true
-            font.pixelSize: 13
+            font.pixelSize: Theme.fontSizeLabel
             elide: Text.ElideRight
             anchors.verticalCenter: parent.verticalCenter
         }
@@ -88,8 +91,8 @@ ItemDelegate {
         Label {
             text: qsTr("collapsed")
             visible: header.collapsed
-            color: "#6c7086"
-            font.pixelSize: 10
+            color: Theme.textDim
+            font.pixelSize: Theme.fontSizeSmall
             anchors.verticalCenter: parent.verticalCenter
         }
     }
@@ -104,22 +107,61 @@ ItemDelegate {
     // a group-reorder drag (tst_sidebar::reordersGroups caught exactly that).
     // The draggable expanse of the header stays draggable.
     Button {
+        id: newSessionButton
         objectName: "newSessionButton:" + header.itemId
-        text: qsTr("+ Session")
+        text: "+"
         visible: !header.collapsed
-        implicitHeight: 22
-        padding: 4
-        font.pixelSize: 10
+        // A compact square instead of a "+ Session" word button: one of these
+        // sits on every group header, and the words were wide enough to crowd
+        // the group name they belong to. 24 logical pixels is the floor for a
+        // pointer target on a high-density display, so the box stays 24 even
+        // though the glyph in it is smaller.
+        implicitWidth: 24
+        implicitHeight: 24
+        padding: 0
+        // Reachable without a pointer: Tab lands here, and the accessible name
+        // below is what a screen reader announces.
+        focusPolicy: Qt.StrongFocus
         anchors.right: parent.right
         anchors.rightMargin: 8
         anchors.verticalCenter: parent.verticalCenter
+
+        // The label is a bare "+", so this sentence is the button's only real
+        // name — and it has to name the GROUP, because there is one of these per
+        // header and "+" alone cannot say which group the click would add to.
+        // The tooltip is a pointer-only hint, so the SAME sentence is also the
+        // accessible name; a tooltip is never the only label.
+        readonly property string actionText:
+            qsTr("Add a Dev Session to \u201c%1\u201d").arg(header.name)
+
+        Accessible.role: Accessible.Button
+        Accessible.name: newSessionButton.actionText
+        ToolTip.text: newSessionButton.actionText
+        ToolTip.visible: newSessionButton.hovered
+        // Long enough that crossing the row on the way somewhere else does not
+        // flash it, matching the row tooltip in SessionRow.qml.
+        ToolTip.delay: 600
+
+        contentItem: Label {
+            text: newSessionButton.text
+            color: newSessionButton.down ? Theme.textOnAccent : Theme.text
+            font.pixelSize: Theme.fontSizeTitle
+            horizontalAlignment: Text.AlignHCenter
+            verticalAlignment: Text.AlignVCenter
+        }
+        background: Rectangle {
+            radius: Theme.radiusSmall
+            color: newSessionButton.down ? Theme.accent
+                 : newSessionButton.hovered ? Theme.border : Theme.surfaceRaised
+            border.width: newSessionButton.visualFocus ? 2 : 1
+            border.color: newSessionButton.visualFocus ? Theme.accent : Theme.borderSubtle
+        }
+
         // The Button consumes the press, so the parent ItemDelegate's onClicked
         // (which toggles collapse) never sees it - creating a session must not
         // also fold the group away. Asserted by
         // tst_sidebar::newSessionButtonTargetsItsGroupWithoutCollapsing.
         onClicked: if (header.host) header.host.requestNewSession(header.itemId)
-        ToolTip.visible: hovered
-        ToolTip.text: qsTr("Create a Dev Session in \u201c%1\u201d").arg(header.name)
     }
 
     onClicked: {

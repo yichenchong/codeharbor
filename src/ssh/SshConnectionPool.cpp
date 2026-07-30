@@ -52,6 +52,26 @@ bool SshConnectionPool::hasBrokenHybridKex(const QString& runtimeVersion)
     return release == QLatin1String("0.12.0");
 }
 
+SshConnectionPool::AuthRung SshConnectionPool::nextAuthRung(
+    const AuthRungsTried& tried, AuthMethods offered, bool canPrompt)
+{
+    // Public-key rungs come first because they need nothing from the user: an
+    // agent key or an unencrypted key file authenticates silently. Only when
+    // those are spent is a human interrupted, and the password rung is last
+    // because it is the only secret that travels to the server.
+    if (offered.publicKey) {
+        if (!tried.agent)
+            return AuthRung::Agent;
+        if (!tried.keyFile)
+            return AuthRung::KeyFile;
+        if (canPrompt && !tried.keyPassphrase)
+            return AuthRung::KeyPassphrase;
+    }
+    if (offered.password && canPrompt && !tried.password)
+        return AuthRung::Password;
+    return AuthRung::Exhausted;
+}
+
 SshConnectionPool::SshConnectionPool(QObject* parent)
     : QObject(parent)
 {
@@ -254,8 +274,27 @@ QStringList identityFileCandidates(ssh_session session,
     return candidates;
 }
 
-bool authenticateIdentityFile(ssh_session session, const QString& identityFile,
-                              const QString& passphrase)
+// The method name for a rung, for diagnostics and the failure explanation.
+// Names only — a rung never carries its secret into a message.
+QString authRungName(SshConnectionPool::AuthRung rung)
+{
+    switch (rung) {
+    case SshConnectionPool::AuthRung::Agent:
+        return QStringLiteral("ssh-agent");
+    case SshConnectionPool::AuthRung::KeyFile:
+        return QStringLiteral("private key");
+    case SshConnectionPool::AuthRung::KeyPassphrase:
+        return QStringLiteral("private key (with passphrase)");
+    case SshConnectionPool::AuthRung::Password:
+        return QStringLiteral("password");
+    case SshConnectionPool::AuthRung::Exhausted:
+        break;
+    }
+    return QStringLiteral("none");
+}
+
+SshConnectionPool::AuthOutcome authenticateIdentityFile(
+    ssh_session session, const QString& identityFile, const QString& passphrase)
 {
     const QByteArray fileName = QFile::encodeName(identityFile);
     QByteArray passphraseUtf8 = passphrase.toUtf8();
@@ -271,27 +310,67 @@ bool authenticateIdentityFile(ssh_session session, const QString& identityFile,
         // costs nothing and closes the leak if a future release ever did.
         if (privateKey)
             ssh_key_free(privateKey);
-        return false;
+        return SshConnectionPool::AuthOutcome::Refused;
     }
 
     const int authenticationResult =
         ssh_userauth_publickey(session, nullptr, privateKey);
     ssh_key_free(privateKey);
-    return authenticationResult == SSH_AUTH_SUCCESS;
+    return SshConnectionPool::classifyAuthResult(authenticationResult);
 }
 
-bool authenticateIdentityFiles(ssh_session session,
-                               const QStringList& identityFiles,
-                               const QString& passphrase)
+// Stops at the first key the server did not reject: a partial success is
+// progress and must not be followed by another key on the same rung, because
+// the server is now asking for a DIFFERENT method.
+SshConnectionPool::AuthOutcome authenticateIdentityFiles(
+    ssh_session session, const QStringList& identityFiles,
+    const QString& passphrase)
 {
     for (const QString& identityFile : identityFiles) {
-        if (authenticateIdentityFile(session, identityFile, passphrase))
-            return true;
+        const SshConnectionPool::AuthOutcome outcome =
+            authenticateIdentityFile(session, identityFile, passphrase);
+        if (outcome != SshConnectionPool::AuthOutcome::Refused)
+            return outcome;
     }
-    return false;
+    return SshConnectionPool::AuthOutcome::Refused;
 }
 
 } // namespace
+
+SshConnectionPool::AuthMethods SshConnectionPool::methodsFromMask(
+    int userauthListMask)
+{
+    const unsigned int mask = static_cast<unsigned int>(userauthListMask);
+    if (mask == SSH_AUTH_METHOD_UNKNOWN) {
+        // The server did not say. Try both rather than nothing: this is exactly
+        // what the single-step ladder did before, and refusing to try anything
+        // here would turn a missing method list into a connection that cannot
+        // authenticate at all.
+        return AuthMethods{true, true};
+    }
+    AuthMethods offered;
+    offered.publicKey = (mask & SSH_AUTH_METHOD_PUBLICKEY) != 0;
+    offered.password = (mask & SSH_AUTH_METHOD_PASSWORD) != 0;
+    return offered;
+}
+
+SshConnectionPool::AuthOutcome SshConnectionPool::classifyAuthResult(
+    int libsshResult)
+{
+    // SSH_AUTH_PARTIAL is the whole point of this function: the method WAS
+    // accepted and the server wants another one. Everything that is neither
+    // success nor partial (denied, error, again, keyboard-interactive info) ends
+    // this rung — SSH_AUTH_AGAIN cannot occur here because the session is
+    // blocking, and this client never requests keyboard-interactive.
+    switch (libsshResult) {
+    case SSH_AUTH_SUCCESS:
+        return AuthOutcome::Granted;
+    case SSH_AUTH_PARTIAL:
+        return AuthOutcome::Partial;
+    default:
+        return AuthOutcome::Refused;
+    }
+}
 
 bool SshConnectionPool::connectToHost(const QString& host, quint16 port,
                                       const QString& user,
@@ -582,12 +661,14 @@ bool SshConnectionPool::verifyHostKey(const QString& host)
 
 bool SshConnectionPool::authenticate(const QString& user)
 {
+    m_partialMethods.clear();
+    m_publicKeyOffered = false;
+
     // ssh_userauth_list() is only defined after a "none" request. It is not
     // enough to query it after an auto-key failure: some libssh builds then
     // report no methods at all, silently skipping the passphrase callback.
     if (ssh_userauth_none(m_session, nullptr) == SSH_AUTH_SUCCESS)
         return true;
-    const int methods = ssh_userauth_list(m_session, nullptr);
 
     // Windows' built-in OpenSSH agent is a named pipe, but libssh expects an
     // AF_UNIX socket. Avoid every libssh auto-auth call in that case: it
@@ -595,60 +676,119 @@ bool SshConnectionPool::authenticate(const QString& user)
     const bool unsupportedWindowsAgent = usesUnsupportedWindowsAgent();
     const QStringList identityFiles =
         identityFileCandidates(m_session, m_identityFile);
-    if (!unsupportedWindowsAgent
-        && ssh_userauth_agent(m_session, nullptr) == SSH_AUTH_SUCCESS) {
-        return true;
-    }
 
-    if (unsupportedWindowsAgent) {
-        if (authenticateIdentityFiles(m_session, identityFiles, QString()))
-            return true;
-    } else if (ssh_userauth_publickey_auto(m_session, nullptr, nullptr)
-               == SSH_AUTH_SUCCESS) {
-        return true;
-    }
+    // Authentication is a CONVERSATION, not a list of fallbacks. A server with
+    // `AuthenticationMethods publickey,password` answers an accepted key with
+    // SSH_AUTH_PARTIAL and then advertises only the method it still wants, so
+    // the ladder is re-derived from the server's current offer after every step
+    // rather than walked blindly. It terminates because nextAuthRung() never
+    // returns a rung already in `tried`: at most four steps, however many
+    // partial successes the server reports.
+    AuthMethods offered = methodsFromMask(ssh_userauth_list(m_session, nullptr));
+    m_publicKeyOffered = offered.publicKey;
+    AuthRungsTried tried;
+    const bool canPrompt = static_cast<bool>(m_credentialCallback);
 
-    // A passphrase is used ONLY for public-key authentication: falling through
-    // to ssh_userauth_password() with it would disclose a local key secret to
-    // the remote server and makes the two credential classes indistinguishable.
-    if (m_credentialCallback && (methods & SSH_AUTH_METHOD_PUBLICKEY)
-        && (!unsupportedWindowsAgent || !identityFiles.isEmpty())) {
-        CredentialReply passphrase =
-            m_credentialCallback(user, CredentialKind::KeyPassphrase);
-        if (passphrase.promptRequested)
-            return false;
-        if (!passphrase.secret.isEmpty()) {
+    for (AuthRung rung = nextAuthRung(tried, offered, canPrompt);
+         rung != AuthRung::Exhausted;
+         rung = nextAuthRung(tried, offered, canPrompt)) {
+        // Marked spent BEFORE the attempt, so no path out of the switch below
+        // can leave the same rung eligible again.
+        tried.add(rung);
+        AuthOutcome outcome = AuthOutcome::Refused;
+
+        switch (rung) {
+        case AuthRung::Agent:
+            if (!unsupportedWindowsAgent) {
+                outcome =
+                    classifyAuthResult(ssh_userauth_agent(m_session, nullptr));
+            }
+            break;
+
+        case AuthRung::KeyFile:
+            outcome =
+                unsupportedWindowsAgent
+                    ? authenticateIdentityFiles(m_session, identityFiles,
+                                                QString())
+                    : classifyAuthResult(ssh_userauth_publickey_auto(
+                          m_session, nullptr, nullptr));
+            break;
+
+        case AuthRung::KeyPassphrase: {
+            // With no key to unlock there is nothing a passphrase could do, and
+            // asking for one would be a prompt the user cannot satisfy.
+            if (unsupportedWindowsAgent && identityFiles.isEmpty())
+                break;
+            // A passphrase is used ONLY for public-key authentication: handing
+            // it to ssh_userauth_password() would disclose a local key secret to
+            // the remote server and make the two credential classes
+            // indistinguishable. The password rung below asks separately.
+            CredentialReply passphrase =
+                m_credentialCallback(user, CredentialKind::KeyPassphrase);
+            if (passphrase.promptRequested) {
+                // The pool never blocks on the user: the attempt is abandoned
+                // here, the controller raises the prompt, and the whole connect
+                // is retried with the secret in hand (SPEC 12.1).
+                appendDiagnostic(QStringLiteral(
+                    "A private-key passphrase is required; abandoning this "
+                    "attempt so it can be requested."));
+                return false;
+            }
+            if (passphrase.secret.isEmpty())
+                break;
             if (unsupportedWindowsAgent) {
-                if (authenticateIdentityFiles(m_session, identityFiles,
-                                              passphrase.secret)) {
-                    return true;
-                }
+                outcome = authenticateIdentityFiles(m_session, identityFiles,
+                                                    passphrase.secret);
             } else {
                 QByteArray secretUtf8 = passphrase.secret.toUtf8();
                 const int result = ssh_userauth_publickey_auto(
                     m_session, nullptr, secretUtf8.constData());
                 wipeSecret(secretUtf8);
-                if (result == SSH_AUTH_SUCCESS)
-                    return true;
+                outcome = classifyAuthResult(result);
             }
+            break;
         }
-    }
 
-    // 4. Password authentication is an independent, opt-in credential. A GUI
-    // that is parked on this request must not be overwritten by another prompt.
-    if (m_credentialCallback && (methods & SSH_AUTH_METHOD_PASSWORD)) {
-        CredentialReply password =
-            m_credentialCallback(user, CredentialKind::Password);
-        if (password.promptRequested)
-            return false;
-        if (!password.secret.isEmpty()) {
+        case AuthRung::Password: {
+            // An independent, opt-in credential. A GUI already parked on the
+            // passphrase request is never overwritten by this one, because the
+            // request above returns from the whole handshake.
+            CredentialReply password =
+                m_credentialCallback(user, CredentialKind::Password);
+            if (password.promptRequested) {
+                appendDiagnostic(QStringLiteral(
+                    "A password is required; abandoning this attempt so it can "
+                    "be requested."));
+                return false;
+            }
+            if (password.secret.isEmpty())
+                break;
             QByteArray secretUtf8 = password.secret.toUtf8();
             const int result = ssh_userauth_password(m_session, nullptr,
                                                     secretUtf8.constData());
             wipeSecret(secretUtf8);
-            if (result == SSH_AUTH_SUCCESS)
-                return true;
+            outcome = classifyAuthResult(result);
+            break;
         }
+
+        case AuthRung::Exhausted:
+            break;  // unreachable: the loop condition excludes it
+        }
+
+        if (outcome == AuthOutcome::Granted)
+            return true;
+        if (outcome == AuthOutcome::Partial) {
+            m_partialMethods << authRungName(rung);
+            appendDiagnostic(
+                QStringLiteral("The server accepted %1 and requires a further "
+                               "authentication method.")
+                    .arg(authRungName(rung)));
+        }
+        // Re-read after every step. The offer belongs to the SERVER and changes
+        // as the exchange proceeds — after a partial success it typically drops
+        // the method just satisfied — so a stale copy would keep offering a
+        // method the server has stopped asking for.
+        offered = methodsFromMask(ssh_userauth_list(m_session, nullptr));
     }
     return false;
 }
@@ -657,6 +797,42 @@ QString SshConnectionPool::authenticationFailure() const
 {
     QStringList details;
     details << QStringLiteral("Authentication failed.");
+
+    // A partial success is a completely different failure from "nothing
+    // worked": the server ACCEPTED what CodeHarbor sent and is asking for a
+    // further method, so the ssh-agent and identity-file advice below would be
+    // actively misleading here. Method names only — never a secret.
+    if (!m_partialMethods.isEmpty()) {
+        details << QStringLiteral(
+                       "The server accepted %1 and then required a further "
+                       "authentication method that CodeHarbor could not "
+                       "supply. Check the server's AuthenticationMethods "
+                       "setting: a private key combined with a password is "
+                       "supported, keyboard-interactive is not.")
+                       .arg(m_partialMethods.join(QStringLiteral(", ")));
+        const QString partialLibsshError =
+            m_session ? QString::fromUtf8(ssh_get_error(m_session)).trimmed()
+                      : QString();
+        if (!partialLibsshError.isEmpty())
+            details << QStringLiteral("libssh: %1.").arg(partialLibsshError);
+        return details.join(QLatin1Char(' '));
+    }
+
+    // A server that never offered public-key authentication was never given a
+    // key, so advice about ssh-agent and identity files describes something that
+    // did not happen. Say what actually did.
+    if (!m_publicKeyOffered) {
+        details << QStringLiteral(
+            "The server does not accept public-key authentication, so only its "
+            "password method could be tried.");
+        const QString passwordOnlyError =
+            m_session ? QString::fromUtf8(ssh_get_error(m_session)).trimmed()
+                      : QString();
+        if (!passwordOnlyError.isEmpty())
+            details << QStringLiteral("libssh: %1.").arg(passwordOnlyError);
+        return details.join(QLatin1Char(' '));
+    }
+
     if (usesUnsupportedWindowsAgent()) {
         details << QStringLiteral(
             "Windows OpenSSH's named-pipe ssh-agent cannot be used by this "

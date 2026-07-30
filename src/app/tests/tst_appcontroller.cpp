@@ -337,6 +337,9 @@ private slots:
     void passphraseIsNeverOfferedAsServerPassword();
     void submittedSecretIsSpentOnceAndNeverPersistedOrLogged();
     void cancellingTheCredentialPromptAbandonsTheAttemptCleanly();
+    // A server requiring BOTH a key and a password takes two prompts and three
+    // attempts; the third has to carry both secrets, each to its own method.
+    void twoMethodServerChainCarriesBothSecretsWithoutCrossingThem();
     void serverOlderThanTheSchemaFloorIsRefusedWithBothVersions();
     void serverAtTheSchemaFloorIsAdoptedNormally();
 };
@@ -1367,6 +1370,112 @@ void TstAppController::cancellingTheCredentialPromptAbandonsTheAttemptCleanly()
     f.boot.duringConnect = {};
     f.controller.connectToProfile(f.profileId);
     QCOMPARE(f.boot.connectCalls, callsBefore + 1);
+}
+
+// A server with `AuthenticationMethods publickey,password` accepts the key and
+// then demands a password as well. The client cannot satisfy that in one
+// attempt: the passphrase is typed before anybody knows a password is also
+// wanted. So the chain runs prompt -> retry -> prompt -> retry, and the LAST
+// attempt has to arrive holding both secrets — the earlier passphrase included,
+// because that attempt has to unlock the key all over again. Losing it is
+// exactly how such a server became impossible to connect to.
+void TstAppController::twoMethodServerChainCarriesBothSecretsWithoutCrossingThem()
+{
+    static const QString kPassphrase = QStringLiteral("unlock-the-key-9f");
+    static const QString kPassword = QStringLiteral("the-account-password-3c");
+    ConnectFixture f;
+    QSignalSpy promptSpy(&f.controller, &AppController::credentialPrompt);
+
+    // Attempt 1: the key is encrypted, so the pool asks for its passphrase and
+    // the attempt is refused so the user can be asked.
+    f.boot.duringConnect = [&f] {
+        const auto reply = f.pool.credentialCallback()(
+            QStringLiteral("yichen"),
+            SshConnectionPool::CredentialKind::KeyPassphrase);
+        QVERIFY(reply.promptRequested);
+    };
+    f.controller.connectToProfile(f.profileId);
+    QCOMPARE(promptSpy.count(), 1);
+    QCOMPARE(promptSpy.at(0).at(3).toString(), QStringLiteral("keyPassphrase"));
+
+    // Attempt 2: the key unlocks and the server reports partial success, so the
+    // pool goes on to the password rung — which must raise a SECOND prompt
+    // rather than replaying the passphrase at it.
+    QString passphraseSeen;
+    QString passwordSeenTooEarly;
+    f.boot.duringConnect = [&f, &passphraseSeen, &passwordSeenTooEarly] {
+        const auto keyReply = f.pool.credentialCallback()(
+            QStringLiteral("yichen"),
+            SshConnectionPool::CredentialKind::KeyPassphrase);
+        passphraseSeen = keyReply.secret;
+        const auto passwordReply = f.pool.credentialCallback()(
+            QStringLiteral("yichen"), SshConnectionPool::CredentialKind::Password);
+        passwordSeenTooEarly = passwordReply.secret;
+        QVERIFY(passwordReply.promptRequested);
+    };
+    f.controller.submitCredential(kPassphrase, QStringLiteral("keyPassphrase"));
+    QCOMPARE(passphraseSeen, kPassphrase);
+    QVERIFY2(passwordSeenTooEarly.isEmpty(),
+             "the private-key passphrase was offered to password auth");
+    QCOMPARE(promptSpy.count(), 2);
+    QCOMPARE(promptSpy.at(1).at(3).toString(), QStringLiteral("password"));
+    QCOMPARE(f.controller.connectionState(), QStringLiteral("credential"));
+
+    // Attempt 3, the one that used to be impossible: BOTH secrets are in hand,
+    // and each is handed only to the method it belongs to.
+    QString finalPassphrase;
+    QString finalPassword;
+    f.boot.duringConnect = [&f, &finalPassphrase, &finalPassword] {
+        finalPassphrase = f.pool
+                              .credentialCallback()(
+                                  QStringLiteral("yichen"),
+                                  SshConnectionPool::CredentialKind::KeyPassphrase)
+                              .secret;
+        finalPassword = f.pool
+                            .credentialCallback()(
+                                QStringLiteral("yichen"),
+                                SshConnectionPool::CredentialKind::Password)
+                            .secret;
+    };
+    f.controller.submitCredential(kPassword, QStringLiteral("password"));
+    QCOMPARE(finalPassphrase, kPassphrase);
+    QCOMPARE(finalPassword, kPassword);
+    // No third question: both credential kinds have been answered in this chain,
+    // so a rung that asks again must be met with silence instead of a prompt
+    // loop the user can never get out of.
+    QCOMPARE(promptSpy.count(), 2);
+
+    // The chain is over (connectOk stayed false, so it failed) and both secrets
+    // are gone with it: nothing may be replayed at the next host dialled.
+    QCOMPARE(f.controller.connectionState(), QStringLiteral("failed"));
+    const auto spentKey = f.pool.credentialCallback()(
+        QStringLiteral("yichen"),
+        SshConnectionPool::CredentialKind::KeyPassphrase);
+    const auto spentPassword = f.pool.credentialCallback()(
+        QStringLiteral("yichen"), SshConnectionPool::CredentialKind::Password);
+    QVERIFY(spentKey.secret.isEmpty());
+    QVERIFY(spentPassword.secret.isEmpty());
+    QVERIFY(!spentKey.promptRequested);
+    QVERIFY(!spentPassword.promptRequested);
+
+    // Neither secret reached disk, and neither reached the SSH log the user can
+    // open from the connection sheet.
+    const QByteArray persisted = f.allPersistedBytes();
+    QVERIFY(!persisted.contains(kPassphrase.toUtf8()));
+    QVERIFY(!persisted.contains(kPassword.toUtf8()));
+    QVERIFY(!f.controller.sshDiagnostics().contains(kPassphrase));
+    QVERIFY(!f.controller.sshDiagnostics().contains(kPassword));
+
+    // A fresh user-initiated connect starts a clean chain: the questions are
+    // asked again rather than assumed already answered.
+    f.boot.duringConnect = [&f] {
+        const auto reply = f.pool.credentialCallback()(
+            QStringLiteral("yichen"),
+            SshConnectionPool::CredentialKind::KeyPassphrase);
+        QVERIFY(reply.promptRequested);
+    };
+    f.controller.connectToProfile(f.profileId);
+    QCOMPARE(promptSpy.count(), 3);
 }
 
 // ServerInfoResult::schemaVersion was parsed and never checked. A client one

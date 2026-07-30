@@ -246,10 +246,10 @@ Item {
         closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutside
 
         background: Rectangle {
-            color: "#1e1e2e"
-            border.color: "#45475a"
+            color: Theme.surface
+            border.color: Theme.border
             border.width: 1
-            radius: 6
+            radius: Theme.radiusMedium
         }
 
         onOpened: filterField.forceActiveFocus()
@@ -264,17 +264,19 @@ Item {
 
             objectName: "filterField"
             placeholderText: qsTr("Type a command\u2026")
+            // #585b70 is a step between Theme.textDim and Theme.textFaint and
+            // has no Theme role.
             placeholderTextColor: "#585b70"
-            color: "#cdd6f4"
+            color: Theme.text
             selectByMouse: true
             leftPadding: 12
             rightPadding: 12
             background: Rectangle {
-                color: "#181825"
+                color: Theme.surfaceDeep
                 // The palette opens with the field focused, so the ring is the
                 // resting state rather than an exception; without it the field
                 // and the popup body are the same slab of dark grey.
-                border.color: filterField.activeFocus ? "#89b4fa" : "#45475a"
+                border.color: filterField.activeFocus ? Theme.accent : Theme.border
                 border.width: filterField.activeFocus ? 2 : 1
             }
 
@@ -316,7 +318,7 @@ Item {
             visible: root.matches.length > 0
             boundsBehavior: Flickable.StopAtBounds
 
-            ScrollBar.vertical: ScrollBar {}
+            ScrollBar.vertical: AppScrollBar {}
 
             delegate: Rectangle {
                 id: resultRow
@@ -327,8 +329,8 @@ Item {
                 width: ListView.view.width
                 height: 36
                 color: resultRow.index === root.highlightedIndex
-                       ? "#313244"
-                       : (rowHover.hovered ? "#232338" : "transparent")
+                       ? Theme.surfaceSelected
+                       : (rowHover.hovered ? Theme.surfaceHover : "transparent")
 
                 // A plain Rectangle carries no accessibility at all, and this
                 // list IS the keyboard surface of the application: without a
@@ -340,15 +342,16 @@ Item {
                                         ? String(resultRow.modelData.shortcut) : ""
                 Accessible.selected: resultRow.index === root.highlightedIndex
 
-                // The row Enter will run. A wash of #313244 on #1e1e2e is a
-                // faint one, and it is the only thing distinguishing "this is
-                // what the next keystroke does" from every other row.
+                // The row Enter will run. A wash of Theme.surfaceSelected on the
+                // popup's own surface is a faint one, and it is the only thing
+                // distinguishing "this is what the next keystroke does" from
+                // every other row.
                 Rectangle {
                     anchors.left: parent.left
                     anchors.top: parent.top
                     anchors.bottom: parent.bottom
                     width: 3
-                    color: "#89b4fa"
+                    color: Theme.accent
                     visible: resultRow.index === root.highlightedIndex
                 }
 
@@ -359,8 +362,8 @@ Item {
                     anchors.rightMargin: 8
                     anchors.verticalCenter: parent.verticalCenter
                     text: root._title(resultRow.modelData)
-                    color: "#cdd6f4"
-                    font.pixelSize: 13
+                    color: Theme.text
+                    font.pixelSize: Theme.fontSizeLabel
                     elide: Text.ElideRight
                 }
 
@@ -372,7 +375,7 @@ Item {
                     anchors.verticalCenter: parent.verticalCenter
                     text: resultRow.modelData && resultRow.modelData.shortcut
                           ? String(resultRow.modelData.shortcut) : ""
-                    color: "#6c7086"
+                    color: Theme.textDim
                     font.pixelSize: 11
                     visible: text.length > 0
                 }
@@ -403,15 +406,15 @@ Item {
                 objectName: "emptyLabel"
                 width: parent.width
                 horizontalAlignment: Text.AlignHCenter
-                color: "#6c7086"
-                font.pixelSize: 12
+                color: Theme.textDim
+                font.pixelSize: Theme.fontSizeBody
                 text: (Array.isArray(root.commands) ? root.commands.length : 0) === 0
                       ? qsTr("No commands available") : qsTr("No matching commands")
             }
             Label {
                 width: parent.width
                 horizontalAlignment: Text.AlignHCenter
-                color: "#45475a"
+                color: Theme.textFaint
                 font.pixelSize: 11
                 visible: (Array.isArray(root.commands) ? root.commands.length : 0) > 0
                 text: qsTr("Esc closes \u2014 %1 reopens").arg(root.activationHint)

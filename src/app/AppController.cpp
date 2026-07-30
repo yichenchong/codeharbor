@@ -215,6 +215,19 @@ void AppController::setConnection(SshConnectionPool* pool,
                         setConnectionState(QStringLiteral("failed"),
                                            m_connectionError);
                         break;
+                    case SessionBootstrap::State::Provisioning:
+                        // First connect to a server with no usable remote
+                        // service: SessionBootstrap is installing it. Its own
+                        // state rather than "connecting", because installing
+                        // downloads and unpacks a release tarball and can take
+                        // far longer than a handshake — a footer that says
+                        // "connecting" for thirty seconds is indistinguishable
+                        // from a hung connect. Every surface that renders a
+                        // connection state has a case for this string
+                        // (ConnectSheet.qml, SessionsSidebar.qml) and
+                        // tst_uxshell enumerates them.
+                        setConnectionState(QStringLiteral("provisioning"));
+                        break;
                     case SessionBootstrap::State::Disconnected:
                         setConnectionState(QStringLiteral("disconnected"));
                         break;
@@ -259,13 +272,14 @@ void AppController::setConnectionState(const QString& state, const QString& err)
 
 void AppController::connectToProfile(QString profileId)
 {
-    startConnect(profileId, QString(), QString(),
-                 CredentialKind::KeyPassphrase);
+    // A user-initiated connect starts a FRESH chain: nothing a previous chain
+    // gathered may be replayed at this one.
+    m_credentials.clear();
+    startConnect(profileId, QString());
 }
 
 void AppController::startConnect(const QString& profileId,
-                                 QString acceptedFingerprint, QString secret,
-                                 CredentialKind secretKind)
+                                 QString acceptedFingerprint)
 {
     if (!m_bootstrap || !m_profiles || !m_pool)
         return;
@@ -278,6 +292,7 @@ void AppController::startConnect(const QString& profileId,
 
     const QVariantMap profile = m_profiles->profile(profileId);
     if (profile.isEmpty()) {
+        m_credentials.clear();
         setConnectionState(QStringLiteral("failed"),
                            tr("No such server profile."));
         return;
@@ -298,8 +313,12 @@ void AppController::startConnect(const QString& profileId,
     m_credentialKind = CredentialKind::KeyPassphrase;
     setConnectionState(QStringLiteral("connecting"));
 
-    installPoolCallbacks(std::move(acceptedFingerprint), std::move(secret),
-                         secretKind);
+    // Copies, not moves: the chain keeps its secrets so the NEXT attempt in the
+    // same chain can re-satisfy the method this one already got past. A server
+    // requiring `publickey,password` needs the passphrase again on the attempt
+    // that finally carries the password.
+    installPoolCallbacks(std::move(acceptedFingerprint),
+                         m_credentials.keyPassphrase, m_credentials.password);
 
     const bool ok = m_bootstrap->connectAndWire(
         profile.value(QStringLiteral("host")).toString(),
@@ -317,7 +336,7 @@ void AppController::startConnect(const QString& profileId,
     // typed for: a secret libssh never asked for would otherwise sit in the
     // callback for the rest of the process, and an approval the attempt never
     // reached the key check to spend would arm the next connect to any host.
-    installPoolCallbacks(QString(), QString(), CredentialKind::KeyPassphrase);
+    installPoolCallbacks(QString(), QString(), QString());
 
     if (ok) {
         m_connecting = false;
@@ -329,6 +348,8 @@ void AppController::startConnect(const QString& profileId,
         m_credentialUser.clear();
         m_credentialLabel.clear();
         m_credentialKind = CredentialKind::KeyPassphrase;
+        // The chain succeeded: its secrets have done their job and go now.
+        m_credentials.clear();
         m_profiles->setActiveId(profileId);
         return;  // wired() -> adoptServerIdentity()
     }
@@ -360,6 +381,9 @@ void AppController::startConnect(const QString& profileId,
     }
     m_connecting = false;
     m_approvedFingerprint.clear();
+    // The chain is over and it failed. Nothing gathered along the way may be
+    // carried into the next one.
+    m_credentials.clear();
     // A genuine failure: report it now that we know it was not the host-key path.
     if (!m_heldConnectError.isEmpty()) {
         const QString held = m_heldConnectError;
@@ -370,8 +394,8 @@ void AppController::startConnect(const QString& profileId,
 }
 
 void AppController::installPoolCallbacks(QString acceptedFingerprint,
-                                         QString secret,
-                                         CredentialKind secretKind)
+                                         QString keyPassphrase,
+                                         QString password)
 {
     if (!m_pool)
         return;
@@ -425,32 +449,50 @@ void AppController::installPoolCallbacks(QString acceptedFingerprint,
     //
     // A passphrase and a server password have different security boundaries:
     // a failed key unlock must not silently send the local key passphrase to a
-    // remote host's password-auth endpoint. `CredentialReply::promptRequested`
-    // lets authenticate() stop at the first outstanding prompt instead of
-    // overwriting it with the next auth method.
+    // remote host's password-auth endpoint. That rule is structural here — each
+    // secret is armed in its OWN variable and only the one matching the kind
+    // libssh asked for is ever returned, so there is no code path along which a
+    // passphrase could be answered to a password request.
+    // `CredentialReply::promptRequested` lets authenticate() stop at the first
+    // outstanding prompt instead of overwriting it with the next auth method.
     //
-    // The secret is captured BY VALUE and consumed exactly once. It is never a
-    // member, never reaches ServerProfiles/QSettings, and is never logged.
+    // Both secrets are captured BY VALUE and each is spent at most once per
+    // attempt. They never reach ServerProfiles/QSettings and are never logged.
+    // A server requiring `publickey,password` legitimately needs BOTH within one
+    // attempt, which is why two can be armed at the same time.
     m_pool->setCredentialCallback(
-        [self, secret = std::move(secret), secretKind](
-            const QString& user, CredentialKind kind) mutable {
+        [self, keyPassphrase = std::move(keyPassphrase),
+         password = std::move(password)](const QString& user,
+                                         CredentialKind kind) mutable {
             if (!self)
                 return SshConnectionPool::CredentialReply{};
-            if (!secret.isEmpty() && kind == secretKind) {
-                const QString once = secret;
-                secret.clear();
+            QString& armed = kind == CredentialKind::KeyPassphrase
+                                 ? keyPassphrase
+                                 : password;
+            if (!armed.isEmpty()) {
+                const QString once = armed;
+                armed.clear();
                 return SshConnectionPool::CredentialReply{once, false};
             }
-            // A supplied credential for the other auth method must not cause a
-            // second prompt. This is how an explicit "Use password" choice
-            // skips the passphrase rung.
-            if (!secret.isEmpty() || !self->m_connecting)
+            // A kind the user has already answered in this chain must not be
+            // asked again: that is how an explicit "Use password" choice skips
+            // the passphrase rung, and it is what bounds the prompt chain to one
+            // question per credential kind instead of an unending cycle.
+            const bool alreadyAsked =
+                kind == CredentialKind::KeyPassphrase
+                    ? self->m_credentials.askedKeyPassphrase
+                    : self->m_credentials.askedPassword;
+            if (alreadyAsked || !self->m_connecting)
                 return SshConnectionPool::CredentialReply{};
 
             self->m_credentialRequested = true;
             self->m_credentialUser = user;
             self->m_credentialLabel = credentialLabel(kind);
             self->m_credentialKind = kind;
+            if (kind == CredentialKind::KeyPassphrase)
+                self->m_credentials.askedKeyPassphrase = true;
+            else
+                self->m_credentials.askedPassword = true;
             return SshConnectionPool::CredentialReply{{}, true};
         });
 }
@@ -473,11 +515,11 @@ void AppController::resolveHostKey(bool accept)
     m_connecting = false;  // the parked attempt ends here, either way
 
     if (!accept || profileId.isEmpty()) {
+        m_credentials.clear();
         setConnectionState(QStringLiteral("disconnected"));
         return;
     }
-    startConnect(profileId, fingerprint, QString(),
-                 CredentialKind::KeyPassphrase);
+    startConnect(profileId, fingerprint);
 }
 
 void AppController::submitCredential(QString secret)
@@ -515,15 +557,28 @@ void AppController::submitCredential(QString secret, QString kind)
     m_connecting = false;  // the parked attempt ends here, either way
 
     if (secret.isEmpty() || profileId.isEmpty()) {
-        // Cancelled. Nothing is retried and nothing is kept.
+        // Cancelled. Nothing is retried and nothing is kept — including the
+        // secrets an earlier step of this chain already supplied.
+        m_credentials.clear();
         setConnectionState(QStringLiteral("disconnected"));
         return;
     }
-    // Moved, not copied: this frame keeps no second reference to the secret,
-    // and startConnect() moves it straight into the pool callback that spends
-    // it. A wrong credential fails one attempt; a failed passphrase may then
-    // ask separately for a password, but is never used as one.
-    startConnect(profileId, fingerprint, std::move(secret), submittedKind);
+    // Moved into the chain's slot for its OWN kind, so the retry can offer it to
+    // that method and to no other. The kind is also marked answered, which is
+    // what lets an explicit "Use password" reply to a passphrase request skip
+    // the passphrase rung instead of being asked about it again.
+    //
+    // The chain keeps it because one attempt may not be enough: a server that
+    // requires a key AND a password needs the passphrase again on the attempt
+    // that finally carries the password.
+    if (submittedKind == CredentialKind::KeyPassphrase) {
+        m_credentials.keyPassphrase = std::move(secret);
+        m_credentials.askedKeyPassphrase = true;
+    } else {
+        m_credentials.password = std::move(secret);
+        m_credentials.askedPassword = true;
+    }
+    startConnect(profileId, fingerprint);
 }
 
 void AppController::disconnectServer()
@@ -539,6 +594,8 @@ void AppController::disconnectServer()
     m_credentialRequested = false;
     m_credentialUser.clear();
     m_credentialLabel.clear();
+    // Whatever the abandoned chain had gathered goes with it.
+    m_credentials.clear();
 
     // Scope-guarded so an early return or a throw inside the teardown cannot
     // leave errors permanently muted. The guard is the ONLY thing bounding the
