@@ -18,6 +18,7 @@ qt_add_qml_module(codeharbor_qml
     OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/CodeHarbor
     QML_FILES
         Theme.qml
+        RemotePath.js
         Main.qml
         AppTitleBar.qml
         AppSplitHandle.qml

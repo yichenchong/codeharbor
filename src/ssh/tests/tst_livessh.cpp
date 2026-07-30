@@ -76,6 +76,7 @@ private slots:
     void encryptedIdentityUsesPassphraseFromCallback();
     void missingAgentAndKeyExplainAuthenticationFailure();
     void multiStepServerAcceptsKeyThenPassword();
+    void keyboardInteractiveOnlyServerAuthenticatesWithPassword();
     void windowsNamedPipeAgentFallsBackToIdentityFile();
     void unavailableTrustedAlgorithmStillReachesHostVerification();
     void deviceOutlivingItsSessionStopsCleanly();
@@ -600,6 +601,66 @@ void TstLiveSsh::multiStepServerAcceptsKeyThenPassword()
                  QStringLiteral("requires a further authentication method")),
              qPrintable(pool.diagnosticLog()));
     // The log is shown to the user from the connection sheet.
+    QVERIFY(!pool.diagnosticLog().contains(password));
+    pool.disconnectFromHost();
+}
+
+// SH14: a keyboard-interactive-only server (PAM: PasswordAuthentication no,
+// KbdInteractiveAuthentication yes) must authenticate with the user's password
+// delivered through the ordinary single-secret credential prompt. Gated on the
+// operator pointing CH_LIVE_KBDINT_PASSWORD at such a server, since the
+// unprivileged fixture sshd cannot verify an account password.
+void TstLiveSsh::keyboardInteractiveOnlyServerAuthenticatesWithPassword()
+{
+    const QString password = env("CH_LIVE_KBDINT_PASSWORD");
+    if (password.isEmpty()) {
+        QSKIP("CH_LIVE_KBDINT_PASSWORD is not set; the keyboard-interactive "
+              "gate needs an sshd with `PasswordAuthentication no` and "
+              "`KbdInteractiveAuthentication yes` plus a real account password, "
+              "which the unprivileged fixture sshd cannot provide");
+    }
+
+    SshConnectionPool pool;
+    KnownHosts hosts;
+    QFile store(m_knownHostsPath);
+    if (store.open(QIODevice::ReadOnly | QIODevice::Text))
+        hosts = KnownHosts::parse(QString::fromUtf8(store.readAll()));
+    store.close();
+    pool.setKnownHosts(hosts);
+    pool.setHostKeyCallback([](const QString&, const QString&,
+                               const QByteArray&, KnownHosts::Verdict) {
+        return SshConnectionPool::HostKeyDecision::Accept;
+    });
+
+    // The prompt seam AppController drives: keyboard-interactive maps each of
+    // the server's prompts onto this ONE password request.
+    QList<SshConnectionPool::CredentialKind> asked;
+    pool.setCredentialCallback(
+        [&asked, &password](const QString&,
+                            SshConnectionPool::CredentialKind kind) {
+            asked.append(kind);
+            if (kind == SshConnectionPool::CredentialKind::Password)
+                return SshConnectionPool::CredentialReply{password, false};
+            return SshConnectionPool::CredentialReply{};
+        });
+
+    QString failure;
+    const auto conn =
+        QObject::connect(&pool, &SshConnectionPool::errorOccurred,
+                         [&failure](const QString& text) { failure += text; });
+    const bool ok = pool.connectToHost(m_host, m_port, m_user);
+    QObject::disconnect(conn);
+    QVERIFY2(ok, qPrintable(failure));
+    QCOMPARE(pool.state(), SshConnectionPool::State::Connected);
+
+    // Proof it really went through keyboard-interactive with the password
+    // request rather than some other method.
+    QVERIFY2(asked.contains(SshConnectionPool::CredentialKind::Password),
+             "the password credential was never requested");
+    QVERIFY2(pool.diagnosticLog().contains(
+                 QStringLiteral("Keyboard-interactive prompt:")),
+             qPrintable(pool.diagnosticLog()));
+    // The transcript is user-visible; the password must never appear in it.
     QVERIFY(!pool.diagnosticLog().contains(password));
     pool.disconnectFromHost();
 }

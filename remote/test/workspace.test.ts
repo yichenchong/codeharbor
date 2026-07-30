@@ -4,7 +4,7 @@ import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { openWorkspace, WORKSPACE_SCHEMA_VERSION } from "../src/workspace.ts";
+import { openWorkspace, WORKSPACE_SCHEMA_VERSION, WORKSPACE_METHODS } from "../src/workspace.ts";
 import type { Workspace } from "../src/workspace.ts";
 
 // A fresh temp-file database path (never :memory:) so the reopen tests exercise
@@ -1144,4 +1144,151 @@ test("the session lookup index is actually chosen by the query planner", async (
     );
     ws.close();
     await cleanup(dbPath);
+});
+
+// --- RW13: server repairs layout integrity on pane delete -------------------
+
+test("RW13: deleting a pane in a 2-pane split promotes the sibling, layout row id/server_id unchanged", async () => {
+    const dbPath = await tmpDbPath();
+    const ws = openWorkspace(dbPath);
+    const group = ws.createGroup({ serverId: SERVER, name: "Work" });
+    const session = ws.createSession({
+        serverId: SERVER,
+        groupId: group.id,
+        name: "s",
+        repositoryRoot: "/r",
+    });
+    const a = ws.createViewerPane({ serverId: SERVER, devSessionId: session.id, url: "https://a" });
+    const b = ws.createViewerPane({ serverId: SERVER, devSessionId: session.id, url: "https://b" });
+    ws.setLayout({
+        serverId: SERVER,
+        devSessionId: session.id,
+        region: "viewer",
+        tree: {
+            type: "split",
+            orientation: "horizontal",
+            children: [
+                { type: "leaf", paneId: a.id },
+                { type: "leaf", paneId: b.id },
+            ],
+            ratios: [0.5, 0.5],
+        },
+    });
+    const before = ws.getLayout({ devSessionId: session.id, region: "viewer" });
+    assert.ok(before);
+
+    ws.deleteViewerPane({ id: a.id });
+
+    const after = ws.getLayout({ devSessionId: session.id, region: "viewer" });
+    assert.ok(after);
+    // The surviving sibling is promoted in place; no leaf names the deleted pane.
+    assert.deepEqual(after.tree, { type: "leaf", paneId: b.id });
+    // The layout row keeps its identity and server.
+    assert.equal(after.id, before.id);
+    assert.equal(after.serverId, before.serverId);
+    assert.equal(after.createdAt, before.createdAt);
+
+    ws.close();
+    await cleanup(dbPath);
+});
+
+test("RW13: deleting the last pane in a region leaves a single empty leaf", async () => {
+    const dbPath = await tmpDbPath();
+    const ws = openWorkspace(dbPath);
+    const group = ws.createGroup({ serverId: SERVER, name: "Work" });
+    const session = ws.createSession({
+        serverId: SERVER,
+        groupId: group.id,
+        name: "s",
+        repositoryRoot: "/r",
+    });
+    const t = ws.createTerminalPane({ serverId: SERVER, devSessionId: session.id, name: "shell" });
+    ws.setLayout({
+        serverId: SERVER,
+        devSessionId: session.id,
+        region: "terminal",
+        tree: { type: "leaf", paneId: t.id },
+    });
+    const before = ws.getLayout({ devSessionId: session.id, region: "terminal" });
+    assert.ok(before);
+
+    ws.deleteTerminalPane({ id: t.id });
+
+    const after = ws.getLayout({ devSessionId: session.id, region: "terminal" });
+    assert.ok(after);
+    assert.deepEqual(after.tree, { type: "leaf", paneId: "" });
+    assert.equal(after.id, before.id);
+    assert.equal(after.serverId, before.serverId);
+
+    ws.close();
+    await cleanup(dbPath);
+});
+
+test("RW13: deleting a pane with no stored layout row is a no-op", async () => {
+    const dbPath = await tmpDbPath();
+    const ws = openWorkspace(dbPath);
+    const group = ws.createGroup({ serverId: SERVER, name: "Work" });
+    const session = ws.createSession({
+        serverId: SERVER,
+        groupId: group.id,
+        name: "s",
+        repositoryRoot: "/r",
+    });
+    const v = ws.createViewerPane({ serverId: SERVER, devSessionId: session.id, url: "https://a" });
+
+    assert.deepEqual(ws.deleteViewerPane({ id: v.id }), { ok: true });
+    assert.equal(ws.getLayout({ devSessionId: session.id, region: "viewer" }), null);
+
+    ws.close();
+    await cleanup(dbPath);
+});
+
+// --- RW14: a corrupt tree must not fail the whole listing -------------------
+
+test("RW14: a corrupt stored layout tree is self-healed to null, not thrown", async () => {
+    const dbPath = await tmpDbPath();
+    const ws = openWorkspace(dbPath);
+    const { session } = seed(ws);
+
+    // Simulate corruption from outside this store (the store only ever writes
+    // JSON.stringify output): overwrite the viewer tree with unparseable text.
+    ws.db
+        .prepare("UPDATE session_layouts SET tree = ? WHERE dev_session_id = ? AND region = ?")
+        .run("{not valid json", session.id, "viewer");
+
+    // getLayout reports the corrupt region as null instead of throwing.
+    assert.equal(ws.getLayout({ devSessionId: session.id, region: "viewer" }), null);
+
+    // The nested listing still returns; the good region survives, the corrupt
+    // one reads as null.
+    const groups = ws.list(SERVER);
+    const listed = groups[0].sessions[0];
+    assert.equal(listed.layouts.viewer, null);
+    assert.notEqual(listed.layouts.terminal, null);
+
+    ws.close();
+    await cleanup(dbPath);
+});
+
+// --- RW15: every handler validates its params -------------------------------
+
+test("RW15: createGroup handler rejects a params object missing name", () => {
+    assert.throws(
+        () => WORKSPACE_METHODS["workspace.createGroup"]({ serverId: SERVER }),
+        /workspace\.createGroup: missing or invalid field 'name'/,
+    );
+});
+
+test("RW15: moveSessionToGroup handler rejects a non-string id", () => {
+    assert.throws(
+        () => WORKSPACE_METHODS["workspace.moveSessionToGroup"]({ id: 123, groupId: "g" }),
+        /workspace\.moveSessionToGroup: missing or invalid field 'id'/,
+    );
+});
+
+test("RW15: a handler rejects a non-object params value", () => {
+    assert.throws(
+        () => WORKSPACE_METHODS["workspace.list"](null),
+        /workspace\.list: missing or invalid params object/,
+    );
 });

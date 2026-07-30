@@ -108,14 +108,12 @@ public:
     // Drive the lifecycle state machine (SPEC 5.6); emits stateChanged() only on
     // an actual transition.
     //
-    // src/terminal itself only ever produces OpeningChannel -> AttachingTmux ->
-    // Ready -> Disconnected (TerminalFactory::attach(), onTransportFinished())
-    // plus Error. Connecting, Authenticating and Reconnecting describe the
-    // SESSION-level connection, which a single pane cannot see; they are here so
-    // a host that DOES track it (ch::SshConnectionPool in src/ssh,
-    // ch::SessionBootstrap in src/app) can publish that progress on a pane.
-    // Nothing in src/terminal sets them, so no caller may treat "this pane never
-    // reported Connecting" as evidence of anything.
+    // src/terminal only ever produces OpeningChannel -> AttachingTmux -> Ready
+    // -> Disconnected (TerminalFactory::attach(), onTransportFinished()) plus
+    // Error. Session-level connection progress (connecting/authenticating/
+    // reconnecting) is tracked once for the whole application on
+    // ch::SessionBootstrap::State and ch::SshConnectionPool::State, never on a
+    // pane, so TerminalState does not carry those values at all.
     void setState(TerminalState next);
 
     // True for the states in which the pane actually has a live channel, and so
@@ -140,19 +138,6 @@ public:
     static QString tmuxNewSessionCommand(const DevSessionId &devSession,
                                          const TerminalId &terminal,
                                          const QString &workingDir);
-
-    // Retry delay in seconds for the Nth (0-based) automatic reconnect attempt:
-    // 1, 2, 5, 10, 30, then 60 thereafter (SPEC 5.6). Manual reconnect bypasses
-    // the wait and is not modelled here.
-    //
-    // Nothing in src/terminal schedules a reconnect: a dropped pane lands in
-    // Disconnected and src/qml/TerminalPaneView.qml offers a Retry button. The
-    // ladder that IS driven automatically is the session-level one in
-    // ch::SessionBootstrap::reconnectDelaySeconds() (src/app), which mirrors
-    // these numbers value for value rather than making ch_app link ch_terminal.
-    // Both are pinned by their own test against this same SPEC 5.6 vector, which
-    // is what keeps them from drifting.
-    static int reconnectDelaySeconds(int attempt);
 
 signals:
     void stateChanged(ch::TerminalState state);

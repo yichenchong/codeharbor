@@ -54,6 +54,15 @@ public:
     // Replace the entire sidebar contents.
     void setGroups(QVector<GroupRow> groups);
 
+    // Incrementally refresh live per-terminal agent/connection state WITHOUT a
+    // full model reset. `groups` must mirror the current structure (same group
+    // and session ids in the same order); only each session's `terminals` are
+    // adopted. For every session whose aggregate row-state actually changes, a
+    // targeted dataChanged() for RowStateRole is emitted for just that row, so
+    // the sidebar's delegates (and the id-tracked selection) survive untouched.
+    // If the structure has drifted, this falls back to a full setGroups().
+    void updateTerminalStates(QVector<GroupRow> groups);
+
     // Highest-priority sidebar state for a set of terminals (SPEC 4.2 precedence:
     // Error > WaitingForInput > Running > FinishedUnseen > Idle > Disconnected).
     // An empty set (session with no terminals) yields Disconnected.

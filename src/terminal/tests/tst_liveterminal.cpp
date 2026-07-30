@@ -215,14 +215,12 @@ void TstLiveTerminal::ensureConnected()
     const auto conn = connect(&m_pool, &SshConnectionPool::errorOccurred,
                               [&failure](const QString& text) { failure += text; });
 
-    m_controller.setState(TerminalState::Connecting);
     const bool ok = m_pool.connectToHost(m_host, m_port, m_user);
     disconnect(conn);
     QVERIFY2(ok, qPrintable(QStringLiteral("connectToHost(%1:%2) failed: %3")
                                 .arg(m_host)
                                 .arg(m_port)
                                 .arg(failure)));
-    m_controller.setState(TerminalState::Authenticating);
 
     QDir().mkpath(QFileInfo(m_knownHostsPath).absolutePath());
     QFile out(m_knownHostsPath);
@@ -436,7 +434,6 @@ void TstLiveTerminal::reattachAfterDropRecoversPaneAndProcess()
     QTest::qWait(500);
     m_out.clear();
 
-    m_controller.setState(TerminalState::Reconnecting);
     // Deliberately open the fresh channel at the channel default 80x24 and bind
     // the controller afterwards: the pane geometry must be restored by the
     // controller, which is the only thing that still knows it.

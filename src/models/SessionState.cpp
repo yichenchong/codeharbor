@@ -6,13 +6,10 @@ QString toString(TerminalState s)
 {
     switch (s) {
     case TerminalState::Unloaded: return QStringLiteral("unloaded");
-    case TerminalState::Connecting: return QStringLiteral("connecting");
-    case TerminalState::Authenticating: return QStringLiteral("authenticating");
     case TerminalState::OpeningChannel: return QStringLiteral("opening_channel");
     case TerminalState::AttachingTmux: return QStringLiteral("attaching_tmux");
     case TerminalState::Ready: return QStringLiteral("ready");
     case TerminalState::Disconnected: return QStringLiteral("disconnected");
-    case TerminalState::Reconnecting: return QStringLiteral("reconnecting");
     case TerminalState::Error: return QStringLiteral("error");
     }
     return QStringLiteral("unknown");

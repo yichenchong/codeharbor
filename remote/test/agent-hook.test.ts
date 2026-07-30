@@ -13,8 +13,9 @@ import {
     type HookInput,
 } from "../src/hooks/oh-my-pi-hook.ts";
 import { FallbackActivityDetector } from "../src/adapters/fallback.ts";
-import { resolveSocketPath } from "../src/events.ts";
-import { processBridgeLine } from "../src/bridge.ts";
+import { PassThrough } from "node:stream";
+import { resolveSocketPath, type AgentEvent } from "../src/events.ts";
+import { processBridgeLine, startBridge, makeStreamSink } from "../src/bridge.ts";
 
 test("toBridgeMessage wraps the raw native event without mapping", () => {
     const message = toBridgeMessage({
@@ -299,4 +300,125 @@ test("missingCoordinates names only the coordinates that are unusable", () => {
         "OMP_DEV_SESSION_ID",
         "OMP_TERMINAL_ID",
     ]);
+});
+
+test("readHookInput parses OMP_METADATA and ignores a malformed value (RR25)", () => {
+    const withMeta = readHookInput(["node", "hook.ts", "agent_start"], {
+        OMP_DEV_SESSION_ID: "sess-1",
+        OMP_TERMINAL_ID: "term-1",
+        OMP_METADATA: '{"turn":3,"model":"opus"}',
+    } as NodeJS.ProcessEnv);
+    assert.deepEqual(withMeta.metadata, { turn: 3, model: "opus" });
+    // The parsed metadata reaches the wire message unchanged.
+    assert.deepEqual(toBridgeMessage(withMeta).metadata, { turn: 3, model: "opus" });
+
+    // Malformed JSON is ignored (never thrown): the field is simply absent.
+    const bad = readHookInput(["node", "hook.ts", "agent_start"], {
+        OMP_DEV_SESSION_ID: "sess-1",
+        OMP_TERMINAL_ID: "term-1",
+        OMP_METADATA: "{not json",
+    } as NodeJS.ProcessEnv);
+    assert.equal(bad.metadata, undefined);
+
+    // A non-object JSON value (a scalar or array) is not a metadata object, so
+    // it is dropped rather than mis-typed onto the field.
+    const scalar = readHookInput(["node", "hook.ts", "agent_start"], {
+        OMP_DEV_SESSION_ID: "sess-1",
+        OMP_TERMINAL_ID: "term-1",
+        OMP_METADATA: "42",
+    } as NodeJS.ProcessEnv);
+    assert.equal(scalar.metadata, undefined);
+
+    // Absent OMP_METADATA leaves the field unset.
+    const none = readHookInput(["node", "hook.ts", "agent_start"], {
+        OMP_DEV_SESSION_ID: "sess-1",
+        OMP_TERMINAL_ID: "term-1",
+    } as NodeJS.ProcessEnv);
+    assert.equal(none.metadata, undefined);
+});
+
+test("startBridge rejects when a live bridge already owns the socket (RR12)", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ch-bridge-live-"));
+    const socketPath = path.join(dir, "bridge.sock");
+    const first = await startBridge(socketPath, () => {});
+    try {
+        // A second bridge on the same live socket must fail loudly instead of
+        // orphaning the first (whose events would silently stop arriving).
+        await assert.rejects(
+            startBridge(socketPath, () => {}),
+            /address already in use/,
+        );
+    } finally {
+        const closed = Promise.withResolvers<void>();
+        first.close(() => closed.resolve());
+        await closed.promise;
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+test("startBridge unlinks a stale socket left by a dead bridge (RR12)", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ch-bridge-stale-"));
+    const socketPath = path.join(dir, "bridge.sock");
+    // Manufacture a stale socket: bind a server, hard-link its socket inode to
+    // a second name, then close the server (which unlinks only the name it
+    // bound). The linked name is still a socket file, but nothing listens on
+    // its inode, so a connect probe is refused — exactly a dead run's leftover.
+    const donorPath = path.join(dir, "donor.sock");
+    const donor = net.createServer();
+    const donorUp = Promise.withResolvers<void>();
+    donor.listen(donorPath, () => donorUp.resolve());
+    await donorUp.promise;
+    fs.linkSync(donorPath, socketPath);
+    const donorDown = Promise.withResolvers<void>();
+    donor.close(() => donorDown.resolve());
+    await donorDown.promise;
+    assert.ok(fs.lstatSync(socketPath).isSocket(), "leftover must be a socket file");
+
+    let server: net.Server | undefined;
+    try {
+        server = await startBridge(socketPath, () => {});
+        assert.ok(server.listening, "startBridge must take over a stale socket");
+    } finally {
+        if (server) {
+            const closed = Promise.withResolvers<void>();
+            server.close(() => closed.resolve());
+            await closed.promise;
+        }
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+test("makeStreamSink pauses the source on a full buffer and resumes on drain (RR24)", async () => {
+    // A tiny highWaterMark forces write() to report a full buffer on the first
+    // event; nothing consumes the readable side until we resume it below.
+    const out = new PassThrough({ highWaterMark: 1 });
+    const sink = makeStreamSink(out);
+    let paused = false;
+    const fakeSource = {
+        pause() {
+            paused = true;
+        },
+        resume() {
+            paused = false;
+        },
+    } as unknown as net.Socket;
+    const event = {
+        harness: "oh-my-pi",
+        state: "running",
+        event: "agent_start",
+        devSessionId: "s",
+        terminalId: "t",
+    } as unknown as AgentEvent;
+
+    // Write until the output buffer is full: the sink must then pause the source.
+    let guard = 0;
+    while (!paused && guard++ < 10) sink(event, fakeSource);
+    assert.equal(paused, true, "a full output buffer must pause the source");
+
+    // Draining the output (consume the readable side) must resume the source.
+    const drained = Promise.withResolvers<void>();
+    out.on("drain", () => drained.resolve());
+    out.resume();
+    await drained.promise;
+    assert.equal(paused, false, "the source must resume once the output drains");
 });

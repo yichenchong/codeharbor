@@ -152,9 +152,25 @@ void TstViewers::resolveUrlTable()
                  QUrl(QStringLiteral("file:///home/yc/project/"))),
              ViewerResolution::DirectoryViewer);
 
-    // Extensionless / known-binary file -> download.
+    // Well-known extensionless files and dotfiles -> text viewer (basename
+    // table), while truly binary/unknown content still -> download.
     QCOMPARE(ViewerHandlerRegistry::resolve(
                  QUrl(QStringLiteral("file:///home/yc/Makefile"))),
+             ViewerResolution::TextEditor);
+    QCOMPARE(ViewerHandlerRegistry::resolve(
+                 QUrl(QStringLiteral("file:///home/yc/Dockerfile"))),
+             ViewerResolution::TextEditor);
+    QCOMPARE(ViewerHandlerRegistry::resolve(
+                 QUrl(QStringLiteral("file:///home/yc/LICENSE"))),
+             ViewerResolution::TextEditor);
+    QCOMPARE(ViewerHandlerRegistry::resolve(
+                 QUrl(QStringLiteral("file:///home/yc/.bashrc"))),
+             ViewerResolution::TextEditor);
+    QCOMPARE(ViewerHandlerRegistry::resolve(
+                 QUrl(QStringLiteral("file:///home/yc/.gitignore"))),
+             ViewerResolution::TextEditor);
+    QCOMPARE(ViewerHandlerRegistry::resolve(
+                 QUrl(QStringLiteral("file:///home/yc/somebinary"))),
              ViewerResolution::Download);
     QCOMPARE(ViewerHandlerRegistry::resolve(
                  QUrl(QStringLiteral("file:///home/yc/archive.zip"))),

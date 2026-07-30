@@ -200,7 +200,7 @@ Window {
 
     function openPane(remoteUrl) {
         paneLoader.setSource("qrc:/qt/qml/CodeHarbor/EditorPaneView.qml",
-                             { fileUrl: remoteUrl });
+                             { fileUrl: remoteUrl, paneId: "viewer-1" });
         return paneLoader.status === Loader.Ready
             ? "ready" : ("loader-status=" + paneLoader.status);
     }
@@ -423,6 +423,10 @@ private:
     ViewerProfiles m_profiles{&m_client};
     ViewerModel m_viewers{&m_client};
     EditorFactory m_editorFactory{&m_client};
+    // The server-reported recovery directory (server.info.recoveryDir),
+    // captured in initTestCase and forwarded to the factory exactly as
+    // AppController::adoptServerIdentity does in production (SPEC 11.3).
+    QString m_recoveryDir;
     std::unique_ptr<SessionBootstrap> m_bootstrap;
     std::unique_ptr<QQmlEngine> m_engine;
     // The host Window (kShellQml). Named for what it is, so it is never confused
@@ -490,15 +494,22 @@ void TstLiveEditor::initTestCase()
              QStringLiteral("codeharbord"));
     QVERIFY(info.toObject().value(QStringLiteral("schemaVersion")).toInt(-1) >= 2);
 
+    // Mirror AppController::adoptServerIdentity: forward the server-reported
+    // recovery directory (SPEC 11.3) to the editor factory, since this harness
+    // bypasses AppController. Per-pane snapshots land at <recoveryDir>/<paneId>.
+    m_recoveryDir = info.toObject().value(QStringLiteral("recoveryDir")).toString();
+    QVERIFY2(!m_recoveryDir.isEmpty(),
+             "server.info reported no recoveryDir; the SPEC 11.3 snapshot path is unknown");
+    m_editorFactory.setRecoveryDir(m_recoveryDir);
+
     // ---- (2a) REMOTE FIXTURE ---------------------------------------------
     // Created over an ssh Exec channel rather than with file.writeFile: the
     // fixture must not depend on the very RPC surface the gate is testing, so a
     // broken writeFile shows up as a failed assertion, not as a missing file.
-    // `.codeharbor-recovery` is pre-created too. file.writeFile does create a
-    // missing parent directory now, but the fixture deliberately does not lean
-    // on that: an ENOENT there would silently swallow the SPEC 11.3 snapshot the
-    // page's debounced reportContent writes, and the gate would pass without
-    // ever exercising it.
+    // Only the working directory is pre-created; the SPEC 11.3 recovery snapshot
+    // now lands under the SERVER-reported recovery directory
+    // (server.info.recoveryDir), whose parent file.writeFile creates on the
+    // first write, so no sibling directory is pre-made here.
     QVERIFY2(startRemoteShell(),
              qPrintable(QStringLiteral("could not start the out-of-band shell channel: %1")
                             .arg(m_execErr)));
@@ -513,7 +524,7 @@ void TstLiveEditor::initTestCase()
     const QString setup =
         QStringList{
             QStringLiteral("mkdir -p"),
-            sq(m_remoteDir + QStringLiteral("/.codeharbor-recovery")),
+            sq(m_remoteDir),
             QStringLiteral("&& printf '%s\\n' "),
             sq(m_marker),
             sq(QStringLiteral("second line: these bytes crossed a real ssh channel")),
@@ -1031,8 +1042,7 @@ void TstLiveEditor::unwritableRemoteFileIsReadOnlyInMonaco()
     const QString lockedPath = m_remoteDir + QStringLiteral("/locked.txt");
     const QString lockedContent =
         QStringLiteral("read-only fixture %1\n").arg(m_marker);
-    const QString recoveryPath =
-        m_remoteDir + QStringLiteral("/.codeharbor-recovery/locked.txt");
+    const QString recoveryPath = m_recoveryDir + QStringLiteral("/viewer-1");
 
     QVERIFY2(remoteExec(QStringLiteral("printf '%s\\n' ")
                             + sq(QStringLiteral("read-only fixture ") + m_marker)
@@ -1109,7 +1119,7 @@ void TstLiveEditor::unwritableRemoteFileIsReadOnlyInMonaco()
     QTest::qWait(1000);
     QVERIFY(remoteExec(QStringLiteral("cat -- ") + sq(lockedPath), &out, &err));
     QCOMPARE(QString::fromUtf8(out), lockedContent);
-    QVERIFY(remoteExec(QStringLiteral("test -e ") + sq(recoveryPath)
+    QVERIFY(remoteExec(QStringLiteral("test -s ") + sq(recoveryPath)
                            + QStringLiteral(" && echo SNAPSHOT || echo NO_SNAPSHOT"),
                        &out, &err));
     QVERIFY2(out.contains("NO_SNAPSHOT"),

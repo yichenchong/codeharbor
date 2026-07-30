@@ -3,6 +3,7 @@
 #include "CodeharbordClient.h"
 #include "RpcTypes.h"
 
+#include <QJsonDocument>
 #include <QJsonObject>
 #include <QPointer>
 
@@ -28,11 +29,18 @@ QJsonObject readFileParams(const QString& path)
 }
 
 QJsonObject writeParams(const QString& path, const QString& content,
-                        const QString& expectedRevision)
+                        const QString& expectedRevision,
+                        std::optional<int> mode = std::nullopt)
 {
-    return QJsonObject{{QStringLiteral("path"), path},
+    QJsonObject params{{QStringLiteral("path"), path},
                        {QStringLiteral("content"), content},
                        {QStringLiteral("expectedRevision"), expectedRevision}};
+    // C1: an optional POSIX file mode. remote/src/files.ts leaves the finished
+    // file at exactly this mode when present (used for the 0600 recovery
+    // snapshot); omitted for ordinary saves, which keep the file's own mode.
+    if (mode.has_value())
+        params.insert(QStringLiteral("mode"), *mode);
+    return params;
 }
 
 QJsonObject unwatchParams(const QString& subscriptionId)
@@ -40,50 +48,92 @@ QJsonObject unwatchParams(const QString& subscriptionId)
     return QJsonObject{{QStringLiteral("subscriptionId"), subscriptionId}};
 }
 
-// POSIX write bits (owner|group|other) of StatResult.mode, which
-// remote/src/files.ts mints straight from fs.lstat().
+// Restrictive mode for a recovery snapshot (SPEC 11.3): read/write for the
+// owner only. Passed through writeFile's C1 `mode` param so the snapshot never
+// inherits a permissive umask default.
+constexpr int kRecoveryFileMode = 0600;
+
+// A recovery snapshot is a small JSON envelope, not the raw buffer, so it can
+// record WHICH file it holds. There is one physical snapshot file per pane
+// (recoveryPath()), reused as the pane switches files, and this recorded path
+// is what lets checkRecovery() refuse to offer a snapshot belonging to a file
+// the pane has since left.
+QString serializeRecovery(const QString& path, const QString& content)
+{
+    const QJsonObject obj{{QStringLiteral("path"), path},
+                          {QStringLiteral("content"), content}};
+    return QString::fromUtf8(QJsonDocument(obj).toJson(QJsonDocument::Compact));
+}
+
+// Parse a snapshot envelope. Returns false (leaving the outputs untouched) for
+// an empty tombstone, a truncated/prefix read, or any non-envelope bytes — each
+// of which means "nothing this pane can offer".
+bool parseRecovery(const QString& raw, QString& outPath, QString& outContent)
+{
+    if (raw.isEmpty())
+        return false;
+    const QJsonDocument doc = QJsonDocument::fromJson(raw.toUtf8());
+    if (!doc.isObject())
+        return false;
+    const QJsonObject obj = doc.object();
+    const QJsonValue path = obj.value(QStringLiteral("path"));
+    const QJsonValue content = obj.value(QStringLiteral("content"));
+    if (!path.isString() || !content.isString())
+        return false;
+    outPath = path.toString();
+    outContent = content.toString();
+    return true;
+}
+
+// POSIX write bits (owner|group|other) of the file.stat result's `mode` field,
+// which remote/src/files.ts mints from fs.lstat(). Used ONLY as a fallback for
+// a server too old to report the authoritative `writable` flag (see below).
 constexpr int kWriteBits = 0222;
 
 // Does the server's stat PROVE the open file cannot be written?
 //
-// StatResult (remote/src/rpc-types.ts) carries `mode`, but no uid/gid — and the
-// client does not know the remote process's euid either. So "some write bit is
-// set" proves nothing: those bits may belong to a user we are not. The one
-// thing mode alone does prove is the negative — with NO write bit set anywhere,
-// no user but root can write the file. Read-only is therefore claimed on that
-// proof only, and every ambiguous case stays editable so the SPEC 8.6 write
-// path can report the real errno. Deliberately conservative: a false read-only
-// takes the file away from a user who could have edited it.
+// The authoritative signal is the file.stat result's `writable` flag (C2,
+// remote/src/rpc-types.ts): the server computes it with fs.access(resolvedPath,
+// W_OK) on the LINK-FOLLOWED target, so it answers the exact question a save
+// asks — can THIS process write the bytes readFile/writeFile actually touch —
+// and it is true iff writable, false on any error. When present it is trusted
+// directly, which also closes the old symlink hole: fs.access follows the link,
+// so a file opened through a symlink now reports the target's real writability
+// instead of the link's perpetual 0777.
 //
 // A directory (or a socket/fifo) is never a writable text buffer regardless.
 //
-// SYMLINKS are a known, deliberately accepted hole. remote/src/files.ts stat()
-// uses lstat, so `mode` describes the LINK, and a symlink's own mode is always
-// 0777 on Linux — the check above can therefore never claim read-only for a file
-// opened through one, however unwritable the target is. The consequence, stated
-// plainly: the user can type into a file they cannot write, and only finds out
-// when the save fails with the server's EACCES via saveError. That is kept in
-// preference to the alternative — treating kind "symlink" as read-only — because
-// symlinks into writable files are the common case (dotfile farms, checked-out
-// worktrees) and a false read-only takes a file away from a user who could have
-// edited it. No other reported field helps: StatResult carries no uid/gid, its
-// `size` for a symlink is the target path's length, and its `revision` is minted
-// from the TARGET's mtime/ctime/inode/size, which says nothing about permission.
+// FALLBACK — a server that predates the `writable` flag reports only `mode`,
+// which comes from lstat and carries no uid/gid (and the client does not know
+// the remote euid), so a SET write bit proves nothing. The one thing mode alone
+// proves is the negative: with NO write bit set anywhere, no user but root can
+// write the file. Read-only is claimed on that proof only, and every ambiguous
+// case stays editable so the SPEC 8.6 write path can report the real errno.
+// That fallback is also symlink-blind — a symlink's own mode is always 0777 on
+// Linux — so against an old server a file opened through a link can be typed
+// into but fails to save with the server's EACCES via saveError. Deliberately
+// kept for that older peer only; a current server never reaches it.
 bool statSaysUnwritable(const QJsonObject& stat)
 {
     const QString kind = stat.value(QStringLiteral("kind")).toString();
     if (kind == QLatin1String("directory") || kind == QLatin1String("other"))
         return true;
+    // Authoritative when present (C2): fs.access(W_OK) on the link-followed
+    // target. Absent only from a server too old to report it.
+    const QJsonValue writable = stat.value(QStringLiteral("writable"));
+    if (writable.isBool())
+        return !writable.toBool();
     const QJsonValue mode = stat.value(QStringLiteral("mode"));
     if (!mode.isDouble())
-        return false;  // field absent: unknown, which is not the same as unwritable
+        return false;  // neither field present: unknown, not the same as unwritable
     return (mode.toInt() & kWriteBits) == 0;
 }
 
 } // namespace
 
-EditorController::EditorController(CodeharbordClient* client, QObject* parent)
-    : QObject(parent), m_client(client)
+EditorController::EditorController(CodeharbordClient* client, QString recoveryId,
+                                  QObject* parent)
+    : QObject(parent), m_client(client), m_recoveryId(recoveryId)
 {
     if (m_client) {
         connect(m_client, &CodeharbordClient::notificationReceived, this,
@@ -421,17 +471,42 @@ void EditorController::ready()
         reload(FileState::Loading);
 }
 
-QString EditorController::recoveryPathFor(const QString& path)
+QString EditorController::recoveryPath() const
 {
-    // POSIX path semantics regardless of the host OS: the recovery snapshot is a
-    // sibling of the file inside a `.codeharbor-recovery/` directory.
-    const int slash = path.lastIndexOf(QLatin1Char('/'));
-    const QString dir = slash >= 0 ? path.left(slash) : QString();
-    const QString name = slash >= 0 ? path.mid(slash + 1) : path;
-    const QString recoveryDir = dir.isEmpty()
-        ? QStringLiteral(".codeharbor-recovery")
-        : dir + QStringLiteral("/.codeharbor-recovery");
-    return recoveryDir + QLatin1Char('/') + name;
+    // One snapshot file per pane (SPEC 11.3), named by the pane's stable id
+    // inside the recovery directory the SERVER reports (server.info.recoveryDir,
+    // fed in via setRecoveryDir()). NOT a sibling of the edited file, so a
+    // snapshot never pollutes the repository, and two panes editing one path
+    // keep independent snapshots. The base is a REMOTE absolute path chosen by
+    // the server, so it is correct across hosts — unlike a client-derived path,
+    // which would name a directory that need not exist or belong to the same
+    // user on the server. An empty base (an older server that does not report
+    // one, or none pushed in yet) or an empty pane id yields an empty path,
+    // which DISABLES recovery rather than sharing one unkeyed file between panes.
+    if (m_recoveryId.isEmpty() || m_recoveryDir.isEmpty())
+        return QString();
+    return m_recoveryDir + QLatin1Char('/') + m_recoveryId;
+}
+
+void EditorController::setRecoveryDir(const QString& dir)
+{
+    // The server-reported recovery base (server.info.recoveryDir), pushed in by
+    // EditorFactory once server.info answers. It can arrive AFTER this pane and
+    // its controller already exist, so it is a mutable setter rather than a
+    // constructor argument: recoveryPath() reads whatever is current at the time
+    // a snapshot is written or probed.
+    m_recoveryDir = dir;
+}
+
+void EditorController::setRecoveryId(const QString& id)
+{
+    // The pane's stable layout id, pushed in by EditorPaneView. It can settle
+    // after this controller exists (the region assigns a pane's paneId as part
+    // of building/rebuilding the layout), so this is a setter rather than a
+    // fixed constructor value; recoveryPath() reads whatever is current when a
+    // snapshot is written or probed. Keyed per pane so two panes on one file
+    // never share a snapshot (SPEC 11.3).
+    m_recoveryId = id;
 }
 
 void EditorController::open(QString path)
@@ -528,9 +603,11 @@ void EditorController::open(QString path)
 
 void EditorController::checkRecovery(const QString& loadedContent, quint64 generation)
 {
-    if (!m_client || m_path.isEmpty())
+    if (!m_client)
         return;
-    const QString recoveryPath = recoveryPathFor(m_path);
+    const QString recoveryPath = this->recoveryPath();
+    if (recoveryPath.isEmpty())
+        return;  // no stable pane id / data location: recovery disabled
 
     QPointer<EditorController> self(this);
     // Stat first: absence (error) simply means there is nothing to recover.
@@ -540,16 +617,10 @@ void EditorController::checkRecovery(const QString& loadedContent, quint64 gener
             QJsonValue statRes, std::optional<RpcError> statErr) {
             if (!self || statErr.has_value())
                 return; // no snapshot present
-            // Superseded: this snapshot belongs to a load that is no longer the
-            // one on screen, so offering it would hand the user one file's
-            // unsaved edits as another file's.
+            // Superseded: this check belongs to a load that is no longer the
+            // one on screen.
             if (generation != self->m_loadGeneration)
                 return;
-            // A snapshot exists; read it and compare. We treat presence +
-            // content difference as "recoverable". (Simplification: rather than
-            // a strict mtime comparison against the file, difference is the
-            // practical signal that unsaved edits survive; the snapshot's
-            // revision is adopted so subsequent reportContent overwrites it.)
             const QString snapshotRevision =
                 statRes.toObject().value(QStringLiteral("revision")).toString();
             self->m_client->call(
@@ -562,24 +633,30 @@ void EditorController::checkRecovery(const QString& loadedContent, quint64 gener
                     if (generation != self->m_loadGeneration)
                         return;
                     const QJsonObject snapshot = readRes.toObject();
-                    // A snapshot larger than kMaxEditableReadBytes came back as
-                    // a prefix, and offering a prefix as "your unsaved work"
-                    // would hand the user a truncated buffer to save over the
-                    // file (SPEC 11.3). Adopt the revision so the next snapshot
-                    // write is still a guarded overwrite, but never offer it.
-                    const QString recovered =
-                        snapshot.value(QStringLiteral("truncated")).toBool()
-                            ? QString()
-                            : snapshot.value(QStringLiteral("content")).toString();
+                    // Adopt the snapshot's revision unconditionally so the next
+                    // write to this pane's slot is a guarded overwrite, even
+                    // when nothing below is offered.
                     self->m_recoveryRevision = snapshotRevision;
-                    // An EMPTY snapshot is the tombstone clearRecovery() leaves
-                    // behind after a successful save: the frozen C1 catalog has
-                    // no delete, so "saved, nothing to recover" is encoded as a
-                    // zero-length file. Adopt its revision (the next snapshot is
-                    // then a guarded overwrite) but never offer it — that is the
-                    // stale "unsaved changes" prompt this exists to prevent.
-                    self->m_recoveryHasContent = !recovered.isEmpty();
-                    if (!recovered.isEmpty() && recovered != loadedContent)
+                    // A snapshot over kMaxEditableReadBytes came back a prefix,
+                    // so its envelope will not parse; a tombstone (empty) does
+                    // not parse either. parseRecovery() folds both into "nothing
+                    // to offer".
+                    QString snapshotPath;
+                    QString recovered;
+                    const bool parsed =
+                        !snapshot.value(QStringLiteral("truncated")).toBool()
+                        && parseRecovery(
+                               snapshot.value(QStringLiteral("content")).toString(),
+                               snapshotPath, recovered);
+                    // This pane's single slot is REUSED as it switches files, so
+                    // a snapshot the envelope records against a different path is
+                    // this pane's snapshot of a PREVIOUS file and must never be
+                    // handed back as the current file's unsaved work (SPEC 11.3).
+                    const bool belongsHere =
+                        parsed && snapshotPath == self->m_path
+                        && !recovered.isEmpty();
+                    self->m_recoveryHasContent = belongsHere;
+                    if (belongsHere && recovered != loadedContent)
                         emit self->recoveryAvailable(recovered);
                 });
         });
@@ -716,8 +793,8 @@ void EditorController::reportContent(QString content)
 
     // A load is in flight, so the page is still showing the buffer of whatever
     // was open BEFORE it: the page debounces by 500ms, which outlives an
-    // open(). Honouring this report would file one file's edits under another
-    // file's recovery path and mark a buffer nobody has edited dirty.
+    // open(). Honouring this report would tag one file's edits with the file
+    // now opening and mark a buffer nobody has edited dirty.
     if (m_fileState == FileState::Loading)
         return;
 
@@ -732,20 +809,27 @@ void EditorController::writeRecovery(const QString& content, bool retryOnMismatc
 {
     if (!m_client || m_path.isEmpty())
         return;
-    const QString recoveryPath = recoveryPathFor(m_path);
+    const QString recoveryPath = this->recoveryPath();
+    if (recoveryPath.isEmpty())
+        return;  // no stable pane id / data location: recovery disabled
+    // The path is recorded INSIDE the snapshot (envelope) so a later open can
+    // tell whose file it holds; the pane's current path is captured separately
+    // to detect a file switch landing during this round trip.
+    const QString path = m_path;
+    const QString payload = serializeRecovery(path, content);
 
     QPointer<EditorController> self(this);
     m_client->call(
         QString::fromLatin1(rpc::kMethodWriteFile),
-        writeParams(recoveryPath, content, m_recoveryRevision),
-        [self, content, recoveryPath, retryOnMismatch](
+        writeParams(recoveryPath, payload, m_recoveryRevision, kRecoveryFileMode),
+        [self, content, path, recoveryPath, retryOnMismatch](
             QJsonValue result, std::optional<RpcError> error) {
             if (!self)
                 return;
-            // The pane switched files: this revision guards ANOTHER file's
-            // snapshot, and adopting it would send the next snapshot write out
-            // with a guard that cannot match.
-            if (recoveryPathFor(self->m_path) != recoveryPath)
+            // The pane switched files while this was in flight: open() has
+            // already reset the recovery bookkeeping for the new file, so this
+            // stale write's revision is not ours to adopt.
+            if (self->m_path != path)
                 return;
             if (!error.has_value()) {
                 // Track the returned revision so the next snapshot is a guarded
@@ -762,11 +846,11 @@ void EditorController::writeRecovery(const QString& content, bool retryOnMismatc
             if (retryOnMismatch && error->code == rpc::kRevisionMismatch) {
                 self->m_client->call(
                     QString::fromLatin1(rpc::kMethodStat), readParams(recoveryPath),
-                    [self, content, recoveryPath](QJsonValue statRes,
-                                                  std::optional<RpcError> statErr) {
+                    [self, content, path](QJsonValue statRes,
+                                          std::optional<RpcError> statErr) {
                         if (!self || statErr.has_value())
                             return;
-                        if (recoveryPathFor(self->m_path) != recoveryPath)
+                        if (self->m_path != path)
                             return;
                         self->m_recoveryRevision =
                             statRes.toObject()
@@ -780,30 +864,33 @@ void EditorController::writeRecovery(const QString& content, bool retryOnMismatc
 
 void EditorController::clearRecovery()
 {
-    // Nothing was ever snapshotted (or it is already the empty tombstone):
-    // writing again would only burn a round trip.
+    // Nothing was ever snapshotted for the open file (or it is already the empty
+    // tombstone): writing again would only burn a round trip.
     if (!m_client || m_path.isEmpty() || !m_recoveryHasContent)
         return;
 
     // The frozen C1 catalog (src/remote/RpcTypes.h) has NO delete method, so
     // clearing is expressed with the write it does have: a zero-length,
     // revision-guarded file.writeFile. Guarding on the snapshot's own revision
-    // keeps the SPEC 8.4/8.6 rule intact — if another pane or session wrote the
-    // snapshot after us the truncate is REFUSED rather than destroying their
-    // buffer. checkRecovery() reads a zero-length snapshot as "nothing to
-    // recover", so the tombstone is equivalent to deletion for every consumer.
-    const QString recoveryPath = recoveryPathFor(m_path);
+    // keeps the SPEC 8.4/8.6 rule intact — if another writer touched the slot
+    // after us the truncate is REFUSED rather than destroying their buffer.
+    // An empty file does not parse as an envelope, so checkRecovery() reads the
+    // tombstone as "nothing to recover" — equivalent to deletion for every
+    // consumer. The 0600 mode is restated so the truncated file keeps its
+    // restrictive permissions (C1).
+    const QString recoveryPath = this->recoveryPath();
+    const QString path = m_path;
     const QString guard = m_recoveryRevision;
 
     QPointer<EditorController> self(this);
     m_client->call(
         QString::fromLatin1(rpc::kMethodWriteFile),
-        writeParams(recoveryPath, QString(), guard),
-        [self, recoveryPath](QJsonValue result, std::optional<RpcError> error) {
+        writeParams(recoveryPath, QString(), guard, kRecoveryFileMode),
+        [self, path, recoveryPath](QJsonValue result, std::optional<RpcError> error) {
             if (!self || error.has_value())
                 return; // best-effort: a stale snapshot is a prompt, not data loss
             // The pane switched files; this bookkeeping is not ours to write.
-            if (recoveryPathFor(self->m_path) != recoveryPath)
+            if (self->m_path != path)
                 return;
             self->m_recoveryRevision =
                 result.toObject().value(QStringLiteral("revision")).toString();

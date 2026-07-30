@@ -21,6 +21,10 @@ export interface StatResult {
     mtimeMs: number;
     mode: number;
     revision: string;
+    // Whether the LINK-FOLLOWED target is writable by this process (fs.access
+    // W_OK on the resolved path; false on any error). Lets the client mark a
+    // buffer read-only up front (X12) instead of discovering it only on save.
+    writable: boolean;
 }
 
 export interface ReadFileParams {
@@ -49,6 +53,11 @@ export interface WriteFileParams {
     content: string;
     encoding?: "utf-8" | "base64";
     expectedRevision: string;
+    // Optional POSIX file mode (e.g. 0o600). When present the atomic write
+    // creates the temp file with this mode and leaves the final file with
+    // exactly it; when absent, the current mode-preservation behaviour (RF7)
+    // stands. Used by the editor for private recovery snapshots (ED15).
+    mode?: number;
 }
 
 export interface WriteFileResult {

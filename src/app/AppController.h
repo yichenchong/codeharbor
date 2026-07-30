@@ -25,6 +25,8 @@
 
 namespace ch {
 
+class EditorFactory;
+
 
 // Top-level application controller (SPEC 4.1, workstream U). Owns the client
 // workspace repository (WorkspaceDb over the injected CodeharbordClient), the
@@ -63,9 +65,16 @@ public:
     // merged into the sidebar on every rebuild. Ownership stays with the caller
     // (the orchestrator/main.cpp). Passing nullptr is safe and disables the
     // merge. Connects the monitor's agentStateChanged/unseenChanged signals to
-    // rebuildRows() so a live agent event re-derives the badges from the last
-    // known workspace tree.
+    // applyAgentStateUpdate() so a live agent event re-derives the badges from
+    // the last known workspace tree and pushes them incrementally (a targeted
+    // dataChanged(), not a full model reset).
     void setAgentMonitor(AgentStatusMonitor* monitor);
+
+    // Wire the per-pane editor factory (workstream E). Ownership stays with the
+    // caller (main.cpp); nullptr is safe. Lets adoptServerIdentity() forward the
+    // server's recovery directory (server.info.recoveryDir) so crash-recovery
+    // snapshots land under a server-chosen path (SPEC 11.3).
+    void setEditorFactory(EditorFactory* factory);
 
     // Inject the connection spine. Ownership stays with main.cpp; any of these
     // may be null (tests). Mirrors setAgentMonitor's injection style rather than
@@ -163,12 +172,21 @@ private:
     // present (caller should not treat the op as successful).
     bool reportIfError(const std::optional<RpcError>& err);
 
-    // Re-derive the sidebar rows from the last successful list() result cached in
+    // Build the sidebar rows from the last successful list() result cached in
     // m_lastNodes, merging live per-terminal agent state from m_agentMonitor
-    // (the source of truth). Called on every successful refresh AND on every
-    // agent event, so neither a workspace refresh nor an agent transition ever
-    // wipes the other's contribution to the badges.
+    // (the source of truth), so neither a workspace refresh nor an agent
+    // transition ever wipes the other's contribution to the badges.
+    QVector<GroupRow> computeRows();
+
+    // Structural refresh: rebuild computeRows() into a full model reset. Called
+    // on every successful workspace refresh.
     void rebuildRows();
+
+    // Incremental refresh: recompute rows and push per-terminal state into the
+    // model in place, emitting a targeted dataChanged() only for rows whose
+    // aggregate state changed. Wired to the monitor's agent events so a status
+    // flip does not reset (and re-create) the whole sidebar.
+    void applyAgentStateUpdate();
 
     // Build a WorkspaceDb callback that, once the async response arrives, is a
     // no-op if this controller was already destroyed (the shared client keeps
@@ -201,6 +219,9 @@ private:
     // Live agent-status monitor (SPEC 6.4), not owned; set via setAgentMonitor.
     // When non-null its per-terminal state is merged into the sidebar rows.
     AgentStatusMonitor* m_agentMonitor = nullptr;
+    // Per-pane editor factory (workstream E), not owned; set via
+    // setEditorFactory. Receives the server's recovery directory on connect.
+    EditorFactory* m_editorFactory = nullptr;
     // Cache of the most recent successful list() tree, so rebuildRows() can
     // re-derive rows (and re-merge agent state) without another server round-
     // trip when an agent event arrives.

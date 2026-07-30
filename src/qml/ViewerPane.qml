@@ -439,7 +439,7 @@ Item {
         }
     }
     Component { id: binaryComponent; ViewerBinaryView { url: pane.effectiveUrl } }
-    Component { id: editorComponent; EditorPaneView { fileUrl: pane.effectiveUrl } }
+    Component { id: editorComponent; EditorPaneView { fileUrl: pane.effectiveUrl; recoveryPaneId: pane.paneId } }
 
     // Nothing open AND no Dev Session to fall back on. A pane a user can land on
     // must say what it is and how to fill it — the internal pane id is plumbing,

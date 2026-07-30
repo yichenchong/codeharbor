@@ -1,5 +1,6 @@
 #include "AppController.h"
 
+#include "EditorFactory.h"
 #include "UiStateStore.h"
 
 #include <QCryptographicHash>
@@ -8,6 +9,7 @@
 #include <QDir>
 #include <QJsonObject>
 #include <QPointer>
+#include <QSet>
 #include <QTimer>
 
 namespace ch {
@@ -152,18 +154,27 @@ void AppController::setAgentMonitor(AgentStatusMonitor* monitor)
     m_agentMonitor = monitor;
     if (m_agentMonitor) {
         // Any agent transition or unseen-flag flip re-derives the badges from
-        // the last known workspace tree. The QPointer-free lambda is safe: the
+        // the last known workspace tree and pushes them incrementally (a
+        // targeted dataChanged(), not a full reset). The QPointer-free lambda is
+        // safe: the
         // connection is bound to `this` as the context object, so Qt severs it
         // automatically when this controller is destroyed (no UAF), and the
         // disconnect above severs it on re-set.
         connect(m_agentMonitor, &AgentStatusMonitor::agentStateChanged, this,
-                [this](const QString&, const QString&, int) { rebuildRows(); });
+                [this](const QString&, const QString&, int) { applyAgentStateUpdate(); });
         connect(m_agentMonitor, &AgentStatusMonitor::unseenChanged, this,
-                [this](const QString&, bool) { rebuildRows(); });
+                [this](const QString&, bool) { applyAgentStateUpdate(); });
     }
     // Re-merge immediately so a monitor set after the initial load reflects any
     // state it already accumulated, and a clear drops back to bare rows.
     rebuildRows();
+}
+
+void AppController::setEditorFactory(EditorFactory* factory)
+{
+    // Not owned; see the header. Null is fine — recoveryDir simply never gets
+    // forwarded and per-pane recovery stays disabled.
+    m_editorFactory = factory;
 }
 
 void AppController::setConnection(SshConnectionPool* pool,
@@ -686,6 +697,14 @@ void AppController::adoptServerIdentity()
                            });
                            return;
                        }
+                       // Forward the server's recovery directory to the editor
+                       // factory so per-pane crash-recovery snapshots (SPEC 11.3)
+                       // land under a SERVER-chosen path, correct across hosts.
+                       // Additive/optional (schemaVersion unchanged): an older
+                       // server omits it and recovery degrades to disabled.
+                       if (self->m_editorFactory)
+                           self->m_editorFactory->setRecoveryDir(
+                               info.value(QStringLiteral("recoveryDir")).toString());
                        const QString id =
                            info.value(QStringLiteral("serverId")).toString();
                        if (id.isEmpty()) {
@@ -795,7 +814,7 @@ QString AppController::activeSessionRepoRoot() const
     return {};
 }
 
-void AppController::rebuildRows()
+QVector<GroupRow> AppController::computeRows()
 {
     // Start from the pure persisted mapping (terminals empty), then overlay the
     // live agent state from the monitor (the source of truth). Deriving the
@@ -834,7 +853,23 @@ void AppController::rebuildRows()
             }
         }
     }
-    m_sessionsModel->setGroups(std::move(rows));
+    return rows;
+}
+
+void AppController::rebuildRows()
+{
+    // Structural refresh: replace the whole tree (used on workspace reload).
+    m_sessionsModel->setGroups(computeRows());
+}
+
+void AppController::applyAgentStateUpdate()
+{
+    // An agent event never alters the sidebar's structure, only per-terminal
+    // state feeding each session's badge. Push it incrementally so the sidebar
+    // is not fully reset - and every delegate destroyed and recreated - on
+    // every single status flip; updateTerminalStates emits a targeted
+    // dataChanged() for just the rows whose aggregate state actually moved.
+    m_sessionsModel->updateTerminalStates(computeRows());
 }
 
 void AppController::refresh()
@@ -874,6 +909,18 @@ void AppController::refresh()
         // Only HERE: past the error return (an RpcError means "we do not know",
         // not "it is gone") and past the generation guard, so a stale list()
         // can never retire a session the newest tree still has.
+        // AG7: evict agent state for Dev Sessions the freshly rebuilt tree no
+        // longer lists. The tree is authoritative here, so a whole Dev Session
+        // subtree that is gone is genuinely gone; retainDevSessions drops it as
+        // a unit (never on terminal close, which would lose an unseen-completion
+        // badge). Done before rebuildRows so the merge sees only live state.
+        if (self->m_agentMonitor) {
+            QSet<QString> liveDevSessions;
+            for (const GroupNode& groupNode : self->m_lastNodes)
+                for (const SessionNode& sessionNode : groupNode.sessions)
+                    liveDevSessions.insert(sessionNode.session.id.value);
+            self->m_agentMonitor->retainDevSessions(liveDevSessions);
+        }
         const bool droppedActive = self->dropActiveSessionIfGone();
         self->rebuildRows();
         if (droppedActive || self->activeSessionRepoRoot() != repoRootBefore)

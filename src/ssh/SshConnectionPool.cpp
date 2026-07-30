@@ -57,8 +57,8 @@ SshConnectionPool::AuthRung SshConnectionPool::nextAuthRung(
 {
     // Public-key rungs come first because they need nothing from the user: an
     // agent key or an unencrypted key file authenticates silently. Only when
-    // those are spent is a human interrupted, and the password rung is last
-    // because it is the only secret that travels to the server.
+    // those are spent is a human interrupted, and the secret-bearing rungs
+    // (password, then keyboard-interactive) come last.
     if (offered.publicKey) {
         if (!tried.agent)
             return AuthRung::Agent;
@@ -69,6 +69,11 @@ SshConnectionPool::AuthRung SshConnectionPool::nextAuthRung(
     }
     if (offered.password && canPrompt && !tried.password)
         return AuthRung::Password;
+    // Keyboard-interactive comes after plain password: the common PAM case is a
+    // single password prompt, so CodeHarbor answers it with the same secret the
+    // password rung would use. Last because it is another user-facing prompt.
+    if (offered.keyboardInteractive && canPrompt && !tried.keyboardInteractive)
+        return AuthRung::KeyboardInteractive;
     return AuthRung::Exhausted;
 }
 
@@ -190,6 +195,14 @@ void SshConnectionPool::disconnectFromHost()
 
 namespace {
 
+// SH15: bound the synchronous handshake's worst-case UI freeze. libssh's own
+// default packet timeout is much longer and version-dependent, so without this
+// a black-holed endpoint could stall the calling (UI) thread for that whole
+// default. 15s is long enough for a slow but live server to finish key exchange
+// and authentication, and is consistent with the connect-side budgets in
+// SessionBootstrap.
+constexpr long kHandshakeTimeoutSeconds = 15;
+
 QString resolveIdentityFilePath(QString identityFile)
 {
     identityFile = identityFile.trimmed();
@@ -287,6 +300,8 @@ QString authRungName(SshConnectionPool::AuthRung rung)
         return QStringLiteral("private key (with passphrase)");
     case SshConnectionPool::AuthRung::Password:
         return QStringLiteral("password");
+    case SshConnectionPool::AuthRung::KeyboardInteractive:
+        return QStringLiteral("keyboard-interactive");
     case SshConnectionPool::AuthRung::Exhausted:
         break;
     }
@@ -342,15 +357,17 @@ SshConnectionPool::AuthMethods SshConnectionPool::methodsFromMask(
 {
     const unsigned int mask = static_cast<unsigned int>(userauthListMask);
     if (mask == SSH_AUTH_METHOD_UNKNOWN) {
-        // The server did not say. Try both rather than nothing: this is exactly
-        // what the single-step ladder did before, and refusing to try anything
-        // here would turn a missing method list into a connection that cannot
-        // authenticate at all.
-        return AuthMethods{true, true};
+        // The server did not say. Try everything this client can supply rather
+        // than nothing: this is what the single-step ladder did before, and
+        // refusing here would turn a missing method list into a connection that
+        // cannot authenticate at all.
+        return AuthMethods{true, true, true};
     }
     AuthMethods offered;
     offered.publicKey = (mask & SSH_AUTH_METHOD_PUBLICKEY) != 0;
     offered.password = (mask & SSH_AUTH_METHOD_PASSWORD) != 0;
+    offered.keyboardInteractive =
+        (mask & SSH_AUTH_METHOD_INTERACTIVE) != 0;
     return offered;
 }
 
@@ -361,7 +378,8 @@ SshConnectionPool::AuthOutcome SshConnectionPool::classifyAuthResult(
     // accepted and the server wants another one. Everything that is neither
     // success nor partial (denied, error, again, keyboard-interactive info) ends
     // this rung — SSH_AUTH_AGAIN cannot occur here because the session is
-    // blocking, and this client never requests keyboard-interactive.
+    // blocking, and SSH_AUTH_INFO is consumed by the keyboard-interactive loop
+    // in authenticate() before this classifier ever sees a terminal result.
     switch (libsshResult) {
     case SSH_AUTH_SUCCESS:
         return AuthOutcome::Granted;
@@ -440,6 +458,7 @@ bool SshConnectionPool::connectToHost(const QString& host, quint16 port,
     // profile values deliberately win over broad config defaults.
     const QString configPath =
         QDir::home().filePath(QStringLiteral(".ssh/config"));
+    bool userConfigParsed = false;
     if (QFileInfo(configPath).isFile()) {
         appendDiagnostic(
             QStringLiteral("Parsing SSH configuration: %1").arg(configPath));
@@ -457,6 +476,7 @@ bool SshConnectionPool::connectToHost(const QString& host, quint16 port,
             setState(State::Error);
             return false;
         }
+        userConfigParsed = true;
     }
 
     setOption(SSH_OPTIONS_PORT, &portValue, QStringLiteral("SSH port"));
@@ -466,6 +486,18 @@ bool SshConnectionPool::connectToHost(const QString& host, quint16 port,
         const QByteArray identityUtf8 = QFile::encodeName(m_identityFile);
         setOption(SSH_OPTIONS_IDENTITY, identityUtf8.constData(),
                   QStringLiteral("private key file %1").arg(m_identityFile));
+    }
+
+    // SH15: cap the worst-case handshake freeze (see kHandshakeTimeoutSeconds).
+    // Skipped when a user OpenSSH config was parsed above: it may carry a
+    // ConnectTimeout the user set, and libssh offers no getter to tell whether
+    // ssh_options_parse_config() already applied SSH_OPTIONS_TIMEOUT — so
+    // parsing a config at all means this client must not override it.
+    if (!userConfigParsed) {
+        const long handshakeTimeout = kHandshakeTimeoutSeconds;
+        setOption(SSH_OPTIONS_TIMEOUT, &handshakeTimeout,
+                  QStringLiteral("handshake timeout (%1s)")
+                      .arg(kHandshakeTimeoutSeconds));
     }
 
     // libssh 0.12.0's mlkem768x25519-sha256 branch hands ssh_buffer_pack() an
@@ -771,6 +803,69 @@ bool SshConnectionPool::authenticate(const QString& user)
             break;
         }
 
+        case AuthRung::KeyboardInteractive: {
+            // Keyboard-interactive (RFC 4256) is the PAM path many servers use
+            // to carry the account password when the plain 'password' method is
+            // disabled. It is a server-driven challenge/response, but the
+            // overwhelmingly common configuration is a single "Password:"
+            // prompt, so each prompt is answered from the SAME single-secret
+            // request the password rung uses (CredentialKind::Password). A
+            // server asking several distinct questions is answered with that one
+            // secret for each — the documented limitation of mapping a
+            // multi-prompt method onto one secret without changing the callback.
+            int result = ssh_userauth_kbdint(m_session, nullptr, nullptr);
+            bool parked = false;
+            // SSH_AUTH_INFO means "here is a batch of prompts; answer them and
+            // call kbdint again". Re-entered until the server stops asking, but
+            // capped: a server that answers every response with yet another
+            // prompt must not spin the UI thread forever. RFC 4256 exchanges
+            // are a handful of rounds, so this ceiling is never hit in practice.
+            constexpr int kMaxKbdIntRounds = 32;
+            for (int round = 0; result == SSH_AUTH_INFO && round < kMaxKbdIntRounds;
+                 ++round) {
+                const int prompts = ssh_userauth_kbdint_getnprompts(m_session);
+                for (int prompt = 0; prompt < prompts; ++prompt) {
+                    char echo = 0;
+                    const char* promptText = ssh_userauth_kbdint_getprompt(
+                        m_session, static_cast<unsigned int>(prompt), &echo);
+                    const QString promptLabel =
+                        promptText ? QString::fromUtf8(promptText).trimmed()
+                                   : QString();
+                    if (!promptLabel.isEmpty())
+                        appendDiagnostic(
+                            QStringLiteral("Keyboard-interactive prompt: %1")
+                                .arg(promptLabel));
+                    CredentialReply answer =
+                        m_credentialCallback(user, CredentialKind::Password);
+                    if (answer.promptRequested) {
+                        // Same non-blocking contract as the other prompts: give
+                        // up now so the controller can gather the secret and
+                        // retry the whole connect (SPEC 12.1).
+                        appendDiagnostic(QStringLiteral(
+                            "A keyboard-interactive answer is required; "
+                            "abandoning this attempt so it can be requested."));
+                        return false;
+                    }
+                    QByteArray answerUtf8 = answer.secret.toUtf8();
+                    const int setResult = ssh_userauth_kbdint_setanswer(
+                        m_session, static_cast<unsigned int>(prompt),
+                        answerUtf8.constData());
+                    wipeSecret(answerUtf8);
+                    if (setResult < 0) {
+                        // libssh rejected the answer; nothing more can be sent
+                        // on this rung.
+                        parked = true;
+                        break;
+                    }
+                }
+                if (parked)
+                    break;
+                result = ssh_userauth_kbdint(m_session, nullptr, nullptr);
+            }
+            outcome = classifyAuthResult(result);
+            break;
+        }
+
         case AuthRung::Exhausted:
             break;  // unreachable: the loop condition excludes it
         }
@@ -807,8 +902,8 @@ QString SshConnectionPool::authenticationFailure() const
                        "The server accepted %1 and then required a further "
                        "authentication method that CodeHarbor could not "
                        "supply. Check the server's AuthenticationMethods "
-                       "setting: a private key combined with a password is "
-                       "supported, keyboard-interactive is not.")
+                       "setting: a private key combined with a password, or "
+                       "keyboard-interactive, is supported.")
                        .arg(m_partialMethods.join(QStringLiteral(", ")));
         const QString partialLibsshError =
             m_session ? QString::fromUtf8(ssh_get_error(m_session)).trimmed()

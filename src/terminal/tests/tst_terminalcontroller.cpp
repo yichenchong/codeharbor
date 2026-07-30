@@ -98,7 +98,6 @@ private slots:
     void tmuxNewSessionCommandEscapesSubstitutionBacktickNewline();
     void tmuxCommandEscapesAdversarialIds();
     void hiddenReplayPrecedesLaterVisibleOutput();
-    void reconnectBackoffSchedule();
     void isLiveStateClassifiesEveryState();
     void transportOutputIsIngestedIncludingBytesBufferedBeforeAttach();
     void detachedTransportStopsFeedingThePane();
@@ -238,10 +237,9 @@ void TstTerminalController::stateTransitionsEmitInOrder()
             [&seen](TerminalState s) { seen.append(s); });
 
     const QList<TerminalState> sequence = {
-        TerminalState::Connecting,     TerminalState::Authenticating,
         TerminalState::OpeningChannel, TerminalState::AttachingTmux,
         TerminalState::Ready,          TerminalState::Disconnected,
-        TerminalState::Reconnecting,   TerminalState::Error,
+        TerminalState::Error,
     };
     for (TerminalState s : sequence)
         controller.setState(s);
@@ -320,20 +318,6 @@ void TstTerminalController::tmuxNewSessionCommandEscapesShellMetacharacters()
                             " \\; set-option -t '=ch_dev1_term1:' mouse on"));
 }
 
-// Reconnect backoff: 1, 2, 5, 10, 30, then 60 thereafter (SPEC 5.6).
-void TstTerminalController::reconnectBackoffSchedule()
-{
-    QCOMPARE(TerminalController::reconnectDelaySeconds(-1), 1);
-    QCOMPARE(TerminalController::reconnectDelaySeconds(0), 1);
-    QCOMPARE(TerminalController::reconnectDelaySeconds(1), 2);
-    QCOMPARE(TerminalController::reconnectDelaySeconds(2), 5);
-    QCOMPARE(TerminalController::reconnectDelaySeconds(3), 10);
-    QCOMPARE(TerminalController::reconnectDelaySeconds(4), 30);
-    QCOMPARE(TerminalController::reconnectDelaySeconds(5), 60);
-    QCOMPARE(TerminalController::reconnectDelaySeconds(6), 60);
-    QCOMPARE(TerminalController::reconnectDelaySeconds(100), 60);
-}
-
 // Command substitution, backticks, and embedded newlines in the working
 // directory are neutralized by single-quoting: inside single quotes the shell
 // treats $(...), `...`, and a literal newline as data, so nothing executes and
@@ -410,10 +394,7 @@ void TstTerminalController::isLiveStateClassifiesEveryState()
     QVERIFY(TerminalController::isLiveState(TerminalState::Ready));
 
     QVERIFY(!TerminalController::isLiveState(TerminalState::Unloaded));
-    QVERIFY(!TerminalController::isLiveState(TerminalState::Connecting));
-    QVERIFY(!TerminalController::isLiveState(TerminalState::Authenticating));
     QVERIFY(!TerminalController::isLiveState(TerminalState::Disconnected));
-    QVERIFY(!TerminalController::isLiveState(TerminalState::Reconnecting));
     QVERIFY(!TerminalController::isLiveState(TerminalState::Error));
 }
 
@@ -558,10 +539,7 @@ void TstTerminalController::channelEndDropsOnlyALivePane()
     }
 
     const QList<TerminalState> untouched = {TerminalState::Unloaded,
-                                            TerminalState::Connecting,
-                                            TerminalState::Authenticating,
                                             TerminalState::Disconnected,
-                                            TerminalState::Reconnecting,
                                             TerminalState::Error};
     for (TerminalState state : untouched) {
         TerminalController controller;

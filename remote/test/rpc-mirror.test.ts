@@ -25,7 +25,7 @@ import {
     RPC_WORKSPACE_METHODS,
     RPC_WATCH_EVENT_NOTIFICATION,
 } from "../src/rpc-types.ts";
-import { RPC_SCHEMA_VERSION } from "../src/codeharbord.ts";
+import { RPC_SCHEMA_VERSION, MAX_LINE_BYTES } from "../src/codeharbord.ts";
 import { WORKSPACE_METHODS } from "../src/workspace.ts";
 
 const headerPath = fileURLToPath(
@@ -167,5 +167,34 @@ test("the server's schemaVersion equals the client's declared minimum", () => {
         Number(declared[1]),
         `codeharbord reports schemaVersion ${RPC_SCHEMA_VERSION} but the client ` +
             `declares its minimum as ${declared[1]}: bump both together`,
+    );
+});
+
+// A fourth cross-language contract: the maximum bytes one input line may reach
+// before the transport is dropped. The C++ client (kMaxLineBytes in
+// src/remote/CodeharbordClient.cpp) and the server (MAX_LINE_BYTES in
+// codeharbord.ts) must agree, or one end tolerates a frame the other rejects.
+test("the remote line cap matches the C++ kMaxLineBytes", () => {
+    const clientPath = fileURLToPath(
+        new URL("../../src/remote/CodeharbordClient.cpp", import.meta.url),
+    );
+    const source = readFileSync(clientPath, "utf8");
+    // `constexpr int kMaxLineBytes = 16 * 1024 * 1024;` — a product of integer
+    // factors, not a single literal, so capture the RHS and multiply it out. A
+    // regex that no longer matches must FAIL, not silently skip the check.
+    const declared = /constexpr\s+int\s+kMaxLineBytes\s*=\s*([^;]+);/.exec(source);
+    assert.ok(
+        declared,
+        `CodeharbordClient.cpp (${clientPath}) must declare kMaxLineBytes as \`= <expr>;\``,
+    );
+    const cppValue = declared[1]
+        .split("*")
+        .map((factor) => Number(factor.trim()))
+        .reduce((product, factor) => product * factor, 1);
+    assert.equal(
+        MAX_LINE_BYTES,
+        cppValue,
+        `codeharbord caps a line at ${MAX_LINE_BYTES} but the C++ client caps ` +
+            `at ${cppValue}: keep both at 16 MiB`,
     );
 });

@@ -27,6 +27,11 @@ import * as monaco from "monaco-editor/esm/vs/editor/editor.api";
 import "monaco-editor/esm/vs/editor/edcore.main";
 import "monaco-editor/esm/vs/basic-languages/monaco.contribution";
 
+// Pure, DOM-free logic split out so it can be unit-tested without loading the
+// Monaco runtime this module imports above (see language.ts / recovery.ts).
+import { selectLanguage } from "./language";
+import { RecoveryReporter } from "./recovery";
+
 // Monaco's editor worker (diff, link detection, word-based suggestions,
 // unicode highlighting). It is bundled to a sibling script and spawned
 // SAME-ORIGIN: a blob: worker is refused by this page's CSP, and there is no
@@ -96,35 +101,13 @@ export interface MountOptions {
 }
 
 /**
- * Resolve a Monaco language id from a remote path by matching the registered
- * language contributions. An exact FILENAME match wins over an extension match
- * everywhere, hence two passes: a filename registration ("Dockerfile",
- * "Gemfile", ".gitconfig") is the more specific statement, and a single pass
- * would let whichever language happens to be registered first claim the file on
- * its extension alone. Falls back to "plaintext" — the editor must render even
- * for an unknown file type.
+ * Resolve a Monaco language id for the pane's remote path from the live
+ * registration list. The precedence rule (exact filename beats extension) and
+ * the fallback live in selectLanguage (language.ts), which is DOM-free and
+ * unit-tested; this wrapper only supplies monaco.languages.getLanguages().
  */
 export function languageForPath(path: string): string {
-    const slash = Math.max(path.lastIndexOf("/"), path.lastIndexOf("\\"));
-    const name = path.slice(slash + 1);
-    // A leading dot is part of the NAME, not an extension (".gitconfig"), so
-    // only a dot after the first character starts one.
-    const dot = name.lastIndexOf(".");
-    const ext = dot > 0 ? name.slice(dot).toLowerCase() : "";
-    const languages = monaco.languages.getLanguages();
-    for (const lang of languages) {
-        if (lang.filenames?.some((f) => f === name)) {
-            return lang.id;
-        }
-    }
-    if (ext) {
-        for (const lang of languages) {
-            if (lang.extensions?.some((e) => e.toLowerCase() === ext)) {
-                return lang.id;
-            }
-        }
-    }
-    return "plaintext";
+    return selectLanguage(path, monaco.languages.getLanguages());
 }
 
 /** Handle the page bootstrap keeps so it can tear the editor down when the pane
@@ -259,53 +242,24 @@ export function mountEditor(
 
     // ---- crash-recovery snapshots and saves (both send the buffer to C++) ----
     // Debounced snapshot of the unsaved buffer (SPEC 11.3): the host writes it
-    // to a server-side recovery path and marks the file dirty.
-    let reportTimer: number | undefined;
-
-    function cancelReport(): void {
-        clearTimeout(reportTimer);
-        reportTimer = undefined;
-    }
-
-    function scheduleReport(): void {
-        cancelReport();
-        if (!dirty) {
-            // Nothing to recover. Snapshotting a clean buffer would flag the
-            // file dirty on the host for no reason, and a dirty flag suppresses
-            // the automatic reload of a clean buffer (SPEC 8.7).
-            return;
-        }
-        reportTimer = setTimeout(() => {
-            reportTimer = undefined;
-            bridge.reportContent(editor.getValue());
-        }, 500);
-    }
-
-    function flushReport(): void {
-        if (reportTimer === undefined) {
-            return; // nothing pending
-        }
-        cancelReport();
-        bridge.reportContent(editor.getValue());
-    }
+    // to a server-side recovery path and marks the file dirty. The debounce,
+    // the flush, and the save-cancels-the-snapshot rule (SPEC 8.7, WB4) live in
+    // RecoveryReporter (recovery.ts) so they can be unit-tested with a fake
+    // bridge and fake timer.
+    const reporter = new RecoveryReporter(bridge, () => editor.getValue());
 
     /**
-     * Persist the buffer guarded by `revision` (SPEC 8.4/8.6). Cancelling the
-     * pending snapshot is part of saving, not an optimisation: reportContent()
-     * marks the file dirty on the host and rewrites the recovery snapshot, so a
-     * timer allowed to fire AFTER the save succeeded would resurrect a stale
-     * "unsaved changes" copy of an already-saved file (the host discards the
-     * snapshot on a successful save) and would leave the buffer flagged dirty,
-     * which suppresses the automatic reload of a clean buffer on an external
-     * change (SPEC 8.7). A save that FAILS re-arms it: those edits really are
-     * still unsaved.
+     * Persist the buffer guarded by `revision` (SPEC 8.4/8.6). reporter.save()
+     * cancels the pending snapshot before sending, so a timer allowed to fire
+     * AFTER the save succeeded cannot resurrect a stale "unsaved changes" copy
+     * of an already-saved file. A save that FAILS re-arms it (the conflict/error
+     * handlers call reporter.schedule): those edits really are still unsaved.
      */
     function requestSave(revision: string): void {
-        cancelReport();
         // The bytes handed over are the buffer as it is NOW; edits after this
         // point are not in them (see the saved handler).
         baselineEditSerial = editSerial;
-        bridge.save(editor.getValue(), revision);
+        reporter.save(revision);
     }
 
     // ---- signals: C++ -> JS ----
@@ -317,7 +271,7 @@ export function mountEditor(
         clearNotice();
         // A snapshot armed by edits this load supersedes must not be sent: it
         // would re-flag the freshly loaded buffer as dirty.
-        cancelReport();
+        reporter.cancel();
         const model = editor.getModel();
         if (model && model.getValue() === content) {
             // Identical buffer (e.g. reload of unchanged file): just re-baseline.
@@ -362,13 +316,13 @@ export function mountEditor(
         // only way those edits reach the crash-recovery snapshot at all
         // (SPEC 11.3): a successful save discards the previous one. When the
         // debounced report already went out during the write, nothing is pending
-        // and the host is dirty already, so flushReport() is a no-op.
+        // and the host is dirty already, so reporter.flush() is a no-op.
         const editedDuringSave = editSerial !== baselineEditSerial;
         dirty = editedDuringSave;
         clearNotice();
         renderState();
         if (editedDuringSave) {
-            flushReport();
+            reporter.flush();
         }
     });
 
@@ -379,7 +333,7 @@ export function mountEditor(
         clearNotice();
         // The buffer is still unsaved, so keep the recovery snapshot current
         // while the notice waits for the user (requestSave cancelled it).
-        scheduleReport();
+        reporter.schedule(dirty);
         const msg = doc.createElement("span");
         msg.textContent = "File changed on disk.";
         const reload = doc.createElement("button");
@@ -405,7 +359,7 @@ export function mountEditor(
 
     bridge.saveError.connect((message: string) => {
         clearNotice();
-        scheduleReport(); // as above: the buffer is still unsaved
+        reporter.schedule(dirty); // as above: the buffer is still unsaved
         const msg = doc.createElement("span");
         msg.textContent = `Save failed: ${message}`;
         const retry = doc.createElement("button");
@@ -439,12 +393,12 @@ export function mountEditor(
             dirty = true;
             renderState();
         }
-        scheduleReport();
+        reporter.schedule(dirty);
     });
 
     // A host that disposes the editor directly (not through the returned host)
     // must not leave a timer that would call getValue() on a dead editor.
-    editor.onDidDispose(cancelReport);
+    editor.onDidDispose(() => reporter.cancel());
 
     // The file state reached before this page finished loading is already in the
     // property cache, so the label is correct without waiting for a transition
@@ -467,7 +421,7 @@ export function mountEditor(
             // unsaved buffer in existence. The pane is going away (closed, or
             // reloaded because the host retargeted it at another file), so send
             // it now instead of dropping it on the floor (SPEC 11.3).
-            flushReport();
+            reporter.flush();
             // Disposing a standalone editor also disposes the model it created
             // from `value`, so nothing is left behind.
             editor.dispose();

@@ -161,7 +161,7 @@ void TstTerminalFactory::detachAndKillWithoutAnAttachmentAreNoOps()
 
     QObject pane;
     TerminalController* controller = factory.create(&pane);
-    controller->setState(TerminalState::Connecting);
+    controller->setState(TerminalState::Unloaded);
 
     factory.detach(controller);
     factory.detach(nullptr);
@@ -170,7 +170,7 @@ void TstTerminalFactory::detachAndKillWithoutAnAttachmentAreNoOps()
 
     // A pane that never attached is not "dropped": its state is left alone and
     // no phantom failure is reported.
-    QVERIFY(controller->state() == TerminalState::Connecting);
+    QVERIFY(controller->state() == TerminalState::Unloaded);
     QVERIFY(!controller->transport());
     QCOMPARE(errors.count(), 0);
 }

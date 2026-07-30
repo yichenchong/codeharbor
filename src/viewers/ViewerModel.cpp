@@ -103,6 +103,10 @@ QQuickWebEngineProfile *ViewerModel::internalProfile()
 
 void ViewerModel::readTextFile(const QString &path)
 {
+    // Every read gets a fresh generation, so an earlier in-flight read is
+    // implicitly superseded: its reply below sees a stale generation and is
+    // dropped instead of racing this one.
+    const quint64 generation = ++m_textReadGeneration;
     if (!m_client) {
         emit textFileError(path, QStringLiteral("no remote client is connected"));
         return;
@@ -121,8 +125,12 @@ void ViewerModel::readTextFile(const QString &path)
     QPointer<ViewerModel> guard(this);
     m_client->call(
         QString::fromLatin1(rpc::kMethodReadFile), params,
-        [guard, path](QJsonValue result, std::optional<RpcError> error) {
+        [guard, path, generation](QJsonValue result, std::optional<RpcError> error) {
             if (!guard)
+                return;
+            // A newer read (or an explicit cancelTextFile) has superseded this
+            // one: ignore the stale reply.
+            if (generation != guard->m_textReadGeneration)
                 return;
             if (error) {
                 emit guard->textFileError(path, error->message);
@@ -159,6 +167,13 @@ void ViewerModel::readTextFile(const QString &path)
             }
             emit guard->textFileRead(path, text);
         });
+}
+
+void ViewerModel::cancelTextFile()
+{
+    // Advance the generation so any read still in flight is treated as
+    // superseded when its reply arrives (see readTextFile).
+    ++m_textReadGeneration;
 }
 
 void ViewerModel::listDirectory(const QString &path)

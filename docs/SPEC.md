@@ -916,37 +916,46 @@ The client must not store project repositories or project files.
 
 ### 11.3 Unsaved Recovery
 
-Unsaved buffers should be recoverable after client failure.
+Unsaved buffers must be recoverable after client failure.
 
-Recovery snapshots are stored on the server, in a hidden directory beside the file
-being edited. For `/repo/note.txt` the snapshot is:
+Recovery snapshots are stored on the server, one file per editor pane, in a
+dedicated recovery directory under the server's user data location. The server
+reports that absolute directory in its `server.info` result as `recoveryDir`
+(`$XDG_DATA_HOME` or `~/.local/share`, plus `/codeharbor/recovery`); the client
+appends the pane's stable layout id:
 
 ```text
-/repo/.codeharbor-recovery/note.txt
+<recoveryDir>/<paneId>
 ```
 
-This is what `EditorController::recoveryPathFor()` in `src/editor/EditorController.cpp`
-computes, and it is a deliberate choice over a single central directory such as
-`~/.local/share/codeharbor/recovery/`:
+`EditorController::recoveryPath()` in `src/editor/EditorController.cpp` builds
+this, and it is a deliberate choice over a directory beside the edited file:
 
+- One file PER PANE, keyed by the pane's stable id rather than by the edited
+  path. Two panes editing the same file therefore keep independent snapshots
+  instead of sharing (and clobbering) one file, and a snapshot never appears
+  inside the user's repository as an untracked file.
+- The base directory is chosen by the SERVER, not derived from the client's own
+  data location. Recovery writes are remote (section 8.3 `writeFile`), so a
+  client-derived path could name a directory that does not exist, or belongs to
+  a different user, on the server; a server-reported directory is correct on any
+  host. A server too old to report `recoveryDir` leaves the client with recovery
+  disabled rather than guessing a path.
+- Because a pane's single snapshot file is reused as the pane opens different
+  files, each snapshot is SELF-DESCRIBING: it records the remote path it belongs
+  to alongside the buffer, and is offered on open only when that recorded path
+  matches the file now open. A snapshot from a file the pane has since left is
+  never handed back as the current file's unsaved work.
 - The snapshot is written and read through the ordinary remote file methods of
-  section 8.3 (`stat`, `readFile`, `writeFile`). Those are the only file methods in
-  the frozen catalog, so a snapshot must live somewhere the client can already
-  address by path — and a path derived from the edited file needs no client
-  identity, no pane identity, and no extra index to map snapshots back to files.
-- Being a sibling of the file, the snapshot travels with the project: it stays
-  correct across a repository that is moved, and it is visible to the user right
-  where the affected file is.
-- The snapshot is guarded by the same revision tokens as a normal save
-  (section 8.4), which is what makes two clients editing the same file unable to
-  destroy each other's snapshots.
+  section 8.3 (`stat`, `readFile`, `writeFile`) and guarded by the same revision
+  tokens as a normal save (section 8.4), so concurrent writers cannot destroy
+  each other's snapshots.
 
-Confidentiality comes from the directory: `.codeharbor-recovery/` is created with mode
-`0700` (see `writeFile` in `remote/src/files.ts`), so the snapshots inside it are
-unreadable by other users on the server regardless of the individual files' own modes.
-A newly created snapshot file itself gets the service's normal new-file mode, `0644`
-masked by the process umask, because it is written by the same generic `writeFile`
-used for project files.
+Confidentiality comes from the file mode: each snapshot is written with mode
+`0600` through `writeFile`'s optional `mode` parameter, so it is readable and
+writable by its owner only, regardless of the process umask. The recovery
+directory itself is created by `writeFile`'s recursive parent creation at mode
+`0700` (`remote/src/files.ts`).
 
 ---
 

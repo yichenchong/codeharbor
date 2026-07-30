@@ -67,6 +67,7 @@ private slots:
     void unknownStateStringMapsToUnknown();
     void perTerminalStateIsIndependent();
     void unseenIsPerDevSession();
+    void retainDevSessionsEvictsStaleSubtrees();
     void completionAfterMarkSeenReArmsUnseen();
     void crlfFramedLinesAreAccepted();
     void transportDestroyedThenRebindIsSafe();
@@ -556,6 +557,36 @@ void TstAgentMonitor::unseenIsPerDevSession()
     QCOMPARE(m_monitor->stateFor("dB", "tB"), asInt(AgentState::IdleUnseen));
     // A terminal id is only meaningful inside its own Dev Session.
     QCOMPARE(m_monitor->stateFor("dA", "tB"), asInt(AgentState::Unknown));
+}
+
+// AG7: retainDevSessions() evicts whole Dev Session subtrees for ids the server
+// no longer lists, and only those — the surviving Dev Session keeps every
+// terminal state and its unseen flag, while the removed one loses both at once.
+void TstAgentMonitor::retainDevSessionsEvictsStaleSubtrees()
+{
+    makePair();
+
+    // Seed two Dev Sessions: A with two terminals (one finished unseen), B with
+    // one finished-unseen terminal. Both carry per-terminal state and an unseen
+    // flag.
+    feed(eventLine("idle_unseen", "A", "ta1"));
+    feed(eventLine("running", "A", "ta2"));
+    feed(eventLine("idle_unseen", "B", "tb1"));
+    QTRY_COMPARE(m_monitor->stateFor("B", "tb1"), asInt(AgentState::IdleUnseen));
+    QVERIFY(m_monitor->hasUnseen("A"));
+    QVERIFY(m_monitor->hasUnseen("B"));
+
+    // Rebuild lists only A: B's subtree and unseen flag are dropped whole.
+    m_monitor->retainDevSessions({QStringLiteral("A")});
+
+    // A survives intact.
+    QCOMPARE(m_monitor->stateFor("A", "ta1"), asInt(AgentState::IdleUnseen));
+    QCOMPARE(m_monitor->stateFor("A", "ta2"), asInt(AgentState::Running));
+    QVERIFY(m_monitor->hasUnseen("A"));
+
+    // B is gone: both its terminal state and its unseen flag.
+    QCOMPARE(m_monitor->stateFor("B", "tb1"), asInt(AgentState::Unknown));
+    QVERIFY(!m_monitor->hasUnseen("B"));
 }
 
 // REGRESSION: a completion that arrives after the user cleared the previous one

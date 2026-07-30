@@ -1,5 +1,6 @@
 import QtQuick
 import QtQuick.Controls.Basic
+import "RemotePath.js" as RemotePath
 
 // Read-only remote text / source view (SPEC 7.5). Content is fetched over the
 // remote file service via ViewerModel.readTextFile (file.readFile). Editing is
@@ -20,21 +21,17 @@ Rectangle {
     // Remote path for file.readFile: strip the file:// scheme, leaving the
     // server-absolute path (a remote file:// URL never carries a host).
     function remotePath(u) {
-        var s = u.toString();
-        if (s.indexOf("file://") === 0)
-            return decodeURIComponent(s.substring("file://".length));
-        return s;
+        return RemotePath.fileUrlToPath(u.toString());
     }
 
-    // Start reading the current URL. A read already in flight for a PREVIOUS URL
-    // is NOT cancelled: ch::ViewerModel (src/viewers/ViewerModel.h) exposes only
-    // readTextFile(path) and answers with textFileRead/textFileError, and has no
-    // cancel entry point at all. The abandoned read therefore runs to completion
-    // on the connection and its answer is discarded here by the path comparison
-    // in the Connections block below — correct on screen, but it does occupy the
-    // remote file service until it finishes. Cancelling it properly needs a new
-    // method on ch::ViewerModel; there is nothing QML can do about it today.
+    // Start reading the current URL. Any read still in flight for a PREVIOUS
+    // URL is cancelled first via viewers.cancelTextFile(): ch::ViewerModel
+    // (src/viewers/ViewerModel.h) advances its request generation so the stale
+    // reply is dropped instead of continuing to occupy the remote file service.
+    // The path comparison in the Connections block below is kept as defence in
+    // depth.
     function reload() {
+        viewers.cancelTextFile();
         root.content = "";
         root.errorText = "";
         root.loading = root.url.toString().length > 0;

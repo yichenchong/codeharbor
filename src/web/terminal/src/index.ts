@@ -7,6 +7,8 @@ import { FitAddon } from "@xterm/addon-fit";
 // Side-effect import: esbuild pulls xterm's stylesheet out of the JS graph into
 // dist/terminal.css, which the packaged page links (see build.mjs).
 import "@xterm/xterm/css/xterm.css";
+// Pure, DOM-free predicate split out so it can be unit-tested (see visibility.ts).
+import { isRendererVisible } from "./visibility";
 
 export interface TerminalBridge {
     /** Forward user keystrokes to the remote PTY (SPEC 5.1). */
@@ -52,7 +54,6 @@ export function mountTerminal(element: HTMLElement, bridge: TerminalBridge): Ter
     // arrives as a browser paste event on xterm.js's hidden textarea, never as a
     // mouse report.
     const term = new Terminal({
-        allowProposedApi: true,
         cursorBlink: true,
         fontFamily: "monospace",
         fontSize: 13,
@@ -174,7 +175,7 @@ export function mountTerminal(element: HTMLElement, bridge: TerminalBridge): Ter
     let intersecting = true;
     function reportVisibility(): void {
         bridge.notifyViewVisible(
-            intersecting && element.ownerDocument.visibilityState === "visible",
+            isRendererVisible(intersecting, element.ownerDocument.visibilityState),
         );
     }
     const visibilityObserver = new IntersectionObserver((entries) => {

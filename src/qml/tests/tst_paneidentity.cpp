@@ -564,6 +564,11 @@ void TstPaneIdentity::editorPaneSurvivesASplit()
         qobject_cast<ch::EditorController *>(asObject(originalEditor->property("controller")));
     QVERIFY2(controller != nullptr, "the editor pane never minted a controller");
     QPointer<ch::EditorController> controllerGuard(controller);
+    // ED15: the per-pane recovery key must be THIS pane's id, never the empty
+    // string a pane starts with before its layout id settles (two panes keyed by
+    // "" would share one crash-recovery snapshot). QTRY: the id can arrive a beat
+    // after the controller is minted.
+    QTRY_COMPARE(controller->recoveryId(), QStringLiteral("viewer-1"));
 
     setNode(branchNode(QStringLiteral("vertical"),
                        QVariantList{leafNode(QStringLiteral("viewer-1"), fileUrl),

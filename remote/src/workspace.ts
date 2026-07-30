@@ -20,6 +20,14 @@ import path from "node:path";
 
 import { RPC_WORKSPACE_METHODS as M } from "./rpc-types.ts";
 import type { RpcWorkspaceMethodName } from "./rpc-types.ts";
+import {
+    requireObject,
+    requireString,
+    optionalString,
+    requireStringArray,
+    optionalNumber,
+    optionalBoolean,
+} from "./validate.ts";
 
 // Current schema version. Mirrors schema_version in remote/sql/schema.sql and
 // WorkspaceDb::kSchemaVersion (bump all three together — see schema.sql header).
@@ -351,6 +359,39 @@ function remapPaneIds(node: unknown, idMap: Record<string, string>): unknown {
     }
     if (n.type === "split" && Array.isArray(n.children)) {
         return { ...n, children: n.children.map((child) => remapPaneIds(child, idMap)) };
+    }
+    return node;
+}
+
+// Remove the leaf that references `paneId` from a split tree (SPEC 4.5),
+// repairing structure so no surviving leaf points at a deleted pane. Returns
+// the rewritten node, or null when the whole subtree drained (the caller then
+// substitutes a single empty leaf). A split left with exactly one child
+// promotes that child in place; surviving children keep parallel, renormalized
+// ratios — SplitNode::toJson / parseNode in src/models/SplitTree.cpp require
+// one finite, positive ratio per child. Shape matches remapPaneIds above.
+function removePaneFromTree(node: unknown, paneId: string): unknown | null {
+    if (node === null || typeof node !== "object") return node;
+    const n = node as Record<string, unknown>;
+    if (n.type === "leaf") {
+        return n.paneId === paneId ? null : node;
+    }
+    if (n.type === "split" && Array.isArray(n.children)) {
+        const ratios = Array.isArray(n.ratios) ? n.ratios : [];
+        const keptChildren: unknown[] = [];
+        const keptRatios: number[] = [];
+        n.children.forEach((child, i) => {
+            const repaired = removePaneFromTree(child, paneId);
+            if (repaired === null) return;
+            keptChildren.push(repaired);
+            const r = ratios[i];
+            keptRatios.push(typeof r === "number" && Number.isFinite(r) && r > 0 ? r : 1);
+        });
+        if (keptChildren.length === 0) return null;
+        if (keptChildren.length === 1) return keptChildren[0];
+        const sum = keptRatios.reduce((a, b) => a + b, 0);
+        const normalized = keptRatios.map((r) => r / sum);
+        return { ...n, children: keptChildren, ratios: normalized };
     }
     return node;
 }
@@ -875,9 +916,21 @@ export class Workspace {
         });
     }
 
+    // Delete a viewer pane, then repair the region's stored split layout so no
+    // leaf still references it. The server is AUTHORITATIVE for this integrity
+    // invariant — a stored layout never references a deleted pane. The client
+    // still authors trees (it rewrites and saves a layout when it closes a
+    // pane), but the server enforces delete-consistency for any client or path
+    // that deletes a pane without a following layout save (RW13).
     deleteViewerPane(params: { id: string }): { ok: true } {
-        this.db.prepare("DELETE FROM viewer_panes WHERE id = ?").run(params.id);
-        return { ok: true };
+        return this.transaction(() => {
+            const row = this.db
+                .prepare("SELECT dev_session_id FROM viewer_panes WHERE id = ?")
+                .get(params.id) as { dev_session_id: string } | undefined;
+            this.db.prepare("DELETE FROM viewer_panes WHERE id = ?").run(params.id);
+            if (row) this.repairLayout(row.dev_session_id, "viewer", params.id);
+            return { ok: true };
+        });
     }
 
     // --- Terminal panes -----------------------------------------------------
@@ -939,9 +992,21 @@ export class Workspace {
         });
     }
 
+    // Delete a terminal pane, then repair the region's stored split layout so no
+    // leaf still references it. The server is AUTHORITATIVE for this integrity
+    // invariant — a stored layout never references a deleted pane. The client
+    // still authors trees (it rewrites and saves a layout when it closes a
+    // pane), but the server enforces delete-consistency for any client or path
+    // that deletes a pane without a following layout save (RW13).
     deleteTerminalPane(params: { id: string }): { ok: true } {
-        this.db.prepare("DELETE FROM terminal_panes WHERE id = ?").run(params.id);
-        return { ok: true };
+        return this.transaction(() => {
+            const row = this.db
+                .prepare("SELECT dev_session_id FROM terminal_panes WHERE id = ?")
+                .get(params.id) as { dev_session_id: string } | undefined;
+            this.db.prepare("DELETE FROM terminal_panes WHERE id = ?").run(params.id);
+            if (row) this.repairLayout(row.dev_session_id, "terminal", params.id);
+            return { ok: true };
+        });
     }
 
     // --- Split layouts ------------------------------------------------------
@@ -951,12 +1016,25 @@ export class Workspace {
             .prepare("SELECT * FROM session_layouts WHERE dev_session_id = ? AND region = ?")
             .get(params.devSessionId, params.region) as SessionLayoutRow | undefined;
         if (!row) return null;
+        // A stored tree that no longer parses must not fail the read: report the
+        // region as having no layout (self-heal) rather than throw. RW13 makes
+        // the server authoritative over layout integrity, so a corrupt blob can
+        // only originate from outside this store (RW14).
+        let tree: unknown;
+        try {
+            tree = JSON.parse(row.tree);
+        } catch {
+            console.error(
+                `workspace: ignoring unparseable layout tree for dev_session_id=${row.dev_session_id} region=${row.region}`,
+            );
+            return null;
+        }
         return {
             id: row.id,
             serverId: row.server_id,
             devSessionId: row.dev_session_id,
             region: row.region,
-            tree: JSON.parse(row.tree),
+            tree,
             createdAt: row.created_at,
             updatedAt: row.updated_at,
         };
@@ -993,6 +1071,33 @@ export class Workspace {
             );
         // Guaranteed present after the upsert above.
         return this.getLayout(params) as SessionLayout;
+    }
+
+    // Repair a region's stored split layout after `paneId`'s row was deleted, so
+    // no leaf still references it (RW13). A no-op when no layout row exists.
+    // A drained tree collapses to a single empty leaf { type: "leaf", paneId: "" },
+    // exactly how the client represents an empty region (see remapPaneIds). Only
+    // the tree and updated_at change; the row's id, created_at, and server_id are
+    // left untouched, matching setLayout's identity-preserving semantics. Callers
+    // must already be inside a transaction (both delete methods are).
+    private repairLayout(devSessionId: string, region: Region, paneId: string): void {
+        const row = this.db
+            .prepare("SELECT * FROM session_layouts WHERE dev_session_id = ? AND region = ?")
+            .get(devSessionId, region) as SessionLayoutRow | undefined;
+        if (!row) return;
+        let tree: unknown;
+        try {
+            tree = JSON.parse(row.tree);
+        } catch {
+            // Already-broken blob; the self-healing read path (getLayout/
+            // getLayouts) reports it as null. Nothing to repair here.
+            return;
+        }
+        const repaired = removePaneFromTree(tree, paneId);
+        const finalTree = repaired === null ? { type: "leaf", paneId: "" } : repaired;
+        this.db
+            .prepare("UPDATE session_layouts SET tree = ?, updated_at = ? WHERE id = ?")
+            .run(JSON.stringify(finalTree), Date.now(), row.id);
     }
 
     // --- Nested read --------------------------------------------------------
@@ -1040,7 +1145,17 @@ export class Workspace {
         const rows = this.db
             .prepare("SELECT region, tree FROM session_layouts WHERE dev_session_id = ?").all(sessionId) as unknown as Array<{ region: Region; tree: string }>;
         const layouts: SessionLayouts = { viewer: null, terminal: null };
-        for (const r of rows) layouts[r.region] = JSON.parse(r.tree);
+        // A single corrupt tree must not fail the whole nested listing: skip it
+        // (leaving that region null / self-healed) rather than throw (RW14).
+        for (const r of rows) {
+            try {
+                layouts[r.region] = JSON.parse(r.tree);
+            } catch {
+                console.error(
+                    `workspace: ignoring unparseable layout tree for dev_session_id=${sessionId} region=${r.region}`,
+                );
+            }
+        }
         return layouts;
     }
 
@@ -1198,27 +1313,146 @@ export function serverIdentity(): string {
 // literal that can drift apart silently.
 export const WORKSPACE_METHODS: Record<RpcWorkspaceMethodName, (params: unknown) => unknown> = {
     [M.list]: (p) => {
-        if (typeof p !== "object" || p === null || !("serverId" in p) || typeof p.serverId !== "string") {
-            throw new Error(`${M.list} requires a string serverId`);
-        }
-        return workspace().list(p.serverId);
+        const o = requireObject(p, M.list);
+        requireString(o, "serverId", M.list);
+        return workspace().list(o.serverId as string);
     },
-    [M.createGroup]: (p) => workspace().createGroup(p as CreateGroupParams),
-    [M.updateGroup]: (p) => workspace().updateGroup(p as UpdateGroupParams),
-    [M.deleteGroup]: (p) => workspace().deleteGroup(p as { id: string }),
-    [M.reorderGroups]: (p) => workspace().reorderGroups(p as { serverId: string; orderedIds: string[] }),
-    [M.createSession]: (p) => workspace().createSession(p as CreateSessionParams),
-    [M.updateSession]: (p) => workspace().updateSession(p as UpdateSessionParams),
-    [M.deleteSession]: (p) => workspace().deleteSession(p as { id: string }),
-    [M.reorderSessions]: (p) => workspace().reorderSessions(p as { groupId: string; orderedIds: string[] }),
-    [M.moveSessionToGroup]: (p) => workspace().moveSessionToGroup(p as MoveSessionParams),
-    [M.duplicateSession]: (p) => workspace().duplicateSession(p as { id: string }),
-    [M.createViewerPane]: (p) => workspace().createViewerPane(p as CreateViewerPaneParams),
-    [M.updateViewerPane]: (p) => workspace().updateViewerPane(p as UpdateViewerPaneParams),
-    [M.deleteViewerPane]: (p) => workspace().deleteViewerPane(p as { id: string }),
-    [M.createTerminalPane]: (p) => workspace().createTerminalPane(p as CreateTerminalPaneParams),
-    [M.updateTerminalPane]: (p) => workspace().updateTerminalPane(p as UpdateTerminalPaneParams),
-    [M.deleteTerminalPane]: (p) => workspace().deleteTerminalPane(p as { id: string }),
-    [M.getLayout]: (p) => workspace().getLayout(p as GetLayoutParams),
-    [M.setLayout]: (p) => workspace().setLayout(p as SetLayoutParams),
+    [M.createGroup]: (p) => {
+        const o = requireObject(p, M.createGroup);
+        requireString(o, "serverId", M.createGroup);
+        requireString(o, "name", M.createGroup);
+        optionalNumber(o, "position", M.createGroup);
+        optionalBoolean(o, "collapsed", M.createGroup);
+        return workspace().createGroup(p as CreateGroupParams);
+    },
+    [M.updateGroup]: (p) => {
+        const o = requireObject(p, M.updateGroup);
+        requireString(o, "id", M.updateGroup);
+        optionalString(o, "name", M.updateGroup);
+        optionalNumber(o, "position", M.updateGroup);
+        optionalBoolean(o, "collapsed", M.updateGroup);
+        return workspace().updateGroup(p as UpdateGroupParams);
+    },
+    [M.deleteGroup]: (p) => {
+        const o = requireObject(p, M.deleteGroup);
+        requireString(o, "id", M.deleteGroup);
+        return workspace().deleteGroup(p as { id: string });
+    },
+    [M.reorderGroups]: (p) => {
+        const o = requireObject(p, M.reorderGroups);
+        requireString(o, "serverId", M.reorderGroups);
+        requireStringArray(o, "orderedIds", M.reorderGroups);
+        return workspace().reorderGroups(p as { serverId: string; orderedIds: string[] });
+    },
+    [M.createSession]: (p) => {
+        const o = requireObject(p, M.createSession);
+        requireString(o, "serverId", M.createSession);
+        requireString(o, "groupId", M.createSession);
+        requireString(o, "name", M.createSession);
+        requireString(o, "repositoryRoot", M.createSession);
+        optionalString(o, "defaultWorkingDirectory", M.createSession);
+        optionalString(o, "taskDescription", M.createSession);
+        optionalNumber(o, "position", M.createSession);
+        optionalBoolean(o, "archived", M.createSession);
+        return workspace().createSession(p as CreateSessionParams);
+    },
+    [M.updateSession]: (p) => {
+        const o = requireObject(p, M.updateSession);
+        requireString(o, "id", M.updateSession);
+        optionalString(o, "name", M.updateSession);
+        optionalString(o, "repositoryRoot", M.updateSession);
+        optionalString(o, "defaultWorkingDirectory", M.updateSession);
+        optionalString(o, "taskDescription", M.updateSession);
+        optionalNumber(o, "position", M.updateSession);
+        optionalBoolean(o, "archived", M.updateSession);
+        return workspace().updateSession(p as UpdateSessionParams);
+    },
+    [M.deleteSession]: (p) => {
+        const o = requireObject(p, M.deleteSession);
+        requireString(o, "id", M.deleteSession);
+        return workspace().deleteSession(p as { id: string });
+    },
+    [M.reorderSessions]: (p) => {
+        const o = requireObject(p, M.reorderSessions);
+        requireString(o, "groupId", M.reorderSessions);
+        requireStringArray(o, "orderedIds", M.reorderSessions);
+        return workspace().reorderSessions(p as { groupId: string; orderedIds: string[] });
+    },
+    [M.moveSessionToGroup]: (p) => {
+        const o = requireObject(p, M.moveSessionToGroup);
+        requireString(o, "id", M.moveSessionToGroup);
+        requireString(o, "groupId", M.moveSessionToGroup);
+        optionalNumber(o, "position", M.moveSessionToGroup);
+        return workspace().moveSessionToGroup(p as MoveSessionParams);
+    },
+    [M.duplicateSession]: (p) => {
+        const o = requireObject(p, M.duplicateSession);
+        requireString(o, "id", M.duplicateSession);
+        return workspace().duplicateSession(p as { id: string });
+    },
+    [M.createViewerPane]: (p) => {
+        const o = requireObject(p, M.createViewerPane);
+        requireString(o, "serverId", M.createViewerPane);
+        requireString(o, "devSessionId", M.createViewerPane);
+        requireString(o, "url", M.createViewerPane);
+        optionalString(o, "handler", M.createViewerPane);
+        optionalString(o, "title", M.createViewerPane);
+        optionalNumber(o, "position", M.createViewerPane);
+        return workspace().createViewerPane(p as CreateViewerPaneParams);
+    },
+    [M.updateViewerPane]: (p) => {
+        const o = requireObject(p, M.updateViewerPane);
+        requireString(o, "id", M.updateViewerPane);
+        optionalString(o, "url", M.updateViewerPane);
+        optionalString(o, "handler", M.updateViewerPane);
+        optionalString(o, "title", M.updateViewerPane);
+        optionalNumber(o, "position", M.updateViewerPane);
+        return workspace().updateViewerPane(p as UpdateViewerPaneParams);
+    },
+    [M.deleteViewerPane]: (p) => {
+        const o = requireObject(p, M.deleteViewerPane);
+        requireString(o, "id", M.deleteViewerPane);
+        return workspace().deleteViewerPane(p as { id: string });
+    },
+    [M.createTerminalPane]: (p) => {
+        const o = requireObject(p, M.createTerminalPane);
+        requireString(o, "serverId", M.createTerminalPane);
+        requireString(o, "devSessionId", M.createTerminalPane);
+        requireString(o, "name", M.createTerminalPane);
+        optionalString(o, "workingDirectory", M.createTerminalPane);
+        optionalString(o, "tmuxTarget", M.createTerminalPane);
+        optionalString(o, "startupCommand", M.createTerminalPane);
+        optionalString(o, "harness", M.createTerminalPane);
+        optionalNumber(o, "position", M.createTerminalPane);
+        return workspace().createTerminalPane(p as CreateTerminalPaneParams);
+    },
+    [M.updateTerminalPane]: (p) => {
+        const o = requireObject(p, M.updateTerminalPane);
+        requireString(o, "id", M.updateTerminalPane);
+        optionalString(o, "name", M.updateTerminalPane);
+        optionalString(o, "workingDirectory", M.updateTerminalPane);
+        optionalString(o, "tmuxTarget", M.updateTerminalPane);
+        optionalString(o, "startupCommand", M.updateTerminalPane);
+        optionalString(o, "harness", M.updateTerminalPane);
+        optionalNumber(o, "position", M.updateTerminalPane);
+        return workspace().updateTerminalPane(p as UpdateTerminalPaneParams);
+    },
+    [M.deleteTerminalPane]: (p) => {
+        const o = requireObject(p, M.deleteTerminalPane);
+        requireString(o, "id", M.deleteTerminalPane);
+        return workspace().deleteTerminalPane(p as { id: string });
+    },
+    [M.getLayout]: (p) => {
+        const o = requireObject(p, M.getLayout);
+        requireString(o, "devSessionId", M.getLayout);
+        requireString(o, "region", M.getLayout);
+        return workspace().getLayout(p as GetLayoutParams);
+    },
+    [M.setLayout]: (p) => {
+        const o = requireObject(p, M.setLayout);
+        requireString(o, "serverId", M.setLayout);
+        requireString(o, "devSessionId", M.setLayout);
+        requireString(o, "region", M.setLayout);
+        return workspace().setLayout(p as SetLayoutParams);
+    },
 };

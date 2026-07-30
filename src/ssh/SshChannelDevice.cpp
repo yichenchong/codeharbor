@@ -299,7 +299,10 @@ qint64 SshChannelDevice::writeData(const char* data, qint64 maxSize)
 
     // The session is in blocking mode, so ssh_channel_write() normally consumes
     // the whole chunk; loop anyway so a short write is resumed rather than
-    // silently truncating a JSON-RPC frame.
+    // silently truncating a JSON-RPC frame. Each ssh_channel_write() is bounded
+    // by the session's SSH_OPTIONS_TIMEOUT (set at connect: kHandshakeTimeoutSeconds,
+    // or the user's OpenSSH ConnectTimeout), so a wedged remote reader stalls
+    // this call for at most that timeout rather than indefinitely (SH15).
     qint64 written = 0;
     while (written < maxSize) {
         const qint64 chunk = qMin<qint64>(maxSize - written, kChunkBytes);

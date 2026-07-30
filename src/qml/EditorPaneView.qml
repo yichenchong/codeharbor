@@ -2,6 +2,7 @@ import QtQuick
 import QtQuick.Controls.Basic
 import QtWebEngine
 import QtWebChannel
+import "RemotePath.js" as RemotePath
 
 // Remote editor pane (SPEC 8.1). Hosts the TRUSTED, app-owned Monaco editor
 // bundle (src/web/editor) in a WebEngineView and bridges it to the C++
@@ -45,18 +46,38 @@ Item {
     // context-property lookup throws, which aborts the whole binding pass that
     // was building the pane); also the seam a test injects a stub through.
     //
-    // The pane's OTHER injected object, `viewers`, is deliberately used
-    // unguarded, exactly as every viewer view does (ViewerImageView,
-    // ViewerPdfView, ViewerBinaryView) — it supplies the WebEngine profile, and
-    // there is no useful pane without one. Nothing can instantiate this pane
-    // without it either: the only thing that creates an EditorPaneView is
-    // ViewerPane, which has already called viewers.viewKind() to decide that the
-    // file belongs here.
+    // The pane's OTHER injected object, `viewers`, is guarded the same way, so a
+    // bare load of this component degrades to inert chrome (a WebEngineView on
+    // the default profile, no bridge) instead of a ReferenceError that aborts
+    // the whole binding pass that was building the pane. Every host and every
+    // test that drives a working pane installs it — the only thing that creates
+    // an EditorPaneView is ViewerPane, which has already called
+    // viewers.viewKind() to decide the file belongs here — but a bare
+    // inspection load no longer has to.
     property var factory: (typeof editorFactory !== "undefined") ? editorFactory : null
 
-    // The ch::EditorController for this pane, created per-pane by that factory
-    // and owned by this pane (destroyed with it); overridable for tests.
-    property var controller: root.factory ? root.factory.create(root) : null
+    // The `viewers` context property (ViewerModel), resolved once and guarded
+    // exactly like `factory` above: it supplies the privileged WebEngine profile
+    // that permits the WebChannel bridge.
+    property var viewerModel: (typeof viewers !== "undefined") ? viewers : null
+
+    // This pane's stable layout id, set by ViewerPane. Passed to the factory so
+    // the controller keys its crash-recovery snapshot per pane (SPEC 11.3), and
+    // two panes editing one path never share a snapshot.
+    //
+    // Deliberately NOT named `paneId`: that name identifies a leaf-pane WRAPPER
+    // (ViewerPane/TerminalPaneView carry `paneId` and no `node`), and a content
+    // view that also exposed `paneId` would be miscounted as a second leaf by
+    // anything walking the region tree by that convention.
+    property string recoveryPaneId: ""
+
+    // The ch::EditorController for this pane, minted ONCE in Component.onCompleted
+    // (below) rather than as a reactive binding: binding create() to a mutable
+    // property such as recoveryPaneId would re-run it when that property settles,
+    // minting a SECOND controller and orphaning the first — the one that already
+    // opened the file and holds its revision guard. Owned by this pane (destroyed
+    // with it); a test may pre-assign a stub before Component.onCompleted runs.
+    property var controller: null
 
     // Entry page of the trusted editor bundle. Embedded into this QML module's
     // resources by src/qml/CMakeLists.txt; overridable by a host or test that
@@ -69,7 +90,7 @@ Item {
     // `fileUrl` as the plain remote path the RPC layer speaks (SPEC 8.3):
     // file:// inside CodeHarbor always means the remote SSH server.
     readonly property string remotePath: fileUrl.toString().length > 0
-        ? decodeURIComponent(fileUrl.toString().replace(/^file:\/\//, ""))
+        ? RemotePath.fileUrlToPath(fileUrl.toString())
         : ""
 
     // Set once Component.onCompleted has registered the bridge object, so a
@@ -110,7 +131,7 @@ Item {
         // Privileged profile: permits the WebChannel bridge (the external
         // profile deliberately does not — SPEC 7.2). The bundle is trusted app
         // code, so scripting is intentionally on.
-        profile: viewers.internalProfile()
+        profile: root.viewerModel ? root.viewerModel.internalProfile() : null
         settings.javascriptEnabled: true
         settings.localContentCanAccessFileUrls: false
         settings.localContentCanAccessRemoteUrls: false
@@ -240,10 +261,21 @@ Item {
     onFileUrlChanged: if (root.started) root.start()
     onEditorBundleUrlChanged: if (root.started) root.navigate()
 
+    // The pane's layout id can settle (""->"viewer-1") AFTER the controller is
+    // minted, so push every change through to the controller's recovery key
+    // rather than capturing it once at create() time — otherwise two panes on
+    // one file would key their crash-recovery snapshots by the same empty id
+    // and share one (SPEC 11.3, ED15).
+    onRecoveryPaneIdChanged: if (root.controller) root.controller.setRecoveryId(root.recoveryPaneId)
+
     // Register the controller under the EXACT object name "editor" required by
     // the frozen C3 contract (channel.objects.editor on the JS side) BEFORE the
     // first navigation, so the page's WebChannel handshake always finds it.
     Component.onCompleted: {
+        // Mint the controller once, here, so create() is not in a reactive
+        // binding (see `controller` above). A pre-assigned stub is kept.
+        if (!root.controller && root.factory)
+            root.controller = root.factory.create(root, root.recoveryPaneId)
         if (root.controller)
             editorChannel.registerObject("editor", root.controller)
         root.started = true

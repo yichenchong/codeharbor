@@ -444,11 +444,9 @@ SessionBootstrap::parseInspection(const QString& output)
 
 int SessionBootstrap::reconnectDelaySeconds(int attempt)
 {
-    // Same ladder as TerminalController::reconnectDelaySeconds() (SPEC 5.6),
-    // mirrored rather than called: ch_app does not link ch_terminal, and adding
-    // that edge for one arithmetic helper would couple the app library to the
-    // terminal subsystem. tst_sessionbootstrap pins the identical vector as
-    // tst_terminalcontroller so the two cannot silently drift.
+    // The connection retry ladder (SPEC 5.6): this is the sole implementation —
+    // reconnect is driven at the session level, not per terminal pane.
+    // tst_sessionbootstrap pins this exact vector against the spec.
     static constexpr int schedule[] = {1, 2, 5, 10, 30};
     constexpr int count = static_cast<int>(sizeof(schedule) / sizeof(schedule[0]));
     if (attempt < 0)

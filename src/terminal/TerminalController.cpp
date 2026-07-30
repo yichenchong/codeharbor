@@ -253,19 +253,14 @@ bool TerminalController::isLiveState(TerminalState state)
 {
     // A pane only has a channel to lose from the moment the channel is being
     // opened until it ends. Unloaded (never attached), Disconnected and Error
-    // are terminal for this purpose; Connecting/Authenticating/Reconnecting
-    // describe the session, not this pane's channel, so a channel end must not
-    // overwrite them either (SPEC 5.6).
+    // are terminal for this purpose (SPEC 5.6).
     switch (state) {
     case TerminalState::OpeningChannel:
     case TerminalState::AttachingTmux:
     case TerminalState::Ready:
         return true;
     case TerminalState::Unloaded:
-    case TerminalState::Connecting:
-    case TerminalState::Authenticating:
     case TerminalState::Disconnected:
-    case TerminalState::Reconnecting:
     case TerminalState::Error:
         return false;
     }
@@ -315,17 +310,6 @@ QString TerminalController::tmuxNewSessionCommand(const DevSessionId &devSession
     return QStringLiteral("tmux new-session -A -s %1 -c %2 \\; set-option -t %3 mouse on")
         .arg(shellSingleQuote(target), shellSingleQuote(workingDir),
              shellSingleQuote(QLatin1Char('=') + target + QLatin1Char(':')));
-}
-
-int TerminalController::reconnectDelaySeconds(int attempt)
-{
-    static constexpr int schedule[] = {1, 2, 5, 10, 30};
-    constexpr int count = static_cast<int>(sizeof(schedule) / sizeof(schedule[0]));
-    if (attempt < 0)
-        return schedule[0];
-    if (attempt < count)
-        return schedule[attempt];
-    return 60;
 }
 
 } // namespace ch

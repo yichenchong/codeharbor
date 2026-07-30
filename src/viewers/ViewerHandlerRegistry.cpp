@@ -107,7 +107,29 @@ ViewerResolution ViewerHandlerRegistry::resolve(const QUrl &url)
         // A remote directory is expressed as a file URL with a trailing slash.
         if (path.endsWith(QLatin1Char('/')))
             return ViewerResolution::DirectoryViewer;
-        return resolveByExtension(extensionOf(path));
+        const QString ext = extensionOf(path);
+        // Extension-based dispatch cannot classify extensionless files, and
+        // extensionOf() reports dotfiles as extensionless too. Match a table of
+        // well-known extensionless names and dotfiles (case-sensitive as
+        // written) by basename so they open as text instead of falling through
+        // to the binary Download pane.
+        if (ext.isEmpty()) {
+            static const QSet<QString> kTextNames = {
+                QStringLiteral("Makefile"),      QStringLiteral("Dockerfile"),
+                QStringLiteral("LICENSE"),       QStringLiteral("COPYING"),
+                QStringLiteral("README"),        QStringLiteral("CHANGELOG"),
+                QStringLiteral("AUTHORS"),       QStringLiteral("NOTICE"),
+                QStringLiteral(".bashrc"),       QStringLiteral(".zshrc"),
+                QStringLiteral(".profile"),      QStringLiteral(".gitignore"),
+                QStringLiteral(".gitattributes"),QStringLiteral(".editorconfig"),
+                QStringLiteral(".env"),
+            };
+            const int slash = path.lastIndexOf(QLatin1Char('/'));
+            const QString name = slash >= 0 ? path.mid(slash + 1) : path;
+            if (kTextNames.contains(name))
+                return ViewerResolution::TextEditor;
+        }
+        return resolveByExtension(ext);
     }
 
     return ViewerResolution::Error;

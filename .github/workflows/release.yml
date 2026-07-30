@@ -161,7 +161,8 @@ jobs:
       # load-bearing as the editor one, and CMake's npm fallback that used to
       # cover it does not work on Windows.
       - name: Build web bundles (must precede CMake configure)
-        run: npm install && npm run build
+        # npm ci requires an up-to-date package-lock.json (installs from it strictly).
+        run: npm ci && npm run build
         shell: bash
 
       # --- configure + build ---------------------------------------------------
@@ -174,6 +175,26 @@ jobs:
 
       - name: Build
         run: cmake --build --preset release
+        shell: bash
+
+      # --- test gate (BD26) ----------------------------------------------------
+      # The release preset builds with tests OFF, so nothing above proves the
+      # tagged commit actually passes its suite - a tag can be pushed at any
+      # commit, including one that never went green on CI. Configure/build/test
+      # the `dev` preset (tests ON) on every platform BEFORE any artifact is
+      # produced. A failing test fails this build job, and `publish` needs
+      # [build, remote], so a red suite blocks the release. This reuses the
+      # Qt/libssh/web-bundle setup already installed above (no duplicated setup).
+      - name: Configure (dev preset, tests on)
+        run: cmake --preset dev
+        shell: bash
+
+      - name: Build (dev preset)
+        run: cmake --build --preset dev
+        shell: bash
+
+      - name: Test (dev preset)
+        run: ctest --preset dev --output-on-failure
         shell: bash
 
       # --- package a runnable artifact per OS ----------------------------------
@@ -339,7 +360,8 @@ jobs:
       - name: Build remote workspace
         working-directory: remote
         run: |
-          npm install
+          # npm ci requires an up-to-date package-lock.json (installs from it strictly).
+          npm ci
           npm test
           npm run build
       - name: Package

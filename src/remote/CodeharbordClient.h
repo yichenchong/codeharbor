@@ -76,7 +76,7 @@ public:
     // that cannot fire. A null callback is accepted
     // for a fire-and-forget request; the request is still written and matched,
     // there is simply nothing to invoke.
-    int call(const QString& method, const QJsonValue& params, ResponseCallback cb);
+    qint64 call(const QString& method, const QJsonValue& params, ResponseCallback cb);
 
     // Number of requests awaiting a response.
     int pendingCount() const { return static_cast<int>(m_pending.size()); }
@@ -130,8 +130,15 @@ private:
 
     QIODevice* m_transport = nullptr;
     QByteArray m_readBuffer;
-    int m_nextId = 1;
-    QHash<int, ResponseCallback> m_pending;
+    // How far into m_readBuffer onReadyRead() has already scanned for a '\n'
+    // without finding one, so a large message arriving in many chunks is not
+    // re-scanned from the front every readyRead. It indexes INTO m_readBuffer,
+    // so it MUST be reset to 0 wherever that buffer is cleared or the transport
+    // is rebound (setTransport, close, the oversize-line drop); a stale offset
+    // would otherwise skip past real bytes.
+    qsizetype m_scanOffset = 0;
+    qint64 m_nextId = 1;
+    QHash<qint64, ResponseCallback> m_pending;
     bool m_closed = false;
 };
 

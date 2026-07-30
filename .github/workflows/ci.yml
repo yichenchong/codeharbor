@@ -21,7 +21,9 @@ jobs:
           node-version: "24"
       - name: Install remote workspace deps
         working-directory: remote
-        run: npm install
+        # npm ci installs exactly what package-lock.json records; it requires an
+        # up-to-date lock file (fails if the manifests and lock have drifted).
+        run: npm ci
       - name: Typecheck
         working-directory: remote
         run: npm run typecheck
@@ -57,7 +59,14 @@ jobs:
       # the terminal bundle to CMake's npm fallback, which is a convenience for
       # local dev and is not portable - it failed outright on the Windows runner.
       - name: Build web bundles (must precede CMake configure)
-        run: npm install && npm run build
+        # npm ci requires an up-to-date package-lock.json (installs from it strictly).
+        run: npm ci && npm run build
+      # BD24: type-check both web bundles. esbuild strips types without checking
+      # them, so a TS error anywhere in src/web/* would otherwise reach a shipped
+      # bundle unreported. The root workspaces script runs tsc --noEmit across the
+      # editor and terminal packages; a type error here fails CI before configure.
+      - name: Typecheck web bundles
+        run: npm run typecheck
       - name: Configure
         run: cmake --preset dev
       - name: Build

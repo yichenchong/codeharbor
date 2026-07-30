@@ -18,6 +18,12 @@ enum class SplitOrientation { Horizontal, Vertical };
 // A default-constructed node is an empty leaf and is used as the "invalid"
 // sentinel returned by fromJson() when the input fails validation.
 //
+// SplitNode is a value type today: children are held by value in the
+// QVector<SplitNode> member, so copies are deep and there is no shared
+// ownership. That describes the current shape only; it is not a standing
+// guarantee. This file has no in-place split/remove/move operations, but if any
+// are ever added, node lifetime and tree invariants must be re-examined here.
+//
 // Depth invariant: every in-memory SplitNode tree is kept within the same
 // nesting bound (kMaxDepth in SplitTree.cpp) that fromJson() enforces on parse.
 // fromJson() rejects deeper input, and layouts constructed in-memory nest only a

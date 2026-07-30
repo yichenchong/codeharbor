@@ -36,6 +36,8 @@ private slots:
     void passwordOnlyServerSpendsNoPublicKeyAttempt();
     void withoutACredentialCallbackOnlySilentMethodsAreOffered();
     void aRungIsNeverClimbedTwiceEvenIfStillOffered();
+    void keyboardInteractiveIsClimbedAfterPasswordWithACallback();
+    void everyMethodOfferedIsClimbedOnceThenExhausted();
 #if CH_HAVE_LIBSSH
     void partialIsClassifiedApartFromSuccessAndFailure();
     void anUnknownMethodMaskFallsBackToTryingBoth();
@@ -159,6 +161,60 @@ void TstSshAuth::aRungIsNeverClimbedTwiceEvenIfStillOffered()
              AuthRung::Exhausted);
 }
 
+// SH14: a server that publishes the account password through
+// keyboard-interactive (PAM: PasswordAuthentication no, KbdInteractive yes) is
+// no longer a dead end. The rung sits after plain password — both carry the
+// same single secret — and it needs a callback, exactly like the password rung.
+void TstSshAuth::keyboardInteractiveIsClimbedAfterPasswordWithACallback()
+{
+    constexpr AuthMethods kKbdOnly{false, false, true};
+    AuthRungsTried tried;
+    QCOMPARE(SshConnectionPool::nextAuthRung(tried, kKbdOnly, true),
+             AuthRung::KeyboardInteractive);
+    tried.add(AuthRung::KeyboardInteractive);
+    QCOMPARE(SshConnectionPool::nextAuthRung(tried, kKbdOnly, true),
+             AuthRung::Exhausted);
+
+    // No callback means nobody to answer the challenge, so the rung is
+    // unreachable rather than calling a callback that does not exist.
+    AuthRungsTried noCallback;
+    QCOMPARE(SshConnectionPool::nextAuthRung(noCallback, kKbdOnly, false),
+             AuthRung::Exhausted);
+
+    // Offered alongside plain password, the password rung is spent first; only
+    // then does the ladder fall back to the keyboard-interactive carrier.
+    constexpr AuthMethods kPasswordAndKbd{false, true, true};
+    AuthRungsTried both;
+    QCOMPARE(SshConnectionPool::nextAuthRung(both, kPasswordAndKbd, true),
+             AuthRung::Password);
+    both.add(AuthRung::Password);
+    QCOMPARE(SshConnectionPool::nextAuthRung(both, kPasswordAndKbd, true),
+             AuthRung::KeyboardInteractive);
+}
+
+// The rung count still bounds the loop with every method on offer: five
+// distinct rungs, each climbed at most once, then Exhausted — a server that
+// keeps answering "partial" cannot spin the handshake forever.
+void TstSshAuth::everyMethodOfferedIsClimbedOnceThenExhausted()
+{
+    constexpr AuthMethods kAll{true, true, true};
+    AuthRungsTried tried;
+    QList<AuthRung> climbed;
+    for (int step = 0; step < 100; ++step) {
+        const AuthRung rung =
+            SshConnectionPool::nextAuthRung(tried, kAll, true);
+        if (rung == AuthRung::Exhausted)
+            break;
+        QVERIFY2(!climbed.contains(rung), "a rung was offered twice");
+        climbed.append(rung);
+        tried.add(rung);  // every step answered SSH_AUTH_PARTIAL
+    }
+    QCOMPARE(climbed.size(), 5);
+    QVERIFY(climbed.contains(AuthRung::KeyboardInteractive));
+    QCOMPARE(SshConnectionPool::nextAuthRung(tried, kAll, true),
+             AuthRung::Exhausted);
+}
+
 #if CH_HAVE_LIBSSH
 
 // SSH_AUTH_PARTIAL used to be indistinguishable from a refusal, which is what
@@ -191,6 +247,7 @@ void TstSshAuth::anUnknownMethodMaskFallsBackToTryingBoth()
         SshConnectionPool::methodsFromMask(SSH_AUTH_METHOD_UNKNOWN);
     QVERIFY(unknown.publicKey);
     QVERIFY(unknown.password);
+    QVERIFY(unknown.keyboardInteractive);
 
     const AuthMethods both = SshConnectionPool::methodsFromMask(
         SSH_AUTH_METHOD_PUBLICKEY | SSH_AUTH_METHOD_PASSWORD);
@@ -207,12 +264,14 @@ void TstSshAuth::anUnknownMethodMaskFallsBackToTryingBoth()
     QVERIFY(!passwordOnly.publicKey);
     QVERIFY(passwordOnly.password);
 
-    // Methods this client cannot supply are not silently promoted to ones it
-    // can: a keyboard-interactive/GSSAPI-only server offers this ladder nothing.
-    const AuthMethods unsupported = SshConnectionPool::methodsFromMask(
+    // GSSAPI remains unsupported, but keyboard-interactive is now a rung this
+    // client can climb: a PAM/keyboard-interactive server is no longer offered
+    // nothing at all.
+    const AuthMethods interactive = SshConnectionPool::methodsFromMask(
         SSH_AUTH_METHOD_INTERACTIVE | SSH_AUTH_METHOD_GSSAPI_MIC);
-    QVERIFY(!unsupported.publicKey);
-    QVERIFY(!unsupported.password);
+    QVERIFY(!interactive.publicKey);
+    QVERIFY(!interactive.password);
+    QVERIFY(interactive.keyboardInteractive);
 }
 
 #endif // CH_HAVE_LIBSSH

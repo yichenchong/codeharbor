@@ -1,14 +1,12 @@
 #pragma once
 
 #include <QString>
-#include <QVector>
-#include <optional>
 
 namespace ch::rpc {
 
 // C1 — RPC method catalog (docs/PLAN.md). C++ mirror of the frozen TypeScript
 // contract in remote/src/rpc-types.ts for the initial SPEC 8.3 editing file
-// method set. Header-only: pure data shapes and method-name constants bound by
+// method set. Header-only: the method-name and error-code constants bound by
 // the R-client workstream. Distinct from the server-side implementation in
 // remote/.
 //
@@ -43,116 +41,6 @@ inline constexpr auto kWatchEventNotification = "file.watchEvent";
 // Mirrors the `server.info` handler in remote/src/codeharbord.ts.
 inline constexpr auto kMethodServerInfo = "server.info";
 
-// Result of `server.info`. `serverId` (SPEC 3.5) is the STABLE, SERVER-OWNED
-// identity of the workspace database on that host: minted by codeharbord on
-// first use and persisted, so it survives restarts and is the SAME for every
-// process sharing the database. It is the value the client must key a remote
-// workspace by — every stored row's server_id refers to it. The client NEVER
-// derives or substitutes it (a locally minted id would leave the user staring
-// at an empty workspace while their real rows sit orphaned on the server), and
-// it does NOT change when the host, port, user, or repository path changes:
-// those describe the route to the data, not the data.
-struct ServerInfoResult {
-    QString name;
-    QString version;
-    int schemaVersion;
-    QString serverId;
-};
-
-enum class Kind { File, Directory, Symlink, Other };
-enum class Encoding { Utf8, Base64 };
-enum class WatchEventKind { Created, Modified, Deleted, Renamed };
-
-struct StatParams {
-    QString path;
-};
-
-struct StatResult {
-    QString path;
-    Kind kind;
-    qint64 size;
-    qint64 mtimeMs;
-    qint64 mode;
-    QString revision;
-};
-
-struct ReadFileParams {
-    QString path;
-    std::optional<qint64> offset;
-    std::optional<qint64> length;
-};
-
-struct ReadFileResult {
-    QString path;
-    Encoding encoding;
-    QString content;
-    QString revision;
-    bool truncated;
-};
-
-struct WriteFileParams {
-    QString path;
-    QString content;
-    std::optional<Encoding> encoding;
-    QString expectedRevision;
-};
-
-struct WriteFileResult {
-    QString path;
-    QString revision;
-};
-
-struct ResolvePathParams {
-    QString path;
-    std::optional<QString> base;
-};
-
-struct ResolvePathResult {
-    QString path;
-    bool insideRepositoryRoot;
-};
-
-struct WatchParams {
-    QString path;
-};
-
-struct WatchResult {
-    QString subscriptionId;
-};
-
-struct UnwatchParams {
-    QString subscriptionId;
-};
-
-struct UnwatchResult {
-    bool ok;
-};
-
-// Server -> client notification for an active watch subscription. `revision` is
-// populated when a new revision is known for the affected path.
-struct WatchEvent {
-    QString subscriptionId;
-    QString path;
-    WatchEventKind event;
-    std::optional<QString> revision;
-};
-
-struct ListDirectoryParams {
-    QString path;
-};
-
-// One entry in a directory listing (SPEC 7.5). Mirrors DirectoryEntry in
-// remote/src/rpc-types.ts; server order is unspecified, so the client sorts.
-struct DirectoryEntry {
-    QString name;
-    Kind kind;
-};
-
-struct ListDirectoryResult {
-    QString path;
-    QVector<DirectoryEntry> entries;
-};
-
 // --- tmux session discovery (SPEC 10.2) -------------------------------------
 //
 // Mirrors the `tmux.*` group in remote/src/rpc-types.ts. It lets the client
@@ -165,33 +53,6 @@ struct ListDirectoryResult {
 inline constexpr auto kMethodListSessions = "tmux.listSessions";
 inline constexpr auto kMethodSessionExists = "tmux.sessionExists";
 inline constexpr auto kMethodKillSession = "tmux.killSession";
-
-// Mirrors TmuxSession. `created` is a UNIX timestamp in SECONDS (tmux's
-// session_created), not milliseconds like StatResult::mtimeMs.
-struct TmuxSession {
-    QString name;
-    int windows;
-    qint64 created;
-    bool attached;
-};
-
-// tmux.listSessions takes no parameters; the result IS the session array.
-using ListSessionsResult = QVector<TmuxSession>;
-
-struct SessionExistsParams {
-    QString name;
-};
-
-struct SessionExistsResult {
-    bool exists;
-};
-
-struct KillSessionParams {
-    QString name;
-};
-
-// kill-session is idempotent and reports no payload (mirrors the empty `{}`).
-struct KillSessionResult {};
 
 // --- workspace persistence (SPEC 4.2, 11.1) ---------------------------------
 //

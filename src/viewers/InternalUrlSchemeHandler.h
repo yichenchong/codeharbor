@@ -4,13 +4,18 @@
 #include <QList>
 #include <QMutex>
 #include <QObject>
+#include <QPointer>
 #include <QString>
 #include <QUrl>
 #include <QWebEngineUrlSchemeHandler>
 
+// Full definition (not a forward declaration): m_client is a QPointer, whose
+// QObject static_cast needs the complete CodeharbordClient (a QObject) type.
+#include "CodeharbordClient.h"
+
 namespace ch {
 
-class CodeharbordClient;
+
 
 // Free-standing, WebEngine-independent bidirectional map between remote
 // file:// URLs and opaque codeharbor-internal://file/<id> URLs (SPEC 7.4).
@@ -115,7 +120,7 @@ public:
     static bool isActiveContentMime(const QByteArray &mime);
 
 private:
-    CodeharbordClient *m_client;
+    QPointer<CodeharbordClient> m_client;
     InternalUrlMap *m_map;
 };
 

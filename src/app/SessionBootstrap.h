@@ -168,10 +168,9 @@ public:
     void disconnectSession();
 
     // Retry delay in seconds for the Nth (0-based) automatic reconnect attempt:
-    // 1, 2, 5, 10, 30, then 60 thereafter (SPEC 5.6). Mirrors
-    // TerminalController::reconnectDelaySeconds() value for value —
-    // tst_sessionbootstrap pins the same vector the terminal test pins — rather
-    // than making ch_app link ch_terminal for six numbers.
+    // 1, 2, 5, 10, 30, then 60 thereafter (SPEC 5.6). The sole retry ladder —
+    // reconnect is a session-level concern, not per terminal pane —
+    // and tst_sessionbootstrap pins this exact vector against the spec.
     static int reconnectDelaySeconds(int attempt);
 
     // Consecutive failed reconnects tolerated before State::Failed. Ten spans

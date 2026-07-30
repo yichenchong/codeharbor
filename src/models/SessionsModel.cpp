@@ -24,6 +24,52 @@ void SessionsModel::setGroups(QVector<GroupRow> groups)
     endResetModel();
 }
 
+void SessionsModel::updateTerminalStates(QVector<GroupRow> groups)
+{
+    // An agent-status change never alters the sidebar's structure, only the
+    // per-terminal state that feeds each session's aggregate badge. If the
+    // structure has drifted from what we hold (group/session count or id order
+    // differs), the assumption is void and a full reset is the only safe path.
+    if (groups.size() != groups_.size()) {
+        setGroups(std::move(groups));
+        return;
+    }
+    for (qsizetype gi = 0; gi < groups.size(); ++gi) {
+        if (groups.at(gi).group.id.value != groups_.at(gi).group.id.value
+            || groups.at(gi).sessions.size() != groups_.at(gi).sessions.size()) {
+            setGroups(std::move(groups));
+            return;
+        }
+        const QVector<SessionRow> &newSessions = groups.at(gi).sessions;
+        const QVector<SessionRow> &oldSessions = groups_.at(gi).sessions;
+        for (qsizetype si = 0; si < newSessions.size(); ++si) {
+            if (newSessions.at(si).session.id.value != oldSessions.at(si).session.id.value) {
+                setGroups(std::move(groups));
+                return;
+            }
+        }
+    }
+
+    // Structure matches: adopt the new terminal state in place and emit a
+    // targeted dataChanged() (RowStateRole only) for each session row whose
+    // aggregate state actually changed. No reset, so delegates and the
+    // id-tracked selection persist.
+    for (qsizetype gi = 0; gi < groups.size(); ++gi) {
+        const QModelIndex groupIndex = index(static_cast<int>(gi), 0, QModelIndex());
+        QVector<SessionRow> &sessions = groups_[gi].sessions;
+        QVector<SessionRow> &incoming = groups[gi].sessions;
+        for (qsizetype si = 0; si < sessions.size(); ++si) {
+            const SessionRowState before = aggregateSessionState(sessions.at(si).terminals);
+            sessions[si].terminals = std::move(incoming[si].terminals);
+            const SessionRowState after = aggregateSessionState(sessions.at(si).terminals);
+            if (before != after) {
+                const QModelIndex sessionIndex = index(static_cast<int>(si), 0, groupIndex);
+                emit dataChanged(sessionIndex, sessionIndex, {RowStateRole});
+            }
+        }
+    }
+}
+
 SessionRowState SessionsModel::aggregateSessionState(const QVector<TerminalStatus> &terminals)
 {
     bool anyError = false;

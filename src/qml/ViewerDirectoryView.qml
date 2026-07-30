@@ -1,5 +1,6 @@
 import QtQuick
 import QtQuick.Controls.Basic
+import "RemotePath.js" as RemotePath
 
 // Remote directory view (SPEC 7.5). Lists a remote directory's entries via
 // ViewerModel.listDirectory (file.listDirectory); directories are suffixed with
@@ -35,10 +36,7 @@ Rectangle {
 
     // Remote path for file.listDirectory: strip the file:// scheme.
     function remotePath(u) {
-        var s = u.toString();
-        if (s.indexOf("file://") === 0)
-            return decodeURIComponent(s.substring("file://".length));
-        return s;
+        return RemotePath.fileUrlToPath(u.toString());
     }
 
     // The directory being listed, WITHOUT the trailing slash that marked the URL

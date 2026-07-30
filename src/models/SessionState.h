@@ -4,16 +4,19 @@
 
 namespace ch {
 
-// Terminal connection lifecycle (SPEC 5.6).
+// Terminal connection lifecycle (SPEC 5.6). Only the states shipping code
+// actually produces are listed: TerminalFactory drives Unloaded (initial) ->
+// OpeningChannel -> AttachingTmux -> Ready -> Disconnected plus Error. The
+// session-level connection progress (connecting/authenticating/reconnecting)
+// is tracked once for the whole application on ch::SessionBootstrap::State and
+// ch::SshConnectionPool::State — a single pane never observes it — so it is
+// deliberately NOT mirrored here.
 enum class TerminalState {
     Unloaded,
-    Connecting,
-    Authenticating,
     OpeningChannel,
     AttachingTmux,
     Ready,
     Disconnected,
-    Reconnecting,
     Error,
 };
 
@@ -76,6 +79,12 @@ enum class FileState {
     Saved,
     ExternallyModified,
     Conflict,
+    // Reachable via a truncated over-size read: a file larger than
+    // EditorController::kMaxEditableReadBytes comes back as a PREFIX, which
+    // settles here rather than Clean because no save can be issued from a
+    // buffer that is only part of the file (see EditorController::open() /
+    // reload()). Read-only-ness for a WRITABLE file is modelled separately as
+    // the boolean EditorController::readOnly, not as this state.
     ReadOnly,
     Error,
     Disconnected,

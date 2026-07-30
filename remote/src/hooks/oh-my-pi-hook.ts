@@ -29,6 +29,10 @@
 // missingCoordinates): an event carrying a blank id reaches the client as a
 // valid event that belongs to no Dev Session.
 //
+// An optional OMP_METADATA environment variable, when present, is parsed as
+// JSON and attached as the event's `metadata` (beside OMP_HOOK_EVENT below).
+// An absent or malformed value is ignored and never fatal (SPEC 6.4).
+//
 // SPEC 6.4: a broken producer must never take down the agent. Any failure to
 // connect or write is swallowed (logged to stderr) and the process exits 0.
 
@@ -85,6 +89,18 @@ export function readHookInput(
     if (env.OMP_TOOL) input.tool = env.OMP_TOOL;
     if (env.OMP_ERROR === "1" || env.OMP_ERROR === "true") input.error = true;
     if (env.OMP_SUMMARY) input.summary = env.OMP_SUMMARY;
+    if (env.OMP_METADATA !== undefined) {
+        try {
+            const parsed: unknown = JSON.parse(env.OMP_METADATA);
+            // Only a JSON object populates metadata; a scalar, array, null, or
+            // parse error omits it. A broken producer must never throw here.
+            if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)) {
+                input.metadata = parsed as Record<string, unknown>;
+            }
+        } catch {
+            // Malformed OMP_METADATA: leave metadata unset (SPEC 6.4).
+        }
+    }
     return input;
 }
 
@@ -147,7 +163,7 @@ export function emitHookEvent(
 
 const USAGE = "usage: node oh-my-pi-hook.ts <native-event>\n" +
     "  env: OMP_DEV_SESSION_ID, OMP_TERMINAL_ID,\n" +
-    "       [OMP_HOOK_EVENT], [OMP_TOOL], [OMP_ERROR], [OMP_SUMMARY]\n";
+    "       [OMP_HOOK_EVENT], [OMP_TOOL], [OMP_ERROR], [OMP_SUMMARY], [OMP_METADATA]\n";
 
 /**
  * Names the environment variables whose session coordinates are missing or

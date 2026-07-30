@@ -57,6 +57,16 @@ public:
     // the terminals into a single sidebar row state).
     Q_INVOKABLE bool hasUnseen(const QString& devSessionId) const;
 
+    // Drop all accumulated state for every Dev Session NOT in
+    // `liveDevSessionIds`. The unit of eviction is a whole Dev Session subtree:
+    // each removed Dev Session's per-terminal agent states and its unseen flag
+    // go together. Called after the sidebar list is rebuilt from the
+    // authoritative server tree, so a Dev Session the server no longer lists is
+    // dropped wholesale — NEVER on a mere terminal close, which would destroy
+    // the finished-with-unseen-output signal the sidebar badge derives from. A
+    // removed Dev Session has no live row, so nothing is emitted.
+    void retainDevSessions(const QSet<QString>& liveDevSessionIds);
+
 signals:
     // A terminal's agent state changed. `state` is an int-valued ch::AgentState.
     void agentStateChanged(const QString& devSessionId,
@@ -81,17 +91,15 @@ private:
     // disconnect() on the old transport would be a use-after-free.
     QPointer<QIODevice> m_transport = nullptr;
     QByteArray m_readBuffer;
-    // devSessionId -> (terminalId -> current AgentState). Entries are never
-    // evicted: ids are server-minted and never reused, so a stale entry can
-    // only ever be dead weight (two small QStrings and an enum per terminal
-    // ever observed in one client run), whereas evicting on terminal close
-    // would lose the raw IdleUnseen state that the sidebar's unseen badge is
-    // derived from. If a future workspace grows large enough for this to
-    // matter, drop whole Dev Session subtrees on deletion, never single
-    // terminals.
+    // devSessionId -> (terminalId -> current AgentState). Evicted only in whole
+    // Dev Session subtrees by retainDevSessions(), called after the sidebar is
+    // rebuilt from the server: ids are server-minted and never reused, so a Dev
+    // Session the server no longer lists is genuinely gone and safe to drop.
+    // NEVER evicted on terminal close, which would lose the raw IdleUnseen
+    // state the sidebar's unseen badge is derived from.
     QHash<QString, QHash<QString, AgentState>> m_states;
     // devSessionIds with an unseen completion pending markSeen(). Same
-    // retention rationale: a set entry for a deleted Dev Session is inert.
+    // eviction: retainDevSessions() drops the flag with its Dev Session subtree.
     QSet<QString> m_unseen;
 };
 

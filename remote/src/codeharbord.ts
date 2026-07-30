@@ -6,12 +6,13 @@
 // the transport can be exercised end-to-end. Workspace DB, file, watch, tmux,
 // and agent methods (SPEC 10.2) land in the workstreams in docs/PLAN.md.
 
-import readline from "node:readline";
 // pathToFileURL, not string concatenation: process.argv[1] is a filesystem
 // path, and a path containing a space (or any character a URL must
 // percent-encode) would never compare equal to import.meta.url, silently
 // turning the CLI entry point below into a no-op.
 import { pathToFileURL } from "node:url";
+import { homedir } from "node:os";
+import { join as pathJoin } from "node:path";
 
 // Frozen file-method catalog (C1, docs/PLAN.md). RPC_METHODS/RPC_REVISION_MISMATCH
 // are re-exported so the wire names and error code stay linked to the transport.
@@ -64,6 +65,13 @@ export const RPC_METHOD_NOT_FOUND = -32601;
 export const RPC_INVALID_PARAMS = -32602;
 export const RPC_INTERNAL_ERROR = -32603;
 
+// Upper bound on one input line before the transport is dropped, mirroring the
+// C++ client's `kMaxLineBytes` in src/remote/CodeharbordClient.cpp (C3): both
+// ends of this wire protocol must agree that a frame past 16 MiB is a fault,
+// not something to buffer without limit. A parity test in
+// remote/test/rpc-mirror.test.ts pins this to the C++ constant.
+export const MAX_LINE_BYTES = 16 * 1024 * 1024;
+
 type MethodHandler = (params: unknown) => unknown | Promise<unknown>;
 
 // Static method table (SPEC 10.2 methods are added here as they land).
@@ -74,11 +82,27 @@ const methods: Record<string, MethodHandler> = {
     // first read and unchanged thereafter. Clients key their view of the remote
     // workspace by it, so it is read from the DB rather than synthesized: an
     // id that changed per process or per route would orphan every stored row.
+    //
+    // `recoveryDir` (SPEC 11.3) is the REMOTE user's data directory for
+    // crash-recovery snapshots, reported so the client writes them to a location
+    // that is valid ON THE SERVER — the client's own data path would be
+    // meaningless across an SSH boundary to a different host/user. The client
+    // appends its per-pane id; writeFile creates the directory (files.ts) at
+    // 0o700 on the first snapshot. Additive and OPTIONAL: it does not raise the
+    // schemaVersion floor, so an older server simply omits it and the client
+    // degrades to no-recovery rather than failing the compatibility gate.
     "server.info": () => ({
         name: RPC_SERVER_NAME,
         version: RPC_SERVER_VERSION,
         schemaVersion: RPC_SCHEMA_VERSION,
         serverId: serverIdentity(),
+        recoveryDir: pathJoin(
+            process.env.XDG_DATA_HOME && process.env.XDG_DATA_HOME.length > 0
+                ? process.env.XDG_DATA_HOME
+                : pathJoin(homedir(), ".local", "share"),
+            "codeharbor",
+            "recovery",
+        ),
     }),
     ...fileMethods,
     ...WORKSPACE_METHODS,
@@ -193,13 +217,48 @@ export async function handleLine(line: string): Promise<RpcResponse | null> {
     return dispatch(decoded);
 }
 
+/**
+ * Hand-written line framer mirroring the C++ client's bounded reader
+ * (kMaxLineBytes in src/remote/CodeharbordClient.cpp, C3). Accumulates incoming
+ * chunks into a pending Buffer, emits each newline-delimited line via `onLine`,
+ * and calls `onOverflow` once the pending buffer grows past MAX_LINE_BYTES with
+ * no newline yet seen — the signal to drop the connection rather than buffer a
+ * frame without bound. Node's readline owns its buffer and offers no maximum
+ * line option, so the framing is done by hand here. Returns the per-chunk feed.
+ */
+export function createLineFramer(
+    onLine: (line: string) => void,
+    onOverflow: () => void,
+): (chunk: Buffer) => void {
+    let pending: Buffer = Buffer.alloc(0);
+    return (chunk) => {
+        pending = pending.length === 0 ? chunk : Buffer.concat([pending, chunk]);
+        let nl = pending.indexOf(0x0a);
+        while (nl !== -1) {
+            onLine(pending.subarray(0, nl).toString("utf8"));
+            pending = pending.subarray(nl + 1);
+            nl = pending.indexOf(0x0a);
+        }
+        // Past the cap with no newline: a peer is streaming an unbounded frame.
+        // Tracking the pending byte length and checking it here bounds memory
+        // to roughly one chunk beyond the cap, unlike a post-line length check
+        // that only fires once the whole oversized line is already resident.
+        if (pending.length > MAX_LINE_BYTES) {
+            pending = Buffer.alloc(0);
+            onOverflow();
+        }
+    };
+}
+
 export function runStdio(): void {
-    const rl = readline.createInterface({ input: process.stdin });
     // The client half of the SSH channel can disappear at any moment, and the
     // next write then raises EPIPE as an 'error' event on stdout. Unhandled,
     // that event terminates the process with a stack trace; swallow it and let
-    // the stdin 'close' handler below perform the orderly shutdown.
+    // the stdin 'close' handler below perform the orderly shutdown. Swallow
+    // stdin errors too: destroying the stream on an over-cap frame (below) must
+    // not surface as an unhandled 'error'.
     process.stdout.on("error", () => {});
+    process.stdin.on("error", () => {});
     // Relay watch notifications to the client as id-less JSON-RPC messages.
     fileWatchService.onWatchEvent((event) => {
         process.stdout.write(
@@ -232,7 +291,7 @@ export function runStdio(): void {
     // ordering hazard that would be a real bug — two concurrent writes to the
     // SAME path racing their revision check against their rename — is already
     // serialized per path by the write locks in files.ts.
-    rl.on("line", (line) => {
+    const dispatchLine = (line: string): void => {
         // Skip separator lines without copying the line: trim() on a multi-MiB
         // base64 file.writeFile frame duplicates the whole string just to answer
         // "is this blank?". The C++ reader avoids the same copy deliberately.
@@ -273,8 +332,20 @@ export function runStdio(): void {
                     })}\n`,
                 );
             });
+    };
+    // Replaces Node's readline, which buffers a line without any upper bound
+    // (RR13). The framer drops the connection past MAX_LINE_BYTES.
+    const feed = createLineFramer(dispatchLine, () => {
+        process.stderr.write(
+            `codeharbord: input line exceeded ${MAX_LINE_BYTES} bytes without a newline; closing connection\n`,
+        );
+        // The transport can no longer be trusted; end the input stream. The
+        // 'close' handler below then releases watch handles so the process can
+        // exit once in-flight work settles.
+        process.stdin.destroy();
     });
-    rl.on("close", () => {
+    process.stdin.on("data", feed);
+    process.stdin.on("close", () => {
         // End of stdin means the SSH channel is gone. Watch subscriptions hold
         // live fs.watch handles that keep the event loop — and therefore this
         // process — alive indefinitely, so release them and let the process

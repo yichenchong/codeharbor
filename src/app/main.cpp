@@ -88,6 +88,11 @@ int main(int argc, char *argv[])
     ch::EditorFactory editorFactory(&client);
     ch::TerminalFactory terminalFactory(&sshPool);
 
+    // Feed server.info.recoveryDir to the editor factory once a server identity
+    // is adopted, so per-pane crash-recovery snapshots (SPEC 11.3) land under a
+    // server-chosen remote path.
+    appController.setEditorFactory(&editorFactory);
+
     // Agent attention -> OS notification (SPEC 6.2). A box with no notification
     // daemon degrades to a silent no-op.
     ch::Notifier notifier;

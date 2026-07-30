@@ -148,6 +148,26 @@ void AgentStatusMonitor::markSeen(const QString& devSessionId)
         emit unseenChanged(devSessionId, false);
 }
 
+void AgentStatusMonitor::retainDevSessions(const QSet<QString>& liveDevSessionIds)
+{
+    // Whole-subtree eviction: a Dev Session absent from the freshly rebuilt
+    // sidebar list is gone server-side, so its terminals' states and its unseen
+    // flag are dropped together. Never called on a mere terminal close, which
+    // would destroy the finished-with-unseen-output signal.
+    for (auto it = m_states.begin(); it != m_states.end();) {
+        if (!liveDevSessionIds.contains(it.key()))
+            it = m_states.erase(it);
+        else
+            ++it;
+    }
+    for (auto it = m_unseen.begin(); it != m_unseen.end();) {
+        if (!liveDevSessionIds.contains(*it))
+            it = m_unseen.erase(it);
+        else
+            ++it;
+    }
+}
+
 int AgentStatusMonitor::stateFor(const QString& devSessionId,
                                  const QString& terminalId) const
 {

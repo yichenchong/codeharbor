@@ -1,9 +1,14 @@
 #pragma once
 
 #include <QObject>
+#include <QPointer>
 #include <QString>
 #include <QUrl>
 #include <QVariantList>
+
+// Full definition (not a forward declaration): m_client is a QPointer, whose
+// QObject static_cast needs the complete CodeharbordClient (a QObject) type.
+#include "CodeharbordClient.h"
 
 QT_BEGIN_NAMESPACE
 class QQuickWebEngineProfile;
@@ -11,7 +16,7 @@ QT_END_NAMESPACE
 
 namespace ch {
 
-class CodeharbordClient;
+
 class InternalUrlMap;
 class ViewerProfiles;
 
@@ -58,6 +63,12 @@ public:
     // file over the cap, or without a client, textFileError.
     Q_INVOKABLE void readTextFile(const QString &path);
 
+    // Cancel any in-flight readTextFile so its late reply is ignored. A fresh
+    // readTextFile also implicitly supersedes an earlier one; this lets a
+    // caller drop the current read without immediately starting another (e.g.
+    // when the pane's URL clears).
+    Q_INVOKABLE void cancelTextFile();
+
     // Asynchronously list a remote directory (SPEC 7.5). On success emits
     // directoryListed with entries sorted (directories first, then by name),
     // each a {name, kind} map; on failure or without a client, directoryError.
@@ -72,10 +83,13 @@ signals:
 private:
     ViewerProfiles *profiles();
 
-    CodeharbordClient *m_client;
+    QPointer<CodeharbordClient> m_client;
     InternalUrlMap *m_map;
     ViewerProfiles *m_profiles = nullptr;
     bool m_ownsProfiles = false;
+    // Bumped on every readTextFile and on cancelTextFile; a reply whose
+    // captured generation no longer matches is a superseded read and dropped.
+    quint64 m_textReadGeneration = 0;
 };
 
 } // namespace ch

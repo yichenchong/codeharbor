@@ -61,6 +61,7 @@ private slots:
     void splitTreeRejectsNonObjectChildAndNonNumericRatio();
     void startingAgentCountsAsRunning();
     void agentStateWireWordsMatchRemoteEventsTs();
+    void updateTerminalStatesEmitsTargetedDataChangedNotReset();
 };
 
 // Group -> DevSession -> viewer + terminal panes tree.
@@ -663,7 +664,7 @@ void TstModels::aggregateRowStateAllFalseIsDisconnected()
 {
     const QVector<TerminalStatus> terminals = {
         terminal(TerminalState::Unloaded, AgentState::Unknown),
-        terminal(TerminalState::Connecting, AgentState::Stopped),
+        terminal(TerminalState::Disconnected, AgentState::Stopped),
     };
     QCOMPARE(static_cast<int>(SessionsModel::aggregateSessionState(terminals)),
              static_cast<int>(SessionRowState::Disconnected));
@@ -730,13 +731,10 @@ void TstModels::aggregateRowStateCoversEveryInputCombination()
 void TstModels::stateStringsArePinnedWireValues()
 {
     QCOMPARE(toString(TerminalState::Unloaded), QStringLiteral("unloaded"));
-    QCOMPARE(toString(TerminalState::Connecting), QStringLiteral("connecting"));
-    QCOMPARE(toString(TerminalState::Authenticating), QStringLiteral("authenticating"));
     QCOMPARE(toString(TerminalState::OpeningChannel), QStringLiteral("opening_channel"));
     QCOMPARE(toString(TerminalState::AttachingTmux), QStringLiteral("attaching_tmux"));
     QCOMPARE(toString(TerminalState::Ready), QStringLiteral("ready"));
     QCOMPARE(toString(TerminalState::Disconnected), QStringLiteral("disconnected"));
-    QCOMPARE(toString(TerminalState::Reconnecting), QStringLiteral("reconnecting"));
     QCOMPARE(toString(TerminalState::Error), QStringLiteral("error"));
 
     QCOMPARE(toString(AgentState::Starting), QStringLiteral("starting"));
@@ -772,12 +770,10 @@ void TstModels::stateStringsArePinnedWireValues()
     const auto allDistinct = [](const QStringList &names) {
         return QSet<QString>(names.cbegin(), names.cend()).size() == names.size();
     };
-    QVERIFY(allDistinct({toString(TerminalState::Unloaded), toString(TerminalState::Connecting),
-                         toString(TerminalState::Authenticating),
+    QVERIFY(allDistinct({toString(TerminalState::Unloaded),
                          toString(TerminalState::OpeningChannel),
                          toString(TerminalState::AttachingTmux), toString(TerminalState::Ready),
-                         toString(TerminalState::Disconnected),
-                         toString(TerminalState::Reconnecting), toString(TerminalState::Error)}));
+                         toString(TerminalState::Disconnected), toString(TerminalState::Error)}));
     QVERIFY(allDistinct({toString(AgentState::Starting), toString(AgentState::Running),
                          toString(AgentState::WaitingInput), toString(AgentState::IdleUnseen),
                          toString(AgentState::Idle), toString(AgentState::Error),
@@ -965,6 +961,71 @@ void TstModels::agentStateWireWordsMatchRemoteEventsTs()
         cppWords << toString(static_cast<AgentState>(i));
 
     QCOMPARE(cppWords, remoteWords);
+}
+
+// The incremental update path must NOT reset the model. It updates per-terminal
+// state in place and emits a targeted dataChanged() (RowStateRole) for only the
+// session rows whose aggregate state actually moved - so delegates and the
+// id-tracked selection survive. A drifted structure falls back to a full reset.
+void TstModels::updateTerminalStatesEmitsTargetedDataChangedNotReset()
+{
+    SessionsModel model;
+
+    const auto session = [](const QString &id, TerminalState conn, AgentState agent) {
+        SessionRow row;
+        row.session.id = DevSessionId{id};
+        row.session.name = id;
+        row.terminals = {terminal(conn, agent)};
+        return row;
+    };
+
+    GroupRow g;
+    g.group.id = GroupId{QStringLiteral("g1")};
+    g.group.name = QStringLiteral("G");
+    g.sessions = {session(QStringLiteral("s1"), TerminalState::Ready, AgentState::Running),
+                  session(QStringLiteral("s2"), TerminalState::Ready, AgentState::Idle)};
+    model.setGroups({g});
+
+    const QModelIndex groupIndex = model.index(0, 0);
+    const QModelIndex s1Index = model.index(0, 0, groupIndex);
+    QCOMPARE(model.data(s1Index, SessionsModel::RowStateRole).toInt(),
+             static_cast<int>(SessionRowState::Running));
+
+    QSignalSpy reset(&model, &QAbstractItemModel::modelReset);
+    QSignalSpy changed(&model, &QAbstractItemModel::dataChanged);
+
+    // Same structure/ids; only s1's terminal moves (Running -> WaitingForInput),
+    // s2 is untouched.
+    GroupRow updated;
+    updated.group.id = GroupId{QStringLiteral("g1")};
+    updated.group.name = QStringLiteral("G");
+    updated.sessions = {session(QStringLiteral("s1"), TerminalState::Ready, AgentState::WaitingInput),
+                        session(QStringLiteral("s2"), TerminalState::Ready, AgentState::Idle)};
+    model.updateTerminalStates({updated});
+
+    // No reset; exactly one targeted change for s1 carrying RowStateRole.
+    QCOMPARE(reset.count(), 0);
+    QCOMPARE(changed.count(), 1);
+    const QModelIndex topLeft = changed.at(0).at(0).value<QModelIndex>();
+    const QModelIndex bottomRight = changed.at(0).at(1).value<QModelIndex>();
+    QCOMPARE(topLeft, s1Index);
+    QCOMPARE(bottomRight, s1Index);
+    QVERIFY(changed.at(0).at(2).value<QList<int>>().contains(SessionsModel::RowStateRole));
+    QCOMPARE(model.data(s1Index, SessionsModel::RowStateRole).toInt(),
+             static_cast<int>(SessionRowState::WaitingForInput));
+
+    // A structural drift (different session id) cannot be applied in place, so it
+    // falls back to a full reset instead of a bogus targeted change.
+    QSignalSpy reset2(&model, &QAbstractItemModel::modelReset);
+    QSignalSpy changed2(&model, &QAbstractItemModel::dataChanged);
+    GroupRow drifted;
+    drifted.group.id = GroupId{QStringLiteral("g1")};
+    drifted.group.name = QStringLiteral("G");
+    drifted.sessions = {session(QStringLiteral("s1"), TerminalState::Ready, AgentState::Running),
+                        session(QStringLiteral("sX"), TerminalState::Ready, AgentState::Idle)};
+    model.updateTerminalStates({drifted});
+    QCOMPARE(reset2.count(), 1);
+    QCOMPARE(changed2.count(), 0);
 }
 
 QTEST_GUILESS_MAIN(TstModels)

@@ -9,7 +9,7 @@
     "src/web/editor"
   ],
   "scripts": {
-    "test": "npm run test --workspace remote",
+    "test": "npm run test --workspaces --if-present",
     "build": "npm run build --workspaces --if-present",
     "typecheck": "npm run typecheck --workspaces --if-present"
   },

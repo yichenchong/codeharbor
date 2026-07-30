@@ -1478,7 +1478,7 @@ void TstAppController::twoMethodServerChainCarriesBothSecretsWithoutCrossingThem
     QCOMPARE(promptSpy.count(), 3);
 }
 
-// ServerInfoResult::schemaVersion was parsed and never checked. A client one
+// The server.info result's schemaVersion field was parsed and never checked. A client one
 // release ahead of its codeharbord got an empty serverId, keyed the workspace to
 // "", and showed an EMPTY SIDEBAR over a healthy SSH session with no
 // explanation. Version skew is the default state under manual deployment.

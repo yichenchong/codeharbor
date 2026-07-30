@@ -87,6 +87,7 @@ void CodeharbordClient::setTransport(QIODevice* transport)
 
     m_transport = transport;
     m_readBuffer.clear();
+    m_scanOffset = 0;
     m_closed = false;
 
     if (m_transport) {
@@ -146,19 +147,20 @@ void CodeharbordClient::setTransport(QIODevice* transport)
     emit transportBound();
 }
 
-int CodeharbordClient::call(const QString& method, const QJsonValue& params,
+qint64 CodeharbordClient::call(const QString& method, const QJsonValue& params,
                             ResponseCallback cb)
 {
     // Assign a monotonically increasing id, wrapping to 1 before the increment
-    // would overflow INT_MAX (signed overflow is undefined behaviour). A wrap
-    // can only collide with a still-pending id after ~2^31 requests are
-    // outstanding at once, which the pending map never realistically reaches.
-    const int id = m_nextId;
-    m_nextId = (m_nextId == std::numeric_limits<int>::max()) ? 1 : m_nextId + 1;
+    // would overflow the maximum signed 64-bit value (signed overflow is
+    // undefined behaviour). At 64 bits a wrap can only collide with a
+    // still-pending id after ~2^63 requests, which no connection reaches; the
+    // pending map would exhaust memory long first.
+    const qint64 id = m_nextId;
+    m_nextId = (m_nextId == std::numeric_limits<qint64>::max()) ? 1 : m_nextId + 1;
 
     QJsonObject request;
     request.insert(QStringLiteral("jsonrpc"), QStringLiteral("2.0"));
-    request.insert(QStringLiteral("id"), id);
+    request.insert(QStringLiteral("id"), QJsonValue(id));
     request.insert(QStringLiteral("method"), method);
     if (!params.isUndefined() && !params.isNull())
         request.insert(QStringLiteral("params"), params);
@@ -170,7 +172,29 @@ int CodeharbordClient::call(const QString& method, const QJsonValue& params,
     // acceptance rule: call() either (a) writes the request and registers the
     // pending callback, or (b) invokes the callback exactly once with an error.
     QString failReason;
-    if (m_closed)
+    // RC13: never emit a frame the server would answer with a null-id error. An
+    // unparseable line or a structurally invalid request carries no id to echo,
+    // so this client could not route the resulting error to the caller that
+    // provoked it — that caller would hang until the connection died. We mint
+    // jsonrpc, id and the frame ourselves, so only the caller-supplied method
+    // and params can be malformed; reject them here and fail the call through
+    // the SAME protocolWarning + single-callback path as a dead transport,
+    // writing nothing. This guarantees the client never provokes an
+    // unattributable null-id server error, closing RC13 from the side we
+    // control.
+    if (request.value(QStringLiteral("jsonrpc")).toString() !=
+        QLatin1String("2.0"))
+        failReason = QStringLiteral("outgoing jsonrpc is not \"2.0\"");
+    else if (!request.value(QStringLiteral("id")).isDouble())
+        failReason = QStringLiteral("outgoing id is not an integer");
+    else if (method.isEmpty())
+        failReason = QStringLiteral("outgoing method is empty");
+    else if (request.contains(QStringLiteral("params")) &&
+             !request.value(QStringLiteral("params")).isObject() &&
+             !request.value(QStringLiteral("params")).isArray())
+        failReason =
+            QStringLiteral("outgoing params is neither object nor array");
+    else if (m_closed)
         failReason = QStringLiteral("transport closed");
     else if (!m_transport)
         failReason = QStringLiteral("no transport bound");
@@ -232,12 +256,20 @@ void CodeharbordClient::onReadyRead()
     // otherwise the loop's next m_readBuffer access is a use-after-free.
     QPointer<CodeharbordClient> self(this);
 
-    // Consume every complete line; a trailing partial line stays buffered until
-    // the rest arrives on a later readyRead (partial-line-mid-JSON handling).
+    // Consume every complete line. m_scanOffset remembers how far we have
+    // already searched for a '\n' and found none, so a single large message
+    // arriving in many small chunks is not re-scanned from the front on every
+    // readyRead (an O(n^2) trap otherwise). It indexes INTO m_readBuffer, so it
+    // is reset to 0 the moment that buffer is mutated at the front or dropped —
+    // see the resets below and in setTransport(). A trailing partial line stays
+    // buffered until the rest arrives on a later readyRead.
     int newline;
-    while ((newline = m_readBuffer.indexOf('\n')) != -1) {
+    while ((newline = m_readBuffer.indexOf('\n', m_scanOffset)) != -1) {
         QByteArray line = m_readBuffer.left(newline);
         m_readBuffer.remove(0, newline + 1);
+        // The consumed prefix is gone, so the unscanned remainder starts at the
+        // front again.
+        m_scanOffset = 0;
         if (line.endsWith('\r'))
             line.chop(1); // tolerate CRLF framing (SPEC 10.3 is newline-delimited)
         if (isBlankLine(line))
@@ -246,6 +278,9 @@ void CodeharbordClient::onReadyRead()
         if (!self)
             return; // a callback deleted us; touch no members
     }
+    // No '\n' past m_scanOffset: the whole buffer has now been searched, so the
+    // next readyRead resumes from its end instead of from position zero.
+    m_scanOffset = m_readBuffer.size();
 
     // Guard against an unterminated line growing the buffer without bound: a
     // peer streaming megabytes with no '\n' is malformed. Drop the garbage and
@@ -258,6 +293,7 @@ void CodeharbordClient::onReadyRead()
             QStringLiteral("RPC line exceeded %1 bytes without a newline; "
                            "resetting transport").arg(kMaxLineBytes));
         m_readBuffer.clear();
+        m_scanOffset = 0;
         onTransportClosed();
     }
 }
@@ -303,17 +339,15 @@ void CodeharbordClient::processLine(const QByteArray& line)
         emit protocolWarning(QStringLiteral("RPC message with no routable id"));
         return;
     }
-    const double idNum = idValue.toDouble();
-    // Range-check before the float->int cast (out-of-range double->int is UB),
-    // then reject fractional ids so a bogus 1.5 can't truncate onto pending #1.
-    if (idNum < static_cast<double>(std::numeric_limits<int>::min()) ||
-        idNum > static_cast<double>(std::numeric_limits<int>::max())) {
-        emit protocolWarning(QStringLiteral("RPC response with out-of-range id"));
-        return;
-    }
-    const int id = static_cast<int>(idNum);
-    if (static_cast<double>(id) != idNum) {
-        emit protocolWarning(QStringLiteral("RPC response with non-integral id"));
+    // toInteger() yields the id when the JSON number is a whole value in qint64
+    // range and its `defaultValue` otherwise, so probing with two distinct
+    // sentinels detects a fractional or out-of-range id without a manual
+    // float->int cast (UB out of range). They agree only for a genuine integer
+    // id; ids are 64-bit now, matching m_nextId (RC14).
+    const qint64 id = idValue.toInteger(0);
+    if (id != idValue.toInteger(1)) {
+        emit protocolWarning(
+            QStringLiteral("RPC response with non-integral or out-of-range id"));
         return;
     }
 
@@ -438,7 +472,7 @@ void CodeharbordClient::failAllPending(const RpcError& error)
     // not observe a half-cleared map. clear() is not redundant — a moved-from Qt
     // container is left in a valid but unspecified state and must be reset
     // before it is used again.
-    const QHash<int, ResponseCallback> pending = std::move(m_pending);
+    const QHash<qint64, ResponseCallback> pending = std::move(m_pending);
     m_pending.clear();
     for (const ResponseCallback& cb : pending) {
         if (cb) // empty for a fire-and-forget call() with a null callback

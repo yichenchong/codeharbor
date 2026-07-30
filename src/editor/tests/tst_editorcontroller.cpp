@@ -77,6 +77,58 @@ qint64 reqLength(const QJsonObject& req)
         .toInteger(-1);
 }
 
+// The paneId the test controller is keyed by, and the server-reported recovery
+// base pushed into it via setRecoveryDir(): its snapshot lives at
+// recoveryFilePath() — one file per pane under that base (SPEC 11.3).
+const QString kPaneId = QStringLiteral("viewer-1");
+const QString kRecoveryBase = QStringLiteral("/srv/data/codeharbor/recovery");
+
+QString recoveryFilePath()
+{
+    return kRecoveryBase + QLatin1Char('/') + kPaneId;
+}
+
+int reqMode(const QJsonObject& req)
+{
+    return req.value(QStringLiteral("params"))
+        .toObject()
+        .value(QStringLiteral("mode"))
+        .toInt(-1);
+}
+
+// The snapshot is a JSON envelope carrying the file path alongside the buffer
+// (EditorController::serializeRecovery), so a pane can tell whose file a reused
+// per-pane snapshot slot holds. These build and read that envelope.
+QString snapshotEnvelope(const QString& path, const QString& content)
+{
+    return QString::fromUtf8(
+        QJsonDocument(QJsonObject{{QStringLiteral("path"), path},
+                                  {QStringLiteral("content"), content}})
+            .toJson(QJsonDocument::Compact));
+}
+
+QString snapshotContentOf(const QJsonObject& writeReq)
+{
+    const QString raw = reqContent(writeReq);
+    if (raw.isEmpty())
+        return QString();
+    return QJsonDocument::fromJson(raw.toUtf8())
+        .object()
+        .value(QStringLiteral("content"))
+        .toString();
+}
+
+QString snapshotPathOf(const QJsonObject& writeReq)
+{
+    const QString raw = reqContent(writeReq);
+    if (raw.isEmpty())
+        return QString();
+    return QJsonDocument::fromJson(raw.toUtf8())
+        .object()
+        .value(QStringLiteral("path"))
+        .toString();
+}
+
 const auto kReadFile = QString::fromLatin1(ch::rpc::kMethodReadFile);
 const auto kWriteFile = QString::fromLatin1(ch::rpc::kMethodWriteFile);
 const auto kWatch = QString::fromLatin1(ch::rpc::kMethodWatch);
@@ -117,6 +169,9 @@ private slots:
     void readOnlyIsRederivedOnReloadAndNotLatched();
     void reconnectRederivesReadOnlyFromTheReconcileStat();
     void readOnlyReachesAPageThatConnectsLate();
+    // X12: the server's `writable` flag (C2) is authoritative over `mode`.
+    void writableFlagOverridesUnwritableMode();
+    void unwritableFlagForcesReadOnlyOverWritableMode();
 
     // SPEC 5.6 reconnect: the transport is swapped for a channel onto a BRAND
     // NEW codeharbord whose file.watch registry has never heard of us.
@@ -186,7 +241,11 @@ int TstEditorController::s_seq = 0;
 void TstEditorController::init()
 {
     m_client = new CodeharbordClient;
-    m_controller = new EditorController(m_client);
+    m_controller = new EditorController(m_client, kPaneId);
+    // Server-reported recovery base (server.info.recoveryDir) that EditorFactory
+    // would push in; set directly here so recoveryPath() is non-empty and the
+    // recovery round trips below actually fire.
+    m_controller->setRecoveryDir(kRecoveryBase);
 }
 
 void TstEditorController::cleanup()
@@ -278,8 +337,8 @@ void TstEditorController::servePermissionStat(int mode)
 {
     const QJsonObject stat = nextRequest();
     QCOMPARE(method(stat), kStat);
-    QVERIFY2(!reqPath(stat).contains(QStringLiteral(".codeharbor-recovery")),
-             "the permission stat must target the file itself");
+    QVERIFY2(!reqPath(stat).contains(QStringLiteral("/recovery/")),
+             "the permission stat must target the file itself, not the recovery snapshot");
     respondResult(reqId(stat), {{"path", reqPath(stat)},
                                 {"kind", "file"},
                                 {"size", 0},
@@ -300,7 +359,7 @@ void TstEditorController::serveWatchThenNoRecovery()
 
     const QJsonObject stat = nextRequest();
     QCOMPARE(method(stat), kStat);
-    QVERIFY(reqPath(stat).contains(QStringLiteral(".codeharbor-recovery")));
+    QCOMPARE(reqPath(stat), recoveryFilePath());
     respondError(reqId(stat), -32002, QStringLiteral("ENOENT")); // no snapshot
 }
 
@@ -479,7 +538,7 @@ void TstEditorController::externalChangeWhileDirtyDoesNotReload()
     m_controller->reportContent(QStringLiteral("local edits"));
     const QJsonObject rec = nextRequest();
     QCOMPARE(method(rec), kWriteFile);
-    QVERIFY(reqPath(rec).contains(QStringLiteral(".codeharbor-recovery")));
+    QCOMPARE(reqPath(rec), recoveryFilePath());
     QCOMPARE(reqExpectedRevision(rec), QString()); // create-only
     respondResult(reqId(rec), {{"path", reqPath(rec)}, {"revision", "rec1"}});
     QCOMPARE(m_controller->fileState(), QStringLiteral("modified"));
@@ -511,8 +570,10 @@ void TstEditorController::recoverySnapshotWrittenAndOfferedOnReopen()
     const QJsonObject rec = nextRequest();
     QCOMPARE(method(rec), kWriteFile);
     const QString recoveryPath = reqPath(rec);
-    QVERIFY(recoveryPath.contains(QStringLiteral(".codeharbor-recovery")));
-    QCOMPARE(reqContent(rec), QStringLiteral("recovered edits"));
+    QCOMPARE(recoveryPath, recoveryFilePath());
+    QCOMPARE(snapshotContentOf(rec), QStringLiteral("recovered edits"));
+    QCOMPARE(snapshotPathOf(rec), QStringLiteral("/foo/f.txt"));
+    QCOMPARE(reqMode(rec), 0600);
     QCOMPARE(reqExpectedRevision(rec), QString()); // first write is create-only
     respondResult(reqId(rec), {{"path", recoveryPath}, {"revision", "rec1"}});
 
@@ -553,7 +614,7 @@ void TstEditorController::recoverySnapshotWrittenAndOfferedOnReopen()
     QCOMPARE(reqPath(recRead), recoveryPath);
     respondResult(reqId(recRead), {{"path", recoveryPath},
                                    {"encoding", "utf-8"},
-                                   {"content", "recovered edits"},
+                                   {"content", snapshotEnvelope(QStringLiteral("/foo/f.txt"), QStringLiteral("recovered edits"))},
                                    {"revision", "rec1"},
                                    {"truncated", false}});
 
@@ -609,7 +670,7 @@ void TstEditorController::reopenUnwatchesPreviousSubscription()
 
     const QJsonObject stat = nextRequest();
     QCOMPARE(method(stat), kStat);
-    QVERIFY(reqPath(stat).contains(QStringLiteral(".codeharbor-recovery")));
+    QCOMPARE(reqPath(stat), recoveryFilePath());
     respondError(reqId(stat), -32002, QStringLiteral("ENOENT")); // no snapshot
 
     QTRY_COMPARE(m_controller->fileState(), QStringLiteral("clean"));
@@ -689,8 +750,9 @@ void TstEditorController::successfulSaveClearsRecoverySnapshot()
     const QJsonObject snapshot = nextRequest();
     QCOMPARE(method(snapshot), kWriteFile);
     const QString recoveryPath = reqPath(snapshot);
-    QVERIFY(recoveryPath.contains(QStringLiteral(".codeharbor-recovery")));
-    QCOMPARE(reqContent(snapshot), QStringLiteral("edited"));
+    QCOMPARE(recoveryPath, recoveryFilePath());
+    QCOMPARE(snapshotContentOf(snapshot), QStringLiteral("edited"));
+    QCOMPARE(reqMode(snapshot), 0600);
     respondResult(reqId(snapshot), {{"path", recoveryPath}, {"revision", "rec1"}});
 
     // Save the buffer for real.
@@ -710,6 +772,7 @@ void TstEditorController::successfulSaveClearsRecoverySnapshot()
     QCOMPARE(reqPath(clear), recoveryPath);
     QCOMPARE(reqContent(clear), QString());
     QCOMPARE(reqExpectedRevision(clear), QStringLiteral("rec1"));
+    QCOMPARE(reqMode(clear), 0600);
     respondResult(reqId(clear), {{"path", recoveryPath}, {"revision", "rec2"}});
 
     // Reopen: the emptied snapshot still EXISTS on the server, so stat+read
@@ -911,7 +974,7 @@ void TstEditorController::reconnectLeavesADirtyBufferAloneAndFlagsIt()
     m_controller->reportContent(QStringLiteral("the user's unsaved work"));
     const QJsonObject snapshot = nextRequest();
     QCOMPARE(method(snapshot), kWriteFile);
-    QVERIFY(reqPath(snapshot).contains(QStringLiteral(".codeharbor-recovery")));
+    QVERIFY(reqPath(snapshot) == recoveryFilePath());
     respondResult(reqId(snapshot),
                   {{"path", reqPath(snapshot)}, {"revision", "rec1"}});
     QCOMPARE(m_controller->fileState(), QStringLiteral("modified"));
@@ -1093,6 +1156,90 @@ void TstEditorController::unwritableFileOpensReadOnlyAndRefusesSave()
     // Nothing failed and nothing moved: the buffer is still a clean r1.
     QCOMPARE(m_controller->fileState(), QStringLiteral("clean"));
     QCOMPARE(m_controller->revision(), QStringLiteral("r1"));
+}
+
+// X12: `mode` comes from lstat and is symlink-blind (a link's own bits are
+// 0777/whatever the link is), so it cannot see the target's real permissions.
+// The server's `writable` flag (C2) is fs.access(W_OK) on the LINK-FOLLOWED
+// target and is authoritative: an unwritable-LOOKING mode with writable:true
+// opens editable.
+void TstEditorController::writableFlagOverridesUnwritableMode()
+{
+    makePair();
+
+    QSignalSpy readOnlySpy(m_controller, &EditorController::readOnlyChanged);
+
+    m_controller->ready();
+    m_controller->open(QStringLiteral("/foo/link.txt"));
+    const QJsonObject read = nextRequest();
+    QCOMPARE(method(read), kReadFile);
+    respondResult(reqId(read), {{"path", "/foo/link.txt"},
+                                {"encoding", "utf-8"},
+                                {"content", "via symlink"},
+                                {"revision", "r1"},
+                                {"truncated", false}});
+    const QJsonObject watch = nextRequest();
+    QCOMPARE(method(watch), kWatch);
+    respondResult(reqId(watch), {{"subscriptionId", "sub1"}});
+
+    // mode 0444 alone would say UNWRITABLE, but writable:true wins.
+    const QJsonObject stat = nextRequest();
+    QCOMPARE(method(stat), kStat);
+    QCOMPARE(reqPath(stat), QStringLiteral("/foo/link.txt"));
+    respondResult(reqId(stat), {{"path", "/foo/link.txt"},
+                                {"kind", "file"},
+                                {"mode", 0444},
+                                {"writable", true},
+                                {"revision", "rperm"}});
+
+    // Not read-only, so the recovery probe goes ahead (SPEC 11.3): a writable
+    // file may legitimately be offered its snapshot.
+    const QJsonObject rec = nextRequest();
+    QCOMPARE(method(rec), kStat);
+    QCOMPARE(reqPath(rec), recoveryFilePath());
+    respondError(reqId(rec), -32002, QStringLiteral("ENOENT"));
+
+    QTest::qWait(100);
+    QCOMPARE(m_controller->readOnly(), false);
+    QVERIFY2(readOnlySpy.isEmpty(),
+             "the writable flag was ignored in favour of the symlink-blind mode");
+    QCOMPARE(m_controller->fileState(), QStringLiteral("clean"));
+}
+
+// The mirror image: a writable-LOOKING mode with writable:false (the server's
+// fs.access denied) is read-only. The flag forces the honest verdict `mode`
+// alone would miss.
+void TstEditorController::unwritableFlagForcesReadOnlyOverWritableMode()
+{
+    makePair();
+
+    m_controller->ready();
+    m_controller->open(QStringLiteral("/foo/link.txt"));
+    const QJsonObject read = nextRequest();
+    QCOMPARE(method(read), kReadFile);
+    respondResult(reqId(read), {{"path", "/foo/link.txt"},
+                                {"encoding", "utf-8"},
+                                {"content", "via symlink"},
+                                {"revision", "r1"},
+                                {"truncated", false}});
+    const QJsonObject watch = nextRequest();
+    QCOMPARE(method(watch), kWatch);
+    respondResult(reqId(watch), {{"subscriptionId", "sub1"}});
+
+    // mode 0644 alone would say writable, but writable:false wins.
+    const QJsonObject stat = nextRequest();
+    QCOMPARE(method(stat), kStat);
+    respondResult(reqId(stat), {{"path", "/foo/link.txt"},
+                                {"kind", "file"},
+                                {"mode", 0644},
+                                {"writable", false},
+                                {"revision", "rperm"}});
+
+    QTRY_COMPARE(m_controller->readOnly(), true);
+    // Read-only => never offered unsaved changes it could not apply (SPEC 11.3):
+    // the recovery probe is not even issued.
+    QVERIFY2(nextRequest(300).isEmpty(),
+             "a read-only (writable:false) open went looking for a recovery snapshot");
 }
 
 // A base64 read means the bytes on screen are NOT the file's bytes. save()
@@ -1350,8 +1497,8 @@ void TstEditorController::editsDuringASaveSurviveTheSaveReply()
     m_controller->reportContent(QStringLiteral("first edit + more typing"));
     const QJsonObject snapshot = nextRequest();
     QCOMPARE(method(snapshot), kWriteFile);
-    QVERIFY(reqPath(snapshot).contains(QStringLiteral(".codeharbor-recovery")));
-    QCOMPARE(reqContent(snapshot), QStringLiteral("first edit + more typing"));
+    QCOMPARE(reqPath(snapshot), recoveryFilePath());
+    QCOMPARE(snapshotContentOf(snapshot), QStringLiteral("first edit + more typing"));
     respondResult(reqId(snapshot),
                   {{"path", reqPath(snapshot)}, {"revision", "rec1"}});
 
@@ -1765,7 +1912,7 @@ void TstEditorController::deletedWhileDisconnectedWithUnsavedWorkIsOnlyFlagged()
     m_controller->reportContent(QStringLiteral("the user's unsaved work"));
     const QJsonObject snapshot = nextRequest();
     QCOMPARE(method(snapshot), kWriteFile);
-    QVERIFY(reqPath(snapshot).contains(QStringLiteral(".codeharbor-recovery")));
+    QVERIFY(reqPath(snapshot) == recoveryFilePath());
     respondResult(reqId(snapshot),
                   {{"path", reqPath(snapshot)}, {"revision", "rec1"}});
     QCOMPARE(m_controller->fileState(), QStringLiteral("modified"));

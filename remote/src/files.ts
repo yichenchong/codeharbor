@@ -7,7 +7,7 @@
 // JSON-RPC notifications. getMimeType stays an internal helper (the client
 // resolves viewer types by extension in ViewerHandlerRegistry).
 
-import { promises as fsp, watch as fsWatch } from "node:fs";
+import { promises as fsp, watch as fsWatch, constants as fsConstants } from "node:fs";
 import type { FSWatcher, Stats } from "node:fs";
 import type { FileHandle } from "node:fs/promises";
 import { EventEmitter } from "node:events";
@@ -112,6 +112,17 @@ export async function stat(params: StatParams): Promise<StatResult> {
     const target = stats.isSymbolicLink()
         ? await fsp.stat(params.path).catch(() => undefined)
         : undefined;
+    // Writability is checked against the LINK-FOLLOWED target (X12): a symlink
+    // to a read-only file must report writable:false even though the link node
+    // itself is writable. fs.access resolves the path, so W_OK reflects the real
+    // target's permissions; any error (no such target, no permission) => false.
+    let writable = false;
+    try {
+        await fsp.access(params.path, fsConstants.W_OK);
+        writable = true;
+    } catch {
+        writable = false;
+    }
     return {
         path: params.path,
         kind: nodeKind(stats),
@@ -119,6 +130,7 @@ export async function stat(params: StatParams): Promise<StatResult> {
         mtimeMs: stats.mtimeMs,
         mode: stats.mode,
         revision: revisionFrom(target ?? stats),
+        writable,
     };
 }
 
@@ -240,8 +252,18 @@ function assertRevisionMatches(filePath: string, expectedRevision: string, curre
 // concurrently, so two writeFile calls carrying the SAME expectedRevision can
 // both pass the guard and then race the rename — the second silently
 // overwriting the first (lost update). Chaining each write onto the previous
-// one for the SAME resolved target makes the revision re-check + rename atomic
-// per path, without globally serializing writes to unrelated files.
+// one for the SAME resolved target makes the whole critical section — the final
+// revision re-check, the rename, AND the post-rename stat that mints the
+// returned revision — atomic per path, without globally serializing writes to
+// unrelated files.
+//
+// RF16: because the lock spans rename+stat, the minted revision reflects
+// exactly the bytes THIS save wrote — no concurrent same-service writer can
+// rename a different version in between and have its stat leak into our token.
+// This guarantee is limited to writers going through this module: a THIRD-PARTY
+// process editing the same file in the sub-millisecond window between our rename
+// and stat remains out of scope, since Node offers no portable OS advisory file
+// lock (flock is non-portable and unavailable via fs/promises) to fence it out.
 const writeLocks = new Map<string, Promise<void>>();
 
 async function resolveWriteKey(p: string): Promise<string> {
@@ -318,19 +340,26 @@ async function writeFileLocked(params: WriteFileParams): Promise<WriteFileResult
     // hold unsaved user work (SPEC 11.3 wants recovery data at mode 0600).
     if (!existing) await fsp.mkdir(dir, { recursive: true, mode: 0o700 });
     // 0o7777 keeps the permission plus setuid/setgid/sticky bits and drops the
-    // file-type bits stat reports. The temp file is created 0o600 when it will
-    // replace an existing file, so its half-written contents are never readable
-    // by other users under a group- or world-readable target mode; the chmod
-    // below pins the real mode once the bytes are on disk.
-    const finalMode = existing ? existing.mode & 0o7777 : 0o644;
-    let handle: FileHandle | undefined = await fsp.open(tmp, "wx", existing ? 0o600 : finalMode);
+    // file-type bits stat reports. An explicit params.mode (C1: recovery
+    // snapshots at 0o600, ED15) wins over the preserved/default mode and is
+    // pinned EXACTLY via chmod below so umask cannot loosen it. The temp file is
+    // created 0o600 whenever it will be chmod'd to a final mode (overwrite or an
+    // explicit mode), so its half-written contents are never readable by other
+    // users under a group- or world-readable target mode.
+    const explicitMode = params.mode !== undefined ? params.mode & 0o7777 : undefined;
+    const finalMode = explicitMode ?? (existing ? existing.mode & 0o7777 : 0o644);
+    // Pin the mode with an explicit chmod (bypassing umask) whenever we overwrite
+    // an existing file or a caller demanded a specific mode; a fresh create with
+    // no explicit mode keeps the umask-masked open() mode (RF7).
+    const pinMode = existing !== undefined || explicitMode !== undefined;
+    let handle: FileHandle | undefined = await fsp.open(tmp, "wx", pinMode ? 0o600 : finalMode);
     try {
         await handle.writeFile(buf);
         await handle.sync();
         await handle.close();
         handle = undefined;
-        // open()'s mode is masked by umask; chmod pins the exact mode on overwrite.
-        if (existing) await fsp.chmod(tmp, finalMode);
+        // open()'s mode is masked by umask; chmod pins the exact mode.
+        if (pinMode) await fsp.chmod(tmp, finalMode);
         // Re-verify as late as possible — right before the atomic replace — so a
         // file changed during the write + flush above is caught instead of being
         // silently overwritten (SPEC 8.6). This shrinks but cannot fully close
@@ -394,9 +423,15 @@ interface Subscription {
     watcher?: FSWatcher;
     poll?: NodeJS.Timeout;
     lastRevision?: string;
-    // Serializes reconcile() calls so overlapping fs.watch and poll signals
-    // dedupe against a single lastRevision instead of racing across awaits.
-    pending?: Promise<void>;
+    // Coalescing scheme (RF14) that bounds the check chain at ONE waiter: the
+    // check currently reading the filesystem, plus at most one follow-up. It
+    // still dedupes overlapping fs.watch and poll signals against a single
+    // lastRevision without racing across awaits.
+    inFlight?: Promise<void>;
+    // A change signal that arrives while a check is in flight sets this
+    // (idempotently) instead of appending a new link to the chain. When the
+    // in-flight check finishes, exactly one follow-up runs if it was set.
+    queued?: boolean;
     // Set on unwatch/closeAll so an in-flight diffAndEmit that is awaiting stat
     // bails instead of emitting a WatchEvent for a released subscription.
     closed?: boolean;
@@ -466,18 +501,41 @@ export class FileWatchService {
         }
     }
 
-    // Serialize reconcile calls per subscription and diff the on-disk revision
-    // against the last one seen. Chaining onto sub.pending closes the await race
-    // where an fs.watch signal and a poll tick both read the pre-change revision
-    // and emit twice for one change. Event kind is derived purely from the state
-    // transition (created/modified/deleted) so it is identical regardless of
-    // which signal — fs.watch or poll — observed the change first.
-    private reconcile(sub: Subscription): Promise<void> {
-        const next = (sub.pending ?? Promise.resolve())
+    // Diff the on-disk revision against the last one seen, coalescing signals so
+    // AT MOST ONE check waits behind the in-flight one (RF14). This closes the
+    // await race where an fs.watch signal and a poll tick both read the
+    // pre-change revision and emit twice for one change, while bounding memory:
+    // a burst of signals collapses into a single queued follow-up rather than a
+    // check per signal. The follow-up reads the filesystem AFTER it begins, so
+    // any change whose signal arrived before it starts is still observed — no
+    // event is lost. Event kind is derived purely from the state transition
+    // (created/modified/deleted) so it is identical regardless of which signal —
+    // fs.watch or poll — observed the change first.
+    private reconcile(sub: Subscription): void {
+        if (sub.inFlight) {
+            // A check is running; record that one more is due. Idempotent: many
+            // signals during one check collapse to a single follow-up.
+            sub.queued = true;
+            return;
+        }
+        this.runCheck(sub);
+    }
+
+    private runCheck(sub: Subscription): void {
+        const done = this.diffAndEmit(sub)
             .catch(() => {})
-            .then(() => this.diffAndEmit(sub));
-        sub.pending = next;
-        return next;
+            .then(() => {
+                sub.inFlight = undefined;
+                if (sub.queued) {
+                    // Clear `queued` exactly when the follow-up check BEGINS, not
+                    // when it was scheduled: the check reads the filesystem after
+                    // this point, so any signal arriving from now on must queue a
+                    // fresh follow-up rather than be absorbed by this one.
+                    sub.queued = false;
+                    this.runCheck(sub);
+                }
+            });
+        sub.inFlight = done;
     }
 
     private async diffAndEmit(sub: Subscription): Promise<void> {

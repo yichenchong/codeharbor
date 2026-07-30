@@ -37,7 +37,8 @@ class EditorController : public QObject {
     // refreshPermissions() / applyStatPermissions() below.
     Q_PROPERTY(bool readOnly READ readOnly NOTIFY readOnlyChanged)
 public:
-    explicit EditorController(CodeharbordClient* client, QObject* parent = nullptr);
+    explicit EditorController(CodeharbordClient* client, QString recoveryId,
+                              QObject* parent = nullptr);
     // Releases the active file.watch subscription (SPEC 8.7) so closing an
     // editor pane never leaks a server-side watcher.
     ~EditorController() override;
@@ -49,6 +50,22 @@ public:
     // Exposed for host/tests; not part of the JS bridge surface.
     QString path() const { return m_path; }
     QString revision() const { return m_revision; }
+
+    // The server-reported recovery directory (server.info.recoveryDir), pushed
+    // in by EditorFactory once server.info answers; may arrive after the pane
+    // already exists. Base for recoveryPath(); empty until set (recovery
+    // disabled), so an older server that reports none degrades cleanly.
+    void setRecoveryDir(const QString& dir);
+
+    // This pane's stable per-pane recovery key (the layout paneId), the other
+    // half of recoveryPath(). Writable, not a fixed constructor value, because
+    // the QML pane's paneId is assigned by the region's layout logic and can
+    // settle AFTER this controller exists; EditorPaneView pushes it here whenever
+    // it changes so the per-pane snapshot is never keyed by an empty id (which
+    // would make two panes on one file share a snapshot). recoveryId() is for
+    // hosts/tests; not part of the JS bridge surface.
+    Q_INVOKABLE void setRecoveryId(const QString& id);
+    QString recoveryId() const { return m_recoveryId; }
 
     // Byte ceiling on every file.readFile this controller issues (SPEC 8.3).
     //
@@ -74,12 +91,12 @@ public slots:
     // Persist the buffer guarded by the revision originally loaded
     // (SPEC 8.4/8.6). Result arrives via saved / saveConflict / saveError.
     Q_INVOKABLE void save(QString content, QString expectedRevision);
-    // Snapshot the unsaved buffer to a server-side recovery path (SPEC 11.3)
-    // and mark the buffer dirty. Call debounced from the editor. Ignored while a
+    // Snapshot the unsaved buffer to this pane's recovery file (SPEC 11.3) and
+    // mark the buffer dirty. Call debounced from the editor. Ignored while a
     // load is in flight: the page is still showing the PREVIOUS file's buffer
-    // (the debounce outlives an open()), so honouring it would snapshot one
-    // file's edits under another file's recovery path and mark a buffer that
-    // nobody has edited dirty.
+    // (the debounce outlives an open()), so honouring it would tag one file's
+    // edits with the file now opening and mark a buffer that nobody has edited
+    // dirty.
     Q_INVOKABLE void reportContent(QString content);
     // Re-fetch the file from the server (SPEC 8.7).
     Q_INVOKABLE void requestReload();
@@ -148,7 +165,7 @@ private:
     // would too. Read-only-ness is DERIVED on every load and every reconnect,
     // never latched from the first open: a chmod is an ordinary external change.
     void refreshPermissions(std::function<void()> then = {});
-    // Fold a file.stat result (RpcTypes StatResult) into m_pathReadOnly.
+    // Fold a file.stat result into m_pathReadOnly.
     void applyStatPermissions(const QJsonObject& stat);
     void reload(FileState transitional);
     // Emit contentLoaded, or hold it until the page reports ready() (see the
@@ -157,10 +174,13 @@ private:
     void deliverContent(const QString& content, const QString& revision);
     // Look for a crash-recovery snapshot for the file `generation` loaded. The
     // generation is carried through both round trips so a snapshot belonging to
-    // a superseded load can never be offered against the file now open.
+    // a superseded load can never be offered against the file now open, and the
+    // snapshot's own recorded path is matched against the open file so this
+    // pane's snapshot of a PREVIOUS file is never offered as the current one
+    // (the recovery file is keyed per pane, not per path).
     void checkRecovery(const QString& loadedContent, quint64 generation);
     void writeRecovery(const QString& content, bool retryOnMismatch);
-    // Discard the server-side recovery snapshot after a successful save
+    // Discard this pane's recovery snapshot after a successful save
     // (SPEC 11.3): the saved file IS the buffer now, so a later reopen must not
     // offer a stale "unsaved changes" copy. No-op when no snapshot holds content.
     void clearRecovery();
@@ -179,9 +199,25 @@ private:
     // a clean buffer is reloaded, a dirty one is only FLAGGED, exactly as
     // onNotification() treats a live watch event.
     void reconcileAfterReconnect();
-    static QString recoveryPathFor(const QString& path);
+    // Absolute REMOTE path of THIS pane's single recovery snapshot: a file named
+    // by the pane's stable id (m_recoveryId) inside the recovery directory the
+    // SERVER reports (m_recoveryDir, from server.info.recoveryDir), NOT a sibling
+    // of the edited file (SPEC 11.3). One file per pane, so two panes editing the
+    // same path keep independent snapshots; the snapshot records the path it
+    // belongs to so a pane that has switched files never offers the wrong one.
+    // Empty when there is no stable id or the server reported no recovery dir,
+    // which disables recovery rather than sharing one unkeyed file between panes.
+    QString recoveryPath() const;
 
     CodeharbordClient* m_client = nullptr;
+    // Stable per-pane id (the persisted layout paneId) this pane's recovery
+    // snapshot is keyed by; see recoveryPath() and setRecoveryId(). Writable: the
+    // pane's paneId can be assigned after this controller is constructed.
+    QString m_recoveryId;
+    // The server-reported recovery base directory, set via setRecoveryDir().
+    // Mutable: it can be pushed in after this controller exists (server.info is
+    // asynchronous). Empty => recovery disabled.
+    QString m_recoveryDir;
 
     QString m_path;
     QString m_revision;      // baseline expectedRevision for the main file
@@ -193,7 +229,7 @@ private:
     //   m_bufferReadOnly — the bytes we hold are not the file's bytes, so
     //                      saving them would corrupt the file. Two ways that
     //                      happens: a base64 (binary) read, and a TRUNCATED
-    //                      read — a ReadFileResult carrying truncated=true is a
+    //                      read — a file.readFile result carrying truncated=true is a
     //                      PREFIX of the file, and writing a prefix back is
     //                      silent data loss for everything past it. A truncated
     //                      load additionally parks FileState at ReadOnly instead
@@ -242,8 +278,11 @@ private:
 
     // Recovery snapshot bookkeeping (SPEC 11.3). Empty revision => the next
     // write is create-only (expectedRevision ""). m_recoveryHasContent tracks
-    // whether the snapshot currently holds a buffer worth offering, so a save
-    // truncates it at most once and an already-empty snapshot is never rewritten.
+    // whether the snapshot currently holds a buffer worth offering FOR THE OPEN
+    // FILE, so a save truncates it at most once and an already-empty snapshot is
+    // never rewritten. The snapshot is a small JSON envelope carrying the remote
+    // path alongside the buffer, so checkRecovery() can refuse to offer a
+    // snapshot this pane wrote for a different file.
     QString m_recoveryRevision;
     bool m_recoveryHasContent = false;
 

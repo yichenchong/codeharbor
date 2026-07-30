@@ -554,7 +554,8 @@ void TstColdStart::cleanupTestCase()
             }
         }
         if (!m_remoteFile.isEmpty()) {
-            runExec(QStringLiteral("rm -f '%1'; rm -rf /tmp/.codeharbor-recovery")
+            runExec(QStringLiteral("rm -f '%1'; "
+                                   "rm -rf \"${XDG_DATA_HOME:-$HOME/.local/share}/codeharbor/recovery\"")
                         .arg(m_remoteFile));
         }
         if (!m_groupId.isEmpty()) {

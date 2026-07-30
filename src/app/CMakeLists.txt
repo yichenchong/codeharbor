@@ -27,6 +27,9 @@ target_link_libraries(ch_app PUBLIC
     ch_remote
     ch_ssh
     ch_agent
+    # AppController forwards server.info.recoveryDir to the per-pane editor
+    # factory (SPEC 11.3 crash recovery); it references ch::EditorFactory.
+    ch_editor
 )
 
 # QtDBus backs the desktop notifications in Notifier (SPEC 6.2) on Linux. It is

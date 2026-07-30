@@ -584,9 +584,8 @@ void TstSessionBootstrap::poolLossReconnects()
     QCOMPARE(h.boot.connectCalls, 2);
 }
 
-// SPEC 5.6, identical to the vector tst_terminalcontroller pins for
-// TerminalController::reconnectDelaySeconds(). These two ladders must not
-// drift.
+// SPEC 5.6: the session-level reconnect backoff ladder. This test pins the
+// exact vector so the schedule cannot silently drift from the spec.
 void TstSessionBootstrap::backoffLadderMatchesSpec()
 {
     QCOMPARE(SessionBootstrap::reconnectDelaySeconds(-1), 1);

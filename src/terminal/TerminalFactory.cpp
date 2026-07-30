@@ -1,5 +1,7 @@
 #include "TerminalFactory.h"
 
+#include <QTimer>
+
 #include "Ids.h"
 #include "SessionState.h"
 #include "SshChannelDevice.h"
@@ -28,6 +30,12 @@ QString shellSingleQuote(const QString& value)
 // to the conventional default.
 constexpr int kDefaultColumns = 80;
 constexpr int kDefaultRows = 24;
+
+// Upper bound on how long the fire-and-forget kill channel may stay alive.
+// The channel self-deletes on its own end-of-stream; if the SSH session dies
+// mid-kill that signal may never arrive, so this bounds the wait before the
+// one-shot object is reclaimed regardless (TM13).
+constexpr int kKillWatchdogMs = 30000;
 
 } // namespace
 
@@ -254,7 +262,20 @@ void TerminalFactory::kill(TerminalController* controller)
     if (!exec->startExec(tmuxKillSessionCommand(target))) {
         emit error(controller, QStringLiteral("could not kill the tmux session %1").arg(target));
         delete exec;
+        return;
     }
+
+    // Watchdog: the self-deletion above is driven ONLY by the channel's own
+    // readChannelFinished(). If the SSH session dies mid-kill that end-of-stream
+    // may never come, and the channel would then live until the factory itself
+    // is destroyed (app exit). A single-shot timer PARENTED to the channel
+    // deletes it after a bounded wait, so the timer itself cannot leak either.
+    // Whichever of {finished, timeout} fires first deletes the channel; because
+    // the timer is a child it is destroyed with it, which cancels the other.
+    auto* watchdog = new QTimer(exec);
+    watchdog->setSingleShot(true);
+    connect(watchdog, &QTimer::timeout, exec, &QObject::deleteLater);
+    watchdog->start(kKillWatchdogMs);
 }
 
 } // namespace ch

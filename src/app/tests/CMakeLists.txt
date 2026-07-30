@@ -44,6 +44,7 @@ set_tests_properties(tst_serverprofiles PROPERTIES
 qt_add_executable(tst_sessionlayouts tst_sessionlayouts.cpp)
 target_link_libraries(tst_sessionlayouts PRIVATE
     ch_app
+    ch_ssh
     Qt6::Test
     Qt6::Core
     Qt6::Gui
@@ -143,6 +144,7 @@ target_link_libraries(tst_liveshell PRIVATE
     ch_models
     ch_persistence
     ch_remote
+    ch_ssh
     ch_viewers
     ch_editor
     ch_agent

@@ -105,8 +105,11 @@ private:
     // Returns false if the channel never reached remote EOF within `timeoutMs`.
     bool runRemote(const QString& command, QByteArray* out, QString* err,
                    int timeoutMs);
-    // Fire one native Oh My Pi lifecycle hook on the remote side.
-    void fireHook(const QString& nativeEvent,
+    // Fire one native Oh My Pi lifecycle hook on the remote side. Returns false
+    // on the first failed check so a caller can QVERIFY it and abort — a void
+    // helper's QVERIFY only returns from the helper, letting the caller wait for
+    // a state change that can never arrive and report a misleading timeout.
+    bool fireHook(const QString& nativeEvent,
                   const QString& tool = QString(),
                   const QString& summary = QString());
     // Live per-terminal status as the sidebar would carry it.
@@ -260,7 +263,7 @@ bool TstLiveAgent::runRemote(const QString& command, QByteArray* out,
     return finished;
 }
 
-void TstLiveAgent::fireHook(const QString& nativeEvent, const QString& tool,
+bool TstLiveAgent::fireHook(const QString& nativeEvent, const QString& tool,
                             const QString& summary)
 {
     // The exact contract a harness must honour (SPEC 6.2): the native event is
@@ -282,21 +285,33 @@ void TstLiveAgent::fireHook(const QString& nativeEvent, const QString& tool,
     if (!tool.isEmpty())
         argv << q(tool);
 
+    // Each check reports through QTest::qVerify (as QVERIFY2 does) but returns
+    // false instead of a bare return, so the caller's QVERIFY(fireHook(...))
+    // aborts the test on the first failure rather than falling through into a
+    // wait for a state change that can never arrive.
     QByteArray out;
     QString err;
     const QString command = argv.join(QLatin1Char(' '));
-    QVERIFY2(runRemote(command, &out, &err, kNodeTimeoutMs),
-             qPrintable(QStringLiteral("hook %1 never finished: %2")
-                            .arg(nativeEvent, command)));
+    if (!QTest::qVerify(runRemote(command, &out, &err, kNodeTimeoutMs),
+                        "runRemote(command, &out, &err, kNodeTimeoutMs)",
+                        qPrintable(QStringLiteral("hook %1 never finished: %2")
+                                       .arg(nativeEvent, command)),
+                        __FILE__, __LINE__))
+        return false;
     // SPEC 6.4: the hook swallows every failure and exits 0 so a broken
     // producer cannot take down the agent. Its only symptom is a stderr
     // warning, so a silent run is the proof that it really reached the bridge
     // socket — without this assertion an unreachable bridge would look green.
-    QVERIFY2(err.trimmed().isEmpty(),
-             qPrintable(QStringLiteral("hook %1 warned: %2")
-                            .arg(nativeEvent, err.trimmed())));
+    if (!QTest::qVerify(err.trimmed().isEmpty(), "err.trimmed().isEmpty()",
+                        qPrintable(QStringLiteral("hook %1 warned: %2")
+                                       .arg(nativeEvent, err.trimmed())),
+                        __FILE__, __LINE__))
+        return false;
     // The hook is a pure producer: its payload goes to the socket, never stdout.
-    QVERIFY2(out.trimmed().isEmpty(), out.constData());
+    if (!QTest::qVerify(out.trimmed().isEmpty(), "out.trimmed().isEmpty()",
+                        out.constData(), __FILE__, __LINE__))
+        return false;
+    return true;
 }
 
 QVector<TerminalStatus> TstLiveAgent::liveTerminals() const
@@ -399,25 +414,25 @@ void TstLiveAgent::realHookDrivesOrderedStates()
 {
     QVERIFY2(m_bridge != nullptr, "bridge channel was not wired");
 
-    fireHook(QStringLiteral("session_start"));
+    QVERIFY(fireHook(QStringLiteral("session_start")));
     QTRY_COMPARE_WITH_TIMEOUT(m_monitor.stateFor(m_dev, m_term),
                               asInt(AgentState::Starting), kRelayTimeoutMs);
 
-    fireHook(QStringLiteral("agent_start"));
+    QVERIFY(fireHook(QStringLiteral("agent_start")));
     QTRY_COMPARE_WITH_TIMEOUT(m_monitor.stateFor(m_dev, m_term),
                               asInt(AgentState::Running), kRelayTimeoutMs);
 
     // `ask` is the tool that blocks on the user (SPEC 6.5).
-    fireHook(QStringLiteral("tool_call"), QStringLiteral("ask"));
+    QVERIFY(fireHook(QStringLiteral("tool_call"), QStringLiteral("ask")));
     QTRY_COMPARE_WITH_TIMEOUT(m_monitor.stateFor(m_dev, m_term),
                               asInt(AgentState::WaitingInput), kRelayTimeoutMs);
     QVERIFY(!m_monitor.hasUnseen(m_dev));
 
-    fireHook(QStringLiteral("tool_result"), QStringLiteral("ask"));
+    QVERIFY(fireHook(QStringLiteral("tool_result"), QStringLiteral("ask")));
     QTRY_COMPARE_WITH_TIMEOUT(m_monitor.stateFor(m_dev, m_term),
                               asInt(AgentState::Running), kRelayTimeoutMs);
 
-    fireHook(QStringLiteral("agent_end"), QString(), m_summary);
+    QVERIFY(fireHook(QStringLiteral("agent_end"), QString(), m_summary));
     QTRY_COMPARE_WITH_TIMEOUT(m_monitor.stateFor(m_dev, m_term),
                               asInt(AgentState::IdleUnseen), kRelayTimeoutMs);
 

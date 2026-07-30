@@ -668,3 +668,112 @@ test("writeFile creates a missing parent directory for a new file", async () => 
 
     await fs.rm(dir, { recursive: true, force: true });
 });
+
+test("writeFile honors an explicit mode on create (masks to 0o600)", async () => {
+    const dir = await tmpDir();
+    const file = path.join(dir, "recovery.snapshot");
+
+    // C1/ED15: a recovery snapshot is written private (0o600). The final file
+    // must carry exactly that mode, not a umask-loosened one.
+    await writeFile({ path: file, content: "unsaved", expectedRevision: "", mode: 0o600 });
+
+    const st = await fs.stat(file);
+    assert.equal(st.mode & 0o777, 0o600);
+    assert.equal((await readFile({ path: file })).content, "unsaved");
+
+    await fs.rm(dir, { recursive: true, force: true });
+});
+
+test("writeFile honors an explicit mode when overwriting", async () => {
+    const dir = await tmpDir();
+    const file = path.join(dir, "pinned.txt");
+    await fs.writeFile(file, "seed");
+    await fs.chmod(file, 0o644);
+
+    const current = await stat({ path: file });
+    // An explicit mode wins over the preserved 0o644 mode.
+    await writeFile({ path: file, content: "changed", expectedRevision: current.revision, mode: 0o600 });
+
+    const st = await fs.stat(file);
+    assert.equal(st.mode & 0o777, 0o600);
+
+    await fs.rm(dir, { recursive: true, force: true });
+});
+
+test("stat reports writable true for a writable file and false for a read-only one", async () => {
+    const dir = await tmpDir();
+    const writableFile = path.join(dir, "rw.txt");
+    const readOnlyFile = path.join(dir, "ro.txt");
+    await fs.writeFile(writableFile, "rw");
+    await fs.writeFile(readOnlyFile, "ro");
+    await fs.chmod(writableFile, 0o644);
+    await fs.chmod(readOnlyFile, 0o444);
+
+    assert.equal((await stat({ path: writableFile })).writable, true);
+    assert.equal((await stat({ path: readOnlyFile })).writable, false);
+
+    await fs.rm(dir, { recursive: true, force: true });
+});
+
+test("stat writable reflects the link-followed target, not the link", async () => {
+    const dir = await tmpDir();
+    const real = path.join(dir, "target.txt");
+    const link = path.join(dir, "link.txt");
+    await fs.writeFile(real, "data");
+    await fs.chmod(real, 0o444);
+    await fs.symlink(real, link);
+
+    // X12: the link node is writable but the target it resolves to is not, so
+    // writability must follow the link and report false.
+    const s = await stat({ path: link });
+    assert.equal(s.kind, "symlink");
+    assert.equal(s.writable, false);
+
+    await fs.rm(dir, { recursive: true, force: true });
+});
+
+test("watch coalesces a burst of rapid changes and observes the final revision", async () => {
+    const dir = await tmpDir();
+    const file = path.join(dir, "busy.log");
+    await fs.writeFile(file, "start");
+
+    const service = new FileWatchService();
+    service.pollIntervalMs = 25;
+    const events: WatchEvent[] = [];
+    service.onWatchEvent((e) => events.push(e));
+
+    const { subscriptionId } = await service.watch({ path: file });
+
+    // Append in a tight loop so change signals arrive faster than a check can
+    // complete: RF14's coalescing must still let the LAST state through — no
+    // lost events — even though intermediate signals collapse into one queued
+    // check rather than one check per signal.
+    let content = "start";
+    for (let i = 0; i < 50; i += 1) {
+        content += ` ${i}`;
+        await fs.writeFile(file, content);
+    }
+    const finalRevision = revisionFrom(await fs.stat(file));
+
+    // The final revision must eventually be observed by an emitted event.
+    await withTimeout(
+        new Promise<void>((resolve) => {
+            const seen = events.some((e) => e.revision === finalRevision);
+            if (seen) return resolve();
+            const off = service.onWatchEvent((e) => {
+                if (e.revision === finalRevision) {
+                    off();
+                    resolve();
+                }
+            });
+        }),
+        5000,
+    );
+
+    service.unwatch({ subscriptionId });
+    service.closeAll();
+
+    assert.equal(events.at(-1)?.revision, finalRevision);
+
+    await fs.rm(dir, { recursive: true, force: true });
+});

@@ -12,8 +12,10 @@ import {
 } from "../src/adapters/index.ts";
 import { processBridgeLine } from "../src/bridge.ts";
 import {
+    createLineFramer,
     dispatch,
     handleLine,
+    MAX_LINE_BYTES,
     RPC_INVALID_PARAMS,
     RPC_INVALID_REQUEST,
     RPC_METHOD_NOT_FOUND,
@@ -105,11 +107,18 @@ async function serverInfo(id: number): Promise<Record<string, unknown>> {
 
 test("codeharbord dispatch answers introspection and rejects unknown methods", async () => {
     const info = await serverInfo(1);
-    // The three original fields stay byte-compatible; serverId is additive.
+    // The three original fields stay byte-compatible; serverId and recoveryDir
+    // (SPEC 11.3, the remote crash-recovery data dir) are additive.
     assert.equal(info.name, "codeharbord");
     assert.equal(info.version, "0.1.0");
     assert.equal(info.schemaVersion, RPC_SCHEMA_VERSION);
-    assert.deepEqual(Object.keys(info).sort(), ["name", "schemaVersion", "serverId", "version"]);
+    assert.deepEqual(
+        Object.keys(info).sort(),
+        ["name", "recoveryDir", "schemaVersion", "serverId", "version"],
+    );
+    // recoveryDir is an absolute server path ending in the recovery directory.
+    assert.equal(typeof info.recoveryDir, "string");
+    assert.match(String(info.recoveryDir), /codeharbor[/\\]recovery$/);
 
     const serverId = info.serverId;
     assert.equal(typeof serverId, "string");
@@ -243,4 +252,37 @@ test("handleLine answers a batch line with a single Invalid Request", async () =
     assert.ok(response !== null && "error" in response);
     assert.equal(response.error.code, RPC_INVALID_REQUEST);
     assert.equal(response.id, null);
+});
+
+test("createLineFramer splits complete lines across chunk boundaries", () => {
+    const lines: string[] = [];
+    let overflowed = false;
+    const feed = createLineFramer((line) => lines.push(line), () => {
+        overflowed = true;
+    });
+    // A line spanning two chunks, then two lines in one chunk, and a trailing
+    // partial that must NOT be emitted until its newline arrives.
+    feed(Buffer.from('{"a":1'));
+    feed(Buffer.from('}\n{"b":2}\n{"c'));
+    assert.deepEqual(lines, ['{"a":1}', '{"b":2}']);
+    feed(Buffer.from('":3}\n'));
+    assert.deepEqual(lines, ['{"a":1}', '{"b":2}', '{"c":3}']);
+    assert.equal(overflowed, false);
+});
+
+test("createLineFramer rejects an over-cap newline-less frame", () => {
+    const lines: string[] = [];
+    let overflowed = false;
+    const feed = createLineFramer((line) => lines.push(line), () => {
+        overflowed = true;
+    });
+    // Stream past the cap in chunks with no newline: the framer must not buffer
+    // unboundedly — it signals overflow (the caller drops the connection) and
+    // emits no line.
+    const chunk = Buffer.alloc(1024 * 1024, 0x41); // 1 MiB of 'A', no newline.
+    for (let sent = 0; sent <= MAX_LINE_BYTES && !overflowed; sent += chunk.length) {
+        feed(chunk);
+    }
+    assert.equal(overflowed, true, "over-cap input must trigger overflow");
+    assert.deepEqual(lines, [], "no line may be emitted from an unterminated frame");
 });

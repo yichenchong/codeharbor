@@ -24,6 +24,14 @@ namespace ch {
 // object stays constructible and reports State::NotAvailable. This class does
 // not drive PTY I/O, reconnect scheduling, or the live handshake loop — those
 // belong to TerminalController and the remote client.
+//
+// The handshake is deliberately SYNCHRONOUS and runs on the calling thread. Its
+// worst-case freeze is therefore bounded: connectToHost() sets an explicit
+// SSH_OPTIONS_TIMEOUT (kHandshakeTimeoutSeconds, 15s) unless the user's own
+// OpenSSH ConnectTimeout was parsed from ~/.ssh/config, so a black-holed
+// endpoint stalls the UI thread for at most that timeout rather than libssh's
+// much longer version-dependent default. Channel writes are bounded by the same
+// session timeout (see SshChannelDevice::writeData).
 class SshConnectionPool : public QObject {
     Q_OBJECT
     Q_PROPERTY(QString diagnosticLog READ diagnosticLog NOTIFY diagnosticLogChanged)
@@ -102,6 +110,7 @@ public:
     struct AuthMethods {
         bool publicKey = false;
         bool password = false;
+        bool keyboardInteractive = false;
     };
 
     // One step of this client's authentication ladder.
@@ -110,6 +119,7 @@ public:
         KeyFile,        // configured/default private key, no passphrase
         KeyPassphrase,  // the same keys, with a passphrase asked of the user
         Password,       // the account password asked of the user
+        KeyboardInteractive,  // PAM/challenge-response, one password prompt
         Exhausted,      // nothing left to try
     };
     Q_ENUM(AuthRung)
@@ -123,6 +133,7 @@ public:
         bool keyFile = false;
         bool keyPassphrase = false;
         bool password = false;
+        bool keyboardInteractive = false;
 
         bool contains(AuthRung rung) const
         {
@@ -131,6 +142,7 @@ public:
             case AuthRung::KeyFile: return keyFile;
             case AuthRung::KeyPassphrase: return keyPassphrase;
             case AuthRung::Password: return password;
+            case AuthRung::KeyboardInteractive: return keyboardInteractive;
             case AuthRung::Exhausted: return true;
             }
             return true;
@@ -143,16 +155,19 @@ public:
             case AuthRung::KeyFile: keyFile = true; return;
             case AuthRung::KeyPassphrase: keyPassphrase = true; return;
             case AuthRung::Password: password = true; return;
+            case AuthRung::KeyboardInteractive:
+                keyboardInteractive = true;
+                return;
             case AuthRung::Exhausted: return;
             }
         }
     };
 
     // The next rung to climb: the first in this client's fixed order (agent ->
-    // key file -> key file with a passphrase -> password) that the server still
-    // offers and that has not been climbed yet, or Exhausted. `canPrompt` is
-    // false when no credential callback is installed, so the two rungs that
-    // need a secret from the user are unreachable.
+    // key file -> key file with a passphrase -> password -> keyboard-interactive)
+    // that the server still offers and that has not been climbed yet, or
+    // Exhausted. `canPrompt` is false when no credential callback is installed,
+    // so the rungs that need a secret from the user are unreachable.
     //
     // Pure, and deliberately driven by the CURRENT offer rather than by a fixed
     // sequence: it is re-evaluated after every step, so a partial success that
@@ -207,11 +222,13 @@ public:
 
     // Connect, verify the host key through KnownHosts, then authenticate. The
     // ladder is agent -> configured/default key -> that key with a passphrase
-    // asked of the user -> the account password, restricted at every step to
-    // the methods the server still offers, so a server that requires SEVERAL
-    // methods (`AuthenticationMethods publickey,password`) is satisfied one
-    // step at a time. `identityFile` is a local private key; empty leaves
-    // OpenSSH config and libssh defaults in charge.
+    // asked of the user -> the account password -> keyboard-interactive (PAM),
+    // restricted at every step to the methods the server still offers, so a
+    // server that requires SEVERAL methods (`AuthenticationMethods
+    // publickey,password`) is satisfied one step at a time. `identityFile` is a
+    // local private key; empty leaves OpenSSH config and libssh defaults in
+    // charge. The synchronous handshake is bounded by kHandshakeTimeoutSeconds
+    // (see the class comment) unless the user configured their own ConnectTimeout.
     bool connectToHost(const QString& host, quint16 port, const QString& user,
                        const QString& identityFile = QString());
     void disconnectFromHost();

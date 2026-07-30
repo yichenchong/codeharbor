@@ -192,11 +192,11 @@ void TstLiveEditorReconnect::initTestCase()
                             .arg(m_sideErr)));
 
     // ---- remote fixture, created out of band ------------------------------
-    // Not through file.writeFile: the fixture must not depend on the RPC
-    // surface under test. `.codeharbor-recovery` is created here as well —
-    // file.writeFile does create a missing parent directory now, but leaning on
-    // that would let an ENOENT silently swallow the SPEC 11.3 snapshot that
-    // reportContent writes, and this gate would pass without exercising it.
+    // Not through file.writeFile: the fixture must not depend on the RPC surface
+    // under test. Only the working directory is created here; the SPEC 11.3
+    // recovery snapshot reportContent writes lands under the recovery directory
+    // set on the controller below, whose parent file.writeFile creates on the
+    // first write.
     const QString token = QUuid::createUuid().toString(QUuid::WithoutBraces).left(12);
     m_remoteDir = QStringLiteral("/tmp/ch-live-editor-reconnect-%1").arg(token);
     m_filePath = m_remoteDir + QStringLiteral("/note.txt");
@@ -204,7 +204,7 @@ void TstLiveEditorReconnect::initTestCase()
     QByteArray out;
     QString err;
     QVERIFY2(remoteExec(QStringLiteral("mkdir -p ")
-                            + sq(m_remoteDir + QStringLiteral("/.codeharbor-recovery"))
+                            + sq(m_remoteDir)
                             + QStringLiteral(" && echo SETUP_OK"),
                         &out, &err),
              qPrintable(QStringLiteral("remote fixture setup timed out: %1").arg(err)));
@@ -380,7 +380,11 @@ void TstLiveEditorReconnect::watchResubscribesAfterReconnect()
     writeRemote(v1);
 
     // ---- open the file through the production controller ------------------
-    m_controller = std::make_unique<EditorController>(&m_client);
+    m_controller = std::make_unique<EditorController>(&m_client, QStringLiteral("viewer-1"));
+    // The recovery base a connected AppController would push in (SPEC 11.3); set
+    // directly here so reportContent's debounced snapshot write is exercised
+    // over the real channel. Its exact path is not asserted by this gate.
+    m_controller->setRecoveryDir(m_remoteDir + QStringLiteral("/recovery"));
     connect(m_controller.get(), &EditorController::contentLoaded, this,
             [this](const QString& content, const QString& revision) {
                 m_lastContent = content;
