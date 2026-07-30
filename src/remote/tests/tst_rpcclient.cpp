@@ -546,6 +546,14 @@ void TstRpcClient::nonRoutableIdWarns()
     QTRY_COMPARE(warnSpy.count(), 2);
     QVERIFY(!fired);
     QCOMPARE(m_client->pendingCount(), 1); // still awaiting the real response
+    // Complete the request before this test's stack locals go away. The client's
+    // destructor correctly fails pending callbacks, but this callback captures
+    // `fired` by reference and must not outlive it.
+    m_serverSide->write(
+        jsonLine({{"jsonrpc", "2.0"}, {"id", id}, {"result", QJsonObject{}}}));
+    m_serverSide->flush();
+    QTRY_VERIFY(fired);
+    QCOMPARE(m_client->pendingCount(), 0);
 }
 
 void TstRpcClient::crlfAndWhitespaceFraming()
@@ -927,8 +935,9 @@ void TstRpcClient::nonObjectJsonWarns()
 
     QSignalSpy warnSpy(m_client, &CodeharbordClient::protocolWarning);
     bool fired = false;
-    m_client->call(QStringLiteral("ping"), QJsonValue(),
-                   [&](QJsonValue, std::optional<RpcError>) { fired = true; });
+    const int id = m_client->call(
+        QStringLiteral("ping"), QJsonValue(),
+        [&](QJsonValue, std::optional<RpcError>) { fired = true; });
 
     m_serverSide->write(QByteArray("[{\"jsonrpc\":\"2.0\",\"id\":1}]\n"));
     m_serverSide->write(QByteArray("\"just a string\"\n"));
@@ -942,6 +951,13 @@ void TstRpcClient::nonObjectJsonWarns()
     }
     QVERIFY(!fired);
     QCOMPARE(m_client->pendingCount(), 1);
+    // As above, finish the request while the callback's captured local still
+    // exists; cleanup destroys the client after this test function returns.
+    m_serverSide->write(
+        jsonLine({{"jsonrpc", "2.0"}, {"id", id}, {"result", QJsonObject{}}}));
+    m_serverSide->flush();
+    QTRY_VERIFY(fired);
+    QCOMPARE(m_client->pendingCount(), 0);
 }
 
 // A response that physically arrived before the peer shut down must be
