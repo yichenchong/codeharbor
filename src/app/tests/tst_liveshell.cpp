@@ -70,6 +70,7 @@
 #include <QtTest/QtTest>
 #include <QtWebEngineQuick/QtWebEngineQuick>
 
+#include <QSettings>
 #include <memory>
 #include <optional>
 
@@ -466,17 +467,20 @@ bool TstLiveShell::waitForRefresh(int previousCount, int timeoutMs)
 
 QString TstLiveShell::configFilePath() const
 {
-    return m_configHome + QStringLiteral("/") + QString::fromLatin1(kOrganization)
-           + QStringLiteral("/") + QString::fromLatin1(kApplication)
-           + QStringLiteral(".conf");
+    // Ask QSettings for the platform-native file rather than assuming the
+    // Linux INI layout. macOS stores NativeFormat differently, while the
+    // production UiStateStore uses this exact constructor.
+    return QSettings(QStringLiteral("CodeHarbor"), QStringLiteral("CodeHarbor"))
+        .fileName();
 }
 
 QString TstLiveShell::readConfigFile() const
 {
-    QFile file(configFilePath());
-    if (!file.open(QIODevice::ReadOnly | QIODevice::Text))
-        return QStringLiteral("<missing %1>").arg(configFilePath());
-    return QString::fromUtf8(file.readAll());
+    QSettings settings(QStringLiteral("CodeHarbor"), QStringLiteral("CodeHarbor"));
+    settings.sync();
+    return QStringLiteral("layout/sidebarWidth=%1\nlayout/terminalWidth=%2")
+        .arg(settings.value(QStringLiteral("layout/sidebarWidth")).toInt())
+        .arg(settings.value(QStringLiteral("layout/terminalWidth")).toInt());
 }
 
 // ---------------------------------------------------------------------------
