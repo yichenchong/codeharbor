@@ -308,7 +308,7 @@ void TstTerminalFactory::bridgeClampsAbsurdGeometryFromThePage()
     QCOMPARE(controller->columns(), 120);
     QCOMPARE(controller->rows(), 40);
 
-    bridge->resize(std::numeric_limits<int>::max(), std::numeric_limits<int>::max());
+    bridge->resize((std::numeric_limits<int>::max)(), (std::numeric_limits<int>::max)());
     QCOMPARE(controller->columns(), TerminalBridge::kMaxDimension);
     QCOMPARE(controller->rows(), TerminalBridge::kMaxDimension);
 
