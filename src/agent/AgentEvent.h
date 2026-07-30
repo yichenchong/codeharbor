@@ -22,6 +22,16 @@ constexpr int kAgentEventVersion = 1;
 // decoded, validated fields of one JSONL agent-status event. `state` is the
 // parsed enum; `summary`/`metadata` are optional (empty when the producer
 // omitted them).
+//
+// `timestamp` is deliberately kept as the producer's opaque string. events.ts
+// documents it as ISO-8601-with-milliseconds but validates only that it IS a
+// string, and the client matches that exactly: it is display/diagnostic data,
+// never a sequencing key. Ordering comes from the single ordered byte stream —
+// one producer, one socket, one channel — so events are applied strictly in
+// arrival order (last one wins for a given terminal). Do NOT start comparing
+// timestamps to reorder or drop events: they are remote wall-clock readings
+// taken in separate short-lived hook processes, so they are neither monotonic
+// nor guaranteed distinct, and a clock step backwards would discard live state.
 struct AgentEvent {
     int version = 0;
     QString timestamp;
@@ -34,10 +44,12 @@ struct AgentEvent {
     QJsonObject metadata;
 };
 
-// Map a wire state string (starting/running/waiting_input/idle_unseen/idle/
-// error/stopped/unknown) to the ch::AgentState enum. Any unrecognized value —
-// including the literal "unknown" — collapses to AgentState::Unknown.
-inline AgentState agentStateFromWire(QStringView s)
+// Single source of truth for the wire state tokens (SPEC 6.4), mirroring
+// AGENT_STATES in remote/src/events.ts. Returns std::nullopt for a token that
+// is not in that list, which is what lets the parser tell a genuine "unknown"
+// (a valid event whose producer does not know the agent's state) from a token
+// some newer producer invented (a malformed event that must be dropped).
+inline std::optional<AgentState> agentStateFromWireStrict(QStringView s)
 {
     if (s == u"starting") return AgentState::Starting;
     if (s == u"running") return AgentState::Running;
@@ -47,20 +59,26 @@ inline AgentState agentStateFromWire(QStringView s)
     if (s == u"error") return AgentState::Error;
     if (s == u"stopped") return AgentState::Stopped;
     if (s == u"unknown") return AgentState::Unknown;
-    return AgentState::Unknown;
+    return std::nullopt;
+}
+
+// Lenient form of the same mapping: any unrecognized value — including the
+// literal "unknown" — collapses to AgentState::Unknown, so a caller that does
+// not need the malformed/genuine distinction never handles a missing value.
+inline AgentState agentStateFromWire(QStringView s)
+{
+    return agentStateFromWireStrict(s).value_or(AgentState::Unknown);
 }
 
 namespace detail {
 
 // Membership test mirroring isAgentState() in events.ts: only the eight wire
-// tokens are valid. Distinct from agentStateFromWire(), which cannot tell a
-// genuine "unknown" from an unrecognized token (both map to Unknown) — parsing
-// must reject the latter as malformed.
+// tokens are valid. Derived from the single token table above so a state added
+// to the wire enum cannot be taught to one list and forgotten in the other —
+// which would either reject a valid event or silently record it as Unknown.
 inline bool isAgentStateWire(QStringView s)
 {
-    return s == u"starting" || s == u"running" || s == u"waiting_input"
-        || s == u"idle_unseen" || s == u"idle" || s == u"error"
-        || s == u"stopped" || s == u"unknown";
+    return agentStateFromWireStrict(s).has_value();
 }
 
 // Membership test mirroring isHarness() in events.ts.
@@ -113,7 +131,13 @@ inline std::optional<AgentEvent> parseAgentEventLine(const QByteArray& line)
         return std::nullopt;
     if (!vTerm.isString())
         return std::nullopt;
-    if (!vState.isString() || !detail::isAgentStateWire(vState.toString()))
+    if (!vState.isString())
+        return std::nullopt;
+    // Resolved once, strictly: an unrecognized token is malformed (dropped),
+    // and the resolved enum is reused below instead of re-mapping the string.
+    const std::optional<AgentState> state =
+        agentStateFromWireStrict(vState.toString());
+    if (!state)
         return std::nullopt;
     if (!vEvent.isString())
         return std::nullopt;
@@ -128,7 +152,7 @@ inline std::optional<AgentEvent> parseAgentEventLine(const QByteArray& line)
     AgentEvent ev;
     ev.version = vVersion.toInt();
     ev.timestamp = vTimestamp.toString();
-    ev.state = agentStateFromWire(vState.toString());
+    ev.state = *state;
     ev.harness = vHarness.toString();
     ev.devSessionId = vDev.toString();
     ev.terminalId = vTerm.toString();

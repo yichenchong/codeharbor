@@ -43,19 +43,39 @@ public:
 
     explicit CodeharbordClient(QObject* parent = nullptr);
 
+    // Fails every request still in flight with a synthetic error, so call()'s
+    // exactly-once guarantee holds on this path too: destroying the client is
+    // the one way a pending callback could otherwise be dropped silently,
+    // because nothing is left that could ever answer the ids we minted.
+    ~CodeharbordClient() override;
+
     // Bind the transport carrying the JSONL RPC stream. Ownership stays with the
-    // caller. Passing a new transport rewires the readyRead/close hooks; the
-    // read buffer is reset but in-flight pending callbacks are preserved.
+    // caller. Passing a new transport rewires the readyRead/close hooks and
+    // resets the read buffer.
+    //
+    // Every request still in flight is FAILED with a synthetic transport error,
+    // because the ids we issued mean nothing to anyone but the peer being
+    // dropped: a reconnect (SPEC 5.6) hands us a different `codeharbord` process
+    // whose request table never heard of them, and a detach
+    // (setTransport(nullptr)) leaves nobody to answer at all. Keeping them would
+    // hang their callers forever. Those failures run synchronously, inside this
+    // call, and may themselves re-enter call() — a retry issued there goes out on
+    // the NEW transport.
+    //
     // Binding a non-null transport emits transportBound() once it is usable.
     void setTransport(QIODevice* transport);
     QIODevice* transport() const { return m_transport; }
 
     // Issue an async request. Returns the monotonically increasing JSON-RPC id
-    // assigned to it. The callback fires exactly once: either when the matching
-    // response arrives, with a synthetic error if the transport closes while the
-    // request is pending, or — if no writable transport is bound (or the write
-    // fails) — synchronously with a synthetic transport error before returning.
-    // No callback is ever registered that cannot fire.
+    // assigned to it (also returned, unused, on the failure paths below). The
+    // callback fires exactly once: when the matching response arrives; with a
+    // synthetic error if the transport closes or is replaced while the request is
+    // pending, or if this client is destroyed while it is still pending; or — if
+    // no writable transport is bound, or the write fails — synchronously with a
+    // synthetic transport error before returning. No callback is ever registered
+    // that cannot fire. A null callback is accepted
+    // for a fire-and-forget request; the request is still written and matched,
+    // there is simply nothing to invoke.
     int call(const QString& method, const QJsonValue& params, ResponseCallback cb);
 
     // Number of requests awaiting a response.
@@ -65,13 +85,23 @@ public:
     static QString launchCommand();
 
 signals:
-    // Server -> client notification (id-less message), e.g. file.watchEvent.
+    // Server -> client notification: a message with a method name and NO id
+    // (JSON-RPC 2.0 section 4.1), e.g. file.watchEvent. A message carrying both
+    // a method and an id is a request aimed at us, which this client does not
+    // implement; it is reported through protocolWarning() instead.
     void notificationReceived(const QString& method, const QJsonValue& params);
     // A malformed line, unknown/duplicate response id, or otherwise unroutable
     // message was received. Non-fatal; the stream continues.
     void protocolWarning(const QString& message);
-    // The transport closed/disconnected. Emitted after all pending callbacks
-    // have been failed with a synthetic error and the pending map cleared.
+    // The transport closed/disconnected, or its byte stream became untrustworthy
+    // (an unframed line past the size cap). Emitted after any bytes still
+    // readable on the transport have been routed, then all remaining pending
+    // callbacks have been failed with a synthetic error and the pending map
+    // cleared. Emitted at most once per bound transport.
+    //
+    // Detaching or replacing the transport with setTransport() does NOT emit
+    // this; it fails pending callbacks without announcing a close, because the
+    // caller doing the detaching already knows.
     void transportClosed();
     // A NEW, non-null transport is bound and ready to carry requests.
     //

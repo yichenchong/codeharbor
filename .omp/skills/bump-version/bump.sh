@@ -10,8 +10,9 @@ Usage: bump.sh <major|minor|patch> [options]
        bump.sh --set X.Y.Z [options]
 
 Computes the next version from the latest v* git tag (or the CMake project
-version if there are no tags), updates the version in CMakeLists.txt and the
-package.json files, commits those files, and creates an annotated tag vX.Y.Z.
+version if there are no tags), updates the version in CMakeLists.txt and every
+package.json in the workspace, commits those files, and creates an annotated tag
+vX.Y.Z.
 
 Options:
   --set X.Y.Z    Use an explicit version instead of bumping a component.
@@ -40,7 +41,14 @@ ALLOW_DIRTY=0
 while [ $# -gt 0 ]; do
     case "$1" in
         major|minor|patch) LEVEL="$1" ;;
-        --set) shift; SET_VERSION="${1:-}" ;;
+        --set)
+            shift
+            # Without this guard `--set` as the last argument would leave $# at 0
+            # and the loop's trailing `shift` would abort the script under
+            # `set -e` with no message at all.
+            [ $# -gt 0 ] || die "--set requires a version (X.Y.Z)"
+            SET_VERSION="$1"
+            ;;
         --push) DO_PUSH=1 ;;
         --no-commit) DO_COMMIT=0 ;;
         --dry-run) DRY_RUN=1 ;;
@@ -92,10 +100,19 @@ if [ "$DRY_RUN" -eq 1 ]; then
     exit 0
 fi
 
+# Every file that carries the release version. The two web-bundle manifests are
+# in here because they are real workspaces: leaving them behind is how
+# src/web/*/package.json drifted to 0.1.0 while the tag said 0.1.7.
+VERSION_FILES=(CMakeLists.txt
+               package.json
+               remote/package.json
+               src/web/terminal/package.json
+               src/web/editor/package.json)
+
 # Guard: never clobber uncommitted edits to the version files we are about to
 # rewrite. Scoped to those files so unrelated work in progress is fine.
 if [ "$DO_COMMIT" -eq 1 ] && [ "$ALLOW_DIRTY" -eq 0 ]; then
-    dirty="$(git status --porcelain -- CMakeLists.txt package.json remote/package.json)"
+    dirty="$(git status --porcelain -- "${VERSION_FILES[@]}")"
     [ -z "$dirty" ] || die "version files have uncommitted changes; commit/stash them or pass --allow-dirty:
 $dirty"
 fi
@@ -105,8 +122,10 @@ if [ "$DO_COMMIT" -eq 1 ]; then
     # so JSON formatting stays intact.
     node -e 'const fs=require("fs");let s=fs.readFileSync("CMakeLists.txt","utf8");s=s.replace(/(project\(CodeHarbor[\s\S]*?VERSION\s+)\d+\.\d+\.\d+/,`$1'"$new"'`);fs.writeFileSync("CMakeLists.txt",s)'
     changed=(CMakeLists.txt)
-    for f in package.json remote/package.json; do
-        [ -f "$f" ] || continue
+    for f in "${VERSION_FILES[@]:1}"; do
+        # A missing manifest is a mistake, not something to skip quietly: a
+        # silently un-bumped version is exactly the bug this list exists to stop.
+        [ -f "$f" ] || die "expected version file is missing: $f"
         node -e 'const fs=require("fs");const f=process.argv[1];const j=JSON.parse(fs.readFileSync(f));j.version=process.argv[2];fs.writeFileSync(f,JSON.stringify(j,null,2)+"\n")' "$f" "$new"
         changed+=("$f")
     done

@@ -96,16 +96,64 @@ export function mountTerminal(element: HTMLElement, bridge: TerminalBridge): Ter
     bridge.resize(term.cols, term.rows);
 
     // Re-fit on container resize; fit() emits onResize only when dims change.
+    // BOTH boxes are observed, because either one alone misses a real resize:
+    //   * element — the pane itself was resized by the host.
+    //   * surface — the root keeps its size while the surface changes, because
+    //     the status strip above it is display:none in the "ready" state (see
+    //     index.html). Observing only the root leaves a row of the grid
+    //     reserved for a strip that is no longer on screen.
+    // A second fit() for one real resize costs nothing: it re-fits to
+    // already-correct dims, which emits no onResize.
     const resizeObserver = new ResizeObserver(() => fit.fit());
     resizeObserver.observe(element);
+    resizeObserver.observe(surface);
 
     // Report visibility so the controller can suspend/resume the renderer while
     // output keeps buffering server-side (SPEC 5.4).
+    //
+    // OWNERSHIP: this page is the AUTHORITATIVE reporter of renderer
+    // visibility, because it is the only layer that observes every condition
+    // deciding whether a byte written now would actually be seen. The reported
+    // value is the CONJUNCTION of both, because either one alone reports a
+    // hidden pane as visible:
+    //   * IntersectionObserver — the element collapsed or scrolled out of view.
+    //     Nothing outside the document can observe this at all.
+    //   * document.visibilityState — Qt WebEngine marks the whole page hidden
+    //     when its WebEngineView stops being rendered (the pane item is not
+    //     visible, the pane is not the active tab, the window is minimised).
+    //     The element still intersects the viewport then, so the observer alone
+    //     never notices.
+    //
+    // The same C++ slot has two other, COARSER callers, and both are strict
+    // subsets of what is computed here:
+    //   * src/qml/TerminalPaneView.qml `onVisibleChanged` — an invisible QML
+    //     item is precisely what stops the WebEngineView rendering, which is
+    //     what turns document.visibilityState to "hidden"; it says nothing
+    //     about an in-document collapse.
+    //   * ch::TerminalBridge::ready() — reports visible when this page mounts,
+    //     to release the buffer retained while the page was loading.
+    // They exist because they can speak before this page has a renderer.
+    //
+    // Consequence: another caller can move ch::TerminalController's flag behind
+    // this page's back, so the page must NOT remember what it last reported and
+    // skip a repeat of it — that memory would be stale and would swallow the
+    // correcting report. Every event re-asserts the full conjunction instead.
+    // ch::TerminalController::setViewVisible() already ignores a value equal to
+    // the one it holds, so a redundant report costs one WebChannel message and
+    // changes nothing.
+    let intersecting = true;
+    function reportVisibility(): void {
+        bridge.notifyViewVisible(
+            intersecting && element.ownerDocument.visibilityState === "visible",
+        );
+    }
     const visibilityObserver = new IntersectionObserver((entries) => {
         for (const entry of entries)
-            bridge.notifyViewVisible(entry.isIntersecting);
+            intersecting = entry.isIntersecting;
+        reportVisibility();
     });
     visibilityObserver.observe(element);
+    element.ownerDocument.addEventListener("visibilitychange", reportVisibility);
 
     return {
         write(data: string): void {
@@ -121,6 +169,16 @@ export function mountTerminal(element: HTMLElement, bridge: TerminalBridge): Ter
         dispose(): void {
             resizeObserver.disconnect();
             visibilityObserver.disconnect();
+            element.ownerDocument.removeEventListener("visibilitychange", reportVisibility);
+            // The renderer is going away (pane closed, or the page is about to
+            // be replaced by a reload). The controller must hear about it
+            // BEFORE the teardown: otherwise it still believes a renderer is
+            // listening and keeps emitting write() at a page that no longer
+            // has a handler attached, and that output is LOST instead of being
+            // retained and replayed to the next page (SPEC 5.4). Sent
+            // unconditionally for the reason given above: what this page last
+            // reported is not proof of what the controller currently holds.
+            bridge.notifyViewVisible(false);
             // Disposing the terminal also disposes loaded addons (FitAddon).
             term.dispose();
         },
@@ -172,18 +230,43 @@ type QWebChannelCtor = new (
     callback: (channel: QWebChannelInstance) => void,
 ) => QWebChannelInstance;
 
-declare const QWebChannel: QWebChannelCtor;
-declare const qt: { webChannelTransport: unknown };
+// Both are injected by the host, so a page opened OUTSIDE Qt WebEngine (or one
+// whose qwebchannel.js failed to load) has neither. Typed as possibly-undefined
+// so the guards in connectTerminal() are the honest shape rather than a cast:
+// only `typeof` may touch a global that was never declared at all.
+declare const QWebChannel: QWebChannelCtor | undefined;
+declare const qt: { webChannelTransport: unknown } | undefined;
+
+/**
+ * Replace the pane with a single explanatory line. Used only for the failures
+ * that happen BEFORE a terminal exists, which would otherwise leave a blank
+ * black rectangle and no clue (the QML pane can only report a page that failed
+ * to LOAD, not one that loaded and found no bridge). textContent, never
+ * innerHTML: this is a privileged page and never builds markup from a string.
+ */
+function showFatal(element: HTMLElement, message: string): void {
+    const status = element.ownerDocument.createElement("div");
+    status.className = "ch-terminal-status";
+    status.dataset.state = "error";
+    status.textContent = message;
+    element.replaceChildren(status);
+}
 
 /**
  * Page entry point: open the WebChannel injected by the QML host and mount the
  * terminal against the "terminal" object (the C++ ch::TerminalBridge proxy).
  */
 export function connectTerminal(element: HTMLElement): void {
+    if (typeof QWebChannel === "undefined" || typeof qt === "undefined"
+        || !qt.webChannelTransport) {
+        showFatal(element, "This page requires the CodeHarbor host: no WebChannel transport.");
+        return;
+    }
     new QWebChannel(qt.webChannelTransport, (channel: QWebChannelInstance) => {
         const bridge = channel.objects.terminal as TerminalChannelObject | undefined;
         if (!bridge) {
-            return; // host registered no bridge: leave the page inert
+            showFatal(element, "The terminal bridge is missing from this window.");
+            return;
         }
         const host = mountTerminal(element, bridge);
         bridge.write.connect((data: string) => host.write(data));
@@ -195,7 +278,9 @@ export function connectTerminal(element: HTMLElement): void {
             host.setConnectionState(bridge.connectionState);
         }
         // A navigated-away or destroyed pane must not leave a ResizeObserver and
-        // an IntersectionObserver firing into a dead terminal.
+        // an IntersectionObserver firing into a dead terminal, and must hand the
+        // controller back the job of retaining output (host.dispose() reports the
+        // renderer hidden on its way out).
         window.addEventListener("pagehide", () => host.dispose(), { once: true });
         // Handshake LAST, once every host callback is connected: the controller
         // has been buffering output since the channel opened and replays it into

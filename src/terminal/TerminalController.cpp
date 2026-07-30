@@ -29,11 +29,33 @@ TerminalController::TerminalController(QObject *parent)
     m_flushTimer.setSingleShot(true);
     m_flushTimer.setInterval(kFlushIntervalMs);
     connect(&m_flushTimer, &QTimer::timeout, this, &TerminalController::flush);
+    m_attachTimer.setSingleShot(true);
+    connect(&m_attachTimer, &QTimer::timeout, this,
+            &TerminalController::onAttachTimeout);
 }
 
 TerminalState TerminalController::state() const
 {
     return m_state;
+}
+
+void TerminalController::setAttachTimeoutMs(int ms)
+{
+    m_attachTimeoutMs = qMax(0, ms);
+    // A pane that is attaching right now is measured against the NEW window,
+    // restarted from this moment: leaving the old interval running would make
+    // the setter silently ineffective for the one pane it was called about.
+    if (m_attachTimer.isActive() || m_state == TerminalState::OpeningChannel
+        || m_state == TerminalState::AttachingTmux) {
+        m_attachTimer.stop();
+        if (m_attachTimeoutMs > 0)
+            m_attachTimer.start(m_attachTimeoutMs);
+    }
+}
+
+int TerminalController::attachTimeoutMs() const
+{
+    return m_attachTimeoutMs;
 }
 
 bool TerminalController::viewVisible() const
@@ -121,15 +143,8 @@ void TerminalController::onTransportFinished()
     // A channel that ends under a live pane is a dropped connection (SPEC 5.6).
     // Only live states transition: an already Disconnected/Error pane must not
     // be walked backwards, and a pane that never came up keeps its state.
-    switch (m_state) {
-    case TerminalState::OpeningChannel:
-    case TerminalState::AttachingTmux:
-    case TerminalState::Ready:
+    if (isLiveState(m_state))
         setState(TerminalState::Disconnected);
-        break;
-    default:
-        break;
-    }
 }
 
 bool TerminalController::sendInput(const QByteArray &bytes)
@@ -201,7 +216,60 @@ void TerminalController::setState(TerminalState next)
     if (m_state == next)
         return;
     m_state = next;
+    // Arm the attach watchdog on the way INTO an attaching state and disarm it
+    // on the way out. Both attaching states restart the window, because each of
+    // them is progress: a slow channel open must not eat the budget tmux gets to
+    // draw its first screenful. Every other state is an outcome — Ready means the
+    // pane came up, Disconnected/Error mean it will not — so the clock stops.
+    if (next == TerminalState::OpeningChannel || next == TerminalState::AttachingTmux) {
+        if (m_attachTimeoutMs > 0)
+            m_attachTimer.start(m_attachTimeoutMs);
+    } else {
+        m_attachTimer.stop();
+    }
     emit stateChanged(m_state);
+}
+
+void TerminalController::onAttachTimeout()
+{
+    // Re-check the state rather than trusting the timer: a timeout already
+    // queued in the event loop can still be delivered after setState() stopped
+    // the timer, and turning a pane that just came up into an Error would be
+    // strictly worse than the stall this guards against.
+    if (m_state != TerminalState::OpeningChannel
+        && m_state != TerminalState::AttachingTmux)
+        return;
+
+    // Error, not Disconnected: nothing was ever established, so there is nothing
+    // for an automatic reconnect ladder to resume — the attach itself has to be
+    // retried, which is what the pane's Retry action does. setState() emits the
+    // transition and stops the timer; the signal only carries the reason out to
+    // whoever writes the pane's message (TerminalFactory).
+    setState(TerminalState::Error);
+    emit attachTimedOut();
+}
+
+bool TerminalController::isLiveState(TerminalState state)
+{
+    // A pane only has a channel to lose from the moment the channel is being
+    // opened until it ends. Unloaded (never attached), Disconnected and Error
+    // are terminal for this purpose; Connecting/Authenticating/Reconnecting
+    // describe the session, not this pane's channel, so a channel end must not
+    // overwrite them either (SPEC 5.6).
+    switch (state) {
+    case TerminalState::OpeningChannel:
+    case TerminalState::AttachingTmux:
+    case TerminalState::Ready:
+        return true;
+    case TerminalState::Unloaded:
+    case TerminalState::Connecting:
+    case TerminalState::Authenticating:
+    case TerminalState::Disconnected:
+    case TerminalState::Reconnecting:
+    case TerminalState::Error:
+        return false;
+    }
+    return false;
 }
 
 QString TerminalController::tmuxTarget(const DevSessionId &devSession,

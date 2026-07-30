@@ -21,23 +21,11 @@ QString shellSingleQuote(const QString& value)
     return QLatin1Char('\'') + escaped + QLatin1Char('\'');
 }
 
-// States a pane can be dropped out of; anything else (Unloaded, Error, an
-// already Disconnected pane) must not be walked backwards.
-bool isLive(ch::TerminalState state)
-{
-    switch (state) {
-    case ch::TerminalState::OpeningChannel:
-    case ch::TerminalState::AttachingTmux:
-    case ch::TerminalState::Ready:
-        return true;
-    default:
-        return false;
-    }
-}
-
 // A PTY with a zero dimension is not a size, it is a bug waiting to surface as
-// an unusable remote window; a pane that has not been laid out yet gets the
-// conventional default until its renderer reports real geometry.
+// an unusable remote window. A pane that has not been laid out yet has no real
+// geometry to offer, so fall back to whatever the controller already recorded
+// (a reconnect knows the pane size even when the caller does not) and only then
+// to the conventional default.
 constexpr int kDefaultColumns = 80;
 constexpr int kDefaultRows = 24;
 
@@ -54,7 +42,30 @@ TerminalController* TerminalFactory::create(QObject* owner)
 {
     // Parented to the pane: destroyed with it (no leaked flush timer, buffers
     // or transport connections).
-    return new TerminalController(owner);
+    auto* controller = new TerminalController(owner);
+
+    // The controller bounds the silent part of an attach itself and moves the
+    // pane to Error when the window expires (TerminalController::kAttachTimeoutMs).
+    // It has no way to say WHY, though: error() is the only message channel the
+    // pane's chrome listens to (src/qml/TerminalPaneView.qml onError), so the
+    // sentence is minted here. Connected once at creation rather than per
+    // attach(), so a pane that re-attaches does not accumulate handlers and
+    // report the same stall several times.
+    connect(controller, &TerminalController::attachTimedOut, this, [this, controller]() {
+        const QString target = targetFor(controller);
+        const QString waited = QString::number(controller->attachTimeoutMs() / 1000);
+        emit error(controller,
+                   target.isEmpty()
+                       ? QStringLiteral("The remote terminal sent nothing for %1 s; "
+                                        "the tmux attach did not complete. Try Retry.")
+                             .arg(waited)
+                       : QStringLiteral("The remote terminal sent nothing for %1 s; "
+                                        "the tmux session %2 did not finish attaching. "
+                                        "Try Retry.")
+                             .arg(waited, target));
+    });
+
+    return controller;
 }
 
 TerminalBridge* TerminalFactory::createBridge(TerminalController* controller, QObject* owner)
@@ -114,8 +125,14 @@ bool TerminalFactory::attach(TerminalController* controller,
     // A re-attach must not leave the previous channel behind.
     detach(controller);
 
-    const int columns = cols > 0 ? cols : kDefaultColumns;
-    const int lines = rows > 0 ? rows : kDefaultRows;
+    // 0 from the caller means "the renderer has not reported a size yet". It
+    // must NOT downgrade a size the pane already established: a reconnect that
+    // arrives without geometry would otherwise snap a 200x60 pane back to 80x24.
+    const int columns = cols > 0 ? cols
+                                 : (controller->columns() > 0 ? controller->columns()
+                                                              : kDefaultColumns);
+    const int lines = rows > 0 ? rows
+                               : (controller->rows() > 0 ? controller->rows() : kDefaultRows);
 
     const DevSessionId devSession{devSessionId};
     const TerminalId terminal{terminalId};
@@ -139,7 +156,14 @@ bool TerminalFactory::attach(TerminalController* controller,
         controller->setTransport(nullptr);
         delete device;
         controller->setState(TerminalState::Error);
-        emit error(controller, QStringLiteral("could not open a PTY channel for %1").arg(target));
+        // No second error() here on purpose. EVERY startPty() failure path in
+        // SshChannelDevice emits channelError first (abortStart(), the
+        // "channel already started"/"no SSH connection pool"/"could not open SSH
+        // channel" refusals, and the built-without-libssh stub), and the
+        // connection above has already forwarded that specific reason. A generic
+        // "could not open a PTY channel for <target>" fired afterwards would
+        // simply overwrite it in the pane's chrome, which shows the LAST message
+        // it was given (src/qml/TerminalPaneView.qml onError).
         return false;
     }
 
@@ -191,7 +215,7 @@ void TerminalFactory::detach(TerminalController* controller)
     controller->setTransport(nullptr);
     device->deleteLater();
 
-    if (isLive(controller->state()))
+    if (TerminalController::isLiveState(controller->state()))
         controller->setState(TerminalState::Disconnected);
 }
 
@@ -199,11 +223,17 @@ void TerminalFactory::kill(TerminalController* controller)
 {
     if (!controller)
         return;
-    auto it = m_attached.find(controller);
-    const QString target = it == m_attached.end() ? QString() : it->target;
+    // Read the target out BEFORE detaching, and re-find the entry afterwards
+    // rather than holding the iterator across the call. detach() closes the SSH
+    // channel, which drives the controller's state machine, which reaches the
+    // WebChannel bridge and the QML pane; anything there is free to attach or
+    // detach another pane on this factory, and a single insert into m_attached
+    // can rehash it and turn a held iterator into a dangling write.
+    const QString target = targetFor(controller);
 
     detach(controller);
-    if (it != m_attached.end())
+
+    if (auto it = m_attached.find(controller); it != m_attached.end())
         it->target.clear();  // the session is gone; nothing left to kill twice
 
     if (target.isEmpty() || !connected())
@@ -211,6 +241,14 @@ void TerminalFactory::kill(TerminalController* controller)
 
     // Out-of-band on its own Exec channel: the pane's own PTY channel is the
     // thing being destroyed, so it cannot carry its own kill.
+    //
+    // channelError is deliberately NOT forwarded to error() from this channel,
+    // unlike the PTY channel in attach(). This command is fire-and-forget: the
+    // pane has already been told it was killed, and tmux writing "can't find
+    // session" to stderr some milliseconds later (which is the expected outcome
+    // when another client got there first) would replace that with an alarming
+    // message about a pane that is gone anyway. The refusal below is reported,
+    // because that one means the command never ran at all.
     auto* exec = new SshChannelDevice(m_pool, SshConnectionPool::ChannelKind::Exec, this);
     connect(exec, &SshChannelDevice::readChannelFinished, exec, &QObject::deleteLater);
     if (!exec->startExec(tmuxKillSessionCommand(target))) {

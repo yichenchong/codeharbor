@@ -15,6 +15,16 @@ Rectangle {
     // its download request. The internal profile is SHARED across panes, so the
     // handler must accept ONLY downloads this pane deliberately started.
     property bool downloadRequested: false
+    // The internal URL that click navigated the hidden view to, remembered so
+    // the handler below can recognise the download WITHOUT minting the URL a
+    // second time. ViewerModel's id map is LRU-bounded: with enough files open,
+    // the entry for this one can be evicted between the click and the callback,
+    // and a re-mint then hands back a DIFFERENT id. The comparison would fail,
+    // the download would never be accepted, and because downloadRequested is
+    // only cleared on acceptance the pane's Download button would stay disabled
+    // for good. Re-minting also bumps the map's usage order, evicting some other
+    // pane's file for no reason.
+    property string pendingDownloadUrl: ""
 
     color: "#1e1e2e"
 
@@ -31,6 +41,12 @@ Rectangle {
 
         Label {
             Layout.alignment: Qt.AlignHCenter
+            // SECURITY: a Label defaults to Text.AutoText, which promotes
+            // anything that LOOKS like markup to StyledText — and StyledText
+            // fetches <img src="http://...">. This is a file NAME chosen on the
+            // remote server, so it is data and is drawn as data. Same rule as
+            // ViewerDirectoryView's entries and TerminalPaneView's chrome.
+            textFormat: Text.PlainText
             text: root.baseName(root.url)
             color: "#cdd6f4"
             font.pixelSize: 15
@@ -46,6 +62,8 @@ Rectangle {
             Layout.alignment: Qt.AlignHCenter
         }
         Label {
+            // Same rule: the remote path is data.
+            textFormat: Text.PlainText
             text: root.url
             color: "#585b70"
             font.pixelSize: 11
@@ -60,8 +78,9 @@ Rectangle {
             // single click cannot fan out into multiple accepted downloads.
             enabled: root.url.toString().length > 0 && !root.downloadRequested
             onClicked: {
+                root.pendingDownloadUrl = viewers.internalUrlFor(root.url);
                 root.downloadRequested = true;
-                downloader.url = viewers.internalUrlFor(root.url);
+                downloader.url = root.pendingDownloadUrl;
             }
         }
     }
@@ -87,13 +106,13 @@ Rectangle {
             // download triggered anywhere (including page-initiated ones).
             if (!root.downloadRequested)
                 return;
-            // Scope to this pane's file and only handle the initial request,
-            // guarding against accepting the same download more than once.
+            // Scope to this pane's own request and only handle the initial
+            // state, guarding against accepting the same download twice.
             if (download.state !== WebEngineDownloadRequest.DownloadRequested
-                || download.url.toString()
-                   !== viewers.internalUrlFor(root.url).toString())
+                || download.url.toString() !== root.pendingDownloadUrl)
                 return;
             root.downloadRequested = false;
+            root.pendingDownloadUrl = "";
             download.accept();
         }
     }

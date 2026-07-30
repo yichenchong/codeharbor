@@ -102,9 +102,34 @@ std::optional<SplitNode> parseLayoutTree(const QJsonValue& value)
 {
     if (!value.isObject())
         return std::nullopt;
-    return SplitNode::fromJson(value.toObject());
+    const QJsonObject obj = value.toObject();
+    const SplitNode tree = SplitNode::fromJson(obj);
+    // SplitNode::fromJson reports "this is not a valid split tree" by returning
+    // its default empty-leaf sentinel - which is also exactly what a genuinely
+    // stored empty leaf parses to (closing a region's last pane persists one;
+    // see src/app/SessionLayouts.cpp). Telling the two apart needs the input: a
+    // leaf ALWAYS parses, so a rejection can only come from an object whose
+    // declared type is not "leaf" (an unknown or absent type, or a split with a
+    // children/ratios count mismatch, a non-finite or non-positive ratio, or
+    // nesting past the depth cap). Report a rejected tree as "no layout" rather
+    // than as a perfectly valid single blank pane: SessionLayouts deliberately
+    // leaves a region null when its layout cannot be loaded (SessionLayouts.h),
+    // because a fabricated one-pane layout is something the user would edit
+    // over, silently overwriting the layout the server still holds.
+    const bool rejected = tree.isLeaf()
+            && obj.value(QStringLiteral("type")).toString()
+                    != QStringLiteral("leaf");
+    if (rejected)
+        return std::nullopt;
+    return tree;
 }
 
+// Nested list elements are skipped unless they are JSON objects. QJsonValue::
+// toObject() turns a non-object into an EMPTY object, which every parse helper
+// above happily maps to a fully-default record: an entry with an empty id that
+// looks real to the rest of the client and can collide with other id-keyed
+// state. A malformed element is dropped instead, so a broken element costs its
+// own entry and nothing more.
 SessionNode parseSessionNode(const QJsonObject& obj)
 {
     SessionNode node;
@@ -112,14 +137,18 @@ SessionNode parseSessionNode(const QJsonObject& obj)
 
     const QJsonArray viewers = obj.value(QStringLiteral("viewerPanes")).toArray();
     node.viewerPanes.reserve(viewers.size());
-    for (const QJsonValue& viewer : viewers)
-        node.viewerPanes.append(parseViewerPane(viewer.toObject()));
+    for (const QJsonValue& viewer : viewers) {
+        if (viewer.isObject())
+            node.viewerPanes.append(parseViewerPane(viewer.toObject()));
+    }
 
     const QJsonArray terminals =
         obj.value(QStringLiteral("terminalPanes")).toArray();
     node.terminalPanes.reserve(terminals.size());
-    for (const QJsonValue& terminal : terminals)
-        node.terminalPanes.append(parseTerminalPane(terminal.toObject()));
+    for (const QJsonValue& terminal : terminals) {
+        if (terminal.isObject())
+            node.terminalPanes.append(parseTerminalPane(terminal.toObject()));
+    }
 
     const QJsonObject layouts = obj.value(QStringLiteral("layouts")).toObject();
     node.viewerLayout = parseLayoutTree(layouts.value(QStringLiteral("viewer")));
@@ -134,8 +163,10 @@ GroupNode parseGroupNode(const QJsonObject& obj)
     node.group = parseGroup(obj);
     const QJsonArray sessions = obj.value(QStringLiteral("sessions")).toArray();
     node.sessions.reserve(sessions.size());
-    for (const QJsonValue& session : sessions)
-        node.sessions.append(parseSessionNode(session.toObject()));
+    for (const QJsonValue& session : sessions) {
+        if (session.isObject())
+            node.sessions.append(parseSessionNode(session.toObject()));
+    }
     return node;
 }
 
@@ -144,8 +175,10 @@ QVector<GroupNode> parseGroupList(const QJsonValue& result)
     const QJsonArray array = result.toArray();
     QVector<GroupNode> groups;
     groups.reserve(array.size());
-    for (const QJsonValue& group : array)
-        groups.append(parseGroupNode(group.toObject()));
+    for (const QJsonValue& group : array) {
+        if (group.isObject())
+            groups.append(parseGroupNode(group.toObject()));
+    }
     return groups;
 }
 

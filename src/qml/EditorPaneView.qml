@@ -1,4 +1,5 @@
 import QtQuick
+import QtQuick.Controls.Basic
 import QtWebEngine
 import QtWebChannel
 
@@ -14,8 +15,11 @@ import QtWebChannel
 // codeharbor-internal:// file document is ever loaded into this view.
 //
 // WIRING (for main.cpp / the QML host):
-//   * `editorController`  — context property: the ch::EditorController instance
-//     exposed to JS under the WebChannel object name "editor".
+//   * `editorFactory`     — context property: the ch::EditorFactory that mints
+//     THIS pane's own ch::EditorController (one per pane, so two panes never
+//     share a path and revision). That controller is what is exposed to JS over
+//     the WebChannel under the object name "editor". There is deliberately no
+//     single shared controller context property.
 //   * `viewers`           — context property (ViewerModel): supplies the
 //     privileged WebEngine profile that permits a WebChannel bridge.
 //
@@ -35,9 +39,24 @@ import QtWebChannel
 Item {
     id: root
 
-    // The ch::EditorController for this pane, created per-pane via the
-    // `editorFactory` context property (owned by this pane); overridable for tests.
-    property var controller: editorFactory.create(root)
+    // The `editorFactory` context property, resolved once. Guarded exactly like
+    // TerminalPaneView guards `terminalFactory`, so a host that does not install
+    // it gets a pane with no controller instead of a ReferenceError (an unguarded
+    // context-property lookup throws, which aborts the whole binding pass that
+    // was building the pane); also the seam a test injects a stub through.
+    //
+    // The pane's OTHER injected object, `viewers`, is deliberately used
+    // unguarded, exactly as every viewer view does (ViewerImageView,
+    // ViewerPdfView, ViewerBinaryView) — it supplies the WebEngine profile, and
+    // there is no useful pane without one. Nothing can instantiate this pane
+    // without it either: the only thing that creates an EditorPaneView is
+    // ViewerPane, which has already called viewers.viewKind() to decide that the
+    // file belongs here.
+    property var factory: (typeof editorFactory !== "undefined") ? editorFactory : null
+
+    // The ch::EditorController for this pane, created per-pane by that factory
+    // and owned by this pane (destroyed with it); overridable for tests.
+    property var controller: root.factory ? root.factory.create(root) : null
 
     // Entry page of the trusted editor bundle. Embedded into this QML module's
     // resources by src/qml/CMakeLists.txt; overridable by a host or test that
@@ -131,6 +150,65 @@ Item {
 
         // NOT bound to editorBundleUrl: navigation is driven by navigate()
         // below so it can never start before registerObject("editor").
+    }
+
+    // ---- observable file state (SPEC 8.2) --------------------------------
+    // The lifecycle word ch::EditorController publishes (see toString(FileState)
+    // in src/models/SessionState.cpp): "loading", "clean", "modified", "saving",
+    // "saved", "externally_modified", "conflict", "read_only", "error",
+    // "disconnected".
+    readonly property string fileState: root.controller ? root.controller.fileState : ""
+
+    // The two states in which the buffer on screen is NOT what the server holds
+    // and the next save cannot simply succeed. The editor page prints the state
+    // word in its status line, which is far too quiet for either: a user who
+    // does not notice keeps typing into a buffer that cannot be saved.
+    //
+    //   disconnected — the SSH transport is down (ch::EditorController leaves
+    //                  the file here from onTransportClosed until a transport is
+    //                  bound again). Nothing can be read or written.
+    //   conflict     — the file changed on the server since it was loaded, so
+    //                  the save was refused rather than overwriting someone
+    //                  else's work (SPEC 8.4/8.6). Only the user can resolve it.
+    // The path check matters: a freshly created ch::EditorController starts in
+    // FileState::Disconnected and only leaves it when a file is opened, so
+    // without it a pane that has no file yet would advertise a connection
+    // failure that has not happened.
+    readonly property bool dropped: root.remotePath.length > 0
+                                    && root.fileState === "disconnected"
+    readonly property bool conflicted: root.fileState === "conflict"
+
+    // Same treatment TerminalPaneView gives a dropped channel: a thin banner
+    // across the top of the pane, so the warning is unmissable without hiding
+    // the text the user is still working on.
+    Rectangle {
+        objectName: "editorStateBanner"
+        anchors.left: parent.left
+        anchors.right: parent.right
+        anchors.top: parent.top
+        height: 22
+        visible: root.dropped || root.conflicted
+        // Red for the state that puts the user's edits at risk, amber for the
+        // one that merely suspends them — the same split, and the same two
+        // colours, TerminalPaneView uses for "error" versus a plain drop.
+        color: root.conflicted ? "#45222c" : "#3a2f1e"
+
+        Label {
+            objectName: "editorStateBannerLabel"
+            anchors.left: parent.left
+            anchors.leftMargin: 8
+            anchors.right: parent.right
+            anchors.rightMargin: 8
+            anchors.verticalCenter: parent.verticalCenter
+            elide: Text.ElideRight
+            // Whole sentences: the state word alone ("conflict") names the
+            // condition without telling anyone what it means for their file.
+            text: root.conflicted
+                  ? qsTr("This file changed on the server since it was opened, so the last save was refused. Reload to take the server's copy, or save again to overwrite it.")
+                  : qsTr("The connection to the server is down. This file cannot be saved or reloaded until it comes back.")
+            color: "#f9e2af"
+            font.pixelSize: 11
+        }
     }
 
     // Navigate the view at the bundle entry, passing the pane's remote path as

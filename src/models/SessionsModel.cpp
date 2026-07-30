@@ -123,10 +123,10 @@ QVariant SessionsModel::data(const QModelIndex &index, int role) const
         return static_cast<int>(aggregateSessionState(session.terminals));
     case IsGroupRole:
         return false;
-        case IdRole:
-            return session.session.id.value;
-        case GroupIdRole:
-            return groupEntry.group.id.value;
+    case IdRole:
+        return session.session.id.value;
+    case GroupIdRole:
+        return groupEntry.group.id.value;
     default:
         return {};
     }
@@ -134,7 +134,12 @@ QVariant SessionsModel::data(const QModelIndex &index, int role) const
 
 QHash<int, QByteArray> SessionsModel::roleNames() const
 {
+    // Every role data() actually serves must appear here, otherwise QML cannot
+    // reach it by name. Qt::DisplayRole is included because data() answers it
+    // (aliased to the row's name) and QAbstractItemModel's default roleNames(),
+    // which does name it, is replaced wholesale by this override.
     return {
+        {Qt::DisplayRole, "display"},
         {NameRole, "name"},
         {SubtitleRole, "subtitle"},
         {RowStateRole, "rowState"},

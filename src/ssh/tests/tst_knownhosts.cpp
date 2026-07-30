@@ -67,7 +67,9 @@ private slots:
     void revocationWinsBeforeTrustedEntry();
     void malformedBase64LineSkipped();
     void crlfAndTabWhitespaceParsed();
-    void hostnamesAreCaseSensitive();
+    void hostnamesMatchCaseInsensitively();
+    void wildcardHostIsATrustedHost();
+    void negatedWildcardHostIsExcluded();
     void trustedHostRefusesUnknownKeyType();
     void markerOnlyHostStaysUnknownForOtherTypes();
     void recognizesWindowsNamedPipeAgentSocket();
@@ -323,10 +325,13 @@ void TstKnownHosts::crlfAndTabWhitespaceParsed()
              KnownHosts::Verdict::Match);
 }
 
-void TstKnownHosts::hostnamesAreCaseSensitive()
+void TstKnownHosts::hostnamesMatchCaseInsensitively()
 {
-    // OpenSSH matches hostnames case-sensitively; the stored case is preserved
-    // and a differently-cased lookup must not match.
+    // OpenSSH's match_pattern() compares host names case-insensitively, and the
+    // strictness is the point: if "Host.Example" did not match a lookup of
+    // "host.example", a CHANGED key for that host would read as first use and
+    // the user would be shown the reassuring trust-this-host prompt instead of
+    // the hard refusal. The stored spelling is preserved either way.
     const KnownHosts store = KnownHosts::parse(QStringLiteral(
         "Host.Example ssh-ed25519 ZWQyNTUxOS1rZXktYWxwaGEtMDAwMQ==\n"));
     QCOMPARE(store.verify(QStringLiteral("Host.Example"),
@@ -334,7 +339,91 @@ void TstKnownHosts::hostnamesAreCaseSensitive()
              KnownHosts::Verdict::Match);
     QCOMPARE(store.verify(QStringLiteral("host.example"),
                           QStringLiteral("ssh-ed25519"), kEd25519Alpha),
+             KnownHosts::Verdict::Match);
+    QCOMPARE(store.verify(QStringLiteral("HOST.EXAMPLE"),
+                          QStringLiteral("ssh-ed25519"), kEd25519Beta),
+             KnownHosts::Verdict::Mismatch);
+    QVERIFY(store.serialize().contains("Host.Example "));
+
+    // add() follows the same rule: re-trusting the host under another spelling
+    // replaces the key instead of appending a second, contradictory line.
+    KnownHosts trusted = store;
+    trusted.add(QStringLiteral("host.example"), QStringLiteral("ssh-ed25519"),
+                kEd25519Beta);
+    QCOMPARE(trusted.entries().size(), 1);
+    QCOMPARE(trusted.verify(QStringLiteral("Host.Example"),
+                            QStringLiteral("ssh-ed25519"), kEd25519Beta),
+             KnownHosts::Verdict::Match);
+}
+
+void TstKnownHosts::wildcardHostIsATrustedHost()
+{
+    // A wildcard entry trusts every host it covers, so a DIFFERENT key at one of
+    // those hosts is a changed key (Mismatch), not first use (Unknown). Treating
+    // the pattern as a literal name made it match nothing at all — the same
+    // downgrade trustedHostRefusesUnknownKeyType() closes for key types: the
+    // friendly first-use prompt where SPEC 12.1 demands a hard refusal.
+    const KnownHosts store = KnownHosts::parse(QStringLiteral(
+        "*.example.com ssh-ed25519 ZWQyNTUxOS1rZXktYWxwaGEtMDAwMQ==\n"));
+    // One entry, kept verbatim, and it survives a serialize round-trip.
+    QCOMPARE(store.entries().size(), 1);
+    QVERIFY(store.serialize().contains("*.example.com "));
+
+    QCOMPARE(store.verify(QStringLiteral("build.example.com"),
+                          QStringLiteral("ssh-ed25519"), kEd25519Alpha),
+             KnownHosts::Verdict::Match);
+    QCOMPARE(store.verify(QStringLiteral("build.example.com"),
+                          QStringLiteral("ssh-ed25519"), kEd25519Beta),
+             KnownHosts::Verdict::Mismatch);
+    // A key of another TYPE at a covered host is refused too.
+    QCOMPARE(store.verify(QStringLiteral("build.example.com"),
+                          QStringLiteral("ssh-rsa"), kRsaGamma),
+             KnownHosts::Verdict::Mismatch);
+    // Hosts the pattern does not cover stay first use: "*." needs a label, and
+    // another domain is unrelated.
+    QCOMPARE(store.verify(QStringLiteral("example.com"),
+                          QStringLiteral("ssh-ed25519"), kEd25519Alpha),
              KnownHosts::Verdict::Unknown);
+    QCOMPARE(store.verify(QStringLiteral("build.example.net"),
+                          QStringLiteral("ssh-ed25519"), kEd25519Alpha),
+             KnownHosts::Verdict::Unknown);
+
+    // '?' stands for exactly one character, never two.
+    const KnownHosts single = KnownHosts::parse(QStringLiteral(
+        "web?.example.com ssh-ed25519 ZWQyNTUxOS1rZXktYWxwaGEtMDAwMQ==\n"));
+    QCOMPARE(single.verify(QStringLiteral("web1.example.com"),
+                           QStringLiteral("ssh-ed25519"), kEd25519Alpha),
+             KnownHosts::Verdict::Match);
+    QCOMPARE(single.verify(QStringLiteral("web12.example.com"),
+                           QStringLiteral("ssh-ed25519"), kEd25519Alpha),
+             KnownHosts::Verdict::Unknown);
+
+    // A wildcard @revoked entry still revokes the key it names.
+    const KnownHosts revoked = KnownHosts::parse(QStringLiteral(
+        "@revoked *.bad.example ssh-ed25519 ZWQyNTUxOS1rZXktYWxwaGEtMDAwMQ==\n"));
+    QCOMPARE(revoked.verify(QStringLiteral("one.bad.example"),
+                            QStringLiteral("ssh-ed25519"), kEd25519Alpha),
+             KnownHosts::Verdict::Mismatch);
+}
+
+void TstKnownHosts::negatedWildcardHostIsExcluded()
+{
+    // OpenSSH lets one line carve a host OUT of its own wildcard with '!'. The
+    // whole field therefore has to stay in a single entry: splitting it on the
+    // comma would strand the negated token as a host name of its own and leave
+    // "*.example.com" trusting the very host the file excludes — that host's key
+    // would then be accepted as a match.
+    const KnownHosts store = KnownHosts::parse(QStringLiteral(
+        "*.example.com,!secret.example.com ssh-ed25519 "
+        "ZWQyNTUxOS1rZXktYWxwaGEtMDAwMQ==\n"));
+    QCOMPARE(store.entries().size(), 1);
+    QCOMPARE(store.verify(QStringLiteral("build.example.com"),
+                          QStringLiteral("ssh-ed25519"), kEd25519Alpha),
+             KnownHosts::Verdict::Match);
+    QCOMPARE(store.verify(QStringLiteral("secret.example.com"),
+                          QStringLiteral("ssh-ed25519"), kEd25519Alpha),
+             KnownHosts::Verdict::Unknown);
+    QVERIFY(store.serialize().contains("*.example.com,!secret.example.com "));
 }
 
 void TstKnownHosts::trustedHostRefusesUnknownKeyType()

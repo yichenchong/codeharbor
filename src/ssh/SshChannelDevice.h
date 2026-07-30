@@ -4,6 +4,7 @@
 
 #include <QByteArray>
 #include <QIODevice>
+#include <QPointer>
 #include <QString>
 
 QT_BEGIN_NAMESPACE
@@ -31,8 +32,13 @@ namespace ch {
 // bytes (a burst is drained back to back) and at kIdlePollMs (10 ms) when the
 // channel is quiet, so it never spins hot and never exceeds the 10 ms cadence.
 //
-// Ownership: the pool retains ownership of the ssh_channel (see
-// SshConnectionPool::openChannel). closeChannel() closes but NEVER frees it.
+// Ownership: the pool owns the ssh_channel (see SshConnectionPool::openChannel).
+// closeChannel() hands it back through SshConnectionPool::releaseChannel()
+// instead of freeing it itself: that reclaims the channel's slot on the SSH
+// connection right away (a server caps concurrent channels per connection) and
+// keeps the pool's channel list accurate. A device also drops its handle when
+// the pool announces sessionClosing(), so a device that outlives its session
+// never polls freed libssh memory.
 //
 // Without libssh (CH_HAVE_LIBSSH=0) the class still compiles and constructs;
 // every start*/resize call returns false and the device never opens.
@@ -61,8 +67,9 @@ public:
     // Push a new window size to the remote PTY. False if no PTY channel is live.
     bool resizePty(int cols, int rows);
 
-    // Close the channel and the device. Idempotent. Does NOT ssh_channel_free():
-    // the pool frees every channel it handed out when the session goes down.
+    // Close the channel and the device. Idempotent. Never ssh_channel_free()s
+    // by hand: the channel is handed back to the pool, which frees it and
+    // reclaims its slot on the connection.
     // Emits readChannelFinished() once if it has not already fired.
     void closeChannel();
 
@@ -91,11 +98,14 @@ private:
     void pump();
     QString lastError() const;
 
-    SshConnectionPool* m_pool = nullptr;
+    QPointer<SshConnectionPool> m_pool;
     SshConnectionPool::ChannelKind m_kind = SshConnectionPool::ChannelKind::Exec;
     QTimer* m_pump = nullptr;
     QByteArray m_readBuffer;
     bool m_remoteFinished = false;
+    // A window-change request is only meaningful on a channel that really has a
+    // PTY, so resizePty() can honour its documented "false if no PTY" contract.
+    bool m_hasPty = false;
     bool m_pumping = false;
 #if CH_HAVE_LIBSSH
     ssh_channel m_channel = nullptr;

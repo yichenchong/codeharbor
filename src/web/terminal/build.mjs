@@ -31,7 +31,11 @@ const result = await build({
     target: ["chrome110"],
     platform: "browser",
     minify: true,
-    legalComments: "none",
+    // "eof", not "none": xterm.js is MIT, and MIT requires its copyright notice
+    // to travel with the code we ship. Collecting the /*! ... */ banners at the
+    // end of the bundle keeps that obligation met at a cost of a few hundred
+    // bytes; dropping them would ship a licence violation.
+    legalComments: "eof",
     entryPoints: [join(root, "src", "index.ts")],
     globalName: "CodeHarborTerminal",
     outfile: join(dist, "terminal.js"),

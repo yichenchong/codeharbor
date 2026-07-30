@@ -190,6 +190,11 @@ struct Harness {
     {
         boot.setKnownHostsPath(dir.filePath(QStringLiteral("known_hosts")));
         boot.setReconnectTimeScale(kTimeScale);
+        // No user interface in this gate, and connectPool() is a test seam that
+        // never performs a real handshake — but attemptWire() refuses to connect
+        // at all unless SOMETHING is prepared to decide about an unknown host
+        // key (SPEC 12.1), so the opt-in has to be explicit here.
+        boot.setTrustUnknownHostKeys(true);
     }
 
     bool wire()
@@ -235,6 +240,7 @@ class TstSessionBootstrap : public QObject {
 private slots:
     void wiresAndReportsState();
     void initialConnectFailureDoesNotRetry();
+    void unknownHostKeyIsNeverTrustedWithoutADecisionPolicy();
     void channelLossReconnectsAndRewires();
     void agentChannelLossAlsoReconnects();
     void pendingCallsFailWhenTheSessionDies();
@@ -311,6 +317,43 @@ void TstSessionBootstrap::initialConnectFailureDoesNotRetry()
     // And it stays down: no timer was armed to change its mind.
     QTest::qWait(50);
     QCOMPARE(h.boot.state(), State::Failed);
+    QCOMPARE(h.boot.connectCalls, 1);
+}
+
+// SPEC 12.1: an unknown host key is the USER's decision. A wire attempt that
+// finds nobody able to make that decision — no host-key callback on the pool,
+// and no explicit unattended opt-in — must refuse, not quietly install an
+// accept-everything policy and trust whatever the server presents.
+void TstSessionBootstrap::unknownHostKeyIsNeverTrustedWithoutADecisionPolicy()
+{
+    Harness h;
+    // Undo the harness opt-in: this case is the ATTENDED production default.
+    h.boot.setTrustUnknownHostKeys(false);
+    QVERIFY(!h.pool.hostKeyCallback());
+    QSignalSpy errorSpy(&h.boot, &SessionBootstrap::error);
+
+    QVERIFY2(!h.wire(),
+             "wired a session with nothing able to decide about an unknown "
+             "host key");
+
+    // Refused BEFORE any handshake, and no auto-accept policy was left behind on
+    // the pool for the next caller to inherit.
+    QCOMPARE(h.boot.connectCalls, 0);
+    QVERIFY2(!h.pool.hostKeyCallback(),
+             "an unconditional accept-the-key policy was installed anyway");
+    QCOMPARE(h.boot.state(), State::Failed);
+    QCOMPARE(errorSpy.size(), 1);
+    QVERIFY2(errorSpy.at(0).at(0).toString().contains(QStringLiteral("host key")),
+             qPrintable(errorSpy.at(0).at(0).toString()));
+
+    // The refusal is about having nobody to ask, not about the flag: an
+    // installed policy — what AppController puts there before every connect —
+    // is enough on its own.
+    h.pool.setHostKeyCallback([](const QString&, const QString&,
+                                 const QByteArray&, ch::KnownHosts::Verdict) {
+        return SshConnectionPool::HostKeyDecision::Reject;
+    });
+    QVERIFY(h.wire());
     QCOMPARE(h.boot.connectCalls, 1);
 }
 
@@ -1201,7 +1244,10 @@ void TstSessionBootstrap::remoteEntryPointsSupportBothReleaseAndCheckoutLayouts(
         const QString path = root + QLatin1Char('/') + relative;
         QDir().mkpath(QFileInfo(path).absolutePath());
         QFile file(path);
-        file.open(QIODevice::WriteOnly);
+        // A value-returning lambda cannot host QVERIFY (it expands to `return;`),
+        // and a fixture that cannot be created makes every later check meaningless.
+        if (!file.open(QIODevice::WriteOnly))
+            qFatal("could not create fixture entry point %s", qUtf8Printable(path));
         file.close();
         return path;
     };

@@ -15,10 +15,10 @@ This stack has been confirmed to configure, build, and link the full tree
 |---|---|---|
 | OS | Ubuntu 26.04 LTS | — |
 | C++ compiler | GCC 15.2 | C++20 (GCC 12+/Clang 15+) |
-| CMake | 4.2.3 | 3.24 |
+| CMake | 4.2.3 | 3.25 (CMakePresets schema v6) |
 | Ninja | 1.13.2 | any |
 | Qt 6 | 6.10.2 | 6.9 |
-| libssh | 0.11.3 | 0.10+, **except 0.12.0** |
+| libssh | 0.11.3 | 0.11.2+, **except 0.12.0** |
 | Node.js | 24.16 | 23.6 (native TS type-stripping) |
 
 The CMake floor is Qt **6.9**; newer (6.10 here) works unchanged. 6.9 is not a
@@ -40,6 +40,29 @@ any host key is seen. Upstream fixed the cast in 0.12.1. Two consequences:
   the attempt and records it in the connection log, so post-quantum KEX stays
   available through `mlkem768nistp256-sha256`.
 
+The libssh floor is **0.11.2**, audited symbol by symbol against what
+`src/ssh/SshConnectionPool.cpp` and `src/ssh/SshChannelDevice.cpp` actually call
+(the audit is recorded as a comment at the top of `SshConnectionPool.cpp`).
+Three separate bounds stack up to that number:
+
+- **0.8.0** is the hard compile/link floor: every libssh symbol these two files
+  use exists in 0.7.0 except `ssh_get_server_publickey()`, which is used by
+  `SshConnectionPool::verifyHostKey()` and first appears in 0.8.0.
+- **0.11.0** is required by the 0.12.0 workaround above: it passes
+  `-mlkem768x25519-sha256` to `ssh_options_set(SSH_OPTIONS_KEY_EXCHANGE, ...)`,
+  and the leading `-` ("subtract from the default list") modifier only arrived in
+  0.11.0. The workaround is gated on the runtime being exactly 0.12.0, so an
+  older libssh never reaches that call — but the code would not work there.
+- **0.11.2** is the first release without CVE-2025-5351, a double free in
+  libssh's public-key blob export. That path backs
+  `ssh_pki_export_pubkey_base64()`, which `verifyHostKey()` calls on **every**
+  connection. The 0.10 series is also end-of-life upstream and is missing the
+  CVE-2023-6004 fix (command injection through a `ProxyCommand` in the user's
+  `~/.ssh/config`, which `ssh_options_parse_config()` reads) before 0.10.6.
+
+The previously documented "0.10+" floor was not derived from anything: no symbol
+in `src/ssh` needs 0.10, and 0.10.x cannot run the shipped 0.12.0 workaround.
+
 ## Ubuntu / Debian (apt)
 
 ### 1. Client build dependencies
@@ -50,7 +73,7 @@ sudo apt-get update && sudo apt-get install -y \
   qt6-base-dev qt6-base-dev-tools qt6-declarative-dev qt6-declarative-dev-tools \
   qt6-webengine-dev qt6-webengine-dev-tools qt6-webchannel-dev \
   qml6-module-qtquick qml6-module-qtquick-controls qml6-module-qtquick-window \
-  qml6-module-qtquick-layouts qml6-module-qtwebengine libqt6sql6-sqlite
+  qml6-module-qtquick-layouts qml6-module-qtwebengine
 ```
 
 What each group provides (maps 1:1 to the `find_package(Qt6 ... COMPONENTS ...)`
@@ -61,14 +84,16 @@ in the top-level `CMakeLists.txt`):
 | Compiler + make | `build-essential` |
 | CMake + Ninja generator | `cmake`, `ninja-build` |
 | `pkg_check_modules(libssh)` (`ch_ssh`) | `pkg-config`, `libssh-dev` |
-| Qt6 Core / Gui / Network / **Sql** | `qt6-base-dev` (+ `libqt6sql6-sqlite` runtime driver) |
+| Qt6 Core / Gui / Network | `qt6-base-dev` |
 | Qt6 Qml / Quick / **QuickControls2** | `qt6-declarative-dev` |
 | Qt6 **WebEngineQuick** | `qt6-webengine-dev` |
 | Qt6 **WebChannel** | `qt6-webchannel-dev` |
 | `qt_add_qml_module` / `moc` / `qmltc` tooling | `qt6-base-dev-tools`, `qt6-declarative-dev-tools`, `qt6-webengine-dev-tools` |
 | Runtime QML imports for the three-region UI | `qml6-module-qtquick*`, `qml6-module-qtwebengine` |
 
-> `qt6-tools-dev` (Qt Linguist etc.) is **not** required.
+> `qt6-tools-dev` (Qt Linguist etc.) is **not** required, and neither is any Qt
+> SQL driver: the client keeps no local database (SPEC 11.2), so nothing links
+> `Qt6::Sql`.
 
 ### 2. Node.js (remote workspace)
 
@@ -106,23 +131,25 @@ CI provisions the same set — see [`.github/workflows/ci.yml`](../.github/workf
 ### Client (Qt / CMake)
 
 ```bash
-npm install                                      # once: web-asset workspaces
-npm run build --workspace src/web/editor         # Monaco bundle -> src/web/editor/dist/
+npm install                   # once: web-asset workspaces
+npm run build                 # Monaco + xterm.js bundles -> src/web/*/dist/
 cmake --preset dev            # configure (Debug, Ninja, build/dev/)
 cmake --build --preset dev    # build -> build/dev/src/app/codeharbor
 ./build/dev/src/app/codeharbor
 ```
 
-The Monaco bundle is a gitignored build artifact that CMake embeds as
-`qrc:/codeharbor/web/editor/index.html` (see `src/qml/CMakeLists.txt`). CMake builds
-it for you at **configure** time when it is missing or older than its sources — so
-`npm install` above is the only prerequisite, and editing `src/web/editor/**`
-re-triggers it on the next configure.
+The Monaco and xterm.js bundles are gitignored build artifacts that CMake embeds
+as `qrc:/codeharbor/web/editor/index.html` and
+`qrc:/codeharbor/web/terminal/index.html` (see `src/qml/CMakeLists.txt`). CMake
+builds them for you at **configure** time when either is missing or older than its
+sources — so `npm install` above is the only real prerequisite, and editing
+`src/web/editor/**` or `src/web/terminal/**` re-triggers the rebuild on the next
+configure.
 
-If the bundle is missing and cannot be built (no `npm` on `PATH`), configure
-**fails** with the command to run: a client whose editor pane silently loads nothing
-is never the default. Pass `-DCODEHARBOR_SKIP_WEB_BUNDLE=ON` to deliberately build
-an editor-less client.
+If a bundle is missing and cannot be built (no `npm` on `PATH`), configure
+**fails** with the command to run: a client whose editor or terminal pane silently
+loads nothing is never the default. Pass `-DCODEHARBOR_SKIP_WEB_BUNDLE=ON` to
+deliberately build a client with both panes inert.
 
 Presets are defined in [`CMakePresets.json`](../CMakePresets.json):
 `dev` (Debug + tests) and `release`.
@@ -136,7 +163,7 @@ Presets are defined in [`CMakePresets.json`](../CMakePresets.json):
 ```bash
 cd remote
 npm install        # dev-only deps (typescript, @types/node); runtime has none
-npm test           # node --test -> 99 tests
+npm test           # node --test -> 130 tests
 npm run typecheck  # tsc --noEmit
 npm run build      # tsc -> dist/ (codeharbord, codeharbor-bridge)
 ```
@@ -221,7 +248,8 @@ ctest --preset dev -L live --output-on-failure
 > `QTWEBENGINE_CHROMIUM_FLAGS=--disable-gpu --no-sandbox --disable-dev-shm-usage`),
 > so no display is needed. Do **not** add `--single-process`: Chromium aborts with
 > "Single mode supports only single profile" as soon as a second
-> `QWebEngineProfile` exists, and the viewer stack creates two by design (SPEC 7.2).
+> `QWebEngineProfile` exists, and the viewer stack creates two by design (SPEC 7.3,
+> "Browser Profiles").
 
 ## Cross-platform builds & releases
 
@@ -247,7 +275,7 @@ git push --tags`) or via the **Run workflow** button (manual `workflow_dispatch`
 | `linux` | `ubuntu-latest` | `CodeHarbor-*.AppImage` | linuxdeploy + qt plugin |
 | `windows` | `windows-latest` | `codeharbor.exe` + Qt/libssh DLLs | `windeployqt` |
 | `macos` | `macos-latest` | `codeharbor.dmg` (bundled `.app`) | `macdeployqt` |
-| `remote` | `ubuntu-latest` | `codeharbor-remote.tar.gz` (`dist/` + `package.json`) | `tsc` + tar |
+| `remote` | `ubuntu-latest` | `codeharbor-remote.tar.gz` (`dist/` + `sql/` + `package.json`) | `tsc` + tar |
 
 A raw Qt/WebEngine executable is **not** runnable off the build machine; the
 deploy tools bundle the Qt libraries, plugins, and the WebEngine runtime so the
@@ -262,7 +290,10 @@ other version lands, because vcpkg's registry port is the unusable 0.12.0.
 1. **Dispatch `release.yml` on `main`** ("Run workflow"). The `publish` job is
    gated on `refs/tags/v*`, so this is a genuine dry run: it exercises all three
    OS builders and publishes nothing.
-2. **Then push the tag.** `bash .omp/skills/bump-version/bump.sh --set X.Y.Z`.
+2. **Then push the tag.** `bash .omp/skills/bump-version/bump.sh --set X.Y.Z`
+   syncs the version files, commits, and creates the annotated tag; it does
+   **not** push. Add `--push`, or run the `git push origin HEAD vX.Y.Z` it
+   prints. Only the push starts the release build.
 
 This ordering is not ceremony, for two reasons.
 

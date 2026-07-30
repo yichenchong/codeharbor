@@ -5,6 +5,11 @@ on:
     branches: [main]
   pull_request:
 
+# Read-only by default: neither job publishes anything, and the release
+# workflow's publish job grants itself `contents: write` explicitly.
+permissions:
+  contents: read
+
 jobs:
   remote:
     name: remote (node)
@@ -37,12 +42,14 @@ jobs:
           # without it find_package(Qt6 COMPONENTS WebEngineCore) fails at configure
           # even though Qt6WebEngineCoreConfig.cmake is present.
           modules: qtwebengine qtwebchannel qtpositioning
+          cache: true
       - name: Install build tooling
         run: sudo apt-get update && sudo apt-get install -y ninja-build libssh-dev
-      # The Monaco bundle is a gitignored build artifact that src/qml/CMakeLists.txt
-      # embeds as a Qt resource AT CONFIGURE TIME. It must exist before `cmake
-      # --preset dev` or CMake only warns and produces a client whose editor pane
-      # has nothing to load - a silently broken editor, not a build failure.
+      # The Monaco and xterm.js bundles are gitignored build artifacts that
+      # src/qml/CMakeLists.txt embeds as Qt resources AT CONFIGURE TIME. CMake
+      # refuses to configure without them (FATAL_ERROR, unless
+      # -DCODEHARBOR_SKIP_WEB_BUNDLE=ON), so building them here is what keeps the
+      # configure step below from failing outright.
       - uses: actions/setup-node@v4
         with:
           node-version: "24"

@@ -125,6 +125,13 @@ struct UpdateTerminalPaneParams {
 // model. All methods are async; each takes a callback receiving EITHER the typed
 // result OR an RpcError forwarded verbatim from the server (SPEC 10.3) —
 // WorkspaceDb never throws and never touches local storage.
+//
+// Lifetime: `client` is borrowed, not owned, and must outlive this object. Each
+// pending callback is owned by that client, NOT by WorkspaceDb, and runs at most
+// once — possibly long after WorkspaceDb itself is gone, since destroying the
+// repository cancels nothing. A callback that captures a QObject therefore has
+// to guard its own lifetime; the house pattern is a QPointer captured by value
+// and checked before use (see src/app/SessionLayouts.cpp).
 class WorkspaceDb {
 public:
     // Informational only: the client runs no migrations (SPEC 11.2). Kept in

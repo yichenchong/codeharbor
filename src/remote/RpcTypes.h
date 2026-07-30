@@ -200,10 +200,12 @@ struct KillSessionResult {};
 // shapes live in src/persistence/WorkspaceDb.h, only the wire names belong to
 // the contract.
 //
-// Stable wire method names, mirroring RPC_WORKSPACE_METHODS. Keep this block in
-// the same order as the TypeScript table: remote/test/rpc-mirror.test.ts parses
-// these `kMethodWorkspace*` definitions out of this header and fails if the two
-// sides' method-name sets diverge.
+// Stable wire method names, mirroring RPC_WORKSPACE_METHODS.
+// remote/test/rpc-mirror.test.ts scrapes every `inline constexpr auto k... =
+// "...";` definition out of this header, groups them by wire-name prefix, and
+// compares the SETS in both directions — so a name added, removed, or renamed on
+// either side fails that test. Declaration order here is free (the test sorts
+// both sides); it is kept aligned with the TypeScript table for readability only.
 inline constexpr auto kMethodWorkspaceList = "workspace.list";
 inline constexpr auto kMethodWorkspaceCreateGroup = "workspace.createGroup";
 inline constexpr auto kMethodWorkspaceUpdateGroup = "workspace.updateGroup";

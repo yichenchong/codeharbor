@@ -1,7 +1,9 @@
 // Internal agent-status event schema (SPEC 6.4). This is the wire contract
 // between harness adapters, codeharbor-bridge, and the client's
 // AgentStatusMonitor. Keep the AgentState union in sync with the C++ enum in
-// src/models/SessionState.h (ch::AgentState).
+// src/models/SessionState.h (ch::AgentState) and with the wire-token mapping in
+// src/agent/AgentEvent.h (agentStateFromWireStrict); remote/test/events.test.ts
+// parses that C++ header and fails if the two token lists drift apart.
 
 import os from "node:os";
 import path from "node:path";
@@ -73,6 +75,32 @@ export function isHarness(value: unknown): value is Harness {
     return typeof value === "string" && (HARNESSES as readonly string[]).includes(value);
 }
 
+/**
+ * True for a usable Dev Session or terminal identifier: a string with at least
+ * one non-whitespace character.
+ *
+ * An empty (or whitespace-only) identifier is worse than a malformed event. It
+ * is structurally valid, so the bridge relays it and the client accepts it, but
+ * it names no row: the event is filed under a Dev Session that does not exist
+ * and no sidebar entry can ever display it. If its state is "waiting for input"
+ * or "finished with unseen output" the client also raises a desktop
+ * notification whose body falls back to "<devSessionId> / <terminalId>" — a
+ * near-empty, unactionable notification. Dropping the event at the edge is the
+ * only outcome the user can make sense of.
+ */
+export function isEventIdentifier(value: unknown): value is string {
+    return typeof value === "string" && value.trim().length > 0;
+}
+
+/**
+ * True for a decoded JSON object (not null, not an array). `typeof x ===
+ * "object"` alone is true for both of those, which is the classic JSON
+ * validation footgun.
+ */
+export function isPlainObject(value: unknown): value is Record<string, unknown> {
+    return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
 /** Structural validation of a decoded object against the event contract. */
 export function validateEvent(value: unknown): value is AgentEvent {
     if (typeof value !== "object" || value === null) return false;
@@ -81,12 +109,17 @@ export function validateEvent(value: unknown): value is AgentEvent {
         e.version === CH_EVENT_VERSION &&
         typeof e.timestamp === "string" &&
         isHarness(e.harness) &&
-        typeof e.devSessionId === "string" &&
-        typeof e.terminalId === "string" &&
+        // Non-blank, not merely a string: see isEventIdentifier for why an empty
+        // identifier is an unroutable event rather than a harmless one.
+        isEventIdentifier(e.devSessionId) &&
+        isEventIdentifier(e.terminalId) &&
         isAgentState(e.state) &&
         typeof e.event === "string" &&
         (e.summary === undefined || typeof e.summary === "string") &&
-        (e.metadata === undefined || (typeof e.metadata === "object" && e.metadata !== null))
+        // metadata is a JSON object: `typeof` alone would also admit an array,
+        // which the C++ side reads with QJsonValue::toObject() and silently
+        // turns into an empty object.
+        (e.metadata === undefined || isPlainObject(e.metadata))
     );
 }
 

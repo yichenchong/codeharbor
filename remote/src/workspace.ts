@@ -33,6 +33,17 @@ const schemaSql = readFileSync(
     "utf8",
 );
 
+// Lookup indexes, applied on EVERY open rather than by the migration runner.
+// They carry no data and every statement is `CREATE INDEX IF NOT EXISTS`, so
+// re-running them is a no-op; that is precisely what lets an existing database
+// at the current schema version gain a newly added index without a version bump
+// (which would have to be mirrored in C++ — see indexes.sql for the full
+// reasoning).
+const indexesSql = readFileSync(
+    fileURLToPath(new URL("../sql/indexes.sql", import.meta.url)),
+    "utf8",
+);
+
 // --- Public row shapes (camelCase mirror of the snake_case schema columns) ---
 
 export interface Group {
@@ -348,7 +359,13 @@ function remapPaneIds(node: unknown, idMap: Record<string, string>): unknown {
  * Open (creating if needed) the workspace database at `dbPath` and bring it up
  * to WORKSPACE_SCHEMA_VERSION. The migration runner applies schema.sql only
  * when the stored schema_version is absent or older; schema.sql is idempotent,
- * so re-application is harmless. Pass ":memory:" for an ephemeral database.
+ * so re-application is harmless. A database from a NEWER build than this one is
+ * rejected with a thrown error rather than used blind. Pass ":memory:" for an
+ * ephemeral database.
+ *
+ * The lookup indexes are applied AFTER migration and unconditionally, so a
+ * database already at the current version still gains an index added later (see
+ * remote/sql/indexes.sql).
  */
 export function openWorkspace(dbPath: string): Workspace {
     if (dbPath !== ":memory:") {
@@ -357,6 +374,8 @@ export function openWorkspace(dbPath: string): Workspace {
     const db = new DatabaseSync(dbPath);
     db.exec("PRAGMA foreign_keys = ON;");
     migrate(db);
+    // After migrate(), never before: the indexed tables must exist first.
+    db.exec(indexesSql);
     return new Workspace(db);
 }
 
@@ -382,20 +401,49 @@ const MIGRATIONS: ReadonlyArray<{
 
 function migrate(db: DatabaseSync): void {
     const from = schemaVersion(db);
-    if (from >= WORKSPACE_SCHEMA_VERSION) return;
-    for (const step of MIGRATIONS) {
-        if (step.version > from && step.version <= WORKSPACE_SCHEMA_VERSION) {
-            step.apply(db);
+    if (from >= WORKSPACE_SCHEMA_VERSION) {
+        // A database written by a NEWER build than this one. Refuse it instead
+        // of using it: the missing migrations may have renamed or dropped
+        // columns this build still selects, and the failures would surface much
+        // later as confusing per-statement SQL errors on a live workspace.
+        // Equality is the normal case and passes through silently.
+        if (from > WORKSPACE_SCHEMA_VERSION) {
+            throw new Error(
+                `workspace database schema version ${from} is newer than this build supports (${WORKSPACE_SCHEMA_VERSION})`,
+            );
         }
+        return;
     }
-    // schema.sql seeds the version row with INSERT OR IGNORE, which cannot
-    // advance an already-present row. Record the target version explicitly so a
-    // WORKSPACE_SCHEMA_VERSION bump is persisted (and migrate stops re-running
-    // steps on every open) rather than the stored version silently drifting
-    // from the DDL's hard-coded literal.
-    db.prepare("UPDATE schema_version SET version = ? WHERE id = 1").run(
-        WORKSPACE_SCHEMA_VERSION,
-    );
+    // One transaction for the whole upgrade, so a step that throws half way
+    // leaves the database exactly as it was rather than at a version nobody
+    // wrote migrations for. (schema.sql's leading `PRAGMA foreign_keys = ON` is
+    // a no-op inside a transaction; openWorkspace already set it on this
+    // connection, so nothing is lost.)
+    db.exec("BEGIN IMMEDIATE");
+    try {
+        for (const step of MIGRATIONS) {
+            if (step.version > from && step.version <= WORKSPACE_SCHEMA_VERSION) {
+                step.apply(db);
+            }
+        }
+        // schema.sql seeds the version row with INSERT OR IGNORE, which cannot
+        // advance an already-present row. Record the target version explicitly
+        // so a WORKSPACE_SCHEMA_VERSION bump is persisted (and migrate stops
+        // re-running steps on every open) rather than the stored version
+        // silently drifting from the DDL's hard-coded literal.
+        db.prepare("UPDATE schema_version SET version = ? WHERE id = 1").run(
+            WORKSPACE_SCHEMA_VERSION,
+        );
+        db.exec("COMMIT");
+    } catch (err) {
+        try {
+            db.exec("ROLLBACK");
+        } catch {
+            // Already rolled back by the failure itself; the original error is
+            // the one worth reporting.
+        }
+        throw err;
+    }
 }
 
 function schemaVersion(db: DatabaseSync): number {
@@ -418,6 +466,8 @@ export class Workspace {
     readonly db: DatabaseSync;
     // Memoized server_identity row (see serverId()); the row never changes.
     private cachedServerId: string | undefined;
+    // Nesting depth of transaction() on this connection; see transaction().
+    private txDepth = 0;
 
     constructor(db: DatabaseSync) {
         this.db = db;
@@ -487,15 +537,22 @@ export class Workspace {
         return toGroup(row);
     }
 
+    // Read-modify-write: every column is rewritten from the row this call read,
+    // so it runs inside a transaction. Without one, two connections editing
+    // different fields of the same group (a rename and a collapse toggle) each
+    // write back their own stale snapshot of the other's column, and one edit
+    // silently disappears.
     updateGroup(params: UpdateGroupParams): Group {
-        const current = this.getGroup(params.id);
-        const name = params.name ?? current.name;
-        const position = params.position ?? current.position;
-        const collapsed = params.collapsed ?? current.collapsed;
-        this.db
-            .prepare("UPDATE groups SET name = ?, position = ?, collapsed = ?, updated_at = ? WHERE id = ?")
-            .run(name, position, collapsed ? 1 : 0, Date.now(), params.id);
-        return this.getGroup(params.id);
+        return this.transaction(() => {
+            const current = this.getGroup(params.id);
+            const name = params.name ?? current.name;
+            const position = params.position ?? current.position;
+            const collapsed = params.collapsed ?? current.collapsed;
+            this.db
+                .prepare("UPDATE groups SET name = ?, position = ?, collapsed = ?, updated_at = ? WHERE id = ?")
+                .run(name, position, collapsed ? 1 : 0, Date.now(), params.id);
+            return this.getGroup(params.id);
+        });
     }
 
     deleteGroup(params: { id: string }): { ok: true } {
@@ -510,13 +567,7 @@ export class Workspace {
 
     reorderGroups(params: { serverId: string; orderedIds: string[] }): { ok: true } {
         return this.transaction(() => {
-            const ts = Date.now();
-            const stmt = this.db.prepare(
-                "UPDATE groups SET position = ?, updated_at = ? WHERE id = ? AND server_id = ?",
-            );
-            params.orderedIds.forEach((id, index) => {
-                stmt.run(index, ts, id, params.serverId);
-            });
+            this.packOrder("groups", "server_id", params.serverId, params.orderedIds, Date.now());
             return { ok: true } as const;
         });
     }
@@ -558,33 +609,38 @@ export class Workspace {
         return toSession(row);
     }
 
+    // Read-modify-write of every column (see updateGroup), so it is wrapped in a
+    // transaction to keep two concurrent partial updates from clobbering each
+    // other's fields.
     updateSession(params: UpdateSessionParams): Session {
-        const current = this.getSession(params.id);
-        const name = params.name ?? current.name;
-        const repositoryRoot = params.repositoryRoot ?? current.repositoryRoot;
-        const defaultWorkingDirectory =
-            params.defaultWorkingDirectory !== undefined
-                ? params.defaultWorkingDirectory
-                : current.defaultWorkingDirectory;
-        const taskDescription =
-            params.taskDescription !== undefined ? params.taskDescription : current.taskDescription;
-        const position = params.position ?? current.position;
-        const archived = params.archived ?? current.archived;
-        this.db
-            .prepare(
-                "UPDATE dev_sessions SET name = ?, repository_root = ?, default_working_directory = ?, task_description = ?, position = ?, archived = ?, updated_at = ? WHERE id = ?",
-            )
-            .run(
-                name,
-                repositoryRoot,
-                defaultWorkingDirectory,
-                taskDescription,
-                position,
-                archived ? 1 : 0,
-                Date.now(),
-                params.id,
-            );
-        return this.getSession(params.id);
+        return this.transaction(() => {
+            const current = this.getSession(params.id);
+            const name = params.name ?? current.name;
+            const repositoryRoot = params.repositoryRoot ?? current.repositoryRoot;
+            const defaultWorkingDirectory =
+                params.defaultWorkingDirectory !== undefined
+                    ? params.defaultWorkingDirectory
+                    : current.defaultWorkingDirectory;
+            const taskDescription =
+                params.taskDescription !== undefined ? params.taskDescription : current.taskDescription;
+            const position = params.position ?? current.position;
+            const archived = params.archived ?? current.archived;
+            this.db
+                .prepare(
+                    "UPDATE dev_sessions SET name = ?, repository_root = ?, default_working_directory = ?, task_description = ?, position = ?, archived = ?, updated_at = ? WHERE id = ?",
+                )
+                .run(
+                    name,
+                    repositoryRoot,
+                    defaultWorkingDirectory,
+                    taskDescription,
+                    position,
+                    archived ? 1 : 0,
+                    Date.now(),
+                    params.id,
+                );
+            return this.getSession(params.id);
+        });
     }
 
     deleteSession(params: { id: string }): { ok: true } {
@@ -596,7 +652,7 @@ export class Workspace {
 
     reorderSessions(params: { groupId: string; orderedIds: string[] }): { ok: true } {
         return this.transaction(() => {
-            this.packSessions(params.groupId, params.orderedIds, Date.now());
+            this.packOrder("dev_sessions", "group_id", params.groupId, params.orderedIds, Date.now());
             return { ok: true } as const;
         });
     }
@@ -611,14 +667,26 @@ export class Workspace {
     // and renumber. The source group is renumbered from its own fresh read so
     // the vacated slot leaves no hole. All of it inside one transaction, the
     // same idiom reorderSessions/reorderGroups use.
+    //
+    // Moving between groups that belong to DIFFERENT servers also re-homes the
+    // session's server_id and that of its panes and layouts, because SPEC 3.5's
+    // invariant is that a row shares its ancestors' server: leaving the old
+    // server_id behind would list the session under the target group while
+    // `list()` of the target server reported a different serverId on the row.
     moveSessionToGroup(params: MoveSessionParams): Session {
         return this.transaction(() => {
-            const sourceGroupId = this.getSession(params.id).groupId; // also rejects an unknown session
+            const session = this.getSession(params.id); // also rejects an unknown session
+            const sourceGroupId = session.groupId;
+            // Rejects an unknown target group up front, before any write, with a
+            // clearer message than the foreign key's.
+            const targetServerId = this.parentServerId("groups", params.groupId);
             const ts = Date.now();
 
             // Target order as it will be AFTER the move, moved row excluded so a
             // same-group move is a pure reorder rather than a duplicate entry.
-            const ordered = this.orderedSessionIds(params.groupId).filter((id) => id !== params.id);
+            const ordered = this.orderedIds("dev_sessions", "group_id", params.groupId).filter(
+                (id) => id !== params.id,
+            );
             const requested = params.position;
             const index =
                 requested === undefined || !Number.isFinite(requested)
@@ -627,13 +695,26 @@ export class Workspace {
             ordered.splice(index, 0, params.id);
 
             this.db
-                .prepare("UPDATE dev_sessions SET group_id = ?, updated_at = ? WHERE id = ?")
-                .run(params.groupId, ts, params.id);
+                .prepare("UPDATE dev_sessions SET group_id = ?, server_id = ?, updated_at = ? WHERE id = ?")
+                .run(params.groupId, targetServerId, ts, params.id);
+            if (targetServerId !== session.serverId) {
+                for (const table of ["viewer_panes", "terminal_panes", "session_layouts"] as const) {
+                    this.db
+                        .prepare(`UPDATE ${table} SET server_id = ? WHERE dev_session_id = ?`)
+                        .run(targetServerId, params.id);
+                }
+            }
 
-            this.packSessions(params.groupId, ordered, ts);
+            this.packOrder("dev_sessions", "group_id", params.groupId, ordered, ts);
             if (sourceGroupId !== params.groupId) {
                 // Fresh read: the moved row already belongs to the target group.
-                this.packSessions(sourceGroupId, this.orderedSessionIds(sourceGroupId), ts);
+                this.packOrder(
+                    "dev_sessions",
+                    "group_id",
+                    sourceGroupId,
+                    this.orderedIds("dev_sessions", "group_id", sourceGroupId),
+                    ts,
+                );
             }
             return this.getSession(params.id);
         });
@@ -672,55 +753,70 @@ export class Workspace {
                     ts,
                 );
 
+            // One prepared statement per table, reused for every copied row: a
+            // fresh prepare() inside the loop compiled the identical SQL again
+            // for each pane and left a statement handle per iteration for the
+            // garbage collector to finalize. The copies take the NEW session's
+            // server_id (which is the source session's) rather than each child
+            // row's own, so a duplicate always satisfies SPEC 3.5's "a row
+            // shares its ancestors' server" invariant even if the source data
+            // predates that rule.
             const viewerIdMap: Record<string, string> = {};
             const viewerRows = this.db
                 .prepare("SELECT * FROM viewer_panes WHERE dev_session_id = ? ORDER BY position, id").all(params.id) as unknown as ViewerPaneRow[];
+            const insertViewer = this.db.prepare(
+                "INSERT INTO viewer_panes (id, server_id, dev_session_id, url, handler, title, position, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            );
             for (const v of viewerRows) {
                 const newId = randomUUID();
                 viewerIdMap[v.id] = newId;
-                this.db
-                    .prepare(
-                        "INSERT INTO viewer_panes (id, server_id, dev_session_id, url, handler, title, position, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    )
-                    .run(newId, v.server_id, newSessionId, v.url, v.handler, v.title, v.position, ts, ts);
+                insertViewer.run(
+                    newId,
+                    source.server_id,
+                    newSessionId,
+                    v.url,
+                    v.handler,
+                    v.title,
+                    v.position,
+                    ts,
+                    ts,
+                );
             }
 
             const terminalIdMap: Record<string, string> = {};
             const terminalRows = this.db
                 .prepare("SELECT * FROM terminal_panes WHERE dev_session_id = ? ORDER BY position, id").all(params.id) as unknown as TerminalPaneRow[];
+            const insertTerminal = this.db.prepare(
+                "INSERT INTO terminal_panes (id, server_id, dev_session_id, name, working_directory, tmux_target, startup_command, harness, position, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            );
             for (const t of terminalRows) {
                 const newId = randomUUID();
                 terminalIdMap[t.id] = newId;
                 const tmuxTarget = `ch_${newSessionId}_${newId}`;
-                this.db
-                    .prepare(
-                        "INSERT INTO terminal_panes (id, server_id, dev_session_id, name, working_directory, tmux_target, startup_command, harness, position, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    )
-                    .run(
-                        newId,
-                        t.server_id,
-                        newSessionId,
-                        t.name,
-                        t.working_directory,
-                        tmuxTarget,
-                        t.startup_command,
-                        t.harness,
-                        t.position,
-                        ts,
-                        ts,
-                    );
+                insertTerminal.run(
+                    newId,
+                    source.server_id,
+                    newSessionId,
+                    t.name,
+                    t.working_directory,
+                    tmuxTarget,
+                    t.startup_command,
+                    t.harness,
+                    t.position,
+                    ts,
+                    ts,
+                );
             }
 
             const layoutRows = this.db
                 .prepare("SELECT * FROM session_layouts WHERE dev_session_id = ?").all(params.id) as unknown as SessionLayoutRow[];
+            const insertLayout = this.db.prepare(
+                "INSERT INTO session_layouts (id, server_id, dev_session_id, region, tree, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            );
             for (const l of layoutRows) {
                 const idMap = l.region === "viewer" ? viewerIdMap : terminalIdMap;
                 const tree = JSON.stringify(remapPaneIds(JSON.parse(l.tree), idMap));
-                this.db
-                    .prepare(
-                        "INSERT INTO session_layouts (id, server_id, dev_session_id, region, tree, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    )
-                    .run(randomUUID(), l.server_id, newSessionId, l.region, tree, ts, ts);
+                insertLayout.run(randomUUID(), source.server_id, newSessionId, l.region, tree, ts, ts);
             }
 
             return this.sessionNode(newSessionId);
@@ -764,16 +860,19 @@ export class Workspace {
         return toViewerPane(row);
     }
 
+    // Read-modify-write of every column (see updateGroup), hence the transaction.
     updateViewerPane(params: UpdateViewerPaneParams): ViewerPane {
-        const current = this.getViewerPane(params.id);
-        const url = params.url ?? current.url;
-        const handler = params.handler !== undefined ? params.handler : current.handler;
-        const title = params.title !== undefined ? params.title : current.title;
-        const position = params.position ?? current.position;
-        this.db
-            .prepare("UPDATE viewer_panes SET url = ?, handler = ?, title = ?, position = ?, updated_at = ? WHERE id = ?")
-            .run(url, handler, title, position, Date.now(), params.id);
-        return this.getViewerPane(params.id);
+        return this.transaction(() => {
+            const current = this.getViewerPane(params.id);
+            const url = params.url ?? current.url;
+            const handler = params.handler !== undefined ? params.handler : current.handler;
+            const title = params.title !== undefined ? params.title : current.title;
+            const position = params.position ?? current.position;
+            this.db
+                .prepare("UPDATE viewer_panes SET url = ?, handler = ?, title = ?, position = ?, updated_at = ? WHERE id = ?")
+                .run(url, handler, title, position, Date.now(), params.id);
+            return this.getViewerPane(params.id);
+        });
     }
 
     deleteViewerPane(params: { id: string }): { ok: true } {
@@ -819,22 +918,25 @@ export class Workspace {
         return toTerminalPane(row);
     }
 
+    // Read-modify-write of every column (see updateGroup), hence the transaction.
     updateTerminalPane(params: UpdateTerminalPaneParams): TerminalPane {
-        const current = this.getTerminalPane(params.id);
-        const name = params.name ?? current.name;
-        const workingDirectory =
-            params.workingDirectory !== undefined ? params.workingDirectory : current.workingDirectory;
-        const tmuxTarget = params.tmuxTarget !== undefined ? params.tmuxTarget : current.tmuxTarget;
-        const startupCommand =
-            params.startupCommand !== undefined ? params.startupCommand : current.startupCommand;
-        const harness = params.harness !== undefined ? params.harness : current.harness;
-        const position = params.position ?? current.position;
-        this.db
-            .prepare(
-                "UPDATE terminal_panes SET name = ?, working_directory = ?, tmux_target = ?, startup_command = ?, harness = ?, position = ?, updated_at = ? WHERE id = ?",
-            )
-            .run(name, workingDirectory, tmuxTarget, startupCommand, harness, position, Date.now(), params.id);
-        return this.getTerminalPane(params.id);
+        return this.transaction(() => {
+            const current = this.getTerminalPane(params.id);
+            const name = params.name ?? current.name;
+            const workingDirectory =
+                params.workingDirectory !== undefined ? params.workingDirectory : current.workingDirectory;
+            const tmuxTarget = params.tmuxTarget !== undefined ? params.tmuxTarget : current.tmuxTarget;
+            const startupCommand =
+                params.startupCommand !== undefined ? params.startupCommand : current.startupCommand;
+            const harness = params.harness !== undefined ? params.harness : current.harness;
+            const position = params.position ?? current.position;
+            this.db
+                .prepare(
+                    "UPDATE terminal_panes SET name = ?, working_directory = ?, tmux_target = ?, startup_command = ?, harness = ?, position = ?, updated_at = ? WHERE id = ?",
+                )
+                .run(name, workingDirectory, tmuxTarget, startupCommand, harness, position, Date.now(), params.id);
+            return this.getTerminalPane(params.id);
+        });
     }
 
     deleteTerminalPane(params: { id: string }): { ok: true } {
@@ -860,23 +962,35 @@ export class Workspace {
         };
     }
 
+    // Store the region's split tree, replacing any tree already there. A single
+    // upsert keyed on the schema's UNIQUE (dev_session_id, region) does it: the
+    // previous SELECT-then-INSERT-or-UPDATE could have two connections both see
+    // no row and both insert, and the loser then failed on the unique index. The
+    // update branch keeps the original id and created_at, so the row's identity
+    // survives every rewrite.
+    //
+    // SPEC 3.5: server_id comes from the parent Dev Session, not from the
+    // client-supplied param (same rule as createViewerPane/createTerminalPane),
+    // which also rejects an unknown devSessionId with a clear error instead of a
+    // bare foreign-key failure. The wire param is still accepted for symmetry
+    // with the other create calls.
     setLayout(params: SetLayoutParams): SessionLayout {
-        const existing = this.db
-            .prepare("SELECT id FROM session_layouts WHERE dev_session_id = ? AND region = ?")
-            .get(params.devSessionId, params.region) as { id: string } | undefined;
+        const serverId = this.parentServerId("dev_sessions", params.devSessionId);
         const ts = Date.now();
-        const tree = JSON.stringify(params.tree);
-        if (existing) {
-            this.db
-                .prepare("UPDATE session_layouts SET tree = ?, updated_at = ? WHERE id = ?")
-                .run(tree, ts, existing.id);
-        } else {
-            this.db
-                .prepare(
-                    "INSERT INTO session_layouts (id, server_id, dev_session_id, region, tree, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                )
-                .run(randomUUID(), params.serverId, params.devSessionId, params.region, tree, ts, ts);
-        }
+        this.db
+            .prepare(
+                "INSERT INTO session_layouts (id, server_id, dev_session_id, region, tree, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?) " +
+                    "ON CONFLICT (dev_session_id, region) DO UPDATE SET server_id = excluded.server_id, tree = excluded.tree, updated_at = excluded.updated_at",
+            )
+            .run(
+                randomUUID(),
+                serverId,
+                params.devSessionId,
+                params.region,
+                JSON.stringify(params.tree),
+                ts,
+                ts,
+            );
         // Guaranteed present after the upsert above.
         return this.getLayout(params) as SessionLayout;
     }
@@ -941,28 +1055,63 @@ export class Workspace {
         this.db.prepare("DELETE FROM dev_sessions WHERE id = ?").run(id);
     }
 
-    // A group's session ids in listing order — the same `position, id` ordering
-    // every read path uses, so a re-pack built from it preserves what the client
-    // last saw.
-    private orderedSessionIds(groupId: string): string[] {
+    // Scope of an ordered, re-packable table: a server's groups, or a group's
+    // sessions. The table/column pairs are literal unions rather than plain
+    // strings because they are interpolated into SQL — an identifier cannot be a
+    // bound parameter, so the type is what keeps a caller-supplied name from
+    // ever reaching the query text.
+    private orderedIds(
+        table: "groups" | "dev_sessions",
+        scopeColumn: "server_id" | "group_id",
+        scopeValue: string,
+    ): string[] {
         const rows = this.db
-            .prepare("SELECT id FROM dev_sessions WHERE group_id = ? ORDER BY position, id").all(groupId) as unknown as Array<{ id: string }>;
+            .prepare(`SELECT id FROM ${table} WHERE ${scopeColumn} = ? ORDER BY position, id`).all(scopeValue) as unknown as Array<{ id: string }>;
         return rows.map((r) => r.id);
     }
 
-    // Assign contiguous positions 0..n-1 to `orderedIds` within one group. The
-    // group_id guard keeps a stale id from renumbering a row that has since
-    // moved elsewhere. Callers must already be inside a transaction.
-    private packSessions(groupId: string, orderedIds: readonly string[], ts: number): void {
+    // Renumber one scope to contiguous positions 0..n-1 in the caller's order.
+    // Callers must already be inside a transaction.
+    //
+    // `orderedIds` is a REQUEST, not the final truth: ids that are not in the
+    // scope (stale, or belonging to another group/server) are dropped, repeats
+    // collapse to their first occurrence, and rows the caller left out keep their
+    // current relative order at the end. That reconciliation is load-bearing —
+    // renumbering only the listed rows would leave every unlisted row on its old
+    // position, so two rows in one scope could end up sharing a position, and
+    // since every listing query orders by `position, id`, the tie would be broken
+    // by UUID, i.e. at random. A client that sends a filtered or stale list gets
+    // its requested prefix and a still-packed scope instead of a shuffle.
+    private packOrder(
+        table: "groups" | "dev_sessions",
+        scopeColumn: "server_id" | "group_id",
+        scopeValue: string,
+        orderedIds: readonly string[],
+        ts: number,
+    ): void {
+        const current = this.orderedIds(table, scopeColumn, scopeValue);
+        const inScope = new Set(current);
+        const wanted = new Set<string>();
+        for (const id of orderedIds) {
+            if (inScope.has(id)) wanted.add(id);
+        }
+        const final = [...wanted, ...current.filter((id) => !wanted.has(id))];
         const stmt = this.db.prepare(
-            "UPDATE dev_sessions SET position = ?, updated_at = ? WHERE id = ? AND group_id = ?",
+            `UPDATE ${table} SET position = ?, updated_at = ? WHERE id = ? AND ${scopeColumn} = ?`,
         );
-        orderedIds.forEach((id, index) => {
-            stmt.run(index, ts, id, groupId);
+        final.forEach((id, index) => {
+            stmt.run(index, ts, id, scopeValue);
         });
     }
 
-    private nextPosition(table: string, scopeColumn: string, scopeValue: string): number {
+    // Next free position in a scope: one past the current maximum, so the first
+    // row of an empty scope lands on 0. See orderedIds on why the identifiers are
+    // literal unions.
+    private nextPosition(
+        table: "groups" | "dev_sessions" | "viewer_panes" | "terminal_panes",
+        scopeColumn: "server_id" | "group_id" | "dev_session_id",
+        scopeValue: string,
+    ): number {
         const row = this.db
             .prepare(`SELECT COALESCE(MAX(position), -1) AS m FROM ${table} WHERE ${scopeColumn} = ?`)
             .get(scopeValue) as { m: number };
@@ -982,14 +1131,36 @@ export class Workspace {
         return row.server_id;
     }
 
+    // All-or-nothing wrapper around a group of writes.
+    //
+    // BEGIN IMMEDIATE, not the default deferred BEGIN: every caller writes, and
+    // taking the write lock up front makes two connections that read-modify-write
+    // the same rows serialize (the loser fails loudly with SQLITE_BUSY) instead of
+    // one silently overwriting fields the other had just changed.
+    //
+    // Re-entrant via a depth counter, because SQLite rejects a nested BEGIN: a
+    // helper that needs atomicity of its own (updateSession, packOrder's callers)
+    // can therefore be called both directly and from inside a larger operation.
+    // A nested failure still aborts the whole outermost transaction, which is the
+    // semantics every caller here wants.
     private transaction<T>(fn: () => T): T {
-        this.db.exec("BEGIN");
+        if (this.txDepth > 0) return fn();
+        this.db.exec("BEGIN IMMEDIATE");
+        this.txDepth = 1;
         try {
             const result = fn();
+            this.txDepth = 0;
             this.db.exec("COMMIT");
             return result;
         } catch (err) {
-            this.db.exec("ROLLBACK");
+            this.txDepth = 0;
+            try {
+                this.db.exec("ROLLBACK");
+            } catch {
+                // Already rolled back by the failure itself (SQLite aborts the
+                // transaction on some errors); the original error is the one
+                // worth propagating, so swallow this one.
+            }
             throw err;
         }
     }

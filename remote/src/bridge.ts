@@ -10,9 +10,15 @@ import net from "node:net";
 import readline from "node:readline";
 import fs from "node:fs";
 import path from "node:path";
+// pathToFileURL, not string concatenation: a script path containing a space (or
+// any character a URL must percent-encode) would never compare equal to
+// import.meta.url, silently turning the CLI entry point below into a no-op.
+import { pathToFileURL } from "node:url";
 import { adapterFor } from "./adapters/index.ts";
 import {
+    isEventIdentifier,
     isHarness,
+    isPlainObject,
     makeEvent,
     resolveSocketPath,
     type AgentEvent,
@@ -46,10 +52,19 @@ export function processBridgeLine(line: string): AgentEvent | null {
 
     if (
         !isHarness(decoded.harness) ||
+        // Non-blank identifiers, checked HERE because this relay builds its
+        // events with makeEvent and never runs them through validateEvent: this
+        // is the only gate on the socket-to-stdout path. An empty id yields a
+        // structurally valid event filed under a Dev Session that does not exist
+        // (see isEventIdentifier). The `typeof` half stays because it is what
+        // narrows the field to `string` for the makeEvent call below.
         typeof decoded.devSessionId !== "string" ||
         typeof decoded.terminalId !== "string" ||
-        typeof decoded.native !== "object" ||
-        decoded.native === null
+        !isEventIdentifier(decoded.devSessionId) ||
+        !isEventIdentifier(decoded.terminalId) ||
+        // An array would pass a bare `typeof === "object"` check and then read
+        // back as a native event with no `type`, i.e. a silent no-op.
+        !isPlainObject(decoded.native)
     ) {
         return null;
     }
@@ -69,10 +84,7 @@ export function processBridgeLine(line: string): AgentEvent | null {
         state,
         event: typeof nativeName === "string" ? nativeName : "unknown",
         summary: typeof decoded.summary === "string" ? decoded.summary : undefined,
-        metadata:
-            typeof decoded.metadata === "object" && decoded.metadata !== null
-                ? (decoded.metadata as Record<string, unknown>)
-                : undefined,
+        metadata: isPlainObject(decoded.metadata) ? decoded.metadata : undefined,
     });
 }
 
@@ -108,6 +120,10 @@ export function startBridge(
     }
     // Only remove a stale entry if it is actually a socket, so a mistyped path
     // pointing at a regular file is never clobbered (listen() will then fail).
+    // Known limitation: a socket file with a LIVE bridge still listening on it
+    // is indistinguishable from a stale one without an async connect probe, so
+    // starting a second bridge on the same path orphans the first instead of
+    // failing with EADDRINUSE. One bridge per host per user is the design.
     try {
         if (fs.lstatSync(socketPath).isSocket()) {
             fs.unlinkSync(socketPath);
@@ -127,8 +143,24 @@ export function startBridge(
     return server;
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {
     const socketPath = resolveSocketPath();
-    startBridge(socketPath);
+    const server = startBridge(socketPath);
     process.stderr.write(`codeharbor-bridge listening on ${socketPath}\n`);
+    // Without a handler, SIGINT/SIGTERM terminate the process outright and
+    // leave the socket file behind, so the next run has to treat a socket that
+    // may still look live as stale. Close the listener and remove the socket
+    // ourselves, then exit immediately: waiting for open connections to drain
+    // would let one stuck producer block shutdown forever.
+    const shutdown = (): void => {
+        server.close();
+        try {
+            if (fs.lstatSync(socketPath).isSocket()) fs.unlinkSync(socketPath);
+        } catch {
+            // Already unlinked by server.close(), or never created.
+        }
+        process.exit(0);
+    };
+    process.on("SIGINT", shutdown);
+    process.on("SIGTERM", shutdown);
 }

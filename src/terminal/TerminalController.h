@@ -30,10 +30,38 @@ public:
     // Rolling buffer retained while the view is hidden (SPEC 5.4/5.5); oldest
     // bytes are evicted past this cap and tmux history covers anything older.
     static constexpr int kHiddenBufferMaxBytes = 2 * 1024 * 1024; // 2 MiB
+    // Upper bound on the SILENT part of an attach (SPEC 5.6). A pane leaves
+    // OpeningChannel/AttachingTmux when the remote PTY produces its first bytes
+    // — that is what "tmux has drawn itself" looks like from this side, and it is
+    // TerminalFactory::attach() that makes the transition. The failure this bound
+    // exists for is a tmux attach that neither draws nor ends: a tmux server
+    // blocked on its socket, or a login shell stalled in an rc file on an
+    // unresponsive network mount. Those produce no bytes AND no end-of-stream, so
+    // without a bound the pane advertises "attaching_tmux" for as long as the
+    // application runs and the user cannot tell a slow attach from a dead one.
+    // On expiry the pane moves to Error, which is the state
+    // src/qml/TerminalPaneView.qml shows a reason and a Retry button for.
+    //
+    // One minute, and deliberately not less: it has to cover a cold tmux server
+    // start plus a login shell over a slow link, and reporting a working pane as
+    // failed is worse than the wait. It is the same budget the live gates
+    // (tst_liveterminal, tst_liveterminalfactory, tst_coldstart) already allow an
+    // attach before they give up on it.
+    static constexpr int kAttachTimeoutMs = 60000;
 
     explicit TerminalController(QObject *parent = nullptr);
 
     TerminalState state() const;
+
+    // The bound above is policy, not physics: a host on a slow link may widen
+    // it, and a unit test compresses it to milliseconds instead of spending a
+    // real minute of suite time. 0 disables the bound entirely and restores the
+    // "wait for the first byte forever" behaviour, mirroring
+    // ch::SessionBootstrap::setConnectTimeoutMs(0) in src/app. Negative values
+    // are clamped to 0. Changing it while a pane is already attaching restarts
+    // the window from now.
+    void setAttachTimeoutMs(int ms);
+    int attachTimeoutMs() const;
 
     bool viewVisible() const;
     // Toggle renderer visibility (SPEC 5.4). While hidden, flushes accumulate
@@ -79,7 +107,23 @@ public:
 
     // Drive the lifecycle state machine (SPEC 5.6); emits stateChanged() only on
     // an actual transition.
+    //
+    // src/terminal itself only ever produces OpeningChannel -> AttachingTmux ->
+    // Ready -> Disconnected (TerminalFactory::attach(), onTransportFinished())
+    // plus Error. Connecting, Authenticating and Reconnecting describe the
+    // SESSION-level connection, which a single pane cannot see; they are here so
+    // a host that DOES track it (ch::SshConnectionPool in src/ssh,
+    // ch::SessionBootstrap in src/app) can publish that progress on a pane.
+    // Nothing in src/terminal sets them, so no caller may treat "this pane never
+    // reported Connecting" as evidence of anything.
     void setState(TerminalState next);
+
+    // True for the states in which the pane actually has a live channel, and so
+    // the only states a dropped connection may move a pane OUT of (SPEC 5.6).
+    // Public and shared on purpose: onTransportFinished() and
+    // TerminalFactory::detach() both have to classify a pane this way, and two
+    // hand-written copies of the list would drift apart unnoticed.
+    static bool isLiveState(TerminalState state);
 
     // Stable tmux target for a pane: ch_<devSessionId>_<terminalId> (SPEC 5.2).
     // Stable IDs are used rather than user-facing display names.
@@ -93,18 +137,34 @@ public:
     // Retry delay in seconds for the Nth (0-based) automatic reconnect attempt:
     // 1, 2, 5, 10, 30, then 60 thereafter (SPEC 5.6). Manual reconnect bypasses
     // the wait and is not modelled here.
+    //
+    // Nothing in src/terminal schedules a reconnect: a dropped pane lands in
+    // Disconnected and src/qml/TerminalPaneView.qml offers a Retry button. The
+    // ladder that IS driven automatically is the session-level one in
+    // ch::SessionBootstrap::reconnectDelaySeconds() (src/app), which mirrors
+    // these numbers value for value rather than making ch_app link ch_terminal.
+    // Both are pinned by their own test against this same SPEC 5.6 vector, which
+    // is what keeps them from drifting.
     static int reconnectDelaySeconds(int attempt);
 
 signals:
     void stateChanged(ch::TerminalState state);
     // A coalesced batch of output ready for the visible renderer (SPEC 5.5).
     void flushReady(QByteArray batch);
+    // kAttachTimeoutMs elapsed with the pane still in OpeningChannel or
+    // AttachingTmux. The pane has ALREADY been moved to Error when this is
+    // emitted; the signal exists because the controller has no user-facing
+    // message channel of its own — ch::TerminalFactory::error() is the one the
+    // pane's chrome listens to, so the factory turns this into the sentence the
+    // user reads.
+    void attachTimedOut();
 
 private:
     void flush();
     void appendHidden(const QByteArray &batch);
     void onTransportReadyRead();
     void onTransportFinished();
+    void onAttachTimeout();
     // Narrow the transport to the only thing that can carry a window-change and
     // push `cols` x `rows` to it.
     bool applyPtySize(int cols, int rows);
@@ -114,6 +174,11 @@ private:
     QByteArray m_pending;   // coalesced output awaiting the next flush
     QByteArray m_hidden;    // rolling buffer retained while hidden
     QTimer m_flushTimer;
+    // Watchdog for the silent part of an attach; armed and disarmed by
+    // setState() so every host that drives the state machine is bounded, not
+    // only TerminalFactory::attach().
+    QTimer m_attachTimer;
+    int m_attachTimeoutMs = kAttachTimeoutMs;
     // QPointer, not a raw pointer: a caller-owned transport may be destroyed
     // while the controller outlives it, and setTransport()'s disconnect() on
     // the stale pointer would then be a use-after-free.

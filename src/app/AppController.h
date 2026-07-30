@@ -13,6 +13,7 @@
 #include "SshConnectionPool.h"
 
 #include <QObject>
+#include <QPair>
 #include <QPointer>
 #include <QString>
 #include <QStringList>
@@ -147,6 +148,9 @@ signals:
     void activeSessionChanged();
     // An UNKNOWN host key was presented (a CHANGED key is refused outright by
     // the pool and never reaches here — SPEC 12.1). Answer with resolveHostKey().
+    // `fingerprint` is for DISPLAY and is in OpenSSH's own form,
+    // "SHA256:<base64 of the SHA-256 of the key, unpadded>", so the user can
+    // compare it character for character with `ssh-keygen -lf` output.
     void hostKeyPrompt(QString host, QString keyType, QString fingerprint);
     // default keys could not authenticate `user` on `host`. `prompt` names the
     // requested credential and `kind` is `keyPassphrase` or `password`.
@@ -243,6 +247,17 @@ private:
     void startConnect(const QString& profileId, QString acceptedFingerprint,
                       QString secret,
                       SshConnectionPool::CredentialKind secretKind);
+    // Install the pool's host-key and credential policies for ONE attempt.
+    // `acceptedFingerprint` and `secret` are captured by value inside the two
+    // callbacks, so they are spendable exactly once and cannot outlive the
+    // attempt: startConnect() re-installs the same pair with both arguments
+    // EMPTY as soon as connectAndWire() returns. That re-install is what stops
+    // a secret libssh never asked for (a passphrase offered to a host that only
+    // does password auth, say) from sitting in the pool's callback for the rest
+    // of the process, and stops an approval the attempt never reached the key
+    // check to spend from arming the next connect to an unrelated host.
+    void installPoolCallbacks(QString acceptedFingerprint, QString secret,
+                              SshConnectionPool::CredentialKind secretKind);
 
     QString m_connectionState = QStringLiteral("disconnected");
     QString m_connectionError;

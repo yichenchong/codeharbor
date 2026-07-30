@@ -5,6 +5,23 @@
 #include <QFileInfo>
 #include <QStringList>
 #include <QScopeGuard>
+// libssh version floor for this file and SshChannelDevice.cpp, audited symbol
+// by symbol against the upstream release headers:
+//   * Compile/link floor is 0.8.0, set by ONE symbol: ssh_get_server_publickey()
+//     in verifyHostKey(). It first appears in include/libssh/libssh.h at tag
+//     libssh-0.8.0 (which deprecates the older ssh_get_publickey()); every other
+//     libssh function, enum and constant used here already exists at 0.7.0.
+//   * The "-mlkem768x25519-sha256" value handed to SSH_OPTIONS_KEY_EXCHANGE
+//     below needs the +,-,^ algorithm-list modifiers, added in 0.11.0. That call
+//     only runs when ssh_version() reports 0.12.0, so an older runtime never
+//     reaches it, but the mitigation itself is a 0.11.0-and-newer feature.
+//   * Practical floor is higher than the API floor, because two advisories land
+//     exactly on the calls made here: CVE-2023-6004 (command injection through a
+//     ProxyCommand built from config, fixed in 0.10.6 — connectToHost() parses
+//     the user's ~/.ssh/config) and CVE-2025-5351 (double free in the public-key
+//     export path used by ssh_pki_export_pubkey_base64(); affects 0.10.0 and
+//     newer built against OpenSSL 3, fixed in 0.11.2). 0.12.0 is excluded
+//     outright — see hasBrokenHybridKex().
 #if CH_HAVE_LIBSSH
 #include <libssh/callbacks.h>
 #endif
@@ -181,6 +198,17 @@ bool usesUnsupportedWindowsAgent()
         qEnvironmentVariable("SSH_AUTH_SOCK"));
 }
 
+// Overwrite a secret in place before its buffer is handed back to the
+// allocator, so a passphrase or password does not linger in freed heap memory
+// for the rest of the process's lifetime (SPEC 12.3). Only the locally owned
+// UTF-8 copy can be scrubbed: the QString it was converted from is
+// reference-counted and shared with the caller that supplied it.
+void wipeSecret(QByteArray& secret)
+{
+    if (!secret.isEmpty())
+        secret.fill('\0');
+}
+
 int declineLibsshPassphrase(const char*, char*, size_t, int, int, void*)
 {
     // CodeHarbor owns passphrase prompts. libssh must never fall back to a
@@ -230,14 +258,21 @@ bool authenticateIdentityFile(ssh_session session, const QString& identityFile,
                               const QString& passphrase)
 {
     const QByteArray fileName = QFile::encodeName(identityFile);
-    const QByteArray passphraseUtf8 = passphrase.toUtf8();
+    QByteArray passphraseUtf8 = passphrase.toUtf8();
     ssh_key privateKey = nullptr;
     const int importResult = ssh_pki_import_privkey_file(
         fileName.constData(),
         passphrase.isEmpty() ? nullptr : passphraseUtf8.constData(),
         declineLibsshPassphrase, nullptr, &privateKey);
-    if (importResult != SSH_OK || !privateKey)
+    // libssh has copied everything it needs out of the buffer by now.
+    wipeSecret(passphraseUtf8);
+    if (importResult != SSH_OK || !privateKey) {
+        // libssh does not hand back a key on failure, but freeing a non-null one
+        // costs nothing and closes the leak if a future release ever did.
+        if (privateKey)
+            ssh_key_free(privateKey);
         return false;
+    }
 
     const int authenticationResult =
         ssh_userauth_publickey(session, nullptr, privateKey);
@@ -299,13 +334,26 @@ bool SshConnectionPool::connectToHost(const QString& host, quint16 port,
         ssh_set_log_callback(previousLogCallback);
     });
 
+    // Option failures are invisible in libssh's later return values: a private
+    // key that never reached the session looks exactly like a key the server
+    // rejected. Record them instead of dropping them on the floor.
+    const auto setOption = [this](ssh_options_e option, const void* value,
+                                  const QString& what) {
+        if (ssh_options_set(m_session, option, value) == SSH_OK)
+            return;
+        appendDiagnostic(
+            QStringLiteral("Could not apply %1: %2")
+                .arg(what, QString::fromUtf8(ssh_get_error(m_session))));
+    };
+
     const QString runtimeVersion = QString::fromUtf8(ssh_version(0));
     appendDiagnostic(
         QStringLiteral("libssh runtime: %1").arg(runtimeVersion));
     const QByteArray hostUtf8 = host.toUtf8();
     const QByteArray userUtf8 = user.toUtf8();
     unsigned int portValue = port;
-    ssh_options_set(m_session, SSH_OPTIONS_HOST, hostUtf8.constData());
+    setOption(SSH_OPTIONS_HOST, hostUtf8.constData(),
+              QStringLiteral("SSH host"));
 
     // libssh only learns IdentityFile, ProxyJump and the rest of the user's
     // OpenSSH configuration when asked to parse it. Set Host first so its
@@ -332,12 +380,13 @@ bool SshConnectionPool::connectToHost(const QString& host, quint16 port,
         }
     }
 
-    ssh_options_set(m_session, SSH_OPTIONS_PORT, &portValue);
-    ssh_options_set(m_session, SSH_OPTIONS_USER, userUtf8.constData());
+    setOption(SSH_OPTIONS_PORT, &portValue, QStringLiteral("SSH port"));
+    setOption(SSH_OPTIONS_USER, userUtf8.constData(),
+              QStringLiteral("SSH user"));
     if (!m_identityFile.isEmpty()) {
         const QByteArray identityUtf8 = QFile::encodeName(m_identityFile);
-        ssh_options_set(m_session, SSH_OPTIONS_IDENTITY,
-                        identityUtf8.constData());
+        setOption(SSH_OPTIONS_IDENTITY, identityUtf8.constData(),
+                  QStringLiteral("private key file %1").arg(m_identityFile));
     }
 
     // libssh 0.12.0's mlkem768x25519-sha256 branch hands ssh_buffer_pack() an
@@ -390,8 +439,15 @@ bool SshConnectionPool::connectToHost(const QString& host, quint16 port,
         QStringLiteral("SSH handshake completed; verifying host key."));
     setState(State::HostKeyCheck);
     if (!verifyHostKey(host)) {
-        appendDiagnostic(QStringLiteral("Host-key verification failed: %1")
-                             .arg(QString::fromUtf8(ssh_get_error(m_session))));
+        const QString libsshError =
+            QString::fromUtf8(ssh_get_error(m_session)).trimmed();
+        // The refusal is CodeHarbor's own policy decision, so libssh normally
+        // has nothing to add here; appending an empty or stale message would
+        // only make the transcript read as though libssh had failed.
+        appendDiagnostic(libsshError.isEmpty()
+                             ? QStringLiteral("Host-key verification failed.")
+                             : QStringLiteral("Host-key verification failed: %1")
+                                   .arg(libsshError));
         closeSession();
         setState(State::Error);
         return false;
@@ -425,20 +481,33 @@ void SshConnectionPool::closeSession()
 {
     if (!m_session)
         return;
+    // Detach the session from the member BEFORE announcing the teardown: a slot
+    // reached from sessionClosing() that asks for another disconnect must not
+    // start a second teardown of the same session, and nothing may open a fresh
+    // channel on a session that is going away. A nested call now sees no session
+    // and returns.
+    const ssh_session session = m_session;
+    m_session = nullptr;
+    // Anything still holding one of our channel handles has to let go BEFORE
+    // the handles are freed, or its next libssh call reads freed memory.
+    // Announced first because a handler answers by calling releaseChannel(),
+    // which mutates m_channels — so the sweep below works on what is left once
+    // that has settled.
+    emit sessionClosing();
     // Channels are attached to the session; ssh_free() would free them too, so
     // free them explicitly FIRST to keep a clear ownership boundary and avoid a
     // double-free/UAF if a caller still holds a (now-invalid) handle.
-    for (ssh_channel channel : m_channels) {
+    const QList<ssh_channel> channels = m_channels;
+    m_channels.clear();
+    for (ssh_channel channel : channels) {
         if (!channel)
             continue;
         ssh_channel_close(channel);
         ssh_channel_free(channel);
     }
-    m_channels.clear();
-    if (ssh_is_connected(m_session))
-        ssh_disconnect(m_session);
-    ssh_free(m_session);
-    m_session = nullptr;
+    if (ssh_is_connected(session))
+        ssh_disconnect(session);
+    ssh_free(session);
 }
 
 bool SshConnectionPool::verifyHostKey(const QString& host)
@@ -454,20 +523,39 @@ bool SshConnectionPool::verifyHostKey(const QString& host)
         typeName ? QString::fromUtf8(typeName) : QString();
 
     // libssh 0.11 exposes the host key as base64 (the OpenSSH known_hosts key
-    // field); decode it to the raw blob KnownHosts stores and compares.
+    // field); decode it to the raw blob KnownHosts stores and compares. Strict
+    // decoding on purpose: a lenient decode silently skips invalid characters
+    // and would hand KnownHosts a blob that is not what the server presented.
     char* b64Key = nullptr;
     if (ssh_pki_export_pubkey_base64(serverKey, &b64Key) != SSH_OK || !b64Key) {
         ssh_key_free(serverKey);
         emit errorOccurred(QStringLiteral("Could not export server host key"));
         return false;
     }
-    const QByteArray keyBlob = QByteArray::fromBase64(QByteArray(b64Key));
+    const auto decoded = QByteArray::fromBase64Encoding(
+        QByteArray(b64Key),
+        QByteArray::Base64Encoding | QByteArray::AbortOnBase64DecodingErrors);
     ssh_string_free_char(b64Key);
     ssh_key_free(serverKey);
 
+    // A key type libssh cannot name, or a blob that will not decode, cannot be
+    // compared against the store — and must NOT be treated as first use.
+    // verify() would answer Unknown, the user would get the reassuring
+    // trust-this-host prompt, and add() would persist a line that reparses as
+    // garbage (an empty key type collapses two fields into one), silently
+    // losing the trust on the next launch.
+    const QByteArray keyBlob = decoded ? decoded.decoded : QByteArray();
+    if (keyType.isEmpty() || keyBlob.isEmpty()) {
+        emit errorOccurred(
+            QStringLiteral("Server host key could not be read as a comparable "
+                           "key — refusing connection"));
+        return false;
+    }
+
     // Non-default ports are stored OpenSSH-style as "[host]:port"; match that
-    // form so a ported entry is found (and persisted) correctly. The SAME token
-    // pinned the algorithm list in connectToHost().
+    // form so a ported entry is found (and persisted) correctly. m_port, not
+    // whatever ~/.ssh/config asked for: connectToHost() re-applies the profile's
+    // port after parsing the config, so this is the port actually connected to.
     const QString lookupHost = lookupHostFor(host, m_port);
     switch (m_knownHosts.verify(lookupHost, keyType, keyBlob)) {
     case KnownHosts::Verdict::Match:
@@ -536,12 +624,12 @@ bool SshConnectionPool::authenticate(const QString& user)
                     return true;
                 }
             } else {
-                const QByteArray secretUtf8 = passphrase.secret.toUtf8();
-                if (ssh_userauth_publickey_auto(m_session, nullptr,
-                                                secretUtf8.constData())
-                    == SSH_AUTH_SUCCESS) {
+                QByteArray secretUtf8 = passphrase.secret.toUtf8();
+                const int result = ssh_userauth_publickey_auto(
+                    m_session, nullptr, secretUtf8.constData());
+                wipeSecret(secretUtf8);
+                if (result == SSH_AUTH_SUCCESS)
                     return true;
-                }
             }
         }
     }
@@ -554,12 +642,12 @@ bool SshConnectionPool::authenticate(const QString& user)
         if (password.promptRequested)
             return false;
         if (!password.secret.isEmpty()) {
-            const QByteArray secretUtf8 = password.secret.toUtf8();
-            if (ssh_userauth_password(m_session, nullptr,
-                                      secretUtf8.constData())
-                == SSH_AUTH_SUCCESS) {
+            QByteArray secretUtf8 = password.secret.toUtf8();
+            const int result = ssh_userauth_password(m_session, nullptr,
+                                                    secretUtf8.constData());
+            wipeSecret(secretUtf8);
+            if (result == SSH_AUTH_SUCCESS)
                 return true;
-            }
         }
     }
     return false;
@@ -638,6 +726,19 @@ ssh_channel SshConnectionPool::openChannel(ChannelKind kind)
     // session, preventing a double-free through ssh_free()'s channel teardown.
     m_channels.append(channel);
     return channel;
+}
+
+void SshConnectionPool::releaseChannel(ssh_channel channel)
+{
+    if (!channel)
+        return;
+    // removeOne() IS the double-release guard: the second call finds nothing to
+    // remove and returns without touching freed memory.
+    if (!m_channels.removeOne(channel))
+        return;
+    if (ssh_channel_is_open(channel))
+        ssh_channel_close(channel);
+    ssh_channel_free(channel);
 }
 
 #endif // CH_HAVE_LIBSSH

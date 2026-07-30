@@ -15,6 +15,9 @@ namespace ch {
 // directly. Hashed (|1|salt|hash) host entries are preserved on round-trip and
 // participate in verification: their hostname is matched via HMAC-SHA1 over the
 // salt, so a changed or @revoked key at a hashed host is refused (Mismatch).
+// Wildcard host fields (`*`, `?`, and `!` negation) are matched with OpenSSH's
+// pattern rules, so a host covered by a pattern is a trusted host and a
+// different key for it is refused rather than offered as first use.
 class KnownHosts {
 public:
     enum class Verdict {
@@ -27,9 +30,10 @@ public:
         QString host;           // single hostname or address as stored
         QString keyType;        // e.g. "ssh-ed25519", "ssh-rsa"
         QByteArray key;         // raw key blob (base64-decoded)
-        bool supported = true;  // false for hashed |1| and @marker entries
-                                // (excluded from add()/replace; verify() still
-                                // consults hashed hosts via HMAC-SHA1)
+        bool supported = true;  // false for hashed |1|, wildcard/negated, and
+                                // @marker entries (excluded from add()/replace;
+                                // verify() still consults hashed hosts via
+                                // HMAC-SHA1 and pattern hosts via glob match)
         QString comment;        // trailing comment, empty if none
         QString marker;         // "@cert-authority"/"@revoked", empty if none
     };
@@ -44,8 +48,9 @@ public:
     // friendly first-use prompt. @revoked and @cert-authority entries never
     // establish that trust, so they cannot turn an unrelated key into a
     // Mismatch. Unknown only when the host has no trusted entry at all. Hashed
-    // |1| entries are matched via their HMAC-SHA1 salted hostname hash, like
-    // plaintext entries.
+    // |1| entries are matched via their HMAC-SHA1 salted hostname hash; wildcard
+    // and negated entries via OpenSSH's pattern rules; plain names are compared
+    // case-insensitively, again like OpenSSH.
     Verdict verify(const QString& host, const QString& keyType,
                    const QByteArray& keyBlob) const;
 
@@ -62,6 +67,9 @@ public:
     // Parse known_hosts-format text. Blank lines and #-comments are ignored;
     // a leading @marker (@cert-authority, @revoked) is captured: a @revoked key
     // is refused (Mismatch) if presented and @cert-authority entries are opaque.
+    // A plain comma-separated host list expands to one entry per name, while a
+    // list containing wildcards or a `!` negation is kept verbatim in one entry
+    // so its negation keeps working.
     static KnownHosts parse(const QString& text);
 
     const QList<Entry>& entries() const;

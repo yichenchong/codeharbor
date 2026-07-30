@@ -320,7 +320,7 @@ ApplicationWindow {
         if (!tree)
             return fallback;
         if (tree.children && tree.children.length > 0)
-            return firstPaneId(tree.children[0], fallback);
+            return window.firstPaneId(tree.children[0], fallback);
         return (tree.paneId === undefined || tree.paneId === null) ? fallback : tree.paneId;
     }
 
@@ -374,7 +374,7 @@ ApplicationWindow {
 
     function splitActivePane(region, orientation) {
         if (!app.layouts || app.activeSessionId.length === 0) {
-            notifyUser(qsTr("Select a Dev Session before splitting a pane."));
+            window.notifyUser(qsTr("Select a Dev Session before splitting a pane."));
             return;
         }
         // Pane focus IS tracked now: each region reports the pane the user last
@@ -392,7 +392,7 @@ ApplicationWindow {
     // region is never left with nothing to show.
     function closeActivePane(region) {
         if (!app.layouts || app.activeSessionId.length === 0) {
-            notifyUser(qsTr("Select a Dev Session before closing a pane."));
+            window.notifyUser(qsTr("Select a Dev Session before closing a pane."));
             return;
         }
         app.layouts.closePane(region, window.targetPaneId(region));
@@ -403,17 +403,17 @@ ApplicationWindow {
     // this is the only way to actually stop it, and it is destructive.
     function killActiveTerminal() {
         if (app.activeSessionId.length === 0) {
-            notifyUser(qsTr("No active Dev Session."));
+            window.notifyUser(qsTr("No active Dev Session."));
             return;
         }
         const paneId = window.targetPaneId("terminal");
         const pane = terminalRegion.paneCache ? terminalRegion.paneCache[paneId] : null;
         if (!pane) {
-            notifyUser(qsTr("No live terminal pane to kill."));
+            window.notifyUser(qsTr("No live terminal pane to kill."));
             return;
         }
         pane.killSession();
-        notifyUser(qsTr("Killed the remote tmux session for \"%1\".").arg(paneId));
+        window.notifyUser(qsTr("Killed the remote tmux session for \"%1\".").arg(paneId));
     }
 
     readonly property var paletteCommands: [

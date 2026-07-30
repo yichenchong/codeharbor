@@ -372,6 +372,8 @@ struct AppGraph {
                                  qmlWarnings << error.toString();
                          });
 
+        // Exactly what main.cpp publishes, no more: QML reaches the layouts
+        // through `app.layouts`, and the Notifier is a C++-only sink.
         engine.rootContext()->setContextProperty(QStringLiteral("app"), &app);
         engine.rootContext()->setContextProperty(QStringLiteral("viewers"), &viewers);
         engine.rootContext()->setContextProperty(QStringLiteral("agentMonitor"), &monitor);
@@ -379,8 +381,6 @@ struct AppGraph {
                                                  &editorFactory);
         engine.rootContext()->setContextProperty(QStringLiteral("terminalFactory"),
                                                  &terminalFactory);
-        engine.rootContext()->setContextProperty(QStringLiteral("notifier"), &notifier);
-        engine.rootContext()->setContextProperty(QStringLiteral("layouts"), &layouts);
 
         engine.loadFromModule("CodeHarbor", "Main");
     }
@@ -878,8 +878,11 @@ void TstColdStart::step3_hostKeyIsPromptedAcceptedAndPersisted()
     // trusted: re-derive base64(SHA-256(blob)) from the stored line and compare
     // it to the fingerprint the prompt presented. This is the assertion that
     // would catch a retry pinning or persisting a different key than the one on
-    // screen.
-    QCOMPARE(fingerprintOfKnownHostsLine(m_knownHostsAfterAccept), m_promptedFingerprint);
+    // screen. The prompt carries OpenSSH's displayed form, "SHA256:" + that
+    // base64, so the comparison has to add the same prefix.
+    QCOMPARE(QStringLiteral("SHA256:")
+                 + fingerprintOfKnownHostsLine(m_knownHostsAfterAccept),
+             m_promptedFingerprint);
 
     // The server identity was adopted from the SERVER, not minted locally.
     QTRY_VERIFY_WITH_TIMEOUT(!m_graph->app.serverId().isEmpty(), kOpTimeoutMs);
@@ -922,8 +925,8 @@ void TstColdStart::step3_hostKeyIsPromptedAcceptedAndPersisted()
     QVERIFY2(m_hostKeyPrompted,
              "SPEC 12.1: an UNKNOWN host key was trusted WITHOUT prompting - "
              "AppController::connectToProfile installs a prompting host-key "
-             "callback, but SessionBootstrap::attemptWire() overwrites it with "
-             "an unconditional Accept before connecting");
+             "callback and SessionBootstrap::attemptWire() must connect through "
+             "it, never through an unconditional Accept of its own");
 }
 
 // ---------------------------------------------------------------------------

@@ -1,6 +1,7 @@
 #include <QtTest/QtTest>
 
 #include <QTemporaryDir>
+#include <QCryptographicHash>
 #include <QDir>
 #include <QDirIterator>
 #include <QFile>
@@ -264,6 +265,36 @@ struct ConnectFixture {
     }
 };
 
+// A throwaway host-key blob and the base64 SHA-256 fingerprint AppController
+// derives from it. The controller shows the fingerprint and later matches the
+// user's approval against exactly this value, so the test has to compute it the
+// same way rather than hardcoding a string.
+const QByteArray kHostKeyBlob = QByteArrayLiteral("ssh-ed25519 test key material");
+
+QString hostKeyFingerprint()
+{
+    return QString::fromLatin1(
+        QCryptographicHash::hash(kHostKeyBlob, QCryptographicHash::Sha256)
+            .toBase64(QByteArray::OmitTrailingEquals));
+}
+
+// The same value as the user is shown it: OpenSSH prints a fingerprint as
+// "SHA256:" followed by exactly the base64 above, and the approval dialog asks
+// the user to compare the two, so the prompt must carry the prefix.
+QString displayedHostKeyFingerprint()
+{
+    return QStringLiteral("SHA256:") + hostKeyFingerprint();
+}
+
+// Stand exactly where SshConnectionPool::verifyHostKey() consults the installed
+// policy for a host it has never trusted, and record the decision.
+SshConnectionPool::HostKeyDecision offerUnknownHostKey(SshConnectionPool& pool)
+{
+    return pool.hostKeyCallback()(QStringLiteral("box.example"),
+                                  QStringLiteral("ssh-ed25519"), kHostKeyBlob,
+                                  KnownHosts::Verdict::Unknown);
+}
+
 } // namespace
 
 class TstAppController : public QObject {
@@ -292,6 +323,13 @@ private slots:
     void staleOrFailedRefreshNeverRetiresActiveSession();
     void deletingActiveSessionRetiresItThroughChainedRefresh();
     void disconnectRetiresActiveSessionButStillRemembersIt();
+
+    // An UNKNOWN host key must be REFUSED and put to the user (SPEC 12.1), and
+    // the approval must be spendable exactly once, on the very key that was
+    // shown, for the whole retry chain that follows.
+    void hostKeyPromptParksTheAttemptAndAcceptRetriesWithItPinned();
+    void rejectedHostKeyEndsTheAttemptAndLeavesNothingPinned();
+    void hostKeyApprovalSurvivesTheCredentialRetryInTheSameChain();
 
     // Authentication prompts must distinguish a private-key passphrase from a
     // server password; neither can be retried as the other.
@@ -1010,6 +1048,132 @@ void TstAppController::disconnectRetiresActiveSessionButStillRemembersIt()
     QCOMPARE(f.controller.activeSessionId(), QStringLiteral("s1"));
     QCOMPARE(f.layouts.devSessionId(), QStringLiteral("s1"));
     QCOMPARE(takeRequestIds(f.transport).size(), 2); // one getLayout per region
+}
+
+// SPEC 12.1: an unknown host key gets a fingerprint prompt, which means the
+// attempt in flight must be REFUSED (libssh is mid-handshake; a dialog there
+// would re-enter the UI) and retried once the user answers. The retry must pin
+// the very key that was shown, or the user is asked the same question forever.
+void TstAppController::hostKeyPromptParksTheAttemptAndAcceptRetriesWithItPinned()
+{
+    ConnectFixture f;
+    QVERIFY2(!f.pool.hostKeyCallback(),
+             "nothing should be installed before a connect is started");
+
+    QVector<SshConnectionPool::HostKeyDecision> decisions;
+    f.boot.duringConnect = [&f, &decisions] {
+        QVERIFY(f.pool.hostKeyCallback());
+        decisions << offerUnknownHostKey(f.pool);
+    };
+
+    QSignalSpy promptSpy(&f.controller, &AppController::hostKeyPrompt);
+    QSignalSpy errorSpy(&f.controller, &AppController::error);
+    f.controller.connectToProfile(f.profileId);
+
+    QCOMPARE(decisions.size(), 1);
+    QVERIFY2(decisions.at(0) == SshConnectionPool::HostKeyDecision::Reject,
+             "an unknown key was trusted without asking the user");
+    QCOMPARE(promptSpy.count(), 1);
+    QCOMPARE(promptSpy.at(0).at(0).toString(), QStringLiteral("box.example"));
+    QCOMPARE(promptSpy.at(0).at(1).toString(), QStringLiteral("ssh-ed25519"));
+    QCOMPARE(promptSpy.at(0).at(2).toString(), displayedHostKeyFingerprint());
+    QCOMPARE(f.controller.connectionState(), QStringLiteral("hostkey"));
+    // The refusal is the EXPECTED outcome, so it must not surface as a fault
+    // while the app is simply waiting on the user's answer.
+    QCOMPARE(errorSpy.count(), 0);
+
+    // A parked prompt swallows a second Connect: starting one underneath it
+    // would swap the pending profile/fingerprint out from under resolveHostKey().
+    const int callsBefore = f.boot.connectCalls;
+    f.controller.connectToProfile(f.profileId);
+    QCOMPARE(f.boot.connectCalls, callsBefore);
+    QCOMPARE(promptSpy.count(), 1);
+    QCOMPARE(f.controller.connectionState(), QStringLiteral("hostkey"));
+
+    // Accept: exactly ONE retry, and this time the same key is trusted.
+    f.controller.resolveHostKey(true);
+    QCOMPARE(f.boot.connectCalls, callsBefore + 1);
+    QCOMPARE(decisions.size(), 2);
+    QVERIFY2(decisions.at(1) == SshConnectionPool::HostKeyDecision::Accept,
+             "the accepted fingerprint was not pinned for the retry");
+    // One question, one answer: no second prompt for the key just approved.
+    QCOMPARE(promptSpy.count(), 1);
+}
+
+// Rejecting is an answer too: the parked attempt ends, nothing is retried, a
+// stale sheet answering again cannot redial, and no approval is left armed for
+// the next connect.
+void TstAppController::rejectedHostKeyEndsTheAttemptAndLeavesNothingPinned()
+{
+    ConnectFixture f;
+    QVector<SshConnectionPool::HostKeyDecision> decisions;
+    f.boot.duringConnect = [&f, &decisions] {
+        decisions << offerUnknownHostKey(f.pool);
+    };
+    QSignalSpy promptSpy(&f.controller, &AppController::hostKeyPrompt);
+    f.controller.connectToProfile(f.profileId);
+    QCOMPARE(promptSpy.count(), 1);
+
+    const int callsBefore = f.boot.connectCalls;
+    f.controller.resolveHostKey(false);
+    QCOMPARE(f.boot.connectCalls, callsBefore);  // no retry
+    QCOMPARE(f.controller.connectionState(), QStringLiteral("disconnected"));
+
+    // A stale sheet answering twice must not start anything.
+    f.controller.resolveHostKey(true);
+    QCOMPARE(f.boot.connectCalls, callsBefore);
+
+    // The next real connect starts UNPINNED: the same key is refused and put to
+    // the user again, proving the rejected fingerprint was not left armed.
+    f.controller.connectToProfile(f.profileId);
+    QCOMPARE(f.boot.connectCalls, callsBefore + 1);
+    QCOMPARE(decisions.size(), 2);
+    QVERIFY2(decisions.at(1) == SshConnectionPool::HostKeyDecision::Reject,
+             "a rejected fingerprint was still armed on the next connect");
+    QCOMPARE(promptSpy.count(), 2);
+}
+
+// The two prompts chain: host key first, then credentials. An attempt that got
+// as far as AUTH never reached the code that writes a newly trusted key to
+// known_hosts, so the credential retry meets the SAME key as unknown all over
+// again — and must trust it on the strength of the approval already given
+// rather than asking a second time.
+void TstAppController::hostKeyApprovalSurvivesTheCredentialRetryInTheSameChain()
+{
+    ConnectFixture f;
+    QVector<SshConnectionPool::HostKeyDecision> decisions;
+    f.boot.duringConnect = [&f, &decisions] {
+        decisions << offerUnknownHostKey(f.pool);
+    };
+    QSignalSpy hostKeySpy(&f.controller, &AppController::hostKeyPrompt);
+    QSignalSpy credentialSpy(&f.controller, &AppController::credentialPrompt);
+    f.controller.connectToProfile(f.profileId);
+    QCOMPARE(hostKeySpy.count(), 1);
+
+    // Attempt 2: the key is accepted, and libssh then asks to unlock the key.
+    f.boot.duringConnect = [&f, &decisions] {
+        decisions << offerUnknownHostKey(f.pool);
+        f.pool.credentialCallback()(
+            QStringLiteral("yichen"),
+            SshConnectionPool::CredentialKind::KeyPassphrase);
+    };
+    f.controller.resolveHostKey(true);
+    QCOMPARE(decisions.size(), 2);
+    QVERIFY(decisions.at(1) == SshConnectionPool::HostKeyDecision::Accept);
+    QCOMPARE(credentialSpy.count(), 1);
+    QCOMPARE(f.controller.connectionState(), QStringLiteral("credential"));
+
+    // Attempt 3: the passphrase is in hand, and the key must still be trusted.
+    f.boot.duringConnect = [&f, &decisions] {
+        decisions << offerUnknownHostKey(f.pool);
+    };
+    f.controller.submitCredential(QStringLiteral("unlock-me"),
+                                  QStringLiteral("keyPassphrase"));
+    QCOMPARE(decisions.size(), 3);
+    QVERIFY2(decisions.at(2) == SshConnectionPool::HostKeyDecision::Accept,
+             "the host-key approval did not survive the credential retry, so "
+             "the user would be asked to re-approve the same key");
+    QCOMPARE(hostKeySpy.count(), 1);
 }
 
 // SshConnectionPool authenticates agent -> configured/default key -> requested

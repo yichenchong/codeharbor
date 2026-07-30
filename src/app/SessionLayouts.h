@@ -69,6 +69,10 @@ public:
     void setDevSessionId(QString devSessionId);
 
     QString serverId() const { return m_serverId; }
+    // Changing the server also DESELECTS the current Dev Session (dropping both
+    // region trees): a Dev Session belongs to exactly one server, so keeping it
+    // loaded would let the next edit persist the old session's tree under the
+    // new server's key.
     void setServerId(QString serverId);
 
     QVariant viewerTree() const;

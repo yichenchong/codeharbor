@@ -16,6 +16,17 @@ QJsonObject readParams(const QString& path)
     return QJsonObject{{QStringLiteral("path"), path}};
 }
 
+// file.readFile params. ALWAYS a bounded byte window: see
+// EditorController::kMaxEditableReadBytes for why an unbounded read is both a
+// memory hazard on the server and unable to report that it hit a limit.
+QJsonObject readFileParams(const QString& path)
+{
+    return QJsonObject{
+        {QStringLiteral("path"), path},
+        {QStringLiteral("offset"), 0},
+        {QStringLiteral("length"), EditorController::kMaxEditableReadBytes}};
+}
+
 QJsonObject writeParams(const QString& path, const QString& content,
                         const QString& expectedRevision)
 {
@@ -45,8 +56,19 @@ constexpr int kWriteBits = 0222;
 // takes the file away from a user who could have edited it.
 //
 // A directory (or a socket/fifo) is never a writable text buffer regardless.
-// Note lstat reports the LINK for a symlink, whose 0777 mode hides an
-// unwritable target; that case falls through to the save-time error.
+//
+// SYMLINKS are a known, deliberately accepted hole. remote/src/files.ts stat()
+// uses lstat, so `mode` describes the LINK, and a symlink's own mode is always
+// 0777 on Linux — the check above can therefore never claim read-only for a file
+// opened through one, however unwritable the target is. The consequence, stated
+// plainly: the user can type into a file they cannot write, and only finds out
+// when the save fails with the server's EACCES via saveError. That is kept in
+// preference to the alternative — treating kind "symlink" as read-only — because
+// symlinks into writable files are the common case (dotfile farms, checked-out
+// worktrees) and a false read-only takes a file away from a user who could have
+// edited it. No other reported field helps: StatResult carries no uid/gid, its
+// `size` for a symlink is the target path's length, and its `revision` is minted
+// from the TARGET's mtime/ctime/inode/size, which says nothing about permission.
 bool statSaysUnwritable(const QJsonObject& stat)
 {
     const QString kind = stat.value(QStringLiteral("kind")).toString();
@@ -155,6 +177,27 @@ void EditorController::onTransportClosed()
     // never created it. The buffer, its revision and its dirty flag are the
     // user's and are deliberately left alone.
     m_watchSubscriptionId.clear();
+
+    // Nothing is open, or the drop has already been reported.
+    if (m_path.isEmpty() || m_fileState == FileState::Disconnected)
+        return;
+
+    // SPEC 8.2: with no transport the file can be neither read nor written, so
+    // the pane reports that instead of advertising whatever state it happened to
+    // be in. Conflict, ExternallyModified and ReadOnly are REMEMBERED: the first
+    // two describe the file on the server diverging from the buffer and only the
+    // user can resolve that, and ReadOnly describes the bytes this pane holds —
+    // a truncated read of a file over kMaxEditableReadBytes, which a reconnect
+    // does not make whole. Every other state described an operation this drop
+    // just voided (CodeharbordClient::failAllPending() has already failed its
+    // callback), so the buffer itself decides where the reconnect lands.
+    if (m_fileState == FileState::Conflict
+        || m_fileState == FileState::ExternallyModified
+        || m_fileState == FileState::ReadOnly)
+        m_resumeState = m_fileState;
+    else
+        m_resumeState.reset();
+    setFileState(FileState::Disconnected);
 }
 
 void EditorController::onTransportBound()
@@ -167,6 +210,15 @@ void EditorController::onTransportBound()
 
     if (m_path.isEmpty())
         return;  // nothing open in this pane
+
+    // Leave the Disconnected state the drop parked us in BEFORE issuing
+    // anything: the reconciliation below may move the state again (to
+    // ExternallyModified, or through a reload), and it has to move it from a
+    // truthful starting point.
+    if (m_fileState == FileState::Disconnected)
+        setFileState(m_resumeState.value_or(m_dirty ? FileState::Modified
+                                                    : FileState::Clean));
+    m_resumeState.reset();
 
     // Order matters: subscribe FIRST so a change landing during the
     // reconciliation round trip is still announced, then close the window the
@@ -190,10 +242,52 @@ void EditorController::reconcileAfterReconnect()
     m_client->call(
         QString::fromLatin1(rpc::kMethodStat), readParams(path),
         [self, path, baseline](QJsonValue statRes, std::optional<RpcError> statErr) {
-            if (!self || statErr.has_value())
-                return;  // gone, or the file cannot be stat'd: nothing to claim
+            if (!self)
+                return;
             if (self->m_path != path || self->m_revision != baseline)
                 return;  // superseded
+
+            if (statErr.has_value()) {
+                // The file cannot be stat'd at all. The transport was just bound
+                // and this request WAS answered, so the fault is the path, not
+                // the link: the file was deleted while the session was down (the
+                // common case — the old codeharbord died before it could emit a
+                // watchEvent, and the replacement's fresh subscription baselines
+                // at whatever is on disk when it is created), or its directory
+                // stopped being traversable. Returning here would re-advertise
+                // the pre-outage state, so the pane would claim "clean" for a
+                // file that no longer exists and the user's next save would be
+                // refused as a revision conflict for a revision they never saw
+                // change.
+                //
+                // The revision baseline is deliberately LEFT ALONE. It is what
+                // turns that next save into a guarded write the server refuses
+                // (assertRevisionMatches in remote/src/files.ts) rather than an
+                // unguarded create that silently resurrects the file — or writes
+                // over whatever else now holds the path. The server's revision
+                // token embeds the inode, so no replacement file can ever match
+                // it by accident, and the create-only retry the page's
+                // "overwrite" affordance issues is refused too if something else
+                // took the path. Recreating a file the user deliberately deleted
+                // must stay an explicit choice.
+                if (self->m_fileState == FileState::Saving)
+                    return;  // the in-flight write decides this file's next state
+                if (self->m_dirty) {
+                    // Unsaved work over a file that is not there: only the user
+                    // can resolve it, exactly as for any other divergence
+                    // (SPEC 8.7), and an existing Conflict already says more.
+                    if (self->m_fileState != FileState::Conflict)
+                        self->setFileState(FileState::ExternallyModified);
+                    return;
+                }
+                // A clean buffer has nothing to lose, so re-READ instead of
+                // guessing: the read either succeeds (the stat failure was
+                // transient; the buffer re-baselines and settles Clean) or fails
+                // too and leaves the pane in FileState::Error — the same place a
+                // "deleted" watchEvent leaves it on a live transport.
+                self->reload(FileState::ExternallyModified);
+                return;
+            }
 
             // This stat is also the reconnect's permission refresh: the file
             // may have been chmod'd while the session was down, and no watch
@@ -212,8 +306,10 @@ void EditorController::reconcileAfterReconnect()
 
             if (self->m_dirty) {
                 // Unsaved edits: NEVER clobber them (SPEC 8.7). Same rule
-                // onNotification() applies to a live watch event.
-                self->setFileState(FileState::ExternallyModified);
+                // onNotification() applies to a live watch event, including the
+                // refusal to downgrade an existing Conflict.
+                if (self->m_fileState != FileState::Conflict)
+                    self->setFileState(FileState::ExternallyModified);
                 return;
             }
             self->reload(FileState::ExternallyModified);
@@ -298,6 +394,16 @@ void EditorController::ready()
     const bool reconnected = m_ready;
     m_ready = true;
 
+    // Every signal emitted before the page attached its handlers went into the
+    // void, so the current file's state is replayed here. Without it a page that
+    // connected after the load renders an empty status bar and — far worse for a
+    // read-only buffer — a freely editable Monaco over a file it can never
+    // write. The defaults (nothing open, not read-only) need no signal.
+    if (!m_path.isEmpty())
+        emit fileStateChanged(toString(m_fileState));
+    if (m_readOnly)
+        emit readOnlyChanged(true);
+
     if (m_pendingContent.has_value()) {
         const QString content = *m_pendingContent;
         const QString revision = m_pendingRevision;
@@ -305,16 +411,9 @@ void EditorController::ready()
         // must not see the buffer a second time.
         m_pendingContent.reset();
         m_pendingRevision.clear();
-        // A read-only buffer would otherwise render editable until the next
-        // toggle; the default (false) needs no signal.
-        if (m_readOnly)
-            emit readOnlyChanged(true);
         emit contentLoaded(content, revision);
         return;
     }
-
-    if (m_readOnly)
-        emit readOnlyChanged(true);
 
     // Nothing held. A repeat ready() is a page RELOAD that lost its buffer:
     // re-fetch rather than replay, so the fresh page cannot show stale bytes.
@@ -362,13 +461,18 @@ void EditorController::open(QString path)
     // a switch; the new load supersedes it.
     m_pendingContent.reset();
     m_pendingRevision.clear();
+    // Supersede any read still in flight: its answer describes the file we are
+    // leaving, and applying it would push the wrong bytes at the page and adopt
+    // the wrong revision as this buffer's save guard.
+    const quint64 generation = ++m_loadGeneration;
     setFileState(FileState::Loading);
 
     QPointer<EditorController> self(this);
-    m_client->call(QString::fromLatin1(rpc::kMethodReadFile), readParams(path),
-                   [self, path](QJsonValue result, std::optional<RpcError> error) {
-                       if (!self)
-                           return;
+    m_client->call(QString::fromLatin1(rpc::kMethodReadFile), readFileParams(path),
+                   [self, generation](QJsonValue result,
+                                      std::optional<RpcError> error) {
+                       if (!self || generation != self->m_loadGeneration)
+                           return;  // gone, or superseded by a newer load
                        if (error.has_value()) {
                            self->setFileState(FileState::Error);
                            return;
@@ -379,15 +483,31 @@ void EditorController::open(QString path)
                        const QString revision =
                            obj.value(QStringLiteral("revision")).toString();
                        self->m_revision = revision;
-                       // A base64 read means the file is binary: the buffer the
-                       // page shows is NOT the file's bytes, so writing it back
-                       // (save sends utf-8) would destroy it.
+                       // The buffer is not the file's bytes when the read came
+                       // back base64 (binary: save() sends utf-8, so writing it
+                       // back would destroy the file) or truncated (a PREFIX:
+                       // writing it back would delete everything past it).
+                       // Either way the buffer cannot be saved (SPEC 8.2).
+                       const bool truncated =
+                           obj.value(QStringLiteral("truncated")).toBool();
                        self->m_bufferReadOnly =
                            obj.value(QStringLiteral("encoding")).toString()
-                           == QLatin1String("base64");
+                               == QLatin1String("base64")
+                           || truncated;
                        self->updateReadOnly();
                        self->deliverContent(content, revision);
-                       self->setFileState(FileState::Clean);
+                       // A file over kMaxEditableReadBytes is NOT opened for
+                       // editing: FileState::Clean asserts "the buffer is what
+                       // the server has", and for a prefix that is false, so the
+                       // pane would advertise a saveable buffer over a file whose
+                       // tail it never read. ReadOnly is the honest SPEC 8.2
+                       // state — the head of the file is still shown, which is
+                       // what makes a huge log useful — and it is a state no
+                       // save can be issued from. Not Error: the read SUCCEEDED,
+                       // and Error would leave the pane blank for a file we can
+                       // legitimately display.
+                       self->setFileState(truncated ? FileState::ReadOnly
+                                                    : FileState::Clean);
 
                        // Subscribe to external-change notifications (SPEC 8.7).
                        self->subscribeWatch();
@@ -398,14 +518,15 @@ void EditorController::open(QString path)
                        // could never apply (SPEC 11.3). Chaining also makes the
                        // order deterministic — the alternative, a parallel
                        // stat, races the recovery prompt it is meant to gate.
-                       self->refreshPermissions([self, content]() {
-                           if (self && !self->m_readOnly)
-                               self->checkRecovery(content);
+                       self->refreshPermissions([self, content, generation]() {
+                           if (self && !self->m_readOnly
+                               && generation == self->m_loadGeneration)
+                               self->checkRecovery(content, generation);
                        });
                    });
 }
 
-void EditorController::checkRecovery(const QString& loadedContent)
+void EditorController::checkRecovery(const QString& loadedContent, quint64 generation)
 {
     if (!m_client || m_path.isEmpty())
         return;
@@ -415,10 +536,15 @@ void EditorController::checkRecovery(const QString& loadedContent)
     // Stat first: absence (error) simply means there is nothing to recover.
     m_client->call(
         QString::fromLatin1(rpc::kMethodStat), readParams(recoveryPath),
-        [self, recoveryPath, loadedContent](QJsonValue statRes,
-                                            std::optional<RpcError> statErr) {
+        [self, recoveryPath, loadedContent, generation](
+            QJsonValue statRes, std::optional<RpcError> statErr) {
             if (!self || statErr.has_value())
                 return; // no snapshot present
+            // Superseded: this snapshot belongs to a load that is no longer the
+            // one on screen, so offering it would hand the user one file's
+            // unsaved edits as another file's.
+            if (generation != self->m_loadGeneration)
+                return;
             // A snapshot exists; read it and compare. We treat presence +
             // content difference as "recoverable". (Simplification: rather than
             // a strict mtime comparison against the file, difference is the
@@ -428,13 +554,23 @@ void EditorController::checkRecovery(const QString& loadedContent)
                 statRes.toObject().value(QStringLiteral("revision")).toString();
             self->m_client->call(
                 QString::fromLatin1(rpc::kMethodReadFile),
-                readParams(recoveryPath),
-                [self, snapshotRevision, loadedContent](
+                readFileParams(recoveryPath),
+                [self, snapshotRevision, loadedContent, generation](
                     QJsonValue readRes, std::optional<RpcError> readErr) {
                     if (!self || readErr.has_value())
                         return;
+                    if (generation != self->m_loadGeneration)
+                        return;
+                    const QJsonObject snapshot = readRes.toObject();
+                    // A snapshot larger than kMaxEditableReadBytes came back as
+                    // a prefix, and offering a prefix as "your unsaved work"
+                    // would hand the user a truncated buffer to save over the
+                    // file (SPEC 11.3). Adopt the revision so the next snapshot
+                    // write is still a guarded overwrite, but never offer it.
                     const QString recovered =
-                        readRes.toObject().value(QStringLiteral("content")).toString();
+                        snapshot.value(QStringLiteral("truncated")).toBool()
+                            ? QString()
+                            : snapshot.value(QStringLiteral("content")).toString();
                     self->m_recoveryRevision = snapshotRevision;
                     // An EMPTY snapshot is the tombstone clearRecovery() leaves
                     // behind after a successful save: the frozen C1 catalog has
@@ -469,6 +605,15 @@ void EditorController::save(QString content, QString expectedRevision)
         return;
     }
 
+    // The bytes handed to us are, by definition, not yet the bytes on the
+    // server. Mark the buffer dirty for the duration of the write: if it fails,
+    // or the session dies with it in flight, the buffer still holds work that is
+    // nowhere else, and a buffer wrongly believed clean is silently
+    // auto-reloaded over by the next external change (SPEC 8.7). Only the reply
+    // below clears it, and only if nothing was typed in the meantime.
+    m_dirty = true;
+    const quint64 editSerial = m_editSerial;
+
     setFileState(FileState::Saving);
     const QString path = m_path;
 
@@ -476,21 +621,36 @@ void EditorController::save(QString content, QString expectedRevision)
     m_client->call(
         QString::fromLatin1(rpc::kMethodWriteFile),
         writeParams(path, content, expectedRevision),
-        [self, path](QJsonValue result, std::optional<RpcError> error) {
+        [self, path, editSerial](QJsonValue result, std::optional<RpcError> error) {
             if (!self)
+                return;
+            // The pane switched files while the write was in flight. This
+            // outcome belongs to a file this controller no longer holds, so it
+            // must not re-baseline the new file's revision, clear the new file's
+            // recovery snapshot, or report a save the page never asked for.
+            if (self->m_path != path)
                 return;
             if (!error.has_value()) {
                 const QString newRevision =
                     result.toObject().value(QStringLiteral("revision")).toString();
                 self->m_revision = newRevision;
-                self->m_dirty = false;
-                // The file on the server now IS the buffer, so the recovery
-                // snapshot is obsolete: drop it before anything can reopen the
-                // file and be offered a stale "unsaved changes" copy (SPEC 11.3).
-                self->clearRecovery();
+                // Anything typed while the write was in flight is NOT in the
+                // bytes that just landed, so the buffer is still dirty and the
+                // recovery snapshot holding those edits must survive
+                // (SPEC 11.3). Clearing either would let the next external
+                // change auto-reload straight over them.
+                const bool editedDuringSave = self->m_editSerial != editSerial;
+                if (!editedDuringSave) {
+                    self->m_dirty = false;
+                    // The file on the server now IS the buffer, so the recovery
+                    // snapshot is obsolete: drop it before anything can reopen
+                    // the file and be offered a stale copy (SPEC 11.3).
+                    self->clearRecovery();
+                }
                 emit self->saved(newRevision);
                 self->setFileState(FileState::Saved);
-                self->setFileState(FileState::Clean);
+                self->setFileState(editedDuringSave ? FileState::Modified
+                                                    : FileState::Clean);
                 return;
             }
 
@@ -498,6 +658,13 @@ void EditorController::save(QString content, QString expectedRevision)
             // current revision so the UI can offer reload/overwrite. Prefer the
             // revision the server attached to the error; otherwise stat the file.
             if (error->code == rpc::kRevisionMismatch) {
+                // RevisionMismatchError in remote/src/files.ts attaches
+                // {path, expected, currentRevision} for a stale write, and
+                // {path, currentRevision} for a create-only write onto a file
+                // that already exists. When the file is GONE the field is
+                // present but JSON null, which reads back as an empty string —
+                // indistinguishable here from a server that sent nothing, and
+                // both fall through to the stat below.
                 const QString current = error->data.toObject()
                                             .value(QStringLiteral("currentRevision"))
                                             .toString();
@@ -508,8 +675,8 @@ void EditorController::save(QString content, QString expectedRevision)
                 }
                 self->m_client->call(
                     QString::fromLatin1(rpc::kMethodStat), readParams(path),
-                    [self](QJsonValue statRes, std::optional<RpcError> statErr) {
-                        if (!self)
+                    [self, path](QJsonValue statRes, std::optional<RpcError> statErr) {
+                        if (!self || self->m_path != path)
                             return;
                         const QString rev =
                             statErr.has_value()
@@ -517,6 +684,13 @@ void EditorController::save(QString content, QString expectedRevision)
                                 : statRes.toObject()
                                       .value(QStringLiteral("revision"))
                                       .toString();
+                        // An EMPTY revision means the file could not be stat'd
+                        // at all, which almost always means it was deleted under
+                        // us. That is still the right thing to hand the page:
+                        // its "Overwrite" affordance re-saves guarded by this
+                        // revision, and an empty expectedRevision is exactly the
+                        // create-only write that recreates a deleted file
+                        // (assertRevisionMatches in remote/src/files.ts).
                         emit self->saveConflict(rev);
                         self->setFileState(FileState::Conflict);
                     });
@@ -540,6 +714,14 @@ void EditorController::reportContent(QString content)
     if (m_readOnly)
         return;
 
+    // A load is in flight, so the page is still showing the buffer of whatever
+    // was open BEFORE it: the page debounces by 500ms, which outlives an
+    // open(). Honouring this report would file one file's edits under another
+    // file's recovery path and mark a buffer nobody has edited dirty.
+    if (m_fileState == FileState::Loading)
+        return;
+
+    ++m_editSerial;
     m_dirty = true;
     if (m_fileState == FileState::Clean)
         setFileState(FileState::Modified);
@@ -560,6 +742,11 @@ void EditorController::writeRecovery(const QString& content, bool retryOnMismatc
             QJsonValue result, std::optional<RpcError> error) {
             if (!self)
                 return;
+            // The pane switched files: this revision guards ANOTHER file's
+            // snapshot, and adopting it would send the next snapshot write out
+            // with a guard that cannot match.
+            if (recoveryPathFor(self->m_path) != recoveryPath)
+                return;
             if (!error.has_value()) {
                 // Track the returned revision so the next snapshot is a guarded
                 // overwrite rather than a create.
@@ -575,9 +762,11 @@ void EditorController::writeRecovery(const QString& content, bool retryOnMismatc
             if (retryOnMismatch && error->code == rpc::kRevisionMismatch) {
                 self->m_client->call(
                     QString::fromLatin1(rpc::kMethodStat), readParams(recoveryPath),
-                    [self, content](QJsonValue statRes,
-                                    std::optional<RpcError> statErr) {
+                    [self, content, recoveryPath](QJsonValue statRes,
+                                                  std::optional<RpcError> statErr) {
                         if (!self || statErr.has_value())
+                            return;
+                        if (recoveryPathFor(self->m_path) != recoveryPath)
                             return;
                         self->m_recoveryRevision =
                             statRes.toObject()
@@ -610,9 +799,12 @@ void EditorController::clearRecovery()
     m_client->call(
         QString::fromLatin1(rpc::kMethodWriteFile),
         writeParams(recoveryPath, QString(), guard),
-        [self](QJsonValue result, std::optional<RpcError> error) {
+        [self, recoveryPath](QJsonValue result, std::optional<RpcError> error) {
             if (!self || error.has_value())
                 return; // best-effort: a stale snapshot is a prompt, not data loss
+            // The pane switched files; this bookkeeping is not ours to write.
+            if (recoveryPathFor(self->m_path) != recoveryPath)
+                return;
             self->m_recoveryRevision =
                 result.toObject().value(QStringLiteral("revision")).toString();
             self->m_recoveryHasContent = false;
@@ -631,12 +823,15 @@ void EditorController::reload(FileState transitional)
 
     setFileState(transitional);
     const QString path = m_path;
+    // Supersede any read still in flight: the replies to two overlapping loads
+    // can arrive in either order, and the older one must never win.
+    const quint64 generation = ++m_loadGeneration;
 
     QPointer<EditorController> self(this);
     m_client->call(
-        QString::fromLatin1(rpc::kMethodReadFile), readParams(path),
-        [self](QJsonValue result, std::optional<RpcError> error) {
-            if (!self)
+        QString::fromLatin1(rpc::kMethodReadFile), readFileParams(path),
+        [self, generation](QJsonValue result, std::optional<RpcError> error) {
+            if (!self || generation != self->m_loadGeneration)
                 return;
             if (error.has_value()) {
                 self->setFileState(FileState::Error);
@@ -647,12 +842,18 @@ void EditorController::reload(FileState transitional)
             const QString revision = obj.value(QStringLiteral("revision")).toString();
             self->m_revision = revision;
             self->m_dirty = false;
+            // base64 => binary, truncated => a prefix of the file. Either way
+            // the bytes on screen are not the file's bytes and must not be
+            // written back (SPEC 8.2); see open(), which also explains why a
+            // truncated read settles at ReadOnly rather than Clean.
+            const bool truncated = obj.value(QStringLiteral("truncated")).toBool();
             self->m_bufferReadOnly =
                 obj.value(QStringLiteral("encoding")).toString()
-                == QLatin1String("base64");
+                    == QLatin1String("base64")
+                || truncated;
             self->updateReadOnly();
             self->deliverContent(content, revision);
-            self->setFileState(FileState::Clean);
+            self->setFileState(truncated ? FileState::ReadOnly : FileState::Clean);
             // A chmod changes ctime, so it changes the revision, so it arrives
             // here as an ordinary external change (SPEC 8.7). Re-derive rather
             // than latch the verdict taken at open: a file made read-only under
@@ -671,20 +872,37 @@ void EditorController::onNotification(const QString& method, const QJsonValue& p
         return;
 
     // Ignore the echo of our own write: the event revision matches the baseline
-    // we just adopted, so there is nothing external to reconcile.
+    // we just adopted, so there is nothing external to reconcile. A "deleted"
+    // event carries NO revision at all (reconcile() in remote/src/files.ts), so
+    // it can never be mistaken for that echo and always falls through below.
     const QString eventRevision = obj.value(QStringLiteral("revision")).toString();
     if (!eventRevision.isEmpty() && eventRevision == m_revision)
         return;
 
     if (m_dirty) {
         // Unsaved local edits: do NOT clobber them. Flag the divergence and let
-        // the UI resolve it (SPEC 8.7).
-        setFileState(FileState::ExternallyModified);
+        // the UI resolve it (SPEC 8.7). An existing Conflict is NOT downgraded:
+        // it claims everything ExternallyModified does plus "a save was already
+        // refused", and it is the state the page's reload/overwrite affordance
+        // belongs to.
+        if (m_fileState != FileState::Conflict)
+            setFileState(FileState::ExternallyModified);
         return;
     }
 
     // Clean buffer: transition through ExternallyModified while we re-fetch,
     // then settle back to Clean on success.
+    //
+    // This is also the DELETED path, and the re-read is what makes it honest:
+    // it fails, so the pane lands in FileState::Error instead of continuing to
+    // advertise a clean buffer for a file that is gone. m_revision keeps the
+    // baseline of the file we loaded — on purpose. It is the guard that makes the
+    // user's next save a write the server REFUSES (assertRevisionMatches in
+    // remote/src/files.ts rejects a non-empty expectedRevision for a missing
+    // file, and its revision token embeds the inode, so a different file that
+    // took the path cannot match either) rather than an unguarded create that
+    // silently resurrects a deleted file. Recreating it stays the user's explicit
+    // choice, made through the page's overwrite affordance.
     reload(FileState::ExternallyModified);
 }
 

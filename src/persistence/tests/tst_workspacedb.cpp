@@ -5,6 +5,7 @@
 #include <QByteArray>
 #include <QCoreApplication>
 #include <QDeadlineTimer>
+#include <QFile>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
@@ -13,6 +14,8 @@
 #include <QLocalSocket>
 #include <QProcess>
 #include <QProcessEnvironment>
+#include <QRegularExpression>
+#include <QRegularExpressionMatch>
 #include <QStandardPaths>
 #include <QString>
 #include <QTemporaryDir>
@@ -75,6 +78,9 @@ private slots:
     void setLayoutSerializesInlineTree();
     void duplicateSessionParsesNestedNode();
     void reorderGroupsSerializesIdArray();
+    void getLayoutMalformedTreeDeliversNullopt();
+    void listSkipsNonObjectEntries();
+    void schemaVersionMatchesTheRemoteSchema();
     void liveCreateAndListOverProcess();
 
 private:
@@ -653,6 +659,163 @@ void TstWorkspaceDb::liveCreateAndListOverProcess()
     proc.terminate();
     if (!proc.waitForFinished(2000))
         proc.kill();
+}
+
+// A layout row whose tree fails SplitNode validation must arrive as "no layout",
+// not as a valid-looking single blank pane: SessionLayouts leaves a region null
+// when its layout cannot be loaded, precisely so the user is never invited to
+// edit a fabricated layout over the real one the server still holds. A tree that
+// genuinely IS an empty leaf (which is what closing a region's last pane
+// persists) must still arrive as a present layout.
+void TstWorkspaceDb::getLayoutMalformedTreeDeliversNullopt()
+{
+    makePair();
+
+    bool fired = false;
+    bool hasLayout = false;
+    std::optional<RpcError> err;
+
+    // Ask for the viewer layout, then answer with a SessionLayout row carrying
+    // `tree`. Leaves the three locals above holding the callback's verdict.
+    const auto requestLayout = [&](const QJsonObject& tree) {
+        fired = false;
+        hasLayout = false;
+        err.reset();
+        m_db->getLayout(ch::DevSessionId{QStringLiteral("s1")}, ch::Region::Viewer,
+                        [&](std::optional<SplitNode> got, std::optional<RpcError> e) {
+                            hasLayout = got.has_value();
+                            err = e;
+                            fired = true;
+                        });
+        const QJsonObject req = readRequest();
+        const QJsonObject row{
+            {"id", "L1"},
+            {"tree", tree},
+        };
+        m_serverSide->write(jsonLine({{"jsonrpc", "2.0"},
+                                      {"id", req.value(QStringLiteral("id")).toInt()},
+                                      {"result", row}}));
+        m_serverSide->flush();
+    };
+
+    // Two children but only one ratio: rejected by SplitNode::fromJson.
+    const QJsonObject leafA{{"type", "leaf"}, {"paneId", "pA"}};
+    const QJsonObject leafB{{"type", "leaf"}, {"paneId", "pB"}};
+    requestLayout(QJsonObject{{"type", "split"},
+                              {"orientation", "vertical"},
+                              {"children", QJsonArray{leafA, leafB}},
+                              {"ratios", QJsonArray{1.0}}});
+    QTRY_VERIFY(fired);
+    QVERIFY(!err.has_value());
+    QVERIFY(!hasLayout);
+
+    // An unknown node type is likewise rejected.
+    requestLayout(QJsonObject{{"type", "gadget"}});
+    QTRY_VERIFY(fired);
+    QVERIFY(!err.has_value());
+    QVERIFY(!hasLayout);
+
+    // A stored empty leaf is a legitimate layout and must survive.
+    requestLayout(QJsonObject{{"type", "leaf"}, {"paneId", ""}});
+    QTRY_VERIFY(fired);
+    QVERIFY(!err.has_value());
+    QVERIFY(hasLayout);
+}
+
+// A non-object element anywhere in the nested workspace.list result is dropped
+// rather than decoded into a fully-default record. Appending one would put an
+// entry with an empty id into the sidebar and into every id-keyed map built from
+// it, where it looks like a real group/session/pane.
+void TstWorkspaceDb::listSkipsNonObjectEntries()
+{
+    makePair();
+
+    QVector<GroupNode> got;
+    bool fired = false;
+    std::optional<RpcError> err;
+    m_db->list(ServerId{QStringLiteral("srv-1")},
+               [&](QVector<GroupNode> groups, std::optional<RpcError> e) {
+                   got = groups;
+                   err = e;
+                   fired = true;
+               });
+
+    const QJsonObject req = readRequest();
+    const int id = req.value(QStringLiteral("id")).toInt();
+
+    const char* kJson = R"([
+      7,
+      {
+        "id": "g1", "serverId": "srv-1", "name": "Alpha",
+        "position": 0, "collapsed": false,
+        "sessions": [
+          null,
+          {
+            "id": "s1", "serverId": "srv-1", "groupId": "g1", "name": "S1",
+            "repositoryRoot": "/r", "position": 0, "archived": false,
+            "viewerPanes": ["nonsense",
+              { "id": "v1", "serverId": "srv-1", "devSessionId": "s1",
+                "url": "http://x", "position": 0 }
+            ],
+            "terminalPanes": [[],
+              { "id": "t1", "serverId": "srv-1", "devSessionId": "s1",
+                "name": "term", "position": 0 }
+            ],
+            "layouts": { "viewer": null, "terminal": null }
+          }
+        ]
+      }
+    ])";
+    const QJsonArray result = QJsonDocument::fromJson(kJson).array();
+    QCOMPARE(result.size(), 2); // guard against a malformed canned fixture
+
+    m_serverSide->write(jsonLine(
+        {{"jsonrpc", "2.0"}, {"id", id}, {"result", result}}));
+    m_serverSide->flush();
+
+    QTRY_VERIFY(fired);
+    QVERIFY(!err.has_value());
+    QCOMPARE(got.size(), 1);
+    QCOMPARE(got[0].group.id.value, QStringLiteral("g1"));
+    QCOMPARE(got[0].sessions.size(), 1);
+    QCOMPARE(got[0].sessions[0].session.id.value, QStringLiteral("s1"));
+    QCOMPARE(got[0].sessions[0].viewerPanes.size(), 1);
+    QCOMPARE(got[0].sessions[0].viewerPanes[0].id.value, QStringLiteral("v1"));
+    QCOMPARE(got[0].sessions[0].terminalPanes.size(), 1);
+    QCOMPARE(got[0].sessions[0].terminalPanes[0].id.value, QStringLiteral("t1"));
+}
+
+// WorkspaceDb::kSchemaVersion documents itself as being kept "in lockstep with
+// remote/sql/schema.sql and WORKSPACE_SCHEMA_VERSION". Nothing enforced that:
+// remote/test/schema.test.ts pins the two TypeScript/SQL sides to each other but
+// cannot see the C++ constant, so a server-side bump could land while the client
+// still advertises the old version. Read both sibling sources and compare.
+void TstWorkspaceDb::schemaVersionMatchesTheRemoteSchema()
+{
+    QFile schema(QStringLiteral(CH_REPO_ROOT "/remote/sql/schema.sql"));
+    QVERIFY2(schema.open(QIODevice::ReadOnly | QIODevice::Text),
+             qPrintable(schema.fileName()));
+    const QString sql = QString::fromUtf8(schema.readAll());
+    const QRegularExpressionMatch seed =
+        QRegularExpression(
+            QStringLiteral("INSERT\\s+OR\\s+IGNORE\\s+INTO\\s+schema_version[^;]*?"
+                           "VALUES\\s*\\(\\s*1\\s*,\\s*(\\d+)\\s*\\)"),
+            QRegularExpression::CaseInsensitiveOption)
+            .match(sql);
+    QVERIFY2(seed.hasMatch(), "schema.sql no longer seeds schema_version as expected");
+    QCOMPARE(seed.captured(1).toInt(), WorkspaceDb::kSchemaVersion);
+
+    QFile module(QStringLiteral(CH_REPO_ROOT "/remote/src/workspace.ts"));
+    QVERIFY2(module.open(QIODevice::ReadOnly | QIODevice::Text),
+             qPrintable(module.fileName()));
+    const QString ts = QString::fromUtf8(module.readAll());
+    const QRegularExpressionMatch declared =
+        QRegularExpression(
+            QStringLiteral("WORKSPACE_SCHEMA_VERSION\\s*=\\s*(\\d+)"))
+            .match(ts);
+    QVERIFY2(declared.hasMatch(),
+             "workspace.ts no longer declares WORKSPACE_SCHEMA_VERSION as expected");
+    QCOMPARE(declared.captured(1).toInt(), WorkspaceDb::kSchemaVersion);
 }
 
 QTEST_GUILESS_MAIN(TstWorkspaceDb)

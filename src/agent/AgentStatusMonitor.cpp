@@ -10,7 +10,7 @@ namespace {
 // event with '\n'; a peer that streams without one is malformed and must not
 // grow the read buffer without bound. Agent events are small (state + short
 // summary), so 1 MiB is generous headroom.
-constexpr int kMaxLineBytes = 1 * 1024 * 1024;
+constexpr qsizetype kMaxLineBytes = 1 * 1024 * 1024;
 
 // Human-readable label for a notification title.
 QString titleFor(AgentState state)
@@ -101,30 +101,45 @@ void AgentStatusMonitor::applyEvent(const AgentEvent& ev)
     QHash<QString, AgentState>& terms = m_states[dev];
     const auto it = terms.find(term);
     const bool hadPrev = (it != terms.end());
-    const AgentState prev = hadPrev ? it.value() : AgentState::Unknown;
-    const bool changed = !hadPrev || prev != next;
+    const bool changed = !hadPrev || it.value() != next;
 
     if (hadPrev)
         it.value() = next;
     else
         terms.insert(term, next);
 
-    if (!changed)
-        return;
+    // Reaching idle_unseen marks the Dev Session's completion unseen until the
+    // user views it (markSeen). Evaluated for EVERY idle_unseen event, not only
+    // for a transition into it: markSeen() clears the per-session unseen flag
+    // but deliberately leaves the terminal's raw state at IdleUnseen (see
+    // AppController::rebuildRows, which downgrades it for display). A genuinely
+    // new completion that arrives with no intervening state — a re-fired
+    // agent_end, or an adapter that only ever reports completions — would
+    // otherwise be discarded here as a no-op and the badge would never come
+    // back for work the user has not seen.
+    const bool armedUnseen =
+        (next == AgentState::IdleUnseen) && !m_unseen.contains(dev);
+    if (armedUnseen)
+        m_unseen.insert(dev);
 
-    emit agentStateChanged(dev, term, static_cast<int>(next));
+    // No reads of `terms`/`it` past this point: a slot may re-enter applyEvent()
+    // and rehash the QHash, invalidating both.
+    if (changed)
+        emit agentStateChanged(dev, term, static_cast<int>(next));
 
-    // Desktop-notification hook fires only on a genuine transition into these
-    // attention-worthy states, not on repeated same-state events.
-    if (next == AgentState::WaitingInput || next == AgentState::IdleUnseen)
+    // Desktop-notification hook: a genuine transition into an attention-worthy
+    // state, or a completion that re-arms a badge the user had already cleared.
+    // A repeat of the same state with nothing newly pending raises nothing —
+    // this transition gate is the first line of defence against a chatty agent
+    // becoming a notification storm.
+    if (armedUnseen
+        || (changed
+            && (next == AgentState::WaitingInput
+                || next == AgentState::IdleUnseen)))
         emit notify(titleFor(next), bodyFor(ev));
 
-    // Reaching idle_unseen marks the Dev Session's completion unseen until the
-    // user views it (markSeen).
-    if (next == AgentState::IdleUnseen && !m_unseen.contains(dev)) {
-        m_unseen.insert(dev);
+    if (armedUnseen)
         emit unseenChanged(dev, true);
-    }
 }
 
 void AgentStatusMonitor::markSeen(const QString& devSessionId)

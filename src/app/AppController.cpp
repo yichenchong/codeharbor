@@ -30,6 +30,24 @@ QString credentialKindName(CredentialKind kind)
                : QStringLiteral("password");
 }
 
+// The fingerprint as OpenSSH prints it, for a human to compare against.
+//
+// Internally a fingerprint is base64(SHA-256(key blob)) with the trailing '='
+// padding dropped, and it stays in that bare form everywhere it is COMPARED
+// (m_approvedFingerprint against the value re-derived inside the host-key
+// callback). But the approval dialog asks the user to check the string against
+// what the server's administrator reports, and every OpenSSH tool that reports
+// it — `ssh-keygen -lf`, `ssh-keyscan | ssh-keygen -lf -`, ssh's own
+// trust-on-first-use question — writes the same base64 with a literal `SHA256:`
+// in front of it. Without that prefix the two strings do not look alike at a
+// glance, which discourages the very comparison being asked for. So the prefix
+// is added HERE, at the one point the value is handed to the user interface, and
+// nowhere else.
+QString displayFingerprint(const QString& fingerprint)
+{
+    return QStringLiteral("SHA256:") + fingerprint;
+}
+
 } // namespace
 
 AppController::AppController(CodeharbordClient* client, QObject* parent)
@@ -64,9 +82,10 @@ void AppController::setServerId(const QString& serverId)
     // restoreActiveSession() reinstates whatever THIS server remembers as soon
     // as its rows arrive.
     if (!m_activeSessionId.isEmpty()) {
-        m_activeSessionId.clear();
-        if (m_layouts)
-            m_layouts->load(QString());  // clears both region trees
+        // forget=false: the session is not GONE, it simply is not this server's
+        // to show. Whatever the PREVIOUS server remembers stays remembered, so
+        // switching back reopens it.
+        clearActiveSession(/*forget=*/false);
         emit activeSessionChanged();
     }
     emit serverIdChanged();
@@ -152,11 +171,14 @@ void AppController::setConnection(SshConnectionPool* pool,
                                   ServerProfiles* profiles,
                                   SessionLayouts* layouts)
 {
-    // Re-injection must not stack duplicate connections onto a second
-    // bootstrap's signals (and must not leave the first one still driving us).
-    if (m_bootstrap && m_bootstrap != bootstrap)
+    // Re-injection must not stack a second set of connections onto the same
+    // signals: a doubled stateChanged/wired/error handler would issue two
+    // server.info calls per wire and show every connect failure twice. Severing
+    // first is unconditional for that reason - re-injecting the SAME bootstrap
+    // is the case a `!=` test silently gets wrong.
+    if (m_bootstrap)
         disconnect(m_bootstrap, nullptr, this, nullptr);
-    if (m_pool && m_pool != pool)
+    if (m_pool)
         disconnect(m_pool, nullptr, this, nullptr);
 
     m_pool = pool;
@@ -276,6 +298,84 @@ void AppController::startConnect(const QString& profileId,
     m_credentialKind = CredentialKind::KeyPassphrase;
     setConnectionState(QStringLiteral("connecting"));
 
+    installPoolCallbacks(std::move(acceptedFingerprint), std::move(secret),
+                         secretKind);
+
+    const bool ok = m_bootstrap->connectAndWire(
+        profile.value(QStringLiteral("host")).toString(),
+        static_cast<quint16>(profile.value(QStringLiteral("port")).toInt()),
+        profile.value(QStringLiteral("user")).toString(),
+        profile.value(QStringLiteral("nodePath")).toString(),
+        profile.value(QStringLiteral("repoRoot")).toString(),
+        profile.value(QStringLiteral("identityFile")).toString());
+
+    // The attempt is over as far as the pool is concerned, so re-install the
+    // very same policy with NOTHING armed. Both callbacks stay installed on
+    // purpose (SessionBootstrap's reconnect ladder re-handshakes through them,
+    // and an unknown key met with nobody waiting must be refused), but neither
+    // the secret nor the host-key approval may outlive the one attempt it was
+    // typed for: a secret libssh never asked for would otherwise sit in the
+    // callback for the rest of the process, and an approval the attempt never
+    // reached the key check to spend would arm the next connect to any host.
+    installPoolCallbacks(QString(), QString(), CredentialKind::KeyPassphrase);
+
+    if (ok) {
+        m_connecting = false;
+        m_heldConnectError.clear();
+        m_pendingFingerprint.clear();
+        m_pendingHostKeyInfo = {};
+        m_approvedFingerprint.clear();
+        m_credentialRequested = false;
+        m_credentialUser.clear();
+        m_credentialLabel.clear();
+        m_credentialKind = CredentialKind::KeyPassphrase;
+        m_profiles->setActiveId(profileId);
+        return;  // wired() -> adoptServerIdentity()
+    }
+    if (!m_pendingFingerprint.isEmpty()) {
+        // The attempt is NOT over: it is parked on the user's answer, and
+        // m_connecting stays set so nothing can start a second one underneath
+        // it and swap m_pendingProfileId/m_pendingFingerprint out from under
+        // resolveHostKey(). The refusal that got us here is expected, so its
+        // error is dropped rather than shown.
+        m_heldConnectError.clear();
+        setConnectionState(QStringLiteral("hostkey"));
+        // displayFingerprint(), not the bare value: what leaves here is read by
+        // a person and compared against ssh-keygen's output.
+        emit hostKeyPrompt(m_pendingHostKeyInfo.first, m_pendingHostKeyInfo.second,
+                           displayFingerprint(m_pendingFingerprint));
+        return;
+    }
+    if (m_credentialRequested) {
+        // The connection is parked on exactly one credential method. The kind
+        // accompanies the prompt so QML can offer "Use password" without ever
+        // reclassifying a private-key passphrase.
+        m_heldConnectError.clear();
+        setConnectionState(QStringLiteral("credential"));
+        emit credentialPrompt(m_credentialUser,
+                              profile.value(QStringLiteral("host")).toString(),
+                              m_credentialLabel,
+                              credentialKindName(m_credentialKind));
+        return;
+    }
+    m_connecting = false;
+    m_approvedFingerprint.clear();
+    // A genuine failure: report it now that we know it was not the host-key path.
+    if (!m_heldConnectError.isEmpty()) {
+        const QString held = m_heldConnectError;
+        m_heldConnectError.clear();
+        emit error(held);
+    }
+    setConnectionState(QStringLiteral("failed"), m_connectionError);
+}
+
+void AppController::installPoolCallbacks(QString acceptedFingerprint,
+                                         QString secret,
+                                         CredentialKind secretKind)
+{
+    if (!m_pool)
+        return;
+
     // Unknown key: refuse THIS attempt, remember the fingerprint, and let the
     // user decide. Accepting re-runs the connect with the fingerprint
     // pre-approved, so the decision never blocks inside the handshake.
@@ -353,61 +453,6 @@ void AppController::startConnect(const QString& profileId,
             self->m_credentialKind = kind;
             return SshConnectionPool::CredentialReply{{}, true};
         });
-
-    const bool ok = m_bootstrap->connectAndWire(
-        profile.value(QStringLiteral("host")).toString(),
-        static_cast<quint16>(profile.value(QStringLiteral("port")).toInt()),
-        profile.value(QStringLiteral("user")).toString(),
-        profile.value(QStringLiteral("nodePath")).toString(),
-        profile.value(QStringLiteral("repoRoot")).toString(),
-        profile.value(QStringLiteral("identityFile")).toString());
-
-    if (ok) {
-        m_connecting = false;
-        m_heldConnectError.clear();
-        m_pendingFingerprint.clear();
-        m_pendingHostKeyInfo = {};
-        m_approvedFingerprint.clear();
-        m_credentialRequested = false;
-        m_credentialUser.clear();
-        m_credentialLabel.clear();
-        m_credentialKind = CredentialKind::KeyPassphrase;
-        m_profiles->setActiveId(profileId);
-        return;  // wired() -> adoptServerIdentity()
-    }
-    if (!m_pendingFingerprint.isEmpty()) {
-        // The attempt is NOT over: it is parked on the user's answer, and
-        // m_connecting stays set so nothing can start a second one underneath
-        // it and swap m_pendingProfileId/m_pendingFingerprint out from under
-        // resolveHostKey(). The refusal that got us here is expected, so its
-        // error is dropped rather than shown.
-        m_heldConnectError.clear();
-        setConnectionState(QStringLiteral("hostkey"));
-        emit hostKeyPrompt(m_pendingHostKeyInfo.first, m_pendingHostKeyInfo.second,
-                           m_pendingFingerprint);
-        return;
-    }
-    if (m_credentialRequested) {
-        // The connection is parked on exactly one credential method. The kind
-        // accompanies the prompt so QML can offer "Use password" without ever
-        // reclassifying a private-key passphrase.
-        m_heldConnectError.clear();
-        setConnectionState(QStringLiteral("credential"));
-        emit credentialPrompt(m_credentialUser,
-                              profile.value(QStringLiteral("host")).toString(),
-                              m_credentialLabel,
-                              credentialKindName(m_credentialKind));
-        return;
-    }
-    m_connecting = false;
-    m_approvedFingerprint.clear();
-    // A genuine failure: report it now that we know it was not the host-key path.
-    if (!m_heldConnectError.isEmpty()) {
-        const QString held = m_heldConnectError;
-        m_heldConnectError.clear();
-        emit error(held);
-    }
-    setConnectionState(QStringLiteral("failed"), m_connectionError);
 }
 
 void AppController::resolveHostKey(bool accept)
@@ -448,13 +493,16 @@ void AppController::submitCredential(QString secret, QString kind)
     if (!m_connecting || !m_credentialRequested)
         return;
 
-    const CredentialKind submittedKind =
-        kind == QLatin1String("password") ? CredentialKind::Password
-                                          : CredentialKind::KeyPassphrase;
+    // Validate before anything is derived from it: a `kind` neither branch
+    // recognises is a QML bug, and silently treating it as a private-key
+    // passphrase would offer the typed secret to the wrong auth method.
     if (kind != QLatin1String("password")
         && kind != QLatin1String("keyPassphrase")) {
         return;
     }
+    const CredentialKind submittedKind =
+        kind == QLatin1String("password") ? CredentialKind::Password
+                                          : CredentialKind::KeyPassphrase;
 
     const QString profileId = m_pendingProfileId;
     // The key the user approved earlier in THIS chain, re-pinned for the retry
@@ -739,7 +787,7 @@ void AppController::refresh()
     // is exactly what a user sees on a cold start before they have connected.
     // This is a capability check, NOT a filter on the error text - a transport
     // that exists and then dies mid-session still reports its failure verbatim.
-    if (m_client && !m_client->transport())
+    if (!m_client || !m_client->transport())
         return;
 
     // Each refresh is a full-tree re-read; several can be in flight at once

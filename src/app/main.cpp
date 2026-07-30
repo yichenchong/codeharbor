@@ -104,13 +104,16 @@ int main(int argc, char *argv[])
     // factories before the pool, the bootstrap before the pool it opened
     // channels on, and the client/monitor the bootstrap points at last of all.
     QQmlApplicationEngine engine;
+    // Only what QML actually reads. `sessionLayouts` is reached through
+    // `app.layouts` (AppController owns the connection spine and QML binds to it
+    // there), and `notifier` is a pure C++ sink for AgentStatusMonitor::notify —
+    // publishing either one again as a root context property would advertise a
+    // second, unread way into the same object and invite bindings to it.
     engine.rootContext()->setContextProperty(QStringLiteral("app"), &appController);
     engine.rootContext()->setContextProperty(QStringLiteral("viewers"), &viewers);
     engine.rootContext()->setContextProperty(QStringLiteral("agentMonitor"), &agentMonitor);
     engine.rootContext()->setContextProperty(QStringLiteral("editorFactory"), &editorFactory);
     engine.rootContext()->setContextProperty(QStringLiteral("terminalFactory"), &terminalFactory);
-    engine.rootContext()->setContextProperty(QStringLiteral("notifier"), &notifier);
-    engine.rootContext()->setContextProperty(QStringLiteral("layouts"), &sessionLayouts);
 
     QObject::connect(
         &engine,

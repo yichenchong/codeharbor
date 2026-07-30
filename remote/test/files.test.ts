@@ -78,10 +78,45 @@ test("readFile returns base64 for binary content and honors offset/length", asyn
     assert.equal(part.content, "234");
     assert.equal(part.truncated, true);
 
+    // A read starting at or past the end of a NON-EMPTY file returns no bytes
+    // at all, which is as far from "the whole file" as a result can get.
     const past = await readFile({ path: text, offset: 1000 });
     assert.equal(past.content, "");
-    assert.equal(past.truncated, false);
+    assert.equal(past.truncated, true);
     assert.equal(past.encoding, "utf-8");
+
+    await fs.rm(dir, { recursive: true, force: true });
+});
+
+// `truncated` means "content is not the whole file", so it must also cover the
+// bytes missing BEFORE the window. A tail read used to report truncated=false,
+// which tells the editor the buffer is safe to save back — writing a tail over
+// the whole file silently deletes everything ahead of the offset.
+test("readFile reports a tail read as truncated and an exact read as complete", async () => {
+    const dir = await tmpDir();
+    const file = path.join(dir, "tail.txt");
+    await fs.writeFile(file, "0123456789");
+
+    // Offset only, no length: the tail through end of file, still not all of it.
+    const tail = await readFile({ path: file, offset: 4 });
+    assert.equal(tail.content, "456789");
+    assert.equal(tail.truncated, true);
+
+    // A window that covers the file exactly, and one that overshoots it, are
+    // both complete reads.
+    const exact = await readFile({ path: file, offset: 0, length: 10 });
+    assert.equal(exact.content, "0123456789");
+    assert.equal(exact.truncated, false);
+    const over = await readFile({ path: file, offset: 0, length: 99 });
+    assert.equal(over.content, "0123456789");
+    assert.equal(over.truncated, false);
+
+    // An EMPTY file has no bytes to miss: any offset returns its whole content.
+    const empty = path.join(dir, "empty.txt");
+    await fs.writeFile(empty, "");
+    const pastEmpty = await readFile({ path: empty, offset: 7, length: 3 });
+    assert.equal(pastEmpty.content, "");
+    assert.equal(pastEmpty.truncated, false);
 
     await fs.rm(dir, { recursive: true, force: true });
 });
@@ -480,4 +515,156 @@ test("resolvePath treats an in-repo name starting with '..' as inside", async ()
     assert.equal(resolvePath({ path: "../x", base }).insideRepositoryRoot, false);
 
     await Promise.resolve();
+});
+
+test("readFile keeps a UTF-8 byte-order mark, and writeFile puts it back byte-exact", async () => {
+    const dir = await tmpDir();
+    const file = path.join(dir, "bom.txt");
+    const bytes = Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from("hello", "utf-8")]);
+    await fs.writeFile(file, bytes);
+
+    // A BOM is valid UTF-8, so the file is text — and the mark must survive as
+    // U+FEFF in the content. A decoder that strips it (TextDecoder's default)
+    // would hand the editor a buffer three bytes shorter than the file, and the
+    // next save would silently delete the mark.
+    const r = await readFile({ path: file });
+    assert.equal(r.encoding, "utf-8");
+    assert.equal(r.content, "\uFEFFhello");
+
+    await writeFile({ path: file, content: r.content, expectedRevision: r.revision });
+    assert.deepEqual(await fs.readFile(file), bytes);
+
+    await fs.rm(dir, { recursive: true, force: true });
+});
+
+test("stat, readFile and writeFile agree on the revision through a symlink", async () => {
+    const dir = await tmpDir();
+    const real = path.join(dir, "real.txt");
+    const link = path.join(dir, "link.txt");
+    await fs.writeFile(real, "original");
+    await fs.symlink(real, link);
+
+    const s = await stat({ path: link });
+    assert.equal(s.kind, "symlink"); // the entry itself is still reported as a link
+    const r = await readFile({ path: link });
+    // readFile and writeFile both FOLLOW the link, so stat's token must name the
+    // target too; otherwise a save through a symlink is a permanent conflict.
+    assert.equal(s.revision, r.revision);
+
+    await writeFile({ path: link, content: "replaced", expectedRevision: s.revision });
+    assert.equal(await fs.readFile(real, "utf-8"), "replaced");
+    // The link was not severed by the atomic rename.
+    assert.equal((await fs.lstat(link)).isSymbolicLink(), true);
+
+    const listing = await listDirectory({ path: dir });
+    const kinds: Record<string, string> = {};
+    for (const entry of listing.entries) kinds[entry.name] = entry.kind;
+    assert.equal(kinds["link.txt"], "symlink");
+    assert.equal(kinds["real.txt"], "file");
+
+    await fs.rm(dir, { recursive: true, force: true });
+});
+
+test("writeFile rejects malformed base64 instead of writing corrupt bytes", async () => {
+    const dir = await tmpDir();
+    const junk = path.join(dir, "junk.bin");
+
+    // Buffer.from(s, "base64") silently drops characters outside the alphabet,
+    // so without validation this would "succeed" and store the wrong bytes.
+    await assert.rejects(
+        () => writeFile({ path: junk, content: "!!! not base64 !!!", encoding: "base64", expectedRevision: "" }),
+        /Invalid base64 content/,
+    );
+    assert.equal(await fs.access(junk).then(() => true, () => false), false);
+
+    // A payload cut mid-group has a stripped length of 1 mod 4, which encodes no
+    // byte string: Buffer would discard the partial group and write short data.
+    const truncated = path.join(dir, "truncated.bin");
+    await assert.rejects(
+        () => writeFile({ path: truncated, content: "QUJDR", encoding: "base64", expectedRevision: "" }),
+        /Invalid base64 content/,
+    );
+    assert.equal(await fs.access(truncated).then(() => true, () => false), false);
+
+    await fs.rm(dir, { recursive: true, force: true });
+});
+
+test("a revision-mismatch error carries the current revision for the conflict dialog", async () => {
+    const dir = await tmpDir();
+    const file = path.join(dir, "conflict.txt");
+    await fs.writeFile(file, "on disk");
+    const current = await stat({ path: file });
+
+    // The client reads `currentRevision` out of the error data to offer
+    // reload/overwrite (SPEC 8.6) without a second stat round-trip.
+    const stale = await writeFile({
+        path: file,
+        content: "mine",
+        expectedRevision: "1-1-1-1",
+    }).then(() => undefined, (err: unknown) => err);
+    if (!isRevisionMismatch(stale)) throw new Error("expected a revision mismatch");
+    assert.deepEqual(stale.data, {
+        path: file,
+        expected: "1-1-1-1",
+        currentRevision: current.revision,
+    });
+
+    // The create-only guard reports it too, so "it already exists" can offer the
+    // same choice rather than a bare failure.
+    const exists = await writeFile({ path: file, content: "mine", expectedRevision: "" })
+        .then(() => undefined, (err: unknown) => err);
+    if (!isRevisionMismatch(exists)) throw new Error("expected a revision mismatch");
+    assert.deepEqual(exists.data, { path: file, currentRevision: current.revision });
+
+    await fs.rm(dir, { recursive: true, force: true });
+});
+
+test("watch on a path that does not exist yet emits created when it appears", async () => {
+    const dir = await tmpDir();
+    const file = path.join(dir, "later.txt");
+
+    // fs.watch cannot attach to a missing path (it throws ENOENT), so this is
+    // the polling fallback's job — and the transition must be "created", not
+    // "modified", because the subscription started with no revision at all.
+    const service = new FileWatchService();
+    service.pollIntervalMs = 25;
+    const eventPromise = firstWatchEvent(service);
+
+    const { subscriptionId } = await service.watch({ path: file });
+    await fs.writeFile(file, "now I exist");
+
+    const event = await withTimeout(eventPromise, 5000);
+    service.closeAll();
+
+    assert.equal(event.subscriptionId, subscriptionId);
+    assert.equal(event.event, "created");
+    assert.equal(typeof event.revision, "string");
+
+    await fs.rm(dir, { recursive: true, force: true });
+});
+
+test("writeFile creates a missing parent directory for a new file", async () => {
+    const dir = await tmpDir();
+    // This is the crash-recovery snapshot shape (SPEC 11.3): a directory beside
+    // the edited file that nothing else ever creates. The frozen method catalog
+    // has no createDirectory, so writeFile is the only thing that can bring the
+    // path into being — without this the very first snapshot fails with ENOENT
+    // and recovery is silently dead.
+    const nested = path.join(dir, ".codeharbor-recovery", "deeper", "notes.txt");
+
+    const created = await writeFile({
+        path: nested,
+        content: "unsaved work",
+        expectedRevision: "",
+    });
+    assert.equal((await readFile({ path: nested })).content, "unsaved work");
+    assert.notEqual(created.revision, "");
+
+    // A directory this service invented stays private to its owner: it can hold
+    // unsaved user work. (Asserting "no group/other access" rather than exactly
+    // 0700 because the process umask can only take permission bits away.)
+    const parent = await fs.stat(path.dirname(nested));
+    assert.equal(parent.mode & 0o077, 0);
+
+    await fs.rm(dir, { recursive: true, force: true });
 });

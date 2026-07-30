@@ -11,7 +11,7 @@ EditorFactory::EditorFactory(CodeharbordClient* client, QObject* parent)
 
 EditorController* EditorFactory::create(QObject* owner)
 {
-    // Parented to the pane: destroyed with it (no leaked watches/recovery).
+    // Parented to the pane: destroyed with it, releasing its file.watch.
     return new EditorController(m_client, owner);
 }
 

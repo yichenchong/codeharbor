@@ -12,6 +12,10 @@ Rectangle {
 
     property string content: ""
     property string errorText: ""
+    // A read is in flight. Without it an empty buffer means both "still asking
+    // the server" and "this file is empty", and the pane looks identical to a
+    // pane that failed silently.
+    property bool loading: false
 
     // Remote path for file.readFile: strip the file:// scheme, leaving the
     // server-absolute path (a remote file:// URL never carries a host).
@@ -22,10 +26,19 @@ Rectangle {
         return s;
     }
 
+    // Start reading the current URL. A read already in flight for a PREVIOUS URL
+    // is NOT cancelled: ch::ViewerModel (src/viewers/ViewerModel.h) exposes only
+    // readTextFile(path) and answers with textFileRead/textFileError, and has no
+    // cancel entry point at all. The abandoned read therefore runs to completion
+    // on the connection and its answer is discarded here by the path comparison
+    // in the Connections block below — correct on screen, but it does occupy the
+    // remote file service until it finishes. Cancelling it properly needs a new
+    // method on ch::ViewerModel; there is nothing QML can do about it today.
     function reload() {
         root.content = "";
         root.errorText = "";
-        if (root.url.toString().length > 0)
+        root.loading = root.url.toString().length > 0;
+        if (root.loading)
             viewers.readTextFile(root.remotePath(root.url));
     }
 
@@ -35,12 +48,16 @@ Rectangle {
     Connections {
         target: viewers
         function onTextFileRead(path, text) {
-            if (path === root.remotePath(root.url))
+            if (path === root.remotePath(root.url)) {
                 root.content = text;
+                root.loading = false;
+            }
         }
         function onTextFileError(path, message) {
-            if (path === root.remotePath(root.url))
+            if (path === root.remotePath(root.url)) {
                 root.errorText = message;
+                root.loading = false;
+            }
         }
     }
 
@@ -56,9 +73,31 @@ Rectangle {
             font.pixelSize: 13
             color: "#cdd6f4"
             background: null
-            text: root.errorText.length > 0
-                  ? qsTr("Error: %1").arg(root.errorText)
-                  : root.content
+            // Content ONLY. A failure used to be rendered in here, in the same
+            // monospace face as the file, where it is indistinguishable from a
+            // file whose first line happens to read "Error: ...".
+            text: root.content
         }
+    }
+
+    // Every "there is nothing to read" answer in one place, so the pane says
+    // which one it is instead of showing an empty buffer. Declared after the
+    // ScrollView so it draws on top of it.
+    Label {
+        objectName: "textStatus"
+        anchors.centerIn: parent
+        width: parent.width - 48
+        horizontalAlignment: Text.AlignHCenter
+        wrapMode: Text.WordWrap
+        // Server-supplied failure text: data, not markup.
+        textFormat: Text.PlainText
+        visible: text.length > 0
+        text: root.errorText.length > 0
+              ? qsTr("Error: %1").arg(root.errorText)
+              : root.loading ? qsTr("Loading\u2026")
+              : root.content.length === 0 && root.url.toString().length > 0
+                ? qsTr("This file is empty.") : ""
+        color: root.errorText.length > 0 ? "#f38ba8" : "#6c7086"
+        font.pixelSize: 13
     }
 }

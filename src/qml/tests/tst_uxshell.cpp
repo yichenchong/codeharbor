@@ -477,6 +477,15 @@ private slots:
     void sheetStatusMatchesTheStatesTheAppPublishes_data();
     void sheetStatusMatchesTheStatesTheAppPublishes();
 
+    // The sheet's own chrome must be unreachable — by pointer AND by keyboard —
+    // while a host-key or credential prompt is waiting on the user.
+    void sheetChromeIsDisabledWhileAPromptIsUp();
+
+    // The sidebar footer is the only connection status a user sees once the
+    // sheet is closed, so it needs a word for every state the app publishes.
+    void sidebarFooterNamesEveryConnectionState_data();
+    void sidebarFooterNamesEveryConnectionState();
+
     // A long RPC error must be readable and the banner must be dismissible,
     // then come back for the next failure.
     void sheetErrorIsReadableAndDismissible();
@@ -496,10 +505,13 @@ void TstUxShell::sheetStatusMatchesTheStatesTheAppPublishes_data()
     QTest::addColumn<QString>("colour");
     QTest::addColumn<bool>("busy");
 
-    // The exact strings ch::AppController::setConnectionState() emits.
+    // The exact strings ch::AppController::setConnectionState() emits — all
+    // SEVEN of them. "credential" was missing here while the sheet grew a case
+    // for it, which is exactly the drift this table exists to catch.
     QTest::newRow("disconnected") << "disconnected" << "#6c7086" << false;
     QTest::newRow("connecting") << "connecting" << "#f9e2af" << true;
     QTest::newRow("hostkey") << "hostkey" << "#f9e2af" << true;
+    QTest::newRow("credential") << "credential" << "#f9e2af" << true;
     QTest::newRow("connected") << "connected" << "#a6e3a1" << false;
     QTest::newRow("reconnecting") << "reconnecting" << "#fab387" << true;
     QTest::newRow("failed") << "failed" << "#f38ba8" << false;
@@ -530,6 +542,116 @@ void TstUxShell::sheetStatusMatchesTheStatesTheAppPublishes()
     // Whatever the colour says, the state is also spelled out in words.
     QVERIFY2(!textOf(surface.child(QStringLiteral("stateLabel"))).isEmpty(),
              "the connection state is conveyed by colour alone");
+
+    QVERIFY2(surface.warnings.isEmpty(), qPrintable(surface.warningReport()));
+}
+
+// The two prompt panels cover the sheet and swallow clicks, but a disabled-free
+// sheet underneath is still TAB-REACHABLE: a keyboard user could reach Close and
+// dismiss the whole sheet while ch::AppController sat waiting for the host-key
+// answer that only this sheet can give, leaving an attempt stuck forever with
+// nothing on screen to answer it.
+void TstUxShell::sheetChromeIsDisabledWhileAPromptIsUp()
+{
+    Surface surface(moduleUrl(QStringLiteral("ConnectSheet.qml")), QSize(900, 560));
+    QVERIFY(surface.expose());
+    QQuickItem *root = surface.root();
+    QVERIFY(root);
+    root->setProperty("profiles", twoProfiles());
+    settle(40);
+
+    auto *closeButton = qobject_cast<QQuickItem *>(surface.child(QStringLiteral("closeButton")));
+    auto *connectButton =
+            qobject_cast<QQuickItem *>(surface.child(QStringLiteral("connectButton")));
+    auto *profileList = qobject_cast<QQuickItem *>(surface.child(QStringLiteral("profileList")));
+    QVERIFY(closeButton && connectButton && profileList);
+    QVERIFY(closeButton->isEnabled());
+
+    root->setProperty("pendingHostKey",
+                      QVariantMap{{QStringLiteral("host"), QStringLiteral("127.0.0.1")},
+                                  {QStringLiteral("keyType"), QStringLiteral("ssh-ed25519")},
+                                  {QStringLiteral("fingerprint"), QStringLiteral("SHA256:abc")}});
+    settle(40);
+
+    QVERIFY2(!closeButton->isEnabled(),
+             "Close is still reachable behind the host-key prompt: dismissing the sheet there "
+             "abandons a connect attempt that is waiting for the answer");
+    QVERIFY2(!connectButton->isEnabled(), "Connect is still reachable behind the host-key prompt");
+    QVERIFY2(!profileList->isEnabled(), "the profile list is still usable behind the prompt");
+
+    // ...while the panel that must be answered stays live.
+    auto *reject =
+            qobject_cast<QQuickItem *>(surface.child(QStringLiteral("hostKeyRejectButton")));
+    QVERIFY(reject);
+    QVERIFY2(reject->isEnabled(), "the host-key prompt disabled its own answer buttons");
+
+    // Answering it hands the sheet back.
+    root->setProperty("pendingHostKey", QVariant());
+    settle(40);
+    QVERIFY2(closeButton->isEnabled(), "the sheet stayed disabled after the prompt was answered");
+
+    // Same rule for the credential prompt.
+    root->setProperty("pendingCredential",
+                      QVariantMap{{QStringLiteral("user"), QStringLiteral("yichen")},
+                                  {QStringLiteral("host"), QStringLiteral("127.0.0.1")},
+                                  {QStringLiteral("prompt"), QStringLiteral("Password:")},
+                                  {QStringLiteral("kind"), QStringLiteral("password")}});
+    settle(40);
+    QVERIFY2(!closeButton->isEnabled(), "Close is still reachable behind the credential prompt");
+
+    root->setProperty("pendingCredential", QVariant());
+    settle(40);
+    QVERIFY(closeButton->isEnabled());
+
+    QVERIFY2(surface.warnings.isEmpty(), qPrintable(surface.warningReport()));
+}
+
+void TstUxShell::sidebarFooterNamesEveryConnectionState_data()
+{
+    QTest::addColumn<QString>("state");
+
+    // Every word ch::AppController::setConnectionState() publishes.
+    QTest::newRow("disconnected") << "disconnected";
+    QTest::newRow("connecting") << "connecting";
+    QTest::newRow("hostkey") << "hostkey";
+    QTest::newRow("credential") << "credential";
+    QTest::newRow("connected") << "connected";
+    QTest::newRow("reconnecting") << "reconnecting";
+    QTest::newRow("failed") << "failed";
+}
+
+// Once the connection sheet is closed the sidebar footer is the ONLY thing on
+// screen saying whether the server is reachable, so a state it has no word for
+// silently reads as "Not connected" — which is a lie for "credential" (the app
+// is waiting for the user's password) and for "connecting".
+void TstUxShell::sidebarFooterNamesEveryConnectionState()
+{
+    QFETCH(QString, state);
+
+    ch::SessionsModel model;
+    model.setGroups(populatedGroups());
+    ShotApp app(&model);
+    Surface surface(moduleUrl(QStringLiteral("SessionsSidebar.qml")), QSize(300, 620), &app);
+    QVERIFY(surface.expose());
+    QVERIFY(surface.root());
+
+    // The wording for "there is no server", i.e. the fall-through answer no
+    // other state may share.
+    app.setConnectionState(QStringLiteral("disconnected"));
+    settle(40);
+    const QString idleWords = textOf(surface.child(QStringLiteral("linkStatusLabel")));
+    QVERIFY2(!idleWords.isEmpty(), "the sidebar footer says nothing at all");
+
+    app.setConnectionState(state);
+    settle(40);
+    const QString words = textOf(surface.child(QStringLiteral("linkStatusLabel")));
+    QVERIFY2(!words.isEmpty(), qPrintable(QStringLiteral("no footer wording for \"%1\"").arg(state)));
+    if (state != QStringLiteral("disconnected")) {
+        QVERIFY2(words != idleWords,
+                 qPrintable(QStringLiteral("the footer describes \"%1\" as \"%2\", the same thing "
+                                           "it says when there is no server at all")
+                                    .arg(state, words)));
+    }
 
     QVERIFY2(surface.warnings.isEmpty(), qPrintable(surface.warningReport()));
 }

@@ -14,9 +14,13 @@
   bundle boots itself on DOMContentLoaded). xterm.js injects its measured cell
   geometry as a <style> element at runtime, hence 'unsafe-inline' for styles
   only. Nothing here fetches: terminal bytes arrive over the WebChannel, never
-  over the network, so connect-src stays 'none'.
+  over the network, so connect-src stays 'none'. base-uri and form-action are
+  NOT covered by default-src, so they are denied explicitly: neither a <base>
+  element (which would re-point every relative URL on the page) nor a form
+  submission (which would navigate this privileged page away) has any business
+  here.
 -->
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' qrc:; style-src 'self' 'unsafe-inline'; font-src 'self' data:; img-src 'self' data:; connect-src 'none'">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' qrc:; style-src 'self' 'unsafe-inline'; font-src 'self' data:; img-src 'self' data:; connect-src 'none'; base-uri 'none'; form-action 'none'">
 <title>CodeHarbor Terminal</title>
 <link rel="stylesheet" href="terminal.css">
 <style>

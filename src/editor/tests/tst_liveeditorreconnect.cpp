@@ -54,6 +54,7 @@
 #include <QFile>
 #include <QJsonObject>
 #include <QJsonValue>
+#include <QPointer>
 #include <QSignalSpy>
 #include <QString>
 #include <QStringList>
@@ -192,9 +193,10 @@ void TstLiveEditorReconnect::initTestCase()
 
     // ---- remote fixture, created out of band ------------------------------
     // Not through file.writeFile: the fixture must not depend on the RPC
-    // surface under test. `.codeharbor-recovery` is pre-created because
-    // file.writeFile does not mkdir -p, so the SPEC 11.3 snapshot that
-    // reportContent writes would otherwise silently ENOENT.
+    // surface under test. `.codeharbor-recovery` is created here as well —
+    // file.writeFile does create a missing parent directory now, but leaning on
+    // that would let an ENOENT silently swallow the SPEC 11.3 snapshot that
+    // reportContent writes, and this gate would pass without exercising it.
     const QString token = QUuid::createUuid().toString(QUuid::WithoutBraces).left(12);
     m_remoteDir = QStringLiteral("/tmp/ch-live-editor-reconnect-%1").arg(token);
     m_filePath = m_remoteDir + QStringLiteral("/note.txt");
@@ -402,8 +404,13 @@ void TstLiveEditorReconnect::watchResubscribesAfterReconnect()
 
     // ---- (2) AWAY: kill the session, edit the file while it is down --------
     QSignalSpy wiredSpy(m_bootstrap.get(), &SessionBootstrap::wired);
-    SshChannelDevice* const rpcBefore = m_bootstrap->rpcDevice();
-    QVERIFY(rpcBefore != nullptr);
+    // QPointer, not a raw pointer: SessionBootstrap::unwire() retires the old
+    // device with deleteLater() and attemptWire() allocates the replacement, so
+    // the freed address can legitimately be handed straight back. Comparing raw
+    // pointers would then claim the session never re-wired. A QPointer that has
+    // gone null proves the old device really was destroyed.
+    QPointer<SshChannelDevice> rpcBefore = m_bootstrap->rpcDevice();
+    QVERIFY(!rpcBefore.isNull());
 
     QElapsedTimer outage;
     outage.start();
@@ -419,7 +426,8 @@ void TstLiveEditorReconnect::watchResubscribesAfterReconnect()
     // channel device on a brand new SSH session, in front of a brand new
     // codeharbord whose watch registry has never heard of us.
     QCOMPARE(wiredSpy.size(), 1);
-    QVERIFY(m_bootstrap->rpcDevice() != rpcBefore);
+    QTRY_VERIFY(rpcBefore.isNull());
+    QVERIFY(m_bootstrap->rpcDevice() != nullptr);
     QCOMPARE(m_client.transport(),
              static_cast<QIODevice*>(m_bootstrap->rpcDevice()));
     qInfo("session dropped and re-wired in %lld ms", outage.elapsed());
@@ -456,13 +464,16 @@ void TstLiveEditorReconnect::dirtyBufferSurvivesReconnect()
     const int loadsBefore = m_loads;
 
     QSignalSpy wiredSpy(m_bootstrap.get(), &SessionBootstrap::wired);
-    SshChannelDevice* const rpcBefore = m_bootstrap->rpcDevice();
+    // QPointer for the same reason as above: the retired device's address can be
+    // recycled by its own replacement.
+    QPointer<SshChannelDevice> rpcBefore = m_bootstrap->rpcDevice();
     dropTheConnection();
     QTRY_VERIFY_WITH_TIMEOUT(m_bootstrap->state() != State::Wired, 30000);
     QTRY_COMPARE_WITH_TIMEOUT(m_bootstrap->state(), State::Wired,
                               kReconnectTimeoutMs);
     QCOMPARE(wiredSpy.size(), 1);
-    QVERIFY(m_bootstrap->rpcDevice() != rpcBefore);
+    QTRY_VERIFY(rpcBefore.isNull());
+    QVERIFY(m_bootstrap->rpcDevice() != nullptr);
 
     // Re-establishing the watch must not touch the buffer: no reload was
     // delivered, the guarded revision is untouched, the state is still dirty.

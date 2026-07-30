@@ -79,9 +79,19 @@ private:
 // URL and streams the file's bytes fetched over the injected CodeharbordClient
 // (file.readFile), replying with a MIME type derived from the extension. Text
 // is served verbatim (utf-8); binary/image content is base64-decoded first.
+//
+// The origin is strictly read-only: only GET requests whose authority is the
+// documented "file" host are answered; everything else is refused without ever
+// touching the remote server.
 class InternalUrlSchemeHandler : public QWebEngineUrlSchemeHandler {
     Q_OBJECT
 public:
+    // Upper bound on the bytes fetched for a single inline viewer render. A
+    // file larger than this is failed (never truncated-and-served) so the RPC
+    // frame stays bounded and no consumer receives partial content as if it
+    // were complete. ViewerModel::readTextFile applies the same cap.
+    static constexpr int kMaxInlineReadBytes = 8 * 1024 * 1024;
+
     // `client` performs the remote reads; `map` resolves opaque ids (defaults to
     // InternalUrlMap::shared()). Neither is owned.
     explicit InternalUrlSchemeHandler(CodeharbordClient *client,
@@ -91,7 +101,9 @@ public:
     void requestStarted(QWebEngineUrlRequestJob *job) override;
 
     // MIME type for a path, derived from its extension only (no filesystem
-    // access). Falls back to application/octet-stream.
+    // access). Falls back to application/octet-stream. This is the bare type
+    // with no parameters; the handler appends "; charset=utf-8" for textual
+    // types when it actually replies.
     static QByteArray mimeForPath(const QString &path);
 
     // Whether a served MIME type is "active content": a type Chromium renders

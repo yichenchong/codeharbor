@@ -13,17 +13,37 @@
   (the bundle boots itself on DOMContentLoaded). Monaco injects theme rules as
   <style> elements at runtime, hence 'unsafe-inline' for styles only; the
   codicon font is inlined as a data: URI by the build. Monaco's editor worker is
-  a same-origin sibling script, hence worker-src 'self'.
+  a same-origin sibling script, hence worker-src 'self'. base-uri and
+  form-action are NOT covered by default-src, so they are denied explicitly: a
+  <base> element would re-point every relative URL on the page (including the
+  worker's), and a form submission would navigate this privileged page away.
 -->
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' qrc:; worker-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self' data:; img-src 'self' data:; connect-src 'none'">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' qrc:; worker-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self' data:; img-src 'self' data:; connect-src 'none'; base-uri 'none'; form-action 'none'">
 <title>CodeHarbor Editor</title>
 <link rel="stylesheet" href="editor.css">
 <style>
     html, body { height: 100%; margin: 0; padding: 0; overflow: hidden; }
     body { background: #1e1e1e; color: #d4d4d4; }
-    #ch-editor-root { height: 100%; width: 100%; }
-    .ch-editor-status { background: #252526; border-bottom: 1px solid #333; color: #cccccc; }
-    .ch-editor-notice button { margin-left: 6px; }
+    /* Column layout: a thin status strip above a surface that takes all
+       remaining height. Monaco lays itself out from the surface's box, so that
+       box needs a definite height — hence flex:1 + min-height:0. The script
+       (src/index.ts) builds these elements and owns only ONE style itself,
+       whether the notice is currently showing. */
+    #ch-editor-root { height: 100%; width: 100%; display: flex; flex-direction: column; }
+    .ch-editor-status {
+        flex: 0 0 auto;
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 2px 8px;
+        background: #252526;
+        border-bottom: 1px solid #333;
+        color: #cccccc;
+        font: 12px/1.6 system-ui, sans-serif;
+    }
+    /* Pushed to the far end of the strip; shown by the script as display:flex. */
+    .ch-editor-notice { margin-left: auto; gap: 6px; }
+    .ch-editor-surface { flex: 1 1 auto; min-height: 0; }
 </style>
 </head>
 <body>

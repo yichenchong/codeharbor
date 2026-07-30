@@ -1,5 +1,6 @@
 #include "InternalUrlSchemeHandler.h"
 #include "ViewerHandlerRegistry.h"
+#include "ViewerModel.h"
 #include "ViewerProfiles.h"
 
 #include <QtWebEngineQuick/QQuickWebEngineProfile>
@@ -17,6 +18,7 @@
 using ch::InternalUrlMap;
 using ch::InternalUrlSchemeHandler;
 using ch::ViewerHandlerRegistry;
+using ch::ViewerModel;
 using ch::ViewerProfiles;
 using ch::ViewerResolution;
 
@@ -39,6 +41,9 @@ private slots:
     void activeContentMimeGate();
     void activeContentMimeFromExtension();
     void urlMappingRemintAfterEviction();
+    void urlMappingBareId();
+    void viewKindStringsMatchQmlContract();
+    void viewerModelWithoutClientReportsErrors();
 };
 
 void TstViewers::resolveByExtensionTable()
@@ -58,6 +63,23 @@ void TstViewers::resolveByExtensionTable()
           QStringLiteral("go"), QStringLiteral("sh"), QStringLiteral("css"),
           QStringLiteral("html"), QStringLiteral("json"), QStringLiteral("yaml"),
           QStringLiteral("yml"), QStringLiteral("toml"), QStringLiteral("xml")}) {
+        QCOMPARE(ViewerHandlerRegistry::resolveByExtension(ext),
+                 ViewerResolution::TextEditor);
+    }
+
+    // Widely-used source and config extensions must also land in the text
+    // editor: falling through to Download hides readable files behind the
+    // binary pane, which was the pre-existing gap.
+    for (const QString &ext :
+         {QStringLiteral("jsx"), QStringLiteral("cjs"), QStringLiteral("mts"),
+          QStringLiteral("java"), QStringLiteral("rb"), QStringLiteral("php"),
+          QStringLiteral("kt"), QStringLiteral("swift"), QStringLiteral("cs"),
+          QStringLiteral("lua"), QStringLiteral("bash"), QStringLiteral("zsh"),
+          QStringLiteral("scss"), QStringLiteral("htm"), QStringLiteral("ini"),
+          QStringLiteral("conf"), QStringLiteral("env"), QStringLiteral("sql"),
+          QStringLiteral("csv"), QStringLiteral("log"), QStringLiteral("diff"),
+          QStringLiteral("patch"), QStringLiteral("cmake"),
+          QStringLiteral("hxx"), QStringLiteral("cxx")}) {
         QCOMPARE(ViewerHandlerRegistry::resolveByExtension(ext),
                  ViewerResolution::TextEditor);
     }
@@ -416,6 +438,73 @@ void TstViewers::urlMappingRemintAfterEviction()
     QVERIFY(ia2 != ia);
     QVERIFY(!map.fileUrlFor(ia).isValid());
     QCOMPARE(map.fileUrlFor(ia2), a);
+}
+
+void TstViewers::urlMappingBareId()
+{
+    // fileUrlFor() documents that it accepts either a full internal URL or a
+    // bare id. The scheme handler resolves the bare id itself, but QML and the
+    // live tests hand the whole URL back; both spellings must agree.
+    InternalUrlMap map;
+    const QUrl file(QStringLiteral("file:///home/yc/project/README.md"));
+    const QString internal = map.internalUrlFor(file);
+    const QString id = internal.mid(InternalUrlMap::prefix().size());
+
+    QCOMPARE(map.fileUrlFor(internal), file);
+    QCOMPARE(map.fileUrlFor(id), file);
+    QCOMPARE(map.fileUrlForId(id), file);
+    // An unknown bare id is not silently aliased onto some other entry.
+    QVERIFY(!map.fileUrlForId(QStringLiteral("00000000000000000000000000000000"))
+                 .isValid());
+}
+
+void TstViewers::viewKindStringsMatchQmlContract()
+{
+    // ViewerPane.qml switches on these exact strings to pick a view; a rename
+    // here silently degrades every pane to the fallback. This pins the mapping
+    // from resolution to QML view kind (SPEC 7.5).
+    ViewerModel viewers;
+    QCOMPARE(viewers.viewKind(QUrl(QStringLiteral("https://example.com/"))),
+             QStringLiteral("web"));
+    QCOMPARE(viewers.viewKind(QUrl(QStringLiteral("file:///p/README.md"))),
+             QStringLiteral("markdown"));
+    QCOMPARE(viewers.viewKind(QUrl(QStringLiteral("file:///p/main.cpp"))),
+             QStringLiteral("text"));
+    QCOMPARE(viewers.viewKind(QUrl(QStringLiteral("file:///p/logo.png"))),
+             QStringLiteral("image"));
+    QCOMPARE(viewers.viewKind(QUrl(QStringLiteral("file:///p/manual.pdf"))),
+             QStringLiteral("pdf"));
+    QCOMPARE(viewers.viewKind(QUrl(QStringLiteral("file:///p/sub/"))),
+             QStringLiteral("directory"));
+    // Download / OpenExternally / Error all collapse onto the binary pane.
+    QCOMPARE(viewers.viewKind(QUrl(QStringLiteral("file:///p/blob.bin"))),
+             QStringLiteral("binary"));
+    QCOMPARE(viewers.viewKind(QUrl(QStringLiteral("ftp://host/x"))),
+             QStringLiteral("binary"));
+}
+
+void TstViewers::viewerModelWithoutClientReportsErrors()
+{
+    // Before a Dev Session is connected there is no remote client. The QML
+    // views bind unconditionally, so both calls must answer with an error
+    // signal rather than doing nothing and leaving a permanently blank pane.
+    ViewerModel viewers;
+    QSignalSpy textErrors(&viewers, &ViewerModel::textFileError);
+    QSignalSpy dirErrors(&viewers, &ViewerModel::directoryError);
+    QSignalSpy textReads(&viewers, &ViewerModel::textFileRead);
+    QSignalSpy dirLists(&viewers, &ViewerModel::directoryListed);
+
+    viewers.readTextFile(QStringLiteral("/p/README.md"));
+    viewers.listDirectory(QStringLiteral("/p"));
+
+    QCOMPARE(textErrors.size(), 1);
+    QCOMPARE(dirErrors.size(), 1);
+    QCOMPARE(textReads.size(), 0);
+    QCOMPARE(dirLists.size(), 0);
+    // The failing path is echoed back so a view can tell whether the error is
+    // about the file it is currently showing.
+    QCOMPARE(textErrors.first().at(0).toString(), QStringLiteral("/p/README.md"));
+    QCOMPARE(dirErrors.first().at(0).toString(), QStringLiteral("/p"));
 }
 
 int main(int argc, char *argv[])

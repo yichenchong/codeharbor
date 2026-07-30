@@ -31,7 +31,11 @@ const common = {
     target: ["chrome110"],
     platform: "browser",
     minify: true,
-    legalComments: "none",
+    // "eof", not "none": monaco-editor is MIT, and MIT requires its copyright
+    // notice to travel with the code we ship. Collecting the /*! ... */ banners
+    // at the end of each bundle keeps that obligation met at a cost of a few
+    // hundred bytes; dropping them would ship a licence violation.
+    legalComments: "eof",
     loader: { ".ttf": "dataurl" },
 };
 

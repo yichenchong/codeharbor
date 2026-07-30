@@ -78,6 +78,22 @@ public:
     void setConnectTimeoutMs(int ms);
     int connectTimeoutMs() const { return m_connectTimeoutMs; }
 
+    // Opt in to accepting an UNKNOWN host key without asking anybody (SPEC
+    // 12.1). OFF by default, and it must stay off in every attended build: with
+    // it off, a wire attempt that finds no host-key decision callback on the
+    // pool FAILS instead of connecting, so there is no path on which an unknown
+    // key can be trusted and persisted with no user consent. AppController
+    // installs a prompting callback before every connect, so the shipped app
+    // never needs this.
+    //
+    // It exists for the two genuinely unattended entry points, where there is
+    // nobody to ask and refusing would simply mean "cannot connect at all":
+    // connectAndWireFromEnvironment() (the CH_LIVE_* harness path) turns it on
+    // for itself, and a live test that drives connectAndWire() directly turns it
+    // on explicitly.
+    void setTrustUnknownHostKeys(bool enabled);
+    bool trustUnknownHostKeys() const { return m_trustUnknownHostKeys; }
+
     // Wall time of the last completed wire attempt (probe + handshake + both
     // channel execs), in milliseconds. -1 before the first attempt. Exposed so
     // the latency gate measures the real thing instead of re-timing a
@@ -296,6 +312,9 @@ private:
     int m_connectTimeoutMs = kDefaultConnectTimeoutMs;
     qint64 m_lastAttemptMs = -1;
     bool m_reconnectEnabled = true;
+    // See setTrustUnknownHostKeys(). Deliberately false by default: the safe
+    // answer to an unknown host key with nobody to ask is "do not connect".
+    bool m_trustUnknownHostKeys = false;
     // Set while we are inside our own connect/teardown, so the pool and device
     // signals those steps provoke are not mistaken for a fresh loss.
     bool m_attempting = false;

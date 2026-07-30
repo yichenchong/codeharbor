@@ -50,6 +50,21 @@ public:
     QString path() const { return m_path; }
     QString revision() const { return m_revision; }
 
+    // Byte ceiling on every file.readFile this controller issues (SPEC 8.3).
+    //
+    // A file.readFile that carries no `length` makes the server read the WHOLE
+    // file into memory (the un-ranged branch of read() in remote/src/files.ts),
+    // which is then held again in this process and once more as a JavaScript
+    // string in the Monaco page — three copies of a file that may be gigabytes.
+    // Worse, remote/src/files.ts derives its `truncated` flag FROM the requested
+    // length, so an unbounded read cannot even report that the file was too big.
+    //
+    // 8 MiB matches InternalUrlSchemeHandler::kMaxInlineReadBytes, the ceiling
+    // the inline file viewer already applies, so one file is never editable but
+    // unviewable (or the reverse). The value is restated here rather than shared
+    // because ch_editor does not link ch_viewers and must not start to.
+    static constexpr int kMaxEditableReadBytes = 8 * 1024 * 1024;
+
 public slots:
     // ---- JS -> C++ bridge slots (fire-and-forget; results via signals) ----
 
@@ -60,7 +75,11 @@ public slots:
     // (SPEC 8.4/8.6). Result arrives via saved / saveConflict / saveError.
     Q_INVOKABLE void save(QString content, QString expectedRevision);
     // Snapshot the unsaved buffer to a server-side recovery path (SPEC 11.3)
-    // and mark the buffer dirty. Call debounced from the editor.
+    // and mark the buffer dirty. Call debounced from the editor. Ignored while a
+    // load is in flight: the page is still showing the PREVIOUS file's buffer
+    // (the debounce outlives an open()), so honouring it would snapshot one
+    // file's edits under another file's recovery path and mark a buffer that
+    // nobody has edited dirty.
     Q_INVOKABLE void reportContent(QString content);
     // Re-fetch the file from the server (SPEC 8.7).
     Q_INVOKABLE void requestReload();
@@ -72,6 +91,11 @@ public slots:
     // and replayed exactly once. Additive to the frozen C3 contract (the JS
     // half declares it optional), so an older bundle that never calls it still
     // works — it simply never receives content, as before.
+    //
+    // The state signals are one-shot too, so fileStateChanged and
+    // readOnlyChanged are re-emitted here for the current file: a page that
+    // connected after the load would otherwise render an empty status bar and,
+    // worse, an editable surface over an unwritable file.
     //
     // A second ready() means the page RELOADED and lost its buffer: there is
     // nothing held to replay, so the file is re-fetched instead of re-emitting
@@ -98,13 +122,16 @@ private slots:
     // reconnect). Its FileWatchService registry is empty — subscriptions live
     // in the remote PROCESS, not in the wire (remote/src/files.ts) — so the
     // watch this controller established is gone and external-change reload has
-    // silently stopped. Re-subscribe and reconcile whatever changed while the
-    // session was down. Never touches the buffer's dirty state.
+    // silently stopped. Leave FileState::Disconnected, re-subscribe, and
+    // reconcile whatever changed while the session was down. Never touches the
+    // buffer's dirty state.
     void onTransportBound();
     // The old transport hit EOF: that codeharbord is unreachable forever, so
     // the subscription id it minted is dead. Forget it WITHOUT an unwatch RPC —
     // the only peer that could receive one is its replacement, which never
-    // created it.
+    // created it. An open file also enters FileState::Disconnected (SPEC 8.2):
+    // nothing can be read or written until a transport is bound again, and a
+    // pane that keeps advertising "clean" through an outage is lying about it.
     void onTransportClosed();
 
 private:
@@ -114,10 +141,12 @@ private:
     void setReadOnly(bool readOnly);
     void updateReadOnly() { setReadOnly(m_pathReadOnly || m_bufferReadOnly); }
     // Ask the server what the current path looks like and re-derive
-    // m_pathReadOnly from the answer, then run `then` (whether the stat
-    // succeeded or not, so a caller can chain work behind it). Read-only-ness is
-    // DERIVED on every load and every reconnect, never latched from the first
-    // open: a chmod is an ordinary external change.
+    // m_pathReadOnly from the answer, then run `then` — whether the stat
+    // succeeded or not, so a caller can chain work behind it. The one case that
+    // does NOT run `then` is a file switch landing while the stat is in flight:
+    // the answer describes the previous file and everything chained behind it
+    // would too. Read-only-ness is DERIVED on every load and every reconnect,
+    // never latched from the first open: a chmod is an ordinary external change.
     void refreshPermissions(std::function<void()> then = {});
     // Fold a file.stat result (RpcTypes StatResult) into m_pathReadOnly.
     void applyStatPermissions(const QJsonObject& stat);
@@ -126,7 +155,10 @@ private:
     // ready() slot). The held buffer is overwritten by a newer load, so a
     // reconnecting page always sees the LATEST content exactly once.
     void deliverContent(const QString& content, const QString& revision);
-    void checkRecovery(const QString& loadedContent);
+    // Look for a crash-recovery snapshot for the file `generation` loaded. The
+    // generation is carried through both round trips so a snapshot belonging to
+    // a superseded load can never be offered against the file now open.
+    void checkRecovery(const QString& loadedContent, quint64 generation);
     void writeRecovery(const QString& content, bool retryOnMismatch);
     // Discard the server-side recovery snapshot after a successful save
     // (SPEC 11.3): the saved file IS the buffer now, so a later reopen must not
@@ -158,13 +190,44 @@ private:
     // Two independent reasons a buffer cannot be written back, OR-ed into
     // m_readOnly by updateReadOnly():
     //   m_pathReadOnly   — file.stat says the file itself is not writable.
-    //   m_bufferReadOnly — the bytes we hold are not the file's bytes (a base64
-    //                      binary read), so saving them would corrupt it.
+    //   m_bufferReadOnly — the bytes we hold are not the file's bytes, so
+    //                      saving them would corrupt the file. Two ways that
+    //                      happens: a base64 (binary) read, and a TRUNCATED
+    //                      read — a ReadFileResult carrying truncated=true is a
+    //                      PREFIX of the file, and writing a prefix back is
+    //                      silent data loss for everything past it. A truncated
+    //                      load additionally parks FileState at ReadOnly instead
+    //                      of Clean: "clean" asserts the buffer equals the file,
+    //                      which for a prefix is simply false.
     bool m_pathReadOnly = false;
     bool m_bufferReadOnly = false;
-    // True once reportContent has been seen since the last load/save: the buffer
-    // holds unsaved edits, so external changes must NOT auto-reload (SPEC 8.7).
+    // True once reportContent has been seen since the last load/save, or once a
+    // save has been issued and not yet confirmed: the buffer holds bytes that
+    // are not on the server, so external changes must NOT auto-reload
+    // (SPEC 8.7).
     bool m_dirty = false;
+    // Bumped by every reportContent(). save() captures it and the write's reply
+    // compares: a report that arrived DURING the save means the buffer moved on
+    // after the bytes now on the server, so the buffer is still dirty and its
+    // recovery snapshot must survive. Without this an edit typed during a save
+    // round trip is treated as saved and the next external change silently
+    // auto-reloads over it.
+    quint64 m_editSerial = 0;
+    // Generation of the load this controller WANTS, bumped by every open() and
+    // every reload(). A file.readFile reply naming a superseded generation is
+    // DROPPED: the responses to two overlapping loads can arrive in either
+    // order, and applying the older one would show the wrong bytes and, worse,
+    // adopt the wrong revision as the save guard.
+    quint64 m_loadGeneration = 0;
+    // Where to go when a transport is bound again after a drop (see
+    // onTransportClosed). Conflict / ExternallyModified / ReadOnly survive an
+    // outage — the first two because the file on the server still diverges from
+    // the buffer and only the user can resolve that, ReadOnly because it
+    // describes the bytes this pane is holding (a truncated read) and a drop
+    // does not make them whole — while an empty optional means "re-derive from
+    // m_dirty", because the load or save the outage killed has no outcome left
+    // to report.
+    std::optional<FileState> m_resumeState;
 
     QString m_watchSubscriptionId;
     // Generation of the watch this controller WANTS, bumped by every open() and

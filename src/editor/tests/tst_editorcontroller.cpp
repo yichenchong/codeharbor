@@ -61,6 +61,22 @@ QString reqSubscriptionId(const QJsonObject& req)
         .toString();
 }
 
+qint64 reqOffset(const QJsonObject& req)
+{
+    return req.value(QStringLiteral("params"))
+        .toObject()
+        .value(QStringLiteral("offset"))
+        .toInteger(-1);
+}
+
+qint64 reqLength(const QJsonObject& req)
+{
+    return req.value(QStringLiteral("params"))
+        .toObject()
+        .value(QStringLiteral("length"))
+        .toInteger(-1);
+}
+
 const auto kReadFile = QString::fromLatin1(ch::rpc::kMethodReadFile);
 const auto kWriteFile = QString::fromLatin1(ch::rpc::kMethodWriteFile);
 const auto kWatch = QString::fromLatin1(ch::rpc::kMethodWatch);
@@ -109,6 +125,32 @@ private slots:
     void reconnectLeavesADirtyBufferAloneAndFlagsIt();
     void reconnectOverAnUnansweredWatchSubscribesExactlyOnce();
     void reconcileLosesToASaveThatSettledFirst();
+    void transportDropParksTheFileStateUntilRebind();
+
+    // The buffer's dirty flag is what stops an external change from being
+    // auto-reloaded over unsaved work (SPEC 8.7), so every path that can leave
+    // bytes only in the page has to raise it.
+    void failedSaveLeavesTheBufferDirty();
+    void editsDuringASaveSurviveTheSaveReply();
+    void reportContentDuringALoadIsIgnored();
+
+    // Out-of-order / superseded replies must never land on the file now open.
+    void staleLoadReplyNeverWins();
+    void saveReplyAfterAFileSwitchIsDropped();
+
+    void truncatedReadIsNotWritableBack();
+    void conflictKeepsItsStateWhenTheWatchEventLands();
+    void lateReadyReplaysTheFileState();
+
+    // SPEC 8.3 read ceiling: every file.readFile carries a byte window, and a
+    // file too big to fit it is not opened for editing at all.
+    void readsAskForABoundedWindow();
+    void aTruncatedFileIsNotOpenedForEditing();
+
+    // SPEC 8.7: a file deleted while the session was down produces no watch
+    // event anywhere, so only the reconnect's file.stat can discover it.
+    void deletedWhileDisconnectedStopsClaimingClean();
+    void deletedWhileDisconnectedWithUnsavedWorkIsOnlyFlagged();
 
 private:
     void makePair();
@@ -274,7 +316,7 @@ void TstEditorController::openClean(const QString& path, const QString& content,
     QCOMPARE(method(read), kReadFile);
     QCOMPARE(reqPath(read), path);
     respondResult(reqId(read), {{"path", path},
-                                {"encoding", "utf8"},
+                                {"encoding", "utf-8"},
                                 {"content", content},
                                 {"revision", rev},
                                 {"truncated", false}});
@@ -409,7 +451,7 @@ void TstEditorController::externalChangeWhileCleanReloads()
     QCOMPARE(method(read), kReadFile);
     QCOMPARE(reqPath(read), QStringLiteral("/foo/f.txt"));
     respondResult(reqId(read), {{"path", "/foo/f.txt"},
-                                {"encoding", "utf8"},
+                                {"encoding", "utf-8"},
                                 {"content", "externally edited"},
                                 {"revision", "r5"},
                                 {"truncated", false}});
@@ -487,7 +529,7 @@ void TstEditorController::recoverySnapshotWrittenAndOfferedOnReopen()
     const QJsonObject read = nextRequest();
     QCOMPARE(method(read), kReadFile);
     respondResult(reqId(read), {{"path", "/foo/f.txt"},
-                                {"encoding", "utf8"},
+                                {"encoding", "utf-8"},
                                 {"content", "orig"},
                                 {"revision", "r1"},
                                 {"truncated", false}});
@@ -510,7 +552,7 @@ void TstEditorController::recoverySnapshotWrittenAndOfferedOnReopen()
     QCOMPARE(method(recRead), kReadFile);
     QCOMPARE(reqPath(recRead), recoveryPath);
     respondResult(reqId(recRead), {{"path", recoveryPath},
-                                   {"encoding", "utf8"},
+                                   {"encoding", "utf-8"},
                                    {"content", "recovered edits"},
                                    {"revision", "rec1"},
                                    {"truncated", false}});
@@ -552,7 +594,7 @@ void TstEditorController::reopenUnwatchesPreviousSubscription()
     QCOMPARE(method(read), kReadFile);
     QCOMPARE(reqPath(read), QStringLiteral("/foo/b.txt"));
     respondResult(reqId(read), {{"path", "/foo/b.txt"},
-                                {"encoding", "utf8"},
+                                {"encoding", "utf-8"},
                                 {"content", "B"},
                                 {"revision", "r2"},
                                 {"truncated", false}});
@@ -594,7 +636,7 @@ void TstEditorController::contentBufferedUntilPageReportsReady()
     const QJsonObject read = nextRequest();
     QCOMPARE(method(read), kReadFile);
     respondResult(reqId(read), {{"path", "/foo/f.txt"},
-                                {"encoding", "utf8"},
+                                {"encoding", "utf-8"},
                                 {"content", "loaded before the page"},
                                 {"revision", "r1"},
                                 {"truncated", false}});
@@ -623,7 +665,7 @@ void TstEditorController::contentBufferedUntilPageReportsReady()
 
     // ...and the re-fetched content lands once, not twice.
     respondResult(reqId(refetch), {{"path", "/foo/f.txt"},
-                                   {"encoding", "utf8"},
+                                   {"encoding", "utf-8"},
                                    {"content", "loaded before the page"},
                                    {"revision", "r1"},
                                    {"truncated", false}});
@@ -680,7 +722,7 @@ void TstEditorController::successfulSaveClearsRecoverySnapshot()
     const QJsonObject read = nextRequest();
     QCOMPARE(method(read), kReadFile);
     respondResult(reqId(read), {{"path", "/foo/f.txt"},
-                                {"encoding", "utf8"},
+                                {"encoding", "utf-8"},
                                 {"content", "edited"},
                                 {"revision", "r2"},
                                 {"truncated", false}});
@@ -699,7 +741,7 @@ void TstEditorController::successfulSaveClearsRecoverySnapshot()
     QCOMPARE(method(recRead), kReadFile);
     QCOMPARE(reqPath(recRead), recoveryPath);
     respondResult(reqId(recRead), {{"path", recoveryPath},
-                                   {"encoding", "utf8"},
+                                   {"encoding", "utf-8"},
                                    {"content", ""},
                                    {"revision", "rec2"},
                                    {"truncated", false}});
@@ -823,7 +865,7 @@ void TstEditorController::reconnectResubscribesAndReconcilesCleanBuffer()
     QCOMPARE(method(read), kReadFile);
     QCOMPARE(reqPath(read), QStringLiteral("/foo/f.txt"));
     respondResult(reqId(read), {{"path", "/foo/f.txt"},
-                                {"encoding", "utf8"},
+                                {"encoding", "utf-8"},
                                 {"content", "changed while away"},
                                 {"revision", "r2"},
                                 {"truncated", false}});
@@ -840,12 +882,12 @@ void TstEditorController::reconnectResubscribesAndReconcilesCleanBuffer()
     // reloads exactly once.
     sendNotification(kWatchEvent, {{"subscriptionId", "sub2"},
                                    {"path", "/foo/f.txt"},
-                                   {"type", "modified"},
+                                   {"event", "modified"},
                                    {"revision", "r3"}});
     const QJsonObject reread = nextRequest();
     QCOMPARE(method(reread), kReadFile);
     respondResult(reqId(reread), {{"path", "/foo/f.txt"},
-                                  {"encoding", "utf8"},
+                                  {"encoding", "utf-8"},
                                   {"content", "later"},
                                   {"revision", "r3"},
                                   {"truncated", false}});
@@ -910,7 +952,7 @@ void TstEditorController::reconnectOverAnUnansweredWatchSubscribesExactlyOnce()
     const QJsonObject read = nextRequest();
     QCOMPARE(method(read), kReadFile);
     respondResult(reqId(read), {{"path", "/foo/f.txt"},
-                                {"encoding", "utf8"},
+                                {"encoding", "utf-8"},
                                 {"content", "hello"},
                                 {"revision", "r1"},
                                 {"truncated", false}});
@@ -1014,7 +1056,7 @@ void TstEditorController::unwritableFileOpensReadOnlyAndRefusesSave()
     const QJsonObject read = nextRequest();
     QCOMPARE(method(read), kReadFile);
     respondResult(reqId(read), {{"path", "/foo/ro.txt"},
-                                {"encoding", "utf8"},
+                                {"encoding", "utf-8"},
                                 {"content", "locked"},
                                 {"revision", "r1"},
                                 {"truncated", false}});
@@ -1101,7 +1143,7 @@ void TstEditorController::readOnlyIsRederivedOnReloadAndNotLatched()
     QJsonObject read = nextRequest();
     QCOMPARE(method(read), kReadFile);
     respondResult(reqId(read), {{"path", "/foo/f.txt"},
-                                {"encoding", "utf8"},
+                                {"encoding", "utf-8"},
                                 {"content", "hello"},
                                 {"revision", "r2"},
                                 {"truncated", false}});
@@ -1117,7 +1159,7 @@ void TstEditorController::readOnlyIsRederivedOnReloadAndNotLatched()
     read = nextRequest();
     QCOMPARE(method(read), kReadFile);
     respondResult(reqId(read), {{"path", "/foo/f.txt"},
-                                {"encoding", "utf8"},
+                                {"encoding", "utf-8"},
                                 {"content", "hello"},
                                 {"revision", "r3"},
                                 {"truncated", false}});
@@ -1182,7 +1224,7 @@ void TstEditorController::readOnlyReachesAPageThatConnectsLate()
     const QJsonObject read = nextRequest();
     QCOMPARE(method(read), kReadFile);
     respondResult(reqId(read), {{"path", "/foo/ro.txt"},
-                                {"encoding", "utf8"},
+                                {"encoding", "utf-8"},
                                 {"content", "locked"},
                                 {"revision", "r1"},
                                 {"truncated", false}});
@@ -1200,6 +1242,553 @@ void TstEditorController::readOnlyReachesAPageThatConnectsLate()
     QCOMPARE(order, QStringList({QStringLiteral("readOnly=true"),
                                  QStringLiteral("readOnly=true"),
                                  QStringLiteral("content")}));
+}
+
+// ---------------------------------------------------------------------------
+// SPEC 8.2 Disconnected.
+//
+// Disconnected is the state this controller STARTS in, and it is in the SPEC 8.2
+// list, but nothing used to enter it again: a pane went on advertising "clean"
+// right through an outage in which it could neither read nor write, and the
+// terminal panes (TerminalController::onTransportFinished) already report the
+// same drop honestly. Coming BACK has to be honest too — the load or save the
+// drop killed has no outcome left to report, so the buffer's dirty flag decides.
+// ---------------------------------------------------------------------------
+void TstEditorController::transportDropParksTheFileStateUntilRebind()
+{
+    makePair();
+    openClean(QStringLiteral("/foo/f.txt"), QStringLiteral("hello"),
+              QStringLiteral("r1"));
+
+    QSignalSpy stateSpy(m_controller, &EditorController::fileStateChanged);
+    reconnectTransport();
+
+    QStringList seen;
+    for (const auto& args : stateSpy)
+        seen << args.at(0).toString();
+    QCOMPARE(seen, QStringList({QStringLiteral("disconnected"),
+                                QStringLiteral("clean")}));
+
+    // Drain the reconnect's own round trips so the wire is quiet for part two.
+    const QJsonObject watch = nextRequest();
+    QCOMPARE(method(watch), kWatch);
+    respondResult(reqId(watch), {{"subscriptionId", "sub2"}});
+    const QJsonObject stat = nextRequest();
+    QCOMPARE(method(stat), kStat);
+    respondResult(reqId(stat), {{"path", "/foo/f.txt"}, {"revision", "r1"}});
+    QVERIFY(nextRequest(300).isEmpty());
+
+    // Part two: with unsaved edits pending, the rebind must come back to
+    // "modified". Landing on "clean" would tell the pane — and the Dev Session
+    // row (SPEC 8.2) — that work still living only in the page is safe on disk.
+    m_controller->reportContent(QStringLiteral("unsaved work"));
+    const QJsonObject snapshot = nextRequest();
+    QCOMPARE(method(snapshot), kWriteFile);
+    respondResult(reqId(snapshot),
+                  {{"path", reqPath(snapshot)}, {"revision", "rec1"}});
+    QCOMPARE(m_controller->fileState(), QStringLiteral("modified"));
+
+    stateSpy.clear();
+    reconnectTransport();
+
+    seen.clear();
+    for (const auto& args : stateSpy)
+        seen << args.at(0).toString();
+    QCOMPARE(seen, QStringList({QStringLiteral("disconnected"),
+                                QStringLiteral("modified")}));
+}
+
+// A save carries bytes that are, by definition, not on the server yet. If the
+// write FAILS those bytes exist only inside the page — and the controller may
+// never have seen a reportContent for them, because the page debounces its
+// report by 500 ms and Ctrl+S beats that. A buffer wrongly believed clean is
+// silently auto-reloaded over by the next external change (SPEC 8.7).
+void TstEditorController::failedSaveLeavesTheBufferDirty()
+{
+    makePair();
+    openClean(QStringLiteral("/foo/f.txt"), QStringLiteral("hello"),
+              QStringLiteral("r1"));
+
+    m_controller->save(QStringLiteral("typed, then saved inside the debounce"),
+                       QStringLiteral("r1"));
+    const QJsonObject write = nextRequest();
+    QCOMPARE(method(write), kWriteFile);
+    respondError(reqId(write), -32000, QStringLiteral("EIO: write failed"));
+    QTRY_COMPARE(m_controller->fileState(), QStringLiteral("error"));
+
+    QSignalSpy contentSpy(m_controller, &EditorController::contentLoaded);
+    sendNotification(kWatchEvent, {{"subscriptionId", "sub1"},
+                                   {"path", "/foo/f.txt"},
+                                   {"event", "modified"},
+                                   {"revision", "r5"}});
+
+    QTRY_COMPARE(m_controller->fileState(), QStringLiteral("externally_modified"));
+    QVERIFY2(nextRequest(300).isEmpty(),
+             "a buffer whose save FAILED was treated as clean and re-read");
+    QCOMPARE(contentSpy.count(), 0);
+    QCOMPARE(m_controller->revision(), QStringLiteral("r1"));
+}
+
+// Typing continues while a save is in flight. The bytes that land on the server
+// are the ones the save carried, NOT what the buffer holds when the reply
+// arrives, so the buffer is still dirty and the recovery snapshot holding those
+// extra keystrokes must survive (SPEC 11.3).
+void TstEditorController::editsDuringASaveSurviveTheSaveReply()
+{
+    makePair();
+    openClean(QStringLiteral("/foo/f.txt"), QStringLiteral("orig"),
+              QStringLiteral("r1"));
+
+    QSignalSpy savedSpy(m_controller, &EditorController::saved);
+    m_controller->save(QStringLiteral("first edit"), QStringLiteral("r1"));
+    const QJsonObject write = nextRequest();
+    QCOMPARE(method(write), kWriteFile);
+    QCOMPARE(reqPath(write), QStringLiteral("/foo/f.txt"));
+    QCOMPARE(reqContent(write), QStringLiteral("first edit"));
+
+    // The user keeps typing; the page's debounced report lands first.
+    m_controller->reportContent(QStringLiteral("first edit + more typing"));
+    const QJsonObject snapshot = nextRequest();
+    QCOMPARE(method(snapshot), kWriteFile);
+    QVERIFY(reqPath(snapshot).contains(QStringLiteral(".codeharbor-recovery")));
+    QCOMPARE(reqContent(snapshot), QStringLiteral("first edit + more typing"));
+    respondResult(reqId(snapshot),
+                  {{"path", reqPath(snapshot)}, {"revision", "rec1"}});
+
+    // Only now does the write succeed.
+    respondResult(reqId(write), {{"path", "/foo/f.txt"}, {"revision", "r2"}});
+    QTRY_COMPARE(savedSpy.count(), 1);
+    QCOMPARE(m_controller->revision(), QStringLiteral("r2"));
+
+    // Still dirty: the state says so, and the snapshot holding the keystrokes
+    // that were NOT saved was not truncated.
+    QTRY_COMPARE(m_controller->fileState(), QStringLiteral("modified"));
+    QVERIFY2(nextRequest(300).isEmpty(),
+             "the recovery snapshot holding unsaved keystrokes was truncated");
+
+    // ...so an external change is flagged instead of clobbering them.
+    sendNotification(kWatchEvent, {{"subscriptionId", "sub1"},
+                                   {"path", "/foo/f.txt"},
+                                   {"event", "modified"},
+                                   {"revision", "r5"}});
+    QTRY_COMPARE(m_controller->fileState(), QStringLiteral("externally_modified"));
+    QVERIFY2(nextRequest(300).isEmpty(),
+             "keystrokes made during a save were re-read over");
+    QCOMPARE(m_controller->revision(), QStringLiteral("r2"));
+}
+
+// The page debounces reportContent by 500 ms, which outlives an open(). A report
+// arriving mid-load describes the buffer of the file the pane is LEAVING, so
+// honouring it would file one file's edits under another file's recovery path
+// and mark a buffer nobody has edited dirty.
+void TstEditorController::reportContentDuringALoadIsIgnored()
+{
+    makePair();
+
+    m_controller->ready();
+    m_controller->open(QStringLiteral("/foo/f.txt"));
+    const QJsonObject read = nextRequest();
+    QCOMPARE(method(read), kReadFile);
+
+    m_controller->reportContent(QStringLiteral("the previous file's buffer"));
+    QVERIFY2(nextRequest(300).isEmpty(),
+             "a report that arrived mid-load wrote a recovery snapshot");
+
+    respondResult(reqId(read), {{"path", "/foo/f.txt"},
+                                {"encoding", "utf-8"},
+                                {"content", "loaded"},
+                                {"revision", "r1"},
+                                {"truncated", false}});
+    serveWatchThenNoRecovery();
+    QTRY_COMPARE(m_controller->fileState(), QStringLiteral("clean"));
+
+    // Genuinely clean, so an external change auto-reloads. Had the mid-load
+    // report been taken as an edit this would have been flagged instead.
+    sendNotification(kWatchEvent, {{"subscriptionId", "sub1"},
+                                   {"path", "/foo/f.txt"},
+                                   {"event", "modified"},
+                                   {"revision", "r5"}});
+    const QJsonObject reread = nextRequest();
+    QCOMPARE(method(reread), kReadFile);
+    QCOMPARE(reqPath(reread), QStringLiteral("/foo/f.txt"));
+}
+
+// Two loads overlap (open A, then open B before A answered). The replies are
+// separate requests and can arrive in either order, so the older one must be
+// DROPPED: applying it would push the wrong file's bytes at the page and, worse,
+// adopt the wrong revision as this buffer's save guard.
+void TstEditorController::staleLoadReplyNeverWins()
+{
+    makePair();
+
+    m_controller->ready();
+    m_controller->open(QStringLiteral("/foo/a.txt"));
+    const QJsonObject readA = nextRequest();
+    QCOMPARE(method(readA), kReadFile);
+    QCOMPARE(reqPath(readA), QStringLiteral("/foo/a.txt")); // left unanswered
+
+    QSignalSpy contentSpy(m_controller, &EditorController::contentLoaded);
+
+    m_controller->open(QStringLiteral("/foo/b.txt"));
+    const QJsonObject readB = nextRequest();
+    QCOMPARE(method(readB), kReadFile);
+    QCOMPARE(reqPath(readB), QStringLiteral("/foo/b.txt"));
+    respondResult(reqId(readB), {{"path", "/foo/b.txt"},
+                                 {"encoding", "utf-8"},
+                                 {"content", "B"},
+                                 {"revision", "rB"},
+                                 {"truncated", false}});
+    serveWatchThenNoRecovery();
+    QTRY_COMPARE(contentSpy.count(), 1);
+    QCOMPARE(m_controller->fileState(), QStringLiteral("clean"));
+
+    // A's read finally answers, out of order.
+    respondResult(reqId(readA), {{"path", "/foo/a.txt"},
+                                 {"encoding", "utf-8"},
+                                 {"content", "A"},
+                                 {"revision", "rA"},
+                                 {"truncated", false}});
+    QTest::qWait(100);
+
+    QCOMPARE(contentSpy.count(), 1);
+    QCOMPARE(contentSpy.at(0).at(0).toString(), QStringLiteral("B"));
+    QCOMPARE(m_controller->revision(), QStringLiteral("rB"));
+    QCOMPARE(m_controller->fileState(), QStringLiteral("clean"));
+    QVERIFY2(nextRequest(300).isEmpty(),
+             "the superseded load re-subscribed a watcher or re-probed recovery");
+}
+
+// A write that answers after the pane switched files describes a file this
+// controller no longer holds. Adopting its revision would guard the NEW file's
+// next save with the OLD file's token — every save refused as a conflict — and
+// the page would be told a save it never asked for succeeded.
+void TstEditorController::saveReplyAfterAFileSwitchIsDropped()
+{
+    makePair();
+    openClean(QStringLiteral("/foo/a.txt"), QStringLiteral("A"),
+              QStringLiteral("r1"));
+
+    QSignalSpy savedSpy(m_controller, &EditorController::saved);
+    m_controller->save(QStringLiteral("A edited"), QStringLiteral("r1"));
+    const QJsonObject write = nextRequest();
+    QCOMPARE(method(write), kWriteFile);
+    QCOMPARE(reqPath(write), QStringLiteral("/foo/a.txt")); // left unanswered
+
+    m_controller->open(QStringLiteral("/foo/b.txt"));
+    const QJsonObject unwatch = nextRequest();
+    QCOMPARE(method(unwatch), kUnwatch);
+    const QJsonObject read = nextRequest();
+    QCOMPARE(method(read), kReadFile);
+    QCOMPARE(reqPath(read), QStringLiteral("/foo/b.txt"));
+    respondResult(reqId(read), {{"path", "/foo/b.txt"},
+                                {"encoding", "utf-8"},
+                                {"content", "B"},
+                                {"revision", "rB"},
+                                {"truncated", false}});
+    serveWatchThenNoRecovery();
+    QTRY_COMPARE(m_controller->fileState(), QStringLiteral("clean"));
+
+    respondResult(reqId(write), {{"path", "/foo/a.txt"}, {"revision", "r2"}});
+    QTest::qWait(100);
+
+    QCOMPARE(savedSpy.count(), 0);
+    QCOMPARE(m_controller->revision(), QStringLiteral("rB"));
+    QCOMPARE(m_controller->fileState(), QStringLiteral("clean"));
+    QVERIFY2(nextRequest(300).isEmpty(),
+             "a save for the previous file wrote against the new file");
+}
+
+// A ReadFileResult with truncated=true is a PREFIX of the file (remote/src/
+// files.ts only fills a requested byte window). The bytes on screen are not the
+// file's bytes, so writing them back would delete everything past the prefix —
+// the same reason a base64 (binary) read is not writable back (SPEC 8.2).
+void TstEditorController::truncatedReadIsNotWritableBack()
+{
+    makePair();
+
+    QSignalSpy saveErrorSpy(m_controller, &EditorController::saveError);
+
+    m_controller->ready();
+    m_controller->open(QStringLiteral("/foo/huge.log"));
+    const QJsonObject read = nextRequest();
+    QCOMPARE(method(read), kReadFile);
+    respondResult(reqId(read), {{"path", "/foo/huge.log"},
+                                {"encoding", "utf-8"},
+                                {"content", "the first window of a huge file"},
+                                {"revision", "r1"},
+                                {"truncated", true}});
+    QTRY_COMPARE(m_controller->readOnly(), true);
+
+    const QJsonObject watch = nextRequest();
+    QCOMPARE(method(watch), kWatch);
+    respondResult(reqId(watch), {{"subscriptionId", "sub1"}});
+    servePermissionStat(0644); // the FILE is writable; the BUFFER still is not
+
+    QTest::qWait(100);
+    QCOMPARE(m_controller->readOnly(), true);
+
+    m_controller->save(QStringLiteral("the first window of a huge file"),
+                       QStringLiteral("r1"));
+    QTRY_COMPARE(saveErrorSpy.count(), 1);
+    QVERIFY2(nextRequest(300).isEmpty(),
+             "a truncated buffer was written back over the whole file");
+}
+
+// The exact revision-mismatch payload the real server sends — RevisionMismatchError
+// in remote/src/files.ts attaches {path, expected, currentRevision} — must
+// short-circuit the fallback file.stat, and the Conflict it produces must then
+// survive the watch event for that same external write.
+void TstEditorController::conflictKeepsItsStateWhenTheWatchEventLands()
+{
+    makePair();
+    openClean(QStringLiteral("/foo/f.txt"), QStringLiteral("hello"),
+              QStringLiteral("r1"));
+
+    QSignalSpy conflictSpy(m_controller, &EditorController::saveConflict);
+
+    m_controller->save(QStringLiteral("stale write"), QStringLiteral("r1"));
+    const QJsonObject write = nextRequest();
+    QCOMPARE(method(write), kWriteFile);
+    respondError(reqId(write), ch::rpc::kRevisionMismatch,
+                 QStringLiteral("Revision mismatch for /foo/f.txt"),
+                 QJsonObject{{"path", "/foo/f.txt"},
+                             {"expected", "r1"},
+                             {"currentRevision", "r9"}});
+
+    QTRY_COMPARE(conflictSpy.count(), 1);
+    QCOMPARE(conflictSpy.at(0).at(0).toString(), QStringLiteral("r9"));
+    QCOMPARE(m_controller->fileState(), QStringLiteral("conflict"));
+    QVERIFY2(nextRequest(300).isEmpty(),
+             "the server had already named the current revision");
+    QCOMPARE(m_controller->revision(), QStringLiteral("r1"));
+
+    // The watch event for that same external write lands moments later. It says
+    // strictly less than the conflict already on screen (the buffer diverges) and
+    // must not overwrite it: the page's reload/overwrite affordance belongs to
+    // Conflict, and a pane that slid back to "externally modified" would report
+    // a refused save as a routine external change.
+    sendNotification(kWatchEvent, {{"subscriptionId", "sub1"},
+                                   {"path", "/foo/f.txt"},
+                                   {"event", "modified"},
+                                   {"revision", "r9"}});
+    QTest::qWait(100);
+    QCOMPARE(m_controller->fileState(), QStringLiteral("conflict"));
+    QVERIFY2(nextRequest(300).isEmpty(),
+             "a conflicted buffer was re-read over the user's refused edits");
+}
+
+// fileStateChanged is one-shot like every other bridge signal, so a page that
+// connects after the load missed all of them and renders an empty status bar
+// until the next transition. ready() replays the current state.
+void TstEditorController::lateReadyReplaysTheFileState()
+{
+    makePair(); // deliberately NO ready(): the page has not connected yet
+
+    m_controller->open(QStringLiteral("/foo/f.txt"));
+    const QJsonObject read = nextRequest();
+    QCOMPARE(method(read), kReadFile);
+    respondResult(reqId(read), {{"path", "/foo/f.txt"},
+                                {"encoding", "utf-8"},
+                                {"content", "hello"},
+                                {"revision", "r1"},
+                                {"truncated", false}});
+    serveWatchThenNoRecovery();
+    QTRY_COMPARE(m_controller->fileState(), QStringLiteral("clean"));
+
+    QSignalSpy stateSpy(m_controller, &EditorController::fileStateChanged);
+    m_controller->ready();
+
+    QTRY_COMPARE(stateSpy.count(), 1);
+    QCOMPARE(stateSpy.at(0).at(0).toString(), QStringLiteral("clean"));
+}
+
+// SPEC 8.3: a file.readFile with no `length` makes the server read the WHOLE
+// file into memory (remote/src/files.ts), which is then held again here and once
+// more as a JS string in the Monaco page — and, because files.ts derives
+// `truncated` from the requested length, such a read cannot even report that the
+// file was too big. Every read this controller issues must therefore be a
+// bounded window, on the first load and on every reload.
+void TstEditorController::readsAskForABoundedWindow()
+{
+    makePair();
+
+    m_controller->ready();
+    m_controller->open(QStringLiteral("/foo/f.txt"));
+
+    const QJsonObject read = nextRequest();
+    QCOMPARE(method(read), kReadFile);
+    QCOMPARE(reqOffset(read), qint64(0));
+    QCOMPARE(reqLength(read), qint64(EditorController::kMaxEditableReadBytes));
+    respondResult(reqId(read), {{"path", "/foo/f.txt"},
+                                {"encoding", "utf-8"},
+                                {"content", "hello"},
+                                {"revision", "r1"},
+                                {"truncated", false}});
+    serveWatchThenNoRecovery();
+    QTRY_COMPARE(m_controller->fileState(), QStringLiteral("clean"));
+
+    // The reload path is a second, independent call site and drifts silently if
+    // it is not pinned: an unbounded reload would re-read the whole file every
+    // time an external change lands.
+    m_controller->requestReload();
+    const QJsonObject reread = nextRequest();
+    QCOMPARE(method(reread), kReadFile);
+    QCOMPARE(reqOffset(reread), qint64(0));
+    QCOMPARE(reqLength(reread), qint64(EditorController::kMaxEditableReadBytes));
+    respondResult(reqId(reread), {{"path", "/foo/f.txt"},
+                                  {"encoding", "utf-8"},
+                                  {"content", "hello"},
+                                  {"revision", "r1"},
+                                  {"truncated", false}});
+    servePermissionStat();
+    QTRY_COMPARE(m_controller->fileState(), QStringLiteral("clean"));
+}
+
+// A read that came back truncated=true is a PREFIX of a file bigger than the
+// ceiling. "clean" asserts the buffer IS what the server has, which is false, so
+// the pane must not report it: the file settles in FileState::ReadOnly, the one
+// SPEC 8.2 state from which no save can be issued. The prefix is still shown —
+// that is what makes a huge log readable — but it can never be written back over
+// the tail nobody read.
+void TstEditorController::aTruncatedFileIsNotOpenedForEditing()
+{
+    makePair();
+
+    m_controller->ready();
+    m_controller->open(QStringLiteral("/foo/huge.log"));
+    const QJsonObject read = nextRequest();
+    QCOMPARE(method(read), kReadFile);
+    respondResult(reqId(read), {{"path", "/foo/huge.log"},
+                                {"encoding", "utf-8"},
+                                {"content", "the first window of a huge file"},
+                                {"revision", "r1"},
+                                {"truncated", true}});
+
+    const QJsonObject watch = nextRequest();
+    QCOMPARE(method(watch), kWatch);
+    respondResult(reqId(watch), {{"subscriptionId", "sub1"}});
+    servePermissionStat(0644); // the FILE is writable; the BUFFER still is not
+
+    QTRY_COMPARE(m_controller->fileState(), QStringLiteral("read_only"));
+    QCOMPARE(m_controller->readOnly(), true);
+    // No recovery probe: a buffer that can never be saved must not be offered
+    // unsaved changes it could never apply (SPEC 11.3).
+    QVERIFY2(nextRequest(300).isEmpty(),
+             "a truncated open went looking for a recovery snapshot");
+
+    // A transport drop must not launder the state back to "clean" on rebind:
+    // ReadOnly describes the bytes this pane holds, and a reconnect does not
+    // make a prefix whole.
+    reconnectTransport();
+    const QJsonObject rewatch = nextRequest();
+    QCOMPARE(method(rewatch), kWatch);
+    respondResult(reqId(rewatch), {{"subscriptionId", "sub2"}});
+    const QJsonObject stat = nextRequest();
+    QCOMPARE(method(stat), kStat);
+    respondResult(reqId(stat), {{"path", "/foo/huge.log"}, {"revision", "r1"}});
+    QTest::qWait(100);
+    QCOMPARE(m_controller->fileState(), QStringLiteral("read_only"));
+    QCOMPARE(m_controller->readOnly(), true);
+}
+
+// The file was DELETED while the session was down. No watchEvent exists for it
+// (the codeharbord that held the subscription died first), so the reconnect's
+// file.stat is the only chance to notice — and it comes back as an error. The
+// pane must stop claiming the pre-outage state, and the revision baseline must
+// SURVIVE, because it is what turns the user's next save into a guarded write
+// the server refuses instead of an unguarded create that silently resurrects the
+// file.
+void TstEditorController::deletedWhileDisconnectedStopsClaimingClean()
+{
+    makePair();
+    openClean(QStringLiteral("/foo/f.txt"), QStringLiteral("hello"),
+              QStringLiteral("r1"));
+
+    reconnectTransport();
+
+    const QJsonObject watch = nextRequest();
+    QCOMPARE(method(watch), kWatch);
+    respondResult(reqId(watch), {{"subscriptionId", "sub2"}});
+
+    // lstat fails: the remote service reports it as a plain internal error
+    // carrying the Node message (dispatch() in remote/src/codeharbord.ts).
+    const QJsonObject stat = nextRequest();
+    QCOMPARE(method(stat), kStat);
+    QCOMPARE(reqPath(stat), QStringLiteral("/foo/f.txt"));
+    respondError(reqId(stat), -32603,
+                 QStringLiteral("ENOENT: no such file or directory, lstat "
+                                "'/foo/f.txt'"));
+
+    // A clean buffer has nothing to lose, so the controller VERIFIES rather than
+    // guesses: it re-reads, and that read fails too.
+    const QJsonObject read = nextRequest();
+    QCOMPARE(method(read), kReadFile);
+    QCOMPARE(reqPath(read), QStringLiteral("/foo/f.txt"));
+    respondError(reqId(read), -32603,
+                 QStringLiteral("ENOENT: no such file or directory, open "
+                                "'/foo/f.txt'"));
+
+    QTRY_COMPARE(m_controller->fileState(), QStringLiteral("error"));
+    QCOMPARE(m_controller->revision(), QStringLiteral("r1"));
+
+    // And the baseline still guards: the page saves with the revision it was
+    // handed, so the write goes out GUARDED (not create-only) and the server
+    // refuses it. Recreating a deleted file stays an explicit user choice.
+    QSignalSpy conflictSpy(m_controller, &EditorController::saveConflict);
+    m_controller->save(QStringLiteral("hello, typed"), m_controller->revision());
+    const QJsonObject write = nextRequest();
+    QCOMPARE(method(write), kWriteFile);
+    QCOMPARE(reqExpectedRevision(write), QStringLiteral("r1"));
+    respondError(reqId(write), ch::rpc::kRevisionMismatch,
+                 QStringLiteral("File no longer exists: /foo/f.txt"));
+
+    // No currentRevision in the payload -> the controller stats, and that fails
+    // too, so the conflict is surfaced with an empty revision.
+    const QJsonObject conflictStat = nextRequest();
+    QCOMPARE(method(conflictStat), kStat);
+    respondError(reqId(conflictStat), -32603, QStringLiteral("ENOENT"));
+
+    QTRY_COMPARE(conflictSpy.count(), 1);
+    QCOMPARE(conflictSpy.at(0).at(0).toString(), QString());
+    QCOMPARE(m_controller->fileState(), QStringLiteral("conflict"));
+}
+
+// Same vanished file, but the buffer holds unsaved work. The reconciliation may
+// FLAG the divergence and must never re-read over it (SPEC 8.7) — a failed read
+// would be no excuse to throw the user's only copy of those edits away.
+void TstEditorController::deletedWhileDisconnectedWithUnsavedWorkIsOnlyFlagged()
+{
+    makePair();
+    openClean(QStringLiteral("/foo/f.txt"), QStringLiteral("hello"),
+              QStringLiteral("r1"));
+
+    m_controller->reportContent(QStringLiteral("the user's unsaved work"));
+    const QJsonObject snapshot = nextRequest();
+    QCOMPARE(method(snapshot), kWriteFile);
+    QVERIFY(reqPath(snapshot).contains(QStringLiteral(".codeharbor-recovery")));
+    respondResult(reqId(snapshot),
+                  {{"path", reqPath(snapshot)}, {"revision", "rec1"}});
+    QCOMPARE(m_controller->fileState(), QStringLiteral("modified"));
+
+    QSignalSpy contentSpy(m_controller, &EditorController::contentLoaded);
+    reconnectTransport();
+
+    const QJsonObject watch = nextRequest();
+    QCOMPARE(method(watch), kWatch);
+    respondResult(reqId(watch), {{"subscriptionId", "sub2"}});
+
+    const QJsonObject stat = nextRequest();
+    QCOMPARE(method(stat), kStat);
+    respondError(reqId(stat), -32603,
+                 QStringLiteral("ENOENT: no such file or directory, lstat "
+                                "'/foo/f.txt'"));
+
+    QTRY_COMPARE(m_controller->fileState(),
+                 QStringLiteral("externally_modified"));
+    QVERIFY2(nextRequest(300).isEmpty(),
+             "a dirty buffer was re-read over the user's unsaved edits");
+    QCOMPARE(contentSpy.count(), 0);
+    QCOMPARE(m_controller->revision(), QStringLiteral("r1"));
 }
 
 QTEST_GUILESS_MAIN(TstEditorController)

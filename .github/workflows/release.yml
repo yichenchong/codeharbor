@@ -11,6 +11,11 @@ on:
         description: "Git ref to build"
         required: false
 
+# Only `publish` needs write access, and it grants itself `contents: write`
+# below. Everything else (three OS builders + the remote packager) is read-only.
+permissions:
+  contents: read
+
 env:
   # Must be >= the CMake floor (6.9). 6.8.1 predates
   # QQuickWebEngineProfile(storageName, parent) and does not compile.
@@ -46,8 +51,12 @@ jobs:
           modules: qtwebengine qtwebchannel qtpositioning qtserialport
           cache: true
 
+      # Pinned, not `@latest`: get-cmake's `latest` tag moves with every CMake
+      # release, so a floating ref silently changes the CMake that builds the
+      # published artifacts. v4.2.3 is the version docs/DEVELOPMENT.md records as
+      # verified for this tree; bump it deliberately, together with that table.
       - name: Install CMake + Ninja
-        uses: lukka/get-cmake@latest
+        uses: lukka/get-cmake@v4.2.3
 
       # --- libssh per platform -------------------------------------------------
       - name: Install libssh (Linux)
@@ -89,6 +98,10 @@ jobs:
         shell: pwsh
         run: |
           echo "v=$env:ImageVersion" >> $env:GITHUB_OUTPUT
+          # The vcpkg root is an image env var, so it is not reachable from the
+          # `env` expression context either - capture it here so the cache step
+          # and the install step below cannot drift apart.
+          echo "vcpkg=$env:VCPKG_INSTALLATION_ROOT" >> $env:GITHUB_OUTPUT
           $pin = (Get-Content packaging/vcpkg-ports/libssh/vcpkg.json | ConvertFrom-Json).version
           echo "libssh=$pin" >> $env:GITHUB_OUTPUT
 
@@ -96,7 +109,7 @@ jobs:
         if: matrix.name == 'windows'
         uses: actions/cache@v4
         with:
-          path: C:\vcpkg\installed
+          path: ${{ steps.imgver.outputs.vcpkg }}\installed
           key: vcpkg-libssh-${{ steps.imgver.outputs.libssh }}-x64-windows-${{ steps.imgver.outputs.v }}
 
       - name: Install libssh via vcpkg (Windows)
@@ -136,9 +149,11 @@ jobs:
         if: matrix.name == 'windows'
         uses: ilammy/msvc-dev-cmd@v1
 
-      # The Monaco bundle is a gitignored artifact embedded as a Qt resource at
-      # CMake CONFIGURE time, so it must exist before the configure step below or
-      # the shipped binary's editor pane has no page to load.
+      # The Monaco and xterm.js bundles are gitignored artifacts embedded as Qt
+      # resources at CMake CONFIGURE time. src/qml/CMakeLists.txt raises a
+      # FATAL_ERROR when they are missing and cannot be built, so this step is
+      # what lets the configure step below run at all - and what keeps a shipped
+      # binary from having editor/terminal panes with no page to load.
       - uses: actions/setup-node@v4
         with:
           node-version: "24"

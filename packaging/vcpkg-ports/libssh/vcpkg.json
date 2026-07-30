@@ -31,10 +31,10 @@
   ],
   "features": {
     "pcap": {
-      "description": "SSH server support"
+      "description": "Pcap generation support"
     },
     "server": {
-      "description": "Pcap generation support"
+      "description": "SSH server support"
     },
     "zlib": {
       "description": "zlib compression support",

@@ -156,6 +156,15 @@ void TstLiveTerminal::initTestCase()
 
     connect(&m_controller, &TerminalController::flushReady, this,
             [this](const QByteArray& batch) { m_out += batch; });
+
+    // This gate drives the SPEC 5.6 states BY HAND and deliberately parks the
+    // pane in AttachingTmux while it types into it and waits for remote answers
+    // — minutes, in the worst case it budgets for. That is exactly the shape the
+    // controller's attach watchdog exists to end (a pane that is attaching and
+    // producing nothing), so the bound is switched off here: what it protects is
+    // pinned by tst_terminalcontroller, and leaving it armed would let a slow
+    // fixture turn a passing run into a pane that reported Error halfway.
+    m_controller.setAttachTimeoutMs(0);
 }
 
 void TstLiveTerminal::cleanupTestCase()

@@ -1,8 +1,12 @@
 #include <QtTest/QtTest>
 
 #include <QAbstractItemModelTester>
+#include <QFile>
 #include <QJsonArray>
 #include <QJsonObject>
+#include <QRegularExpression>
+#include <QSet>
+#include <QStringList>
 
 #include <cmath>
 #include <limits>
@@ -51,6 +55,12 @@ private slots:
     void sessionsModelDataOnInvalidIndex();
     void sessionsModelSetGroupsTwiceResets();
     void aggregateRowStateAllFalseIsDisconnected();
+    void aggregateRowStateCoversEveryInputCombination();
+    void stateStringsArePinnedWireValues();
+    void sessionsModelRoleNamesCoverEveryServedRole();
+    void splitTreeRejectsNonObjectChildAndNonNumericRatio();
+    void startingAgentCountsAsRunning();
+    void agentStateWireWordsMatchRemoteEventsTs();
 };
 
 // Group -> DevSession -> viewer + terminal panes tree.
@@ -662,6 +672,299 @@ void TstModels::aggregateRowStateAllFalseIsDisconnected()
     QCOMPARE(static_cast<int>(SessionsModel::aggregateSessionState(
                  {terminal(TerminalState::Disconnected, AgentState::WaitingInput)})),
              static_cast<int>(SessionRowState::WaitingForInput));
+}
+
+// The precedence reducer has five boolean inputs, so its behaviour is fully
+// described by 32 cases; the scenario tests above only sample a handful of them
+// through SessionsModel::aggregateSessionState. Enumerate all 32 against an
+// independent restatement of the SPEC 4.2 order, written lowest-priority-first
+// so it shares no structure with the implementation's highest-priority-first
+// early returns. Any swapped pair of levels fails here.
+void TstModels::aggregateRowStateCoversEveryInputCombination()
+{
+    for (int mask = 0; mask < 32; ++mask) {
+        const bool anyError = (mask & 1) != 0;
+        const bool anyWaitingInput = (mask & 2) != 0;
+        const bool anyRunning = (mask & 4) != 0;
+        const bool anyFinishedUnseen = (mask & 8) != 0;
+        const bool anyConnected = (mask & 16) != 0;
+
+        SessionRowState expected = SessionRowState::Disconnected;
+        if (anyConnected) expected = SessionRowState::Idle;
+        if (anyFinishedUnseen) expected = SessionRowState::FinishedUnseen;
+        if (anyRunning) expected = SessionRowState::Running;
+        if (anyWaitingInput) expected = SessionRowState::WaitingForInput;
+        if (anyError) expected = SessionRowState::Error;
+
+        const SessionRowState got = aggregateRowState(
+                anyError, anyWaitingInput, anyRunning, anyFinishedUnseen, anyConnected);
+        QVERIFY2(got == expected,
+                 qPrintable(QStringLiteral("mask %1: got %2, expected %3")
+                                    .arg(mask)
+                                    .arg(toString(got), toString(expected))));
+    }
+
+    // The enum's declaration order IS the priority order (lower ordinal = higher
+    // priority), which the sidebar's colour/glyph table in SessionRow.qml relies
+    // on. Reordering the enumerators would silently repaint every row.
+    QVERIFY(static_cast<int>(SessionRowState::Error)
+            < static_cast<int>(SessionRowState::WaitingForInput));
+    QVERIFY(static_cast<int>(SessionRowState::WaitingForInput)
+            < static_cast<int>(SessionRowState::Running));
+    QVERIFY(static_cast<int>(SessionRowState::Running)
+            < static_cast<int>(SessionRowState::FinishedUnseen));
+    QVERIFY(static_cast<int>(SessionRowState::FinishedUnseen)
+            < static_cast<int>(SessionRowState::Idle));
+    QVERIFY(static_cast<int>(SessionRowState::Idle)
+            < static_cast<int>(SessionRowState::Disconnected));
+}
+
+// These strings cross process and language boundaries, so they are contracts and
+// not display text: toString(AgentState) must match the AGENT_STATES union the
+// remote agent-status bridge emits (remote/src/events.ts), toString(TerminalState)
+// is what TerminalBridge::connectionState hands the xterm.js page and
+// TerminalPaneView.qml compares against, and toString(FileState) is what
+// EditorController's fileState property publishes to the Monaco page. Renaming
+// any of them breaks a consumer that this test suite cannot see, so the tables
+// are pinned here.
+void TstModels::stateStringsArePinnedWireValues()
+{
+    QCOMPARE(toString(TerminalState::Unloaded), QStringLiteral("unloaded"));
+    QCOMPARE(toString(TerminalState::Connecting), QStringLiteral("connecting"));
+    QCOMPARE(toString(TerminalState::Authenticating), QStringLiteral("authenticating"));
+    QCOMPARE(toString(TerminalState::OpeningChannel), QStringLiteral("opening_channel"));
+    QCOMPARE(toString(TerminalState::AttachingTmux), QStringLiteral("attaching_tmux"));
+    QCOMPARE(toString(TerminalState::Ready), QStringLiteral("ready"));
+    QCOMPARE(toString(TerminalState::Disconnected), QStringLiteral("disconnected"));
+    QCOMPARE(toString(TerminalState::Reconnecting), QStringLiteral("reconnecting"));
+    QCOMPARE(toString(TerminalState::Error), QStringLiteral("error"));
+
+    QCOMPARE(toString(AgentState::Starting), QStringLiteral("starting"));
+    QCOMPARE(toString(AgentState::Running), QStringLiteral("running"));
+    QCOMPARE(toString(AgentState::WaitingInput), QStringLiteral("waiting_input"));
+    QCOMPARE(toString(AgentState::IdleUnseen), QStringLiteral("idle_unseen"));
+    QCOMPARE(toString(AgentState::Idle), QStringLiteral("idle"));
+    QCOMPARE(toString(AgentState::Error), QStringLiteral("error"));
+    QCOMPARE(toString(AgentState::Stopped), QStringLiteral("stopped"));
+    QCOMPARE(toString(AgentState::Unknown), QStringLiteral("unknown"));
+
+    QCOMPARE(toString(SessionRowState::Error), QStringLiteral("error"));
+    QCOMPARE(toString(SessionRowState::WaitingForInput), QStringLiteral("waiting_for_input"));
+    QCOMPARE(toString(SessionRowState::Running), QStringLiteral("running"));
+    QCOMPARE(toString(SessionRowState::FinishedUnseen), QStringLiteral("finished_unseen"));
+    QCOMPARE(toString(SessionRowState::Idle), QStringLiteral("idle"));
+    QCOMPARE(toString(SessionRowState::Disconnected), QStringLiteral("disconnected"));
+
+    QCOMPARE(toString(FileState::Loading), QStringLiteral("loading"));
+    QCOMPARE(toString(FileState::Clean), QStringLiteral("clean"));
+    QCOMPARE(toString(FileState::Modified), QStringLiteral("modified"));
+    QCOMPARE(toString(FileState::Saving), QStringLiteral("saving"));
+    QCOMPARE(toString(FileState::Saved), QStringLiteral("saved"));
+    QCOMPARE(toString(FileState::ExternallyModified), QStringLiteral("externally_modified"));
+    QCOMPARE(toString(FileState::Conflict), QStringLiteral("conflict"));
+    QCOMPARE(toString(FileState::ReadOnly), QStringLiteral("read_only"));
+    QCOMPARE(toString(FileState::Error), QStringLiteral("error"));
+    QCOMPARE(toString(FileState::Disconnected), QStringLiteral("disconnected"));
+
+    // Within one enum every name must be distinct: two enumerators sharing a
+    // string make the states indistinguishable to the page reading them, which a
+    // copy-paste in the switch would otherwise produce silently.
+    const auto allDistinct = [](const QStringList &names) {
+        return QSet<QString>(names.cbegin(), names.cend()).size() == names.size();
+    };
+    QVERIFY(allDistinct({toString(TerminalState::Unloaded), toString(TerminalState::Connecting),
+                         toString(TerminalState::Authenticating),
+                         toString(TerminalState::OpeningChannel),
+                         toString(TerminalState::AttachingTmux), toString(TerminalState::Ready),
+                         toString(TerminalState::Disconnected),
+                         toString(TerminalState::Reconnecting), toString(TerminalState::Error)}));
+    QVERIFY(allDistinct({toString(AgentState::Starting), toString(AgentState::Running),
+                         toString(AgentState::WaitingInput), toString(AgentState::IdleUnseen),
+                         toString(AgentState::Idle), toString(AgentState::Error),
+                         toString(AgentState::Stopped), toString(AgentState::Unknown)}));
+    QVERIFY(allDistinct({toString(SessionRowState::Error),
+                         toString(SessionRowState::WaitingForInput),
+                         toString(SessionRowState::Running),
+                         toString(SessionRowState::FinishedUnseen),
+                         toString(SessionRowState::Idle),
+                         toString(SessionRowState::Disconnected)}));
+    QVERIFY(allDistinct({toString(FileState::Loading), toString(FileState::Clean),
+                         toString(FileState::Modified), toString(FileState::Saving),
+                         toString(FileState::Saved), toString(FileState::ExternallyModified),
+                         toString(FileState::Conflict), toString(FileState::ReadOnly),
+                         toString(FileState::Error), toString(FileState::Disconnected)}));
+}
+
+// roleNames() is the ONLY way QML can reach a role: a role that data() answers
+// but roleNames() does not name is unreachable from the sidebar delegates, and a
+// name change breaks the delegates' bindings. Pin both directions, plus the fact
+// that a role a given row kind does not carry yields an INVALID QVariant rather
+// than a default-constructed one a view would render as real data.
+void TstModels::sessionsModelRoleNamesCoverEveryServedRole()
+{
+    SessionsModel model;
+    SessionRow s;
+    s.session.id = DevSessionId{QStringLiteral("s1")};
+    s.session.name = QStringLiteral("S");
+    s.subtitle = QStringLiteral("sub");
+    GroupRow g;
+    g.group.id = GroupId{QStringLiteral("g1")};
+    g.group.name = QStringLiteral("G");
+    g.sessions = {s};
+    model.setGroups({g});
+
+    const QModelIndex group = model.index(0, 0);
+    const QModelIndex session = model.index(0, 0, group);
+    const QHash<int, QByteArray> names = model.roleNames();
+
+    const QVector<int> served = {Qt::DisplayRole,
+                                 SessionsModel::NameRole,
+                                 SessionsModel::SubtitleRole,
+                                 SessionsModel::RowStateRole,
+                                 SessionsModel::IsGroupRole,
+                                 SessionsModel::CollapsedRole,
+                                 SessionsModel::IdRole,
+                                 SessionsModel::GroupIdRole};
+    QCOMPARE(names.size(), served.size());
+    for (int role : served) {
+        QVERIFY2(names.contains(role), "roleNames() omits a role that data() serves");
+        QVERIFY2(model.data(group, role).isValid() || model.data(session, role).isValid(),
+                 "roleNames() names a role no row kind answers");
+    }
+
+    // The exact names SessionsSidebar.qml, GroupHeader.qml and SessionRow.qml bind to.
+    QCOMPARE(names.value(SessionsModel::NameRole), QByteArrayLiteral("name"));
+    QCOMPARE(names.value(SessionsModel::SubtitleRole), QByteArrayLiteral("subtitle"));
+    QCOMPARE(names.value(SessionsModel::RowStateRole), QByteArrayLiteral("rowState"));
+    QCOMPARE(names.value(SessionsModel::IsGroupRole), QByteArrayLiteral("isGroup"));
+    QCOMPARE(names.value(SessionsModel::CollapsedRole), QByteArrayLiteral("collapsed"));
+    QCOMPARE(names.value(SessionsModel::IdRole), QByteArrayLiteral("itemId"));
+    QCOMPARE(names.value(SessionsModel::GroupIdRole), QByteArrayLiteral("groupId"));
+
+    // Group rows carry no subtitle or aggregate state; session rows carry no
+    // collapsed flag; nobody serves a role the model never declared.
+    QVERIFY(!model.data(group, SessionsModel::SubtitleRole).isValid());
+    QVERIFY(!model.data(group, SessionsModel::RowStateRole).isValid());
+    QVERIFY(!model.data(session, SessionsModel::CollapsedRole).isValid());
+    QVERIFY(!model.data(group, Qt::DecorationRole).isValid());
+    QVERIFY(!model.data(session, Qt::DecorationRole).isValid());
+
+    // Qt::DisplayRole is an alias for the row's name on both row kinds.
+    QCOMPARE(model.data(group, Qt::DisplayRole).toString(), QStringLiteral("G"));
+    QCOMPARE(model.data(session, Qt::DisplayRole).toString(), QStringLiteral("S"));
+}
+
+// Two rejection branches in SplitTree.cpp's parser that no other case reaches: a
+// children[] entry that is not a JSON object, and a ratios[] entry that is not a
+// number. Both can only come from corrupt or hostile stored/remote data, and both
+// must sink the whole tree rather than being coerced into something plausible.
+void TstModels::splitTreeRejectsNonObjectChildAndNonNumericRatio()
+{
+    QJsonObject leaf;
+    leaf[QStringLiteral("type")] = QStringLiteral("leaf");
+    leaf[QStringLiteral("paneId")] = QStringLiteral("A");
+
+    // children: [leaf, 42] - a number where a subtree belongs.
+    QJsonObject numericChild;
+    numericChild[QStringLiteral("type")] = QStringLiteral("split");
+    numericChild[QStringLiteral("orientation")] = QStringLiteral("horizontal");
+    numericChild[QStringLiteral("children")] = QJsonArray{leaf, 42};
+    numericChild[QStringLiteral("ratios")] = QJsonArray{0.5, 0.5};
+    QVERIFY(SplitNode::fromJson(numericChild) == SplitNode{});
+
+    // ratios: [0.5, "0.5"] - a string where a number belongs. A silently
+    // coerced 0 here would divide the pane geometry by zero.
+    QJsonObject stringRatio;
+    stringRatio[QStringLiteral("type")] = QStringLiteral("split");
+    stringRatio[QStringLiteral("orientation")] = QStringLiteral("horizontal");
+    stringRatio[QStringLiteral("children")] = QJsonArray{leaf, leaf};
+    stringRatio[QStringLiteral("ratios")] =
+            QJsonArray{0.5, QStringLiteral("0.5")};
+    QVERIFY(SplitNode::fromJson(stringRatio) == SplitNode{});
+
+    // ratios: [0.5, true] - a boolean is not a number either.
+    QJsonObject boolRatio = stringRatio;
+    boolRatio[QStringLiteral("ratios")] = QJsonArray{0.5, true};
+    QVERIFY(SplitNode::fromJson(boolRatio) == SplitNode{});
+}
+
+// An agent that has been asked to start but has not reported Running yet is
+// still work in flight, so the sidebar shows Running rather than dropping to
+// Idle for the gap. Nothing else covers the Starting -> Running mapping in
+// SessionsModel::aggregateSessionState.
+void TstModels::startingAgentCountsAsRunning()
+{
+    QCOMPARE(static_cast<int>(SessionsModel::aggregateSessionState(
+                 {terminal(TerminalState::Ready, AgentState::Starting)})),
+             static_cast<int>(SessionRowState::Running));
+
+    // It outranks a sibling terminal that has finished with unseen output...
+    QCOMPARE(static_cast<int>(SessionsModel::aggregateSessionState(
+                 {terminal(TerminalState::Ready, AgentState::Starting),
+                  terminal(TerminalState::Ready, AgentState::IdleUnseen)})),
+             static_cast<int>(SessionRowState::Running));
+
+    // ...and is outranked by one waiting for the user.
+    QCOMPARE(static_cast<int>(SessionsModel::aggregateSessionState(
+                 {terminal(TerminalState::Ready, AgentState::Starting),
+                  terminal(TerminalState::Ready, AgentState::WaitingInput)})),
+             static_cast<int>(SessionRowState::WaitingForInput));
+}
+
+// The AgentState ordinals are what actually cross into the user interface —
+// ch::AgentStatusMonitor::stateFor() returns an int and its agentStateChanged
+// signal carries an int — and the wire words are what the remote agent-status
+// bridge sends. Both sides therefore have to agree on the same words in the same
+// order, and the TypeScript half of that agreement lives in a file no C++
+// compiler ever looks at (remote/src/events.ts). So read it here and compare.
+//
+// This fails if either side is reordered, if a state is added to only one side,
+// or if a word is spelled differently. Note it deliberately checks the file's
+// literal AGENT_STATES array rather than a copy pinned in this test: a copy
+// would only re-state what stateStringsArePinnedWireValues() already checks and
+// could not notice an edit made on the TypeScript side.
+void TstModels::agentStateWireWordsMatchRemoteEventsTs()
+{
+    // CH_REPO_ROOT is the configure-time source directory (see this directory's
+    // CMakeLists.txt), the same mechanism tst_workspacedb uses to reach
+    // repository files. A missing file is a hard failure, never a silent skip:
+    // the whole point of this test is that it cannot be quietly disabled.
+    QFile events(QStringLiteral(CH_REPO_ROOT "/remote/src/events.ts"));
+    QVERIFY2(events.open(QIODevice::ReadOnly | QIODevice::Text),
+             qPrintable(QStringLiteral("cannot open %1: %2")
+                                .arg(events.fileName(), events.errorString())));
+    const QString source = QString::fromUtf8(events.readAll());
+
+    // Cut out exactly the AGENT_STATES array literal, then take the quoted words
+    // inside it in order. Anchoring on both the opening and the closing bracket
+    // keeps unrelated string literals elsewhere in the file out of the list.
+    // Escaped rather than raw string literals on purpose: moc's own preprocessor
+    // does not understand a raw string used as a macro argument and fails with
+    // "missing ')' in macro usage" on QStringLiteral(R"(...)").
+    static const QRegularExpression arrayRe(
+            QStringLiteral("export const AGENT_STATES\\s*=\\s*\\[([^\\]]*)\\]"));
+    const QRegularExpressionMatch arrayMatch = arrayRe.match(source);
+    QVERIFY2(arrayMatch.hasMatch(),
+             qPrintable(QStringLiteral("no AGENT_STATES array literal in %1")
+                                .arg(events.fileName())));
+
+    static const QRegularExpression wordRe(QStringLiteral("\"([^\"]*)\""));
+    QStringList remoteWords;
+    QRegularExpressionMatchIterator it = wordRe.globalMatch(arrayMatch.captured(1));
+    while (it.hasNext())
+        remoteWords << it.next().captured(1);
+    QVERIFY2(!remoteWords.isEmpty(),
+             qPrintable(QStringLiteral("AGENT_STATES in %1 parsed as empty")
+                                .arg(events.fileName())));
+
+    // Every C++ enumerator, walked by ordinal so the comparison covers order and
+    // count as well as spelling.
+    QStringList cppWords;
+    cppWords.reserve(kAgentStateCount);
+    for (int i = 0; i < kAgentStateCount; ++i)
+        cppWords << toString(static_cast<AgentState>(i));
+
+    QCOMPARE(cppWords, remoteWords);
 }
 
 QTEST_GUILESS_MAIN(TstModels)

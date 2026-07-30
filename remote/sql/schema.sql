@@ -9,7 +9,18 @@
 --   * INTEGER for positions, booleans (0/1), and timestamps (unix epoch ms).
 --   * Every domain table carries `server_id` (SPEC 3.5) so multi-server support
 --     can be added later without a schema break.
+--
+-- Indexes are NOT here: they live in indexes.sql, which openWorkspace() applies
+-- on every open. This file is applied only by the migration runner, so an index
+-- added here would never reach a database that is already at the current schema
+-- version. See indexes.sql for the full reasoning.
 
+-- Foreign keys are OFF by default in SQLite and the setting is per CONNECTION,
+-- not stored in the file, so this line only covers connections that execute this
+-- script (the schema tests). It is also a no-op inside a transaction, and the
+-- migration runner applies this DDL in one — openWorkspace() in
+-- remote/src/workspace.ts therefore sets the same pragma itself, before
+-- migrating, and that is what every runtime connection actually relies on.
 PRAGMA foreign_keys = ON;
 
 -- Schema versioning ---------------------------------------------------------

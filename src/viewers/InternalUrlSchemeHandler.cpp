@@ -14,14 +14,9 @@
 #include <QUuid>
 #include <QWebEngineUrlRequestJob>
 
-namespace ch {
+#include <utility>
 
-namespace {
-// Cap the bytes fetched for a single inline viewer render. A file larger than
-// this is failed (never truncated-and-served) so the RPC frame stays bounded
-// and WebEngine never receives partial content as if it were complete.
-constexpr int kMaxInlineReadBytes = 8 * 1024 * 1024;
-} // namespace
+namespace ch {
 
 QString InternalUrlMap::scheme()
 {
@@ -177,7 +172,26 @@ void InternalUrlSchemeHandler::requestStarted(QWebEngineUrlRequestJob *job)
     if (!job)
         return;
 
+    // The privileged origin is strictly read-only. A rendered document could
+    // still submit a form or issue a non-GET fetch; answer only GET rather than
+    // silently treating every method as a read.
+    if (job->requestMethod().compare(QByteArrayLiteral("GET"), Qt::CaseInsensitive)
+        != 0) {
+        job->fail(QWebEngineUrlRequestJob::RequestDenied);
+        return;
+    }
+
     const QUrl requestUrl = job->requestUrl();
+    // The one documented shape is codeharbor-internal://file/<id> (SPEC 7.4).
+    // Reject any other authority instead of accepting it as an alias for
+    // "file": a differing host is a different web origin, and serving the same
+    // bytes under several origins would hand a rendered page extra origins to
+    // play same-origin games with.
+    if (requestUrl.host().compare(QLatin1String("file"), Qt::CaseInsensitive) != 0) {
+        job->fail(QWebEngineUrlRequestJob::UrlNotFound);
+        return;
+    }
+
     QString id = requestUrl.path();
     if (id.startsWith(QLatin1Char('/')))
         id = id.mid(1);
@@ -222,10 +236,25 @@ void InternalUrlSchemeHandler::requestStarted(QWebEngineUrlRequestJob *job)
             }
             const QString encoding = obj.value(QStringLiteral("encoding")).toString();
             const QString content = obj.value(QStringLiteral("content")).toString();
-            const QByteArray bytes =
-                encoding == QLatin1String("base64")
-                    ? QByteArray::fromBase64(content.toUtf8())
-                    : content.toUtf8();
+            QByteArray bytes;
+            if (encoding == QLatin1String("base64")) {
+                // Strict decode. QByteArray::fromBase64() silently yields an
+                // empty/garbled result for a malformed payload, which would be
+                // served to Chromium as a successful but empty document; abort
+                // instead so the viewer reports a failure.
+                QByteArray encoded = content.toUtf8();
+                const auto decoded = QByteArray::fromBase64Encoding(
+                    std::move(encoded),
+                    QByteArray::Base64Encoding
+                        | QByteArray::AbortOnBase64DecodingErrors);
+                if (!decoded) {
+                    guard->fail(QWebEngineUrlRequestJob::RequestFailed);
+                    return;
+                }
+                bytes = *decoded;
+            } else {
+                bytes = content.toUtf8();
+            }
 
             auto *buffer = new QBuffer(guard);
             buffer->setData(bytes);
@@ -249,8 +278,20 @@ void InternalUrlSchemeHandler::requestStarted(QWebEngineUrlRequestJob *job)
                     QByteArrayLiteral("Content-Security-Policy"),
                     QByteArrayLiteral("default-src 'none'; sandbox"));
             }
+            // Declare the encoding for textual payloads. The bytes are the raw
+            // remote file bytes, served as UTF-8 by the file service; without an
+            // explicit charset Chromium falls back to a locale-derived guess and
+            // a UTF-8 file with non-ASCII characters renders as mojibake. The
+            // CSP gate above deliberately keys off the bare type, and
+            // isActiveContentMime() strips any parameter anyway.
+            const bool textual = mime.startsWith(QByteArrayLiteral("text/"))
+                || mime.endsWith(QByteArrayLiteral("+xml"))
+                || mime == QByteArrayLiteral("application/xml")
+                || mime == QByteArrayLiteral("application/json");
+            const QByteArray contentType =
+                textual ? mime + QByteArrayLiteral("; charset=utf-8") : mime;
             guard->setAdditionalResponseHeaders(headers);
-            guard->reply(mime, buffer);
+            guard->reply(contentType, buffer);
         });
 }
 

@@ -63,10 +63,16 @@ Rectangle {
                                                   ? String(app.activeSessionId) : ""
 
     // Same three-way encoding as ConnectSheet's chip: colour, glyph and word.
+    // Every word ch::AppController::setConnectionState() publishes needs a case
+    // here — including "credential", which it enters while the connect attempt
+    // is parked on a password or key passphrase. Falling through to the default
+    // painted that as a grey "Not connected", i.e. the footer denied there was
+    // anything to answer while the sheet was asking for it.
     function linkColor(state) {
         switch (state) {
         case "connected": return "#a6e3a1";
         case "connecting":
+        case "credential":
         case "hostkey": return "#f9e2af";
         case "reconnecting": return "#fab387";
         case "failed": return "#f38ba8";
@@ -78,6 +84,7 @@ Rectangle {
         case "connected": return "\u2713";
         case "connecting": return "\u2219";
         case "hostkey": return "?";
+        case "credential": return "*"; // the password mask
         case "reconnecting": return "\u21bb";
         case "failed": return "\u2715";
         default: return "\u2013";
@@ -88,6 +95,7 @@ Rectangle {
         case "connected": return qsTr("Connected");
         case "connecting": return qsTr("Connecting\u2026");
         case "hostkey": return qsTr("Host key needs approval");
+        case "credential": return qsTr("Password or passphrase needed");
         case "reconnecting": return qsTr("Reconnecting\u2026 rows may be stale");
         case "failed": return qsTr("Connection failed");
         default: return qsTr("Not connected");
@@ -663,7 +671,10 @@ Rectangle {
                 anchors.verticalCenter: parent.verticalCenter
                 width: 12
                 height: 12
-                radius: sidebar.linkState === "hostkey" || sidebar.linkState === "failed" ? 2 : 6
+                // Squared off for every state that is waiting on the user, the
+                // same silhouette rule ConnectSheet's chip uses.
+                radius: sidebar.linkState === "hostkey" || sidebar.linkState === "credential"
+                        || sidebar.linkState === "failed" ? 2 : 6
                 color: sidebar.linkColor(sidebar.linkState)
 
                 Label {
@@ -792,19 +803,29 @@ Rectangle {
         }
     }
 
-    Dialog {
+    AppDialog {
         id: newGroupDialog
+        objectName: "newGroupDialog"
         title: qsTr("New group")
         modal: true
         standardButtons: Dialog.Ok | Dialog.Cancel
         anchors.centerIn: Overlay.overlay
 
         // Reset the field each open so a cancelled edit doesn't resurface as
-        // stale text next time (imperative input breaks the initial binding).
-        onOpened: newGroupField.text = qsTr("New group")
+        // stale text next time (imperative input breaks the initial binding),
+        // then SELECT it: assigning `text` leaves the cursor at the end, so a
+        // user who opens this and types "api" was getting "New groupapi".
+        // Selecting the placeholder default makes the first keystroke replace
+        // it, which is what every other pre-filled field here now does too.
+        onOpened: {
+            newGroupField.text = qsTr("New group");
+            newGroupField.forceActiveFocus();
+            newGroupField.selectAll();
+        }
 
         TextField {
             id: newGroupField
+            objectName: "newGroupField"
             width: 240
             placeholderText: qsTr("Group name")
             text: qsTr("New group")
@@ -814,7 +835,6 @@ Rectangle {
             var groupName = newGroupField.text.length > 0
                             ? newGroupField.text : qsTr("New group");
             app.createGroup(groupName);
-            newGroupField.text = qsTr("New group");
         }
     }
 
@@ -828,7 +848,7 @@ Rectangle {
         newSessionDialog.open();
     }
 
-    Dialog {
+    AppDialog {
         id: newSessionDialog
         objectName: "newSessionDialog"
         title: qsTr("New Dev Session")
@@ -836,10 +856,13 @@ Rectangle {
         standardButtons: Dialog.Ok | Dialog.Cancel
         anchors.centerIn: Overlay.overlay
 
+        // Same rule as the group dialog: pre-filled name, selected so typing
+        // replaces it instead of appending to it.
         onOpened: {
             newSessionField.text = qsTr("New session");
             newSessionRepoField.text = "";
             newSessionField.forceActiveFocus();
+            newSessionField.selectAll();
         }
 
         ColumnLayout {

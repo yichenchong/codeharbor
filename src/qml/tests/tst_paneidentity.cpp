@@ -46,6 +46,7 @@
 #include <QQuickItem>
 #include <QQuickWindow>
 #include <QSet>
+#include <QSignalSpy>
 #include <QStandardPaths>
 #include <QString>
 #include <QStringList>
@@ -289,6 +290,11 @@ private slots:
     // The one that decides whether any of the above is worth wiring: a click
     // INSIDE the live web page, not on the pane's chrome.
     void aClickInsideTheLivePageReportsFocusAndStillReachesThePage();
+
+    // CONTENT (SPEC 4.5). Geometry alone is not a restored Dev Session: the
+    // region has to tell the host WHAT each pane has open, or reopening a
+    // session brings back the right split with a set of blank panes in it.
+    void openingAFileInAPaneIsReportedToTheHost();
 
 private:
     QObject *openRegion(const QString &file, const QVariantMap &node, bool terminal);
@@ -796,6 +802,35 @@ void TstPaneIdentity::closingTheFocusedPaneClearsTheFocus()
     // Keeping the closed pane's id would aim the next split at a pane that does
     // not exist, and the host would go on persisting it.
     QCOMPARE(m_region->property("focusedPaneId").toString(), QString());
+}
+
+// The host persists this report as the leaf's url (SessionLayouts::setPaneUrl),
+// which is the whole mechanism behind "reopening a Dev Session shows the files I
+// had open". Nothing else in the suite exercises it, and a broken wire is
+// invisible: the pane still shows the file, it is only the NEXT open of that
+// session that comes up blank.
+void TstPaneIdentity::openingAFileInAPaneIsReportedToTheHost()
+{
+    QVERIFY(openRegion(QStringLiteral("ViewerRegion.qml"), leafNode(QStringLiteral("viewer-1")),
+                       /*terminal=*/false));
+    const auto panes = [this] { return collect(m_region, isLeafPane); };
+    QTRY_VERIFY(panes().size() == 1);
+    QTest::qWait(kSettleMs);
+
+    QSignalSpy reported(m_region, SIGNAL(paneUrlReported(QString, QString)));
+    QVERIFY2(reported.isValid(), "the region does not report what its panes have open");
+
+    // Exactly what "open this file in that pane" publishes: the same leaf, now
+    // carrying a url.
+    const QString fileUrl = QStringLiteral("file:///tmp/ch-pane-report.txt");
+    setNode(leafNode(QStringLiteral("viewer-1"), fileUrl));
+
+    QTRY_VERIFY2(reported.size() >= 1,
+                 "the region never told the host what the pane opened; the Dev Session would "
+                 "reopen with a blank pane");
+    const QList<QVariant> arguments = reported.constLast();
+    QCOMPARE(arguments.at(0).toString(), QStringLiteral("viewer-1"));
+    QCOMPARE(arguments.at(1).toString(), fileUrl);
 }
 
 void TstPaneIdentity::nestedPaneFocusReachesTheRootRegion()

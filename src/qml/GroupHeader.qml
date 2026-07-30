@@ -27,8 +27,22 @@ ItemDelegate {
     Component.onCompleted: if (host) host.registerHeader(header)
     Component.onDestruction: if (host) host.unregisterHeader(header)
 
-    width: ListView.view ? ListView.view.width : implicitWidth
+    // Width is assigned by the instantiating parent (SessionsSidebar sets it to
+    // the group block's width); fall back to the parent's width otherwise. This
+    // is a Column child inside a DelegateModel delegate, never a ListView
+    // delegate itself, so there is no ListView.view to size against — reading
+    // one here only ever yielded null and the implicitWidth fallback. Same rule
+    // as SessionRow.
+    width: parent ? parent.width : implicitWidth
     height: 32
+
+    // Without this a screen reader announces an unnamed item: the delegate's own
+    // `text` property is unused (the name arrives in `name`, a SessionsModel
+    // role) and the collapse state is drawn as a chevron glyph.
+    Accessible.role: Accessible.ListItem
+    Accessible.name: header.name
+    Accessible.description: header.collapsed ? qsTr("Collapsed group")
+                                             : qsTr("Expanded group")
 
     background: Rectangle {
         color: header.selected ? "#2a2a40" : "#181825"

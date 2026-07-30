@@ -2,6 +2,7 @@
 #include "RpcTypes.h"
 
 #include <QCoreApplication>
+#include <QIODevice>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QJsonValue>
@@ -13,6 +14,7 @@
 #include <QString>
 #include <QtTest/QtTest>
 
+#include <cstring>
 #include <optional>
 
 using ch::CodeharbordClient;
@@ -25,6 +27,47 @@ QByteArray jsonLine(const QJsonObject& obj)
 {
     return QJsonDocument(obj).toJson(QJsonDocument::Compact) + '\n';
 }
+
+// An in-process QIODevice the test drives byte for byte. Two things a real
+// socket cannot be made to do on demand live here:
+//  * queueSilently() followed by announceEof() delivers an end-of-stream while a
+//    COMPLETE frame is still sitting unread. Qt is free to pick that ordering on
+//    a real socket, and it is the ordering that used to lose the response.
+//  * setShortWrite() makes write() report fewer bytes than it was handed — the
+//    truncated-frame case ch::SshChannelDevice::writeData() really can produce.
+// No Q_OBJECT: only inherited QIODevice signals are emitted, so no moc is needed.
+class ScriptedDevice : public QIODevice {
+public:
+    ScriptedDevice() { open(QIODevice::ReadWrite); }
+
+    // Make bytes readable WITHOUT emitting readyRead().
+    void queueSilently(const QByteArray& bytes) { m_in += bytes; }
+    void announceEof() { emit readChannelFinished(); }
+    void setShortWrite(bool on) { m_shortWrite = on; }
+
+    bool isSequential() const override { return true; }
+    qint64 bytesAvailable() const override
+    {
+        return m_in.size() + QIODevice::bytesAvailable();
+    }
+
+protected:
+    qint64 readData(char* data, qint64 maxSize) override
+    {
+        const qint64 n = qMin<qint64>(maxSize, m_in.size());
+        std::memcpy(data, m_in.constData(), static_cast<size_t>(n));
+        m_in.remove(0, n);
+        return n;
+    }
+    qint64 writeData(const char*, qint64 maxSize) override
+    {
+        return m_shortWrite ? maxSize / 2 : maxSize;
+    }
+
+private:
+    QByteArray m_in;
+    bool m_shortWrite = false;
+};
 
 } // namespace
 
@@ -58,11 +101,25 @@ private slots:
     void callWithNoTransportFailsCallbackOnce();
     void callAfterTransportClosedFailsOnce();
     void callbackDeletingClientMidDispatchIsSafe();
+    void destroyingClientFailsPendingCallbacks();
     void oversizedNewlinelessInputIsBounded();
+    void detachingTransportFailsPendingOnce();
+    void retryFromRebindFailureUsesNewTransport();
+    void rebindAfterCloseRevivesClient();
+    void methodWithIdIsNotANotification();
+    void nullCallbackIsTolerated();
+    void nonObjectJsonWarns();
+    void responseQueuedBeforeEofIsStillDelivered();
+    void shortWriteFailsCallAndClosesTransport();
+    void transportBoundFiresOnlyForNonNullBind();
     void liveServerInfoOverProcess();
 
 private:
     void makePair();
+    // Second socket pair for the transport-swap cases. Both ends stay owned by
+    // the caller's stack frame, so they outlive the swap under test.
+    void makeSwapPair(QLocalServer* server, QLocalSocket* clientSide,
+                      QLocalSocket** serverSide);
 
     QLocalServer* m_server = nullptr;
     QLocalSocket* m_clientSide = nullptr; // transport bound to the client
@@ -110,6 +167,22 @@ void TstRpcClient::makePair()
     QVERIFY(m_serverSide != nullptr);
 
     m_client->setTransport(m_clientSide);
+}
+
+void TstRpcClient::makeSwapPair(QLocalServer* server, QLocalSocket* clientSide,
+                                QLocalSocket** serverSide)
+{
+    const QString name = QStringLiteral("ch_rpc_test_%1_swap_%2")
+                             .arg(QCoreApplication::applicationPid())
+                             .arg(++s_seq);
+    QLocalServer::removeServer(name);
+    QVERIFY(server->listen(name));
+
+    clientSide->connectToServer(name);
+    QVERIFY(clientSide->waitForConnected(2000));
+    QVERIFY(server->waitForNewConnection(2000));
+    *serverSide = server->nextPendingConnection();
+    QVERIFY(*serverSide != nullptr);
 }
 
 void TstRpcClient::matchesResponsesById()
@@ -601,44 +674,388 @@ void TstRpcClient::setTransportTwiceDetachesOld()
 {
     makePair();
 
-    bool fired = false;
+    // Rebinding FAILS the in-flight call. The id was minted for the transport
+    // being dropped, and a SPEC 5.6 reconnect binds a channel onto a different
+    // `codeharbord` process that never heard of it, so preserving the callback
+    // would hang its caller forever.
+    int fired = 0;
+    std::optional<RpcError> got;
     const int id = m_client->call(
         QStringLiteral("ping"), QJsonValue(),
-        [&](QJsonValue, std::optional<RpcError>) { fired = true; });
+        [&](QJsonValue, std::optional<RpcError> err) {
+            ++fired;
+            got = err;
+        });
 
-    // Rebind to a fresh transport; the old socket's frames must no longer route.
     QLocalSocket* oldSide = m_serverSide;
     QLocalServer server2;
-    const QString name = QStringLiteral("ch_rpc_test_%1_swap_%2")
-                             .arg(QCoreApplication::applicationPid())
-                             .arg(++s_seq);
-    QLocalServer::removeServer(name);
-    QVERIFY(server2.listen(name));
     QLocalSocket newClient;
-    newClient.connectToServer(name);
-    QVERIFY(newClient.waitForConnected(2000));
-    QVERIFY(server2.waitForNewConnection(2000));
-    QLocalSocket* newServer = server2.nextPendingConnection();
-    QVERIFY(newServer != nullptr);
+    QLocalSocket* newServer = nullptr;
+    makeSwapPair(&server2, &newClient, &newServer);
 
+    QSignalSpy closedSpy(m_client, &CodeharbordClient::transportClosed);
     m_client->setTransport(&newClient);
 
-    // A frame on the OLD transport must be ignored (hooks disconnected).
+    QCOMPARE(fired, 1);
+    QVERIFY(got.has_value());
+    QCOMPARE(got->code, -32603);
+    QCOMPARE(m_client->pendingCount(), 0);
+    // A swap is not a close: whoever swapped the transport already knows.
+    QCOMPARE(closedSpy.count(), 0);
+
+    // A frame on the OLD transport must be ignored (its hooks are disconnected)
+    // and the stale id must not resurrect the callback.
     QSignalSpy warnSpy(m_client, &CodeharbordClient::protocolWarning);
     oldSide->write(
         jsonLine({{"jsonrpc", "2.0"}, {"id", id}, {"result", QJsonObject{}}}));
     oldSide->flush();
     QTest::qWait(150);
-    QVERIFY(!fired);
+    QCOMPARE(fired, 1);
 
-    // The matching frame on the NEW transport still routes the pending call.
+    // The NEW transport carries fresh work normally.
+    bool second = false;
+    const int id2 = m_client->call(
+        QStringLiteral("ping"), QJsonValue(),
+        [&](QJsonValue, std::optional<RpcError> err) {
+            QVERIFY(!err.has_value());
+            second = true;
+        });
     newServer->write(
-        jsonLine({{"jsonrpc", "2.0"}, {"id", id}, {"result", QJsonObject{}}}));
+        jsonLine({{"jsonrpc", "2.0"}, {"id", id2}, {"result", QJsonObject{}}}));
     newServer->flush();
-    QTRY_VERIFY(fired);
+    QTRY_VERIFY(second);
     QCOMPARE(warnSpy.count(), 0);
 
     m_client->setTransport(nullptr);
+}
+
+// A detach is not a close, but it must still honour call()'s exactly-once
+// guarantee: once the transport is gone, nobody is left who could ever answer
+// the ids still in flight.
+void TstRpcClient::detachingTransportFailsPendingOnce()
+{
+    makePair();
+
+    int fired = 0;
+    std::optional<RpcError> got;
+    m_client->call(QStringLiteral("ping"), QJsonValue(),
+                   [&](QJsonValue, std::optional<RpcError> err) {
+                       ++fired;
+                       got = err;
+                   });
+    QCOMPARE(m_client->pendingCount(), 1);
+
+    QSignalSpy closedSpy(m_client, &CodeharbordClient::transportClosed);
+    QSignalSpy boundSpy(m_client, &CodeharbordClient::transportBound);
+    m_client->setTransport(nullptr);
+
+    QCOMPARE(fired, 1);
+    QVERIFY(got.has_value());
+    QCOMPARE(got->code, -32603);
+    QCOMPARE(m_client->pendingCount(), 0);
+    QCOMPARE(closedSpy.count(), 0);
+    QCOMPARE(boundSpy.count(), 0);
+}
+
+// The usual answer to a failed call is "retry". A retry issued from INSIDE the
+// rebind sweep must go out on the transport being BOUND, not the one being
+// dropped, and the pending entry it creates must survive the sweep that caused
+// it.
+void TstRpcClient::retryFromRebindFailureUsesNewTransport()
+{
+    makePair();
+
+    bool retried = false;
+    bool retryAnswered = false;
+    int retryId = -1;
+    m_client->call(QStringLiteral("first"), QJsonValue(),
+                   [&](QJsonValue, std::optional<RpcError> err) {
+                       QVERIFY(err.has_value());
+                       retried = true;
+                       retryId = m_client->call(
+                           QStringLiteral("retry"), QJsonValue(),
+                           [&](QJsonValue, std::optional<RpcError> e) {
+                               QVERIFY(!e.has_value());
+                               retryAnswered = true;
+                           });
+                   });
+
+    QLocalServer server2;
+    QLocalSocket newClient;
+    QLocalSocket* newServer = nullptr;
+    makeSwapPair(&server2, &newClient, &newServer);
+
+    m_client->setTransport(&newClient);
+
+    QVERIFY(retried);
+    QVERIFY(retryId > 0);
+    QCOMPARE(m_client->pendingCount(), 1);
+
+    // The retry frame really left on the NEW socket.
+    newClient.flush();
+    QVERIFY(newServer->waitForReadyRead(2000));
+    const QJsonObject sent =
+        QJsonDocument::fromJson(newServer->readAll().trimmed()).object();
+    QCOMPARE(sent.value(QStringLiteral("method")).toString(),
+             QStringLiteral("retry"));
+    QCOMPARE(sent.value(QStringLiteral("id")).toInt(), retryId);
+
+    newServer->write(jsonLine(
+        {{"jsonrpc", "2.0"}, {"id", retryId}, {"result", QJsonObject{}}}));
+    newServer->flush();
+    QTRY_VERIFY(retryAnswered);
+
+    m_client->setTransport(nullptr);
+}
+
+// A close latches the client dead so no further call is written into a corpse.
+// Binding a replacement must clear that latch: SPEC 5.6 reconnect wires a
+// brand-new channel, and every call after it has to go out for real.
+void TstRpcClient::rebindAfterCloseRevivesClient()
+{
+    makePair();
+
+    QSignalSpy closedSpy(m_client, &CodeharbordClient::transportClosed);
+    m_serverSide->disconnectFromServer();
+    QTRY_COMPARE(closedSpy.count(), 1);
+
+    int failed = 0;
+    m_client->call(QStringLiteral("ping"), QJsonValue(),
+                   [&](QJsonValue, std::optional<RpcError> err) {
+                       if (err.has_value())
+                           ++failed;
+                   });
+    QCOMPARE(failed, 1); // dead: nothing was written, the callback failed inline
+
+    QLocalServer server2;
+    QLocalSocket newClient;
+    QLocalSocket* newServer = nullptr;
+    makeSwapPair(&server2, &newClient, &newServer);
+
+    QSignalSpy boundSpy(m_client, &CodeharbordClient::transportBound);
+    m_client->setTransport(&newClient);
+    QCOMPARE(boundSpy.count(), 1);
+
+    bool answered = false;
+    const int id = m_client->call(
+        QStringLiteral("ping"), QJsonValue(),
+        [&](QJsonValue, std::optional<RpcError> err) {
+            QVERIFY(!err.has_value());
+            answered = true;
+        });
+    QCOMPARE(m_client->pendingCount(), 1);
+    newServer->write(
+        jsonLine({{"jsonrpc", "2.0"}, {"id", id}, {"result", QJsonObject{}}}));
+    newServer->flush();
+    QTRY_VERIFY(answered);
+
+    m_client->setTransport(nullptr);
+}
+
+// A message carrying BOTH a method and an id is a request aimed at the client
+// (JSON-RPC 2.0 section 4.1 defines a notification as a request WITHOUT an id),
+// not a notification. Treating it as one would also swallow a malformed RESPONSE
+// that echoed `method` back and leave its caller pending forever.
+void TstRpcClient::methodWithIdIsNotANotification()
+{
+    makePair();
+
+    QSignalSpy notifySpy(m_client, &CodeharbordClient::notificationReceived);
+    QSignalSpy warnSpy(m_client, &CodeharbordClient::protocolWarning);
+
+    std::optional<RpcError> got;
+    bool fired = false;
+    const int id = m_client->call(
+        QStringLiteral("ping"), QJsonValue(),
+        [&](QJsonValue, std::optional<RpcError> err) {
+            got = err;
+            fired = true;
+        });
+
+    m_serverSide->write(jsonLine({{"jsonrpc", "2.0"},
+                                  {"id", id},
+                                  {"method", ch::rpc::kWatchEventNotification},
+                                  {"params", QJsonObject{{"path", "/w"}}}}));
+    m_serverSide->flush();
+
+    QTRY_VERIFY(fired);
+    QCOMPARE(notifySpy.count(), 0);
+    QVERIFY(got.has_value()); // failed, not left hanging
+    QCOMPARE(got->code, -32603);
+    QVERIFY(warnSpy.count() >= 1);
+    QCOMPARE(m_client->pendingCount(), 0);
+
+    // An explicit null id is still a notification: no request this client issues
+    // can carry one, so there is nothing it could be a response to.
+    m_serverSide->write(jsonLine({{"jsonrpc", "2.0"},
+                                  {"id", QJsonValue(QJsonValue::Null)},
+                                  {"method", ch::rpc::kWatchEventNotification},
+                                  {"params", QJsonObject{{"path", "/w"}}}}));
+    m_serverSide->flush();
+    QTRY_COMPARE(notifySpy.count(), 1);
+}
+
+// A null callback is a legitimate fire-and-forget request. The response must be
+// matched and dropped, and the teardown sweep must skip it, instead of throwing
+// std::bad_function_call out of a Qt slot.
+void TstRpcClient::nullCallbackIsTolerated()
+{
+    makePair();
+
+    const int id = m_client->call(QStringLiteral("ping"), QJsonValue(), nullptr);
+    QCOMPARE(m_client->pendingCount(), 1);
+    m_serverSide->write(
+        jsonLine({{"jsonrpc", "2.0"}, {"id", id}, {"result", QJsonObject{}}}));
+    m_serverSide->flush();
+    QTRY_COMPARE(m_client->pendingCount(), 0);
+
+    // Same again, but torn down with the request still in flight.
+    m_client->call(QStringLiteral("ping"), QJsonValue(), nullptr);
+    QCOMPARE(m_client->pendingCount(), 1);
+    QSignalSpy closedSpy(m_client, &CodeharbordClient::transportClosed);
+    m_serverSide->disconnectFromServer();
+    QTRY_COMPARE(closedSpy.count(), 1);
+    QCOMPARE(m_client->pendingCount(), 0);
+}
+
+// Well-formed JSON that is not an object — a JSON-RPC 2.0 batch array, a bare
+// scalar — is unroutable. It must warn without disturbing the pending call, and
+// the warning must not quote a parse error that never happened ("no error").
+void TstRpcClient::nonObjectJsonWarns()
+{
+    makePair();
+
+    QSignalSpy warnSpy(m_client, &CodeharbordClient::protocolWarning);
+    bool fired = false;
+    m_client->call(QStringLiteral("ping"), QJsonValue(),
+                   [&](QJsonValue, std::optional<RpcError>) { fired = true; });
+
+    m_serverSide->write(QByteArray("[{\"jsonrpc\":\"2.0\",\"id\":1}]\n"));
+    m_serverSide->write(QByteArray("\"just a string\"\n"));
+    m_serverSide->flush();
+
+    QTRY_COMPARE(warnSpy.count(), 2);
+    for (int i = 0; i < warnSpy.count(); ++i) {
+        const QString message = warnSpy.at(i).at(0).toString();
+        QVERIFY2(!message.contains(QStringLiteral("no error")),
+                 qPrintable(message));
+    }
+    QVERIFY(!fired);
+    QCOMPARE(m_client->pendingCount(), 1);
+}
+
+// A response that physically arrived before the peer shut down must be
+// DELIVERED, not reported as "transport closed with request pending". Qt may
+// announce end-of-stream with complete frames still unread, so the close path
+// drains what is left before failing anything.
+void TstRpcClient::responseQueuedBeforeEofIsStillDelivered()
+{
+    ScriptedDevice device;
+    m_client->setTransport(&device);
+
+    QJsonValue res;
+    std::optional<RpcError> err;
+    bool fired = false;
+    const int id = m_client->call(
+        QStringLiteral("ping"), QJsonValue(),
+        [&](QJsonValue r, std::optional<RpcError> e) {
+            res = r;
+            err = e;
+            fired = true;
+        });
+
+    QSignalSpy closedSpy(m_client, &CodeharbordClient::transportClosed);
+    device.queueSilently(jsonLine({{"jsonrpc", "2.0"},
+                                   {"id", id},
+                                   {"result", QJsonObject{{"pong", true}}}}));
+    device.announceEof(); // end-of-stream with the frame still unread
+
+    QVERIFY(fired);
+    QVERIFY(!err.has_value());
+    QVERIFY(res.toObject().value(QStringLiteral("pong")).toBool());
+    QCOMPARE(closedSpy.count(), 1); // announced exactly once, after the drain
+    QCOMPARE(m_client->pendingCount(), 0);
+
+    m_client->setTransport(nullptr);
+}
+
+// A SHORT write leaves a truncated frame on the wire, so the peer glues the next
+// request onto the fragment and the byte stream is desynchronised beyond repair.
+// The client must fail this call once AND declare the transport dead, rather than
+// keep emitting frames the server can only answer with parse errors.
+void TstRpcClient::shortWriteFailsCallAndClosesTransport()
+{
+    ScriptedDevice device;
+    m_client->setTransport(&device);
+
+    int firstFailures = 0;
+    m_client->call(QStringLiteral("first"), QJsonValue(),
+                   [&](QJsonValue, std::optional<RpcError> err) {
+                       if (err.has_value())
+                           ++firstFailures;
+                   });
+    QCOMPARE(m_client->pendingCount(), 1);
+
+    device.setShortWrite(true);
+    QSignalSpy warnSpy(m_client, &CodeharbordClient::protocolWarning);
+    QSignalSpy closedSpy(m_client, &CodeharbordClient::transportClosed);
+
+    int fired = 0;
+    std::optional<RpcError> got;
+    m_client->call(QStringLiteral("second"), QJsonValue(),
+                   [&](QJsonValue, std::optional<RpcError> err) {
+                       ++fired;
+                       got = err;
+                   });
+
+    QCOMPARE(fired, 1);
+    QVERIFY(got.has_value());
+    QCOMPARE(got->code, -32603);
+    QCOMPARE(firstFailures, 1);     // the already-pending caller was failed too
+    QCOMPARE(closedSpy.count(), 1); // the desynchronised stream was declared dead
+    QVERIFY(warnSpy.count() >= 1);
+    QCOMPARE(m_client->pendingCount(), 0);
+
+    // Nothing more is written onto a stream that can no longer be framed.
+    int afterFailures = 0;
+    m_client->call(QStringLiteral("third"), QJsonValue(),
+                   [&](QJsonValue, std::optional<RpcError> err) {
+                       if (err.has_value())
+                           ++afterFailures;
+                   });
+    QCOMPARE(afterFailures, 1);
+    QCOMPARE(m_client->pendingCount(), 0);
+
+    m_client->setTransport(nullptr);
+}
+
+// transportBound() announces a NEW, usable transport and nothing else: exactly
+// once per non-null bind, never for a re-bind of the same device, never for a
+// detach, and late enough that a handler's very first call() goes out on the
+// transport just bound.
+void TstRpcClient::transportBoundFiresOnlyForNonNullBind()
+{
+    QSignalSpy boundSpy(m_client, &CodeharbordClient::transportBound);
+    makePair();
+    QCOMPARE(boundSpy.count(), 1);
+
+    m_client->setTransport(m_clientSide); // same device: a no-op, not an event
+    QCOMPARE(boundSpy.count(), 1);
+
+    int handlerId = 0;
+    connect(m_client, &CodeharbordClient::transportBound, m_client, [&] {
+        handlerId = m_client->call(QStringLiteral("ping"), QJsonValue(), nullptr);
+    });
+
+    ScriptedDevice device;
+    m_client->setTransport(&device);
+    QCOMPARE(boundSpy.count(), 2);
+    QVERIFY(handlerId > 0);
+    QCOMPARE(m_client->pendingCount(), 1); // the handler's call really registered
+
+    m_client->setTransport(nullptr);
+    QCOMPARE(boundSpy.count(), 2);
+    QCOMPARE(m_client->pendingCount(), 0);
 }
 
 void TstRpcClient::callWithNoTransportFailsCallbackOnce()
@@ -707,6 +1124,49 @@ void TstRpcClient::callbackDeletingClientMidDispatchIsSafe()
 
     QTRY_VERIFY(fired);
     QVERIFY(m_client == nullptr); // deleted cleanly; no crash / UAF
+}
+
+// Destroying the client is the last path that could orphan a pending callback:
+// once it is gone nothing can answer the ids it minted. Every request in flight
+// must be failed exactly once, and a retry issued from inside that teardown must
+// be rejected synchronously rather than registered on a dying object.
+void TstRpcClient::destroyingClientFailsPendingCallbacks()
+{
+    makePair();
+
+    int firedFirst = 0;
+    int firedRetry = 0;
+    std::optional<RpcError> got;
+    int retryId = -1;
+
+    m_client->call(QStringLiteral("first"), QJsonValue(),
+                   [&](QJsonValue, std::optional<RpcError> err) {
+                       ++firedFirst;
+                       got = err;
+                       retryId = m_client->call(
+                           QStringLiteral("retry"), QJsonValue(),
+                           [&](QJsonValue, std::optional<RpcError> e) {
+                               // Nobody is left to answer, so the retry fails
+                               // immediately instead of being queued.
+                               QVERIFY(e.has_value());
+                               ++firedRetry;
+                           });
+                   });
+    // A fire-and-forget request (null callback) must be swept without tripping
+    // over the empty std::function.
+    m_client->call(QStringLiteral("second"), QJsonValue(), nullptr);
+    QCOMPARE(m_client->pendingCount(), 2);
+
+    delete m_client;
+    m_client = nullptr;
+
+    QCOMPARE(firedFirst, 1);
+    QCOMPARE(firedRetry, 1);
+    QVERIFY(got.has_value());
+    QCOMPARE(got->code, -32603);
+    QCOMPARE(got->message,
+             QStringLiteral("client destroyed with request pending"));
+    QVERIFY(retryId > 0);
 }
 
 void TstRpcClient::oversizedNewlinelessInputIsBounded()

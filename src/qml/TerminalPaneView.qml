@@ -84,10 +84,22 @@ Rectangle {
     implicitWidth: 160
     implicitHeight: 100
 
+    // True only while pane.factory.attach() is running. `attached` cannot serve
+    // as the guard against re-entering attachNow(): it is assigned from
+    // attach()'s RETURN value, so it is still false for the whole duration of
+    // the call. Anything the C++ side emits synchronously from inside attach()
+    // that lands back here — bridge.geometryChanged is wired to attachNow()
+    // below — would therefore open a SECOND PTY for this pane and leak the
+    // first. The bridge is documented not to emit that signal from inside
+    // attach(), and this is the belt to that braces: the invariant is enforced
+    // on the QML side too, so a future change on either side cannot reintroduce
+    // the double attach silently. Not part of the pane's observable contract.
+    property bool attaching: false
+
     // Open (or re-open) this pane's PTY. Idempotent while attached; safe to call
     // from the host whenever the session or the SSH connection changes.
     function attachNow() {
-        if (pane.attached || !pane.factory || !pane.controller)
+        if (pane.attaching || pane.attached || !pane.factory || !pane.controller)
             return
         if (pane.devSessionId.length === 0 || pane.terminalId.length === 0) {
             pane.statusText = qsTr("No Dev Session selected for this pane.")
@@ -101,8 +113,16 @@ Rectangle {
         // factory open at the conventional 80x24 until the first fit arrives.
         const cols = pane.bridge ? pane.bridge.columns : 0
         const rows = pane.bridge ? pane.bridge.rows : 0
-        pane.attached = pane.factory.attach(pane.controller, pane.devSessionId,
-                                            pane.terminalId, pane.workingDir, cols, rows)
+        // try/finally, not two plain assignments: attach() reaching into libssh
+        // can throw back into QML, and a guard left stuck at true would make the
+        // pane permanently unattachable — including through its own Retry button.
+        pane.attaching = true
+        try {
+            pane.attached = pane.factory.attach(pane.controller, pane.devSessionId,
+                                                pane.terminalId, pane.workingDir, cols, rows)
+        } finally {
+            pane.attaching = false
+        }
         if (pane.attached)
             pane.statusText = ""
     }

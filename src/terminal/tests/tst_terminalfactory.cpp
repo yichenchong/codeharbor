@@ -33,9 +33,16 @@ namespace {
 
 // A writable stand-in for the SSH PTY channel: the controller only requires a
 // QIODevice, so input can be inspected with no session in sight.
+//
+// WriteOnly on purpose. A QBuffer opened ReadWrite hands back everything written
+// into it as READABLE data, so the moment an event loop turned, a keystroke sent
+// through the bridge would arrive again as terminal OUTPUT and every assertion
+// about what the page received would really be measuring the test's own echo.
+// Write-only keeps the controller's readyRead handler inert (it refuses a
+// transport that is not readable) while sendInput() still works.
 class FakeTransport : public QBuffer {
 public:
-    FakeTransport() { open(QIODevice::ReadWrite); }
+    FakeTransport() { open(QIODevice::WriteOnly); }
 };
 
 } // namespace
@@ -57,6 +64,7 @@ private slots:
     void bridgeDecodesUtf8SplitAcrossFlushes();
     void bridgeReportsStateTransitionsAsStrings();
     void bridgeClearIsAViewOnlyRequest();
+    void attachStallIsReportedAsAPaneMessage();
 };
 
 // Every pane owns its controller: it must be parented to the pane so closing
@@ -496,6 +504,41 @@ void TstTerminalFactory::bridgeClearIsAViewOnlyRequest()
     QCOMPARE(cleared.count(), 1);
     // Clearing the screen must never type anything at the remote shell.
     QVERIFY(transport.data().isEmpty());
+}
+
+// A pane whose attach never produces a byte is bounded by the controller (see
+// tst_terminalcontroller silentAttachIsBoundedAndReportedAsAnError), but "error"
+// on its own tells the user nothing. The factory owns the only message channel
+// the pane's chrome reads (src/qml/TerminalPaneView.qml binds factory.onError),
+// so the reason has to come out of there, once per stall and against the right
+// pane.
+void TstTerminalFactory::attachStallIsReportedAsAPaneMessage()
+{
+    QObject pane;
+    TerminalFactory factory(nullptr);
+    TerminalController* controller = factory.create(&pane);
+    // A second pane on the same factory: a stall on one must not be reported on
+    // the other.
+    TerminalController* quiet = factory.create(&pane);
+    QSignalSpy errors(&factory, &TerminalFactory::error);
+
+    controller->setAttachTimeoutMs(50);
+    controller->setState(TerminalState::AttachingTmux);
+
+    QVERIFY(errors.wait(2000));
+    QCOMPARE(errors.count(), 1);
+    QCOMPARE(errors.at(0).at(0).value<TerminalController*>(), controller);
+    QVERIFY(!errors.at(0).at(1).toString().isEmpty());
+    QVERIFY(controller->state() == TerminalState::Error);
+    QVERIFY(quiet->state() == TerminalState::Unloaded);
+
+    // Retrying the attach and stalling again reports exactly once more: the
+    // handler is installed per controller, not per attach, so a pane that
+    // reconnects repeatedly cannot end up shouting the same stall N times.
+    controller->setState(TerminalState::AttachingTmux);
+    QTRY_COMPARE(errors.count(), 2);
+    QTest::qWait(200);
+    QCOMPARE(errors.count(), 2);
 }
 
 QTEST_GUILESS_MAIN(TstTerminalFactory)

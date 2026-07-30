@@ -22,11 +22,14 @@ Item {
     // leaf (SessionLayouts::setPaneUrl), which is what makes reopening a Dev
     // Session restore the FILES the user had open and not just the geometry.
     //
-    // Reported on a paneId change too, because a pane is born before it has a
+    // Also emitted on a paneId change, because a pane is born before it has a
     // name: ViewerRegion.takePane() creates the Item WITH its url and assigns
     // paneId immediately afterwards, so a url-only report would arrive
-    // anonymous. That extra report is an echo of what is already stored, and
-    // SessionLayouts drops an unchanged url without writing.
+    // anonymous. That birth report is pure echo — the url came out of the very
+    // leaf the host has stored — and the region deliberately subscribes AFTER
+    // naming the pane, so nobody hears it; see the ordering comment in
+    // ViewerRegion.takePane(). What the host needs is every later CHANGE, and
+    // this signal is how those arrive.
     signal urlOpened(string paneId, string url)
 
     function reportUrl() {

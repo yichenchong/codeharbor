@@ -6,10 +6,12 @@
 
 // Core data-model value types (SPEC 3.1-3.4, workstream M). These carry the
 // identifying/domain columns of the corresponding remote/sql/schema.sql tables
-// plus server_id (SPEC 3.5, multi-server future-proofing); persistence-only
-// bookkeeping (created_at/updated_at) stays in the persistence layer, and
-// runtime/connection state lives with the sidebar model. Ids use the
-// strongly-typed wrappers from Ids.h.
+// plus server_id (SPEC 3.5, multi-server future-proofing). The server's
+// created_at/updated_at bookkeeping columns are deliberately NOT represented:
+// nothing on the client reads them, so WorkspaceDb drops them on decode rather
+// than carrying a timestamp no UI shows. Runtime/connection state likewise lives
+// with the sidebar model (SessionsModel.h), not here. Ids use the strongly-typed
+// wrappers from Ids.h.
 namespace ch {
 
 // A collapsible sidebar container (SPEC 3.1).

@@ -54,6 +54,13 @@ void TerminalBridge::requestClear()
 
 void TerminalBridge::sendInput(const QString& data)
 {
+    // The controller reports a refused write (no channel, or a closed one), but
+    // there is nowhere to send that: the page-side contract is
+    // `sendInput(data): void` and it is frozen. Dropping the keystroke is the
+    // right outcome anyway — the pane's status strip is already showing
+    // "disconnected" or "error", which is what the user needs to see, and
+    // buffering keystrokes to replay into a future shell would type a command
+    // the user typed minutes ago at whatever prompt happens to be there.
     if (m_controller)
         m_controller->sendInput(data.toUtf8());
 }

@@ -28,6 +28,19 @@ class SshConnectionPool;
 // tmux command in it, and bind the channel to the controller as its transport.
 // The tmux target and command come from TerminalController's own helpers, which
 // are the shell-injection-hardened ones (SPEC 5.2).
+//
+// It deliberately does NOT subscribe to SshConnectionPool::stateChanged to push
+// panes to Disconnected when the session goes down, because the channel already
+// does it, per pane and earlier: SshConnectionPool::closeSession() emits
+// sessionClosing() BEFORE it frees the session's channels, every
+// ch::SshChannelDevice closes on that signal, closing emits
+// readChannelFinished(), and TerminalController::onTransportFinished() turns
+// that into Disconnected for any pane that was live (SPEC 5.6). A session that
+// dies at the network level with no local disconnect reaches the same place from
+// the other end: the device's read pump sees the error/EOF and reports the same
+// end-of-stream. A second, pool-level path would only race the first one, and it
+// could not do better than per-pane: a pane whose channel ended for its own
+// reasons must not be re-reported when the session later goes down.
 class TerminalFactory : public QObject {
     Q_OBJECT
 public:
@@ -49,6 +62,11 @@ public:
     // `controller`. Re-attaching releases the previous channel first. False if
     // there is no connection or the channel/PTY could not be started; the
     // reason is reported through error().
+    //
+    // `cols`/`rows` at or below 0 mean "the renderer has not reported a size
+    // yet": the geometry the controller already recorded is used instead, and
+    // only a controller that has never been sized falls back to 80x24. A
+    // reconnect therefore never shrinks a pane that is already laid out.
     Q_INVOKABLE bool attach(ch::TerminalController* controller,
                             const QString& devSessionId,
                             const QString& terminalId,

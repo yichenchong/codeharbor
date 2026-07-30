@@ -263,6 +263,11 @@ void SessionBootstrap::setConnectTimeoutMs(int ms)
     m_connectTimeoutMs = qMax(0, ms);
 }
 
+void SessionBootstrap::setTrustUnknownHostKeys(bool enabled)
+{
+    m_trustUnknownHostKeys = enabled;
+}
+
 void SessionBootstrap::cancelReconnect()
 {
     m_reconnectTimer->stop();
@@ -417,6 +422,13 @@ bool SessionBootstrap::probeEndpoint(const QString& host, quint16 port,
 
     bool spoke = false;
     bool timedOut = false;
+    // A verdict that landed BEFORE loop.exec(). connectToHost() may fail
+    // synchronously (an unresolvable name it already has cached, an address
+    // family the host has no route for), and QEventLoop::quit() called before
+    // exec() is simply forgotten: entering the loop anyway would sit there for
+    // the whole connect budget and then report the endpoint as MUTE rather than
+    // as unreachable.
+    bool settled = false;
 
     // The server's identification string (RFC 4253 §4.2) is sent as soon as the
     // TCP connection is up, so the first byte is a sufficient liveness proof —
@@ -425,17 +437,23 @@ bool SessionBootstrap::probeEndpoint(const QString& host, quint16 port,
     // socket is a throwaway and libssh opens its own.
     connect(&socket, &QIODevice::readyRead, &loop, [&] {
         spoke = true;
+        settled = true;
         loop.quit();
     });
     // A peer that hangs up without speaking is dead for our purposes, and so is
     // any resolve/connect failure.
     connect(&socket, &QAbstractSocket::errorOccurred, &loop,
-            [&loop](QAbstractSocket::SocketError) { loop.quit(); });
-    connect(&socket, &QAbstractSocket::disconnected, &loop, [&loop] {
+            [&](QAbstractSocket::SocketError) {
+                settled = true;
+                loop.quit();
+            });
+    connect(&socket, &QAbstractSocket::disconnected, &loop, [&] {
+        settled = true;
         loop.quit();
     });
     connect(&deadline, &QTimer::timeout, &loop, [&] {
         timedOut = true;
+        settled = true;
         loop.quit();
     });
 
@@ -447,7 +465,8 @@ bool SessionBootstrap::probeEndpoint(const QString& host, quint16 port,
     const auto clearLoop = qScopeGuard([this] { m_probeLoop = nullptr; });
     // ExcludeUserInputEvents: repaints, timers and sockets keep running so the
     // shell stays alive on screen, but a second click cannot re-enter connect.
-    loop.exec(QEventLoop::ExcludeUserInputEvents);
+    if (!settled)
+        loop.exec(QEventLoop::ExcludeUserInputEvents);
 
     if (spoke && !m_cancelRequested)
         return true;
@@ -603,12 +622,18 @@ bool SessionBootstrap::attemptWire()
     // reaches a callback at all — the pool refuses a changed key outright
     // (SPEC 12.1) and that stays untouched.
     //
-    // The accept-an-unknown-key-once default is ONLY for headless/unattended use
-    // (the CH_LIVE_* env path and tests), where there is nobody to ask. If a
-    // caller has already installed its own policy — AppController installs a
-    // prompting callback that refuses the key and asks the user — we MUST NOT
-    // replace it: doing so silently trusted and persisted unknown host keys with
-    // no consent and made the whole host-key prompt dead code.
+    // An UNKNOWN key needs a decision, and SPEC 12.1 says the decision is the
+    // USER's: the pool asks the installed host-key callback, and AppController
+    // installs one that refuses the attempt and raises the fingerprint prompt.
+    // If NO callback is installed we must not invent one that says yes — that is
+    // blind trust-on-first-use: whatever key the server presented would be
+    // trusted, written into the known_hosts store and connected to, with nobody
+    // ever asked. So the attempt is refused here instead, before any handshake.
+    //
+    // Accepting an unknown key unasked is available only where there is nobody
+    // to ask and refusing means "cannot connect at all" — the CH_LIVE_* harness
+    // path and live tests — and only when that caller has explicitly opted in
+    // via setTrustUnknownHostKeys().
     KnownHosts hosts;
     QFile store(m_knownHostsPath);
     if (store.open(QIODevice::ReadOnly | QIODevice::Text))
@@ -617,6 +642,15 @@ bool SessionBootstrap::attemptWire()
     const int knownBefore = hosts.entries().size();
     m_pool->setKnownHosts(hosts);
     if (!m_pool->hostKeyCallback()) {
+        if (!m_trustUnknownHostKeys) {
+            emit error(QStringLiteral(
+                           "refusing to connect to %1:%2: no host-key decision "
+                           "policy is installed, so an unknown host key could "
+                           "not be shown to you for approval")
+                           .arg(m_host)
+                           .arg(m_port));
+            return false;
+        }
         m_pool->setHostKeyCallback([](const QString&, const QString&,
                                       const QByteArray&, KnownHosts::Verdict) {
             return SshConnectionPool::HostKeyDecision::Accept;
@@ -738,6 +772,13 @@ bool SessionBootstrap::connectAndWireFromEnvironment()
     const QString knownHosts = qEnvironmentVariable("CH_LIVE_KNOWN_HOSTS");
     if (!knownHosts.isEmpty())
         setKnownHostsPath(knownHosts);
+
+    // This entry point IS the unattended one: it only runs when CH_LIVE_SSH is
+    // set, which no ordinary desktop launch does, and it has no user interface to
+    // raise a host-key prompt in. Opt in explicitly so attemptWire() accepts an
+    // unknown key here and ONLY here — every attended connect goes through
+    // AppController, which installs a prompting callback and leaves this off.
+    setTrustUnknownHostKeys(true);
 
     return connectAndWire(host, static_cast<quint16>(port), user, nodePath,
                           repoRoot, identityFile);

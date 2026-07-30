@@ -6,6 +6,7 @@
 #include "ViewerHandlerRegistry.h"
 #include "ViewerProfiles.h"
 
+#include <QByteArray>
 #include <QJsonArray>
 #include <QJsonObject>
 #include <QJsonValue>
@@ -13,6 +14,7 @@
 #include <QVariantMap>
 #include <QtWebEngineQuick/QQuickWebEngineProfile>
 #include <algorithm>
+#include <utility>
 
 namespace ch {
 
@@ -55,6 +57,10 @@ ViewerModel::ViewerModel(CodeharbordClient *client, InternalUrlMap *map,
 
 void ViewerModel::setProfiles(ViewerProfiles *profiles)
 {
+    // Handing back the very object we already own must not delete it out from
+    // under the caller and leave a dangling pointer behind.
+    if (profiles == m_profiles)
+        return;
     if (m_ownsProfiles)
         delete m_profiles;
     m_profiles = profiles;
@@ -102,7 +108,16 @@ void ViewerModel::readTextFile(const QString &path)
         return;
     }
 
-    const QJsonObject params{{QStringLiteral("path"), path}};
+    // Bound the read exactly as the internal scheme handler does: a text pane
+    // must never try to pull a multi-gigabyte file through a single JSON-RPC
+    // frame. Passing offset/length makes the file service perform a ranged read
+    // and report `truncated` when the file is bigger than the window.
+    const QJsonObject params{
+        {QStringLiteral("path"), path},
+        {QStringLiteral("offset"), 0},
+        {QStringLiteral("length"),
+         InternalUrlSchemeHandler::kMaxInlineReadBytes},
+    };
     QPointer<ViewerModel> guard(this);
     m_client->call(
         QString::fromLatin1(rpc::kMethodReadFile), params,
@@ -114,16 +129,34 @@ void ViewerModel::readTextFile(const QString &path)
                 return;
             }
             const QJsonObject obj = result.toObject();
+            if (obj.value(QStringLiteral("truncated")).toBool()) {
+                // Report the failure rather than silently showing a prefix of
+                // the file as if it were the whole thing.
+                emit guard->textFileError(
+                    path, QStringLiteral("file is too large to display inline"));
+                return;
+            }
             const QString encoding =
                 obj.value(QStringLiteral("encoding")).toString();
             const QString content =
                 obj.value(QStringLiteral("content")).toString();
             // Text is served utf-8; decode a base64 payload defensively so the
-            // view still shows something legible for near-text binaries.
-            const QString text =
-                encoding == QLatin1String("base64")
-                    ? QString::fromUtf8(QByteArray::fromBase64(content.toUtf8()))
-                    : content;
+            // view still shows something legible for near-text binaries. A
+            // malformed payload is reported, never rendered as an empty file.
+            QString text = content;
+            if (encoding == QLatin1String("base64")) {
+                QByteArray encoded = content.toUtf8();
+                const auto decoded = QByteArray::fromBase64Encoding(
+                    std::move(encoded),
+                    QByteArray::Base64Encoding
+                        | QByteArray::AbortOnBase64DecodingErrors);
+                if (!decoded) {
+                    emit guard->textFileError(
+                        path, QStringLiteral("file contents could not be decoded"));
+                    return;
+                }
+                text = QString::fromUtf8(*decoded);
+            }
             emit guard->textFileRead(path, text);
         });
 }
@@ -159,7 +192,11 @@ void ViewerModel::listDirectory(const QString &path)
                      entry.value(QStringLiteral("kind")).toString()},
                 });
             }
-            // Server order is unspecified; sort directories first, then by name.
+            // Server order is unspecified; sort directories first, then by
+            // name. The name comparison is case-insensitive with a
+            // case-sensitive tie-break, so two names differing only in case
+            // ("Readme" vs "readme") get a stable, reproducible order instead
+            // of whatever std::sort happens to produce for "equal" elements.
             std::sort(entries.begin(), entries.end(),
                       [](const QVariant &a, const QVariant &b) {
                           const QVariantMap ma = a.toMap();
@@ -172,12 +209,15 @@ void ViewerModel::listDirectory(const QString &path)
                               == QLatin1String("directory");
                           if (aDir != bDir)
                               return aDir;
-                          return ma.value(QStringLiteral("name"))
-                                     .toString()
-                                     .compare(mb.value(QStringLiteral("name"))
-                                                  .toString(),
-                                              Qt::CaseInsensitive)
-                                 < 0;
+                          const QString na =
+                              ma.value(QStringLiteral("name")).toString();
+                          const QString nb =
+                              mb.value(QStringLiteral("name")).toString();
+                          const int folded =
+                              na.compare(nb, Qt::CaseInsensitive);
+                          if (folded != 0)
+                              return folded < 0;
+                          return na.compare(nb, Qt::CaseSensitive) < 0;
                       });
             emit guard->directoryListed(path, entries);
         });

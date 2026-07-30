@@ -107,3 +107,33 @@ test("every domain table carries server_id (SPEC 3.5)", () => {
     }
     db.close();
 });
+
+// Two constraints on session_layouts that the store leans on directly: the CHECK
+// is what lets Workspace.getLayouts key a { viewer, terminal } object straight
+// off the stored string, and the UNIQUE pair is the conflict target of
+// setLayout's upsert. Losing either turns a bad write into silent data instead
+// of a rejection.
+test("session_layouts pins one row per region and rejects an unknown region", () => {
+    const db = loadSchema();
+    db.exec(
+        "INSERT INTO groups (id, server_id, name, position, collapsed, created_at, updated_at) VALUES ('g', 's', 'G', 0, 0, 1, 1)",
+    );
+    db.exec(
+        "INSERT INTO dev_sessions (id, server_id, group_id, name, repository_root, position, archived, created_at, updated_at) VALUES ('d', 's', 'g', 'S', '/r', 0, 0, 1, 1)",
+    );
+    const insert = db.prepare(
+        "INSERT INTO session_layouts (id, server_id, dev_session_id, region, tree, created_at, updated_at) VALUES (?, 's', 'd', ?, '{}', 1, 1)",
+    );
+    insert.run("l1", "viewer");
+    insert.run("l2", "terminal");
+    // A second viewer tree for the same Dev Session is a duplicate, not a second
+    // layout: the region slot is single-valued.
+    assert.throws(() => insert.run("l3", "viewer"));
+    // Anything outside the two regions is refused outright.
+    assert.throws(() => insert.run("l4", "sidebar"));
+    const rows = db
+        .prepare("SELECT region FROM session_layouts ORDER BY region")
+        .all() as Array<{ region: string }>;
+    assert.deepEqual(rows.map((r) => r.region), ["terminal", "viewer"]);
+    db.close();
+});

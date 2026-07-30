@@ -68,6 +68,10 @@ private:
     // Hands (title, body) to the backend. `replacesId` is 0 for a new bubble or
     // a previously returned id to update in place. Returns the id the backend
     // assigned, or 0 when there is no backend / the call failed.
+    //
+    // The backend answers asynchronously, so a NEW bubble's id is folded into
+    // m_lastId when the reply lands. That reply is only adopted while the raise
+    // it belongs to is still the tracked one — see m_raiseSerial.
     unsigned int deliver(const QString& title, const QString& body,
                          unsigned int replacesId);
 
@@ -79,6 +83,13 @@ private:
     QString m_lastBody;
     bool m_haveLast = false;
     unsigned int m_lastId = 0;
+    // Incremented once per RAISED bubble. Two distinct notifications in quick
+    // succession each start an asynchronous Notify, and the replies may land in
+    // either order: without this stamp the FIRST bubble's id could be adopted
+    // as m_lastId after the SECOND has become the tracked pair, so a repeat of
+    // the second notification would rewrite the first bubble with the second's
+    // text. A reply whose serial is no longer current is discarded instead.
+    quint64 m_raiseSerial = 0;
     QElapsedTimer m_sinceLast;
 };
 

@@ -35,7 +35,9 @@ contract so downstream work can build against it before it is fully implemented.
   - `adapters/` — `oh-my-pi` (SPEC 6.5 mapping), `pi`, `claude-code`, registry.
   - `bridge.ts` — Unix-socket → JSONL relay (dir-create + stale-socket guard).
   - `codeharbord.ts` — JSON-RPC 2.0 `--stdio` dispatch (`ping`, `server.info`).
-  - **Verified:** `npm test` → 11/11 pass; RPC stdio + bridge socket smoke-tested.
+  - **Verified at bootstrap:** `npm test` → 11/11 pass (the suite has grown a
+    long way past that since; see docs/DEVELOPMENT.md for the current count);
+    RPC stdio + bridge socket smoke-tested.
 - CI: `remote` job (install/typecheck/test) and `client` job (Qt+CMake build).
 
 > The bootstrap seams described above are all filled in by later waves; see
@@ -413,8 +415,31 @@ drag-reorder regression it briefly introduced caught by `tst_sidebar` and fixed.
 >   and reverted for lack of tests, and it cascades to every session in the group, so
 >   it needs a confirmation that states the real cost.
 > - **Crash-recovery is written but never offered.** `EditorController::recoveryAvailable`
->   has no consumer, so SPEC 11.3 snapshots are taken, found on reopen, and ignored.
->   The fix belongs in `EditorPaneView.qml`.
+>   has no consumer, so SPEC 11.3 snapshots are taken, found on reopen, and ignored:
+>   `checkRecovery()` reads the server-side snapshot, sees it differs from the file on
+>   disk, emits the signal — and because no QML connects to it the recovered text is
+>   dropped on the floor. The user is never asked, and the unsaved work the snapshot
+>   exists to protect is silently lost. The fix belongs in `EditorPaneView.qml`.
+> - **The sidebar row shows a status dot, not the counters SPEC 4.2 asks for.** SPEC 4.2
+>   wants the number of active terminals, the number of terminals requiring attention,
+>   an unsaved-file indicator and an error indicator on each Dev Session row. Only the
+>   aggregate state (which does cover the error case) is delivered:
+>   `SessionsModel::Roles` in `src/models/SessionsModel.h` has no role for either
+>   counter, so the delegate has nothing to bind to. Needs two new roles plus the
+>   per-session terminal tallies to feed them. SPEC 4.2 now marks these unimplemented.
+> - **Unsaved-file state never reaches the Dev Session row (SPEC 8.2).**
+>   `aggregateRowState()` in `src/models/SessionState.cpp` folds only terminal and
+>   coding-agent conditions — error, waiting-for-input, running, finished-unseen,
+>   connected. No file state is an input, so a session with a dirty editor buffer looks
+>   identical to a clean one in the sidebar. Fixing it means routing `FileState` from
+>   the editor controllers up to the per-session aggregation, which is a real design
+>   step, not a wiring change. SPEC 8.2 now records this.
+> - **Conflict handling offers two of the four documented choices (SPEC 8.6).** The
+>   notice in `src/web/editor/src/index.ts` has **Reload** and **Overwrite**;
+>   **Compare** and **Save As** are absent because the C++ bridge
+>   (`src/editor/EditorController.h`) has no diff-view and no write-to-another-path
+>   method. The safety requirement of that section is met — no silent overwrite — so
+>   this is a missing affordance, not a correctness hole. SPEC 8.6 now records it.
 > - **`viewer_panes`/`terminal_panes` CRUD is unused.** Pane URLs ride in the layout
 >   tree instead (atomic with the structure, no extra RPC); those six methods and the
 >   two tables stay dead until per-pane metadata needs a home.
@@ -437,7 +462,7 @@ drag-reorder regression it briefly introduced caught by `tst_sidebar` and fixed.
 >   the key as unknown, and parked awaiting a prompt nobody could answer headlessly —
 >   which reads exactly like a broken auto-reconnect. The product was right; the
 >   coverage is not.
-> - **Two live gates hardcode the dev layout.** `tst_livessh:183` and
+> - **Two live gates hardcode the dev layout.** `tst_livessh:194` and
 >   `tst_liveagent:355` build their remote command from
 >   `<CH_LIVE_REPO>/remote/src/*.ts` instead of going through
 >   `SessionBootstrap::entryCandidates()`, so they only pass against a git

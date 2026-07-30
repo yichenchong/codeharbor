@@ -2,7 +2,6 @@
 /build/
 /build-*/
 /out/
-/dist/
 *.o
 *.obj
 *.a

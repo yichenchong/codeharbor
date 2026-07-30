@@ -45,7 +45,17 @@ export type CommandRunner = (argv: string[]) => Promise<CommandResult>;
 /** Exit code used when tmux is not on PATH (or otherwise unspawnable). */
 export const SPAWN_FAILED = -1;
 
+// The binary is overridable so the live suite can point at a wrapper or a
+// non-PATH tmux; unset it and this is plain `tmux` resolved through PATH.
 const TMUX_BINARY = process.env.CODEHARBOR_TMUX ?? "tmux";
+
+// Wall-clock ceiling for one tmux invocation. Every caller awaits its runner and
+// the dispatcher awaits the handler, so a tmux that never answers (an
+// unresponsive server socket, a stuck NFS-mounted socket directory) would hang
+// the RPC method — and the client's session list — forever. Ten seconds is far
+// beyond any healthy `list-sessions`, and hitting it lands on rule 1's empty
+// result rather than an error.
+const TMUX_TIMEOUT_MS = 10_000;
 
 // Machine-readable listing format. The NAME COMES LAST on purpose: a tmux
 // session name may contain the field delimiter (and spaces, and `:`), so the
@@ -55,26 +65,12 @@ const TMUX_BINARY = process.env.CODEHARBOR_TMUX ?? "tmux";
 export const LIST_SESSIONS_FORMAT =
     "#{session_windows}\t#{session_created}\t#{?session_attached,1,0}\t#{session_name}";
 
-// SECURITY: a session name is REMOTE-CONTROLLED data that is echoed back inside
-// the listing, so "one line = one record" is an assumption an attacker gets to
-// attack. tmux 3.6 does escape a newline in a name to the two characters \ and
-// n (session_check_name() vis-encodes VIS_NL|VIS_TAB), which is what stops a
-// name like "x\n9\t0\t1\tforged" from injecting a whole extra record today —
-// but that is the SERVER's normalization, not an invariant this parser may rest
-// on. So every record is prefixed with a per-call, unguessable marker that tmux
-// emits as literal format text: a line that does not start with the marker is
-// not a record tmux produced for THIS call, and is dropped. A name cannot carry
-// a marker it cannot predict, so forging a record is impossible rather than
-// merely unlikely.
-//
-// base64url so the marker can never contain a tab (the field delimiter) or `#`
-// (which tmux would read as a format directive).
 export const execFileRunner: CommandRunner = (argv) =>
     new Promise<CommandResult>((resolve) => {
         execFile(
             TMUX_BINARY,
             argv,
-            { encoding: "utf8", maxBuffer: 8 * 1024 * 1024 },
+            { encoding: "utf8", maxBuffer: 8 * 1024 * 1024, timeout: TMUX_TIMEOUT_MS },
             (err, stdout, stderr) => {
                 if (err === null) {
                     resolve({ code: 0, stdout, stderr });
@@ -100,6 +96,21 @@ async function run(runner: CommandRunner, argv: string[]): Promise<CommandResult
         return { code: SPAWN_FAILED, stdout: "", stderr: err instanceof Error ? err.message : String(err) };
     }
 }
+
+// SECURITY: a session name is REMOTE-CONTROLLED data that is echoed back inside
+// the listing, so "one line = one record" is an assumption an attacker gets to
+// attack. tmux 3.6 does escape a newline in a name to the two characters \ and
+// n (session_check_name() vis-encodes VIS_NL|VIS_TAB), which is what stops a
+// name like "x\n9\t0\t1\tforged" from injecting a whole extra record today —
+// but that is the SERVER's normalization, not an invariant this parser may rest
+// on. So every record is prefixed with a per-call, unguessable marker that tmux
+// emits as literal format text: a line that does not start with the marker is
+// not a record tmux produced for THIS call, and is dropped. A name cannot carry
+// a marker it cannot predict, so forging a record is impossible rather than
+// merely unlikely.
+//
+// listSessions mints the marker with base64url so it can never contain a tab
+// (the field delimiter) or `#` (which tmux would read as a format directive).
 
 /**
  * Parse the tab-separated output of `tmux list-sessions -F LIST_SESSIONS_FORMAT`.
@@ -179,6 +190,14 @@ export async function sessionExists(
 /**
  * Kill one session by exact name. Idempotent: killing an absent session, or
  * calling this where tmux is not installed, is a successful no-op.
+ *
+ * Unlike sessionExists this does go through tmux's `-t` target grammar, because
+ * there is no listing-only way to destroy a session. `=` pins the lookup to an
+ * exact name, so neither an option-shaped nor a glob name can reach another
+ * session. The one construct `=` does not neutralize is a `:` inside the name,
+ * which the grammar may read as a session/window separator — tmux rewrites `:`
+ * out of a session name when the session is created, so such a name should not
+ * exist on the host, but this is the reason sessionExists prefers the listing.
  */
 export async function killSession(
     params: KillSessionParams,

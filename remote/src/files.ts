@@ -82,27 +82,43 @@ async function statOrUndefined(target: string): Promise<Stats | undefined> {
     }
 }
 
-// Detect binary content: any NUL byte, or bytes that are not valid UTF-8.
-function isBinary(buf: Buffer): boolean {
-    if (buf.includes(0)) return true;
+// Decode as UTF-8, or report "not text" (undefined) for any NUL byte or any
+// byte sequence that is not valid UTF-8. One decode serves both the verdict and
+// the string that is returned, so the bytes are walked once instead of twice.
+//
+// ignoreBOM is required for correctness, not speed: TextDecoder DROPS a leading
+// byte-order mark by default, so decoding without it would hand the client a
+// buffer three bytes shorter than the file. Saving that buffer back would then
+// silently delete the BOM (SPEC 8.5 saves must round-trip the exact bytes).
+function decodeUtf8(buf: Buffer): string | undefined {
+    if (buf.includes(0)) return undefined;
     try {
-        new TextDecoder("utf-8", { fatal: true }).decode(buf);
-        return false;
+        return new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(buf);
     } catch {
-        return true;
+        return undefined;
     }
 }
 
 export async function stat(params: StatParams): Promise<StatResult> {
     // lstat so symlinks report kind "symlink" rather than their target.
     const stats = await fsp.lstat(params.path);
+    // The revision must name the inode readFile and writeFile actually touch,
+    // and both of those FOLLOW a symlink. Minting the token from the link
+    // itself would make every save through a symlink a guaranteed — and
+    // unresolvable — revision mismatch: the client would load one token from
+    // stat and the write guard would compare it against a different one.
+    // A dangling or looping link has no readable target; fall back to the
+    // link's own token so stat still answers instead of failing.
+    const target = stats.isSymbolicLink()
+        ? await fsp.stat(params.path).catch(() => undefined)
+        : undefined;
     return {
         path: params.path,
         kind: nodeKind(stats),
         size: stats.size,
         mtimeMs: stats.mtimeMs,
         mode: stats.mode,
-        revision: revisionFrom(stats),
+        revision: revisionFrom(target ?? stats),
     };
 }
 
@@ -128,38 +144,56 @@ export async function readFile(params: ReadFileParams): Promise<ReadFileResult> 
         // negative offset would otherwise index from the end of the file and
         // silently return the wrong tail.
         const offset = Math.max(0, Math.trunc(params.offset ?? 0));
+        const wanted =
+            params.length === undefined ? undefined : Math.max(0, Math.trunc(params.length));
         let slice: Buffer;
-        let truncated = false;
-        if (params.offset !== undefined || params.length !== undefined) {
+        if (params.offset !== undefined || wanted !== undefined) {
             // Ranged read: pull ONLY the requested window into memory via a
             // positioned read, so a multi-GiB file never loads whole (which
             // would also exceed Buffer's max length).
             if (offset >= size) {
                 slice = Buffer.alloc(0);
             } else {
-                const want =
-                    params.length !== undefined
-                        ? Math.min(Math.max(0, Math.trunc(params.length)), size - offset)
-                        : size - offset;
+                const want = wanted === undefined ? size - offset : Math.min(wanted, size - offset);
                 const dest = Buffer.alloc(want);
                 const { bytesRead } = await handle.read(dest, 0, want, offset);
                 slice = bytesRead === want ? dest : dest.subarray(0, bytesRead);
-                if (params.length !== undefined) {
-                    truncated = offset + Math.max(0, Math.trunc(params.length)) < size;
-                }
             }
         } else {
             slice = await handle.readFile();
         }
 
+        // `truncated` answers exactly ONE question: is `content` the WHOLE file?
+        // It is true whenever any byte of the file is absent from the returned
+        // content — bytes BEFORE the window (any offset past byte 0) count just
+        // as much as bytes after it (a length that stops short of the end, and
+        // the degenerate case of an offset at or beyond the end of a non-empty
+        // file, which returns nothing at all). Every consumer depends on that
+        // one meaning and on nothing else: the viewer refuses to render a
+        // partial document (src/viewers/InternalUrlSchemeHandler.cpp,
+        // src/viewers/ViewerModel.cpp) and the editor marks the buffer
+        // read-only so a save can never delete the bytes it never received
+        // (src/editor/EditorController.cpp).
+        //
+        // Derived ONCE from the CLAMPED window [start, end) against the file
+        // size, so every return path above obeys the same definition — the flag
+        // used to be assigned only inside the ranged branch, which reported
+        // "whole file" for an offset-only tail read and for a read past the end.
+        // Computed from the requested window rather than from bytesRead: a short
+        // read caused by the file shrinking mid-read is a separate concern, and
+        // an empty file always reports false because "" IS its whole content.
+        const start = Math.min(offset, size);
+        const end = wanted === undefined ? size : Math.min(start + wanted, size);
+        const truncated = start > 0 || end < size;
+
         // A byte range that cuts a multibyte codepoint is not valid UTF-8, so
-        // isBinary() flips encoding to base64 — the exact bytes round-trip
-        // losslessly rather than being mangled by a lossy UTF-8 decode.
-        const binary = isBinary(slice);
+        // the decode fails and the encoding flips to base64 — the exact bytes
+        // round-trip losslessly rather than being mangled by a lossy decode.
+        const text = decodeUtf8(slice);
         return {
             path: params.path,
-            encoding: binary ? "base64" : "utf-8",
-            content: binary ? slice.toString("base64") : slice.toString("utf-8"),
+            encoding: text === undefined ? "base64" : "utf-8",
+            content: text ?? slice.toString("base64"),
             revision,
             truncated,
         };
@@ -171,12 +205,16 @@ export async function readFile(params: ReadFileParams): Promise<ReadFileResult> 
 // Enforce the revision guard (SPEC 8.4 / 8.6). "" means create-only. Factored
 // out so the identical rule runs both at the start of a write and again just
 // before the rename, shrinking the window where a file changes mid-write.
+// The on-disk token is reported under the key `currentRevision`, which is the
+// one the client reads to offer reload/overwrite straight from the error
+// (EditorController::save, src/web/editor/src/index.ts); any other name costs
+// the conflict path an extra stat round-trip.
 function assertRevisionMatches(filePath: string, expectedRevision: string, current: Stats | undefined): void {
     if (expectedRevision === "") {
         if (current) {
             throw new RevisionMismatchError(
                 `File already exists: ${filePath}`,
-                { path: filePath, revision: revisionFrom(current) },
+                { path: filePath, currentRevision: revisionFrom(current) },
             );
         }
     } else if (!current) {
@@ -185,14 +223,14 @@ function assertRevisionMatches(filePath: string, expectedRevision: string, curre
         // silent recreate (SPEC 8.6: never silently overwrite a changed file).
         throw new RevisionMismatchError(
             `File no longer exists: ${filePath}`,
-            { path: filePath, expected: expectedRevision, actual: null },
+            { path: filePath, expected: expectedRevision, currentRevision: null },
         );
     } else {
         const rev = revisionFrom(current);
         if (rev !== expectedRevision) {
             throw new RevisionMismatchError(
                 `Revision mismatch for ${filePath}`,
-                { path: filePath, expected: expectedRevision, actual: rev },
+                { path: filePath, expected: expectedRevision, currentRevision: rev },
             );
         }
     }
@@ -239,6 +277,20 @@ export async function writeFile(params: WriteFileParams): Promise<WriteFileResul
 
 async function writeFileLocked(params: WriteFileParams): Promise<WriteFileResult> {
     const encoding = params.encoding ?? "utf-8";
+    // Buffer.from(s, "base64") is LENIENT: it silently drops every character
+    // outside the alphabet and discards a trailing partial group. A payload
+    // mangled in transit would therefore be written as short, corrupt bytes and
+    // reported back as a successful save. Reject it instead. Node accepts the
+    // standard (+/) and URL-safe (-_) alphabets and ignores whitespace, so the
+    // check mirrors that; a stripped length of 1 mod 4 encodes no byte string.
+    if (encoding === "base64") {
+        const compact = params.content.replace(/\s/g, "").replace(/=+$/, "");
+        if (!/^[A-Za-z0-9+\/\-_]*$/.test(compact) || compact.length % 4 === 1) {
+            throw Object.assign(new Error(`Invalid base64 content for ${params.path}`), {
+                code: "ERR_INVALID_ARG_VALUE",
+            });
+        }
+    }
     const existing = await statOrUndefined(params.path);
 
     assertRevisionMatches(params.path, params.expectedRevision, existing);
@@ -253,15 +305,32 @@ async function writeFileLocked(params: WriteFileParams): Promise<WriteFileResult
     const target = existing ? await fsp.realpath(params.path) : params.path;
     const dir = path.dirname(target);
     const tmp = path.join(dir, `.${path.basename(target)}.${randomBytes(6).toString("hex")}.tmp`);
-    const mode = existing ? existing.mode : 0o644;
-    let handle: FileHandle | undefined = await fsp.open(tmp, "wx", mode);
+    // Creating a file whose parent directory does not exist yet must WORK, not
+    // fail with ENOENT: the frozen C1 method catalog has no createDirectory, so
+    // writeFile is the only way a client can bring a new path into being. The
+    // editor's crash-recovery snapshots (SPEC 11.3) are exactly this case — they
+    // are written to a `.codeharbor-recovery/` directory beside the file that
+    // nothing else ever creates, and the write is best-effort, so an ENOENT here
+    // silently disabled recovery altogether. Only the create path needs this: an
+    // overwrite proves the directory already exists. `recursive` also makes it a
+    // no-op when it does. 0o700 applies ONLY to directories actually created,
+    // and keeps a directory this service invented private to its owner — it can
+    // hold unsaved user work (SPEC 11.3 wants recovery data at mode 0600).
+    if (!existing) await fsp.mkdir(dir, { recursive: true, mode: 0o700 });
+    // 0o7777 keeps the permission plus setuid/setgid/sticky bits and drops the
+    // file-type bits stat reports. The temp file is created 0o600 when it will
+    // replace an existing file, so its half-written contents are never readable
+    // by other users under a group- or world-readable target mode; the chmod
+    // below pins the real mode once the bytes are on disk.
+    const finalMode = existing ? existing.mode & 0o7777 : 0o644;
+    let handle: FileHandle | undefined = await fsp.open(tmp, "wx", existing ? 0o600 : finalMode);
     try {
         await handle.writeFile(buf);
         await handle.sync();
         await handle.close();
         handle = undefined;
         // open()'s mode is masked by umask; chmod pins the exact mode on overwrite.
-        if (existing) await fsp.chmod(tmp, existing.mode);
+        if (existing) await fsp.chmod(tmp, finalMode);
         // Re-verify as late as possible — right before the atomic replace — so a
         // file changed during the write + flush above is caught instead of being
         // silently overwritten (SPEC 8.6). This shrinks but cannot fully close
@@ -270,7 +339,10 @@ async function writeFileLocked(params: WriteFileParams): Promise<WriteFileResult
         await fsp.rename(tmp, target);
     } catch (err) {
         if (handle) await handle.close().catch(() => {});
-        await fsp.rm(tmp, { force: true });
+        // Cleanup must never mask the real failure: a RevisionMismatchError
+        // rethrown as an unlink error would reach the client as a generic
+        // internal error and the conflict dialog (SPEC 8.6) would never open.
+        await fsp.rm(tmp, { force: true }).catch(() => {});
         throw err;
     }
 
@@ -294,6 +366,12 @@ async function writeFileLocked(params: WriteFileParams): Promise<WriteFileResult
 // Resolve relative paths against `base` (the repository root, defaulting to the
 // process cwd). insideRepositoryRoot follows SPEC 9: outside paths are allowed
 // but flagged so the UI can indicate the file is outside the project.
+//
+// The flag is LEXICAL and deliberately so: it never touches the filesystem, so
+// it costs nothing and works for paths that do not exist yet, but a symlink
+// inside the root that points elsewhere still reports inside. It is a UI hint,
+// NOT a sandbox — nothing in this service confines reads or writes to the root,
+// because SPEC 9 requires paths outside the root to remain openable.
 export function resolvePath(params: ResolvePathParams): ResolvePathResult {
     const base = path.resolve(params.base ?? process.cwd());
     const resolved = path.isAbsolute(params.path)

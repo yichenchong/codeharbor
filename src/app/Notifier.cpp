@@ -1,6 +1,6 @@
 #include "Notifier.h"
 
-#include <QVariantList>
+#include <QStringList>
 #include <QVariantMap>
 
 #if CH_HAVE_DBUS
@@ -82,6 +82,7 @@ void Notifier::notify(QString title, QString body)
     m_lastBody = body;
     m_haveLast = true;
     m_sinceLast.restart();
+    ++m_raiseSerial;
     m_lastId = deliver(title, body, 0);
     emit notificationRaised(title, body);
 }
@@ -108,12 +109,18 @@ unsigned int Notifier::deliver(const QString& title, const QString& body,
     // is asynchronous; the assigned id is folded back in for later replacement.
     QDBusPendingCall call = QDBusConnection::sessionBus().asyncCall(msg);
     auto* watcher = new QDBusPendingCallWatcher(call, this);
+    const quint64 serial = m_raiseSerial;
     connect(watcher, &QDBusPendingCallWatcher::finished, this,
-            [this, watcher, replacesId] {
+            [this, watcher, replacesId, serial] {
                 const QDBusPendingReply<unsigned int> reply = *watcher;
                 // A failed Notify is not the user's problem: stay silent and
                 // leave m_lastId alone so the next repeat just starts fresh.
-                if (!reply.isError() && replacesId == 0)
+                // The serial check drops a reply for a bubble that is no longer
+                // the tracked one, which would otherwise point m_lastId at an
+                // older bubble and make the next coalesced repeat rewrite THAT
+                // one with this notification's text.
+                if (!reply.isError() && replacesId == 0
+                    && serial == m_raiseSerial)
                     m_lastId = reply.value();
                 watcher->deleteLater();
             });

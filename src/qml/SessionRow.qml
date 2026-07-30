@@ -98,6 +98,17 @@ ItemDelegate {
                   ? qsTr("%1 (last known \u2014 the link is down)").arg(row.stateWords(row.rowState))
                   : row.stateWords(row.rowState)
 
+    // A screen reader gets nothing from this row otherwise: the delegate's own
+    // `text` property is never used (the name arrives in `name`, a SessionsModel
+    // role), so the accessible name would be empty and the status dot — colour,
+    // glyph and silhouette — carries no text at all.
+    Accessible.role: Accessible.ListItem
+    Accessible.name: row.name
+    Accessible.description: row.subtitle.length > 0
+                            ? qsTr("%1 \u2014 %2").arg(row.stateWords(row.rowState))
+                                                  .arg(row.subtitle)
+                            : row.stateWords(row.rowState)
+
     // Selection wins over hover; the source row of a live drag dims so the
     // floating proxy reads as the thing being moved.
     background: Rectangle {
@@ -227,7 +238,7 @@ ItemDelegate {
         }
     }
 
-    Dialog {
+    AppDialog {
         id: renameDialog
         title: qsTr("Rename session")
         modal: true
@@ -236,8 +247,14 @@ ItemDelegate {
 
         // Reset to the current name each open: imperative edits break the
         // `text: row.name` binding, so without this a cancelled edit would
-        // resurface as stale text on the next open.
-        onOpened: renameField.text = row.name
+        // resurface as stale text on the next open. Focused and selected, so
+        // "rename" starts by replacing the old name rather than appending to it
+        // (assigning `text` leaves the cursor at the end).
+        onOpened: {
+            renameField.text = row.name;
+            renameField.forceActiveFocus();
+            renameField.selectAll();
+        }
 
         TextField {
             id: renameField

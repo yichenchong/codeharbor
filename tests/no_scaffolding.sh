@@ -20,12 +20,16 @@ cd "$root"
 #   DEBUG ONLY     - debug-only code paths
 pattern='MUTATION-TEST|FIXME\(remove\)|DEBUG ONLY'
 
-# Search the sources humans ship. Build output, node_modules and this script
-# itself are excluded (this file names the markers by necessity).
-hits=$(grep -REn "$pattern" \
+# Search the sources humans ship. Dependency trees and generated bundles are
+# excluded explicitly: npm may install a workspace's dependencies into
+# src/web/*/node_modules instead of hoisting them, and a marker string inside
+# some third-party .ts file must never fail this gate. This script itself is not
+# searched because its extension is not in the include list.
+hits=$(grep -rEn "$pattern" \
         --include='*.cpp' --include='*.h' --include='*.qml' \
         --include='*.ts' --include='*.mjs' --include='*.sql' \
         --include='*.cmake' --include='CMakeLists.txt' \
+        --exclude-dir=node_modules --exclude-dir=dist \
         src remote 2>/dev/null || true)
 
 if [ -n "$hits" ]; then

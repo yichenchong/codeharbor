@@ -20,10 +20,12 @@ import { fileURLToPath } from "node:url";
 
 import {
     RPC_METHODS,
+    RPC_REVISION_MISMATCH,
     RPC_TMUX_METHODS,
     RPC_WORKSPACE_METHODS,
     RPC_WATCH_EVENT_NOTIFICATION,
 } from "../src/rpc-types.ts";
+import { RPC_SCHEMA_VERSION } from "../src/codeharbord.ts";
 import { WORKSPACE_METHODS } from "../src/workspace.ts";
 
 const headerPath = fileURLToPath(
@@ -112,5 +114,58 @@ test("every workspace.* contract name has a server handler", () => {
     assert.deepEqual(
         Object.keys(WORKSPACE_METHODS).sort(),
         tsGroup(RPC_WORKSPACE_METHODS),
+    );
+});
+
+// Method names are not the only duplicated contract: the application-level
+// error code travels the same wire and is written out twice as well. A server
+// that rejects a stale write with a code the client does not recognize turns a
+// precise "the file changed under you" conflict into a generic failure.
+test("the revision-mismatch error code matches between TypeScript and C++", () => {
+    const declared = /^inline constexpr int kRevisionMismatch\s*=\s*(-?\d+);/m.exec(header);
+    assert.ok(declared, "RpcTypes.h must declare kRevisionMismatch");
+    assert.equal(Number(declared[1]), RPC_REVISION_MISMATCH);
+    // JSON-RPC 2.0 reserves -32000..-32099 for implementation-defined server
+    // errors; anything outside that band collides with the spec's own codes.
+    assert.ok(
+        RPC_REVISION_MISMATCH <= -32000 && RPC_REVISION_MISMATCH >= -32099,
+        `${RPC_REVISION_MISMATCH} is outside the reserved server-error range`,
+    );
+});
+
+// The third copy of the schema-version contract. RPC_SCHEMA_VERSION lives in
+// remote/src/codeharbord.ts and is reported by server.info; the client refuses
+// to adopt a server whose reported schemaVersion is below
+// AppController::kMinimumServerSchemaVersion (src/app/AppController.h). The two
+// numbers are kept in LOCKSTEP, and this test pins them to each other, because
+// each bump so far added a method group or an info field the client actually
+// uses:
+//   * floor above the server  -> every connection fails the compatibility gate
+//     and the user gets an empty sidebar, the exact failure that gate explains;
+//   * server above the floor  -> the client accepts a server whose newer
+//     contract it was never taught, and the mismatch surfaces later as a
+//     method-not-found or a missing field on a live connection.
+// If a future bump is ever genuinely one-sided (a server capability no client
+// needs), relax this to an inequality deliberately, here, with a reason.
+test("the server's schemaVersion equals the client's declared minimum", () => {
+    const controllerPath = fileURLToPath(
+        new URL("../../src/app/AppController.h", import.meta.url),
+    );
+    // A header that no longer declares the constant in this form must FAIL, not
+    // quietly skip: a regex that matches nothing would turn this gate into a
+    // no-op exactly when the C++ side has been reshaped and needs checking.
+    const declared = /kMinimumServerSchemaVersion\s*=\s*(\d+);/.exec(
+        readFileSync(controllerPath, "utf8"),
+    );
+    assert.ok(
+        declared,
+        `AppController.h (${controllerPath}) must declare ` +
+            "kMinimumServerSchemaVersion as `= <integer>;`",
+    );
+    assert.equal(
+        RPC_SCHEMA_VERSION,
+        Number(declared[1]),
+        `codeharbord reports schemaVersion ${RPC_SCHEMA_VERSION} but the client ` +
+            `declares its minimum as ${declared[1]}: bump both together`,
     );
 });

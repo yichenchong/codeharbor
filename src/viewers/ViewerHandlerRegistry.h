@@ -37,9 +37,6 @@ public:
     // Classify a bare file extension (without the leading dot, case
     // insensitive). Unknown / known-binary extensions resolve to Download.
     static ViewerResolution resolveByExtension(const QString &ext);
-
-    // Back-compat scheme-only resolver retained for the bootstrap callers.
-    static ViewerResolution resolveScheme(const QString &scheme);
 };
 
 } // namespace ch

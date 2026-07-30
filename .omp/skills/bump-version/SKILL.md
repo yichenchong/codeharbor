@@ -24,9 +24,11 @@ What it does (commit mode, the default):
    `project(CodeHarbor VERSION …)` in `CMakeLists.txt`, else `0.0.0`).
 2. Computes the next version (`major` → `X+1.0.0`, `minor` → `X.Y+1.0`,
    `patch` → `X.Y.Z+1`) or uses `--set`.
-3. Rewrites the version in `CMakeLists.txt`, `package.json`, and
-   `remote/package.json` so the built binary (`CODEHARBOR_VERSION`) and the
-   remote artifact report the tagged version.
+3. Rewrites the version in `CMakeLists.txt` and in every workspace manifest —
+   `package.json`, `remote/package.json`, `src/web/terminal/package.json` and
+   `src/web/editor/package.json` — so the built binary (`CODEHARBOR_VERSION`),
+   the remote artifact and both web bundles report the tagged version. A missing
+   manifest aborts the run rather than being skipped.
 4. Commits **only those files** as `Release vX.Y.Z`.
 5. Creates the annotated tag `vX.Y.Z`.
 
@@ -46,9 +48,8 @@ actually starts the release workflow.
 ### Safety
 
 - Aborts if the target tag already exists.
-- Aborts if `CMakeLists.txt` / `package.json` / `remote/package.json` have
-  uncommitted changes (unless `--allow-dirty`), so in-progress version edits are
-  never clobbered.
+- Aborts if any of those version files have uncommitted changes (unless
+  `--allow-dirty`), so in-progress version edits are never clobbered.
 - Only the version files are staged — unrelated working-tree changes are left
   untouched.
 

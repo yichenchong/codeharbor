@@ -25,6 +25,16 @@ SshChannelDevice::SshChannelDevice(SshConnectionPool* pool,
     m_pump->setSingleShot(true);
     m_pump->setTimerType(Qt::PreciseTimer);
     connect(m_pump, &QTimer::timeout, this, &SshChannelDevice::pump);
+
+    // The pool frees every channel when its session goes down, so a device that
+    // outlives that moment MUST let go first: the read pump would otherwise
+    // call into a freed ssh_channel. Nothing else guarantees the owner tore the
+    // device down in time — a terminal pane deliberately survives an SSH drop
+    // and reattaches (SPEC 5.6).
+    if (m_pool) {
+        connect(m_pool, &SshConnectionPool::sessionClosing, this,
+                &SshChannelDevice::closeChannel);
+    }
 }
 
 SshChannelDevice::~SshChannelDevice()
@@ -35,9 +45,13 @@ SshChannelDevice::~SshChannelDevice()
     m_remoteFinished = true;
 #if CH_HAVE_LIBSSH
     if (m_channel) {
-        if (ssh_channel_is_open(m_channel))
-            ssh_channel_close(m_channel);
-        m_channel = nullptr;  // owned by the pool; never ssh_channel_free() here
+        // Hand it back rather than merely closing it: the channel's slot on the
+        // SSH connection is only reclaimed when the pool frees the channel, and
+        // a session that opens one channel per remote command runs out of slots
+        // long before it is disconnected.
+        if (m_pool)
+            m_pool->releaseChannel(m_channel);
+        m_channel = nullptr;
     }
 #endif
 }
@@ -86,10 +100,14 @@ void SshChannelDevice::abortStart(const QString& reason)
 {
 #if CH_HAVE_LIBSSH
     if (m_channel) {
-        if (ssh_channel_is_open(m_channel))
-            ssh_channel_close(m_channel);
+        // A start that failed halfway must not keep the channel: every failed
+        // attempt would otherwise burn one of the connection's channel slots
+        // for good, and a reconnect loop retries this path.
+        if (m_pool)
+            m_pool->releaseChannel(m_channel);
         m_channel = nullptr;
     }
+    m_hasPty = false;
 #endif
     emit channelError(reason);
 }
@@ -124,6 +142,7 @@ bool SshChannelDevice::resizePty(int cols, int rows)
 void SshChannelDevice::closeChannel()
 {
     m_pump->stop();
+    m_hasPty = false;
     m_readBuffer.clear();
     if (isOpen())
         QIODevice::close();
@@ -219,6 +238,7 @@ bool SshChannelDevice::startPty(const QString& term, int cols, int rows,
             return false;
         }
     }
+    m_hasPty = true;
 
     if (command.isEmpty()) {
         if (ssh_channel_request_shell(m_channel) != SSH_OK) {
@@ -238,7 +258,7 @@ bool SshChannelDevice::startPty(const QString& term, int cols, int rows,
 
 bool SshChannelDevice::resizePty(int cols, int rows)
 {
-    if (!m_channel)
+    if (!m_channel || !m_hasPty)
         return false;
     return ssh_channel_change_pty_size(m_channel, cols, rows) == SSH_OK;
 }
@@ -248,12 +268,15 @@ void SshChannelDevice::closeChannel()
     m_pump->stop();
 
     if (m_channel) {
-        if (ssh_channel_is_open(m_channel))
-            ssh_channel_close(m_channel);
-        // The pool owns every channel it hands out (SshConnectionPool.h) and
-        // frees them in closeSession(); freeing here would double-free.
+        // Hand the channel back: the pool owns it (SshConnectionPool.h) and
+        // freeing it here would double-free. Closing alone is not enough —
+        // an already-EOF channel is not even closable, and its slot on the SSH
+        // connection would stay consumed until the whole session went down.
+        if (m_pool)
+            m_pool->releaseChannel(m_channel);
         m_channel = nullptr;
     }
+    m_hasPty = false;
 
     // Drop anything still buffered: bytesAvailable() must not advertise
     // readable bytes on a device that has been closed.

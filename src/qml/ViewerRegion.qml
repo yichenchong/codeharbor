@@ -95,6 +95,19 @@ Rectangle {
             pane.paneActivated.connect(region.noteFocus);
             // Same reasoning for what the pane is SHOWING: wired once, at mint
             // time, so the report survives the re-parenting a split performs.
+            //
+            // Deliberately wired AFTER the paneId assignment, which is the one
+            // subtlety here. Assigning the id makes the brand-new pane report
+            // the url it was born with (ViewerPane reports on a paneId change
+            // too, since it refuses to report while unnamed), and that report is
+            // pure echo: the url came OUT of the leaf the host already has
+            // stored. Delivering it would be worse than dropping it, because a
+            // pane minted for the SPEC 4.5 fallback node — the window between
+            // switching Dev Session and its layout arriving — would echo into a
+            // SessionLayouts that has no tree yet, and the host would paint
+            // "layout not loaded" at a user who merely clicked another session.
+            // Every url the host actually needs is a later CHANGE, which this
+            // connection does carry.
             pane.urlOpened.connect(region.notePaneUrl);
         }
         if (pane.parent !== host) {

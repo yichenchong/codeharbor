@@ -95,8 +95,15 @@ signals:
     void connectionStateChanged(const QString& state);
     void clearRequested();
 
-    // The renderer reported a new cols x rows (not part of the page contract;
-    // the QML pane uses it to attach at the right size).
+    // The RENDERER reported a new cols x rows. Not part of the frozen page
+    // contract; the QML pane uses it to attach at the right size.
+    //
+    // FOOTGUN: src/qml/TerminalPaneView.qml answers this signal by calling
+    // attachNow(). It must therefore stay a report of what the PAGE asked for
+    // and nothing else. In particular it must NOT be re-broadcast from geometry
+    // the C++ side records itself: TerminalFactory::attach() sizes the
+    // controller as part of attaching, so a bridge that relayed every
+    // controller-side size change would re-enter attach() from inside attach().
     void geometryChanged();
 
 private:

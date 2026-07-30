@@ -79,6 +79,13 @@ export interface EditorBridge {
      *  OPTIONAL so this bundle still runs against an older C++ host that does
      *  not expose the slot (the proxy simply has no `ready` property). */
     ready?(): void;
+    /** The host's `fileState` Q_PROPERTY, cached by qwebchannel.js when the
+     *  channel opens (SPEC 8.2). fileStateChanged only fires on a TRANSITION,
+     *  and the transitions for a file whose load finished before this page
+     *  connected have already happened, so without reading the cached value the
+     *  status label stays blank until the file next changes state. OPTIONAL
+     *  because a host that does not publish the property leaves it undefined. */
+    readonly fileState?: string;
 }
 
 /** Extra, host-supplied context that is NOT carried by the frozen bridge. */
@@ -90,23 +97,41 @@ export interface MountOptions {
 
 /**
  * Resolve a Monaco language id from a remote path by matching the registered
- * language contributions (extension first, then exact filename). Falls back to
- * "plaintext" — the editor must render even for an unknown file type.
+ * language contributions. An exact FILENAME match wins over an extension match
+ * everywhere, hence two passes: a filename registration ("Dockerfile",
+ * "Gemfile", ".gitconfig") is the more specific statement, and a single pass
+ * would let whichever language happens to be registered first claim the file on
+ * its extension alone. Falls back to "plaintext" — the editor must render even
+ * for an unknown file type.
  */
 export function languageForPath(path: string): string {
     const slash = Math.max(path.lastIndexOf("/"), path.lastIndexOf("\\"));
     const name = path.slice(slash + 1);
+    // A leading dot is part of the NAME, not an extension (".gitconfig"), so
+    // only a dot after the first character starts one.
     const dot = name.lastIndexOf(".");
     const ext = dot > 0 ? name.slice(dot).toLowerCase() : "";
-    for (const lang of monaco.languages.getLanguages()) {
+    const languages = monaco.languages.getLanguages();
+    for (const lang of languages) {
         if (lang.filenames?.some((f) => f === name)) {
             return lang.id;
         }
-        if (ext && lang.extensions?.some((e) => e.toLowerCase() === ext)) {
-            return lang.id;
+    }
+    if (ext) {
+        for (const lang of languages) {
+            if (lang.extensions?.some((e) => e.toLowerCase() === ext)) {
+                return lang.id;
+            }
         }
     }
     return "plaintext";
+}
+
+/** Handle the page bootstrap keeps so it can tear the editor down when the pane
+ *  goes away. Mirrors TerminalHost in src/web/terminal/src/index.ts. */
+export interface EditorHost {
+    /** Flush a pending crash-recovery snapshot (SPEC 11.3) and release Monaco. */
+    dispose(): void;
 }
 
 /**
@@ -119,36 +144,28 @@ export function mountEditor(
     element: HTMLElement,
     bridge: EditorBridge,
     options: MountOptions = {},
-): void {
+): EditorHost {
     // ---- DOM scaffold: a thin status bar above the editor surface. ----
-    element.style.display = "flex";
-    element.style.flexDirection = "column";
+    // Appearance and layout live in the page's stylesheet next to the rest of
+    // the page's rules (see ../index.html); only STATE the script owns —
+    // whether the notice is showing — is set as an inline style here.
+    const doc = element.ownerDocument;
 
-    const statusEl = document.createElement("div");
+    const statusEl = doc.createElement("div");
     statusEl.className = "ch-editor-status";
-    statusEl.style.flex = "0 0 auto";
-    statusEl.style.font = "12px/1.6 system-ui, sans-serif";
-    statusEl.style.padding = "2px 8px";
-    statusEl.style.display = "flex";
-    statusEl.style.alignItems = "center";
-    statusEl.style.gap = "8px";
 
-    const stateLabel = document.createElement("span");
+    const stateLabel = doc.createElement("span");
     stateLabel.className = "ch-editor-state";
     statusEl.appendChild(stateLabel);
 
     // Conflict/error affordance, hidden until a save fails.
-    const notice = document.createElement("span");
+    const notice = doc.createElement("span");
     notice.className = "ch-editor-notice";
     notice.style.display = "none";
-    notice.style.marginLeft = "auto";
-    notice.style.gap = "6px";
     statusEl.appendChild(notice);
 
-    const editorEl = document.createElement("div");
+    const editorEl = doc.createElement("div");
     editorEl.className = "ch-editor-surface";
-    editorEl.style.flex = "1 1 auto";
-    editorEl.style.minHeight = "0";
 
     element.appendChild(statusEl);
     element.appendChild(editorEl);
@@ -161,7 +178,10 @@ export function mountEditor(
         theme: "vs-dark",
         readOnly: false,
         automaticLayout: true,
-        minimap: { enabled: false },
+        // SPEC 8.1 lists the minimap among the things the embedded editor is
+        // expected to provide, alongside find/replace, multiple cursors,
+        // folding and bracket matching (all Monaco defaults).
+        minimap: { enabled: true },
         scrollBeyondLastLine: false,
     });
 
@@ -173,6 +193,14 @@ export function mountEditor(
     let applyingHostEdit = false;
     // Whether the buffer diverges from loadedRevision (unsaved user edits).
     let dirty = false;
+    // Monotonic count of USER edits to the model. Its only job is to answer
+    // "did the buffer change since the bytes of the in-flight save were taken?",
+    // which decides whether a reported success leaves the buffer clean.
+    let editSerial = 0;
+    // Value of editSerial when the bytes currently believed to be on the server
+    // were taken: set by every save this page issues and by every host-driven
+    // load, both of which re-baseline the buffer against the file.
+    let baselineEditSerial = 0;
     // Mirror of the host readOnly toggle (SPEC 8.2). A read-only buffer must
     // never issue a save, even via the Ctrl/Cmd+S command binding.
     let readOnly = false;
@@ -188,10 +216,67 @@ export function mountEditor(
         stateLabel.textContent = dirty && base ? `${base} \u2022` : base;
     }
 
+    // ---- crash-recovery snapshots and saves (both send the buffer to C++) ----
+    // Debounced snapshot of the unsaved buffer (SPEC 11.3): the host writes it
+    // to a server-side recovery path and marks the file dirty.
+    let reportTimer: number | undefined;
+
+    function cancelReport(): void {
+        clearTimeout(reportTimer);
+        reportTimer = undefined;
+    }
+
+    function scheduleReport(): void {
+        cancelReport();
+        if (!dirty) {
+            // Nothing to recover. Snapshotting a clean buffer would flag the
+            // file dirty on the host for no reason, and a dirty flag suppresses
+            // the automatic reload of a clean buffer (SPEC 8.7).
+            return;
+        }
+        reportTimer = setTimeout(() => {
+            reportTimer = undefined;
+            bridge.reportContent(editor.getValue());
+        }, 500);
+    }
+
+    function flushReport(): void {
+        if (reportTimer === undefined) {
+            return; // nothing pending
+        }
+        cancelReport();
+        bridge.reportContent(editor.getValue());
+    }
+
+    /**
+     * Persist the buffer guarded by `revision` (SPEC 8.4/8.6). Cancelling the
+     * pending snapshot is part of saving, not an optimisation: reportContent()
+     * marks the file dirty on the host and rewrites the recovery snapshot, so a
+     * timer allowed to fire AFTER the save succeeded would resurrect a stale
+     * "unsaved changes" copy of an already-saved file (the host discards the
+     * snapshot on a successful save) and would leave the buffer flagged dirty,
+     * which suppresses the automatic reload of a clean buffer on an external
+     * change (SPEC 8.7). A save that FAILS re-arms it: those edits really are
+     * still unsaved.
+     */
+    function requestSave(revision: string): void {
+        cancelReport();
+        // The bytes handed over are the buffer as it is NOW; edits after this
+        // point are not in them (see the saved handler).
+        baselineEditSerial = editSerial;
+        bridge.save(editor.getValue(), revision);
+    }
+
     // ---- signals: C++ -> JS ----
     bridge.contentLoaded.connect((content: string, revision: string) => {
         loadedRevision = revision;
+        // The buffer now IS the file, so a save reported later must not be
+        // second-guessed by edits this load already superseded.
+        baselineEditSerial = editSerial;
         clearNotice();
+        // A snapshot armed by edits this load supersedes must not be sent: it
+        // would re-flag the freshly loaded buffer as dirty.
+        cancelReport();
         const model = editor.getModel();
         if (model && model.getValue() === content) {
             // Identical buffer (e.g. reload of unchanged file): just re-baseline.
@@ -222,9 +307,28 @@ export function mountEditor(
 
     bridge.saved.connect((revision: string) => {
         loadedRevision = revision;
-        dirty = false;
+        // Anything typed while the write was in flight is NOT in the bytes that
+        // just landed, so the buffer still diverges from the file and MUST stay
+        // marked as having unsaved changes.
+        //
+        // ch::EditorController::save() applies exactly this rule to its own
+        // dirty flag and FileState (src/editor/EditorController.cpp), but it can
+        // only notice edits it was TOLD about: its edit counter advances on the
+        // reportContent() slot, which this page debounces by 500 ms. So if a
+        // snapshot is still pending here, the host saw no edit, cleared its
+        // dirty flag and published the "clean" file state. Flushing the pending
+        // snapshot now corrects the host in the same turn, and it is also the
+        // only way those edits reach the crash-recovery snapshot at all
+        // (SPEC 11.3): a successful save discards the previous one. When the
+        // debounced report already went out during the write, nothing is pending
+        // and the host is dirty already, so flushReport() is a no-op.
+        const editedDuringSave = editSerial !== baselineEditSerial;
+        dirty = editedDuringSave;
         clearNotice();
         renderState();
+        if (editedDuringSave) {
+            flushReport();
+        }
     });
 
     bridge.saveConflict.connect((currentRevision: string) => {
@@ -232,16 +336,19 @@ export function mountEditor(
         // user a choice: reload (discard local edits) or overwrite (force save
         // against the server's current revision).
         clearNotice();
-        const msg = document.createElement("span");
+        // The buffer is still unsaved, so keep the recovery snapshot current
+        // while the notice waits for the user (requestSave cancelled it).
+        scheduleReport();
+        const msg = doc.createElement("span");
         msg.textContent = "File changed on disk.";
-        const reload = document.createElement("button");
+        const reload = doc.createElement("button");
         reload.type = "button";
         reload.textContent = "Reload";
         reload.addEventListener("click", () => {
             clearNotice();
             bridge.requestReload();
         });
-        const overwrite = document.createElement("button");
+        const overwrite = doc.createElement("button");
         overwrite.type = "button";
         overwrite.textContent = "Overwrite";
         overwrite.addEventListener("click", () => {
@@ -249,7 +356,7 @@ export function mountEditor(
             // it is accepted; adopt it locally so a subsequent saved lines up.
             loadedRevision = currentRevision;
             clearNotice();
-            bridge.save(editor.getValue(), currentRevision);
+            requestSave(currentRevision);
         });
         notice.replaceChildren(msg, reload, overwrite);
         notice.style.display = "flex";
@@ -257,14 +364,15 @@ export function mountEditor(
 
     bridge.saveError.connect((message: string) => {
         clearNotice();
-        const msg = document.createElement("span");
+        scheduleReport(); // as above: the buffer is still unsaved
+        const msg = doc.createElement("span");
         msg.textContent = `Save failed: ${message}`;
-        const retry = document.createElement("button");
+        const retry = doc.createElement("button");
         retry.type = "button";
         retry.textContent = "Retry";
         retry.addEventListener("click", () => {
             clearNotice();
-            bridge.save(editor.getValue(), loadedRevision);
+            requestSave(loadedRevision);
         });
         notice.replaceChildren(msg, retry);
         notice.style.display = "flex";
@@ -276,31 +384,34 @@ export function mountEditor(
         if (readOnly) {
             return;
         }
-        bridge.save(editor.getValue(), loadedRevision);
+        requestSave(loadedRevision);
     });
 
-    // Debounced crash-recovery snapshot on user edits (SPEC 11.3). Host-driven
-    // setValue is excluded via applyingHostEdit.
-    let reportTimer: number | undefined;
+    // Arm the snapshot on USER edits only; host-driven setValue is excluded via
+    // applyingHostEdit.
     editor.onDidChangeModelContent(() => {
         if (applyingHostEdit) {
             return;
         }
+        ++editSerial;
         if (!dirty) {
             dirty = true;
             renderState();
         }
-        clearTimeout(reportTimer);
-        reportTimer = setTimeout(() => {
-            reportTimer = undefined;
-            bridge.reportContent(editor.getValue());
-        }, 500);
+        scheduleReport();
     });
 
-    // Flush any pending snapshot and release Monaco when the surface goes away.
-    editor.onDidDispose(() => {
-        clearTimeout(reportTimer);
-    });
+    // A host that disposes the editor directly (not through the returned host)
+    // must not leave a timer that would call getValue() on a dead editor.
+    editor.onDidDispose(cancelReport);
+
+    // The file state reached before this page finished loading is already in the
+    // property cache, so the label is correct without waiting for a transition
+    // (the same trick the terminal page uses for connectionState).
+    if (typeof bridge.fileState === "string") {
+        stateLabel.dataset.state = bridge.fileState;
+        renderState();
+    }
 
     // READY HANDSHAKE — MUST be the last thing mountEditor does. Every signal
     // handler above is now attached, so the host may safely replay a load that
@@ -308,6 +419,19 @@ export function mountEditor(
     // is emitted into the void and the pane stays empty). Optional-called so an
     // older host without the slot is a no-op rather than a TypeError.
     bridge.ready?.();
+
+    return {
+        dispose(): void {
+            // A debounced snapshot still pending is the newest copy of the
+            // unsaved buffer in existence. The pane is going away (closed, or
+            // reloaded because the host retargeted it at another file), so send
+            // it now instead of dropping it on the floor (SPEC 11.3).
+            flushReport();
+            // Disposing a standalone editor also disposes the model it created
+            // from `value`, so nothing is left behind.
+            editor.dispose();
+        },
+    };
 }
 
 // ---- QWebChannel page-entry bootstrap ----
@@ -327,16 +451,52 @@ type QWebChannelCtor = new (
     callback: (channel: QWebChannelInstance) => void,
 ) => QWebChannelInstance;
 
-declare const QWebChannel: QWebChannelCtor;
-declare const qt: { webChannelTransport: unknown };
+// Both are injected by the host, so a page opened OUTSIDE Qt WebEngine (or one
+// whose qwebchannel.js failed to load) has neither. Typed as possibly-undefined
+// so the guards in connectEditor() are the honest shape rather than a cast:
+// only `typeof` may touch a global that was never declared at all.
+declare const QWebChannel: QWebChannelCtor | undefined;
+declare const qt: { webChannelTransport: unknown } | undefined;
+
+/**
+ * Replace the pane with a single explanatory line. Used only for the failures
+ * that happen BEFORE an editor exists, which would otherwise leave a blank grey
+ * rectangle and no clue (the QML pane can only report a page that failed to
+ * LOAD, not one that loaded and found no bridge). textContent, never innerHTML:
+ * this is a privileged page and never builds markup from a string.
+ */
+function showFatal(element: HTMLElement, message: string): void {
+    const status = element.ownerDocument.createElement("div");
+    status.className = "ch-editor-status";
+    const label = element.ownerDocument.createElement("span");
+    label.className = "ch-editor-state";
+    label.textContent = message;
+    status.appendChild(label);
+    element.replaceChildren(status);
+}
 
 /**
  * Page entry point: open the WebChannel injected by the QML host and mount the
  * editor against the "editor" object (the C++ EditorController proxy).
  */
 export function connectEditor(element: HTMLElement, options: MountOptions = {}): void {
+    if (typeof QWebChannel === "undefined" || typeof qt === "undefined"
+        || !qt.webChannelTransport) {
+        showFatal(element, "This page requires the CodeHarbor host: no WebChannel transport.");
+        return;
+    }
     new QWebChannel(qt.webChannelTransport, (channel: QWebChannelInstance) => {
-        mountEditor(element, channel.objects.editor as EditorBridge, options);
+        const bridge = channel.objects.editor as EditorBridge | undefined;
+        if (!bridge) {
+            showFatal(element, "The editor bridge is missing from this window.");
+            return;
+        }
+        const host = mountEditor(element, bridge, options);
+        // The pane is destroyed, or navigated to another file (the QML host
+        // reloads this page to change the language hint). Either way the pending
+        // crash-recovery snapshot has to reach the host before the page dies,
+        // and Monaco has to be released (SPEC 11.3).
+        window.addEventListener("pagehide", () => host.dispose(), { once: true });
     });
 }
 

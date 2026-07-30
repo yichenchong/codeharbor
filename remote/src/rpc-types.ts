@@ -34,6 +34,13 @@ export interface ReadFileResult {
     encoding: "utf-8" | "base64";
     content: string;
     revision: string;
+    /**
+     * True when `content` is NOT the whole file: bytes are missing before the
+     * returned window (`offset` past byte 0) or after it (`length` stopping
+     * short of the end, including a read starting at or past the end of a
+     * non-empty file). False only when `content` carries every byte of the
+     * file. Definition and every return path live in readFile (files.ts).
+     */
     truncated: boolean;
 }
 
@@ -101,10 +108,12 @@ export interface ListDirectoryResult {
     entries: DirectoryEntry[];
 }
 
-// Stable wire method names for the file set (SPEC 8.3, 7.5). Handlers are added
-// in the R-server workstream; these string values are the frozen contract.
+// Stable wire method names for the file set (SPEC 8.3, 7.5). The handlers live
+// in files.ts (the `fileMethods` table codeharbord.ts spreads into its method
+// map); these string values are the frozen contract.
 // listDirectory (SPEC 7.5) was added after the initial six for the viewer
-// workstream — bump RPC_SCHEMA_VERSION when this set changes.
+// workstream — bump RPC_SCHEMA_VERSION (defined in remote/src/codeharbord.ts,
+// not in this file) when this set changes.
 export const RPC_METHODS = {
     stat: "file.stat",
     readFile: "file.readFile",
@@ -171,7 +180,8 @@ export interface KillSessionParams {
 export type KillSessionResult = Record<string, never>;
 
 // Stable wire method names for the tmux group. Mirrored in C++ at
-// src/remote/RpcTypes.h — bump RPC_SCHEMA_VERSION when this set changes.
+// src/remote/RpcTypes.h — bump RPC_SCHEMA_VERSION (defined in
+// remote/src/codeharbord.ts, not in this file) when this set changes.
 export const RPC_TMUX_METHODS = {
     listSessions: "tmux.listSessions",
     sessionExists: "tmux.sessionExists",
@@ -188,7 +198,8 @@ export type RpcTmuxMethodName = (typeof RPC_TMUX_METHODS)[RpcTmuxMethodKey];
 // namespace: RPC_METHODS stays exactly the file.* catalog.
 //
 // Stable wire method names for the workspace group. Mirrored in C++ at
-// src/remote/RpcTypes.h — bump RPC_SCHEMA_VERSION when this set changes.
+// src/remote/RpcTypes.h — bump RPC_SCHEMA_VERSION (defined in
+// remote/src/codeharbord.ts, not in this file) when this set changes.
 // remote/test/rpc-mirror.test.ts parses that header and fails if the two sides
 // disagree, so a rename here without the matching C++ edit is caught at test
 // time rather than at runtime as a method-not-found against a live server.

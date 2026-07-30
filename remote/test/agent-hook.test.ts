@@ -6,6 +6,8 @@ import fs from "node:fs";
 import path from "node:path";
 import {
     emitHookEvent,
+    main,
+    missingCoordinates,
     toBridgeMessage,
     readHookInput,
     type HookInput,
@@ -158,4 +160,143 @@ test("FallbackActivityDetector: starting, then running within threshold, idle af
     // Fresh output revives the running state.
     detector.note(5000);
     assert.equal(detector.state(5100), "running");
+});
+
+test("readHookInput falls back to OMP_HOOK_EVENT and ignores a false OMP_ERROR", () => {
+    const fromEnv = readHookInput(["node", "hook.ts"], {
+        OMP_HOOK_EVENT: "agent_end",
+        OMP_DEV_SESSION_ID: "sess-1",
+        OMP_TERMINAL_ID: "term-1",
+    } as NodeJS.ProcessEnv);
+    assert.equal(fromEnv.event, "agent_end");
+
+    // Only "1" and "true" mean error; anything else leaves the flag unset so the
+    // bridge does not map an ordinary event to the error state.
+    const notAnError = readHookInput(["node", "hook.ts", "agent_start"], {
+        OMP_ERROR: "0",
+    } as NodeJS.ProcessEnv);
+    assert.equal(notAnError.error, undefined);
+    // Missing coordinates degrade to empty strings rather than throwing: the
+    // hook must never fail the agent run (SPEC 6.4).
+    assert.equal(notAnError.devSessionId, "");
+    assert.equal(notAnError.terminalId, "");
+});
+
+// Capture stderr for the duration of `body`. The hook reports its failures
+// there, and a test that let them through would print noise into the run.
+async function captureStderr(body: () => Promise<void>): Promise<string[]> {
+    const written: string[] = [];
+    const real = process.stderr.write.bind(process.stderr);
+    process.stderr.write = ((chunk: string | Uint8Array): boolean => {
+        written.push(String(chunk));
+        return true;
+    }) as unknown as typeof process.stderr.write;
+    try {
+        await body();
+    } finally {
+        process.stderr.write = real;
+    }
+    return written;
+}
+
+test("a missing bridge socket fails fast and main swallows it (SPEC 6.4)", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ch-hook-dead-"));
+    const env = {
+        XDG_RUNTIME_DIR: dir,
+        OMP_DEV_SESSION_ID: "sess-1",
+        OMP_TERMINAL_ID: "term-1",
+    } as NodeJS.ProcessEnv;
+    try {
+        // Nothing ever listened on this path, so the connect fails outright
+        // instead of leaving the agent's hook invocation hanging.
+        await assert.rejects(
+            emitHookEvent(
+                { event: "agent_start", devSessionId: "sess-1", terminalId: "term-1" },
+                resolveSocketPath(env),
+            ),
+        );
+
+        // The CLI turns that failure into one stderr line and returns normally:
+        // an unavailable CodeHarbor must never break the agent run.
+        const logged = await captureStderr(async () => {
+            await main(["node", "oh-my-pi-hook.ts", "agent_start"], env);
+        });
+        assert.equal(logged.length, 1);
+        assert.match(logged[0], /^oh-my-pi-hook: /);
+    } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+test("main prints usage and touches no socket when the event name is missing", async () => {
+    const logged = await captureStderr(async () => {
+        await main(["node", "oh-my-pi-hook.ts"], {} as NodeJS.ProcessEnv);
+    });
+    assert.equal(logged.length, 1);
+    assert.match(logged[0], /^usage: /);
+});
+
+// A hook whose environment lacks the session coordinates must NOT emit: the
+// event would be structurally valid all the way to the desktop client, which
+// would file it under a Dev Session that does not exist and, for a notifying
+// state, pop a notification whose body is little more than a slash. It must
+// still not break the agent run (SPEC 6.4), so the failure is a stderr message
+// and a normal return — never a throw.
+test("main refuses to emit when the session coordinates are missing", async () => {
+    // A REAL listener on the socket the hook would resolve, counting inbound
+    // connections: the assertion is "the hook never even dialled", not merely
+    // "no error was raised". No wait is needed — main() returns synchronously
+    // from the refusal path, before any connect could be attempted.
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ch-hook-blank-"));
+    const env = { XDG_RUNTIME_DIR: dir } as NodeJS.ProcessEnv;
+    let connections = 0;
+    const server = net.createServer(() => {
+        connections += 1;
+    });
+    const listening = Promise.withResolvers<void>();
+    server.listen(resolveSocketPath(env), () => listening.resolve());
+    await listening.promise;
+    try {
+        const logged = await captureStderr(async () => {
+            await main(["node", "oh-my-pi-hook.ts", "agent_start"], env);
+        });
+        assert.equal(logged.length, 1);
+        assert.match(logged[0], /^oh-my-pi-hook: not emitting agent_start: /);
+        // Both variables are named, so the user knows exactly what to export.
+        assert.match(logged[0], /OMP_DEV_SESSION_ID and OMP_TERMINAL_ID/);
+
+        // A blank (whitespace-only) value is as unroutable as an unset one, and
+        // only the offending variable is named.
+        const blank = await captureStderr(async () => {
+            await main(["node", "oh-my-pi-hook.ts", "agent_start"], {
+                XDG_RUNTIME_DIR: dir,
+                OMP_DEV_SESSION_ID: "sess-1",
+                OMP_TERMINAL_ID: "   ",
+            } as NodeJS.ProcessEnv);
+        });
+        assert.equal(blank.length, 1);
+        // The usage reminder that follows names BOTH variables, so the check
+        // that only the offending one was reported reads the first line alone.
+        const firstLine = blank[0].split("\n")[0];
+        assert.match(firstLine, /OMP_TERMINAL_ID unset or blank/);
+        assert.doesNotMatch(firstLine, /OMP_DEV_SESSION_ID/);
+
+        assert.equal(connections, 0);
+    } finally {
+        const closed = Promise.withResolvers<void>();
+        server.close(() => closed.resolve());
+        await closed.promise;
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+test("missingCoordinates names only the coordinates that are unusable", () => {
+    const full: HookInput = { event: "agent_start", devSessionId: "s", terminalId: "t" };
+    assert.deepEqual(missingCoordinates(full), []);
+    assert.deepEqual(missingCoordinates({ ...full, devSessionId: "" }), ["OMP_DEV_SESSION_ID"]);
+    assert.deepEqual(missingCoordinates({ ...full, terminalId: "\t" }), ["OMP_TERMINAL_ID"]);
+    assert.deepEqual(missingCoordinates({ ...full, devSessionId: "", terminalId: "" }), [
+        "OMP_DEV_SESSION_ID",
+        "OMP_TERMINAL_ID",
+    ]);
 });

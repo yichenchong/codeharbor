@@ -273,3 +273,24 @@ test("the tmux group is registered under its frozen wire names", async () => {
 test("the schema version was bumped for the tmux group", () => {
     assert.ok(RPC_SCHEMA_VERSION >= 3, `expected >= 3, got ${RPC_SCHEMA_VERSION}`);
 });
+
+// tmux's output arrives over an SSH channel, which may translate line endings.
+// A trailing CR must be stripped before the fields are read, or it lands inside
+// the session NAME and every exact-name comparison (sessionExists, adopt, kill)
+// silently stops matching.
+test("a CRLF listing parses the same as an LF one", () => {
+    assert.deepEqual(parseSessions("3\t1753372800\t1\tcodeharbor\r\n"), [
+        { name: "codeharbor", windows: 3, created: 1753372800, attached: true },
+    ]);
+});
+
+test("a MARKED line with too few fields is skipped, not half-parsed", async () => {
+    // The marker proves tmux emitted the line, but a truncated record still has
+    // no name to report: it must be dropped rather than yielding an entry with
+    // an empty or undefined name that a later kill could act on.
+    const tmux = listingRunner(["1\t1753372800\t0", "2\t1753372900\t0\treal"]);
+    assert.deepEqual(
+        (await listSessions(tmux.run)).map((session) => session.name),
+        ["real"],
+    );
+});

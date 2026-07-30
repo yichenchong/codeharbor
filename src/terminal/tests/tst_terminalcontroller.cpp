@@ -1,13 +1,83 @@
 #include <QtTest/QtTest>
 
 #include <QByteArray>
+#include <QIODevice>
 #include <QList>
 #include <QSignalSpy>
+
+#include <cstring>
 
 #include "SessionState.h"
 #include "TerminalController.h"
 
 using namespace ch;
+
+namespace {
+
+// Stand-in for the production transport (ch::SshChannelDevice) at the seam the
+// controller actually depends on: a sequential QIODevice that can be handed
+// bytes as if a remote PTY had produced them, records what was written back,
+// and can end its read channel. Using this instead of a QBuffer matters —
+// a QBuffer's write() makes the same bytes readable, so a keystroke would come
+// straight back as terminal output and every assertion about output would be
+// measuring the test's own echo.
+class FakeChannel : public QIODevice {
+public:
+    FakeChannel() { open(QIODevice::ReadWrite | QIODevice::Unbuffered); }
+
+    // Make bytes readable and announce them, as the remote PTY does.
+    void pushRemote(const QByteArray& bytes)
+    {
+        m_incoming.append(bytes);
+        emit readyRead();
+    }
+
+    // Queue bytes WITHOUT announcing them: this is the window between a channel
+    // being opened and the controller subscribing to it.
+    void queueRemoteSilently(const QByteArray& bytes) { m_incoming.append(bytes); }
+
+    // The peer went away but the device is still readable, so the controller's
+    // last-chance drain can claim the tail (a socket-shaped end).
+    void finishRemote() { emit readChannelFinished(); }
+
+    // The local end closed first and only then reported the end, exactly as
+    // ch::SshChannelDevice::closeChannel() does.
+    void closeRemote()
+    {
+        close();
+        emit readChannelFinished();
+    }
+
+    const QByteArray& written() const { return m_written; }
+
+    bool isSequential() const override { return true; }
+    qint64 bytesAvailable() const override
+    {
+        return m_incoming.size() + QIODevice::bytesAvailable();
+    }
+
+protected:
+    qint64 readData(char* data, qint64 maxSize) override
+    {
+        const qint64 taken = qMin<qint64>(maxSize, m_incoming.size());
+        if (taken > 0) {
+            std::memcpy(data, m_incoming.constData(), static_cast<size_t>(taken));
+            m_incoming.remove(0, taken);
+        }
+        return taken;
+    }
+    qint64 writeData(const char* data, qint64 maxSize) override
+    {
+        m_written.append(data, maxSize);
+        return maxSize;
+    }
+
+private:
+    QByteArray m_incoming;
+    QByteArray m_written;
+};
+
+} // namespace
 
 class TstTerminalController : public QObject {
     Q_OBJECT
@@ -28,6 +98,16 @@ private slots:
     void tmuxCommandEscapesAdversarialIds();
     void hiddenReplayPrecedesLaterVisibleOutput();
     void reconnectBackoffSchedule();
+    void isLiveStateClassifiesEveryState();
+    void transportOutputIsIngestedIncludingBytesBufferedBeforeAttach();
+    void detachedTransportStopsFeedingThePane();
+    void destroyedTransportDetachesInsteadOfDangling();
+    void transportSwapKeepsBufferedOutputAndGeometry();
+    void channelEndClaimsTheFinalBytes();
+    void channelEndDropsOnlyALivePane();
+    void silentAttachIsBoundedAndReportedAsAnError();
+    void sendInputNeedsAWritableTransport();
+    void resizeRejectsNonPositiveGeometry();
 };
 
 // A single ingest at or above the size cap flushes synchronously (SPEC 5.5).
@@ -285,6 +365,302 @@ void TstTerminalController::hiddenReplayPrecedesLaterVisibleOutput()
     QVERIFY(spy.wait(1000));
     QCOMPARE(spy.count(), 2);
     QCOMPARE(spy.at(1).at(0).toByteArray(), newer);
+}
+
+// The single definition of "this pane has a channel to lose" (SPEC 5.6). Both
+// onTransportFinished() and TerminalFactory::detach() drop a pane to
+// Disconnected only from these states, so the classification is pinned here
+// state by state rather than implicitly through one caller.
+void TstTerminalController::isLiveStateClassifiesEveryState()
+{
+    QVERIFY(TerminalController::isLiveState(TerminalState::OpeningChannel));
+    QVERIFY(TerminalController::isLiveState(TerminalState::AttachingTmux));
+    QVERIFY(TerminalController::isLiveState(TerminalState::Ready));
+
+    QVERIFY(!TerminalController::isLiveState(TerminalState::Unloaded));
+    QVERIFY(!TerminalController::isLiveState(TerminalState::Connecting));
+    QVERIFY(!TerminalController::isLiveState(TerminalState::Authenticating));
+    QVERIFY(!TerminalController::isLiveState(TerminalState::Disconnected));
+    QVERIFY(!TerminalController::isLiveState(TerminalState::Reconnecting));
+    QVERIFY(!TerminalController::isLiveState(TerminalState::Error));
+}
+
+// Everything the transport emits must reach the buffer — including bytes that
+// arrived BEFORE the controller subscribed. tmux redraws the whole pane the
+// instant it attaches, so those first bytes are the entire visible screen and
+// losing them leaves a blank terminal until the user presses a key.
+void TstTerminalController::transportOutputIsIngestedIncludingBytesBufferedBeforeAttach()
+{
+    TerminalController controller;
+    QSignalSpy spy(&controller, &TerminalController::flushReady);
+
+    FakeChannel channel;
+    // Already sitting in the channel, never announced: only setTransport()'s own
+    // drain can rescue these.
+    channel.queueRemoteSilently(QByteArrayLiteral("first screenful"));
+    controller.setTransport(&channel);
+    QCOMPARE(controller.transport(), static_cast<QIODevice*>(&channel));
+
+    QVERIFY(spy.wait(1000));
+    QCOMPARE(spy.count(), 1);
+    QCOMPARE(spy.at(0).at(0).toByteArray(), QByteArrayLiteral("first screenful"));
+
+    // And live output afterwards, through readyRead.
+    channel.pushRemote(QByteArrayLiteral("later"));
+    QVERIFY(spy.wait(1000));
+    QCOMPARE(spy.count(), 2);
+    QCOMPARE(spy.at(1).at(0).toByteArray(), QByteArrayLiteral("later"));
+}
+
+// Detaching must actually unsubscribe: a channel the factory has released still
+// exists for a turn of the event loop, and its trailing bytes belong to nobody.
+void TstTerminalController::detachedTransportStopsFeedingThePane()
+{
+    TerminalController controller;
+    FakeChannel channel;
+    controller.setTransport(&channel);
+
+    controller.setTransport(nullptr);
+    QVERIFY(controller.transport() == nullptr);
+
+    QSignalSpy spy(&controller, &TerminalController::flushReady);
+    channel.pushRemote(QByteArrayLiteral("orphaned"));
+    QVERIFY(!spy.wait(100));
+    QCOMPARE(spy.count(), 0);
+}
+
+// Transport ownership stays with the caller, so a channel can be destroyed under
+// a live pane. The controller must notice rather than disconnect() a freed
+// pointer on the next attach.
+void TstTerminalController::destroyedTransportDetachesInsteadOfDangling()
+{
+    TerminalController controller;
+    auto* channel = new FakeChannel;
+    controller.setTransport(channel);
+    QCOMPARE(controller.transport(), static_cast<QIODevice*>(channel));
+
+    delete channel;
+    QVERIFY(controller.transport() == nullptr);
+
+    // Both of these would be a use-after-free if the pointer were raw.
+    QVERIFY(!controller.sendInput(QByteArrayLiteral("x")));
+    FakeChannel replacement;
+    controller.setTransport(&replacement);
+    QCOMPARE(controller.transport(), static_cast<QIODevice*>(&replacement));
+}
+
+// The reconnect case (SPEC 5.6): a new channel is swapped in under the same
+// pane. Neither the retained scrollback nor the pane geometry may be lost —
+// the controller is the only thing that still knows the size, because the fresh
+// PTY opens at the channel default.
+void TstTerminalController::transportSwapKeepsBufferedOutputAndGeometry()
+{
+    TerminalController controller;
+    controller.setViewVisible(false); // renderer suspended, so output is retained
+
+    FakeChannel first;
+    controller.setTransport(&first);
+    controller.resize(200, 60);
+    QCOMPARE(controller.columns(), 200);
+    QCOMPARE(controller.rows(), 60);
+
+    first.pushRemote(QByteArray(TerminalController::kFlushSizeBytes, 'A'));
+    QTRY_COMPARE(controller.hiddenBuffer().size(),
+                 static_cast<qsizetype>(TerminalController::kFlushSizeBytes));
+
+    // The drop, then the fresh channel.
+    controller.setTransport(nullptr);
+    QCOMPARE(controller.hiddenBuffer().size(),
+             static_cast<qsizetype>(TerminalController::kFlushSizeBytes));
+
+    FakeChannel second;
+    controller.setTransport(&second);
+    QCOMPARE(controller.columns(), 200);
+    QCOMPARE(controller.rows(), 60);
+
+    second.pushRemote(QByteArray(TerminalController::kFlushSizeBytes, 'B'));
+    QTRY_COMPARE(controller.hiddenBuffer().size(),
+                 static_cast<qsizetype>(2 * TerminalController::kFlushSizeBytes));
+    // Old scrollback first, new channel's output after it.
+    QCOMPARE(controller.hiddenBuffer().at(0), 'A');
+    QCOMPARE(controller.hiddenBuffer().back(), 'B');
+}
+
+// A remote process that prints and immediately exits delivers its last bytes
+// just before the read channel ends. Those bytes are the whole point of running
+// the command, so the drop handler drains once more before reporting.
+void TstTerminalController::channelEndClaimsTheFinalBytes()
+{
+    TerminalController controller;
+    controller.setState(TerminalState::Ready);
+    QSignalSpy spy(&controller, &TerminalController::flushReady);
+
+    FakeChannel channel;
+    controller.setTransport(&channel);
+    // Queued but never announced, then the channel ends while still readable.
+    channel.queueRemoteSilently(QByteArrayLiteral("goodbye"));
+    channel.finishRemote();
+
+    QVERIFY(spy.wait(1000));
+    QCOMPARE(spy.at(0).at(0).toByteArray(), QByteArrayLiteral("goodbye"));
+    QVERIFY(controller.state() == TerminalState::Disconnected);
+}
+
+// A channel that ends is a dropped connection only for a pane that had one
+// (SPEC 5.6). Every other state must be left exactly as it was: reporting
+// "disconnected" for a pane that never attached, or overwriting an Error with
+// it, would replace the real reason with a misleading one.
+void TstTerminalController::channelEndDropsOnlyALivePane()
+{
+    const QList<TerminalState> live = {TerminalState::OpeningChannel,
+                                       TerminalState::AttachingTmux,
+                                       TerminalState::Ready};
+    for (TerminalState state : live) {
+        TerminalController controller;
+        controller.setState(state);
+        FakeChannel channel;
+        controller.setTransport(&channel);
+        channel.closeRemote();
+        QVERIFY2(controller.state() == TerminalState::Disconnected,
+                 qPrintable(toString(state)));
+    }
+
+    const QList<TerminalState> untouched = {TerminalState::Unloaded,
+                                            TerminalState::Connecting,
+                                            TerminalState::Authenticating,
+                                            TerminalState::Disconnected,
+                                            TerminalState::Reconnecting,
+                                            TerminalState::Error};
+    for (TerminalState state : untouched) {
+        TerminalController controller;
+        controller.setState(state);
+        FakeChannel channel;
+        controller.setTransport(&channel);
+        QSignalSpy spy(&controller, &TerminalController::stateChanged);
+        channel.closeRemote();
+        QVERIFY2(controller.state() == state, qPrintable(toString(state)));
+        QCOMPARE(spy.count(), 0);
+    }
+}
+
+// The transition out of AttachingTmux is driven by the PANE's first bytes
+// (TerminalFactory::attach()), and a channel that ends drives Disconnected. A
+// tmux attach that produces neither — a tmux server wedged on its socket, or a
+// login shell stalled in an rc file on an unresponsive mount — is invisible to
+// both, and used to leave the pane advertising "attaching_tmux" for the rest of
+// the process's life. The window is bounded instead, and the pane says so.
+void TstTerminalController::silentAttachIsBoundedAndReportedAsAnError()
+{
+    // The default is the documented one-minute budget, and a negative window is
+    // not a negative timer: it is "no bound".
+    TerminalController defaults;
+    QCOMPARE(defaults.attachTimeoutMs(), TerminalController::kAttachTimeoutMs);
+    defaults.setAttachTimeoutMs(-1);
+    QCOMPARE(defaults.attachTimeoutMs(), 0);
+
+    // (1) THE STALL. The channel stays open the whole time, so there is no
+    // end-of-stream for the drop path to lean on: only the bound can end this.
+    TerminalController controller;
+    controller.setAttachTimeoutMs(50);
+    QSignalSpy timedOut(&controller, &TerminalController::attachTimedOut);
+    controller.setState(TerminalState::OpeningChannel);
+    controller.setState(TerminalState::AttachingTmux);
+    FakeChannel channel;
+    controller.setTransport(&channel);
+
+    QVERIFY(timedOut.wait(2000));
+    QVERIFY(controller.state() == TerminalState::Error);
+    QCOMPARE(timedOut.count(), 1);
+    // The Error it produced must not re-arm the watchdog on itself.
+    QTest::qWait(200);
+    QCOMPARE(timedOut.count(), 1);
+
+    // (2) NO FALSE POSITIVE. A pane whose first bytes arrive inside the window
+    // is Ready, and Ready stops the clock: reporting a working terminal as
+    // failed is worse than the stall this guards against.
+    TerminalController live;
+    live.setAttachTimeoutMs(50);
+    QSignalSpy liveTimedOut(&live, &TerminalController::attachTimedOut);
+    live.setState(TerminalState::AttachingTmux);
+    live.setState(TerminalState::Ready);
+    QTest::qWait(200);
+    QVERIFY(live.state() == TerminalState::Ready);
+    QCOMPARE(liveTimedOut.count(), 0);
+
+    // (3) A REAL REASON WINS. A pane that dropped while attaching keeps
+    // Disconnected; the expired window must not overwrite it with Error.
+    TerminalController dropped;
+    dropped.setAttachTimeoutMs(50);
+    dropped.setState(TerminalState::AttachingTmux);
+    dropped.setState(TerminalState::Disconnected);
+    QTest::qWait(200);
+    QVERIFY(dropped.state() == TerminalState::Disconnected);
+
+    // (4) The window can be changed WHILE a pane is attaching, and takes effect
+    // for that pane rather than silently applying to the next one.
+    TerminalController retimed;
+    retimed.setState(TerminalState::AttachingTmux);
+    retimed.setAttachTimeoutMs(50);
+    QTRY_VERIFY(retimed.state() == TerminalState::Error);
+
+    // (5) 0 restores "wait for the first byte for as long as it takes", which is
+    // what a host on a very slow link opts into.
+    TerminalController unbounded;
+    unbounded.setAttachTimeoutMs(0);
+    unbounded.setState(TerminalState::AttachingTmux);
+    QTest::qWait(200);
+    QVERIFY(unbounded.state() == TerminalState::AttachingTmux);
+}
+
+// Keystrokes need a transport that is open and writable; without one the pane
+// must say so rather than silently swallow what the user typed.
+void TstTerminalController::sendInputNeedsAWritableTransport()
+{
+    TerminalController controller;
+    QVERIFY(!controller.sendInput(QByteArrayLiteral("ls\n")));
+
+    FakeChannel channel;
+    controller.setTransport(&channel);
+    QVERIFY(controller.sendInput(QByteArrayLiteral("ls\n")));
+    QCOMPARE(channel.written(), QByteArrayLiteral("ls\n"));
+
+    // Nothing to send is not a failure: the pane is writable.
+    QVERIFY(controller.sendInput(QByteArray()));
+    QCOMPARE(channel.written(), QByteArrayLiteral("ls\n"));
+
+    // Once the channel is closed the write must be refused, not attempted.
+    channel.closeRemote();
+    QVERIFY(!controller.sendInput(QByteArrayLiteral("more")));
+    QCOMPARE(channel.written(), QByteArrayLiteral("ls\n"));
+}
+
+// A renderer that has not been laid out yet reports 0 rows and columns. Taking
+// that at face value would resize the remote grid to nothing, so it is refused
+// and the last real geometry is kept — that is the size a reconnect re-applies.
+void TstTerminalController::resizeRejectsNonPositiveGeometry()
+{
+    TerminalController controller;
+    QCOMPARE(controller.columns(), 0); // never reported
+    QCOMPARE(controller.rows(), 0);
+
+    QVERIFY(!controller.resize(0, 24));
+    QVERIFY(!controller.resize(80, 0));
+    QVERIFY(!controller.resize(-1, -1));
+    QCOMPARE(controller.columns(), 0);
+    QCOMPARE(controller.rows(), 0);
+
+    // A real size is recorded. resize() returns false here because a plain
+    // QIODevice cannot carry an SSH window-change — only ch::SshChannelDevice
+    // can — so the recorded geometry, not the return value, is the contract.
+    FakeChannel channel;
+    controller.setTransport(&channel);
+    controller.resize(132, 43);
+    QCOMPARE(controller.columns(), 132);
+    QCOMPARE(controller.rows(), 43);
+
+    controller.resize(0, 0);
+    QCOMPARE(controller.columns(), 132);
+    QCOMPARE(controller.rows(), 43);
 }
 
 QTEST_GUILESS_MAIN(TstTerminalController)

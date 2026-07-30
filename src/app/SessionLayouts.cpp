@@ -104,6 +104,16 @@ void SessionLayouts::setServerId(QString serverId)
 {
     if (serverId == m_serverId)
         return;
+    // A Dev Session belongs to exactly one server, so a tree loaded for the
+    // PREVIOUS server's session must not stay editable under the new key: the
+    // next splitPane/closePane/setRatios would persist it as
+    // setLayout(NEW serverId, OLD devSessionId) and write one server's layout
+    // into another server's row. load(QString()) drops the id and both region
+    // trees and issues no request. AppController::setServerId already does this
+    // from its side; enforcing it here too means the guarantee does not depend
+    // on the order in which one caller happens to drive the two setters.
+    if (!m_devSessionId.isEmpty())
+        load(QString());
     m_serverId = std::move(serverId);
     emit serverIdChanged();
 }

@@ -18,6 +18,12 @@ QString toString(TerminalState s)
     return QStringLiteral("unknown");
 }
 
+// These are the agent-status wire words (SPEC 6.4). They must stay identical, in
+// this order, to AGENT_STATES in remote/src/events.ts and to the tokens
+// agentStateFromWireStrict() accepts in src/agent/AgentEvent.h; adding a case
+// here without adding it there (or the other way round) is caught by
+// TstModels::agentStateWireWordsMatchRemoteEventsTs, which reads that TypeScript
+// file and compares the whole ordered list.
 QString toString(AgentState s)
 {
     switch (s) {

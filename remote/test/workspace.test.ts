@@ -941,3 +941,207 @@ test("serverId is independent of the database's path", async () => {
     await fs.rm(movedDir, { recursive: true, force: true });
     await cleanup(dbPath);
 });
+
+// --- Re-pack robustness, layout upsert, cross-server moves, migration guard --
+
+test("reorderGroups/reorderSessions keep the scope packed when the given order is partial", async () => {
+    const dbPath = await tmpDbPath();
+    const ws = openWorkspace(dbPath);
+    const g = ws.createGroup({ serverId: SERVER, name: "G" });
+    const a = mkSession(ws, g.id, "A");
+    const b = mkSession(ws, g.id, "B");
+    mkSession(ws, g.id, "C");
+
+    // A client that sends a filtered/stale list (only B, plus an id that is not
+    // in this group at all, plus a repeat) must still leave the group with the
+    // requested rows first and EVERY row on a unique, contiguous position.
+    // Renumbering only the listed ids used to leave B at 0 next to A at 0, and
+    // `ORDER BY position, id` then broke the tie by UUID, i.e. at random.
+    ws.reorderSessions({ groupId: g.id, orderedIds: [b.id, "not-a-session", b.id] });
+    assert.deepEqual(ordered(ws, g.id), { names: ["B", "A", "C"], positions: [0, 1, 2] });
+
+    // A stale id belonging to another group cannot drag that row into this one.
+    const other = ws.createGroup({ serverId: SERVER, name: "Other" });
+    const outsider = mkSession(ws, other.id, "X");
+    ws.reorderSessions({ groupId: g.id, orderedIds: [outsider.id, a.id] });
+    assert.deepEqual(ordered(ws, g.id), { names: ["A", "B", "C"], positions: [0, 1, 2] });
+    assert.deepEqual(ordered(ws, other.id), { names: ["X"], positions: [0] });
+
+    // Same contract for groups, scoped by server.
+    const h = ws.createGroup({ serverId: SERVER, name: "H" });
+    ws.reorderGroups({ serverId: SERVER, orderedIds: [h.id] });
+    const groups = ws.list(SERVER);
+    assert.deepEqual(groups.map((x) => x.name), ["H", "G", "Other"]);
+    assert.deepEqual(groups.map((x) => x.position), [0, 1, 2]);
+
+    ws.close();
+    await cleanup(dbPath);
+});
+
+test("setLayout takes server_id from the parent session and rejects an unknown one (SPEC 3.5)", async () => {
+    const dbPath = await tmpDbPath();
+    const ws = openWorkspace(dbPath);
+    const g = ws.createGroup({ serverId: SERVER, name: "G" });
+    const s = ws.createSession({ serverId: SERVER, groupId: g.id, name: "S", repositoryRoot: "/r" });
+
+    // Same rule as createViewerPane/createTerminalPane: a mismatched serverId in
+    // the params cannot detach the layout row from its session's server.
+    const first = ws.setLayout({
+        serverId: "srv-EVIL",
+        devSessionId: s.id,
+        region: "viewer",
+        tree: { type: "leaf", paneId: "p1" },
+    });
+    assert.equal(first.serverId, SERVER);
+
+    // The upsert rewrites the SAME row: one row, stable id, original created_at.
+    const second = ws.setLayout({
+        serverId: SERVER,
+        devSessionId: s.id,
+        region: "viewer",
+        tree: { type: "leaf", paneId: "p2" },
+    });
+    assert.equal(second.id, first.id);
+    assert.equal(second.createdAt, first.createdAt);
+    assert.deepEqual(second.tree, { type: "leaf", paneId: "p2" });
+
+    assert.throws(
+        () => ws.setLayout({ serverId: SERVER, devSessionId: "nope", region: "viewer", tree: {} }),
+        /dev_sessions not found: nope/,
+    );
+
+    ws.close();
+    await cleanup(dbPath);
+});
+
+test("moveSessionToGroup re-homes the session and its children onto the target group's server", async () => {
+    const dbPath = await tmpDbPath();
+    const ws = openWorkspace(dbPath);
+    const OTHER = "srv-2";
+    const home = ws.createGroup({ serverId: SERVER, name: "Home" });
+    const away = ws.createGroup({ serverId: OTHER, name: "Away" });
+    const s = ws.createSession({ serverId: SERVER, groupId: home.id, name: "S", repositoryRoot: "/r" });
+    const v = ws.createViewerPane({ serverId: SERVER, devSessionId: s.id, url: "http://x" });
+    const t = ws.createTerminalPane({ serverId: SERVER, devSessionId: s.id, name: "sh" });
+    ws.setLayout({
+        serverId: SERVER,
+        devSessionId: s.id,
+        region: "viewer",
+        tree: { type: "leaf", paneId: v.id },
+    });
+
+    const moved = ws.moveSessionToGroup({ id: s.id, groupId: away.id });
+
+    // SPEC 3.5's invariant is that a row shares its ancestors' server, so the
+    // move carries the session AND its panes and layouts to the new server.
+    // Leaving the old server_id behind listed the session under the target group
+    // while reporting a foreign serverId on the row itself.
+    assert.equal(moved.serverId, OTHER);
+    assert.equal(ws.getViewerPane(v.id).serverId, OTHER);
+    assert.equal(ws.getTerminalPane(t.id).serverId, OTHER);
+    assert.equal(ws.getLayout({ devSessionId: s.id, region: "viewer" })?.serverId, OTHER);
+    assert.deepEqual(ws.list(SERVER).map((x) => x.sessions.length), [0]);
+    assert.deepEqual(ws.list(OTHER)[0].sessions.map((x) => x.name), ["S"]);
+
+    // An unknown target group is rejected before any write, so the session stays
+    // exactly where it was.
+    assert.throws(() => ws.moveSessionToGroup({ id: s.id, groupId: "nope" }), /groups not found: nope/);
+    assert.equal(ws.getSession(s.id).groupId, away.id);
+    assert.equal(ws.getSession(s.id).serverId, OTHER);
+
+    ws.close();
+    await cleanup(dbPath);
+});
+
+test("migrate refuses a database written by a newer build instead of using it", async () => {
+    const dbPath = await tmpDbPath();
+    const first = openWorkspace(dbPath);
+    // A future release's database, reopened by this build. Its migrations may
+    // have renamed or dropped columns this build still selects, so opening it
+    // must fail loudly rather than fail later, one confusing query at a time.
+    first.db
+        .prepare("UPDATE schema_version SET version = ? WHERE id = 1")
+        .run(WORKSPACE_SCHEMA_VERSION + 1);
+    first.close();
+
+    assert.throws(() => openWorkspace(dbPath), /newer than this build supports/);
+
+    await cleanup(dbPath);
+});
+
+// The four lookup columns that every listing joins or filters on. They are
+// indexed by remote/sql/indexes.sql, which openWorkspace applies on EVERY open
+// rather than through the migration runner: migrate() skips its DDL entirely
+// once the stored schema_version has reached the current one, so an index
+// delivered only by schema.sql would never appear on an existing database — and
+// bumping the version to force it is not available, because that number is
+// mirrored in C++ (WorkspaceDb::kSchemaVersion) and a one-sided bump breaks the
+// client's compatibility gate.
+const EXPECTED_INDEXES = [
+    "idx_dev_sessions_group_id",
+    "idx_groups_server_id",
+    "idx_terminal_panes_dev_session_id",
+    "idx_viewer_panes_dev_session_id",
+];
+
+function indexNames(ws: Workspace): string[] {
+    const rows = ws.db
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name LIKE 'idx_%' ORDER BY name")
+        .all() as { name: string }[];
+    return rows.map((r) => r.name);
+}
+
+test("opening an existing database without the lookup indexes creates them", async () => {
+    const dbPath = await tmpDbPath();
+    const first = openWorkspace(dbPath);
+    assert.deepEqual(indexNames(first), EXPECTED_INDEXES);
+
+    // Reproduce a database written by an older build: the rows and the CURRENT
+    // schema version are there, the indexes are not. This is the case the
+    // migration runner cannot fix, because it has nothing left to migrate.
+    const { group } = seed(first);
+    for (const name of EXPECTED_INDEXES) {
+        first.db.exec(`DROP INDEX ${name}`);
+    }
+    assert.deepEqual(indexNames(first), []);
+    const stored = first.db
+        .prepare("SELECT version FROM schema_version WHERE id = 1")
+        .get() as { version: number };
+    assert.equal(stored.version, WORKSPACE_SCHEMA_VERSION);
+    first.close();
+
+    const second = openWorkspace(dbPath);
+    assert.deepEqual(indexNames(second), EXPECTED_INDEXES);
+    // The upgrade adds indexes and nothing else: the data and the version are
+    // untouched, and a third open is a no-op rather than an error.
+    assert.deepEqual(second.getGroup(group.id), group);
+    const after = second.db
+        .prepare("SELECT version FROM schema_version WHERE id = 1")
+        .get() as { version: number };
+    assert.equal(after.version, WORKSPACE_SCHEMA_VERSION);
+    second.close();
+
+    const third = openWorkspace(dbPath);
+    assert.deepEqual(indexNames(third), EXPECTED_INDEXES);
+    third.close();
+
+    await cleanup(dbPath);
+});
+
+// An index nobody can use is worse than none: it costs every write and buys
+// nothing. Ask SQLite's planner directly whether the session listing uses the
+// group_id index, so a typo in a column name fails here rather than passing as
+// "the index exists".
+test("the session lookup index is actually chosen by the query planner", async () => {
+    const dbPath = await tmpDbPath();
+    const ws = openWorkspace(dbPath);
+    const plan = ws.db
+        .prepare("EXPLAIN QUERY PLAN SELECT * FROM dev_sessions WHERE group_id = ?")
+        .all("g1") as { detail: string }[];
+    assert.match(
+        plan.map((r) => r.detail).join("\n"),
+        /USING INDEX idx_dev_sessions_group_id/,
+    );
+    ws.close();
+    await cleanup(dbPath);
+});

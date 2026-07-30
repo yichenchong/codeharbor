@@ -29,13 +29,84 @@ bool hashedHostMatches(const QString& hostField, const QString& host)
     return mac.result() == expected;
 }
 
-// A stored entry names `host` if it matches the plaintext token or, for a
-// hashed |1| token, the HMAC-SHA1 salted hash of the hostname.
+// OpenSSH's known_hosts host field is a pattern list, not always a literal
+// name: `*` stands for any run of characters, `?` for exactly one, and a
+// leading `!` on a token excludes the hosts that token covers. Report whether a
+// field uses any of that syntax: such a field can be matched, but never
+// compared for equality nor replaced by add().
+bool hasHostPatternSyntax(const QString& hostField)
+{
+    return hostField.contains(QLatin1Char('*'))
+           || hostField.contains(QLatin1Char('?'))
+           || hostField.contains(QLatin1Char('!'));
+}
+
+// OpenSSH's match_pattern(): `*` matches any run of characters (including
+// none), `?` matches exactly one, every other character is literal, and the
+// comparison is case-insensitive. Iterative with a single backtrack point, so
+// an adversarial pattern cannot recurse the stack away.
+bool globMatches(const QString& pattern, const QString& host)
+{
+    qsizetype p = 0;
+    qsizetype h = 0;
+    qsizetype star = -1;   // index of the last '*' seen, -1 while none
+    qsizetype resume = 0;  // how far into `host` that '*' has consumed
+    while (h < host.size()) {
+        if (p < pattern.size()
+            && (pattern.at(p) == QLatin1Char('?')
+                || pattern.at(p).toCaseFolded() == host.at(h).toCaseFolded())) {
+            ++p;
+            ++h;
+        } else if (p < pattern.size() && pattern.at(p) == QLatin1Char('*')) {
+            star = p++;
+            resume = h;
+        } else if (star >= 0) {
+            // Backtrack: let the most recent '*' swallow one more character.
+            p = star + 1;
+            h = ++resume;
+        } else {
+            return false;
+        }
+    }
+    // Trailing '*'s may match nothing at all.
+    while (p < pattern.size() && pattern.at(p) == QLatin1Char('*'))
+        ++p;
+    return p == pattern.size();
+}
+
+// OpenSSH pattern-list semantics: comma-separated patterns where a match on any
+// negated (`!`) token rejects the whole entry outright, and one positive match
+// accepts it. The negation is the only thing that stops a wildcard from
+// covering a host the file deliberately carves out
+// ("*.example.com,!secret.example.com"), so the list must be evaluated as a
+// whole rather than one token at a time.
+bool patternListMatches(const QString& hostField, const QString& host)
+{
+    bool matched = false;
+    const QStringList tokens =
+        hostField.split(QLatin1Char(','), Qt::SkipEmptyParts);
+    for (const QString& token : tokens) {
+        if (token.startsWith(QLatin1Char('!'))) {
+            if (globMatches(token.sliced(1), host))
+                return false;
+        } else if (globMatches(token, host)) {
+            matched = true;
+        }
+    }
+    return matched;
+}
+
+// A stored entry names `host` if it matches the plaintext token (compared
+// case-insensitively, as OpenSSH does), the pattern list of a wildcard or
+// negated token, or, for a hashed |1| token, the HMAC-SHA1 salted hash of the
+// hostname.
 bool entryHostMatches(const QString& storedHost, const QString& host)
 {
     if (storedHost.startsWith(QLatin1Char('|')))
         return hashedHostMatches(storedHost, host);
-    return storedHost == host;
+    if (hasHostPatternSyntax(storedHost))
+        return patternListMatches(storedHost, host);
+    return storedHost.compare(host, Qt::CaseInsensitive) == 0;
 }
 
 } // namespace
@@ -83,7 +154,11 @@ void KnownHosts::add(const QString& host, const QString& keyType,
                      const QByteArray& keyBlob)
 {
     for (Entry& e : m_entries) {
-        if (e.supported && e.host == host && e.keyType == keyType) {
+        // Case-insensitively, because that is how verify() matches: a store
+        // holding "Host.Example" must not gain a second "host.example" line
+        // whose key silently contradicts the first.
+        if (e.supported && e.host.compare(host, Qt::CaseInsensitive) == 0
+            && e.keyType == keyType) {
             e.key = keyBlob;
             return;
         }
@@ -155,8 +230,14 @@ KnownHosts KnownHosts::parse(const QString& text)
         // but still round-trip and are consulted by verify(). Hashed (|1|) hosts
         // are likewise supported == false for add(), yet verify() resolves them
         // by HMAC-SHA1, so they DO produce Match/Mismatch (and honor @revoked).
+        // A wildcard/negated host field is kept whole for the same reason plus
+        // one of its own: splitting "*.example.com,!secret.example.com" on the
+        // comma would strand the negated token as a host name of its own, and
+        // the surviving wildcard would then cover the very host the file carves
+        // out — a key accepted for a host the administrator excluded.
         const bool opaque = !marker.isEmpty();
-        if (hostField.startsWith(QLatin1Char('|'))) {
+        if (hostField.startsWith(QLatin1Char('|'))
+            || hasHostPatternSyntax(hostField)) {
             store.m_entries.append(
                 Entry{hostField, keyType, key, false, comment, marker});
             continue;

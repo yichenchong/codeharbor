@@ -326,8 +326,19 @@ Item {
 
                 width: ListView.view.width
                 height: 36
-                color: index === root.highlightedIndex ? "#313244"
-                                                       : (rowHover.hovered ? "#232338" : "transparent")
+                color: resultRow.index === root.highlightedIndex
+                       ? "#313244"
+                       : (rowHover.hovered ? "#232338" : "transparent")
+
+                // A plain Rectangle carries no accessibility at all, and this
+                // list IS the keyboard surface of the application: without a
+                // name a screen reader announces the command list as a stack of
+                // anonymous boxes.
+                Accessible.role: Accessible.ListItem
+                Accessible.name: root._title(resultRow.modelData)
+                Accessible.description: resultRow.modelData && resultRow.modelData.shortcut
+                                        ? String(resultRow.modelData.shortcut) : ""
+                Accessible.selected: resultRow.index === root.highlightedIndex
 
                 // The row Enter will run. A wash of #313244 on #1e1e2e is a
                 // faint one, and it is the only thing distinguishing "this is

@@ -167,8 +167,13 @@ struct FreshView {
 
     ~FreshView()
     {
-        client.setTransport(nullptr);
+        // Same order SessionBootstrap::unwire() uses in production: CLOSE the
+        // channel first, THEN detach the client. Closing is what makes
+        // CodeharbordClient fail any in-flight call with a transport error;
+        // detaching first tears the transport away while a request is still
+        // outstanding, which is a sequence the shipped code deliberately avoids.
         device.closeChannel();
+        client.setTransport(nullptr);
     }
 
     bool start(const QString& command, const QString& serverId)
@@ -375,6 +380,11 @@ void TstLiveShell::initTestCase()
                                    ? m_scratch.filePath(QStringLiteral("known_hosts"))
                                    : env("CH_LIVE_KNOWN_HOSTS");
     m_bootstrap->setKnownHostsPath(knownHosts);
+    // Headless gate against a throwaway fixture: there is no user interface here
+    // to approve the fixture's host key, so accepting it unasked has to be opted
+    // into explicitly. Without this, attemptWire() refuses to connect at all
+    // (SPEC 12.1) — which is exactly what an attended build must do.
+    m_bootstrap->setTrustUnknownHostKeys(true);
     QVERIFY2(m_bootstrap->connectAndWire(m_host, m_port, m_user, m_node, m_repo),
              qPrintable(bootstrapError));
     QCOMPARE(m_pool.state(), SshConnectionPool::State::Connected);

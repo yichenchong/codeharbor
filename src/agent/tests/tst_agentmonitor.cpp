@@ -4,12 +4,15 @@
 
 #include <QCoreApplication>
 #include <QBuffer>
+#include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QJsonValue>
 #include <QLocalServer>
 #include <QLocalSocket>
 #include <QSignalSpy>
 #include <QString>
+#include <QStringView>
 #include <QtTest/QtTest>
 
 using ch::AgentState;
@@ -53,6 +56,7 @@ private slots:
     void cleanup();
 
     void wireMappingIsExhaustive();       // pure parser
+    void strictWireMappingSeparatesUnknownFromGarbage(); // pure parser
     void parseRejectsMalformed();         // pure parser
     void mapsStatesFromWire();
     void runningToIdleUnseenSetsUnseenAndNotify();
@@ -62,6 +66,9 @@ private slots:
     void lineSplitAcrossReadsIsBuffered();
     void unknownStateStringMapsToUnknown();
     void perTerminalStateIsIndependent();
+    void unseenIsPerDevSession();
+    void completionAfterMarkSeenReArmsUnseen();
+    void crlfFramedLinesAreAccepted();
     void transportDestroyedThenRebindIsSafe();
     void accumulatedStateSurvivesAReconnect();
 
@@ -153,6 +160,39 @@ void TstAgentMonitor::wireMappingIsExhaustive()
     QCOMPARE(asInt(ch::agentStateFromWire(u"")), asInt(AgentState::Unknown));
 }
 
+// The strict mapping is the single token table both the lenient mapping and the
+// parser's validation are derived from, and the ONLY thing that can tell the
+// two ways of arriving at AgentState::Unknown apart: the wire token "unknown"
+// is a legitimate state a producer may report, while any other token means the
+// producer is speaking a schema this client does not know and the whole event
+// must be dropped. Collapse the two and an unrecognized token would be recorded
+// as a real "unknown" state, overwriting whatever the terminal was actually
+// doing.
+void TstAgentMonitor::strictWireMappingSeparatesUnknownFromGarbage()
+{
+    const auto genuine = ch::agentStateFromWireStrict(u"unknown");
+    QVERIFY(genuine.has_value());
+    QCOMPARE(asInt(*genuine), asInt(AgentState::Unknown));
+
+    QVERIFY(!ch::agentStateFromWireStrict(u"banana").has_value());
+    QVERIFY(!ch::agentStateFromWireStrict(u"").has_value());
+    // Tokens are exact: no case folding, no trimming, no prefix matching.
+    QVERIFY(!ch::agentStateFromWireStrict(u"Idle").has_value());
+    QVERIFY(!ch::agentStateFromWireStrict(u" idle").has_value());
+    QVERIFY(!ch::agentStateFromWireStrict(u"idle_").has_value());
+    // Every state the lenient mapping resolves is also a valid wire token.
+    for (QStringView token : {QStringView(u"starting"), QStringView(u"running"),
+                              QStringView(u"waiting_input"),
+                              QStringView(u"idle_unseen"), QStringView(u"idle"),
+                              QStringView(u"error"), QStringView(u"stopped"),
+                              QStringView(u"unknown")}) {
+        QVERIFY2(ch::agentStateFromWireStrict(token).has_value(),
+                 qPrintable(token.toString()));
+        QCOMPARE(asInt(*ch::agentStateFromWireStrict(token)),
+                 asInt(ch::agentStateFromWire(token)));
+    }
+}
+
 void TstAgentMonitor::parseRejectsMalformed()
 {
     // Blank / whitespace.
@@ -235,6 +275,67 @@ void TstAgentMonitor::parseRejectsMalformed()
                      QJsonDocument(o).toJson(QJsonDocument::Compact))
                      .has_value());
     }
+    // metadata must be an object, not an array either.
+    {
+        QJsonObject o{{"version", 1},
+                      {"timestamp", "x"},
+                      {"harness", "generic"},
+                      {"devSessionId", "d"},
+                      {"terminalId", "t"},
+                      {"state", "idle"},
+                      {"event", "e"},
+                      {"metadata", QJsonArray{1, 2}}};
+        QVERIFY(!ch::parseAgentEventLine(
+                     QJsonDocument(o).toJson(QJsonDocument::Compact))
+                     .has_value());
+    }
+    // Every remaining field is type-checked too, matching validateEvent() in
+    // remote/src/events.ts field for field. Without these an event carrying a
+    // number where a string belongs would be silently coerced (QJsonValue's
+    // toString() yields an empty QString for a non-string), so a terminal would
+    // be filed under the empty id instead of its own.
+    {
+        struct WrongType {
+            const char* field;
+            QJsonValue bad;
+        };
+        const WrongType wrongTypes[] = {
+            {"timestamp", QJsonValue(7)},   {"harness", QJsonValue(7)},
+            {"devSessionId", QJsonValue(7)}, {"terminalId", QJsonValue(7)},
+            {"state", QJsonValue(7)},       {"event", QJsonValue(7)},
+            {"summary", QJsonValue(7)},
+        };
+        for (const WrongType& wt : wrongTypes) {
+            QJsonObject o{{"version", 1},
+                          {"timestamp", "x"},
+                          {"harness", "generic"},
+                          {"devSessionId", "d"},
+                          {"terminalId", "t"},
+                          {"state", "idle"},
+                          {"event", "e"}};
+            o.insert(QString::fromLatin1(wt.field), wt.bad);
+            QVERIFY2(!ch::parseAgentEventLine(
+                          QJsonDocument(o).toJson(QJsonDocument::Compact))
+                          .has_value(),
+                     wt.field);
+        }
+    }
+    // Unknown extra fields are ignored, not rejected: events.ts's validator is
+    // structural, so a newer producer adding a field must not break an older
+    // client.
+    {
+        QJsonObject o{{"version", 1},
+                      {"timestamp", "x"},
+                      {"harness", "generic"},
+                      {"devSessionId", "d"},
+                      {"terminalId", "t"},
+                      {"state", "idle"},
+                      {"event", "e"},
+                      {"somethingNew", "ignored"}};
+        QVERIFY(ch::parseAgentEventLine(
+                     QJsonDocument(o).toJson(QJsonDocument::Compact))
+                     .has_value());
+    }
 
     // A well-formed line with optional summary + metadata parses.
     QJsonObject good{{"version", 1},
@@ -307,12 +408,16 @@ void TstAgentMonitor::runningToIdleUnseenSetsUnseenAndNotify()
     QCOMPARE(notifySpy.at(0).at(1).toString(), QStringLiteral("done building"));
     QCOMPARE(m_monitor->stateFor("d1", "t1"), asInt(AgentState::IdleUnseen));
 
-    // A second idle_unseen on the same session (already unseen) does not
-    // re-emit unseenChanged, and repeating the identical state is no transition.
+    // A second idle_unseen while the session is STILL flagged unseen adds
+    // nothing: no unseenChanged (the flag did not flip), no agentStateChanged
+    // (identical state is not a transition), and no notification (the user is
+    // already being told about work they have not seen).
     feed(eventLine("idle_unseen", "d1", "t1", "generic", "turn_end",
                    "done building"));
     QTest::qWait(100);
     QCOMPARE(unseenSpy.count(), 1);
+    QCOMPARE(stateSpy.count(), 2);
+    QCOMPARE(notifySpy.count(), 1);
 }
 
 void TstAgentMonitor::markSeenClearsUnseen()
@@ -420,6 +525,103 @@ void TstAgentMonitor::perTerminalStateIsIndependent()
     feed(eventLine("idle_unseen", "d1", "t2"));
     QTRY_COMPARE(unseenSpy.count(), 1);
     QVERIFY(m_monitor->hasUnseen("d1"));
+}
+
+// The unseen-completion flag is scoped to ONE Dev Session, not to the whole
+// client and not to a single terminal (SPEC 4.2: the sidebar folds a session's
+// terminals into one row state, so "finished with unseen output" is a property
+// of the row). One session finishing must not light up its neighbour's badge,
+// and clearing one must not clear the other's.
+void TstAgentMonitor::unseenIsPerDevSession()
+{
+    makePair();
+    QSignalSpy unseenSpy(m_monitor, &AgentStatusMonitor::unseenChanged);
+
+    feed(eventLine("idle_unseen", "dA", "tA"));
+    QTRY_VERIFY(m_monitor->hasUnseen("dA"));
+    QVERIFY(!m_monitor->hasUnseen("dB"));
+
+    feed(eventLine("idle_unseen", "dB", "tB"));
+    QTRY_VERIFY(m_monitor->hasUnseen("dB"));
+    QCOMPARE(unseenSpy.count(), 2);
+
+    // Marking one seen leaves the other pending.
+    m_monitor->markSeen(QStringLiteral("dA"));
+    QVERIFY(!m_monitor->hasUnseen("dA"));
+    QVERIFY(m_monitor->hasUnseen("dB"));
+    QCOMPARE(unseenSpy.count(), 3);
+
+    // ...and the per-terminal raw states stayed in their own sub-maps.
+    QCOMPARE(m_monitor->stateFor("dA", "tA"), asInt(AgentState::IdleUnseen));
+    QCOMPARE(m_monitor->stateFor("dB", "tB"), asInt(AgentState::IdleUnseen));
+    // A terminal id is only meaningful inside its own Dev Session.
+    QCOMPARE(m_monitor->stateFor("dA", "tB"), asInt(AgentState::Unknown));
+}
+
+// REGRESSION: a completion that arrives after the user cleared the previous one
+// must raise the badge again even though the terminal's raw state never left
+// IdleUnseen.
+//
+// markSeen() clears the per-session flag but deliberately leaves the terminal at
+// IdleUnseen (AppController::rebuildRows downgrades it for display). So the next
+// idle_unseen event carries the SAME state the monitor already has, and gating
+// the unseen bookkeeping on the state transition — as the monitor originally did
+// — discarded it as a no-op: the badge never returned and no notification was
+// raised for finished work the user had genuinely not seen. The flag must
+// therefore be re-armed from the EVENT, not from the transition.
+void TstAgentMonitor::completionAfterMarkSeenReArmsUnseen()
+{
+    makePair();
+    QSignalSpy stateSpy(m_monitor, &AgentStatusMonitor::agentStateChanged);
+    QSignalSpy unseenSpy(m_monitor, &AgentStatusMonitor::unseenChanged);
+    QSignalSpy notifySpy(m_monitor, &AgentStatusMonitor::notify);
+
+    feed(eventLine("idle_unseen", "d1", "t1", "generic", "turn_end", "first"));
+    QTRY_COMPARE(unseenSpy.count(), 1);
+    QCOMPARE(notifySpy.count(), 1);
+    QCOMPARE(stateSpy.count(), 1);
+
+    m_monitor->markSeen(QStringLiteral("d1"));
+    QCOMPARE(unseenSpy.count(), 2);
+    QVERIFY(!m_monitor->hasUnseen("d1"));
+    // The raw state is intentionally still IdleUnseen.
+    QCOMPARE(m_monitor->stateFor("d1", "t1"), asInt(AgentState::IdleUnseen));
+
+    // A brand-new completion, with no intervening running/idle event.
+    feed(eventLine("idle_unseen", "d1", "t1", "generic", "turn_end", "second"));
+    QTRY_COMPARE(unseenSpy.count(), 3);
+    QCOMPARE(unseenSpy.at(2).at(0).toString(), QStringLiteral("d1"));
+    QCOMPARE(unseenSpy.at(2).at(1).toBool(), true);
+    QVERIFY(m_monitor->hasUnseen("d1"));
+
+    // The user is told about it, with THIS completion's summary.
+    QCOMPARE(notifySpy.count(), 2);
+    QCOMPARE(notifySpy.at(1).at(0).toString(), QStringLiteral("Agent finished"));
+    QCOMPARE(notifySpy.at(1).at(1).toString(), QStringLiteral("second"));
+
+    // Still not a state transition, so no redundant agentStateChanged.
+    QCOMPARE(stateSpy.count(), 1);
+}
+
+// The producer frames with '\n'; a peer that emits CRLF (a Windows-side relay,
+// or a shell wrapper that translates line endings) must still be understood.
+// The carriage return has to be stripped before the JSON payload is handed to
+// the parser, and a bare CRLF must count as a blank line rather than a
+// malformed event.
+void TstAgentMonitor::crlfFramedLinesAreAccepted()
+{
+    makePair();
+    QSignalSpy stateSpy(m_monitor, &AgentStatusMonitor::agentStateChanged);
+
+    QByteArray chunk = QByteArray("\r\n"); // blank CRLF line
+    QByteArray framed = eventLine("running");
+    framed.chop(1); // drop the '\n' so we can re-frame it as CRLF
+    chunk += framed + "\r\n";
+    feed(chunk);
+
+    QTRY_COMPARE(stateSpy.count(), 1);
+    QCOMPARE(stateSpy.at(0).at(2).toInt(), asInt(AgentState::Running));
+    QCOMPARE(m_monitor->stateFor("d1", "t1"), asInt(AgentState::Running));
 }
 
 // The transport is caller-owned; if it is destroyed while the monitor lives,

@@ -39,10 +39,12 @@ src/            C++/QML client
   terminal/     TerminalController, buffering, reconnect
   viewers/      viewer handler registry, WebEngine profiles
   remote/       client-side RPC client for codeharbord
+  editor/       EditorController: remote file state machine, guarded saves
+  agent/        AgentStatusMonitor: coding-agent status over the bridge
   qml/          shared QML components
   web/          bundled web assets (terminal, editor)
 remote/         server-side service, agent bridge, harness adapters
-docs/           SPEC.md, PLAN.md
+docs/           SPEC.md, PLAN.md, DEVELOPMENT.md
 ```
 
 ## Install
@@ -114,6 +116,23 @@ server, and you have terminals, an editor, and viewers against that project.
 > AppImage, pointed at an unpacked `codeharbor-remote.tar.gz`, connected over SSH
 > and launched both remote services from `dist/`. No source checkout involved.
 
+## Keyboard shortcuts
+
+Almost everything is reached through the command palette rather than a key sequence.
+The complete set of bindings — with the reasoning, and the reconciliation against the
+shortcuts SPEC 15 originally suggested, in [`docs/SPEC.md`](docs/SPEC.md) — is:
+
+| Keys | Action |
+|---|---|
+| `Ctrl+Shift+P` (`⌘⇧P` on macOS) | Open the command palette |
+| `Ctrl+Shift+O` | Connect to Server… |
+| `Ctrl+R` | Refresh Workspace |
+| `Ctrl+S` | Save the file in the focused editor pane |
+
+Splitting and closing panes, killing a terminal's remote tmux session, disconnecting,
+and marking agent output seen are palette commands with no key sequence. There is no
+Dev Session switcher shortcut and no "focus next pane" shortcut.
+
 ## Build
 
 Full environment setup (all platforms, exact packages, troubleshooting) is in
@@ -121,10 +140,11 @@ Full environment setup (all platforms, exact packages, troubleshooting) is in
 
 ### Client (Qt / CMake)
 
-Requires Qt 6.9+, a C++20 compiler, CMake 3.24+, Ninja, and libssh.
+Requires Qt 6.9+, a C++20 compiler, CMake 3.25+, Ninja, and libssh.
 
 ```bash
-cmake --preset dev            # configure
+npm install                   # once: builds need the web-asset workspaces
+cmake --preset dev            # configure (also builds the web bundles)
 cmake --build --preset dev    # -> build/dev/src/app/codeharbor
 ```
 
@@ -174,14 +194,15 @@ were trusted silently, and one where presenting a different key ALGORITHM downgr
 a hard refusal into a friendly "trust this new host?" prompt.
 
 The corrections note in [`docs/PLAN.md`](docs/PLAN.md) records each one, and the gap
-list beside it is deliberately honest about what is still missing: no UI for creating,
-renaming or deleting a group; crash-recovery snapshots that are taken but never
-offered back; a reconnect that cannot prompt for a newly-unknown host key; and a
-connect that briefly blocks the GUI thread.
+list beside it is deliberately honest about what is still missing: no UI for renaming
+or deleting a group (creating one is wired); crash-recovery snapshots that are taken
+but never offered back; a reconnect that cannot prompt for a newly-unknown host key;
+and a connect that briefly blocks the GUI thread.
 
 **Building requires Node** — the Monaco and xterm.js bundles are build artifacts
 embedded as Qt resources, and CMake builds them at configure time (it refuses to
-configure a silently editor-less client; `-DCODEHARBOR_SKIP_WEB_BUNDLE=ON` opts out).
+configure a client whose editor or terminal pane would silently load nothing;
+`-DCODEHARBOR_SKIP_WEB_BUNDLE=ON` opts out).
 
 ## License
 

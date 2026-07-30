@@ -277,11 +277,13 @@ constexpr auto kJsReadStatus = R"JS(
 })()
 )JS";
 
-// The conflict affordance mountEditor() renders from saveConflict. Unlike the
-// status label this is STICKY: it stays up until the user resolves the
-// conflict, so it is the stable page-side evidence that the refusal reached the
-// UI. (The label is not: a watch event for the same external write can land
-// after the conflict and re-render it as "externally_modified".)
+// The conflict affordance mountEditor() renders from saveConflict. It stays up
+// until the user resolves the conflict, so it is the stable page-side evidence
+// that the refusal reached the UI — stabler than the status label, which the
+// user's next keystroke re-renders with its dirty mark. (EditorController no
+// longer downgrades Conflict to ExternallyModified when the watch event for the
+// same external write lands, so the label itself is not racy any more; the
+// notice is still the thing that proves the PAGE was told.)
 constexpr auto kJsReadNotice = R"JS(
 (function () {
     try {
@@ -492,9 +494,11 @@ void TstLiveEditor::initTestCase()
     // Created over an ssh Exec channel rather than with file.writeFile: the
     // fixture must not depend on the very RPC surface the gate is testing, so a
     // broken writeFile shows up as a failed assertion, not as a missing file.
-    // `.codeharbor-recovery` is pre-created because file.writeFile does not
-    // mkdir -p, and without it the SPEC 11.3 snapshot the page's debounced
-    // reportContent writes would silently ENOENT instead of exercising.
+    // `.codeharbor-recovery` is pre-created too. file.writeFile does create a
+    // missing parent directory now, but the fixture deliberately does not lean
+    // on that: an ENOENT there would silently swallow the SPEC 11.3 snapshot the
+    // page's debounced reportContent writes, and the gate would pass without
+    // ever exercising it.
     QVERIFY2(startRemoteShell(),
              qPrintable(QStringLiteral("could not start the out-of-band shell channel: %1")
                             .arg(m_execErr)));

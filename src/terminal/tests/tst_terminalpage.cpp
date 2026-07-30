@@ -377,8 +377,13 @@ void TstTerminalPage::controllerStateAndOutputReachTheRenderer()
 // controller writes to — the frozen bridge.sendInput() contract, end to end.
 void TstTerminalPage::keystrokesReachTheControllerTransport()
 {
+    // WriteOnly, not ReadWrite: a QBuffer hands back everything written into it
+    // as READABLE data, so a ReadWrite buffer would feed the keystroke straight
+    // back to the controller as terminal OUTPUT and echo it onto the real xterm
+    // screen the next test inspects. The controller refuses to read a transport
+    // that is not readable, so write-only keeps the direction one-way.
     QBuffer transport;
-    QVERIFY(transport.open(QIODevice::ReadWrite));
+    QVERIFY(transport.open(QIODevice::WriteOnly));
     m_controller->setTransport(&transport);
 
     QCOMPARE(evalJs(QString::fromLatin1(kJsPressEnter)), QStringLiteral("SENT"));

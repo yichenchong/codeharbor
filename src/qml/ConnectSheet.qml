@@ -19,12 +19,16 @@ import QtQuick.Controls.Basic
 //
 //   profiles         array of {id, name, host, port, user, identityFile, nodePath, repoRoot}
 //   activeId         id of the profile the host considers current ("" = none)
-//   connectionState  free-form status text; "connecting"/"authenticating"/
-//                    "hostkeycheck"/"connected"/"error"/"notavailable" are
-//                    additionally recognised for colouring (case-insensitive)
+//   connectionState  free-form status text; the words ch::AppController
+//                    publishes ("disconnected"/"connecting"/"hostkey"/
+//                    "credential"/"connected"/"reconnecting"/"failed") and the
+//                    older libssh-level ones ("authenticating"/"hostkeycheck"/
+//                    "error"/"notavailable") are recognised for colouring
+//                    (case-insensitive)
 //   errorText        last failure; shown as a non-blocking banner while non-empty
 //   pendingHostKey   null, or {host, keyType, fingerprint} to prompt about
-//   pendingCredential null, or {user, host, prompt} to ask a secret for
+//   pendingCredential null, or {user, host, prompt, kind} to ask a secret for;
+//                    `kind` is "password" or "keyPassphrase"
 //
 // Outputs
 //   connectRequested(profileId)  connect using that stored profile
@@ -60,6 +64,21 @@ Rectangle {
     // selected as soon as the host hands back a longer list.
     property bool awaitingNewProfile: false
     property int knownProfileCount: 0
+
+    // A host-key or credential prompt is up, so the connection this sheet is
+    // about is parked on that one answer.
+    //
+    // The prompt panels below cover the sheet and swallow every CLICK, but that
+    // is only half of it: the buttons underneath stayed enabled, and therefore
+    // TAB-REACHABLE. A keyboard user could reach Close/Cancel behind an unknown
+    // host-key panel and dismiss the whole sheet, leaving ch::AppController
+    // waiting for a resolveHostKey() that no longer has any UI to come from —
+    // an attempt stuck "connecting" forever with nothing on screen to answer.
+    // Disabling the sheet body is what makes the panels actually modal.
+    // Same truthiness test the two panels' `visible` bindings use, so "a panel
+    // is showing" and "the sheet is blocked" can never disagree.
+    readonly property bool promptActive: (root.pendingHostKey ? true : false)
+                                         || (root.pendingCredential ? true : false)
 
     implicitWidth: 760
     implicitHeight: 480
@@ -202,14 +221,17 @@ Rectangle {
             root.profileRemoved(root.editingId);
     }
 
-    // Hand the typed secret up and wipe it here in the same turn. This file
-    // keeps no copy of it and never routes it through the profile form, so it
-    // cannot reach profileSaved() and therefore cannot reach QSettings.
+    // Which secret the pending prompt is asking for. Anything the host did not
+    // label "password" is treated as a private-key passphrase, so a passphrase
+    // is never offered to password authentication by accident.
     function credentialKind() {
         var kind = root.textOf(root.pendingCredential, "kind");
         return kind === "password" ? "password" : "keyPassphrase";
     }
 
+    // Hand the typed secret up and wipe it here in the same turn. This file
+    // keeps no copy of it and never routes it through the profile form, so it
+    // cannot reach profileSaved() and therefore cannot reach QSettings.
     function submitSecret(kind) {
         var secret = secretField.text;
         secretField.clear();
@@ -224,9 +246,10 @@ Rectangle {
     // ---- connection status vocabulary -------------------------------------
     //
     // `connectionState` is free-form text from the host. These map it onto the
-    // six states ch::AppController::setConnectionState() actually publishes
-    // (disconnected / connecting / hostkey / connected / reconnecting / failed),
-    // keeping the older libssh-level words the pool can still surface.
+    // seven states ch::AppController::setConnectionState() actually publishes
+    // (disconnected / connecting / hostkey / credential / connected /
+    // reconnecting / failed), keeping the older libssh-level words the pool can
+    // still surface.
     //
     // Every state is encoded THREE ways — colour, glyph and word — because a
     // colour-only dot is unreadable to a colour-blind user and vanishes in a
@@ -418,6 +441,9 @@ Rectangle {
     // ---- header -----------------------------------------------------------
     Rectangle {
         id: header
+        // Untouchable — by pointer AND by keyboard — while a prompt is up; see
+        // root.promptActive.
+        enabled: !root.promptActive
         anchors.top: parent.top
         anchors.left: parent.left
         anchors.right: parent.right
@@ -575,6 +601,7 @@ Rectangle {
     Rectangle {
         id: errorBanner
         objectName: "errorBanner"
+        enabled: !root.promptActive
         anchors.left: parent.left
         anchors.right: parent.right
         anchors.bottom: parent.bottom
@@ -656,7 +683,7 @@ Rectangle {
         }
     }
 
-    Dialog {
+    AppDialog {
         id: sshDiagnosticsDialog
         objectName: "sshDiagnosticsDialog"
         title: qsTr("SSH connection details")
@@ -685,6 +712,7 @@ Rectangle {
     // ---- body -------------------------------------------------------------
     Item {
         id: body
+        enabled: !root.promptActive
         anchors.top: header.bottom
         anchors.left: parent.left
         anchors.right: parent.right

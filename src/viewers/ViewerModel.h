@@ -51,8 +51,11 @@ public:
     Q_INVOKABLE QQuickWebEngineProfile *externalProfile();
     Q_INVOKABLE QQuickWebEngineProfile *internalProfile();
 
-    // Asynchronously read a remote text file (SPEC 8.3). On success emits
-    // textFileRead(path, content); on failure or without a client, textFileError.
+    // Asynchronously read a remote text file (SPEC 8.3). The read is capped at
+    // InternalUrlSchemeHandler::kMaxInlineReadBytes, the same bound the internal
+    // scheme handler applies; a larger file fails instead of being shown
+    // truncated. On success emits textFileRead(path, content); on failure, on a
+    // file over the cap, or without a client, textFileError.
     Q_INVOKABLE void readTextFile(const QString &path);
 
     // Asynchronously list a remote directory (SPEC 7.5). On success emits

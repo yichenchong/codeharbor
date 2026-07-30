@@ -30,15 +30,41 @@ ViewerResolution ViewerHandlerRegistry::resolveByExtension(const QString &ext)
         return ViewerResolution::InternalHtmlRenderer;
 
     // Source code, plain text, and structured-data formats open in the text
-    // editor / source viewer.
+    // editor / source viewer. The list is deliberately generous: anything a
+    // developer would expect to read as text must NOT fall through to the
+    // Download resolution, which hides the contents behind a binary pane.
     static const QSet<QString> kText = {
-        QStringLiteral("txt"),  QStringLiteral("ts"),   QStringLiteral("tsx"),
-        QStringLiteral("js"),   QStringLiteral("mjs"),  QStringLiteral("c"),
-        QStringLiteral("cc"),   QStringLiteral("cpp"),  QStringLiteral("h"),
-        QStringLiteral("hpp"),  QStringLiteral("py"),   QStringLiteral("rs"),
-        QStringLiteral("go"),   QStringLiteral("sh"),   QStringLiteral("css"),
-        QStringLiteral("html"), QStringLiteral("json"), QStringLiteral("yaml"),
-        QStringLiteral("yml"),  QStringLiteral("toml"), QStringLiteral("xml"),
+        QStringLiteral("txt"),        QStringLiteral("ts"),
+        QStringLiteral("tsx"),        QStringLiteral("mts"),
+        QStringLiteral("cts"),        QStringLiteral("js"),
+        QStringLiteral("mjs"),        QStringLiteral("cjs"),
+        QStringLiteral("jsx"),        QStringLiteral("c"),
+        QStringLiteral("cc"),         QStringLiteral("cxx"),
+        QStringLiteral("cpp"),        QStringLiteral("h"),
+        QStringLiteral("hh"),         QStringLiteral("hxx"),
+        QStringLiteral("hpp"),        QStringLiteral("py"),
+        QStringLiteral("rs"),         QStringLiteral("go"),
+        QStringLiteral("java"),       QStringLiteral("kt"),
+        QStringLiteral("kts"),        QStringLiteral("rb"),
+        QStringLiteral("php"),        QStringLiteral("swift"),
+        QStringLiteral("scala"),      QStringLiteral("cs"),
+        QStringLiteral("lua"),        QStringLiteral("pl"),
+        QStringLiteral("sh"),         QStringLiteral("bash"),
+        QStringLiteral("zsh"),        QStringLiteral("fish"),
+        QStringLiteral("css"),        QStringLiteral("scss"),
+        QStringLiteral("sass"),       QStringLiteral("less"),
+        QStringLiteral("html"),       QStringLiteral("htm"),
+        QStringLiteral("vue"),        QStringLiteral("svelte"),
+        QStringLiteral("json"),       QStringLiteral("jsonc"),
+        QStringLiteral("yaml"),       QStringLiteral("yml"),
+        QStringLiteral("toml"),       QStringLiteral("ini"),
+        QStringLiteral("cfg"),        QStringLiteral("conf"),
+        QStringLiteral("properties"), QStringLiteral("env"),
+        QStringLiteral("xml"),        QStringLiteral("sql"),
+        QStringLiteral("csv"),        QStringLiteral("tsv"),
+        QStringLiteral("log"),        QStringLiteral("diff"),
+        QStringLiteral("patch"),      QStringLiteral("cmake"),
+        QStringLiteral("gradle"),     QStringLiteral("mk"),
     };
     if (kText.contains(e))
         return ViewerResolution::TextEditor;
@@ -84,19 +110,6 @@ ViewerResolution ViewerHandlerRegistry::resolve(const QUrl &url)
         return resolveByExtension(extensionOf(path));
     }
 
-    return ViewerResolution::Error;
-}
-
-ViewerResolution ViewerHandlerRegistry::resolveScheme(const QString &scheme)
-{
-    const QString s = scheme.toLower();
-    if (s == QLatin1String("http") || s == QLatin1String("https"))
-        return ViewerResolution::DirectWebNavigation;
-    if (s == QLatin1String("codeharbor-internal"))
-        return ViewerResolution::InternalHtmlRenderer;
-    if (s == QLatin1String("file"))
-        // Remote file:// is resolved by MIME/extension in a later pass.
-        return ViewerResolution::TextEditor;
     return ViewerResolution::Error;
 }
 

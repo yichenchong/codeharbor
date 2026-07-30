@@ -1,4 +1,8 @@
-cmake_minimum_required(VERSION 3.24)
+# 3.25 is the floor, not 3.24: CMakePresets.json declares schema "version": 6,
+# which CMake 3.24 rejects outright ("Unrecognized 'version' field"). Since every
+# documented build goes through `cmake --preset ...`, a 3.24 claim was a claim
+# nobody could act on.
+cmake_minimum_required(VERSION 3.25)
 
 project(CodeHarbor
     VERSION 0.1.7
@@ -23,18 +27,27 @@ option(CODEHARBOR_BUILD_TESTS "Build C++ unit tests" ON)
 # arrived in 6.9, and it is the only profile-creation form that does not emit the
 # "use WebEngineProfilePrototype" deprecation warning that tst_qmlload treats as a
 # failure. 6.6/6.8 do not compile (see src/viewers/ViewerProfiles.cpp).
+#
+# The list is exactly what the tree links. Qt6::Sql is deliberately absent: all
+# persistence goes through codeharbord over RPC (SPEC 11.2), so the client owns
+# no local database and nothing links Qt6::Sql (see src/persistence/CMakeLists.txt).
 find_package(Qt6 6.9 REQUIRED COMPONENTS
     Core
     Gui
     Quick
     Qml
     QuickControls2
-    Sql
     WebEngineCore
     WebEngineQuick
     WebChannel
-    Network
-    Test)
+    Network)
+
+# Qt Test is used ONLY by the per-module test targets, every one of which sits
+# behind `if(CODEHARBOR_BUILD_TESTS)`. Requiring it unconditionally made the
+# tests-off release configure fail on a Qt install that ships no Test module.
+if(CODEHARBOR_BUILD_TESTS)
+    find_package(Qt6 6.9 REQUIRED COMPONENTS Test)
+endif()
 
 qt_standard_project_setup(REQUIRES 6.9)
 
@@ -52,10 +65,33 @@ if(libssh_FOUND)
         set(_ch_libssh_target libssh::libssh)
     endif()
 endif()
+# The audited floor is libssh 0.11.2 (docs/DEVELOPMENT.md § Verified toolchain,
+# and the per-symbol audit comment at the top of src/ssh/SshConnectionPool.cpp).
+# This is a WARNING, not a hard requirement: several supported distributions
+# still ship 0.10.x, the client compiles and links against it, and everything
+# except the libssh-0.12.0 key-exchange workaround works there. Turning it into
+# a `find_package` version constraint would refuse to configure on those
+# machines, which is a worse outcome than an explicit warning.
+set(CODEHARBOR_LIBSSH_FLOOR "0.11.2")
+function(_ch_warn_if_old_libssh version how)
+    if("${version}" STREQUAL ""
+       OR "${version}" VERSION_GREATER_EQUAL "${CODEHARBOR_LIBSSH_FLOOR}")
+        return()
+    endif()
+    message(WARNING
+        "libssh ${version} (found via ${how}) is older than the audited floor "
+        "${CODEHARBOR_LIBSSH_FLOOR}. It will build and connect, but it is missing "
+        "the CVE-2025-5351 fix in the public-key export path this client calls on "
+        "every connect, and the libssh-0.12.0 key-exchange workaround in "
+        "src/ssh/SshConnectionPool.cpp needs the 0.11.0 algorithm-list syntax. "
+        "See docs/DEVELOPMENT.md.")
+endfunction()
 if(_ch_libssh_target)
     add_library(ch_libssh INTERFACE)
     target_link_libraries(ch_libssh INTERFACE ${_ch_libssh_target})
-    message(STATUS "libssh: found via CONFIG package (target ${_ch_libssh_target})")
+    message(STATUS "libssh: found via CONFIG package (target ${_ch_libssh_target})"
+                   " version ${libssh_VERSION}")
+    _ch_warn_if_old_libssh("${libssh_VERSION}" "CONFIG package")
 else()
     find_package(PkgConfig QUIET)
     if(PkgConfig_FOUND)
@@ -65,6 +101,7 @@ else()
         add_library(ch_libssh INTERFACE)
         target_link_libraries(ch_libssh INTERFACE PkgConfig::LIBSSH)
         message(STATUS "libssh: found via pkg-config ${LIBSSH_VERSION}")
+        _ch_warn_if_old_libssh("${LIBSSH_VERSION}" "pkg-config")
     endif()
 endif()
 if(NOT TARGET ch_libssh)

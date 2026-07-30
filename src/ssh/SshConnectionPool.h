@@ -143,8 +143,18 @@ public:
     // connected or the channel could not be opened. The pool RETAINS ownership:
     // channels MUST NOT outlive the session — disconnectFromHost()/closeSession()
     // closes and frees every opened channel before freeing the session. Callers
-    // must not ssh_channel_free() a returned channel themselves.
+    // must not ssh_channel_free() a returned channel themselves; they hand it
+    // back with releaseChannel() instead.
     ssh_channel openChannel(ChannelKind kind);
+
+    // Give a channel back: closes it if still open, frees it, and drops it from
+    // the pool's list. Unknown or null handles are ignored, so a double release
+    // is harmless. This is the ONLY way a channel slot is reclaimed before the
+    // whole session goes down, and it matters: an SSH server caps the number of
+    // concurrent sessions per connection (OpenSSH's MaxSessions, 10 by default),
+    // so a client that opens a channel per remote command and never releases
+    // wedges the connection after ten of them.
+    void releaseChannel(ssh_channel channel);
 #endif
 
 signals:
@@ -153,6 +163,10 @@ signals:
     void errorOccurred(const QString& message);
     // Emitted on a Verdict::Mismatch refusal so the UI can surface a warning.
     void hostKeyMismatch(const QString& host);
+    // Emitted immediately before the session's channels are freed, so anything
+    // holding a channel handle (SshChannelDevice) can drop it first. Without it
+    // a device that outlives its session keeps polling freed libssh memory.
+    void sessionClosing();
 
 private:
     void clearDiagnostics();

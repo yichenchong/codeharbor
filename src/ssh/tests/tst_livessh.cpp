@@ -70,12 +70,14 @@ private slots:
     void connectsToFixture();
     void connectionLogRecordsLibsshTrace();
     void execChannelDeliversStdout();
+    void manyShortLivedChannelsReuseTheirSlots();
     void rpcServerInfoOverSshChannel();
     void stderrStaysOutOfReadStream();
     void encryptedIdentityUsesPassphraseFromCallback();
     void missingAgentAndKeyExplainAuthenticationFailure();
     void windowsNamedPipeAgentFallsBackToIdentityFile();
     void unavailableTrustedAlgorithmStillReachesHostVerification();
+    void deviceOutlivingItsSessionStopsCleanly();
 
 private:
     void ensureConnected();
@@ -181,6 +183,40 @@ void TstLiveSsh::execChannelDeliversStdout()
     QTRY_VERIFY_WITH_TIMEOUT(sink.finished, kExecTimeoutMs);
     QCOMPARE(sink.out, QByteArray("LIVE_EXEC_OK\n"));
     device.closeChannel();
+}
+
+// An SSH server caps how many channels ("sessions") one connection may have
+// open at a time — OpenSSH's MaxSessions, 10 by default — so a device that is
+// done with its channel MUST hand it back. Running far more short-lived exec
+// channels than that cap on ONE session is the regression test: while
+// closeChannel()/~SshChannelDevice() only closed the channel and left the pool
+// holding it, the slots were never reclaimed and the eleventh exec simply
+// failed to open, wedging the session for everything else.
+void TstLiveSsh::manyShortLivedChannelsReuseTheirSlots()
+{
+    ensureConnected();
+    QCOMPARE(m_pool.state(), SshConnectionPool::State::Connected);
+
+    constexpr int kChannelCount = 25;
+    for (int i = 0; i < kChannelCount; ++i) {
+        SshChannelDevice device(&m_pool, SshConnectionPool::ChannelKind::Exec);
+        ChannelSink sink;
+        sink.attach(&device);
+
+        QVERIFY2(device.startExec(QStringLiteral("echo SLOT_%1").arg(i)),
+                 qPrintable(QStringLiteral("exec channel %1 of %2 would not "
+                                           "open: %3")
+                                .arg(i)
+                                .arg(kChannelCount)
+                                .arg(sink.err)));
+        QTRY_VERIFY_WITH_TIMEOUT(sink.finished, kExecTimeoutMs);
+        QCOMPARE(sink.out, QStringLiteral("SLOT_%1\n").arg(i).toUtf8());
+        // The device goes out of scope here: its destructor gives the channel
+        // back to the pool, which frees it and releases the server-side slot.
+    }
+
+    // The session itself is untouched by all that churn.
+    QCOMPARE(m_pool.state(), SshConnectionPool::State::Connected);
 }
 
 // (c) The end-to-end spine: real codeharbord, over a real SSH channel, driven
@@ -523,6 +559,45 @@ void TstLiveSsh::unavailableTrustedAlgorithmStillReachesHostVerification()
     QVERIFY2(!failure.contains(QStringLiteral("client init buffer"),
                                Qt::CaseInsensitive),
              qPrintable(failure));
+}
+
+// The dangerous ordering for a device that outlives its session: a channel with
+// a live remote process still on it when the session goes down. The pool frees
+// every channel it handed out during disconnectFromHost(), so unless the device
+// is told first, its poll timer keeps calling libssh on a freed ssh_channel.
+// sessionClosing() is that notification; this proves the device drops the
+// handle, reports end of stream exactly once, and stays inert afterwards.
+// Declared last on purpose: it deliberately takes the shared session down.
+void TstLiveSsh::deviceOutlivingItsSessionStopsCleanly()
+{
+    ensureConnected();
+    QCOMPARE(m_pool.state(), SshConnectionPool::State::Connected);
+
+    SshChannelDevice device(&m_pool, SshConnectionPool::ChannelKind::Exec);
+    ChannelSink sink;
+    sink.attach(&device);
+
+    // `cat` copies the channel's own stdin, which nothing ever closes here, so
+    // the remote end sends no EOF of its own: the channel is still live when the
+    // session is torn down below.
+    QVERIFY2(device.startExec(QStringLiteral("cat")), qPrintable(sink.err));
+    QVERIFY(device.isOpen());
+    QVERIFY(!sink.finished);
+
+    m_pool.disconnectFromHost();
+
+    // Synchronous: sessionClosing() reaches closeChannel() on a direct
+    // connection, before the pool frees anything.
+    QVERIFY(sink.finished);
+    QVERIFY(!device.isOpen());
+    QCOMPARE(device.bytesAvailable(), qint64(0));
+    QVERIFY(!device.resizePty(80, 24));
+
+    // Longer than the device's idle poll interval: a pump that survived the
+    // teardown would fault inside libssh right here instead of doing nothing.
+    QTest::qWait(100);
+    QVERIFY(!device.isOpen());
+    QCOMPARE(m_pool.state(), SshConnectionPool::State::Disconnected);
 }
 
 QTEST_GUILESS_MAIN(TstLiveSsh)

@@ -220,10 +220,19 @@ Each Dev Session row should display:
 - session name;
 - optional repository or branch subtitle;
 - aggregate terminal connection state;
-- number of active terminals;
-- number of terminals requiring attention;
-- unsaved-file indicator;
-- error indicator.
+- number of active terminals — **not yet implemented**;
+- number of terminals requiring attention — **not yet implemented**;
+- unsaved-file indicator — **not yet implemented** (see section 8.2);
+- error indicator (delivered as the `Error` value of the aggregate state above,
+  not as a separate badge).
+
+> **Implementation status.** The shipped row renders the session name, the optional
+> subtitle, and ONE aggregate status dot. The sidebar data model
+> (`SessionsModel::Roles` in `src/models/SessionsModel.h`) exposes only `NameRole`,
+> `SubtitleRole`, `RowStateRole`, `IsGroupRole`, `CollapsedRole`, `IdRole` and
+> `GroupIdRole`; there is no role for either terminal counter and none for unsaved
+> files, so the QML delegate could not draw them even if it tried. Tracked in
+> `docs/PLAN.md`.
 
 Suggested state precedence:
 
@@ -510,14 +519,21 @@ agent or hook error      → error
 
 ### 6.6 Fallback Activity Detection
 
-Without a harness adapter, CodeHarbor may expose only coarse states:
+Without a harness adapter, CodeHarbor may expose only coarse states. Those states are
+drawn from the SAME `state` vocabulary as section 6.4 — a fallback must never invent a
+value the desktop client cannot interpret — and only this subset is used:
 
 ```text
-connected
-activity detected
-idle
-disconnected
+starting     no terminal output observed yet
+running      output observed within the idle threshold
+idle         no output for longer than the idle threshold
 ```
+
+`FallbackActivityDetector` in `remote/src/adapters/fallback.ts` produces exactly these
+three for the `generic` harness; the full vocabulary is `AGENT_STATES` in
+`remote/src/events.ts`. Loss of the SSH channel is a TRANSPORT condition, reported by
+the client's own connection state, so there is deliberately no `disconnected` agent
+state here.
 
 It must not pretend to reliably distinguish agent work, long-running commands, waiting for input, or completion.
 
@@ -650,6 +666,12 @@ Disconnected
 
 Unsaved-file state should appear both in the pane header and in the Dev Session row.
 
+> **Implementation status.** Only the pane header shows it. The row aggregation,
+> `aggregateRowState()` in `src/models/SessionState.cpp`, takes five booleans — error,
+> waiting-for-input, running, finished-with-unseen-output, connected — all derived from
+> terminal and coding-agent conditions. No file state is passed in, so an unsaved
+> buffer never reaches the sidebar row. Tracked in `docs/PLAN.md`.
+
 ### 8.3 Remote File API
 
 The server-side file service should eventually support:
@@ -707,6 +729,13 @@ File changed externally.
 ```
 
 CodeHarbor must never silently overwrite a changed remote file.
+
+> **Implementation status.** The conflict notice in `src/web/editor/src/index.ts` offers
+> **Reload** and **Overwrite** only. **Compare** would need a diff view, and **Save As**
+> a "write this buffer to a different path" call; neither has a method on the C++ editor
+> bridge (`src/editor/EditorController.h`), so neither button can be wired yet. The
+> mandatory sentence above still holds: an overwrite happens only when the user asks for
+> one. Tracked in `docs/PLAN.md`.
 
 ### 8.7 Remote File Watching
 
@@ -809,7 +838,41 @@ It does not need to run permanently.
 
 ### 10.3 RPC
 
-Use newline-delimited JSON or framed JSON-RPC.
+The wire protocol is JSON-RPC 2.0 carried as newline-delimited JSON on the RPC
+channel's stdin/stdout. The rules below are the ones the implementation
+(`remote/src/codeharbord.ts`, with the shared constants in
+`remote/src/rpc-types.ts`) actually enforces:
+
+- **One request per line, one response per line.** Each line is one complete
+  JSON-RPC request object.
+- **No batch requests.** A JSON *array* of request objects is deliberately
+  unsupported: it fails the request-shape check and is answered with a single
+  Invalid Request (`-32600`), never with an array of responses. The only client
+  writes one request per line and correlates replies by `id`.
+- **Blank lines are ignored.** A line containing no non-whitespace character is
+  skipped silently and produces no response, so stray separators are harmless.
+- **Unparseable or structurally invalid input is answered with `id: null`.**
+  Malformed JSON yields Parse error (`-32700`). A decoded value that is not a
+  request object — wrong or missing `jsonrpc`, a non-string `method`, or an `id`
+  that is neither a string, a number, nor `null` — yields Invalid Request
+  (`-32600`). Both use `id: null` because no usable request id could be recovered.
+  Note that an explicit `"id": null` IS a legal id and is echoed back as such.
+- **`params`, when present, must be an object or an array.** A primitive or `null`
+  is rejected up front with Invalid params (`-32602`) rather than failing later,
+  confusingly, inside a method handler.
+- **Unknown method** yields Method not found (`-32601`), and it outranks bad
+  params. An exception escaping a handler yields Internal error (`-32603`).
+- **A notification never receives a response.** A request with no `id` member is
+  dispatched for its side effects only and answered with nothing at all, whether it
+  succeeds, hits an unknown method, or throws. Server-initiated messages use the
+  same id-less form — see the `file.watchEvent` notification in section 8.7.
+- **Application-level failures use JSON-RPC's implementation-defined
+  `-32000..-32099` range.** Exactly one code is defined so far: **`-32001`,
+  revision mismatch**, returned for a `file.writeFile` whose `expectedRevision` no
+  longer matches the file (sections 8.4 and 8.6). Its constant is
+  `RPC_REVISION_MISMATCH` in `remote/src/rpc-types.ts`, mirrored in C++ as
+  `kRevisionMismatch` in `src/remote/RpcTypes.h`; `remote/test/rpc-mirror.test.ts`
+  fails if the two sides drift apart.
 
 ---
 
@@ -855,13 +918,35 @@ The client must not store project repositories or project files.
 
 Unsaved buffers should be recoverable after client failure.
 
-Recovery snapshots should be stored on the server:
+Recovery snapshots are stored on the server, in a hidden directory beside the file
+being edited. For `/repo/note.txt` the snapshot is:
 
 ```text
-~/.local/share/codeharbor/recovery/<client-id>/<pane-id>.json
+/repo/.codeharbor-recovery/note.txt
 ```
 
-Recovery files should use mode `0600`.
+This is what `EditorController::recoveryPathFor()` in `src/editor/EditorController.cpp`
+computes, and it is a deliberate choice over a single central directory such as
+`~/.local/share/codeharbor/recovery/`:
+
+- The snapshot is written and read through the ordinary remote file methods of
+  section 8.3 (`stat`, `readFile`, `writeFile`). Those are the only file methods in
+  the frozen catalog, so a snapshot must live somewhere the client can already
+  address by path — and a path derived from the edited file needs no client
+  identity, no pane identity, and no extra index to map snapshots back to files.
+- Being a sibling of the file, the snapshot travels with the project: it stays
+  correct across a repository that is moved, and it is visible to the user right
+  where the affected file is.
+- The snapshot is guarded by the same revision tokens as a normal save
+  (section 8.4), which is what makes two clients editing the same file unable to
+  destroy each other's snapshots.
+
+Confidentiality comes from the directory: `.codeharbor-recovery/` is created with mode
+`0700` (see `writeFile` in `remote/src/files.ts`), so the snapshots inside it are
+unreadable by other users on the server regardless of the individual files' own modes.
+A newly created snapshot file itself gets the service's normal new-file mode, `0644`
+masked by the process umask, because it is written by the same generic `writeFile`
+used for project files.
 
 ---
 
@@ -874,7 +959,15 @@ Requirements:
 - host-key verification;
 - persistent known-hosts store;
 - fingerprint prompt for unknown hosts;
-- refusal of changed host keys unless explicitly approved;
+- unconditional refusal of a changed host key. When the known-hosts store already
+  trusts a host but under a DIFFERENT key — including the same key presented under a
+  different algorithm — the connection is refused outright and the user is never
+  offered a way to approve it. `SshConnectionPool::verifyHostKey()` in
+  `src/ssh/SshConnectionPool.cpp` consults the user-decision callback only for a host
+  that is not in the store at all. A user who genuinely needs to accept a new key for
+  an already-known host must edit the known-hosts file deliberately, outside
+  CodeHarbor; that friction is the point — an in-app "approve" button on this path is
+  exactly what a man-in-the-middle needs;
 - SSH agent preferred;
 - password or key passphrases stored only in the operating-system credential store;
 - no credentials stored in the workspace database.
@@ -981,18 +1074,40 @@ Suggested technologies:
 
 ## 15. Keyboard Shortcuts
 
-Suggested defaults:
+Implemented bindings:
 
 ```text
-Ctrl+K          Command palette
-Ctrl+P          Switch Dev Session
-Ctrl+Shift+T    New terminal
-Ctrl+Shift+V    New viewer
-Ctrl+S          Save active remote file
-Ctrl+W          Close active pane
-Ctrl+Tab        Next pane
-Alt+1..9        Select Dev Session
+Ctrl+Shift+P    Command palette
+Ctrl+Shift+O    Connect to Server…
+Ctrl+R          Refresh Workspace
+Ctrl+S          Save active remote file (inside a focused editor pane)
 ```
+
+`Ctrl+Shift+P` opens the palette (`activationSequence` in
+`src/qml/CommandPalette.qml`; Qt maps `Ctrl` in a key sequence to Command on macOS,
+so it is `⌘⇧P` there). The other two are `shortcut` entries on the command list in
+`src/qml/Main.qml`, which the palette turns into real window-wide `Shortcut` objects,
+so they fire whether or not the palette is open. `Ctrl+S` is registered on the Monaco
+instance itself in `src/web/editor/src/index.ts`, so it applies to the focused editor
+pane rather than window-wide.
+
+Every remaining command — splitting a viewer or terminal pane, closing a focused
+pane, killing a terminal's remote tmux session, disconnecting from the server,
+marking agent output seen — is reachable through the palette only and carries no key
+sequence.
+
+Originally suggested defaults, and how they were reconciled:
+
+| Suggested | Status |
+|---|---|
+| `Ctrl+K` Command palette | Superseded by `Ctrl+Shift+P` (`activationSequence` in `src/qml/CommandPalette.qml`). `Ctrl+K` is not bound at all. |
+| `Ctrl+P` Switch Dev Session | Not implemented — there is no session switcher. |
+| `Ctrl+Shift+T` New terminal | Not implemented as a key sequence; a new terminal pane comes from the palette's "Split Terminal Pane Horizontally/Vertically". |
+| `Ctrl+Shift+V` New viewer | Not implemented as a key sequence; a new viewer pane comes from the palette's "Split Viewer Pane Horizontally/Vertically". |
+| `Ctrl+S` Save active remote file | Implemented, in the editor pane. |
+| `Ctrl+W` Close active pane | Not implemented as a key sequence; "Close Focused Viewer/Terminal Pane" are palette commands. |
+| `Ctrl+Tab` Next pane | Not implemented. Pane focus is click-based today, so a "focus next pane" command would first have to be able to move focus (see `docs/PLAN.md`). |
+| `Alt+1..9` Select Dev Session | Not implemented. |
 
 Split shortcuts should be configurable because terminal applications and tmux may use overlapping combinations.
 
