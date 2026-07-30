@@ -334,10 +334,9 @@ void TstLiveShell::initTestCase()
     QVERIFY(m_scratch.isValid());
 
     // Linux's native QSettings path follows XDG_CONFIG_HOME. macOS and
-    // Windows ignore that variable, so use Qt's test-mode path when this
-    // process will not launch a live child, and otherwise use the native path
-    // that the child process will share.
-    const bool liveRequested = !qEnvironmentVariableIsEmpty("CH_LIVE_SSH");
+    // Windows ignore that variable, so use the native path those child
+    // processes share. The CI hosts are disposable, and using the native
+    // path is required because QStandardPaths test mode is process-local.
 #if defined(Q_OS_LINUX)
     m_configHome = m_scratch.filePath(QStringLiteral("config"));
     QVERIFY(QDir().mkpath(m_configHome));
@@ -345,8 +344,6 @@ void TstLiveShell::initTestCase()
     QCOMPARE(QStandardPaths::writableLocation(QStandardPaths::GenericConfigLocation),
              m_configHome);
 #else
-    if (!liveRequested)
-        QStandardPaths::setTestModeEnabled(true);
     m_configHome = QStandardPaths::writableLocation(QStandardPaths::GenericConfigLocation);
     QVERIFY(QDir().mkpath(m_configHome));
 #endif
