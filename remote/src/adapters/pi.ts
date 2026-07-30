@@ -30,4 +30,7 @@ export const piAdapter: HarnessAdapter = {
                 return null;
         }
     },
+    metadata(native: NativeEvent): Record<string, unknown> | undefined {
+        return typeof native.tool === "string" ? { tool: native.tool } : undefined;
+    },
 };

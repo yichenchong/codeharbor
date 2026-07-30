@@ -56,14 +56,32 @@ test("processBridgeLine builds a validated event from a native message", () => {
         devSessionId: "sess-1",
         terminalId: "term-1",
         native: { type: "tool_call", tool: "ask" },
-        metadata: { toolName: "ask" },
+        // Explicit wire metadata overrides the adapter-derived `tool`.
+        metadata: { tool: "explicit", toolName: "ask" },
     });
     const event = processBridgeLine(line);
     assert.ok(event);
     assert.equal(event.state, "waiting_input");
     assert.equal(event.event, "tool_call");
     assert.equal(event.devSessionId, "sess-1");
-    assert.deepEqual(event.metadata, { toolName: "ask" });
+    assert.deepEqual(event.metadata, { tool: "explicit", toolName: "ask" });
+});
+
+test("oh-my-pi adapter derives metadata from the native event", () => {
+    assert.deepEqual(ohMyPiAdapter.metadata?.({ type: "tool_call", tool: "ask" }), { tool: "ask" });
+    assert.equal(ohMyPiAdapter.metadata?.({ type: "agent_start" }), undefined);
+});
+
+test("processBridgeLine attaches adapter-derived metadata (RR25)", () => {
+    const line = JSON.stringify({
+        harness: "oh-my-pi",
+        devSessionId: "sess-1",
+        terminalId: "term-1",
+        native: { type: "tool_call", tool: "ask" },
+    });
+    const event = processBridgeLine(line);
+    assert.ok(event);
+    assert.deepEqual(event.metadata, { tool: "ask" });
 });
 
 test("processBridgeLine drops malformed, unknown-harness, and no-op lines", () => {
@@ -185,6 +203,11 @@ test("pi adapter mirrors the oh-my-pi mapping", () => {
             piAdapter.map(native),
             ohMyPiAdapter.map(native),
             `pi and oh-my-pi disagree on ${JSON.stringify(native)}`,
+        );
+        assert.deepEqual(
+            piAdapter.metadata?.(native),
+            ohMyPiAdapter.metadata?.(native),
+            `pi and oh-my-pi metadata disagree on ${JSON.stringify(native)}`,
         );
     }
     assert.equal(piAdapter.harness, "pi");

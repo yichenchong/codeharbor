@@ -11,4 +11,10 @@ export interface HarnessAdapter {
      * event carries no state transition and should be ignored.
      */
     map(native: NativeEvent): AgentState | null;
+    /**
+     * Derive auxiliary event metadata from the native event. The bridge
+     * attaches the returned object to the AgentEvent; return undefined when the
+     * event carries no metadata.
+     */
+    metadata?(native: NativeEvent): Record<string, unknown> | undefined;
 }

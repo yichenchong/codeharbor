@@ -302,41 +302,6 @@ test("missingCoordinates names only the coordinates that are unusable", () => {
     ]);
 });
 
-test("readHookInput parses OMP_METADATA and ignores a malformed value (RR25)", () => {
-    const withMeta = readHookInput(["node", "hook.ts", "agent_start"], {
-        OMP_DEV_SESSION_ID: "sess-1",
-        OMP_TERMINAL_ID: "term-1",
-        OMP_METADATA: '{"turn":3,"model":"opus"}',
-    } as NodeJS.ProcessEnv);
-    assert.deepEqual(withMeta.metadata, { turn: 3, model: "opus" });
-    // The parsed metadata reaches the wire message unchanged.
-    assert.deepEqual(toBridgeMessage(withMeta).metadata, { turn: 3, model: "opus" });
-
-    // Malformed JSON is ignored (never thrown): the field is simply absent.
-    const bad = readHookInput(["node", "hook.ts", "agent_start"], {
-        OMP_DEV_SESSION_ID: "sess-1",
-        OMP_TERMINAL_ID: "term-1",
-        OMP_METADATA: "{not json",
-    } as NodeJS.ProcessEnv);
-    assert.equal(bad.metadata, undefined);
-
-    // A non-object JSON value (a scalar or array) is not a metadata object, so
-    // it is dropped rather than mis-typed onto the field.
-    const scalar = readHookInput(["node", "hook.ts", "agent_start"], {
-        OMP_DEV_SESSION_ID: "sess-1",
-        OMP_TERMINAL_ID: "term-1",
-        OMP_METADATA: "42",
-    } as NodeJS.ProcessEnv);
-    assert.equal(scalar.metadata, undefined);
-
-    // Absent OMP_METADATA leaves the field unset.
-    const none = readHookInput(["node", "hook.ts", "agent_start"], {
-        OMP_DEV_SESSION_ID: "sess-1",
-        OMP_TERMINAL_ID: "term-1",
-    } as NodeJS.ProcessEnv);
-    assert.equal(none.metadata, undefined);
-});
-
 test("startBridge rejects when a live bridge already owns the socket (RR12)", async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ch-bridge-live-"));
     const socketPath = path.join(dir, "bridge.sock");

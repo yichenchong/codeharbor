@@ -76,6 +76,15 @@ export function processBridgeLine(line: string): AgentEvent | null {
     const state = adapter.map(native);
     if (state === null) return null;
 
+    // Metadata is derived from the native event by the adapter (harness-agnostic),
+    // then merged with any explicit metadata a bridge producer put on the wire.
+    // Explicit wire fields win over derived ones.
+    const derived = adapter.metadata?.(native);
+    const explicit = isPlainObject(decoded.metadata) ? decoded.metadata : undefined;
+    const metadata = (derived || explicit)
+        ? { ...(derived ?? {}), ...(explicit ?? {}) }
+        : undefined;
+
     const nativeName = native.type ?? native.hook;
     return makeEvent({
         harness: decoded.harness,
@@ -84,7 +93,7 @@ export function processBridgeLine(line: string): AgentEvent | null {
         state,
         event: typeof nativeName === "string" ? nativeName : "unknown",
         summary: typeof decoded.summary === "string" ? decoded.summary : undefined,
-        metadata: isPlainObject(decoded.metadata) ? decoded.metadata : undefined,
+        metadata,
     });
 }
 

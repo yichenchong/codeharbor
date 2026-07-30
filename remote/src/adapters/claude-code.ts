@@ -27,4 +27,7 @@ export const claudeCodeAdapter: HarnessAdapter = {
                 return null;
         }
     },
+    metadata(native: NativeEvent): Record<string, unknown> | undefined {
+        return typeof native.tool_name === "string" ? { tool: native.tool_name } : undefined;
+    },
 };
