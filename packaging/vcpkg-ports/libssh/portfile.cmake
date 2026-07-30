@@ -54,6 +54,12 @@ endif()
 
 vcpkg_cmake_config_fixup(CONFIG_PATH lib/cmake/libssh)
 
+# The zlib guard in the config written just below is correct as written: the
+# vcpkg_check_features() call above sets WITH_ZLIB to ON/OFF in THIS scope
+# (set(... PARENT_SCOPE) in scripts/cmake/vcpkg_check_features.cmake), so the
+# embedded conditional expands to if("ON")/if("OFF") at port time — it is not an
+# unresolved if(""). Left upstream-verbatim; this comment only stops the
+# port-time expansion being misread as a deferred variable (BD28).
 file(READ "${CURRENT_PACKAGES_DIR}/share/libssh/libssh-config.cmake" cmake_config)
 file(WRITE "${CURRENT_PACKAGES_DIR}/share/libssh/libssh-config.cmake" "
 include(CMakeFindDependencyMacro)

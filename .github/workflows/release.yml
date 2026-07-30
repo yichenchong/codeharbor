@@ -208,6 +208,14 @@ jobs:
         run: |
           curl -fsSLO https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage
           curl -fsSLO https://github.com/linuxdeploy/linuxdeploy-plugin-qt/releases/download/continuous/linuxdeploy-plugin-qt-x86_64.AppImage
+          # BD25: linuxdeploy ships only a rolling `continuous` release (no
+          # versioned tag to pin, unlike get-cmake/libssh above), so pin the two
+          # tools by content hash and FAIL the release if either changes. An
+          # upstream rebuild or a poisoned download can no longer silently alter
+          # the Linux toolchain; bump these hashes deliberately (from each
+          # release asset's `digest`) when the tools are intentionally updated.
+          echo "e87ee0815d109282fdda73e34c2361d64d02b0ffaea3674b18f1fd1f6a687dcf  linuxdeploy-x86_64.AppImage" | sha256sum -c -
+          echo "be1b7e166bf9975cfb694ebe6759ba40502ffc6196440d3e64aa90c4dbd67e9f  linuxdeploy-plugin-qt-x86_64.AppImage" | sha256sum -c -
           chmod +x linuxdeploy*.AppImage
           export QML_SOURCES_PATHS=$PWD/src/qml
           ./linuxdeploy-x86_64.AppImage \

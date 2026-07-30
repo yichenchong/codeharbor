@@ -396,8 +396,12 @@ export function mountEditor(
         reporter.schedule(dirty);
     });
 
-    // A host that disposes the editor directly (not through the returned host)
-    // must not leave a timer that would call getValue() on a dead editor.
+    // Cancel only; the pending snapshot is NOT flushed here. It is flushed in
+    // EditorHost.dispose() (flushReport() runs before editor.dispose()). By the
+    // time Monaco fires onDidDispose the editor is already being torn down, so
+    // a flush here would call getValue() on a dead model. This handler exists so
+    // that a host disposing the editor directly (not through the returned host)
+    // at least does not leave a timer that would fire on that dead editor.
     editor.onDidDispose(() => reporter.cancel());
 
     // The file state reached before this page finished loading is already in the
