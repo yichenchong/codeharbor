@@ -1419,16 +1419,27 @@ int main(int argc, char* argv[])
                             "CH_LIVE_NODE", "CH_LIVE_REPO", "CH_LIVE_KNOWN_HOSTS"})
         qunsetenv(key);
 
-    // A brand-new config home, installed before any QSettings, QStandardPaths
-    // lookup or WebEngine initialisation can resolve the real one.
     QTemporaryDir configRoot;
     if (!configRoot.isValid()) {
         qCritical("could not create a temporary config home");
         return 2;
     }
+
+    // Linux's native QSettings path follows XDG_CONFIG_HOME. macOS and
+    // Windows ignore that variable; when the live fixture is absent, Qt's
+    // test-mode path keeps this skipped gate away from the user's settings.
+#if !defined(Q_OS_LINUX)
+    if (!g_live.present)
+        QStandardPaths::setTestModeEnabled(true);
+#endif
+#if defined(Q_OS_LINUX)
     g_configHome = configRoot.filePath(QStringLiteral("config"));
     QDir().mkpath(g_configHome);
     qputenv("XDG_CONFIG_HOME", QFile::encodeName(g_configHome));
+#else
+    g_configHome = QStandardPaths::writableLocation(QStandardPaths::GenericConfigLocation);
+    QDir().mkpath(g_configHome);
+#endif
 
     // main.cpp's startup order: URL scheme, then WebEngine, then the GUI app.
     ch::ViewerProfiles::registerUrlScheme();
@@ -1439,11 +1450,13 @@ int main(int argc, char* argv[])
     QGuiApplication::setOrganizationName(QString::fromLatin1(kOrganization));
     QQuickStyle::setStyle(QStringLiteral("Basic"));
 
+#if defined(Q_OS_LINUX)
     if (QStandardPaths::writableLocation(QStandardPaths::GenericConfigLocation)
         != g_configHome) {
         qCritical("XDG_CONFIG_HOME redirection did not take effect");
         return 2;
     }
+#endif
 
     TstColdStart testCase;
     return QTest::qExec(&testCase, argc, argv);

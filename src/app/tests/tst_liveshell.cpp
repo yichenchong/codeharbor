@@ -333,15 +333,23 @@ void TstLiveShell::initTestCase()
 {
     QVERIFY(m_scratch.isValid());
 
-    // The production UiStateStore uses QSettings' native user scope, which on
-    // Unix resolves through XDG_CONFIG_HOME. Redirect it (before any QSettings
-    // exists) so this gate — and the real GUI binary it relaunches — never
-    // touch the developer's ~/.config/CodeHarbor.
+    // Linux's native QSettings path follows XDG_CONFIG_HOME. macOS and
+    // Windows ignore that variable, so use Qt's test-mode path when this
+    // process will not launch a live child, and otherwise use the native path
+    // that the child process will share.
+    const bool liveRequested = !qEnvironmentVariableIsEmpty("CH_LIVE_SSH");
+#if defined(Q_OS_LINUX)
     m_configHome = m_scratch.filePath(QStringLiteral("config"));
     QVERIFY(QDir().mkpath(m_configHome));
     qputenv("XDG_CONFIG_HOME", QFile::encodeName(m_configHome));
     QCOMPARE(QStandardPaths::writableLocation(QStandardPaths::GenericConfigLocation),
              m_configHome);
+#else
+    if (!liveRequested)
+        QStandardPaths::setTestModeEnabled(true);
+    m_configHome = QStandardPaths::writableLocation(QStandardPaths::GenericConfigLocation);
+    QVERIFY(QDir().mkpath(m_configHome));
+#endif
 
     if (qEnvironmentVariableIsEmpty("CH_LIVE_SSH")) {
         qInfo("CH_LIVE_SSH is not set; the SSH-backed cases will skip");

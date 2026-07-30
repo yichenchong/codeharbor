@@ -474,10 +474,9 @@ void TstSessionBootstrap::channelLossReconnectsAndRewires()
 {
     Harness h;
     QVERIFY(h.wire());
-    FakeChannel* dead = h.boot.rpcChannel();
+    QPointer<FakeChannel> dead = h.boot.rpcChannel();
     QPointer<FakeChannel> deadAgent =
         static_cast<FakeChannel*>(h.boot.agentDevice());
-
     QSignalSpy stateSpy(&h.boot, &SessionBootstrap::stateChanged);
     QSignalSpy wiredSpy(&h.boot, &SessionBootstrap::wired);
     QSignalSpy scheduleSpy(&h.boot, &SessionBootstrap::reconnectScheduled);
@@ -502,8 +501,10 @@ void TstSessionBootstrap::channelLossReconnectsAndRewires()
     QCOMPARE(h.boot.reconnectAttempt(), 0);
     QVERIFY(!h.boot.reconnectPending());
 
-    // Fresh channels, and the consumers hold the new ones.
-    QVERIFY(h.boot.rpcDevice() != static_cast<SshChannelDevice*>(dead));
+    // Fresh channels, and the consumers hold the new ones. Prove the old
+    // channel was destroyed through QPointer rather than comparing a freed
+    // address, which can be recycled by the allocator on another platform.
+    QTRY_VERIFY(dead.isNull());
     QCOMPARE(h.client.transport(),
              static_cast<QIODevice*>(h.boot.rpcDevice()));
     QCOMPARE(h.monitor.transport(),

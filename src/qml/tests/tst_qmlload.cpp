@@ -117,6 +117,10 @@ constexpr const char *kEnvironmentalNoise[] = {
     "Failed to create GLES3 context",
     "Passthrough is not supported",
     "Fontconfig error",
+    // macOS's offscreen Qt platform may lazily populate its system font
+    // aliases while the first QML/WebEngine graph is created. This is host
+    // setup noise, not a warning produced by the CodeHarbor QML tree.
+    "Populating font family aliases took",
 };
 
 bool isEnvironmentalNoise(const QString &msg)
