@@ -426,13 +426,22 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          # A retry after a published release exists must replace its assets
-          # instead of failing at `gh release create`.
-          gh release upload "$GITHUB_REF_NAME" \
-            --repo "$GITHUB_REPOSITORY" \
-            --clobber \
-            dist/*
-          gh release edit "$GITHUB_REF_NAME" \
-            --repo "$GITHUB_REPOSITORY" \
-            --title "CodeHarbor $GITHUB_REF_NAME" \
-            --target "$GITHUB_SHA"
+          if gh release view "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            # A retry after a published release exists must replace its assets
+            # instead of failing at `gh release create`.
+            gh release upload "$GITHUB_REF_NAME" \
+              --repo "$GITHUB_REPOSITORY" \
+              --clobber \
+              dist/*
+            gh release edit "$GITHUB_REF_NAME" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "CodeHarbor $GITHUB_REF_NAME" \
+              --target "$GITHUB_SHA"
+          else
+            gh release create "$GITHUB_REF_NAME" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "CodeHarbor $GITHUB_REF_NAME" \
+              --generate-notes \
+              dist/*
+          fi
