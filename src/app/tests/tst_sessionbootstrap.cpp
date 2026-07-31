@@ -28,6 +28,7 @@
 #include <QList>
 #include <QPointer>
 #include <QProcess>
+#include <QStandardPaths>
 #include <QScopeGuard>
 #include <QSignalSpy>
 #include <QStringList>
@@ -1249,6 +1250,8 @@ void TstSessionBootstrap::channelLossCarriesThatChannelsLastRemoteWords()
 // payload tries to create a canary file, and the shell must refuse to make it.
 void TstSessionBootstrap::remoteCommandsQuoteHostileProfileFields()
 {
+    const QString shell = QStandardPaths::findExecutable(QStringLiteral("sh"));
+    QVERIFY2(!shell.isEmpty(), "a POSIX sh is required for this remote-command test");
     QTemporaryDir dir;
     QVERIFY(dir.isValid());
     const QString canary = dir.filePath(QStringLiteral("CANARY"));
@@ -1291,10 +1294,8 @@ void TstSessionBootstrap::remoteCommandsQuoteHostileProfileFields()
             QFile::remove(canary);
             QProcess sh;
             sh.setWorkingDirectory(dir.path());
-            sh.start(QStringLiteral("/bin/sh"),
-                     {QStringLiteral("-c"), command});
+            sh.start(shell, {QStringLiteral("-c"), command});
             QVERIFY2(sh.waitForStarted(5000), c.what);
-            // bridgeCommand's watchdog blocks on `cat`; EOF releases it.
             sh.closeWriteChannel();
             QVERIFY2(sh.waitForFinished(15000), c.what);
             QVERIFY2(!QFileInfo::exists(canary),
@@ -1321,9 +1322,8 @@ void TstSessionBootstrap::remoteCommandsQuoteHostileProfileFields()
 
     QProcess argv;
     argv.setWorkingDirectory(dir.path());
-    argv.start(QStringLiteral("/bin/sh"),
-               {QStringLiteral("-c"),
-                SessionBootstrap::rpcCommand(spacedNode, spacedRoot)});
+    argv.start(shell, {QStringLiteral("-c"),
+                       SessionBootstrap::rpcCommand(spacedNode, spacedRoot)});
     QVERIFY(argv.waitForFinished(15000));
     QCOMPARE(QString::fromUtf8(argv.readAllStandardOutput()),
              QStringLiteral("[%1][rpc][--stdio]").arg(spacedEntry));
@@ -1344,6 +1344,8 @@ void TstSessionBootstrap::remoteCommandsQuoteHostileProfileFields()
 void TstSessionBootstrap::remoteEntryPointsSupportBothReleaseAndCheckoutLayouts()
 {
     QTemporaryDir dir;
+    const QString shell = QStandardPaths::findExecutable(QStringLiteral("sh"));
+    QVERIFY2(!shell.isEmpty(), "a POSIX sh is required for this remote-command test");
     QVERIFY(dir.isValid());
     const QString root = dir.path();
     // The interpreter lives outside the candidate tree, so placing entry points
@@ -1365,11 +1367,10 @@ void TstSessionBootstrap::remoteEntryPointsSupportBothReleaseAndCheckoutLayouts(
 
     // Run one command exactly as the remote login shell would — no rewriting.
     // `node` is the argv echo, so the entry the shell SELECTED is observable.
-    // Returns {stdout, stderr}.
-    const auto choose = [&root](const QString& command, bool waitForOutput = false) {
+    const auto choose = [&root, &shell](const QString& command, bool waitForOutput = false) {
         QProcess sh;
         sh.setWorkingDirectory(root);
-        sh.start(QStringLiteral("/bin/sh"), {QStringLiteral("-c"), command});
+        sh.start(shell, {QStringLiteral("-c"), command});
         if (waitForOutput)
             sh.waitForReadyRead(15000);
         sh.closeWriteChannel();  // releases bridgeCommand's `cat` watchdog
