@@ -1366,10 +1366,12 @@ void TstSessionBootstrap::remoteEntryPointsSupportBothReleaseAndCheckoutLayouts(
     // Run one command exactly as the remote login shell would — no rewriting.
     // `node` is the argv echo, so the entry the shell SELECTED is observable.
     // Returns {stdout, stderr}.
-    const auto choose = [&root](const QString& command) {
+    const auto choose = [&root](const QString& command, bool waitForOutput = false) {
         QProcess sh;
         sh.setWorkingDirectory(root);
         sh.start(QStringLiteral("/bin/sh"), {QStringLiteral("-c"), command});
+        if (waitForOutput)
+            sh.waitForReadyRead(15000);
         sh.closeWriteChannel();  // releases bridgeCommand's `cat` watchdog
         sh.waitForFinished(15000);
         return QStringList{QString::fromUtf8(sh.readAllStandardOutput()),
@@ -1404,9 +1406,9 @@ void TstSessionBootstrap::remoteEntryPointsSupportBothReleaseAndCheckoutLayouts(
     QCOMPARE(choose(SessionBootstrap::rpcCommand(node, root)).at(0),
              QStringLiteral("[%1][rpc][--stdio]").arg(release));
 
-    // The bridge resolves through the same ladder and keeps its stdin watchdog.
     const QString bridge = place(QStringLiteral("dist/bridge.js"));
-    QCOMPARE(choose(SessionBootstrap::bridgeCommand(node, root)).at(0),
+    // The bridge resolves through the same ladder and keeps its stdin watchdog.
+    QCOMPARE(choose(SessionBootstrap::bridgeCommand(node, root), true).at(0),
              QStringLiteral("[%1]").arg(bridge));
 }
 
