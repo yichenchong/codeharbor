@@ -107,6 +107,7 @@ jobs:
 
       - name: Cache vcpkg libssh (Windows)
         if: matrix.name == 'windows'
+        id: vcpkg_cache
         uses: actions/cache@v4
         with:
           path: ${{ steps.imgver.outputs.vcpkg }}\installed
@@ -143,6 +144,14 @@ jobs:
           }
           Write-Host "libssh $installed"
           echo "CMAKE_TOOLCHAIN_FILE=$root/scripts/buildsystems/vcpkg.cmake" >> $env:GITHUB_ENV
+      # Save immediately: a later packaging failure must not throw away the
+      # ten-minute dependency build that made this cache entry.
+      - name: Save vcpkg libssh cache (Windows)
+        if: matrix.name == 'windows' && steps.vcpkg_cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ steps.imgver.outputs.vcpkg }}\installed
+          key: vcpkg-libssh-${{ steps.imgver.outputs.libssh }}-x64-windows-${{ steps.imgver.outputs.v }}
 
       # --- MSVC environment for the Ninja generator (Windows) ------------------
       - name: Set up MSVC (Windows)
@@ -268,12 +277,15 @@ jobs:
           # resolve it, and install it if it is genuinely missing rather than
           # skipping the installer and producing a green run with nothing in it.
           function Resolve-Iscc {
-            $cmd = Get-Command ISCC.exe -ErrorAction SilentlyContinue
-            if ($cmd) { return $cmd.Source }
+            # Chocolatey puts a shim named ISCC.exe ahead of the real compiler
+            # on PATH; its file version is 0.0.0.0. Prefer the installation
+            # paths so the version check validates Inno Setup itself.
             foreach ($p in @("${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
                              "$env:ProgramFiles\Inno Setup 6\ISCC.exe")) {
               if (Test-Path $p) { return $p }
             }
+            $cmd = Get-Command ISCC.exe -ErrorAction SilentlyContinue
+            if ($cmd) { return $cmd.Source }
             return $null
           }
           $iscc = Resolve-Iscc
