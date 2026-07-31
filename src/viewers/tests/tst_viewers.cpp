@@ -1,20 +1,29 @@
+#include "CodeharbordClient.h"
 #include "InternalUrlSchemeHandler.h"
+#include "RpcTypes.h"
 #include "ViewerHandlerRegistry.h"
 #include "ViewerModel.h"
 #include "ViewerProfiles.h"
 
 #include <QtWebEngineQuick/QQuickWebEngineProfile>
 
+#include <QCoreApplication>
+#include <QDeadlineTimer>
 #include <QGuiApplication>
-#include <QString>
-#include <QUrl>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QList>
+#include <QLocalServer>
+#include <QLocalSocket>
 #include <QRegularExpression>
 #include <QSet>
+#include <QString>
+#include <QUrl>
 #include <QWebEngineUrlScheme>
 #include <QtTest/QtTest>
 #include <QtWebEngineQuick/QtWebEngineQuick>
 
+using ch::CodeharbordClient;
 using ch::InternalUrlMap;
 using ch::InternalUrlSchemeHandler;
 using ch::ViewerHandlerRegistry;
@@ -22,10 +31,123 @@ using ch::ViewerModel;
 using ch::ViewerProfiles;
 using ch::ViewerResolution;
 
+namespace {
+
+// A CodeharbordClient wired to a QLocalSocket pair with the TEST playing the
+// remote codeharbord: requests written by the client are read off one end and
+// canned JSON-RPC responses are written back. Same shape as the harness in
+// tst_rpcclient / tst_editorcontroller, kept local because ViewerModel needs
+// only a handful of round trips.
+class RpcPair {
+public:
+    // Wire the pair up. Returns false if the socket pair could not be made,
+    // which the caller turns into a QVERIFY failure.
+    bool listen()
+    {
+        static int seq = 0;
+        const QString name = QStringLiteral("ch_viewers_test_%1_%2")
+                                 .arg(QCoreApplication::applicationPid())
+                                 .arg(++seq);
+        QLocalServer::removeServer(name);
+        if (!m_server.listen(name))
+            return false;
+        m_clientSide.connectToServer(name);
+        if (!m_clientSide.waitForConnected(2000))
+            return false;
+        if (!m_server.waitForNewConnection(2000))
+            return false;
+        m_serverSide = m_server.nextPendingConnection();
+        if (!m_serverSide)
+            return false;
+        m_client.setTransport(&m_clientSide);
+        return true;
+    }
+
+    CodeharbordClient *client() { return &m_client; }
+
+    // Next framed request the client wrote, or an empty object on timeout. The
+    // event loop is pumped first every iteration so the client can flush.
+    QJsonObject nextRequest(int timeoutMs = 3000)
+    {
+        QDeadlineTimer deadline(timeoutMs);
+        forever {
+            QTest::qWait(5);
+            if (m_serverSide)
+                m_buffer += m_serverSide->readAll();
+            const int nl = m_buffer.indexOf('\n');
+            if (nl >= 0) {
+                const QByteArray raw = m_buffer.left(nl);
+                m_buffer.remove(0, nl + 1);
+                return QJsonDocument::fromJson(raw).object();
+            }
+            if (deadline.hasExpired())
+                break;
+        }
+        return {};
+    }
+
+    void respondResult(const QJsonObject &request, const QJsonObject &result)
+    {
+        write(QJsonObject{{QStringLiteral("jsonrpc"), QStringLiteral("2.0")},
+                          {QStringLiteral("id"), request.value(QStringLiteral("id"))},
+                          {QStringLiteral("result"), result}});
+    }
+
+    void respondError(const QJsonObject &request, int code, const QString &message)
+    {
+        write(QJsonObject{
+            {QStringLiteral("jsonrpc"), QStringLiteral("2.0")},
+            {QStringLiteral("id"), request.value(QStringLiteral("id"))},
+            {QStringLiteral("error"),
+             QJsonObject{{QStringLiteral("code"), code},
+                         {QStringLiteral("message"), message}}}});
+    }
+
+private:
+    void write(const QJsonObject &message)
+    {
+        m_serverSide->write(QJsonDocument(message).toJson(QJsonDocument::Compact)
+                            + '\n');
+        m_serverSide->flush();
+    }
+
+    QLocalServer m_server;
+    QLocalSocket m_clientSide;
+    QLocalSocket *m_serverSide = nullptr;  // owned by m_server
+    QByteArray m_buffer;
+    // Declared last so it is destroyed FIRST and unbinds from m_clientSide
+    // while that socket is still alive.
+    CodeharbordClient m_client;
+};
+
+// The path a file.readFile request asks for.
+QString requestPath(const QJsonObject &request)
+{
+    return request.value(QStringLiteral("params"))
+        .toObject()
+        .value(QStringLiteral("path"))
+        .toString();
+}
+
+// A successful file.readFile result for `path`.
+QJsonObject readResult(const QString &path, const QString &content,
+                       const QString &encoding = QStringLiteral("utf-8"),
+                       bool truncated = false)
+{
+    return QJsonObject{{QStringLiteral("path"), path},
+                       {QStringLiteral("encoding"), encoding},
+                       {QStringLiteral("content"), content},
+                       {QStringLiteral("revision"), QStringLiteral("r1")},
+                       {QStringLiteral("truncated"), truncated}};
+}
+
+} // namespace
+
 // Unit tests for the viewer handler registry (SPEC 7.5), the file <-> internal
-// URL mapping (SPEC 7.4), and the external/internal WebEngine profile isolation
-// invariant (M3). The registry and URL-mapping assertions require no WebEngine
-// runtime and run unconditionally; only the live profile checks may QSKIP.
+// URL mapping (SPEC 7.4), the remote text-read plumbing, and the
+// external/internal WebEngine profile isolation invariant (M3). The registry,
+// URL-mapping and read-plumbing assertions require no WebEngine runtime and run
+// unconditionally; only the live profile checks may QSKIP.
 class TstViewers : public QObject {
     Q_OBJECT
 private slots:
@@ -44,6 +166,15 @@ private slots:
     void urlMappingBareId();
     void viewKindStringsMatchQmlContract();
     void viewerModelWithoutClientReportsErrors();
+
+    // ONE ViewerModel serves every viewer pane (it is a single QML context
+    // property), so its in-flight bookkeeping must be per file. These pin that
+    // one pane can never strand or cancel another pane's read.
+    void textReadsOfDifferentPathsAreIndependent();
+    void cancelTextFileDropsOnlyItsOwnPath();
+    void aRepeatReadOfOnePathSupersedesTheOlderOne();
+    // What the text pane is told when the server's answer is not plain text.
+    void textReadFailureModes();
 };
 
 void TstViewers::resolveByExtensionTable()
@@ -521,6 +652,165 @@ void TstViewers::viewerModelWithoutClientReportsErrors()
     // about the file it is currently showing.
     QCOMPARE(textErrors.first().at(0).toString(), QStringLiteral("/p/README.md"));
     QCOMPARE(dirErrors.first().at(0).toString(), QStringLiteral("/p"));
+}
+
+void TstViewers::textReadsOfDifferentPathsAreIndependent()
+{
+    // Two viewer panes, two files, one shared ViewerModel. Both reads are in
+    // flight at once and their replies can arrive in either order; each pane
+    // must get its own answer. A single global "latest read wins" counter drops
+    // the first pane's reply, leaving that pane stuck on "Loading…" forever
+    // with no error to show.
+    RpcPair pair;
+    QVERIFY(pair.listen());
+    ViewerModel viewers(pair.client());
+    QSignalSpy reads(&viewers, &ViewerModel::textFileRead);
+    QSignalSpy errors(&viewers, &ViewerModel::textFileError);
+
+    viewers.readTextFile(QStringLiteral("/p/a.txt"));
+    const QJsonObject requestA = pair.nextRequest();
+    QCOMPARE(requestA.value(QStringLiteral("method")).toString(),
+             QString::fromLatin1(ch::rpc::kMethodReadFile));
+    QCOMPARE(requestPath(requestA), QStringLiteral("/p/a.txt"));
+
+    viewers.readTextFile(QStringLiteral("/p/b.txt"));
+    const QJsonObject requestB = pair.nextRequest();
+    QCOMPARE(requestPath(requestB), QStringLiteral("/p/b.txt"));
+
+    // Out of order: the SECOND pane's file answers first.
+    pair.respondResult(requestB,
+                       readResult(QStringLiteral("/p/b.txt"), QStringLiteral("B")));
+    pair.respondResult(requestA,
+                       readResult(QStringLiteral("/p/a.txt"), QStringLiteral("A")));
+
+    QTRY_COMPARE(reads.size(), 2);
+    QCOMPARE(errors.size(), 0);
+    QVariantMap byPath;
+    for (const QList<QVariant> &args : reads)
+        byPath.insert(args.at(0).toString(), args.at(1));
+    QCOMPARE(byPath.value(QStringLiteral("/p/a.txt")).toString(),
+             QStringLiteral("A"));
+    QCOMPARE(byPath.value(QStringLiteral("/p/b.txt")).toString(),
+             QStringLiteral("B"));
+}
+
+void TstViewers::cancelTextFileDropsOnlyItsOwnPath()
+{
+    // A pane whose URL clears cancels ITS read. Every other pane's read must
+    // survive: they share this one ViewerModel.
+    RpcPair pair;
+    QVERIFY(pair.listen());
+    ViewerModel viewers(pair.client());
+    QSignalSpy reads(&viewers, &ViewerModel::textFileRead);
+    QSignalSpy errors(&viewers, &ViewerModel::textFileError);
+
+    viewers.readTextFile(QStringLiteral("/p/keep.txt"));
+    const QJsonObject keep = pair.nextRequest();
+    QCOMPARE(requestPath(keep), QStringLiteral("/p/keep.txt"));
+    viewers.readTextFile(QStringLiteral("/p/drop.txt"));
+    const QJsonObject drop = pair.nextRequest();
+    QCOMPARE(requestPath(drop), QStringLiteral("/p/drop.txt"));
+
+    viewers.cancelTextFile(QStringLiteral("/p/drop.txt"));
+
+    pair.respondResult(drop, readResult(QStringLiteral("/p/drop.txt"),
+                                        QStringLiteral("dropped")));
+    pair.respondResult(keep, readResult(QStringLiteral("/p/keep.txt"),
+                                        QStringLiteral("kept")));
+
+    QTRY_COMPARE(reads.size(), 1);
+    QCOMPARE(reads.first().at(0).toString(), QStringLiteral("/p/keep.txt"));
+    QCOMPARE(reads.first().at(1).toString(), QStringLiteral("kept"));
+    QCOMPARE(errors.size(), 0);
+
+    // Cancelling a path with nothing in flight — including the empty path a
+    // caller passes when it has nothing to cancel — disturbs nothing.
+    viewers.cancelTextFile();
+    viewers.cancelTextFile(QStringLiteral("/p/never-read.txt"));
+    viewers.readTextFile(QStringLiteral("/p/after.txt"));
+    const QJsonObject after = pair.nextRequest();
+    pair.respondResult(after, readResult(QStringLiteral("/p/after.txt"),
+                                         QStringLiteral("after")));
+    QTRY_COMPARE(reads.size(), 2);
+    QCOMPARE(reads.at(1).at(1).toString(), QStringLiteral("after"));
+}
+
+void TstViewers::aRepeatReadOfOnePathSupersedesTheOlderOne()
+{
+    // Re-reading the SAME file (a pane refreshing) does supersede: two replies
+    // for one path can arrive in either order, and the older one must never be
+    // the content left on screen.
+    RpcPair pair;
+    QVERIFY(pair.listen());
+    ViewerModel viewers(pair.client());
+    QSignalSpy reads(&viewers, &ViewerModel::textFileRead);
+
+    viewers.readTextFile(QStringLiteral("/p/a.txt"));
+    const QJsonObject first = pair.nextRequest();
+    viewers.readTextFile(QStringLiteral("/p/a.txt"));
+    const QJsonObject second = pair.nextRequest();
+    QVERIFY(first.value(QStringLiteral("id")).toInt()
+            != second.value(QStringLiteral("id")).toInt());
+
+    pair.respondResult(second, readResult(QStringLiteral("/p/a.txt"),
+                                          QStringLiteral("newest")));
+    pair.respondResult(first, readResult(QStringLiteral("/p/a.txt"),
+                                         QStringLiteral("stale")));
+
+    QTRY_COMPARE(reads.size(), 1);
+    QCOMPARE(reads.first().at(1).toString(), QStringLiteral("newest"));
+    QTest::qWait(100);
+    QCOMPARE(reads.size(), 1);
+}
+
+void TstViewers::textReadFailureModes()
+{
+    // Everything the text pane can be told other than "here is your file". Each
+    // must arrive as an ERROR carrying the path, never as an empty document:
+    // a blank pane is indistinguishable from an empty file.
+    RpcPair pair;
+    QVERIFY(pair.listen());
+    ViewerModel viewers(pair.client());
+    QSignalSpy reads(&viewers, &ViewerModel::textFileRead);
+    QSignalSpy errors(&viewers, &ViewerModel::textFileError);
+
+    // 1. The server refused the read: its message is surfaced verbatim.
+    viewers.readTextFile(QStringLiteral("/p/missing.txt"));
+    pair.respondError(pair.nextRequest(), -32603, QStringLiteral("ENOENT"));
+    QTRY_COMPARE(errors.size(), 1);
+    QCOMPARE(errors.at(0).at(0).toString(), QStringLiteral("/p/missing.txt"));
+    QCOMPARE(errors.at(0).at(1).toString(), QStringLiteral("ENOENT"));
+
+    // 2. A file over the inline cap comes back as a PREFIX (truncated). Showing
+    //    it as though it were the whole file would be a lie, so it is an error.
+    viewers.readTextFile(QStringLiteral("/p/huge.log"));
+    pair.respondResult(pair.nextRequest(),
+                       readResult(QStringLiteral("/p/huge.log"),
+                                  QStringLiteral("first window"),
+                                  QStringLiteral("utf-8"), /*truncated=*/true));
+    QTRY_COMPARE(errors.size(), 2);
+    QCOMPARE(errors.at(1).at(0).toString(), QStringLiteral("/p/huge.log"));
+
+    // 3. Base64 (a file the server could not decode as utf-8) is decoded here
+    //    so a near-text binary still shows something legible.
+    viewers.readTextFile(QStringLiteral("/p/bin.dat"));
+    pair.respondResult(pair.nextRequest(),
+                       readResult(QStringLiteral("/p/bin.dat"),
+                                  QStringLiteral("aGVsbG8="),
+                                  QStringLiteral("base64")));
+    QTRY_COMPARE(reads.size(), 1);
+    QCOMPARE(reads.at(0).at(0).toString(), QStringLiteral("/p/bin.dat"));
+    QCOMPARE(reads.at(0).at(1).toString(), QStringLiteral("hello"));
+
+    // 4. A malformed base64 payload is reported, NOT rendered as an empty file.
+    viewers.readTextFile(QStringLiteral("/p/broken.dat"));
+    pair.respondResult(pair.nextRequest(),
+                       readResult(QStringLiteral("/p/broken.dat"),
+                                  QStringLiteral("not base64 at all!!"),
+                                  QStringLiteral("base64")));
+    QTRY_COMPARE(errors.size(), 3);
+    QCOMPARE(errors.at(2).at(0).toString(), QStringLiteral("/p/broken.dat"));
+    QCOMPARE(reads.size(), 1);
 }
 
 int main(int argc, char *argv[])

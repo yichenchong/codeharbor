@@ -98,12 +98,19 @@ SessionBootstrap::SessionBootstrap(SshConnectionPool* pool,
 
     m_reconnectTimer->setSingleShot(true);
     connect(m_reconnectTimer, &QTimer::timeout, this, [this] {
-        // m_attempting: probeEndpoint() spins a nested event loop, so this
-        // timer really can fire while an attempt is already in flight. Firing
-        // then would re-enter attemptWire() and unwire the session the outer
-        // attempt is halfway through building.
-        if (m_state != State::Reconnecting || m_attempting)
+        if (m_state != State::Reconnecting)
             return;
+        // m_attempting: probeEndpoint() and runRemoteScript() spin nested event
+        // loops, so this timer really can fire while an attempt is already in
+        // flight. Running then would re-enter attemptWire() and unwire the
+        // session the outer attempt is halfway through building. Simply
+        // dropping the tick would end the ladder for good — single-shot timer,
+        // nothing left to re-arm it, State::Reconnecting for ever — so the rung
+        // is deferred instead.
+        if (m_attempting) {
+            scheduleReconnect();
+            return;
+        }
         ++m_attempt;
         if (!attemptWire())
             scheduleReconnect();
@@ -115,13 +122,21 @@ SessionBootstrap::SessionBootstrap(SshConnectionPool* pool,
         // are driving ourselves, and handleConnectionLost() ignores anything
         // that is not a loss from State::Wired anyway.
         //
-        // A user-driven teardown MUST go through disconnectSession(), not
-        // pool->disconnectFromHost(): SshConnectionPool::closeSession() frees
-        // every channel it handed out, so a device that is still alive when the
-        // pool drops the session holds a dangling ssh_channel (the device
-        // destructor dereferences it — a hazard that predates this handler and
-        // lives in the frozen src/ssh ownership model). disconnectSession()
-        // closes the devices first, which is the correct order.
+        // A user-driven teardown SHOULD still go through disconnectSession()
+        // rather than pool->disconnectFromHost(), but NOT because of a dangling
+        // ssh_channel: SshConnectionPool::closeSession() emits sessionClosing()
+        // before it frees anything, every SshChannelDevice has that signal wired
+        // to closeChannel() on a direct (same-thread) connection, and
+        // closeChannel() hands the channel back and nulls its own handle — so by
+        // the time the pool's sweep runs, no device holds a channel and no
+        // destructor can dereference one. src/ssh/tests/tst_livessh.cpp
+        // (deviceOutlivingItsSessionStopsCleanly) pins exactly that.
+        //
+        // The reason to prefer disconnectSession() is ordering of the teardown
+        // we own: it closes and detaches the devices deliberately, so each
+        // channel's readChannelFinished() drives CodeharbordClient's
+        // failAllPending() while the wiring is still intact, and no late
+        // channelError() arrives at a half-dismantled graph.
         connect(m_pool, &SshConnectionPool::stateChanged, this,
                 [this](SshConnectionPool::State state) {
                     if (state == SshConnectionPool::State::Disconnected
@@ -857,9 +872,13 @@ bool SessionBootstrap::runRemoteScript(const QString& script, int timeoutMs,
     // second click cannot re-enter the connect path.
     loop.exec(QEventLoop::ExcludeUserInputEvents);
     poll.stop();
-    // Whatever landed together with the EOF that ended the loop.
+    // Whatever landed together with the EOF that ended the loop, and then
+    // whatever the first drain's own read left behind. Twice rather than a bare
+    // readAll(): readAll() would append those bytes to `collected` without ever
+    // scanning them, so the last progress line of an install - the "installed"
+    // verdict itself - would never reach the user.
     drain();
-    collected += device.readAll();
+    drain();
     device.closeChannel();
 
     if (output)
@@ -1204,21 +1223,35 @@ bool SessionBootstrap::attemptWire()
     store.close();
     const int knownBefore = hosts.entries().size();
     m_pool->setKnownHosts(hosts);
-    if (!m_pool->hostKeyCallback()) {
-        if (!m_trustUnknownHostKeys) {
-            emit error(QStringLiteral(
-                           "refusing to connect to %1:%2: no host-key decision "
-                           "policy is installed, so an unknown host key could "
-                           "not be shown to you for approval")
-                           .arg(m_host)
-                           .arg(m_port));
-            return false;
-        }
+    // The unattended auto-accept policy is installed for THIS attempt only and
+    // taken straight back off again. The pool is shared and outlives the
+    // attempt, so leaving it behind would be a one-way door: every later
+    // attempt would find a callback already installed, skip the check above
+    // entirely, and keep trusting unknown keys blindly even after
+    // setTrustUnknownHostKeys(false). Restoring what was there is also correct
+    // for the ordinary case, where AppController's prompting callback is the
+    // previous value and must survive untouched.
+    const bool installedAutoAccept =
+        !m_pool->hostKeyCallback() && m_trustUnknownHostKeys;
+    if (!m_pool->hostKeyCallback() && !m_trustUnknownHostKeys) {
+        emit error(QStringLiteral(
+                       "refusing to connect to %1:%2: no host-key decision "
+                       "policy is installed, so an unknown host key could "
+                       "not be shown to you for approval")
+                       .arg(m_host)
+                       .arg(m_port));
+        return false;
+    }
+    if (installedAutoAccept) {
         m_pool->setHostKeyCallback([](const QString&, const QString&,
                                       const QByteArray&, KnownHosts::Verdict) {
             return SshConnectionPool::HostKeyDecision::Accept;
         });
     }
+    const auto dropAutoAccept = qScopeGuard([this, installedAutoAccept] {
+        if (installedAutoAccept)
+            m_pool->setHostKeyCallback({});
+    });
 
     m_lastPoolError.clear();
     if (!connectPool(m_host, m_port, m_user, m_identityFile)) {
@@ -1230,11 +1263,25 @@ bool SessionBootstrap::attemptWire()
     }
 
     if (m_pool->knownHosts().entries().size() != knownBefore) {
+        // Reported rather than swallowed. Silently failing to record a key the
+        // user has just approved is not cosmetic: the decision is gone, so the
+        // very next connect presents the same fingerprint prompt again, for
+        // ever, and nothing on screen ever explains why. The session itself is
+        // already up, so this is the one error() that does not abort anything.
         const QFileInfo info(m_knownHostsPath);
         QDir().mkpath(info.absolutePath());
         QFile out(m_knownHostsPath);
-        if (out.open(QIODevice::WriteOnly | QIODevice::Truncate))
-            out.write(m_pool->knownHosts().serialize());
+        const QByteArray serialized = m_pool->knownHosts().serialize();
+        if (!out.open(QIODevice::WriteOnly | QIODevice::Truncate)
+            || out.write(serialized) != serialized.size() || !out.flush()) {
+            emit error(QStringLiteral(
+                           "connected, but could not record the host key of "
+                           "%1:%2 in %3 (%4); you will be asked to approve it "
+                           "again on the next connect")
+                           .arg(m_host)
+                           .arg(m_port)
+                           .arg(m_knownHostsPath, out.errorString()));
+        }
     }
 
     // The session is authenticated; before anything is exec'd on it, make sure

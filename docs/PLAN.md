@@ -35,10 +35,13 @@ contract so downstream work can build against it before it is fully implemented.
   - `adapters/` — `oh-my-pi` (SPEC 6.5 mapping), `pi`, `claude-code`, registry.
   - `bridge.ts` — Unix-socket → JSONL relay (dir-create + stale-socket guard).
   - `codeharbord.ts` — JSON-RPC 2.0 `--stdio` dispatch (`ping`, `server.info`).
-  - **Verified at bootstrap:** `npm test` → 11/11 pass (the suite has grown a
-    long way past that since; see docs/DEVELOPMENT.md for the current count);
-    RPC stdio + bridge socket smoke-tested.
-- CI: `remote` job (install/typecheck/test) and `client` job (Qt+CMake build).
+  - **Verified at bootstrap:** `npm test` → 11/11 pass (a bootstrap-era number,
+    kept only as a record of that moment; the suite is far larger now and no
+    document pins a current count on purpose, because every pinned count in this
+    repo has gone stale). RPC stdio + bridge socket smoke-tested.
+- CI: a `remote` job (install/typecheck/test), a `client` job (web bundles +
+  Qt/CMake configure/build/test), and a Windows job that only warms the shared
+  vcpkg libssh cache on `main`.
 
 > The bootstrap seams described above are all filled in by later waves; see
 > "Delivery progress" for what actually landed and the corrections found when the

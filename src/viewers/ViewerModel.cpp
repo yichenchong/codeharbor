@@ -103,14 +103,20 @@ QQuickWebEngineProfile *ViewerModel::internalProfile()
 
 void ViewerModel::readTextFile(const QString &path)
 {
-    // Every read gets a fresh generation, so an earlier in-flight read is
-    // implicitly superseded: its reply below sees a stale generation and is
-    // dropped instead of racing this one.
-    const quint64 generation = ++m_textReadGeneration;
     if (!m_client) {
         emit textFileError(path, QStringLiteral("no remote client is connected"));
         return;
     }
+
+    // Every read gets a fresh generation stamp FOR ITS PATH, so an earlier
+    // in-flight read of the same file is implicitly superseded: its reply below
+    // sees a stale stamp and is dropped instead of racing this one. Reads of
+    // OTHER paths are untouched — one ViewerModel serves every pane, and a
+    // second pane opening a second file must not strand the first pane's read.
+    // Stamps come from one monotonic counter and are therefore never reused, so
+    // a cancelled read can never be revived by a later read of the same path.
+    const quint64 generation = ++m_nextReadGeneration;
+    m_textReadGenerations.insert(path, generation);
 
     // Bound the read exactly as the internal scheme handler does: a text pane
     // must never try to pull a multi-gigabyte file through a single JSON-RPC
@@ -128,10 +134,15 @@ void ViewerModel::readTextFile(const QString &path)
         [guard, path, generation](QJsonValue result, std::optional<RpcError> error) {
             if (!guard)
                 return;
-            // A newer read (or an explicit cancelTextFile) has superseded this
-            // one: ignore the stale reply.
-            if (generation != guard->m_textReadGeneration)
+            // A newer read of this path (or an explicit cancelTextFile for it)
+            // has superseded this one: ignore the stale reply.
+            const auto it = guard->m_textReadGenerations.find(path);
+            if (it == guard->m_textReadGenerations.end()
+                || it.value() != generation)
                 return;
+            // This read has settled; stop tracking it so the map only ever
+            // holds live reads.
+            guard->m_textReadGenerations.erase(it);
             if (error) {
                 emit guard->textFileError(path, error->message);
                 return;
@@ -169,11 +180,15 @@ void ViewerModel::readTextFile(const QString &path)
         });
 }
 
-void ViewerModel::cancelTextFile()
+void ViewerModel::cancelTextFile(const QString &path)
 {
-    // Advance the generation so any read still in flight is treated as
-    // superseded when its reply arrives (see readTextFile).
-    ++m_textReadGeneration;
+    // Forget this path's in-flight read: its reply then finds no entry and is
+    // dropped (see readTextFile). Generation stamps are never reused, so the
+    // next read of the same path cannot be mistaken for the cancelled one.
+    // Nothing in flight for the path — including the empty path a caller passes
+    // when it has nothing to cancel — means nothing to do, and in particular no
+    // other pane's read is disturbed.
+    m_textReadGenerations.remove(path);
 }
 
 void ViewerModel::listDirectory(const QString &path)

@@ -336,7 +336,7 @@ struct AppGraph {
         , app(&client)
         , viewerProfiles(&client)
         , viewers(&client)
-        , layouts(app.workspaceDb())
+        , layouts(app.workspaceDb(), app.uiState())
         , editorFactory(&client)
         , terminalFactory(&pool)
     {

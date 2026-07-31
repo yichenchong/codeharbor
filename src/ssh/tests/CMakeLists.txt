@@ -20,6 +20,18 @@ target_link_libraries(tst_sshauth PRIVATE
 
 add_test(NAME tst_sshauth COMMAND tst_sshauth)
 
+# The server-free half of SshChannelDevice: its QIODevice contract with no
+# channel behind it, and how a refused start is reported.
+qt_add_executable(tst_sshchanneldevice tst_sshchanneldevice.cpp)
+
+target_link_libraries(tst_sshchanneldevice PRIVATE
+    Qt6::Core
+    Qt6::Test
+    ch_ssh
+)
+
+add_test(NAME tst_sshchanneldevice COMMAND tst_sshchanneldevice)
+
 # LIVE gate (docs/PLAN.md S): exercises the real SSH spine against a real sshd.
 # Registered unconditionally and labelled `live`; the test QSKIPs when
 # CH_LIVE_SSH is unset so the default `ctest` run stays green everywhere.

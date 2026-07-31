@@ -53,15 +53,23 @@ CodeharbordClient::~CodeharbordClient()
     // that cannot fire" contract promises cannot happen. So fail them here,
     // mirroring failAllPending()'s synthetic-error path.
     //
-    // Two rules keep dispatching from a destructor sound:
-    //  * Latch closed and drop the transport FIRST. A callback whose usual
-    //    reaction is to retry then takes call()'s "transport closed" branch,
+    // Three rules keep dispatching from a destructor sound:
+    //  * Latch DESTROYING and closed, and drop the transport FIRST. A callback
+    //    whose usual reaction is to retry then takes call()'s failure branch,
     //    which fails it synchronously and registers nothing — a fresh pending
     //    entry on a dying object could never fire. Disconnecting also stops a
     //    late readyRead()/disconnected() from landing in a half-destroyed slot.
+    //  * m_destroying, unlike m_closed, is one-way. setTransport() clears
+    //    m_closed by design (that is how a reconnect revives the client), so a
+    //    callback that reacts to the failure by driving a reconnect — plausible
+    //    at shutdown, where AppController's error path can reach
+    //    SessionBootstrap — would otherwise un-latch a client already inside its
+    //    own destructor, wire fresh signal connections into a half-destroyed
+    //    QObject, and start registering pending entries that can never fire.
     //  * Touch no member after the dispatch loop. failAllPending() moves the map
     //    out before iterating, so re-entry cannot observe a half-cleared map, and
     //    there is nothing left to do once it returns.
+    m_destroying = true;
     m_closed = true;
     if (m_transport) {
         m_transport->disconnect(this);
@@ -79,7 +87,22 @@ CodeharbordClient::~CodeharbordClient()
 
 void CodeharbordClient::setTransport(QIODevice* transport)
 {
-    if (m_transport == transport)
+    // This object is already inside ~CodeharbordClient, dispatching the failures
+    // for the requests it is abandoning. Binding anything now would connect
+    // signals into a half-destroyed QObject, clear the destructor's close latch,
+    // and let the very callbacks being failed queue fresh requests that nothing
+    // will ever service. The one-way m_destroying latch makes teardown final.
+    if (m_destroying)
+        return;
+
+    // Rebinding the device already bound is normally a no-op. The exception is
+    // a client that has latched CLOSED on it: a caller that reopens the same
+    // QIODevice object rather than allocating a new one (nothing in the API
+    // forbids it) would otherwise be left with a permanently dead client, every
+    // later call() failing with "transport closed". Falling through re-runs the
+    // full bind, which clears the latch — disconnect()+connect() below makes
+    // re-wiring the same device harmless.
+    if (m_transport == transport && !m_closed)
         return;
 
     if (m_transport)
@@ -104,6 +127,14 @@ void CodeharbordClient::setTransport(QIODevice* transport)
             connect(m_transport, SIGNAL(disconnected()), this,
                     SLOT(onTransportClosed()));
         }
+        // The transport belongs to the CALLER, which may simply delete it while
+        // requests are still in flight (a stack-allocated device going out of
+        // scope is enough). Nothing else would ever tell us: QIODevice emits no
+        // readChannelFinished() from its destructor, so every pending callback
+        // would sit in the map until this client itself died. Treat the death
+        // as the transport loss it is.
+        connect(m_transport, &QObject::destroyed, this,
+                &CodeharbordClient::onTransportDestroyed);
     }
 
     // Any callback invoked below may delete this client; stop touching members
@@ -194,6 +225,8 @@ qint64 CodeharbordClient::call(const QString& method, const QJsonValue& params,
              !request.value(QStringLiteral("params")).isArray())
         failReason =
             QStringLiteral("outgoing params is neither object nor array");
+    else if (m_destroying)
+        failReason = QStringLiteral("client is being destroyed");
     else if (m_closed)
         failReason = QStringLiteral("transport closed");
     else if (!m_transport)
@@ -263,7 +296,12 @@ void CodeharbordClient::onReadyRead()
     // is reset to 0 the moment that buffer is mutated at the front or dropped —
     // see the resets below and in setTransport(). A trailing partial line stays
     // buffered until the rest arrives on a later readyRead.
-    int newline;
+    //
+    // qsizetype, not int: QByteArray indexes are 64-bit and m_readBuffer holds
+    // whatever one readAll() handed us, which is only bounded by the cap check
+    // BELOW — narrowing the index here would corrupt the split of a buffer that
+    // grew past 2 GiB before that check ever ran.
+    qsizetype newline;
     while ((newline = m_readBuffer.indexOf('\n', m_scanOffset)) != -1) {
         QByteArray line = m_readBuffer.left(newline);
         m_readBuffer.remove(0, newline + 1);
@@ -277,6 +315,18 @@ void CodeharbordClient::onReadyRead()
         processLine(line);
         if (!self)
             return; // a callback deleted us; touch no members
+        // A callback (or a slot on one of the signals it provoked) may have
+        // torn the transport down mid-chunk — SessionBootstrap really does
+        // close the RPC channel from inside a response callback. Once the close
+        // is latched every pending caller has already been failed and
+        // transportClosed() announced, so the rest of this chunk belongs to a
+        // connection that no longer exists: dispatching it would emit
+        // notifications AFTER the close and warn about ids we just swept.
+        if (m_closed) {
+            m_readBuffer.clear();
+            m_scanOffset = 0;
+            return;
+        }
     }
     // No '\n' past m_scanOffset: the whole buffer has now been searched, so the
     // next readyRead resumes from its end instead of from position zero.
@@ -289,11 +339,16 @@ void CodeharbordClient::onReadyRead()
     // belongs to the caller and may still be physically healthy); what is gone
     // is our ability to trust a single byte on it, so nothing more is read.
     if (m_readBuffer.size() > kMaxLineBytes) {
+        // Drop the garbage BEFORE announcing anything: a protocolWarning slot
+        // may delete this client, and the release must not depend on surviving
+        // the emit. Frees up to the cap (16 MiB) as a side effect.
+        m_readBuffer.clear();
+        m_scanOffset = 0;
         emit protocolWarning(
             QStringLiteral("RPC line exceeded %1 bytes without a newline; "
                            "resetting transport").arg(kMaxLineBytes));
-        m_readBuffer.clear();
-        m_scanOffset = 0;
+        if (!self)
+            return;
         onTransportClosed();
     }
 }
@@ -452,6 +507,13 @@ void CodeharbordClient::onTransportClosed()
             return;
     }
     m_closed = true;
+    // Whatever is left is a half-received frame from a peer that will never
+    // finish it, or bytes we have decided not to trust. Release them: keeping
+    // them pins up to the 16 MiB cap for the client's whole remaining life, and
+    // a later rebind must never splice a dead producer's tail onto the first
+    // frame of the new one.
+    m_readBuffer.clear();
+    m_scanOffset = 0;
 
     RpcError error;
     error.code = kInternalError;
@@ -466,6 +528,17 @@ void CodeharbordClient::onTransportClosed()
     emit transportClosed();
 }
 
+void CodeharbordClient::onTransportDestroyed()
+{
+    // Runs from inside the device's ~QObject, so its QIODevice subobject is
+    // already gone: even bytesAvailable() would be a use-after-free. Drop the
+    // pointer FIRST — do not rely on when QPointer clears relative to
+    // destroyed() — then run the ordinary loss path, which now skips the drain
+    // and simply fails every pending caller once and announces the close.
+    m_transport = nullptr;
+    onTransportClosed();
+}
+
 void CodeharbordClient::failAllPending(const RpcError& error)
 {
     // Move out first: a callback may re-enter (e.g. issue a fresh call) and must
@@ -478,11 +551,6 @@ void CodeharbordClient::failAllPending(const RpcError& error)
         if (cb) // empty for a fire-and-forget call() with a null callback
             cb(QJsonValue(), error);
     }
-}
-
-QString CodeharbordClient::launchCommand()
-{
-    return QStringLiteral("codeharbord rpc --stdio");
 }
 
 } // namespace ch

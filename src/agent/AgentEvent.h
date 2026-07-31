@@ -72,20 +72,29 @@ inline AgentState agentStateFromWire(QStringView s)
 
 namespace detail {
 
-// Membership test mirroring isAgentState() in events.ts: only the eight wire
-// tokens are valid. Derived from the single token table above so a state added
-// to the wire enum cannot be taught to one list and forgotten in the other —
-// which would either reject a valid event or silently record it as Unknown.
-inline bool isAgentStateWire(QStringView s)
-{
-    return agentStateFromWireStrict(s).has_value();
-}
-
 // Membership test mirroring isHarness() in events.ts.
 inline bool isHarnessWire(QStringView h)
 {
     return h == u"generic" || h == u"oh-my-pi" || h == u"pi"
         || h == u"claude-code";
+}
+
+// Membership test mirroring isEventIdentifier() in events.ts: a usable Dev
+// Session or terminal id is a string with at least one non-whitespace
+// character.
+//
+// An empty (or whitespace-only) identifier is worse than a malformed event. It
+// is structurally valid, so it would be accepted and filed under a Dev Session
+// that does not exist and no sidebar row can ever display — and, for the two
+// states that notify, AgentStatusMonitor's bodyFor() would fall back to
+// "<devSessionId> / <terminalId>", i.e. a desktop notification that is little
+// more than a slash. Every producer in the chain already refuses to emit one
+// (missingCoordinates() in remote/src/hooks/oh-my-pi-hook.ts, the relay guard
+// in remote/src/bridge.ts, validateEvent() in remote/src/events.ts); the client
+// is the last edge and must refuse it too rather than trust them.
+inline bool isEventIdentifierWire(QStringView v)
+{
+    return !v.trimmed().isEmpty();
 }
 
 } // namespace detail
@@ -127,9 +136,18 @@ inline std::optional<AgentEvent> parseAgentEventLine(const QByteArray& line)
         return std::nullopt;
     if (!vHarness.isString() || !detail::isHarnessWire(vHarness.toString()))
         return std::nullopt;
+    // devSessionId/terminalId: non-blank, not merely a string — see
+    // detail::isEventIdentifierWire for why an empty id is an unroutable event
+    // rather than a harmless one. Resolved once here and reused below.
     if (!vDev.isString())
         return std::nullopt;
+    const QString dev = vDev.toString();
+    if (!detail::isEventIdentifierWire(dev))
+        return std::nullopt;
     if (!vTerm.isString())
+        return std::nullopt;
+    const QString term = vTerm.toString();
+    if (!detail::isEventIdentifierWire(term))
         return std::nullopt;
     if (!vState.isString())
         return std::nullopt;
@@ -154,8 +172,8 @@ inline std::optional<AgentEvent> parseAgentEventLine(const QByteArray& line)
     ev.timestamp = vTimestamp.toString();
     ev.state = *state;
     ev.harness = vHarness.toString();
-    ev.devSessionId = vDev.toString();
-    ev.terminalId = vTerm.toString();
+    ev.devSessionId = dev;
+    ev.terminalId = term;
     ev.event = vEvent.toString();
     if (vSummary.isString())
         ev.summary = vSummary.toString();

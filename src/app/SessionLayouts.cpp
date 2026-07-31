@@ -14,24 +14,16 @@ namespace {
 
 // Decode a QML-authored (or otherwise foreign) tree. Returns std::nullopt when
 // the value is not a valid split tree, so an invalid layout is rejected instead
-// of being silently replaced by an empty leaf.
-//
-// SplitNode::fromJson returns the empty-leaf sentinel BOTH for a genuine leaf
-// and for input it rejected; the persisted "type" tag is what disambiguates the
-// two. A split that parses is necessarily valid (it has children), which is why
-// only the leaf case needs the tag check.
+// of being silently replaced by an empty leaf - which is a legitimate tree in
+// its own right (it is what a region with no panes left persists), not a
+// "nothing here" marker. SplitNode::tryFromJson draws that distinction from the
+// parser itself; see its comment for why fromJson() cannot.
 std::optional<SplitNode> parseVariantTree(const QVariant& value)
 {
     const QJsonValue json = QJsonValue::fromVariant(value);
     if (!json.isObject())
         return std::nullopt;
-    const QJsonObject obj = json.toObject();
-    const SplitNode node = SplitNode::fromJson(obj);
-    if (!node.isLeaf())
-        return node;
-    if (obj.value(QStringLiteral("type")).toString() == QStringLiteral("leaf"))
-        return node;
-    return std::nullopt;
+    return SplitNode::tryFromJson(json.toObject());
 }
 
 // Depth-first search for the leaf carrying `paneId`. On success `outNode` points
@@ -77,9 +69,11 @@ void collectMaxPaneSuffix(const SplitNode& node, const QString& prefix,
 
 } // namespace
 
-SessionLayouts::SessionLayouts(WorkspaceDb* db, QObject* parent)
+SessionLayouts::SessionLayouts(WorkspaceDb* db, UiStateStore* uiState,
+                               QObject* parent)
     : QObject(parent)
     , m_db(db)
+    , m_uiState(uiState)
 {
 }
 
@@ -133,6 +127,27 @@ Region SessionLayouts::regionEnum(int index)
     return index == kTerminal ? Region::Terminal : Region::Viewer;
 }
 
+QString SessionLayouts::regionKey(int index)
+{
+    return index == kTerminal ? QStringLiteral("terminal")
+                              : QStringLiteral("viewer");
+}
+
+int SessionLayouts::reservePaneSuffix(int index, const SplitNode& tree)
+{
+    const QString region = regionKey(index);
+    int highest = 0;
+    collectMaxPaneSuffix(tree, region + QLatin1Char('-'), highest);
+    const int stored = m_uiState->nextPaneSuffix(m_devSessionId, region);
+    const int next = qMax(stored, highest + 1);
+    // Only write when the counter actually moved: this runs on every published
+    // tree, including the one a splitter drag republishes, and each write syncs
+    // to disk.
+    if (next != stored)
+        m_uiState->setNextPaneSuffix(m_devSessionId, region, next);
+    return next;
+}
+
 SplitNode SessionLayouts::defaultTree(int index)
 {
     if (index != kTerminal) {
@@ -167,6 +182,13 @@ void SessionLayouts::setTreeQuietly(int index, SplitNode tree)
     RegionState& state = m_regions[index];
     state.tree = std::move(tree);
     state.valid = true;
+    // Burn the suffixes this tree carries HERE, the one funnel every tree
+    // assignment goes through (a loaded tree, a QML-authored saveTree, a split,
+    // a close, a ratio drag). Doing it at mint time only would not be enough:
+    // closePane() removes the pane from the tree, so by the time the next split
+    // looked at the tree the closed pane's suffix would look free again - and
+    // re-minting it re-attaches that pane's still-running remote tmux session.
+    reservePaneSuffix(index, state.tree);
     // Publish the exact persisted wire shape; QML reads paneId/orientation/
     // children/ratios straight off this map.
     state.cache = state.tree.toJson().toVariantMap();
@@ -204,6 +226,10 @@ void SessionLayouts::load(QString devSessionId)
         return; // deselection: nothing to fetch
 
     m_pendingLoads = kRegionCount;
+    // A deliberate reload adopts whatever the server has, so no earlier edit
+    // may veto it; only an edit made from HERE ON supersedes these replies.
+    for (RegionState& state : m_regions)
+        state.superseded = false;
     QPointer<SessionLayouts> self(this);
     const DevSessionId sessionId{m_devSessionId};
     for (int index = 0; index < kRegionCount; ++index) {
@@ -230,7 +256,11 @@ void SessionLayouts::applyLoadedTree(quint64 generation, int index,
     if (generation != m_generation)
         return; // a newer load() has taken over; drop this reply entirely
 
-    if (!err) {
+    // `superseded`: an edit was persisted while this getLayout was on the wire,
+    // so its answer is older than the tree QML is already showing. Applying it
+    // would revert the edit - and on the seeding branch below would replace it
+    // with the region default and write THAT to the server. See RegionState.
+    if (!err && !m_regions[index].superseded) {
         // No persisted layout for this region: adopt the default AND write it
         // back, so it becomes the session's real layout instead of a shape that
         // is re-derived on every load and lost the moment anything saves a tree.
@@ -282,6 +312,11 @@ bool SessionLayouts::canEdit()
 void SessionLayouts::persist(int index)
 {
     // Callers gate on canEdit(), so both ids are set here.
+    //
+    // Every write also retires any getLayout still on the wire for this region:
+    // its answer predates this tree and applying it would undo the edit being
+    // persisted right now.
+    m_regions[index].superseded = true;
     QPointer<SessionLayouts> self(this);
     m_db->setLayout(ServerId{m_serverId}, DevSessionId{m_devSessionId},
                     regionEnum(index), m_regions[index].tree,
@@ -406,11 +441,14 @@ QString SessionLayouts::splitPane(QString region, QString paneId,
         return {};
     }
 
-    int highest = 0;
-    const QString prefix = (index == kTerminal ? QStringLiteral("terminal-")
-                                               : QStringLiteral("viewer-"));
-    collectMaxPaneSuffix(state.tree, prefix, highest);
-    const QString newPaneId = prefix + QString::number(highest + 1);
+    // Every earlier return above left the tree untouched, so the counter is only
+    // consumed once the split is certain to happen.
+    const int suffix = reservePaneSuffix(index, state.tree);
+    const QString newPaneId =
+        regionKey(index) + QLatin1Char('-') + QString::number(suffix);
+    // Consume it: this id is now spent for this Dev Session's region for good,
+    // whether or not the pane holding it is ever closed.
+    m_uiState->setNextPaneSuffix(m_devSessionId, regionKey(index), suffix + 1);
 
     if (leaf->paneId.isEmpty()) {
         // The empty leaf a region is left with after its last pane closed is a

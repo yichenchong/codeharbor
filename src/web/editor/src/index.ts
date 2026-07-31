@@ -91,6 +91,11 @@ export interface EditorBridge {
      *  status label stays blank until the file next changes state. OPTIONAL
      *  because a host that does not publish the property leaves it undefined. */
     readonly fileState?: string;
+    /** The host's `readOnly` Q_PROPERTY, cached alongside `fileState`. Same
+     *  one-shot problem as above, with a worse failure: a page that connects
+     *  after the host has already decided the file is unwritable would render
+     *  an editable surface over it. OPTIONAL for the same reason. */
+    readonly readOnly?: boolean;
 }
 
 /** Extra, host-supplied context that is NOT carried by the frozen bridge. */
@@ -263,7 +268,21 @@ export function mountEditor(
     }
 
     // ---- signals: C++ -> JS ----
-    bridge.contentLoaded.connect((content: string, revision: string) => {
+    // Every handler is attached through bind() so dispose() can take it back
+    // off the proxy. qwebchannel.js holds each connected handler on the proxy
+    // object for the lifetime of the channel, and the proxy outlives this
+    // editor: the pane is torn down (or retargeted at another file) while the
+    // channel stays open. A handler left attached then runs against a DISPOSED
+    // Monaco editor — editor.setValue() on a disposed instance throws, and the
+    // exception surfaces inside the WebChannel message dispatch rather than
+    // anywhere a user could act on.
+    const disconnects: Array<() => void> = [];
+    function bind<F extends (...args: never[]) => void>(signal: Signal<F>, handler: F): void {
+        signal.connect(handler);
+        disconnects.push(() => signal.disconnect(handler));
+    }
+
+    bind(bridge.contentLoaded, (content: string, revision: string) => {
         loadedRevision = revision;
         // The buffer now IS the file, so a save reported later must not be
         // second-guessed by edits this load already superseded.
@@ -290,17 +309,17 @@ export function mountEditor(
         renderState();
     });
 
-    bridge.fileStateChanged.connect((state: string) => {
+    bind(bridge.fileStateChanged, (state: string) => {
         stateLabel.dataset.state = state;
         renderState();
     });
 
-    bridge.readOnlyChanged.connect((ro: boolean) => {
+    bind(bridge.readOnlyChanged, (ro: boolean) => {
         readOnly = ro;
         editor.updateOptions({ readOnly: ro });
     });
 
-    bridge.saved.connect((revision: string) => {
+    bind(bridge.saved, (revision: string) => {
         loadedRevision = revision;
         // Anything typed while the write was in flight is NOT in the bytes that
         // just landed, so the buffer still diverges from the file and MUST stay
@@ -326,7 +345,7 @@ export function mountEditor(
         }
     });
 
-    bridge.saveConflict.connect((currentRevision: string) => {
+    bind(bridge.saveConflict, (currentRevision: string) => {
         // The file moved on the server since we loaded it (SPEC 8.6). Offer the
         // user a choice: reload (discard local edits) or overwrite (force save
         // against the server's current revision).
@@ -357,7 +376,7 @@ export function mountEditor(
         notice.style.display = "flex";
     });
 
-    bridge.saveError.connect((message: string) => {
+    bind(bridge.saveError, (message: string) => {
         clearNotice();
         reporter.schedule(dirty); // as above: the buffer is still unsaved
         const msg = doc.createElement("span");
@@ -404,12 +423,20 @@ export function mountEditor(
     // at least does not leave a timer that would fire on that dead editor.
     editor.onDidDispose(() => reporter.cancel());
 
-    // The file state reached before this page finished loading is already in the
-    // property cache, so the label is correct without waiting for a transition
-    // (the same trick the terminal page uses for connectionState).
+    // The file state and read-only flag reached before this page finished
+    // loading are already in the property cache, so the label and the editor's
+    // writability are correct without waiting for a transition (the same trick
+    // the terminal page uses for connectionState). readOnly matters more than
+    // the label: without it a file the host already determined to be unwritable
+    // opens as an editable surface, and the user only discovers the truth when
+    // a save is refused.
     if (typeof bridge.fileState === "string") {
         stateLabel.dataset.state = bridge.fileState;
         renderState();
+    }
+    if (typeof bridge.readOnly === "boolean") {
+        readOnly = bridge.readOnly;
+        editor.updateOptions({ readOnly });
     }
 
     // READY HANDSHAKE — MUST be the last thing mountEditor does. Every signal
@@ -419,8 +446,21 @@ export function mountEditor(
     // older host without the slot is a no-op rather than a TypeError.
     bridge.ready?.();
 
+    let disposed = false;
     return {
         dispose(): void {
+            // Reachable twice: a host that tears the pane down explicitly still
+            // has the "pagehide" handler registered in connectEditor() below.
+            if (disposed) {
+                return;
+            }
+            disposed = true;
+            // Detach the WebChannel handlers BEFORE Monaco goes away, so a
+            // signal already on its way from C++ cannot run against a disposed
+            // editor.
+            for (const disconnect of disconnects) {
+                disconnect();
+            }
             // A debounced snapshot still pending is the newest copy of the
             // unsaved buffer in existence. The pane is going away (closed, or
             // reloaded because the host retargeted it at another file), so send

@@ -25,12 +25,27 @@ pattern='MUTATION-TEST|FIXME\(remove\)|DEBUG ONLY'
 # src/web/*/node_modules instead of hoisting them, and a marker string inside
 # some third-party .ts file must never fail this gate. This script itself is not
 # searched because its extension is not in the include list.
+#
+# grep exits 0 when it matched, 1 when it did not, and >1 on a REAL failure
+# (unreadable tree, bad pattern, missing directory). The three must not be
+# collapsed: a `|| true` here made a broken search print "no scaffolding markers
+# found" and pass the gate, which is the exact failure mode this gate exists to
+# prevent. Errors are left on stderr rather than discarded.
+set +e
 hits=$(grep -rEn "$pattern" \
         --include='*.cpp' --include='*.h' --include='*.qml' \
         --include='*.ts' --include='*.mjs' --include='*.sql' \
         --include='*.cmake' --include='CMakeLists.txt' \
         --exclude-dir=node_modules --exclude-dir=dist \
-        src remote 2>/dev/null || true)
+        src remote)
+status=$?
+set -e
+
+if [ "$status" -gt 1 ]; then
+    echo "no_scaffolding.sh: grep failed with exit status $status;" \
+         "the scaffolding gate did not run." >&2
+    exit 1
+fi
 
 if [ -n "$hits" ]; then
     echo "Review scaffolding left in the tree:"

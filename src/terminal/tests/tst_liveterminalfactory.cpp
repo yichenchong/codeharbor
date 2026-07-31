@@ -68,6 +68,7 @@ private slots:
 
     void factoryAttachDeliversRemoteMarkerThroughTheBridge();
     void detachReleasesTheChannelButKeepsTheRemoteSession();
+    void killWithoutAConnectionKeepsTheTargetAndTheSession();
     void killDestroysTheRemoteSession();
 
 private:
@@ -330,6 +331,37 @@ void TstLiveTerminalFactory::detachReleasesTheChannelButKeepsTheRemoteSession()
              qPrintable(QStringLiteral("marker %1 did not survive the detach; tail=%2")
                             .arg(m_marker, m_rendered.right(400))));
     qInfo().noquote() << "detach: re-attached and recovered" << m_marker;
+}
+
+// (c1) A kill that cannot run must not pretend it did. The pane's tmux target
+// is the ONLY handle anything still has on the remote session, so forgetting it
+// on a kill that never reached the server strands the user's processes: the
+// session keeps running, and neither Retry nor any later kill can name it any
+// more. Proved against the real server: drop the connection, ask for a kill,
+// reconnect, and check that both the target and the session are still there.
+void TstLiveTerminalFactory::killWithoutAConnectionKeepsTheTargetAndTheSession()
+{
+    QCOMPARE(m_pool.state(), SshConnectionPool::State::Connected);
+    QCOMPARE(m_factory->targetFor(m_controller), m_target);
+
+    m_pool.disconnectFromHost();
+    QVERIFY(!m_factory->connected());
+
+    m_factoryErrors.clear();
+    m_factory->kill(m_controller);
+
+    // The refusal is reported rather than swallowed...
+    QVERIFY2(m_factoryErrors.contains(m_target),
+             qPrintable(QStringLiteral("kill() said nothing useful: '%1'").arg(m_factoryErrors)));
+    // ...and the pane can still name what it failed to destroy.
+    QCOMPARE(m_factory->targetFor(m_controller), m_target);
+    m_factoryErrors.clear();
+
+    ensureConnected();
+    QCOMPARE(m_pool.state(), SshConnectionPool::State::Connected);
+    QVERIFY2(remoteSessionExists(),
+             "a kill that never ran must leave the remote session alone");
+    qInfo().noquote() << "kill refusal: target" << m_target << "and session both survived";
 }
 
 // (c) kill() destroys the remote session for real; the server is asked, not

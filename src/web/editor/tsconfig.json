@@ -5,12 +5,21 @@
     "moduleResolution": "bundler",
     "noEmit": true,
     "strict": true,
+    // The tests import the sources by their real "../src/x.ts" specifier (node
+    // strips the types and runs them directly), so tsc has to accept a .ts
+    // extension in an import. Same setting, same reason, as remote/tsconfig.json.
+    "allowImportingTsExtensions": true,
     "verbatimModuleSyntax": true,
     "noUnusedLocals": true,
     "noUnusedParameters": true,
     "skipLibCheck": true,
     "lib": ["ES2022", "DOM", "DOM.Iterable"],
-    "types": []
+    // "node" for the test files' node:test / node:assert imports. The bundled
+    // sources use only DOM APIs; nothing under src/ may rely on a node global.
+    "types": ["node"]
   },
-  "include": ["src"]
+  // "test" as well as "src": without it the test files are never typechecked at
+  // all, so a test that no longer matches the module it exercises still passes
+  // typecheck. remote/tsconfig.json already includes both.
+  "include": ["src", "test"]
 }

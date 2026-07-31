@@ -5,11 +5,11 @@
 #include <QPointer>
 #include <QString>
 
+// Brings ch::CodeharbordClient's full definition with it, which the QPointer
+// member below needs.
 #include "EditorController.h"
 
 namespace ch {
-
-class CodeharbordClient;
 
 // Per-pane EditorController factory (SPEC 4.5 split panes). Each editor pane
 // must own its OWN controller: a single shared controller would let split panes
@@ -37,7 +37,12 @@ public:
     void setRecoveryDir(QString dir);
 
 private:
-    CodeharbordClient* m_client = nullptr;
+    // QPointer for the same reason EditorController holds one: the client is
+    // owned by the caller and can be destroyed while this factory (a QML
+    // context property that lives as long as the process) still exists. A
+    // controller minted afterwards would otherwise connect to freed memory;
+    // with a QPointer it is simply created clientless and does nothing.
+    QPointer<CodeharbordClient> m_client = nullptr;
     QString m_recoveryDir;
     // Every controller minted, guarded so a pane destroyed since is pruned
     // rather than dereferenced when setRecoveryDir() fans a late value out.

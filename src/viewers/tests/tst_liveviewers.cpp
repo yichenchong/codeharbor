@@ -377,27 +377,42 @@ struct SplitMeasurement {
     }
 };
 
-// Measure `panes` in `region`'s coordinate space, ordered along the split axis.
+// Measure `panes` in the coordinate space of the item that actually lays them
+// out, ordered along the split axis.
+//
+// That item is the region's SplitView, NOT the region root. A region draws a
+// header strip (the split/close buttons) above its panes, so the SplitView is
+// inset from the region's top by the header's height and is that much shorter.
+// Measuring against the region root therefore reported every pane as ~30px
+// short across the split axis and every vertical split as starting ~30px down,
+// which is correct layout described against the wrong frame. Falling back to
+// the region keeps the helper usable if a region ever has no SplitView.
 SplitMeasurement measureSplit(QQuickItem *region, bool horizontal,
                               const QList<QObject *> &panes)
 {
     SplitMeasurement m;
+    QQuickItem *frame = region;
+    const QList<QObject *> splitViews = collect(region, isRegionSplitView);
+    if (splitViews.size() == 1) {
+        if (auto *item = qobject_cast<QQuickItem *>(splitViews.constFirst()))
+            frame = item;
+    }
     for (QObject *object : panes) {
         if (auto *item = qobject_cast<QQuickItem *>(object))
             m.panes.append(item);
     }
     // Repeater order is not a layout guarantee; position on the axis is.
-    std::sort(m.panes.begin(), m.panes.end(), [region, horizontal](QQuickItem *a, QQuickItem *b) {
-        const QPointF pa = a->mapToItem(region, QPointF(0, 0));
-        const QPointF pb = b->mapToItem(region, QPointF(0, 0));
+    std::sort(m.panes.begin(), m.panes.end(), [frame, horizontal](QQuickItem *a, QQuickItem *b) {
+        const QPointF pa = a->mapToItem(frame, QPointF(0, 0));
+        const QPointF pb = b->mapToItem(frame, QPointF(0, 0));
         return horizontal ? pa.x() < pb.x() : pa.y() < pb.y();
     });
 
-    m.total = horizontal ? region->width() : region->height();
-    m.crossTotal = horizontal ? region->height() : region->width();
+    m.total = horizontal ? frame->width() : frame->height();
+    m.crossTotal = horizontal ? frame->height() : frame->width();
     for (QQuickItem *pane : std::as_const(m.panes)) {
         const QRectF rect =
-            pane->mapRectToItem(region, QRectF(0, 0, pane->width(), pane->height()));
+            pane->mapRectToItem(frame, QRectF(0, 0, pane->width(), pane->height()));
         m.rects.append(rect);
         m.extents.append(horizontal ? rect.width() : rect.height());
         m.crossExtents.append(horizontal ? rect.height() : rect.width());

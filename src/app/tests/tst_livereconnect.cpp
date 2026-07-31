@@ -36,6 +36,7 @@
 #include <QElapsedTimer>
 #include <QJsonObject>
 #include <QJsonValue>
+#include <QPointer>
 #include <QRandomGenerator>
 #include <QScopeGuard>
 #include <QString>
@@ -251,8 +252,15 @@ void TstLiveReconnect::survivesADroppedConnection()
     QString detail;
     QVERIFY2(serverInfoAnswers(&detail), qPrintable(detail));
 
-    SshChannelDevice* firstRpc = m_bootstrap->rpcDevice();
-    QVERIFY(firstRpc != nullptr);
+    // Held as a QPointer, not a raw pointer. The old device is destroyed during
+    // the teardown below, and the heap is free to hand its exact address back
+    // for the replacement -- which really does happen, and made the old raw
+    // "new != old" comparison fail intermittently for a correct reconnect. A
+    // QPointer self-clears when its object is destroyed, so "the original was
+    // torn down" becomes an observation about the object rather than a
+    // comparison of a dangling address.
+    QPointer<SshChannelDevice> firstRpc = m_bootstrap->rpcDevice();
+    QVERIFY(!firstRpc.isNull());
 
     QSignalSpy scheduleSpy(m_bootstrap.get(),
                            &SessionBootstrap::reconnectScheduled);
@@ -279,6 +287,9 @@ void TstLiveReconnect::survivesADroppedConnection()
     QCOMPARE(scheduleSpy.at(0).at(1).toInt(), 1);  // 1 s, first rung
     QVERIFY(m_client.transport() == nullptr);
     QVERIFY(m_monitor.transport() == nullptr);
+    // The original RPC device was destroyed, not merely detached. This is the
+    // half of "the transport was rebuilt" that address reuse cannot fake.
+    QVERIFY(firstRpc.isNull());
 
     // The in-flight call was answered, not left hanging.
     QCOMPARE(orphanAnswers, 1);
@@ -291,7 +302,8 @@ void TstLiveReconnect::survivesADroppedConnection()
     QCOMPARE(wiredSpy.size(), 1);
     QCOMPARE(m_pool.state(), SshConnectionPool::State::Connected);
     QVERIFY(m_bootstrap->rpcDevice() != nullptr);
-    QVERIFY(m_bootstrap->rpcDevice() != firstRpc);
+    // ... and its replacement exists. Together with the null check above, that
+    // is strictly stronger than comparing the two addresses.
     QCOMPARE(m_client.transport(),
              static_cast<QIODevice*>(m_bootstrap->rpcDevice()));
     QCOMPARE(m_monitor.transport(),

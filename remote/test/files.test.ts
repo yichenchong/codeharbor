@@ -16,7 +16,7 @@ import {
     FileWatchService,
 } from "../src/files.ts";
 import { RPC_REVISION_MISMATCH } from "../src/rpc-types.ts";
-import { dispatch } from "../src/codeharbord.ts";
+import { dispatch, RPC_INVALID_PARAMS } from "../src/codeharbord.ts";
 import type { WatchEvent } from "../src/rpc-types.ts";
 
 async function tmpDir(): Promise<string> {
@@ -774,6 +774,148 @@ test("watch coalesces a burst of rapid changes and observes the final revision",
     service.closeAll();
 
     assert.equal(events.at(-1)?.revision, finalRevision);
+
+    await fs.rm(dir, { recursive: true, force: true });
+});
+
+// --- file.* param validation -------------------------------------------------
+//
+// Every file method validates its params before touching the filesystem. These
+// pin the four failures the unvalidated table used to produce: a misleading
+// "internal error", a phantom revision CONFLICT, a chmod to 000, and an
+// out-of-range Buffer error.
+
+async function callFile(method: string, params: unknown) {
+    const response = await dispatch({ jsonrpc: "2.0", id: 7, method, params });
+    assert.ok(response !== null && "error" in response, `${method} should have failed`);
+    return response.error;
+}
+
+test("file methods reject a missing or non-string path with Invalid params", async () => {
+    for (const method of ["file.stat", "file.readFile", "file.resolvePath", "file.watch", "file.listDirectory"]) {
+        const missing = await callFile(method, {});
+        assert.equal(missing.code, RPC_INVALID_PARAMS, `${method} with no path`);
+        assert.match(missing.message, /field 'path'/);
+
+        const wrongType = await callFile(method, { path: 42 });
+        assert.equal(wrongType.code, RPC_INVALID_PARAMS, `${method} with a numeric path`);
+    }
+
+    const unwatch = await callFile("file.unwatch", {});
+    assert.equal(unwatch.code, RPC_INVALID_PARAMS);
+    assert.match(unwatch.message, /field 'subscriptionId'/);
+});
+
+// An omitted expectedRevision used to be compared against the on-disk token and
+// always lose, so a plainly malformed request came back as a revision CONFLICT
+// (-32001) — which makes the editor offer the user a reload/overwrite choice
+// for a conflict that never happened.
+test("file.writeFile reports a missing expectedRevision as Invalid params, not a conflict", async () => {
+    const dir = await tmpDir();
+    const file = path.join(dir, "no-rev.txt");
+
+    const error = await callFile("file.writeFile", { path: file, content: "hello" });
+    assert.equal(error.code, RPC_INVALID_PARAMS);
+    assert.notEqual(error.code, RPC_REVISION_MISMATCH);
+    assert.match(error.message, /field 'expectedRevision'/);
+    // The rejected request wrote nothing.
+    await assert.rejects(fs.stat(file));
+
+    await fs.rm(dir, { recursive: true, force: true });
+});
+
+// `mode & 0o7777` turns any non-numeric value into 0, so a client bug that sent
+// the mode as a string used to save the file and then chmod it to 000 — locking
+// the user out of their own document.
+test("file.writeFile rejects a non-integer or out-of-range mode instead of chmod 000", async () => {
+    const dir = await tmpDir();
+
+    for (const mode of ["0600", 0.5, -1, 0o10000, null]) {
+        const target = path.join(dir, `mode-${String(mode)}.txt`);
+        const error = await callFile("file.writeFile", {
+            path: target,
+            content: "x",
+            expectedRevision: "",
+            mode,
+        });
+        assert.equal(error.code, RPC_INVALID_PARAMS, `mode ${String(mode)} must be rejected`);
+        assert.match(error.message, /field 'mode'/);
+        await assert.rejects(fs.stat(target), `mode ${String(mode)} must not create a file`);
+    }
+
+    // A legitimate mode still works and is pinned exactly.
+    const ok = path.join(dir, "ok.txt");
+    const response = await dispatch({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "file.writeFile",
+        params: { path: ok, content: "x", expectedRevision: "", mode: 0o600 },
+    });
+    assert.ok(response !== null && "result" in response);
+    assert.equal((await fs.stat(ok)).mode & 0o7777, 0o600);
+
+    await fs.rm(dir, { recursive: true, force: true });
+});
+
+// An unlisted encoding used to fall through to utf-8. For a client that meant
+// base64 that writes the base64 TEXT into the file as if it were the document,
+// and reports the corruption as a successful save.
+test("file.writeFile rejects an unknown encoding rather than defaulting to utf-8", async () => {
+    const dir = await tmpDir();
+    const file = path.join(dir, "enc.bin");
+
+    const error = await callFile("file.writeFile", {
+        path: file,
+        content: "aGk=",
+        expectedRevision: "",
+        encoding: "utf16",
+    });
+    assert.equal(error.code, RPC_INVALID_PARAMS);
+    assert.match(error.message, /field 'encoding'/);
+    await assert.rejects(fs.stat(file));
+
+    // Both listed encodings still round-trip.
+    for (const [encoding, content, expected] of [
+        ["utf-8", "plain", "plain"],
+        ["base64", "aGk=", "hi"],
+    ] as const) {
+        const target = path.join(dir, `enc-${encoding}.txt`);
+        const response = await dispatch({
+            jsonrpc: "2.0",
+            id: 1,
+            method: "file.writeFile",
+            params: { path: target, content, expectedRevision: "", encoding },
+        });
+        assert.ok(response !== null && "result" in response);
+        assert.equal(await fs.readFile(target, "utf8"), expected);
+    }
+
+    await fs.rm(dir, { recursive: true, force: true });
+});
+
+test("file.readFile rejects a non-integer or negative offset/length", async () => {
+    const dir = await tmpDir();
+    const file = path.join(dir, "range.txt");
+    await fs.writeFile(file, "0123456789");
+
+    for (const params of [
+        { path: file, offset: "3" },
+        { path: file, offset: -1 },
+        { path: file, offset: 1.5 },
+        { path: file, length: Number.NaN },
+        { path: file, length: -4 },
+    ]) {
+        const error = await callFile("file.readFile", params);
+        assert.equal(error.code, RPC_INVALID_PARAMS, JSON.stringify(params));
+        assert.match(error.message, /non-negative integer/);
+    }
+
+    // A well-formed window still reads. Goes through the typed readFile API so
+    // the assertion reads a checked shape rather than an inline cast of an
+    // opaque RPC result.
+    const result = await readFile({ path: file, offset: 2, length: 3 });
+    assert.equal(result.content, "234");
+    assert.equal(result.truncated, true);
 
     await fs.rm(dir, { recursive: true, force: true });
 });

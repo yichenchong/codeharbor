@@ -151,8 +151,10 @@ EditorController::EditorController(CodeharbordClient* client, QString recoveryId
 EditorController::~EditorController()
 {
     // Release the server-side watcher subscribed in open() (SPEC 8.7). The
-    // client is borrowed and outlives us; the response is irrelevant (we are
-    // gone), so the callback is a no-op that touches no members.
+    // client is borrowed and may already be gone (m_client is a QPointer, and
+    // unwatchCurrent() checks it), in which case there is nothing to release:
+    // the subscription died with the process that minted it. The response is
+    // irrelevant either way — we are gone — so the callback is an empty no-op.
     unwatchCurrent();
 }
 
@@ -200,12 +202,14 @@ void EditorController::subscribeWatch()
             // Superseded: the controller was destroyed (pane closed), the file
             // was switched, or the transport was replaced while this was in
             // flight. The server may have created a subscription nobody tracks,
-            // so release it through the BORROWED client — it outlives the
-            // controller per the ctor contract — and NEVER touch m_watchPending,
-            // which now belongs to a newer attempt.
+            // so release it through the BORROWED client — captured separately
+            // because `self` may be gone — and NEVER touch m_watchPending,
+            // which now belongs to a newer attempt. The capture is a QPointer:
+            // if the client itself has been destroyed there is nobody left to
+            // tell, and the subscription died with its process anyway.
             if (!self || generation != self->m_watchGeneration
                 || self->m_path != path) {
-                if (!subId.isEmpty())
+                if (!subId.isEmpty() && client)
                     client->call(QString::fromLatin1(rpc::kMethodUnwatch),
                                  unwatchParams(subId),
                                  [](QJsonValue, std::optional<RpcError>) {});
@@ -465,10 +469,23 @@ void EditorController::ready()
         return;
     }
 
-    // Nothing held. A repeat ready() is a page RELOAD that lost its buffer:
-    // re-fetch rather than replay, so the fresh page cannot show stale bytes.
-    if (reconnected && !m_path.isEmpty())
-        reload(FileState::Loading);
+    // Nothing held. A repeat ready() is a page RELOAD: the Monaco page threw
+    // its buffer away (a renderer crash, a bundle reload), so replaying is not
+    // an option and the file must be fetched again.
+    if (!reconnected || m_path.isEmpty())
+        return;
+    if (m_dirty) {
+        // The buffer the page just lost held unsaved work. A plain reload would
+        // silently replace it with the server's bytes and the only surviving
+        // copy — this pane's crash-recovery snapshot (SPEC 11.3) — would never
+        // be mentioned again, because only open() probes for it. Re-open the
+        // file instead: the fresh page is treated exactly like a first open, so
+        // the snapshot is offered back through recoveryAvailable and the user
+        // decides.
+        open(m_path);
+        return;
+    }
+    reload(FileState::Loading, /*discardLocalEdits=*/true);
 }
 
 QString EditorController::recoveryPath() const
@@ -536,6 +553,11 @@ void EditorController::open(QString path)
     // a switch; the new load supersedes it.
     m_pendingContent.reset();
     m_pendingRevision.clear();
+    // Where an outage that is still unresolved wanted to come back to. It
+    // described the file being left behind (a conflict over ITS bytes, a
+    // truncated read of IT), so a rebind must not restore it over the file
+    // opening now; this load decides the new file's state on its own.
+    m_resumeState.reset();
     // Supersede any read still in flight: its answer describes the file we are
     // leaving, and applying it would push the wrong bytes at the page and adopt
     // the wrong revision as this buffer's save guard.
@@ -615,8 +637,8 @@ void EditorController::checkRecovery(const QString& loadedContent, quint64 gener
         QString::fromLatin1(rpc::kMethodStat), readParams(recoveryPath),
         [self, recoveryPath, loadedContent, generation](
             QJsonValue statRes, std::optional<RpcError> statErr) {
-            if (!self || statErr.has_value())
-                return; // no snapshot present
+            if (!self || !self->m_client || statErr.has_value())
+                return; // gone, clientless, or no snapshot present
             // Superseded: this check belongs to a load that is no longer the
             // one on screen.
             if (generation != self->m_loadGeneration)
@@ -750,6 +772,14 @@ void EditorController::save(QString content, QString expectedRevision)
                     self->setFileState(FileState::Conflict);
                     return;
                 }
+                if (!self->m_client) {
+                    // No client left to ask. Report the conflict with no
+                    // revision rather than dropping it: the page must not be
+                    // left believing the save is still running.
+                    emit self->saveConflict(QString());
+                    self->setFileState(FileState::Conflict);
+                    return;
+                }
                 self->m_client->call(
                     QString::fromLatin1(rpc::kMethodStat), readParams(path),
                     [self, path](QJsonValue statRes, std::optional<RpcError> statErr) {
@@ -843,7 +873,8 @@ void EditorController::writeRecovery(const QString& content, bool retryOnMismatc
             // session; adopt its current revision and retry once. Recovery is
             // best-effort — other errors are swallowed (never surfaced as a
             // save failure).
-            if (retryOnMismatch && error->code == rpc::kRevisionMismatch) {
+            if (retryOnMismatch && self->m_client
+                && error->code == rpc::kRevisionMismatch) {
                 self->m_client->call(
                     QString::fromLatin1(rpc::kMethodStat), readParams(recoveryPath),
                     [self, content, path](QJsonValue statRes,
@@ -879,6 +910,8 @@ void EditorController::clearRecovery()
     // consumer. The 0600 mode is restated so the truncated file keeps its
     // restrictive permissions (C1).
     const QString recoveryPath = this->recoveryPath();
+    if (recoveryPath.isEmpty())
+        return;  // pane id / recovery dir withdrawn since: nothing to clear
     const QString path = m_path;
     const QString guard = m_recoveryRevision;
 
@@ -900,10 +933,12 @@ void EditorController::clearRecovery()
 
 void EditorController::requestReload()
 {
-    reload(FileState::Loading);
+    // The USER asked for the file back (the page's conflict/error "Reload"
+    // affordance calls this), so replacing the buffer is the whole point.
+    reload(FileState::Loading, /*discardLocalEdits=*/true);
 }
 
-void EditorController::reload(FileState transitional)
+void EditorController::reload(FileState transitional, bool discardLocalEdits)
 {
     if (!m_client || m_path.isEmpty())
         return;
@@ -913,15 +948,33 @@ void EditorController::reload(FileState transitional)
     // Supersede any read still in flight: the replies to two overlapping loads
     // can arrive in either order, and the older one must never win.
     const quint64 generation = ++m_loadGeneration;
+    // Where the buffer stands right now. A report landing during the round trip
+    // bumps this, which is how the reply below notices that the bytes it is
+    // about to install would destroy keystrokes typed since it was issued.
+    const quint64 editSerial = m_editSerial;
 
     QPointer<EditorController> self(this);
     m_client->call(
         QString::fromLatin1(rpc::kMethodReadFile), readFileParams(path),
-        [self, generation](QJsonValue result, std::optional<RpcError> error) {
+        [self, generation, editSerial, discardLocalEdits](
+            QJsonValue result, std::optional<RpcError> error) {
             if (!self || generation != self->m_loadGeneration)
                 return;
             if (error.has_value()) {
                 self->setFileState(FileState::Error);
+                return;
+            }
+            // The user typed while this read was in flight. Only a reload the
+            // user ASKED for may overwrite that: for a system-initiated reload
+            // (a watch event, a reconnect reconciliation) the buffer is now
+            // unsaved work that exists nowhere else, and pushing the server's
+            // bytes at the page would silently delete it. Drop the fetched
+            // bytes and flag the divergence instead — the same answer
+            // onNotification() gives for a change that arrives against an
+            // already-dirty buffer (SPEC 8.7).
+            if (!discardLocalEdits && self->m_editSerial != editSerial) {
+                if (self->m_fileState != FileState::Conflict)
+                    self->setFileState(FileState::ExternallyModified);
                 return;
             }
             const QJsonObject obj = result.toObject();
@@ -929,6 +982,11 @@ void EditorController::reload(FileState transitional)
             const QString revision = obj.value(QStringLiteral("revision")).toString();
             self->m_revision = revision;
             self->m_dirty = false;
+            // The buffer just became the file's bytes again, so a recovery
+            // snapshot of the edits this reload replaced is obsolete: drop it,
+            // or reopening the pane offers unsaved changes the user already
+            // discarded (SPEC 11.3). A no-op unless a snapshot holds content.
+            self->clearRecovery();
             // base64 => binary, truncated => a prefix of the file. Either way
             // the bytes on screen are not the file's bytes and must not be
             // written back (SPEC 8.2); see open(), which also explains why a

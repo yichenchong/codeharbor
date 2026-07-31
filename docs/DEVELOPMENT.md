@@ -151,8 +151,12 @@ If a bundle is missing and cannot be built (no `npm` on `PATH`), configure
 loads nothing is never the default. Pass `-DCODEHARBOR_SKIP_WEB_BUNDLE=ON` to
 deliberately build a client with both panes inert.
 
-Presets are defined in [`CMakePresets.json`](../CMakePresets.json):
-`dev` (Debug + tests) and `release`.
+Presets are defined in [`CMakePresets.json`](../CMakePresets.json): `dev`
+(Debug + tests, `build/dev/`), `release` (Release, tests off, `build/release/`)
+and `release-tests` (Release **with** tests, also `build/release/` — it is what
+CI and the release workflow configure, build, and `ctest` against, so the tree
+that is packaged is the tree that was tested). `release` and `release-tests`
+deliberately share one binary directory; switching between them reconfigures it.
 
 > Running the GUI needs a display. On a headless box use an X/Wayland session or
 > `xvfb-run ./build/dev/src/app/codeharbor`. WebEngine may need
@@ -235,14 +239,24 @@ ssh-agent -a $PWD/$D/agent.sock &
 SSH_AUTH_SOCK=$PWD/$D/agent.sock ssh-add $D/id
 ```
 
-Then run them:
+Then run them. Every variable below is REQUIRED and none of them has a default:
+omit `CH_LIVE_SSH` and every gate QSKIPs, which reports as a green run that
+proved nothing — the exact outcome this whole section exists to avoid. Omit any
+of `CH_LIVE_HOST` / `CH_LIVE_PORT` / `CH_LIVE_USER` / `CH_LIVE_NODE` /
+`CH_LIVE_REPO` and the gates fail their own precondition check instead.
 
 ```bash
+export CH_LIVE_SSH=1
+export CH_LIVE_HOST=127.0.0.1 CH_LIVE_PORT=2222 CH_LIVE_USER=$(whoami)
 export CH_LIVE_NODE=$(command -v node) CH_LIVE_REPO=$PWD CH_LIVE_IDENTITY=$PWD/$D/id
 export SSH_AUTH_SOCK=$PWD/tests/live/.fixture/agent.sock
 export CH_LIVE_KNOWN_HOSTS=$(mktemp -u /tmp/ch_kh_XXXX)
 ctest --preset dev -L live --output-on-failure
 ```
+
+`CH_LIVE_PORT` and `CH_LIVE_HOST` must match the `Port` and `ListenAddress` in
+the `sshd_config` written above; `CH_LIVE_USER` must be the account named by
+`AllowUsers`.
 
 > These tests render QML and Chromium headlessly; each target pins its own
 > environment (`QT_QPA_PLATFORM=offscreen`, `QT_QUICK_BACKEND=software`,
@@ -274,9 +288,16 @@ git push --tags`) or via the **Run workflow** button (manual `workflow_dispatch`
 | Job | Runner | Output artifact | Deploy tool |
 |---|---|---|---|
 | `linux` | `ubuntu-latest` | `CodeHarbor-*.AppImage` | linuxdeploy + qt plugin |
-| `windows` | `windows-latest` | `codeharbor.exe` + Qt/libssh DLLs | `windeployqt` |
+| `windows` | `windows-latest` | `codeharbor-windows/` (`codeharbor.exe` + Qt/libssh DLLs) and `CodeHarbor-<version>-windows-x64-setup.exe` | `windeployqt`, then Inno Setup (`packaging/windows/codeharbor.iss`) |
 | `macos` | `macos-latest` | `codeharbor.dmg` (bundled `.app`) | `macdeployqt` |
 | `remote` | `ubuntu-latest` | `codeharbor-remote.tar.gz` (`dist/` + `sql/` + `package.json`) | `tsc` + tar |
+
+The `publish` job zips the Windows directory into `codeharbor-windows.zip`, then
+refuses to publish unless both Windows assets are present **and** the
+installer's filename carries exactly the tag's version. The installer takes its
+version from `project(CodeHarbor VERSION …)` in the top-level `CMakeLists.txt`,
+so that second check is what stops a `v0.2.0` tag on an un-bumped tree from
+publishing an installer that calls itself 0.1.8.
 
 A raw Qt/WebEngine executable is **not** runnable off the build machine; the
 deploy tools bundle the Qt libraries, plugins, and the WebEngine runtime so the

@@ -108,6 +108,7 @@ private slots:
     void silentAttachIsBoundedAndReportedAsAnError();
     void sendInputNeedsAWritableTransport();
     void resizeRejectsNonPositiveGeometry();
+    void hiddenEvictionResumesOnACleanBoundary();
 };
 
 // A single ingest at or above the size cap flushes synchronously (SPEC 5.5).
@@ -671,6 +672,71 @@ void TstTerminalController::resizeRejectsNonPositiveGeometry()
     controller.resize(0, 0);
     QCOMPARE(controller.columns(), 132);
     QCOMPARE(controller.rows(), 43);
+}
+
+// The rolling hidden buffer is replayed VERBATIM into the renderer when the
+// pane comes back (SPEC 5.4), so the first byte kept after an eviction is the
+// first byte xterm.js's parser sees. Cutting at the raw overflow offset lands
+// wherever the byte count happens to fall — in the middle of a multi-byte UTF-8
+// character (whose leftover continuation bytes decode to U+FFFD) or in the
+// middle of an ANSI escape sequence (whose leftover bytes are printed as
+// literal text). The cut is moved forward to a point that can be inside
+// neither.
+void TstTerminalController::hiddenEvictionResumesOnACleanBoundary()
+{
+    constexpr qsizetype kCap = TerminalController::kHiddenBufferMaxBytes;
+
+    // (1) A line feed within the resync window is the preferred resume point:
+    // no escape sequence contains one, and it is ASCII, so the byte after it
+    // starts both a fresh line and a fresh character.
+    {
+        TerminalController controller;
+        controller.setViewVisible(false);
+
+        QByteArray fill(kCap, 'A');
+        const QByteArray tail(TerminalController::kFlushSizeBytes, 'B');
+        // The raw cut would land at index tail.size(); the only line feed sits
+        // ten bytes past it, comfortably inside the window.
+        const qsizetype newline = tail.size() + 10;
+        fill[newline] = '\n';
+
+        controller.ingestOutput(fill); // >= size cap: flushes into the hidden buffer
+        controller.ingestOutput(tail); // >= size cap: overflows it
+
+        const QByteArray &hidden = controller.hiddenBuffer();
+        // Everything up to AND INCLUDING the line feed went, so eleven bytes
+        // more than the raw overflow.
+        QCOMPARE(hidden.size(), kCap - 11);
+        QVERIFY(!hidden.contains('\n'));
+        // The newest bytes are untouched: only the oldest end is trimmed.
+        QCOMPARE(hidden.right(tail.size()), tail);
+    }
+
+    // (2) A full-screen TUI can redraw for a long time without emitting a line
+    // feed. With no line feed in the window the cut must still land on a
+    // character boundary.
+    {
+        TerminalController controller;
+        controller.setViewVisible(false);
+
+        // "é" is C3 A9, so every ODD index in this fill is a continuation byte.
+        const QByteArray fill = QByteArrayLiteral("\xC3\xA9").repeated(kCap / 2);
+        QCOMPARE(fill.size(), kCap);
+        // An ODD overflow therefore puts the raw cut inside a character.
+        const QByteArray tail(TerminalController::kFlushSizeBytes + 1, 'z');
+        QCOMPARE(tail.size() % 2, static_cast<qsizetype>(1));
+
+        controller.ingestOutput(fill);
+        controller.ingestOutput(tail);
+
+        const QByteArray &hidden = controller.hiddenBuffer();
+        // Exactly one extra byte was dropped to reach the boundary.
+        QCOMPARE(hidden.size(), kCap - 1);
+        QCOMPARE(hidden.at(0), '\xC3'); // a lead byte, not an orphaned tail
+        // Which is the point: decoding the replay produces no replacement
+        // characters. Cutting at the raw offset would open it with U+FFFD.
+        QVERIFY(!QString::fromUtf8(hidden).contains(QChar(0xFFFD)));
+    }
 }
 
 QTEST_GUILESS_MAIN(TstTerminalController)

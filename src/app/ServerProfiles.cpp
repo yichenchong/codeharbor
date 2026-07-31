@@ -209,14 +209,16 @@ void ServerProfiles::persist()
 }
 
 // The store holds no secret — authentication is ssh-agent/keys and nothing here
-// ever writes a password or a key (see sanitize(): six whitelisted fields, and
-// anything else in the caller's map is dropped on the floor). It is still not
-// world business: it names every machine you reach, the account you reach it
-// as, and where your checkout lives. Qt leaves it at the umask default, which
-// on a typical box is 0644 — and 0664 wherever the user's primary group is
-// shared, which makes it WRITABLE by another account. That last case is the
-// real one: an attacker who can edit this file redirects `host` at a machine
-// they own, and the app connects there on its next launch.
+// ever writes a password or a passphrase (see sanitize(): seven whitelisted
+// fields — name, host, port, user, identityFile, nodePath, repoRoot — and
+// anything else in the caller's map, a credential prompt's answer included, is
+// dropped on the floor). It is still not world business: it names every machine
+// you reach, the account you reach it as, and where your checkout lives. Qt
+// leaves it at the umask default, which on a typical box is 0644 — and 0664
+// wherever the user's primary group is shared, which makes it WRITABLE by
+// another account. That last case is the real one: an attacker who can edit
+// this file redirects `host` at a machine they own, and the app connects there
+// on its next launch.
 //
 // So: owner-only. Best effort by design — a store on a filesystem with no POSIX
 // permissions is not a reason to refuse to save. The containing DIRECTORY is

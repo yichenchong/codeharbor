@@ -351,6 +351,13 @@ Rectangle {
 
     onProfilesChanged: root.syncFromModel()
     onActiveIdChanged: {
+        // Follow the host's active profile, but never onto the one already being
+        // edited: selectIndex() re-loads the form from the STORED profile, so
+        // re-selecting the current row would silently throw away whatever the
+        // user has typed but not saved — and pressing Connect is exactly what
+        // makes the host publish a new activeId.
+        if (root.activeId === root.editingId)
+            return;
         var index = root.indexOfId(root.activeId);
         if (index >= 0)
             root.selectIndex(index);
@@ -794,6 +801,21 @@ Rectangle {
                     height: 46
                     objectName: "profileRow" + profileDelegate.index
                     onClicked: root.selectIndex(profileDelegate.index)
+
+                    // An ItemDelegate normally lends its `text` to a screen
+                    // reader, but this one draws a two-line contentItem of its
+                    // own and leaves `text` empty — so without these the whole
+                    // list, which is the keyboard surface of the sheet a user
+                    // meets before any server is reachable, is announced as a
+                    // stack of anonymous rows. Same rule as the sidebar's
+                    // session rows and the command palette's results.
+                    Accessible.role: Accessible.ListItem
+                    Accessible.name: root.textOf(profileDelegate.modelData, "name")
+                    Accessible.description: root.textOf(profileDelegate.modelData, "user") + "@"
+                                            + root.textOf(profileDelegate.modelData, "host") + ":"
+                                            + root.textOf(profileDelegate.modelData, "port")
+                    Accessible.selected: root.textOf(profileDelegate.modelData, "id")
+                                         === root.editingId
 
                     background: Rectangle {
                         color: root.textOf(profileDelegate.modelData, "id") === root.editingId

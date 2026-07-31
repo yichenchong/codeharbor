@@ -123,8 +123,15 @@ struct UpdateTerminalPaneParams {
 // operation is a `workspace.*` JSON-RPC round-trip through the injected
 // CodeharbordClient, whose camelCase result JSON is mapped into the ch:: data
 // model. All methods are async; each takes a callback receiving EITHER the typed
-// result OR an RpcError forwarded verbatim from the server (SPEC 10.3) —
-// WorkspaceDb never throws and never touches local storage.
+// result OR an RpcError (SPEC 10.3) — WorkspaceDb never throws and never touches
+// local storage. A server error is forwarded verbatim. One error is synthesized
+// here rather than received: a response that reports success but whose result is
+// not the expected JSON kind (an object per record, an array for list()) is
+// failed with the reserved code -32603, because decoding it would manufacture a
+// record with an empty id that the rest of the client cannot tell from a real
+// one. getLayout is the sole method for which a JSON null result is legitimate —
+// it means "this region has no persisted layout" and delivers std::nullopt with
+// no error.
 //
 // Lifetime: `client` is borrowed, not owned, and must outlive this object. Each
 // pending callback is owned by that client, NOT by WorkspaceDb, and runs at most

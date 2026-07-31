@@ -34,7 +34,7 @@ The client provides only UI, rendering, input, and transport.
 src/            C++/QML client
   app/          application entry + QML
   models/       core data model (Group, DevSession, panes)
-  persistence/  Qt SQL access to the remote SQLite workspace DB
+  persistence/  workspace load/save, over codeharbord RPC (no local database)
   ssh/          libssh connection pool, channels, host-key handling
   terminal/     TerminalController, buffering, reconnect
   viewers/      viewer handler registry, WebEngine profiles
@@ -74,7 +74,8 @@ there is no `npm install` and no `node_modules`. You get `dist/`, `sql/` and
 |---|---|---|
 | Linux | `CodeHarbor-x86_64.AppImage` | `chmod +x` then run. Needs FUSE and an X11/XWayland display. |
 | macOS | `codeharbor.dmg` | Unsigned: right-click → **Open**, or `xattr -d com.apple.quarantine`. |
-| Windows | `codeharbor-windows.zip` | Extract, run `codeharbor.exe`. SmartScreen will warn (unsigned). |
+| Windows | `CodeHarbor-<version>-windows-x64-setup.exe` | Per-user installer, no admin rights. SmartScreen will warn (unsigned). |
+| Windows (portable) | `codeharbor-windows.zip` | Extract, run `codeharbor.exe`. Same files, no shortcuts or uninstaller. |
 
 ### 3. Connect
 
@@ -126,7 +127,8 @@ shortcuts SPEC 15 originally suggested, in [`docs/SPEC.md`](docs/SPEC.md) — is
 |---|---|
 | `Ctrl+Shift+P` (`⌘⇧P` on macOS) | Open the command palette |
 | `Ctrl+Shift+O` | Connect to Server… |
-| `Ctrl+R` | Refresh Workspace |
+| `Ctrl+Shift+R` | Refresh Workspace |
+| `Ctrl+Shift+W` | Close Window (the window is frameless, so it has no close button) |
 | `Ctrl+S` | Save the file in the focused editor pane |
 
 Splitting and closing panes, killing a terminal's remote tmux session, disconnecting,

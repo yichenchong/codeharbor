@@ -96,6 +96,8 @@ private slots:
     void distinctNotificationsAreNotCoalesced();
     void coalescingExpiresWithTheWindow();
     void zeroWindowDisablesCoalescing();
+    void negativeWindowDisablesCoalescing();
+    void theWindowIsMeasuredFromTheLastRaise();
     void agentEventRaisesNotificationEndToEnd();
 };
 
@@ -216,6 +218,52 @@ void TestNotifier::zeroWindowDisablesCoalescing()
     notifier.notify(QStringLiteral("A"), QStringLiteral("b"));
     QCOMPARE(raised.count(), 2);
     QCOMPARE(coalesced.count(), 0);
+}
+
+// The documented contract is "<= 0 disables coalescing entirely", so a negative
+// window has to behave exactly like zero rather than, say, wrapping into a
+// gigantic window that swallows every repeat for the rest of the run.
+void TestNotifier::negativeWindowDisablesCoalescing()
+{
+    ch::Notifier notifier;
+    notifier.setCoalesceWindowMs(-1);
+    QCOMPARE(notifier.coalesceWindowMs(), -1);
+    QSignalSpy raised(&notifier, &ch::Notifier::notificationRaised);
+    QSignalSpy coalesced(&notifier, &ch::Notifier::notificationCoalesced);
+
+    notifier.notify(QStringLiteral("A"), QStringLiteral("b"));
+    notifier.notify(QStringLiteral("A"), QStringLiteral("b"));
+    QCOMPARE(raised.count(), 2);
+    QCOMPARE(coalesced.count(), 0);
+}
+
+// "Every raise restarts the window." The window is therefore measured from the
+// last RAISE, not from when the object was built and not from the last call:
+// a distinct notification part-way through resets the clock, and a repeat of
+// THAT one is judged against its own raise. Getting this wrong would let a
+// fresh bubble's first repeat slip through as a second bubble.
+void TestNotifier::theWindowIsMeasuredFromTheLastRaise()
+{
+    ch::Notifier notifier;
+    notifier.setCoalesceWindowMs(120);
+    QSignalSpy raised(&notifier, &ch::Notifier::notificationRaised);
+    QSignalSpy coalesced(&notifier, &ch::Notifier::notificationCoalesced);
+
+    notifier.notify(QStringLiteral("A"), QStringLiteral("first"));
+    QCOMPARE(raised.count(), 1);
+
+    // A DISTINCT notification most of the way through the window: it is raised,
+    // and that raise restarts the clock.
+    QTest::qWait(90);
+    notifier.notify(QStringLiteral("A"), QStringLiteral("second"));
+    QCOMPARE(raised.count(), 2);
+
+    // Now past 120 ms since the FIRST raise but well inside 120 ms of the
+    // second, so the repeat must coalesce.
+    QTest::qWait(20);
+    notifier.notify(QStringLiteral("A"), QStringLiteral("second"));
+    QCOMPARE(raised.count(), 2);
+    QCOMPARE(coalesced.count(), 1);
 }
 
 // SPEC 6.2 end to end, over the ONE connection that makes the feature exist:

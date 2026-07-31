@@ -2,6 +2,9 @@ qt_add_executable(tst_viewers tst_viewers.cpp)
 
 target_link_libraries(tst_viewers PRIVATE
     ch_viewers
+    # QLocalServer/QLocalSocket: the local RPC harness that drives ViewerModel's
+    # file.readFile round trips without a server.
+    Qt6::Network
     Qt6::Test
 )
 

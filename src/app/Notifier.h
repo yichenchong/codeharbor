@@ -41,7 +41,9 @@ public:
 
     // True iff a notification backend was found at construction: compiled with
     // QtDBus, a session bus is connected, and org.freedesktop.Notifications is
-    // registered on it. Constant for the lifetime of the object.
+    // either already registered on it or is a name the bus knows how to start
+    // on demand (a D-Bus activatable service, which is how most desktops ship
+    // their notification daemon). Constant for the lifetime of the object.
     bool available() const { return m_available; }
 
     // Gate for the user-facing "notifications off" switch. Disabled notify()
@@ -66,12 +68,15 @@ signals:
 
 private:
     // Hands (title, body) to the backend. `replacesId` is 0 for a new bubble or
-    // a previously returned id to update in place. Returns the id the backend
-    // assigned, or 0 when there is no backend / the call failed.
+    // a previously returned id to update in place.
     //
-    // The backend answers asynchronously, so a NEW bubble's id is folded into
-    // m_lastId when the reply lands. That reply is only adopted while the raise
-    // it belongs to is still the tracked one — see m_raiseSerial.
+    // Returns `replacesId` straight back — NOT the id the backend assigned. The
+    // backend answers asynchronously, so no id exists yet when this returns;
+    // for a new bubble the caller therefore stores 0 and a repeat arriving
+    // before the reply is dropped rather than replaced. The real id is folded
+    // into m_lastId when the reply lands, and only while the raise it belongs
+    // to is still the tracked one — see m_raiseSerial. With no backend the
+    // return is 0 and nothing is sent.
     unsigned int deliver(const QString& title, const QString& body,
                          unsigned int replacesId);
 

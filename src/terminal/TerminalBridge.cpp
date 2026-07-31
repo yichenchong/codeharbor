@@ -18,8 +18,10 @@ TerminalBridge::TerminalBridge(TerminalController* controller, QObject* parent)
 
     // No renderer until the page mounts and calls ready(): everything the pane
     // produces until then belongs in the controller's rolling buffer, not in a
-    // signal nobody is connected to yet (SPEC 5.4).
-    m_controller->setViewVisible(false);
+    // signal nobody is connected to yet (SPEC 5.4). Routed through
+    // applyVisibility() rather than a bare setViewVisible(false) so there is
+    // exactly one place that decides the controller's visibility.
+    applyVisibility();
 }
 
 TerminalController* TerminalBridge::controller() const
@@ -89,8 +91,8 @@ void TerminalBridge::resize(int cols, int rows)
 
 void TerminalBridge::notifyViewVisible(bool visible)
 {
-    if (m_controller)
-        m_controller->setViewVisible(visible);
+    m_viewVisible = visible;
+    applyVisibility();
 }
 
 void TerminalBridge::ready()
@@ -99,10 +101,24 @@ void TerminalBridge::ready()
     if (!m_controller)
         return;
     // Re-announce the state a page that loaded late (or reloaded) missed, then
-    // release the buffer: setViewVisible(true) replays everything retained
-    // while the renderer was absent as one flushReady batch.
+    // release the buffer: becoming visible replays everything retained while
+    // the renderer was absent as one flushReady batch.
     emit connectionStateChanged(toString(m_controller->state()));
-    m_controller->setViewVisible(true);
+    // The handshake IS a visibility report: the page says it has mounted and
+    // wired up host.write(). It has to reset m_viewVisible rather than merely
+    // re-apply it, because the PREVIOUS page reported hidden on its way out
+    // (TerminalHost.dispose() in src/web/terminal/src/index.ts), and a reload
+    // would otherwise leave the pane retaining output forever behind a page
+    // that is very much on screen. The page's own observers correct this within
+    // a frame if the pane really is hidden.
+    m_viewVisible = true;
+    applyVisibility();
+}
+
+void TerminalBridge::applyVisibility()
+{
+    if (m_controller)
+        m_controller->setViewVisible(m_viewVisible && m_rendererReady);
 }
 
 void TerminalBridge::onFlushReady(const QByteArray& batch)

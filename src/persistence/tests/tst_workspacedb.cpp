@@ -81,6 +81,11 @@ private slots:
     void getLayoutMalformedTreeDeliversNullopt();
     void listSkipsNonObjectEntries();
     void schemaVersionMatchesTheRemoteSchema();
+    void malformedResultsDeliverRpcErrorInsteadOfBlankRecords();
+    void deleteSessionSerializesIdAndForwardsOutcome();
+    void reorderSessionsSerializesGroupIdAndIdArray();
+    void moveSessionToGroupSerializesParams();
+    void createTerminalPaneSerializesOptionalsAndParsesRecord();
     void liveCreateAndListOverProcess();
 
 private:
@@ -816,6 +821,299 @@ void TstWorkspaceDb::schemaVersionMatchesTheRemoteSchema()
     QVERIFY2(declared.hasMatch(),
              "workspace.ts no longer declares WORKSPACE_SCHEMA_VERSION as expected");
     QCOMPARE(declared.captured(1).toInt(), WorkspaceDb::kSchemaVersion);
+}
+
+// A response that carries no `error` still says nothing about the SHAPE of its
+// result. QJsonValue::toObject()/toArray() turn anything of the wrong kind into
+// an EMPTY object/array, and the parse helpers map an empty object to a
+// fully-DEFAULT record whose id is "". Handing that to the caller as a SUCCESS
+// is what puts a nameless, empty-id group into the sidebar and into every
+// id-keyed map built from it. Every workspace method must instead report the
+// wrong-kind result as a failure. getLayout is the single exception: JSON null
+// is its documented "no layout here", so null stays a success with no layout,
+// while a non-null non-object is still a failure.
+void TstWorkspaceDb::malformedResultsDeliverRpcErrorInsteadOfBlankRecords()
+{
+    makePair();
+
+    // Answer the next request with `result`, then report what the callback saw.
+    const auto respond = [&](const QJsonValue& result) {
+        const QJsonObject req = readRequest();
+        m_serverSide->write(jsonLine({{"jsonrpc", "2.0"},
+                                      {"id", req.value(QStringLiteral("id")).toInt()},
+                                      {"result", result}}));
+        m_serverSide->flush();
+    };
+
+    // A record method (createGroup) answered with an array instead of an object.
+    std::optional<Group> group;
+    std::optional<RpcError> groupErr;
+    bool groupFired = false;
+    m_db->createGroup(
+        CreateGroupParams{.serverId = ServerId{QStringLiteral("srv-1")},
+                          .name = QStringLiteral("Beta")},
+        [&](std::optional<Group> g, std::optional<RpcError> e) {
+            group = g;
+            groupErr = e;
+            groupFired = true;
+        });
+    respond(QJsonArray{});
+    QTRY_VERIFY(groupFired);
+    QVERIFY(!group.has_value()); // never a blank Group with an empty id
+    QVERIFY(groupErr.has_value());
+    QCOMPARE(groupErr->code, -32603); // JSON-RPC reserved "internal error"
+    QVERIFY(groupErr->message.contains(QStringLiteral("workspace.createGroup")));
+
+    // The same for a record method answered with JSON null.
+    std::optional<ch::TerminalPane> pane;
+    std::optional<RpcError> paneErr;
+    bool paneFired = false;
+    m_db->createTerminalPane(
+        ch::CreateTerminalPaneParams{.serverId = ServerId{QStringLiteral("srv-1")},
+                                     .devSessionId = ch::DevSessionId{QStringLiteral("s1")},
+                                     .name = QStringLiteral("sh")},
+        [&](std::optional<ch::TerminalPane> p, std::optional<RpcError> e) {
+            pane = p;
+            paneErr = e;
+            paneFired = true;
+        });
+    respond(QJsonValue(QJsonValue::Null));
+    QTRY_VERIFY(paneFired);
+    QVERIFY(!pane.has_value());
+    QVERIFY(paneErr.has_value());
+
+    // list() answered with an object instead of an array: an empty sidebar
+    // reported as a successful load is indistinguishable from a server that
+    // really has no groups, so it must fail instead.
+    QVector<GroupNode> listed;
+    std::optional<RpcError> listErr;
+    bool listFired = false;
+    m_db->list(ServerId{QStringLiteral("srv-1")},
+               [&](QVector<GroupNode> groups, std::optional<RpcError> e) {
+                   listed = groups;
+                   listErr = e;
+                   listFired = true;
+               });
+    respond(QJsonObject{{"nonsense", true}});
+    QTRY_VERIFY(listFired);
+    QVERIFY(listed.isEmpty());
+    QVERIFY(listErr.has_value());
+    QVERIFY(listErr->message.contains(QStringLiteral("workspace.list")));
+
+    // getLayout answered with a number: not the documented null, so a failure.
+    bool layoutFired = false;
+    bool hasLayout = true;
+    std::optional<RpcError> layoutErr;
+    m_db->getLayout(ch::DevSessionId{QStringLiteral("s1")}, ch::Region::Viewer,
+                    [&](std::optional<SplitNode> tree, std::optional<RpcError> e) {
+                        hasLayout = tree.has_value();
+                        layoutErr = e;
+                        layoutFired = true;
+                    });
+    respond(QJsonValue(7));
+    QTRY_VERIFY(layoutFired);
+    QVERIFY(!hasLayout);
+    QVERIFY(layoutErr.has_value());
+
+    // ...whereas null remains a plain "this region has no layout" success. (The
+    // same case as getLayoutNullDeliversNullopt, repeated here so the boundary
+    // between the two verdicts is asserted in one place.)
+    layoutFired = false;
+    hasLayout = true;
+    layoutErr.reset();
+    m_db->getLayout(ch::DevSessionId{QStringLiteral("s1")}, ch::Region::Viewer,
+                    [&](std::optional<SplitNode> tree, std::optional<RpcError> e) {
+                        hasLayout = tree.has_value();
+                        layoutErr = e;
+                        layoutFired = true;
+                    });
+    respond(QJsonValue(QJsonValue::Null));
+    QTRY_VERIFY(layoutFired);
+    QVERIFY(!hasLayout);
+    QVERIFY(!layoutErr.has_value());
+}
+
+// The delete methods discard the result entirely and report only success or
+// failure. Nothing covered one, so neither the parameter shape nor the fact that
+// a server error reaches the caller was pinned for this whole family.
+void TstWorkspaceDb::deleteSessionSerializesIdAndForwardsOutcome()
+{
+    makePair();
+
+    std::optional<RpcError> err;
+    bool fired = false;
+    m_db->deleteSession(ch::DevSessionId{QStringLiteral("s1")},
+                        [&](std::optional<RpcError> e) {
+                            err = e;
+                            fired = true;
+                        });
+
+    QJsonObject req = readRequest();
+    QCOMPARE(req.value(QStringLiteral("method")).toString(),
+             QString::fromLatin1(ch::rpc::kMethodWorkspaceDeleteSession));
+    QCOMPARE(req.value(QStringLiteral("params")).toObject()
+                 .value(QStringLiteral("id")).toString(),
+             QStringLiteral("s1"));
+
+    m_serverSide->write(jsonLine({{"jsonrpc", "2.0"},
+                                  {"id", req.value(QStringLiteral("id")).toInt()},
+                                  {"result", QJsonObject{{"ok", true}}}}));
+    m_serverSide->flush();
+    QTRY_VERIFY(fired);
+    QVERIFY(!err.has_value());
+
+    // A server-side failure is forwarded verbatim rather than swallowed.
+    err.reset();
+    fired = false;
+    m_db->deleteSession(ch::DevSessionId{QStringLiteral("gone")},
+                        [&](std::optional<RpcError> e) {
+                            err = e;
+                            fired = true;
+                        });
+    req = readRequest();
+    m_serverSide->write(jsonLine(
+        {{"jsonrpc", "2.0"},
+         {"id", req.value(QStringLiteral("id")).toInt()},
+         {"error", QJsonObject{{"code", -32602}, {"message", "no such session"}}}}));
+    m_serverSide->flush();
+    QTRY_VERIFY(fired);
+    QVERIFY(err.has_value());
+    QCOMPARE(err->code, -32602);
+    QCOMPARE(err->message, QStringLiteral("no such session"));
+}
+
+// reorderSessions is keyed by groupId, not serverId (unlike reorderGroups), and
+// the order of the id array IS the new sidebar order. Sending the wrong key or
+// losing the order silently reshuffles the user's sessions.
+void TstWorkspaceDb::reorderSessionsSerializesGroupIdAndIdArray()
+{
+    makePair();
+
+    bool fired = false;
+    m_db->reorderSessions(ch::GroupId{QStringLiteral("g1")},
+                          {ch::DevSessionId{QStringLiteral("s2")},
+                           ch::DevSessionId{QStringLiteral("s3")},
+                           ch::DevSessionId{QStringLiteral("s1")}},
+                          [&](std::optional<RpcError>) { fired = true; });
+
+    const QJsonObject req = readRequest();
+    QCOMPARE(req.value(QStringLiteral("method")).toString(),
+             QString::fromLatin1(ch::rpc::kMethodWorkspaceReorderSessions));
+    const QJsonObject params = req.value(QStringLiteral("params")).toObject();
+    QCOMPARE(params.value(QStringLiteral("groupId")).toString(), QStringLiteral("g1"));
+    QVERIFY(!params.contains(QStringLiteral("serverId")));
+    const QJsonArray ids = params.value(QStringLiteral("orderedIds")).toArray();
+    QCOMPARE(ids.size(), 3);
+    QCOMPARE(ids.at(0).toString(), QStringLiteral("s2"));
+    QCOMPARE(ids.at(1).toString(), QStringLiteral("s3"));
+    QCOMPARE(ids.at(2).toString(), QStringLiteral("s1"));
+
+    m_serverSide->write(jsonLine({{"jsonrpc", "2.0"},
+                                  {"id", req.value(QStringLiteral("id")).toInt()},
+                                  {"result", QJsonObject{{"ok", true}}}}));
+    m_serverSide->flush();
+    QTRY_VERIFY(fired);
+}
+
+// moveSessionToGroup carries the DESTINATION group id as a required field and an
+// optional insertion position, and answers with the moved session. Untested.
+void TstWorkspaceDb::moveSessionToGroupSerializesParams()
+{
+    makePair();
+
+    std::optional<ch::DevSession> moved;
+    bool fired = false;
+    m_db->moveSessionToGroup(
+        ch::MoveSessionParams{.id = ch::DevSessionId{QStringLiteral("s1")},
+                              .groupId = ch::GroupId{QStringLiteral("g2")},
+                              .position = 0},
+        [&](std::optional<ch::DevSession> s, std::optional<RpcError>) {
+            moved = s;
+            fired = true;
+        });
+
+    const QJsonObject req = readRequest();
+    QCOMPARE(req.value(QStringLiteral("method")).toString(),
+             QString::fromLatin1(ch::rpc::kMethodWorkspaceMoveSessionToGroup));
+    const QJsonObject params = req.value(QStringLiteral("params")).toObject();
+    QCOMPARE(params.value(QStringLiteral("id")).toString(), QStringLiteral("s1"));
+    QCOMPARE(params.value(QStringLiteral("groupId")).toString(), QStringLiteral("g2"));
+    // position 0 is a SET optional and must survive: omission keys on has_value,
+    // not on the contained value, and 0 means "first" rather than "unspecified".
+    QVERIFY(params.contains(QStringLiteral("position")));
+    QCOMPARE(params.value(QStringLiteral("position")).toInt(), 0);
+
+    m_serverSide->write(jsonLine(
+        {{"jsonrpc", "2.0"},
+         {"id", req.value(QStringLiteral("id")).toInt()},
+         {"result", QJsonObject{{"id", "s1"}, {"serverId", "srv-1"},
+                                {"groupId", "g2"}, {"name", "S1"},
+                                {"repositoryRoot", "/r"}, {"position", 0},
+                                {"archived", false}}}}));
+    m_serverSide->flush();
+    QTRY_VERIFY(fired);
+    QVERIFY(moved.has_value());
+    QCOMPARE(moved->groupId.value, QStringLiteral("g2"));
+    QCOMPARE(moved->position, 0);
+}
+
+// The terminal-pane family has the widest optional set (working directory, tmux
+// target, startup command, harness) and none of it was covered: every unset
+// optional must be ABSENT on the wire so the server keeps its own default, and
+// the full record must decode back, including the tmux target that makes a
+// terminal reattach to the right remote session after a disconnect.
+void TstWorkspaceDb::createTerminalPaneSerializesOptionalsAndParsesRecord()
+{
+    makePair();
+
+    std::optional<ch::TerminalPane> created;
+    bool fired = false;
+    m_db->createTerminalPane(
+        ch::CreateTerminalPaneParams{
+            .serverId = ServerId{QStringLiteral("srv-1")},
+            .devSessionId = ch::DevSessionId{QStringLiteral("s1")},
+            .name = QStringLiteral("shell"),
+            .workingDirectory = QStringLiteral("/home/me/repo"),
+            .harness = QStringLiteral("oh-my-pi")},
+        [&](std::optional<ch::TerminalPane> p, std::optional<RpcError>) {
+            created = p;
+            fired = true;
+        });
+
+    const QJsonObject req = readRequest();
+    QCOMPARE(req.value(QStringLiteral("method")).toString(),
+             QString::fromLatin1(ch::rpc::kMethodWorkspaceCreateTerminalPane));
+    const QJsonObject params = req.value(QStringLiteral("params")).toObject();
+    QCOMPARE(params.value(QStringLiteral("serverId")).toString(), QStringLiteral("srv-1"));
+    QCOMPARE(params.value(QStringLiteral("devSessionId")).toString(), QStringLiteral("s1"));
+    QCOMPARE(params.value(QStringLiteral("name")).toString(), QStringLiteral("shell"));
+    QCOMPARE(params.value(QStringLiteral("workingDirectory")).toString(),
+             QStringLiteral("/home/me/repo"));
+    QCOMPARE(params.value(QStringLiteral("harness")).toString(),
+             QStringLiteral("oh-my-pi"));
+    QVERIFY(!params.contains(QStringLiteral("tmuxTarget")));
+    QVERIFY(!params.contains(QStringLiteral("startupCommand")));
+    QVERIFY(!params.contains(QStringLiteral("position")));
+
+    m_serverSide->write(jsonLine(
+        {{"jsonrpc", "2.0"},
+         {"id", req.value(QStringLiteral("id")).toInt()},
+         {"result", QJsonObject{{"id", "t9"}, {"serverId", "srv-1"},
+                                {"devSessionId", "s1"}, {"name", "shell"},
+                                {"workingDirectory", "/home/me/repo"},
+                                {"tmuxTarget", "ch_s1_t9"},
+                                {"startupCommand", QJsonValue(QJsonValue::Null)},
+                                {"harness", "oh-my-pi"}, {"position", 2}}}}));
+    m_serverSide->flush();
+    QTRY_VERIFY(fired);
+    QVERIFY(created.has_value());
+    QCOMPARE(created->id.value, QStringLiteral("t9"));
+    QCOMPARE(created->devSessionId.value, QStringLiteral("s1"));
+    QCOMPARE(created->tmuxTarget, QStringLiteral("ch_s1_t9"));
+    QCOMPARE(created->harness, QStringLiteral("oh-my-pi"));
+    QCOMPARE(created->position, 2);
+    // Documented narrowing: a null nullable-text column decodes to "".
+    QVERIFY(created->startupCommand.isEmpty());
 }
 
 QTEST_GUILESS_MAIN(TstWorkspaceDb)

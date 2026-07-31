@@ -604,14 +604,21 @@ void TstLiveEditor::cleanupTestCase()
 bool TstLiveEditor::startRemoteShell()
 {
     // ONE ssh channel carries every out-of-band command this gate runs, rather
-    // than one channel per command. That is not tidiness, it is a hard limit:
-    // sshd caps concurrent session channels per connection (MaxSessions, 10 by
-    // default) and this session already spends two of them on the RPC and
-    // bridge channels — and a finished exec channel does NOT give its slot back
-    // here, because SshChannelDevice::closeChannel() only sends the SSH close
-    // while ssh_channel_is_open() is still true, which it no longer is once the
-    // remote command has exited. A channel per command therefore wedges the
-    // whole session part-way through the run.
+    // than one channel per command.
+    //
+    // NOT because a finished channel would leak its slot — it does not.
+    // SshChannelDevice::closeChannel() hands the channel back to
+    // SshConnectionPool::releaseChannel(), which closes it only if it is still
+    // open but ALWAYS ssh_channel_free()s it, so the slot is reclaimed either
+    // way; src/ssh/tests/tst_livessh.cpp's manyShortLivedChannelsReuseTheirSlots
+    // runs 25 short-lived exec channels on one session to prove exactly that.
+    //
+    // The reasons are cost and headroom. Every command would otherwise pay a
+    // channel-open plus exec round trip, and this session already holds two of
+    // sshd's MaxSessions slots (10 by default) for the RPC and bridge channels
+    // for its whole life — commands here are issued while the page is live, so
+    // keeping a single long-lived helper leaves that budget alone instead of
+    // opening and closing a third channel dozens of times underneath it.
     //
     // `sh -s` reads its command stream from stdin and exits on EOF, so closing
     // the channel reaps it — the same stdin-driven lifetime

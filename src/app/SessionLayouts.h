@@ -1,6 +1,7 @@
 #pragma once
 
 #include "SplitTree.h"
+#include "UiStateStore.h"
 #include "WorkspaceDb.h"
 
 #include <QObject>
@@ -27,8 +28,8 @@ namespace ch {
 //     branch { "type": "split", "orientation": "horizontal"|"vertical",
 //              "children": [ ... ], "ratios": [ 1, 1 ] }
 // so QML consumes them directly as `node`. Every tree published to QML has been
-// through SplitNode::fromJson, so a malformed persisted or QML-authored tree can
-// never reach the regions: it is rejected with error() instead.
+// through SplitNode::tryFromJson, so a malformed persisted or QML-authored tree
+// can never reach the regions: it is rejected with error() instead.
 //
 // Both trees read as a NULL QVariant until a load resolves (and again while a
 // load for a different Dev Session is in flight). That is deliberate: the QML
@@ -66,9 +67,11 @@ class SessionLayouts : public QObject {
     Q_PROPERTY(QVariant terminalTree READ terminalTree NOTIFY terminalTreeChanged)
 
 public:
-    // `db` is borrowed (owned by AppController/main.cpp) and must outlive this
-    // object.
-    explicit SessionLayouts(WorkspaceDb* db, QObject* parent = nullptr);
+    // `db` and `uiState` are both borrowed (owned by AppController/main.cpp) and
+    // must outlive this object. `uiState` holds the persisted per-(Dev Session,
+    // region) pane-suffix counter splitPane() mints from.
+    explicit SessionLayouts(WorkspaceDb* db, UiStateStore* uiState,
+                            QObject* parent = nullptr);
 
     QString devSessionId() const { return m_devSessionId; }
     // Equivalent to load(id), skipped when the id is unchanged. Lets QML bind
@@ -108,9 +111,10 @@ public:
 
     // Split the leaf holding `paneId` into a branch of the given orientation
     // ("horizontal" | "vertical") with the original pane first and a new,
-    // equally sized pane second. Returns the new paneId ("<region>-<n>", n one
-    // past the highest existing "<region>-<n>" suffix in that region's tree),
-    // or an empty string when nothing was changed.
+    // equally sized pane second. Returns the new paneId ("<region>-<n>", n taken
+    // from the never-decreasing per-(Dev Session, region) counter in
+    // UiStateStore, so an id is never minted twice for one Dev Session), or an
+    // empty string when nothing was changed.
     //
     // Passing the empty paneId of the placeholder leaf an emptied region is
     // left with FILLS it in place instead of splitting it: that placeholder is
@@ -142,8 +146,10 @@ signals:
     // misuse (unknown region, unknown paneId, malformed tree/ratios).
     void error(QString message);
     // Both regions of the load for this Dev Session have resolved. Fires once
-    // per load, including when a region errored (error() reported that
-    // separately), so a consumer waiting on it can never hang.
+    // per load that actually issued requests, including when a region errored
+    // (error() reported that separately), so a consumer waiting on it can never
+    // hang. A load with an EMPTY id is a deselection: it fetches nothing and
+    // therefore reports nothing.
     void loaded(QString devSessionId);
 
 private:
@@ -156,6 +162,15 @@ private:
         SplitNode tree;      // meaningful only while `valid`
         bool valid = false;  // false -> the property reads as a null QVariant
         QVariant cache;      // tree.toJson().toVariantMap(), kept in lockstep
+        // A local edit has already replaced this region's tree since the
+        // in-flight load for it was issued, so that load's reply is history and
+        // must not be applied. Without it, a getLayout answer that crossed a
+        // saveTree/splitPane on the wire would silently revert the user's edit -
+        // or, when the server had no row yet, overwrite it with the region
+        // DEFAULT and persist that, destroying the edit on the server too.
+        // Cleared by load() (a deliberate reload must adopt the server's tree)
+        // and by clearTrees().
+        bool superseded = false;
     };
 
     // "viewer"/"terminal" -> kViewer/kTerminal; -1 (after emitting error) for
@@ -173,17 +188,17 @@ private:
     // at it, and reaching the second one meant finding "Split Terminal Pane" in
     // the command palette.
     //
-    // The pane ids stay "<region>-<n>" with n starting at 1, so splitPane()'s
-    // collectMaxPaneSuffix() hands out "terminal-3" next, and a Dev Session
-    // created before this change keeps the panes it already has (its layout row
-    // exists and is loaded verbatim).
+    // The pane ids stay "<region>-<n>" with n starting at 1, so the next id
+    // splitPane() hands out is "terminal-3" (reservePaneSuffix() sees both
+    // default panes), and a Dev Session created before this change keeps the
+    // panes it already has (its layout row exists and is loaded verbatim).
     static SplitNode defaultTree(int index);
 
     void applyLoadedTree(quint64 generation, int index,
                          std::optional<SplitNode> tree,
                          std::optional<RpcError> err);
-    // Store `tree` in the slot, refresh the variant cache, and emit the
-    // region's changed signal.
+    // Store `tree` in the slot, reserve the pane suffixes it carries, refresh
+    // the variant cache, and emit the region's changed signal.
     void setTree(int index, SplitNode tree);
     // Store without emitting - for edits QML already applied (see the signal
     // discipline note above).
@@ -197,8 +212,25 @@ private:
     // Write the slot's current tree back with workspace.setLayout. Only valid
     // after canEdit() returned true.
     void persist(int index);
+    // "viewer" / "terminal" for the region slot - both the pane-id prefix (with
+    // a "-" appended) and the per-region key half of the persisted counter.
+    static QString regionKey(int index);
+    // Burn every "<region>-<n>" suffix `tree` carries so none of them can ever
+    // be minted again for this Dev Session, and answer the next free one.
+    //
+    // Returns max(stored counter, highest suffix in `tree` + 1) and stores that
+    // when it moved. Consulting the TREE as well as the counter is what makes an
+    // existing Dev Session safe: one created before the counter existed, or one
+    // whose settings file was cleared, reads the default 1 and would otherwise
+    // mint an id its own layout is already showing. Consulting the COUNTER as
+    // well as the tree is what fixes the recycling bug: a closed pane is gone
+    // from the tree but its suffix stays burnt, so splitting again cannot re-mint
+    // the id that names its remote tmux session (see UiStateStore's comment) and
+    // silently re-attach the closed shell.
+    int reservePaneSuffix(int index, const SplitNode& tree);
 
     WorkspaceDb* m_db = nullptr;
+    UiStateStore* m_uiState = nullptr;
     QString m_devSessionId;
     QString m_serverId;
     RegionState m_regions[kRegionCount];

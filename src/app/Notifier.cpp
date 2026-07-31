@@ -34,10 +34,20 @@ Notifier::Notifier(QObject* parent)
     // no DBUS_SESSION_BUS_ADDRESS); isServiceRegistered() is false when a bus
     // exists but nothing implements the notification spec. Both are silent
     // queries: neither warns nor blocks on a missing daemon.
+    //
+    // A registered service is not the only healthy case. Most desktops ship
+    // their notification daemon as a D-Bus *activatable* service: it is not
+    // running until something calls it, and the bus starts it on demand. On a
+    // freshly logged-in session CodeHarbor is routinely the first caller, so
+    // isServiceRegistered() alone answered false and — because available() is
+    // fixed for the lifetime of the object — notifications stayed silently
+    // disabled for the whole run on a perfectly good desktop. Treat a name the
+    // bus knows how to start as available too; asyncCall() then activates it.
     const QDBusConnection bus = QDBusConnection::sessionBus();
     if (bus.isConnected()) {
         if (QDBusConnectionInterface* iface = bus.interface()) {
-            m_available = iface->isServiceRegistered(kService).value();
+            m_available = iface->isServiceRegistered(kService).value()
+                || iface->activatableServiceNames().value().contains(kService);
         }
     }
 #endif

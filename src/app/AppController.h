@@ -221,7 +221,13 @@ private:
     AgentStatusMonitor* m_agentMonitor = nullptr;
     // Per-pane editor factory (workstream E), not owned; set via
     // setEditorFactory. Receives the server's recovery directory on connect.
-    EditorFactory* m_editorFactory = nullptr;
+    //
+    // QPointer for the same reason as the connection spine below: main.cpp
+    // declares EditorFactory AFTER this controller, so it is destroyed BEFORE
+    // it, and the only dereference happens inside an async server.info callback
+    // that can in principle still be dispatched during teardown. A QPointer
+    // reads back null there instead of dangling.
+    QPointer<EditorFactory> m_editorFactory;
     // Cache of the most recent successful list() tree, so rebuildRows() can
     // re-derive rows (and re-merge agent state) without another server round-
     // trip when an agent event arrives.

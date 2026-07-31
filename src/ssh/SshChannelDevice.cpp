@@ -66,6 +66,17 @@ void SshChannelDevice::close()
     closeChannel();
 }
 
+bool SshChannelDevice::open(OpenMode mode)
+{
+    Q_UNUSED(mode);
+    // Refused on purpose; see the header. beginStreaming() opens the device
+    // through QIODevice::open() once a channel really exists.
+    setErrorString(
+        QStringLiteral("an SSH channel device is opened by startExec() or "
+                       "startPty(), not by open()"));
+    return false;
+}
+
 qint64 SshChannelDevice::readData(char* data, qint64 maxSize)
 {
     if (maxSize <= 0)
@@ -96,6 +107,12 @@ QString SshChannelDevice::lastError() const
     return QStringLiteral("unknown libssh error");
 }
 
+void SshChannelDevice::failWith(const QString& reason)
+{
+    setErrorString(reason);
+    emit channelError(reason);
+}
+
 void SshChannelDevice::abortStart(const QString& reason)
 {
 #if CH_HAVE_LIBSSH
@@ -109,7 +126,7 @@ void SshChannelDevice::abortStart(const QString& reason)
     }
     m_hasPty = false;
 #endif
-    emit channelError(reason);
+    failWith(reason);
 }
 
 #if !CH_HAVE_LIBSSH
@@ -117,7 +134,7 @@ void SshChannelDevice::abortStart(const QString& reason)
 bool SshChannelDevice::startExec(const QString& command)
 {
     Q_UNUSED(command);
-    emit channelError(QStringLiteral("built without libssh"));
+    failWith(QStringLiteral("built without libssh"));
     return false;
 }
 
@@ -128,7 +145,7 @@ bool SshChannelDevice::startPty(const QString& term, int cols, int rows,
     Q_UNUSED(cols);
     Q_UNUSED(rows);
     Q_UNUSED(command);
-    emit channelError(QStringLiteral("built without libssh"));
+    failWith(QStringLiteral("built without libssh"));
     return false;
 }
 
@@ -146,6 +163,14 @@ void SshChannelDevice::closeChannel()
     m_readBuffer.clear();
     if (isOpen())
         QIODevice::close();
+    // Same contract as the libssh build: the end of the read channel is
+    // reported exactly once. A consumer that keys its teardown on this signal
+    // (CodeharbordClient fails every pending call from it) must not behave
+    // differently just because the client was built without libssh.
+    if (!m_remoteFinished) {
+        m_remoteFinished = true;
+        emit readChannelFinished();
+    }
 }
 
 qint64 SshChannelDevice::writeData(const char* data, qint64 maxSize)
@@ -172,16 +197,16 @@ void SshChannelDevice::pump() {}
 bool SshChannelDevice::acquireChannel()
 {
     if (m_channel) {
-        emit channelError(QStringLiteral("channel already started"));
+        failWith(QStringLiteral("channel already started"));
         return false;
     }
     if (!m_pool) {
-        emit channelError(QStringLiteral("no SSH connection pool"));
+        failWith(QStringLiteral("no SSH connection pool"));
         return false;
     }
     m_channel = m_pool->openChannel(m_kind);
     if (!m_channel) {
-        emit channelError(QStringLiteral("could not open SSH channel"));
+        failWith(QStringLiteral("could not open SSH channel"));
         return false;
     }
     return true;
@@ -191,6 +216,9 @@ bool SshChannelDevice::beginStreaming()
 {
     m_readBuffer.clear();
     m_remoteFinished = false;
+    // A previous channel may have ended mid-character; the new channel's stderr
+    // must not inherit that half-decoded state.
+    m_stderrDecoder.resetState();
     // Unbuffered: QIODevice must not interpose a read buffer in front of our
     // own, and CodeharbordClient requires isOpen() && isWritable() before it
     // will emit a request.
@@ -220,6 +248,13 @@ bool SshChannelDevice::startPty(const QString& term, int cols, int rows,
 {
     if (!acquireChannel())
         return false;
+
+    // A terminal is at least one cell in each direction. A renderer can report
+    // 0 columns for one frame while its layout settles, and a 0-wide remote tty
+    // makes line-editing shells and full-screen programs draw nonsense until
+    // the next resize arrives.
+    cols = qMax(1, cols);
+    rows = qMax(1, rows);
 
     if (m_kind == SshConnectionPool::ChannelKind::Pty) {
         // openChannel(Pty) already issued ssh_channel_request_pty(); a second
@@ -260,7 +295,9 @@ bool SshChannelDevice::resizePty(int cols, int rows)
 {
     if (!m_channel || !m_hasPty)
         return false;
-    return ssh_channel_change_pty_size(m_channel, cols, rows) == SSH_OK;
+    // Same floor as startPty(): never push a zero-sized window to the remote.
+    return ssh_channel_change_pty_size(m_channel, qMax(1, cols), qMax(1, rows))
+           == SSH_OK;
 }
 
 void SshChannelDevice::closeChannel()
@@ -292,8 +329,10 @@ void SshChannelDevice::closeChannel()
 
 qint64 SshChannelDevice::writeData(const char* data, qint64 maxSize)
 {
-    if (!m_channel)
+    if (!m_channel) {
+        setErrorString(QStringLiteral("no SSH channel"));
         return -1;
+    }
     if (maxSize <= 0)
         return 0;
 
@@ -309,7 +348,10 @@ qint64 SshChannelDevice::writeData(const char* data, qint64 maxSize)
         const int n = ssh_channel_write(m_channel, data + written,
                                         static_cast<uint32_t>(chunk));
         if (n == SSH_ERROR) {
-            emit channelError(lastError());
+            // -1 without an errorString() is what QIODevice consumers see as
+            // "Unknown error"; failWith() records the libssh message so a
+            // generic reader/writer can report the real cause.
+            failWith(lastError());
             return -1;
         }
         if (n <= 0)
@@ -321,11 +363,17 @@ qint64 SshChannelDevice::writeData(const char* data, qint64 maxSize)
 
 void SshChannelDevice::pump()
 {
+    if (!m_channel)
+        return;
     // A slot reached from readyRead() may spin a nested event loop (QTRY_*,
     // QSignalSpy::wait); re-entering libssh from inside our own drain would
-    // reorder the stream.
-    if (m_pumping || !m_channel)
+    // reorder the stream. The timer is single-shot, so a swallowed tick MUST be
+    // re-armed or the read pump would be dead for good — silently, with the
+    // channel still open.
+    if (m_pumping) {
+        m_pump->start(kIdlePollMs);
         return;
+    }
     m_pumping = true;
 
     char chunk[kChunkBytes];
@@ -373,12 +421,19 @@ void SshChannelDevice::pump()
     if (m_channel && !eof && failure.isEmpty())
         m_pump->start(gotPayload || !stderrBytes.isEmpty() ? 0 : kIdlePollMs);
 
-    // Decode stderr once per pass rather than per read, so a multi-byte UTF-8
-    // sequence straddling a 16 KiB read boundary is not mangled.
-    if (!stderrBytes.isEmpty())
-        emit channelError(QString::fromUtf8(stderrBytes));
+    // Decode with the device's own stateful decoder, not QString::fromUtf8():
+    // stderr is a byte stream cut at arbitrary 16 KiB boundaries, and a
+    // multi-byte character split across two reads (or two pump passes) would
+    // otherwise become replacement characters at both ends of the seam.
+    if (!stderrBytes.isEmpty()) {
+        const QString text = m_stderrDecoder.decode(stderrBytes);
+        // A pass that carried nothing but the first half of one character has
+        // nothing to report yet.
+        if (!text.isEmpty())
+            emit channelError(text);
+    }
     if (!failure.isEmpty())
-        emit channelError(failure);
+        failWith(failure);
     if (gotPayload)
         emit readyRead();
 

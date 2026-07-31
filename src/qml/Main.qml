@@ -186,11 +186,25 @@ ApplicationWindow {
         // destroys and recreates its panes: a live terminal killed and a dirty
         // editor buffer dropped, for a node that did not actually change.
         ViewerRegion {
+            id: viewerRegion
+            objectName: "viewerRegion"
             node: (app.layouts && app.layouts.viewerTree)
                   ? app.layouts.viewerTree
                   : window.viewerFallbackNode
             SplitView.fillWidth: true
             SplitView.minimumWidth: 320
+            // The region header's own split/close buttons, and every pane's
+            // header close button, arrive here: a region cannot publish a tree,
+            // so it raises a REQUEST and the host runs the same command the
+            // palette does. Without these handlers those buttons are drawn,
+            // hovered, pressed — and do nothing at all.
+            onSplitRequested: (orientation) => window.splitActivePane("viewer", orientation)
+            onClosePaneRequested: (paneId) => window.closeRequestedPane("viewer", paneId)
+            // A divider INSIDE the region was dragged. Persisted per Dev Session
+            // (SPEC 4.5) so the proportions the user set survive a reopen; the
+            // regions already restore them.
+            onSplitRatiosAdjusted: (pathIndexes, ratios) =>
+                window.persistSplitRatios("viewer", pathIndexes, ratios)
             // The region reports the pane the user last interacted with; record
             // it so pane commands act on THAT pane instead of the region's first
             // leaf. The empty value is deliberately NOT filtered: a focused pane
@@ -211,6 +225,7 @@ ApplicationWindow {
 
         TerminalRegion {
             id: terminalRegion
+            objectName: "terminalRegion"
             node: (app.layouts && app.layouts.terminalTree)
                   ? app.layouts.terminalTree
                   : window.terminalFallbackNode
@@ -221,6 +236,12 @@ ApplicationWindow {
             onFocusedPaneIdChanged: if (app.uiState && app.activeSessionId.length > 0)
                                         app.uiState.setSelectedPane(app.activeSessionId,
                                                                     focusedPaneId)
+            onSplitRequested: (orientation) => window.splitActivePane("terminal", orientation)
+            onClosePaneRequested: (paneId) => window.closeRequestedPane("terminal", paneId)
+            // Destructive, and the only route to it besides the palette command.
+            onKillTerminalRequested: window.killActiveTerminal()
+            onSplitRatiosAdjusted: (pathIndexes, ratios) =>
+                window.persistSplitRatios("terminal", pathIndexes, ratios)
         }
     }
 
@@ -285,6 +306,7 @@ ApplicationWindow {
     // visible instead of silently swallowed.
     Rectangle {
         id: errorBanner
+        objectName: "shellErrorBanner"
         z: 1000
         visible: opacity > 0
         opacity: 0
@@ -300,8 +322,18 @@ ApplicationWindow {
 
         Label {
             id: errorLabel
+            objectName: "shellErrorLabel"
             anchors.centerIn: parent
             width: parent.width - 32
+            // SECURITY: a Label defaults to Text.AutoText, which promotes any
+            // string that merely LOOKS like markup to StyledText — and
+            // StyledText fetches <img src="http://..."> and turns <a href> into
+            // a live link. What lands here is app.error / SessionLayouts.error,
+            // i.e. RPC and libssh failure text forwarded VERBATIM from the
+            // server (SPEC 10.3), so a hostile server must not be able to turn
+            // this toast into a network callback. Same rule as every other
+            // server-fed Label in this module.
+            textFormat: Text.PlainText
             color: Theme.textOnAccent
             font.pixelSize: Theme.fontSizeLabel
             wrapMode: Text.WordWrap
@@ -529,6 +561,36 @@ ApplicationWindow {
         app.layouts.closePane(region, window.targetPaneId(region));
     }
 
+    // Close the pane a REGION asked about. A pane's own header close button names
+    // itself, and that name wins: the user pressed the button on THAT pane, which
+    // is not necessarily the pane the region last reported as focused (the button
+    // reports focus first, but a pane whose id is empty cannot).
+    //
+    // An empty paneId is the region header's "whichever pane you would pick
+    // anyway", and it is also what the placeholder leaf of an emptied region
+    // reports; both are served correctly by falling back to the focused/first
+    // pane, which for a tree holding only the placeholder IS that placeholder.
+    function closeRequestedPane(region, paneId) {
+        if (!app.layouts || app.activeSessionId.length === 0) {
+            window.notifyUser(qsTr("Select a Dev Session before closing a pane."));
+            return;
+        }
+        if (paneId.length === 0) {
+            window.closeActivePane(region);
+            return;
+        }
+        app.layouts.closePane(region, paneId);
+    }
+
+    // Persist the split proportions a drag inside a region produced (SPEC 4.5).
+    // setRatios is deliberately quiet — it does NOT re-publish the tree — so
+    // recording a drag cannot rebuild the panes the drag just resized.
+    function persistSplitRatios(region, pathIndexes, ratios) {
+        if (!app.layouts || app.activeSessionId.length === 0)
+            return;
+        app.layouts.setRatios(region, pathIndexes, ratios);
+    }
+
     // End the focused terminal's REMOTE tmux session. Closing or detaching a pane
     // deliberately leaves the remote shell running - that is what tmux is for - so
     // this is the only way to actually stop it, and it is destructive.
@@ -543,8 +605,19 @@ ApplicationWindow {
             window.notifyUser(qsTr("No live terminal pane to kill."));
             return;
         }
-        pane.killSession();
-        window.notifyUser(qsTr("Killed the remote tmux session for \"%1\".").arg(paneId));
+        // killSession() reports whether the kill actually reached the server: it
+        // deliberately refuses (and keeps the remote session alive) when there is
+        // no SSH connection, so announcing success unconditionally — which this
+        // used to do — told the user their processes were gone while they were
+        // still running. The pane's own sentence is the better message in that
+        // case, because it names the session that survived.
+        if (pane.killSession()) {
+            window.notifyUser(qsTr("Killed the remote tmux session for \"%1\".").arg(paneId));
+        } else {
+            window.notifyUser(pane.statusText.length > 0
+                              ? pane.statusText
+                              : qsTr("Could not kill the remote session for \"%1\".").arg(paneId));
+        }
     }
 
     readonly property var paletteCommands: [
@@ -552,7 +625,11 @@ ApplicationWindow {
           invoke: () => { connectSheet.shown = true; } },
         { id: "server.disconnect", title: qsTr("Disconnect from Server"),
           invoke: () => app.disconnectServer() },
-        { id: "session.refresh", title: qsTr("Refresh Workspace"), shortcut: "Ctrl+R",
+        // Ctrl+Shift+R, not Ctrl+R: a global Shortcut is matched before the key
+        // reaches the focused item, and Ctrl+R is reverse-history-search in every
+        // shell a terminal pane hosts (and reload in a WebEngineView). Same rule
+        // as Ctrl+Shift+W below.
+        { id: "session.refresh", title: qsTr("Refresh Workspace"), shortcut: "Ctrl+Shift+R",
           invoke: () => app.refresh() },
         { id: "viewer.split.h", title: qsTr("Split Viewer Pane Horizontally"),
           invoke: () => window.splitActivePane("viewer", "horizontal") },

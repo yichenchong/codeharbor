@@ -23,6 +23,14 @@ endif()
 
 option(CODEHARBOR_BUILD_TESTS "Build C++ unit tests" ON)
 
+# Escape hatch used by src/qml/CMakeLists.txt: build a client whose editor and
+# terminal panes have no page to load. Declared here as a real option (rather
+# than only being read where it is used) so it shows up in `cmake -LH`, ccmake
+# and the IDE preset UIs - README.md and docs/DEVELOPMENT.md both advertise it,
+# and an undeclared cache variable is invisible in every one of those places.
+option(CODEHARBOR_SKIP_WEB_BUNDLE
+       "Do not embed the Monaco/xterm.js bundles (produces an unshippable client)" OFF)
+
 # Qt 6.9+ is required: QQuickWebEngineProfile's (storageName, parent) constructor
 # arrived in 6.9, and it is the only profile-creation form that does not emit the
 # "use WebEngineProfilePrototype" deprecation warning that tst_qmlload treats as a

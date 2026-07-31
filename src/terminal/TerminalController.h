@@ -30,6 +30,14 @@ public:
     // Rolling buffer retained while the view is hidden (SPEC 5.4/5.5); oldest
     // bytes are evicted past this cap and tmux history covers anything older.
     static constexpr int kHiddenBufferMaxBytes = 2 * 1024 * 1024; // 2 MiB
+    // How far past the raw eviction point appendHidden() may look for a point
+    // it can safely resume the replay from (a line feed, else a UTF-8 character
+    // boundary), so the retained buffer never starts inside a multi-byte
+    // character or an escape sequence. Bounded so the scan stays cheap and so a
+    // pathological stream with no line feed at all still evicts something.
+    // 4 KiB is a couple of full-width terminal lines: far more than any escape
+    // sequence, far less than the buffer it trims.
+    static constexpr int kHiddenResyncWindowBytes = 4 * 1024;
     // Upper bound on the SILENT part of an attach (SPEC 5.6). A pane leaves
     // OpeningChannel/AttachingTmux when the remote PTY produces its first bytes
     // — that is what "tmux has drawn itself" looks like from this side, and it is

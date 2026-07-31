@@ -10,6 +10,14 @@ on:
 permissions:
   contents: read
 
+# A PR that is pushed to repeatedly would otherwise keep several full Qt +
+# WebEngine builds running against superseded commits. Supersede them instead.
+# Pushes to `main` are NOT cancelled: the windows-vcpkg-cache job below only
+# runs there, and cancelling it would leave the shared dependency cache cold.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   remote:
     name: remote (node)
@@ -19,10 +27,21 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "24"
+      # BEFORE npm ci: `npm ci` rewrites a workspace package.json's own
+      # `version` field to whatever package-lock.json says, so running this
+      # afterwards would be reading a manifest npm had already "corrected".
+      - name: Versions agree across CMakeLists, manifests and the lock
+        # package-lock.json records the version of the root package and of every
+        # workspace, and nothing updates it automatically, so it silently drifted
+        # a full release behind the manifests (lock 0.1.7 vs manifests 0.1.8).
+        # `npm ci` does not complain - it just installs the stale version, which
+        # then ships inside the released remote tarball's package.json.
+        run: node .github/scripts/check-versions.mjs
       - name: Install remote workspace deps
         working-directory: remote
-        # npm ci installs exactly what package-lock.json records; it requires an
-        # up-to-date lock file (fails if the manifests and lock have drifted).
+        # npm ci installs exactly what package-lock.json records, and fails if
+        # the lock cannot satisfy the manifests' DEPENDENCY ranges. It does NOT
+        # police the `version` fields - that is the step above.
         run: npm ci
       - name: Typecheck
         working-directory: remote
@@ -48,9 +67,14 @@ jobs:
           echo "vcpkg=$env:VCPKG_INSTALLATION_ROOT" >> $env:GITHUB_OUTPUT
           $pin = (Get-Content packaging/vcpkg-ports/libssh/vcpkg.json | ConvertFrom-Json).version
           echo "libssh=$pin" >> $env:GITHUB_OUTPUT
+      # cache/restore, NOT the combined `actions/cache` action: the combined one
+      # registers its own post-job save under the same key, which then races the
+      # explicit save step below and logs a "cache already exists" failure. The
+      # explicit save is the one we want, because it runs as soon as the build
+      # succeeds rather than at the very end of the job.
       - name: Restore vcpkg libssh cache
         id: vcpkg_cache
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: ${{ steps.imgver.outputs.vcpkg }}\installed
           key: vcpkg-libssh-${{ steps.imgver.outputs.libssh }}-x64-windows-${{ steps.imgver.outputs.v }}
@@ -125,7 +149,13 @@ jobs:
       # editor and terminal packages; a type error here fails CI before configure.
       - name: Typecheck web bundles
         run: npm run typecheck
-      - name: Configure + build + test (release tree)
+      # The web bundles ship real logic (Monaco language selection, unsaved-work
+      # snapshots, terminal visibility) with node --test suites next to them.
+      # Nothing ran them before: the `remote` job only tests remote/, and this
+      # job only type-checked. A regression in either bundle reached a release.
+      - name: Test web bundles
+        run: npm test --workspace src/web/terminal --workspace src/web/editor
+      - name: Configure (release preset, tests on)
         run: cmake --preset release-tests
       - name: Build
         run: cmake --build --preset release-tests

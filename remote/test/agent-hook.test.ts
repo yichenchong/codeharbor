@@ -15,7 +15,12 @@ import {
 import { FallbackActivityDetector } from "../src/adapters/fallback.ts";
 import { PassThrough } from "node:stream";
 import { resolveSocketPath, type AgentEvent } from "../src/events.ts";
-import { processBridgeLine, startBridge, makeStreamSink } from "../src/bridge.ts";
+import {
+    processBridgeLine,
+    startBridge,
+    makeStreamSink,
+    MAX_BRIDGE_LINE_BYTES,
+} from "../src/bridge.ts";
 
 test("toBridgeMessage wraps the raw native event without mapping", () => {
     const message = toBridgeMessage({
@@ -353,37 +358,144 @@ test("startBridge unlinks a stale socket left by a dead bridge (RR12)", async ()
     }
 });
 
+// A stand-in for a producer socket that records the three things the sink does
+// to one: pause it, resume it, and subscribe to its 'close' so a producer that
+// disconnects mid-stall can be forgotten.
+function fakeSource(): {
+    socket: net.Socket;
+    paused: boolean;
+    pauses: number;
+    resumes: number;
+    close: () => void;
+} {
+    const state = {
+        paused: false,
+        pauses: 0,
+        resumes: 0,
+        close: (): void => {},
+        socket: undefined as unknown as net.Socket,
+    };
+    state.socket = {
+        pause() {
+            state.paused = true;
+            state.pauses += 1;
+        },
+        resume() {
+            state.paused = false;
+            state.resumes += 1;
+        },
+        once(event: string, handler: () => void) {
+            if (event === "close") state.close = handler;
+        },
+    } as unknown as net.Socket;
+    return state;
+}
+
+const RELAY_EVENT = {
+    harness: "oh-my-pi",
+    state: "running",
+    event: "agent_start",
+    devSessionId: "s",
+    terminalId: "t",
+} as unknown as AgentEvent;
+
 test("makeStreamSink pauses the source on a full buffer and resumes on drain (RR24)", async () => {
     // A tiny highWaterMark forces write() to report a full buffer on the first
     // event; nothing consumes the readable side until we resume it below.
     const out = new PassThrough({ highWaterMark: 1 });
     const sink = makeStreamSink(out);
-    let paused = false;
-    const fakeSource = {
-        pause() {
-            paused = true;
-        },
-        resume() {
-            paused = false;
-        },
-    } as unknown as net.Socket;
-    const event = {
-        harness: "oh-my-pi",
-        state: "running",
-        event: "agent_start",
-        devSessionId: "s",
-        terminalId: "t",
-    } as unknown as AgentEvent;
+    const source = fakeSource();
 
     // Write until the output buffer is full: the sink must then pause the source.
     let guard = 0;
-    while (!paused && guard++ < 10) sink(event, fakeSource);
-    assert.equal(paused, true, "a full output buffer must pause the source");
+    while (!source.paused && guard++ < 10) sink(RELAY_EVENT, source.socket);
+    assert.equal(source.paused, true, "a full output buffer must pause the source");
+
+    // Further events while still stalled must not re-pause an already paused
+    // producer (and must not re-subscribe to its 'close').
+    const pausesAfterFirst = source.pauses;
+    sink(RELAY_EVENT, source.socket);
+    assert.equal(source.pauses, pausesAfterFirst, "an already paused source is not paused again");
 
     // Draining the output (consume the readable side) must resume the source.
     const drained = Promise.withResolvers<void>();
     out.on("drain", () => drained.resolve());
     out.resume();
     await drained.promise;
-    assert.equal(paused, false, "the source must resume once the output drains");
+    assert.equal(source.paused, false, "the source must resume once the output drains");
+});
+
+// A producer that disconnects while the output is still stalled must be
+// forgotten. Otherwise the sink holds a reference to every socket paused since
+// the last drain — and when the consumer at the far end of the SSH channel
+// never drains again, which is exactly why they were paused, that set is never
+// released for the lifetime of the bridge.
+test("makeStreamSink forgets a source that disconnects while the output is stalled", async () => {
+    const out = new PassThrough({ highWaterMark: 1 });
+    const sink = makeStreamSink(out);
+    const source = fakeSource();
+
+    let guard = 0;
+    while (!source.paused && guard++ < 10) sink(RELAY_EVENT, source.socket);
+    assert.equal(source.paused, true, "a full output buffer must pause the source");
+
+    // The producer goes away before the output ever drains.
+    source.close();
+
+    const drained = Promise.withResolvers<void>();
+    out.on("drain", () => drained.resolve());
+    out.resume();
+    await drained.promise;
+    assert.equal(source.resumes, 0, "a disconnected source must not be resumed");
+});
+
+// readline has no maximum line length, so a producer that streams bytes and
+// never sends a newline used to grow the bridge's memory until the process
+// died — taking every other harness's status reporting down with it. The
+// connection must be dropped instead, and a well-formed producer on another
+// connection must keep working.
+test("startBridge drops a producer that never sends a newline", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ch-bridge-cap-"));
+    const socketPath = path.join(dir, "bridge.sock");
+    // Await the relayed event itself rather than polling: the sink IS the
+    // signal that the bridge finished processing the good producer's line.
+    const relayed = Promise.withResolvers<AgentEvent>();
+    const server = await startBridge(socketPath, (event) => relayed.resolve(event));
+    try {
+        const flood = net.createConnection(socketPath);
+        const floodClosed = Promise.withResolvers<void>();
+        const floodUp = Promise.withResolvers<void>();
+        flood.on("close", () => floodClosed.resolve());
+        // The server destroys the connection mid-write, which surfaces as
+        // EPIPE/ECONNRESET on this end. That IS the expected outcome here.
+        flood.on("error", () => {});
+        flood.once("connect", () => floodUp.resolve());
+        await floodUp.promise;
+        // Twice the cap with no newline at all.
+        const junk = Buffer.alloc(256 * 1024, 0x61);
+        for (let sent = 0; sent < MAX_BRIDGE_LINE_BYTES * 2; sent += junk.length) {
+            flood.write(junk);
+        }
+        await floodClosed.promise;
+
+        // The server survived and still serves a well-behaved producer.
+        const good = net.createConnection(socketPath);
+        const goodUp = Promise.withResolvers<void>();
+        good.once("connect", () => goodUp.resolve());
+        await goodUp.promise;
+        good.end(
+            `${JSON.stringify({
+                harness: "oh-my-pi",
+                devSessionId: "s1",
+                terminalId: "t1",
+                native: { type: "agent_start" },
+            })}\n`,
+        );
+        assert.equal((await relayed.promise).state, "running");
+    } finally {
+        const closed = Promise.withResolvers<void>();
+        server.close(() => closed.resolve());
+        await closed.promise;
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
 });

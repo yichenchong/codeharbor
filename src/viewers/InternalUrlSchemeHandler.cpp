@@ -197,7 +197,14 @@ void InternalUrlSchemeHandler::requestStarted(QWebEngineUrlRequestJob *job)
         id = id.mid(1);
 
     const QUrl fileUrl = m_map->fileUrlForId(id);
-    if (!fileUrl.isValid()) {
+    // Every id must stand for a REMOTE FILE. The map itself accepts any QUrl,
+    // so this is the one place that pins the invariant: without it an id minted
+    // for, say, an http URL would be turned into a server path below and read
+    // off the remote filesystem — an attacker-chosen path smuggled in through a
+    // URL the app was merely asked to display.
+    if (!fileUrl.isValid()
+        || fileUrl.scheme().compare(QLatin1String("file"), Qt::CaseInsensitive)
+               != 0) {
         job->fail(QWebEngineUrlRequestJob::UrlNotFound);
         return;
     }
@@ -210,6 +217,12 @@ void InternalUrlSchemeHandler::requestStarted(QWebEngineUrlRequestJob *job)
     // Remote path for the read: a remote file:// URL's path is the server path.
     const QString localPath = fileUrl.toLocalFile();
     const QString path = localPath.isEmpty() ? fileUrl.path() : localPath;
+    if (path.isEmpty()) {
+        // A file URL with no path at all names nothing on the server; asking
+        // the file service to read "" would only produce a confusing error.
+        job->fail(QWebEngineUrlRequestJob::UrlNotFound);
+        return;
+    }
 
     // Guard against the job being destroyed before the async reply arrives.
     QPointer<QWebEngineUrlRequestJob> guard(job);

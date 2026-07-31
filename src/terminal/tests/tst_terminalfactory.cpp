@@ -61,6 +61,9 @@ private slots:
     void bridgeExposesNoRemoteTargetingSlots();
     void bridgeForwardsInputResizeAndVisibility();
     void bridgeHoldsOutputUntilTheRendererIsReady();
+    void bridgeIgnoresAVisibleReportFromAPaneWithNoRenderer();
+    void bridgeRetainsOutputForAHiddenPaneAndAcrossAPageReload();
+    void bridgeIsInertOnceItsControllerIsDestroyed();
     void bridgeDecodesUtf8SplitAcrossFlushes();
     void bridgeReportsStateTransitionsAsStrings();
     void bridgeClearIsAViewOnlyRequest();
@@ -448,6 +451,119 @@ void TstTerminalFactory::bridgeHoldsOutputUntilTheRendererIsReady()
     controller->ingestOutput(QByteArrayLiteral("live"));
     QTRY_COMPARE(writes.count(), 2);
     QCOMPARE(writes.at(1).at(0).toString(), QStringLiteral("live"));
+}
+
+// "The controller may emit output" means "a renderer is listening to write()",
+// and only the mount handshake proves that. The QML pane
+// (src/qml/TerminalPaneView.qml onVisibleChanged) reports the ITEM's
+// visibility, and it can speak long before Chromium has finished loading the
+// bundle — a pane hidden by a Dev Session switch and shown again while the page
+// is still loading reports "visible" with no renderer behind it. Taking that at
+// face value emits the whole first screenful tmux drew at a page that has no
+// handler attached yet, and those bytes are gone: they are not in the rolling
+// buffer either, because the controller already handed them over. The user is
+// left staring at a blank terminal until they press a key.
+void TstTerminalFactory::bridgeIgnoresAVisibleReportFromAPaneWithNoRenderer()
+{
+    QObject pane;
+    TerminalFactory factory(nullptr);
+    TerminalController* controller = factory.create(&pane);
+    TerminalBridge* bridge = factory.createBridge(controller, &pane);
+    QSignalSpy writes(bridge, &TerminalBridge::write);
+
+    QVERIFY(!bridge->rendererReady());
+    bridge->notifyViewVisible(false);
+    bridge->notifyViewVisible(true);
+    QVERIFY(!controller->viewVisible());
+
+    controller->ingestOutput(QByteArrayLiteral("first screenful"));
+    QTRY_COMPARE(controller->hiddenBuffer(), QByteArrayLiteral("first screenful"));
+    QCOMPARE(writes.count(), 0);
+
+    // The handshake is the only thing that may release the buffer.
+    bridge->ready();
+    QVERIFY(controller->viewVisible());
+    QCOMPARE(writes.count(), 1);
+    QCOMPARE(writes.at(0).at(0).toString(), QStringLiteral("first screenful"));
+}
+
+// The other side of the same rule, in the two shapes production produces:
+// a pane the user hid, and a page that reloaded under a pane that never moved.
+void TstTerminalFactory::bridgeRetainsOutputForAHiddenPaneAndAcrossAPageReload()
+{
+    QObject pane;
+    TerminalFactory factory(nullptr);
+    TerminalController* controller = factory.create(&pane);
+    TerminalBridge* bridge = factory.createBridge(controller, &pane);
+    bridge->ready();
+    QVERIFY(controller->viewVisible());
+    QSignalSpy writes(bridge, &TerminalBridge::write);
+
+    // (1) A mounted renderer that is not on screen: retain, then replay once.
+    bridge->notifyViewVisible(false);
+    QVERIFY(!controller->viewVisible());
+    controller->ingestOutput(QByteArrayLiteral("while hidden"));
+    QTRY_COMPARE(controller->hiddenBuffer(), QByteArrayLiteral("while hidden"));
+    QCOMPARE(writes.count(), 0);
+
+    bridge->notifyViewVisible(true);
+    QCOMPARE(writes.count(), 1);
+    QCOMPARE(writes.at(0).at(0).toString(), QStringLiteral("while hidden"));
+
+    // (2) A reload. The outgoing document reports hidden on its way out
+    // (TerminalHost.dispose() in src/web/terminal/src/index.ts) and the fresh
+    // one announces itself with ready(). The handshake must OVERRIDE the
+    // outgoing page's last word, or the pane would retain output forever behind
+    // a renderer that is plainly on screen.
+    bridge->notifyViewVisible(false);
+    controller->ingestOutput(QByteArrayLiteral("across the reload"));
+    QTRY_COMPARE(controller->hiddenBuffer(), QByteArrayLiteral("across the reload"));
+    QCOMPARE(writes.count(), 1);
+
+    bridge->ready();
+    QVERIFY(controller->viewVisible());
+    QCOMPARE(writes.count(), 2);
+    QCOMPARE(writes.at(1).at(0).toString(), QStringLiteral("across the reload"));
+}
+
+// The bridge holds its controller weakly because the two can be destroyed in
+// either order. Everything the PAGE can call is reachable for as long as the
+// WebChannel object lives, so each entry point has to be inert rather than a
+// crash once the controller is gone.
+void TstTerminalFactory::bridgeIsInertOnceItsControllerIsDestroyed()
+{
+    TerminalFactory factory(nullptr);
+    QObject pane;
+    // A separate owner, so the controller can die while the bridge lives.
+    auto* controllerOwner = new QObject;
+    TerminalController* controller = factory.create(controllerOwner);
+    TerminalBridge* bridge = factory.createBridge(controller, &pane);
+    QCOMPARE(bridge->controller(), controller);
+
+    delete controllerOwner;
+    QVERIFY(bridge->controller() == nullptr);
+
+    QSignalSpy writes(bridge, &TerminalBridge::write);
+    QSignalSpy states(bridge, &TerminalBridge::connectionStateChanged);
+    QSignalSpy geometry(bridge, &TerminalBridge::geometryChanged);
+    QSignalSpy cleared(bridge, &TerminalBridge::clearRequested);
+
+    bridge->sendInput(QStringLiteral("ls\n"));
+    bridge->resize(120, 40);
+    bridge->notifyViewVisible(false);
+    bridge->notifyViewVisible(true);
+    bridge->ready();
+    bridge->requestClear();
+
+    QCOMPARE(bridge->columns(), 0);
+    QCOMPARE(bridge->rows(), 0);
+    QCOMPARE(bridge->connectionState(), toString(TerminalState::Unloaded));
+    QCOMPARE(writes.count(), 0);
+    // Nothing to report a transition for, and no geometry was recorded.
+    QCOMPARE(states.count(), 0);
+    QCOMPARE(geometry.count(), 0);
+    // requestClear() is a pure view operation and needs no controller at all.
+    QCOMPARE(cleared.count(), 1);
 }
 
 // The controller flushes on byte thresholds (SPEC 5.5) and will split a

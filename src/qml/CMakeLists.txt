@@ -81,7 +81,25 @@ function(codeharbor_embed_web_bundle)
     # Inputs the bundle is built FROM. Tracking these (not just the output) is
     # what makes the embedded copy honest: editing the sources re-triggers
     # configure, which rebuilds a stale bundle before it is embedded.
-    file(GLOB_RECURSE _chb_inputs ${_chb_src}/src/*.ts)
+    #
+    # CONFIGURE_DEPENDS is what makes that true for a source file that did not
+    # exist yet. A plain glob is evaluated ONLY during this configure run, and
+    # nothing asks CMake to look again: the CMAKE_CONFIGURE_DEPENDS property set
+    # at the bottom of this function can only list the files the glob already
+    # found, so ADDING a new .ts triggered no reconfigure, the new file was in
+    # neither list, and the embedded bundle silently stayed on the old sources
+    # until something unrelated happened to re-run configure. (That is not
+    # hypothetical: src/web/terminal/src/writer.ts was added and had to be
+    # rebuilt by hand.) With CONFIGURE_DEPENDS the generator re-runs the glob on
+    # every build and re-runs configure when the matched SET changes, so a new
+    # file is picked up by the next build like an edit to an existing one.
+    #
+    # The two mechanisms are complementary and both are needed: this catches
+    # files appearing and disappearing, CMAKE_CONFIGURE_DEPENDS below catches
+    # edits to the files themselves. The staleness comparison underneath is
+    # untouched — for a tree whose file set has not changed the glob yields
+    # exactly the same list as before.
+    file(GLOB_RECURSE _chb_inputs CONFIGURE_DEPENDS ${_chb_src}/src/*.ts)
     list(APPEND _chb_inputs
          ${_chb_src}/build.mjs
          ${_chb_src}/index.html

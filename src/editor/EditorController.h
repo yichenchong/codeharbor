@@ -2,17 +2,20 @@
 
 #include "SessionState.h"
 
+// Full definition (not a forward declaration): m_client is a QPointer, whose
+// QObject static_cast needs the complete CodeharbordClient (a QObject) type.
+#include "CodeharbordClient.h"
+
 #include <QJsonObject>
 #include <QJsonValue>
 #include <QObject>
+#include <QPointer>
 #include <QString>
 
 #include <functional>
 #include <optional>
 
 namespace ch {
-
-class CodeharbordClient;
 
 // C++ half of the frozen C3 editor bridge (src/web/editor/src/index.ts,
 // EditorBridge) plus the SPEC 8.2 remote-file state machine. A single instance
@@ -26,9 +29,14 @@ class CodeharbordClient;
 // fire-and-forget bridge actions invoked from JS. The signal/slot signatures
 // MUST match EditorBridge exactly.
 //
-// Lifetime: the client is borrowed (not owned) and MUST outlive the
-// controller. Pending RPC callbacks are guarded by a QPointer so a callback
-// that fires after the controller is destroyed is a safe no-op.
+// Lifetime: the client is BORROWED, not owned, and is held through a QPointer
+// so it may be destroyed first — a controller parented to a QML pane outlives
+// the client whenever the QML engine is torn down last, and the destructor
+// below still wants to release its file.watch. A raw pointer would be a
+// use-after-free there; the QPointer self-clears and every remote operation
+// simply becomes a no-op. Pending RPC callbacks are likewise guarded by a
+// QPointer to the controller, so a callback that fires after the controller is
+// destroyed is a safe no-op.
 class EditorController : public QObject {
     Q_OBJECT
     // SPEC 8.2 file lifecycle as a ch::FileState string (see toString(FileState)).
@@ -167,7 +175,18 @@ private:
     void refreshPermissions(std::function<void()> then = {});
     // Fold a file.stat result into m_pathReadOnly.
     void applyStatPermissions(const QJsonObject& stat);
-    void reload(FileState transitional);
+    // Re-fetch the file, parking the pane in `transitional` for the round trip.
+    //
+    // `discardLocalEdits` says what to do when the buffer moved WHILE the read
+    // was in flight — the page debounces its reportContent by 500 ms, so a
+    // keystroke can easily land inside the round trip. False (the default, used
+    // by every reload the SYSTEM starts: a watch event, a reconnect
+    // reconciliation) refuses to overwrite those keystrokes: the fetched bytes
+    // are dropped and the pane is left dirty and flagged ExternallyModified,
+    // exactly as if the change had been noticed one moment later. True is for
+    // reloads the USER asked for (the page's "Reload" affordance, a page that
+    // reloaded and lost its buffer), where replacing the buffer IS the request.
+    void reload(FileState transitional, bool discardLocalEdits = false);
     // Emit contentLoaded, or hold it until the page reports ready() (see the
     // ready() slot). The held buffer is overwritten by a newer load, so a
     // reconnecting page always sees the LATEST content exactly once.
@@ -209,7 +228,9 @@ private:
     // which disables recovery rather than sharing one unkeyed file between panes.
     QString recoveryPath() const;
 
-    CodeharbordClient* m_client = nullptr;
+    // QPointer: see the lifetime note at the top of this file — the client may
+    // be destroyed before this controller, and the destructor still touches it.
+    QPointer<CodeharbordClient> m_client = nullptr;
     // Stable per-pane id (the persisted layout paneId) this pane's recovery
     // snapshot is keyed by; see recoveryPath() and setRecoveryId(). Writable: the
     // pane's paneId can be assigned after this controller is constructed.

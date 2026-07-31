@@ -62,11 +62,6 @@ set_tests_properties(tst_sessionlayouts PROPERTIES LABELS live TIMEOUT 120)
 # a 300 ms budget, so the whole target still runs in a couple of seconds.
 # Qt6::Network is what QTcpServer/QTcpSocket come from.
 qt_add_executable(tst_sessionbootstrap tst_sessionbootstrap.cpp)
-if(WIN32)
-    # Keep QTest diagnostics visible on Windows instead of sending failures
-    # only through the GUI subsystem's invisible console.
-    set_target_properties(tst_sessionbootstrap PROPERTIES WIN32_EXECUTABLE FALSE)
-endif()
 target_link_libraries(tst_sessionbootstrap PRIVATE
     ch_app
     ch_ssh
@@ -211,6 +206,18 @@ set_tests_properties(tst_coldstart PROPERTIES
     ENVIRONMENT "QT_QPA_PLATFORM=offscreen;QT_QUICK_BACKEND=software;QTWEBENGINE_CHROMIUM_FLAGS=--disable-gpu --no-sandbox --disable-dev-shm-usage"
     TIMEOUT 900
 )
+# Console-mode on Windows for every plain QTest target here. qt_add_executable
+# marks executables as GUI subsystem, which on Windows swallows QTest's stdout
+# and stderr — a failing assertion then reports nothing at all through ctest.
+# tst_serverprofiles/tst_liveshell/tst_coldstart drive real QML windows and are
+# left as GUI executables on purpose.
 if(WIN32)
-    set_target_properties(tst_sessionbootstrap PROPERTIES WIN32_EXECUTABLE FALSE)
+    set_target_properties(
+        tst_appcontroller
+        tst_notifier
+        tst_notifierlive
+        tst_sessionbootstrap
+        tst_sessionlayouts
+        tst_livereconnect
+        PROPERTIES WIN32_EXECUTABLE FALSE)
 endif()

@@ -38,6 +38,7 @@ private slots:
     void aRungIsNeverClimbedTwiceEvenIfStillOffered();
     void keyboardInteractiveIsClimbedAfterPasswordWithACallback();
     void everyMethodOfferedIsClimbedOnceThenExhausted();
+    void aServerOfferingNoSupportedMethodIsExhaustedImmediately();
 #if CH_HAVE_LIBSSH
     void partialIsClassifiedApartFromSuccessAndFailure();
     void anUnknownMethodMaskFallsBackToTryingBoth();
@@ -215,6 +216,32 @@ void TstSshAuth::everyMethodOfferedIsClimbedOnceThenExhausted()
              AuthRung::Exhausted);
 }
 
+// A server may offer only methods this client cannot climb (host-based,
+// GSSAPI). The ladder must then be finished on the spot rather than throwing a
+// key or a password at a method the server never asked for: OpenSSH counts each
+// attempt against MaxAuthTries and drops the connection, which turns a clear
+// "no supported method" into a confusing mid-handshake disconnect.
+void TstSshAuth::aServerOfferingNoSupportedMethodIsExhaustedImmediately()
+{
+    constexpr AuthMethods kNothing{false, false, false};
+    AuthRungsTried tried;
+    QCOMPARE(SshConnectionPool::nextAuthRung(tried, kNothing, true),
+             AuthRung::Exhausted);
+    QCOMPARE(SshConnectionPool::nextAuthRung(tried, kNothing, false),
+             AuthRung::Exhausted);
+
+    // Public-key-only with every key rung already spent and no callback: the
+    // secret-bearing rungs stay unreachable instead of looping.
+    AuthRungsTried spent;
+    spent.add(AuthRung::Agent);
+    spent.add(AuthRung::KeyFile);
+    QCOMPARE(SshConnectionPool::nextAuthRung(spent, kPublicKeyOnly, false),
+             AuthRung::Exhausted);
+    // With a callback the passphrase rung is still available on that same offer.
+    QCOMPARE(SshConnectionPool::nextAuthRung(spent, kPublicKeyOnly, true),
+             AuthRung::KeyPassphrase);
+}
+
 #if CH_HAVE_LIBSSH
 
 // SSH_AUTH_PARTIAL used to be indistinguishable from a refusal, which is what
@@ -272,6 +299,16 @@ void TstSshAuth::anUnknownMethodMaskFallsBackToTryingBoth()
     QVERIFY(!interactive.publicKey);
     QVERIFY(!interactive.password);
     QVERIFY(interactive.keyboardInteractive);
+
+    // A mask that IS present but names only methods this client cannot climb
+    // must decode to nothing, not to the "the server did not say, try
+    // everything" fallback: 0 is the only value that means "not told".
+    const AuthMethods unsupportedOnly = SshConnectionPool::methodsFromMask(
+        SSH_AUTH_METHOD_NONE | SSH_AUTH_METHOD_HOSTBASED
+        | SSH_AUTH_METHOD_GSSAPI_MIC);
+    QVERIFY(!unsupportedOnly.publicKey);
+    QVERIFY(!unsupportedOnly.password);
+    QVERIFY(!unsupportedOnly.keyboardInteractive);
 }
 
 #endif // CH_HAVE_LIBSSH

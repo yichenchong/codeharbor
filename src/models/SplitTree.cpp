@@ -4,6 +4,7 @@
 #include <QJsonValue>
 
 #include <cmath>
+#include <utility>
 
 namespace ch {
 
@@ -95,7 +96,11 @@ bool parseNode(const QJsonObject &obj, SplitNode &out, int depth)
         SplitNode child;
         if (!parseNode(value.toObject(), child, depth + 1))
             return false;
-        node.children.append(child);
+        // Move, never copy: a SplitNode holds its children by value, so copying
+        // one duplicates its whole subtree. Copying at every level would make
+        // parsing a d-level tree re-copy the same nodes d times over, on data
+        // that arrives from the network.
+        node.children.append(std::move(child));
     }
 
     node.ratios.reserve(ratioArray.size());
@@ -115,18 +120,23 @@ bool parseNode(const QJsonObject &obj, SplitNode &out, int depth)
         node.ratios.append(ratio);
     }
 
-    out = node;
+    out = std::move(node);
     return true;
 }
 
 } // namespace
 
-SplitNode SplitNode::fromJson(const QJsonObject &obj)
+std::optional<SplitNode> SplitNode::tryFromJson(const QJsonObject &obj)
 {
     SplitNode node;
     if (!parseNode(obj, node, 1))
-        return {};
+        return std::nullopt;
     return node;
+}
+
+SplitNode SplitNode::fromJson(const QJsonObject &obj)
+{
+    return tryFromJson(obj).value_or(SplitNode{});
 }
 
 bool SplitNode::operator==(const SplitNode &other) const

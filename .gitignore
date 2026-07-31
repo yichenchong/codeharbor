@@ -55,6 +55,9 @@ dist/
 *.sqlite
 *.sqlite-journal
 
+# Python virtual environment used by tooling/analysis scripts.
+.venv/
+
 # Live-gate test fixture: generated sshd host/client keypairs + runtime state.
 # NEVER commit these - they are real private keys, regenerated on demand.
 tests/live/.fixture/

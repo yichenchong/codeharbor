@@ -70,6 +70,10 @@ private slots:
     void hostnamesMatchCaseInsensitively();
     void wildcardHostIsATrustedHost();
     void negatedWildcardHostIsExcluded();
+    void wildcardCoversAHostSpelledWithAnAsterisk();
+    void commentsAndMarkersSurviveARoundTrip();
+    void addIgnoresATripleThatCannotBeStored();
+    void lookupHostCanonicalizesTheEndpoint();
     void trustedHostRefusesUnknownKeyType();
     void markerOnlyHostStaysUnknownForOtherTypes();
     void recognizesWindowsNamedPipeAgentSocket();
@@ -424,6 +428,122 @@ void TstKnownHosts::negatedWildcardHostIsExcluded()
                           QStringLiteral("ssh-ed25519"), kEd25519Alpha),
              KnownHosts::Verdict::Unknown);
     QVERIFY(store.serialize().contains("*.example.com,!secret.example.com "));
+}
+
+void TstKnownHosts::wildcardCoversAHostSpelledWithAnAsterisk()
+{
+    // '*' is a metacharacter in the STORED pattern, and the looked-up name is
+    // just data. Comparing the two for equality first let a name that happens
+    // to contain '*' at the wildcard's own offset consume it as an ordinary
+    // character: "web*.example.com" then covered no host at all for such a
+    // lookup, and a key presented for it read as first use (Unknown) instead of
+    // the refusal a covered host is owed. The lookup name is not always a
+    // resolved DNS label — it is whatever the server profile says — so it must
+    // not be able to steer pattern matching.
+    const KnownHosts store = KnownHosts::parse(QStringLiteral(
+        "web*.example.com ssh-ed25519 ZWQyNTUxOS1rZXktYWxwaGEtMDAwMQ==\n"));
+
+    QCOMPARE(store.verify(QStringLiteral("web*x.example.com"),
+                          QStringLiteral("ssh-ed25519"), kEd25519Alpha),
+             KnownHosts::Verdict::Match);
+    QCOMPARE(store.verify(QStringLiteral("web*x.example.com"),
+                          QStringLiteral("ssh-ed25519"), kEd25519Beta),
+             KnownHosts::Verdict::Mismatch);
+    // The ordinary covered and uncovered names are unaffected.
+    QCOMPARE(store.verify(QStringLiteral("web1.example.com"),
+                          QStringLiteral("ssh-ed25519"), kEd25519Alpha),
+             KnownHosts::Verdict::Match);
+    QCOMPARE(store.verify(QStringLiteral("db1.example.com"),
+                          QStringLiteral("ssh-ed25519"), kEd25519Alpha),
+             KnownHosts::Verdict::Unknown);
+}
+
+void TstKnownHosts::commentsAndMarkersSurviveARoundTrip()
+{
+    // known_hosts is the user's file: CodeHarbor reads it, adds at most one
+    // line, and writes the whole thing back. Anything it drops on that trip is
+    // data destroyed in a file it does not own — a trailing comment naming the
+    // machine, or the @cert-authority marker that makes a line a CA rather than
+    // a host key.
+    const QString text = QStringLiteral(
+        "@cert-authority ca.host ssh-ed25519 ZWQyNTUxOS1rZXktYWxwaGEtMDAwMQ== "
+        "the org CA\n"
+        "plain.host ssh-rsa cnNhLWtleS1nYW1tYS0wMDAz lab machine 3\n");
+    const KnownHosts store = KnownHosts::parse(text);
+    QCOMPARE(store.entries().size(), 2);
+    QCOMPARE(store.entries().at(0).marker, QStringLiteral("@cert-authority"));
+    QCOMPARE(store.entries().at(0).comment, QStringLiteral("the org CA"));
+    QCOMPARE(store.entries().at(1).marker, QString());
+    QCOMPARE(store.entries().at(1).comment, QStringLiteral("lab machine 3"));
+
+    const KnownHosts reparsed =
+        KnownHosts::parse(QString::fromUtf8(store.serialize()));
+    QCOMPARE(reparsed.entries().size(), 2);
+    QCOMPARE(reparsed.entries().at(0).marker, QStringLiteral("@cert-authority"));
+    QCOMPARE(reparsed.entries().at(0).comment, QStringLiteral("the org CA"));
+    QCOMPARE(reparsed.entries().at(1).comment,
+             QStringLiteral("lab machine 3"));
+    QCOMPARE(reparsed.verify(QStringLiteral("plain.host"),
+                             QStringLiteral("ssh-rsa"), kRsaGamma),
+             KnownHosts::Verdict::Match);
+}
+
+void TstKnownHosts::addIgnoresATripleThatCannotBeStored()
+{
+    // A known_hosts line needs all three fields. Recording one with an empty
+    // key type or blob would write "host type\n", which parse() drops as
+    // malformed: verify() would answer Match for the rest of this process and
+    // Unknown on the next launch, so the user would approve the same key again
+    // and again with no idea why. Refusing to record it keeps the store honest.
+    KnownHosts store;
+    store.add(QStringLiteral("no.type"), QString(), kEd25519Alpha);
+    store.add(QStringLiteral("no.blob"), QStringLiteral("ssh-ed25519"),
+              QByteArray());
+    store.add(QString(), QStringLiteral("ssh-ed25519"), kEd25519Alpha);
+    QCOMPARE(store.entries().size(), 0);
+    QCOMPARE(store.serialize(), QByteArray());
+    QCOMPARE(store.verify(QStringLiteral("no.type"), QString(), kEd25519Alpha),
+             KnownHosts::Verdict::Unknown);
+
+    // A complete triple is still recorded, and it still round-trips.
+    store.add(QStringLiteral("good.host"), QStringLiteral("ssh-ed25519"),
+              kEd25519Alpha);
+    QCOMPARE(store.entries().size(), 1);
+    const KnownHosts reparsed =
+        KnownHosts::parse(QString::fromUtf8(store.serialize()));
+    QCOMPARE(reparsed.verify(QStringLiteral("good.host"),
+                             QStringLiteral("ssh-ed25519"), kEd25519Alpha),
+             KnownHosts::Verdict::Match);
+}
+
+void TstKnownHosts::lookupHostCanonicalizesTheEndpoint()
+{
+    using ch::SshConnectionPool;
+
+    // The store is keyed by OpenSSH's endpoint spelling, and both halves matter.
+    // Writing "[host]:22" for the default port would never be found again by
+    // OpenSSH (or by a later CodeHarbor launch), and dropping the port for a
+    // non-default one would file two different servers behind one name — the
+    // second would then look like a changed key for the first.
+    QCOMPARE(SshConnectionPool::lookupHostFor(QStringLiteral("example.com"), 22),
+             QStringLiteral("example.com"));
+    QCOMPARE(
+        SshConnectionPool::lookupHostFor(QStringLiteral("example.com"), 2222),
+        QStringLiteral("[example.com]:2222"));
+    QCOMPARE(SshConnectionPool::lookupHostFor(QStringLiteral("10.0.0.5"), 2022),
+             QStringLiteral("[10.0.0.5]:2022"));
+
+    // And the canonical token is what a store written from it matches.
+    KnownHosts store;
+    store.add(SshConnectionPool::lookupHostFor(QStringLiteral("example.com"),
+                                               2222),
+              QStringLiteral("ssh-ed25519"), kEd25519Alpha);
+    QCOMPARE(store.verify(QStringLiteral("[example.com]:2222"),
+                          QStringLiteral("ssh-ed25519"), kEd25519Alpha),
+             KnownHosts::Verdict::Match);
+    QCOMPARE(store.verify(QStringLiteral("example.com"),
+                          QStringLiteral("ssh-ed25519"), kEd25519Alpha),
+             KnownHosts::Verdict::Unknown);
 }
 
 void TstKnownHosts::trustedHostRefusesUnknownKeyType()

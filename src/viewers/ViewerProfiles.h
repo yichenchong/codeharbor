@@ -1,6 +1,11 @@
 #pragma once
 
 #include <QObject>
+#include <QPointer>
+
+// Full definition (not a forward declaration): m_client is a QPointer, whose
+// QObject static_cast needs the complete CodeharbordClient (a QObject) type.
+#include "CodeharbordClient.h"
 
 QT_BEGIN_NAMESPACE
 class QQuickWebEngineProfile;
@@ -8,8 +13,6 @@ QT_END_NAMESPACE
 
 namespace ch {
 
-class CodeharbordClient;
-class InternalUrlMap;
 class InternalUrlSchemeHandler;
 
 // Owns the two Qt WebEngine security contexts required by SPEC 7.2/7.3: a
@@ -50,7 +53,13 @@ public:
     bool internalHasInternalScheme() const;
 
 private:
-    CodeharbordClient *m_client;
+    // QPointer, not a raw pointer: the client is owned by the caller and can be
+    // destroyed before this object is (the internal profile — and with it the
+    // scheme handler this pointer is handed to — is created LAZILY, so the
+    // pointer may not be read until long after it was passed in). A raw pointer
+    // would dangle and be adopted by the handler; QPointer self-clears, and the
+    // handler is simply constructed clientless and fails its reads honestly.
+    QPointer<CodeharbordClient> m_client;
     InternalUrlSchemeHandler *m_handler = nullptr;
     QQuickWebEngineProfile *m_external = nullptr;
     QQuickWebEngineProfile *m_internal = nullptr;

@@ -25,8 +25,30 @@ import { serverIdentity, WORKSPACE_METHODS } from "./workspace.ts";
 // tmux session discovery (SPEC 10.2). Its own `tmux.*` method group, likewise
 // outside the frozen C1 file catalog.
 import { TMUX_METHODS } from "./tmux.ts";
-import { RPC_REVISION_MISMATCH, RPC_WATCH_EVENT_NOTIFICATION } from "./rpc-types.ts";
+// isInvalidParams recognizes the tagged error the param guards throw, so a
+// malformed request is answered with "Invalid params" instead of a generic
+// internal error that blames the server for the client's bad payload.
+import { isInvalidParams } from "./validate.ts";
+import {
+    RPC_INTERNAL_ERROR,
+    RPC_INVALID_PARAMS,
+    RPC_INVALID_REQUEST,
+    RPC_METHOD_NOT_FOUND,
+    RPC_PARSE_ERROR,
+    RPC_REVISION_MISMATCH,
+    RPC_WATCH_EVENT_NOTIFICATION,
+} from "./rpc-types.ts";
 export { RPC_METHODS } from "./rpc-types.ts";
+// JSON-RPC 2.0 reserved error codes are DEFINED in rpc-types.ts (see the note
+// there on the import cycle) and re-exported here, which is where every
+// consumer has always imported them from.
+export {
+    RPC_PARSE_ERROR,
+    RPC_INVALID_REQUEST,
+    RPC_METHOD_NOT_FOUND,
+    RPC_INVALID_PARAMS,
+    RPC_INTERNAL_ERROR,
+} from "./rpc-types.ts";
 export { RPC_REVISION_MISMATCH, RPC_WATCH_EVENT_NOTIFICATION };
 
 export const RPC_SERVER_NAME = "codeharbord";
@@ -57,13 +79,6 @@ export interface RpcError {
 }
 
 export type RpcResponse = RpcSuccess | RpcError;
-
-// JSON-RPC 2.0 reserved error codes used at bootstrap.
-export const RPC_PARSE_ERROR = -32700;
-export const RPC_INVALID_REQUEST = -32600;
-export const RPC_METHOD_NOT_FOUND = -32601;
-export const RPC_INVALID_PARAMS = -32602;
-export const RPC_INTERNAL_ERROR = -32603;
 
 // Upper bound on one input line before the transport is dropped, mirroring the
 // C++ client's `kMaxLineBytes` in src/remote/CodeharbordClient.cpp (C3): both
@@ -191,6 +206,17 @@ export async function dispatch(value: unknown): Promise<RpcResponse | null> {
                 error: { code: RPC_REVISION_MISMATCH, message: err.message, data: err.data },
             };
         }
+        // A param guard rejected the payload (validate.ts). That is a fault in
+        // the REQUEST, so it must not be reported as -32603 "internal error",
+        // which tells the client the SERVER broke and hides the real cause from
+        // whoever has to debug it.
+        if (isInvalidParams(err)) {
+            return {
+                jsonrpc: "2.0",
+                id,
+                error: { code: RPC_INVALID_PARAMS, message: err.message },
+            };
+        }
         return {
             jsonrpc: "2.0",
             id,
@@ -274,9 +300,10 @@ export function runStdio(): void {
     // client MUST match a response to its call by the `id` field alone — never
     // by position in the stream (ch::CodeharbordClient in
     // src/remote/CodeharbordClient.cpp does exactly that: it keys its pending
-    // callbacks in a QHash<int, ResponseCallback> by request id). The only
-    // ordered part of the stream is the framing:
-    // one JSON object per line, so a reader never has to interleave two.
+    // callbacks in a QHash<qint64, ResponseCallback> by request id — those ids
+    // are 64-bit on the C++ side, not int). The only ordered part of the stream
+    // is the framing: one JSON object per line, so a reader never has to
+    // interleave two.
     //
     // The in-flight count is deliberately NOT bounded. A bound would need real
     // backpressure (pausing stdin, or queueing lines), and getting that wrong is

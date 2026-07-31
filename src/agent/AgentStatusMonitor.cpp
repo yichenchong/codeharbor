@@ -46,7 +46,11 @@ void AgentStatusMonitor::setTransport(QIODevice* transport)
         m_transport->disconnect(this);
 
     m_transport = transport;
+    // Both halves of the framing state go together: a half-received line from
+    // the dead producer must never be spliced onto the new one's first frame,
+    // and a pending oversize discard belongs to a stream that no longer exists.
     m_readBuffer.clear();
+    m_discardingLine = false;
 
     if (!m_transport)
         return;
@@ -68,20 +72,42 @@ void AgentStatusMonitor::onReadyRead()
 
     // Consume every complete line; a trailing partial line stays buffered until
     // the rest arrives on a later readyRead (a line split across reads).
-    int newline;
+    //
+    // No CR stripping and no blank-line test here: parseAgentEventLine() trims
+    // the frame before it looks at it, so a CRLF-framed line loses its '\r'
+    // there and a blank (or whitespace-only, or bare "\r") line is rejected as
+    // "not an event" by the same code path as any other unparseable line.
+    // Doing it twice costs an extra QByteArray allocation per line for no
+    // behavioural difference.
+    //
+    // indexOf() returns qsizetype: narrowing it to int would wrap a >2 GiB
+    // buffer to a negative offset and hand left()/remove() nonsense. The
+    // oversize guard below makes that unreachable in practice, but the guard
+    // runs AFTER this loop, so the loop must be correct on its own.
+    qsizetype newline;
     while ((newline = m_readBuffer.indexOf('\n')) != -1) {
-        QByteArray line = m_readBuffer.left(newline);
-        m_readBuffer.remove(0, newline + 1);
-        if (line.endsWith('\r'))
-            line.chop(1); // tolerate CRLF framing
-        if (line.trimmed().isEmpty())
+        if (m_discardingLine) {
+            // Everything up to this newline is the tail of a frame whose head
+            // already blew the size cap and was thrown away. It is half of
+            // something, never an event of its own, so it is dropped without
+            // even being copied out: framing resumes at the NEXT newline.
+            m_discardingLine = false;
+            m_readBuffer.remove(0, newline + 1);
             continue;
+        }
+        const QByteArray line = m_readBuffer.left(newline);
+        m_readBuffer.remove(0, newline + 1);
         processLine(line);
     }
 
-    // Guard against an unterminated line growing the buffer without bound.
-    if (m_readBuffer.size() > kMaxLineBytes)
+    // Guard against an unterminated line growing the buffer without bound. The
+    // accumulated bytes are dropped and the remainder of that frame is marked
+    // for discard, so the arbitrary cut point can never produce a fragment that
+    // is mistaken for a complete event.
+    if (m_readBuffer.size() > kMaxLineBytes) {
         m_readBuffer.clear();
+        m_discardingLine = true;
+    }
 }
 
 void AgentStatusMonitor::processLine(const QByteArray& line)
@@ -124,8 +150,15 @@ void AgentStatusMonitor::applyEvent(const AgentEvent& ev)
 
     // No reads of `terms`/`it` past this point: a slot may re-enter applyEvent()
     // and rehash the QHash, invalidating both.
+    //
+    // Both data signals go out before the notification hook so the display
+    // layer has already re-derived the sidebar row by the time the desktop
+    // bubble is raised; notify() is a side effect, not a source of truth, and
+    // must never be the thing that tells the UI something changed.
     if (changed)
         emit agentStateChanged(dev, term, static_cast<int>(next));
+    if (armedUnseen)
+        emit unseenChanged(dev, true);
 
     // Desktop-notification hook: a genuine transition into an attention-worthy
     // state, or a completion that re-arms a badge the user had already cleared.
@@ -137,9 +170,6 @@ void AgentStatusMonitor::applyEvent(const AgentEvent& ev)
             && (next == AgentState::WaitingInput
                 || next == AgentState::IdleUnseen)))
         emit notify(titleFor(next), bodyFor(ev));
-
-    if (armedUnseen)
-        emit unseenChanged(dev, true);
 }
 
 void AgentStatusMonitor::markSeen(const QString& devSessionId)

@@ -27,6 +27,8 @@ import {
 } from "../src/rpc-types.ts";
 import { RPC_SCHEMA_VERSION, MAX_LINE_BYTES } from "../src/codeharbord.ts";
 import { WORKSPACE_METHODS } from "../src/workspace.ts";
+import { fileMethods } from "../src/files.ts";
+import { TMUX_METHODS } from "../src/tmux.ts";
 
 const headerPath = fileURLToPath(
     new URL("../../src/remote/RpcTypes.h", import.meta.url),
@@ -115,6 +117,15 @@ test("every workspace.* contract name has a server handler", () => {
         Object.keys(WORKSPACE_METHODS).sort(),
         tsGroup(RPC_WORKSPACE_METHODS),
     );
+});
+
+// The same gate for the other two groups. `fileMethods` and `TMUX_METHODS` are
+// spread into codeharbord's method map verbatim, so a contract name with no key
+// here is a method the client is told exists and the server answers with
+// "method not found".
+test("every file.* and tmux.* contract name has a server handler", () => {
+    assert.deepEqual(Object.keys(fileMethods).sort(), tsGroup(RPC_METHODS));
+    assert.deepEqual(Object.keys(TMUX_METHODS).sort(), tsGroup(RPC_TMUX_METHODS));
 });
 
 // Method names are not the only duplicated contract: the application-level

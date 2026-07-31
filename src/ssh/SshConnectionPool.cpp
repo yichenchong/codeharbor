@@ -678,8 +678,19 @@ bool SshConnectionPool::verifyHostKey(const QString& host)
                 .arg(host));
         return false;  // hard refusal (SPEC 12.1)
     case KnownHosts::Verdict::Unknown:
-        if (!m_hostKeyCallback)
+        if (!m_hostKeyCallback) {
+            // Nothing here can be decided without asking, and there is nobody
+            // to ask. Say so: without this the connect failed with no
+            // errorOccurred() at all, so the caller (and the user) saw a state
+            // change to Error and no reason for it anywhere but the diagnostic
+            // transcript.
+            emit errorOccurred(
+                QStringLiteral("%1 presented an unknown %2 host key and there "
+                               "is no way to ask whether to trust it — "
+                               "refusing connection")
+                    .arg(host, keyType));
             return false;
+        }
         if (m_hostKeyCallback(host, keyType, keyBlob,
                               KnownHosts::Verdict::Unknown)
             == HostKeyDecision::Accept) {
@@ -699,8 +710,22 @@ bool SshConnectionPool::authenticate(const QString& user)
     // ssh_userauth_list() is only defined after a "none" request. It is not
     // enough to query it after an auto-key failure: some libssh builds then
     // report no methods at all, silently skipping the passphrase callback.
-    if (ssh_userauth_none(m_session, nullptr) == SSH_AUTH_SUCCESS)
+    const int noneResult = ssh_userauth_none(m_session, nullptr);
+    if (noneResult == SSH_AUTH_SUCCESS)
         return true;
+    if (noneResult == SSH_AUTH_ERROR) {
+        // Not a refusal: the request itself failed, which in a blocking session
+        // means the transport is gone (the server dropped us right after key
+        // exchange, MaxStartups, a firewall reset). Every rung below would then
+        // fail identically — and the two rungs that need a secret would first
+        // interrupt the user for a passphrase or password that can no longer be
+        // sent anywhere. Stop here instead.
+        appendDiagnostic(
+            QStringLiteral("The SSH connection failed before any "
+                           "authentication method could be tried: %1")
+                .arg(QString::fromUtf8(ssh_get_error(m_session))));
+        return false;
+    }
 
     // Windows' built-in OpenSSH agent is a named pipe, but libssh expects an
     // AF_UNIX socket. Avoid every libssh auto-auth call in that case: it
@@ -846,6 +871,16 @@ bool SshConnectionPool::authenticate(const QString& user)
                             "abandoning this attempt so it can be requested."));
                         return false;
                     }
+                    if (answer.secret.isEmpty()) {
+                        // No secret and no prompt request: the callback has
+                        // nothing for this method. Sending an empty answer
+                        // would spend one of the server's MaxAuthTries on a
+                        // credential nobody supplied — and on a PAM stack with
+                        // lockout counting, help lock the account out. The
+                        // password rung refuses an empty secret the same way.
+                        parked = true;
+                        break;
+                    }
                     QByteArray answerUtf8 = answer.secret.toUtf8();
                     const int setResult = ssh_userauth_kbdint_setanswer(
                         m_session, static_cast<unsigned int>(prompt),
@@ -878,6 +913,20 @@ bool SshConnectionPool::authenticate(const QString& user)
                 QStringLiteral("The server accepted %1 and requires a further "
                                "authentication method.")
                     .arg(authRungName(rung)));
+        }
+        // A rung can fail because the server dropped the connection rather than
+        // because it refused the credential, and libssh reports both as a plain
+        // non-success. On a dead transport ssh_userauth_list() then answers 0,
+        // which methodsFromMask() reads as "the server did not say, try
+        // everything" — so the ladder would walk on and, worse, interrupt the
+        // user for a password that cannot be sent anywhere. Stop while the
+        // failure can still be explained.
+        if (!ssh_is_connected(m_session)) {
+            appendDiagnostic(
+                QStringLiteral("The SSH connection dropped while trying %1: %2")
+                    .arg(authRungName(rung),
+                         QString::fromUtf8(ssh_get_error(m_session))));
+            return false;
         }
         // Re-read after every step. The offer belongs to the SERVER and changes
         // as the exchange proceeds — after a partial success it typically drops

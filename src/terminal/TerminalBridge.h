@@ -85,6 +85,9 @@ public slots:
     // untouched, including the non-positive values an unmounted renderer
     // reports (the controller rejects those).
     void resize(int cols, int rows);
+    // Reports what the RENDERER (or the QML pane) can currently show. It is
+    // only half of the controller's visibility: the other half is whether a
+    // renderer exists at all — see applyVisibility().
     void notifyViewVisible(bool visible);
     // Mount handshake; optional on the JS side (`ready?()`).
     void ready();
@@ -108,12 +111,32 @@ signals:
 
 private:
     void onFlushReady(const QByteArray& batch);
+    // Push `m_viewVisible && m_rendererReady` at the controller.
+    //
+    // BOTH conjuncts are required, and the second one is the load-bearing part:
+    // "visible" on the controller means "there is a renderer listening to
+    // write(), so stop retaining output and emit it" (SPEC 5.4). A page that has
+    // not finished mounting has connected NO handler to write(), so anything
+    // emitted at it is gone for good — it is not in the controller's rolling
+    // buffer either, because the controller already handed it over.
+    //
+    // notifyViewVisible() alone cannot decide this: it has a caller that speaks
+    // before the page exists. src/qml/TerminalPaneView.qml reports the QML
+    // item's own visibility (onVisibleChanged), and a pane that is hidden and
+    // shown again while Chromium is still loading the bundle would otherwise
+    // flip the controller visible and throw away the whole first screenful tmux
+    // drew — leaving a blank terminal until the user presses a key.
+    void applyVisibility();
 
     // Weak: the controller is owned by the pane and may outlive or predecease
     // the bridge depending on teardown order.
     QPointer<TerminalController> m_controller;
     QStringDecoder m_decoder{QStringDecoder::Utf8};
     bool m_rendererReady = false;
+    // Last visibility reported by the page or the QML pane. True by default:
+    // a pane is shown unless something says otherwise, and QML only reports on
+    // a CHANGE, so the initial "visible" report never arrives.
+    bool m_viewVisible = true;
 };
 
 } // namespace ch

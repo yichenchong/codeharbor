@@ -6,6 +6,7 @@
 #include <QIODevice>
 #include <QPointer>
 #include <QString>
+#include <QStringConverter>
 
 QT_BEGIN_NAMESPACE
 class QTimer;
@@ -77,6 +78,11 @@ public:
     bool isSequential() const override { return true; }
     qint64 bytesAvailable() const override;
     void close() override;
+    // Always false. A channel is what makes this device readable, so the only
+    // way in is startExec()/startPty(); QIODevice::open() would otherwise hand
+    // back an "open" device with no channel behind it, on which every read
+    // returns nothing and every write fails.
+    bool open(OpenMode mode) override;
 
 signals:
     // Channel-level diagnostics: stderr of an Exec/Rpc channel plus libssh
@@ -95,6 +101,11 @@ private:
     bool acquireChannel();
     bool beginStreaming();
     void abortStart(const QString& reason);
+    // Report a device-level failure: records it as QIODevice::errorString() —
+    // which is what a generic QIODevice consumer inspects — and emits
+    // channelError() for the ones that listen for it. Not used for remote
+    // stderr: that is the remote program talking, not a failure of the device.
+    void failWith(const QString& reason);
     void pump();
     QString lastError() const;
 
@@ -107,6 +118,11 @@ private:
     // PTY, so resizePty() can honour its documented "false if no PTY" contract.
     bool m_hasPty = false;
     bool m_pumping = false;
+    // Remote stderr arrives in 16 KiB reads spread over as many pump passes as
+    // the writer needs, so a multi-byte UTF-8 character can straddle two of
+    // them. A stateful decoder holds the incomplete sequence over until the
+    // rest arrives instead of turning it into replacement characters.
+    QStringDecoder m_stderrDecoder{QStringDecoder::Utf8};
 #if CH_HAVE_LIBSSH
     ssh_channel m_channel = nullptr;
 #endif

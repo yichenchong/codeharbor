@@ -248,6 +248,14 @@ void AppController::setConnection(SshConnectionPool* pool,
                 [this] { adoptServerIdentity(); });
         connect(m_bootstrap, &SessionBootstrap::error, this,
                 [this](const QString& message) {
+                    // connectionStateChanged is the NOTIFY of both
+                    // connectionState and connectionError, so it must fire when
+                    // one of them actually moves and not on every repeat. The
+                    // reconnect ladder re-emits the SAME failure text on every
+                    // rung, which used to re-notify every binding on the
+                    // connection footer several times a second for as long as a
+                    // host stayed down.
+                    const bool changed = m_connectionError != message;
                     m_connectionError = message;
                     // While a connect attempt is in flight the failure may be
                     // EXPECTED: an unknown host key is deliberately refused so
@@ -255,12 +263,15 @@ void AppController::setConnection(SshConnectionPool* pool,
                     // for that would tell the user something went wrong when the
                     // app is simply waiting on their answer. Hold it until the
                     // attempt resolves, then either drop it (prompt raised) or
-                    // report it (genuine failure).
+                    // report it (genuine failure). `error` is a one-shot event,
+                    // not a property, so it is emitted for every failure even
+                    // when the text repeats.
                     if (m_connecting)
                         m_heldConnectError = message;
                     else
                         emit error(message);
-                    emit connectionStateChanged();
+                    if (changed)
+                        emit connectionStateChanged();
                 });
     }
     emit connectionChanged();
@@ -283,6 +294,15 @@ void AppController::setConnectionState(const QString& state, const QString& err)
 
 void AppController::connectToProfile(QString profileId)
 {
+    // The guard comes FIRST, before anything is cleared. startConnect() refuses
+    // a second connect while one is in flight or parked on a prompt, so
+    // clearing the chain up here wiped the secrets and the `asked` flags of an
+    // attempt that is still alive: a stray second click on Connect while the
+    // password sheet was up threw away the passphrase the user had already
+    // given, and the retry that followed arrived with the key locked again -
+    // the exact `publickey,password` dead end the chain exists to avoid.
+    if (m_connecting)
+        return;
     // A user-initiated connect starts a FRESH chain: nothing a previous chain
     // gathered may be replayed at this one.
     m_credentials.clear();
@@ -392,9 +412,11 @@ void AppController::startConnect(const QString& profileId,
     }
     m_connecting = false;
     m_approvedFingerprint.clear();
-    // The chain is over and it failed. Nothing gathered along the way may be
-    // carried into the next one.
+    // The chain is over and it failed. Nothing gathered along the way — the
+    // secrets, nor the profile the chain was dialling — may be carried into the
+    // next one.
     m_credentials.clear();
+    m_pendingProfileId.clear();
     // A genuine failure: report it now that we know it was not the host-key path.
     if (!m_heldConnectError.isEmpty()) {
         const QString held = m_heldConnectError;
@@ -526,7 +548,15 @@ void AppController::resolveHostKey(bool accept)
     m_connecting = false;  // the parked attempt ends here, either way
 
     if (!accept || profileId.isEmpty()) {
+        // The chain is abandoned: nothing it gathered, and nothing it was
+        // aiming at, may leak into the next one. m_heldConnectError in
+        // particular can have been re-armed while the prompt was parked (the
+        // bootstrap keeps emitting failures at us with m_connecting still set),
+        // and a leftover would be reported by the NEXT chain's failure path as
+        // though it had just happened.
         m_credentials.clear();
+        m_pendingProfileId.clear();
+        m_heldConnectError.clear();
         setConnectionState(QStringLiteral("disconnected"));
         return;
     }
@@ -569,8 +599,11 @@ void AppController::submitCredential(QString secret, QString kind)
 
     if (secret.isEmpty() || profileId.isEmpty()) {
         // Cancelled. Nothing is retried and nothing is kept — including the
-        // secrets an earlier step of this chain already supplied.
+        // secrets an earlier step of this chain already supplied, the profile
+        // it was dialling, and any failure held back while it was parked.
         m_credentials.clear();
+        m_pendingProfileId.clear();
+        m_heldConnectError.clear();
         setConnectionState(QStringLiteral("disconnected"));
         return;
     }
@@ -602,9 +635,15 @@ void AppController::disconnectServer()
     m_pendingFingerprint.clear();
     m_pendingHostKeyInfo = {};
     m_approvedFingerprint.clear();
+    // The abandoned attempt's profile and its held-back failure text go too.
+    // A held error that outlived its attempt would be reported by the NEXT
+    // chain's failure path as if it had just happened.
+    m_pendingProfileId.clear();
+    m_heldConnectError.clear();
     m_credentialRequested = false;
     m_credentialUser.clear();
     m_credentialLabel.clear();
+    m_credentialKind = CredentialKind::KeyPassphrase;
     // Whatever the abandoned chain had gathered goes with it.
     m_credentials.clear();
 

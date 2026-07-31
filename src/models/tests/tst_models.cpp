@@ -3,13 +3,16 @@
 #include <QAbstractItemModelTester>
 #include <QFile>
 #include <QJsonArray>
+#include <QJsonDocument>
 #include <QJsonObject>
 #include <QRegularExpression>
 #include <QSet>
 #include <QStringList>
 
 #include <cmath>
+#include <functional>
 #include <limits>
+#include <utility>
 
 #include "SessionState.h"
 #include "SessionsModel.h"
@@ -62,6 +65,12 @@ private slots:
     void startingAgentCountsAsRunning();
     void agentStateWireWordsMatchRemoteEventsTs();
     void updateTerminalStatesEmitsTargetedDataChangedNotReset();
+    void updateTerminalStatesFallsBackForEveryStructuralDrift();
+    void updateTerminalStatesStaysSilentWhenTheAggregateDoesNotMove();
+    void sessionsModelSessionIndicesAreScopedToTheirGroup();
+    void sessionsModelIsSingleColumn();
+    void splitTreeSplitUrlIgnoredOnRoundTrip();
+    void workspaceValueTypesCompareEveryField();
 };
 
 // Group -> DevSession -> viewer + terminal panes tree.
@@ -1026,6 +1035,275 @@ void TstModels::updateTerminalStatesEmitsTargetedDataChangedNotReset()
     model.updateTerminalStates({drifted});
     QCOMPARE(reset2.count(), 1);
     QCOMPARE(changed2.count(), 0);
+}
+
+// updateTerminalStates may only patch rows in place while the structure it is
+// handed still matches the one held. Three different kinds of drift can reach it
+// and each must fall back to a full reset; only the session-id case above was
+// covered, so a regression in the group-count, group-id or session-count check
+// would silently patch terminal state onto the WRONG rows.
+void TstModels::updateTerminalStatesFallsBackForEveryStructuralDrift()
+{
+    const auto session = [](const QString &id, AgentState agent) {
+        SessionRow row;
+        row.session.id = DevSessionId{id};
+        row.session.name = id;
+        row.terminals = {terminal(TerminalState::Ready, agent)};
+        return row;
+    };
+    const auto group = [](const QString &id, QVector<SessionRow> sessions) {
+        GroupRow row;
+        row.group.id = GroupId{id};
+        row.group.name = id;
+        row.sessions = std::move(sessions);
+        return row;
+    };
+
+    const GroupRow baseline = group(QStringLiteral("g1"),
+                                    {session(QStringLiteral("s1"), AgentState::Running)});
+
+    // Each entry is a drifted replacement that must trigger a reset.
+    const QVector<QVector<GroupRow>> drifts = {
+        // A second group appeared: group count differs.
+        {baseline, group(QStringLiteral("g2"), {})},
+        // Same count, different group id (a group was replaced wholesale).
+        {group(QStringLiteral("gX"), {session(QStringLiteral("s1"), AgentState::Running)})},
+        // Same group, an extra session: session count differs.
+        {group(QStringLiteral("g1"),
+               {session(QStringLiteral("s1"), AgentState::Running),
+                session(QStringLiteral("s2"), AgentState::Idle)})},
+    };
+
+    for (const QVector<GroupRow> &drift : drifts) {
+        SessionsModel model;
+        model.setGroups({baseline});
+
+        QSignalSpy reset(&model, &QAbstractItemModel::modelReset);
+        QSignalSpy changed(&model, &QAbstractItemModel::dataChanged);
+        model.updateTerminalStates(drift);
+
+        QCOMPARE(reset.count(), 1);
+        QCOMPARE(changed.count(), 0);
+        // The drifted contents are what the model now holds.
+        QCOMPARE(model.rowCount(), static_cast<int>(drift.size()));
+        QCOMPARE(model.data(model.index(0, 0), SessionsModel::IdRole).toString(),
+                 drift.at(0).group.id.value);
+        QCOMPARE(model.rowCount(model.index(0, 0)),
+                 static_cast<int>(drift.at(0).sessions.size()));
+    }
+}
+
+// The other half of the targeted-update contract: a refresh that leaves a row's
+// aggregate state where it was must emit NOTHING for that row. Every emitted
+// dataChanged re-evaluates the delegate's bindings, and agent status refreshes
+// arrive continuously, so signalling unchanged rows would undo the whole point
+// of not resetting the model.
+void TstModels::updateTerminalStatesStaysSilentWhenTheAggregateDoesNotMove()
+{
+    SessionsModel model;
+
+    SessionRow s1;
+    s1.session.id = DevSessionId{QStringLiteral("s1")};
+    s1.session.name = QStringLiteral("s1");
+    s1.terminals = {terminal(TerminalState::Ready, AgentState::Running)};
+    GroupRow g;
+    g.group.id = GroupId{QStringLiteral("g1")};
+    g.sessions = {s1};
+    model.setGroups({g});
+
+    const QModelIndex sessionIndex = model.index(0, 0, model.index(0, 0));
+
+    QSignalSpy reset(&model, &QAbstractItemModel::modelReset);
+    QSignalSpy changed(&model, &QAbstractItemModel::dataChanged);
+
+    // A different terminal set that still reduces to Running (Starting counts as
+    // Running, and an extra Idle terminal is outranked by it).
+    GroupRow refreshed = g;
+    refreshed.sessions[0].terminals = {terminal(TerminalState::Ready, AgentState::Starting),
+                                       terminal(TerminalState::Ready, AgentState::Idle)};
+    model.updateTerminalStates({refreshed});
+
+    QCOMPARE(reset.count(), 0);
+    QCOMPARE(changed.count(), 0);
+    QCOMPARE(model.data(sessionIndex, SessionsModel::RowStateRole).toInt(),
+             static_cast<int>(SessionRowState::Running));
+
+    // A refresh that DOES move it still signals, so silence above is selective
+    // rather than the update path being broken outright.
+    refreshed.sessions[0].terminals = {terminal(TerminalState::Ready, AgentState::Idle)};
+    model.updateTerminalStates({refreshed});
+    QCOMPARE(changed.count(), 1);
+    QCOMPARE(model.data(sessionIndex, SessionsModel::RowStateRole).toInt(),
+             static_cast<int>(SessionRowState::Idle));
+}
+
+// Session indices carry their parent group's ROW in the QModelIndex internal id.
+// That encoding is the model's only link from a child back to its group, so row 0
+// of group 0 and row 0 of group 1 must be different indices that resolve to
+// different parents and different data. Getting this wrong shows one group's
+// sessions under another.
+void TstModels::sessionsModelSessionIndicesAreScopedToTheirGroup()
+{
+    SessionsModel model;
+
+    const auto session = [](const QString &id) {
+        SessionRow row;
+        row.session.id = DevSessionId{id};
+        row.session.name = id;
+        return row;
+    };
+
+    GroupRow first;
+    first.group.id = GroupId{QStringLiteral("g1")};
+    first.sessions = {session(QStringLiteral("a")), session(QStringLiteral("b"))};
+    GroupRow second;
+    second.group.id = GroupId{QStringLiteral("g2")};
+    second.sessions = {session(QStringLiteral("c"))};
+    model.setGroups({first, second});
+
+    const QModelIndex g1 = model.index(0, 0);
+    const QModelIndex g2 = model.index(1, 0);
+    const QModelIndex a = model.index(0, 0, g1);
+    const QModelIndex c = model.index(0, 0, g2);
+
+    QVERIFY(a.isValid());
+    QVERIFY(c.isValid());
+    QVERIFY(a != c); // same row, different parent
+    QCOMPARE(model.parent(a), g1);
+    QCOMPARE(model.parent(c), g2);
+    QCOMPARE(model.data(a, SessionsModel::IdRole).toString(), QStringLiteral("a"));
+    QCOMPARE(model.data(c, SessionsModel::IdRole).toString(), QStringLiteral("c"));
+    // GroupIdRole on a session row reports the CONTAINING group, not its own id.
+    QCOMPARE(model.data(a, SessionsModel::GroupIdRole).toString(), QStringLiteral("g1"));
+    QCOMPARE(model.data(c, SessionsModel::GroupIdRole).toString(), QStringLiteral("g2"));
+    // Group 2 has one session, so its row 1 does not exist even though group 1's does.
+    QVERIFY(model.index(1, 0, g1).isValid());
+    QVERIFY(!model.index(1, 0, g2).isValid());
+    // Sessions are leaves.
+    QVERIFY(!model.hasChildren(a));
+    QVERIFY(model.hasChildren(g1));
+}
+
+// The sidebar is a single-column tree. columnCount() must say so for the root,
+// for a group and for a session, and parent() of an invalid index must be
+// invalid rather than a fabricated row -1 index.
+void TstModels::sessionsModelIsSingleColumn()
+{
+    SessionsModel model;
+    QCOMPARE(model.columnCount(), 1);
+    QVERIFY(!model.parent(QModelIndex()).isValid());
+
+    SessionRow s;
+    s.session.name = QStringLiteral("s");
+    GroupRow g;
+    g.group.name = QStringLiteral("G");
+    g.sessions = {s};
+    model.setGroups({g});
+
+    const QModelIndex group = model.index(0, 0);
+    const QModelIndex session = model.index(0, 0, group);
+    QCOMPARE(model.columnCount(group), 1);
+    QCOMPARE(model.columnCount(session), 1);
+}
+
+// url, like paneId, is persisted for LEAVES only: a split has no content of its
+// own. toJson() must drop a split's stray url and equality must ignore it, or a
+// tree stops comparing equal to its own round-trip and SessionLayouts rewrites
+// the layout on every load.
+void TstModels::splitTreeSplitUrlIgnoredOnRoundTrip()
+{
+    SplitNode child;
+    child.paneId = QStringLiteral("A");
+    child.url = QStringLiteral("codeharbor-internal://file/a.txt");
+
+    SplitNode split;
+    split.url = QStringLiteral("codeharbor-internal://file/ignored-on-splits.txt");
+    split.orientation = SplitOrientation::Horizontal;
+    split.children = {child};
+    split.ratios = {1.0};
+
+    const QJsonObject json = split.toJson();
+    QVERIFY(!json.contains(QStringLiteral("url")));
+
+    const SplitNode restored = SplitNode::fromJson(json);
+    QVERIFY(!restored.isLeaf());
+    QVERIFY(restored.url.isEmpty());
+    QVERIFY(restored == split);
+    // The child's url, by contrast, is preserved.
+    QCOMPARE(restored.children.at(0).url, child.url);
+}
+
+// Defaulted equality on the persisted value types has to compare EVERY member:
+// these structs are diffed to decide whether a change needs writing back, so a
+// field left out of the comparison is a field whose edits are silently dropped.
+// Only DevSession was covered; flip each member of the other three in turn.
+void TstModels::workspaceValueTypesCompareEveryField()
+{
+    Group group;
+    group.id = GroupId{QStringLiteral("g1")};
+    group.serverId = ServerId{QStringLiteral("srv")};
+    group.name = QStringLiteral("Work");
+    group.position = 2;
+    group.collapsed = false;
+    QVERIFY(group == Group(group));
+    for (const auto &mutate : QVector<std::function<void(Group &)>>{
+                 [](Group &g) { g.id = GroupId{QStringLiteral("other")}; },
+                 [](Group &g) { g.serverId = ServerId{QStringLiteral("other")}; },
+                 [](Group &g) { g.name = QStringLiteral("other"); },
+                 [](Group &g) { g.position = 3; },
+                 [](Group &g) { g.collapsed = true; }}) {
+        Group changed = group;
+        mutate(changed);
+        QVERIFY(!(changed == group));
+    }
+
+    ViewerPane viewer;
+    viewer.id = ViewerPaneId{QStringLiteral("v1")};
+    viewer.serverId = ServerId{QStringLiteral("srv")};
+    viewer.devSessionId = DevSessionId{QStringLiteral("s1")};
+    viewer.url = QStringLiteral("file:///a");
+    viewer.handler = QStringLiteral("markdown");
+    viewer.title = QStringLiteral("A");
+    viewer.position = 1;
+    QVERIFY(viewer == ViewerPane(viewer));
+    for (const auto &mutate : QVector<std::function<void(ViewerPane &)>>{
+                 [](ViewerPane &p) { p.id = ViewerPaneId{QStringLiteral("other")}; },
+                 [](ViewerPane &p) { p.serverId = ServerId{QStringLiteral("other")}; },
+                 [](ViewerPane &p) { p.devSessionId = DevSessionId{QStringLiteral("other")}; },
+                 [](ViewerPane &p) { p.url = QStringLiteral("file:///b"); },
+                 [](ViewerPane &p) { p.handler = QStringLiteral("web"); },
+                 [](ViewerPane &p) { p.title = QStringLiteral("B"); },
+                 [](ViewerPane &p) { p.position = 2; }}) {
+        ViewerPane changed = viewer;
+        mutate(changed);
+        QVERIFY(!(changed == viewer));
+    }
+
+    TerminalPane term;
+    term.id = TerminalId{QStringLiteral("t1")};
+    term.serverId = ServerId{QStringLiteral("srv")};
+    term.devSessionId = DevSessionId{QStringLiteral("s1")};
+    term.name = QStringLiteral("shell");
+    term.workingDirectory = QStringLiteral("/wd");
+    term.tmuxTarget = QStringLiteral("ch:0.0");
+    term.startupCommand = QStringLiteral("git status");
+    term.harness = QStringLiteral("oh-my-pi");
+    term.position = 1;
+    QVERIFY(term == TerminalPane(term));
+    for (const auto &mutate : QVector<std::function<void(TerminalPane &)>>{
+                 [](TerminalPane &p) { p.id = TerminalId{QStringLiteral("other")}; },
+                 [](TerminalPane &p) { p.serverId = ServerId{QStringLiteral("other")}; },
+                 [](TerminalPane &p) { p.devSessionId = DevSessionId{QStringLiteral("other")}; },
+                 [](TerminalPane &p) { p.name = QStringLiteral("other"); },
+                 [](TerminalPane &p) { p.workingDirectory = QStringLiteral("/other"); },
+                 [](TerminalPane &p) { p.tmuxTarget = QStringLiteral("ch:1.0"); },
+                 [](TerminalPane &p) { p.startupCommand = QStringLiteral("ls"); },
+                 [](TerminalPane &p) { p.harness = QStringLiteral("generic"); },
+                 [](TerminalPane &p) { p.position = 2; }}) {
+        TerminalPane changed = term;
+        mutate(changed);
+        QVERIFY(!(changed == term));
+    }
 }
 
 QTEST_GUILESS_MAIN(TstModels)

@@ -58,6 +58,7 @@ private slots:
     void wireMappingIsExhaustive();       // pure parser
     void strictWireMappingSeparatesUnknownFromGarbage(); // pure parser
     void parseRejectsMalformed();         // pure parser
+    void parseRejectsBlankIdentifiers();  // pure parser
     void mapsStatesFromWire();
     void runningToIdleUnseenSetsUnseenAndNotify();
     void markSeenClearsUnseen();
@@ -72,6 +73,18 @@ private slots:
     void crlfFramedLinesAreAccepted();
     void transportDestroyedThenRebindIsSafe();
     void accumulatedStateSurvivesAReconnect();
+    void blankIdentifierEventsNeverReachTheState();
+    void bufferedBytesAreDrainedWhenTheTransportIsBound();
+    void rebindingTheSameTransportDoesNotDuplicateDelivery();
+    void oversizedUnterminatedLineIsDroppedAndStreamResyncs();
+    void oversizedFrameTailIsNeverParsedAsItsOwnEvent();
+    void errorStateIsNotSticky();
+    void onlyAttentionStatesNotify();
+    void notificationBodyFallsBackToIdentifiers();
+    void repeatedAndReorderedEventsAreAppliedInArrivalOrder();
+    void retainDevSessionsIsSilentAndTotalWhenNothingIsLive();
+    void markSeenForAnUnknownDevSessionIsSilent();
+    void monitorWithoutATransportIsInert();
 
 private:
     void makePair();
@@ -356,6 +369,61 @@ void TstAgentMonitor::parseRejectsMalformed()
     QCOMPARE(ev->devSessionId, QStringLiteral("d9"));
     QCOMPARE(ev->summary, QStringLiteral("need input"));
     QCOMPARE(ev->metadata.value("k").toString(), QStringLiteral("v"));
+}
+
+// A devSessionId or terminalId that is present and a string but BLANK is not a
+// harmless event: it is structurally valid, so a parser that only checks the
+// type accepts it and files the terminal under a Dev Session that does not
+// exist and no sidebar row can ever show. Worse, for the two states that
+// notify, the notification body falls back to "<devSessionId> / <terminalId>",
+// so the user gets a desktop bubble that reads " / " and points nowhere.
+//
+// Every producer in the chain already refuses to emit one — missingCoordinates()
+// in remote/src/hooks/oh-my-pi-hook.ts, the relay guard in remote/src/bridge.ts,
+// and isEventIdentifier() inside validateEvent() in remote/src/events.ts — and
+// the client is the last edge, so it must refuse it too instead of trusting
+// them. This is the case that pins the C++ validator to validateEvent() field
+// for field rather than merely field-type for field-type.
+void TstAgentMonitor::parseRejectsBlankIdentifiers()
+{
+    const char* const blanks[] = {"", " ", "\t", "\n", "   \t  "};
+    for (const char* blank : blanks) {
+        for (const char* field : {"devSessionId", "terminalId"}) {
+            QJsonObject o{{"version", 1},
+                          {"timestamp", "x"},
+                          {"harness", "generic"},
+                          {"devSessionId", "d"},
+                          {"terminalId", "t"},
+                          {"state", "idle"},
+                          {"event", "e"}};
+            o.insert(QString::fromLatin1(field),
+                     QString::fromUtf8(blank));
+            QVERIFY2(!ch::parseAgentEventLine(
+                          QJsonDocument(o).toJson(QJsonDocument::Compact))
+                          .has_value(),
+                     qPrintable(QStringLiteral("%1=0x%2 was accepted")
+                                    .arg(QString::fromLatin1(field),
+                                         QString::fromLatin1(
+                                             QByteArray(blank).toHex()))));
+        }
+    }
+
+    // An id with surrounding whitespace but real content is NOT blank and is
+    // kept verbatim: trimming is the emptiness test, never a normalisation
+    // step. The server mints these ids and the client must echo back exactly
+    // what it was given.
+    QJsonObject padded{{"version", 1},
+                       {"timestamp", "x"},
+                       {"harness", "generic"},
+                       {"devSessionId", " d "},
+                       {"terminalId", "\tt"},
+                       {"state", "idle"},
+                       {"event", "e"}};
+    const auto ev = ch::parseAgentEventLine(
+        QJsonDocument(padded).toJson(QJsonDocument::Compact));
+    QVERIFY(ev.has_value());
+    QCOMPARE(ev->devSessionId, QStringLiteral(" d "));
+    QCOMPARE(ev->terminalId, QStringLiteral("\tt"));
 }
 
 // --- Monitor ---------------------------------------------------------------
@@ -742,6 +810,378 @@ void TstAgentMonitor::accumulatedStateSurvivesAReconnect()
     m_monitor->markSeen(QStringLiteral("d1"));
     QCOMPARE(unseenSpy.count(), 2);
     QCOMPARE(unseenSpy.at(1).at(1).toBool(), false);
+}
+
+// The wire-level counterpart of parseRejectsBlankIdentifiers(): an event whose
+// devSessionId or terminalId is blank must be dropped by the monitor, leaving
+// no state, no unseen flag and no notification behind. The one well-formed
+// event at the end proves the monitor really was reading the stream, so a
+// silent transport cannot make this case pass by accident.
+void TstAgentMonitor::blankIdentifierEventsNeverReachTheState()
+{
+    makePair();
+    QSignalSpy stateSpy(m_monitor, &AgentStatusMonitor::agentStateChanged);
+    QSignalSpy unseenSpy(m_monitor, &AgentStatusMonitor::unseenChanged);
+    QSignalSpy notifySpy(m_monitor, &AgentStatusMonitor::notify);
+
+    // idle_unseen and waiting_input are the two states that would otherwise
+    // raise a desktop notification whose body is little more than a slash.
+    feed(eventLine("idle_unseen", QString(), QStringLiteral("t1")));
+    feed(eventLine("waiting_input", QStringLiteral("d1"), QStringLiteral("   ")));
+    feed(eventLine("running", QStringLiteral("\t"), QStringLiteral("\t")));
+    feed(eventLine("running", QStringLiteral("d1"), QStringLiteral("t1")));
+
+    QTRY_COMPARE(stateSpy.count(), 1);
+    QCOMPARE(stateSpy.at(0).at(0).toString(), QStringLiteral("d1"));
+    QCOMPARE(stateSpy.at(0).at(1).toString(), QStringLiteral("t1"));
+    QCOMPARE(stateSpy.at(0).at(2).toInt(), asInt(AgentState::Running));
+
+    QTest::qWait(100);
+    QCOMPARE(stateSpy.count(), 1);
+    QCOMPARE(unseenSpy.count(), 0);
+    QCOMPARE(notifySpy.count(), 0);
+    QVERIFY(!m_monitor->hasUnseen(QString()));
+    QVERIFY(!m_monitor->hasUnseen(QStringLiteral("d1")));
+    QCOMPARE(m_monitor->stateFor(QString(), QStringLiteral("t1")),
+             asInt(AgentState::Unknown));
+    QCOMPARE(m_monitor->stateFor(QStringLiteral("d1"), QStringLiteral("   ")),
+             asInt(AgentState::Unknown));
+}
+
+// setTransport() drains whatever is ALREADY buffered on the device, and it does
+// so synchronously, before it returns. Two consequences are asserted here
+// because production depends on both: the first frames of a freshly opened SSH
+// channel are never lost to the gap between opening it and subscribing to
+// readyRead, and a caller that wants to observe those frames must connect its
+// own slots BEFORE binding the transport (this case does exactly that, and the
+// counts are checked with no event loop spun in between).
+void TstAgentMonitor::bufferedBytesAreDrainedWhenTheTransportIsBound()
+{
+    QBuffer preloaded;
+    preloaded.setData(eventLine("running", QStringLiteral("dB"),
+                                QStringLiteral("tB"))
+                      + eventLine("idle_unseen", QStringLiteral("dB"),
+                                  QStringLiteral("tB"), QStringLiteral("generic"),
+                                  QStringLiteral("turn_end"),
+                                  QStringLiteral("done")));
+    QVERIFY(preloaded.open(QIODevice::ReadOnly));
+
+    QSignalSpy stateSpy(m_monitor, &AgentStatusMonitor::agentStateChanged);
+    QSignalSpy unseenSpy(m_monitor, &AgentStatusMonitor::unseenChanged);
+    QSignalSpy notifySpy(m_monitor, &AgentStatusMonitor::notify);
+
+    m_monitor->setTransport(&preloaded);
+
+    QCOMPARE(stateSpy.count(), 2);
+    QCOMPARE(stateSpy.at(0).at(2).toInt(), asInt(AgentState::Running));
+    QCOMPARE(stateSpy.at(1).at(2).toInt(), asInt(AgentState::IdleUnseen));
+    QCOMPARE(unseenSpy.count(), 1);
+    QCOMPARE(notifySpy.count(), 1);
+    QCOMPARE(notifySpy.at(0).at(1).toString(), QStringLiteral("done"));
+    QVERIFY(m_monitor->hasUnseen(QStringLiteral("dB")));
+
+    // Drop the pointer before the local buffer dies.
+    m_monitor->setTransport(nullptr);
+}
+
+// Binding the device that is already bound is documented as a no-op "buffer
+// included", and both halves of that matter. If it instead re-ran the wiring it
+// would add a SECOND readyRead connection and every chunk would be handled
+// twice; if it instead cleared the read buffer it would throw away a frame that
+// is only half-received, and the half that eventually arrives would be parsed
+// as a line of its own and dropped, losing a real state change.
+void TstAgentMonitor::rebindingTheSameTransportDoesNotDuplicateDelivery()
+{
+    makePair();
+    m_monitor->setTransport(m_monitorSide);
+    m_monitor->setTransport(m_monitorSide);
+
+    QSignalSpy stateSpy(m_monitor, &AgentStatusMonitor::agentStateChanged);
+
+    feed(eventLine("running"));
+    QTRY_COMPARE(stateSpy.count(), 1);
+    QTest::qWait(100);
+    QCOMPARE(stateSpy.count(), 1);
+
+    // Half a frame in flight, then a redundant rebind, then the other half.
+    const QByteArray full = eventLine("idle");
+    const int half = full.size() / 2;
+    feed(full.left(half));
+    QTest::qWait(150);
+    m_monitor->setTransport(m_monitorSide);
+    feed(full.mid(half));
+
+    QTRY_COMPARE(stateSpy.count(), 2);
+    QCOMPARE(stateSpy.at(1).at(2).toInt(), asInt(AgentState::Idle));
+    QCOMPARE(m_monitor->stateFor("d1", "t1"), asInt(AgentState::Idle));
+}
+
+// A producer that streams without ever emitting '\n' must not be able to grow
+// the client's read buffer without bound. The monitor caps an unframed frame at
+// 1 MiB and drops it — and, crucially, remembers that it did: the bytes between
+// the cut and the next newline are the discarded frame's TAIL, an arbitrary
+// fragment, and handing that to the JSON parser is asking to be lucky. It is
+// skipped, and framing resumes at the following line, which is a real event.
+void TstAgentMonitor::oversizedUnterminatedLineIsDroppedAndStreamResyncs()
+{
+    makePair();
+    QSignalSpy stateSpy(m_monitor, &AgentStatusMonitor::agentStateChanged);
+
+    // 1.5 MiB, no newline anywhere: comfortably past the 1 MiB cap.
+    feed(QByteArray(3 * 512 * 1024, 'x'));
+    QTRY_COMPARE_WITH_TIMEOUT(m_writerSide->bytesToWrite(), qint64(0), 15000);
+    QTest::qWait(200);
+    QCOMPARE(stateSpy.count(), 0);
+
+    // The newline that finally arrives closes the oversized frame; the event on
+    // the line after it must still be understood.
+    feed(QByteArray("\n")
+         + eventLine("running", QStringLiteral("dOS"), QStringLiteral("tOS")));
+    QTRY_COMPARE(stateSpy.count(), 1);
+    QCOMPARE(stateSpy.at(0).at(0).toString(), QStringLiteral("dOS"));
+    QCOMPARE(stateSpy.at(0).at(2).toInt(), asInt(AgentState::Running));
+    QCOMPARE(m_monitor->stateFor("dOS", "tOS"), asInt(AgentState::Running));
+}
+
+// The discriminating case for the oversize guard's discard bookkeeping, and the
+// reason it exists at all.
+//
+// Here the producer emits 1 MiB + 1 bytes of unframed junk and then, WITHOUT
+// ever writing the newline that would have closed it, a perfectly well-formed
+// event line. On the wire that is ONE frame — junk and event glued together —
+// and it is malformed. The junk alone blows the size cap, so the monitor throws
+// the accumulated bytes away; what is left in the socket is the second half of
+// a frame the client has already mutilated.
+//
+// If the monitor simply cleared its buffer and carried on, that leftover would
+// look exactly like a complete, valid event and would be applied — the client
+// would have invented a frame boundary the producer never wrote and recorded a
+// state from a corrupted stream. It must instead skip everything up to the next
+// newline and resume framing there.
+//
+// (The junk is written and fully consumed before the event is written, so the
+// clear is guaranteed to have happened first: without that ordering the two
+// halves could arrive in one read and be framed as a single line anyway, which
+// would prove nothing.)
+void TstAgentMonitor::oversizedFrameTailIsNeverParsedAsItsOwnEvent()
+{
+    makePair();
+    QSignalSpy stateSpy(m_monitor, &AgentStatusMonitor::agentStateChanged);
+
+    feed(QByteArray(1024 * 1024 + 1, 'x'));
+    QTRY_COMPARE_WITH_TIMEOUT(m_writerSide->bytesToWrite(), qint64(0), 15000);
+    QTest::qWait(200);
+    QCOMPARE(stateSpy.count(), 0);
+
+    // Valid on its own, but it is the tail of the mutilated frame above.
+    feed(eventLine("running", QStringLiteral("dTail"), QStringLiteral("tTail")));
+    QTest::qWait(200);
+    QCOMPARE(stateSpy.count(), 0);
+    QCOMPARE(m_monitor->stateFor("dTail", "tTail"), asInt(AgentState::Unknown));
+
+    // Framing has resynchronised: the NEXT line is a frame of its own and is
+    // applied normally.
+    feed(eventLine("idle", QStringLiteral("dTail"), QStringLiteral("tTail")));
+    QTRY_COMPARE(stateSpy.count(), 1);
+    QCOMPARE(stateSpy.at(0).at(2).toInt(), asInt(AgentState::Idle));
+    QCOMPARE(m_monitor->stateFor("dTail", "tTail"), asInt(AgentState::Idle));
+}
+
+// Error is a state, not a latch. Nothing in the monitor keeps a Dev Session red
+// once the agent reports it is working again, and no explicit reset is needed
+// to leave Error — the next event simply replaces it. Error also never notifies
+// (SPEC 6.2 lists waiting_input and idle_unseen only) and is not a completion,
+// so it must not arm the unseen badge.
+void TstAgentMonitor::errorStateIsNotSticky()
+{
+    makePair();
+    QSignalSpy stateSpy(m_monitor, &AgentStatusMonitor::agentStateChanged);
+    QSignalSpy notifySpy(m_monitor, &AgentStatusMonitor::notify);
+
+    feed(eventLine("running"));
+    QTRY_COMPARE(stateSpy.count(), 1);
+
+    feed(eventLine("error", QStringLiteral("d1"), QStringLiteral("t1"),
+                   QStringLiteral("generic"), QStringLiteral("hook_failed"),
+                   QStringLiteral("boom")));
+    QTRY_COMPARE(stateSpy.count(), 2);
+    QCOMPARE(m_monitor->stateFor("d1", "t1"), asInt(AgentState::Error));
+    QVERIFY(!m_monitor->hasUnseen("d1"));
+    QCOMPARE(notifySpy.count(), 0);
+
+    feed(eventLine("running"));
+    QTRY_COMPARE(stateSpy.count(), 3);
+    QCOMPARE(m_monitor->stateFor("d1", "t1"), asInt(AgentState::Running));
+
+    // ...and the way OUT of Error is reachable for every following state too,
+    // including the completion that arms the badge.
+    feed(eventLine("idle_unseen"));
+    QTRY_VERIFY(m_monitor->hasUnseen("d1"));
+    QCOMPARE(notifySpy.count(), 1);
+}
+
+// Only the two attention-worthy states raise the desktop-notification hook. The
+// six quiet states all record a transition and all stay silent: a coding agent
+// that emits a dozen lifecycle events per turn must not turn into a dozen
+// desktop bubbles.
+void TstAgentMonitor::onlyAttentionStatesNotify()
+{
+    makePair();
+    QSignalSpy stateSpy(m_monitor, &AgentStatusMonitor::agentStateChanged);
+    QSignalSpy notifySpy(m_monitor, &AgentStatusMonitor::notify);
+
+    for (const char* quiet : {"starting", "running", "idle", "error", "stopped",
+                              "unknown"})
+        feed(eventLine(QString::fromLatin1(quiet)));
+
+    QTRY_COMPARE(stateSpy.count(), 6);
+    QTest::qWait(100);
+    QCOMPARE(notifySpy.count(), 0);
+
+    feed(eventLine("waiting_input"));
+    QTRY_COMPARE(notifySpy.count(), 1);
+    QCOMPARE(notifySpy.at(0).at(0).toString(),
+             QStringLiteral("Agent waiting for input"));
+
+    feed(eventLine("idle_unseen"));
+    QTRY_COMPARE(notifySpy.count(), 2);
+    QCOMPARE(notifySpy.at(1).at(0).toString(), QStringLiteral("Agent finished"));
+}
+
+// The notification body prefers the producer's summary, but a harness that
+// supplies none — or supplies an empty one — must still yield a body that names
+// the terminal rather than an empty bubble.
+void TstAgentMonitor::notificationBodyFallsBackToIdentifiers()
+{
+    makePair();
+    QSignalSpy notifySpy(m_monitor, &AgentStatusMonitor::notify);
+
+    // No `summary` key at all.
+    feed(eventLine("waiting_input", QStringLiteral("dN"), QStringLiteral("tN")));
+    QTRY_COMPARE(notifySpy.count(), 1);
+    QCOMPARE(notifySpy.at(0).at(1).toString(), QStringLiteral("dN / tN"));
+
+    // Present but empty: same fallback.
+    feed(eventLine("idle_unseen", QStringLiteral("dN"), QStringLiteral("tN"),
+                   QStringLiteral("generic"), QStringLiteral("turn_end"),
+                   QStringLiteral("")));
+    QTRY_COMPARE(notifySpy.count(), 2);
+    QCOMPARE(notifySpy.at(1).at(1).toString(), QStringLiteral("dN / tN"));
+}
+
+// Sequencing comes from the single ordered byte stream, never from the
+// timestamp field: those are wall-clock readings taken in separate short-lived
+// hook processes, so they are neither monotonic nor guaranteed distinct, and a
+// clock step backwards would discard live state if it were used to reorder or
+// drop. An event with an OLDER timestamp arriving later therefore wins, and a
+// burst of identical events collapses to nothing extra.
+void TstAgentMonitor::repeatedAndReorderedEventsAreAppliedInArrivalOrder()
+{
+    makePair();
+    QSignalSpy stateSpy(m_monitor, &AgentStatusMonitor::agentStateChanged);
+
+    const auto stamped = [](const QString& state, const QString& ts) {
+        QJsonObject o{{"version", 1},   {"timestamp", ts},
+                      {"harness", "generic"}, {"devSessionId", "dO"},
+                      {"terminalId", "tO"},   {"state", state},
+                      {"event", "tick"}};
+        return QByteArray(QJsonDocument(o).toJson(QJsonDocument::Compact) + '\n');
+    };
+
+    feed(stamped(QStringLiteral("running"),
+                 QStringLiteral("2026-07-25T00:00:03.000Z")));
+    QTRY_COMPARE(stateSpy.count(), 1);
+    QCOMPARE(m_monitor->stateFor("dO", "tO"), asInt(AgentState::Running));
+
+    // Two seconds OLDER, but it arrived second, so it is the current state.
+    feed(stamped(QStringLiteral("idle"),
+                 QStringLiteral("2026-07-25T00:00:01.000Z")));
+    QTRY_COMPARE(stateSpy.count(), 2);
+    QCOMPARE(stateSpy.at(1).at(2).toInt(), asInt(AgentState::Idle));
+    QCOMPARE(m_monitor->stateFor("dO", "tO"), asInt(AgentState::Idle));
+
+    // Three duplicates delivered as ONE chunk: every line is framed and parsed,
+    // and none of them is a transition, so nothing further is emitted.
+    feed(stamped(QStringLiteral("idle"), QStringLiteral("a"))
+         + stamped(QStringLiteral("idle"), QStringLiteral("b"))
+         + stamped(QStringLiteral("idle"), QStringLiteral("c")));
+    QTest::qWait(150);
+    QCOMPARE(stateSpy.count(), 2);
+    QCOMPARE(m_monitor->stateFor("dO", "tO"), asInt(AgentState::Idle));
+}
+
+// retainDevSessions() is the only eviction path, and it is deliberately silent:
+// it runs right after the sidebar list has been rebuilt from the authoritative
+// server tree, so every Dev Session it drops has already stopped having a row,
+// and a change signal would name something nobody can display. Retaining
+// exactly what is live must not disturb anything, an empty live set must clear
+// everything, and eviction must leave no tombstone behind.
+void TstAgentMonitor::retainDevSessionsIsSilentAndTotalWhenNothingIsLive()
+{
+    makePair();
+    feed(eventLine("idle_unseen", QStringLiteral("dR"), QStringLiteral("tR")));
+    QTRY_VERIFY(m_monitor->hasUnseen("dR"));
+
+    QSignalSpy stateSpy(m_monitor, &AgentStatusMonitor::agentStateChanged);
+    QSignalSpy unseenSpy(m_monitor, &AgentStatusMonitor::unseenChanged);
+
+    m_monitor->retainDevSessions({QStringLiteral("dR")});
+    QCOMPARE(m_monitor->stateFor("dR", "tR"), asInt(AgentState::IdleUnseen));
+    QVERIFY(m_monitor->hasUnseen("dR"));
+
+    m_monitor->retainDevSessions({});
+    QCOMPARE(m_monitor->stateFor("dR", "tR"), asInt(AgentState::Unknown));
+    QVERIFY(!m_monitor->hasUnseen("dR"));
+    QCOMPARE(stateSpy.count(), 0);
+    QCOMPARE(unseenSpy.count(), 0);
+
+    // No tombstone: the same id reporting again is tracked from scratch and can
+    // re-arm its badge.
+    feed(eventLine("idle_unseen", QStringLiteral("dR"), QStringLiteral("tR")));
+    QTRY_COMPARE(unseenSpy.count(), 1);
+    QCOMPARE(stateSpy.count(), 1);
+    QVERIFY(m_monitor->hasUnseen("dR"));
+}
+
+// markSeen() reports the unseen flag FLIPPING, not the user looking. A Dev
+// Session the monitor has never heard of, and one it knows but that has no
+// pending completion, must both be silent no-ops — otherwise every sidebar
+// selection change would emit a signal and re-derive every row.
+void TstAgentMonitor::markSeenForAnUnknownDevSessionIsSilent()
+{
+    makePair();
+    QSignalSpy unseenSpy(m_monitor, &AgentStatusMonitor::unseenChanged);
+
+    m_monitor->markSeen(QStringLiteral("never-heard-of-it"));
+    m_monitor->markSeen(QString());
+    QCOMPARE(unseenSpy.count(), 0);
+    QVERIFY(!m_monitor->hasUnseen("never-heard-of-it"));
+
+    feed(eventLine("running", QStringLiteral("dM"), QStringLiteral("tM")));
+    QTRY_COMPARE(m_monitor->stateFor("dM", "tM"), asInt(AgentState::Running));
+    m_monitor->markSeen(QStringLiteral("dM"));
+    QCOMPARE(unseenSpy.count(), 0);
+    QCOMPARE(m_monitor->stateFor("dM", "tM"), asInt(AgentState::Running));
+}
+
+// main.cpp constructs the monitor and hands it to AppController and the
+// Notifier long before the SSH channel that feeds it exists, and SessionBootstrap
+// unbinds it again on every disconnect. Every query and command must therefore
+// be safe with no transport at all.
+void TstAgentMonitor::monitorWithoutATransportIsInert()
+{
+    QCOMPARE(m_monitor->transport(), static_cast<QIODevice*>(nullptr));
+    QSignalSpy unseenSpy(m_monitor, &AgentStatusMonitor::unseenChanged);
+
+    QCOMPARE(m_monitor->stateFor("d", "t"), asInt(AgentState::Unknown));
+    QVERIFY(!m_monitor->hasUnseen("d"));
+    m_monitor->markSeen(QStringLiteral("d"));
+    m_monitor->retainDevSessions({});
+    QCOMPARE(unseenSpy.count(), 0);
+
+    // Unbinding what was never bound is a no-op, not a crash.
+    m_monitor->setTransport(nullptr);
+    QCOMPARE(m_monitor->transport(), static_cast<QIODevice*>(nullptr));
 }
 
 QTEST_MAIN(TstAgentMonitor)

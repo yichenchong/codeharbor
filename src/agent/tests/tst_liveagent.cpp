@@ -97,6 +97,7 @@ private slots:
     void realHookDrivesOrderedStates();   // (b)
     void sidebarRowIsFinishedUnseen();    // (d), while unseen
     void markSeenClearsBadgeAndRow();     // (c) + (d), after markSeen
+    void errorAndShutdownReachTheRowState(); // (b) remainder of SPEC 6.5
     void remoteBridgeIsReaped();          // (e)
 
 private:
@@ -111,7 +112,8 @@ private:
     // a state change that can never arrive and report a misleading timeout.
     bool fireHook(const QString& nativeEvent,
                   const QString& tool = QString(),
-                  const QString& summary = QString());
+                  const QString& summary = QString(),
+                  bool error = false);
     // Live per-terminal status as the sidebar would carry it.
     QVector<TerminalStatus> liveTerminals() const;
     // Aggregate row state read back through the real model's RowStateRole.
@@ -197,10 +199,18 @@ void TstLiveAgent::cleanupTestCase()
     }
     if (m_pool.state() == SshConnectionPool::State::Connected
         && !m_runtimeDir.isEmpty()) {
+        // A failed cleanup is not a test failure — the gate has already made
+        // its assertions — but it MUST NOT be invisible: silently swallowing it
+        // leaves a private bridge socket and its scratch directory on the
+        // fixture host, and the next run inherits the litter.
         QByteArray out;
         QString err;
-        runRemote(QStringLiteral("rm -rf ") + q(m_runtimeDir), &out, &err,
-                  kExecTimeoutMs);
+        if (!runRemote(QStringLiteral("rm -rf ") + q(m_runtimeDir), &out, &err,
+                       kExecTimeoutMs)
+            || !err.trimmed().isEmpty()) {
+            qWarning("failed to remove remote scratch dir %s: %s",
+                     qPrintable(m_runtimeDir), qPrintable(err.trimmed()));
+        }
     }
     m_pool.disconnectFromHost();
 }
@@ -264,7 +274,7 @@ bool TstLiveAgent::runRemote(const QString& command, QByteArray* out,
 }
 
 bool TstLiveAgent::fireHook(const QString& nativeEvent, const QString& tool,
-                            const QString& summary)
+                            const QString& summary, bool error)
 {
     // The exact contract a harness must honour (SPEC 6.2): the native event is
     // argv[1] of the installed hook, the session coordinates and the optional
@@ -279,6 +289,10 @@ bool TstLiveAgent::fireHook(const QString& nativeEvent, const QString& tool,
          << q(QStringLiteral("OMP_TERMINAL_ID=") + m_term);
     if (!summary.isEmpty())
         argv << q(QStringLiteral("OMP_SUMMARY=") + summary);
+    // SPEC 6.5's "agent or hook error" arm: the harness marks the firing and
+    // the adapter maps it to `error` ahead of the native event name.
+    if (error)
+        argv << q(QStringLiteral("OMP_ERROR=1"));
     argv << QStringLiteral("sh")
          << q(m_repo + QStringLiteral("/tests/live/fake-omp-agent.sh"))
          << q(nativeEvent);
@@ -499,6 +513,49 @@ void TstLiveAgent::markSeenClearsBadgeAndRow()
     QCOMPARE(asInt(SessionsModel::aggregateSessionState(terminals)),
              asInt(SessionRowState::Idle));
     QCOMPARE(asInt(modelRowState(terminals)), asInt(SessionRowState::Idle));
+}
+
+// The two SPEC 6.5 mappings realHookDrivesOrderedStates() does not reach, and
+// with them the top of the sidebar's precedence ladder. Both go through the
+// same real chain: fake harness -> real hook -> real bridge adapter -> SSH ->
+// monitor -> SessionsModel row state.
+//
+//   agent or hook error -> error     highest-priority row state there is
+//   session_shutdown    -> stopped   the terminal's last word
+//
+// Error is also the state most easily got wrong in the direction the user
+// notices: a row that latches red, or an error that pops a desktop bubble the
+// spec never asked for. Both are asserted against here.
+void TstLiveAgent::errorAndShutdownReachTheRowState()
+{
+    QVERIFY2(m_bridge != nullptr, "bridge channel was not wired");
+    const int notifiesBefore = m_notifySpy->count();
+    const int unseenBefore = m_unseenSpy->count();
+
+    // OMP_ERROR=1 marks the firing; adapters/oh-my-pi.ts checks it BEFORE the
+    // native event name, so even an agent_end maps to error.
+    QVERIFY(fireHook(QStringLiteral("agent_end"), QString(),
+                     QStringLiteral("live gate: agent blew up"), true));
+    QTRY_COMPARE_WITH_TIMEOUT(m_monitor.stateFor(m_dev, m_term),
+                              asInt(AgentState::Error), kRelayTimeoutMs);
+    QCOMPARE(asInt(modelRowState(liveTerminals())),
+             asInt(SessionRowState::Error));
+    // An error is not a completion: no unseen badge...
+    QVERIFY(!m_monitor.hasUnseen(m_dev));
+    QCOMPARE(m_unseenSpy->count(), unseenBefore);
+    // ...and not attention-worthy in the notification sense either (SPEC 6.2
+    // names waiting_input and idle_unseen, and only those).
+    QCOMPARE(m_notifySpy->count(), notifiesBefore);
+
+    QVERIFY(fireHook(QStringLiteral("session_shutdown")));
+    QTRY_COMPARE_WITH_TIMEOUT(m_monitor.stateFor(m_dev, m_term),
+                              asInt(AgentState::Stopped), kRelayTimeoutMs);
+    // Error is a state, not a latch: the shutdown replaced it with no explicit
+    // reset, and the row leaves Error for Idle (the pane is still connected, so
+    // it is Idle rather than Disconnected).
+    QCOMPARE(asInt(modelRowState(liveTerminals())), asInt(SessionRowState::Idle));
+    QCOMPARE(m_notifySpy->count(), notifiesBefore);
+    QCOMPARE(m_unseenSpy->count(), unseenBefore);
 }
 
 // (e) Closing the channel must reap the relay: no orphan node process may

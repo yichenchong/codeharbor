@@ -38,6 +38,13 @@ Rectangle {
     property var rootRegion: null
     readonly property var paneOwner: region.rootRegion ? region.rootRegion : region
 
+    // Where this region's `node` sits in the ROOT region's tree, as the index
+    // path ch::SessionLayouts::setRatios() addresses a branch by: [] is the
+    // root node, ["1"] its second child, ["1","0"] that child's first child.
+    // Handed down by setSource() beside `node`, so a nested region can name the
+    // branch a drag just resized without the host having to search for it.
+    property var nodePath: []
+
     // Liveness marker. A DESTROYED QObject reads back `undefined` for every
     // property (it only throws when one is CALLED), so this is how a region on
     // its way out asks "is my owner still there?" during a teardown that may
@@ -66,6 +73,22 @@ Rectangle {
     // takePane() wires the panes and where `focusedPaneId` lives.
     signal splitRequested(string orientation)
     signal closePaneRequested(string paneId)
+
+    // A handle INSIDE this region was dragged, so the branch at `pathIndexes`
+    // now has these child fractions (one per child, each > 0, summing to 1).
+    // Relayed to the host, which persists them through
+    // ch::SessionLayouts::setRatios() — the counterpart of the `ratios` this
+    // file already RESTORES in ratioFor(). Without it a drag inside a region is
+    // forgotten the moment the Dev Session is reopened.
+    //
+    // Emitted by the ROOT region only, like the two requests above: nested
+    // regions hand their reading up through reportRatios() on the owner, so the
+    // host has exactly one signal to listen to per region.
+    signal splitRatiosAdjusted(var pathIndexes, var ratios)
+
+    function reportRatios(pathIndexes, ratios) {
+        region.splitRatiosAdjusted(pathIndexes, ratios);
+    }
 
     function isLeaf(n) {
         return !n || !n.children || n.children.length === 0;
@@ -483,6 +506,42 @@ Rectangle {
             onHeightChanged: applyRatios()
             Component.onCompleted: applyRatios()
 
+            // The write side of `ratios` (SPEC 4.5). SplitView.resizing is true
+            // only while a handle is under the pointer, so this fires exactly
+            // once, when a drag FINISHES — the same discipline Main.qml uses for
+            // the outer region widths. A binding-driven size change (a window
+            // resize, a republish re-applying stored ratios) must never be
+            // written back: it would overwrite the user's own proportions with
+            // whatever the current window happens to allow.
+            function publishRatios() {
+                const count = childRepeater.count;
+                if (count < 2)
+                    return;
+                const sizes = [];
+                let total = 0;
+                for (let i = 0; i < count; ++i) {
+                    const child = childRepeater.itemAt(i);
+                    if (!child)
+                        return;
+                    const size = orientation === Qt.Horizontal ? child.width : child.height;
+                    // ch::SessionLayouts::setRatios() rejects a non-positive
+                    // ratio, and a zero-extent child is a mid-layout reading
+                    // rather than a proportion worth storing.
+                    if (!(size > 0))
+                        return;
+                    sizes.push(size);
+                    total += size;
+                }
+                if (!(total > 0))
+                    return;
+                const ratios = [];
+                for (let k = 0; k < sizes.length; ++k)
+                    ratios.push(sizes[k] / total);
+                region.paneOwner.reportRatios(region.nodePath, ratios);
+            }
+
+            onResizingChanged: if (!resizing) split.publishRatios()
+
             // Every republish re-applies the node's persisted ratios. The
             // Repeater below is keyed on the child COUNT, so it no longer
             // notices a republish that changed only the ratios or only what the
@@ -524,7 +583,9 @@ Rectangle {
                     // node first, transiently building a stray leaf pane.
                     Component.onCompleted: setSource("ViewerRegion.qml",
                                                      { node: childLoader.childNode,
-                                                       rootRegion: region.paneOwner })
+                                                       rootRegion: region.paneOwner,
+                                                       nodePath: region.nodePath.concat(
+                                                           [String(childLoader.index)]) })
                     onChildNodeChanged: if (item) item.node = childLoader.childNode
                 }
             }

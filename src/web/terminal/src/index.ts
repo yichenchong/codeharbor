@@ -9,6 +9,8 @@ import { FitAddon } from "@xterm/addon-fit";
 import "@xterm/xterm/css/xterm.css";
 // Pure, DOM-free predicate split out so it can be unit-tested (see visibility.ts).
 import { isRendererVisible } from "./visibility";
+// Output flow control, likewise DOM-free and unit-tested (see writer.ts).
+import { CoalescingWriter } from "./writer";
 
 export interface TerminalBridge {
     /** Forward user keystrokes to the remote PTY (SPEC 5.1). */
@@ -110,6 +112,26 @@ export function mountTerminal(element: HTMLElement, bridge: TerminalBridge): Ter
     // onData, so this listener's ordering is independent of the size handshake.
     term.onData((data) => bridge.sendInput(data));
 
+    // Re-fit the terminal to the surface, but ONLY while the surface actually
+    // has a box on screen.
+    //
+    // FitAddon clamps its proposal to a floor of 2 columns by 1 row. So when
+    // the pane is collapsed to zero height or zero width — a splitter dragged
+    // shut, a tab switched away in a layout that keeps the page alive at size
+    // 0 — an unguarded fit() does not skip: it resizes the terminal to 2x1 and
+    // that size is forwarded to the remote PTY. tmux then re-wraps every pane
+    // in the session to two columns, permanently mangling the scrollback and
+    // any full-screen program running in it; restoring the pane restores the
+    // size but not the destroyed content. Skipping the fit leaves the last good
+    // size in place, and the ResizeObserver fires again the moment the pane
+    // regains a box.
+    function fitToSurface(): void {
+        if (surface.clientWidth === 0 || surface.clientHeight === 0) {
+            return;
+        }
+        fit.fit();
+    }
+
     // Initial-size ordering invariant: fit() FIRST (with no onResize listener
     // attached), THEN attach onResize, THEN send the fitted size exactly once.
     //   - Fitting before term.open()'s listener is wired avoids relying on fit()
@@ -121,7 +143,10 @@ export function mountTerminal(element: HTMLElement, bridge: TerminalBridge): Ter
     //     the remote PTY unconditionally, so the initial size is sent EXACTLY
     //     ONCE. The ResizeObserver's first fit() then re-fits to already-correct
     //     dims (a no-op that emits no onResize), so there is no double-send.
-    fit.fit();
+    //   - Mounted into a pane that has no box yet, the fit is skipped and the
+    //     size sent here is xterm's 80x24 default; the ResizeObserver corrects
+    //     it (exactly once more) as soon as the pane is laid out.
+    fitToSurface();
     // Report renderer size changes so C++ can resize the remote PTY (SPEC 5.1).
     term.onResize(({ cols, rows }) => bridge.resize(cols, rows));
     bridge.resize(term.cols, term.rows);
@@ -135,7 +160,7 @@ export function mountTerminal(element: HTMLElement, bridge: TerminalBridge): Ter
     //     reserved for a strip that is no longer on screen.
     // A second fit() for one real resize costs nothing: it re-fits to
     // already-correct dims, which emits no onResize.
-    const resizeObserver = new ResizeObserver(() => fit.fit());
+    const resizeObserver = new ResizeObserver(fitToSurface);
     resizeObserver.observe(element);
     resizeObserver.observe(surface);
 
@@ -186,18 +211,48 @@ export function mountTerminal(element: HTMLElement, bridge: TerminalBridge): Ter
     visibilityObserver.observe(element);
     element.ownerDocument.addEventListener("visibilitychange", reportVisibility);
 
+    // Terminal output goes through the coalescing writer rather than straight
+    // into term.write(): see writer.ts for why an unthrottled write() can throw
+    // and wedge the pane on a large burst.
+    const writer = new CoalescingWriter({
+        write: (data, done) => term.write(data, done),
+    });
+
+    // dispose() can be reached twice — a host that tears the pane down
+    // explicitly still has the "pagehide" handler registered in
+    // connectTerminal() below — and the WebChannel signals that drive write() /
+    // clear() / setConnectionState() stay connected until the page itself is
+    // gone. Both are covered by refusing to touch the terminal once it is
+    // disposed: xterm.js' write buffer has no disposal guard of its own, so a
+    // single late batch of output would throw inside the signal dispatch.
+    let disposed = false;
+
     return {
         write(data: string): void {
-            term.write(data);
+            if (disposed) {
+                return;
+            }
+            writer.write(data);
         },
         setConnectionState(state: string): void {
+            if (disposed) {
+                return;
+            }
             status.dataset.state = state;
             status.textContent = state;
         },
         clear(): void {
+            if (disposed) {
+                return;
+            }
             term.clear();
         },
         dispose(): void {
+            if (disposed) {
+                return;
+            }
+            disposed = true;
+            writer.close();
             resizeObserver.disconnect();
             visibilityObserver.disconnect();
             element.ownerDocument.removeEventListener("visibilitychange", reportVisibility);
@@ -300,9 +355,16 @@ export function connectTerminal(element: HTMLElement): void {
             return;
         }
         const host = mountTerminal(element, bridge);
-        bridge.write.connect((data: string) => host.write(data));
-        bridge.connectionStateChanged.connect((state: string) => host.setConnectionState(state));
-        bridge.clearRequested.connect(() => host.clear());
+        // Named, so the same references can be handed back to disconnect()
+        // during teardown. An anonymous arrow could never be unsubscribed, and
+        // qwebchannel.js keeps every connected handler alive on the proxy for
+        // as long as the channel exists.
+        const onWrite = (data: string): void => host.write(data);
+        const onConnectionStateChanged = (state: string): void => host.setConnectionState(state);
+        const onClearRequested = (): void => host.clear();
+        bridge.write.connect(onWrite);
+        bridge.connectionStateChanged.connect(onConnectionStateChanged);
+        bridge.clearRequested.connect(onClearRequested);
         // The state reached before this page finished loading is already in the
         // property cache, so the strip is correct without waiting for a signal.
         if (typeof bridge.connectionState === "string") {
@@ -311,8 +373,15 @@ export function connectTerminal(element: HTMLElement): void {
         // A navigated-away or destroyed pane must not leave a ResizeObserver and
         // an IntersectionObserver firing into a dead terminal, and must hand the
         // controller back the job of retaining output (host.dispose() reports the
-        // renderer hidden on its way out).
-        window.addEventListener("pagehide", () => host.dispose(), { once: true });
+        // renderer hidden on its way out). The signal handlers go first so that
+        // output still in flight from C++ stops reaching this page at all,
+        // rather than relying on the host's post-dispose guards.
+        window.addEventListener("pagehide", () => {
+            bridge.write.disconnect(onWrite);
+            bridge.connectionStateChanged.disconnect(onConnectionStateChanged);
+            bridge.clearRequested.disconnect(onClearRequested);
+            host.dispose();
+        }, { once: true });
         // Handshake LAST, once every host callback is connected: the controller
         // has been buffering output since the channel opened and replays it into
         // a renderer that is now listening (SPEC 5.4).

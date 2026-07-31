@@ -134,3 +134,80 @@ test("flush is a no-op when nothing is pending", () => {
     reporter.flush();
     assert.deepEqual(reports, []);
 });
+
+test("re-scheduling replaces the armed timer instead of stacking a second one", () => {
+    const clock = new FakeClock();
+    const { bridge, reports } = fakeBridge();
+    const reporter = new RecoveryReporter(bridge, () => "final", clock.timers);
+
+    // Every keystroke calls schedule(); the debounce only works if each call
+    // cancels the previous timer rather than adding one.
+    reporter.schedule(true);
+    reporter.schedule(true);
+    reporter.schedule(true);
+    assert.equal(clock.armed, 1, "keystrokes must not stack timers");
+
+    clock.fire();
+    assert.deepEqual(reports, ["final"], "exactly one snapshot per debounce window");
+});
+
+test("the snapshot carries the buffer as of the moment the timer fires", () => {
+    const clock = new FakeClock();
+    const { bridge, reports } = fakeBridge();
+    let buffer = "at schedule time";
+    const reporter = new RecoveryReporter(bridge, () => buffer, clock.timers);
+
+    reporter.schedule(true);
+    buffer = "at fire time";
+    clock.fire();
+    assert.deepEqual(reports, ["at fire time"]);
+});
+
+test("cancel disarms without reporting, and leaves the reporter reusable", () => {
+    const clock = new FakeClock();
+    const { bridge, reports } = fakeBridge();
+    const reporter = new RecoveryReporter(bridge, () => "x", clock.timers);
+
+    reporter.schedule(true);
+    reporter.cancel();
+    assert.equal(reporter.pending, false);
+    assert.equal(clock.armed, 0, "cancel must release the timer, not just forget it");
+    clock.fire();
+    assert.deepEqual(reports, []);
+
+    // cancel() is also a no-op when nothing is armed (contentLoaded calls it
+    // unconditionally).
+    reporter.cancel();
+    reporter.schedule(true);
+    clock.fire();
+    assert.deepEqual(reports, ["x"]);
+});
+
+test("schedule(false) disarms an already-armed snapshot", () => {
+    const clock = new FakeClock();
+    const { bridge, reports } = fakeBridge();
+    const reporter = new RecoveryReporter(bridge, () => "x", clock.timers);
+
+    reporter.schedule(true);
+    // The conflict/error handlers call schedule(dirty) with whatever the flag
+    // currently is; a clean buffer must end up with nothing armed.
+    reporter.schedule(false);
+    assert.equal(reporter.pending, false);
+    clock.fire();
+    assert.deepEqual(reports, []);
+});
+
+test("save sends the buffer as of the save, guarded by the given revision", () => {
+    const clock = new FakeClock();
+    const { bridge, saves } = fakeBridge();
+    let buffer = "one";
+    const reporter = new RecoveryReporter(bridge, () => buffer, clock.timers);
+
+    reporter.save("rev-1");
+    buffer = "two";
+    reporter.save("rev-2");
+    assert.deepEqual(saves, [
+        { content: "one", revision: "rev-1" },
+        { content: "two", revision: "rev-2" },
+    ]);
+});

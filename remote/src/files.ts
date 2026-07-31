@@ -31,7 +31,16 @@ import type {
     WatchEvent,
     ListDirectoryParams,
     ListDirectoryResult,
+    RpcMethodName,
 } from "./rpc-types.ts";
+import {
+    optionalIndex,
+    optionalIntegerInRange,
+    optionalOneOf,
+    optionalString,
+    requireObject,
+    requireString,
+} from "./validate.ts";
 
 // Opaque revision token (SPEC 8.4/8.6). Clients treat it as bytes and never
 // parse it. It must change whenever the file changes, so it folds in a
@@ -608,15 +617,90 @@ export function getMimeType(filePath: string): string {
     return MIME_TYPES[path.extname(filePath).toLowerCase()] ?? "application/octet-stream";
 }
 
-// RPC handler table keyed by the frozen wire names (RPC_METHODS). codeharbord
-// merges this into its method map. Handlers take opaque params and cast to the
-// C1 request shapes; dispatch awaits any returned promise.
-export const fileMethods: Record<string, (params: unknown) => unknown | Promise<unknown>> = {
-    [RPC_METHODS.stat]: (params) => stat(params as StatParams),
-    [RPC_METHODS.readFile]: (params) => readFile(params as ReadFileParams),
-    [RPC_METHODS.writeFile]: (params) => writeFile(params as WriteFileParams),
-    [RPC_METHODS.resolvePath]: (params) => resolvePath(params as ResolvePathParams),
-    [RPC_METHODS.watch]: (params) => fileWatchService.watch(params as WatchParams),
-    [RPC_METHODS.unwatch]: (params) => fileWatchService.unwatch(params as UnwatchParams),
-    [RPC_METHODS.listDirectory]: (params) => listDirectory(params as ListDirectoryParams),
+// --- RPC handler table ------------------------------------------------------
+//
+// Keyed by the frozen wire names (RPC_METHODS); codeharbord merges this into
+// its method map and awaits any returned promise.
+//
+// Every handler VALIDATES its params before touching the filesystem, the same
+// way the `workspace.*` group does. The table used to cast opaque params
+// straight to the C1 request shapes, which turned every malformed request into
+// a misleading failure deeper in:
+//   * an omitted `path` reached fs as `undefined` and came back as a generic
+//     internal error naming an "argument", not the field the client got wrong;
+//   * an omitted `expectedRevision` compared `undefined` against the on-disk
+//     token and always lost, so a plainly malformed write was reported as a
+//     revision CONFLICT and the client offered the user a reload/overwrite
+//     dialog for a conflict that did not exist;
+//   * a non-numeric `mode` (say the string "x") survived `mode & 0o7777` as 0,
+//     so the atomic save chmod'd the user's file to 000 and locked them out of
+//     their own data;
+//   * a non-numeric `offset` propagated as NaN into Buffer.alloc and failed
+//     with an out-of-range message about "size".
+// Guard failures are tagged InvalidParamsError, which the dispatcher answers
+// with JSON-RPC -32602.
+
+const FILE_ENCODINGS = ["utf-8", "base64"] as const;
+
+// POSIX permission bits plus setuid/setgid/sticky — exactly the range
+// writeFile keeps (`mode & 0o7777`).
+const MAX_FILE_MODE = 0o7777;
+
+function pathParams<T extends { path: string }>(params: unknown, method: string): T {
+    const obj = requireObject(params, method);
+    return { path: requireString(obj, "path", method) } as T;
+}
+
+function readFileParams(params: unknown, method: string): ReadFileParams {
+    const obj = requireObject(params, method);
+    const result: ReadFileParams = { path: requireString(obj, "path", method) };
+    const offset = optionalIndex(obj, "offset", method);
+    if (offset !== undefined) result.offset = offset;
+    const length = optionalIndex(obj, "length", method);
+    if (length !== undefined) result.length = length;
+    return result;
+}
+
+function writeFileParams(params: unknown, method: string): WriteFileParams {
+    const obj = requireObject(params, method);
+    const result: WriteFileParams = {
+        path: requireString(obj, "path", method),
+        content: requireString(obj, "content", method),
+        expectedRevision: requireString(obj, "expectedRevision", method),
+    };
+    // An unlisted encoding used to fall through to utf-8, which for a client
+    // that meant base64 writes the base64 TEXT into the file as if it were the
+    // document — a silent corruption reported as a successful save.
+    const encoding = optionalOneOf(obj, "encoding", method, FILE_ENCODINGS);
+    if (encoding !== undefined) result.encoding = encoding;
+    const mode = optionalIntegerInRange(obj, "mode", method, 0, MAX_FILE_MODE);
+    if (mode !== undefined) result.mode = mode;
+    return result;
+}
+
+function resolvePathParams(params: unknown, method: string): ResolvePathParams {
+    const obj = requireObject(params, method);
+    const result: ResolvePathParams = { path: requireString(obj, "path", method) };
+    const base = optionalString(obj, "base", method);
+    if (typeof base === "string") result.base = base;
+    return result;
+}
+
+function unwatchParams(params: unknown, method: string): UnwatchParams {
+    const obj = requireObject(params, method);
+    return { subscriptionId: requireString(obj, "subscriptionId", method) };
+}
+
+export const fileMethods: Record<RpcMethodName, (params: unknown) => unknown | Promise<unknown>> = {
+    [RPC_METHODS.stat]: (params) => stat(pathParams<StatParams>(params, RPC_METHODS.stat)),
+    [RPC_METHODS.readFile]: (params) => readFile(readFileParams(params, RPC_METHODS.readFile)),
+    [RPC_METHODS.writeFile]: (params) => writeFile(writeFileParams(params, RPC_METHODS.writeFile)),
+    [RPC_METHODS.resolvePath]: (params) =>
+        resolvePath(resolvePathParams(params, RPC_METHODS.resolvePath)),
+    [RPC_METHODS.watch]: (params) =>
+        fileWatchService.watch(pathParams<WatchParams>(params, RPC_METHODS.watch)),
+    [RPC_METHODS.unwatch]: (params) =>
+        fileWatchService.unwatch(unwatchParams(params, RPC_METHODS.unwatch)),
+    [RPC_METHODS.listDirectory]: (params) =>
+        listDirectory(pathParams<ListDirectoryParams>(params, RPC_METHODS.listDirectory)),
 };

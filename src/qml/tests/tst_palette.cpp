@@ -13,12 +13,18 @@
 // counter on an injected C++ probe — the documented {id,title,shortcut,invoke}
 // shape.
 //
-// The second half of the file is about colour rather than the palette: it reads
-// every `color` role out of the live Theme singleton and then refuses to let any
-// QML file in src/qml spell one of those colours out as a hex literal. That is
-// the check that stops the module drifting back into two hundred copies of the
-// same eight shades. It lives here because this is the one QML test that already
-// holds a plain QQmlEngine with the module registered and no window to set up.
+// The second half of the file is not about the palette at all. It holds the two
+// checks that need nothing but a plain QQmlEngine with the module registered and
+// no window to set up, which is the one thing this file already has:
+//
+//   * the COLOUR gate — every `color` role is read out of the live Theme
+//     singleton, and no QML file in src/qml may then spell one of those colours
+//     out as a hex literal. That is what stops the module drifting back into two
+//     hundred copies of the same eight shades.
+//   * the REMOTE PATH gate — RemotePath.js converts between a remote POSIX path
+//     and the file:// URL the viewer stack passes around, in BOTH directions, and
+//     the two directions have to be exact inverses. They are the module's only
+//     copy of that rule, and getting it wrong reads the wrong remote file.
 //
 // Everything runs headless (offscreen QPA + software Quick backend, pinned by
 // the ctest registration). Key events are posted to the QQuickView itself, so
@@ -370,6 +376,11 @@ private slots:
     // reason a mis-registered singleton would, which is why they live together.
     void themeSingletonPublishesEveryColourRole();
     void noQmlFileSpellsOutAThemeColour();
+
+    // RemotePath.js: the module's one conversion between a remote POSIX path and
+    // a file:// URL, in both directions.
+    void remotePathAndFileUrlAreExactInverses();
+    void remotePathLeavesANonFileAddressAlone();
 };
 
 void TstPalette::harnessLoadsPalette()
@@ -728,6 +739,124 @@ void TstPalette::noQmlFileSpellsOutAThemeColour()
              qPrintable(QStringLiteral("%1 hard-coded colour(s) that Theme already names:\n%2")
                                 .arg(hits.size())
                                 .arg(report.join(QLatin1Char('\n')))));
+}
+
+// ---------------------------------------------------------------------------
+// RemotePath.js (SPEC 8.3)
+//
+// Inside CodeHarbor a file:// URL ALWAYS names a file on the remote SSH server,
+// never a local one, and the remote file service speaks plain server-absolute
+// POSIX paths. RemotePath.js is the module's only copy of the conversion between
+// the two spellings, in both directions, and every viewer/editor surface calls
+// it. If the two directions are not exact inverses, a pane silently reads a
+// DIFFERENT file from the one whose name is on screen — which is why this is
+// asserted on the shipped module copy rather than on a re-implementation.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// A document that pulls in the module's own RemotePath.js and exposes both
+// directions as invokable functions.
+class RemotePathProbe
+{
+public:
+    RemotePathProbe()
+    {
+        m_component.setData(QByteArrayLiteral(
+                                "import QtQml\n"
+                                // Absolute qrc path: this document is synthetic,
+                                // so a relative import has no directory to
+                                // resolve against.
+                                "import \"qrc:/qt/qml/CodeHarbor/RemotePath.js\" as RemotePath\n"
+                                "QtObject {\n"
+                                "    function toPath(url) { return RemotePath.fileUrlToPath(url) }\n"
+                                "    function toUrl(path) { return RemotePath.pathToFileUrl(path) }\n"
+                                "}\n"),
+                            QUrl(QStringLiteral("qrc:/chtest/RemotePathProbe.qml")));
+        m_object.reset(m_component.create());
+    }
+
+    QObject *object() const { return m_object.get(); }
+    QString error() const { return m_component.errorString(); }
+
+    QString call(const char *method, const QString &argument) const
+    {
+        QVariant result;
+        if (!m_object
+            || !QMetaObject::invokeMethod(m_object.get(), method, Q_RETURN_ARG(QVariant, result),
+                                          Q_ARG(QVariant, argument)))
+            return QStringLiteral("<invokeMethod failed>");
+        return result.toString();
+    }
+
+private:
+    QQmlEngine m_engine;
+    QQmlComponent m_component{&m_engine};
+    std::unique_ptr<QObject> m_object;
+};
+
+} // namespace
+
+void TstPalette::remotePathAndFileUrlAreExactInverses()
+{
+    const RemotePathProbe probe;
+    QVERIFY2(probe.object() != nullptr, qPrintable(probe.error()));
+
+    struct Case {
+        const char *path;
+        const char *url;
+        const char *why;
+    };
+    // Every entry is a path that only survives if each SEGMENT is encoded on its
+    // own and the "/" separators are left alone.
+    const Case cases[] = {
+        {"/srv/repos/app/README.md", "file:///srv/repos/app/README.md", "an ordinary file"},
+        // "#" and "?" are URL delimiters: leaving either unescaped (which
+        // encodeURI does) turns the rest of the name into a fragment or a query
+        // and reads the wrong file.
+        {"/tmp/notes#1.txt", "file:///tmp/notes%231.txt", "a fragment delimiter in a file name"},
+        {"/srv/a b/c?d", "file:///srv/a%20b/c%3Fd", "a space and a query delimiter"},
+        // Paths here are ALWAYS remote POSIX paths, so a backslash is an ordinary
+        // character in a file name and must never be treated as a separator.
+        {"/tmp/we\\ird", "file:///tmp/we%5Cird", "a backslash is not a separator"},
+        // A trailing slash is what marks a directory for the handler registry, so
+        // it has to survive both directions verbatim.
+        {"/srv/repos/", "file:///srv/repos/", "a directory's trailing slash"},
+        {"/", "file:///", "the filesystem root"},
+        {"/srv/\xC3\xBC/ok", "file:///srv/%C3%BC/ok", "a non-ASCII segment"},
+        // A path that already CONTAINS a percent sequence must be escaped again,
+        // or decoding would hand back something the server never named.
+        {"/a%20b/c", "file:///a%2520b/c", "a literal percent sequence in a path"},
+    };
+
+    for (const Case &testCase : cases) {
+        const QString path = QString::fromUtf8(testCase.path);
+        const QString url = QString::fromUtf8(testCase.url);
+        QVERIFY2(probe.call("toUrl", path) == url,
+                 qPrintable(QStringLiteral("%1: pathToFileUrl(\"%2\") gave \"%3\", expected \"%4\"")
+                                .arg(QLatin1String(testCase.why), path, probe.call("toUrl", path),
+                                     url)));
+        QVERIFY2(probe.call("toPath", url) == path,
+                 qPrintable(QStringLiteral("%1: fileUrlToPath(\"%2\") gave \"%3\", expected \"%4\"")
+                                .arg(QLatin1String(testCase.why), url, probe.call("toPath", url),
+                                     path)));
+    }
+}
+
+// An address that is not a file:// URL is not a remote path at all — an https://
+// page IS its address — and a plain path is already in the spelling the RPC layer
+// wants. Both must come back untouched, because a viewer pane hands whatever it
+// is showing to this function before deciding what to do with it.
+void TstPalette::remotePathLeavesANonFileAddressAlone()
+{
+    const RemotePathProbe probe;
+    QVERIFY2(probe.object() != nullptr, qPrintable(probe.error()));
+
+    QCOMPARE(probe.call("toPath", QStringLiteral("https://example.com/docs?a=1#b")),
+             QStringLiteral("https://example.com/docs?a=1#b"));
+    QCOMPARE(probe.call("toPath", QStringLiteral("/srv/repos/app")),
+             QStringLiteral("/srv/repos/app"));
+    QCOMPARE(probe.call("toPath", QString()), QString());
 }
 
 int main(int argc, char *argv[])

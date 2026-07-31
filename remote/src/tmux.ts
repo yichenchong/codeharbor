@@ -26,11 +26,13 @@ import { RPC_TMUX_METHODS } from "./rpc-types.ts";
 import type {
     TmuxSession,
     ListSessionsResult,
+    RpcTmuxMethodName,
     SessionExistsParams,
     SessionExistsResult,
     KillSessionParams,
     KillSessionResult,
 } from "./rpc-types.ts";
+import { InvalidParamsError } from "./validate.ts";
 
 /** Outcome of one tmux invocation. `code` is -1 when the binary could not be spawned at all. */
 export interface CommandResult {
@@ -164,12 +166,14 @@ export async function listSessions(runner: CommandRunner = execFileRunner): Prom
 // Validates the one parameter shared by sessionExists and killSession. A blank
 // or non-string name is a malformed REQUEST — unlike a missing tmux, it is a
 // genuine error and must surface as one rather than silently matching nothing.
+// Tagged as invalid params so the dispatcher answers -32602 (the client's
+// payload is at fault) rather than -32603 (the server is at fault).
 function requireName(params: unknown, method: string): string {
     if (typeof params === "object" && params !== null && "name" in params) {
         const { name } = params;
         if (typeof name === "string" && name !== "") return name;
     }
-    throw new Error(`${method} requires a non-empty string name`);
+    throw new InvalidParamsError(`${method} requires a non-empty string name`);
 }
 
 /**
@@ -210,7 +214,7 @@ export async function killSession(
 
 // RPC handler table for the `tmux.*` group, keyed by the frozen wire names.
 // codeharbord spreads these into its method map and awaits the returned promise.
-export const TMUX_METHODS: Record<string, (params: unknown) => unknown | Promise<unknown>> = {
+export const TMUX_METHODS: Record<RpcTmuxMethodName, (params: unknown) => unknown | Promise<unknown>> = {
     [RPC_TMUX_METHODS.listSessions]: () => listSessions(),
     [RPC_TMUX_METHODS.sessionExists]: (params) => sessionExists(params as SessionExistsParams),
     [RPC_TMUX_METHODS.killSession]: (params) => killSession(params as KillSessionParams),

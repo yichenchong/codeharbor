@@ -244,6 +244,35 @@ QStringList paneIds(const QList<PaneInfo> &panes)
     return ids;
 }
 
+// The one descendant carrying `name`, over BOTH child lists for the same reason
+// collectPanesInto walks both. Null when there is not exactly one, so an
+// ambiguous name fails the test instead of picking arbitrarily.
+void findNamedInto(QObject *root, const QString &name, QSet<const QObject *> &visited,
+                   QList<QObject *> &out)
+{
+    if (!root || visited.contains(root))
+        return;
+    visited.insert(root);
+    if (root->objectName() == name)
+        out.append(root);
+    const auto objectChildren = root->children();
+    for (QObject *child : objectChildren)
+        findNamedInto(child, name, visited, out);
+    if (auto *item = qobject_cast<QQuickItem *>(root)) {
+        const auto itemChildren = item->childItems();
+        for (QQuickItem *child : itemChildren)
+            findNamedInto(child, name, visited, out);
+    }
+}
+
+QObject *findNamed(QObject *root, const QString &name)
+{
+    QSet<const QObject *> visited;
+    QList<QObject *> found;
+    findNamedInto(root, name, visited, found);
+    return found.size() == 1 ? found.constFirst() : nullptr;
+}
+
 QString describePanes(const QList<PaneInfo> &panes)
 {
     QStringList parts;
@@ -503,6 +532,11 @@ private slots:
     // 5. The Theme singleton must actually RESOLVE. A mis-registered QML
     //    singleton is silent, not loud: see the test body.
     void themeSingletonResolves();
+
+    // 6. The region headers and pane headers are only BUTTONS: the work behind
+    //    them belongs to the host, which has to be listening. Nothing else in
+    //    the suite notices when it is not.
+    void regionRequestsReachTheHost();
 };
 
 void TstQmlLoad::init()
@@ -786,6 +820,89 @@ void TstQmlLoad::regionLeafNodeProducesSinglePane()
                                 .arg(describePanes(panes))));
         QCOMPARE(panes.constFirst().paneId, QString(QLatin1String(testCase.paneId)));
     }
+
+    QVERIFY2(fixture.allWarnings().isEmpty(), qPrintable(fixture.warningReport()));
+}
+
+// A region draws the pane commands (split, close, and for terminals "Kill") in
+// its own header, and every pane draws a close button in its per-pane header.
+// None of them can DO anything: a region cannot publish a split tree, so each
+// one raises a request and the host — Main.qml, which owns ch::SessionLayouts —
+// carries it out. If the host is not listening, all of those buttons still draw,
+// still hover and still animate their press, and nothing whatsoever happens.
+// That is invisible to every other test here, because the tree is structurally
+// perfect either way.
+//
+// Driven by emitting the region's own signals (invoking a signal through the
+// meta-object emits it), which is exactly what the header buttons do.
+//
+// With no Dev Session loaded — this fixture has no transport, so there is none —
+// each command's FIRST act is to refuse and say why in the shell's toast. That
+// refusal is the observable proof that the request arrived: an unhandled signal
+// leaves the toast untouched.
+void TstQmlLoad::regionRequestsReachTheHost()
+{
+    ShellFixture fixture;
+    fixture.engine.load(moduleUrl(QStringLiteral("Main.qml")));
+    QVERIFY(!fixture.engine.rootObjects().isEmpty());
+    QObject *root = fixture.engine.rootObjects().constFirst();
+    settle();
+
+    QObject *viewerRegion = findNamed(root, QStringLiteral("viewerRegion"));
+    QObject *terminalRegion = findNamed(root, QStringLiteral("terminalRegion"));
+    QVERIFY2(viewerRegion && terminalRegion, "Main.qml no longer names its two regions");
+    QObject *toast = findNamed(root, QStringLiteral("shellErrorLabel"));
+    QVERIFY2(toast, "the shell has no error toast to report a refusal in");
+
+    struct Case {
+        QObject *region;
+        const char *signalName;
+        QVariant argument;   // invalid = no argument
+        const char *expected;
+        const char *what;
+    };
+    const Case cases[] = {
+        {viewerRegion, "splitRequested", QStringLiteral("horizontal"),
+         "Select a Dev Session before splitting a pane.", "viewer split"},
+        {viewerRegion, "closePaneRequested", QString(),
+         "Select a Dev Session before closing a pane.", "viewer close"},
+        {terminalRegion, "splitRequested", QStringLiteral("vertical"),
+         "Select a Dev Session before splitting a pane.", "terminal split"},
+        {terminalRegion, "closePaneRequested", QStringLiteral("terminal-1"),
+         "Select a Dev Session before closing a pane.", "terminal close"},
+        {terminalRegion, "killTerminalRequested", QVariant(),
+         "No active Dev Session.", "terminal kill"},
+    };
+
+    for (const Case &testCase : cases) {
+        toast->setProperty("text", QString());
+        const bool emitted = testCase.argument.isValid()
+                ? QMetaObject::invokeMethod(testCase.region, testCase.signalName,
+                                            Q_ARG(QString, testCase.argument.toString()))
+                : QMetaObject::invokeMethod(testCase.region, testCase.signalName);
+        QVERIFY2(emitted, qPrintable(QStringLiteral("no %1 signal to emit for the %2 request")
+                                         .arg(QLatin1String(testCase.signalName),
+                                              QLatin1String(testCase.what))));
+        settle(80);
+        QVERIFY2(toast->property("text").toString() == QLatin1String(testCase.expected),
+                 qPrintable(QStringLiteral("the %1 request produced \"%2\"; the host is not "
+                                           "handling it (expected \"%3\")")
+                                .arg(QLatin1String(testCase.what),
+                                     toast->property("text").toString(),
+                                     QLatin1String(testCase.expected))));
+    }
+
+    // The ratio report has no visible effect without a loaded layout (setRatios
+    // is deliberately quiet), so what is asserted here is that the host's handler
+    // ACCEPTS it: a handler with the wrong parameter list raises a TypeError on
+    // emit, which the warning nets below turn into a failure.
+    for (QObject *region : {viewerRegion, terminalRegion}) {
+        QVERIFY(QMetaObject::invokeMethod(
+            region, "splitRatiosAdjusted",
+            Q_ARG(QVariant, QVariant(QVariantList{QStringLiteral("0")})),
+            Q_ARG(QVariant, QVariant(QVariantList{0.25, 0.75}))));
+    }
+    settle(80);
 
     QVERIFY2(fixture.allWarnings().isEmpty(), qPrintable(fixture.warningReport()));
 }

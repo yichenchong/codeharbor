@@ -93,6 +93,18 @@ QString TerminalFactory::targetFor(TerminalController* controller) const
     return m_attached.value(controller).target;
 }
 
+void TerminalFactory::rememberTarget(TerminalController* controller, const QString& target)
+{
+    auto it = m_attached.find(controller);
+    if (it == m_attached.end()) {
+        it = m_attached.insert(controller, Attachment{});
+        // The key must never dangle: entries die with their pane.
+        connect(controller, &QObject::destroyed, this,
+                [this](QObject* dead) { m_attached.remove(dead); });
+    }
+    it->target = target;
+}
+
 QString TerminalFactory::tmuxKillSessionCommand(const QString& target)
 {
     // Two layers, and BOTH are needed.
@@ -150,6 +162,15 @@ bool TerminalFactory::attach(TerminalController* controller,
     const QString command =
         TerminalController::tmuxNewSessionCommand(devSession, terminal, workingDir);
 
+    // Record the tmux target BEFORE anything below can fail. targetFor() is
+    // what kill() destroys, and it has to name the session THIS pane is now
+    // pointing at. Left until after a successful open, a pane that was
+    // retargeted at a different terminal (or a different Dev Session) and then
+    // failed to open its channel would still answer kill() with the PREVIOUS
+    // attach's target — and kill() would destroy a tmux session, processes and
+    // all, belonging to a pane the user never touched.
+    rememberTarget(controller, target);
+
     auto* device = new SshChannelDevice(m_pool, SshConnectionPool::ChannelKind::Pty, controller);
     connect(device, &SshChannelDevice::channelError, this,
             [this, controller](const QString& message) { emit error(controller, message); });
@@ -191,15 +212,13 @@ bool TerminalFactory::attach(TerminalController* controller,
         }
     });
 
-    auto it = m_attached.find(controller);
-    if (it == m_attached.end()) {
-        it = m_attached.insert(controller, Attachment{});
-        // The key must never dangle: entries die with their pane.
-        connect(controller, &QObject::destroyed, this,
-                [this](QObject* dead) { m_attached.remove(dead); });
-    }
-    it->device = device;
-    it->target = target;
+    // Re-found rather than carried down from rememberTarget(): setState(),
+    // setTransport() and startPty() all emit signals that reach QML, and
+    // anything there is free to attach or detach another pane on this factory.
+    // A single insert can rehash m_attached and turn a held iterator into a
+    // dangling write (the same rule kill() follows).
+    if (auto it = m_attached.find(controller); it != m_attached.end())
+        it->device = device;
     return true;
 }
 
@@ -241,11 +260,21 @@ void TerminalFactory::kill(TerminalController* controller)
 
     detach(controller);
 
-    if (auto it = m_attached.find(controller); it != m_attached.end())
-        it->target.clear();  // the session is gone; nothing left to kill twice
-
-    if (target.isEmpty() || !connected())
+    if (target.isEmpty())
+        return;  // never attached: there is no remote session to destroy
+    if (!connected()) {
+        // The target is deliberately KEPT. Forgetting it here (which is what
+        // this used to do, unconditionally, before the command had even been
+        // attempted) stranded the remote tmux session for good: targetFor()
+        // went empty, so a later kill() on the same pane became a silent no-op
+        // and the user's processes kept running on the server with nothing in
+        // the UI able to name them again.
+        emit error(controller,
+                   QStringLiteral("no SSH connection: the tmux session %1 is still "
+                                  "running and was not killed.")
+                       .arg(target));
         return;
+    }
 
     // Out-of-band on its own Exec channel: the pane's own PTY channel is the
     // thing being destroyed, so it cannot carry its own kill.
@@ -260,10 +289,21 @@ void TerminalFactory::kill(TerminalController* controller)
     auto* exec = new SshChannelDevice(m_pool, SshConnectionPool::ChannelKind::Exec, this);
     connect(exec, &SshChannelDevice::readChannelFinished, exec, &QObject::deleteLater);
     if (!exec->startExec(tmuxKillSessionCommand(target))) {
+        // The target is kept here too: the command never ran, so the session is
+        // still there and Retry has to be able to name it.
         emit error(controller, QStringLiteral("could not kill the tmux session %1").arg(target));
         delete exec;
         return;
     }
+
+    // The command is on its way, so the pane may forget its target: nothing is
+    // left to kill twice. Re-found rather than carried across detach() and
+    // startExec(), both of which emit signals that reach QML, where anything is
+    // free to attach or detach another pane on this factory — and a single
+    // insert can rehash m_attached and turn a held iterator into a dangling
+    // write.
+    if (auto it = m_attached.find(controller); it != m_attached.end())
+        it->target.clear();
 
     // Watchdog: the self-deletion above is driven ONLY by the channel's own
     // readChannelFinished(). If the SSH session dies mid-kill that end-of-stream

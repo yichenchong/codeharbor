@@ -30,6 +30,15 @@ int main(int argc, char *argv[])
     QGuiApplication::setApplicationName(QStringLiteral("CodeHarbor"));
     QGuiApplication::setOrganizationName(QStringLiteral("CodeHarbor"));
     QGuiApplication::setApplicationVersion(QStringLiteral(CODEHARBOR_VERSION));
+    // Pins the Wayland app_id (and the X11 startup-notification id) to the
+    // basename of packaging/codeharbor.desktop, whose StartupWMClass=codeharbor
+    // is what associates the running window with its launcher icon in the
+    // dock/taskbar. Qt only falls back to the executable's base name when this
+    // is unset, which happens to match today - so this makes a guarantee out of
+    // what was an accident of the binary being named `codeharbor`. NO ".desktop"
+    // suffix: Qt documents this as the base name and only strips a trailing
+    // ".desktop" for backward compatibility, printing a warning when it does.
+    QGuiApplication::setDesktopFileName(QStringLiteral("codeharbor"));
 
     QQuickStyle::setStyle(QStringLiteral("Basic"));
 
@@ -67,9 +76,27 @@ int main(int argc, char *argv[])
     // split layouts read back from that server. The workspace is keyed by the
     // SERVER's own id, taken from server.info once wired.
     ch::ServerProfiles serverProfiles;
-    ch::SessionLayouts sessionLayouts(appController.workspaceDb());
+    ch::SessionLayouts sessionLayouts(appController.workspaceDb(),
+                                      appController.uiState());
     appController.setConnection(&sshPool, &sessionBootstrap, &serverProfiles,
                                 &sessionLayouts);
+
+    // Per-pane factories (workstreams E and T): each pane owns its controller so
+    // split panes never clobber each other. Declared AFTER sshPool so they are
+    // destroyed before the pool TerminalFactory points at.
+    ch::EditorFactory editorFactory(&client);
+    ch::TerminalFactory terminalFactory(&sshPool);
+
+    // Feed server.info.recoveryDir to the editor factory once a server identity
+    // is adopted, so per-pane crash-recovery snapshots (SPEC 11.3) land under a
+    // server-chosen remote path.
+    //
+    // This MUST be wired before the environment auto-connect below, for the
+    // same reason setConnection() must: connectAndWire() emits wired()
+    // SYNCHRONOUSLY, which runs adoptServerIdentity() and issues server.info.
+    // Registering the factory afterwards left the recoveryDir handoff racing
+    // that response.
+    appController.setEditorFactory(&editorFactory);
 
     // A normal desktop launch stays server-less: this returns immediately unless
     // CH_LIVE_SSH is set (with CH_LIVE_HOST/PORT/USER/NODE/REPO), so the UI still
@@ -82,16 +109,6 @@ int main(int argc, char *argv[])
     // empty, workspace.list was issued for "" and the whole shell came up with
     // an empty sidebar on top of a perfectly good SSH session.
     sessionBootstrap.connectAndWireFromEnvironment();
-
-    // Per-pane factories (workstreams E and T): each pane owns its controller so
-    // split panes never clobber each other.
-    ch::EditorFactory editorFactory(&client);
-    ch::TerminalFactory terminalFactory(&sshPool);
-
-    // Feed server.info.recoveryDir to the editor factory once a server identity
-    // is adopted, so per-pane crash-recovery snapshots (SPEC 11.3) land under a
-    // server-chosen remote path.
-    appController.setEditorFactory(&editorFactory);
 
     // Agent attention -> OS notification (SPEC 6.2). A box with no notification
     // daemon degrades to a silent no-op.

@@ -11,6 +11,8 @@ const languages: readonly LanguageInfo[] = [
     { id: "cmake", filenames: ["CMakeLists.txt"] },
     { id: "javascript", extensions: [".js", ".JS"] },
     { id: "shell", filenames: [".bashrc"] },
+    { id: "dockerfile", extensions: [".dockerfile"], filenames: ["Dockerfile"] },
+    { id: "no-patterns" },
 ];
 
 test("exact filename match wins over an extension match registered earlier", () => {
@@ -40,4 +42,34 @@ test("unknown paths fall back to plaintext", () => {
 test("the basename is taken after the last path separator (both slash kinds)", () => {
     assert.equal(selectLanguage("C:\\proj\\CMakeLists.txt", languages), "cmake");
     assert.equal(selectLanguage("weird.txt/CMakeLists.txt", languages), "cmake");
+});
+
+test("filename match is case-insensitive, as it is in VS Code", () => {
+    // Monaco registers the name as "Dockerfile"; a plain lowercase "dockerfile"
+    // on a Linux server is the same file type and must not fall to plaintext.
+    assert.equal(selectLanguage("/srv/app/dockerfile", languages), "dockerfile");
+    assert.equal(selectLanguage("/srv/app/DOCKERFILE", languages), "dockerfile");
+    assert.equal(selectLanguage("/srv/app/Dockerfile", languages), "dockerfile");
+});
+
+test("a registration with neither extensions nor filenames is skipped, not matched", () => {
+    // `no-patterns` sits in the list with no patterns at all (Monaco really does
+    // ship such entries). Both passes must step over it instead of throwing on
+    // the missing arrays or claiming the file.
+    assert.equal(selectLanguage("/home/u/mystery.unknownext", languages), "plaintext");
+});
+
+test("a directory-shaped path with no basename falls back to plaintext", () => {
+    assert.equal(selectLanguage("/home/u/project/", languages), "plaintext");
+    assert.equal(selectLanguage("", languages), "plaintext");
+});
+
+test("a dotfile with a suffix still resolves on the suffix", () => {
+    // ".config.js": the LEADING dot is part of the name, but the later dot does
+    // start a real extension.
+    assert.equal(selectLanguage("/home/u/.config.js", languages), "javascript");
+});
+
+test("a name that is nothing but a dot has no extension", () => {
+    assert.equal(selectLanguage("/home/u/.", languages), "plaintext");
 });

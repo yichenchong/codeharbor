@@ -388,7 +388,7 @@ Item {
             { id: "server.connect", title: "Connect to Server\u2026", shortcut: "Ctrl+Shift+O",
               invoke: function () {} },
             { id: "server.disconnect", title: "Disconnect from Server", invoke: function () {} },
-            { id: "session.refresh", title: "Refresh Workspace", shortcut: "Ctrl+R",
+            { id: "session.refresh", title: "Refresh Workspace", shortcut: "Ctrl+Shift+R",
               invoke: function () {} },
             { id: "viewer.split.h", title: "Split Viewer Pane Horizontally",
               invoke: function () {} },

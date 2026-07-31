@@ -97,31 +97,21 @@ TerminalPane parseTerminalPane(const QJsonObject& obj)
 }
 
 // A layout slot is either an inline split-tree object or null/absent; decode the
-// former through SplitNode::fromJson and the latter to std::nullopt.
+// former through SplitNode::tryFromJson and the latter to std::nullopt.
+//
+// tryFromJson rather than fromJson: fromJson reports "not a valid split tree" by
+// returning its default empty-leaf value, which is also exactly what a genuinely
+// stored empty leaf parses to (closing a region's last pane persists one; see
+// src/app/SessionLayouts.cpp). A rejected tree must read as "no layout", not as
+// a perfectly valid single blank pane: SessionLayouts deliberately leaves a
+// region null when its layout cannot be loaded (SessionLayouts.h), because a
+// fabricated one-pane layout is something the user would edit over, silently
+// overwriting the layout the server still holds.
 std::optional<SplitNode> parseLayoutTree(const QJsonValue& value)
 {
     if (!value.isObject())
         return std::nullopt;
-    const QJsonObject obj = value.toObject();
-    const SplitNode tree = SplitNode::fromJson(obj);
-    // SplitNode::fromJson reports "this is not a valid split tree" by returning
-    // its default empty-leaf sentinel - which is also exactly what a genuinely
-    // stored empty leaf parses to (closing a region's last pane persists one;
-    // see src/app/SessionLayouts.cpp). Telling the two apart needs the input: a
-    // leaf ALWAYS parses, so a rejection can only come from an object whose
-    // declared type is not "leaf" (an unknown or absent type, or a split with a
-    // children/ratios count mismatch, a non-finite or non-positive ratio, or
-    // nesting past the depth cap). Report a rejected tree as "no layout" rather
-    // than as a perfectly valid single blank pane: SessionLayouts deliberately
-    // leaves a region null when its layout cannot be loaded (SessionLayouts.h),
-    // because a fabricated one-pane layout is something the user would edit
-    // over, silently overwriting the layout the server still holds.
-    const bool rejected = tree.isLeaf()
-            && obj.value(QStringLiteral("type")).toString()
-                    != QStringLiteral("leaf");
-    if (rejected)
-        return std::nullopt;
-    return tree;
+    return SplitNode::tryFromJson(value.toObject());
 }
 
 // Nested list elements are skipped unless they are JSON objects. QJsonValue::
@@ -184,11 +174,11 @@ QVector<GroupNode> parseGroupList(const QJsonValue& result)
 
 // workspace.getLayout returns a SessionLayout row (or null) and setLayout the
 // upserted row; callers only need the split tree, held under the "tree" key.
-std::optional<SplitNode> parseLayoutResult(const QJsonValue& result)
+// The null case belongs to getLayout alone and is handled at the call site, so
+// this takes an already-validated row object.
+std::optional<SplitNode> parseLayoutRow(const QJsonObject& row)
 {
-    if (!result.isObject())
-        return std::nullopt;
-    return parseLayoutTree(result.toObject().value(QStringLiteral("tree")));
+    return parseLayoutTree(row.value(QStringLiteral("tree")));
 }
 
 // --- ch:: struct -> request-params JSON -------------------------------------
@@ -354,6 +344,56 @@ QJsonObject serializeUpdateTerminalPane(const UpdateTerminalPaneParams& params)
     return obj;
 }
 
+// --- successful-result validation -------------------------------------------
+// A response with no `error` still says nothing about the SHAPE of its result,
+// and QJsonValue's accessors are lossy about that: toObject() turns null, a
+// number, a string or an array into an EMPTY object, and toArray() does the same
+// for anything that is not an array. Fed to the parse helpers above, an empty
+// object yields a fully-DEFAULT record whose id is the empty string — exactly
+// the entry parseSessionNode()/parseGroupList() go out of their way to drop for
+// nested elements, because the rest of the client cannot tell it from a real
+// group/session/pane and will key maps and sidebar rows by that empty id.
+// Top-level results get the same treatment: a result of the wrong JSON kind is
+// reported as a failure instead of being decoded into a plausible-looking blank.
+//
+// -32603 is JSON-RPC 2.0's reserved "internal error", the same code
+// CodeharbordClient uses for the failures it synthesizes itself
+// (src/remote/CodeharbordClient.cpp), so callers need no new code path.
+constexpr int kMalformedResultCode = -32603;
+
+// `method` and `expected` are string literals with static storage; they are only
+// ever formatted into the message.
+RpcError malformedResult(const char* method, const char* expected)
+{
+    RpcError error;
+    error.code = kMalformedResultCode;
+    error.message = QStringLiteral("malformed %1 result: expected %2")
+                        .arg(QString::fromLatin1(method),
+                             QString::fromLatin1(expected));
+    return error;
+}
+
+// Response handler for every workspace.* method whose result is a single record
+// object: forwards a server error verbatim, rejects a non-object result, and
+// otherwise hands the decoded record to `cb`. `decode` maps the result object to
+// the callback's payload type.
+template <typename Callback, typename Decode>
+auto recordHandler(const char* method, Callback cb, Decode decode)
+{
+    return [method, cb = std::move(cb), decode](
+               QJsonValue result, std::optional<RpcError> error) {
+        if (error) {
+            cb(std::nullopt, std::move(error));
+            return;
+        }
+        if (!result.isObject()) {
+            cb(std::nullopt, malformedResult(method, "a JSON object"));
+            return;
+        }
+        cb(decode(result.toObject()), std::nullopt);
+    };
+}
+
 } // namespace
 
 WorkspaceDb::WorkspaceDb(CodeharbordClient* client) : m_client(client) {}
@@ -365,7 +405,15 @@ void WorkspaceDb::list(const ServerId& serverId, ListCallback cb)
         QString::fromLatin1(rpc::kMethodWorkspaceList), params,
         [cb = std::move(cb)](QJsonValue result, std::optional<RpcError> error) {
             if (error) {
-                cb({}, error);
+                cb({}, std::move(error));
+                return;
+            }
+            // Not an array: toArray() would silently yield an EMPTY one, i.e. an
+            // empty sidebar reported as a successful load, which the caller
+            // cannot distinguish from a server that genuinely has no groups.
+            if (!result.isArray()) {
+                cb({}, malformedResult(rpc::kMethodWorkspaceList,
+                                       "a JSON array of groups"));
                 return;
             }
             cb(parseGroupList(result), std::nullopt);
@@ -374,30 +422,18 @@ void WorkspaceDb::list(const ServerId& serverId, ListCallback cb)
 
 void WorkspaceDb::createGroup(const CreateGroupParams& params, GroupCallback cb)
 {
-    m_client->call(
-        QString::fromLatin1(rpc::kMethodWorkspaceCreateGroup),
-        serializeCreateGroup(params),
-        [cb = std::move(cb)](QJsonValue result, std::optional<RpcError> error) {
-            if (error) {
-                cb(std::nullopt, error);
-                return;
-            }
-            cb(parseGroup(result.toObject()), std::nullopt);
-        });
+    m_client->call(QString::fromLatin1(rpc::kMethodWorkspaceCreateGroup),
+                   serializeCreateGroup(params),
+                   recordHandler(rpc::kMethodWorkspaceCreateGroup, std::move(cb),
+                                 parseGroup));
 }
 
 void WorkspaceDb::updateGroup(const UpdateGroupParams& params, GroupCallback cb)
 {
-    m_client->call(
-        QString::fromLatin1(rpc::kMethodWorkspaceUpdateGroup),
-        serializeUpdateGroup(params),
-        [cb = std::move(cb)](QJsonValue result, std::optional<RpcError> error) {
-            if (error) {
-                cb(std::nullopt, error);
-                return;
-            }
-            cb(parseGroup(result.toObject()), std::nullopt);
-        });
+    m_client->call(QString::fromLatin1(rpc::kMethodWorkspaceUpdateGroup),
+                   serializeUpdateGroup(params),
+                   recordHandler(rpc::kMethodWorkspaceUpdateGroup, std::move(cb),
+                                 parseGroup));
 }
 
 void WorkspaceDb::deleteGroup(const GroupId& id, OkCallback cb)
@@ -406,7 +442,7 @@ void WorkspaceDb::deleteGroup(const GroupId& id, OkCallback cb)
     m_client->call(
         QString::fromLatin1(rpc::kMethodWorkspaceDeleteGroup), params,
         [cb = std::move(cb)](QJsonValue, std::optional<RpcError> error) {
-            cb(error);
+            cb(std::move(error));
         });
 }
 
@@ -421,38 +457,26 @@ void WorkspaceDb::reorderGroups(const ServerId& serverId,
     m_client->call(
         QString::fromLatin1(rpc::kMethodWorkspaceReorderGroups), params,
         [cb = std::move(cb)](QJsonValue, std::optional<RpcError> error) {
-            cb(error);
+            cb(std::move(error));
         });
 }
 
 void WorkspaceDb::createSession(const CreateSessionParams& params,
                                 SessionCallback cb)
 {
-    m_client->call(
-        QString::fromLatin1(rpc::kMethodWorkspaceCreateSession),
-        serializeCreateSession(params),
-        [cb = std::move(cb)](QJsonValue result, std::optional<RpcError> error) {
-            if (error) {
-                cb(std::nullopt, error);
-                return;
-            }
-            cb(parseSession(result.toObject()), std::nullopt);
-        });
+    m_client->call(QString::fromLatin1(rpc::kMethodWorkspaceCreateSession),
+                   serializeCreateSession(params),
+                   recordHandler(rpc::kMethodWorkspaceCreateSession,
+                                 std::move(cb), parseSession));
 }
 
 void WorkspaceDb::updateSession(const UpdateSessionParams& params,
                                 SessionCallback cb)
 {
-    m_client->call(
-        QString::fromLatin1(rpc::kMethodWorkspaceUpdateSession),
-        serializeUpdateSession(params),
-        [cb = std::move(cb)](QJsonValue result, std::optional<RpcError> error) {
-            if (error) {
-                cb(std::nullopt, error);
-                return;
-            }
-            cb(parseSession(result.toObject()), std::nullopt);
-        });
+    m_client->call(QString::fromLatin1(rpc::kMethodWorkspaceUpdateSession),
+                   serializeUpdateSession(params),
+                   recordHandler(rpc::kMethodWorkspaceUpdateSession,
+                                 std::move(cb), parseSession));
 }
 
 void WorkspaceDb::deleteSession(const DevSessionId& id, OkCallback cb)
@@ -461,7 +485,7 @@ void WorkspaceDb::deleteSession(const DevSessionId& id, OkCallback cb)
     m_client->call(
         QString::fromLatin1(rpc::kMethodWorkspaceDeleteSession), params,
         [cb = std::move(cb)](QJsonValue, std::optional<RpcError> error) {
-            cb(error);
+            cb(std::move(error));
         });
 }
 
@@ -476,68 +500,45 @@ void WorkspaceDb::reorderSessions(const GroupId& groupId,
     m_client->call(
         QString::fromLatin1(rpc::kMethodWorkspaceReorderSessions), params,
         [cb = std::move(cb)](QJsonValue, std::optional<RpcError> error) {
-            cb(error);
+            cb(std::move(error));
         });
 }
 
 void WorkspaceDb::moveSessionToGroup(const MoveSessionParams& params,
                                      SessionCallback cb)
 {
-    m_client->call(
-        QString::fromLatin1(rpc::kMethodWorkspaceMoveSessionToGroup),
-        serializeMoveSession(params),
-        [cb = std::move(cb)](QJsonValue result, std::optional<RpcError> error) {
-            if (error) {
-                cb(std::nullopt, error);
-                return;
-            }
-            cb(parseSession(result.toObject()), std::nullopt);
-        });
+    m_client->call(QString::fromLatin1(rpc::kMethodWorkspaceMoveSessionToGroup),
+                   serializeMoveSession(params),
+                   recordHandler(rpc::kMethodWorkspaceMoveSessionToGroup,
+                                 std::move(cb), parseSession));
 }
 
 void WorkspaceDb::duplicateSession(const DevSessionId& id,
                                    SessionNodeCallback cb)
 {
     const QJsonObject params{{QStringLiteral("id"), id.value}};
-    m_client->call(
-        QString::fromLatin1(rpc::kMethodWorkspaceDuplicateSession), params,
-        [cb = std::move(cb)](QJsonValue result, std::optional<RpcError> error) {
-            if (error) {
-                cb(std::nullopt, error);
-                return;
-            }
-            cb(parseSessionNode(result.toObject()), std::nullopt);
-        });
+    m_client->call(QString::fromLatin1(rpc::kMethodWorkspaceDuplicateSession),
+                   params,
+                   recordHandler(rpc::kMethodWorkspaceDuplicateSession,
+                                 std::move(cb), parseSessionNode));
 }
 
 void WorkspaceDb::createViewerPane(const CreateViewerPaneParams& params,
                                    ViewerPaneCallback cb)
 {
-    m_client->call(
-        QString::fromLatin1(rpc::kMethodWorkspaceCreateViewerPane),
-        serializeCreateViewerPane(params),
-        [cb = std::move(cb)](QJsonValue result, std::optional<RpcError> error) {
-            if (error) {
-                cb(std::nullopt, error);
-                return;
-            }
-            cb(parseViewerPane(result.toObject()), std::nullopt);
-        });
+    m_client->call(QString::fromLatin1(rpc::kMethodWorkspaceCreateViewerPane),
+                   serializeCreateViewerPane(params),
+                   recordHandler(rpc::kMethodWorkspaceCreateViewerPane,
+                                 std::move(cb), parseViewerPane));
 }
 
 void WorkspaceDb::updateViewerPane(const UpdateViewerPaneParams& params,
                                    ViewerPaneCallback cb)
 {
-    m_client->call(
-        QString::fromLatin1(rpc::kMethodWorkspaceUpdateViewerPane),
-        serializeUpdateViewerPane(params),
-        [cb = std::move(cb)](QJsonValue result, std::optional<RpcError> error) {
-            if (error) {
-                cb(std::nullopt, error);
-                return;
-            }
-            cb(parseViewerPane(result.toObject()), std::nullopt);
-        });
+    m_client->call(QString::fromLatin1(rpc::kMethodWorkspaceUpdateViewerPane),
+                   serializeUpdateViewerPane(params),
+                   recordHandler(rpc::kMethodWorkspaceUpdateViewerPane,
+                                 std::move(cb), parseViewerPane));
 }
 
 void WorkspaceDb::deleteViewerPane(const ViewerPaneId& id, OkCallback cb)
@@ -546,38 +547,26 @@ void WorkspaceDb::deleteViewerPane(const ViewerPaneId& id, OkCallback cb)
     m_client->call(
         QString::fromLatin1(rpc::kMethodWorkspaceDeleteViewerPane), params,
         [cb = std::move(cb)](QJsonValue, std::optional<RpcError> error) {
-            cb(error);
+            cb(std::move(error));
         });
 }
 
 void WorkspaceDb::createTerminalPane(const CreateTerminalPaneParams& params,
                                      TerminalPaneCallback cb)
 {
-    m_client->call(
-        QString::fromLatin1(rpc::kMethodWorkspaceCreateTerminalPane),
-        serializeCreateTerminalPane(params),
-        [cb = std::move(cb)](QJsonValue result, std::optional<RpcError> error) {
-            if (error) {
-                cb(std::nullopt, error);
-                return;
-            }
-            cb(parseTerminalPane(result.toObject()), std::nullopt);
-        });
+    m_client->call(QString::fromLatin1(rpc::kMethodWorkspaceCreateTerminalPane),
+                   serializeCreateTerminalPane(params),
+                   recordHandler(rpc::kMethodWorkspaceCreateTerminalPane,
+                                 std::move(cb), parseTerminalPane));
 }
 
 void WorkspaceDb::updateTerminalPane(const UpdateTerminalPaneParams& params,
                                      TerminalPaneCallback cb)
 {
-    m_client->call(
-        QString::fromLatin1(rpc::kMethodWorkspaceUpdateTerminalPane),
-        serializeUpdateTerminalPane(params),
-        [cb = std::move(cb)](QJsonValue result, std::optional<RpcError> error) {
-            if (error) {
-                cb(std::nullopt, error);
-                return;
-            }
-            cb(parseTerminalPane(result.toObject()), std::nullopt);
-        });
+    m_client->call(QString::fromLatin1(rpc::kMethodWorkspaceUpdateTerminalPane),
+                   serializeUpdateTerminalPane(params),
+                   recordHandler(rpc::kMethodWorkspaceUpdateTerminalPane,
+                                 std::move(cb), parseTerminalPane));
 }
 
 void WorkspaceDb::deleteTerminalPane(const TerminalId& id, OkCallback cb)
@@ -586,7 +575,7 @@ void WorkspaceDb::deleteTerminalPane(const TerminalId& id, OkCallback cb)
     m_client->call(
         QString::fromLatin1(rpc::kMethodWorkspaceDeleteTerminalPane), params,
         [cb = std::move(cb)](QJsonValue, std::optional<RpcError> error) {
-            cb(error);
+            cb(std::move(error));
         });
 }
 
@@ -601,10 +590,23 @@ void WorkspaceDb::getLayout(const DevSessionId& devSessionId, Region region,
         QString::fromLatin1(rpc::kMethodWorkspaceGetLayout), params,
         [cb = std::move(cb)](QJsonValue result, std::optional<RpcError> error) {
             if (error) {
-                cb(std::nullopt, error);
+                cb(std::nullopt, std::move(error));
                 return;
             }
-            cb(parseLayoutResult(result), std::nullopt);
+            // getLayout is the ONE workspace method whose success result is
+            // legitimately JSON null: that is how the server says the region has
+            // no persisted layout (SessionLayout | null in workspace.ts).
+            if (result.isNull()) {
+                cb(std::nullopt, std::nullopt);
+                return;
+            }
+            if (!result.isObject()) {
+                cb(std::nullopt,
+                   malformedResult(rpc::kMethodWorkspaceGetLayout,
+                                   "a SessionLayout object or null"));
+                return;
+            }
+            cb(parseLayoutRow(result.toObject()), std::nullopt);
         });
 }
 
@@ -618,15 +620,10 @@ void WorkspaceDb::setLayout(const ServerId& serverId,
         {QStringLiteral("region"), regionKey(region)},
         {QStringLiteral("tree"), tree.toJson()},
     };
-    m_client->call(
-        QString::fromLatin1(rpc::kMethodWorkspaceSetLayout), params,
-        [cb = std::move(cb)](QJsonValue result, std::optional<RpcError> error) {
-            if (error) {
-                cb(std::nullopt, error);
-                return;
-            }
-            cb(parseLayoutResult(result), std::nullopt);
-        });
+    // setLayout always echoes the upserted SessionLayout row, never null.
+    m_client->call(QString::fromLatin1(rpc::kMethodWorkspaceSetLayout), params,
+                   recordHandler(rpc::kMethodWorkspaceSetLayout, std::move(cb),
+                                 parseLayoutRow));
 }
 
 } // namespace ch

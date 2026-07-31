@@ -44,6 +44,13 @@ namespace ch {
 // the user is empty or the port falls outside 1..65535. Everything else is
 // normalized: strings are trimmed, a missing/blank port becomes 22, and a blank
 // name becomes the host.
+//
+// NO SECRET IS EVER STORED. The seven fields above are a whitelist, applied to
+// every addProfile()/updateProfile() call: any other key in the caller's map is
+// discarded before anything is written, so a "password" or "passphrase" that a
+// credential prompt happened to leave in the same map cannot reach the disk
+// even by accident. Authentication is ssh-agent and key files; this store only
+// ever names the key FILE.
 class ServerProfiles : public QObject {
     Q_OBJECT
     Q_PROPERTY(QVariantList profiles READ profiles NOTIFY profilesChanged)
@@ -108,7 +115,7 @@ private:
     void restrictPermissions() const;
 
     std::unique_ptr<QSettings> m_settings;
-    // Ordered list of QVariantMaps, each holding id + the six profile fields.
+    // Ordered list of QVariantMaps, each holding id + the seven profile fields.
     QVariantList m_profiles;
     QString m_activeId;
     // True for the native per-user store, whose containing directory is ours to

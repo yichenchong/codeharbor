@@ -34,6 +34,11 @@ public:
     // it is the user's — which terminals are busy, which Dev Sessions have an
     // unseen completion — and not the wire's. Passing the device already bound
     // is a no-op, buffer included; a reconnect always supplies a NEW device.
+    //
+    // Anything already buffered on the new device is drained SYNCHRONOUSLY
+    // before this returns, so agentStateChanged/unseenChanged/notify can all
+    // fire from inside the call. A caller that installs its own connections
+    // must do so BEFORE binding the transport or it will miss those events.
     void setTransport(QIODevice* transport);
     QIODevice* transport() const { return m_transport; }
 
@@ -69,6 +74,12 @@ public:
 
 signals:
     // A terminal's agent state changed. `state` is an int-valued ch::AgentState.
+    // Also emitted the FIRST time a (devSessionId, terminalId) pair is observed,
+    // including when that first event carries the wire token "unknown": going
+    // from "no event has ever named this terminal" to "the producer says its
+    // agent state is unknown" is a real change of knowledge even though
+    // stateFor() reports AgentState::Unknown for both. Never emitted for a
+    // repeat of the state already recorded for that pair.
     void agentStateChanged(const QString& devSessionId,
                            const QString& terminalId, int state);
     // The Dev Session's unseen-completion flag flipped.
@@ -91,6 +102,10 @@ private:
     // disconnect() on the old transport would be a use-after-free.
     QPointer<QIODevice> m_transport = nullptr;
     QByteArray m_readBuffer;
+    // Set when a frame exceeded the size cap and its head was discarded: the
+    // bytes up to the NEXT newline are that frame's tail, not an event, and are
+    // dropped without being parsed. Cleared with m_readBuffer on rebind.
+    bool m_discardingLine = false;
     // devSessionId -> (terminalId -> current AgentState). Evicted only in whole
     // Dev Session subtrees by retainDevSessions(), called after the sidebar is
     // rebuilt from the server: ids are server-minted and never reused, so a Dev

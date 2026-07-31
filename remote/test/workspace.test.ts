@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { DatabaseSync } from "node:sqlite";
 
 import { openWorkspace, WORKSPACE_SCHEMA_VERSION, WORKSPACE_METHODS } from "../src/workspace.ts";
 import type { Workspace } from "../src/workspace.ts";
@@ -257,13 +258,20 @@ test("duplicateSession rolls back completely when a copy step fails (transaction
     const ws = openWorkspace(dbPath);
     const { group, session } = seed(ws);
 
-    // Corrupt one stored layout tree so duplicateSession's JSON.parse throws
-    // AFTER the new session and panes are inserted, forcing a full rollback.
-    ws.db
-        .prepare("UPDATE session_layouts SET tree = ? WHERE dev_session_id = ? AND region = ?")
-        .run("{ not valid json", session.id, "terminal");
+    // Force a failure in the LAST copy step (the layouts), after the new
+    // session and both panes have already been inserted, so a missing
+    // transaction would leave a half-built duplicate behind. A trigger that
+    // aborts every session_layouts insert is the injection: it is independent
+    // of how duplicateSession happens to handle any particular bad input, so
+    // the test keeps measuring atomicity and nothing else.
+    ws.db.exec(
+        "CREATE TRIGGER fail_layout_copy BEFORE INSERT ON session_layouts " +
+            "BEGIN SELECT RAISE(ABORT, 'injected layout insert failure'); END",
+    );
 
     assert.throws(() => ws.duplicateSession({ id: session.id }));
+
+    ws.db.exec("DROP TRIGGER fail_layout_copy");
 
     // Nothing partial survived: exactly the original session and its panes.
     const count = (sql: string, ...args: string[]): number => {
@@ -273,6 +281,43 @@ test("duplicateSession rolls back completely when a copy step fails (transaction
     assert.equal(count("SELECT COUNT(*) AS n FROM dev_sessions WHERE group_id = ?", group.id), 1);
     assert.equal(count("SELECT COUNT(*) AS n FROM viewer_panes"), 1);
     assert.equal(count("SELECT COUNT(*) AS n FROM terminal_panes"), 1);
+
+    ws.close();
+    await cleanup(dbPath);
+});
+
+// A corrupt layout blob self-heals to "no layout" on every read path (RW14).
+// Duplicating used to be the one exception: JSON.parse threw out of the copy
+// loop and the whole "Duplicate Dev Session" action failed for a session whose
+// panes were all intact. The duplicate must be created, with the readable
+// region copied and the broken one simply absent.
+test("duplicateSession skips an unparseable layout instead of failing the copy", async () => {
+    const dbPath = await tmpDbPath();
+    const ws = openWorkspace(dbPath);
+    const { group, session } = seed(ws);
+
+    ws.db
+        .prepare("UPDATE session_layouts SET tree = ? WHERE dev_session_id = ? AND region = ?")
+        .run("{ not valid json", session.id, "terminal");
+
+    const copy = ws.duplicateSession({ id: session.id });
+
+    assert.notEqual(copy.id, session.id);
+    assert.equal(copy.viewerPanes.length, 1);
+    assert.equal(copy.terminalPanes.length, 1);
+    // The readable region came across; the corrupt one is reported as absent
+    // rather than copied as garbage.
+    assert.ok(copy.layouts.viewer, "the parseable viewer layout must be copied");
+    assert.equal(copy.layouts.terminal, null);
+    // The group now holds both sessions and the corrupt source blob is left
+    // exactly as it was — duplicating reads, it never rewrites the original.
+    const sessions = ws.list(SERVER)[0].sessions;
+    assert.equal(sessions.length, 2);
+    assert.equal(sessions[0].groupId, group.id);
+    const sourceTree = ws.db
+        .prepare("SELECT tree FROM session_layouts WHERE dev_session_id = ? AND region = 'terminal'")
+        .get(session.id) as { tree: string };
+    assert.equal(sourceTree.tree, "{ not valid json");
 
     ws.close();
     await cleanup(dbPath);
@@ -1291,4 +1336,115 @@ test("RW15: a handler rejects a non-object params value", () => {
         () => WORKSPACE_METHODS["workspace.list"](null),
         /workspace\.list: missing or invalid params object/,
     );
+});
+
+// The region names a column with a CHECK constraint. An unlisted value used to
+// travel all the way to SQLite and come back as a raw constraint-violation
+// message that named neither the field nor the two values it accepts.
+test("RW15: the layout handlers reject a region outside viewer/terminal", () => {
+    assert.throws(
+        () =>
+            WORKSPACE_METHODS["workspace.setLayout"]({
+                serverId: SERVER,
+                devSessionId: "s",
+                region: "sidebar",
+                tree: { type: "leaf", paneId: "" },
+            }),
+        /workspace\.setLayout: field 'region' must be one of viewer, terminal/,
+    );
+    assert.throws(
+        () => WORKSPACE_METHODS["workspace.getLayout"]({ devSessionId: "s", region: "" }),
+        /workspace\.getLayout: field 'region' must be one of viewer, terminal/,
+    );
+});
+
+// An omitted tree stringifies to `undefined`, which the SQLite driver rejects
+// with an opaque type error naming no field at all.
+test("RW15: setLayout rejects a params object with no tree", () => {
+    assert.throws(
+        () =>
+            WORKSPACE_METHODS["workspace.setLayout"]({
+                serverId: SERVER,
+                devSessionId: "s",
+                region: "viewer",
+            }),
+        /workspace\.setLayout: missing field 'tree'/,
+    );
+});
+
+// Every create is a read-then-write (read the scope's highest position, then
+// insert at one past it) and now runs inside a transaction, so two connections
+// cannot both claim the same position and leave the ordering to be broken by
+// UUID. What is observable from outside is the rollback contract: a failed
+// create leaves no row AND leaves the connection usable, i.e. the wrapper
+// really did roll its transaction back instead of leaving one open — a leaked
+// open transaction would break every later write on the connection.
+test("a failed create rolls back and leaves the connection usable", async () => {
+    const dbPath = await tmpDbPath();
+    const ws = openWorkspace(dbPath);
+    const group = ws.createGroup({ serverId: SERVER, name: "G" });
+    const session = ws.createSession({
+        serverId: SERVER,
+        groupId: group.id,
+        name: "S",
+        repositoryRoot: "/r",
+    });
+
+    ws.db.exec(
+        "CREATE TRIGGER fail_viewer_insert BEFORE INSERT ON viewer_panes " +
+            "BEGIN SELECT RAISE(ABORT, 'injected insert failure'); END",
+    );
+    assert.throws(() =>
+        ws.createViewerPane({ serverId: SERVER, devSessionId: session.id, url: "a" }),
+    );
+    ws.db.exec("DROP TRIGGER fail_viewer_insert");
+
+    // Nothing was written, and the very next write succeeds.
+    assert.equal(ws.list(SERVER)[0].sessions[0].viewerPanes.length, 0);
+    ws.createViewerPane({ serverId: SERVER, devSessionId: session.id, url: "a" });
+    ws.createViewerPane({ serverId: SERVER, devSessionId: session.id, url: "b" });
+    ws.createTerminalPane({ serverId: SERVER, devSessionId: session.id, name: "sh" });
+
+    // Positions stay contiguous from 0 across the failure.
+    const node = ws.list(SERVER)[0].sessions[0];
+    assert.deepEqual(
+        node.viewerPanes.map((p) => p.position),
+        [0, 1],
+    );
+    assert.deepEqual(
+        node.terminalPanes.map((p) => p.position),
+        [0],
+    );
+
+    ws.close();
+    await cleanup(dbPath);
+});
+
+// openWorkspace opens the connection BEFORE it migrates. A database written by
+// a newer build is refused — and the connection it already opened must be
+// closed, or it leaks a descriptor and keeps SQLite's lock on the file, so the
+// next attempt fails for a second, unrelated reason.
+test("openWorkspace closes the connection when it refuses a newer database", async () => {
+    const dbPath = await tmpDbPath();
+    const first = openWorkspace(dbPath);
+    first.db.prepare("UPDATE schema_version SET version = ? WHERE id = 1").run(
+        WORKSPACE_SCHEMA_VERSION + 1,
+    );
+    first.close();
+
+    assert.throws(() => openWorkspace(dbPath), /newer than this build supports/);
+
+    // Proof the refused connection was released: put the version back through a
+    // fresh connection and reopen normally. A still-open handle from the failed
+    // attempt would have left the file locked.
+    const repair = new DatabaseSync(dbPath);
+    repair.prepare("UPDATE schema_version SET version = ? WHERE id = 1").run(
+        WORKSPACE_SCHEMA_VERSION,
+    );
+    repair.close();
+    const reopened = openWorkspace(dbPath);
+    assert.equal(typeof reopened.serverId(), "string");
+    reopened.close();
+
+    await cleanup(dbPath);
 });

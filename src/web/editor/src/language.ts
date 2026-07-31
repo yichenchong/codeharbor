@@ -19,16 +19,23 @@ export interface LanguageInfo {
  * statement, and a single pass would let whichever language happens to be
  * registered first claim the file on its extension alone. Falls back to
  * "plaintext" — the editor must render even for an unknown file type.
+ *
+ * Both passes compare case-insensitively, which is what VS Code does with the
+ * very same registration lists Monaco ships. It matters for the filename pass
+ * in particular: Monaco registers the Dockerfile language under the exact name
+ * "Dockerfile", while a "dockerfile" (all lowercase) is an entirely ordinary
+ * name for the file on a Linux server, and a case-sensitive comparison would
+ * silently drop it to plaintext.
  */
 export function selectLanguage(path: string, languages: readonly LanguageInfo[]): string {
     const slash = Math.max(path.lastIndexOf("/"), path.lastIndexOf("\\"));
-    const name = path.slice(slash + 1);
+    const name = path.slice(slash + 1).toLowerCase();
     // A leading dot is part of the NAME, not an extension (".gitconfig"), so
     // only a dot after the first character starts one.
     const dot = name.lastIndexOf(".");
-    const ext = dot > 0 ? name.slice(dot).toLowerCase() : "";
+    const ext = dot > 0 ? name.slice(dot) : "";
     for (const lang of languages) {
-        if (lang.filenames?.some((f) => f === name)) {
+        if (lang.filenames?.some((f) => f.toLowerCase() === name)) {
             return lang.id;
         }
     }

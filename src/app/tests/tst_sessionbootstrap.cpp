@@ -337,6 +337,7 @@ private slots:
     void wiresAndReportsState();
     void initialConnectFailureDoesNotRetry();
     void unknownHostKeyIsNeverTrustedWithoutADecisionPolicy();
+    void unattendedTrustDoesNotOutliveTheAttempt();
     void channelLossReconnectsAndRewires();
     void agentChannelLossAlsoReconnects();
     void pendingCallsFailWhenTheSessionDies();
@@ -467,6 +468,47 @@ void TstSessionBootstrap::unknownHostKeyIsNeverTrustedWithoutADecisionPolicy()
     });
     QVERIFY(h.wire());
     QCOMPARE(h.boot.connectCalls, 1);
+}
+
+// setTrustUnknownHostKeys() is worth exactly ONE attempt's worth of "there is
+// nobody to ask". The pool it borrows is shared and outlives the attempt, so an
+// accept-everything policy left installed on it would be a one-way door: every
+// later attempt reads "a callback exists" as "somebody is deciding", skips the
+// refusal above, and keeps trusting unknown keys blindly — even after the
+// opt-in has been withdrawn. So the attempt puts the policy on and takes it
+// straight back off, and leaves a policy it did not install alone.
+void TstSessionBootstrap::unattendedTrustDoesNotOutliveTheAttempt()
+{
+    Harness h;  // opts in, and installs no host-key policy on the pool
+    QVERIFY(!h.pool.hostKeyCallback());
+
+    QVERIFY(h.wire());
+    QVERIFY2(!h.pool.hostKeyCallback(),
+             "the unattended accept-everything policy was left on the shared "
+             "pool for the next caller to inherit");
+
+    // Withdrawing the opt-in therefore really does restore the safe answer.
+    h.boot.disconnectSession();
+    h.boot.setTrustUnknownHostKeys(false);
+    QSignalSpy errorSpy(&h.boot, &SessionBootstrap::error);
+    QVERIFY2(!h.wire(), "an unknown host key was still trusted with the "
+                        "unattended opt-in switched off");
+    QCOMPARE(h.boot.connectCalls, 1);  // refused before the handshake, as before
+    QCOMPARE(errorSpy.size(), 1);
+    QVERIFY2(errorSpy.at(0).at(0).toString().contains(QStringLiteral("host key")),
+             qPrintable(errorSpy.at(0).at(0).toString()));
+
+    // The caller's OWN policy is the one thing that must survive an attempt:
+    // AppController installs it before every connect and expects it to still be
+    // there for the retry that follows a fingerprint prompt.
+    h.boot.setTrustUnknownHostKeys(true);
+    h.pool.setHostKeyCallback([](const QString&, const QString&,
+                                 const QByteArray&, ch::KnownHosts::Verdict) {
+        return SshConnectionPool::HostKeyDecision::Reject;
+    });
+    QVERIFY(h.wire());
+    QVERIFY2(static_cast<bool>(h.pool.hostKeyCallback()),
+             "the attempt removed a host-key policy it did not install");
 }
 
 // The load-bearing case: the RPC channel dies, both devices are dropped, a

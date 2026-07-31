@@ -24,6 +24,14 @@ import {
     type AgentEvent,
 } from "./events.ts";
 
+// Upper bound on one line arriving on the bridge socket. A bridge message is a
+// handful of short identifiers plus an optional one-line summary, so a
+// megabyte is already several orders of magnitude of headroom; anything past
+// it is a producer that lost its newline, not a real event. Deliberately much
+// smaller than codeharbord's 16 MiB transport cap: that one has to carry whole
+// file contents, this one never does.
+export const MAX_BRIDGE_LINE_BYTES = 1024 * 1024;
+
 // Wire format for a single line arriving on the bridge socket.
 interface BridgeMessage {
     harness: unknown;
@@ -121,9 +129,16 @@ export function makeStreamSink(out: NodeJS.WritableStream): EventSink {
     });
     return (event, source) => {
         const ok = out.write(`${JSON.stringify(event)}\n`);
-        if (!ok) {
+        if (!ok && !paused.has(source)) {
             source.pause();
             paused.add(source);
+            // Forget a producer that disconnects while the output is still
+            // stalled. Without this the set holds a reference to every socket
+            // paused since the last 'drain', and if the consumer at the far end
+            // of the SSH channel never drains again — the exact situation that
+            // caused the pause — that set (and the sockets in it) is never
+            // released for as long as the bridge runs.
+            source.once("close", () => paused.delete(source));
         }
     };
 }
@@ -149,6 +164,27 @@ export async function startBridge(
             const event = processBridgeLine(line);
             if (event) sink(event, socket);
         });
+        // readline buffers an unterminated line without any upper bound, so a
+        // producer that streams bytes and never sends a newline grows the
+        // bridge's memory until the process dies — taking every other harness's
+        // status reporting with it. Count the bytes since the last newline and
+        // drop such a producer, the same rule codeharbord's framer applies to
+        // its own transport (MAX_LINE_BYTES there).
+        let sinceNewline = 0;
+        socket.on("data", (chunk: Buffer) => {
+            const nl = chunk.lastIndexOf(0x0a);
+            sinceNewline = nl === -1 ? sinceNewline + chunk.length : chunk.length - nl - 1;
+            if (sinceNewline > MAX_BRIDGE_LINE_BYTES) {
+                process.stderr.write(
+                    `codeharbor-bridge: dropping a producer that sent more than ${MAX_BRIDGE_LINE_BYTES} bytes without a newline\n`,
+                );
+                lines.close();
+                socket.destroy();
+            }
+        });
+        // Release readline's listeners with the connection rather than leaving
+        // one interface per socket attached for the lifetime of the process.
+        socket.on("close", () => lines.close());
         socket.on("error", () => socket.destroy());
     });
     // Ensure the socket's parent directory exists (the ~/.cache fallback may

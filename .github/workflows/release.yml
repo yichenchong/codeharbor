@@ -105,10 +105,14 @@ jobs:
           $pin = (Get-Content packaging/vcpkg-ports/libssh/vcpkg.json | ConvertFrom-Json).version
           echo "libssh=$pin" >> $env:GITHUB_OUTPUT
 
+      # cache/restore, NOT the combined `actions/cache`: the combined action
+      # registers a post-job save under the same key, which collides with the
+      # explicit save step below ("cache already exists"). The explicit save is
+      # the one that matters here - see its comment.
       - name: Cache vcpkg libssh (Windows)
         if: matrix.name == 'windows'
         id: vcpkg_cache
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: ${{ steps.imgver.outputs.vcpkg }}\installed
           key: vcpkg-libssh-${{ steps.imgver.outputs.libssh }}-x64-windows-${{ steps.imgver.outputs.v }}
@@ -411,13 +415,24 @@ jobs:
       # A release missing the Windows installer is a release most Windows users
       # cannot install, and a silently absent asset is worse than a red run: the
       # tag is permanent. Assert both Windows assets before anything is published.
-      - name: Verify Windows assets are present
+      #
+      # The installer's filename carries the version the Windows job parsed out
+      # of CMakeLists.txt, so requiring it to equal the TAG also catches the one
+      # mistake nothing else here would: tagging v0.2.0 on a tree whose
+      # CMakeLists.txt still says 0.1.8. That would publish, under the v0.2.0
+      # release, an installer that names and registers itself as 0.1.8 in
+      # "Installed apps" - a wrong version is worse than a missing one, because
+      # it looks fine. The wildcard this replaces waved that straight through.
+      - name: Verify Windows assets are present and versioned like the tag
         run: |
           set -eu
-          for pattern in 'codeharbor-windows.zip' 'CodeHarbor-*-windows-x64-setup.exe'; do
-            matches=$(find dist -maxdepth 1 -name "$pattern" | wc -l)
+          version="${GITHUB_REF_NAME#v}"
+          for name in "codeharbor-windows.zip" "CodeHarbor-$version-windows-x64-setup.exe"; do
+            matches=$(find dist -maxdepth 1 -name "$name" | wc -l)
             [ "$matches" -eq 1 ] || {
-              echo "expected exactly one dist/$pattern, found $matches" >&2
+              echo "expected exactly one dist/$name, found $matches" >&2
+              echo "assets present:" >&2
+              ls -1 dist >&2
               exit 1
             }
           done

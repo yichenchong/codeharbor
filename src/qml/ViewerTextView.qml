@@ -24,19 +24,34 @@ Rectangle {
         return RemotePath.fileUrlToPath(u.toString());
     }
 
-    // Start reading the current URL. Any read still in flight for a PREVIOUS
-    // URL is cancelled first via viewers.cancelTextFile(): ch::ViewerModel
-    // (src/viewers/ViewerModel.h) advances its request generation so the stale
-    // reply is dropped instead of continuing to occupy the remote file service.
+    // The path this view last asked the server for, so a read it ABANDONS can be
+    // named. Empty when nothing is outstanding.
+    property string requestedPath: ""
+
+    // Start reading the current URL, dropping any read still in flight for the
+    // PREVIOUS one.
+    //
+    // ch::ViewerModel::cancelTextFile() takes the PATH of the read to drop
+    // (src/viewers/ViewerModel.h): ONE ViewerModel is shared by every viewer
+    // pane, so a blanket cancel would drop the read another pane is still waiting
+    // for and leave that pane loading forever — and calling it with no path
+    // cancels nothing at all. It has to be the path this view asked for, not the
+    // one it is about to ask for: `url` has ALREADY changed by the time this runs
+    // (onUrlChanged), so the stale read is the one recorded in requestedPath.
+    //
     // The path comparison in the Connections block below is kept as defence in
     // depth.
     function reload() {
-        viewers.cancelTextFile();
+        if (root.requestedPath.length > 0)
+            viewers.cancelTextFile(root.requestedPath);
+        root.requestedPath = "";
         root.content = "";
         root.errorText = "";
         root.loading = root.url.toString().length > 0;
-        if (root.loading)
-            viewers.readTextFile(root.remotePath(root.url));
+        if (root.loading) {
+            root.requestedPath = root.remotePath(root.url);
+            viewers.readTextFile(root.requestedPath);
+        }
     }
 
     onUrlChanged: reload()
@@ -44,14 +59,20 @@ Rectangle {
 
     Connections {
         target: viewers
+        // One ViewerModel serves every pane, so a reply is only this view's when
+        // it names the path this view asked for. Settling clears requestedPath:
+        // there is nothing left to cancel, and the next reload must not ask the
+        // model to drop a read that already finished.
         function onTextFileRead(path, text) {
             if (path === root.remotePath(root.url)) {
+                root.requestedPath = "";
                 root.content = text;
                 root.loading = false;
             }
         }
         function onTextFileError(path, message) {
             if (path === root.remotePath(root.url)) {
+                root.requestedPath = "";
                 root.errorText = message;
                 root.loading = false;
             }

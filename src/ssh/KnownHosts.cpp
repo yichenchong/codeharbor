@@ -52,14 +52,22 @@ bool globMatches(const QString& pattern, const QString& host)
     qsizetype star = -1;   // index of the last '*' seen, -1 while none
     qsizetype resume = 0;  // how far into `host` that '*' has consumed
     while (h < host.size()) {
-        if (p < pattern.size()
-            && (pattern.at(p) == QLatin1Char('?')
-                || pattern.at(p).toCaseFolded() == host.at(h).toCaseFolded())) {
-            ++p;
-            ++h;
-        } else if (p < pattern.size() && pattern.at(p) == QLatin1Char('*')) {
+        // `*` FIRST: it is a metacharacter, so a looked-up name that itself
+        // contains a literal '*' at the same offset must not be allowed to
+        // consume it as an ordinary character. Testing equality first made
+        // "web*.example.com" fail to cover a lookup of "web*x.example.com" —
+        // the entry then named no host at all and a different key there read as
+        // first use (Unknown) instead of the refusal (Mismatch) a covered host
+        // is owed.
+        if (p < pattern.size() && pattern.at(p) == QLatin1Char('*')) {
             star = p++;
             resume = h;
+        } else if (p < pattern.size()
+                   && (pattern.at(p) == QLatin1Char('?')
+                       || pattern.at(p).toCaseFolded()
+                              == host.at(h).toCaseFolded())) {
+            ++p;
+            ++h;
         } else if (star >= 0) {
             // Backtrack: let the most recent '*' swallow one more character.
             p = star + 1;
@@ -153,6 +161,14 @@ KnownHosts::Verdict KnownHosts::verify(const QString& host,
 void KnownHosts::add(const QString& host, const QString& keyType,
                      const QByteArray& keyBlob)
 {
+    // A line needs all three fields to survive serialize()/parse(): an empty
+    // host, key type or blob writes "host type\n" (or worse), which parse()
+    // then drops as malformed — the trust would be silently gone on the next
+    // launch and the user asked to approve the same key all over again. Refuse
+    // to record something that cannot be stored instead.
+    if (host.isEmpty() || keyType.isEmpty() || keyBlob.isEmpty())
+        return;
+
     for (Entry& e : m_entries) {
         // Case-insensitively, because that is how verify() matches: a store
         // holding "Host.Example" must not gain a second "host.example" line

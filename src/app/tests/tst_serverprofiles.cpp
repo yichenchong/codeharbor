@@ -210,6 +210,7 @@ private slots:
     void unicodeAndSpacesSurviveTheIniRoundTrip();
     void insertionOrderSurvivesReload();
     void handEditedStoreIsRepairedOnLoad();
+    void secretsInTheCallersMapNeverReachTheStore();
 
     // ---- ConnectSheet.qml ----
     void sheetLoadsSilentlyAndExposesItsApi();
@@ -673,6 +674,70 @@ void TstServerProfiles::handEditedStoreIsRepairedOnLoad()
     QCOMPARE(reopened.activeId(), QStringLiteral("bbb"));
     QCOMPARE(namesOf(reopened.profiles()), QStringList({QStringLiteral("Alpha"),
                                                         QStringLiteral("Beta")}));
+}
+
+// The store is the one file on disk that says how to REACH a machine, and it
+// must never say how to AUTHENTICATE to it. addProfile()/updateProfile() take a
+// free-form map straight from QML, and the realistic way a secret gets in is not
+// malice but proximity: the connect sheet holds a password or key passphrase in
+// the same object as the profile fields, and one careless spread operator later
+// it is in the map. Seven fields are whitelisted; everything else is dropped
+// before anything is written, so that mistake cannot reach the disk.
+void TstServerProfiles::secretsInTheCallersMapNeverReachTheStore()
+{
+    const QString path = iniPath(QStringLiteral("secrets.ini"));
+    const QString password = QStringLiteral("hunter2-must-not-be-stored");
+    const QString passphrase = QStringLiteral("keyphrase-must-not-be-stored");
+    const QString keyFile = QStringLiteral("/home/u/.ssh/id_ed25519");
+
+    QVariantMap fields = profileFields(
+        QStringLiteral("box"), QStringLiteral("h"), 22, QStringLiteral("u"),
+        QStringLiteral("/usr/bin/node"), QStringLiteral("/srv/repo"), keyFile);
+    fields.insert(QStringLiteral("password"), password);
+    fields.insert(QStringLiteral("passphrase"), passphrase);
+
+    QString id;
+    {
+        ServerProfiles store(path);
+        id = store.addProfile(fields);
+        QVERIFY(!id.isEmpty());
+
+        // Exactly the whitelist, plus the minted id, and nothing else.
+        QCOMPARE(store.profile(id).keys(),
+                 QStringList({QStringLiteral("host"), QStringLiteral("id"),
+                              QStringLiteral("identityFile"),
+                              QStringLiteral("name"), QStringLiteral("nodePath"),
+                              QStringLiteral("port"), QStringLiteral("repoRoot"),
+                              QStringLiteral("user")}));
+        // The key FILE is legitimate profile state; the phrase that unlocks it
+        // is not, and the two must not be confused for each other.
+        QCOMPARE(store.profile(id).value(QStringLiteral("identityFile")).toString(),
+                 keyFile);
+
+        // An edit cannot smuggle one in either, and the edit that carries it
+        // still applies its legitimate half.
+        store.updateProfile(id,
+                            QVariantMap{{QStringLiteral("host"), QStringLiteral("h2")},
+                                        {QStringLiteral("password"), password}});
+        QCOMPARE(store.profile(id).value(QStringLiteral("host")).toString(),
+                 QStringLiteral("h2"));
+        QVERIFY(!store.profile(id).contains(QStringLiteral("password")));
+    }
+
+    // ...and no trace of either reached the file, neither as a value nor as a
+    // key somebody could later start reading.
+    QFile file(path);
+    QVERIFY(file.open(QIODevice::ReadOnly | QIODevice::Text));
+    const QString ini = QString::fromUtf8(file.readAll());
+    QVERIFY2(!ini.contains(password), qPrintable(ini));
+    QVERIFY2(!ini.contains(passphrase), qPrintable(ini));
+    QVERIFY2(!ini.contains(QStringLiteral("password")), qPrintable(ini));
+    QVERIFY2(!ini.contains(QStringLiteral("passphrase")), qPrintable(ini));
+
+    ServerProfiles reopened(path);
+    QVERIFY(!reopened.profile(id).contains(QStringLiteral("password")));
+    QCOMPARE(reopened.profile(id).value(QStringLiteral("identityFile")).toString(),
+             keyFile);
 }
 
 // ---------------------------------------------------------------------------

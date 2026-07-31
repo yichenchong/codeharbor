@@ -1,5 +1,6 @@
 import QtQuick
 import QtQuick.Controls.Basic
+import "RemotePath.js" as RemotePath
 
 // A single viewer pane (SPEC 3.3, 7.5) — a leaf of the viewer split tree. It
 // asks the ViewerModel (`viewers`) to classify its URL and loads the matching
@@ -78,25 +79,17 @@ Item {
     // ---- remote paths <-> file:// URLs -------------------------------------
 
     // The remote path inside a file:// URL; anything else (http/https) comes
-    // back unchanged, because that IS its address.
+    // back unchanged, because that IS its address. The rule itself lives in
+    // RemotePath.js, which is the module's ONE copy of it (QM17).
     function remotePathOf(u) {
-        const s = u.toString();
-        if (s.indexOf("file://") === 0)
-            return decodeURIComponent(s.substring("file://".length));
-        return s;
+        return RemotePath.fileUrlToPath(u.toString());
     }
 
     // The exact inverse of remotePathOf(), and of ViewerDirectoryView's
-    // remotePath(): each SEGMENT is percent-encoded and the separators are left
-    // alone, so decodeURIComponent() on the result returns the original path
-    // character for character. encodeURI() would not do — it leaves "#" and "?"
-    // unescaped, and a remote file named "notes#1" would silently become a URL
-    // with a fragment.
+    // remotePath(): see RemotePath.pathToFileUrl() for why every segment is
+    // percent-encoded individually.
     function fileUrlFor(path) {
-        const parts = String(path).split("/");
-        for (let i = 0; i < parts.length; ++i)
-            parts[i] = encodeURIComponent(parts[i]);
-        return "file://" + parts.join("/");
+        return RemotePath.pathToFileUrl(path);
     }
 
     // Open a remote path in THIS pane. A trailing slash means a directory, which
@@ -477,7 +470,7 @@ Item {
                     // What actually works, which the old text did not describe:
                     // it pointed at a file browser in the sidebar and at palette
                     // commands, and neither exists.
-                    text: qsTr("Type a remote path or a https:// address in the bar above and "
+                    text: qsTr("Type a remote path or an https:// address in the bar above and "
                                + "press Enter. Open a Dev Session and this pane starts at its "
                                + "repository root instead.")
                     color: Theme.textDim

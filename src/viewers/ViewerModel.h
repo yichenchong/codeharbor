@@ -1,5 +1,6 @@
 #pragma once
 
+#include <QHash>
 #include <QObject>
 #include <QPointer>
 #include <QString>
@@ -35,9 +36,6 @@ public:
                          InternalUrlMap *map = nullptr,
                          QObject *parent = nullptr);
 
-    void setClient(CodeharbordClient *client) { m_client = client; }
-    CodeharbordClient *client() const { return m_client; }
-
     // Inject the WebEngine profiles. When unset, ViewerModel lazily creates its
     // own ViewerProfiles from `client`, so QML always has working profiles.
     void setProfiles(ViewerProfiles *profiles);
@@ -63,11 +61,17 @@ public:
     // file over the cap, or without a client, textFileError.
     Q_INVOKABLE void readTextFile(const QString &path);
 
-    // Cancel any in-flight readTextFile so its late reply is ignored. A fresh
-    // readTextFile also implicitly supersedes an earlier one; this lets a
-    // caller drop the current read without immediately starting another (e.g.
-    // when the pane's URL clears).
-    Q_INVOKABLE void cancelTextFile();
+    // Drop the in-flight readTextFile for `path`, so its reply is ignored when
+    // it arrives. A fresh readTextFile for the SAME path also supersedes an
+    // earlier one implicitly; this lets a caller drop a read without
+    // immediately starting another (e.g. when a pane's URL clears).
+    //
+    // The path is REQUIRED to identify the read. ONE ViewerModel is shared by
+    // every viewer pane (it is a single QML context property), so a blanket
+    // "cancel whatever is in flight" would drop the read another pane is still
+    // waiting for and leave that pane loading forever. Calling this with no
+    // path therefore cancels nothing.
+    Q_INVOKABLE void cancelTextFile(const QString &path = QString());
 
     // Asynchronously list a remote directory (SPEC 7.5). On success emits
     // directoryListed with entries sorted (directories first, then by name),
@@ -87,9 +91,16 @@ private:
     InternalUrlMap *m_map;
     ViewerProfiles *m_profiles = nullptr;
     bool m_ownsProfiles = false;
-    // Bumped on every readTextFile and on cancelTextFile; a reply whose
-    // captured generation no longer matches is a superseded read and dropped.
-    quint64 m_textReadGeneration = 0;
+    // Stamp of the in-flight readTextFile for each path, keyed BY PATH because
+    // one ViewerModel serves every pane: two panes reading two different files
+    // must not supersede each other. A reply whose captured stamp is no longer
+    // the one recorded for its path (a newer read replaced it, or
+    // cancelTextFile dropped it) is superseded and discarded. Entries are
+    // erased as soon as their read settles, so this holds only live reads.
+    QHash<QString, quint64> m_textReadGenerations;
+    // Source of those stamps. Monotonic and never reset, so a stamp is never
+    // reused and a cancelled read can never be mistaken for a later one.
+    quint64 m_nextReadGeneration = 0;
 };
 
 } // namespace ch

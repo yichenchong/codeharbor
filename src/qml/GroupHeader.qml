@@ -3,9 +3,9 @@ import QtQuick.Controls.Basic
 
 // Sidebar group header (SPEC 4.2): group name with a collapse chevron. Bound to
 // a SessionsModel group row via role names (name, collapsed, itemId). Clicking
-// the header toggles the collapse via app.setGroupCollapsed(itemId, ...) and
-// moves the sidebar's keyboard cursor here; dragging it reorders the groups
-// through the sidebar (`host`), which owns every app.* call.
+// the header moves the sidebar's keyboard cursor here and toggles the collapse;
+// both that and a reorder drag go through the sidebar (`host`), which owns every
+// app.* call.
 ItemDelegate {
     id: header
 
@@ -164,10 +164,20 @@ ItemDelegate {
         onClicked: if (header.host) header.host.requestNewSession(header.itemId)
     }
 
+    // Selecting the header first is what makes the toggle unambiguous: the
+    // sidebar's toggleCurrentGroup() acts on the keyboard cursor, which
+    // selectGroup() has just moved here — so the click and the Space key take
+    // exactly the same path.
+    //
+    // Deliberately routed through `host` rather than calling app.setGroupCollapsed
+    // directly: the sidebar owns every app.* call (see its drag-and-drop
+    // contract), and a header with no host is documented to stay usable
+    // standalone, which a bare `app` lookup would break with a ReferenceError.
     onClicked: {
-        if (host)
-            host.selectGroup(header);
-        app.setGroupCollapsed(header.itemId, !header.collapsed);
+        if (!header.host)
+            return;
+        header.host.selectGroup(header);
+        header.host.toggleCurrentGroup();
     }
 
     // Vertical drag = reorder groups. Same grab discipline as SessionRow: the

@@ -4,6 +4,8 @@
 #include <QString>
 #include <QVector>
 
+#include <optional>
+
 // Recursive split-tree model for the viewer and terminal regions (SPEC 4.5).
 // Each region persists an independent tree; ratios are stored per Dev Session.
 namespace ch {
@@ -15,8 +17,9 @@ enum class SplitOrientation { Horizontal, Vertical };
 //     empty); or
 //   * an internal split, holding an orientation, child subtrees, and one ratio
 //     per child (ratios.size() == children.size()).
-// A default-constructed node is an empty leaf and is used as the "invalid"
-// sentinel returned by fromJson() when the input fails validation.
+// A default-constructed node is an empty leaf. It doubles as the "invalid"
+// sentinel fromJson() returns when the input fails validation, which is exactly
+// why tryFromJson() exists — see below.
 //
 // SplitNode is a value type today: children are held by value in the
 // QVector<SplitNode> member, so copies are deep and there is no shared
@@ -46,8 +49,22 @@ struct SplitNode {
 
     // Exact JSON round-trip. toJson()/fromJson() are inverses for any valid tree.
     QJsonObject toJson() const;
+
+    // Decode, or std::nullopt when `obj` is not a valid split tree.
+    //
+    // PREFER THIS over fromJson(). fromJson() has to report a rejection by
+    // returning its default-constructed value, which is an empty leaf - and an
+    // empty leaf is also a perfectly legitimate stored tree (closing a region's
+    // last pane persists exactly that; see src/app/SessionLayouts.cpp). A caller
+    // that needs to tell "rejected" from "a genuinely empty leaf" therefore has
+    // to re-inspect the input's "type" tag, a subtle rule that was independently
+    // reimplemented in two places before this existed. The parser already knows
+    // the answer; this simply does not throw it away.
+    static std::optional<SplitNode> tryFromJson(const QJsonObject &obj);
+
     // Returns a default (empty-leaf) node when obj is not a valid split tree,
-    // including the case where ratios.size() != children.size().
+    // including the case where ratios.size() != children.size(). Kept for
+    // callers to which a rejected tree and an empty leaf are the same thing.
     static SplitNode fromJson(const QJsonObject &obj);
 
     // Structural equality mirroring toJson(): leaf identity is its paneId and

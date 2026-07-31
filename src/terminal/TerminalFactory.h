@@ -67,6 +67,21 @@ public:
     // yet": the geometry the controller already recorded is used instead, and
     // only a controller that has never been sized falls back to 80x24. A
     // reconnect therefore never shrinks a pane that is already laid out.
+    //
+    // CALLER CONTRACT — `terminalId` must be UNIQUE FOR EVER within its Dev
+    // Session, not merely unique among the panes alive right now. The pair
+    // (devSessionId, terminalId) is the whole tmux target, and the attach
+    // command is `tmux new-session -A`, i.e. "attach if it already exists,
+    // create otherwise". That is exactly what makes a terminal survive a
+    // disconnect, an app restart and a session switch — and it is also why a
+    // RECYCLED id silently adopts a stranger: detach() and pane closure both
+    // leave the remote session running on purpose, so an id handed out a second
+    // time re-attaches the first terminal's shell, scrollback and running
+    // processes into what the user asked for as a brand new pane (and
+    // `workingDir` is ignored, because -c only applies when the session is
+    // created). This class cannot detect that: "reconnect to my terminal" and
+    // "give me a new terminal that happens to reuse an id" arrive here as
+    // byte-identical calls. Uniqueness is the caller's to guarantee.
     Q_INVOKABLE bool attach(ch::TerminalController* controller,
                             const QString& devSessionId,
                             const QString& terminalId,
@@ -79,11 +94,16 @@ public:
     Q_INVOKABLE void detach(ch::TerminalController* controller);
 
     // Detach and destroy the remote tmux session for this pane: the pane's
-    // processes go away with it.
+    // processes go away with it. The recorded target is only forgotten once the
+    // kill command has actually been handed to the server; a kill that could
+    // not run (no connection, or the exec channel was refused) reports through
+    // error() and leaves targetFor() intact, so the pane can try again instead
+    // of stranding a running session nothing can name any more.
     Q_INVOKABLE void kill(ch::TerminalController* controller);
 
-    // tmux target last attached for `controller`; empty if it never attached.
-    // Survives detach() so kill() still knows what to destroy.
+    // tmux target for `controller`: the one its LAST attach() aimed at, whether
+    // or not that attach succeeded, and empty before the first one (or after a
+    // kill that ran). Survives detach() so kill() still knows what to destroy.
     Q_INVOKABLE QString targetFor(ch::TerminalController* controller) const;
 
     // The command kill() runs on its own Exec channel:
@@ -107,6 +127,11 @@ private:
         QPointer<SshChannelDevice> device;
         QString target;
     };
+
+    // Create-or-update the pane's entry with the tmux target it is aiming at,
+    // wiring the destroyed() cleanup the first time. Never returns or keeps an
+    // iterator: callers re-find the entry after any call that can emit.
+    void rememberTarget(ch::TerminalController* controller, const QString& target);
 
     SshConnectionPool* m_pool = nullptr;
     // Keyed on the controller; entries are dropped when it is destroyed and

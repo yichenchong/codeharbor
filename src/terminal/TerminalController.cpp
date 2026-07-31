@@ -4,6 +4,7 @@
 
 #include <QIODevice>
 
+#include <cstring>
 #include <utility>
 
 namespace {
@@ -206,9 +207,45 @@ void TerminalController::flush()
 void TerminalController::appendHidden(const QByteArray &batch)
 {
     m_hidden.append(batch);
-    const qsizetype overflow = m_hidden.size() - kHiddenBufferMaxBytes;
-    if (overflow > 0)
-        m_hidden.remove(0, overflow); // evict oldest bytes past the cap
+    qsizetype drop = m_hidden.size() - kHiddenBufferMaxBytes;
+    if (drop <= 0)
+        return;
+
+    // WHERE the cut lands matters, not just how much it removes. The retained
+    // buffer is replayed verbatim into the renderer when the pane becomes
+    // visible again, so the first byte after the cut is the first byte
+    // xterm.js's parser sees. Cutting at the raw overflow offset lands in the
+    // middle of whatever byte sequence happened to straddle it:
+    //
+    //   * a multi-byte UTF-8 character loses its lead byte, and
+    //     ch::TerminalBridge's decoder turns the orphaned continuation bytes
+    //     into U+FFFD replacement glyphs at the top of the replay, and
+    //   * an ANSI escape sequence loses its ESC, so its remaining bytes
+    //     ("[1;31m") are printed as literal text instead of setting a colour.
+    //
+    // Both are visible corruption in a pane the user only hid for a while.
+    // Move the cut forward to a point that cannot be inside either sequence,
+    // dropping a few more bytes of the oldest scrollback than strictly needed
+    // (tmux's own history covers anything older anyway, SPEC 5.4).
+    const char *bytes = m_hidden.constData();
+    const qsizetype limit = qMin(m_hidden.size(), drop + kHiddenResyncWindowBytes);
+
+    // Best case: a line feed. No escape sequence contains one and it is ASCII,
+    // so the byte after it starts both a fresh line and a fresh character.
+    if (const void *lf = std::memchr(bytes + drop, '\n', static_cast<size_t>(limit - drop))) {
+        m_hidden.remove(0, static_cast<const char *>(lf) - bytes + 1);
+        return;
+    }
+
+    // No line feed within the window (a pane drawing a full-screen TUI can go a
+    // long way without one). Settle for a character boundary: skip the UTF-8
+    // continuation bytes (10xxxxxx) that belong to the character being cut.
+    // That still cannot resurrect a decapitated escape sequence, but it does
+    // keep the replay free of replacement characters, and a lone stray escape
+    // fragment is a one-off smudge rather than a mis-decoded stream.
+    while (drop < limit && (static_cast<unsigned char>(bytes[drop]) & 0xC0) == 0x80)
+        ++drop;
+    m_hidden.remove(0, drop);
 }
 
 void TerminalController::setState(TerminalState next)

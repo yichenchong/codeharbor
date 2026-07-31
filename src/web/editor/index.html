@@ -51,8 +51,26 @@
         color: #cdd6f4;                   /* text */
         font: 12px/1.6 system-ui, sans-serif;
     }
-    /* Pushed to the far end of the strip; shown by the script as display:flex. */
-    .ch-editor-notice { margin-left: auto; gap: 6px; }
+    /* Pushed to the far end of the strip; shown by the script as display:flex.
+       The notice only ever appears for a FAILED save (conflict or error), so it
+       carries Theme.warning as its text colour. */
+    .ch-editor-notice { margin-left: auto; gap: 6px; align-items: center; color: #f9e2af; }
+    /* Without these the Reload / Overwrite / Retry buttons the script creates
+       fall back to Chromium's native button chrome — a light grey slab with a
+       bevel, on a dark status strip, in an application that styles every other
+       control itself. The colours are the same Theme roles the rest of this
+       page mirrors. */
+    .ch-editor-notice button {
+        font: inherit;
+        color: #cdd6f4;                 /* text */
+        background: #313244;            /* surfaceRaised */
+        border: 1px solid #45475a;      /* border */
+        border-radius: 4px;             /* radiusSmall */
+        padding: 0 8px;
+        cursor: pointer;
+    }
+    .ch-editor-notice button:hover { background: #45475a; }        /* border */
+    .ch-editor-notice button:focus-visible { outline: 1px solid #89b4fa; } /* accent */
     .ch-editor-surface { flex: 1 1 auto; min-height: 0; }
 
     /* ---- scrollbars ----------------------------------------------------

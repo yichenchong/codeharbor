@@ -27,6 +27,8 @@ import {
     requireStringArray,
     optionalNumber,
     optionalBoolean,
+    requireOneOf,
+    requireDefined,
 } from "./validate.ts";
 
 // Current schema version. Mirrors schema_version in remote/sql/schema.sql and
@@ -104,7 +106,12 @@ export interface TerminalPane {
     updatedAt: number;
 }
 
-export type Region = "viewer" | "terminal";
+// The two split regions of the fixed layout. Declared as a runtime array so the
+// RPC guards can reject an unlisted region by name (requireOneOf below) instead
+// of letting SQLite's CHECK constraint answer for them; the TYPE is derived
+// from the array, so the two can never drift apart.
+export const REGIONS = ["viewer", "terminal"] as const;
+export type Region = (typeof REGIONS)[number];
 
 export interface SessionLayout {
     id: string;
@@ -413,10 +420,25 @@ export function openWorkspace(dbPath: string): Workspace {
         mkdirSync(path.dirname(dbPath), { recursive: true });
     }
     const db = new DatabaseSync(dbPath);
-    db.exec("PRAGMA foreign_keys = ON;");
-    migrate(db);
-    // After migrate(), never before: the indexed tables must exist first.
-    db.exec(indexesSql);
+    try {
+        db.exec("PRAGMA foreign_keys = ON;");
+        migrate(db);
+        // After migrate(), never before: the indexed tables must exist first.
+        db.exec(indexesSql);
+    } catch (err) {
+        // Setup failed (most commonly: a database written by a NEWER build, or
+        // a corrupt file). The connection is already open at this point, so
+        // leaving it dangling leaks a file descriptor and keeps SQLite's lock
+        // on the file for the rest of the process — the next open attempt, and
+        // any other process, then fails for a second, unrelated reason. Close
+        // it and report the ORIGINAL error.
+        try {
+            db.close();
+        } catch {
+            // Nothing useful to do; the original failure is what matters.
+        }
+        throw err;
+    }
     return new Workspace(db);
 }
 
@@ -560,16 +582,28 @@ export class Workspace {
 
     // --- Groups -------------------------------------------------------------
 
+    // Wrapped in a transaction because it is a read-then-write: nextPosition
+    // reads the scope's current maximum position and the INSERT then claims
+    // "one past" it. Two connections doing that at the same time (several
+    // codeharbord processes may share one database file — see serverId) both
+    // read the same maximum and both insert at the same position. Every listing
+    // query orders by `position, id`, so the tie is then broken by UUID, i.e.
+    // at random: the group the user just created can appear anywhere. The
+    // BEGIN IMMEDIATE inside transaction() takes the write lock before the
+    // read, so the second connection waits (or fails loudly) instead.
     createGroup(params: CreateGroupParams): Group {
-        const id = randomUUID();
-        const ts = Date.now();
-        const position = params.position ?? this.nextPosition("groups", "server_id", params.serverId);
-        this.db
-            .prepare(
-                "INSERT INTO groups (id, server_id, name, position, collapsed, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            )
-            .run(id, params.serverId, params.name, position, params.collapsed ? 1 : 0, ts, ts);
-        return this.getGroup(id);
+        return this.transaction(() => {
+            const id = randomUUID();
+            const ts = Date.now();
+            const position =
+                params.position ?? this.nextPosition("groups", "server_id", params.serverId);
+            this.db
+                .prepare(
+                    "INSERT INTO groups (id, server_id, name, position, collapsed, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                )
+                .run(id, params.serverId, params.name, position, params.collapsed ? 1 : 0, ts, ts);
+            return this.getGroup(id);
+        });
     }
 
     getGroup(id: string): Group {
@@ -615,33 +649,38 @@ export class Workspace {
 
     // --- Sessions -----------------------------------------------------------
 
+    // Read-then-write (parent lookup + nextPosition + INSERT), so it runs in a
+    // transaction for the same reason createGroup does.
     createSession(params: CreateSessionParams): Session {
-        const id = randomUUID();
-        const ts = Date.now();
-        // SPEC 3.5: a child's server_id is authoritative from its parent row,
-        // never the client-supplied param — otherwise a mismatched serverId
-        // could surface this session under a foreign server's group. The wire
-        // param is still accepted (C1) but overridden here.
-        const serverId = this.parentServerId("groups", params.groupId);
-        const position = params.position ?? this.nextPosition("dev_sessions", "group_id", params.groupId);
-        this.db
-            .prepare(
-                "INSERT INTO dev_sessions (id, server_id, group_id, name, repository_root, default_working_directory, task_description, position, archived, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            )
-            .run(
-                id,
-                serverId,
-                params.groupId,
-                params.name,
-                params.repositoryRoot,
-                params.defaultWorkingDirectory ?? null,
-                params.taskDescription ?? null,
-                position,
-                params.archived ? 1 : 0,
-                ts,
-                ts,
-            );
-        return this.getSession(id);
+        return this.transaction(() => {
+            const id = randomUUID();
+            const ts = Date.now();
+            // SPEC 3.5: a child's server_id is authoritative from its parent row,
+            // never the client-supplied param — otherwise a mismatched serverId
+            // could surface this session under a foreign server's group. The wire
+            // param is still accepted (C1) but overridden here.
+            const serverId = this.parentServerId("groups", params.groupId);
+            const position =
+                params.position ?? this.nextPosition("dev_sessions", "group_id", params.groupId);
+            this.db
+                .prepare(
+                    "INSERT INTO dev_sessions (id, server_id, group_id, name, repository_root, default_working_directory, task_description, position, archived, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                )
+                .run(
+                    id,
+                    serverId,
+                    params.groupId,
+                    params.name,
+                    params.repositoryRoot,
+                    params.defaultWorkingDirectory ?? null,
+                    params.taskDescription ?? null,
+                    position,
+                    params.archived ? 1 : 0,
+                    ts,
+                    ts,
+                );
+            return this.getSession(id);
+        });
     }
 
     getSession(id: string): Session {
@@ -856,7 +895,24 @@ export class Workspace {
             );
             for (const l of layoutRows) {
                 const idMap = l.region === "viewer" ? viewerIdMap : terminalIdMap;
-                const tree = JSON.stringify(remapPaneIds(JSON.parse(l.tree), idMap));
+                // A stored tree that no longer parses must not abort the whole
+                // duplicate. Everywhere else a corrupt blob self-heals to "this
+                // region has no layout" (getLayout / getLayouts, RW14); here it
+                // used to throw out of JSON.parse, roll the transaction back,
+                // and make "Duplicate Dev Session" fail outright for a session
+                // whose panes are all perfectly fine. Skip the region instead:
+                // the copy comes up with a default layout, exactly as the
+                // original already renders.
+                let parsed: unknown;
+                try {
+                    parsed = JSON.parse(l.tree);
+                } catch {
+                    console.error(
+                        `workspace: skipping unparseable layout tree while duplicating dev_session_id=${params.id} region=${l.region}`,
+                    );
+                    continue;
+                }
+                const tree = JSON.stringify(remapPaneIds(parsed, idMap));
                 insertLayout.run(randomUUID(), source.server_id, newSessionId, l.region, tree, ts, ts);
             }
 
@@ -866,31 +922,36 @@ export class Workspace {
 
     // --- Viewer panes -------------------------------------------------------
 
+    // Read-then-write (parent lookup + nextPosition + INSERT), so it runs in a
+    // transaction for the same reason createGroup does.
     createViewerPane(params: CreateViewerPaneParams): ViewerPane {
-        const id = randomUUID();
-        const ts = Date.now();
-        // SPEC 3.5: server_id is derived from the parent session, not trusted
-        // from the param, so a mismatched serverId cannot detach this pane from
-        // its session's server.
-        const serverId = this.parentServerId("dev_sessions", params.devSessionId);
-        const position =
-            params.position ?? this.nextPosition("viewer_panes", "dev_session_id", params.devSessionId);
-        this.db
-            .prepare(
-                "INSERT INTO viewer_panes (id, server_id, dev_session_id, url, handler, title, position, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            )
-            .run(
-                id,
-                serverId,
-                params.devSessionId,
-                params.url,
-                params.handler ?? null,
-                params.title ?? null,
-                position,
-                ts,
-                ts,
-            );
-        return this.getViewerPane(id);
+        return this.transaction(() => {
+            const id = randomUUID();
+            const ts = Date.now();
+            // SPEC 3.5: server_id is derived from the parent session, not trusted
+            // from the param, so a mismatched serverId cannot detach this pane from
+            // its session's server.
+            const serverId = this.parentServerId("dev_sessions", params.devSessionId);
+            const position =
+                params.position ??
+                this.nextPosition("viewer_panes", "dev_session_id", params.devSessionId);
+            this.db
+                .prepare(
+                    "INSERT INTO viewer_panes (id, server_id, dev_session_id, url, handler, title, position, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                )
+                .run(
+                    id,
+                    serverId,
+                    params.devSessionId,
+                    params.url,
+                    params.handler ?? null,
+                    params.title ?? null,
+                    position,
+                    ts,
+                    ts,
+                );
+            return this.getViewerPane(id);
+        });
     }
 
     getViewerPane(id: string): ViewerPane {
@@ -935,32 +996,37 @@ export class Workspace {
 
     // --- Terminal panes -----------------------------------------------------
 
+    // Read-then-write (parent lookup + nextPosition + INSERT), so it runs in a
+    // transaction for the same reason createGroup does.
     createTerminalPane(params: CreateTerminalPaneParams): TerminalPane {
-        const id = randomUUID();
-        const ts = Date.now();
-        // SPEC 3.5: server_id derived from the parent session (see
-        // createViewerPane); the client-sent serverId is overridden.
-        const serverId = this.parentServerId("dev_sessions", params.devSessionId);
-        const position =
-            params.position ?? this.nextPosition("terminal_panes", "dev_session_id", params.devSessionId);
-        this.db
-            .prepare(
-                "INSERT INTO terminal_panes (id, server_id, dev_session_id, name, working_directory, tmux_target, startup_command, harness, position, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            )
-            .run(
-                id,
-                serverId,
-                params.devSessionId,
-                params.name,
-                params.workingDirectory ?? null,
-                params.tmuxTarget ?? null,
-                params.startupCommand ?? null,
-                params.harness ?? null,
-                position,
-                ts,
-                ts,
-            );
-        return this.getTerminalPane(id);
+        return this.transaction(() => {
+            const id = randomUUID();
+            const ts = Date.now();
+            // SPEC 3.5: server_id derived from the parent session (see
+            // createViewerPane); the client-sent serverId is overridden.
+            const serverId = this.parentServerId("dev_sessions", params.devSessionId);
+            const position =
+                params.position ??
+                this.nextPosition("terminal_panes", "dev_session_id", params.devSessionId);
+            this.db
+                .prepare(
+                    "INSERT INTO terminal_panes (id, server_id, dev_session_id, name, working_directory, tmux_target, startup_command, harness, position, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                )
+                .run(
+                    id,
+                    serverId,
+                    params.devSessionId,
+                    params.name,
+                    params.workingDirectory ?? null,
+                    params.tmuxTarget ?? null,
+                    params.startupCommand ?? null,
+                    params.harness ?? null,
+                    position,
+                    ts,
+                    ts,
+                );
+            return this.getTerminalPane(id);
+        });
     }
 
     getTerminalPane(id: string): TerminalPane {
@@ -1053,24 +1119,39 @@ export class Workspace {
     // bare foreign-key failure. The wire param is still accepted for symmetry
     // with the other create calls.
     setLayout(params: SetLayoutParams): SessionLayout {
-        const serverId = this.parentServerId("dev_sessions", params.devSessionId);
-        const ts = Date.now();
-        this.db
-            .prepare(
-                "INSERT INTO session_layouts (id, server_id, dev_session_id, region, tree, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?) " +
-                    "ON CONFLICT (dev_session_id, region) DO UPDATE SET server_id = excluded.server_id, tree = excluded.tree, updated_at = excluded.updated_at",
-            )
-            .run(
-                randomUUID(),
-                serverId,
-                params.devSessionId,
-                params.region,
-                JSON.stringify(params.tree),
-                ts,
-                ts,
-            );
-        // Guaranteed present after the upsert above.
-        return this.getLayout(params) as SessionLayout;
+        // One transaction around the parent lookup, the upsert, and the
+        // read-back: without it a second connection writing the same region in
+        // between makes this call RETURN that other tree as if it were the one
+        // it just stored, and the client then renders a layout it never saved.
+        return this.transaction(() => {
+            const serverId = this.parentServerId("dev_sessions", params.devSessionId);
+            const ts = Date.now();
+            this.db
+                .prepare(
+                    "INSERT INTO session_layouts (id, server_id, dev_session_id, region, tree, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?) " +
+                        "ON CONFLICT (dev_session_id, region) DO UPDATE SET server_id = excluded.server_id, tree = excluded.tree, updated_at = excluded.updated_at",
+                )
+                .run(
+                    randomUUID(),
+                    serverId,
+                    params.devSessionId,
+                    params.region,
+                    JSON.stringify(params.tree),
+                    ts,
+                    ts,
+                );
+            const stored = this.getLayout(params);
+            // Present unless the tree we just wrote does not read back as JSON,
+            // which nothing can produce through this method. Checked rather
+            // than asserted away, so a future change cannot hand the client a
+            // `null` typed as a SessionLayout.
+            if (!stored) {
+                throw new Error(
+                    `layout could not be read back after write: ${params.devSessionId}/${params.region}`,
+                );
+            }
+            return stored;
+        });
     }
 
     // Repair a region's stored split layout after `paneId`'s row was deleted, so
@@ -1314,8 +1395,7 @@ export function serverIdentity(): string {
 export const WORKSPACE_METHODS: Record<RpcWorkspaceMethodName, (params: unknown) => unknown> = {
     [M.list]: (p) => {
         const o = requireObject(p, M.list);
-        requireString(o, "serverId", M.list);
-        return workspace().list(o.serverId as string);
+        return workspace().list(requireString(o, "serverId", M.list));
     },
     [M.createGroup]: (p) => {
         const o = requireObject(p, M.createGroup);
@@ -1444,15 +1524,22 @@ export const WORKSPACE_METHODS: Record<RpcWorkspaceMethodName, (params: unknown)
     },
     [M.getLayout]: (p) => {
         const o = requireObject(p, M.getLayout);
-        requireString(o, "devSessionId", M.getLayout);
-        requireString(o, "region", M.getLayout);
-        return workspace().getLayout(p as GetLayoutParams);
+        const devSessionId = requireString(o, "devSessionId", M.getLayout);
+        const region = requireOneOf(o, "region", M.getLayout, REGIONS);
+        return workspace().getLayout({ devSessionId, region });
     },
     [M.setLayout]: (p) => {
         const o = requireObject(p, M.setLayout);
-        requireString(o, "serverId", M.setLayout);
-        requireString(o, "devSessionId", M.setLayout);
-        requireString(o, "region", M.setLayout);
-        return workspace().setLayout(p as SetLayoutParams);
+        const serverId = requireString(o, "serverId", M.setLayout);
+        const devSessionId = requireString(o, "devSessionId", M.setLayout);
+        // A closed set, not merely "a string": the region names a column with a
+        // CHECK constraint, so an unlisted value used to reach SQLite and come
+        // back as a raw constraint-violation message that named neither the
+        // field nor the two values it accepts.
+        const region = requireOneOf(o, "region", M.setLayout, REGIONS);
+        // `tree` must be PRESENT. Omitted, it stringifies to `undefined`, which
+        // the SQLite driver rejects with an opaque type error naming no field.
+        const tree = requireDefined(o, "tree", M.setLayout);
+        return workspace().setLayout({ serverId, devSessionId, region, tree });
     },
 };

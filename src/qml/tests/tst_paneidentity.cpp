@@ -267,6 +267,26 @@ QObject *asObject(const QVariant &value)
     return value.value<QJSValue>().toQObject();
 }
 
+// Same story for a QML `var` holding a JS ARRAY: a signal argument or a property
+// read may hand it over already converted to a QVariantList, or still boxed in a
+// QJSValue.
+QVariantList asList(const QVariant &value)
+{
+    if (value.userType() == qMetaTypeId<QJSValue>())
+        return value.value<QJSValue>().toVariant().toList();
+    return value.toList();
+}
+
+// The index path a region reports its ratios under, printed so a failure names
+// it: [] is the root branch, ["1"] its second child.
+QString pathText(const QVariantList &path)
+{
+    QStringList parts;
+    for (const QVariant &step : path)
+        parts.append(step.toString());
+    return QLatin1Char('[') + parts.join(QLatin1Char(',')) + QLatin1Char(']');
+}
+
 QVariantMap leafNode(const QString &paneId, const QString &url = QString())
 {
     QVariantMap leaf{{QStringLiteral("paneId"), paneId},
@@ -345,6 +365,13 @@ private slots:
     // the FIRST frame — the case the one-shot sizing latch gets wrong most
     // easily, and one a single-pane region can never exercise.
     void twoStackedTerminalPanesComeUpFromTheFirstFrame();
+
+    // SPLIT RATIOS (SPEC 4.5). Restoring stored ratios was already implemented
+    // and tested by the sizing latch; REPORTING the ones a drag produces was
+    // not, so every drag on a divider inside a region was forgotten when the
+    // Dev Session was reopened. The reading has to name the branch it belongs
+    // to by index path, which is the part a nested region gets wrong.
+    void dragAdjustedRatiosAreReportedForTheRightBranch();
 
 private:
     QObject *openRegion(const QString &file, const QVariantMap &node, bool terminal);
@@ -1268,6 +1295,107 @@ void TstPaneIdentity::twoStackedTerminalPanesComeUpFromTheFirstFrame()
     QTRY_COMPARE(m_region->property("focusedPaneId").toString(), QStringLiteral("terminal-2"));
     clickPane(top);
     QTRY_COMPARE(m_region->property("focusedPaneId").toString(), QStringLiteral("terminal-1"));
+}
+
+// ---------------------------------------------------------------------------
+// (11) Split ratios, the WRITE side.
+//
+// A region already RESTORES the ratios stored in its node (ratioFor + the
+// one-shot sizing latch), so a reopened Dev Session came back with the
+// proportions the server held. What was missing is the other half: nothing told
+// the host when a DRAG changed them, so ch::SessionLayouts::setRatios() was
+// never called from anywhere and every divider the user moved inside a region
+// snapped back to the stored fractions on the next reopen.
+//
+// The reading has to name the branch it belongs to as an index path from the
+// root of the region tree — that is setRatios()'s addressing — and a nested
+// region is the case that can get it wrong while a single-level one still looks
+// perfect. So the tree here is deliberately two levels deep, and the inner
+// branch's own report has to arrive on the ROOT region carrying ["1"].
+//
+// publishRatios() is invoked directly rather than by synthesising a drag: what
+// is under test is the arithmetic and the path, and SplitView only sets
+// `resizing` for a real pointer grab on a handle.
+// ---------------------------------------------------------------------------
+void TstPaneIdentity::dragAdjustedRatiosAreReportedForTheRightBranch()
+{
+    // [ viewer-1 | [ viewer-2 / viewer-3 ] ]
+    const QVariantMap tree = branchNode(
+        QStringLiteral("horizontal"),
+        QVariantList{leafNode(QStringLiteral("viewer-1")),
+                     branchNode(QStringLiteral("vertical"),
+                                QVariantList{leafNode(QStringLiteral("viewer-2")),
+                                             leafNode(QStringLiteral("viewer-3"))})});
+    QVERIFY(openRegion(QStringLiteral("ViewerRegion.qml"), tree, /*terminal=*/false));
+
+    const auto panes = [this] { return collect(m_region, isLeafPane); };
+    QTRY_VERIFY2(panes().size() == 3,
+                 qPrintable(QStringLiteral("expected 3 panes, found %1: %2")
+                                .arg(panes().size())
+                                .arg(describePanes(panes()))));
+    QTest::qWait(kSettleMs);
+
+    // Every region in the tree knows where it sits. A leaf region's path is what
+    // its PARENT branch would report under, so all five are checked at once.
+    const QList<QObject *> regions = collect(m_region, [](QObject *object) {
+        return object->metaObject()->indexOfProperty("nodePath") >= 0;
+    });
+    QStringList paths;
+    for (QObject *region : regions)
+        paths.append(pathText(asList(region->property("nodePath"))));
+    paths.sort();
+    // Sorted on both sides: the comparison is about the SET of paths, and
+    // QStringList::sort() orders by code unit, so "[0]" sorts before "[]"
+    // (']' is 0x5D, '0' is 0x30). Writing the literal in reading order and
+    // sorting it too keeps the expectation legible without depending on that.
+    QStringList expectedPaths{QStringLiteral("[]"), QStringLiteral("[0]"),
+                              QStringLiteral("[1]"), QStringLiteral("[1,0]"),
+                              QStringLiteral("[1,1]")};
+    expectedPaths.sort();
+    QCOMPARE(paths, expectedPaths);
+
+    QSignalSpy reported(m_region, SIGNAL(splitRatiosAdjusted(QVariant, QVariant)));
+    QVERIFY(reported.isValid());
+
+    // Two branches, so two SplitViews: the root one and the nested one.
+    const QList<QObject *> splits = collect(m_region, isRegionSplitView);
+    QCOMPARE(splits.size(), 2);
+    for (QObject *split : splits) {
+        QVERIFY2(QMetaObject::invokeMethod(split, "publishRatios"),
+                 "the region's SplitView has no publishRatios(), so a drag inside a region "
+                 "cannot be reported to the host");
+    }
+    QTRY_COMPARE(reported.size(), 2);
+
+    // Both readings land on the ROOT region (a nested one relays through its
+    // owner), each naming its own branch and carrying one fraction per child.
+    QStringList reportedPaths;
+    for (const QList<QVariant> &emission : reported) {
+        const QVariantList path = asList(emission.at(0));
+        const QVariantList ratios = asList(emission.at(1));
+        reportedPaths.append(pathText(path));
+
+        QCOMPARE(ratios.size(), 2);
+        double sum = 0;
+        for (const QVariant &ratio : ratios) {
+            const double value = ratio.toDouble();
+            // ch::SessionLayouts::setRatios() rejects anything not strictly
+            // positive, and an even two-way split is what this tree starts at.
+            QVERIFY2(value > 0.2 && value < 0.8,
+                     qPrintable(QStringLiteral("%1 reported the implausible ratio %2")
+                                    .arg(pathText(path))
+                                    .arg(value)));
+            sum += value;
+        }
+        QVERIFY2(qAbs(sum - 1.0) < 0.001,
+                 qPrintable(QStringLiteral("%1 reported ratios summing to %2, not 1")
+                                .arg(pathText(path))
+                                .arg(sum)));
+    }
+    reportedPaths.sort();
+    QStringList expectedReported{QStringLiteral("[]"), QStringLiteral("[1]")};
+    expectedReported.sort();
+    QCOMPARE(reportedPaths, expectedReported);
 }
 
 // QTEST_MAIN cannot be used: registerUrlScheme() and QtWebEngineQuick::initialize()

@@ -84,20 +84,34 @@ Rectangle {
     property bool pageLoaded: false
     // Human-readable reason the pane is not live; shown instead of a blank pane.
     // Whole sentences, because this is the only thing on screen when a terminal
-    // fails to come up — "notconnected" is a state name, not an explanation.
+    // fails to come up — "unloaded" is a state name, not an explanation.
     property string statusText: pane.factory ? qsTr("Not attached to a shell yet.")
                                              : qsTr("No terminal service in this window.")
     // Live means: a PTY is attached AND the renderer is showing it.
     readonly property bool live: pane.attached && pane.pageLoaded
                                  && pane.connectionState === "ready"
 
+    // The pane is on its way up. `attaching` alone cannot answer this: it brackets
+    // the SYNCHRONOUS factory.attach() call, so it is true for a blink and never
+    // observably so. The slow part is the CONTROLLER's — opening the SSH channel
+    // and running `tmux new-session -A` on it, which is where its multi-second
+    // budget goes — and those are the two states it publishes while doing it
+    // (ch::toString(TerminalState), src/models/SessionState.cpp).
+    readonly property bool comingUp: pane.attaching
+                                     || pane.connectionState === "opening_channel"
+                                     || pane.connectionState === "attaching_tmux"
+
     // The pane's state in ONE word, for the header. Deliberately not
-    // `connectionState` verbatim: that publishes machine words ("notconnected",
-    // "unloaded") which mean nothing beside a terminal's name. The whole
+    // `connectionState` verbatim: that publishes machine words ("unloaded",
+    // "opening_channel") which mean nothing beside a terminal's name. The whole
     // sentence still exists — `statusText`, drawn in the placeholder and the
     // banner below — and this is the glance version of it.
+    //
+    // "attaching…" is the shell coming up; "starting…" is the shell already up
+    // (or not started yet) with the RENDERER still loading, which is the other
+    // half of `live`.
     readonly property string stateLabel: pane.live ? qsTr("live")
-        : pane.attaching ? qsTr("attaching\u2026")
+        : pane.comingUp ? qsTr("attaching\u2026")
         : pane.attached ? qsTr("starting\u2026")
         : pane.connectionState === "error" ? qsTr("error")
         : pane.connectionState === "disconnected" ? qsTr("disconnected")
@@ -159,12 +173,46 @@ Rectangle {
         pane.attached = false
     }
 
-    // Destroy the remote tmux session for this pane, processes and all.
+    // Destroy the remote tmux session for this pane, processes and all. Returns
+    // whether the kill actually reached the server, so a caller does not tell the
+    // user their session is gone when it is still running.
+    //
+    // ch::TerminalFactory::kill() returns nothing and reports a refusal through
+    // its error() signal — SYNCHRONOUSLY, from inside the call, which lands in
+    // this pane's onError handler and writes `statusText`. Assigning a cheerful
+    // "Session killed" afterwards (which this used to do unconditionally)
+    // overwrote that explanation with its exact opposite: a kill attempted with
+    // no SSH connection deliberately KEEPS the tmux target and says the session
+    // "is still running and was not killed", and the user was shown "Session
+    // killed. Connect to start a new one."
+    //
+    // What the factory does publish is `targetFor()`: the tmux session this pane
+    // last aimed at, cleared ONLY once the kill command has actually been handed
+    // to the server (documented on TerminalFactory::kill/targetFor) and kept
+    // otherwise so the pane can try again. Comparing it across the call is
+    // therefore how QML learns what happened.
     function killSession() {
-        if (pane.factory && pane.controller)
-            pane.factory.kill(pane.controller)
+        if (!pane.factory || !pane.controller) {
+            pane.statusText = qsTr("No terminal service in this window.")
+            return false
+        }
+        const target = pane.factory.targetFor(pane.controller)
+        pane.factory.kill(pane.controller)
+        // kill() detaches first in every case, so the channel is gone either way.
         pane.attached = false
+        if (target.length === 0) {
+            // Never attached: there was no remote session to destroy, and the
+            // factory stays silent about it rather than reporting a failure.
+            pane.statusText = qsTr("This pane has no remote session to kill yet.")
+            return false
+        }
+        if (pane.factory.targetFor(pane.controller).length > 0) {
+            // Refused. The factory has already written the reason into
+            // `statusText` through error(); leave it there.
+            return false
+        }
         pane.statusText = qsTr("Session killed. Connect to start a new one.")
+        return true
     }
 
     // A pane retargeted at another session/terminal must follow it: drop the
@@ -178,6 +226,15 @@ Rectangle {
 
     onDevSessionIdChanged: pane.retarget()
     onTerminalIdChanged: pane.retarget()
+    // Deliberately NOT retarget() like the two above, and not an oversight: the
+    // working directory only reaches the server as `tmux new-session -A -c <dir>`
+    // (TerminalController), and tmux honours -c only when it CREATES the session.
+    // Re-attaching a live pane would therefore drop its channel and rebuild it in
+    // the very same directory as before — all of the cost of a retarget and none
+    // of the effect. So a live pane keeps its directory (the user can `cd`), and
+    // only a pane that has not attached yet adopts a late one, which is what
+    // makes the host's ordered devSessionId/workingDir push work (see Main.qml's
+    // retargetTerminals).
     onWorkingDirChanged: if (!pane.attached) pane.attachNow()
     // Hidden panes keep their PTY but must stop being treated as renderable, so
     // output buffers instead of being flushed at a view nobody can see (SPEC 5.4).
@@ -223,12 +280,21 @@ Rectangle {
         anchors.rightMargin: pane.border.width
         anchors.topMargin: pane.border.width
 
-        // terminalId is server-derived data; AppPaneHeader draws it as plain
-        // text. A pane with no id yet says what it IS instead of nothing.
+        // terminalId is NOT server data: it is the client-minted layout pane id
+        // (`terminalId: pane.paneId` above), handed out by
+        // ch::SessionLayouts::splitPane as "terminal-<n>". It names this pane's
+        // remote tmux session ("ch_<devSessionId>_<terminalId>", see
+        // src/terminal/TerminalController.cpp), so it must never be reused within
+        // a Dev Session: an id handed out twice re-attaches the earlier pane's
+        // surviving shell instead of starting a new one. Drawn as plain text
+        // anyway, since AppPaneHeader draws every title that way. A pane with no
+        // id yet says what it IS instead of nothing.
         title: pane.terminalId.length > 0 ? pane.terminalId : qsTr("Terminal")
         subtitle: pane.stateLabel
         active: pane.paneActive
-        busy: pane.attaching
+        // `comingUp`, not `attaching`: the latter is a blink around a synchronous
+        // call, so the dot never actually appeared while the pane was coming up.
+        busy: pane.comingUp
 
         actions: [
             AppPaneHeader.Action {
@@ -384,7 +450,9 @@ Rectangle {
             Label {
                 objectName: "paneIdentityLabel"
                 anchors.horizontalCenter: parent.horizontalCenter
-                // Same rule: terminalId comes from server data.
+                // Same rule: terminalId is the client-minted layout pane id
+                // (see the header above), drawn as plain text like every other
+                // identifier on this pane.
                 textFormat: Text.PlainText
                 text: pane.terminalId
                 visible: pane.terminalId.length > 0

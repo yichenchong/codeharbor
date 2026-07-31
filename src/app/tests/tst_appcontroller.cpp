@@ -6,6 +6,7 @@
 #include <QDirIterator>
 #include <QFile>
 #include <QScopeGuard>
+#include <QSettings>
 #include <QVariantMap>
 #include <QPair>
 #include <QByteArray>
@@ -120,6 +121,24 @@ QByteArray listWithTerminalFrame(int id, const QString& groupName,
     const QJsonObject session{{"id", sessionId},
                               {"name", sessionId},
                               {"terminalPanes", QJsonArray{terminal}}};
+    const QJsonObject group{{"id", groupName},
+                            {"name", groupName},
+                            {"sessions", QJsonArray{session}}};
+    const QJsonObject resp{{"jsonrpc", "2.0"},
+                           {"id", id},
+                           {"result", QJsonArray{group}}};
+    return QJsonDocument(resp).toJson(QJsonDocument::Compact) + '\n';
+}
+
+// As above, but the session also carries a repositoryRoot. activeSessionRepoRoot
+// is derived from it, so a test can change it server-side between refreshes.
+QByteArray listWithRepoRootFrame(int id, const QString& groupName,
+                                 const QString& sessionId,
+                                 const QString& repoRoot)
+{
+    const QJsonObject session{{"id", sessionId},
+                              {"name", sessionId},
+                              {"repositoryRoot", repoRoot}};
     const QJsonObject group{{"id", groupName},
                             {"name", groupName},
                             {"sessions", QJsonArray{session}}};
@@ -323,6 +342,9 @@ private slots:
     void staleOrFailedRefreshNeverRetiresActiveSession();
     void deletingActiveSessionRetiresItThroughChainedRefresh();
     void disconnectRetiresActiveSessionButStillRemembersIt();
+    void refreshWithoutATransportIsASilentNoOp();
+    void serverSideRepoRootChangeNotifiesActiveSession();
+    void switchingServerDropsTheActiveSessionButKeepsItRemembered();
 
     // An UNKNOWN host key must be REFUSED and put to the user (SPEC 12.1), and
     // the approval must be spendable exactly once, on the very key that was
@@ -340,8 +362,12 @@ private slots:
     // A server requiring BOTH a key and a password takes two prompts and three
     // attempts; the third has to carry both secrets, each to its own method.
     void twoMethodServerChainCarriesBothSecretsWithoutCrossingThem();
+    void connectWhileParkedLeavesTheChainsSecretsIntact();
+    void submitCredentialWithAnUnknownKindIsIgnored();
     void serverOlderThanTheSchemaFloorIsRefusedWithBothVersions();
     void serverAtTheSchemaFloorIsAdoptedNormally();
+    void uiStateStoreIgnoresCorruptWidths();
+    void uiStateStoreRejectsAnEmptyDevSessionId();
 };
 
 // Two GroupNodes with sessions map to GroupRows preserving order, with the
@@ -832,7 +858,7 @@ struct ActiveSessionFixture {
     FakeTransport transport;
     CodeharbordClient client;
     AppController controller{&client};
-    SessionLayouts layouts{controller.workspaceDb()};
+    SessionLayouts layouts{controller.workspaceDb(), controller.uiState()};
 
     ActiveSessionFixture()
     {
@@ -1051,6 +1077,111 @@ void TstAppController::disconnectRetiresActiveSessionButStillRemembersIt()
     QCOMPARE(f.controller.activeSessionId(), QStringLiteral("s1"));
     QCOMPARE(f.layouts.devSessionId(), QStringLiteral("s1"));
     QCOMPARE(takeRequestIds(f.transport).size(), 2); // one getLayout per region
+}
+
+// refresh() with no transport bound is DOCUMENTED to return without asking
+// anything. That is the whole cold-start experience: the shell comes up before
+// the user has connected to any server, and a workspace.list issued there would
+// fail instantly with a synthetic "no transport bound" and paint an error toast
+// over an app that has done nothing wrong. Nothing may be sent, no error may be
+// raised, and `refreshed` (which drives restoreActiveSession) must not fire on
+// a tree that was never read.
+void TstAppController::refreshWithoutATransportIsASilentNoOp()
+{
+    CodeharbordClient client;  // no setTransport()
+    AppController controller(&client);
+    QSignalSpy errorSpy(&controller, &AppController::error);
+    QSignalSpy refreshedSpy(&controller, &AppController::refreshed);
+
+    controller.refresh();
+    // Setting a server id also drives a refresh; it must be just as quiet.
+    controller.setServerId(QStringLiteral("srv-cold"));
+
+    QCOMPARE(errorSpy.count(), 0);
+    QCOMPARE(refreshedSpy.count(), 0);
+    QCOMPARE(controller.sessionsModel()->rowCount(), 0);
+}
+
+// activeSessionRepoRoot is a Q_PROPERTY read off the cached workspace tree but
+// notified by activeSessionChanged, which a plain refresh does not otherwise
+// emit. Somebody editing the Dev Session's repository root (here or from
+// another client) must therefore still re-notify, or every binding on it - the
+// terminal region's working directory above all - stays pinned to the old path
+// for the rest of the run. Equally, a refresh that changes nothing must NOT
+// emit: activeSessionChanged tears down and rebuilds the panes bound to it.
+void TstAppController::serverSideRepoRootChangeNotifiesActiveSession()
+{
+    ActiveSessionFixture f;
+
+    f.controller.refresh();
+    f.transport.deliver(listWithRepoRootFrame(
+        takeRequest(f.transport).value(QStringLiteral("id")).toInt(),
+        QStringLiteral("g"), QStringLiteral("s1"), QStringLiteral("/srv/old")));
+    f.controller.activateSession(QStringLiteral("s1"));
+    f.transport.takeSent();
+    QCOMPARE(f.controller.activeSessionRepoRoot(), QStringLiteral("/srv/old"));
+
+    QSignalSpy activeSpy(&f.controller, &AppController::activeSessionChanged);
+
+    // Same tree again: nothing moved, so nothing may be notified.
+    f.controller.refresh();
+    f.transport.deliver(listWithRepoRootFrame(
+        takeRequest(f.transport).value(QStringLiteral("id")).toInt(),
+        QStringLiteral("g"), QStringLiteral("s1"), QStringLiteral("/srv/old")));
+    QCOMPARE(activeSpy.count(), 0);
+
+    // The repository root moved on the server.
+    f.controller.refresh();
+    f.transport.deliver(listWithRepoRootFrame(
+        takeRequest(f.transport).value(QStringLiteral("id")).toInt(),
+        QStringLiteral("g"), QStringLiteral("s1"), QStringLiteral("/srv/new")));
+    QCOMPARE(f.controller.activeSessionRepoRoot(), QStringLiteral("/srv/new"));
+    QCOMPARE(activeSpy.count(), 1);
+    // Still active: a repo-root edit is not a deletion.
+    QCOMPARE(f.controller.activeSessionId(), QStringLiteral("s1"));
+}
+
+// A Dev Session belongs to exactly one server. Switching serverId must drop the
+// active session and both region layout trees immediately - carrying them over
+// would show the previous server's panes against the new server's workspace and
+// pair the OLD devSessionId with the NEW serverId on the next layout write. But
+// the session is not GONE, so the PREVIOUS server's memory of it must survive:
+// switching back has to reopen it.
+void TstAppController::switchingServerDropsTheActiveSessionButKeepsItRemembered()
+{
+    ActiveSessionFixture f;
+    f.deliverTreeWithS1();
+    f.activateAndLoadS1();
+    QCOMPARE(f.controller.activeSessionId(), QStringLiteral("s1"));
+    QVERIFY(!f.layouts.viewerTree().isNull());
+    f.transport.takeSent();
+
+    // Hermetic: a previous run must not leave srv-2 remembering a session.
+    f.controller.uiState()->setActiveSession(QStringLiteral("srv-2"), QString());
+
+    QSignalSpy activeSpy(&f.controller, &AppController::activeSessionChanged);
+    QSignalSpy serverSpy(&f.controller, &AppController::serverIdChanged);
+    f.controller.setServerId(QStringLiteral("srv-2"));
+
+    QCOMPARE(serverSpy.count(), 1);
+    QCOMPARE(activeSpy.count(), 1);
+    QCOMPARE(f.controller.activeSessionId(), QString());
+    QCOMPARE(f.layouts.devSessionId(), QString());
+    QVERIFY(f.layouts.viewerTree().isNull());
+    QVERIFY(f.layouts.terminalTree().isNull());
+    // The layouts repository is re-keyed in lockstep, so a later setLayout
+    // cannot land under the previous server's key.
+    QCOMPARE(f.layouts.serverId(), QStringLiteral("srv-2"));
+    // Forgotten for nobody: switching back must reopen s1.
+    QCOMPARE(f.controller.uiState()->activeSession(QStringLiteral("srv")),
+             QStringLiteral("s1"));
+
+    // The switch reloads the sidebar from the NEW server, and that tree has no
+    // s1, so nothing is restored under srv-2.
+    f.transport.deliver(listResultFrame(
+        takeRequest(f.transport).value(QStringLiteral("id")).toInt(),
+        QStringLiteral("other")));
+    QCOMPARE(f.controller.activeSessionId(), QString());
 }
 
 // SPEC 12.1: an unknown host key gets a fingerprint prompt, which means the
@@ -1478,6 +1609,126 @@ void TstAppController::twoMethodServerChainCarriesBothSecretsWithoutCrossingThem
     QCOMPARE(promptSpy.count(), 3);
 }
 
+// A stray second click on Connect while a credential sheet is up must be
+// REFUSED and must otherwise change nothing. The refusal was always there, but
+// the state it was protecting was thrown away before the guard ever ran: the
+// handler wiped the chain's gathered secrets and its "already asked" flags
+// first, so a user who clicked Connect again while the password box was open
+// lost the private-key passphrase they had already typed. The next attempt then
+// arrived with the key locked again - and on a server that demands a key AND a
+// password (OpenSSH `AuthenticationMethods publickey,password`) that chain can
+// never complete, which is exactly the dead end the chain exists to avoid.
+void TstAppController::connectWhileParkedLeavesTheChainsSecretsIntact()
+{
+    static const QString kPassphrase = QStringLiteral("unlock-the-key-aa");
+    static const QString kPassword = QStringLiteral("account-password-bb");
+    ConnectFixture f;
+    QSignalSpy promptSpy(&f.controller, &AppController::credentialPrompt);
+
+    // Attempt 1: the key is encrypted; ask for the passphrase.
+    f.boot.duringConnect = [&f] {
+        f.pool.credentialCallback()(
+            QStringLiteral("yichen"),
+            SshConnectionPool::CredentialKind::KeyPassphrase);
+    };
+    f.controller.connectToProfile(f.profileId);
+    QCOMPARE(promptSpy.count(), 1);
+
+    // Attempt 2: the passphrase unlocks the key, the server then wants a
+    // password as well, so a SECOND prompt goes up. The passphrase now lives in
+    // the chain, which is what the stray Connect below used to destroy.
+    f.boot.duringConnect = [&f] {
+        f.pool.credentialCallback()(
+            QStringLiteral("yichen"),
+            SshConnectionPool::CredentialKind::KeyPassphrase);
+        f.pool.credentialCallback()(QStringLiteral("yichen"),
+                                    SshConnectionPool::CredentialKind::Password);
+    };
+    f.controller.submitCredential(kPassphrase, QStringLiteral("keyPassphrase"));
+    QCOMPARE(promptSpy.count(), 2);
+    QCOMPARE(f.controller.connectionState(), QStringLiteral("credential"));
+
+    // THE STRAY CLICK. Nothing may be dialled and nothing may be forgotten.
+    const int callsBefore = f.boot.connectCalls;
+    f.controller.connectToProfile(f.profileId);
+    QCOMPARE(f.boot.connectCalls, callsBefore);
+    QCOMPARE(promptSpy.count(), 2);
+    QCOMPARE(f.controller.connectionState(), QStringLiteral("credential"));
+
+    // Attempt 3 must still hold BOTH secrets, each offered only to its own
+    // method, and must not ask a third question.
+    QString finalPassphrase;
+    QString finalPassword;
+    f.boot.duringConnect = [&f, &finalPassphrase, &finalPassword] {
+        finalPassphrase =
+            f.pool
+                .credentialCallback()(
+                    QStringLiteral("yichen"),
+                    SshConnectionPool::CredentialKind::KeyPassphrase)
+                .secret;
+        finalPassword =
+            f.pool
+                .credentialCallback()(QStringLiteral("yichen"),
+                                      SshConnectionPool::CredentialKind::Password)
+                .secret;
+    };
+    f.controller.submitCredential(kPassword, QStringLiteral("password"));
+
+    QVERIFY2(finalPassphrase == kPassphrase,
+             "a refused second Connect wiped the passphrase the chain had "
+             "already gathered");
+    QCOMPARE(finalPassword, kPassword);
+    QCOMPARE(promptSpy.count(), 2);
+}
+
+// `kind` comes from QML. A value neither branch recognises is a bug on that
+// side, and guessing at it would offer the typed secret to the wrong
+// authentication method - a private-key passphrase sent to a remote host's
+// password endpoint. The submission is dropped whole: nothing is dialled, the
+// prompt stays parked, and the user's next (correct) answer still works.
+void TstAppController::submitCredentialWithAnUnknownKindIsIgnored()
+{
+    ConnectFixture f;
+    f.boot.duringConnect = [&f] {
+        f.pool.credentialCallback()(
+            QStringLiteral("yichen"),
+            SshConnectionPool::CredentialKind::KeyPassphrase);
+    };
+    QSignalSpy promptSpy(&f.controller, &AppController::credentialPrompt);
+    f.controller.connectToProfile(f.profileId);
+    QCOMPARE(promptSpy.count(), 1);
+
+    const int callsBefore = f.boot.connectCalls;
+    f.controller.submitCredential(QStringLiteral("typed-by-the-user"),
+                                  QStringLiteral("totp"));
+    QCOMPARE(f.boot.connectCalls, callsBefore);            // nothing dialled
+    QCOMPARE(f.controller.connectionState(),
+             QStringLiteral("credential"));                // still parked
+
+    // The prompt was not consumed: a well-formed answer still drives the retry
+    // and still reaches only the method it was typed for.
+    QString seenPassphrase;
+    QString seenPassword;
+    f.boot.duringConnect = [&f, &seenPassphrase, &seenPassword] {
+        seenPassphrase =
+            f.pool
+                .credentialCallback()(
+                    QStringLiteral("yichen"),
+                    SshConnectionPool::CredentialKind::KeyPassphrase)
+                .secret;
+        seenPassword =
+            f.pool
+                .credentialCallback()(QStringLiteral("yichen"),
+                                      SshConnectionPool::CredentialKind::Password)
+                .secret;
+    };
+    f.controller.submitCredential(QStringLiteral("the-real-passphrase"),
+                                  QStringLiteral("keyPassphrase"));
+    QCOMPARE(f.boot.connectCalls, callsBefore + 1);
+    QCOMPARE(seenPassphrase, QStringLiteral("the-real-passphrase"));
+    QVERIFY(seenPassword.isEmpty());
+}
+
 // The server.info result's schemaVersion field was parsed and never checked. A client one
 // release ahead of its codeharbord got an empty serverId, keyed the workspace to
 // "", and showed an EMPTY SIDEBAR over a healthy SSH session with no
@@ -1538,6 +1789,88 @@ void TstAppController::serverAtTheSchemaFloorIsAdoptedNormally()
     const QJsonObject listRequest = takeRequest(transport);
     QCOMPARE(listRequest.value(QStringLiteral("method")).toString(),
              QStringLiteral("workspace.list"));
+}
+
+// A settings file is plain text a human can edit and a crash can truncate. Every
+// width read has to survive that, because QVariant::toInt() answers 0 for
+// anything it cannot parse and 0 is not a width — it is a region that has
+// vanished, with no handle left on screen to drag it back. The documented
+// default is the only safe answer.
+void TstAppController::uiStateStoreIgnoresCorruptWidths()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QString iniPath = dir.filePath(QStringLiteral("corrupt.ini"));
+
+    {
+        QSettings raw(iniPath, QSettings::IniFormat);
+        raw.setValue(QStringLiteral("layout/sidebarWidth"), QStringLiteral("wide"));
+        raw.setValue(QStringLiteral("layout/viewerWidth"), QStringLiteral("-40"));
+        // A line the writer never finished.
+        raw.setValue(QStringLiteral("layout/terminalWidth"), QString());
+        raw.sync();
+    }
+
+    UiStateStore store(iniPath);
+    QCOMPARE(store.sidebarWidth(), 260);
+    QCOMPARE(store.viewerWidth(), 0);
+    QCOMPARE(store.terminalWidth(), 520);
+
+    // A zero is corrupt for the two regions whose width IS their presence on
+    // screen, and legitimate for the viewer, where it means "fill the rest".
+    {
+        QSettings raw(iniPath, QSettings::IniFormat);
+        raw.setValue(QStringLiteral("layout/sidebarWidth"), 0);
+        raw.setValue(QStringLiteral("layout/terminalWidth"), -1);
+        raw.setValue(QStringLiteral("layout/viewerWidth"), 0);
+        raw.sync();
+    }
+    UiStateStore reread(iniPath);
+    QCOMPARE(reread.sidebarWidth(), 260);
+    QCOMPARE(reread.terminalWidth(), 520);
+    QCOMPARE(reread.viewerWidth(), 0);
+
+    // Honest values are still honoured, including deliberately narrow ones.
+    {
+        UiStateStore writer(iniPath);
+        writer.setRegionWidths(1, 0, 3);
+    }
+    UiStateStore narrow(iniPath);
+    QCOMPARE(narrow.sidebarWidth(), 1);
+    QCOMPARE(narrow.terminalWidth(), 3);
+}
+
+// The empty devSessionId is not a Dev Session, and is treated exactly as
+// setActiveSession() treats an empty serverId. Without the guard every write
+// made before a session was picked landed on the bare "selectedPane/" key, and
+// the next such read handed that stale pane id back as if it belonged to
+// whatever the user opened next.
+void TstAppController::uiStateStoreRejectsAnEmptyDevSessionId()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QString iniPath = dir.filePath(QStringLiteral("emptyid.ini"));
+
+    {
+        UiStateStore store(iniPath);
+        store.setSelectedPane(QString(), QStringLiteral("terminal-4"));
+        QVERIFY(store.selectedPane(QString()).isEmpty());
+        // A real session is unaffected by the neighbouring no-op.
+        store.setSelectedPane(QStringLiteral("s1"), QStringLiteral("viewer-2"));
+        QCOMPARE(store.selectedPane(QStringLiteral("s1")),
+                 QStringLiteral("viewer-2"));
+    }
+
+    UiStateStore reopened(iniPath);
+    QVERIFY(reopened.selectedPane(QString()).isEmpty());
+    QCOMPARE(reopened.selectedPane(QStringLiteral("s1")),
+             QStringLiteral("viewer-2"));
+
+    // Nothing was parked under the placeholder key on disk either.
+    QFile file(iniPath);
+    QVERIFY(file.open(QIODevice::ReadOnly | QIODevice::Text));
+    const QString ini = QString::fromUtf8(file.readAll());
+    QVERIFY2(!ini.contains(QStringLiteral("terminal-4")), qPrintable(ini));
 }
 
 QTEST_GUILESS_MAIN(TstAppController)

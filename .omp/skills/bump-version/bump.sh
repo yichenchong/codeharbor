@@ -129,6 +129,26 @@ if [ "$DO_COMMIT" -eq 1 ]; then
         node -e 'const fs=require("fs");const f=process.argv[1];const j=JSON.parse(fs.readFileSync(f));j.version=process.argv[2];fs.writeFileSync(f,JSON.stringify(j,null,2)+"\n")' "$f" "$new"
         changed+=("$f")
     done
+
+    # package-lock.json mirrors every manifest version it locks (the root one
+    # and one entry per workspace path). npm does NOT rewrite those on its own
+    # unless someone runs an install, so leaving the lock out of this list is
+    # how it drifted to 0.1.7 while every manifest said 0.1.8 - and a stale lock
+    # is what `npm ci` in CI actually installs.
+    [ -f package-lock.json ] || die "expected version file is missing: package-lock.json"
+    node -e '
+const fs=require("fs");
+const v=process.argv[1];
+const l=JSON.parse(fs.readFileSync("package-lock.json","utf8"));
+l.version=v;
+const pkgs=l.packages||{};
+if(pkgs[""])pkgs[""].version=v;
+for(const w of JSON.parse(fs.readFileSync("package.json","utf8")).workspaces||[]){
+  if(pkgs[w])pkgs[w].version=v;
+}
+fs.writeFileSync("package-lock.json",JSON.stringify(l,null,2)+"\n");
+' "$new"
+    changed+=(package-lock.json)
     git add "${changed[@]}"
     if git diff --cached --quiet; then
         echo "Version files already at $new; tagging current HEAD without a commit"

@@ -149,6 +149,18 @@ export const RPC_WATCH_EVENT_NOTIFICATION = "file.watchEvent";
 // overwriting concurrent changes (SPEC 8.4 / 8.6).
 export const RPC_REVISION_MISMATCH = -32001;
 
+// JSON-RPC 2.0 reserved error codes. They live in this contract module rather
+// than in codeharbord.ts because the param guards in validate.ts tag their
+// errors with RPC_INVALID_PARAMS, and validate.ts is imported BY the modules
+// codeharbord.ts imports — sourcing the constant from codeharbord.ts would
+// close an import cycle. codeharbord.ts re-exports all five, so every existing
+// importer (and the C++-mirror tests) keeps its current import path.
+export const RPC_PARSE_ERROR = -32700;
+export const RPC_INVALID_REQUEST = -32600;
+export const RPC_METHOD_NOT_FOUND = -32601;
+export const RPC_INVALID_PARAMS = -32602;
+export const RPC_INTERNAL_ERROR = -32603;
+
 // --- tmux session discovery (SPEC 10.2, docs/PLAN.md R-server) ---------------
 //
 // The client must be able to LIST and ADOPT tmux sessions that already exist on

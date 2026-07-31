@@ -57,6 +57,9 @@ public:
 
     // Record (or replace) a host key. A subsequent verify() with the same triple
     // returns Match. Distinct key types for one host are kept independently.
+    // An empty host, key type or blob is ignored: such a triple cannot be
+    // written as a known_hosts line that parses back, so recording it would
+    // silently lose the trust on the next launch.
     void add(const QString& host, const QString& keyType,
              const QByteArray& keyBlob);
 

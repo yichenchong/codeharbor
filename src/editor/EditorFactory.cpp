@@ -18,6 +18,12 @@ EditorController* EditorFactory::create(QObject* owner, const QString& paneId)
     controller->setRecoveryDir(m_recoveryDir);
     // Track it so a recoveryDir arriving later (server.info is asynchronous and
     // may answer after panes exist) still reaches controllers already created.
+    // Panes come and go for the lifetime of the process, so the entries whose
+    // pane is already gone are dropped here too: pruning only in
+    // setRecoveryDir() (which fires at most once per connect) lets this list
+    // grow with every pane ever opened.
+    m_controllers.removeIf(
+        [](const QPointer<EditorController>& c) { return c.isNull(); });
     m_controllers.append(controller);
     return controller;
 }

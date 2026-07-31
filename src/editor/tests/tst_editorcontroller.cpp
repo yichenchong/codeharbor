@@ -187,6 +187,9 @@ private slots:
     // bytes only in the page has to raise it.
     void failedSaveLeavesTheBufferDirty();
     void editsDuringASaveSurviveTheSaveReply();
+    void editsTypedDuringASystemReloadAreNotClobbered();
+    void anExplicitReloadDiscardsTheRecoverySnapshotItThrewAway();
+    void aPageReloadWithUnsavedWorkIsOfferedItsRecoverySnapshot();
     void reportContentDuringALoadIsIgnored();
 
     // Out-of-order / superseded replies must never land on the file now open.
@@ -1936,6 +1939,190 @@ void TstEditorController::deletedWhileDisconnectedWithUnsavedWorkIsOnlyFlagged()
              "a dirty buffer was re-read over the user's unsaved edits");
     QCOMPARE(contentSpy.count(), 0);
     QCOMPARE(m_controller->revision(), QStringLiteral("r1"));
+}
+
+// A reload the SYSTEM started (here: a watch event on a clean buffer) takes a
+// round trip, and the page debounces its reportContent by 500 ms — so a
+// keystroke typed just after the change was noticed lands INSIDE that round
+// trip. Installing the fetched bytes then would replace a buffer holding work
+// that exists nowhere on the server: silent data loss, one keystroke wide. The
+// reply must recognise that the buffer moved and flag the divergence instead,
+// exactly as if the change had been noticed a moment later against an
+// already-dirty buffer (SPEC 8.7).
+void TstEditorController::editsTypedDuringASystemReloadAreNotClobbered()
+{
+    makePair();
+    openClean(QStringLiteral("/foo/f.txt"), QStringLiteral("hello"),
+              QStringLiteral("r1"));
+
+    QSignalSpy contentSpy(m_controller, &EditorController::contentLoaded);
+
+    // Clean buffer + external change -> the controller starts re-reading.
+    sendNotification(kWatchEvent, {{"subscriptionId", "sub1"},
+                                   {"path", "/foo/f.txt"},
+                                   {"event", "modified"},
+                                   {"revision", "r5"}});
+    const QJsonObject read = nextRequest();
+    QCOMPARE(method(read), kReadFile);
+    QCOMPARE(reqPath(read), QStringLiteral("/foo/f.txt"));
+
+    // The user types while that read is in flight; the debounced report lands
+    // first and is snapshotted (SPEC 11.3).
+    m_controller->reportContent(QStringLiteral("work typed during the reload"));
+    const QJsonObject snapshot = nextRequest();
+    QCOMPARE(method(snapshot), kWriteFile);
+    QCOMPARE(reqPath(snapshot), recoveryFilePath());
+    QCOMPARE(snapshotContentOf(snapshot),
+             QStringLiteral("work typed during the reload"));
+    respondResult(reqId(snapshot),
+                  {{"path", reqPath(snapshot)}, {"revision", "rec1"}});
+
+    // ...and only now does the reload answer.
+    respondResult(reqId(read), {{"path", "/foo/f.txt"},
+                                {"encoding", "utf-8"},
+                                {"content", "the server's bytes"},
+                                {"revision", "r5"},
+                                {"truncated", false}});
+    QTest::qWait(100);
+
+    // Nothing was pushed at the page, the baseline was NOT re-adopted (a save
+    // must still be refused as a conflict), and the snapshot holding the
+    // keystrokes was not truncated.
+    QCOMPARE(contentSpy.count(), 0);
+    QCOMPARE(m_controller->revision(), QStringLiteral("r1"));
+    QCOMPARE(m_controller->fileState(), QStringLiteral("externally_modified"));
+    QVERIFY2(nextRequest(300).isEmpty(),
+             "the abandoned reload still re-derived permissions or cleared the "
+             "recovery snapshot holding the user's keystrokes");
+
+    // The buffer is still dirty, so the NEXT external change is flagged too
+    // rather than auto-reloaded over those keystrokes.
+    sendNotification(kWatchEvent, {{"subscriptionId", "sub1"},
+                                   {"path", "/foo/f.txt"},
+                                   {"event", "modified"},
+                                   {"revision", "r6"}});
+    QTest::qWait(100);
+    QCOMPARE(m_controller->fileState(), QStringLiteral("externally_modified"));
+    QVERIFY2(nextRequest(300).isEmpty(),
+             "a dirty buffer was re-read after the abandoned reload");
+    QCOMPARE(contentSpy.count(), 0);
+}
+
+// The mirror image: a reload the USER asked for (the page's conflict/error
+// "Reload" button calls requestReload) DOES replace the buffer — and must then
+// retire the crash-recovery snapshot of the edits it just threw away, or the
+// next time the pane opens this file it offers back "unsaved changes" the user
+// deliberately discarded (SPEC 11.3).
+void TstEditorController::anExplicitReloadDiscardsTheRecoverySnapshotItThrewAway()
+{
+    makePair();
+    openClean(QStringLiteral("/foo/f.txt"), QStringLiteral("orig"),
+              QStringLiteral("r1"));
+
+    m_controller->reportContent(QStringLiteral("edits the user will discard"));
+    const QJsonObject snapshot = nextRequest();
+    QCOMPARE(method(snapshot), kWriteFile);
+    QCOMPARE(reqPath(snapshot), recoveryFilePath());
+    respondResult(reqId(snapshot),
+                  {{"path", reqPath(snapshot)}, {"revision", "rec1"}});
+    QCOMPARE(m_controller->fileState(), QStringLiteral("modified"));
+
+    QSignalSpy contentSpy(m_controller, &EditorController::contentLoaded);
+    m_controller->requestReload();
+
+    const QJsonObject read = nextRequest();
+    QCOMPARE(method(read), kReadFile);
+    respondResult(reqId(read), {{"path", "/foo/f.txt"},
+                                {"encoding", "utf-8"},
+                                {"content", "orig"},
+                                {"revision", "r1"},
+                                {"truncated", false}});
+
+    // The snapshot is truncated by a zero-length, revision-GUARDED write (the
+    // C1 catalog has no delete), guarded on the snapshot's own revision so a
+    // slot another writer replaced is refused rather than destroyed.
+    const QJsonObject clear = nextRequest();
+    QCOMPARE(method(clear), kWriteFile);
+    QCOMPARE(reqPath(clear), recoveryFilePath());
+    QCOMPARE(reqContent(clear), QString());
+    QCOMPARE(reqExpectedRevision(clear), QStringLiteral("rec1"));
+    QCOMPARE(reqMode(clear), 0600);
+    respondResult(reqId(clear), {{"path", reqPath(clear)}, {"revision", "rec2"}});
+
+    servePermissionStat();
+
+    // The buffer WAS replaced (that is what was asked for) and is clean again.
+    QTRY_COMPARE(contentSpy.count(), 1);
+    QCOMPARE(contentSpy.at(0).at(0).toString(), QStringLiteral("orig"));
+    QTRY_COMPARE(m_controller->fileState(), QStringLiteral("clean"));
+}
+
+// The Monaco page can reload underneath the controller (a renderer crash, a
+// re-navigated bundle): it re-runs its handshake, and its buffer is gone. When
+// that buffer held unsaved work the ONLY surviving copy is this pane's recovery
+// snapshot, and only an open() probes for one — so a page reload over a dirty
+// buffer must re-open the file and offer the snapshot back, not quietly re-read
+// the server's bytes and bury it (SPEC 11.3).
+void TstEditorController::aPageReloadWithUnsavedWorkIsOfferedItsRecoverySnapshot()
+{
+    makePair();
+    openClean(QStringLiteral("/foo/f.txt"), QStringLiteral("orig"),
+              QStringLiteral("r1"));
+
+    m_controller->reportContent(QStringLiteral("work only the page holds"));
+    const QJsonObject snapshot = nextRequest();
+    QCOMPARE(method(snapshot), kWriteFile);
+    QCOMPARE(reqPath(snapshot), recoveryFilePath());
+    respondResult(reqId(snapshot),
+                  {{"path", reqPath(snapshot)}, {"revision", "rec1"}});
+    QCOMPARE(m_controller->fileState(), QStringLiteral("modified"));
+
+    QSignalSpy recoverySpy(m_controller, &EditorController::recoveryAvailable);
+
+    // The page reloads: a SECOND ready() with nothing held to replay.
+    m_controller->ready();
+
+    // A full re-open, so the old watcher is released first (SPEC 8.7).
+    const QJsonObject unwatch = nextRequest();
+    QCOMPARE(method(unwatch), kUnwatch);
+    QCOMPARE(reqSubscriptionId(unwatch), QStringLiteral("sub1"));
+
+    const QJsonObject read = nextRequest();
+    QCOMPARE(method(read), kReadFile);
+    QCOMPARE(reqPath(read), QStringLiteral("/foo/f.txt"));
+    respondResult(reqId(read), {{"path", "/foo/f.txt"},
+                                {"encoding", "utf-8"},
+                                {"content", "orig"},
+                                {"revision", "r1"},
+                                {"truncated", false}});
+
+    const QJsonObject watch = nextRequest();
+    QCOMPARE(method(watch), kWatch);
+    respondResult(reqId(watch), {{"subscriptionId", "sub2"}});
+
+    servePermissionStat();
+
+    const QJsonObject recStat = nextRequest();
+    QCOMPARE(method(recStat), kStat);
+    QCOMPARE(reqPath(recStat), recoveryFilePath());
+    respondResult(reqId(recStat),
+                  {{"path", recoveryFilePath()}, {"revision", "rec1"}});
+
+    const QJsonObject recRead = nextRequest();
+    QCOMPARE(method(recRead), kReadFile);
+    QCOMPARE(reqPath(recRead), recoveryFilePath());
+    respondResult(
+        reqId(recRead),
+        {{"path", recoveryFilePath()},
+         {"encoding", "utf-8"},
+         {"content", snapshotEnvelope(QStringLiteral("/foo/f.txt"),
+                                      QStringLiteral("work only the page holds"))},
+         {"revision", "rec1"},
+         {"truncated", false}});
+
+    QTRY_COMPARE(recoverySpy.count(), 1);
+    QCOMPARE(recoverySpy.at(0).at(0).toString(),
+             QStringLiteral("work only the page holds"));
 }
 
 QTEST_GUILESS_MAIN(TstEditorController)

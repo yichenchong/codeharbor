@@ -1036,7 +1036,10 @@ The practical invariant is:
 
 ---
 
-## 14. Proposed Code Architecture
+## 14. Code Architecture
+
+This section was written as a proposal. It is kept up to date with the tree as
+built, so it describes what exists rather than what was once suggested.
 
 ```text
 src/
@@ -1047,6 +1050,8 @@ src/
 ├── terminal/
 ├── viewers/
 ├── remote/
+├── editor/
+├── agent/
 ├── qml/
 └── web/
     ├── terminal/
@@ -1057,27 +1062,29 @@ Remote component:
 
 ```text
 remote/
-├── codeharbord
-├── codeharbor-bridge
-└── adapters/
-    ├── oh-my-pi.ts
-    ├── pi.ts
-    └── claude-code-hook
+├── src/
+│   ├── codeharbord.ts        RPC service
+│   ├── bridge.ts             agent event relay
+│   ├── adapters/             oh-my-pi.ts, pi.ts, claude-code.ts, fallback.ts
+│   └── hooks/                oh-my-pi-hook.ts (the native harness hook)
+└── sql/                      schema.sql, indexes.sql
 ```
 
-Suggested technologies:
+Technologies actually used:
 
-- Qt 6;
+- Qt 6 (floor 6.9);
 - Qt Quick and QML;
 - C++20;
 - Qt WebEngine;
 - Qt WebChannel;
-- Qt SQL;
-- libssh;
+- libssh (floor 0.11.2, never 0.12.0);
 - xterm.js;
 - Monaco Editor;
-- SQLite;
-- CMake.
+- SQLite, on the server only — the workspace database is opened by
+  `codeharbord`, never by the client, so the client links no Qt SQL module
+  (§ 11.2, *Local State*);
+- CMake (floor 3.25) and Ninja;
+- Node.js (floor 23.6) and TypeScript for `remote/` and `src/web/`.
 
 ---
 
@@ -1088,17 +1095,27 @@ Implemented bindings:
 ```text
 Ctrl+Shift+P    Command palette
 Ctrl+Shift+O    Connect to Server…
-Ctrl+R          Refresh Workspace
+Ctrl+Shift+R    Refresh Workspace
+Ctrl+Shift+W    Close Window
 Ctrl+S          Save active remote file (inside a focused editor pane)
 ```
 
 `Ctrl+Shift+P` opens the palette (`activationSequence` in
 `src/qml/CommandPalette.qml`; Qt maps `Ctrl` in a key sequence to Command on macOS,
-so it is `⌘⇧P` there). The other two are `shortcut` entries on the command list in
-`src/qml/Main.qml`, which the palette turns into real window-wide `Shortcut` objects,
-so they fire whether or not the palette is open. `Ctrl+S` is registered on the Monaco
-instance itself in `src/web/editor/src/index.ts`, so it applies to the focused editor
-pane rather than window-wide.
+so it is `⌘⇧P` there). `Ctrl+Shift+O`, `Ctrl+Shift+R` and `Ctrl+Shift+W` are
+`shortcut` entries on the command list in `src/qml/Main.qml`, which the palette
+turns into real window-wide `Shortcut` objects, so they fire whether or not the
+palette is open. `Ctrl+S` is registered on the Monaco instance itself in
+`src/web/editor/src/index.ts`, so it applies to the focused editor pane rather
+than window-wide.
+
+Two of these deviate from the plain sequence this section originally suggested,
+for the same reason: a window-wide `Shortcut` is matched before the key ever
+reaches the focused item, and every terminal pane hosts a real shell.
+`Ctrl+R` is reverse-history-search there, and `Ctrl+W` is delete-word, so
+**Refresh Workspace** is `Ctrl+Shift+R` and **Close Window** is `Ctrl+Shift+W`.
+`Close Window` exists as a binding at all because the window is frameless and
+therefore has no window-manager close button of its own.
 
 Every remaining command — splitting a viewer or terminal pane, closing a focused
 pane, killing a terminal's remote tmux session, disconnecting from the server,
@@ -1114,7 +1131,7 @@ Originally suggested defaults, and how they were reconciled:
 | `Ctrl+Shift+T` New terminal | Not implemented as a key sequence; a new terminal pane comes from the palette's "Split Terminal Pane Horizontally/Vertically". |
 | `Ctrl+Shift+V` New viewer | Not implemented as a key sequence; a new viewer pane comes from the palette's "Split Viewer Pane Horizontally/Vertically". |
 | `Ctrl+S` Save active remote file | Implemented, in the editor pane. |
-| `Ctrl+W` Close active pane | Not implemented as a key sequence; "Close Focused Viewer/Terminal Pane" are palette commands. |
+| `Ctrl+W` Close active pane | Not implemented as a key sequence; "Close Focused Viewer/Terminal Pane" are palette commands. Note `Ctrl+Shift+W` is **not** this — it closes the whole window. |
 | `Ctrl+Tab` Next pane | Not implemented. Pane focus is click-based today, so a "focus next pane" command would first have to be able to move focus (see `docs/PLAN.md`). |
 | `Alt+1..9` Select Dev Session | Not implemented. |
 
