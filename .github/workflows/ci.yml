@@ -31,6 +31,64 @@ jobs:
         working-directory: remote
         run: npm test
 
+  # Release tags cannot restore a cache written by another tag. Warm the
+  # Windows dependency cache on the default branch so release jobs do not
+  # rebuild OpenSSL from source on every tag.
+  windows-vcpkg-cache:
+    if: github.event_name == 'push'
+    name: windows (vcpkg cache)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Resolve cache key
+        id: imgver
+        shell: pwsh
+        run: |
+          echo "v=$env:ImageVersion" >> $env:GITHUB_OUTPUT
+          echo "vcpkg=$env:VCPKG_INSTALLATION_ROOT" >> $env:GITHUB_OUTPUT
+          $pin = (Get-Content packaging/vcpkg-ports/libssh/vcpkg.json | ConvertFrom-Json).version
+          echo "libssh=$pin" >> $env:GITHUB_OUTPUT
+      - name: Restore vcpkg libssh cache
+        id: vcpkg_cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.imgver.outputs.vcpkg }}\installed
+          key: vcpkg-libssh-${{ steps.imgver.outputs.libssh }}-x64-windows-${{ steps.imgver.outputs.v }}
+      - name: Set up MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+      - name: Install libssh via vcpkg
+        shell: pwsh
+        env:
+          LIBSSH_PIN: ${{ steps.imgver.outputs.libssh }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $root = $env:VCPKG_INSTALLATION_ROOT
+          $header = "$root/installed/x64-windows/include/libssh/libssh_version.h"
+          if (Test-Path $header) {
+            $text = Get-Content $header -Raw
+            $parts = "MAJOR", "MINOR", "MICRO" | ForEach-Object {
+              [regex]::Match($text, "LIBSSH_VERSION_$_\s+(\d+)").Groups[1].Value
+            }
+            $present = $parts -join "."
+            if ($present -ne $env:LIBSSH_PIN) {
+              vcpkg remove libssh:x64-windows --recurse
+            }
+          }
+          vcpkg install libssh:x64-windows "--overlay-ports=$(Resolve-Path packaging/vcpkg-ports)"
+          $text = Get-Content $header -Raw
+          $parts = "MAJOR", "MINOR", "MICRO" | ForEach-Object {
+            [regex]::Match($text, "LIBSSH_VERSION_$_\s+(\d+)").Groups[1].Value
+          }
+          if (($parts -join ".") -ne $env:LIBSSH_PIN) {
+            throw "cached libssh version is not the pinned version"
+          }
+      - name: Save vcpkg libssh cache
+        if: steps.vcpkg_cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ steps.imgver.outputs.vcpkg }}\installed
+          key: vcpkg-libssh-${{ steps.imgver.outputs.libssh }}-x64-windows-${{ steps.imgver.outputs.v }}
+
   client:
     name: client (qt/cmake)
     runs-on: ubuntu-latest
