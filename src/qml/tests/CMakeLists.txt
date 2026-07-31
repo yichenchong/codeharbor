@@ -17,6 +17,12 @@ set(CODEHARBOR_QML_TEST_ENV
 # does and fails on any QML error/warning. Without this the unit suite can be
 # green while the shipped binary cannot start.
 qt_add_executable(tst_qmlload tst_qmlload.cpp)
+if(WIN32)
+    # Keep QTest diagnostics visible on Windows. qt_add_executable otherwise
+    # selects the GUI subsystem, so a failing test exits with code 1 but emits
+    # no assertion or test-case name to the release log.
+    set_target_properties(tst_qmlload PROPERTIES WIN32_EXECUTABLE FALSE)
+endif()
 
 target_link_libraries(tst_qmlload PRIVATE
     Qt6::Test

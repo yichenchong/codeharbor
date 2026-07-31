@@ -62,6 +62,11 @@ set_tests_properties(tst_sessionlayouts PROPERTIES LABELS live TIMEOUT 120)
 # a 300 ms budget, so the whole target still runs in a couple of seconds.
 # Qt6::Network is what QTcpServer/QTcpSocket come from.
 qt_add_executable(tst_sessionbootstrap tst_sessionbootstrap.cpp)
+if(WIN32)
+    # Keep QTest diagnostics visible on Windows instead of sending failures
+    # only through the GUI subsystem's invisible console.
+    set_target_properties(tst_sessionbootstrap PROPERTIES WIN32_EXECUTABLE FALSE)
+endif()
 target_link_libraries(tst_sessionbootstrap PRIVATE
     ch_app
     ch_ssh
