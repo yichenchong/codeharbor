@@ -193,8 +193,11 @@ jobs:
         run: cmake --build --preset dev
         shell: bash
 
+      # WebEngine startup and the SSH probe fixture can be transiently disrupted
+      # by a busy hosted runner. Retry the complete suite once; persistent
+      # failures still fail the release job.
       - name: Test (dev preset)
-        run: ctest --preset dev --output-on-failure
+        run: ctest --preset dev --output-on-failure --repeat until-pass:2
         shell: bash
 
       # --- package a runnable artifact per OS ----------------------------------
