@@ -198,3 +198,8 @@ set_tests_properties(tst_uxshell PROPERTIES
     ENVIRONMENT "${CODEHARBOR_QML_TEST_ENV}"
     TIMEOUT 180
 )
+if(WIN32)
+    # Apply after qt_add_executable has finished configuring the target; this
+    # keeps QTest's assertion output visible in Windows release logs.
+    set_target_properties(tst_qmlload PROPERTIES WIN32_EXECUTABLE FALSE)
+endif()

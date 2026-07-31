@@ -211,3 +211,6 @@ set_tests_properties(tst_coldstart PROPERTIES
     ENVIRONMENT "QT_QPA_PLATFORM=offscreen;QT_QUICK_BACKEND=software;QTWEBENGINE_CHROMIUM_FLAGS=--disable-gpu --no-sandbox --disable-dev-shm-usage"
     TIMEOUT 900
 )
+if(WIN32)
+    set_target_properties(tst_sessionbootstrap PROPERTIES WIN32_EXECUTABLE FALSE)
+endif()
