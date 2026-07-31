@@ -121,6 +121,9 @@ constexpr const char *kEnvironmentalNoise[] = {
     // aliases while the first QML/WebEngine graph is created. This is host
     // setup noise, not a warning produced by the CodeHarbor QML tree.
     "Populating font family aliases took",
+    // Chromium's Windows headless backend reports this informational startup
+    // line at warning level even though it explicitly says it is not a warning.
+    "VizNullHypothesis is disabled (not a warning)",
 };
 
 bool isEnvironmentalNoise(const QString &msg)

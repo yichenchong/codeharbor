@@ -1484,8 +1484,8 @@ void TstAppController::twoMethodServerChainCarriesBothSecretsWithoutCrossingThem
 // explanation. Version skew is the default state under manual deployment.
 void TstAppController::serverOlderThanTheSchemaFloorIsRefusedWithBothVersions()
 {
-    ConnectFixture f;
     FakeTransport transport;
+    ConnectFixture f;
     f.client.setTransport(&transport);
     QSignalSpy errorSpy(&f.controller, &AppController::error);
 
@@ -1521,8 +1521,8 @@ void TstAppController::serverOlderThanTheSchemaFloorIsRefusedWithBothVersions()
 // so the gate refuses old servers rather than all of them.
 void TstAppController::serverAtTheSchemaFloorIsAdoptedNormally()
 {
-    ConnectFixture f;
     FakeTransport transport;
+    ConnectFixture f;
     f.client.setTransport(&transport);
     QSignalSpy errorSpy(&f.controller, &AppController::error);
 
