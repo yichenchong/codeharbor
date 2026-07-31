@@ -192,6 +192,23 @@ jobs:
       - name: Build (dev preset)
         run: cmake --build --preset dev
         shell: bash
+      - name: Diagnose focused Windows tests
+        if: matrix.name == 'windows'
+        shell: bash
+        env:
+          QT_QPA_PLATFORM: offscreen
+          QT_QUICK_BACKEND: software
+          QTWEBENGINE_CHROMIUM_FLAGS: --disable-gpu --no-sandbox --disable-dev-shm-usage
+        run: |
+          set +e
+          ./build/dev/tst_qmlload.exe -o "$RUNNER_TEMP/qmlload.txt,txt"
+          qml_rc=$?
+          cat "$RUNNER_TEMP/qmlload.txt"
+          ./build/dev/tst_sessionbootstrap.exe -o "$RUNNER_TEMP/sessionbootstrap.txt,txt"
+          session_rc=$?
+          cat "$RUNNER_TEMP/sessionbootstrap.txt"
+          echo "focused qml=$qml_rc sessionbootstrap=$session_rc"
+          exit 0
 
       # Keep the individual QTest assertion output in the release log. This is
       # needed on Windows, where a failed GUI-subsystem test otherwise exposes
