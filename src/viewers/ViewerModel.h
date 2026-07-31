@@ -1,8 +1,8 @@
 #pragma once
 
-#include <QHash>
 #include <QObject>
 #include <QPointer>
+#include <QSet>
 #include <QString>
 #include <QUrl>
 #include <QVariantList>
@@ -57,21 +57,38 @@ public:
     // Asynchronously read a remote text file (SPEC 8.3). The read is capped at
     // InternalUrlSchemeHandler::kMaxInlineReadBytes, the same bound the internal
     // scheme handler applies; a larger file fails instead of being shown
-    // truncated. On success emits textFileRead(path, content); on failure, on a
-    // file over the cap, or without a client, textFileError.
-    Q_INVOKABLE void readTextFile(const QString &path);
-
-    // Drop the in-flight readTextFile for `path`, so its reply is ignored when
-    // it arrives. A fresh readTextFile for the SAME path also supersedes an
-    // earlier one implicitly; this lets a caller drop a read without
-    // immediately starting another (e.g. when a pane's URL clears).
+    // truncated. On success emits textFileRead(token, path, content); on
+    // failure, on a file over the cap, or without a client, textFileError.
     //
-    // The path is REQUIRED to identify the read. ONE ViewerModel is shared by
-    // every viewer pane (it is a single QML context property), so a blanket
-    // "cancel whatever is in flight" would drop the read another pane is still
-    // waiting for and leave that pane loading forever. Calling this with no
-    // path therefore cancels nothing.
-    Q_INVOKABLE void cancelTextFile(const QString &path = QString());
+    // Returns the token identifying THIS read. Both reply signals carry it back,
+    // and cancelTextFile() takes it. That token — not the path — is a read's
+    // identity, because ONE ViewerModel is shared by every viewer pane and two
+    // panes may perfectly well be showing the SAME file: a path cannot tell
+    // those two reads apart, so anything keyed by path makes one pane's cancel
+    // or reload silently discard the other pane's reply and leave it loading
+    // forever.
+    //
+    // The token is a QString rather than a 64-bit integer because QML numbers
+    // are IEEE doubles and cannot represent large 64-bit values exactly; a
+    // string round-trips through QML unchanged, and callers only ever compare
+    // it for equality.
+    //
+    // Delivery is ALWAYS asynchronous, including the no-client failure: a reply
+    // emitted before this function returned would carry a token the caller has
+    // not been given yet and could not match.
+    Q_INVOKABLE QString readTextFile(const QString &path);
+
+    // Drop the in-flight readTextFile identified by `token`, so its reply is
+    // ignored when it arrives. This cancels EXACTLY that one read: another
+    // pane's read — of a different file or of the very same file — is never
+    // touched. An unknown or empty token (what a caller passes when it has
+    // nothing outstanding) cancels nothing.
+    Q_INVOKABLE void cancelTextFile(const QString &token = QString());
+
+    // How many readTextFile calls are still awaiting a reply. Bookkeeping that
+    // outlived its request is otherwise invisible from outside the class, so
+    // this is what lets a test pin that entries never accumulate.
+    int inFlightTextReadCount() const { return m_liveTextReads.size(); }
 
     // Asynchronously list a remote directory (SPEC 7.5). On success emits
     // directoryListed with entries sorted (directories first, then by name),
@@ -79,8 +96,10 @@ public:
     Q_INVOKABLE void listDirectory(const QString &path);
 
 signals:
-    void textFileRead(const QString &path, const QString &content);
-    void textFileError(const QString &path, const QString &message);
+    void textFileRead(const QString &token, const QString &path,
+                      const QString &content);
+    void textFileError(const QString &token, const QString &path,
+                       const QString &message);
     void directoryListed(const QString &path, const QVariantList &entries);
     void directoryError(const QString &path, const QString &message);
 
@@ -91,16 +110,16 @@ private:
     InternalUrlMap *m_map;
     ViewerProfiles *m_profiles = nullptr;
     bool m_ownsProfiles = false;
-    // Stamp of the in-flight readTextFile for each path, keyed BY PATH because
-    // one ViewerModel serves every pane: two panes reading two different files
-    // must not supersede each other. A reply whose captured stamp is no longer
-    // the one recorded for its path (a newer read replaced it, or
-    // cancelTextFile dropped it) is superseded and discarded. Entries are
-    // erased as soon as their read settles, so this holds only live reads.
-    QHash<QString, quint64> m_textReadGenerations;
-    // Source of those stamps. Monotonic and never reset, so a stamp is never
+    // Tokens of the readTextFile calls still in flight. A reply whose token is
+    // no longer here (cancelTextFile dropped it) is discarded; a reply that
+    // finds its token removes it, so this holds live reads and nothing else.
+    // Keyed by TOKEN, not by path: one hash slot per path cannot represent two
+    // concurrent reads of one file, which is ordinary usage the moment two
+    // panes show the same document.
+    QSet<QString> m_liveTextReads;
+    // Source of those tokens. Monotonic and never reset, so a token is never
     // reused and a cancelled read can never be mistaken for a later one.
-    quint64 m_nextReadGeneration = 0;
+    quint64 m_nextReadToken = 0;
 };
 
 } // namespace ch

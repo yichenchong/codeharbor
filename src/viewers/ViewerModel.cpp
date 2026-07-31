@@ -10,6 +10,7 @@
 #include <QJsonArray>
 #include <QJsonObject>
 #include <QJsonValue>
+#include <QMetaObject>
 #include <QPointer>
 #include <QVariantMap>
 #include <QtWebEngineQuick/QQuickWebEngineProfile>
@@ -101,22 +102,31 @@ QQuickWebEngineProfile *ViewerModel::internalProfile()
     return profiles()->internalProfile();
 }
 
-void ViewerModel::readTextFile(const QString &path)
+QString ViewerModel::readTextFile(const QString &path)
 {
-    if (!m_client) {
-        emit textFileError(path, QStringLiteral("no remote client is connected"));
-        return;
-    }
+    // One monotonic counter for the whole model, so a token is never reused and
+    // a cancelled read can never be revived by a later one. Minted BEFORE the
+    // no-client check so every read, successful or not, is named the same way.
+    const QString token = QString::number(++m_nextReadToken);
+    m_liveTextReads.insert(token);
 
-    // Every read gets a fresh generation stamp FOR ITS PATH, so an earlier
-    // in-flight read of the same file is implicitly superseded: its reply below
-    // sees a stale stamp and is dropped instead of racing this one. Reads of
-    // OTHER paths are untouched — one ViewerModel serves every pane, and a
-    // second pane opening a second file must not strand the first pane's read.
-    // Stamps come from one monotonic counter and are therefore never reused, so
-    // a cancelled read can never be revived by a later read of the same path.
-    const quint64 generation = ++m_nextReadGeneration;
-    m_textReadGenerations.insert(path, generation);
+    if (!m_client) {
+        // Deferred, not emitted here: the caller has not been handed the token
+        // yet, so a reply delivered before this function returns is a reply it
+        // cannot recognise as its own. Passing `this` as the context object
+        // makes the queued call die with the model.
+        QMetaObject::invokeMethod(
+            this,
+            [this, token, path] {
+                if (!m_liveTextReads.remove(token))
+                    return;
+                emit textFileError(
+                    token, path,
+                    QStringLiteral("no remote client is connected"));
+            },
+            Qt::QueuedConnection);
+        return token;
+    }
 
     // Bound the read exactly as the internal scheme handler does: a text pane
     // must never try to pull a multi-gigabyte file through a single JSON-RPC
@@ -131,20 +141,16 @@ void ViewerModel::readTextFile(const QString &path)
     QPointer<ViewerModel> guard(this);
     m_client->call(
         QString::fromLatin1(rpc::kMethodReadFile), params,
-        [guard, path, generation](QJsonValue result, std::optional<RpcError> error) {
+        [guard, path, token](QJsonValue result, std::optional<RpcError> error) {
             if (!guard)
                 return;
-            // A newer read of this path (or an explicit cancelTextFile for it)
-            // has superseded this one: ignore the stale reply.
-            const auto it = guard->m_textReadGenerations.find(path);
-            if (it == guard->m_textReadGenerations.end()
-                || it.value() != generation)
+            // cancelTextFile() dropped this exact read: ignore its reply.
+            // Removing the token here is also what stops the set from growing —
+            // a settled read is no longer in flight.
+            if (!guard->m_liveTextReads.remove(token))
                 return;
-            // This read has settled; stop tracking it so the map only ever
-            // holds live reads.
-            guard->m_textReadGenerations.erase(it);
             if (error) {
-                emit guard->textFileError(path, error->message);
+                emit guard->textFileError(token, path, error->message);
                 return;
             }
             const QJsonObject obj = result.toObject();
@@ -152,7 +158,8 @@ void ViewerModel::readTextFile(const QString &path)
                 // Report the failure rather than silently showing a prefix of
                 // the file as if it were the whole thing.
                 emit guard->textFileError(
-                    path, QStringLiteral("file is too large to display inline"));
+                    token, path,
+                    QStringLiteral("file is too large to display inline"));
                 return;
             }
             const QString encoding =
@@ -171,24 +178,24 @@ void ViewerModel::readTextFile(const QString &path)
                         | QByteArray::AbortOnBase64DecodingErrors);
                 if (!decoded) {
                     emit guard->textFileError(
-                        path, QStringLiteral("file contents could not be decoded"));
+                        token, path,
+                        QStringLiteral("file contents could not be decoded"));
                     return;
                 }
                 text = QString::fromUtf8(*decoded);
             }
-            emit guard->textFileRead(path, text);
+            emit guard->textFileRead(token, path, text);
         });
+    return token;
 }
 
-void ViewerModel::cancelTextFile(const QString &path)
+void ViewerModel::cancelTextFile(const QString &token)
 {
-    // Forget this path's in-flight read: its reply then finds no entry and is
-    // dropped (see readTextFile). Generation stamps are never reused, so the
-    // next read of the same path cannot be mistaken for the cancelled one.
-    // Nothing in flight for the path — including the empty path a caller passes
-    // when it has nothing to cancel — means nothing to do, and in particular no
-    // other pane's read is disturbed.
-    m_textReadGenerations.remove(path);
+    // Forget this ONE read: its reply then finds no token and is dropped (see
+    // readTextFile). Any other read — including a concurrent read of the very
+    // same file by another pane — keeps its own token and is untouched. An
+    // unknown or empty token means nothing to do.
+    m_liveTextReads.remove(token);
 }
 
 void ViewerModel::listDirectory(const QString &path)
