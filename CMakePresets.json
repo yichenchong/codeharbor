@@ -28,16 +28,31 @@
         "CMAKE_BUILD_TYPE": "Release",
         "CODEHARBOR_BUILD_TESTS": "OFF"
       }
+    },
+    {
+      "name": "release-tests",
+      "displayName": "Release (with tests)",
+      "inherits": "release",
+      "binaryDir": "${sourceDir}/build/release",
+      "cacheVariables": {
+        "CODEHARBOR_BUILD_TESTS": "ON"
+      }
     }
   ],
   "buildPresets": [
     { "name": "dev", "configurePreset": "dev" },
-    { "name": "release", "configurePreset": "release" }
+    { "name": "release", "configurePreset": "release" },
+    { "name": "release-tests", "configurePreset": "release-tests" }
   ],
   "testPresets": [
     {
       "name": "dev",
       "configurePreset": "dev",
+      "output": { "outputOnFailure": true }
+    },
+    {
+      "name": "release-tests",
+      "configurePreset": "release-tests",
       "output": { "outputOnFailure": true }
     }
   ]

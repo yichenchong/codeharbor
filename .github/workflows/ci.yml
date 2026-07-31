@@ -67,11 +67,9 @@ jobs:
       # editor and terminal packages; a type error here fails CI before configure.
       - name: Typecheck web bundles
         run: npm run typecheck
-      - name: Configure
-        run: cmake --preset dev
+      - name: Configure + build + test (release tree)
+        run: cmake --preset release-tests
       - name: Build
-        run: cmake --build --preset dev
+        run: cmake --build --preset release-tests
       - name: Test
-        run: ctest --preset dev --output-on-failure
-      - name: Configure + build (release preset)
-        run: cmake --preset release && cmake --build --preset release
+        run: ctest --preset release-tests --output-on-failure

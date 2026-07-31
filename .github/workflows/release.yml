@@ -165,56 +165,24 @@ jobs:
         run: npm ci && npm run build
         shell: bash
 
-      # --- configure + build ---------------------------------------------------
+      # --- configure + build + test -------------------------------------------
       # CMake 3.21+ reads CMAKE_TOOLCHAIN_FILE from the environment (set by the
       # vcpkg step on Windows), so one command works on every OS. On Windows the
       # MSVC env from the previous step lets Ninja find cl.exe under bash.
-      - name: Configure
-        run: cmake --preset release
+      #
+      # Build the release tree with tests enabled and test that exact tree before
+      # packaging. The old flow built a Debug tree for tests and then rebuilt
+      # every production target in Release, doubling the C++ work on Windows.
+      - name: Configure (release preset, tests on)
+        run: cmake --preset release-tests
         shell: bash
 
-      - name: Build
-        run: cmake --build --preset release
+      - name: Build (release preset, tests on)
+        run: cmake --build --preset release-tests
         shell: bash
 
-      # --- test gate (BD26) ----------------------------------------------------
-      # The release preset builds with tests OFF, so nothing above proves the
-      # tagged commit actually passes its suite - a tag can be pushed at any
-      # commit, including one that never went green on CI. Configure/build/test
-      # the `dev` preset (tests ON) on every platform BEFORE any artifact is
-      # produced. A failing test fails this build job, and `publish` needs
-      # [build, remote], so a red suite blocks the release. This reuses the
-      # Qt/libssh/web-bundle setup already installed above (no duplicated setup).
-      - name: Configure (dev preset, tests on)
-        run: cmake --preset dev
-        shell: bash
-
-      - name: Build (dev preset)
-        run: cmake --build --preset dev
-        shell: bash
-      - name: Diagnose focused Windows tests
-        if: matrix.name == 'windows'
-        shell: bash
-        env:
-          QT_QPA_PLATFORM: offscreen
-          QT_QUICK_BACKEND: software
-          QTWEBENGINE_CHROMIUM_FLAGS: --disable-gpu --no-sandbox --disable-dev-shm-usage
-        run: |
-          set +e
-          ./build/dev/tst_qmlload.exe -o "$RUNNER_TEMP/qmlload.txt,txt"
-          qml_rc=$?
-          cat "$RUNNER_TEMP/qmlload.txt"
-          ./build/dev/tst_sessionbootstrap.exe -o "$RUNNER_TEMP/sessionbootstrap.txt,txt"
-          session_rc=$?
-          cat "$RUNNER_TEMP/sessionbootstrap.txt"
-          echo "focused qml=$qml_rc sessionbootstrap=$session_rc"
-          exit 0
-
-      # Keep the individual QTest assertion output in the release log. This is
-      # needed on Windows, where a failed GUI-subsystem test otherwise exposes
-      # only its aggregate CTest exit code.
-      - name: Test (dev preset)
-        run: ctest --preset dev --verbose --output-on-failure --repeat until-pass:2
+      - name: Test (release preset)
+        run: ctest --preset release-tests --verbose --output-on-failure --repeat until-pass:2
         shell: bash
 
       # --- package a runnable artifact per OS ----------------------------------

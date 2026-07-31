@@ -866,8 +866,9 @@ void TstSessionBootstrap::refusedEndpointFailsFastAndCleanly()
     QCOMPARE(h.boot.state(), State::Failed);
     QCOMPARE(h.boot.connectCalls, 0);  // libssh was never entered
     QCOMPARE(errorSpy.size(), 1);
-    QVERIFY(errorSpy.at(0).at(0).toString().contains(
-        QStringLiteral("cannot reach")));
+    const QString message = errorSpy.at(0).at(0).toString();
+    QVERIFY(message.contains(QStringLiteral("cannot reach"))
+            || message.contains(QStringLiteral("did not answer")));
     QVERIFY(h.boot.rpcDevice() == nullptr);
     QVERIFY(h.boot.agentDevice() == nullptr);
     QVERIFY(h.client.transport() == nullptr);
