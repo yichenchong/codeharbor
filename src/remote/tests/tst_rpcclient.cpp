@@ -13,6 +13,7 @@
 #include <QStandardPaths>
 #include <QString>
 #include <QtTest/QtTest>
+#include <QScopeGuard>
 
 #include <cstring>
 #include <optional>
@@ -1217,6 +1218,13 @@ void TstRpcClient::liveServerInfoOverProcess()
         QSKIP("node not on PATH");
 
     QProcess proc;
+    // The process is a stack object. Detach even when a later assertion fails,
+    // because QTest continues unwinding the case before cleanup() runs and the
+    // stack process would otherwise leave a dangling QIODevice pointer.
+    const auto detach = qScopeGuard([this] {
+        if (m_client && m_client->transport())
+            m_client->setTransport(nullptr);
+    });
     proc.setProgram(node);
     proc.setArguments({QStringLiteral(CH_REPO_ROOT "/remote/src/codeharbord.ts"),
                        QStringLiteral("rpc"), QStringLiteral("--stdio")});

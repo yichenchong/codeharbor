@@ -193,11 +193,11 @@ jobs:
         run: cmake --build --preset dev
         shell: bash
 
-      # WebEngine startup and the SSH probe fixture can be transiently disrupted
-      # by a busy hosted runner. Retry the complete suite once; persistent
-      # failures still fail the release job.
+      # Keep the individual QTest assertion output in the release log. This is
+      # needed on Windows, where a failed GUI-subsystem test otherwise exposes
+      # only its aggregate CTest exit code.
       - name: Test (dev preset)
-        run: ctest --preset dev --output-on-failure --repeat until-pass:2
+        run: ctest --preset dev --verbose --output-on-failure --repeat until-pass:2
         shell: bash
 
       # --- package a runnable artifact per OS ----------------------------------
