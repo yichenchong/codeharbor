@@ -12,6 +12,12 @@ set(CODEHARBOR_QML_TEST_ENV
     "QT_QUICK_BACKEND=software"
     "QTWEBENGINE_CHROMIUM_FLAGS=--disable-gpu --no-sandbox --disable-dev-shm-usage"
 )
+if(WIN32)
+    # Qt 6.9 no longer bundles fonts with the SDK. Use the Windows font
+    # directory so QFontDatabase does not turn that deployment detail into a
+    # false QML warning.
+    list(APPEND CODEHARBOR_QML_TEST_ENV "QT_QPA_FONTDIR=$ENV{WINDIR}/Fonts")
+endif()
 
 # Regression gate: instantiates the REAL application QML tree the way main.cpp
 # does and fails on any QML error/warning. Without this the unit suite can be

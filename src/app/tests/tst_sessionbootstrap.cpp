@@ -839,6 +839,10 @@ constexpr int kProbeBudgetMs = 120;
 // Generous ceiling: the assertion is "bounded", not "fast to the millisecond",
 // and a loaded CI box must not turn a real bound into a flake.
 constexpr int kProbeCeilingMs = 3000;
+constexpr int kProbeRefusalSlackMs = 100;
+// A refused TCP connect can report one scheduler tick after the requested
+// timeout on Windows; keep the assertion tight without making that boundary
+// a platform-specific failure.
 } // namespace
 
 // A port nobody is listening on is refused by the kernel at once: no wait, no
@@ -854,10 +858,11 @@ void TstSessionBootstrap::refusedEndpointFailsFastAndCleanly()
     clock.start();
     QVERIFY(!h.wire());
     const qint64 elapsed = clock.elapsed();
-
     qInfo() << "refused endpoint: connectAndWire blocked" << elapsed << "ms";
-    QVERIFY2(elapsed < kProbeBudgetMs,
-             qPrintable(QStringLiteral("refusal took %1 ms").arg(elapsed)));
+    QVERIFY2(elapsed < kProbeBudgetMs + kProbeRefusalSlackMs,
+             qPrintable(QStringLiteral("refusal took %1 ms (limit %2 ms)")
+                            .arg(elapsed)
+                            .arg(kProbeBudgetMs + kProbeRefusalSlackMs)));
     QCOMPARE(h.boot.state(), State::Failed);
     QCOMPARE(h.boot.connectCalls, 0);  // libssh was never entered
     QCOMPARE(errorSpy.size(), 1);
