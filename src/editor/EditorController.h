@@ -209,6 +209,11 @@ private:
     // (SPEC 11.3): the saved file IS the buffer now, so a later reopen must not
     // offer a stale "unsaved changes" copy. No-op when no snapshot holds content.
     void clearRecovery();
+    // Run a truncate that clearRecovery() had to defer, once the LAST outstanding
+    // snapshot write has answered. A no-op unless one was deferred and the count
+    // has reached zero; clearRecovery() itself decides whether there is anything
+    // to truncate. Called from every terminal path of a snapshot write's reply.
+    void honourDeferredRecoveryClear();
     // Release the active file.watch subscription (if any) and forget it, so a
     // pane close / file switch never leaks or duplicates a server-side watcher.
     void unwatchCurrent();
@@ -319,6 +324,41 @@ private:
     // snapshot this pane wrote for a different file.
     QString m_recoveryRevision;
     bool m_recoveryHasContent = false;
+    // How many snapshot writes issued by writeRecovery() are on the wire. m_recoveryRevision
+    // and m_recoveryHasContent are only adopted when its reply lands, so between
+    // the two there is a window in which the controller does not yet know a
+    // snapshot exists — and clearRecovery() would take its "nothing was ever
+    // snapshotted" early exit and truncate nothing.
+    //
+    // A successful save inside that window therefore used to leave the snapshot
+    // behind. If the user typed again between the page's report and the save, that
+    // snapshot holds OLDER text than the file now on the server, so the next open
+    // offers to restore work the save had already superseded — and since the
+    // recovery offer is now a real dialog (see the crash-recovery restore path in
+    // the editor pane) accepting it walks the buffer backwards.
+    //
+    // clearRecovery() therefore records the intent instead of dropping it, and the
+    // LAST outstanding snapshot write's reply carries it out once it knows what to
+    // truncate.
+    // A COUNT, not a flag: nothing serialises snapshot writes, so two reports in
+    // quick succession put two on the wire, and a bool would read "idle" the moment
+    // the first answered while the second was still outstanding — the deferred
+    // truncate would then be guarded against a revision the second write is about
+    // to replace, resurrecting the snapshot after the save.
+    int m_recoveryWritesInFlight = 0;
+    // Which file's recovery slot the bookkeeping above describes, bumped by every
+    // open(). Every snapshot-write callback captures it and returns before touching
+    // anything if it has moved: the count and the deferred-truncate intent are
+    // shared state, so a reply belonging to the PREVIOUS file must not decrement the
+    // new file's count (which would fire its deferred truncate early, or make a
+    // later legitimate decrement clamp at zero and lose it). Same idiom as
+    // m_loadGeneration and m_watchGeneration.
+    quint64 m_recoveryGeneration = 0;
+    // Set by clearRecovery() when it cannot act yet; carried out by the last
+    // outstanding snapshot write's reply. CLEARED by a fresh content write, because
+    // bytes reported after the save are unsaved work the save did not cover and
+    // must not be truncated.
+    bool m_recoveryClearPending = false;
 
     // Ready handshake (see the ready() slot). m_pendingContent holds a load that
     // completed before the page connected; std::nullopt means nothing is held.

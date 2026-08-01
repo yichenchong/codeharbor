@@ -550,6 +550,11 @@ void EditorController::open(QString path)
     m_dirty = false;
     m_recoveryRevision.clear();
     m_recoveryHasContent = false;
+    // A clear intended for the file being left behind is not owed to the new one,
+    // and no reply from that file may touch this bookkeeping again.
+    m_recoveryWritesInFlight = 0;
+    m_recoveryClearPending = false;
+    ++m_recoveryGeneration;
     // Read-only is per-FILE and re-derived below; carrying the previous file's
     // verdict over would either lock an editable file or, worse, leave an
     // unwritable one editable.
@@ -758,8 +763,11 @@ void EditorController::save(QString content, QString expectedRevision)
             // its reply is discarded by the guard in reload() without touching
             // anything — and this check would then wrongly swallow the write's
             // real outcome, which is the honest conflict that reply exists to
-            // report (see aSaveInFlightIsNotClobberedByASystemReload). Bump a
-            // separate counter at the two commit sites if that day comes.
+            // report (see aSaveInFlightIsNotClobberedByASystemReload). The fix
+            // then is a separate counter bumped where a load actually COMMITS to
+            // the buffer — the two points that assign m_revision and call
+            // deliverContent, in open()'s and reload()'s replies — captured here
+            // in place of m_loadGeneration.
             if (self->m_loadGeneration != loadGeneration)
                 return;
             if (!error.has_value()) {
@@ -885,58 +893,112 @@ void EditorController::writeRecovery(const QString& content, bool retryOnMismatc
     // tell whose file it holds; the pane's current path is captured separately
     // to detect a file switch landing during this round trip.
     const QString path = m_path;
+    const quint64 recoveryGeneration = m_recoveryGeneration;
     const QString payload = serializeRecovery(path, content);
+
+    // See m_recoveryWritesInFlight: until this answers, clearRecovery() cannot know
+    // a snapshot exists, so it must defer to this reply rather than no-op.
+    ++m_recoveryWritesInFlight;
+    // A FRESH report carries bytes the last save did not write, so a truncate that
+    // save deferred must not be allowed to delete them. The stale-guard retry below
+    // re-sends the SAME bytes, so it must not cancel anything.
+    if (retryOnMismatch)
+        m_recoveryClearPending = false;
 
     QPointer<EditorController> self(this);
     m_client->call(
         QString::fromLatin1(rpc::kMethodWriteFile),
         writeParams(recoveryPath, payload, m_recoveryRevision, kRecoveryFileMode),
-        [self, content, path, recoveryPath, retryOnMismatch](
+        [self, content, path, recoveryPath, retryOnMismatch, recoveryGeneration](
             QJsonValue result, std::optional<RpcError> error) {
-            if (!self)
+            // The pane switched files while this was in flight: open() has already
+            // reset the recovery bookkeeping for the new file, so neither this
+            // write's revision nor its slot in the in-flight count is ours to touch.
+            // Checked BEFORE the decrement, which is shared state.
+            if (!self || recoveryGeneration != self->m_recoveryGeneration)
                 return;
-            // The pane switched files while this was in flight: open() has
-            // already reset the recovery bookkeeping for the new file, so this
-            // stale write's revision is not ours to adopt.
-            if (self->m_path != path)
-                return;
+            if (self->m_recoveryWritesInFlight > 0)
+                --self->m_recoveryWritesInFlight;
             if (!error.has_value()) {
                 // Track the returned revision so the next snapshot is a guarded
                 // overwrite rather than a create.
                 self->m_recoveryRevision =
                     result.toObject().value(QStringLiteral("revision")).toString();
                 self->m_recoveryHasContent = !content.isEmpty();
+                self->honourDeferredRecoveryClear();
                 return;
             }
             // A stale create-only guard means a snapshot survives from a prior
             // session; adopt its current revision and retry once. Recovery is
             // best-effort — other errors are swallowed (never surfaced as a
             // save failure).
-            if (retryOnMismatch && self->m_client
-                && error->code == rpc::kRevisionMismatch) {
-                self->m_client->call(
-                    QString::fromLatin1(rpc::kMethodStat), readParams(recoveryPath),
-                    [self, content, path](QJsonValue statRes,
-                                          std::optional<RpcError> statErr) {
-                        if (!self || statErr.has_value())
-                            return;
-                        if (self->m_path != path)
-                            return;
-                        self->m_recoveryRevision =
-                            statRes.toObject()
-                                .value(QStringLiteral("revision"))
-                                .toString();
-                        self->writeRecovery(content, /*retryOnMismatch=*/false);
-                    });
+            if (!(retryOnMismatch && self->m_client
+                  && error->code == rpc::kRevisionMismatch)) {
+                // THIS snapshot never landed. Whether there is anything left to
+                // truncate depends on an earlier write having succeeded, which
+                // m_recoveryHasContent already records — so run the same check
+                // rather than assuming either answer.
+                self->honourDeferredRecoveryClear();
+                return;
             }
+            // The retry is a continuation of THIS snapshot write, so keep it
+            // counted across the stat hop. Without this the count reads zero for
+            // the duration of the stat, and a truncate deferred by a save landing
+            // in that window would act on what is known now — nothing — and then be
+            // undone by the retry write that follows.
+            ++self->m_recoveryWritesInFlight;
+            self->m_client->call(
+                QString::fromLatin1(rpc::kMethodStat), readParams(recoveryPath),
+                [self, content, path, recoveryGeneration](
+                    QJsonValue statRes, std::optional<RpcError> statErr) {
+                    // File switched: open() reset the recovery bookkeeping including
+                    // any deferred truncate, so nothing is owed to the file being
+                    // left behind — and the count now belongs to the new file.
+                    if (!self || recoveryGeneration != self->m_recoveryGeneration)
+                        return;
+                    if (self->m_recoveryWritesInFlight > 0)
+                        --self->m_recoveryWritesInFlight;
+                    if (statErr.has_value()) {
+                        // The chain ends here without a snapshot of its own; a
+                        // truncate deferred meanwhile is still owed an answer.
+                        self->honourDeferredRecoveryClear();
+                        return;
+                    }
+                    self->m_recoveryRevision =
+                        statRes.toObject()
+                            .value(QStringLiteral("revision"))
+                            .toString();
+                    // Re-counts the chain; its reply honours any deferred truncate.
+                    self->writeRecovery(content, /*retryOnMismatch=*/false);
+                });
         });
+}
+
+void EditorController::honourDeferredRecoveryClear()
+{
+    // Only the LAST outstanding snapshot write may act: an earlier reply that
+    // truncated on its own revision would be overwritten by the write still on the
+    // wire, putting the snapshot back after the save that asked for it to go.
+    if (!m_recoveryClearPending || m_recoveryWritesInFlight > 0)
+        return;
+    m_recoveryClearPending = false;
+    clearRecovery();
 }
 
 void EditorController::clearRecovery()
 {
+    if (!m_client || m_path.isEmpty())
+        return;
+    // A snapshot write is on the wire and we do not yet know its revision, so we
+    // cannot guard a truncate against it. Record the intent; that write's reply
+    // performs it. See m_recoveryWritesInFlight.
+    if (m_recoveryWritesInFlight > 0) {
+        m_recoveryClearPending = true;
+        return;
+    }
     // Nothing was ever snapshotted for the open file (or it is already the empty
     // tombstone): writing again would only burn a round trip.
-    if (!m_client || m_path.isEmpty() || !m_recoveryHasContent)
+    if (!m_recoveryHasContent)
         return;
 
     // The frozen C1 catalog (src/remote/RpcTypes.h) has NO delete method, so
@@ -951,18 +1013,19 @@ void EditorController::clearRecovery()
     const QString recoveryPath = this->recoveryPath();
     if (recoveryPath.isEmpty())
         return;  // pane id / recovery dir withdrawn since: nothing to clear
-    const QString path = m_path;
+    const quint64 recoveryGeneration = m_recoveryGeneration;
     const QString guard = m_recoveryRevision;
 
     QPointer<EditorController> self(this);
     m_client->call(
         QString::fromLatin1(rpc::kMethodWriteFile),
         writeParams(recoveryPath, QString(), guard, kRecoveryFileMode),
-        [self, path, recoveryPath](QJsonValue result, std::optional<RpcError> error) {
+        [self, recoveryGeneration](QJsonValue result,
+                                   std::optional<RpcError> error) {
             if (!self || error.has_value())
                 return; // best-effort: a stale snapshot is a prompt, not data loss
             // The pane switched files; this bookkeeping is not ours to write.
-            if (self->m_path != path)
+            if (recoveryGeneration != self->m_recoveryGeneration)
                 return;
             self->m_recoveryRevision =
                 result.toObject().value(QStringLiteral("revision")).toString();

@@ -204,6 +204,10 @@ private slots:
     void aSaveInFlightIsNotClobberedByASystemReload();
     void aSaveReplyIsDroppedAfterAnExplicitReloadTookOverTheBuffer();
     void aSaveConflictIsDroppedAfterASamePathReopenTookOverTheBuffer();
+    void aSuccessfulSaveStillClearsASnapshotThatWasStillInFlight();
+    void aReportAfterASaveCancelsTheTruncateThatSaveDeferred();
+    void aDeferredTruncateSurvivesTheSnapshotRetryChain();
+    void aStaleSnapshotReplyDoesNotDisturbTheNextFilesBookkeeping();
     void anExplicitReloadDiscardsTheRecoverySnapshotItThrewAway();
     void aPageReloadWithUnsavedWorkIsOfferedItsRecoverySnapshot();
     void reportContentDuringALoadIsIgnored();
@@ -2330,9 +2334,12 @@ void TstEditorController::aSaveReplyIsDroppedAfterAnExplicitReloadTookOverTheBuf
 }
 
 // The same hole reached the other way: re-opening the file the pane is already
-// showing. open() bumps nothing the save callback inspects and leaves m_path
-// identical, so before the commit-serial guard the write's reply ran in full
-// against the freshly loaded buffer.
+// showing. open() leaves m_path identical, so the save callback's path check
+// cannot see it, and before the load-generation guard the write's reply ran in
+// full against the freshly loaded buffer. Note that open(), unlike reload(),
+// does NOT truncate the recovery snapshot — it re-probes it, which is how
+// unsaved work is offered back — so a superseded save clearing it here would
+// destroy work the pane may be in the middle of offering to the user.
 //
 // This case answers the write with a CONFLICT rather than a success, because the
 // conflict path is two asynchronous hops (the write reply, then a stat to find
@@ -2391,6 +2398,218 @@ void TstEditorController::aSaveConflictIsDroppedAfterASamePathReopenTookOverTheB
     QVERIFY2(nextRequest(300).isEmpty(),
              "the superseded save chased a conflict revision for a buffer the "
              "pane had already replaced");
+}
+
+// A successful save retires the crash-recovery snapshot, because the file on the
+// server now IS the buffer. But the controller only learns a snapshot exists when
+// that snapshot's own write answers, and clearRecovery() used to read "no snapshot
+// known" as "nothing to do" — so a save whose reply beat the snapshot's reply left
+// the snapshot behind entirely.
+//
+// That matters when the user keeps typing between the page's debounced report and
+// the save, which is ordinary: the surviving snapshot then holds OLDER text than
+// the file, so the next open offers to restore work the save already superseded,
+// and accepting it walks the buffer backwards. The offer is a real dialog now, so
+// this is a wrong answer the user can act on.
+void TstEditorController::aSuccessfulSaveStillClearsASnapshotThatWasStillInFlight()
+{
+    makePair();
+    openClean(QStringLiteral("/foo/f.txt"), QStringLiteral("hello"),
+              QStringLiteral("r1"));
+
+    // The page reports its buffer; the snapshot write goes out and stays unanswered.
+    m_controller->reportContent(QStringLiteral("older edits"));
+    const QJsonObject snapshot = nextRequest();
+    QCOMPARE(method(snapshot), kWriteFile);
+    QCOMPARE(reqPath(snapshot), recoveryFilePath());
+
+    // The user types more and saves before that snapshot has answered.
+    m_controller->save(QStringLiteral("newer edits"), QStringLiteral("r1"));
+    const QJsonObject write = nextRequest();
+    QCOMPARE(method(write), kWriteFile);
+    QCOMPARE(reqPath(write), QStringLiteral("/foo/f.txt"));
+
+    // The save succeeds first. It cannot truncate the snapshot yet — it does not
+    // know the revision to guard the truncate against — so it must defer, not skip.
+    QSignalSpy savedSpy(m_controller, &EditorController::saved);
+    respondResult(reqId(write), {{"path", "/foo/f.txt"}, {"revision", "r2"}});
+    QTRY_COMPARE(savedSpy.count(), 1);
+    QCOMPARE(m_controller->fileState(), QStringLiteral("clean"));
+    QVERIFY2(nextRequest(300).isEmpty(),
+             "a truncate was guarded against a snapshot revision nobody knew yet");
+
+    // Now the snapshot answers, and the deferred truncate runs, guarded by the
+    // revision that reply just supplied.
+    respondResult(reqId(snapshot),
+                  {{"path", recoveryFilePath()}, {"revision", "rec1"}});
+    const QJsonObject truncate = nextRequest();
+    QVERIFY2(!truncate.isEmpty(),
+             "the snapshot survived a successful save, so the next open would "
+             "offer to restore text the save had already superseded");
+    QCOMPARE(method(truncate), kWriteFile);
+    QCOMPARE(reqPath(truncate), recoveryFilePath());
+    QCOMPARE(reqContent(truncate), QString());
+    QCOMPARE(reqExpectedRevision(truncate), QStringLiteral("rec1"));
+    respondResult(reqId(truncate),
+                  {{"path", recoveryFilePath()}, {"revision", "rec2"}});
+
+    // Exactly once: nothing re-arms the deferred clear.
+    QVERIFY2(nextRequest(300).isEmpty(), "the deferred clear fired more than once");
+}
+
+// The deferral has to survive the snapshot write's stale-guard RETRY, which adds two
+// round trips: a stat for the current revision, then the re-write. The discriminating
+// order is a save that succeeds DURING the stat hop — if the chain stops being
+// counted for that hop, the truncate the save asks for is decided on what is known
+// right then (no snapshot revision at all, because the first write was refused), so
+// the request is dropped, and the retry write that follows then leaves a snapshot of
+// pre-save text sitting behind a successful save.
+void TstEditorController::aDeferredTruncateSurvivesTheSnapshotRetryChain()
+{
+    makePair();
+    openClean(QStringLiteral("/foo/f.txt"), QStringLiteral("hello"),
+              QStringLiteral("r1"));
+
+    m_controller->reportContent(QStringLiteral("older edits"));
+    const QJsonObject snapshot = nextRequest();
+    QCOMPARE(reqPath(snapshot), recoveryFilePath());
+
+    // The snapshot write is refused first: a snapshot from a previous session already
+    // occupies the slot, so the controller stats it and will retry once.
+    respondError(reqId(snapshot), ch::rpc::kRevisionMismatch,
+                 QStringLiteral("stale create guard"), QJsonObject{});
+    const QJsonObject stat = nextRequest();
+    QCOMPARE(method(stat), kStat);
+    QCOMPARE(reqPath(stat), recoveryFilePath());
+
+    // The user saves, and that save SUCCEEDS while the retry chain is parked on its
+    // stat. This is the window the count has to keep covered.
+    m_controller->save(QStringLiteral("newer edits"), QStringLiteral("r1"));
+    const QJsonObject write = nextRequest();
+    QCOMPARE(reqPath(write), QStringLiteral("/foo/f.txt"));
+    QSignalSpy savedSpy(m_controller, &EditorController::saved);
+    respondResult(reqId(write), {{"path", "/foo/f.txt"}, {"revision", "r2"}});
+    QTRY_COMPARE(savedSpy.count(), 1);
+
+    // Nothing may be truncated yet: no snapshot revision exists to guard against.
+    QVERIFY2(nextRequest(300).isEmpty(),
+             "a truncate ran during the retry's stat hop, before the retry write had "
+             "established what it would be guarding against");
+
+    respondResult(reqId(stat), {{"path", recoveryFilePath()}, {"revision", "recX"}});
+    const QJsonObject retry = nextRequest();
+    QCOMPARE(reqPath(retry), recoveryFilePath());
+    QCOMPARE(reqExpectedRevision(retry), QStringLiteral("recX"));
+    respondResult(reqId(retry),
+                  {{"path", recoveryFilePath()}, {"revision", "recY"}});
+
+    // Only now, with the snapshot really on the server, does the deferred truncate
+    // run — guarded by the revision the retry produced.
+    const QJsonObject truncate = nextRequest();
+    QVERIFY2(!truncate.isEmpty(),
+             "the deferred truncate was lost across the retry chain, leaving a "
+             "snapshot of pre-save text behind a successful save");
+    QCOMPARE(reqPath(truncate), recoveryFilePath());
+    QCOMPARE(reqContent(truncate), QString());
+    QCOMPARE(reqExpectedRevision(truncate), QStringLiteral("recY"));
+}
+
+// The in-flight count and the deferred-truncate intent are shared pane state, so a
+// snapshot write belonging to a file the pane has since left must not touch either.
+// Without a generation stamp the stale reply decrements the NEW file's count, which
+// fires that file's deferred truncate early — guarded by the wrong revision, and
+// before the write it was meant to wait for has answered.
+void TstEditorController::aStaleSnapshotReplyDoesNotDisturbTheNextFilesBookkeeping()
+{
+    makePair();
+    openClean(QStringLiteral("/foo/a.txt"), QStringLiteral("A"),
+              QStringLiteral("ra1"));
+
+    // A snapshot for the FIRST file goes out and is left unanswered.
+    m_controller->reportContent(QStringLiteral("edits in a.txt"));
+    const QJsonObject staleSnapshot = nextRequest();
+    QCOMPARE(reqPath(staleSnapshot), recoveryFilePath());
+
+    // Switch to another file.
+    m_controller->open(QStringLiteral("/foo/b.txt"));
+    const QJsonObject unwatch = nextRequest();
+    QCOMPARE(method(unwatch), kUnwatch);
+    respondResult(reqId(unwatch), {});
+    const QJsonObject read = nextRequest();
+    QCOMPARE(reqPath(read), QStringLiteral("/foo/b.txt"));
+    respondResult(reqId(read), {{"path", "/foo/b.txt"},
+                                {"encoding", "utf-8"},
+                                {"content", "B"},
+                                {"revision", "rb1"},
+                                {"truncated", false}});
+    serveWatchThenNoRecovery();
+
+    // The new file gets its own snapshot, and a save that defers a truncate.
+    m_controller->reportContent(QStringLiteral("edits in b.txt"));
+    const QJsonObject liveSnapshot = nextRequest();
+    QCOMPARE(reqPath(liveSnapshot), recoveryFilePath());
+    m_controller->save(QStringLiteral("saved b"), QStringLiteral("rb1"));
+    const QJsonObject write = nextRequest();
+    QCOMPARE(reqPath(write), QStringLiteral("/foo/b.txt"));
+    QSignalSpy savedSpy(m_controller, &EditorController::saved);
+    respondResult(reqId(write), {{"path", "/foo/b.txt"}, {"revision", "rb2"}});
+    QTRY_COMPARE(savedSpy.count(), 1);
+
+    // Now the FIRST file's snapshot finally answers. It must change nothing.
+    respondResult(reqId(staleSnapshot),
+                  {{"path", recoveryFilePath()}, {"revision", "stale"}});
+    QVERIFY2(nextRequest(300).isEmpty(),
+             "a snapshot reply from the previous file released the current file's "
+             "deferred truncate early");
+
+    // The current file's own snapshot answers, and only then does the truncate run,
+    // guarded by that snapshot's revision rather than the stale one.
+    respondResult(reqId(liveSnapshot),
+                  {{"path", recoveryFilePath()}, {"revision", "recB"}});
+    const QJsonObject truncate = nextRequest();
+    QVERIFY2(!truncate.isEmpty(), "the deferred truncate never ran");
+    QCOMPARE(reqPath(truncate), recoveryFilePath());
+    QCOMPARE(reqContent(truncate), QString());
+    QCOMPARE(reqExpectedRevision(truncate), QStringLiteral("recB"));
+}
+
+// The half of that rule which must NOT fire. If the user types again AFTER the save
+// succeeded, those bytes are unsaved work the save did not write, and the snapshot
+// holding them must survive — so a fresh report cancels a truncate the save had
+// deferred rather than being deleted by it.
+void TstEditorController::aReportAfterASaveCancelsTheTruncateThatSaveDeferred()
+{
+    makePair();
+    openClean(QStringLiteral("/foo/f.txt"), QStringLiteral("hello"),
+              QStringLiteral("r1"));
+
+    m_controller->reportContent(QStringLiteral("older edits"));
+    const QJsonObject firstSnapshot = nextRequest();
+    QCOMPARE(reqPath(firstSnapshot), recoveryFilePath());
+
+    m_controller->save(QStringLiteral("saved bytes"), QStringLiteral("r1"));
+    const QJsonObject write = nextRequest();
+    QCOMPARE(reqPath(write), QStringLiteral("/foo/f.txt"));
+    respondResult(reqId(write), {{"path", "/foo/f.txt"}, {"revision", "r2"}});
+    QTest::qWait(50);
+
+    // The user types again while the first snapshot is STILL unanswered. This is
+    // newer than anything the save wrote.
+    m_controller->reportContent(QStringLiteral("typed after the save"));
+    const QJsonObject secondSnapshot = nextRequest();
+    QCOMPARE(reqPath(secondSnapshot), recoveryFilePath());
+
+    // Both snapshot writes now answer, oldest first.
+    respondResult(reqId(firstSnapshot),
+                  {{"path", recoveryFilePath()}, {"revision", "rec1"}});
+    respondResult(reqId(secondSnapshot),
+                  {{"path", recoveryFilePath()}, {"revision", "rec2"}});
+    QTest::qWait(100);
+
+    QVERIFY2(nextRequest(300).isEmpty(),
+             "the save's deferred truncate deleted a snapshot of work typed AFTER "
+             "that save, which exists nowhere else");
+    QCOMPARE(m_controller->fileState(), QStringLiteral("modified"));
 }
 
 // The mirror image: a reload the USER asked for (the page's conflict/error
