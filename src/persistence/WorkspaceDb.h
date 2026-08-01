@@ -38,6 +38,22 @@ struct GroupNode {
 // Required members map 1:1 to the wire fields. Optional members are omitted from
 // the request when unset, letting the server apply its default (create) or keep
 // the current value (update).
+//
+// The server reads the nullable-text fields (workingDirectory, tmuxTarget,
+// startupCommand, harness, taskDescription, defaultWorkingDirectory, handler,
+// title) as THREE-valued on an update: absent means "keep what is stored", JSON
+// null means "clear the column to NULL", and a string means "store that string"
+// (remote/src/workspace.ts, e.g. updateTerminalPane). A std::optional<QString>
+// spans only two of those three: disengaged omits the key, and engaged always
+// writes a JSON string, an empty one included. There is deliberately no way to
+// send JSON null from here, so the server's clear-to-NULL branch is not
+// reachable through this class; no caller needs to clear a field, and a second
+// way to spell "absent" would cost more than the gap does.
+//
+// An engaged optional holding an empty string is therefore a WRITE of "", not a
+// clear. On tmuxTarget that write is refused rather than applied: the server
+// requires 1-N characters of [A-Za-z0-9_-], so an empty tmuxTarget fails the
+// whole request with -32602 instead of blanking the column.
 
 struct CreateGroupParams {
     ServerId serverId;
@@ -146,14 +162,19 @@ struct UpdateTerminalPaneParams {
 // CodeharbordClient, whose camelCase result JSON is mapped into the ch:: data
 // model. All methods are async; each takes a callback receiving EITHER the typed
 // result OR an RpcError (SPEC 10.3) — WorkspaceDb never throws and never touches
-// local storage. A server error is forwarded verbatim. One error is synthesized
-// here rather than received: a response that reports success but whose result is
-// not the expected JSON kind (an object per record, an array for list()) is
-// failed with the reserved code -32603, because decoding it would manufacture a
-// record with an empty id that the rest of the client cannot tell from a real
-// one. getLayout is the sole method for which a JSON null result is legitimate —
-// it means "this region has no persisted layout" and delivers std::nullopt with
-// no error.
+// local storage. A server error is forwarded verbatim. The only errors
+// synthesized here rather than received all describe one thing: a response that
+// reports success but whose result is not the shape the method promises. That
+// is failed with the reserved code -32603, because decoding it would manufacture
+// a record with an empty id that the rest of the client cannot tell from a real
+// one. Concretely, a result that is not the expected JSON kind (an object per
+// record, an array for list()), and, for setLayout, a SessionLayout row whose
+// `tree` is missing or fails split-tree validation. getLayout is the sole method
+// for which a JSON null result is legitimate — it means "this region has no
+// persisted layout" and delivers std::nullopt with no error; it is also the sole
+// method that maps an unreadable stored tree to that same "no layout" verdict
+// rather than to an error, because a region whose layout cannot be loaded must
+// stay empty instead of inviting the user to edit a fabricated one.
 //
 // Lifetime: `client` is borrowed, not owned, and must outlive this object. Each
 // pending callback is owned by that client, NOT by WorkspaceDb, and runs at most
@@ -243,7 +264,10 @@ public:
     void deleteTerminalPane(const TerminalId& id, OkCallback cb);
 
     // Per-region split layouts. getLayout delivers std::nullopt when the region
-    // has no persisted layout; setLayout delivers the stored tree on success.
+    // has no persisted layout (and likewise when the stored tree is unreadable);
+    // setLayout delivers the stored tree on success, and fails with -32603
+    // rather than delivering an empty std::nullopt if the echoed row carries no
+    // valid tree.
     void getLayout(const DevSessionId& devSessionId, Region region,
                    LayoutCallback cb);
     void setLayout(const ServerId& serverId, const DevSessionId& devSessionId,

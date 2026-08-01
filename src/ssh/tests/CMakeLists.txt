@@ -60,3 +60,16 @@ target_link_libraries(tst_livessh PRIVATE
 
 add_test(NAME tst_livessh COMMAND tst_livessh)
 set_tests_properties(tst_livessh PROPERTIES LABELS live)
+
+# Console-mode on Windows, for the same reason as src/app/tests: qt_add_executable
+# marks executables as GUI subsystem, which on Windows swallows QTest's stdout and
+# stderr, so a failing assertion reports nothing at all through ctest.
+if(WIN32)
+    set_target_properties(
+        tst_knownhosts
+        tst_sshauth
+        tst_sshchanneldevice
+        tst_sshlogrouter
+        tst_livessh
+        PROPERTIES WIN32_EXECUTABLE FALSE)
+endif()

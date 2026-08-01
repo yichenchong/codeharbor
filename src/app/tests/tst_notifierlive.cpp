@@ -7,8 +7,8 @@
 
 // LIVE gate: actually delivers a notification to whatever daemon owns
 // org.freedesktop.Notifications on the session bus. It is the ONLY proof that
-// SPEC 6.2 notifications reach a real display; every other notifier test runs
-// against the deliberately bus-less no-op path.
+// agent-attention notifications reach a real display; every other notifier test
+// runs against the deliberately bus-less no-op path.
 //
 // A machine with no session bus and no daemon (headless CI, a bare SSH login)
 // is a legitimate environment, so this must not fail there. But a QSKIP that
@@ -44,7 +44,7 @@ void TestNotifierLive::deliversToTheSessionBus()
             << QString(78, u'*') << "\n"
             << kNotVerifiedToken << "\n"
             << "No session bus / no org.freedesktop.Notifications service, so\n"
-            << "NOTHING WAS DELIVERED and NOTHING WAS PROVEN about SPEC 6.2\n"
+            << "NOTHING WAS DELIVERED and NOTHING WAS PROVEN about desktop\n"
             << "notification display. This is a legitimate environment and is\n"
             << "NOT a failure -- but it is NOT a pass either: ctest reports\n"
             << "this target as Skipped. Run it on a real desktop session\n"

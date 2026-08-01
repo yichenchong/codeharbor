@@ -6,10 +6,12 @@
 
 namespace ch {
 
-// Real OS desktop notifications for agent attention (SPEC 6.2: a terminal
-// transitioning into waiting_input or idle_unseen). AgentStatusMonitor emits a
-// notify(title, body) hook; this class is the display layer that turns it into
-// a bubble the user actually sees.
+// Real OS desktop notifications for agent attention: a terminal transitioning
+// into waiting_input or idle_unseen, the state names SPEC 6.4 "Internal Event
+// Schema" defines. Section 6 defines only those states; the display layer here
+// has no section of its own and is a Phase 4 deliverable in SPEC 16.
+// AgentStatusMonitor emits a notify(title, body) hook; this class is the
+// display layer that turns it into a bubble the user actually sees.
 //
 // Backend: on Linux the freedesktop.org spec's session-bus service
 // org.freedesktop.Notifications is called directly over QtDBus. The dependency
@@ -46,7 +48,9 @@ public:
     // their notification daemon). Constant for the lifetime of the object.
     bool available() const { return m_available; }
 
-    // Gate for the user-facing "notifications off" switch. Disabled notify()
+    // Programmatic gate on delivery. No control is wired to it: main.cpp keeps
+    // this object as a pure C++ sink and never publishes it to QML, so
+    // `enabled` only ever moves by an in-process call. Disabled notify()
     // returns immediately without raising, coalescing or touching state.
     Q_INVOKABLE void setEnabled(bool enabled);
     bool isEnabled() const { return m_enabled; }

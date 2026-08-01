@@ -170,6 +170,8 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "24"
+          # ~/.npm across runs; the bundle install is Monaco plus esbuild.
+          cache: npm
       # BOTH bundles, via the root workspaces script: the terminal bundle is as
       # load-bearing as the editor one, and CMake's npm fallback that used to
       # cover it does not work on Windows.
@@ -363,6 +365,15 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "24"
+          cache: npm
+      # BEFORE npm ci, exactly as in ci.yml: `npm ci` rewrites a workspace
+      # package.json's own `version` field to whatever package-lock.json says, so
+      # a lock that lagged the manifests would silently ship the WRONG version
+      # inside this job's codeharbor-remote.tar.gz — under a release named after
+      # the tag. The `publish` job's version assertion only covers the Windows
+      # installer, so nothing else here would catch it.
+      - name: Versions agree across CMakeLists, manifests and the lock
+        run: node .github/scripts/check-versions.mjs
       - name: Build remote workspace
         working-directory: remote
         run: |

@@ -148,6 +148,21 @@ void TerminalFactory::setServerId(const QString& serverId)
     // Targets name rows on a SERVER. Carrying them to another one would hand a
     // pane a target belonging to a workspace it is no longer looking at.
     m_targets.clear();
+    // Same reasoning for the lookups that are still on the wire: they were
+    // asked of the PREVIOUS server, so their answers name rows that mean
+    // nothing here and must not be cached (the callback in resolveTarget()
+    // drops them for exactly that reason). Failing them now is what keeps the
+    // panes waiting on them from waiting for ever: resolveTarget() promises an
+    // answer for every call it accepted, and this is the one place that promise
+    // could otherwise be broken. Keys are taken from a snapshot because
+    // finishResolution() erases from the map, and a waiter is free to react by
+    // re-entering resolveTarget() and inserting a fresh entry under the same key.
+    const QList<QString> stale = m_resolving.keys();
+    for (const QString& key : stale) {
+        finishResolution(key, QString(),
+                         QStringLiteral("the workspace server changed while this "
+                                        "terminal was being resolved"));
+    }
 }
 
 ResolveTerminalPaneParams TerminalFactory::resolveParamsFor(const QString& serverId,
@@ -232,10 +247,19 @@ bool TerminalFactory::resolveTarget(TerminalController* controller,
         return true;
 
     QPointer<TerminalFactory> self(this);
+    const QString askedOf = m_serverId;
     m_workspace->resolveTerminalPane(
-        params, [self, key, byRow, devSessionId, paneName](std::optional<TerminalPane> pane,
-                                                           std::optional<RpcError> err) {
+        params, [self, key, byRow, askedOf, devSessionId,
+                 paneName](std::optional<TerminalPane> pane, std::optional<RpcError> err) {
             if (!self)
+                return;
+            // The answer names a row on the server the question was asked of.
+            // setServerId() may have moved this factory to another one while it
+            // was on the wire, in which case caching the target would hand a
+            // pane a name from a workspace it is no longer looking at — and
+            // setServerId() has already answered (and forgotten) every waiter
+            // this key had, so there is nobody left to deliver to either.
+            if (self->m_serverId != askedOf)
                 return;
             if (err) {
                 self->finishResolution(key, QString(), err->message);
@@ -398,9 +422,20 @@ void TerminalFactory::detach(TerminalController* controller)
     // through its own state machine, then unbind and release the device.
     device->disconnect(this);  // no late channelError for a pane we just dropped
     device->closeChannel();
-    controller->setTransport(nullptr);
-    device->deleteLater();
 
+    // closeChannel() ends the read channel, which walks the controller's state
+    // machine, which reaches the WebChannel bridge and the QML pane — and
+    // anything there is free to call attach() straight back on THIS pane (the
+    // same re-entrancy the m_attached lookups above and in kill() guard
+    // against). If it did, the controller is already bound to a brand new
+    // channel and the three steps below would unbind it, then report the fresh
+    // pane as dropped. The device we came here to release is still released.
+    const bool stillOurs = controller->transport() == device;
+    device->deleteLater();
+    if (!stillOurs)
+        return;
+
+    controller->setTransport(nullptr);
     if (TerminalController::isLiveState(controller->state()))
         controller->setState(TerminalState::Disconnected);
 }

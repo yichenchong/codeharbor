@@ -5,7 +5,7 @@
 # --single-process is deliberately ABSENT: Chromium aborts ("Single mode supports
 # only single profile") as soon as a second QWebEngineProfile exists, and the
 # viewer stack creates two by design (sandboxed external + privileged internal,
-# SPEC 7.2). A WebEngineView's transient default profile can trip it alone, so it
+# SPEC 7.3). A WebEngineView's transient default profile can trip it alone, so it
 # is unsafe here even though Main.qml's empty panes happen to survive it.
 set(CODEHARBOR_QML_TEST_ENV
     "QT_QPA_PLATFORM=offscreen"

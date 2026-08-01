@@ -256,22 +256,18 @@ bool SshChannelDevice::startPty(const QString& term, int cols, int rows,
     cols = qMax(1, cols);
     rows = qMax(1, rows);
 
-    if (m_kind == SshConnectionPool::ChannelKind::Pty) {
-        // openChannel(Pty) already issued ssh_channel_request_pty(); a second
-        // pty-req on the same channel is a protocol violation, so only resize.
-        if (ssh_channel_change_pty_size(m_channel, cols, rows) != SSH_OK) {
-            abortStart(lastError());
-            return false;
-        }
-    } else {
-        const QByteArray termUtf8 =
-            term.isEmpty() ? QByteArrayLiteral("xterm-256color") : term.toUtf8();
-        if (ssh_channel_request_pty_size(m_channel, termUtf8.constData(), cols,
-                                         rows)
-            != SSH_OK) {
-            abortStart(lastError());
-            return false;
-        }
+    // One pty-req per channel, issued here whatever ChannelKind this device was
+    // constructed with: the pool no longer negotiates a PTY of its own, so the
+    // terminal type asked for is the one the remote session actually gets. It
+    // used to be sent by openChannel(Pty) as ssh_channel_request_pty(), which
+    // hard-codes TERM=xterm — a pane asking for xterm-256color then silently ran
+    // a 16-colour terminal, and only the window size could still be applied.
+    const QByteArray termUtf8 =
+        term.isEmpty() ? QByteArrayLiteral("xterm-256color") : term.toUtf8();
+    if (ssh_channel_request_pty_size(m_channel, termUtf8.constData(), cols, rows)
+        != SSH_OK) {
+        abortStart(lastError());
+        return false;
     }
     m_hasPty = true;
 
@@ -421,6 +417,13 @@ void SshChannelDevice::pump()
     if (m_channel && !eof && failure.isEmpty())
         m_pump->start(gotPayload || !stderrBytes.isEmpty() ? 0 : kIdlePollMs);
 
+    // Every emit below can reach a handler that destroys this device: the
+    // documented teardown path runs from inside readChannelFinished(), and a
+    // stray `delete` there (rather than deleteLater()) would leave the rest of
+    // this function writing to freed memory. Watch for it instead of trusting
+    // every present and future consumer to get that right.
+    const QPointer<SshChannelDevice> self(this);
+
     // Decode with the device's own stateful decoder, not QString::fromUtf8():
     // stderr is a byte stream cut at arbitrary 16 KiB boundaries, and a
     // multi-byte character split across two reads (or two pump passes) would
@@ -432,15 +435,15 @@ void SshChannelDevice::pump()
         if (!text.isEmpty())
             emit channelError(text);
     }
-    if (!failure.isEmpty())
+    if (self && !failure.isEmpty())
         failWith(failure);
-    if (gotPayload)
+    if (self && gotPayload)
         emit readyRead();
 
     // Remote EOF: report the end of the read channel exactly once, after the
     // final bytes have been surfaced. The device stays open so buffered data is
     // still readable; the owner decides when to closeChannel().
-    if ((eof || !failure.isEmpty()) && !m_remoteFinished) {
+    if (self && (eof || !failure.isEmpty()) && !m_remoteFinished) {
         m_remoteFinished = true;
         emit readChannelFinished();
     }

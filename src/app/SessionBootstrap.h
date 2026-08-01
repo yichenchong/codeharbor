@@ -147,6 +147,13 @@ public:
     // Automatic reconnect is on by default. Turning it off cancels a pending
     // retry AND aborts a retry that is already inside its connect pre-flight,
     // so a user who asked to stay disconnected is not dragged back.
+    //
+    // A connect the USER asked for is not the ladder's to abandon: switching
+    // this off while connectAndWire() is in flight leaves that attempt alone.
+    // Cancelling it here would strand the object, because connectAndWire()
+    // treats a cancelled attempt as "the canceller already chose the end state"
+    // and disconnectSession() is the only caller that does — so nothing would
+    // ever move the state off Connecting.
     void setReconnectEnabled(bool enabled);
     bool reconnectEnabled() const { return m_reconnectEnabled; }
 
@@ -489,6 +496,10 @@ private:
     // Set while we are inside our own connect/teardown, so the pool and device
     // signals those steps provoke are not mistaken for a fresh loss.
     bool m_attempting = false;
+    // Whether the attempt m_attempting refers to is a rung of the reconnect
+    // ladder rather than a connectAndWire() the user asked for. Only a rung may
+    // be abandoned by setReconnectEnabled(false); see there.
+    bool m_attemptIsRetry = false;
     bool m_tearingDown = false;
     // Non-owning: valid only for the duration of the nested event loop an
     // attempt is currently parked in — probeEndpoint()'s connect pre-flight or

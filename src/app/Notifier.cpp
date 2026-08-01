@@ -20,6 +20,12 @@ const QString kPath = QStringLiteral("/org/freedesktop/Notifications");
 const QString kIface = QStringLiteral("org.freedesktop.Notifications");
 const QString kAppName = QStringLiteral("CodeHarbor");
 const QString kAppIcon = QStringLiteral("utilities-terminal");
+// The basename of packaging/codeharbor.desktop, which is exactly what
+// QGuiApplication::setDesktopFileName() pins in src/app/main.cpp. Passed as the
+// freedesktop `desktop-entry` hint so a notification centre can resolve the
+// application's icon and group its bubbles under CodeHarbor, instead of falling
+// back to matching the raw app_name string against installed desktop files.
+const QString kDesktopEntry = QStringLiteral("codeharbor");
 // Pin a bounded expiry rather than passing -1 ("daemon default"): agent
 // attention is informational, not modal, and a daemon whose default is "never
 // expire" would otherwise leave a bubble on screen until it is clicked.
@@ -104,6 +110,9 @@ unsigned int Notifier::deliver(const QString& title, const QString& body,
         return 0;
 
 #if CH_HAVE_DBUS
+    QVariantMap hints;
+    hints.insert(QStringLiteral("desktop-entry"), kDesktopEntry);
+
     QDBusMessage msg = QDBusMessage::createMethodCall(kService, kPath, kIface,
                                                       QStringLiteral("Notify"));
     msg << kAppName
@@ -112,7 +121,7 @@ unsigned int Notifier::deliver(const QString& title, const QString& body,
         << title
         << body
         << QStringList()      // actions
-        << QVariantMap()      // hints
+        << hints
         << kExpireTimeoutMs;
 
     // Blocking here would stall the UI thread on a wedged daemon, so the call

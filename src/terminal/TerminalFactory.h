@@ -5,7 +5,6 @@
 #include <QObject>
 #include <QPointer>
 #include <QString>
-#include <QVector>
 
 #include "TerminalBridge.h"
 #include "TerminalController.h"

@@ -209,7 +209,16 @@ function(codeharbor_embed_web_bundle)
                             OUTPUT_VARIABLE _chb_bundle_out
                             ERROR_VARIABLE _chb_bundle_out)
             if(NOT _chb_bundle_rc EQUAL 0)
-                message(STATUS "CodeHarbor: ${CHB_LABEL} bundle build failed (${_chb_bundle_rc}):\n${_chb_bundle_out}")
+                # WARNING, not STATUS. When dist/ is absent the FATAL_ERROR below
+                # reports the problem anyway, but when a STALE dist/ is present
+                # configure carries on and embeds it - so the ONLY notice that the
+                # binary now contains an out-of-date bundle is this line, and a
+                # STATUS line is indistinguishable from the dozens of ordinary
+                # ones CMake prints.
+                message(WARNING
+                    "CodeHarbor: the ${CHB_LABEL} bundle failed to build (${_chb_bundle_rc}). "
+                    "If a previously built ${_chb_dist} is present it will be embedded AS IS, "
+                    "which means the ${CHB_PANE} pane runs stale code.\n${_chb_bundle_out}")
             endif()
         endif()
     endif()

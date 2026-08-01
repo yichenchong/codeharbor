@@ -50,10 +50,16 @@ void SessionsModel::updateTerminalStates(QVector<GroupRow> groups)
         }
     }
 
-    // Structure matches: adopt the new terminal state in place and emit a
+    // Structure matches: adopt the new terminal state in place, then emit a
     // targeted dataChanged() (RowStateRole only) for each session row whose
     // aggregate state actually changed. No reset, so delegates and the
     // id-tracked selection persist.
+    //
+    // Every row is updated BEFORE the first signal goes out. Emitting from
+    // inside the mutation loop would show a receiver a half-updated model, and
+    // a receiver that reacted by calling setGroups() would free the two vectors
+    // the loop is still walking, leaving it iterating over released memory.
+    QVector<QModelIndex> changedRows;
     for (qsizetype gi = 0; gi < groups.size(); ++gi) {
         const QModelIndex groupIndex = index(static_cast<int>(gi), 0, QModelIndex());
         QVector<SessionRow> &sessions = groups_[gi].sessions;
@@ -61,13 +67,12 @@ void SessionsModel::updateTerminalStates(QVector<GroupRow> groups)
         for (qsizetype si = 0; si < sessions.size(); ++si) {
             const SessionRowState before = aggregateSessionState(sessions.at(si).terminals);
             sessions[si].terminals = std::move(incoming[si].terminals);
-            const SessionRowState after = aggregateSessionState(sessions.at(si).terminals);
-            if (before != after) {
-                const QModelIndex sessionIndex = index(static_cast<int>(si), 0, groupIndex);
-                emit dataChanged(sessionIndex, sessionIndex, {RowStateRole});
-            }
+            if (before != aggregateSessionState(sessions.at(si).terminals))
+                changedRows.append(index(static_cast<int>(si), 0, groupIndex));
         }
     }
+    for (const QModelIndex &row : std::as_const(changedRows))
+        emit dataChanged(row, row, {RowStateRole});
 }
 
 SessionRowState SessionsModel::aggregateSessionState(const QVector<TerminalStatus> &terminals)

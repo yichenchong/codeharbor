@@ -86,11 +86,24 @@ Rectangle {
     // factory's targetResolved signal, which re-enters attachNow().
     property bool resolving: false
     // The slot the outstanding resolution was started FOR, as
-    // "<devSessionId>/<terminalId>". A pane can be pointed at another Dev
-    // Session while its lookup is still travelling, and the answer to the old
-    // question would otherwise be adopted as the new slot's target — which is
-    // two panes on one shell, the exact failure this whole path removes.
+    // "<devSessionId>/<terminalId>/<terminalPaneId>". A pane can be pointed at
+    // another Dev Session while its lookup is still travelling, and the answer
+    // to the old question must never be adopted as the new slot's target —
+    // which is two panes on one shell, the exact failure this whole path
+    // removes.
     property string resolvingFor: ""
+    // The pane was retargeted while that lookup was in flight, so the answer
+    // still travelling names a slot this pane has LEFT.
+    //
+    // Comparing `resolvingFor` against slotKey() cannot catch that on its own.
+    // If a retarget were allowed to ask its new question straight away, TWO
+    // lookups would be outstanding at once, `resolvingFor` would already hold
+    // the NEW key, and the OLD answer — which carries nothing but a controller
+    // and a target string — would sail through the comparison and attach this
+    // pane to the previous Dev Session's shell. So exactly ONE lookup is ever
+    // outstanding: a retarget marks the flight stale instead of starting a
+    // second one, and the answer, once it lands, asks the current question.
+    property bool resolveStale: false
 
     // ---- focus reporting (SPEC 4.5) ----
     // The user is working in THIS pane. TerminalRegion connects this when it
@@ -382,9 +395,13 @@ Rectangle {
             pane.detachNow()
         pane.tmuxTarget = ""
         // A lookup still in flight was asked about the slot this pane has just
-        // left. Stop waiting for it — `resolvingFor` is what makes its answer
-        // recognisable as stale when it does land — and ask the new question.
-        pane.resolving = false
+        // left. It is NOT cancelled and no second one is started beside it:
+        // marking it stale keeps exactly one answer outstanding, which is the
+        // only way an answer that carries no slot of its own can be told apart
+        // from the one this pane wants now. onTargetResolved discards it and
+        // asks the current question.
+        if (pane.resolving)
+            pane.resolveStale = true
         // The new slot gets a fresh window, and a stalled report about the old
         // one must not stick to it.
         pane.clearIdentityWait()
@@ -447,13 +464,21 @@ Rectangle {
         function onTargetResolved(controller, target) {
             if (controller !== pane.controller)
                 return
-            if (pane.resolvingFor !== pane.slotKey()) {
+            // The one outstanding lookup is over either way. Clearing this
+            // FIRST is what lets the stale branch below ask again: attachNow()
+            // declines while a resolution is in flight, so a stale answer that
+            // left `resolving` set would strand the pane for good — its own
+            // Retry button included.
+            pane.resolving = false
+            if (pane.resolveStale || pane.resolvingFor !== pane.slotKey()) {
                 // Answer to a question this pane no longer has: it was pointed
                 // at another slot while the lookup travelled. Adopting it would
-                // attach this pane to the OTHER slot's shell.
+                // attach this pane to the OTHER slot's shell. Ask the question
+                // it has now instead — nothing else will.
+                pane.resolveStale = false
+                pane.attachNow()
                 return
             }
-            pane.resolving = false
             if (target.length === 0)
                 return
             pane.tmuxTarget = target
@@ -554,8 +579,9 @@ Rectangle {
                 url: pane.terminalBundleUrl
 
                 // Privileged profile: permits the WebChannel bridge (the external
-                // profile deliberately does not — SPEC 7.2). The bundle is trusted
-                // app code, so scripting is intentionally on.
+                // profile deliberately does not — SPEC 7.3, "Browser Profiles",
+                // which is the section requiring the two-profile split). The
+                // bundle is trusted app code, so scripting is intentionally on.
                 profile: viewers.internalProfile()
                 settings.javascriptEnabled: true
                 settings.localContentCanAccessFileUrls: false

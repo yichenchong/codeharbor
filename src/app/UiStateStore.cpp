@@ -126,6 +126,14 @@ void UiStateStore::setNextPaneSuffix(QString devSessionId, QString region,
     // exists to prevent.
     if (devSessionId.isEmpty())
         return;
+    // The same floor nextPaneSuffix() enforces on the way out. Without it the
+    // two halves disagree: a caller could store 0 or a negative, the read side
+    // would silently repair it to 1, and the counter would quietly forget every
+    // id already spent - which is a duplicate pane label, the one thing it
+    // exists to prevent. Refusing here makes the stored state the documented
+    // one rather than something every reader has to keep patching up.
+    if (suffix < kFirstPaneSuffix)
+        return;
     m_settings->setValue(paneSuffixKey(devSessionId, region), suffix);
     // sync() here, unlike setRegionWidths(): this is called once per pane
     // created (not once per mouse move), and a counter lost to a crash before

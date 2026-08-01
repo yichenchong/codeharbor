@@ -77,6 +77,7 @@ class TstSshLogRouter : public QObject {
 private slots:
     void transcriptCapKeepsExactlyOneTruncationMarker();
     void transcriptBelowTheCapIsNeverMarked();
+    void oneOversizedLineIsTruncatedRatherThanRetainedWhole();
 #if CH_HAVE_LIBSSH
     void threadStateIsInstalledOnceAndRestoredOnlyByTheLastRelease();
     void routesReleasedOutOfOrderStillRestoreTheThreadStateExactlyOnce();
@@ -123,6 +124,35 @@ void TstSshLogRouter::transcriptBelowTheCapIsNeverMarked()
     SshConnectionPool::appendTranscriptLine(transcript, QStringLiteral("second"));
     QCOMPARE(transcript, QStringLiteral("first\nsecond"));
     QVERIFY(!transcript.contains(kTruncationMarker));
+}
+
+// The cap must hold for ONE enormous line too, not only for many small ones. A
+// server (or a libssh diagnostic quoting a server's banner) can emit a single
+// line larger than the whole budget; retaining it whole because no earlier line
+// existed to drop would put an attacker-chosen amount of text into memory that
+// is held for the life of the session.
+void TstSshLogRouter::oneOversizedLineIsTruncatedRatherThanRetainedWhole()
+{
+    constexpr qsizetype limit = SshConnectionPool::kTranscriptCharacterLimit;
+    QString transcript;
+    const QString huge = QStringLiteral("HEAD")
+                         + QString(limit * 2, QLatin1Char('x'))
+                         + QStringLiteral("TAIL");
+    SshConnectionPool::appendTranscriptLine(transcript, huge);
+
+    QCOMPARE(transcript.size(), limit + kTruncationMarker.size());
+    QVERIFY(transcript.startsWith(kTruncationMarker));
+    QCOMPARE(transcript.count(kTruncationMarker), qsizetype(1));
+    // The END of the line survives, which is the half a reader needs: the front
+    // is what gets dropped.
+    QVERIFY(transcript.endsWith(QStringLiteral("TAIL")));
+    QVERIFY(!transcript.contains(QStringLiteral("HEAD")));
+
+    // A following ordinary line still leaves exactly one marker.
+    SshConnectionPool::appendTranscriptLine(transcript,
+                                            QStringLiteral("next line"));
+    QCOMPARE(transcript.count(kTruncationMarker), qsizetype(1));
+    QVERIFY(transcript.endsWith(QStringLiteral("next line")));
 }
 
 #if CH_HAVE_LIBSSH
@@ -546,6 +576,6 @@ void TstSshLogRouter::
 
 #endif // CH_HAVE_LIBSSH
 
-QTEST_MAIN(TstSshLogRouter)
+QTEST_GUILESS_MAIN(TstSshLogRouter)
 
 #include "tst_sshlogrouter.moc"

@@ -25,3 +25,13 @@ target_link_libraries(tst_liveagent PRIVATE
 
 add_test(NAME tst_liveagent COMMAND tst_liveagent)
 set_tests_properties(tst_liveagent PROPERTIES LABELS live)
+
+# Console-mode on Windows, for the same reason as src/app/tests: qt_add_executable
+# marks executables as GUI subsystem, which on Windows swallows QTest's stdout and
+# stderr, so a failing assertion reports nothing at all through ctest.
+if(WIN32)
+    set_target_properties(
+        tst_agentmonitor
+        tst_liveagent
+        PROPERTIES WIN32_EXECUTABLE FALSE)
+endif()

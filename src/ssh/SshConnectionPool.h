@@ -129,11 +129,12 @@ private:
 //
 // The handshake is deliberately SYNCHRONOUS and runs on the calling thread. Its
 // worst-case freeze is therefore bounded: connectToHost() sets an explicit
-// SSH_OPTIONS_TIMEOUT (kHandshakeTimeoutSeconds, 15s) unless the user's own
-// OpenSSH ConnectTimeout was parsed from ~/.ssh/config, so a black-holed
-// endpoint stalls the UI thread for at most that timeout rather than libssh's
-// much longer version-dependent default. Channel writes are bounded by the same
-// session timeout (see SshChannelDevice::writeData).
+// SSH_OPTIONS_TIMEOUT (kHandshakeTimeoutSeconds, 15s) BEFORE parsing
+// ~/.ssh/config, so a ConnectTimeout the user really did configure still wins
+// while everyone else keeps the bound. A black-holed endpoint therefore stalls
+// the UI thread for at most that timeout rather than libssh's much longer
+// version-dependent default. Channel writes are bounded by the same session
+// timeout (see SshChannelDevice::writeData).
 class SshConnectionPool : public QObject {
     Q_OBJECT
     Q_PROPERTY(QString diagnosticLog READ diagnosticLog NOTIFY diagnosticLogChanged)
@@ -281,8 +282,9 @@ public:
 
 #if CH_HAVE_LIBSSH
     // Split an ssh_userauth_list() bitmask into the methods this client can
-    // climb. A zero mask means the server did not tell us (the "none" request
-    // errored), and is treated as "try both" — which is what this client did
+    // climb. A zero mask (the server did not tell us) and SSH_AUTH_ERROR (the
+    // query itself failed) both mean "not told", and are treated as "try
+    // everything this client can supply" — which is what this client did
     // unconditionally before multi-step support existed. Guarded because the
     // bit values it decodes are libssh's SSH_AUTH_METHOD_* macros; the mask is
     // never redefined here, so the two cannot drift apart.
@@ -371,11 +373,14 @@ public:
 
 #if CH_HAVE_LIBSSH
     // Open an independent channel on the shared session. Returns nullptr if not
-    // connected or the channel could not be opened. The pool RETAINS ownership:
-    // channels MUST NOT outlive the session — disconnectFromHost()/closeSession()
-    // closes and frees every opened channel before freeing the session. Callers
-    // must not ssh_channel_free() a returned channel themselves; they hand it
-    // back with releaseChannel() instead.
+    // connected or the channel could not be opened. `kind` only labels the
+    // channel: no PTY is negotiated here even for ChannelKind::Pty, because a
+    // channel accepts exactly one pty-req and the terminal type and geometry are
+    // the caller's to choose (SshChannelDevice::startPty). The pool RETAINS
+    // ownership: channels MUST NOT outlive the session —
+    // disconnectFromHost()/closeSession() closes and frees every opened channel
+    // before freeing the session. Callers must not ssh_channel_free() a returned
+    // channel themselves; they hand it back with releaseChannel() instead.
     ssh_channel openChannel(ChannelKind kind);
 
     // Give a channel back: closes it if still open, frees it, and drops it from

@@ -75,8 +75,23 @@ void collectLeafPaneIds(const SplitNode& node, QStringList& out)
         collectLeafPaneIds(child, out);
 }
 
+// Ceiling on a pane-label suffix. Far above any Dev Session a person will ever
+// build, and far enough below INT_MAX that `highest + 1` and `suffix + 1` are
+// always representable.
+//
+// It exists because neither input to the counter is ours. The tree comes off
+// the wire from a server another client also writes to, and the counter itself
+// is read back out of a hand-editable settings file, so "viewer-2147483647" is
+// reachable without anything in this client ever minting it. Adding one to
+// that is signed overflow: undefined behaviour, and in practice a wrap to
+// INT_MIN, which qMax() then floors back to 1 - so the very next split hands
+// out a label a pane already on screen is wearing. Saturating instead keeps
+// the numbers monotonic and the arithmetic defined.
+constexpr int kMaxPaneSuffix = 1000000000;
+
 // Highest n over every "<prefix>n" leaf paneId in the tree, or 0 when none
-// matches. Makes the generated ids deterministic for a given tree.
+// matches, ignoring anything above kMaxPaneSuffix. Makes the generated ids
+// deterministic for a given tree.
 void collectMaxPaneSuffix(const SplitNode& node, const QString& prefix,
                           int& highest)
 {
@@ -85,7 +100,7 @@ void collectMaxPaneSuffix(const SplitNode& node, const QString& prefix,
             return;
         bool ok = false;
         const int n = QStringView(node.paneId).mid(prefix.size()).toInt(&ok);
-        if (ok && n > highest)
+        if (ok && n > highest && n <= kMaxPaneSuffix)
             highest = n;
         return;
     }
@@ -200,8 +215,19 @@ int SessionLayouts::reservePaneSuffix(int index, const SplitNode& tree)
     const QString region = regionKey(index);
     int highest = 0;
     collectMaxPaneSuffix(tree, region + QLatin1Char('-'), highest);
-    const int stored = m_uiState->nextPaneSuffix(m_devSessionId, region);
-    const int next = qMax(stored, highest + 1);
+    int stored = m_uiState->nextPaneSuffix(m_devSessionId, region);
+    // A counter above the ceiling cannot have come from this client - every
+    // write below is bounded by kMaxPaneSuffix - so it is a corrupt or
+    // hand-edited value, and the answer is the same one a MISSING counter gets:
+    // fall back to the tree. Clamping it to the ceiling instead would be worse
+    // than useless, because the ceiling is a fixed point: every later split
+    // would mint the very same label.
+    if (stored > kMaxPaneSuffix)
+        stored = 1;
+    // `highest` is bounded by collectMaxPaneSuffix() and `stored` by the line
+    // above, so both this addition and the `suffix + 1` splitPane() stores
+    // afterwards stay far inside int.
+    const int next = qMin(qMax(stored, highest + 1), kMaxPaneSuffix);
     // Only write when the counter actually moved: this runs on every published
     // tree, including the one a splitter drag republishes, and each write syncs
     // to disk.
@@ -570,7 +596,12 @@ QString SessionLayouts::splitPane(QString region, QString paneId,
         regionKey(index) + QLatin1Char('-') + QString::number(suffix);
     // Consume it: this id is now spent for this Dev Session's region for good,
     // whether or not the pane holding it is ever closed.
-    m_uiState->setNextPaneSuffix(m_devSessionId, regionKey(index), suffix + 1);
+    //
+    // reservePaneSuffix() bounds `suffix` by kMaxPaneSuffix, so this addition
+    // is always representable; qMin keeps what is STORED in the same range, so
+    // the next read never has to treat our own counter as corrupt.
+    m_uiState->setNextPaneSuffix(m_devSessionId, regionKey(index),
+                                 qMin(suffix + 1, kMaxPaneSuffix));
 
     if (leaf->paneId.isEmpty()) {
         // The empty leaf a region is left with after its last pane closed is a

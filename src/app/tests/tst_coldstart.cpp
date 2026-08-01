@@ -1240,11 +1240,15 @@ void TstColdStart::step6_editorPaneSavesToTheRemoteDisk()
     QCOMPARE(QString::fromUtf8(runExec(QStringLiteral("cat '%1'").arg(m_remoteFile))),
              original);
 
-    // Put the file in the viewer region. The persisted split tree carries only
-    // paneIds (ch::SplitNode has no url field) and the shipped UI has no
-    // open-a-file affordance at all, so this assigns the region the same literal
-    // node shape Main.qml's own fallback uses, with the url a "file opened" node
-    // would carry. Everything below is then the real pane path.
+    // Put the file in the viewer region directly rather than through the UI.
+    // The shipped affordance is ViewerDirectoryView's openRequested, which
+    // needs a directory listing pane already showing the parent of the file -
+    // several steps of navigation this gate has no business rehearsing. So the
+    // region is handed the same literal node shape Main.qml's own fallback
+    // uses, carrying the url a "file opened" leaf carries (ch::SplitNode::url,
+    // which IS persisted - Main.qml records it through
+    // SessionLayouts::setPaneUrl, and step 7 relies on that to restore the
+    // pane). Everything below is then the real pane path.
     QQuickItem* viewerRegion = findByType(m_graph->window(), QStringLiteral("ViewerRegion"));
     QVERIFY(viewerRegion != nullptr);
     QVariantMap node;

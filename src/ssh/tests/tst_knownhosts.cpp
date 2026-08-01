@@ -59,6 +59,7 @@ private slots:
     void serializeRoundTrips();
     void emptyStoreIsUnknown();
     void hashedEntryIsOpaqueButPreserved();
+    void malformedHashedHostTokenNeverMatches();
     void hashedHostMatchesAndMismatches();
     void hashedRevokedKeyRefused();
     void bracketedHostPortMatches();
@@ -220,6 +221,51 @@ void TstKnownHosts::hashedHostMatchesAndMismatches()
     QCOMPARE(store.verify(QStringLiteral("other.host"),
                           QStringLiteral("ssh-ed25519"), kEd25519Alpha),
              KnownHosts::Verdict::Unknown);
+}
+
+// A hashed host token whose salt or hash is not valid base64 names no host at
+// all. The decode has to be STRICT for that to hold, and the difference is not
+// theoretical: Qt's lenient decoder SILENTLY DISCARDS characters outside the
+// base64 alphabet, so "Y2-9kZWhhcmJvcg==" decodes to exactly the same bytes as
+// "Y29kZWhhcmJvcg==". A token corrupted in transit — or crafted — therefore
+// resolved to a real hostname and its key line was honoured for that host,
+// while OpenSSH itself would have rejected the line outright. The two tools
+// must agree about which lines in the user's known_hosts file count.
+void TstKnownHosts::malformedHashedHostTokenNeverMatches()
+{
+    const QByteArray salt = QByteArrayLiteral("codeharbor-hash-salt");
+    const QString wellFormed = hashedHost(QStringLiteral("secret.host"), salt);
+    const QString keyFields =
+        QStringLiteral(" ssh-ed25519 ZWQyNTUxOS1rZXktYWxwaGEtMDAwMQ==\n");
+
+    // Control: the intact token DOES match, so the assertions below fail for
+    // the corruption and not for the fixture.
+    QCOMPARE(KnownHosts::parse(wellFormed + keyFields)
+                 .verify(QStringLiteral("secret.host"),
+                         QStringLiteral("ssh-ed25519"), kEd25519Alpha),
+             KnownHosts::Verdict::Match);
+
+    const QStringList parts = wellFormed.split(QLatin1Char('|'));
+    QCOMPARE(parts.size(), 4);
+    // '-' is not in the standard base64 alphabet, so each of these tokens is
+    // malformed while still decoding — leniently — to the correct bytes.
+    const QString dirtyHash = QStringLiteral("|1|%1|%2").arg(
+        parts.at(2), QString(parts.at(3)).insert(2, QLatin1Char('-')));
+    const QString dirtySalt = QStringLiteral("|1|%1|%2").arg(
+        QString(parts.at(2)).insert(2, QLatin1Char('-')), parts.at(3));
+    // And one that is simply unreadable either way.
+    const QString rubbish = QStringLiteral("|1|***|(((not-b64");
+
+    for (const QString& token : {dirtyHash, dirtySalt, rubbish}) {
+        const KnownHosts store = KnownHosts::parse(token + keyFields);
+        QCOMPARE(store.entries().size(), 1);
+        QCOMPARE(store.verify(QStringLiteral("secret.host"),
+                              QStringLiteral("ssh-ed25519"), kEd25519Alpha),
+                 KnownHosts::Verdict::Unknown);
+        // Unreadable, but still the user's file: the line survives a round trip
+        // rather than being quietly rewritten or dropped.
+        QVERIFY(store.serialize().contains(token.toUtf8()));
+    }
 }
 
 void TstKnownHosts::hashedRevokedKeyRefused()
@@ -648,5 +694,5 @@ void TstKnownHosts::recognizesLibsshVersionsWithBrokenHybridKex()
     QVERIFY(!SshConnectionPool::hasBrokenHybridKex(QString()));
 }
 
-QTEST_MAIN(TstKnownHosts)
+QTEST_GUILESS_MAIN(TstKnownHosts)
 #include "tst_knownhosts.moc"

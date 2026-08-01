@@ -132,6 +132,20 @@ QQuickItem *findByName(QQuickItem *root, const QString &objectName)
     return nullptr;
 }
 
+// A row's context-menu entry, found by the words on it. MenuItem is the only
+// thing here that both carries `text` and can be triggered, so the pair is
+// unambiguous without giving every entry an objectName.
+QObject *menuItemNamed(QQuickItem *owner, const QString &text)
+{
+    const auto children = owner->findChildren<QObject *>();
+    for (QObject *child : children) {
+        if (child->property("text").toString() == text
+            && child->metaObject()->indexOfSignal("triggered()") >= 0)
+            return child;
+    }
+    return nullptr;
+}
+
 // Reads an ATTACHED property such as `Accessible.name` or `ToolTip.text`. The
 // attached type ("Accessible", "ToolTip") is resolved through the imports of the
 // QML file that declared it, so the item's own QML context has to be handed to
@@ -377,6 +391,8 @@ private slots:
     void serverSettingsButtonEmitsRequest();
     void dialogContentFitsInsideItsDialog();
     void addButtonsAreLabelledWithoutAPointer();
+    void longNamesAreElidedInsteadOfOverflowingTheSidebar();
+    void rowMenuActionsReachTheWorkspace();
 
 private:
     // Two expanded groups: Alpha[s1,s2,s3], Beta[s4,s5].
@@ -814,6 +830,115 @@ void TstSidebar::addButtonsAreLabelledWithoutAPointer()
                  qPrintable(QStringLiteral("%1 is not reachable by Tab")
                                     .arg(button->objectName())));
     }
+
+    QVERIFY2(fixture.warnings().isEmpty(), qPrintable(fixture.warnings().join(QLatin1Char('\n'))));
+}
+
+// The sidebar is a few hundred pixels wide and the names in it come off a
+// remote server: repository paths and Dev Session names are routinely longer
+// than that. Every label here already asks to be elided, but `elide` does
+// nothing to a Text with no width of its own — and a Label inside a Row/Column
+// positioner has none, so
+// the text simply grew and painted straight over the panel's edge, over the
+// group's add-session button, and over whatever sat beside it.
+//
+// Asserted as GEOMETRY rather than as "the text ends in an ellipsis": eliding
+// is the mechanism, staying inside the panel is the requirement.
+void TstSidebar::longNamesAreElidedInsteadOfOverflowingTheSidebar()
+{
+    ch::GroupRow group = makeGroup(QStringLiteral("g1"),
+                                   QString(120, QLatin1Char('G')),
+                                   {QStringLiteral("s1")});
+    group.sessions[0].session.name = QString(160, QLatin1Char('S'));
+    group.sessions[0].subtitle = QString(160, QLatin1Char('p'));
+
+    SidebarFixture fixture({group});
+    expose(fixture);
+
+    QQuickItem *row = findByName(fixture.root(), QStringLiteral("sessionRow:s1"));
+    QQuickItem *header = findByName(fixture.root(), QStringLiteral("groupHeader:g1"));
+    QQuickItem *addButton = findByName(fixture.root(), QStringLiteral("newSessionButton:g1"));
+    QVERIFY(row && header && addButton);
+
+    const qreal panelRight = fixture.root()->width();
+    for (QQuickItem *owner : {row, header}) {
+        const auto items = allItems(owner);
+        for (QQuickItem *item : items) {
+            // On screen only: a row also owns a rename dialog whose field is
+            // pre-filled with the same long name, and that field is not part of
+            // the panel until it is opened.
+            if (!item->isVisible())
+                continue;
+            const QVariant text = item->property("text");
+            if (!text.isValid() || text.toString().length() < 10)
+                continue;
+            const qreal right = item->mapToScene(QPointF(item->width(), 0)).x();
+            QVERIFY2(right <= panelRight + 0.5,
+                     qPrintable(QStringLiteral("a %1-character label in %2 reaches x=%3, past the "
+                                               "%4-pixel sidebar")
+                                        .arg(text.toString().length())
+                                        .arg(owner->objectName())
+                                        .arg(right)
+                                        .arg(panelRight)));
+        }
+    }
+
+    // The group name must also stop before the button that adds a session to
+    // that group: a name painted over it makes the only route into a Dev
+    // Session unreadable, and the panel edge alone would not catch it.
+    const qreal buttonLeft = addButton->mapToScene(QPointF(0, 0)).x();
+    const auto headerItems = allItems(header);
+    for (QQuickItem *item : headerItems) {
+        if (item->property("text").toString() != group.group.name)
+            continue;
+        QVERIFY2(item->mapToScene(QPointF(item->width(), 0)).x() <= buttonLeft + 0.5,
+                 "the group name runs under its own add-session button");
+    }
+
+    QVERIFY2(fixture.warnings().isEmpty(), qPrintable(fixture.warnings().join(QLatin1Char('\n'))));
+}
+
+// The row's right-click menu is the only place Rename, Duplicate, Move to top
+// and Delete exist at all. Nothing exercised it, so it could be — and was —
+// wired in a way that works only by accident: the entries called `app.*`
+// directly out of a delegate, while every other mutation in this panel goes
+// through the sidebar, which is the object that actually holds `app`. A
+// delegate reaching for a context property it is documented not to need is one
+// refactor away from a ReferenceError that nothing would catch.
+void TstSidebar::rowMenuActionsReachTheWorkspace()
+{
+    SidebarFixture fixture(twoGroups());
+    expose(fixture);
+
+    QQuickItem *row = findByName(fixture.root(), QStringLiteral("sessionRow:s2"));
+    QVERIFY(row);
+    fixture.app.clearCalls();
+
+    const QStringList entries{QStringLiteral("Duplicate"), QStringLiteral("Move to top"),
+                              QStringLiteral("Delete")};
+    for (const QString &entry : entries) {
+        QObject *item = menuItemNamed(row, entry);
+        QVERIFY2(item, qPrintable(QStringLiteral("the session row has no \"%1\" action")
+                                          .arg(entry)));
+        QVERIFY(QMetaObject::invokeMethod(item, "triggered"));
+    }
+    QTest::qWait(50);
+
+    // s2 sits in Alpha, so "move to top" is position 0 of g1.
+    QCOMPARE(fixture.app.calls(),
+             (QStringList{QStringLiteral("duplicateSession(s2)"),
+                          QStringLiteral("moveSession(s2,g1,0)"),
+                          QStringLiteral("deleteSession(s2)")}));
+
+    // Rename is the one entry that goes through a dialog first.
+    fixture.app.clearCalls();
+    QObject *dialog = row->findChild<QObject *>(QStringLiteral("renameDialog:s2"));
+    QObject *field = row->findChild<QObject *>(QStringLiteral("renameField:s2"));
+    QVERIFY(dialog && field);
+    field->setProperty("text", QStringLiteral("renamed"));
+    QMetaObject::invokeMethod(dialog, "accept");
+    QTest::qWait(50);
+    QCOMPARE(fixture.app.calls(), (QStringList{QStringLiteral("renameSession(s2,renamed)")}));
 
     QVERIFY2(fixture.warnings().isEmpty(), qPrintable(fixture.warnings().join(QLatin1Char('\n'))));
 }

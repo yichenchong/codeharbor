@@ -352,8 +352,15 @@ Rectangle {
         const pane = region.paneOwner.paneCache[region.shownPaneId];
         if (!pane)
             return;
-        pane.devSessionId = region.devSessionId;
+        // WORKING DIRECTORY FIRST, exactly as the host pushes the pair (see
+        // Main.qml's retargetTerminals). Assigning devSessionId is what makes a
+        // pane drop its PTY and re-attach, and `tmux new-session -c <dir>`
+        // honours the directory only when it CREATES the session — so a pane
+        // that saw the new id while still holding the old directory would open
+        // its shell in the previous session's checkout, and the directory
+        // arriving a line later could no longer move it.
         pane.workingDir = region.workingDir;
+        pane.devSessionId = region.devSessionId;
         pane.terminalLegacy = region.leafTerminalLegacy();
         pane.terminalPaneId = region.leafTerminalPaneId();
     }

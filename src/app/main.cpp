@@ -134,8 +134,9 @@ int main(int argc, char *argv[])
     // an empty sidebar on top of a perfectly good SSH session.
     sessionBootstrap.connectAndWireFromEnvironment();
 
-    // Agent attention -> OS notification (SPEC 6.2). A box with no notification
-    // daemon degrades to a silent no-op.
+    // Agent attention -> OS notification: a Phase 4 deliverable in SPEC 16, over
+    // the agent states SPEC 6.4 defines. A box with no notification daemon
+    // degrades to a silent no-op.
     ch::Notifier notifier;
     QObject::connect(&agentMonitor, &ch::AgentStatusMonitor::notify, &notifier,
                      &ch::Notifier::notify);

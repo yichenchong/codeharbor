@@ -66,7 +66,11 @@ ROOT="$(git rev-parse --show-toplevel)"
 cd "$ROOT"
 
 # Resolve the current version: newest v* tag, else CMake project version, else 0.0.0.
-current="$(git tag --list 'v*' --sort=-v:refname | head -n1 | sed 's/^v//')"
+# awk, not `head -n1`: `set -o pipefail` is on, and `head` exits after the first
+# line, so on a repository with enough tags to fill the pipe buffer git dies of
+# SIGPIPE (141), pipefail propagates it, and the whole script aborts here with no
+# message. awk consumes the entire stream.
+current="$(git tag --list 'v*' --sort=-v:refname | awk 'NR==1 { sub(/^v/, ""); print }')"
 if [ -z "$current" ]; then
     current="$(node -e 'const s=require("fs").readFileSync("CMakeLists.txt","utf8");const m=s.match(/project\(CodeHarbor[\s\S]*?VERSION\s+(\d+\.\d+\.\d+)/);process.stdout.write(m?m[1]:"0.0.0")')"
 fi
@@ -100,17 +104,33 @@ if [ "$DRY_RUN" -eq 1 ]; then
     exit 0
 fi
 
-# Every file that carries the release version. The two web-bundle manifests are
-# in here because they are real workspaces: leaving them behind is how
+# The npm manifests, rewritten as JSON. Split out from VERSION_FILES below only
+# because they share one edit shape; the two web-bundle manifests are in here
+# because they are real workspaces, and leaving them behind is how
 # src/web/*/package.json drifted to 0.1.0 while the tag said 0.1.7.
-VERSION_FILES=(CMakeLists.txt
-               package.json
-               remote/package.json
-               src/web/terminal/package.json
-               src/web/editor/package.json)
+MANIFEST_FILES=(package.json
+                remote/package.json
+                src/web/terminal/package.json
+                src/web/editor/package.json)
 
-# Guard: never clobber uncommitted edits to the version files we are about to
-# rewrite. Scoped to those files so unrelated work in progress is fine.
+# EVERY file that carries the release version, in the order they are rewritten.
+# This is the list the dirty guard and the existence check work from, so a file
+# that carries the version and is not in here is a file the bump silently skips.
+#
+# remote/src/codeharbord.ts hand-carries RPC_SERVER_VERSION, which the daemon
+# reports to the client in its `server.info` reply and which the client shows to
+# the user verbatim. It was NOT in this list, so it sat at 0.1.0 while the tag
+# said v0.1.8 and every server announced a version three releases stale.
+VERSION_FILES=(CMakeLists.txt
+               remote/src/codeharbord.ts
+               "${MANIFEST_FILES[@]}"
+               package-lock.json)
+
+# Guard: never clobber uncommitted edits to the files we are about to rewrite.
+# package-lock.json is in the list because the block below rewrites AND stages it,
+# so an uncommitted edit there would be swept into the release commit unnoticed -
+# which is precisely what this guard exists to prevent. Scoped to these files so
+# unrelated work in progress is fine.
 if [ "$DO_COMMIT" -eq 1 ] && [ "$ALLOW_DIRTY" -eq 0 ]; then
     dirty="$(git status --porcelain -- "${VERSION_FILES[@]}")"
     [ -z "$dirty" ] || die "version files have uncommitted changes; commit/stash them or pass --allow-dirty:
@@ -118,14 +138,38 @@ $dirty"
 fi
 
 if [ "$DO_COMMIT" -eq 1 ]; then
-    # Version files kept in sync with the tag. package.json edits go through node
-    # so JSON formatting stays intact.
+    # Every file must exist BEFORE the first rewrite. A missing one is a mistake,
+    # not something to skip quietly - a silently un-bumped version is exactly the
+    # bug this list exists to stop - and discovering it halfway through would
+    # leave the tree bumped in some files and not in others.
+    for f in "${VERSION_FILES[@]}"; do
+        [ -f "$f" ] || die "expected version file is missing: $f"
+    done
+
+    # Version files kept in sync with the tag. The two source files are rewritten
+    # with a targeted regex; package.json edits go through node so JSON formatting
+    # stays intact.
     node -e 'const fs=require("fs");let s=fs.readFileSync("CMakeLists.txt","utf8");s=s.replace(/(project\(CodeHarbor[\s\S]*?VERSION\s+)\d+\.\d+\.\d+/,`$1'"$new"'`);fs.writeFileSync("CMakeLists.txt",s)'
     changed=(CMakeLists.txt)
-    for f in "${VERSION_FILES[@]:1}"; do
-        # A missing manifest is a mistake, not something to skip quietly: a
-        # silently un-bumped version is exactly the bug this list exists to stop.
-        [ -f "$f" ] || die "expected version file is missing: $f"
+
+    # RPC_SERVER_VERSION in the daemon. The substitution is anchored on the whole
+    # declaration and asserts it matched, because a silent no-op here is exactly
+    # the failure that let this constant fall three releases behind.
+    node -e '
+const fs=require("fs");
+const f="remote/src/codeharbord.ts";
+const v=process.argv[1];
+const s=fs.readFileSync(f,"utf8");
+const re=/(export const RPC_SERVER_VERSION\s*=\s*")\d+\.\d+\.\d+(")/;
+if(!re.test(s)){
+  console.error(`bump.sh: could not find the RPC_SERVER_VERSION declaration in ${f}`);
+  process.exit(1);
+}
+fs.writeFileSync(f,s.replace(re,`$1${v}$2`));
+' "$new"
+    changed+=(remote/src/codeharbord.ts)
+
+    for f in "${MANIFEST_FILES[@]}"; do
         node -e 'const fs=require("fs");const f=process.argv[1];const j=JSON.parse(fs.readFileSync(f));j.version=process.argv[2];fs.writeFileSync(f,JSON.stringify(j,null,2)+"\n")' "$f" "$new"
         changed+=("$f")
     done
@@ -135,7 +179,6 @@ if [ "$DO_COMMIT" -eq 1 ]; then
     # unless someone runs an install, so leaving the lock out of this list is
     # how it drifted to 0.1.7 while every manifest said 0.1.8 - and a stale lock
     # is what `npm ci` in CI actually installs.
-    [ -f package-lock.json ] || die "expected version file is missing: package-lock.json"
     node -e '
 const fs=require("fs");
 const v=process.argv[1];

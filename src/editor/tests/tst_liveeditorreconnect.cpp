@@ -312,7 +312,7 @@ bool TstLiveEditorReconnect::remoteExec(const QString& command,
     while (!m_sideOut.contains(sentinel) && !deadline.hasExpired())
         QTest::qWait(20);
 
-    const int at = m_sideOut.indexOf(sentinel);
+    const qsizetype at = m_sideOut.indexOf(sentinel);
     if (at < 0) {
         if (stderrText)
             *stderrText = m_sideErr + QStringLiteral(" (sentinel never arrived)");

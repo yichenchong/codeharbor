@@ -180,6 +180,9 @@ private slots:
     void retryFromRebindFailureUsesNewTransport();
     void rebindAfterCloseRevivesClient();
     void methodWithIdIsNotANotification();
+    void responseCarryingMethodIsNeverAResult();
+    void errorCodeOutOfIntRangeWarns();
+    void rebindFromASweptCallbackAnnouncesBoundOnce();
     void nullCallbackIsTolerated();
     void nonObjectJsonWarns();
     void responseQueuedBeforeEofIsStillDelivered();
@@ -989,6 +992,125 @@ void TstRpcClient::methodWithIdIsNotANotification()
                                   {"params", QJsonObject{{"path", "/w"}}}}));
     m_serverSide->flush();
     QTRY_COMPARE(notifySpy.count(), 1);
+}
+
+// The sibling of the case above, and the one it does not reach: a message
+// carrying an id, a method AND a result. JSON-RPC 2.0 section 5 says a response
+// object has jsonrpc/id and exactly one of result/error — never `method` — so
+// this is either a REQUEST aimed at the client or a corrupted response, and its
+// `result` is not an answer to anything. Handing it to the caller as a success
+// would resolve a pending request with a payload from a message that was never
+// a reply to it.
+void TstRpcClient::responseCarryingMethodIsNeverAResult()
+{
+    makePair();
+
+    QSignalSpy warnSpy(m_client, &CodeharbordClient::protocolWarning);
+    QSignalSpy notifySpy(m_client, &CodeharbordClient::notificationReceived);
+
+    QJsonValue res(QJsonValue::Undefined);
+    std::optional<RpcError> got;
+    bool fired = false;
+    const qint64 id = m_client->call(
+        QStringLiteral("file.stat"), QJsonObject{{"path", "/a"}},
+        [&](QJsonValue r, std::optional<RpcError> err) {
+            res = r;
+            got = err;
+            fired = true;
+        });
+
+    m_serverSide->write(jsonLine({{"jsonrpc", "2.0"},
+                                  {"id", id},
+                                  {"method", ch::rpc::kWatchEventNotification},
+                                  {"result", QJsonObject{{"size", 7}}}}));
+    m_serverSide->flush();
+
+    QTRY_VERIFY(fired);
+    QVERIFY(got.has_value()); // failed, NOT resolved with the bogus result
+    QCOMPARE(got->code, -32603);
+    QVERIFY(res.isNull());
+    QCOMPARE(notifySpy.count(), 0); // and it is not a notification either
+    QVERIFY(warnSpy.count() >= 1);
+    QCOMPARE(m_client->pendingCount(), 0);
+}
+
+// An error `code` that is a JSON number but not a whole value an int can hold
+// is best-effort'd to 0 — which is indistinguishable from a server that sent
+// {"code": 0}. The loss must be REPORTED, not silent, exactly like the
+// missing-code case beside it.
+void TstRpcClient::errorCodeOutOfIntRangeWarns()
+{
+    makePair();
+
+    QSignalSpy warnSpy(m_client, &CodeharbordClient::protocolWarning);
+    std::optional<RpcError> got;
+    bool fired = false;
+    const qint64 id = m_client->call(
+        QStringLiteral("file.stat"), QJsonObject{{"path", "/a"}},
+        [&](QJsonValue, std::optional<RpcError> err) {
+            got = err;
+            fired = true;
+        });
+
+    m_serverSide->write(jsonLine({{"jsonrpc", "2.0"},
+                                  {"id", id},
+                                  {"error", QJsonObject{{"code", 1.0e12},
+                                                        {"message", "huge"}}}}));
+    m_serverSide->flush();
+
+    QTRY_VERIFY(fired);
+    QVERIFY(got.has_value());
+    QCOMPARE(got->message, QStringLiteral("huge"));
+    QCOMPARE(got->code, 0); // best effort, and flagged rather than swallowed
+    QTRY_COMPARE(warnSpy.count(), 1);
+    QCOMPARE(m_client->pendingCount(), 0);
+}
+
+// A callback failed by a rebind's pending-sweep may rebind AGAIN — reconnecting
+// is the plausible reaction to a transport error. That nested setTransport()
+// runs the whole bind itself, so the outer call must notice it no longer holds
+// the device it was binding and stop: otherwise it drains a transport it does
+// not own and announces transportBound() a second time, making every consumer
+// re-establish its server-side state (a file.watch subscription) twice over.
+void TstRpcClient::rebindFromASweptCallbackAnnouncesBoundOnce()
+{
+    ScriptedDevice first;
+    ScriptedDevice second;
+    ScriptedDevice third;
+    m_client->setTransport(&first);
+
+    QSignalSpy boundSpy(m_client, &CodeharbordClient::transportBound);
+
+    int swept = 0;
+    m_client->call(QStringLiteral("workspace.list"), QJsonValue(),
+                   [&](QJsonValue, std::optional<RpcError> err) {
+                       QVERIFY(err.has_value());
+                       ++swept;
+                       m_client->setTransport(&third);
+                   });
+    QCOMPARE(m_client->pendingCount(), 1);
+
+    m_client->setTransport(&second);
+
+    QCOMPARE(swept, 1);
+    // The callback's bind is the one that stands, and it was announced once.
+    QVERIFY(m_client->transport() == &third);
+    QCOMPARE(boundSpy.count(), 1);
+
+    // And the surviving transport really carries traffic.
+    bool answered = false;
+    const qint64 id = m_client->call(
+        QStringLiteral("ping"), QJsonValue(),
+        [&](QJsonValue, std::optional<RpcError> err) {
+            QVERIFY(!err.has_value());
+            answered = true;
+        });
+    third.deliver(
+        jsonLine({{"jsonrpc", "2.0"}, {"id", id}, {"result", QJsonObject{}}}));
+    QVERIFY(answered);
+    QCOMPARE(m_client->pendingCount(), 0);
+
+    m_client->setTransport(nullptr);
 }
 
 // A null callback is a legitimate fire-and-forget request. The response must be

@@ -650,8 +650,13 @@ void AppController::submitCredential(QString secret, QString kind)
 
 void AppController::disconnectServer()
 {
-    if (!m_bootstrap)
-        return;
+    // Deliberately NOT gated on m_bootstrap. Everything below the teardown call
+    // is CLIENT-side state - a parked prompt, a gathered secret, the active Dev
+    // Session - and it is just as wrong to keep any of it when there is no
+    // session spine to tear down. An early return here left refuseServer()'s
+    // deferred disconnect (and any shell built without a bootstrap) wedged with
+    // m_connecting set, which refuses every later connect.
+    //
     // A disconnect while a host-key prompt is parked also abandons that
     // attempt; leaving m_connecting set would wedge every later connect.
     m_connecting = false;
@@ -677,9 +682,11 @@ void AppController::disconnectServer()
     // runs every pending callback inline before returning, so they all land
     // inside this scope. A client that ever deferred them would need this flag
     // cleared by the arrival of the LAST failure instead.
-    m_tearingDown = true;
-    const auto restore = qScopeGuard([this] { m_tearingDown = false; });
-    m_bootstrap->disconnectSession();
+    if (m_bootstrap) {
+        m_tearingDown = true;
+        const auto restore = qScopeGuard([this] { m_tearingDown = false; });
+        m_bootstrap->disconnectSession();
+    }
 
     // Land on a clear empty state instead of a half-live shell. The Dev
     // Session context is unreachable now, and leaving it "active" is not
@@ -717,10 +724,16 @@ void AppController::adoptServerIdentity()
                    [self](QJsonValue result, std::optional<RpcError> err) {
                        if (!self)
                            return;
-                       if (err) {
-                           emit self->error(err->message);
+                       // reportIfError(), not a bare emit: a teardown WE
+                       // started fails every in-flight call by design (the
+                       // client synthesises "transport closed with request
+                       // pending"), and this call is in flight for the whole
+                       // window a user's Disconnect covers. Painting that red
+                       // tells the user something broke when they are the one
+                       // who pressed the button. Every other callback in this
+                       // class already routes through the same gate.
+                       if (self->reportIfError(err))
                            return;
-                       }
                        const QJsonObject info = result.toObject();
                        // Compatibility gate, BEFORE anything is adopted.
                        // `schemaVersion` was parsed and then never checked, so
@@ -745,18 +758,7 @@ void AppController::adoptServerIdentity()
                                             : remoteVersion)
                                    .arg(schema)
                                    .arg(kMinimumServerSchemaVersion);
-                           emit self->error(message);
-                           // Refuse rather than limp on. Deferred by one event-
-                           // loop turn because we are INSIDE a
-                           // CodeharbordClient response callback and the
-                           // teardown drops that very client's transport.
-                           QTimer::singleShot(0, self, [self, message] {
-                               if (!self)
-                                   return;
-                               self->disconnectServer();
-                               self->setConnectionState(
-                                   QStringLiteral("failed"), message);
-                           });
+                           self->refuseServer(message);
                            return;
                        }
                        // Forward the server's recovery directory to the editor
@@ -770,7 +772,14 @@ void AppController::adoptServerIdentity()
                        const QString id =
                            info.value(QStringLiteral("serverId")).toString();
                        if (id.isEmpty()) {
-                           emit self->error(
+                           // Refused on the same terms as a too-old server, and
+                           // for the same reason: workspace rows are keyed by
+                           // this id, so carrying on would leave a healthy SSH
+                           // session showing a permanently empty sidebar with
+                           // nothing but a toast to explain it. Any server at
+                           // or above the schema floor reports one (SPEC 3.5),
+                           // so an empty value is a broken remote, not skew.
+                           self->refuseServer(
                                tr("Server did not report an identity; refusing to "
                                   "key this workspace to a client-side id."));
                            return;
@@ -792,6 +801,23 @@ void AppController::adoptServerIdentity()
                        // active session and refreshes.
                        self->setServerId(id);
                    });
+}
+
+void AppController::refuseServer(const QString& message)
+{
+    emit error(message);
+    // Refuse rather than limp on. Deferred by one event-loop turn because both
+    // callers run INSIDE a CodeharbordClient response callback and the teardown
+    // drops that very client's transport. The QPointer keeps the deferred work
+    // from touching a controller destroyed in the meantime; QTimer's context
+    // overload would already cancel it, and the explicit check documents why.
+    QPointer<AppController> self(this);
+    QTimer::singleShot(0, this, [self, message] {
+        if (!self)
+            return;
+        self->disconnectServer();
+        self->setConnectionState(QStringLiteral("failed"), message);
+    });
 }
 
 bool AppController::sessionExists(const QString& devSessionId) const

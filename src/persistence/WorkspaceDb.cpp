@@ -160,9 +160,12 @@ GroupNode parseGroupNode(const QJsonObject& obj)
     return node;
 }
 
-QVector<GroupNode> parseGroupList(const QJsonValue& result)
+// Takes the already-kind-checked array rather than a QJsonValue: toArray() on
+// anything else yields an EMPTY array, which would report a wrong-kind result
+// as an empty-but-successful sidebar. The one caller checks isArray() first,
+// and this signature is what keeps a future one from forgetting.
+QVector<GroupNode> parseGroupList(const QJsonArray& array)
 {
-    const QJsonArray array = result.toArray();
     QVector<GroupNode> groups;
     groups.reserve(array.size());
     for (const QJsonValue& group : array) {
@@ -416,7 +419,7 @@ void WorkspaceDb::list(const ServerId& serverId, ListCallback cb)
                                        "a JSON array of groups"));
                 return;
             }
-            cb(parseGroupList(result), std::nullopt);
+            cb(parseGroupList(result.toArray()), std::nullopt);
         });
 }
 
@@ -645,10 +648,33 @@ void WorkspaceDb::setLayout(const ServerId& serverId,
         {QStringLiteral("region"), regionKey(region)},
         {QStringLiteral("tree"), tree.toJson()},
     };
-    // setLayout always echoes the upserted SessionLayout row, never null.
-    m_client->call(QString::fromLatin1(rpc::kMethodWorkspaceSetLayout), params,
-                   recordHandler(rpc::kMethodWorkspaceSetLayout, std::move(cb),
-                                 parseLayoutRow));
+    m_client->call(
+        QString::fromLatin1(rpc::kMethodWorkspaceSetLayout), params,
+        [cb = std::move(cb)](QJsonValue result, std::optional<RpcError> error) {
+            if (error) {
+                cb(std::nullopt, std::move(error));
+                return;
+            }
+            if (!result.isObject()) {
+                cb(std::nullopt, malformedResult(rpc::kMethodWorkspaceSetLayout,
+                                                 "a SessionLayout object"));
+                return;
+            }
+            // Unlike getLayout, setLayout has NO legitimate "there is no layout
+            // here" answer: it echoes the row it has just stored. So a row whose
+            // `tree` is missing or fails SplitNode validation is a malformed
+            // reply, not an absent layout, and handing the caller
+            // (no tree, no error) would tell it the write succeeded while
+            // silently giving it nothing to adopt.
+            std::optional<SplitNode> stored = parseLayoutRow(result.toObject());
+            if (!stored) {
+                cb(std::nullopt,
+                   malformedResult(rpc::kMethodWorkspaceSetLayout,
+                                   "a SessionLayout object with a valid tree"));
+                return;
+            }
+            cb(std::move(stored), std::nullopt);
+        });
 }
 
 } // namespace ch

@@ -391,13 +391,25 @@ QStringList identityFileCandidates(ssh_session session,
 
     add(profileIdentityFile);
 
-    // The public API exposes the first identity parsed from ~/.ssh/config.
-    // Keep it after the explicitly saved profile value, which deliberately has
+    // The public API exposes the first identity in libssh's list — the one
+    // parsed from ~/.ssh/config when the config named an IdentityFile. Keep it
+    // after the explicitly saved profile value, which deliberately has
     // precedence over broader OpenSSH defaults.
+    //
+    // A fresh session's list is NOT empty, though: libssh seeds it with its own
+    // defaults, spelled with the tokens it expands at connect time
+    // ("%d/id_ed25519", %d being the .ssh directory). Those are not paths any
+    // file API can open, and accepting one would ALSO make `candidates`
+    // non-empty and so skip the real ~/.ssh scan below — leaving the Windows
+    // named-pipe-agent fallback, the only caller that reads this list, with a
+    // single unopenable key and no way to reach the user's actual keys. Anything
+    // still carrying a libssh '%' escape is therefore dropped.
     char* configuredIdentity = nullptr;
     if (ssh_options_get(session, SSH_OPTIONS_IDENTITY, &configuredIdentity)
         == SSH_OK) {
-        add(QFile::decodeName(configuredIdentity));
+        const QString identity = QFile::decodeName(configuredIdentity);
+        if (!identity.contains(QLatin1Char('%')))
+            add(identity);
         ssh_string_free_char(configuredIdentity);
     }
 
@@ -486,14 +498,21 @@ SshConnectionPool::AuthOutcome authenticateIdentityFiles(
 SshConnectionPool::AuthMethods SshConnectionPool::methodsFromMask(
     int userauthListMask)
 {
-    const unsigned int mask = static_cast<unsigned int>(userauthListMask);
-    if (mask == SSH_AUTH_METHOD_UNKNOWN) {
+    // ssh_userauth_list() answers a bitmask, 0 when the server never sent a
+    // method list, and SSH_AUTH_ERROR (-1) when the query itself failed. Both
+    // mean "we were not told", and both take the fallback below. Testing the
+    // signed value is deliberate: reinterpreting -1 as unsigned happens to set
+    // every bit, which reaches the same answer by accident rather than on
+    // purpose, and would quietly stop doing so the day a new method bit is
+    // added that this client must not assume is on offer.
+    if (userauthListMask <= 0) {
         // The server did not say. Try everything this client can supply rather
         // than nothing: this is what the single-step ladder did before, and
         // refusing here would turn a missing method list into a connection that
         // cannot authenticate at all.
         return AuthMethods{true, true, true};
     }
+    const unsigned int mask = static_cast<unsigned int>(userauthListMask);
     AuthMethods offered;
     offered.publicKey = (mask & SSH_AUTH_METHOD_PUBLICKEY) != 0;
     offered.password = (mask & SSH_AUTH_METHOD_PASSWORD) != 0;
@@ -509,8 +528,10 @@ SshConnectionPool::AuthOutcome SshConnectionPool::classifyAuthResult(
     // accepted and the server wants another one. Everything that is neither
     // success nor partial (denied, error, again, keyboard-interactive info) ends
     // this rung — SSH_AUTH_AGAIN cannot occur here because the session is
-    // blocking, and SSH_AUTH_INFO is consumed by the keyboard-interactive loop
-    // in authenticate() before this classifier ever sees a terminal result.
+    // blocking, and SSH_AUTH_INFO reaches this classifier only when the
+    // keyboard-interactive loop in authenticate() gave up mid-conversation
+    // (nobody supplied an answer, libssh refused one, or the round cap was hit),
+    // which is a refusal and not progress.
     switch (libsshResult) {
     case SSH_AUTH_SUCCESS:
         return AuthOutcome::Granted;
@@ -585,13 +606,25 @@ bool SshConnectionPool::connectToHost(const QString& host, quint16 port,
     setOption(SSH_OPTIONS_HOST, hostUtf8.constData(),
               QStringLiteral("SSH host"));
 
+    // SH15: cap the worst-case handshake freeze (see kHandshakeTimeoutSeconds).
+    // Applied BEFORE the user's OpenSSH config is parsed, not after: libssh's
+    // config parser calls ssh_options_set(SSH_OPTIONS_TIMEOUT) for a
+    // ConnectTimeout directive, so a user who set one still wins, while a user
+    // whose config says nothing about timeouts keeps this bound. Setting it
+    // after the parse instead would have overridden the user's ConnectTimeout,
+    // and skipping it whenever a config exists at all — which is nearly every
+    // developer machine — silently removed the bound this constant exists for.
+    const long handshakeTimeout = kHandshakeTimeoutSeconds;
+    setOption(SSH_OPTIONS_TIMEOUT, &handshakeTimeout,
+              QStringLiteral("handshake timeout (%1s)")
+                  .arg(kHandshakeTimeoutSeconds));
+
     // libssh only learns IdentityFile, ProxyJump and the rest of the user's
     // OpenSSH configuration when asked to parse it. Set Host first so its
     // `Host` blocks match, then re-apply the explicitly saved user/port below:
     // profile values deliberately win over broad config defaults.
     const QString configPath =
         QDir::home().filePath(QStringLiteral(".ssh/config"));
-    bool userConfigParsed = false;
     if (QFileInfo(configPath).isFile()) {
         appendDiagnostic(
             QStringLiteral("Parsing SSH configuration: %1").arg(configPath));
@@ -609,7 +642,6 @@ bool SshConnectionPool::connectToHost(const QString& host, quint16 port,
             setState(State::Error);
             return false;
         }
-        userConfigParsed = true;
     }
 
     setOption(SSH_OPTIONS_PORT, &portValue, QStringLiteral("SSH port"));
@@ -619,18 +651,6 @@ bool SshConnectionPool::connectToHost(const QString& host, quint16 port,
         const QByteArray identityUtf8 = QFile::encodeName(m_identityFile);
         setOption(SSH_OPTIONS_IDENTITY, identityUtf8.constData(),
                   QStringLiteral("private key file %1").arg(m_identityFile));
-    }
-
-    // SH15: cap the worst-case handshake freeze (see kHandshakeTimeoutSeconds).
-    // Skipped when a user OpenSSH config was parsed above: it may carry a
-    // ConnectTimeout the user set, and libssh offers no getter to tell whether
-    // ssh_options_parse_config() already applied SSH_OPTIONS_TIMEOUT — so
-    // parsing a config at all means this client must not override it.
-    if (!userConfigParsed) {
-        const long handshakeTimeout = kHandshakeTimeoutSeconds;
-        setOption(SSH_OPTIONS_TIMEOUT, &handshakeTimeout,
-                  QStringLiteral("handshake timeout (%1s)")
-                      .arg(kHandshakeTimeoutSeconds));
     }
 
     // libssh 0.12.0's mlkem768x25519-sha256 branch hands ssh_buffer_pack() an
@@ -1166,14 +1186,15 @@ ssh_channel SshConnectionPool::openChannel(ChannelKind kind)
         return nullptr;
     }
 
-    // Terminal channels want a PTY; the caller drives shell/exec and I/O. A
-    // failed PTY request must not masquerade as a usable channel.
-    if (kind == ChannelKind::Pty
-        && ssh_channel_request_pty(channel) != SSH_OK) {
-        ssh_channel_close(channel);
-        ssh_channel_free(channel);
-        return nullptr;
-    }
+    // No PTY is negotiated here, whatever `kind` says. ssh_channel_request_pty()
+    // hard-codes TERM=xterm at 80x24, and a pty-req may be sent only ONCE per
+    // channel, so requesting it here left SshChannelDevice::startPty() able to
+    // change only the window size — silently downgrading the TERM its caller
+    // asked for (the terminal panes ask for xterm-256color) to a 16-colour one.
+    // The device issues the single pty-req itself, with the terminal type and
+    // geometry it was given. `kind` remains the channel's label for the pool's
+    // own bookkeeping and diagnostics.
+    Q_UNUSED(kind);
 
     // The pool owns the channel: track it so closeSession() frees it before the
     // session, preventing a double-free through ssh_free()'s channel teardown.

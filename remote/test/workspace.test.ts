@@ -1887,6 +1887,56 @@ test("RW15: setLayout rejects a params object with no tree", () => {
     );
 });
 
+// `null` is not "leave it alone". The nullable fields genuinely mean "clear
+// this" (updateSession taskDescription, update*Pane title/harness/…), but the
+// columns that cannot be null — a group's name, a session's repositoryRoot, a
+// viewer pane's url, a terminal pane's slot label — used to accept a null,
+// discard it through the store's `?? current` fallback, and answer the caller
+// with a success and an unchanged row. A caller that meant to rename something
+// was told it had.
+test("RW15: a null is rejected for the fields that cannot be cleared", () => {
+    for (const [method, params, field] of [
+        ["workspace.updateGroup", { id: "g", name: null }, "name"],
+        ["workspace.updateSession", { id: "s", name: null }, "name"],
+        ["workspace.updateSession", { id: "s", repositoryRoot: null }, "repositoryRoot"],
+        ["workspace.updateViewerPane", { id: "v", url: null }, "url"],
+        ["workspace.updateTerminalPane", { id: "t", name: null }, "name"],
+    ] as const) {
+        assert.throws(
+            () => WORKSPACE_METHODS[method](params),
+            new RegExp(`${method.replace(".", "\\.")}: missing or invalid field '${field}'`),
+            `${method}.${field} accepted a null`,
+        );
+    }
+});
+
+// `position` on a create/update is written STRAIGHT into the ordering column
+// that every other path (packOrder) keeps at contiguous integers 0..n-1.
+// SQLite stores -5 and 2.5 verbatim in an INTEGER-affinity column, so one such
+// call left the scope ordered around a negative or fractional slot for ever
+// after, and nextPosition then handed the following row 3.5.
+test("RW15: a fractional or negative position is rejected by every create/update", () => {
+    const cases: Array<[keyof typeof WORKSPACE_METHODS, Record<string, unknown>]> = [
+        ["workspace.createGroup", { serverId: SERVER, name: "G" }],
+        ["workspace.updateGroup", { id: "g" }],
+        ["workspace.createSession", { serverId: SERVER, groupId: "g", name: "S", repositoryRoot: "/r" }],
+        ["workspace.updateSession", { id: "s" }],
+        ["workspace.createViewerPane", { serverId: SERVER, devSessionId: "s", url: "u" }],
+        ["workspace.updateViewerPane", { id: "v" }],
+        ["workspace.createTerminalPane", { serverId: SERVER, devSessionId: "s", name: "t" }],
+        ["workspace.updateTerminalPane", { id: "t" }],
+    ];
+    for (const [method, base] of cases) {
+        for (const position of [2.5, -1, Number.NaN]) {
+            assert.throws(
+                () => WORKSPACE_METHODS[method]({ ...base, position }),
+                /field 'position' must be a non-negative integer/,
+                `${method} accepted position ${position}`,
+            );
+        }
+    }
+});
+
 // Every create is a read-then-write (read the scope's highest position, then
 // insert at one past it) and now runs inside a transaction, so two connections
 // cannot both claim the same position and leave the ordering to be broken by
@@ -2175,6 +2225,66 @@ test("isDatabaseBusy recognizes a real lock failure and nothing else", async () 
     );
     assert.equal(isDatabaseBusy(new Error("database is locked")), false);
     holder.close();
+
+    await cleanup(dbPath);
+});
+
+// A split tree is authored by the CLIENT, so its pane ids are arbitrary
+// strings. duplicateSession looked each one up in a plain object literal, and
+// a leaf whose paneId was "constructor" or "toString" therefore resolved to a
+// FUNCTION inherited from Object.prototype — which JSON.stringify drops, so
+// the copied leaf came out with no paneId at all and the region rendered
+// empty. The lookup is a Map now, which has no inherited keys.
+test("duplicateSession leaves a paneId named after an Object.prototype member alone", async () => {
+    const dbPath = await tmpDbPath();
+    const ws = openWorkspace(dbPath);
+    const g = ws.createGroup({ serverId: SERVER, name: "G" });
+    const s = ws.createSession({ serverId: SERVER, groupId: g.id, name: "S", repositoryRoot: "/r" });
+    const real = ws.createViewerPane({ serverId: SERVER, devSessionId: s.id, url: "u" });
+    ws.setLayout({
+        serverId: SERVER,
+        devSessionId: s.id,
+        region: "viewer",
+        tree: {
+            type: "split",
+            orientation: "horizontal",
+            ratios: [0.5, 0.5],
+            children: [
+                { type: "leaf", paneId: "constructor" },
+                { type: "leaf", paneId: real.id, terminalPaneId: "toString" },
+            ],
+        },
+    });
+
+    const copy = ws.duplicateSession({ id: s.id });
+    const tree = copy.layouts.viewer as { children: Array<Record<string, unknown>> };
+    // The unmapped id survives verbatim rather than vanishing...
+    assert.equal(tree.children[0].paneId, "constructor");
+    // ...the mapped one is still remapped to the copied pane...
+    assert.equal(tree.children[1].paneId, copy.viewerPanes[0].id);
+    assert.notEqual(copy.viewerPanes[0].id, real.id);
+    // ...and an unmapped terminalPaneId is dropped, not turned into a function.
+    assert.equal("terminalPaneId" in tree.children[1], false);
+
+    ws.close();
+    await cleanup(dbPath);
+});
+
+// schemaVersion() reads the stored version and answers 0 when the table is not
+// there yet. It used to answer 0 for EVERY failure, so a database this build
+// cannot read at all was mistaken for an unmigrated one: migrate() went on to
+// BEGIN IMMEDIATE and the full schema.sql, and the operator was shown whichever
+// of those failed second instead of the actual defect.
+test("openWorkspace reports why an unreadable database failed, not a downstream error", async () => {
+    const dbPath = await tmpDbPath();
+    const broken = new DatabaseSync(dbPath);
+    applyConnectionPragmas(broken);
+    // A schema_version table whose shape this build does not understand: the
+    // version SELECT fails on the column, not on the table.
+    broken.exec("CREATE TABLE schema_version (id INTEGER NOT NULL PRIMARY KEY, v INTEGER NOT NULL)");
+    broken.close();
+
+    assert.throws(() => openWorkspace(dbPath), /no such column: version/);
 
     await cleanup(dbPath);
 });

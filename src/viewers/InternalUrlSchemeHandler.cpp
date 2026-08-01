@@ -70,6 +70,13 @@ QUrl InternalUrlMap::fileUrlFor(const QString &internalUrl) const
     QString id;
     if (u.scheme().compare(scheme(), Qt::CaseInsensitive) == 0) {
         // codeharbor-internal://file/<id>: host is "file", path is "/<id>".
+        // The authority is checked, not assumed. InternalUrlSchemeHandler
+        // refuses any other host (a differing host is a differing web origin),
+        // and this inverse has to agree with it: an accepting inverse next to a
+        // refusing handler is precisely the sort of split that lets a URL be
+        // "valid" on one side of the subsystem and rejected on the other.
+        if (u.host().compare(QLatin1String("file"), Qt::CaseInsensitive) != 0)
+            return QUrl();
         id = u.path();
         if (id.startsWith(QLatin1Char('/')))
             id = id.mid(1);

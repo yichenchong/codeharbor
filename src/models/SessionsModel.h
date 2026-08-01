@@ -60,6 +60,8 @@ public:
     // adopted. For every session whose aggregate row-state actually changes, a
     // targeted dataChanged() for RowStateRole is emitted for just that row, so
     // the sidebar's delegates (and the id-tracked selection) survive untouched.
+    // Every row is adopted BEFORE the first signal goes out, so a slot reading
+    // any other row already sees its new value.
     // If the structure has drifted, this falls back to a full setGroups().
     void updateTerminalStates(QVector<GroupRow> groups);
 

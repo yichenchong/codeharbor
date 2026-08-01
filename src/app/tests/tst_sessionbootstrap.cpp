@@ -364,6 +364,7 @@ private slots:
     void disconnectDuringProbeCutsTheWaitShort();
     void disablingReconnectDuringProbeStopsTheLadder();
     void disconnectMidBackoffStopsImmediately();
+    void disablingReconnectDuringAUserConnectLeavesItAlone();
 
     // Remote command construction from attacker-influenced profile fields.
     void remoteCommandsQuoteHostileProfileFields();
@@ -1223,6 +1224,64 @@ void TstSessionBootstrap::disconnectMidBackoffStopsImmediately()
     QCOMPARE(h.boot.state(), State::Disconnected);
     QCOMPARE(h.boot.connectCalls, 1);
     QCOMPARE(h.boot.probeCalls, 1);
+}
+
+// The other side of disablingReconnectDuringProbeStopsTheLadder(): the switch
+// governs the automatic LADDER, and a connect the user asked for themselves is
+// not the ladder's to abandon.
+//
+// This used to strand the whole object. setReconnectEnabled(false) cancelled
+// whatever attempt was in flight, including a connectAndWire() parked in its
+// pre-flight; that attempt then unwound with the cancel flag set, and
+// connectAndWire() deliberately does NOT relabel a cancelled attempt Failed
+// (a cancel means the canceller chose the end state, which is true of
+// disconnectSession() and of nothing else). So nothing ever moved the state
+// off Connecting: no session, no error, no retry armed, and the connect button
+// stuck on "connecting" for the rest of the run.
+//
+// The observable is the STATE, not the clock: a manual connect must be allowed
+// to finish, pass or fail, on its own terms.
+void TstSessionBootstrap::disablingReconnectDuringAUserConnectLeavesItAlone()
+{
+    ProbeServer server;
+    server.mute = true;
+    QVERIFY(server.listen(QHostAddress::LocalHost, 0));
+
+    Harness h;
+    h.useRealProbeAgainst(server.serverPort());
+    h.boot.setConnectTimeoutMs(kProbeBudgetMs);
+    QSignalSpy errorSpy(&h.boot, &SessionBootstrap::error);
+
+    // Comfortably inside the budget, so it lands while the pre-flight really is
+    // parked rather than after it has unwound.
+    bool toggled = false;
+    QTimer::singleShot(30, &h.boot, [&] {
+        h.boot.setReconnectEnabled(false);
+        toggled = true;
+    });
+
+    QVERIFY(!h.wire());
+    QVERIFY2(toggled, "the toggle never ran inside the pre-flight");
+
+    // The connect ran to its own conclusion and SAID so.
+    QCOMPARE(h.boot.state(), State::Failed);
+    QCOMPARE(errorSpy.size(), 1);
+    QVERIFY2(errorSpy.at(0).at(0).toString().contains(
+                 QStringLiteral("did not answer within")),
+             qPrintable(errorSpy.at(0).at(0).toString()));
+    QVERIFY(!h.boot.reconnectPending());
+
+    // ...and the object is not wedged: the very next connect still works, which
+    // a stranded m_attempting/m_cancelRequested pair would refuse.
+    h.boot.realProbe = false;
+    QVERIFY2(h.wire(), "a later connect was refused after the toggle");
+    QCOMPARE(h.boot.state(), State::Wired);
+
+    // Reconnect really is off, though: losing the session now leaves it down
+    // rather than arming a rung.
+    h.boot.rpcChannel()->dropRemote();
+    QCOMPARE(h.boot.state(), State::Disconnected);
+    QVERIFY(!h.boot.reconnectPending());
 }
 namespace {
 

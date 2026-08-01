@@ -74,6 +74,7 @@ private slots:
     void splitTreeWithoutTerminalPaneIdIsUnchangedByTheField();
     void splitTreeSplitTerminalPaneIdIgnoredOnRoundTrip();
     void workspaceValueTypesCompareEveryField();
+    void updateTerminalStatesFinishesEveryRowBeforeSignalling();
 };
 
 // Group -> DevSession -> viewer + terminal panes tree.
@@ -1403,6 +1404,55 @@ void TstModels::workspaceValueTypesCompareEveryField()
         mutate(changed);
         QVERIFY(!(changed == term));
     }
+}
+
+// updateTerminalStates has to put the WHOLE model into its new state before the
+// first dataChanged goes out. A receiver that reads another row from inside its
+// slot - a proxy model recomputing a filter, a delegate re-evaluating a binding -
+// would otherwise be shown rows that are still carrying their previous terminal
+// state, and a receiver that reacted by calling setGroups() would free the
+// vectors the update loop is still walking.
+void TstModels::updateTerminalStatesFinishesEveryRowBeforeSignalling()
+{
+    SessionsModel model;
+
+    const auto session = [](const QString &id, AgentState agent) {
+        SessionRow row;
+        row.session.id = DevSessionId{id};
+        row.session.name = id;
+        row.terminals = {terminal(TerminalState::Ready, agent)};
+        return row;
+    };
+
+    GroupRow g;
+    g.group.id = GroupId{QStringLiteral("g1")};
+    g.sessions = {session(QStringLiteral("s1"), AgentState::Idle),
+                  session(QStringLiteral("s2"), AgentState::Idle)};
+    model.setGroups({g});
+
+    const QModelIndex groupIndex = model.index(0, 0);
+    const QModelIndex s1 = model.index(0, 0, groupIndex);
+    const QModelIndex s2 = model.index(1, 0, groupIndex);
+
+    // Record what the model reports for BOTH rows each time a change is
+    // announced, including the very first announcement.
+    QVector<int> s1AtSignal;
+    QVector<int> s2AtSignal;
+    QObject::connect(&model, &QAbstractItemModel::dataChanged, &model,
+                     [&](const QModelIndex &, const QModelIndex &, const QList<int> &) {
+                         s1AtSignal.append(model.data(s1, SessionsModel::RowStateRole).toInt());
+                         s2AtSignal.append(model.data(s2, SessionsModel::RowStateRole).toInt());
+                     });
+
+    // Both rows move Idle -> Error, so two signals go out.
+    GroupRow refreshed = g;
+    refreshed.sessions = {session(QStringLiteral("s1"), AgentState::Error),
+                          session(QStringLiteral("s2"), AgentState::Error)};
+    model.updateTerminalStates({refreshed});
+
+    const int error = static_cast<int>(SessionRowState::Error);
+    QCOMPARE(s1AtSignal, QVector<int>({error, error}));
+    QCOMPARE(s2AtSignal, QVector<int>({error, error}));
 }
 
 QTEST_GUILESS_MAIN(TstModels)

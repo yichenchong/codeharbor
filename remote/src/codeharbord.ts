@@ -64,7 +64,13 @@ export {
 };
 
 export const RPC_SERVER_NAME = "codeharbord";
-export const RPC_SERVER_VERSION = "0.1.0";
+// The release version, reported by server.info and shown to the USER verbatim
+// in the client's "Server too old: codeharbord <version> speaks ..." message
+// (AppController). It must match remote/package.json, which the release script
+// (.omp/skills/bump-version/bump.sh) rewrites; this constant is NOT one of that
+// script's version files, which is how it sat at 0.1.0 while the tag said
+// 0.1.8 and every server reported a version three releases stale.
+export const RPC_SERVER_VERSION = "0.1.8";
 // Bumped 1 -> 2 when file.listDirectory joined the C1 catalog (SPEC 7.5).
 // Bumped 2 -> 3 when the tmux.* discovery group joined the catalog (SPEC 10.2).
 // Bumped 3 -> 4 when server.info gained `serverId` (SPEC 3.5).
@@ -292,32 +298,69 @@ export async function handleLine(line: string): Promise<RpcResponse | null> {
 
 /**
  * Hand-written line framer mirroring the C++ client's bounded reader
- * (kMaxLineBytes in src/remote/CodeharbordClient.cpp, C3). Accumulates incoming
- * chunks into a pending Buffer, emits each newline-delimited line via `onLine`,
- * and calls `onOverflow` once the pending buffer grows past MAX_LINE_BYTES with
- * no newline yet seen — the signal to drop the connection rather than buffer a
- * frame without bound. Node's readline owns its buffer and offers no maximum
- * line option, so the framing is done by hand here. Returns the per-chunk feed.
+ * (kMaxLineBytes in src/remote/CodeharbordClient.cpp, C3). Emits each
+ * newline-delimited line via `onLine`, and calls `onOverflow` once the bytes
+ * held for an unfinished line pass MAX_LINE_BYTES — the signal to drop the
+ * connection rather than buffer a frame without bound. Node's readline owns its
+ * buffer and offers no maximum line option, so the framing is done by hand
+ * here. Returns the per-chunk feed.
+ *
+ * Incomplete lines are held as a LIST of chunk slices and joined only when the
+ * newline arrives. Appending each chunk to one growing Buffer instead (a
+ * Buffer.concat per chunk) copies everything received so far on every chunk, so
+ * a 16 MiB frame — which is a routine file.writeFile of a large file, base64 —
+ * arriving in 64 KiB reads costs gigabytes of memcpy for a megabytes-sized
+ * request. The join is one copy of the finished line.
+ *
+ * After an overflow the framer RESYNCHRONIZES: everything up to the next
+ * newline is discarded instead of being framed as a line of its own. Emitting
+ * the tail of an oversized frame would hand the dispatcher an arbitrary slice
+ * of a payload the peer never finished — parsed as if it were a request the
+ * peer had actually sent — and would fire `onOverflow` again for every further
+ * MAX_LINE_BYTES of the same frame.
  */
 export function createLineFramer(
     onLine: (line: string) => void,
     onOverflow: () => void,
 ): (chunk: Buffer) => void {
-    let pending: Buffer = Buffer.alloc(0);
+    let held: Buffer[] = [];
+    let heldBytes = 0;
+    // True between an overflow and the newline that ends the offending frame.
+    let discarding = false;
     return (chunk) => {
-        pending = pending.length === 0 ? chunk : Buffer.concat([pending, chunk]);
-        let nl = pending.indexOf(0x0a);
+        let start = 0;
+        let nl = chunk.indexOf(0x0a);
         while (nl !== -1) {
-            onLine(pending.subarray(0, nl).toString("utf8"));
-            pending = pending.subarray(nl + 1);
-            nl = pending.indexOf(0x0a);
+            const segment = chunk.subarray(start, nl);
+            if (discarding) {
+                // The end of the over-cap frame: drop it and resume framing.
+                discarding = false;
+            } else if (heldBytes === 0) {
+                onLine(segment.toString("utf8"));
+            } else {
+                held.push(segment);
+                onLine(Buffer.concat(held, heldBytes + segment.length).toString("utf8"));
+            }
+            held = [];
+            heldBytes = 0;
+            start = nl + 1;
+            nl = chunk.indexOf(0x0a, start);
+        }
+        // Still inside the over-cap frame: this whole chunk is part of it.
+        if (discarding) return;
+        if (start < chunk.length) {
+            const rest = chunk.subarray(start);
+            held.push(rest);
+            heldBytes += rest.length;
         }
         // Past the cap with no newline: a peer is streaming an unbounded frame.
-        // Tracking the pending byte length and checking it here bounds memory
-        // to roughly one chunk beyond the cap, unlike a post-line length check
-        // that only fires once the whole oversized line is already resident.
-        if (pending.length > MAX_LINE_BYTES) {
-            pending = Buffer.alloc(0);
+        // Checking the held byte count here bounds memory to roughly one chunk
+        // beyond the cap, unlike a post-line length check that only fires once
+        // the whole oversized line is already resident.
+        if (heldBytes > MAX_LINE_BYTES) {
+            held = [];
+            heldBytes = 0;
+            discarding = true;
             onOverflow();
         }
     };
@@ -351,6 +394,14 @@ export interface WatchNotificationRelay {
     deliver(event: WatchEvent): void;
     // Forget everything held for a subscription the service has released.
     forget(subscriptionId: string): void;
+    // Report that SOMEONE ELSE's write to the same stream reported a full
+    // buffer. The relay shares `out` with the RPC response writer, and only
+    // sees the return value of its own writes; without this a response that
+    // stalled the stream would leave the relay believing the output is still
+    // flowing, so every subsequent notification would be written straight into
+    // an internal buffer with no bound — the exact failure the queue below
+    // exists to prevent. Cleared by the stream's next 'drain'.
+    stall(): void;
     // Queue depth, for tests asserting the bound actually holds.
     pendingCount(): number;
 }
@@ -482,6 +533,9 @@ export function createWatchNotificationRelay(
             }
             lost.delete(subscriptionId);
         },
+        stall() {
+            stalled = true;
+        },
         pendingCount: () => pending.size,
     };
 }
@@ -534,6 +588,13 @@ export function runStdio(): void {
     // ordering hazard that would be a real bug — two concurrent writes to the
     // SAME path racing their revision check against their rename — is already
     // serialized per path by the write locks in files.ts.
+    // Every response goes through here so the watch relay learns when the
+    // SHARED stdout stalls. The relay only sees the return value of its own
+    // writes; a large response that filled the buffer would otherwise leave it
+    // writing notifications straight into an unbounded internal buffer.
+    const writeOut = (line: string): void => {
+        if (!process.stdout.write(line)) watchRelay.stall();
+    };
     const dispatchLine = (line: string): void => {
         // Skip separator lines without copying the line: trim() on a multi-MiB
         // base64 file.writeFile frame duplicates the whole string just to answer
@@ -543,14 +604,14 @@ export function runStdio(): void {
             .then((response) => {
                 if (!response) return;
                 try {
-                    process.stdout.write(`${JSON.stringify(response)}\n`);
+                    writeOut(`${JSON.stringify(response)}\n`);
                 } catch {
                     // Only a non-serializable handler payload (a reference
                     // cycle, or a BigInt) reaches here. Answer the request with
                     // an internal error so the client's pending call completes
                     // instead of waiting forever for a line that cannot be
                     // produced.
-                    process.stdout.write(
+                    writeOut(
                         `${JSON.stringify({
                             jsonrpc: "2.0",
                             id: response.id,
@@ -567,7 +628,7 @@ export function runStdio(): void {
                 // unhandled promise rejection is fatal by default in Node: one
                 // future non-total code path would take the whole service — and
                 // every live watch subscription — down with it.
-                process.stdout.write(
+                writeOut(
                     `${JSON.stringify({
                         jsonrpc: "2.0",
                         id: null,

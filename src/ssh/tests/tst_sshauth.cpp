@@ -259,15 +259,18 @@ void TstSshAuth::partialIsClassifiedApartFromSuccessAndFailure()
              AuthOutcome::Refused);
     QCOMPARE(SshConnectionPool::classifyAuthResult(SSH_AUTH_AGAIN),
              AuthOutcome::Refused);
-    // Keyboard-interactive's "more prompts follow" is not partial success: this
-    // client never requests that method and must not treat it as progress.
+    // Keyboard-interactive's "more prompts follow" is not partial success. It
+    // reaches this classifier only when the conversation was abandoned mid-way
+    // (nobody supplied an answer, libssh refused one, or the round cap was
+    // hit), and every one of those ends the rung rather than advancing it.
     QCOMPARE(SshConnectionPool::classifyAuthResult(SSH_AUTH_INFO),
              AuthOutcome::Refused);
 }
 
-// ssh_userauth_list() answers 0 when the server never sent a method list. That
-// must not be read as "no method is allowed" — the client would then refuse to
-// try anything at all and every connection would fail.
+// ssh_userauth_list() answers 0 when the server never sent a method list, and
+// SSH_AUTH_ERROR (-1) when the query itself failed. Neither may be read as "no
+// method is allowed" — the client would then refuse to try anything at all and
+// every connection would fail.
 void TstSshAuth::anUnknownMethodMaskFallsBackToTryingBoth()
 {
     const AuthMethods unknown =
@@ -275,6 +278,16 @@ void TstSshAuth::anUnknownMethodMaskFallsBackToTryingBoth()
     QVERIFY(unknown.publicKey);
     QVERIFY(unknown.password);
     QVERIFY(unknown.keyboardInteractive);
+
+    // The error return is a NEGATIVE int, not a bitmask. Decoding it as one
+    // happens to set every bit today, which reaches the right answer by
+    // accident; the fallback has to be reached on purpose so a future method
+    // bit cannot silently be reported as offered.
+    const AuthMethods errored =
+        SshConnectionPool::methodsFromMask(SSH_AUTH_ERROR);
+    QVERIFY(errored.publicKey);
+    QVERIFY(errored.password);
+    QVERIFY(errored.keyboardInteractive);
 
     const AuthMethods both = SshConnectionPool::methodsFromMask(
         SSH_AUTH_METHOD_PUBLICKEY | SSH_AUTH_METHOD_PASSWORD);
@@ -313,5 +326,5 @@ void TstSshAuth::anUnknownMethodMaskFallsBackToTryingBoth()
 
 #endif // CH_HAVE_LIBSSH
 
-QTEST_MAIN(TstSshAuth)
+QTEST_GUILESS_MAIN(TstSshAuth)
 #include "tst_sshauth.moc"

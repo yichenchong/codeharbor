@@ -32,7 +32,7 @@ The client provides only UI, rendering, input, and transport.
 
 ```text
 src/            C++/QML client
-  app/          application entry + QML
+  app/          application entry (main.cpp) + AppController, session bootstrap
   models/       core data model (Group, DevSession, panes)
   persistence/  workspace load/save, over codeharbord RPC (no local database)
   ssh/          libssh connection pool, channels, host-key handling

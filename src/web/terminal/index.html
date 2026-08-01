@@ -51,8 +51,13 @@
     /* The two alert backgrounds are darkened blends with no Theme role of their
        own; the foregrounds are Theme.danger and Theme.warning. */
     .ch-terminal-status[data-state="error"] { background: #45222c; color: #f38ba8; }
-    .ch-terminal-status[data-state="disconnected"],
-    .ch-terminal-status[data-state="reconnecting"] { background: #3a2f1e; color: #f9e2af; }
+    /* The six values this attribute can ever hold are exactly
+       ch::toString(ch::TerminalState): unloaded, opening_channel,
+       attaching_tmux, ready, disconnected, error. Session-level progress
+       (connecting/authenticating/reconnecting) is tracked once for the whole
+       application and never reaches a pane (see SessionState.h), so there is
+       deliberately no rule for it. */
+    .ch-terminal-status[data-state="disconnected"] { background: #3a2f1e; color: #f9e2af; }
     .ch-terminal-surface { flex: 1 1 auto; min-height: 0; }
 
     /* ---- scrollbars ----------------------------------------------------

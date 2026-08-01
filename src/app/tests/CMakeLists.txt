@@ -87,9 +87,10 @@ target_link_libraries(tst_livereconnect PRIVATE
 add_test(NAME tst_livereconnect COMMAND tst_livereconnect)
 set_tests_properties(tst_livereconnect PROPERTIES LABELS live TIMEOUT 300)
 
-# Notifier (SPEC 6.2). tst_notifier forces a bus-less environment in its own
-# main() so it exercises the headless no-op path everywhere; tst_notifierlive
-# is the only proof that a notification reaches a real display.
+# Notifier (a Phase 4 deliverable in SPEC 16; it has no section of its own).
+# tst_notifier forces a bus-less environment in its own main() so it exercises
+# the headless no-op path everywhere; tst_notifierlive is the only proof that a
+# notification reaches a real display.
 qt_add_executable(tst_notifier tst_notifier.cpp)
 target_link_libraries(tst_notifier PRIVATE ch_app Qt6::Test Qt6::Core)
 add_test(NAME tst_notifier COMMAND tst_notifier)

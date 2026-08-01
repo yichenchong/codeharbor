@@ -10,6 +10,7 @@
 #include <QJsonArray>
 #include <QJsonObject>
 #include <QJsonValue>
+#include <QList>
 #include <QMetaObject>
 #include <QPointer>
 #include <QVariantMap>
@@ -44,6 +45,31 @@ QString viewKindFor(ViewerResolution resolution)
     // Download / OpenExternally / Error all fall back to the binary view, which
     // shows metadata plus a download/open affordance.
     return QStringLiteral("binary");
+}
+
+// One remote directory entry on its way to the {name, kind} map QML consumes.
+// Sorting these rather than the finished QVariantMaps keeps the comparator off
+// QVariant::toMap() and QMap key lookups, which it would otherwise pay four
+// times for every single comparison.
+struct DirectoryEntry {
+    QString name;
+    QString kind;
+};
+
+// Directories first, then by name. The name comparison is case-insensitive with
+// a case-sensitive tie-break, so two names differing only in case ("Readme" vs
+// "readme") get a stable, reproducible order instead of whatever std::sort
+// happens to produce for "equal" elements.
+bool directoryEntryLess(const DirectoryEntry &a, const DirectoryEntry &b)
+{
+    const bool aDir = a.kind == QLatin1String("directory");
+    const bool bDir = b.kind == QLatin1String("directory");
+    if (aDir != bDir)
+        return aDir;
+    const int folded = a.name.compare(b.name, Qt::CaseInsensitive);
+    if (folded != 0)
+        return folded < 0;
+    return a.name.compare(b.name, Qt::CaseSensitive) < 0;
 }
 
 } // namespace
@@ -144,49 +170,69 @@ QString ViewerModel::readTextFile(const QString &path)
         [guard, path, token](QJsonValue result, std::optional<RpcError> error) {
             if (!guard)
                 return;
-            // cancelTextFile() dropped this exact read: ignore its reply.
-            // Removing the token here is also what stops the set from growing —
-            // a settled read is no longer in flight.
-            if (!guard->m_liveTextReads.remove(token))
-                return;
-            if (error) {
-                emit guard->textFileError(token, path, error->message);
-                return;
-            }
-            const QJsonObject obj = result.toObject();
-            if (obj.value(QStringLiteral("truncated")).toBool()) {
-                // Report the failure rather than silently showing a prefix of
-                // the file as if it were the whole thing.
-                emit guard->textFileError(
-                    token, path,
-                    QStringLiteral("file is too large to display inline"));
-                return;
-            }
-            const QString encoding =
-                obj.value(QStringLiteral("encoding")).toString();
-            const QString content =
-                obj.value(QStringLiteral("content")).toString();
-            // Text is served utf-8; decode a base64 payload defensively so the
-            // view still shows something legible for near-text binaries. A
-            // malformed payload is reported, never rendered as an empty file.
-            QString text = content;
-            if (encoding == QLatin1String("base64")) {
-                QByteArray encoded = content.toUtf8();
-                const auto decoded = QByteArray::fromBase64Encoding(
-                    std::move(encoded),
-                    QByteArray::Base64Encoding
-                        | QByteArray::AbortOnBase64DecodingErrors);
-                if (!decoded) {
-                    emit guard->textFileError(
-                        token, path,
-                        QStringLiteral("file contents could not be decoded"));
-                    return;
-                }
-                text = QString::fromUtf8(*decoded);
-            }
-            emit guard->textFileRead(token, path, text);
+            // NEVER settled straight from here. call() runs its callback
+            // SYNCHRONOUSLY when it cannot transmit — no transport bound,
+            // transport closed, short write — which is exactly the state a
+            // dropped SSH session leaves the client in. That reply would be
+            // emitted before readTextFile() had returned the token, so the pane
+            // (which matches replies by token) would throw its own failure away
+            // and sit on "Loading…" for good. One queued hop puts every reply
+            // after the token, and the context object makes it die with the
+            // model.
+            ViewerModel *const self = guard;
+            QMetaObject::invokeMethod(
+                self,
+                [self, path, token, result = std::move(result),
+                 error = std::move(error)] {
+                    self->settleTextRead(token, path, result, error);
+                },
+                Qt::QueuedConnection);
         });
     return token;
+}
+
+void ViewerModel::settleTextRead(const QString &token, const QString &path,
+                                 const QJsonValue &result,
+                                 const std::optional<RpcError> &error)
+{
+    // cancelTextFile() dropped this exact read: ignore its reply. Removing the
+    // token here is also what stops the set from growing — a settled read is no
+    // longer in flight.
+    if (!m_liveTextReads.remove(token))
+        return;
+    if (error) {
+        emit textFileError(token, path, error->message);
+        return;
+    }
+    const QJsonObject obj = result.toObject();
+    if (obj.value(QStringLiteral("truncated")).toBool()) {
+        // Report the failure rather than silently showing a prefix of the file
+        // as if it were the whole thing.
+        emit textFileError(token, path,
+                           QStringLiteral("file is too large to display inline"));
+        return;
+    }
+    const QString encoding = obj.value(QStringLiteral("encoding")).toString();
+    const QString content = obj.value(QStringLiteral("content")).toString();
+    // Text is served utf-8; decode a base64 payload defensively so the view
+    // still shows something legible for near-text binaries. A malformed payload
+    // is reported, never rendered as an empty file.
+    QString text = content;
+    if (encoding == QLatin1String("base64")) {
+        QByteArray encoded = content.toUtf8();
+        const auto decoded = QByteArray::fromBase64Encoding(
+            std::move(encoded),
+            QByteArray::Base64Encoding
+                | QByteArray::AbortOnBase64DecodingErrors);
+        if (!decoded) {
+            emit textFileError(
+                token, path,
+                QStringLiteral("file contents could not be decoded"));
+            return;
+        }
+        text = QString::fromUtf8(*decoded);
+    }
+    emit textFileRead(token, path, text);
 }
 
 void ViewerModel::cancelTextFile(const QString &token)
@@ -218,44 +264,24 @@ void ViewerModel::listDirectory(const QString &path)
             }
             const QJsonArray array =
                 result.toObject().value(QStringLiteral("entries")).toArray();
-            QVariantList entries;
-            entries.reserve(array.size());
+            QList<DirectoryEntry> parsed;
+            parsed.reserve(array.size());
             for (const QJsonValue &value : array) {
                 const QJsonObject entry = value.toObject();
+                parsed.append(
+                    DirectoryEntry{entry.value(QStringLiteral("name")).toString(),
+                                   entry.value(QStringLiteral("kind")).toString()});
+            }
+            // Server order is unspecified.
+            std::sort(parsed.begin(), parsed.end(), directoryEntryLess);
+            QVariantList entries;
+            entries.reserve(parsed.size());
+            for (const DirectoryEntry &entry : std::as_const(parsed)) {
                 entries.push_back(QVariantMap{
-                    {QStringLiteral("name"),
-                     entry.value(QStringLiteral("name")).toString()},
-                    {QStringLiteral("kind"),
-                     entry.value(QStringLiteral("kind")).toString()},
+                    {QStringLiteral("name"), entry.name},
+                    {QStringLiteral("kind"), entry.kind},
                 });
             }
-            // Server order is unspecified; sort directories first, then by
-            // name. The name comparison is case-insensitive with a
-            // case-sensitive tie-break, so two names differing only in case
-            // ("Readme" vs "readme") get a stable, reproducible order instead
-            // of whatever std::sort happens to produce for "equal" elements.
-            std::sort(entries.begin(), entries.end(),
-                      [](const QVariant &a, const QVariant &b) {
-                          const QVariantMap ma = a.toMap();
-                          const QVariantMap mb = b.toMap();
-                          const bool aDir =
-                              ma.value(QStringLiteral("kind")).toString()
-                              == QLatin1String("directory");
-                          const bool bDir =
-                              mb.value(QStringLiteral("kind")).toString()
-                              == QLatin1String("directory");
-                          if (aDir != bDir)
-                              return aDir;
-                          const QString na =
-                              ma.value(QStringLiteral("name")).toString();
-                          const QString nb =
-                              mb.value(QStringLiteral("name")).toString();
-                          const int folded =
-                              na.compare(nb, Qt::CaseInsensitive);
-                          if (folded != 0)
-                              return folded < 0;
-                          return na.compare(nb, Qt::CaseSensitive) < 0;
-                      });
             emit guard->directoryListed(path, entries);
         });
 }

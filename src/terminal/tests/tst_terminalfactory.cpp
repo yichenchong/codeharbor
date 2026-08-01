@@ -11,7 +11,6 @@
 
 #include <QBuffer>
 #include <QByteArray>
-#include <QHash>
 #include <QMetaMethod>
 #include <QMetaObject>
 #include <QMetaProperty>
@@ -19,10 +18,8 @@
 #include <QSignalSpy>
 #include <QString>
 #include <QStringList>
-#include <QVector>
 
 #include <limits>
-#include <utility>
 
 #include "Ids.h"
 #include "SessionState.h"

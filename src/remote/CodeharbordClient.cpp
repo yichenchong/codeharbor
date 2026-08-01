@@ -190,13 +190,25 @@ void CodeharbordClient::setTransport(QIODevice* transport)
             return;
     }
 
-    if (!m_transport)
+    // A callback in the sweep above may itself have rebound (a reconnect is the
+    // plausible reaction to a transport error) or detached. That nested
+    // setTransport() already drained and announced whatever it bound, so the
+    // rest of THIS call now belongs to a device we no longer hold: carrying on
+    // would drain the wrong transport and emit a SECOND transportBound() for
+    // it, making every consumer re-establish its server-side state twice.
+    if (m_transport != transport || !m_transport)
         return;
 
     // Drain anything already buffered on the transport before we subscribed.
     if (m_transport->bytesAvailable() > 0) {
         onReadyRead();
         if (!self)
+            return;
+        // The drain can end the connection outright — a queued EOF frame, or an
+        // unframed line past the size cap — and a callback it dispatched can
+        // rebind just like one in the sweep. Announcing a usable transport after
+        // either would be a lie.
+        if (m_closed || m_transport != transport)
             return;
     }
 
@@ -282,6 +294,11 @@ qint64 CodeharbordClient::call(const QString& method, const QJsonValue& params,
     }
 
     if (!failReason.isEmpty()) {
+        // A protocolWarning slot is free to delete this client, so everything
+        // that still touches a member has to survive that. Guard the emit the
+        // way onReadyRead() does and bail out to the callback — which is a local
+        // copy, like `error` and `id` — the moment the object is gone.
+        QPointer<CodeharbordClient> self(this);
         emit protocolWarning(
             QStringLiteral("call(%1): %2").arg(method, failReason));
         RpcError error;
@@ -291,7 +308,7 @@ qint64 CodeharbordClient::call(const QString& method, const QJsonValue& params,
         // transport closed first: that fails every OTHER pending caller exactly
         // once. Nothing after this point touches a member, so a callback that
         // deletes this client from inside the teardown is safe.
-        if (framingLost)
+        if (framingLost && self)
             onTransportClosed();
         // Deliver the failure exactly once and register nothing. The callback
         // may delete this client, so touch no members after invoking it; `id`
@@ -460,6 +477,26 @@ void CodeharbordClient::processLine(const QByteArray& line)
     const ResponseCallback cb = it.value();
     m_pending.erase(it);
 
+    // JSON-RPC 2.0 section 5: a response object carries jsonrpc/id and exactly
+    // one of result/error — never `method`. Reaching here with one means the
+    // message is either a REQUEST aimed at us (which this client does not
+    // implement) or a corrupted response, so it is not an answer to anything and
+    // its `result` must not be handed to the caller as one. Fail the caller
+    // instead: that is what keeps the exactly-once contract honest for a message
+    // the notification branch above deliberately refused.
+    if (!methodValue.isUndefined()) {
+        emit protocolWarning(
+            QStringLiteral("response %1 carries a method member; treating as "
+                           "malformed").arg(id));
+        RpcError error;
+        error.code = kInternalError;
+        error.message =
+            QStringLiteral("malformed response: carries a method member");
+        if (cb)
+            cb(QJsonValue(), error);
+        return;
+    }
+
     // JSON-RPC 2.0 section 5: a response carries exactly one of result/error.
     // `error` counts as present only when it is a non-null value: servers
     // commonly spell a successful response {"result":…,"error":null}, and
@@ -479,16 +516,23 @@ void CodeharbordClient::processLine(const QByteArray& line)
         RpcError error;
         if (errValue.isObject()) {
             const QJsonObject errObj = errValue.toObject();
+            const QJsonValue codeValue = errObj.value(QStringLiteral("code"));
             // A well-formed error object has an integer code and string message
             // (JSON-RPC 2.0 section 5.1). Surface the violation but still fail
             // the callback with best-effort fields so the caller cannot hang.
-            if (!errObj.value(QStringLiteral("code")).isDouble() ||
+            //
+            // `code` is probed with two distinct sentinels for the same reason
+            // the id is: toInt() silently yields its defaultValue for a
+            // fractional or out-of-int-range number, so `{"code": 1e12}` would
+            // otherwise reach the caller as a perfectly plausible-looking 0 with
+            // no hint that anything was lost.
+            if (!codeValue.isDouble() || codeValue.toInt(0) != codeValue.toInt(1) ||
                 !errObj.value(QStringLiteral("message")).isString()) {
                 emit protocolWarning(
                     QStringLiteral("response %1 error object missing code/message")
                         .arg(id));
             }
-            error.code = errObj.value(QStringLiteral("code")).toInt();
+            error.code = codeValue.toInt();
             error.message = errObj.value(QStringLiteral("message")).toString();
             error.data = errObj.value(QStringLiteral("data"));
         } else {
@@ -695,6 +739,8 @@ void CodeharbordClient::onHeartbeatTick()
                            "intervals of %2 ms; treating transport as dead")
                 .arg(m_heartbeatMissTolerance)
                 .arg(m_heartbeatIntervalMs));
+        if (!self)
+            return; // the warning slot deleted us; there is nothing left to tear down
         onTransportClosed();
         return;
     }

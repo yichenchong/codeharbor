@@ -42,6 +42,12 @@ ItemDelegate {
     // the sessions column width); fall back to the parent's width otherwise.
     // This is a Repeater/Column delegate, never a ListView delegate, so there
     // is no ListView.view to size against.
+    //
+    // `implicitWidth` is a CONSTANT rather than the control's usual
+    // content-derived one, because the labels below are sized FROM this row's
+    // width: a content-derived implicit width would close that loop into a
+    // binding cycle the moment a row was built without a parent.
+    implicitWidth: 240
     width: parent ? parent.width : implicitWidth
     height: 44
 
@@ -170,14 +176,28 @@ ItemDelegate {
         Column {
             spacing: 2
             anchors.verticalCenter: parent.verticalCenter
+            // Text elides only against a WIDTH, and a Label inside a Column
+            // inside a Row has none of its own: without this the two labels
+            // grew to their full natural width, so a long session name or
+            // repository path ran straight off the edge of the sidebar,
+            // `elide` notwithstanding.
+            //
+            // Measured from the Row's OWN width, which the control sets to its
+            // available width (the delegate's width less its padding) — not
+            // from the Row's implicit width, which is derived from these very
+            // children and would be a cycle.
+            width: Math.max(0, parent.width - parent.leftPadding - dot.width
+                            - parent.spacing - 8)
 
             Label {
+                width: parent.width
                 text: row.name
                 color: Theme.text
                 font.pixelSize: Theme.fontSizeLabel
                 elide: Text.ElideRight
             }
             Label {
+                width: parent.width
                 text: row.subtitle
                 color: Theme.textDim
                 font.pixelSize: 11
@@ -228,16 +248,16 @@ ItemDelegate {
         }
         MenuItem {
             text: qsTr("Duplicate")
-            onTriggered: app.duplicateSession(row.itemId)
+            onTriggered: if (row.host) row.host.duplicateSession(row.itemId)
         }
         MenuItem {
             text: qsTr("Move to top")
             // Move within the current group to position 0.
-            onTriggered: app.moveSession(row.itemId, row.groupId, 0)
+            onTriggered: if (row.host) row.host.moveSessionToTop(row.itemId, row.groupId)
         }
         MenuItem {
             text: qsTr("Delete")
-            onTriggered: app.deleteSession(row.itemId)
+            onTriggered: if (row.host) row.host.deleteSession(row.itemId)
         }
     }
 
@@ -284,8 +304,8 @@ ItemDelegate {
         }
 
         onAccepted: {
-            if (renameField.text.length > 0)
-                app.renameSession(row.itemId, renameField.text);
+            if (row.host && renameField.text.length > 0)
+                row.host.renameSession(row.itemId, renameField.text);
         }
     }
 }

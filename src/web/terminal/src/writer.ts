@@ -71,11 +71,24 @@ export class CoalescingWriter {
      *  `bytes` is the batch's PTY byte weight, reported back through
      *  `onConsumed` once the sink has consumed it. */
     write(data: string, bytes: number): void {
-        if (this.closed || data.length === 0) {
+        if (this.closed) {
+            return;
+        }
+        // The WEIGHT is accumulated even when the text is empty; the empty text
+        // itself is dropped rather than pumped as an empty chunk. The two are
+        // separate quantities: the C++ side charges every PTY byte it emits
+        // against its flow-control window, and a batch can legitimately decode
+        // to no text at all (a multi-byte sequence split across two flushes).
+        // Returning early on an empty string would strand those bytes
+        // unacknowledged for good and bleed the controller's credit away one
+        // truncated glyph at a time until the pane stopped receiving output.
+        // Carrying them onto the next chunk that does have text is exactly what
+        // ch::TerminalBridge does with its own undelivered-byte carry.
+        this.backlogBytes += bytes;
+        if (data.length === 0) {
             return;
         }
         this.backlog += data;
-        this.backlogBytes += bytes;
         this.pump();
     }
 

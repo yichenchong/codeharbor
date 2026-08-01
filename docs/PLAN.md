@@ -214,13 +214,23 @@ graph TD
   really packaged (esbuild → qrc), built automatically at configure time.
 - **Parallel with:** T.
 
-### A — Agent awareness — ✅ LANDED (Wave 4); live gate MET (Wave 5)
+### A — Agent awareness — ✅ LANDED (Wave 4) except SPEC 6.6 fallback detection; live gate MET (Wave 5)
 - **Start gate:** [x] bridge+adapters DONE · [x] S agent channel (ChannelKind::AgentStatus) · [x] U sidebar.
 - **TODO:**
   - [x] `AgentStatusMonitor` (C++) consuming AgentEvent JSONL over the agent channel.
   - [x] Map `AgentState` → sidebar row precedence + unseen-completion; markSeen clears the badge; notify() hook on waiting_input/idle_unseen (OS notification display-deferred).
   - [x] `oh-my-pi` installable hook emitting BridgeMessage through the bridge (single mapping point); `pi`/`claude-code` adapters already registered server-side.
-  - [x] Fallback coarse activity detection (SPEC 6.6) for the adapterless `generic` harness.
+  - [ ] Fallback coarse activity detection (SPEC 6.6) for the adapterless `generic`
+    harness. **NOT DONE.** `FallbackActivityDetector`
+    (`remote/src/adapters/fallback.ts`) exists and is correct, but nothing in
+    production constructs it — the only caller is
+    `remote/test/agent-hook.test.ts`. SPEC 6.6 needs exactly one input, terminal
+    OUTPUT BYTES, and no part of the daemon has a source for them: `codeharbord.ts`
+    reads only JSON-RPC lines from stdin, `bridge.ts` only hook messages from a Unix
+    socket, and `tmux.ts` only ever runs `list-sessions`/`kill-session` (there is no
+    `capture-pane` or `pipe-pane` anywhere in `remote/`). Terminal output exists on
+    the CLIENT side only, so wiring this up is a new server-side output tap, not a
+    missing connection.
 - **Stop gate:** ✅ MET — `tst_liveagent` runs the REAL hook on the remote side
   (one node process per firing) into the REAL bridge, over an SSH AgentStatus
   channel, and observes the ordered transitions
@@ -465,8 +475,9 @@ drag-reorder regression it briefly introduced caught by `tst_sidebar` and fixed.
 >   the key as unknown, and parked awaiting a prompt nobody could answer headlessly —
 >   which reads exactly like a broken auto-reconnect. The product was right; the
 >   coverage is not.
-> - **Two live gates hardcode the dev layout.** `tst_livessh:194` and
->   `tst_liveagent:355` build their remote command from
+> - **Two live gates hardcode the dev layout.**
+>   `TstLiveSsh::rpcServerInfoOverSshChannel()` and
+>   `TstLiveAgent::bridgeChannelWiresMonitor()` build their remote command from
 >   `<CH_LIVE_REPO>/remote/src/*.ts` instead of going through
 >   `SessionBootstrap::entryCandidates()`, so they only pass against a git
 >   checkout and fail against an unpacked release tarball. Not a product defect —

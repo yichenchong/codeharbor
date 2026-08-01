@@ -33,8 +33,21 @@ ItemDelegate {
     // delegate itself, so there is no ListView.view to size against — reading
     // one here only ever yielded null and the implicitWidth fallback. Same rule
     // as SessionRow.
+    //
+    // `implicitWidth` is a CONSTANT rather than the control's usual
+    // content-derived one, because the name label below is sized FROM this
+    // header's width: a content-derived implicit width would close that loop
+    // into a binding cycle the moment a header was built without a parent.
+    implicitWidth: 240
     width: parent ? parent.width : implicitWidth
     height: 32
+
+    // Where this header's own text has to stop: the add-session button pinned
+    // to the right edge, or that edge itself while the button is hidden. The
+    // button is a child of the HEADER rather than of the content row, so it is
+    // not part of what the row lays out around.
+    readonly property real contentRightEdge:
+        newSessionButton.visible ? newSessionButton.x : header.width - 8
 
     // Without this a screen reader announces an unnamed item: the delegate's own
     // `text` property is unused (the name arrives in `name`, a SessionsModel
@@ -85,10 +98,25 @@ ItemDelegate {
             font.pixelSize: Theme.fontSizeLabel
             elide: Text.ElideRight
             anchors.verticalCenter: parent.verticalCenter
+            // Text elides only against a WIDTH. Without one this label grew to
+            // the group name's full natural width, so a long name ran under the
+            // "collapsed" tag and under the add-session button pinned to the
+            // right edge — the two things a header needs to keep legible.
+            //
+            // Measured against `contentRightEdge` in HEADER coordinates, since
+            // the button is a child of the header and not of this Row; the
+            // Row's own implicit width is derived from these children and would
+            // be a cycle.
+            width: Math.max(0, header.contentRightEdge - header.leftPadding
+                            - parent.leftPadding - chevron.width - parent.spacing
+                            - (collapsedTag.visible
+                               ? collapsedTag.implicitWidth + parent.spacing : 0)
+                            - 6)
         }
         // Collapsed groups hide their rows, so the header is the only thing
         // left saying there is anything in there at all.
         Label {
+            id: collapsedTag
             text: qsTr("collapsed")
             visible: header.collapsed
             color: Theme.textDim

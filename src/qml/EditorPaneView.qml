@@ -1,5 +1,6 @@
 import QtQuick
 import QtQuick.Controls.Basic
+import QtQuick.Layouts
 import QtWebEngine
 import QtWebChannel
 import "RemotePath.js" as RemotePath
@@ -129,8 +130,9 @@ Item {
         anchors.fill: parent
 
         // Privileged profile: permits the WebChannel bridge (the external
-        // profile deliberately does not — SPEC 7.2). The bundle is trusted app
-        // code, so scripting is intentionally on.
+        // profile deliberately does not — SPEC 7.3, "Browser Profiles", which
+        // is the section requiring the two-profile split). The bundle is
+        // trusted app code, so scripting is intentionally on.
         profile: root.viewerModel ? root.viewerModel.internalProfile() : null
         settings.javascriptEnabled: true
         settings.localContentCanAccessFileUrls: false
@@ -235,6 +237,145 @@ Item {
         }
     }
 
+    // ---- crash recovery (SPEC 11.3) ----------------------------------------
+    //
+    // While the user types, ch::EditorController snapshots the unsaved buffer
+    // to a per-pane file on the SERVER. When the same file is opened again it
+    // compares that snapshot with the bytes on disk, and a snapshot that
+    // differs is unsaved work the application died holding: it announces it as
+    // `recoveryAvailable`. Announcing is ALL the controller can do — keeping or
+    // dropping the work is a decision only the person who typed it can make —
+    // so the offer below is the other half of the feature. Without it every
+    // recovered buffer was read back off the server and then dropped on the
+    // floor, one round trip per file open, and the user was never told their
+    // work had survived.
+
+    // The revision the page's buffer is guarded at (SPEC 8.4/8.6), read off the
+    // same `contentLoaded` the editor page takes its content from.
+    //
+    // Restoring needs it: putting the recovered text into the page must not
+    // change WHICH revision the next save is guarded by. An empty guard is not
+    // a lax one — remote/src/files.ts reads it as a create-only write — so a
+    // restore that lost the revision would leave the user unable to save the
+    // very work it just handed back.
+    property string loadedRevision: ""
+
+    // The recovered buffer waiting to be offered, or "" when there is none.
+    property string recoveredContent: ""
+
+    Connections {
+        target: root.controller
+        function onContentLoaded(content, revision) { root.loadedRevision = revision }
+        // Named `recovered`, not `recoveredContent`: a parameter that shadows
+        // the property it is assigned to reads as a self-assignment.
+        function onRecoveryAvailable(recovered) {
+            root.recoveredContent = recovered
+            root.showRecoveryOffer()
+        }
+    }
+
+    // Offer the recovered buffer, but never before the page can be GIVEN it.
+    // ch::EditorController holds contentLoaded until the page reports ready(),
+    // so an empty `loadedRevision` means the page has not taken the file yet
+    // and a restore would push the text at a page with no handler attached —
+    // losing exactly the work this exists to save. The revision arriving IS the
+    // page being able to take it, so the offer waits for that instead.
+    function showRecoveryOffer() {
+        if (root.recoveredContent.length > 0 && root.loadedRevision.length > 0
+                && !recoveryDialog.visible)
+            recoveryDialog.open()
+    }
+
+    onLoadedRevisionChanged: root.showRecoveryOffer()
+
+    // Put the recovered text back into the pane, and keep it recoverable.
+    //
+    // TWO steps, both required. `contentLoaded` is the ONE way content reaches
+    // the Monaco page (the frozen C3 bridge has no other), re-emitted here with
+    // the revision the page already holds so the save guard is untouched. The
+    // page treats a host-driven load as not-an-edit and therefore does NOT mark
+    // the buffer dirty — so reportContent() states what is now true: the bytes
+    // on screen are not the bytes on the server. That is what stops an external
+    // change from silently reloading over the restored work (SPEC 8.7), and
+    // what keeps the snapshot alive until the user actually saves.
+    function restoreRecovered() {
+        const recovered = root.recoveredContent
+        root.recoveredContent = ""
+        if (!root.controller || recovered.length === 0)
+            return
+        root.controller.contentLoaded(recovered, root.loadedRevision)
+        root.controller.reportContent(recovered)
+    }
+
+    // Keep what the server has. The snapshot itself is deliberately left where
+    // it is: this answers "what should this pane show", and ch::EditorController
+    // is what discards the snapshot, on the next successful save.
+    function discardRecovered() {
+        root.recoveredContent = ""
+    }
+
+    AppDialog {
+        id: recoveryDialog
+        objectName: "editorRecoveryDialog"
+        title: qsTr("Unsaved changes were recovered")
+        modal: true
+        anchors.centerIn: Overlay.overlay
+        // The frame has to hold the fixed-width content plus its own padding;
+        // the Basic style's 320-pixel default would clip it. Same arithmetic as
+        // the sidebar's dialogs.
+        width: 380 + leftPadding + rightPadding
+        // Deliberately NOT dismissible by Escape or by a click outside. Every
+        // other dialog here asks about something the user can redo; this one
+        // asks about work that exists in exactly one place, and a stray keypress
+        // must not be able to answer it.
+        closePolicy: Popup.NoAutoClose
+        standardButtons: Dialog.Discard | Dialog.Ok
+
+        // "OK" beside a recovered buffer does not say which button keeps the
+        // work, and the standard set has no Restore. The button is renamed
+        // rather than replaced so it keeps the dialog's own styling and its
+        // place in the platform's button order.
+        onOpened: {
+            const restore = recoveryDialog.standardButton(Dialog.Ok)
+            if (restore)
+                restore.text = qsTr("Restore")
+        }
+
+        onAccepted: root.restoreRecovered()
+        onDiscarded: {
+            root.discardRecovered()
+            recoveryDialog.close()
+        }
+
+        ColumnLayout {
+            // A Dialog sizes itself from its content item's IMPLICIT width, so
+            // the layout states one; see the sidebar dialogs for the full note.
+            implicitWidth: 380
+            spacing: 8
+
+            Label {
+                Layout.preferredWidth: 380
+                wrapMode: Text.WordWrap
+                // A remote path: data, never markup, like every server-fed
+                // string in this module.
+                textFormat: Text.PlainText
+                text: qsTr("CodeHarbor still had unsaved changes to %1 when it last closed. "
+                           + "They are not in the file on the server.").arg(root.remotePath)
+                color: Theme.text
+                font.pixelSize: Theme.fontSizeBody
+            }
+            Label {
+                Layout.preferredWidth: 380
+                wrapMode: Text.WordWrap
+                text: qsTr("Restore puts them back in this editor, unsaved, so you can look "
+                           + "them over and save. Discard keeps the file exactly as it is on "
+                           + "the server.")
+                color: Theme.textDim
+                font.pixelSize: Theme.fontSizeSmall
+            }
+        }
+    }
+
     // Navigate the view at the bundle entry, passing the pane's remote path as
     // a query parameter. The path is metadata only — a language hint for the
     // bundle; file CONTENT never reaches this view as a document, it arrives
@@ -251,6 +392,13 @@ Item {
     }
 
     function start() {
+        // A pane reused for another file carries nothing over: the revision
+        // belongs to the file being left, and so does any recovery offer that
+        // was still standing. Offering the previous file's unsaved work against
+        // the new one would restore it into the wrong buffer.
+        root.loadedRevision = ""
+        root.recoveredContent = ""
+        recoveryDialog.close()
         if (root.controller && root.remotePath.length > 0)
             root.controller.open(root.remotePath)
         root.navigate()

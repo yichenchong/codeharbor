@@ -1,8 +1,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import {
     adapterFor,
     claudeCodeAdapter,
@@ -87,6 +88,13 @@ test("processBridgeLine attaches adapter-derived metadata (RR25)", () => {
 test("processBridgeLine drops malformed, unknown-harness, and no-op lines", () => {
     assert.equal(processBridgeLine(""), null);
     assert.equal(processBridgeLine("{bad json"), null);
+    // `null` and `[]` PARSE — JSON.parse does not reject them — so the field
+    // reads that follow used to throw a TypeError inside the socket's 'line'
+    // handler, where nothing catches it: four bytes on the wire killed the
+    // whole bridge process.
+    assert.equal(processBridgeLine("null"), null);
+    assert.equal(processBridgeLine("[]"), null);
+    assert.equal(processBridgeLine("42"), null);
     assert.equal(
         processBridgeLine(JSON.stringify({ harness: "nope", devSessionId: "s", terminalId: "t", native: {} })),
         null,
@@ -128,7 +136,15 @@ test("codeharbord dispatch answers introspection and rejects unknown methods", a
     // The three original fields stay byte-compatible; serverId and recoveryDir
     // (SPEC 11.3, the remote crash-recovery data dir) are additive.
     assert.equal(info.name, "codeharbord");
-    assert.equal(info.version, "0.1.0");
+    // `version` is the RELEASE version and the client shows it to the user
+    // verbatim ("Server too old: codeharbord <version> ..."). It lives in
+    // codeharbord.ts by hand while the release script only rewrites the
+    // manifests, so pin it to remote/package.json — pinning the literal instead
+    // is what let every server report 0.1.0 three releases after the fact.
+    const manifest = JSON.parse(
+        readFileSync(fileURLToPath(new URL("../package.json", import.meta.url)), "utf8"),
+    ) as { version: string };
+    assert.equal(info.version, manifest.version);
     assert.equal(info.schemaVersion, RPC_SCHEMA_VERSION);
     assert.deepEqual(
         Object.keys(info).sort(),
@@ -170,7 +186,11 @@ test("claude-code adapter maps its lifecycle hook names", () => {
     assert.equal(claudeCodeAdapter.map({ hook: "PostToolUse" }), "running");
     assert.equal(claudeCodeAdapter.map({ hook: "Notification" }), "waiting_input");
     assert.equal(claudeCodeAdapter.map({ hook: "Stop" }), "idle_unseen");
-    assert.equal(claudeCodeAdapter.map({ hook: "SubagentStop" }), "idle_unseen");
+    // SubagentStop fires when a Task-tool subagent finishes while the MAIN agent
+    // is still working. Mapping it to a completion would arm the Dev Session's
+    // unseen-completion badge and raise an "Agent finished" desktop notification
+    // mid-turn, once per subagent; the agent is running, so that is the state.
+    assert.equal(claudeCodeAdapter.map({ hook: "SubagentStop" }), "running");
     assert.equal(claudeCodeAdapter.map({ hook: "SessionEnd" }), "stopped");
     assert.equal(claudeCodeAdapter.map({ hook: "Anything", error: true }), "error");
     assert.equal(claudeCodeAdapter.map({ hook: "Unrecognized" }), null);
@@ -308,4 +328,33 @@ test("createLineFramer rejects an over-cap newline-less frame", () => {
     }
     assert.equal(overflowed, true, "over-cap input must trigger overflow");
     assert.deepEqual(lines, [], "no line may be emitted from an unterminated frame");
+});
+
+// After an overflow the rest of the offending frame is NOT a request. Framing
+// it as one hands the dispatcher an arbitrary slice of a payload the peer never
+// finished — and re-reports overflow for every further cap's worth of the same
+// frame. The framer must discard through the frame's newline and resume there.
+test("createLineFramer discards the rest of an over-cap frame instead of framing it", () => {
+    const lines: string[] = [];
+    let overflows = 0;
+    const feed = createLineFramer((line) => lines.push(line), () => {
+        overflows += 1;
+    });
+
+    const chunk = Buffer.alloc(1024 * 1024, 0x41); // 1 MiB of 'A', no newline.
+    for (let sent = 0; sent <= MAX_LINE_BYTES; sent += chunk.length) {
+        feed(chunk);
+    }
+    assert.equal(overflows, 1);
+
+    // More of the same frame: still one overflow, still no line.
+    for (let i = 0; i < 4; i += 1) feed(chunk);
+    assert.equal(overflows, 1, "one oversized frame must be reported once");
+    assert.deepEqual(lines, []);
+
+    // The tail of the frame, then a real request behind it: the tail is
+    // dropped, the request behind it is framed normally.
+    feed(Buffer.from('trailing garbage\n{"a":1}\n'));
+    assert.deepEqual(lines, ['{"a":1}']);
+    assert.equal(overflows, 1);
 });

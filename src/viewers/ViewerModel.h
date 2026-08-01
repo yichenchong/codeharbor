@@ -1,11 +1,14 @@
 #pragma once
 
+#include <QJsonValue>
 #include <QObject>
 #include <QPointer>
 #include <QSet>
 #include <QString>
 #include <QUrl>
 #include <QVariantList>
+
+#include <optional>
 
 // Full definition (not a forward declaration): m_client is a QPointer, whose
 // QObject static_cast needs the complete CodeharbordClient (a QObject) type.
@@ -73,9 +76,14 @@ public:
     // string round-trips through QML unchanged, and callers only ever compare
     // it for equality.
     //
-    // Delivery is ALWAYS asynchronous, including the no-client failure: a reply
-    // emitted before this function returned would carry a token the caller has
-    // not been given yet and could not match.
+    // Delivery is ALWAYS asynchronous — for EVERY outcome, not just the
+    // no-client one. A reply emitted before this function returned would carry
+    // a token the caller has not been given yet and could not match, so it
+    // would be discarded and the pane would wait for an answer that already
+    // came and went. That is not hypothetical: CodeharbordClient::call()
+    // invokes its callback synchronously whenever it cannot transmit (no
+    // transport bound, transport closed, write failed), which is precisely what
+    // a dropped SSH session looks like.
     Q_INVOKABLE QString readTextFile(const QString &path);
 
     // Drop the in-flight readTextFile identified by `token`, so its reply is
@@ -88,7 +96,10 @@ public:
     // How many readTextFile calls are still awaiting a reply. Bookkeeping that
     // outlived its request is otherwise invisible from outside the class, so
     // this is what lets a test pin that entries never accumulate.
-    int inFlightTextReadCount() const { return m_liveTextReads.size(); }
+    int inFlightTextReadCount() const
+    {
+        return static_cast<int>(m_liveTextReads.size());
+    }
 
     // Asynchronously list a remote directory (SPEC 7.5). On success emits
     // directoryListed with entries sorted (directories first, then by name),
@@ -132,6 +143,14 @@ signals:
 
 private:
     ViewerProfiles *profiles();
+
+    // Turn one settled file.readFile reply into the textFileRead/textFileError
+    // the pane is waiting for, and retire its token. Always reached through a
+    // queued invocation, never straight from the RPC callback: see the
+    // asynchrony note on readTextFile().
+    void settleTextRead(const QString &token, const QString &path,
+                        const QJsonValue &result,
+                        const std::optional<RpcError> &error);
 
     QPointer<CodeharbordClient> m_client;
     InternalUrlMap *m_map;

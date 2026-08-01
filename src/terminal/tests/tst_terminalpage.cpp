@@ -38,11 +38,7 @@
 #include <QBuffer>
 #include <QByteArray>
 #include <QCoreApplication>
-#include <QDateTime>
-#include <QDir>
 #include <QElapsedTimer>
-#include <QFile>
-#include <QFileInfo>
 #include <QGuiApplication>
 #include <QJsonArray>
 #include <QJsonDocument>
@@ -259,7 +255,6 @@ private:
     std::unique_ptr<QQmlEngine> m_engine;
     std::unique_ptr<QObject> m_window;
     TerminalController* m_controller = nullptr;
-    QString m_liveTarget;
 };
 
 void TstTerminalPage::initTestCase()
@@ -550,8 +545,7 @@ void TstTerminalPage::livePaneRendersARealRemoteShell()
     // attached to the target the SERVER minted for its row — not to anything
     // the client composed, and not to a target derived from the slot label.
     QTRY_VERIFY_WITH_TIMEOUT(!m_factory.targetFor(m_controller).isEmpty(), 20000);
-    m_liveTarget = m_factory.targetFor(m_controller);
-    QCOMPARE(m_liveTarget, row->tmuxTarget);
+    QCOMPARE(m_factory.targetFor(m_controller), row->tmuxTarget);
 
     QVariant loaded;
     QTRY_VERIFY_WITH_TIMEOUT(
@@ -591,7 +585,6 @@ void TstTerminalPage::livePaneRendersARealRemoteShell()
     // rows it was built from.
     QVERIFY(QMetaObject::invokeMethod(m_window.get(), "paneKill"));
     QTest::qWait(1000);
-    m_liveTarget.clear();
 
     bool cleaned = false;
     db.deleteGroup(group->id, [&](std::optional<ch::RpcError>) { cleaned = true; });

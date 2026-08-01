@@ -24,7 +24,9 @@ import {
     requireObject,
     requireString,
     optionalString,
+    optionalPlainString,
     requireStringArray,
+    optionalIndex,
     optionalNumber,
     optionalBoolean,
     requireOneOf,
@@ -397,17 +399,17 @@ function toTerminalPane(r: TerminalPaneRow): TerminalPane {
 // and the original on the SAME remote shells — every keystroke mirrored — even
 // though duplicateSession went to the trouble of inserting fresh rows with
 // freshly minted targets for exactly the opposite outcome.
-function remapPaneIds(node: unknown, idMap: Record<string, string>): unknown {
+function remapPaneIds(node: unknown, idMap: ReadonlyMap<string, string>): unknown {
     if (node === null || typeof node !== "object") return node;
     const n = node as Record<string, unknown>;
     if (n.type === "leaf") {
         const paneId = typeof n.paneId === "string" ? n.paneId : "";
-        const leaf: Record<string, unknown> = { ...n, paneId: idMap[paneId] ?? paneId };
+        const leaf: Record<string, unknown> = { ...n, paneId: idMap.get(paneId) ?? paneId };
         if (typeof n.terminalPaneId === "string" && n.terminalPaneId !== "") {
             // An unmapped row id would name a row in ANOTHER Dev Session, which
             // resolveTerminalPane refuses. Dropping the field instead lets the
             // copied leaf mint a row of its own on first use.
-            const mapped = idMap[n.terminalPaneId];
+            const mapped = idMap.get(n.terminalPaneId);
             if (mapped === undefined) delete leaf.terminalPaneId;
             else leaf.terminalPaneId = mapped;
         }
@@ -646,16 +648,17 @@ const MIGRATIONS: ReadonlyArray<{
     { version: 4, apply: migrateDropTerminalPaneAddressUnique },
 ];
 
-// The unique index over exactly `columns`, in order, or null when the table
-// does not enforce that pair. A table-level UNIQUE shows up as an
-// sqlite_autoindex, a migration-added one under its own name, and both answer
-// PRAGMA index_list. Asking rather than using CREATE UNIQUE INDEX IF NOT
-// EXISTS: that only matches on the index NAME, so on a FRESH database (where
-// step v1 applied a schema.sql whose CREATE TABLE already carries the
-// constraint) it would add a second index over the same columns and charge
-// every write for it twice. The NAME, not just a yes/no, because v4 has to
-// remove one of these again and how it does that depends on which kind it is.
-function uniqueIndexOver(db: DatabaseSync, columns: string[]): string | null {
+// The unique index over exactly `columns` of `terminal_panes`, in order, or
+// null when the table does not enforce that combination. A table-level UNIQUE
+// shows up as an sqlite_autoindex, a migration-added one under its own name,
+// and both answer PRAGMA index_list. Asking rather than using CREATE UNIQUE
+// INDEX IF NOT EXISTS: that only matches on the index NAME, so on a FRESH
+// database (where step v1 applied a schema.sql whose CREATE TABLE already
+// carries the constraint) it would add a second index over the same columns
+// and charge every write for it twice. The NAME, not just a yes/no, because v4
+// has to remove one of these again and how it does that depends on which kind
+// it is.
+function terminalPaneUniqueIndexOver(db: DatabaseSync, columns: string[]): string | null {
     const indexes = db.prepare("PRAGMA index_list(terminal_panes)").all() as unknown as Array<{
         name: string;
         unique: number;
@@ -774,12 +777,12 @@ function migrateTerminalPaneIdentity(db: DatabaseSync): void {
         assignName.run(renamed, row.rowid);
     }
 
-    if (uniqueIndexOver(db, ["tmux_target"]) === null) {
+    if (terminalPaneUniqueIndexOver(db, ["tmux_target"]) === null) {
         db.exec(
             "CREATE UNIQUE INDEX terminal_panes_tmux_target_unique ON terminal_panes (tmux_target)",
         );
     }
-    if (uniqueIndexOver(db, ["dev_session_id", "name"]) === null) {
+    if (terminalPaneUniqueIndexOver(db, ["dev_session_id", "name"]) === null) {
         db.exec(
             "CREATE UNIQUE INDEX terminal_panes_address_unique ON terminal_panes (dev_session_id, name)",
         );
@@ -810,7 +813,7 @@ function migrateTerminalPaneIdentity(db: DatabaseSync): void {
 //     UNIQUE (tmux_target) rule is re-declared on the new table: THAT one still
 //     holds, and dropping the old table takes its index with it.
 function migrateDropTerminalPaneAddressUnique(db: DatabaseSync): void {
-    const index = uniqueIndexOver(db, ["dev_session_id", "name"]);
+    const index = terminalPaneUniqueIndexOver(db, ["dev_session_id", "name"]);
     if (index === null) return;
     if (!index.startsWith("sqlite_autoindex_")) {
         db.exec(`DROP INDEX ${JSON.stringify(index)}`);
@@ -894,9 +897,16 @@ function schemaVersion(db: DatabaseSync): number {
             .prepare("SELECT version FROM schema_version WHERE id = 1")
             .get() as { version: number } | undefined;
         return row?.version ?? 0;
-    } catch {
-        // schema_version table absent -> database is unmigrated (version 0).
-        return 0;
+    } catch (err) {
+        // Exactly ONE failure means "unmigrated": the schema_version table is
+        // not there yet. Every other failure — a file that is not a SQLite
+        // database at all, a malformed image, a lock that outlasted the busy
+        // timeout — used to be swallowed here and answered as version 0, which
+        // sent migrate() on to BEGIN IMMEDIATE and the full schema.sql and
+        // buried the real cause under whichever of those failed second. Report
+        // it instead.
+        if (err instanceof Error && /no such table/i.test(err.message)) return 0;
+        throw err;
     }
 }
 
@@ -908,8 +918,11 @@ export class Workspace {
     readonly db: DatabaseSync;
     // Memoized server_identity row (see serverId()); the row never changes.
     private cachedServerId: string | undefined;
-    // Nesting depth of transaction() on this connection; see transaction().
-    private txDepth = 0;
+    // Whether transaction() already has this connection inside a BEGIN; see
+    // transaction(). A flag rather than a counter: a nested call never opens a
+    // transaction of its own, so the value only ever toggles between the two
+    // states and a counter invited a reader to expect otherwise.
+    private inTransaction = false;
 
     constructor(db: DatabaseSync) {
         this.db = db;
@@ -1220,7 +1233,12 @@ export class Workspace {
             // row's own, so a duplicate always satisfies SPEC 3.5's "a row
             // shares its ancestors' server" invariant even if the source data
             // predates that rule.
-            const viewerIdMap: Record<string, string> = {};
+            // A Map, not a plain object: the keys are pane ids read out of a
+            // CLIENT-authored split tree, and on an object literal a leaf whose
+            // paneId is "constructor" or "toString" would look up a function
+            // inherited from Object.prototype, which JSON.stringify then drops
+            // — silently deleting the field from the copied leaf.
+            const viewerIdMap = new Map<string, string>();
             const viewerRows = this.db
                 .prepare("SELECT * FROM viewer_panes WHERE dev_session_id = ? ORDER BY position, id").all(params.id) as unknown as ViewerPaneRow[];
             const insertViewer = this.db.prepare(
@@ -1228,7 +1246,7 @@ export class Workspace {
             );
             for (const v of viewerRows) {
                 const newId = randomUUID();
-                viewerIdMap[v.id] = newId;
+                viewerIdMap.set(v.id, newId);
                 insertViewer.run(
                     newId,
                     source.server_id,
@@ -1242,7 +1260,7 @@ export class Workspace {
                 );
             }
 
-            const terminalIdMap: Record<string, string> = {};
+            const terminalIdMap = new Map<string, string>();
             const terminalRows = this.db
                 .prepare("SELECT * FROM terminal_panes WHERE dev_session_id = ? ORDER BY position, id").all(params.id) as unknown as TerminalPaneRow[];
             const insertTerminal = this.db.prepare(
@@ -1250,7 +1268,7 @@ export class Workspace {
             );
             for (const t of terminalRows) {
                 const newId = randomUUID();
-                terminalIdMap[t.id] = newId;
+                terminalIdMap.set(t.id, newId);
                 const tmuxTarget = mintTmuxTarget(newSessionId, newId);
                 insertTerminal.run(
                     newId,
@@ -1813,22 +1831,22 @@ export class Workspace {
     // the same rows serialize (the loser fails loudly with SQLITE_BUSY) instead of
     // one silently overwriting fields the other had just changed.
     //
-    // Re-entrant via a depth counter, because SQLite rejects a nested BEGIN: a
-    // helper that needs atomicity of its own (updateSession, packOrder's callers)
-    // can therefore be called both directly and from inside a larger operation.
-    // A nested failure still aborts the whole outermost transaction, which is the
+    // Re-entrant, because SQLite rejects a nested BEGIN: a helper that needs
+    // atomicity of its own (updateSession, packOrder's callers) can therefore
+    // be called both directly and from inside a larger operation. A nested
+    // failure still aborts the whole outermost transaction, which is the
     // semantics every caller here wants.
     private transaction<T>(fn: () => T): T {
-        if (this.txDepth > 0) return fn();
+        if (this.inTransaction) return fn();
         this.db.exec("BEGIN IMMEDIATE");
-        this.txDepth = 1;
+        this.inTransaction = true;
         try {
             const result = fn();
-            this.txDepth = 0;
+            this.inTransaction = false;
             this.db.exec("COMMIT");
             return result;
         } catch (err) {
-            this.txDepth = 0;
+            this.inTransaction = false;
             try {
                 this.db.exec("ROLLBACK");
             } catch {
@@ -1872,6 +1890,18 @@ export function serverIdentity(): string {
 // change is a one-place edit here and in its C++ mirror — never a retyped
 // literal that can drift apart silently.
 export const WORKSPACE_METHODS: Record<RpcWorkspaceMethodName, (params: unknown) => unknown> = {
+    // `position` is guarded with optionalIndex, not optionalNumber: it is
+    // written STRAIGHT into an ordering column that every other path keeps at
+    // contiguous integers 0..n-1 (packOrder). optionalNumber accepts -5 and
+    // 2.5, and SQLite stores both verbatim in an INTEGER-affinity column, so a
+    // single such create left the scope ordered around a fractional or negative
+    // slot for ever after — and nextPosition then handed the NEXT row 3.5.
+    //
+    // The non-nullable text fields (a group's name, a session's repositoryRoot,
+    // a viewer pane's url) are guarded with optionalPlainString rather than
+    // optionalString, which admits an explicit null. A null reached the store
+    // and was discarded by its `?? current` fallback: the caller was answered
+    // with a success and an unchanged row.
     [M.list]: (p) => {
         const o = requireObject(p, M.list);
         return workspace().list(requireString(o, "serverId", M.list));
@@ -1880,15 +1910,15 @@ export const WORKSPACE_METHODS: Record<RpcWorkspaceMethodName, (params: unknown)
         const o = requireObject(p, M.createGroup);
         requireString(o, "serverId", M.createGroup);
         requireString(o, "name", M.createGroup);
-        optionalNumber(o, "position", M.createGroup);
+        optionalIndex(o, "position", M.createGroup);
         optionalBoolean(o, "collapsed", M.createGroup);
         return workspace().createGroup(p as CreateGroupParams);
     },
     [M.updateGroup]: (p) => {
         const o = requireObject(p, M.updateGroup);
         requireString(o, "id", M.updateGroup);
-        optionalString(o, "name", M.updateGroup);
-        optionalNumber(o, "position", M.updateGroup);
+        optionalPlainString(o, "name", M.updateGroup);
+        optionalIndex(o, "position", M.updateGroup);
         optionalBoolean(o, "collapsed", M.updateGroup);
         return workspace().updateGroup(p as UpdateGroupParams);
     },
@@ -1911,18 +1941,18 @@ export const WORKSPACE_METHODS: Record<RpcWorkspaceMethodName, (params: unknown)
         requireString(o, "repositoryRoot", M.createSession);
         optionalString(o, "defaultWorkingDirectory", M.createSession);
         optionalString(o, "taskDescription", M.createSession);
-        optionalNumber(o, "position", M.createSession);
+        optionalIndex(o, "position", M.createSession);
         optionalBoolean(o, "archived", M.createSession);
         return workspace().createSession(p as CreateSessionParams);
     },
     [M.updateSession]: (p) => {
         const o = requireObject(p, M.updateSession);
         requireString(o, "id", M.updateSession);
-        optionalString(o, "name", M.updateSession);
-        optionalString(o, "repositoryRoot", M.updateSession);
+        optionalPlainString(o, "name", M.updateSession);
+        optionalPlainString(o, "repositoryRoot", M.updateSession);
         optionalString(o, "defaultWorkingDirectory", M.updateSession);
         optionalString(o, "taskDescription", M.updateSession);
-        optionalNumber(o, "position", M.updateSession);
+        optionalIndex(o, "position", M.updateSession);
         optionalBoolean(o, "archived", M.updateSession);
         return workspace().updateSession(p as UpdateSessionParams);
     },
@@ -1941,6 +1971,11 @@ export const WORKSPACE_METHODS: Record<RpcWorkspaceMethodName, (params: unknown)
         const o = requireObject(p, M.moveSessionToGroup);
         requireString(o, "id", M.moveSessionToGroup);
         requireString(o, "groupId", M.moveSessionToGroup);
+        // optionalNumber, deliberately unlike the create/update pair above:
+        // here `position` is a drag INDEX rather than a stored position, and
+        // moveSessionToGroup truncates and clamps it into the target group's
+        // range before renumbering, so an out-of-range drag is a legitimate
+        // request with a defined answer instead of a rejected one.
         optionalNumber(o, "position", M.moveSessionToGroup);
         return workspace().moveSessionToGroup(p as MoveSessionParams);
     },
@@ -1956,16 +1991,16 @@ export const WORKSPACE_METHODS: Record<RpcWorkspaceMethodName, (params: unknown)
         requireString(o, "url", M.createViewerPane);
         optionalString(o, "handler", M.createViewerPane);
         optionalString(o, "title", M.createViewerPane);
-        optionalNumber(o, "position", M.createViewerPane);
+        optionalIndex(o, "position", M.createViewerPane);
         return workspace().createViewerPane(p as CreateViewerPaneParams);
     },
     [M.updateViewerPane]: (p) => {
         const o = requireObject(p, M.updateViewerPane);
         requireString(o, "id", M.updateViewerPane);
-        optionalString(o, "url", M.updateViewerPane);
+        optionalPlainString(o, "url", M.updateViewerPane);
         optionalString(o, "handler", M.updateViewerPane);
         optionalString(o, "title", M.updateViewerPane);
-        optionalNumber(o, "position", M.updateViewerPane);
+        optionalIndex(o, "position", M.updateViewerPane);
         return workspace().updateViewerPane(p as UpdateViewerPaneParams);
     },
     [M.deleteViewerPane]: (p) => {
@@ -1982,7 +2017,7 @@ export const WORKSPACE_METHODS: Record<RpcWorkspaceMethodName, (params: unknown)
         optionalString(o, "tmuxTarget", M.createTerminalPane);
         optionalString(o, "startupCommand", M.createTerminalPane);
         optionalString(o, "harness", M.createTerminalPane);
-        optionalNumber(o, "position", M.createTerminalPane);
+        optionalIndex(o, "position", M.createTerminalPane);
         return workspace().createTerminalPane(p as CreateTerminalPaneParams);
     },
     [M.resolveTerminalPane]: (p) => {
@@ -1999,12 +2034,12 @@ export const WORKSPACE_METHODS: Record<RpcWorkspaceMethodName, (params: unknown)
     [M.updateTerminalPane]: (p) => {
         const o = requireObject(p, M.updateTerminalPane);
         requireString(o, "id", M.updateTerminalPane);
-        optionalString(o, "name", M.updateTerminalPane);
+        optionalPlainString(o, "name", M.updateTerminalPane);
         optionalString(o, "workingDirectory", M.updateTerminalPane);
         optionalString(o, "tmuxTarget", M.updateTerminalPane);
         optionalString(o, "startupCommand", M.updateTerminalPane);
         optionalString(o, "harness", M.updateTerminalPane);
-        optionalNumber(o, "position", M.updateTerminalPane);
+        optionalIndex(o, "position", M.updateTerminalPane);
         return workspace().updateTerminalPane(p as UpdateTerminalPaneParams);
     },
     [M.deleteTerminalPane]: (p) => {

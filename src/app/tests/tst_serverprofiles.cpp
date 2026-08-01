@@ -243,6 +243,7 @@ private slots:
     void unicodeAndSpacesSurviveTheIniRoundTrip();
     void insertionOrderSurvivesReload();
     void handEditedStoreIsRepairedOnLoad();
+    void outOfRangeStoredPortsAreRepairedNotTruncated();
     void secretsInTheCallersMapNeverReachTheStore();
     void aSecondWritersProfileSurvivesEveryMutation();
     void aDeletionIsNeverResurrectedByTheMerge();
@@ -716,6 +717,92 @@ void TstServerProfiles::handEditedStoreIsRepairedOnLoad()
     QCOMPARE(reopened.activeId(), QStringLiteral("bbb"));
     QCOMPARE(namesOf(reopened.profiles()), QStringList({QStringLiteral("Alpha"),
                                                         QStringLiteral("Beta")}));
+}
+
+// The port is the one stored field where a hand edit turns from wrong into
+// MISLEADING. Its consumer (AppController::connectToProfile) narrows whatever
+// profile() hands back with a plain static_cast<quint16> before giving it to
+// SshConnectionPool, so a value that escaped the store unchecked would not be
+// rejected downstream - it would be silently truncated. A stored 70000 becomes
+// 4464, a stored -1 becomes 65535, and the user is told the connection to a
+// port they never typed failed, with nothing anywhere naming the real cause.
+//
+// There is exactly one place that may catch this and it is the store: the read
+// side repairs anything outside 1..65535 to the SSH default, and the write side
+// refuses it outright. handEditedStoreIsRepairedOnLoad() covers only the
+// NON-NUMERIC spelling, which lands at 0 and is caught by the lower bound
+// alone; the upper bound and the negative case had no test at all, so dropping
+// either half of that check was a silent regression.
+void TstServerProfiles::outOfRangeStoredPortsAreRepairedNotTruncated()
+{
+    const QString path = iniPath(QStringLiteral("ports.ini"));
+    {
+        QSettings raw(path, QSettings::IniFormat);
+        const auto seed = [&raw](const QString& id, const QVariant& port) {
+            const QString prefix = QStringLiteral("servers/") + id + QLatin1Char('/');
+            raw.setValue(prefix + QStringLiteral("name"), id);
+            raw.setValue(prefix + QStringLiteral("host"), id + QStringLiteral(".example"));
+            raw.setValue(prefix + QStringLiteral("user"), QStringLiteral("u"));
+            raw.setValue(prefix + QStringLiteral("port"), port);
+        };
+        seed(QStringLiteral("aaa-over"), 70000);  // quint16 truncation -> 4464
+        seed(QStringLiteral("bbb-neg"), -1);      // -> 65535
+        seed(QStringLiteral("ccc-wrap"), 65558);  // -> 22, i.e. wrong AND plausible
+        seed(QStringLiteral("ddd-zero"), 0);
+        seed(QStringLiteral("eee-top"), 65535);   // the legal boundary
+        seed(QStringLiteral("fff-bottom"), 1);    // the other legal boundary
+        raw.sync();
+    }
+
+    ServerProfiles store(path);
+    const auto portOf = [&store](const char* id) {
+        return store.profile(QLatin1String(id)).value(QStringLiteral("port")).toInt();
+    };
+    QCOMPARE(portOf("aaa-over"), 22);
+    QCOMPARE(portOf("bbb-neg"), 22);
+    QCOMPARE(portOf("ccc-wrap"), 22);
+    QCOMPARE(portOf("ddd-zero"), 22);
+    // ...and the legal boundaries are NOT "repaired". A store that answered 22
+    // for everything would satisfy the four above and quietly break port 65535.
+    QCOMPARE(portOf("eee-top"), 65535);
+    QCOMPARE(portOf("fff-bottom"), 1);
+
+    // Nothing a consumer can see changes value when it is narrowed to quint16,
+    // which is the property the cast at the other end depends on.
+    const QVariantList visible = store.profiles();
+    QCOMPARE(visible.size(), 6);
+    for (const QVariant& entry : visible) {
+        const int port = entry.toMap().value(QStringLiteral("port")).toInt();
+        QVERIFY2(port >= 1 && port <= 65535, qPrintable(QString::number(port)));
+        QCOMPARE(static_cast<int>(static_cast<quint16>(port)), port);
+    }
+
+    // The repair is written back on the next save, so the bad value is not left
+    // in the file for an older build - or a hand edit of a DIFFERENT field - to
+    // pick up again.
+    store.setActiveId(QStringLiteral("eee-top"));
+    QFile file(path);
+    QVERIFY(file.open(QIODevice::ReadOnly | QIODevice::Text));
+    const QString ini = QString::fromUtf8(file.readAll());
+    QVERIFY2(!ini.contains(QStringLiteral("port=70000")), qPrintable(ini));
+    QVERIFY2(!ini.contains(QStringLiteral("port=-1")), qPrintable(ini));
+    ServerProfiles reopened(path);
+    QCOMPARE(reopened.profile(QStringLiteral("aaa-over"))
+                 .value(QStringLiteral("port")).toInt(), 22);
+    QCOMPARE(reopened.profile(QStringLiteral("eee-top"))
+                 .value(QStringLiteral("port")).toInt(), 65535);
+
+    // Same rule on the way IN, so the read side is repairing hand edits rather
+    // than covering for this store's own writer: one rule, both ends.
+    QVERIFY(store.addProfile(profileFields(QStringLiteral("g"), QStringLiteral("hg"),
+                                           70000, QStringLiteral("u")))
+                .isEmpty());
+    QVERIFY(store.addProfile(profileFields(QStringLiteral("h"), QStringLiteral("hh"),
+                                           -1, QStringLiteral("u")))
+                .isEmpty());
+    store.updateProfile(QStringLiteral("eee-top"),
+                        QVariantMap{{QStringLiteral("port"), 70000}});
+    QCOMPARE(portOf("eee-top"), 65535);
 }
 
 // The store is the one file on disk that says how to REACH a machine, and it

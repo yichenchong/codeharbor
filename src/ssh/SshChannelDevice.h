@@ -58,10 +58,10 @@ public:
     bool startExec(const QString& command);
 
     // Open a channel with a PTY of `cols` x `rows` and start either `command`
-    // (exec) or the login shell (when `command` is empty). When the device was
-    // constructed with ChannelKind::Pty the pool has already negotiated the PTY,
-    // so only the window size is applied and `term` is ignored; construct with
-    // another kind to choose the TERM value here.
+    // (exec) or the login shell (when `command` is empty). `term` is the
+    // terminal type sent to the remote session (empty means xterm-256color) and
+    // is honoured for every ChannelKind: the single pty-req a channel may carry
+    // is issued here, not by the pool.
     bool startPty(const QString& term, int cols, int rows,
                   const QString& command = QString());
 

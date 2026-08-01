@@ -1,9 +1,11 @@
 // SPEC 6.6 — coarse activity detection for the "generic" harness.
 //
 // The generic harness has no lifecycle-event adapter (see adapters/index.ts),
-// so we infer a coarse agent state purely from terminal output activity: recent
-// output means the agent is running; a quiet stretch means it has gone idle;
-// no output yet means it is still starting.
+// so a coarse agent state can only be derived from terminal output activity:
+// recent output means the agent is running; a quiet stretch means it has gone
+// idle; no output yet means it is still starting. The detector is the derivation
+// only — it holds no clock and reads no stream, so it produces states only for a
+// caller that feeds it note() from a terminal's output and publishes state().
 //
 // The detector is deterministic — every time value is passed in, never read
 // from a clock — so it is trivially testable and reproducible.

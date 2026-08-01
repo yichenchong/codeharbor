@@ -19,8 +19,10 @@
 #include <QVariantList>
 #include <QVariantMap>
 
+#include <limits>
 #include <memory>
 #include <optional>
+#include <utility>
 
 #include "AgentStatusMonitor.h"
 #include "CodeharbordClient.h"
@@ -182,6 +184,7 @@ private slots:
     void refillingAnEmptiedRegionNeverReusesThePaneId();
     void paneNumberingIsPerDevSessionAndSurvivesRestart();
     void legacyTerminalLeafIsBackfilledOnceAndPersisted();
+    void anAbsurdPaneCounterCannotHandOutALabelAlreadyOnScreen();
     void aFailedTerminalMintReportsAndTakesTheHalfMadePaneBack();
     void aPaneCreatedAfterOneWithTheSameLabelWasClosedGetsItsOwnRow();
     void liveLayoutRoundTripOverSsh();
@@ -1366,6 +1369,69 @@ void TstSessionLayouts::paneNumberingIsPerDevSessionAndSurvivesRestart()
                                   QStringLiteral("viewer-1"),
                                   QStringLiteral("vertical")),
              QStringLiteral("viewer-2"));
+}
+
+// The pane-label counter takes two inputs and this client owns NEITHER of them:
+// the split tree arrives from a server other clients also write to, and the
+// counter itself is read back out of a hand-editable settings file. Both feed
+// an addition - "max(counter, highest label in the tree) + 1" - and at INT_MAX
+// that addition is signed overflow.
+//
+// The consequence was not an abstract one. The wrapped counter was stored as a
+// negative, the settings store repaired it to 1 on the way back out (its
+// documented floor), and the very next split therefore handed out "viewer-1" -
+// the label of a pane still on screen, the exact duplicate this counter exists
+// to prevent. Two panes wearing one label is confusing on its own; it is also
+// what makes a stale "resolve by label" answer plausible again.
+void TstSessionLayouts::anAbsurdPaneCounterCannotHandOutALabelAlreadyOnScreen()
+{
+    makePair();
+    // Nothing in this client can mint this. It gets into the file the way any
+    // client-local setting does: a hand edit, a line half-written when the
+    // machine went down, a config copied off another box.
+    m_uiState->setNextPaneSuffix(QStringLiteral("s1"), QStringLiteral("viewer"),
+                                 std::numeric_limits<int>::max());
+
+    SessionLayouts layouts(m_db, m_uiState);
+    layouts.setServerId(QStringLiteral("srv-1"));
+    completeLoad(layouts, QStringLiteral("s1"),
+                 layoutRow(leaf(QStringLiteral("viewer-1"))),
+                 QJsonValue(QJsonValue::Null));
+
+    QSignalSpy errorSpy(&layouts, &SessionLayouts::error);
+    QStringList minted;
+    for (int i = 0; i < 2; ++i) {
+        const QString id = layouts.splitPane(QStringLiteral("viewer"),
+                                             QStringLiteral("viewer-1"),
+                                             QStringLiteral("horizontal"));
+        QVERIFY2(!id.isEmpty(), "the split was refused");
+        nextRequest(); // the setLayout each split persists
+        minted.append(id);
+    }
+    QCOMPARE(errorSpy.count(), 0);
+
+    // Every label is a real, positive suffix - never "viewer--2147483648".
+    const QString prefix = QStringLiteral("viewer-");
+    for (const QString& id : std::as_const(minted)) {
+        QVERIFY2(id.startsWith(prefix), qPrintable(id));
+        bool ok = false;
+        const int suffix = id.mid(prefix.size()).toInt(&ok);
+        QVERIFY2(ok && suffix > 0, qPrintable(id));
+    }
+    // ...none of them is a label a pane is ALREADY wearing...
+    QVERIFY2(!minted.contains(QStringLiteral("viewer-1")),
+             qPrintable(minted.join(QLatin1Char(','))));
+    // ...and the two splits did not collide with each other either.
+    QCOMPARE(QSet<QString>(minted.cbegin(), minted.cend()).size(), minted.size());
+
+    // The published tree really shows three distinct panes, so the check above
+    // is about what QML renders and not only about the return value.
+    const QByteArray published = compact(asObject(layouts.viewerTree()));
+    for (const QString& id : QStringList{QStringLiteral("viewer-1")} + minted) {
+        const QByteArray needle =
+            QStringLiteral("\"paneId\":\"%1\"").arg(id).toUtf8();
+        QCOMPARE(published.count(needle), 1);
+    }
 }
 
 // SELF-MIGRATION. A terminal leaf stored before layouts carried a row id has

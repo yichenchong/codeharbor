@@ -19,8 +19,19 @@ bool hashedHostMatches(const QString& hostField, const QString& host)
     if (parts.size() != 4 || !parts.at(0).isEmpty()
         || parts.at(1) != QLatin1String("1"))
         return false;
-    const QByteArray salt = QByteArray::fromBase64(parts.at(2).toUtf8());
-    const QByteArray expected = QByteArray::fromBase64(parts.at(3).toUtf8());
+    // Strict, like the key-blob decode in parse(): a lenient decode silently
+    // skips invalid characters, so a corrupt salt or hash would still produce
+    // SOME bytes and could be compared as though the token were well formed.
+    constexpr auto strict = QByteArray::Base64Encoding
+                            | QByteArray::AbortOnBase64DecodingErrors;
+    const auto saltDecoded =
+        QByteArray::fromBase64Encoding(parts.at(2).toUtf8(), strict);
+    const auto hashDecoded =
+        QByteArray::fromBase64Encoding(parts.at(3).toUtf8(), strict);
+    if (!saltDecoded || !hashDecoded)
+        return false;
+    const QByteArray salt = saltDecoded.decoded;
+    const QByteArray expected = hashDecoded.decoded;
     if (salt.isEmpty() || expected.isEmpty())
         return false;
     QMessageAuthenticationCode mac(QCryptographicHash::Sha1);
@@ -207,15 +218,18 @@ QByteArray KnownHosts::serialize() const
 KnownHosts KnownHosts::parse(const QString& text)
 {
     KnownHosts store;
+    // Compiled once for the whole file rather than once per line: a real
+    // known_hosts store runs to hundreds of lines, and QRegularExpression
+    // compiles its pattern on construction.
+    static const QRegularExpression fieldSeparator(QStringLiteral("\\s+"));
     const QStringList lines = text.split(QLatin1Char('\n'));
     for (const QString& raw : lines) {
         const QString line = raw.trimmed();
         if (line.isEmpty() || line.startsWith(QLatin1Char('#')))
             continue;
 
-        QStringList fields =
-            line.split(QRegularExpression(QStringLiteral("\\s+")),
-                       Qt::SkipEmptyParts);
+        const QStringList fields =
+            line.split(fieldSeparator, Qt::SkipEmptyParts);
         int idx = 0;
         // Capture an optional leading marker (@cert-authority, @revoked).
         QString marker;

@@ -167,6 +167,35 @@ test("an empty write is dropped rather than becoming an empty chunk", () => {
     assert.equal(writer.backlogSize, 0);
 });
 
+// A batch can legitimately decode to NO text — a multi-byte sequence split
+// across two of the controller's flushes — while still carrying PTY bytes the
+// C++ side has charged against its flow-control window. Those bytes must be
+// carried onto the next chunk that does have text: dropping them leaks the
+// controller's credit away one truncated glyph at a time, and a pane whose
+// credit has leaked to zero stops receiving output altogether.
+test("the byte weight of a text-less batch is carried onto the next real chunk", () => {
+    const { sink, chunks, ack } = fakeSink();
+    const acked: number[] = [];
+    const writer = new CoalescingWriter(sink, (bytes) => acked.push(bytes));
+
+    // Two PTY bytes that decoded to nothing yet, then the byte that completes
+    // the glyph. Nothing is handed to the sink for the text-less batch.
+    writer.write("", 2);
+    assert.deepEqual(chunks, []);
+    assert.equal(writer.backlogSize, 0);
+
+    writer.write("é", 1);
+    assert.deepEqual(chunks, ["é"]);
+    ack();
+    // All three bytes the controller emitted are acknowledged, exactly once.
+    assert.deepEqual(acked, [3]);
+
+    // ...and the carry is not double-counted on the batch after it.
+    writer.write("x", 1);
+    ack();
+    assert.deepEqual(acked, [3, 1]);
+});
+
 test("close discards the backlog, refuses later writes and acknowledges nothing", () => {
     const { sink, chunks, ack } = fakeSink();
     const acked: number[] = [];

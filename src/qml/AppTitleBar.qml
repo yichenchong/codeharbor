@@ -175,13 +175,18 @@ Rectangle {
         width: Math.max(0, parent.width - Theme.headerHeight * 3 - Theme.radiusMedium * 2)
 
         Label {
+            id: titleLabel
             objectName: "windowTitleLabel"
             text: bar.title
             textFormat: Text.PlainText
             color: Theme.text
             font.pixelSize: Theme.fontSizeBody
             elide: Text.ElideRight
-            width: Math.min(implicitWidth, titleRow.width)
+            // Half the row at most once there is a session beside it: the two
+            // labels share the strip, and a long application title must not be
+            // able to push the session name out from under it.
+            width: Math.min(implicitWidth,
+                            bar.sessionLabel.length > 0 ? titleRow.width / 2 : titleRow.width)
             verticalAlignment: Text.AlignVCenter
         }
 
@@ -201,8 +206,13 @@ Rectangle {
             color: Theme.textDim
             font.pixelSize: Theme.fontSizeBody
             elide: Text.ElideLeft
+            // What the title and the separator have left. Without subtracting
+            // the title's own width, a long window title and a long session
+            // name together overflowed the row and ran under the window
+            // buttons — a Row does not clip its children to its width.
             width: Math.min(implicitWidth,
-                            Math.max(0, titleRow.width - titleRow.spacing * 2 - 1))
+                            Math.max(0, titleRow.width - titleLabel.width
+                                     - titleRow.spacing * 2 - 1))
             verticalAlignment: Text.AlignVCenter
         }
     }

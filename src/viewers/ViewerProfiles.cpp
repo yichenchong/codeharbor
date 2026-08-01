@@ -51,7 +51,8 @@ QQuickWebEngineProfile *ViewerProfiles::externalProfile()
     if (!m_external) {
         // A named (persistent) profile persists cookies and local storage to
         // disk. It deliberately gets NO internal scheme handler and NO
-        // WebChannel bridge — arbitrary sites stay sandboxed (SPEC 7.2).
+        // WebChannel bridge — arbitrary sites stay sandboxed (SPEC 7.3, the
+        // separate-profiles requirement; 7.2 is what those sites ARE).
         m_external =
             new QQuickWebEngineProfile(QStringLiteral("codeharbor-external"), this);
         m_external->setPersistentCookiesPolicy(

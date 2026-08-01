@@ -373,6 +373,13 @@ private slots:
     // A profile save that could not take its interprocess lock has to reach the
     // user, not stop at a signal nothing is connected to.
     void aDegradedProfileSaveReachesTheShellsErrorToast();
+    // server.info is the one server round-trip that did not route its failure
+    // through the teardown gate, and it is in flight for exactly the window a
+    // user's Disconnect covers.
+    void serverInfoFailureDuringDisconnectIsNotPaintedAsAFault();
+    // A server at the schema floor that still names no identity is as
+    // undrivable as one that is too old, and must be refused the same way.
+    void serverThatReportsNoIdentityIsRefusedRatherThanLeftConnected();
 };
 
 // Two GroupNodes with sessions map to GroupRows preserving order, with the
@@ -1929,6 +1936,89 @@ void TstAppController::aDegradedProfileSaveReachesTheShellsErrorToast()
     f.profiles.updateProfile(id, {{QStringLiteral("host"), QStringLiteral("10.0.0.11")}});
     blocker.unlock();
     QCOMPARE(errors.count(), 2);
+}
+
+// A user-initiated Disconnect fails every in-flight RPC by design: the client
+// answers each pending call with a synthetic "transport closed with request
+// pending". reportIfError() exists to swallow exactly that window, because
+// painting it red tells the user something broke when they are the one who
+// pressed Disconnect. `server.info` was the lone call that bypassed the gate
+// and emitted straight to the toast - and it is in flight for precisely that
+// window, since adoptServerIdentity() issues it on every wire and reconnect.
+void TstAppController::serverInfoFailureDuringDisconnectIsNotPaintedAsAFault()
+{
+    FakeTransport transport;
+    ConnectFixture f;
+    f.client.setTransport(&transport);
+
+    // A failed connect leaves the bootstrap in State::Failed, so the teardown
+    // below really does transition it (and emit) rather than no-op.
+    f.controller.connectToProfile(f.profileId);
+
+    // Now put a server.info on the wire and leave it unanswered.
+    f.boot.fireWired();
+    QCOMPARE(takeRequest(transport).value(QStringLiteral("method")).toString(),
+             QStringLiteral("server.info"));
+
+    // The real teardown drops the RPC channel device, which is what fails the
+    // pending call. This fixture's transport is a plain QIODevice the bootstrap
+    // does not own, so drop it at the same point in the same sequence.
+    QObject::connect(&f.boot, &SessionBootstrap::stateChanged, &f.client,
+                     [&f](SessionBootstrap::State state) {
+                         if (state == SessionBootstrap::State::Disconnected)
+                             f.client.setTransport(nullptr);
+                     });
+
+    QSignalSpy errorSpy(&f.controller, &AppController::error);
+    f.controller.disconnectServer();
+
+    // Named so a regression reads as "Disconnect showed the user an error"
+    // rather than a bare count mismatch.
+    const QString painted =
+        errorSpy.isEmpty() ? QString() : errorSpy.at(0).at(0).toString();
+    QVERIFY2(painted.isEmpty(), qPrintable(painted));
+    QCOMPARE(f.controller.connectionState(), QStringLiteral("disconnected"));
+}
+
+// The workspace is keyed by the SERVER's own id. A server that answers
+// server.info without one cannot be driven at all: adopting "" would key every
+// group and session to nothing, which is the same permanently-empty sidebar
+// over a healthy SSH session that the schema floor already refuses. It used to
+// emit a toast and then leave the shell sitting there reporting "connected",
+// with the toast gone a few seconds later and no way to tell what happened.
+void TstAppController::serverThatReportsNoIdentityIsRefusedRatherThanLeftConnected()
+{
+    FakeTransport transport;
+    ConnectFixture f;
+    f.client.setTransport(&transport);
+    QSignalSpy errorSpy(&f.controller, &AppController::error);
+
+    f.boot.fireWired();
+    const QJsonObject request = takeRequest(transport);
+    QCOMPARE(request.value(QStringLiteral("method")).toString(),
+             QStringLiteral("server.info"));
+
+    // Current schema, but no serverId field at all.
+    transport.deliver(
+        serverInfoFrame(request.value(QStringLiteral("id")).toInt(),
+                        AppController::kMinimumServerSchemaVersion, QString(),
+                        QStringLiteral("1.0.0")));
+
+    QCOMPARE(errorSpy.count(), 1);
+    const QString message = errorSpy.at(0).at(0).toString();
+    QVERIFY2(message.contains(QStringLiteral("identity")), qPrintable(message));
+
+    // Nothing adopted, and crucially no workspace.list for the empty id - that
+    // call IS the empty sidebar.
+    QCOMPARE(f.controller.serverId(), QString());
+    QVERIFY(takeRequestIds(transport).isEmpty());
+
+    // Refused, not left half-alive: the link is dropped one event-loop turn
+    // later (we were inside the client's own response callback) and the failure
+    // is a durable property the connection footer can show, not a vanished
+    // toast.
+    QTRY_COMPARE(f.controller.connectionState(), QStringLiteral("failed"));
+    QCOMPARE(f.controller.connectionError(), message);
 }
 
 QTEST_GUILESS_MAIN(TstAppController)

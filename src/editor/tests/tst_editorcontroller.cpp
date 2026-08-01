@@ -201,6 +201,7 @@ private slots:
     void failedSaveLeavesTheBufferDirty();
     void editsDuringASaveSurviveTheSaveReply();
     void editsTypedDuringASystemReloadAreNotClobbered();
+    void aSaveInFlightIsNotClobberedByASystemReload();
     void anExplicitReloadDiscardsTheRecoverySnapshotItThrewAway();
     void aPageReloadWithUnsavedWorkIsOfferedItsRecoverySnapshot();
     void reportContentDuringALoadIsIgnored();
@@ -2188,6 +2189,71 @@ void TstEditorController::editsTypedDuringASystemReloadAreNotClobbered()
     QCOMPARE(m_controller->fileState(), QStringLiteral("externally_modified"));
     QVERIFY2(nextRequest(300).isEmpty(),
              "a dirty buffer was re-read after the abandoned reload");
+    QCOMPARE(contentSpy.count(), 0);
+}
+
+// The twin of the case above, for the OTHER way a system reload can land on
+// bytes that exist nowhere but in the page. Ctrl/Cmd+S beats the page's 500 ms
+// debounce, so a save can carry keystrokes the controller was never told about:
+// m_editSerial has not moved, and the reload's own "did the buffer change?"
+// guard therefore sees nothing. Installing the fetched bytes then replaces the
+// buffer the write is still carrying, re-baselines the revision that write is
+// guarded by (so its reply is refused as a conflict) and drops the only copy of
+// the edits. The save is the authority over this file until its reply lands.
+void TstEditorController::aSaveInFlightIsNotClobberedByASystemReload()
+{
+    makePair();
+    openClean(QStringLiteral("/foo/f.txt"), QStringLiteral("hello"),
+              QStringLiteral("r1"));
+
+    QSignalSpy contentSpy(m_controller, &EditorController::contentLoaded);
+    QSignalSpy conflictSpy(m_controller, &EditorController::saveConflict);
+
+    // Clean buffer + external change -> the controller starts re-reading.
+    sendNotification(kWatchEvent, {{"subscriptionId", "sub1"},
+                                   {"path", "/foo/f.txt"},
+                                   {"event", "modified"},
+                                   {"revision", "r5"}});
+    const QJsonObject read = nextRequest();
+    QCOMPARE(method(read), kReadFile);
+    QCOMPARE(reqPath(read), QStringLiteral("/foo/f.txt"));
+
+    // The user types and hits Ctrl+S inside the debounce, so NO reportContent
+    // ever reached the controller for these bytes.
+    m_controller->save(QStringLiteral("typed, then saved inside the debounce"),
+                       QStringLiteral("r1"));
+    const QJsonObject write = nextRequest();
+    QCOMPARE(method(write), kWriteFile);
+    QCOMPARE(reqPath(write), QStringLiteral("/foo/f.txt"));
+    QCOMPARE(reqExpectedRevision(write), QStringLiteral("r1"));
+    QCOMPARE(m_controller->fileState(), QStringLiteral("saving"));
+
+    // ...and only now does the abandoned reload answer.
+    respondResult(reqId(read), {{"path", "/foo/f.txt"},
+                                {"encoding", "utf-8"},
+                                {"content", "the server's bytes"},
+                                {"revision", "r5"},
+                                {"truncated", false}});
+    QTest::qWait(100);
+
+    // Nothing was pushed at the page, the save's guard revision still stands,
+    // and the pane is still reporting the write it is waiting on.
+    QCOMPARE(contentSpy.count(), 0);
+    QCOMPARE(m_controller->revision(), QStringLiteral("r1"));
+    QCOMPARE(m_controller->fileState(), QStringLiteral("saving"));
+    QVERIFY2(nextRequest(300).isEmpty(),
+             "the abandoned reload still re-derived permissions or cleared the "
+             "recovery snapshot holding the bytes the save is carrying");
+
+    // The write's own reply decides the outcome, and it is the honest one: the
+    // file really did move, so the guarded write is refused.
+    respondError(reqId(write), ch::rpc::kRevisionMismatch,
+                 QStringLiteral("stale revision"),
+                 QJsonObject{{"currentRevision", "r5"}});
+    QTRY_COMPARE(conflictSpy.count(), 1);
+    QCOMPARE(conflictSpy.at(0).at(0).toString(), QStringLiteral("r5"));
+    QCOMPARE(m_controller->fileState(), QStringLiteral("conflict"));
+    QCOMPARE(m_controller->revision(), QStringLiteral("r1"));
     QCOMPARE(contentSpy.count(), 0);
 }
 

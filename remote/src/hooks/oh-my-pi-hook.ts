@@ -68,14 +68,24 @@ export interface BridgeMessage {
 
 /**
  * Read a HookInput from process argv/env. The native event name is the first
- * positional argument (argv[2]); session coordinates and tool come from the
- * environment so the same script serves every hook.
+ * positional argument (argv[2]), falling back to $OMP_HOOK_EVENT; session
+ * coordinates and tool come from the environment so the same script serves
+ * every hook.
  */
 export function readHookInput(
     argv: readonly string[] = process.argv,
     env: NodeJS.ProcessEnv = process.env,
 ): HookInput {
-    const event = argv[2] ?? env.OMP_HOOK_EVENT ?? "";
+    // A BLANK positional argument means "no event name given", not "the event
+    // is the empty string". Shell hook configurations routinely interpolate a
+    // variable into the argument (`node oh-my-pi-hook.ts "$OMP_EVENT"`), and an
+    // unset variable hands us an empty argv[2]; `??` would accept that empty
+    // string as the answer and never consult OMP_HOOK_EVENT, so the documented
+    // environment fallback would be dead for the exact configuration that needs
+    // it. Whitespace-only is the same case, and if BOTH sources are blank the
+    // event stays empty and main() prints usage instead of emitting an event
+    // whose type no adapter can ever map.
+    const event = (argv[2] ?? "").trim() || (env.OMP_HOOK_EVENT ?? "").trim();
     const input: HookInput = {
         event,
         devSessionId: env.OMP_DEV_SESSION_ID ?? "",
@@ -137,6 +147,11 @@ export function emitHookEvent(
     socket.on("error", reject);
     socket.on("connect", () => {
         socket.end(`${JSON.stringify(message)}\n`, () => {
+            // Disarm the watchdog: the write succeeded, and a promise that has
+            // resolved must never reject afterwards. Node closes the socket
+            // itself once the writable side finishes with the readable side
+            // never consumed, so the hook process is free to exit even against
+            // a peer that keeps its own half open.
             socket.setTimeout(0);
             resolve(message);
         });

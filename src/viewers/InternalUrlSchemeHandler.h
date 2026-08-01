@@ -54,8 +54,10 @@ public:
     QString internalUrlFor(const QUrl &fileUrl);
 
     // Inverse of internalUrlFor. Accepts either a full internal URL or a bare
-    // id; returns an invalid QUrl when the id is unknown. Marks the entry as
-    // recently used so actively-displayed files resist eviction.
+    // id; returns an invalid QUrl when the id is unknown, and equally when a
+    // full internal URL names an authority other than "file" — the same URL
+    // InternalUrlSchemeHandler would refuse. Marks the entry as recently used
+    // so actively-displayed files resist eviction.
     QUrl fileUrlFor(const QString &internalUrl) const;
 
     // Resolve just the opaque id component back to its file URL. Marks the entry

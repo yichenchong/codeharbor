@@ -132,6 +132,16 @@ export async function stat(params: StatParams): Promise<StatResult> {
     } catch {
         writable = false;
     }
+    // Which fields describe the LINK and which describe its TARGET is a mix, on
+    // purpose, and worth stating because it is not guessable: `kind`, `size`,
+    // `mtimeMs` and `mode` come from the link node itself (that is what makes
+    // `kind` able to say "symlink" at all, and `mode` is documented as
+    // symlink-blind on the client side — X12 in EditorController), while
+    // `revision` and `writable` describe the target, because those two are what
+    // readFile and writeFile act on. So `size` through a symlink is the length
+    // of the link's own path text, NOT the size of the file readFile returns;
+    // no consumer reads `size` for that purpose today, and one that starts to
+    // must resolve the link itself.
     return {
         path: params.path,
         kind: nodeKind(stats),
@@ -306,6 +316,28 @@ export async function writeFile(params: WriteFileParams): Promise<WriteFileResul
     return withWriteLock(key, () => writeFileLocked(params));
 }
 
+// Name of the temp file the atomic save renames over `basename`. The random
+// suffix is what makes it unique; the basename is only there so a leftover temp
+// (a crash between open and rename) is recognizable.
+//
+// The basename half is CLIPPED to fit NAME_MAX (255 bytes on Linux and macOS).
+// A legitimately long filename — 250 bytes is a perfectly valid name — plus the
+// 18 characters this adds would otherwise overflow the limit, so open() failed
+// with ENAMETOOLONG and EVERY save of that file was an error the user could do
+// nothing about. Clipping is measured in BYTES, not code units, and never cuts
+// a multibyte character in half, because the limit the kernel enforces is a
+// byte count while a JavaScript string is counted in UTF-16 units.
+const NAME_MAX_BYTES = 255;
+
+function tempName(basename: string): string {
+    const suffix = `.${randomBytes(6).toString("hex")}.tmp`;
+    // The leading dot plus the suffix are fixed overhead.
+    const room = NAME_MAX_BYTES - suffix.length - 1;
+    let stem = basename;
+    while (stem.length > 0 && Buffer.byteLength(stem) > room) stem = stem.slice(0, -1);
+    return `.${stem}${suffix}`;
+}
+
 async function writeFileLocked(params: WriteFileParams): Promise<WriteFileResult> {
     const encoding = params.encoding ?? "utf-8";
     // Buffer.from(s, "base64") is LENIENT: it silently drops every character
@@ -335,7 +367,7 @@ async function writeFileLocked(params: WriteFileParams): Promise<WriteFileResult
     // consistent with the revision guard above, which stat()'d through the link.
     const target = existing ? await fsp.realpath(params.path) : params.path;
     const dir = path.dirname(target);
-    const tmp = path.join(dir, `.${path.basename(target)}.${randomBytes(6).toString("hex")}.tmp`);
+    const tmp = path.join(dir, tempName(path.basename(target)));
     // Creating a file whose parent directory does not exist yet must WORK, not
     // fail with ENOENT: the frozen C1 method catalog has no createDirectory, so
     // writeFile is the only way a client can bring a new path into being. The

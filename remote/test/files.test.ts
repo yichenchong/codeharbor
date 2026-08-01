@@ -679,6 +679,30 @@ test("writeFile creates a missing parent directory for a new file", async () => 
     await fs.rm(dir, { recursive: true, force: true });
 });
 
+// The atomic save writes a temp file NAMED AFTER the target in the same
+// directory and renames it over the original. A file name may be up to 255
+// bytes, and the temp name adds 18 characters, so a long — but perfectly
+// legal — name overflowed the limit: open() failed with ENAMETOOLONG and every
+// save of that file was an error the user could do nothing about.
+test("writeFile saves a file whose name nearly fills the 255-byte limit", async () => {
+    const dir = await tmpDir();
+    const name = "n".repeat(250);
+    const file = path.join(dir, name);
+
+    const created = await writeFile({ path: file, content: "first", expectedRevision: "" });
+    assert.equal(await fs.readFile(file, "utf-8"), "first");
+
+    // Overwriting takes the other branch of the save (mode preserved, target
+    // resolved through realpath) and must clear the same hurdle.
+    await writeFile({ path: file, content: "second", expectedRevision: created.revision });
+    assert.equal(await fs.readFile(file, "utf-8"), "second");
+
+    // Neither save left its temp file behind.
+    assert.deepEqual(await fs.readdir(dir), [name]);
+
+    await fs.rm(dir, { recursive: true, force: true });
+});
+
 test("writeFile honors an explicit mode on create (masks to 0o600)", async () => {
     const dir = await tmpDir();
     const file = path.join(dir, "recovery.snapshot");
@@ -1013,6 +1037,32 @@ test("a stalled consumer cannot grow the relay's queue past its bound", () => {
         relay.pendingCount() <= MAX_PENDING_WATCH_EVENTS,
         `queued ${relay.pendingCount()} notifications, above the ${MAX_PENDING_WATCH_EVENTS} bound`,
     );
+});
+
+// The relay shares stdout with the RPC response writer and only learns of a
+// stall from the return value of its OWN writes. A large response that filled
+// the stream's buffer therefore left the relay believing the output was still
+// flowing, and every notification after it went straight into an internal
+// buffer with no bound — exactly the failure the queue exists to prevent.
+// runStdio reports that foreign stall through relay.stall().
+test("a stall caused by a response write still bounds the relay's queue", () => {
+    const sink = fakeOut();
+    const live = new Set(["sub-1", "sub-2"]);
+    const relay = createWatchNotificationRelay(sink.out, (id) => live.has(id));
+
+    // An RPC response — written by runStdio, not by the relay — fills the
+    // stream's buffer and reports the stall.
+    sink.stall();
+    relay.stall();
+
+    relay.deliver(relayEvent("sub-1", "/w/a.txt", "r1"));
+    relay.deliver(relayEvent("sub-2", "/w/b.txt", "r1"));
+    assert.deepEqual(sink.lines, [], "a notification must not be written into a full buffer");
+    assert.equal(relay.pendingCount(), 2);
+
+    sink.drain();
+    assert.equal(relay.pendingCount(), 0);
+    assert.equal(sink.lines.length, 2);
 });
 
 test("the relay coalesces a burst for one path into a single latest notification", () => {

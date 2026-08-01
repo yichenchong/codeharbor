@@ -1,8 +1,11 @@
 import type { AgentState, Harness } from "../events.ts";
 
-// A harness-native event as received on the bridge socket. The `type` field
-// names the harness's own event; other fields are harness-specific.
-export type NativeEvent = Record<string, unknown> & { type?: unknown };
+// A harness-native event as received on the bridge socket. Which field names
+// the harness's own event depends on the harness: Oh My Pi and Pi use `type`,
+// Claude Code uses `hook` (it has lifecycle hooks, not an event stream). Both
+// are declared so a reader of an adapter does not have to guess which key is
+// load-bearing; every other field is harness-specific.
+export type NativeEvent = Record<string, unknown> & { type?: unknown; hook?: unknown };
 
 export interface HarnessAdapter {
     readonly harness: Harness;

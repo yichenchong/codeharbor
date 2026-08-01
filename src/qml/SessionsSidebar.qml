@@ -8,7 +8,7 @@ import QtQuick.Layouts
 // app.sessionsModel (a two-level QAbstractItemModel) via a nested DelegateModel:
 // the top level renders GroupHeader rows, each of which nests its group's
 // SessionRow children (hidden while the group is collapsed). Role names
-// consumed: name, subtitle, rowState, isGroup, collapsed, itemId, groupId.
+// consumed: name, subtitle, rowState, collapsed, itemId, groupId.
 //
 // Drag-and-drop contract (SPEC 4.2): the sidebar NEVER reorders the model
 // itself. A drop calls the matching app.* invokable with the INDEX/ordering the
@@ -350,6 +350,30 @@ Rectangle {
         ids.splice(from, 1);
         ids.splice(to, 0, header.itemId);
         app.reorderGroups(ids);
+    }
+
+    // ---------------------------------------------------------------------
+    // Row context-menu mutations
+    //
+    // Routed through here for the same reason every drop is: the sidebar owns
+    // every app.* call. A SessionRow documents itself as usable with no host
+    // (that is what all its `host !== null` guards are for), and a bare `app`
+    // lookup inside a row would make that false — the row would raise a
+    // ReferenceError the moment its menu was used. The group header already
+    // took this route for its own collapse call; the row's menu did not, which
+    // is the drift these close.
+    // ---------------------------------------------------------------------
+    function renameSession(sessionId, name) {
+        app.renameSession(sessionId, name);
+    }
+    function duplicateSession(sessionId) {
+        app.duplicateSession(sessionId);
+    }
+    function moveSessionToTop(sessionId, groupId) {
+        app.moveSession(sessionId, groupId, 0);
+    }
+    function deleteSession(sessionId) {
+        app.deleteSession(sessionId);
     }
 
     // ---------------------------------------------------------------------
@@ -739,7 +763,6 @@ Rectangle {
             id: groupBlock
             required property int index
             required property string name
-            required property bool isGroup
             required property bool collapsed
             required property string itemId
 

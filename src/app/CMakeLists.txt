@@ -32,10 +32,11 @@ target_link_libraries(ch_app PUBLIC
     ch_editor
 )
 
-# QtDBus backs the desktop notifications in Notifier (SPEC 6.2) on Linux. It is
-# optional at configure time exactly like libssh in src/ssh: without it the
-# module still builds (CH_HAVE_DBUS=0) and Notifier::available() is false, so
-# notify() degrades to a silent no-op.
+# QtDBus backs the desktop notifications in Notifier on Linux - a Phase 4
+# deliverable in SPEC 16, which has no section of its own. It is optional at
+# configure time exactly like libssh in src/ssh: without it the module still
+# builds (CH_HAVE_DBUS=0) and Notifier::available() is false, so notify()
+# degrades to a silent no-op.
 find_package(Qt6 6.9 QUIET COMPONENTS DBus)
 if(Qt6DBus_FOUND)
     target_link_libraries(ch_app PUBLIC Qt6::DBus)

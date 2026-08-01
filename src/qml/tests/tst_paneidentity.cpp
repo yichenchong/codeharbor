@@ -337,6 +337,108 @@ signals:
 private:
     QString m_repoRoot;
 };
+
+// The slice of ch::TerminalFactory a terminal pane drives, with the two-phase
+// resolution under this test's control. The pane documents `factory` as the
+// seam a test injects through, and a stub is the only way to hold a lookup
+// OPEN — the real factory answers (or refuses) before a test can retarget the
+// pane underneath the flight, which is exactly the window the pane has to get
+// right.
+//
+// createBridge() deliberately hands back nothing: with no bridge the pane skips
+// its WebEngineView entirely, so this stays a pure QML/logic test.
+class TerminalFactoryStub : public QObject
+{
+    Q_OBJECT
+
+public:
+    struct Resolution {
+        QString devSessionId;
+        QString paneName;
+        QString terminalPaneId;
+        QString workingDir;
+    };
+
+    Q_INVOKABLE QObject *create(QObject *)
+    {
+        // Parented here, so the object has C++ ownership: a QObject* returned
+        // to QML with no parent is handed to the JavaScript collector.
+        m_controller = new QObject(this);
+        return m_controller;
+    }
+    Q_INVOKABLE QObject *createBridge(QObject *, QObject *) { return nullptr; }
+    Q_INVOKABLE bool connected() const { return true; }
+
+    Q_INVOKABLE bool resolveTarget(QObject *, const QString &devSessionId,
+                                   const QString &paneName, const QString &terminalPaneId,
+                                   const QString &workingDir)
+    {
+        m_resolutions.append({devSessionId, paneName, terminalPaneId, workingDir});
+        return true;
+    }
+
+    Q_INVOKABLE bool attach(QObject *, const QString &target, const QString &, int, int)
+    {
+        m_attached.append(target);
+        return true;
+    }
+    Q_INVOKABLE void detach(QObject *) { }
+    Q_INVOKABLE QString targetFor(QObject *) const { return QString(); }
+    Q_INVOKABLE void kill(QObject *) { }
+
+    QObject *controller() const { return m_controller; }
+    const QList<Resolution> &resolutions() const { return m_resolutions; }
+    const QStringList &attached() const { return m_attached; }
+
+signals:
+    void error(QObject *controller, const QString &message);
+    void targetResolved(QObject *controller, const QString &target);
+
+private:
+    QObject *m_controller = nullptr;
+    QList<Resolution> m_resolutions;
+    QStringList m_attached;
+};
+
+// The slice of ch::EditorController an editor pane binds to. The pane documents
+// `controller` as a seam a test may pre-assign, and a stub is what lets a
+// crash-recovery offer (SPEC 11.3) be driven without a server holding a
+// snapshot: the recovered buffer arrives as `recoveryAvailable`, and what the
+// pane pushes BACK into the page arrives here as `contentLoaded`.
+class EditorControllerStub : public QObject
+{
+    Q_OBJECT
+    Q_PROPERTY(QString fileState READ fileState NOTIFY fileStateChanged)
+
+public:
+    QString fileState() const { return m_fileState; }
+
+    Q_INVOKABLE void open(const QString &path) { m_opened.append(path); }
+    Q_INVOKABLE void save(const QString &, const QString &) { }
+    Q_INVOKABLE void reportContent(const QString &content) { m_reported.append(content); }
+    Q_INVOKABLE void requestReload() { }
+    Q_INVOKABLE void ready() { }
+    Q_INVOKABLE void setRecoveryId(const QString &id) { m_recoveryId = id; }
+
+    const QStringList &opened() const { return m_opened; }
+    const QStringList &reported() const { return m_reported; }
+    QString recoveryId() const { return m_recoveryId; }
+
+signals:
+    void contentLoaded(const QString &content, const QString &revision);
+    void fileStateChanged(const QString &state);
+    void readOnlyChanged(bool readOnly);
+    void saved(const QString &revision);
+    void saveConflict(const QString &currentRevision);
+    void saveError(const QString &message);
+    void recoveryAvailable(const QString &recoveredContent);
+
+private:
+    QString m_fileState = QStringLiteral("clean");
+    QStringList m_opened;
+    QStringList m_reported;
+    QString m_recoveryId;
+};
 } // namespace
 
 class TstPaneIdentity : public QObject
@@ -411,7 +513,36 @@ private slots:
     // to by index path, which is the part a nested region gets wrong.
     void dragAdjustedRatiosAreReportedForTheRightBranch();
 
+    // ADDRESS BAR, part two. A name typed without a leading "/" is resolved
+    // against the directory the pane is showing, so what the pane opens is NOT
+    // what the user typed — and the bar has to end up saying what was actually
+    // opened, or it claims the pane is showing a file called "notes.md" in no
+    // particular place.
+    void theAddressBarShowsWhatARelativeNameResolvedTo();
+
+    // TERMINAL IDENTITY, the asynchronous half. Naming a pane's remote shell is
+    // a server round trip, and the pane can be pointed at another Dev Session
+    // while that question is still travelling. The answer carries a controller
+    // and a target string and nothing else, so an answer to the OLD question
+    // must not be able to look like the answer to the new one: that is two
+    // panes on one shell, which is the failure the whole resolution path
+    // exists to prevent.
+    void aTerminalPaneNeverAdoptsTheAnswerToASupersededLookup();
+
+    // CRASH RECOVERY (SPEC 11.3). ch::EditorController snapshots the unsaved
+    // buffer while the user types and finds it again on the next open, but
+    // finding it is worth nothing unless the user is told and can take it back.
+    void theEditorOffersToRestoreARecoveredBuffer();
+    void discardingARecoveredBufferLeavesTheEditorShowingTheFile();
+
 private:
+    // Load one qrc component into the harness window with `props` as its
+    // initial properties, and hand back the loaded item. The region types are
+    // inert until they have a node, so the properties must be supplied at
+    // creation rather than assigned afterwards; a leaf pane is loaded the same
+    // way, with the seams (`factory`, `controller`) its own documentation
+    // describes.
+    QObject *openInShell(const QString &file, const QVariantMap &props);
     QObject *openRegion(const QString &file, const QVariantMap &node, bool terminal);
     void setNode(const QVariantMap &node);
     QString evalJs(QObject *paneItem, const QString &script, int timeoutMs = kProbeTimeoutMs);
@@ -467,19 +598,13 @@ void TstPaneIdentity::cleanup()
     QTest::qWait(50);
 }
 
-QObject *TstPaneIdentity::openRegion(const QString &file, const QVariantMap &node, bool terminal)
+QObject *TstPaneIdentity::openInShell(const QString &file, const QVariantMap &props)
 {
     QQmlComponent component(m_engine.get());
     component.setData(QByteArray(kShellQml), QUrl(QStringLiteral("qrc:/tst_paneidentity/shell.qml")));
     if (component.isError()) {
         QTest::qFail(qPrintable(component.errorString()), __FILE__, __LINE__);
         return nullptr;
-    }
-
-    QVariantMap props{{QStringLiteral("node"), node}};
-    if (terminal) {
-        props.insert(QStringLiteral("devSessionId"), QStringLiteral("dev-identity"));
-        props.insert(QStringLiteral("workingDir"), QStringLiteral("/tmp"));
     }
 
     m_shell.reset(component.createWithInitialProperties(
@@ -501,8 +626,18 @@ QObject *TstPaneIdentity::openRegion(const QString &file, const QVariantMap &nod
     }
     m_region = asObject(regionItem);
     if (!m_region)
-        QTest::qFail("the region component never loaded", __FILE__, __LINE__);
+        QTest::qFail("the component never loaded in the harness window", __FILE__, __LINE__);
     return m_region;
+}
+
+QObject *TstPaneIdentity::openRegion(const QString &file, const QVariantMap &node, bool terminal)
+{
+    QVariantMap props{{QStringLiteral("node"), node}};
+    if (terminal) {
+        props.insert(QStringLiteral("devSessionId"), QStringLiteral("dev-identity"));
+        props.insert(QStringLiteral("workingDir"), QStringLiteral("/tmp"));
+    }
+    return openInShell(file, props);
 }
 
 void TstPaneIdentity::setNode(const QVariantMap &node)
@@ -1542,6 +1677,196 @@ void TstPaneIdentity::dragAdjustedRatiosAreReportedForTheRightBranch()
     QStringList expectedReported{QStringLiteral("[]"), QStringLiteral("[1]")};
     expectedReported.sort();
     QCOMPARE(reportedPaths, expectedReported);
+}
+
+// ---------------------------------------------------------------------------
+// (11) The address bar after a RELATIVE name.
+//
+// A name with no leading "/" is resolved against the directory the pane is
+// showing, so the pane opens something the user did not literally type. The
+// field keeps the keyboard after Enter, so the rule "never overwrite what the
+// user is typing" used to leave the fragment sitting there: the bar said
+// "notes.md" while the pane showed /srv/repos/app/notes.md, and the next Enter
+// would then resolve that fragment against the NEW directory.
+// ---------------------------------------------------------------------------
+void TstPaneIdentity::theAddressBarShowsWhatARelativeNameResolvedTo()
+{
+    QVERIFY(openRegion(QStringLiteral("ViewerRegion.qml"), leafNode(QStringLiteral("viewer-1")),
+                       /*terminal=*/false));
+    const auto panes = [this] { return collect(m_region, isLeafPane); };
+    QTRY_VERIFY(panes().size() == 1);
+    QTest::qWait(kSettleMs);
+    QObject *const pane = panes().constFirst();
+
+    // A trailing slash is already spelled as a directory, so it opens without a
+    // probe and becomes the directory a relative name is measured from.
+    enterAddress(pane, QStringLiteral("/srv/repos/app/"));
+    QTRY_COMPARE(pane->property("url").toUrl(), QUrl(QStringLiteral("file:///srv/repos/app/")));
+
+    enterAddress(pane, QStringLiteral("notes.md"));
+    QTRY_COMPARE(pane->property("url").toUrl(),
+                 QUrl(QStringLiteral("file:///srv/repos/app/notes.md")));
+
+    QObject *const field = childNamed(pane, QStringLiteral("viewerAddressField"));
+    QVERIFY(field);
+    QVERIFY2(field->property("activeFocus").toBool(),
+             "the address field lost the keyboard, so this no longer exercises the case it "
+             "is about");
+    QTRY_COMPARE(field->property("text").toString(),
+                 QStringLiteral("/srv/repos/app/notes.md"));
+}
+
+// ---------------------------------------------------------------------------
+// (12) A terminal pane must not adopt the answer to a question it no longer
+// has.
+//
+// Naming a pane's remote shell is a server round trip. A user who switches Dev
+// Session while it is travelling leaves an answer in flight that describes the
+// PREVIOUS session's shell, and ch::TerminalFactory delivers it as nothing but
+// (controller, target) — there is no slot in the reply to check. Adopting it
+// attaches this pane to the other session's tmux session, which is two panes on
+// one shell.
+// ---------------------------------------------------------------------------
+void TstPaneIdentity::aTerminalPaneNeverAdoptsTheAnswerToASupersededLookup()
+{
+    TerminalFactoryStub factory;
+    QObject *const pane = openInShell(
+        QStringLiteral("TerminalPaneView.qml"),
+        {{QStringLiteral("factory"), QVariant::fromValue<QObject *>(&factory)},
+         {QStringLiteral("paneId"), QStringLiteral("terminal-1")},
+         {QStringLiteral("devSessionId"), QStringLiteral("dev-a")},
+         {QStringLiteral("terminalPaneId"), QStringLiteral("row-a")},
+         {QStringLiteral("workingDir"), QStringLiteral("/srv/a")}});
+    QVERIFY(pane);
+
+    QTRY_COMPARE(factory.resolutions().size(), 1);
+    QCOMPARE(factory.resolutions().constLast().devSessionId, QStringLiteral("dev-a"));
+    QVERIFY2(pane->property("resolving").toBool(),
+             "the pane is not waiting on the lookup it just started");
+    QVERIFY(factory.controller());
+
+    // The user picks another Dev Session while that lookup is still in flight.
+    // The host pushes the pair working-directory first, exactly as Main.qml does.
+    pane->setProperty("workingDir", QStringLiteral("/srv/b"));
+    pane->setProperty("devSessionId", QStringLiteral("dev-b"));
+    pane->setProperty("terminalPaneId", QStringLiteral("row-b"));
+    QTest::qWait(80);
+    QVERIFY2(factory.resolutions().size() == 1,
+             "a second lookup was started beside the one still in flight: their answers carry "
+             "nothing but a controller and a target, so neither could then be told apart");
+
+    // ...and the answer to the ABANDONED question lands.
+    emit factory.targetResolved(factory.controller(), QStringLiteral("ch-dev-a-terminal-1"));
+    QTest::qWait(80);
+    QVERIFY2(pane->property("tmuxTarget").toString().isEmpty(),
+             qPrintable(QStringLiteral("the pane adopted \"%1\", the shell belonging to the Dev "
+                                       "Session it has already left")
+                            .arg(pane->property("tmuxTarget").toString())));
+    QVERIFY2(factory.attached().isEmpty(), "the pane attached a PTY to the wrong shell");
+
+    // Discarding it is only half the job: nothing else would ever ask again, so
+    // the pane has to put its current question instead of stranding itself.
+    QTRY_COMPARE(factory.resolutions().size(), 2);
+    QCOMPARE(factory.resolutions().constLast().devSessionId, QStringLiteral("dev-b"));
+    QCOMPARE(factory.resolutions().constLast().terminalPaneId, QStringLiteral("row-b"));
+
+    emit factory.targetResolved(factory.controller(), QStringLiteral("ch-dev-b-terminal-1"));
+    QTRY_COMPARE(pane->property("tmuxTarget").toString(), QStringLiteral("ch-dev-b-terminal-1"));
+    QCOMPARE(factory.attached(), QStringList{QStringLiteral("ch-dev-b-terminal-1")});
+}
+
+namespace {
+
+// The editor pane, driven by a stub controller and with NO page: the offer and
+// the restore are decisions the QML pane makes, and loading Monaco would turn
+// this into a Chromium test for no extra coverage. The pane's navigate() reads
+// an empty bundle url as "go nowhere", which is what keeps the view inert.
+QVariantMap recoveryPaneProps(QObject *controller)
+{
+    return {{QStringLiteral("controller"), QVariant::fromValue(controller)},
+            {QStringLiteral("editorBundleUrl"), QString()},
+            {QStringLiteral("recoveryPaneId"), QStringLiteral("viewer-1")},
+            {QStringLiteral("fileUrl"), QStringLiteral("file:///srv/repos/app/notes.md")}};
+}
+
+} // namespace
+
+// ---------------------------------------------------------------------------
+// (13) SPEC 11.3: unsaved work survives a crash, and the user is offered it.
+//
+// ch::EditorController already does the finding — it snapshots the buffer while
+// the user types and compares the snapshot with the file on the next open — and
+// announces the difference as `recoveryAvailable`. Nothing listened, so the
+// recovered buffer was read back off the server and dropped, once per file
+// open, and the user was never told their work had survived.
+// ---------------------------------------------------------------------------
+void TstPaneIdentity::theEditorOffersToRestoreARecoveredBuffer()
+{
+    EditorControllerStub controller;
+    QSignalSpy delivered(&controller, &EditorControllerStub::contentLoaded);
+    QVERIFY(delivered.isValid());
+
+    QObject *const pane =
+        openInShell(QStringLiteral("EditorPaneView.qml"), recoveryPaneProps(&controller));
+    QVERIFY(pane);
+    QTRY_COMPARE(controller.opened(), QStringList{QStringLiteral("/srv/repos/app/notes.md")});
+
+    QObject *const dialog = childNamed(pane, QStringLiteral("editorRecoveryDialog"));
+    QVERIFY2(dialog, "the editor pane never offers a recovered buffer, so unsaved work found on "
+                     "the server is read back and thrown away");
+    QVERIFY(!dialog->property("visible").toBool());
+
+    // The snapshot is found before the page has taken the file...
+    emit controller.recoveryAvailable(QStringLiteral("recovered line\n"));
+    QTest::qWait(80);
+    QVERIFY2(!dialog->property("visible").toBool(),
+             "the offer went up before the editor page held the file: restoring then pushes the "
+             "recovered text at a page that cannot take it, losing the very work being offered");
+
+    // ...and the load completes, which is when the offer can safely be acted on.
+    emit controller.contentLoaded(QStringLiteral("what is on disk\n"), QStringLiteral("rev-7"));
+    QTRY_VERIFY2(dialog->property("visible").toBool(),
+                 "unsaved work was recovered and the user was never told");
+    QCOMPARE(delivered.size(), 1);
+
+    QVERIFY(QMetaObject::invokeMethod(dialog, "accept"));
+    QTRY_COMPARE(delivered.size(), 2);
+    // The recovered text goes into the page...
+    QCOMPARE(delivered.constLast().at(0).toString(), QStringLiteral("recovered line\n"));
+    // ...guarded by the revision the page already holds. An empty guard is a
+    // create-only write on the server, i.e. a save that would be refused.
+    QCOMPARE(delivered.constLast().at(1).toString(), QStringLiteral("rev-7"));
+    // ...and the host is told the buffer no longer matches the server, so an
+    // external change cannot silently reload over the restored work (SPEC 8.7)
+    // and the snapshot survives until the user saves.
+    QCOMPARE(controller.reported(), QStringList{QStringLiteral("recovered line\n")});
+    QTRY_VERIFY(!dialog->property("visible").toBool());
+}
+
+void TstPaneIdentity::discardingARecoveredBufferLeavesTheEditorShowingTheFile()
+{
+    EditorControllerStub controller;
+    QSignalSpy delivered(&controller, &EditorControllerStub::contentLoaded);
+    QVERIFY(delivered.isValid());
+
+    QObject *const pane =
+        openInShell(QStringLiteral("EditorPaneView.qml"), recoveryPaneProps(&controller));
+    QVERIFY(pane);
+
+    QObject *const dialog = childNamed(pane, QStringLiteral("editorRecoveryDialog"));
+    QVERIFY(dialog);
+    emit controller.contentLoaded(QStringLiteral("what is on disk\n"), QStringLiteral("rev-7"));
+    emit controller.recoveryAvailable(QStringLiteral("recovered line\n"));
+    QTRY_VERIFY(dialog->property("visible").toBool());
+    QCOMPARE(delivered.size(), 1);
+
+    // Exactly what the Discard button does.
+    QVERIFY(QMetaObject::invokeMethod(dialog, "discarded"));
+    QTRY_VERIFY2(!dialog->property("visible").toBool(),
+                 "answering the recovery offer left it on screen");
+    QCOMPARE(delivered.size(), 1);
+    QVERIFY2(controller.reported().isEmpty(),
+             "discarding the recovered buffer still marked the file dirty");
 }
 
 // QTEST_MAIN cannot be used: registerUrlScheme() and QtWebEngineQuick::initialize()

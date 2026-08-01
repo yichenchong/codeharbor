@@ -27,6 +27,11 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "24"
+          # ~/.npm across runs. Every job here installs the SAME root lockfile
+          # (npm resolves the workspace root even from remote/), and the client
+          # job's share of it is Monaco plus esbuild - tens of megabytes fetched
+          # from the registry on every single run without this.
+          cache: npm
       # BEFORE npm ci: `npm ci` rewrites a workspace package.json's own
       # `version` field to whatever package-lock.json says, so running this
       # afterwards would be reading a manifest npm had already "corrected".
@@ -137,6 +142,7 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "24"
+          cache: npm
       # BOTH bundles, via the root workspaces script. Naming only the editor left
       # the terminal bundle to CMake's npm fallback, which is a convenience for
       # local dev and is not portable - it failed outright on the Windows runner.

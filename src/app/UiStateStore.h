@@ -83,7 +83,9 @@ public:
     // must not consume each other's numbers.
     //
     // A key that is absent, or holds anything that is not a whole number of at
-    // least 1, reads back as 1 - a fresh region starts at "<region>-1". Same
+    // least 1, reads back as 1 - a fresh region starts at "<region>-1". A WRITE
+    // below 1 is dropped for the same reason, so the two halves cannot disagree
+    // about what is stored. Same
     // reasoning as the widths above: one hand-edited or half-written line must
     // fall back to the documented start, never to 0 (which would mint a
     // "<region>-0") and never to a number below one already in the tree.

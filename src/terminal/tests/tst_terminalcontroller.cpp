@@ -907,6 +907,56 @@ void TstTerminalController::hiddenEvictionResumesOnACleanBoundary()
         // characters. Cutting at the raw offset would open it with U+FFFD.
         QVERIFY(!QString::fromUtf8(hidden).contains(QChar(0xFFFD)));
     }
+
+    // (3) The resume point must be searched for FORWARD of the overflow offset,
+    // never from the start of the buffer. A line feed that sits BEFORE the cut
+    // is not a resume point at all — resuming there keeps bytes the eviction
+    // exists to remove, so the buffer stays over its cap and the "rolling
+    // buffer is bounded" guarantee quietly stops holding.
+    {
+        TerminalController controller;
+        controller.setViewVisible(false);
+
+        QByteArray fill(kCap, 'A');
+        const QByteArray tail(TerminalController::kFlushSizeBytes, 'B');
+        // The raw cut lands at index tail.size(). One line feed sits ten bytes
+        // SHORT of it (a decoy) and one ten bytes past it (the real one).
+        fill[tail.size() - 10] = '\n';
+        fill[tail.size() + 10] = '\n';
+
+        controller.ingestOutput(fill);
+        controller.ingestOutput(tail);
+
+        const QByteArray &hidden = controller.hiddenBuffer();
+        // The LATER line feed was used, so the buffer is back under its cap.
+        QVERIFY(hidden.size() <= kCap);
+        QCOMPARE(hidden.size(), kCap - 11);
+        QVERIFY(!hidden.contains('\n')); // both decoy and resume point are gone
+        QCOMPARE(hidden.right(tail.size()), tail);
+    }
+
+    // (4) The forward scan is BOUNDED by kHiddenResyncWindowBytes, and the bound
+    // has to hold even for a stream that offers no resume point at all. Without
+    // it, a pathological pane — one that emits no line feed and nothing that
+    // reads as a character boundary — would walk the scan across the whole
+    // buffer and evict far more scrollback than the overflow called for.
+    {
+        TerminalController controller;
+        controller.setViewVisible(false);
+
+        // Every byte is a UTF-8 CONTINUATION byte (10xxxxxx), so the boundary
+        // scan can never stop on its own, and there is no line feed either.
+        const QByteArray fill(kCap, '\x80');
+        const QByteArray tail(TerminalController::kFlushSizeBytes, 'z');
+
+        controller.ingestOutput(fill);
+        controller.ingestOutput(tail);
+
+        const QByteArray &hidden = controller.hiddenBuffer();
+        // The overflow plus exactly one window, and not a byte more.
+        QCOMPARE(hidden.size(), kCap - TerminalController::kHiddenResyncWindowBytes);
+        QCOMPARE(hidden.right(tail.size()), tail);
+    }
 }
 
 QTEST_GUILESS_MAIN(TstTerminalController)

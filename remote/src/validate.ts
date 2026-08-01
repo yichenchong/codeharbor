@@ -64,6 +64,27 @@ export function optionalString(
     return value;
 }
 
+/**
+ * Optional field that must be a STRING when present. Unlike optionalString it
+ * REJECTS an explicit null, because it guards the params that map to columns
+ * which are not nullable (a group's name, a session's repository root, a
+ * viewer pane's url). There, `null` passed optionalString and was then thrown
+ * away by the handler's `?? current` fallback: the caller asked for a change,
+ * got a success response, and the row was left exactly as it was.
+ */
+export function optionalPlainString(
+    obj: Record<string, unknown>,
+    field: string,
+    method: string,
+): string | undefined {
+    const value = obj[field];
+    if (value === undefined) return undefined;
+    if (typeof value !== "string") {
+        throw new InvalidParamsError(`${method}: missing or invalid field '${field}'`);
+    }
+    return value;
+}
+
 export function requireStringArray(obj: Record<string, unknown>, field: string, method: string): string[] {
     const value = obj[field];
     if (!Array.isArray(value) || value.some((v) => typeof v !== "string")) {

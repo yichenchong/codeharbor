@@ -159,7 +159,9 @@ Window {
 
         function readDocument() {
             view.runJavaScript(
-                "[document.title," +
+                "[document.contentType," +
+                " document.characterSet," +
+                " document.title," +
                 " document.body ? document.body.innerText.length : -1," +
                 " document.body ? document.body.innerText : ''].join('@@CH@@')",
                 function(result) {
@@ -659,13 +661,17 @@ void TstLiveViewers::remoteBytesRenderThroughInternalScheme()
 
     const QStringList parts = view->property("jsResult").toString().split(
         QLatin1String(kJsSeparator));
-    QCOMPARE(parts.size(), 3);
-    const QString title = parts.at(0);
-    const int bodyLength = parts.at(1).toInt();
-    const QString body = parts.at(2);
+    QCOMPARE(parts.size(), 5);
+    const QString contentType = parts.at(0);
+    const QString characterSet = parts.at(1);
+    const QString title = parts.at(2);
+    const int bodyLength = parts.at(3).toInt();
+    const QString body = parts.at(4);
 
-    qInfo("internal-scheme DOM: title=\"%s\" innerText.length=%d body=\"%s\"",
-          qPrintable(title), bodyLength,
+    qInfo("internal-scheme DOM: contentType=%s charset=%s title=\"%s\" "
+          "innerText.length=%d body=\"%s\"",
+          qPrintable(contentType), qPrintable(characterSet), qPrintable(title),
+          bodyLength,
           qPrintable(QString(body).trimmed().replace(QLatin1Char('\n'), QLatin1String(" / "))));
 
     // The whole point: the bytes in the DOM are the bytes on the remote disk.
@@ -680,6 +686,17 @@ void TstLiveViewers::remoteBytesRenderThroughInternalScheme()
     // though the navigated URL is an opaque, extensionless id.
     QCOMPARE(InternalUrlSchemeHandler::mimeForPath(alphaPath()),
              QByteArrayLiteral("text/plain"));
+
+    // ...and that declaration is what Chromium actually received and honoured.
+    // Only the browser can confirm this: the handler's header could be dropped,
+    // sniffed away, or overridden and the DOM assertions above would still
+    // pass, with the file quietly rendered as the wrong type.
+    QCOMPARE(contentType, QStringLiteral("text/plain"));
+    // The charset parameter matters just as much. Without it Chromium guesses
+    // from the locale and a UTF-8 file with any non-ASCII byte renders as
+    // mojibake; the guess is invisible in ASCII-only content, so it is checked
+    // directly rather than inferred from the text having come out readable.
+    QCOMPARE(characterSet, QStringLiteral("UTF-8"));
 }
 
 // ---------------------------------------------------------------------------

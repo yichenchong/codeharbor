@@ -32,12 +32,15 @@ import {
 // file contents, this one never does.
 export const MAX_BRIDGE_LINE_BYTES = 1024 * 1024;
 
-// Wire format for a single line arriving on the bridge socket.
+// Wire format for a single line arriving on the bridge socket. Every field is
+// optional and `unknown`: this describes what a producer is SUPPOSED to send,
+// and a decoded JSON object is free to omit or mistype any of it — which is
+// what the guards in processBridgeLine are for.
 interface BridgeMessage {
-    harness: unknown;
-    devSessionId: unknown;
-    terminalId: unknown;
-    native: unknown;
+    harness?: unknown;
+    devSessionId?: unknown;
+    terminalId?: unknown;
+    native?: unknown;
     summary?: unknown;
     metadata?: unknown;
 }
@@ -51,36 +54,45 @@ export function processBridgeLine(line: string): AgentEvent | null {
     const trimmed = line.trim();
     if (trimmed.length === 0) return null;
 
-    let decoded: BridgeMessage;
+    let decoded: unknown;
     try {
-        decoded = JSON.parse(trimmed) as BridgeMessage;
+        decoded = JSON.parse(trimmed);
     } catch {
         return null;
     }
+    // A bare `null` line PARSES — JSON.parse("null") is null, not an error — so
+    // without this every field access below would throw a TypeError. That
+    // TypeError happens inside the socket's 'line' handler, where nothing
+    // catches it: one producer sending the four bytes `null` would take the
+    // whole bridge process down and with it every harness's status reporting.
+    // An array or a primitive is likewise not a message.
+    if (!isPlainObject(decoded)) return null;
+    const message = decoded as BridgeMessage;
 
     if (
-        !isHarness(decoded.harness) ||
+        !isHarness(message.harness) ||
         // Non-blank identifiers, checked HERE because this relay builds its
         // events with makeEvent and never runs them through validateEvent: this
         // is the only gate on the socket-to-stdout path. An empty id yields a
         // structurally valid event filed under a Dev Session that does not exist
         // (see isEventIdentifier). The `typeof` half stays because it is what
         // narrows the field to `string` for the makeEvent call below.
-        typeof decoded.devSessionId !== "string" ||
-        typeof decoded.terminalId !== "string" ||
-        !isEventIdentifier(decoded.devSessionId) ||
-        !isEventIdentifier(decoded.terminalId) ||
+        typeof message.devSessionId !== "string" ||
+        typeof message.terminalId !== "string" ||
+        !isEventIdentifier(message.devSessionId) ||
+        !isEventIdentifier(message.terminalId) ||
         // An array would pass a bare `typeof === "object"` check and then read
         // back as a native event with no `type`, i.e. a silent no-op.
-        !isPlainObject(decoded.native)
+        !isPlainObject(message.native)
     ) {
         return null;
     }
 
-    const adapter = adapterFor(decoded.harness);
+    const adapter = adapterFor(message.harness);
     if (!adapter) return null;
 
-    const native = decoded.native as Record<string, unknown>;
+    const native = message.native as Record<string, unknown>;
+
     const state = adapter.map(native);
     if (state === null) return null;
 
@@ -88,19 +100,19 @@ export function processBridgeLine(line: string): AgentEvent | null {
     // then merged with any explicit metadata a bridge producer put on the wire.
     // Explicit wire fields win over derived ones.
     const derived = adapter.metadata?.(native);
-    const explicit = isPlainObject(decoded.metadata) ? decoded.metadata : undefined;
+    const explicit = isPlainObject(message.metadata) ? message.metadata : undefined;
     const metadata = (derived || explicit)
         ? { ...(derived ?? {}), ...(explicit ?? {}) }
         : undefined;
 
     const nativeName = native.type ?? native.hook;
     return makeEvent({
-        harness: decoded.harness,
-        devSessionId: decoded.devSessionId,
-        terminalId: decoded.terminalId,
+        harness: message.harness,
+        devSessionId: message.devSessionId,
+        terminalId: message.terminalId,
         state,
         event: typeof nativeName === "string" ? nativeName : "unknown",
-        summary: typeof decoded.summary === "string" ? decoded.summary : undefined,
+        summary: typeof message.summary === "string" ? message.summary : undefined,
         metadata,
     });
 }
@@ -123,6 +135,13 @@ export type EventSink = (event: AgentEvent, source: net.Socket) => void;
  */
 export function makeStreamSink(out: NodeJS.WritableStream): EventSink {
     const paused = new Set<net.Socket>();
+    // Sockets that already carry the cleanup listener below. A long-lived
+    // producer can be paused and resumed many times, and attaching a fresh
+    // 'close' listener on every pause piles them up on the same socket: Node
+    // warns at eleven ("possible EventEmitter memory leak") and every one of
+    // them is retained until the socket finally closes. Weak so a closed socket
+    // is still collectable.
+    const hooked = new WeakSet<net.Socket>();
     out.on("drain", () => {
         for (const socket of paused) socket.resume();
         paused.clear();
@@ -138,7 +157,10 @@ export function makeStreamSink(out: NodeJS.WritableStream): EventSink {
             // of the SSH channel never drains again — the exact situation that
             // caused the pause — that set (and the sockets in it) is never
             // released for as long as the bridge runs.
-            source.once("close", () => paused.delete(source));
+            if (!hooked.has(source)) {
+                hooked.add(source);
+                source.once("close", () => paused.delete(source));
+            }
         }
     };
 }

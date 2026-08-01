@@ -345,6 +345,16 @@ void TstLiveShell::initTestCase()
     QCOMPARE(QStandardPaths::writableLocation(QStandardPaths::GenericConfigLocation),
              m_configHome);
 #else
+    // ...but only the LIVE cases spawn child processes. With no fixture the
+    // one case that still runs, qmlRestoresAndPersistsRegionWidths(), lives
+    // entirely in this process AND WRITES region widths through the production
+    // native-scope store - which off Linux is the developer's own
+    // CodeHarbor settings. Test mode is process-local, so it is exactly right
+    // here and exactly wrong for the live cases; tst_coldstart draws the same
+    // line for the same reason.
+    if (qEnvironmentVariableIsEmpty("CH_LIVE_SSH")
+        || !SshConnectionPool::libsshAvailable())
+        QStandardPaths::setTestModeEnabled(true);
     m_configHome = QStandardPaths::writableLocation(QStandardPaths::GenericConfigLocation);
     QVERIFY(QDir().mkpath(m_configHome));
 #endif
@@ -870,7 +880,9 @@ bool TstLiveShell::launchRealApp(const QString& knownHostsPath, QString* output)
     appEnv.insert(QStringLiteral("QT_QUICK_BACKEND"), QStringLiteral("software"));
     // NB: no --single-process. It is fatal the moment a second
     // QWebEngineProfile exists (QFATAL "Single mode supports only single
-    // profile."), and the viewer stack creates two by design (SPEC 7.2).
+    // profile."), and the viewer stack creates two by design (SPEC 7.3,
+    // "Browser Profiles": one sandboxed profile for external sites, one
+    // privileged profile for internal content).
     appEnv.insert(QStringLiteral("QTWEBENGINE_CHROMIUM_FLAGS"),
                   QStringLiteral("--disable-gpu --no-sandbox --disable-dev-shm-usage"));
     appEnv.insert(QStringLiteral("LD_PRELOAD"), QStringLiteral(CH_LIVESHELL_QUIT_SHIM));

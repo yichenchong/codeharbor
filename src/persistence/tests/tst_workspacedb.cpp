@@ -88,6 +88,8 @@ private slots:
     void createTerminalPaneSerializesOptionalsAndParsesRecord();
     void resolveTerminalPaneSendsTheSlotAddressAndParsesTheRow();
     void resolveTerminalPaneAddressesARowByIdWithoutItsLabel();
+    void setLayoutMalformedTreeDeliversRpcError();
+    void updateOptionalsOmitUnsetAndSendEmptyStringsVerbatim();
     void liveCreateAndListOverProcess();
 
 private:
@@ -1206,6 +1208,136 @@ void TstWorkspaceDb::resolveTerminalPaneAddressesARowByIdWithoutItsLabel()
         readRequest().value(QStringLiteral("params")).toObject();
     QCOMPARE(params.value(QStringLiteral("id")).toString(), QStringLiteral("row-uuid"));
     QVERIFY(!params.contains(QStringLiteral("name")));
+}
+
+// setLayout has NO legitimate "there is no layout here" answer: it echoes the
+// SessionLayout row it has just stored. A row whose `tree` is missing or fails
+// split-tree validation is therefore a malformed reply, and handing the caller
+// (no tree, no error) would report the write as landed while giving it nothing
+// to adopt - the same blank-record trap every other method reports as -32603.
+// getLayout's opposite verdict (an unreadable tree means "no layout") is
+// deliberate and covered by getLayoutMalformedTreeDeliversNullopt; this pins the
+// boundary between the two.
+void TstWorkspaceDb::setLayoutMalformedTreeDeliversRpcError()
+{
+    makePair();
+
+    SplitNode leaf;
+    leaf.paneId = QStringLiteral("pA");
+
+    bool fired = false;
+    bool hasTree = true;
+    std::optional<RpcError> err;
+
+    // Write the current tree, then answer with `row`. Leaves the three locals
+    // above holding the callback's verdict.
+    const auto writeLayout = [&](const QJsonObject& row) {
+        fired = false;
+        hasTree = true;
+        err.reset();
+        m_db->setLayout(ServerId{QStringLiteral("srv-1")},
+                        ch::DevSessionId{QStringLiteral("s1")}, ch::Region::Viewer,
+                        leaf,
+                        [&](std::optional<SplitNode> tree, std::optional<RpcError> e) {
+                            hasTree = tree.has_value();
+                            err = e;
+                            fired = true;
+                        });
+        const QJsonObject req = readRequest();
+        m_serverSide->write(jsonLine({{"jsonrpc", "2.0"},
+                                      {"id", req.value(QStringLiteral("id")).toInt()},
+                                      {"result", row}}));
+        m_serverSide->flush();
+    };
+
+    // A SessionLayout row carrying no `tree` key at all.
+    writeLayout(QJsonObject{{"id", "L1"}, {"devSessionId", "s1"}});
+    QTRY_VERIFY(fired);
+    QVERIFY(!hasTree);
+    QVERIFY(err.has_value());
+    QCOMPARE(err->code, -32603);
+    QVERIFY(err->message.contains(QStringLiteral("workspace.setLayout")));
+
+    // A row whose tree is structurally invalid: two children, one ratio.
+    const QJsonObject leafA{{"type", "leaf"}, {"paneId", "pA"}};
+    const QJsonObject leafB{{"type", "leaf"}, {"paneId", "pB"}};
+    writeLayout(QJsonObject{
+        {"id", "L1"},
+        {"tree", QJsonObject{{"type", "split"},
+                             {"orientation", "vertical"},
+                             {"children", QJsonArray{leafA, leafB}},
+                             {"ratios", QJsonArray{1.0}}}}});
+    QTRY_VERIFY(fired);
+    QVERIFY(!hasTree);
+    QVERIFY(err.has_value());
+    QCOMPARE(err->code, -32603);
+
+    // The rejection is selective: a row echoing a valid tree still succeeds, and
+    // an empty leaf (what closing a region's last pane stores) is a valid tree.
+    writeLayout(QJsonObject{{"id", "L1"},
+                            {"tree", QJsonObject{{"type", "leaf"}, {"paneId", ""}}}});
+    QTRY_VERIFY(fired);
+    QVERIFY(!err.has_value());
+    QVERIFY(hasTree);
+}
+
+// The server reads the nullable-text update fields as three-valued: absent means
+// "keep the stored value", JSON null means "clear the column", and a string means
+// "store that string" (remote/src/workspace.ts updateTerminalPane). A
+// std::optional<QString> can only express two of those, and WHICH two is a wire
+// contract the server's logic depends on: a disengaged optional MUST leave the
+// key out (or the update would overwrite a column the caller never mentioned),
+// and an engaged one MUST send a JSON string even when it is empty (turning ""
+// into an omission would silently drop a deliberate write, and turning it into
+// null would clear a column the caller only meant to blank). Neither rule is
+// visible from the C++ signature, so pin both here.
+void TstWorkspaceDb::updateOptionalsOmitUnsetAndSendEmptyStringsVerbatim()
+{
+    makePair();
+
+    bool fired = false;
+    m_db->updateTerminalPane(
+        ch::UpdateTerminalPaneParams{.id = ch::TerminalId{QStringLiteral("t1")},
+                                     .workingDirectory = QString(),
+                                     .tmuxTarget = QString(),
+                                     .harness = QString()},
+        [&](std::optional<ch::TerminalPane>, std::optional<RpcError>) { fired = true; });
+
+    const QJsonObject req = readRequest();
+    QCOMPARE(req.value(QStringLiteral("method")).toString(),
+             QString::fromLatin1(ch::rpc::kMethodWorkspaceUpdateTerminalPane));
+    const QJsonObject params = req.value(QStringLiteral("params")).toObject();
+    QCOMPARE(params.value(QStringLiteral("id")).toString(), QStringLiteral("t1"));
+
+    // Engaged-but-empty: present, a JSON string, and empty. Not absent, not null.
+    for (const QString& key : {QStringLiteral("workingDirectory"),
+                               QStringLiteral("tmuxTarget"),
+                               QStringLiteral("harness")}) {
+        QVERIFY2(params.contains(key), qPrintable(key));
+        QVERIFY2(params.value(key).isString(), qPrintable(key));
+        QVERIFY2(!params.value(key).isNull(), qPrintable(key));
+        QVERIFY2(params.value(key).toString().isEmpty(), qPrintable(key));
+    }
+    // An empty tmuxTarget is a WRITE of "", which the server refuses (it demands
+    // 1-N characters of [A-Za-z0-9_-]) rather than treating as a clear. The
+    // client's job is to send it verbatim and let that -32602 come back, which is
+    // exactly what the assertions above pin.
+
+    // Disengaged: absent entirely, so the server keeps the stored value.
+    QVERIFY(!params.contains(QStringLiteral("name")));
+    QVERIFY(!params.contains(QStringLiteral("startupCommand")));
+    QVERIFY(!params.contains(QStringLiteral("position")));
+
+    m_serverSide->write(jsonLine(
+        {{"jsonrpc", "2.0"},
+         {"id", req.value(QStringLiteral("id")).toInt()},
+         {"result", QJsonObject{{"id", "t1"}, {"serverId", "srv-1"},
+                                {"devSessionId", "s1"}, {"name", "sh"},
+                                {"workingDirectory", ""}, {"tmuxTarget", ""},
+                                {"startupCommand", QJsonValue(QJsonValue::Null)},
+                                {"harness", ""}, {"position", 0}}}}));
+    m_serverSide->flush();
+    QTRY_VERIFY(fired);
 }
 
 QTEST_GUILESS_MAIN(TstWorkspaceDb)

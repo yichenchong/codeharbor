@@ -78,6 +78,7 @@ private slots:
     void rebindingTheSameTransportDoesNotDuplicateDelivery();
     void oversizedUnterminatedLineIsDroppedAndStreamResyncs();
     void oversizedFrameTailIsNeverParsedAsItsOwnEvent();
+    void overCapCompleteFrameIsDroppedWhateverTheChunking();
     void errorStateIsNotSticky();
     void onlyAttentionStatesNotify();
     void notificationBodyFallsBackToIdentifiers();
@@ -987,11 +988,60 @@ void TstAgentMonitor::oversizedFrameTailIsNeverParsedAsItsOwnEvent()
     QCOMPARE(m_monitor->stateFor("dTail", "tTail"), asInt(AgentState::Idle));
 }
 
+// The size cap is a property of the FRAME, not of how the producer's bytes
+// happened to be chopped up by the socket.
+//
+// oversizedUnterminatedLineIsDroppedAndStreamResyncs() covers the fragmented
+// case: bytes accumulate past 1 MiB with no newline in sight, the buffer is
+// thrown away and the frame's tail skipped. But a line that is over the cap AND
+// arrives newline-and-all in a single read never touches that guard — the
+// framing loop sees a complete line and used to parse and apply it. The same
+// event was therefore accepted or rejected purely on read granularity, which is
+// not a property any producer or test can control.
+//
+// The window is reachable rather than theoretical: codeharbor-bridge caps the
+// message it accepts at MAX_BRIDGE_LINE_BYTES (1 MiB, the same number) and then
+// emits a strictly LARGER event line — it adds version, timestamp and harness
+// fields — so a harness whose summary is close to a megabyte produces exactly
+// this frame.
+//
+// A QBuffer is used instead of the socket pair on purpose: setTransport()
+// drains it in one synchronous read, so the whole over-cap line is guaranteed to
+// be framed as one complete line. That is the case the socket pair cannot
+// reliably reproduce.
+void TstAgentMonitor::overCapCompleteFrameIsDroppedWhateverTheChunking()
+{
+    QBuffer preloaded;
+    // 1 MiB of summary alone puts the framed line past the 1 MiB cap.
+    preloaded.setData(eventLine("running", QStringLiteral("dCap"),
+                                QStringLiteral("tCap"),
+                                QStringLiteral("generic"),
+                                QStringLiteral("turn_end"),
+                                QString(1024 * 1024, QLatin1Char('a')))
+                      + eventLine("idle", QStringLiteral("dCap"),
+                                  QStringLiteral("tCap")));
+    QVERIFY(preloaded.data().size() > 1024 * 1024);
+    QVERIFY(preloaded.open(QIODevice::ReadOnly));
+
+    QSignalSpy stateSpy(m_monitor, &AgentStatusMonitor::agentStateChanged);
+    m_monitor->setTransport(&preloaded);
+
+    // Only the small line was applied; the over-cap one left no trace, and
+    // framing resumed at its newline rather than swallowing what followed.
+    QCOMPARE(stateSpy.count(), 1);
+    QCOMPARE(stateSpy.at(0).at(2).toInt(), asInt(AgentState::Idle));
+    QCOMPARE(m_monitor->stateFor("dCap", "tCap"), asInt(AgentState::Idle));
+
+    m_monitor->setTransport(nullptr);
+}
+
 // Error is a state, not a latch. Nothing in the monitor keeps a Dev Session red
 // once the agent reports it is working again, and no explicit reset is needed
-// to leave Error — the next event simply replaces it. Error also never notifies
-// (SPEC 6.2 lists waiting_input and idle_unseen only) and is not a completion,
-// so it must not arm the unseen badge.
+// to leave Error — the next event simply replaces it. Error also never notifies:
+// the notification hook fires for waiting_input and idle_unseen only, the state
+// names SPEC 6.4 "Internal Event Schema" defines (the notification display layer
+// itself has no section of its own and is a Phase 4 deliverable in SPEC 16).
+// Error is not a completion either, so it must not arm the unseen badge.
 void TstAgentMonitor::errorStateIsNotSticky()
 {
     makePair();

@@ -483,10 +483,17 @@ Fallback:
   "event": "ask_started",
   "summary": "Agent is waiting for structured input",
   "metadata": {
-    "toolName": "ask"
+    "tool": "ask"
   }
 }
 ```
+
+`metadata` is free-form, but the tool name is keyed **`tool`**. That is not a
+preference: all three shipped adapters in `remote/src/adapters/` emit it under
+that exact key — `oh-my-pi.ts` and `pi.ts` pass their harness's own `tool` field
+through, and `claude-code.ts` renames the harness's `tool_name` to it. An adapter
+that picks a different key compiles, validates and relays fine, and the client
+simply never sees a tool name.
 
 Supported states:
 
@@ -1063,9 +1070,16 @@ Remote component:
 ```text
 remote/
 ├── src/
-│   ├── codeharbord.ts        RPC service
+│   ├── codeharbord.ts        RPC service (JSON-RPC 2.0 over newline-delimited JSON)
+│   ├── rpc-types.ts          request/result shapes shared by the RPC modules
+│   ├── files.ts              file.* methods: stat/read/write/watch/listDirectory
+│   ├── workspace.ts          workspace.* methods over the SQLite database
+│   ├── tmux.ts               tmux.* discovery methods
+│   ├── validate.ts           request-parameter validation helpers
+│   ├── events.ts             agent event schema + socket-path resolution
 │   ├── bridge.ts             agent event relay
-│   ├── adapters/             oh-my-pi.ts, pi.ts, claude-code.ts, fallback.ts
+│   ├── adapters/             oh-my-pi.ts, pi.ts, claude-code.ts, fallback.ts,
+│   │                         types.ts, index.ts (the harness registry)
 │   └── hooks/                oh-my-pi-hook.ts (the native harness hook)
 └── sql/                      schema.sql, indexes.sql
 ```

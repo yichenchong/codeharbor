@@ -79,7 +79,8 @@ QByteArray agentEventLine(const QString& state, const QString& dev,
 }
 } // namespace
 
-// Notifier's no-backend behaviour, gating and coalescing (SPEC 6.2).
+// Notifier's no-backend behaviour, gating and coalescing. The display layer has
+// no SPEC section of its own; it is a Phase 4 deliverable in SPEC 16.
 //
 // main() below forces DBUS_SESSION_BUS_ADDRESS to an unusable value before
 // QCoreApplication exists, so QDBusConnection::sessionBus() cannot connect and
@@ -266,12 +267,12 @@ void TestNotifier::theWindowIsMeasuredFromTheLastRaise()
     QCOMPARE(coalesced.count(), 1);
 }
 
-// SPEC 6.2 end to end, over the ONE connection that makes the feature exist:
-// main.cpp's `connect(&agentMonitor, &AgentStatusMonitor::notify, &notifier,
-// &Notifier::notify)`. Both sides are covered in isolation and neither test
-// touches the join, so deleting that line would leave the whole suite green
-// and every agent silent. Drive real AgentEvent JSONL in one end and assert a
-// notification comes out the other.
+// The agent-attention path end to end, over the ONE connection that makes the
+// feature exist: main.cpp's `connect(&agentMonitor,
+// &AgentStatusMonitor::notify, &notifier, &Notifier::notify)`. Both sides are
+// covered in isolation and neither test touches the join, so deleting that line
+// would leave the whole suite green and every agent silent. Drive real
+// AgentEvent JSONL in one end and assert a notification comes out the other.
 void TestNotifier::agentEventRaisesNotificationEndToEnd()
 {
     AgentFeed feed;

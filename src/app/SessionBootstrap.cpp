@@ -112,6 +112,9 @@ SessionBootstrap::SessionBootstrap(SshConnectionPool* pool,
             return;
         }
         ++m_attempt;
+        // This attempt belongs to the ladder, so setReconnectEnabled(false) may
+        // abandon it mid-flight; a connectAndWire() may not. See there.
+        m_attemptIsRetry = true;
         if (!attemptWire())
             scheduleReconnect();
     });
@@ -501,9 +504,22 @@ void SessionBootstrap::setReconnectEnabled(bool enabled)
     // retry that is already inside its connect pre-flight must unwind rather
     // than finish wiring a session the user just opted out of.
     cancelReconnect();
-    abortAttempt();
-    if (m_state == State::Reconnecting)
+    // ONLY a rung of the ladder. Aborting a connectAndWire() the user asked for
+    // strands the object: that attempt unwinds with m_cancelRequested set,
+    // connectAndWire() then declines to relabel it Failed (a cancel means the
+    // canceller owns the end state, which is true of disconnectSession() and of
+    // nothing else), and the state sits on Connecting for ever with no retry
+    // armed and no way back. A user turning auto-reconnect off has not asked to
+    // abandon the connect they are in the middle of making.
+    if (m_attempting && m_attemptIsRetry) {
+        abortAttempt();
+        // The rung is gone and nothing will re-arm it, so this attempt's end
+        // state is ours to set: it unwinds through scheduleReconnect(), which
+        // returns at once for a cancelled attempt.
         setState(State::Disconnected);
+    } else if (m_state == State::Reconnecting) {
+        setState(State::Disconnected);
+    }
 }
 
 void SessionBootstrap::setMaxReconnectAttempts(int attempts)
@@ -585,6 +601,12 @@ void SessionBootstrap::handleConnectionLost(const QString& reason)
         return;
     }
     m_attempt = 0;
+    // A loss of a LIVE session is, by definition, not a cancelled attempt. The
+    // flag is scoped to one attempt but only cleared where an attempt STARTS,
+    // so a cancel that outlived its attempt would make scheduleReconnect()
+    // return here without arming anything - leaving the object reporting Wired
+    // with both devices already torn down and no path back.
+    m_cancelRequested = false;
     scheduleReconnect();
 }
 
@@ -787,6 +809,16 @@ bool SessionBootstrap::runRemoteScript(const QString& script, int timeoutMs,
     if (!m_pool) {
         if (error)
             *error = QStringLiteral("no SSH connection pool");
+        return false;
+    }
+    // The attempt was already cancelled before this step began - abortAttempt()
+    // can land between two provisioning steps, where there is no nested loop of
+    // ours for it to quit. Entering the wait anyway would spend the whole
+    // budget (three minutes for an install) on the GUI thread before noticing,
+    // and would run a remote command for a session nobody wants any more.
+    if (m_cancelRequested) {
+        if (error)
+            *error = QStringLiteral("cancelled");
         return false;
     }
 
@@ -1291,6 +1323,15 @@ bool SessionBootstrap::attemptWire()
     // reported it. See its comment for why a failed INSPECTION does not.
     if (!ensureRemoteService())
         return false;
+    // Provisioning can park this attempt in a nested event loop for minutes,
+    // which is exactly where a "disconnect" lands. ensureRemoteService() reports
+    // that as a plain false only when a step of its own failed; a cancel that
+    // arrived between its steps leaves it succeeding. Answering the user's
+    // teardown by wiring the very session they abandoned is the one outcome
+    // that must not happen, so the flag is the last thing checked before
+    // anything is exec'd.
+    if (m_cancelRequested)
+        return false;
 
     m_rpcDevice = openChannelDevice(SshConnectionPool::ChannelKind::Rpc,
                                     rpcCommand(m_nodePath, m_repoRoot),
@@ -1359,6 +1400,8 @@ bool SessionBootstrap::connectAndWire(const QString& host, quint16 port,
 
     cancelReconnect();
     m_attempt = 0;
+    // The user asked for this one, so the ladder switch may not abandon it.
+    m_attemptIsRetry = false;
     setState(State::Connecting);
 
     if (attemptWire())

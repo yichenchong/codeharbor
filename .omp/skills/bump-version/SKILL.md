@@ -24,11 +24,22 @@ What it does (commit mode, the default):
    `project(CodeHarbor VERSION …)` in `CMakeLists.txt`, else `0.0.0`).
 2. Computes the next version (`major` → `X+1.0.0`, `minor` → `X.Y+1.0`,
    `patch` → `X.Y.Z+1`) or uses `--set`.
-3. Rewrites the version in `CMakeLists.txt` and in every workspace manifest —
-   `package.json`, `remote/package.json`, `src/web/terminal/package.json` and
-   `src/web/editor/package.json` — so the built binary (`CODEHARBOR_VERSION`),
-   the remote artifact and both web bundles report the tagged version. A missing
-   manifest aborts the run rather than being skipped.
+3. Rewrites the version in all seven files that carry it: `CMakeLists.txt`;
+   `remote/src/codeharbord.ts` (the `RPC_SERVER_VERSION` constant); the four
+   workspace manifests `package.json`, `remote/package.json`,
+   `src/web/terminal/package.json` and `src/web/editor/package.json`; and
+   `package-lock.json` (its top-level `version`, `packages[""]` and one entry per
+   workspace path). So the built binary (`CODEHARBOR_VERSION`), the daemon's own
+   `server.info` reply, the remote artifact and both web bundles all report the
+   tagged version. The last two are in the list because they are the two that have
+   actually drifted: nothing else updates the lock and `npm ci` installs whatever
+   version it records, and `RPC_SERVER_VERSION` sat at 0.1.0 while the tag said
+   v0.1.8, so every server announced a version three releases stale. A missing file
+   aborts the run, before anything is rewritten, rather than being skipped.
+
+   `.github/scripts/check-versions.mjs` checks the same seven files and runs in CI.
+   **A file that carries the release version must be added to both**, or it will
+   drift with nothing to notice.
 4. Commits **only those files** as `Release vX.Y.Z`.
 5. Creates the annotated tag `vX.Y.Z`.
 
@@ -48,8 +59,9 @@ actually starts the release workflow.
 ### Safety
 
 - Aborts if the target tag already exists.
-- Aborts if any of those version files have uncommitted changes (unless
-  `--allow-dirty`), so in-progress version edits are never clobbered.
+- Aborts if any of those files — including `package-lock.json` — have
+  uncommitted changes (unless `--allow-dirty`), so in-progress version edits are
+  never clobbered.
 - Only the version files are staged — unrelated working-tree changes are left
   untouched.
 

@@ -360,6 +360,14 @@ export function mountEditor(
         reload.textContent = "Reload";
         reload.addEventListener("click", () => {
             clearNotice();
+            // Discarding the local edits is the whole point of this button, so
+            // the snapshot armed above must not outlive the click: a timer that
+            // fires inside the reload round trip reports the buffer the user
+            // just threw away, which re-flags the file dirty on the host and
+            // rewrites the crash-recovery snapshot the reload is about to
+            // retire (SPEC 11.3). requestSave() cancels for the same reason;
+            // this path bypasses it.
+            reporter.cancel();
             bridge.requestReload();
         });
         const overwrite = doc.createElement("button");

@@ -8,6 +8,8 @@
 #include <QJsonObject>
 #include <QPointer>
 
+#include <utility>
+
 namespace ch {
 
 namespace {
@@ -134,7 +136,7 @@ bool statSaysUnwritable(const QJsonObject& stat)
 
 EditorController::EditorController(CodeharbordClient* client, QString recoveryId,
                                   QObject* parent)
-    : QObject(parent), m_client(client), m_recoveryId(recoveryId)
+    : QObject(parent), m_client(client), m_recoveryId(std::move(recoveryId))
 {
     if (m_client) {
         connect(m_client, &CodeharbordClient::notificationReceived, this,
@@ -344,18 +346,22 @@ void EditorController::reconcileAfterReconnect()
                 return;
             }
 
+            // One conversion, two readers: `statRes` is a QJsonValue and every
+            // toObject() on it rebuilds the object.
+            const QJsonObject stat = statRes.toObject();
+
             // This stat is also the reconnect's permission refresh: the file
             // may have been chmod'd while the session was down, and no watch
             // event exists to tell us. Free — the round trip is already made —
             // and it covers the dirty-buffer branch below, which never reloads
             // and so would otherwise keep the pre-outage verdict forever.
-            self->applyStatPermissions(statRes.toObject());
+            self->applyStatPermissions(stat);
 
             if (self->m_fileState == FileState::Saving)
                 return;  // the in-flight write decides this file's next state
 
             const QString revision =
-                statRes.toObject().value(QStringLiteral("revision")).toString();
+                stat.value(QStringLiteral("revision")).toString();
             if (revision.isEmpty() || revision == baseline)
                 return;  // nothing changed while we were away
 
@@ -978,6 +984,19 @@ void EditorController::reload(FileState transitional, bool discardLocalEdits)
                     self->setFileState(FileState::ExternallyModified);
                 return;
             }
+            // A save is in flight. Its bytes are the user's, they are not on
+            // the server yet, and only its own reply can decide this file's
+            // next state — exactly the rule reconcileAfterReconnect() applies
+            // to its stat. Installing the server's bytes here would replace the
+            // buffer the write is carrying, re-baseline the revision that write
+            // is guarded by, and clear the recovery snapshot holding those
+            // bytes, one moment before the reply lands (the reply is then
+            // refused as a conflict, and the only copy of the edits is gone).
+            // m_editSerial cannot notice this on its own: a save carries bytes
+            // the controller may never have seen a reportContent for, because
+            // Ctrl/Cmd+S beats the page's 500 ms debounce.
+            if (!discardLocalEdits && self->m_fileState == FileState::Saving)
+                return;
             const QJsonObject obj = result.toObject();
             const QString content = obj.value(QStringLiteral("content")).toString();
             const QString revision = obj.value(QStringLiteral("revision")).toString();

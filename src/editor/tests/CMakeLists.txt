@@ -22,7 +22,7 @@ add_test(NAME tst_editorcontroller COMMAND tst_editorcontroller)
 # --single-process is DELIBERATELY ABSENT: Chromium aborts ("Single mode supports
 # only single profile") the moment a second QWebEngineProfile exists, and the
 # viewer stack (which supplies this pane's privileged profile) creates two by
-# design (SPEC 7.2).
+# design (SPEC 7.3).
 set(CODEHARBOR_LIVE_EDITOR_TEST_ENV
     "QT_QPA_PLATFORM=offscreen"
     "QT_QUICK_BACKEND=software"
@@ -95,3 +95,14 @@ set_tests_properties(tst_liveeditorreconnect PROPERTIES
     LABELS live
     TIMEOUT 600
 )
+
+# Console-mode on Windows, for the same reason as src/app/tests: qt_add_executable
+# marks executables as GUI subsystem, which on Windows swallows QTest's stdout and
+# stderr, so a failing assertion reports nothing at all through ctest.
+# tst_liveeditor drives a real QML/WebEngine window and is left as a GUI executable.
+if(WIN32)
+    set_target_properties(
+        tst_editorcontroller
+        tst_liveeditorreconnect
+        PROPERTIES WIN32_EXECUTABLE FALSE)
+endif()

@@ -276,10 +276,11 @@ bool TstLiveAgent::runRemote(const QString& command, QByteArray* out,
 bool TstLiveAgent::fireHook(const QString& nativeEvent, const QString& tool,
                             const QString& summary, bool error)
 {
-    // The exact contract a harness must honour (SPEC 6.2): the native event is
-    // argv[1] of the installed hook, the session coordinates and the optional
+    // The exact contract a harness must honour, as documented by the hook it
+    // installs (remote/src/hooks/oh-my-pi-hook.ts): the native event is the
+    // hook's first positional argument, the session coordinates and the optional
     // summary come from the environment, and XDG_RUNTIME_DIR selects the bridge
-    // socket (SPEC 6.3).
+    // socket (SPEC 6.3 "Remote Agent Bridge").
     QStringList argv;
     argv << QStringLiteral("env")
          << q(QStringLiteral("XDG_RUNTIME_DIR=") + m_runtimeDir)
@@ -543,8 +544,9 @@ void TstLiveAgent::errorAndShutdownReachTheRowState()
     // An error is not a completion: no unseen badge...
     QVERIFY(!m_monitor.hasUnseen(m_dev));
     QCOMPARE(m_unseenSpy->count(), unseenBefore);
-    // ...and not attention-worthy in the notification sense either (SPEC 6.2
-    // names waiting_input and idle_unseen, and only those).
+    // ...and not attention-worthy in the notification sense either: the hook
+    // fires for waiting_input and idle_unseen only, the state names SPEC 6.4
+    // defines (notifications themselves are a Phase 4 deliverable in SPEC 16).
     QCOMPARE(m_notifySpy->count(), notifiesBefore);
 
     QVERIFY(fireHook(QStringLiteral("session_shutdown")));

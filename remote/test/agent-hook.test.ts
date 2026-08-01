@@ -176,6 +176,29 @@ test("readHookInput falls back to OMP_HOOK_EVENT and ignores a false OMP_ERROR",
     } as NodeJS.ProcessEnv);
     assert.equal(fromEnv.event, "agent_end");
 
+    // A BLANK positional argument is "no event given", not the empty event, so
+    // the environment fallback still applies. This is the common shape of a
+    // shell hook config: `node oh-my-pi-hook.ts "$OMP_EVENT"` with the variable
+    // unset hands the hook an empty argv[2], and taking that empty string as the
+    // answer would make OMP_HOOK_EVENT unreachable for exactly the setups that
+    // rely on it.
+    for (const blank of ["", "   ", "\t"]) {
+        const viaEnv = readHookInput(["node", "hook.ts", blank], {
+            OMP_HOOK_EVENT: "agent_end",
+            OMP_DEV_SESSION_ID: "sess-1",
+            OMP_TERMINAL_ID: "term-1",
+        } as NodeJS.ProcessEnv);
+        assert.equal(viaEnv.event, "agent_end", `argv[2]=${JSON.stringify(blank)}`);
+    }
+
+    // Both sources blank leaves no event at all, so main() prints usage instead
+    // of emitting an event whose type no adapter can map.
+    assert.equal(
+        readHookInput(["node", "hook.ts", "  "], { OMP_HOOK_EVENT: " " } as NodeJS.ProcessEnv)
+            .event,
+        "",
+    );
+
     // Only "1" and "true" mean error; anything else leaves the flag unset so the
     // bridge does not map an ordinary event to the error state.
     const notAnError = readHookInput(["node", "hook.ts", "agent_start"], {
@@ -366,12 +389,14 @@ function fakeSource(): {
     paused: boolean;
     pauses: number;
     resumes: number;
+    closeSubscriptions: number;
     close: () => void;
 } {
     const state = {
         paused: false,
         pauses: 0,
         resumes: 0,
+        closeSubscriptions: 0,
         close: (): void => {},
         socket: undefined as unknown as net.Socket,
     };
@@ -385,7 +410,9 @@ function fakeSource(): {
             state.resumes += 1;
         },
         once(event: string, handler: () => void) {
-            if (event === "close") state.close = handler;
+            if (event !== "close") return;
+            state.closeSubscriptions += 1;
+            state.close = handler;
         },
     } as unknown as net.Socket;
     return state;
@@ -447,6 +474,35 @@ test("makeStreamSink forgets a source that disconnects while the output is stall
     out.resume();
     await drained.promise;
     assert.equal(source.resumes, 0, "a disconnected source must not be resumed");
+});
+
+// A long-lived producer is paused and resumed once per stall, and the sink
+// subscribes to its 'close' each time it pauses it. Re-subscribing on every
+// stall piles listeners onto the same socket: Node warns at eleven ("possible
+// EventEmitter memory leak") and each one is retained until the socket closes.
+test("makeStreamSink subscribes to a source's close only once across stalls", async () => {
+    const out = new PassThrough({ highWaterMark: 1 });
+    const sink = makeStreamSink(out);
+    const source = fakeSource();
+
+    for (let cycle = 0; cycle < 3; cycle += 1) {
+        let guard = 0;
+        while (!source.paused && guard++ < 10) sink(RELAY_EVENT, source.socket);
+        assert.equal(source.paused, true, "a full output buffer must pause the source");
+
+        const drained = Promise.withResolvers<void>();
+        out.once("drain", () => drained.resolve());
+        out.resume();
+        await drained.promise;
+        out.pause();
+        assert.equal(source.paused, false, "the source must resume once the output drains");
+    }
+
+    assert.equal(
+        source.closeSubscriptions,
+        1,
+        "the sink must not stack a 'close' listener per stall cycle",
+    );
 });
 
 // readline has no maximum line length, so a producer that streams bytes and

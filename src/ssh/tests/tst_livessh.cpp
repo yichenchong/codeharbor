@@ -71,6 +71,7 @@ private slots:
     void connectionLogRecordsLibsshTrace();
     void execChannelDeliversStdout();
     void manyShortLivedChannelsReuseTheirSlots();
+    void ptyChannelRunsWithTheRequestedTerminalType();
     void rpcServerInfoOverSshChannel();
     void stderrStaysOutOfReadStream();
     void encryptedIdentityUsesPassphraseFromCallback();
@@ -219,6 +220,38 @@ void TstLiveSsh::manyShortLivedChannelsReuseTheirSlots()
 
     // The session itself is untouched by all that churn.
     QCOMPARE(m_pool.state(), SshConnectionPool::State::Connected);
+}
+
+// The terminal type a PTY channel asks for is the one the remote session gets.
+// A channel accepts exactly ONE pty-req, and the pool used to spend it on
+// libssh's ssh_channel_request_pty(), which hard-codes TERM=xterm: startPty()
+// could then only change the window size, so a pane that asked for
+// xterm-256color silently ran everything (tmux, vim, ls) as a 16-colour
+// terminal. Nothing but a live remote shell can observe which TERM was
+// negotiated, which is why this case lives in the live gate.
+void TstLiveSsh::ptyChannelRunsWithTheRequestedTerminalType()
+{
+    ensureConnected();
+    QCOMPARE(m_pool.state(), SshConnectionPool::State::Connected);
+
+    SshChannelDevice device(&m_pool, SshConnectionPool::ChannelKind::Pty);
+    ChannelSink sink;
+    sink.attach(&device);
+
+    // printf, not echo: no trailing newline to be rewritten by the tty's
+    // output processing, and the markers make the value findable in whatever
+    // else a login PTY decides to print.
+    QVERIFY2(device.startPty(QStringLiteral("xterm-256color"), 120, 40,
+                             QStringLiteral(
+                                 "sh -c 'printf \"<%s>\" \"$TERM\"'")),
+             qPrintable(sink.err));
+    QTRY_VERIFY_WITH_TIMEOUT(sink.finished, kExecTimeoutMs);
+
+    QVERIFY2(sink.out.contains("<xterm-256color>"),
+             qPrintable(QStringLiteral("remote TERM was not the requested one; "
+                                       "channel produced: %1")
+                            .arg(QString::fromUtf8(sink.out))));
+    device.closeChannel();
 }
 
 // (c) The end-to-end spine: real codeharbord, over a real SSH channel, driven

@@ -71,10 +71,25 @@ Rectangle {
         // Component.onCompleted runs this again once it certainly does.
         if (!actionRow)
             return;
+        // Anything the row still holds that the new list does not name is no
+        // longer one of this header's actions. Re-assigning `actions` is the
+        // only way that happens, and without this the dropped controls would
+        // stay in the row — still drawn, still clickable, still wired to
+        // whatever they were wired to — because a `list<Item>` entry keeps the
+        // header as its QObject parent whatever the list says.
+        const wanted = [];
         for (let i = 0; i < header.actions.length; ++i) {
             const item = header.actions[i];
-            if (item && item.parent !== actionRow)
+            if (!item)
+                continue;
+            wanted.push(item);
+            if (item.parent !== actionRow)
                 item.parent = actionRow;
+        }
+        const shown = actionRow.children;
+        for (let k = shown.length - 1; k >= 0; --k) {
+            if (wanted.indexOf(shown[k]) < 0)
+                shown[k].parent = null;
         }
     }
 

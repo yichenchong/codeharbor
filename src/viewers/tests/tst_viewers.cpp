@@ -10,6 +10,7 @@
 #include <QCoreApplication>
 #include <QDeadlineTimer>
 #include <QGuiApplication>
+#include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QList>
@@ -18,6 +19,7 @@
 #include <QRegularExpression>
 #include <QSet>
 #include <QString>
+#include <QStringList>
 #include <QUrl>
 #include <QWebEngineUrlScheme>
 #include <QtTest/QtTest>
@@ -179,6 +181,12 @@ private slots:
     void textReadBookkeepingDoesNotLeak();
     // What the text pane is told when the server's answer is not plain text.
     void textReadFailureModes();
+    // A read the client cannot even put on the wire still has to reach the pane
+    // that asked for it, and reach it AFTER the token naming it.
+    void textReadOnADeadTransportStillReachesItsCaller();
+
+    // The order and the shape of the entries the directory pane renders.
+    void directoryListingIsSortedDirectoriesFirst();
 
     // SPEC 9: an out-of-project path stays openable, but the pane has to be
     // TOLD it is out of project. These pin the flag's trip from the reply to
@@ -225,10 +233,33 @@ void TstViewers::resolveByExtensionTable()
                  ViewerResolution::TextEditor);
     }
 
+    // Build, infra and less-common source formats a developer reads as text.
+    // These are files this very repository (and any repository it is used on)
+    // is full of; each one landing in the binary Download pane is a file the
+    // user simply cannot read.
+    for (const QString &ext :
+         {QStringLiteral("qml"), QStringLiteral("qrc"), QStringLiteral("proto"),
+          QStringLiteral("graphql"), QStringLiteral("tf"), QStringLiteral("nix"),
+          QStringLiteral("bzl"), QStringLiteral("ninja"), QStringLiteral("m4"),
+          QStringLiteral("ac"), QStringLiteral("am"), QStringLiteral("mod"),
+          QStringLiteral("sum"), QStringLiteral("lock"), QStringLiteral("rst"),
+          QStringLiteral("tex"), QStringLiteral("ps1"), QStringLiteral("bat"),
+          QStringLiteral("dart"), QStringLiteral("jl"), QStringLiteral("hs"),
+          QStringLiteral("ex"), QStringLiteral("erl"), QStringLiteral("zig"),
+          QStringLiteral("asm"), QStringLiteral("ipynb"),
+          QStringLiteral("desktop"), QStringLiteral("service")}) {
+        QCOMPARE(ViewerHandlerRegistry::resolveByExtension(ext),
+                 ViewerResolution::TextEditor);
+    }
+
     // Images.
     for (const QString &ext :
          {QStringLiteral("png"), QStringLiteral("jpg"), QStringLiteral("jpeg"),
-          QStringLiteral("gif"), QStringLiteral("svg"), QStringLiteral("webp")}) {
+          QStringLiteral("gif"), QStringLiteral("svg"), QStringLiteral("webp"),
+          // Raster formats Chromium decodes natively; without these an .ico or
+          // a .bmp opened as a download instead of showing the picture.
+          QStringLiteral("bmp"), QStringLiteral("ico"), QStringLiteral("avif"),
+          QStringLiteral("apng")}) {
         QCOMPARE(ViewerHandlerRegistry::resolveByExtension(ext),
                  ViewerResolution::ImageViewer);
     }
@@ -247,6 +278,12 @@ void TstViewers::resolveByExtensionTable()
     QCOMPARE(ViewerHandlerRegistry::resolveByExtension(QStringLiteral("exe")),
              ViewerResolution::Download);
     QCOMPARE(ViewerHandlerRegistry::resolveByExtension(QString()),
+             ViewerResolution::Download);
+    // A format Chromium cannot decode stays a download rather than becoming an
+    // image pane stuck on a broken-image icon.
+    QCOMPARE(ViewerHandlerRegistry::resolveByExtension(QStringLiteral("tiff")),
+             ViewerResolution::Download);
+    QCOMPARE(ViewerHandlerRegistry::resolveByExtension(QStringLiteral("psd")),
              ViewerResolution::Download);
 }
 
@@ -316,6 +353,50 @@ void TstViewers::resolveUrlTable()
     QCOMPARE(ViewerHandlerRegistry::resolve(
                  QUrl(QStringLiteral("file:///home/yc/archive.zip"))),
              ViewerResolution::Download);
+
+    // The name table is matched CASE-INSENSITIVELY. "makefile" all lower case
+    // is what GNU make itself looks for and what countless repositories ship;
+    // a case-sensitive table showed it as an undecipherable binary.
+    for (const QString &name :
+         {QStringLiteral("makefile"), QStringLiteral("MAKEFILE"),
+          QStringLiteral("GNUmakefile"), QStringLiteral("readme"),
+          QStringLiteral("License"), QStringLiteral("Jenkinsfile"),
+          QStringLiteral("Rakefile"), QStringLiteral("CODEOWNERS"),
+          QStringLiteral(".dockerignore"), QStringLiteral(".clang-format"),
+          QStringLiteral(".npmrc")}) {
+        QCOMPARE(ViewerHandlerRegistry::resolve(
+                     QUrl(QStringLiteral("file:///home/yc/") + name)),
+                 ViewerResolution::TextEditor);
+    }
+
+    // A well-known name with a MEANINGLESS suffix bolted on is still that file.
+    // These spellings are everywhere and each one used to open as a binary.
+    for (const QString &name :
+         {QStringLiteral("Dockerfile.dev"), QStringLiteral("Makefile.am"),
+          QStringLiteral("Makefile.in"), QStringLiteral(".env.local"),
+          QStringLiteral(".env.production"), QStringLiteral("README.old")}) {
+        QCOMPARE(ViewerHandlerRegistry::resolve(
+                     QUrl(QStringLiteral("file:///home/yc/") + name)),
+                 ViewerResolution::TextEditor);
+    }
+
+    // The suffix rule must not swallow ordinary binaries: the stem has to be a
+    // known text name, and a KNOWN extension still wins outright.
+    QCOMPARE(ViewerHandlerRegistry::resolve(
+                 QUrl(QStringLiteral("file:///home/yc/notmakefile.bin"))),
+             ViewerResolution::Download);
+    QCOMPARE(ViewerHandlerRegistry::resolve(
+                 QUrl(QStringLiteral("file:///home/yc/README.png"))),
+             ViewerResolution::ImageViewer);
+    QCOMPARE(ViewerHandlerRegistry::resolve(
+                 QUrl(QStringLiteral("file:///home/yc/README.md"))),
+             ViewerResolution::InternalHtmlRenderer);
+
+    // A directory whose own name is a well-known text name is still a
+    // directory: the trailing slash is decided first.
+    QCOMPARE(ViewerHandlerRegistry::resolve(
+                 QUrl(QStringLiteral("file:///home/yc/LICENSE/"))),
+             ViewerResolution::DirectoryViewer);
 
     // Unknown scheme -> error.
     QCOMPARE(ViewerHandlerRegistry::resolve(QUrl(QStringLiteral("ftp://host/x"))),
@@ -613,6 +694,18 @@ void TstViewers::urlMappingBareId()
     // An unknown bare id is not silently aliased onto some other entry.
     QVERIFY(!map.fileUrlForId(QStringLiteral("00000000000000000000000000000000"))
                  .isValid());
+
+    // A full internal URL naming a DIFFERENT authority is refused, exactly as
+    // InternalUrlSchemeHandler refuses it. In a browser a differing host is a
+    // differing origin, so an inverse that quietly accepted one would disagree
+    // with the handler about whether the very same URL is legitimate.
+    QVERIFY(!map.fileUrlFor(QStringLiteral("codeharbor-internal://evil/") + id)
+                 .isValid());
+    QVERIFY(!map.fileUrlFor(QStringLiteral("codeharbor-internal://files/") + id)
+                 .isValid());
+    // Host matching stays case-insensitive, which is how URLs work.
+    QCOMPARE(map.fileUrlFor(QStringLiteral("codeharbor-internal://FILE/") + id),
+             file);
 }
 
 void TstViewers::viewKindStringsMatchQmlContract()
@@ -987,6 +1080,113 @@ void TstViewers::textReadFailureModes()
     QCOMPARE(errors.at(2).at(1).toString(), QStringLiteral("/p/broken.dat"));
     QCOMPARE(reads.size(), 1);
     QCOMPARE(viewers.inFlightTextReadCount(), 0);
+}
+
+void TstViewers::textReadOnADeadTransportStillReachesItsCaller()
+{
+    // A Dev Session whose SSH connection dropped leaves a CodeharbordClient
+    // that exists but has no usable transport. Its call() refuses the request
+    // and runs the callback THERE AND THEN, inside readTextFile(), before
+    // readTextFile() has returned the token that names the read.
+    //
+    // The pane matches replies by token (ViewerTextView.ownsReply), and it only
+    // learns the token when readTextFile() returns. A failure emitted before
+    // that carries a token the pane has never heard of, so it throws its own
+    // error away and sits on "Loading…" for ever with nothing to show and
+    // nothing to retry. The reply must therefore always land after the token.
+    CodeharbordClient clientWithNoTransport;
+    ViewerModel viewers(&clientWithNoTransport);
+    QSignalSpy errors(&viewers, &ViewerModel::textFileError);
+    QSignalSpy reads(&viewers, &ViewerModel::textFileRead);
+
+    const QString token = viewers.readTextFile(QStringLiteral("/p/a.txt"));
+    QVERIFY(!token.isEmpty());
+    // NOTHING may have been emitted yet: the caller only now holds the token.
+    QCOMPARE(errors.size(), 0);
+    QCOMPARE(viewers.inFlightTextReadCount(), 1);
+
+    QTRY_COMPARE(errors.size(), 1);
+    QCOMPARE(errors.first().at(0).toString(), token);
+    QCOMPARE(errors.first().at(1).toString(), QStringLiteral("/p/a.txt"));
+    QVERIFY(!errors.first().at(2).toString().isEmpty());
+    QCOMPARE(reads.size(), 0);
+    // The read settled, so its bookkeeping is gone: the deferral must not turn
+    // an unsendable read into a permanent in-flight entry.
+    QCOMPARE(viewers.inFlightTextReadCount(), 0);
+
+    // Cancelling before the deferred reply runs still suppresses it — the extra
+    // hop must not smuggle a cancelled read's failure onto a pane that has
+    // already navigated away.
+    const QString cancelled = viewers.readTextFile(QStringLiteral("/p/b.txt"));
+    viewers.cancelTextFile(cancelled);
+    QTest::qWait(50);
+    QCOMPARE(errors.size(), 1);
+    QCOMPARE(viewers.inFlightTextReadCount(), 0);
+}
+
+void TstViewers::directoryListingIsSortedDirectoriesFirst()
+{
+    // The server states no order, so the model imposes one: directories first,
+    // then names case-insensitively, with a case-sensitive tie-break so two
+    // names differing only in case do not swap places between runs. The pane
+    // renders this list verbatim, so this IS the on-screen order.
+    RpcPair pair;
+    QVERIFY(pair.listen());
+    ViewerModel viewers(pair.client());
+    QSignalSpy listings(&viewers, &ViewerModel::directoryListed);
+    QSignalSpy failures(&viewers, &ViewerModel::directoryError);
+
+    viewers.listDirectory(QStringLiteral("/p"));
+    const QJsonObject request = pair.nextRequest();
+    QCOMPARE(request.value(QStringLiteral("method")).toString(),
+             QString::fromLatin1(ch::rpc::kMethodListDirectory));
+    QCOMPARE(requestPath(request), QStringLiteral("/p"));
+
+    const auto entry = [](const QString &name, const QString &kind) {
+        return QJsonObject{{QStringLiteral("name"), name},
+                           {QStringLiteral("kind"), kind},
+                           // A field the model does not forward; the pane's
+                           // delegate reads name/kind and nothing else.
+                           {QStringLiteral("size"), 42}};
+    };
+    pair.respondResult(
+        request,
+        QJsonObject{
+            {QStringLiteral("entries"),
+             QJsonArray{entry(QStringLiteral("zebra.txt"), QStringLiteral("file")),
+                        entry(QStringLiteral("readme"), QStringLiteral("file")),
+                        entry(QStringLiteral("src"), QStringLiteral("directory")),
+                        entry(QStringLiteral("Readme"), QStringLiteral("file")),
+                        entry(QStringLiteral("Apps"), QStringLiteral("directory")),
+                        entry(QStringLiteral("apple.txt"), QStringLiteral("file"))}}});
+
+    QTRY_COMPARE(listings.size(), 1);
+    QCOMPARE(failures.size(), 0);
+    QCOMPARE(listings.first().at(0).toString(), QStringLiteral("/p"));
+
+    QStringList names;
+    const QVariantList entries = listings.first().at(1).toList();
+    for (const QVariant &value : entries) {
+        const QVariantMap map = value.toMap();
+        names.append(map.value(QStringLiteral("name")).toString());
+        // Exactly the two keys the pane consumes: nothing else leaks through.
+        QCOMPARE(map.size(), 2);
+        QVERIFY(map.contains(QStringLiteral("kind")));
+    }
+    QCOMPARE(names,
+             (QStringList{QStringLiteral("Apps"), QStringLiteral("src"),
+                          QStringLiteral("apple.txt"), QStringLiteral("Readme"),
+                          QStringLiteral("readme"), QStringLiteral("zebra.txt")}));
+
+    // An empty directory is a successful listing, not an error: the pane has to
+    // be able to say "nothing here" rather than "something went wrong".
+    viewers.listDirectory(QStringLiteral("/p/empty"));
+    pair.respondResult(pair.nextRequest(),
+                       QJsonObject{{QStringLiteral("entries"), QJsonArray{}}});
+    QTRY_COMPARE(listings.size(), 2);
+    QCOMPARE(listings.at(1).at(0).toString(), QStringLiteral("/p/empty"));
+    QVERIFY(listings.at(1).at(1).toList().isEmpty());
+    QCOMPARE(failures.size(), 0);
 }
 
 void TstViewers::resolvePathCarriesTheRepositoryRootFlag()

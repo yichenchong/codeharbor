@@ -95,6 +95,18 @@ void AgentStatusMonitor::onReadyRead()
             m_readBuffer.remove(0, newline + 1);
             continue;
         }
+        // The cap is a property of the FRAME, not of how the bytes happened to
+        // arrive. An over-cap line that comes in one read would otherwise be
+        // parsed and applied, while the same line split across reads trips the
+        // unterminated-buffer guard below and is dropped — the same event
+        // accepted or rejected depending on socket chunking. It is reachable:
+        // the bridge caps its INPUT at MAX_BRIDGE_LINE_BYTES (also 1 MiB) and
+        // then emits a strictly larger event line, so a producer with a
+        // near-megabyte summary lands in that window. Drop it either way.
+        if (newline > kMaxLineBytes) {
+            m_readBuffer.remove(0, newline + 1);
+            continue;
+        }
         const QByteArray line = m_readBuffer.left(newline);
         m_readBuffer.remove(0, newline + 1);
         processLine(line);

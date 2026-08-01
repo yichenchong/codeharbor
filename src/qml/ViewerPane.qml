@@ -73,7 +73,15 @@ Item {
         pane.urlOpened(pane.paneId, pane.url.toString());
     }
 
-    onUrlChanged: pane.reportUrl()
+    // A navigation is the pane's OWN answer to whatever was asked of it, so the
+    // field follows it even while it has the keyboard: the user pressed Enter on
+    // a relative name ("README.md" typed in a listing, or a path the server had
+    // to be asked about first), and leaving that fragment sitting in the bar
+    // would have the pane claim to be showing something it is not.
+    onUrlChanged: {
+        pane.reportUrl();
+        pane.syncAddressField(true);
+    }
     onPaneIdChanged: pane.reportUrl()
 
     // ---- remote paths <-> file:// URLs -------------------------------------
@@ -323,12 +331,37 @@ Item {
         addressField.selectAll();
     }
 
+    // The address as the field should read it RIGHT NOW.
+    //
+    // COMPUTED, deliberately, rather than read off `displayPath`. That property
+    // is bound to `effectiveUrl`, which is bound to `url` — and the handler
+    // below runs from the very notification that refreshes those bindings.
+    // Whether they have been refreshed BEFORE a given handler runs is an
+    // ordering detail of the QML engine, not something this pane may depend on:
+    // reading `displayPath` from inside onUrlChanged handed back the PREVIOUS
+    // address, so the field showed the directory the pane had just left.
+    // (TerminalPaneView.awaitingIdentity() is a function for the same reason.)
+    // The rule here is the one `effectiveUrl` states: what the user opened,
+    // else the session-root default.
+    function shownPath() {
+        return pane.remotePathOf(pane.url.toString().length > 0 ? pane.url : pane.defaultUrl);
+    }
+
     // The field shows the pane's address, but it is EDITABLE, so a plain
     // binding cannot be used: the first keystroke would break it and the field
     // would then never follow a navigation again. It is pushed instead, and
     // never on top of what the user is in the middle of typing.
-    onDisplayPathChanged: if (!addressField.activeFocus)
-                              addressField.text = pane.displayPath
+    //
+    // `addressField` is null-checked because a pane is BORN with a url
+    // (ViewerRegion.takePane passes it as an initial property), so these
+    // handlers can run before this pane's own children exist; the
+    // Component.onCompleted below is what pushes the first value.
+    function syncAddressField(force) {
+        if (addressField && (force || !addressField.activeFocus))
+            addressField.text = pane.shownPath();
+    }
+
+    onDisplayPathChanged: pane.syncAddressField(false)
 
     Component.onCompleted: {
         addressField.text = pane.displayPath;

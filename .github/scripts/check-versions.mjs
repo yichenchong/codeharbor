@@ -3,11 +3,21 @@
 // top-level CMakeLists.txt: the Windows installer parses its version out of that
 // line, and .omp/skills/bump-version/bump.sh rewrites it first.
 //
-// This exists because package-lock.json is the one file nothing bumps on its
-// own, and it silently fell a whole release behind (lock said 0.1.7 while every
-// manifest said 0.1.8). `npm ci` does not complain about that - it just rewrites
-// the workspace's `version` back down to the lock's value, which then ships
-// inside the released remote tarball's package.json.
+// This exists because the files nothing bumps on their own drift silently, and
+// `npm ci` does not complain about a stale lock - it just rewrites the workspace's
+// `version` back down to the lock's value, which then ships inside the released
+// remote tarball's package.json. Two files have already done exactly that:
+//
+//   * package-lock.json fell a whole release behind (lock 0.1.7, manifests 0.1.8).
+//   * remote/src/codeharbord.ts hand-carries RPC_SERVER_VERSION and sat at 0.1.0
+//     while the tag said v0.1.8. That constant is what the daemon reports in its
+//     `server.info` reply and what the client shows the user verbatim, so every
+//     server announced a version three releases stale - and this script said
+//     "all version strings agree", because it was not looking.
+//
+// The rule this encodes: a file that carries the release version and is not
+// checked here is a file that WILL drift. Add it to both this script and to
+// VERSION_FILES in .omp/skills/bump-version/bump.sh.
 //
 // Run from the repository root: `node .github/scripts/check-versions.mjs`
 import { readFileSync } from "node:fs";
@@ -35,6 +45,20 @@ for (const ws of root.workspaces ?? []) {
   check(`${ws}/package.json`, JSON.parse(readFileSync(`${ws}/package.json`, "utf8")).version);
   check(`package-lock.json packages["${ws}"]`, lock.packages?.[ws]?.version);
 }
+
+// The daemon's own reported version. Not JSON, so it is matched out of the source:
+// a missing declaration is reported as a distinct failure rather than being read as
+// "no version here, nothing to compare", which is how a renamed constant would
+// quietly turn this check back off.
+const daemonPath = "remote/src/codeharbord.ts";
+const daemon = readFileSync(daemonPath, "utf8").match(
+  /export const RPC_SERVER_VERSION\s*=\s*"(\d+\.\d+\.\d+)"/,
+);
+if (!daemon) {
+  console.error(`could not find the RPC_SERVER_VERSION declaration in ${daemonPath}`);
+  process.exit(1);
+}
+check(`${daemonPath} RPC_SERVER_VERSION`, daemon[1]);
 
 if (bad.length > 0) {
   console.error(`Version drift. CMakeLists.txt says ${want}, but:`);
