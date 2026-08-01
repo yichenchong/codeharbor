@@ -79,11 +79,17 @@ QQuickWebEngineProfile *ViewerProfiles::internalProfile()
         // (QQuickWebEngineProfilePrototype) is QML-only private API whose header
         // is not installed, so C++ cannot use it directly.
         m_internal = new QQuickWebEngineProfile(QString(), this);
-        if (!m_handler)
-            m_handler = new InternalUrlSchemeHandler(m_client, nullptr, this);
-        m_internal->installUrlSchemeHandler(internalSchemeName(), m_handler);
+        m_internal->installUrlSchemeHandler(internalSchemeName(),
+                                            internalSchemeHandler());
     }
     return m_internal;
+}
+
+InternalUrlSchemeHandler *ViewerProfiles::internalSchemeHandler()
+{
+    if (!m_handler)
+        m_handler = new InternalUrlSchemeHandler(m_client, nullptr, this);
+    return m_handler;
 }
 
 bool ViewerProfiles::externalHasInternalScheme() const

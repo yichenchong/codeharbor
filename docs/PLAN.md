@@ -214,23 +214,27 @@ graph TD
   really packaged (esbuild → qrc), built automatically at configure time.
 - **Parallel with:** T.
 
-### A — Agent awareness — ✅ LANDED (Wave 4) except SPEC 6.6 fallback detection; live gate MET (Wave 5)
-- **Start gate:** [x] bridge+adapters DONE · [x] S agent channel (ChannelKind::AgentStatus) · [x] U sidebar.
+### A — Agent awareness — ✅ LANDED (Wave 4); live gate MET (Wave 5)
+- **Start gate:** [x] bridge+adapters DONE · [x] S agent channel (dedicated exec channel for AgentEvent JSONL) · [x] U sidebar.
 - **TODO:**
   - [x] `AgentStatusMonitor` (C++) consuming AgentEvent JSONL over the agent channel.
   - [x] Map `AgentState` → sidebar row precedence + unseen-completion; markSeen clears the badge; notify() hook on waiting_input/idle_unseen (OS notification display-deferred).
   - [x] `oh-my-pi` installable hook emitting BridgeMessage through the bridge (single mapping point); `pi`/`claude-code` adapters already registered server-side.
-  - [ ] Fallback coarse activity detection (SPEC 6.6) for the adapterless `generic`
-    harness. **NOT DONE.** `FallbackActivityDetector`
-    (`remote/src/adapters/fallback.ts`) exists and is correct, but nothing in
-    production constructs it — the only caller is
-    `remote/test/agent-hook.test.ts`. SPEC 6.6 needs exactly one input, terminal
-    OUTPUT BYTES, and no part of the daemon has a source for them: `codeharbord.ts`
-    reads only JSON-RPC lines from stdin, `bridge.ts` only hook messages from a Unix
-    socket, and `tmux.ts` only ever runs `list-sessions`/`kill-session` (there is no
-    `capture-pane` or `pipe-pane` anywhere in `remote/`). Terminal output exists on
-    the CLIENT side only, so wiring this up is a new server-side output tap, not a
-    missing connection.
+  - [x] Fallback coarse activity detection (SPEC 6.6) for the adapterless `generic`
+    harness, plus the SPEC 6.7 silence timeout. Done CLIENT-side, which is where
+    the one input SPEC 6.6 needs — terminal output — actually exists. No part of
+    the daemon has a source for it (`codeharbord.ts` reads only JSON-RPC lines
+    from stdin, `bridge.ts` only hook messages from a Unix socket, and `tmux.ts`
+    only ever runs `list-sessions`/`kill-session`; there is no `capture-pane` or
+    `pipe-pane` anywhere in `remote/`), so the server-side `FallbackActivityDetector`
+    was deleted rather than left with no caller: `ch::TerminalController` already
+    ingests every byte for the renderer, so duplicating the stream back over SSH
+    to derive "has this pane printed recently" would have been pure cost.
+    `ch::TerminalController::outputReceived` (payload-free) →
+    `ch::TerminalFactory`, the one object holding both the pane's
+    `terminal_panes` row id and its PTY channel → `ch::AgentStatusMonitor`, which
+    derives starting/running/idle for `generic` panes and demotes any silent
+    `starting`/`running` pane to `unknown`. Covered by `tst_agentmonitor`.
 - **Stop gate:** ✅ MET — `tst_liveagent` runs the REAL hook on the remote side
   (one node process per firing) into the REAL bridge, over an SSH AgentStatus
   channel, and observes the ordered transitions

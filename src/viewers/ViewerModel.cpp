@@ -6,12 +6,10 @@
 #include "ViewerHandlerRegistry.h"
 #include "ViewerProfiles.h"
 
-#include <QByteArray>
 #include <QJsonArray>
 #include <QJsonObject>
 #include <QJsonValue>
 #include <QList>
-#include <QMetaObject>
 #include <QPointer>
 #include <QVariantMap>
 #include <QtWebEngineQuick/QQuickWebEngineProfile>
@@ -38,12 +36,14 @@ QString viewKindFor(ViewerResolution resolution)
     case ViewerResolution::DirectoryViewer:
         return QStringLiteral("directory");
     case ViewerResolution::Download:
-    case ViewerResolution::OpenExternally:
     case ViewerResolution::Error:
         break;
     }
-    // Download / OpenExternally / Error all fall back to the binary view, which
-    // shows metadata plus a download/open affordance.
+    // Download and Error both fall back to the binary view, which shows
+    // metadata plus a download/open affordance. This is the "unclaimed
+    // resource" disposition SPEC 7.5 mandates: an unrecognised resource stays
+    // with the browser and becomes a download/metadata view, never a text
+    // buffer.
     return QStringLiteral("binary");
 }
 
@@ -92,6 +92,7 @@ void ViewerModel::setProfiles(ViewerProfiles *profiles)
         delete m_profiles;
     m_profiles = profiles;
     m_ownsProfiles = false;
+    wireProfileSignals();
 }
 
 ViewerProfiles *ViewerModel::profiles()
@@ -99,8 +100,27 @@ ViewerProfiles *ViewerModel::profiles()
     if (!m_profiles) {
         m_profiles = new ViewerProfiles(m_client, this);
         m_ownsProfiles = true;
+        wireProfileSignals();
     }
     return m_profiles;
+}
+
+void ViewerModel::wireProfileSignals()
+{
+    // Drop whatever the previous ViewerProfiles was connected through: a model
+    // handed profiles A, then B (or nothing) must not keep forwarding A's
+    // reports.
+    disconnect(m_handlerConnection);
+    if (!m_profiles)
+        return;
+    m_handlerConnection =
+        connect(m_profiles->internalSchemeHandler(),
+                &InternalUrlSchemeHandler::requestFailed, this,
+                [this](const QUrl &internalUrl,
+                       InternalUrlSchemeHandler::Failure,
+                       const QString &message) {
+                    emit internalResourceError(internalUrl, message);
+                });
 }
 
 QString ViewerModel::viewKind(const QUrl &url) const
@@ -118,6 +138,16 @@ QUrl ViewerModel::fileUrlFor(const QString &internalUrl) const
     return m_map->fileUrlFor(internalUrl);
 }
 
+bool ViewerModel::retainInternalUrl(const QString &internalUrl)
+{
+    return m_map->retain(internalUrl);
+}
+
+void ViewerModel::releaseInternalUrl(const QString &internalUrl)
+{
+    m_map->release(internalUrl);
+}
+
 QQuickWebEngineProfile *ViewerModel::externalProfile()
 {
     return profiles()->externalProfile();
@@ -126,122 +156,6 @@ QQuickWebEngineProfile *ViewerModel::externalProfile()
 QQuickWebEngineProfile *ViewerModel::internalProfile()
 {
     return profiles()->internalProfile();
-}
-
-QString ViewerModel::readTextFile(const QString &path)
-{
-    // One monotonic counter for the whole model, so a token is never reused and
-    // a cancelled read can never be revived by a later one. Minted BEFORE the
-    // no-client check so every read, successful or not, is named the same way.
-    const QString token = QString::number(++m_nextReadToken);
-    m_liveTextReads.insert(token);
-
-    if (!m_client) {
-        // Deferred, not emitted here: the caller has not been handed the token
-        // yet, so a reply delivered before this function returns is a reply it
-        // cannot recognise as its own. Passing `this` as the context object
-        // makes the queued call die with the model.
-        QMetaObject::invokeMethod(
-            this,
-            [this, token, path] {
-                if (!m_liveTextReads.remove(token))
-                    return;
-                emit textFileError(
-                    token, path,
-                    QStringLiteral("no remote client is connected"));
-            },
-            Qt::QueuedConnection);
-        return token;
-    }
-
-    // Bound the read exactly as the internal scheme handler does: a text pane
-    // must never try to pull a multi-gigabyte file through a single JSON-RPC
-    // frame. Passing offset/length makes the file service perform a ranged read
-    // and report `truncated` when the file is bigger than the window.
-    const QJsonObject params{
-        {QStringLiteral("path"), path},
-        {QStringLiteral("offset"), 0},
-        {QStringLiteral("length"),
-         InternalUrlSchemeHandler::kMaxInlineReadBytes},
-    };
-    QPointer<ViewerModel> guard(this);
-    m_client->call(
-        QString::fromLatin1(rpc::kMethodReadFile), params,
-        [guard, path, token](QJsonValue result, std::optional<RpcError> error) {
-            if (!guard)
-                return;
-            // NEVER settled straight from here. call() runs its callback
-            // SYNCHRONOUSLY when it cannot transmit — no transport bound,
-            // transport closed, short write — which is exactly the state a
-            // dropped SSH session leaves the client in. That reply would be
-            // emitted before readTextFile() had returned the token, so the pane
-            // (which matches replies by token) would throw its own failure away
-            // and sit on "Loading…" for good. One queued hop puts every reply
-            // after the token, and the context object makes it die with the
-            // model.
-            ViewerModel *const self = guard;
-            QMetaObject::invokeMethod(
-                self,
-                [self, path, token, result = std::move(result),
-                 error = std::move(error)] {
-                    self->settleTextRead(token, path, result, error);
-                },
-                Qt::QueuedConnection);
-        });
-    return token;
-}
-
-void ViewerModel::settleTextRead(const QString &token, const QString &path,
-                                 const QJsonValue &result,
-                                 const std::optional<RpcError> &error)
-{
-    // cancelTextFile() dropped this exact read: ignore its reply. Removing the
-    // token here is also what stops the set from growing — a settled read is no
-    // longer in flight.
-    if (!m_liveTextReads.remove(token))
-        return;
-    if (error) {
-        emit textFileError(token, path, error->message);
-        return;
-    }
-    const QJsonObject obj = result.toObject();
-    if (obj.value(QStringLiteral("truncated")).toBool()) {
-        // Report the failure rather than silently showing a prefix of the file
-        // as if it were the whole thing.
-        emit textFileError(token, path,
-                           QStringLiteral("file is too large to display inline"));
-        return;
-    }
-    const QString encoding = obj.value(QStringLiteral("encoding")).toString();
-    const QString content = obj.value(QStringLiteral("content")).toString();
-    // Text is served utf-8; decode a base64 payload defensively so the view
-    // still shows something legible for near-text binaries. A malformed payload
-    // is reported, never rendered as an empty file.
-    QString text = content;
-    if (encoding == QLatin1String("base64")) {
-        QByteArray encoded = content.toUtf8();
-        const auto decoded = QByteArray::fromBase64Encoding(
-            std::move(encoded),
-            QByteArray::Base64Encoding
-                | QByteArray::AbortOnBase64DecodingErrors);
-        if (!decoded) {
-            emit textFileError(
-                token, path,
-                QStringLiteral("file contents could not be decoded"));
-            return;
-        }
-        text = QString::fromUtf8(*decoded);
-    }
-    emit textFileRead(token, path, text);
-}
-
-void ViewerModel::cancelTextFile(const QString &token)
-{
-    // Forget this ONE read: its reply then finds no token and is dropped (see
-    // readTextFile). Any other read — including a concurrent read of the very
-    // same file by another pane — keeps its own token and is untouched. An
-    // unknown or empty token means nothing to do.
-    m_liveTextReads.remove(token);
 }
 
 void ViewerModel::listDirectory(const QString &path)

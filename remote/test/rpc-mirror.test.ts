@@ -22,6 +22,7 @@ import {
     RPC_DATABASE_BUSY,
     RPC_METHODS,
     RPC_REVISION_MISMATCH,
+    RPC_RESOURCE_LIMIT,
     RPC_TMUX_METHODS,
     RPC_WORKSPACE_METHODS,
     RPC_PING_METHOD,
@@ -200,6 +201,29 @@ test("the database-busy error code matches between TypeScript and C++", () => {
     // Two distinct conditions must never collapse onto one code: the client
     // special-cases -32001 as "the file changed under you".
     assert.notEqual(RPC_DATABASE_BUSY, RPC_REVISION_MISMATCH);
+});
+
+// Same contract, third error code. RPC_RESOURCE_LIMIT is what a file.listDirectory
+// on a huge directory, or a file.watch past the subscription cap, answers instead
+// of serializing a reply nobody can carry. That refusal is the client's
+// protection: a listing written out anyway exceeded CodeharbordClient's 16 MiB
+// unframed-line cap, and going over that cap does not fail one reply, it drops
+// the whole transport — every terminal and editor on that connection with it. If
+// the two sides drift on this number, the code that keeps that from happening
+// stops being recognisable as one.
+test("the resource-limit error code matches between TypeScript and C++", () => {
+    const declared = /^inline constexpr int kResourceLimit\s*=\s*(-?\d+);/m.exec(header);
+    assert.ok(declared, "RpcTypes.h must declare kResourceLimit");
+    assert.equal(Number(declared[1]), RPC_RESOURCE_LIMIT);
+    assert.ok(
+        RPC_RESOURCE_LIMIT <= -32000 && RPC_RESOURCE_LIMIT >= -32099,
+        `${RPC_RESOURCE_LIMIT} is outside the reserved server-error range`,
+    );
+    // Three distinct conditions, three distinct codes: "the file changed under
+    // you", "retry, the database was busy", and "too big, nothing was done" are
+    // different answers and the client must be able to tell them apart.
+    assert.notEqual(RPC_RESOURCE_LIMIT, RPC_REVISION_MISMATCH);
+    assert.notEqual(RPC_RESOURCE_LIMIT, RPC_DATABASE_BUSY);
 });
 
 // The third copy of the schema-version contract. RPC_SCHEMA_VERSION lives in

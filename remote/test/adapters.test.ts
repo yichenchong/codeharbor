@@ -199,10 +199,17 @@ test("claude-code adapter maps its lifecycle hook names", () => {
     assert.equal(claudeCodeAdapter.map({ type: "SessionStart" }), null);
 });
 
-// pi.ts documents itself as "currently identical" to oh-my-pi.ts. That claim is
-// only true while nobody edits one file alone, which is exactly what this
-// asserts — including the no-op and error cases, not just the happy path.
-test("pi adapter mirrors the oh-my-pi mapping", () => {
+// pi.ts and oh-my-pi.ts used to be byte-for-byte copies of one mapping, kept in
+// step by hand and by this test. They now SHARE the mapping (adapters/
+// pi-family.ts) and differ only in harness identity, so the strongest form of
+// this assertion is available: same function, not merely same answers.
+test("pi and oh-my-pi share one mapping rather than a copy of it", () => {
+    assert.equal(piAdapter.map, ohMyPiAdapter.map);
+    assert.equal(piAdapter.metadata, ohMyPiAdapter.metadata);
+    assert.equal(piAdapter.harness, "pi");
+    assert.equal(ohMyPiAdapter.harness, "oh-my-pi");
+    // The behaviour that identity now guarantees, still spelled out once so a
+    // future split cannot quietly drop a case.
     const natives: NativeEvent[] = [
         { type: "session_start" },
         { type: "agent_start" },
@@ -230,7 +237,36 @@ test("pi adapter mirrors the oh-my-pi mapping", () => {
             `pi and oh-my-pi metadata disagree on ${JSON.stringify(native)}`,
         );
     }
-    assert.equal(piAdapter.harness, "pi");
+});
+
+// AG-N3. A shutdown is a terminal, observed fact: the session is over and
+// nothing more will arrive for this terminal. The error flag describes an agent
+// that is still there and broken, and it is not a latch on the client side —
+// but a producer that exports OMP_ERROR=1 once and never unsets it turns every
+// later firing, INCLUDING the shutdown, into another error. Before the fix that
+// left the sidebar row red forever for a session that no longer exists, because
+// nothing after the shutdown can ever replace the state. `stopped` is the
+// terminal's last word and must not be maskable.
+test("a shutdown event outranks the error flag in every adapter (AG-N3)", () => {
+    assert.equal(ohMyPiAdapter.map({ type: "session_shutdown", error: true }), "stopped");
+    assert.equal(piAdapter.map({ type: "session_shutdown", error: true }), "stopped");
+    assert.equal(claudeCodeAdapter.map({ hook: "SessionEnd", error: true }), "stopped");
+
+    // The flag still outranks every NON-terminal event: an agent_end that blew
+    // up is an error, not a completion, and that is the arm the live gate
+    // drives.
+    assert.equal(ohMyPiAdapter.map({ type: "agent_end", error: true }), "error");
+    assert.equal(piAdapter.map({ type: "agent_end", error: true }), "error");
+    assert.equal(claudeCodeAdapter.map({ hook: "Stop", error: true }), "error");
+    // ...and an unrecognised event with the flag set is still an error, since
+    // the flag is the only thing in it that carries meaning.
+    assert.equal(ohMyPiAdapter.map({ type: "unrecognized", error: true }), "error");
+    assert.equal(claudeCodeAdapter.map({ hook: "Unrecognized", error: true }), "error");
+
+    // The shutdown arm is exact, not a prefix or a truthiness test: only the
+    // real terminal event outranks the flag.
+    assert.equal(ohMyPiAdapter.map({ type: "session_shutdown_pending", error: true }), "error");
+    assert.equal(claudeCodeAdapter.map({ hook: "SessionEnded", error: true }), "error");
 });
 
 // JSON-RPC 2.0 conformance for the request envelope. Every rejection must be a

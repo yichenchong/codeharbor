@@ -8,6 +8,7 @@
 #include <QString>
 #include <QVector>
 
+#include <cstddef>
 #include <functional>
 #include <optional>
 
@@ -124,16 +125,24 @@ struct CreateTerminalPaneParams {
     std::optional<int> position;
 };
 
-// Find the `terminal_panes` row ONE layout leaf owns. Exactly one of `id` and
-// `name` is given; anything else is refused by the server.
+// Find the `terminal_panes` row ONE layout leaf owns. At least one of `id` and
+// `name` must be set; supplying neither is a caller error this class refuses
+// locally (see resolveTerminalPane) on the same terms the server would.
 //
 //   * `id` — the row's own identity, taken from the layout leaf
-//     (SplitNode::terminalPaneId). A pure lookup, and the normal case.
+//     (SplitNode::terminalPaneId). A pure lookup, and the normal case. Empty
+//     means "not addressed by row"; TerminalId, like every other id here.
 //
 //   * `name` — a layout slot label ("terminal-1", …), lookup-or-CREATE, and
 //     ONLY for a leaf stored before layouts carried a row id, where the label
 //     is genuinely the historical key. The caller writes the answer's id back
 //     into the leaf, so a leaf takes this path once in its life.
+//
+//     Deliberately a plain QString and NOT an id type: a slot label is not an
+//     identity and this class says so twice over (kSchemaVersion 4 below dropped
+//     the server's UNIQUE (dev_session_id, name) for exactly that reason, and a
+//     closed pane keeps its label for the next pane to reuse). It is the same
+//     plain string as SplitNode::paneId, which is where it comes from.
 //
 // Deliberately narrow — it is a lookup key, not a row editor — so a caller
 // cannot use it to rewrite a pane it merely wanted to find. `workingDirectory`
@@ -141,7 +150,7 @@ struct CreateTerminalPaneParams {
 struct ResolveTerminalPaneParams {
     ServerId serverId;
     DevSessionId devSessionId;
-    QString id;
+    TerminalId id;
     QString name;
     std::optional<QString> workingDirectory;
 };
@@ -176,12 +185,23 @@ struct UpdateTerminalPaneParams {
 // rather than to an error, because a region whose layout cannot be loaded must
 // stay empty instead of inviting the user to edit a fabricated one.
 //
-// Lifetime: `client` is borrowed, not owned, and must outlive this object. Each
-// pending callback is owned by that client, NOT by WorkspaceDb, and runs at most
-// once — possibly long after WorkspaceDb itself is gone, since destroying the
-// repository cancels nothing. A callback that captures a QObject therefore has
-// to guard its own lifetime; the house pattern is a QPointer captured by value
-// and checked before use (see src/app/SessionLayouts.cpp).
+// Two failures are detected here rather than received, and both are the
+// CALLER's mistake, not the server's: an addressing-mode violation in
+// resolveTerminalPane and a setLayout tree that cannot be serialized. They are
+// reported as -32602 ("invalid params"), the code the server itself would have
+// answered with, and they are delivered ASYNCHRONOUSLY like every other reply —
+// posted to the client's event loop, never invoked before the method returns —
+// so no caller is re-entered from inside its own call.
+//
+// Lifetime: `client` is borrowed, not owned, must be non-null, and must outlive
+// this object. Passing a literal nullptr does not compile; a null computed at
+// runtime trips the constructor's assertion, which is where the mistake is,
+// instead of surfacing as a crash inside whichever method happened to be called
+// first. Each pending callback is owned by that client, NOT by WorkspaceDb, and
+// runs at most once — possibly long after WorkspaceDb itself is gone, since
+// destroying the repository cancels nothing. A callback that captures a QObject
+// therefore has to guard its own lifetime; the house pattern is a QPointer
+// captured by value and checked before use (see src/app/SessionLayouts.cpp).
 class WorkspaceDb {
 public:
     // Informational only: the client runs no migrations (SPEC 11.2). Kept in
@@ -210,6 +230,9 @@ public:
     using OkCallback = std::function<void(std::optional<RpcError>)>;
 
     explicit WorkspaceDb(CodeharbordClient* client);
+    // No repository without a client: every method here dereferences it
+    // unconditionally.
+    WorkspaceDb(std::nullptr_t) = delete;
 
     // Nested read: groups -> sessions -> {viewerPanes, terminalPanes, layouts}.
     void list(const ServerId& serverId, ListCallback cb);
@@ -257,6 +280,11 @@ public:
     // slot two rows, two server-minted targets and two tmux sessions. The
     // server does it inside one BEGIN IMMEDIATE transaction, so the two
     // converge on one row and neither client needs a retry path.
+    //
+    // At least one of `params.id` and `params.name` must be non-empty; the id
+    // wins when both are, and only it is sent. Setting NEITHER is refused HERE,
+    // with -32602 and no request on the wire. It used to go out as an empty
+    // `name`, asking the server to look up — or create — a pane called "".
     void resolveTerminalPane(const ResolveTerminalPaneParams& params,
                              TerminalPaneCallback cb);
     void updateTerminalPane(const UpdateTerminalPaneParams& params,
@@ -267,7 +295,9 @@ public:
     // has no persisted layout (and likewise when the stored tree is unreadable);
     // setLayout delivers the stored tree on success, and fails with -32603
     // rather than delivering an empty std::nullopt if the echoed row carries no
-    // valid tree.
+    // valid tree. A `tree` that SplitNode::tryToJson() refuses is never sent:
+    // it would store bytes no client could load back, so setLayout fails it
+    // with -32602 instead.
     void getLayout(const DevSessionId& devSessionId, Region region,
                    LayoutCallback cb);
     void setLayout(const ServerId& serverId, const DevSessionId& devSessionId,

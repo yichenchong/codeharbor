@@ -254,6 +254,8 @@ private slots:
     void aSaveThatCannotTakeTheLockStillSavesAndSaysSo();
     void aStaleLockFromADeadHolderDoesNotWedgeTheStore();
     void aFirstRunWithNoConfigDirectoryLocksSilently();
+    void blankHostOrUserRowsAreNotProfilesAndAreDroppedOnLoad();
+    void aSaveDegradedHandlerMayMutateTheStore();
 
     // ---- ConnectSheet.qml ----
     void sheetLoadsSilentlyAndExposesItsApi();
@@ -1357,6 +1359,123 @@ void TstServerProfiles::aFirstRunWithNoConfigDirectoryLocksSilently()
     ServerProfiles reader(path);
     QCOMPARE(namesOf(reader.profiles()), QStringList({QStringLiteral("first ever")}));
     QCOMPARE(reader.activeId(), id);
+}
+
+// Read-side counterpart to addRejectsInputThatCouldNeverConnect(): the save
+// path refuses to store a profile with no host or no user, so a store that has
+// one has been hand edited (or written by something that is not this class).
+// Such a row is not a profile - connectToHost(host, port, user) needs all
+// three - it is a server entry that can only fail the moment it is selected,
+// and before this it loaded, listed, and could be made active.
+//
+// The port is the contrast, and the reason this lives at the same site: a
+// nonsense port is REPAIRED, because "absent" already means 22 so the repair
+// invents nothing. There is no such answer for a blank host.
+void TstServerProfiles::blankHostOrUserRowsAreNotProfilesAndAreDroppedOnLoad()
+{
+    const QString path = iniPath(QStringLiteral("blankfields.ini"));
+    {
+        QSettings raw(path, QSettings::IniFormat);
+        // Usable.
+        raw.setValue(QStringLiteral("servers/aaa/name"), QStringLiteral("Good"));
+        raw.setValue(QStringLiteral("servers/aaa/host"), QStringLiteral("good.example"));
+        raw.setValue(QStringLiteral("servers/aaa/user"), QStringLiteral("u"));
+        raw.setValue(QStringLiteral("servers/aaa/port"), 22);
+        // Host key deleted by hand.
+        raw.setValue(QStringLiteral("servers/bbb/name"), QStringLiteral("NoHost"));
+        raw.setValue(QStringLiteral("servers/bbb/user"), QStringLiteral("u"));
+        raw.setValue(QStringLiteral("servers/bbb/port"), 22);
+        // Host present but blank.
+        raw.setValue(QStringLiteral("servers/ccc/name"), QStringLiteral("BlankHost"));
+        raw.setValue(QStringLiteral("servers/ccc/host"), QStringLiteral("   "));
+        raw.setValue(QStringLiteral("servers/ccc/user"), QStringLiteral("u"));
+        raw.setValue(QStringLiteral("servers/ccc/port"), 22);
+        // User blank.
+        raw.setValue(QStringLiteral("servers/ddd/name"), QStringLiteral("NoUser"));
+        raw.setValue(QStringLiteral("servers/ddd/host"), QStringLiteral("d.example"));
+        raw.setValue(QStringLiteral("servers/ddd/user"), QString());
+        raw.setValue(QStringLiteral("servers/ddd/port"), 22);
+        // The selection points at one of the unusable rows.
+        raw.setValue(QStringLiteral("servers/active"), QStringLiteral("ccc"));
+        raw.sync();
+    }
+
+    ServerProfiles store(path);
+    QCOMPARE(namesOf(store.profiles()), QStringList({QStringLiteral("Good")}));
+    QVERIFY(store.profile(QStringLiteral("bbb")).isEmpty());
+    QVERIFY(store.profile(QStringLiteral("ccc")).isEmpty());
+    QVERIFY(store.profile(QStringLiteral("ddd")).isEmpty());
+    // A selection naming a row that is not a profile is dangling like any other.
+    QVERIFY(store.activeId().isEmpty());
+    // The one usable row is untouched.
+    QCOMPARE(store.profile(QStringLiteral("aaa")).value(QStringLiteral("host")).toString(),
+             QStringLiteral("good.example"));
+
+    // The drop is written back on the next save, exactly like the port repair:
+    // no unusable row is left in the file for an older build to pick up, and no
+    // orphan `servers/<id>/*` keys survive the wipe-and-rewrite.
+    store.setActiveId(QStringLiteral("aaa"));
+    {
+        QSettings raw(path, QSettings::IniFormat);
+        raw.sync();
+        raw.beginGroup(QStringLiteral("servers"));
+        QCOMPARE(raw.childGroups(), QStringList({QStringLiteral("aaa")}));
+        raw.endGroup();
+    }
+    ServerProfiles reopened(path);
+    QCOMPARE(namesOf(reopened.profiles()), QStringList({QStringLiteral("Good")}));
+    QCOMPARE(reopened.activeId(), QStringLiteral("aaa"));
+}
+
+// persist() carries no re-entrancy guard, and this is the path that would need
+// one if anything inside the locked region ever emitted: saveDegraded() is
+// emitted from inside persist(), and a handler is explicitly allowed to react
+// by mutating the store. QLockFile is not recursive, so if that emit ever moved
+// above the unlock the nested save would sit out the full timeout against a
+// lock its own call stack holds and then blame "another process".
+//
+// Pinned here so the ordering is a tested property rather than a comment: the
+// nested save completes, both profiles survive, and the whole thing stays
+// inside a bound that a self-deadlocked wait could not.
+void TstServerProfiles::aSaveDegradedHandlerMayMutateTheStore()
+{
+    const QString path = iniPath(QStringLiteral("reentrant.ini"));
+    const QString lockPath = path + QStringLiteral(".merge-lock");
+
+    ServerProfiles store(path);
+    // Held by a live process that never lets go, so every save below takes the
+    // degraded path and therefore really does emit.
+    QLockFile blocker(lockPath);
+    QVERIFY(blocker.tryLock(5000));
+
+    int handlerRuns = 0;
+    QString nested;
+    QObject::connect(&store, &ServerProfiles::saveDegraded, &store,
+                     [&store, &handlerRuns, &nested](const QString&) {
+                         if (handlerRuns++ > 0)
+                             return; // one level is the property; not a loop test
+                         nested = store.addProfile(profileFields(
+                             QStringLiteral("from the handler"),
+                             QStringLiteral("h2"), 22, QStringLiteral("u")));
+                     });
+
+    QElapsedTimer waited;
+    waited.start();
+    const QString first = store.addProfile(profileFields(
+        QStringLiteral("outer"), QStringLiteral("h1"), 22, QStringLiteral("u")));
+    const qint64 elapsed = waited.elapsed();
+
+    QCOMPARE(handlerRuns, 1);
+    QVERIFY(!first.isEmpty());
+    QVERIFY2(!nested.isEmpty(), "the nested save was refused");
+    // Two sequential 1.5 s timeouts, not one plus a deadlock.
+    QVERIFY2(elapsed < 15000, qPrintable(QStringLiteral("waited %1 ms").arg(elapsed)));
+
+    blocker.unlock();
+    ServerProfiles reader(path);
+    QCOMPARE(namesOf(reader.profiles()),
+             QStringList({QStringLiteral("outer"),
+                          QStringLiteral("from the handler")}));
 }
 
 // ---------------------------------------------------------------------------

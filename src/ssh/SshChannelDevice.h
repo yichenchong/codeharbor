@@ -47,7 +47,6 @@ class SshChannelDevice : public QIODevice {
     Q_OBJECT
 public:
     explicit SshChannelDevice(SshConnectionPool* pool,
-                              SshConnectionPool::ChannelKind kind,
                               QObject* parent = nullptr);
     ~SshChannelDevice() override;
 
@@ -59,9 +58,8 @@ public:
 
     // Open a channel with a PTY of `cols` x `rows` and start either `command`
     // (exec) or the login shell (when `command` is empty). `term` is the
-    // terminal type sent to the remote session (empty means xterm-256color) and
-    // is honoured for every ChannelKind: the single pty-req a channel may carry
-    // is issued here, not by the pool.
+    // terminal type sent to the remote session (empty means xterm-256color):
+    // the single pty-req a channel may carry is issued here, not by the pool.
     bool startPty(const QString& term, int cols, int rows,
                   const QString& command = QString());
 
@@ -85,14 +83,22 @@ public:
     bool open(OpenMode mode) override;
 
 signals:
-    // Channel-level diagnostics: stderr of an Exec/Rpc channel plus libssh
-    // failures. Kept OUT of the read stream on purpose — folding stderr into
-    // readData() would splice non-JSON bytes into the JSON-RPC/JSONL framing.
+    // Channel-level diagnostics: the remote side's stderr plus libssh failures.
+    // Kept OUT of the read stream on purpose — folding stderr into readData()
+    // would splice non-JSON bytes into the JSON-RPC/JSONL framing.
     void channelError(const QString& message);
 
 protected:
     qint64 readData(char* data, qint64 maxSize) override;
     qint64 writeData(const char* data, qint64 maxSize) override;
+
+    // Latch the end of the read channel: emits readChannelFinished() exactly
+    // once and makes readData() answer -1, as QIODevice requires of a stream
+    // that has finished. The device stays OPEN, so bytes already buffered are
+    // still readable. Protected rather than private because the fake channel
+    // devices the higher layers are tested against subclass this one and drive
+    // the same end-of-stream state without a live SSH session.
+    void finishReadChannel();
 
 private:
     // Poll cadence when the channel produced nothing on the previous pass.
@@ -110,7 +116,6 @@ private:
     QString lastError() const;
 
     QPointer<SshConnectionPool> m_pool;
-    SshConnectionPool::ChannelKind m_kind = SshConnectionPool::ChannelKind::Exec;
     QTimer* m_pump = nullptr;
     QByteArray m_readBuffer;
     bool m_remoteFinished = false;

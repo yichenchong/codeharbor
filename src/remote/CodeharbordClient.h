@@ -119,7 +119,11 @@ public:
     // probe is deliberately excluded: it is this client's own traffic rather
     // than anyone's call(), and counting it would make the number jitter with
     // the timer under every consumer that reasons about it.
-    int pendingCount() const;
+    //
+    // qsizetype, not int: this is derived from a QHash::size(), which is
+    // 64-bit. Narrowing it here would be a silent truncation of a container
+    // size — the one arithmetic in this class that a caller reads directly.
+    qsizetype pendingCount() const;
 
     // Default heartbeat interval, in milliseconds. 15 s is chosen from both
     // ends: it is more than an order of magnitude above the round trip of even
@@ -170,6 +174,14 @@ public:
     // tests can compress a 60 s budget into milliseconds. Non-positive values
     // are refused (the heartbeat stays off) rather than silently corrected.
     // Called while a transport is already bound, the heartbeat starts at once.
+    //
+    // Calling this AGAIN with the configuration already running is a true
+    // no-op: it neither retires the probe in flight nor resets the miss
+    // counter. Re-arming does both, and a consumer that re-enabled on a timer
+    // or on every reconnect attempt would otherwise reset the silence
+    // measurement forever (a silent peer would never be detected) while piling
+    // an abandoned-but-still-pending probe onto the wire each time. A
+    // configuration CHANGE still re-arms, because the old cadence has to go.
     void enableHeartbeat(int intervalMs = kDefaultHeartbeatIntervalMs,
                          int missTolerance = kDefaultHeartbeatMisses);
 
@@ -240,6 +252,21 @@ private:
     // the transport we just moved to. Called from every place the bound/closed
     // state changes, so the timer can never outlive its transport.
     void restartHeartbeat();
+    // Drop the bytes onReadyRead() has already consumed (everything before
+    // m_readPos) and rebase the two offsets onto the shortened buffer. Called
+    // ONCE per readyRead rather than once per frame.
+    //
+    // This is NOT a performance fix, and the record it replaces claimed it was.
+    // The per-frame remove() was never quadratic: Qt 6's
+    // QArrayDataPointer::erase has a front-erase fast path that only advances
+    // the data pointer, and QByteArray::left() deep-copies rather than sharing,
+    // so nothing forced a detach either. Isolating the two disciplines
+    // (80 000 frames, no JSON) puts this one ahead — 29 ms against 12 ms — but
+    // end to end that is invisible next to parsing: 20 000 real frames through
+    // one read measure the same either way. What this shape buys is that the
+    // consumption point is a member, so a callback that re-enters the reader
+    // advances the same cursor instead of re-dispatching consumed frames.
+    void compactReadBuffer();
 
     // QPointer, not a raw pointer: the transport is owned by the CALLER and can
     // be destroyed while still bound. A raw pointer would dangle, and the next
@@ -248,12 +275,24 @@ private:
     // the connections for us.
     QPointer<QIODevice> m_transport = nullptr;
     QByteArray m_readBuffer;
-    // How far into m_readBuffer onReadyRead() has already scanned for a '\n'
-    // without finding one, so a large message arriving in many chunks is not
-    // re-scanned from the front every readyRead. It indexes INTO m_readBuffer,
-    // so it MUST be reset to 0 wherever that buffer is cleared or the transport
-    // is rebound (setTransport, close, the oversize-line drop); a stale offset
-    // would otherwise skip past real bytes.
+    // m_readPos is the first byte onReadyRead() has NOT yet consumed;
+    // m_scanOffset is how far past it the search for the next '\n' has already
+    // looked and found none, so a large message arriving in many chunks is not
+    // re-scanned from the front every readyRead. Invariant:
+    // 0 <= m_readPos <= m_scanOffset <= m_readBuffer.size().
+    //
+    // Both index INTO m_readBuffer, so both MUST be reset wherever that buffer
+    // is cleared or the transport is rebound (setTransport, close, the
+    // oversize-line drop); a stale offset would otherwise skip past real bytes.
+    //
+    // Consumption is a CURSOR, not a prefix removal, and it is deliberately
+    // kept in members rather than in onReadyRead()'s frame: a response callback
+    // may spin a nested event loop and re-enter the reader, and the nested call
+    // must see — and advance — the same consumption point. Holding it in a
+    // local (or holding a pointer into the buffer, which an append can
+    // reallocate) is what would let a re-entrant reader re-dispatch frames the
+    // outer loop had already logically consumed.
+    qsizetype m_readPos = 0;
     qsizetype m_scanOffset = 0;
     qint64 m_nextId = 1;
     QHash<qint64, ResponseCallback> m_pending;
@@ -308,6 +347,12 @@ private:
     // failed exactly once with everybody else. Entries are removed by the
     // probe's own callback, which call() guarantees fires exactly once, so this
     // can neither leak nor go stale.
+    //
+    // BOUNDED: onHeartbeatTick() refuses to issue a probe once
+    // kMaxOutstandingProbes of them are unanswered, and counts the interval as
+    // a miss instead. Without that, re-arming against a peer that never answers
+    // strands one more entry here — and one more in m_pending — every time,
+    // with nothing but transport loss to reclaim them.
     QHash<quint64, qint64> m_heartbeatProbeIds;
 };
 

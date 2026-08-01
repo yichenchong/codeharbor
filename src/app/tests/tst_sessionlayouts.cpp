@@ -187,6 +187,8 @@ private slots:
     void anAbsurdPaneCounterCannotHandOutALabelAlreadyOnScreen();
     void aFailedTerminalMintReportsAndTakesTheHalfMadePaneBack();
     void aPaneCreatedAfterOneWithTheSameLabelWasClosedGetsItsOwnRow();
+    void closingTheOnlyChildOfAOneChildSplitLeavesNoBlankSlot();
+    void aTerminalMintThatIsNeverAnsweredStopsBlockingTheRegion();
     void liveLayoutRoundTripOverSsh();
 
 private:
@@ -1655,6 +1657,148 @@ void TstSessionLayouts::aPaneCreatedAfterOneWithTheSameLabelWasClosedGetsItsOwnR
     QCOMPARE(compact(write.value(QStringLiteral("params")).toObject()
                          .value(QStringLiteral("tree")).toObject()),
              compact(expected));
+}
+
+// A split with exactly ONE child is a legal persisted tree - the parser accepts
+// it, and the layout row comes off a server that other clients also write to,
+// so this client cannot assume it never sees one. Removing that only child used
+// to leave the childless branch sitting in its parent, and a branch with no
+// children serialises as a leaf with no paneId: a blank slot in the region that
+// no pane can ever occupy and nothing but a reload can clear.
+//
+// Both shapes are covered here, because they fail differently: the viewer tree
+// has the one-child split as a SIBLING (its removal must not disturb the two
+// real panes beside it), and the terminal tree nests one-child splits two deep
+// (the emptiness has to propagate up more than one level before the root can
+// collapse onto the survivor).
+void TstSessionLayouts::closingTheOnlyChildOfAOneChildSplitLeavesNoBlankSlot()
+{
+    makePair();
+    SessionLayouts layouts(m_db, m_uiState);
+    layouts.setServerId(QStringLiteral("srv-1"));
+
+    // viewer root = split[ viewer-1 , viewer-2 , split[ viewer-3 ] ]
+    const QJsonObject lonely = split(QStringLiteral("vertical"),
+                                     {leaf(QStringLiteral("viewer-3"))}, {1});
+    const QJsonObject viewerRoot =
+        split(QStringLiteral("horizontal"),
+              {leaf(QStringLiteral("viewer-1")), leaf(QStringLiteral("viewer-2")),
+               lonely},
+              {1, 2, 3});
+    // terminal root = split[ terminal-1 , split[ split[ terminal-2 ] ] ]
+    const QJsonObject t1 =
+        terminalLeaf(QStringLiteral("terminal-1"), QStringLiteral("row-one"));
+    const QJsonObject t2 =
+        terminalLeaf(QStringLiteral("terminal-2"), QStringLiteral("row-two"));
+    const QJsonObject terminalRoot =
+        split(QStringLiteral("vertical"),
+              {t1, split(QStringLiteral("horizontal"),
+                         {split(QStringLiteral("vertical"), {t2}, {1})}, {1})},
+              {1, 1});
+    completeLoad(layouts, QStringLiteral("s1"), layoutRow(viewerRoot),
+                 layoutRow(terminalRoot));
+
+    layouts.closePane(QStringLiteral("viewer"), QStringLiteral("viewer-3"));
+
+    // The one-child branch is GONE, not emptied: two children, two ratios, and
+    // the surviving ratios are the ones those two panes already had.
+    const QJsonObject expectedViewer =
+        split(QStringLiteral("horizontal"),
+              {leaf(QStringLiteral("viewer-1")), leaf(QStringLiteral("viewer-2"))},
+              {1, 2});
+    QCOMPARE(compact(asObject(layouts.viewerTree())), compact(expectedViewer));
+
+    QJsonObject write = nextRequest();
+    QCOMPARE(write.value(QStringLiteral("method")).toString(),
+             QStringLiteral("workspace.setLayout"));
+    QCOMPARE(compact(write.value(QStringLiteral("params")).toObject()
+                         .value(QStringLiteral("tree")).toObject()),
+             compact(expectedViewer));
+
+    layouts.closePane(QStringLiteral("terminal"), QStringLiteral("terminal-2"));
+
+    // Two levels of one-child branch collapse in turn, and the root - left with
+    // a single child - collapses onto the survivor.
+    QCOMPARE(compact(asObject(layouts.terminalTree())), compact(t1));
+
+    write = nextRequest();
+    QCOMPARE(write.value(QStringLiteral("method")).toString(),
+             QStringLiteral("workspace.setLayout"));
+    QCOMPARE(compact(write.value(QStringLiteral("params")).toObject()
+                         .value(QStringLiteral("tree")).toObject()),
+             compact(t1));
+}
+
+// persist() refuses to write the terminal region while any leaf is still
+// waiting for its terminal_panes row, which is load-bearing: an id-less
+// terminal leaf on the server is indistinguishable from a pre-migration one.
+// The refusal had no lower bound, though. A mint the peer simply never answers
+// left that leaf pending for the rest of the session, and every later split,
+// close, ratio drag and pane url in the terminal region was then silently
+// dropped on the floor - no error, no write, no way back short of reselecting
+// the Dev Session.
+//
+// The transport's own silent-peer detection is the primary mechanism and still
+// comes first (see kDefaultTerminalMintTimeoutMs); this covers the case it
+// cannot see, a healthy connection on which one request went missing, and it is
+// driven here by answering the mint with nothing at all.
+void TstSessionLayouts::aTerminalMintThatIsNeverAnsweredStopsBlockingTheRegion()
+{
+    makePair();
+    SessionLayouts layouts(m_db, m_uiState);
+    layouts.setServerId(QStringLiteral("srv-1"));
+    // A test-chosen budget. setTerminalMintTimeoutMs is production API, not a
+    // seam bolted on for this: 90 s of unattended wall clock has no place in the
+    // default suite, and nothing here depends on the number beyond its being
+    // whole seconds (the message names it).
+    layouts.setTerminalMintTimeoutMs(2000);
+    const QJsonObject stored =
+        terminalLeaf(QStringLiteral("terminal-1"), QStringLiteral("row-one"));
+    completeLoad(layouts, QStringLiteral("s1"),
+                 layoutRow(leaf(QStringLiteral("viewer-1"))), layoutRow(stored));
+
+    QSignalSpy errorSpy(&layouts, &SessionLayouts::error);
+    QCOMPARE(layouts.splitPane(QStringLiteral("terminal"),
+                               QStringLiteral("terminal-1"),
+                               QStringLiteral("horizontal")),
+             QStringLiteral("terminal-2"));
+
+    const QJsonObject mint = nextRequest();
+    QCOMPARE(mint.value(QStringLiteral("method")).toString(),
+             QStringLiteral("workspace.createTerminalPane"));
+    // ...and it is never answered.
+
+    // While the leaf is pending the region is correctly unwritable: this is the
+    // behaviour being bounded, not one being removed.
+    QVERIFY(noMoreRequests());
+
+    QTRY_COMPARE_WITH_TIMEOUT(errorSpy.count(), 1, 6000);
+    const QString reason = errorSpy.at(0).at(0).toString();
+    QVERIFY2(reason.contains(QStringLiteral("never answered")), qPrintable(reason));
+    QVERIFY2(reason.contains(QStringLiteral("terminal-2")), qPrintable(reason));
+
+    // The half-made pane is taken back out, exactly as for a mint that fails
+    // outright, so no id-less terminal leaf can reach the server.
+    QCOMPARE(compact(asObject(layouts.terminalTree())), compact(stored));
+
+    // And the region is writable again: the corrected tree goes out...
+    QJsonObject write = nextRequest();
+    QCOMPARE(write.value(QStringLiteral("method")).toString(),
+             QStringLiteral("workspace.setLayout"));
+    QCOMPARE(compact(write.value(QStringLiteral("params")).toObject()
+                         .value(QStringLiteral("tree")).toObject()),
+             compact(stored));
+    // ...and so does the next ordinary terminal-region edit, which before this
+    // would have been swallowed forever.
+    layouts.setPaneUrl(QStringLiteral("terminal"), QStringLiteral("terminal-1"),
+                       QStringLiteral("file:///tmp/after"));
+    write = nextRequest();
+    QCOMPARE(write.value(QStringLiteral("method")).toString(),
+             QStringLiteral("workspace.setLayout"));
+    QCOMPARE(write.value(QStringLiteral("params")).toObject()
+                 .value(QStringLiteral("tree")).toObject()
+                 .value(QStringLiteral("url")).toString(),
+             QStringLiteral("file:///tmp/after"));
 }
 
 // LIVE (docs/PLAN.md): the same flow against the REAL Node codeharbord reached

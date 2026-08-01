@@ -190,18 +190,35 @@ QVariantList ServerProfiles::readStoredProfiles(QString* activeOut) const
     rows.reserve(ids.size());
     for (const QString& id : ids) {
         const QString prefix = id + QLatin1Char('/');
-        // Read-side normalization is limited to the port: a hand-edited store is
-        // still the user's data, so nothing is dropped here, but a nonsense port
-        // must not reach connectToHost().
+        // Read-side normalisation, and the ONLY read-side normalisation there
+        // is: a hand-edited store is still the user's data, so a field that can
+        // be repaired is repaired rather than dropped. A nonsense port becomes
+        // the default, because the default is what an ABSENT port already
+        // means, so the repair invents nothing.
+        //
+        // Host and user have no such repair, and no default to fall back on.
+        // SshConnectionPool::connectToHost(host, port, user) needs all three,
+        // and the save path already refuses to store a profile missing any of
+        // them (see sanitize()), so a row with either blank cannot have come
+        // from this client and is not a profile at all - it is a row that can
+        // only ever offer the user a server entry which fails the moment it is
+        // selected. It is skipped, which is the same verdict sanitize() reaches
+        // on the way in; the rule lives in this class and is applied on both
+        // sides of it rather than being duplicated somewhere else. Like the
+        // port repair, the skip is written back by the next save.
+        const QString host = m_settings->value(prefix + kHost).toString().trimmed();
+        const QString user = m_settings->value(prefix + kUser).toString().trimmed();
+        if (host.isEmpty() || user.isEmpty())
+            continue;
         const int storedPort = m_settings->value(prefix + kPort).toInt();
         const bool portUsable = storedPort >= kMinPort && storedPort <= kMaxPort;
 
         QVariantMap fields;
         fields.insert(kId, id);
         fields.insert(kName, m_settings->value(prefix + kName).toString());
-        fields.insert(kHost, m_settings->value(prefix + kHost).toString());
+        fields.insert(kHost, host);
         fields.insert(kPort, portUsable ? storedPort : kDefaultPort);
-        fields.insert(kUser, m_settings->value(prefix + kUser).toString());
+        fields.insert(kUser, user);
         fields.insert(kIdentityFile,
                       m_settings->value(prefix + kIdentityFile).toString());
         fields.insert(kNodePath, m_settings->value(prefix + kNodePath).toString());
@@ -261,17 +278,19 @@ void ServerProfiles::writeEntry(const QVariantMap& fields, int ordinal)
 // sides re-read, both merge the same list, both write, the loser's brand new
 // profile is gone — and that window is exactly what the class comment promises
 // does not exist.
+//
+// INVARIANT, and the reason there is no re-entrancy guard here: nothing between
+// tryLock() and unlock() may emit a signal, run a callback, or spin an event
+// loop. QLockFile is not recursive, so a slot that reacted by mutating the
+// store would re-enter this function and wait out the whole timeout against a
+// lock this very call stack holds — then report "another process is holding it"
+// about itself. The locked region is therefore only mergeAndWrite(), which
+// touches QSettings and the filesystem and nothing else. The one signal this
+// function emits, saveDegraded(), is emitted AFTER the unlock, precisely so a
+// handler is free to mutate the store; that re-entry is normal and takes the
+// lock cleanly. Anything new that emits belongs after the unlock too.
 void ServerProfiles::persist()
 {
-    if (m_persisting) {
-        // Re-entered from a slot that mutated the store again. QLockFile is not
-        // recursive, so asking for the lock here would wait out the whole
-        // timeout against a lock this call stack already holds.
-        mergeAndWrite();
-        return;
-    }
-    m_persisting = true;
-
     const QString settingsPath = m_settings->fileName();
     // A brand new installation has no config directory yet: QSettings creates it
     // lazily, on its first write, which is AFTER this point. QLockFile cannot
@@ -303,10 +322,9 @@ void ServerProfiles::persist()
 
     if (locked)
         lock.unlock();
-    m_persisting = false;
 
-    // After the unlock and after the guard is clear: a handler is free to react
-    // by mutating the store, and must not find either still held.
+    // After the unlock: a handler is free to react by mutating the store, and
+    // must not find the lock still held (see the INVARIANT above).
     //
     // Only the FIRST degraded save of a run is reported. A store that could not
     // get the lock a moment ago will not get it for the next keystroke either,

@@ -4,6 +4,7 @@
 #include <QIODevice>
 #include <QList>
 #include <QSignalSpy>
+#include <QStringDecoder>
 
 #include <cstring>
 
@@ -87,6 +88,7 @@ private slots:
     void sizeFlushCancelsTimerNoDoubleFlushPreservesOrder();
     void flushesOnTimeThreshold();
     void emptyOutputNeverFlushes();
+    void outputReceivedFiresOnEveryIngestWhateverTheRendererIsDoing();
     void hiddenDrainRetainsCapAndEvictsOldest();
     void hiddenBufferReplaysOnBecomingVisible();
     void visibleOutputPastTheAckWindowIsRetainedNotEmitted();
@@ -113,6 +115,9 @@ private slots:
     void sendInputNeedsAWritableTransport();
     void resizeRejectsNonPositiveGeometry();
     void hiddenEvictionResumesOnACleanBoundary();
+    void flushBoundariesNeverSplitAMultiByteCharacter();
+    void anEvictionCannotOrphanHalfOfACharacterInTheDecoder();
+    void releasingRetainedOutputStaysInsideTheCreditWindow();
 };
 
 // A single ingest at or above the size cap flushes synchronously (SPEC 5.5).
@@ -250,6 +255,52 @@ void fillTheAckWindow(TerminalController &controller)
 
 } // namespace
 
+// outputReceived() is the pane's liveness signal, and ch::TerminalFactory
+// forwards it to ch::AgentStatusMonitor for SPEC 6.6 activity detection on the
+// adapterless "generic" harness — the only way such a pane ever gets an agent
+// state, since no adapter produces an event for it.
+//
+// It must therefore fire for output the RENDERER never sees. flushReady() is
+// silent for a hidden pane and for a visible one held back on acknowledgements,
+// both of which are very much alive, so deriving liveness from it would report
+// the opposite of the truth exactly when the user is not looking. Empty input
+// is still nothing at all.
+void TstTerminalController::outputReceivedFiresOnEveryIngestWhateverTheRendererIsDoing()
+{
+    TerminalController controller;
+    QSignalSpy live(&controller, &TerminalController::outputReceived);
+    QSignalSpy flushes(&controller, &TerminalController::flushReady);
+
+    controller.ingestOutput(QByteArrayLiteral("x"));
+    QCOMPARE(live.count(), 1);
+    // Sub-threshold, so nothing has reached the renderer yet.
+    QCOMPARE(flushes.count(), 0);
+
+    // Empty output is a no-op here too.
+    controller.ingestOutput(QByteArray());
+    QCOMPARE(live.count(), 1);
+
+    // Hidden: everything goes to the rolling buffer, and the pane is still
+    // demonstrably producing.
+    controller.setViewVisible(false);
+    const int flushesBefore = flushes.count();
+    controller.ingestOutput(QByteArray(TerminalController::kFlushSizeBytes, 'y'));
+    QCOMPARE(live.count(), 2);
+    QCOMPARE(flushes.count(), flushesBefore);
+
+    // Visible but too far behind on acknowledgements: same story. A fresh pane,
+    // because fillTheAckWindow() starts from an empty credit account.
+    TerminalController atLimit;
+    QSignalSpy limitLive(&atLimit, &TerminalController::outputReceived);
+    QSignalSpy limitFlushes(&atLimit, &TerminalController::flushReady);
+    fillTheAckWindow(atLimit);
+    const int flushesAtLimit = limitFlushes.count();
+    const int liveAtLimit = limitLive.count();
+    atLimit.ingestOutput(QByteArray(TerminalController::kFlushSizeBytes, 'z'));
+    QCOMPARE(limitLive.count(), liveAtLimit + 1);
+    QCOMPARE(limitFlushes.count(), flushesAtLimit);
+}
+
 // The core of the flow control: a VISIBLE pane stops emitting once too much of
 // what it already emitted is unacknowledged, and what it withholds goes into
 // the same rolling buffer a hidden pane uses. Without this the controller emits
@@ -300,16 +351,32 @@ void TstTerminalController::acknowledgementsReleaseRetainedOutputInOrder()
     controller.acknowledgeOutput(0);
     QCOMPARE(spy.count(), 0);
 
-    // A real one releases everything retained, once, as a single batch.
+    // A real one releases retained output — but only as much of it as the
+    // credit it just freed, so the release cannot itself blow the window it is
+    // policing. One batch's worth acknowledged, one batch's worth released.
     controller.acknowledgeOutput(TerminalController::kFlushSizeBytes);
     QCOMPARE(spy.count(), 1);
-    QCOMPARE(spy.at(0).at(0).toByteArray(), expected);
-    QVERIFY(controller.hiddenBuffer().isEmpty());
+    QCOMPARE(spy.at(0).at(0).toByteArray(),
+             expected.left(TerminalController::kFlushSizeBytes));
+    QCOMPARE(controller.unacknowledgedBytes(),
+             static_cast<qint64>(TerminalController::kMaxUnacknowledgedBytes));
 
-    // A second acknowledgement of the same size must not re-deliver anything:
-    // the buffer is empty, and the released batch was charged to the account.
+    // The remaining four batches drain the same way, in arrival order, with no
+    // byte dropped and none delivered twice.
+    QByteArray delivered = spy.at(0).at(0).toByteArray();
+    while (!controller.hiddenBuffer().isEmpty()) {
+        const int before = spy.count();
+        controller.acknowledgeOutput(TerminalController::kFlushSizeBytes);
+        QCOMPARE(spy.count(), before + 1);
+        delivered += spy.at(before).at(0).toByteArray();
+    }
+    QCOMPARE(delivered, expected);
+
+    // A further acknowledgement must not re-deliver anything: the buffer is
+    // empty, and everything released was charged to the account.
+    const int settled = spy.count();
     controller.acknowledgeOutput(TerminalController::kFlushSizeBytes);
-    QCOMPARE(spy.count(), 1);
+    QCOMPARE(spy.count(), settled);
 
     // A nonsense acknowledgement from a page that over-reports cannot drive the
     // account negative; it only hands this pane back its full credit.
@@ -956,6 +1023,198 @@ void TstTerminalController::hiddenEvictionResumesOnACleanBoundary()
         // The overflow plus exactly one window, and not a byte more.
         QCOMPARE(hidden.size(), kCap - TerminalController::kHiddenResyncWindowBytes);
         QCOMPARE(hidden.right(tail.size()), tail);
+    }
+}
+
+// A flush must not END in the middle of a multi-byte UTF-8 character, which is
+// the same rule the eviction obeys at the other end of the buffer. The bytes
+// that would be cut off are held back in the pending buffer and ride on the
+// next flush, so a character is emitted whole or not at all.
+void TstTerminalController::flushBoundariesNeverSplitAMultiByteCharacter()
+{
+    // (1) The ordinary case: a batch that would end two bytes into a
+    // three-byte character is cut before it, and the fragment is completed by
+    // the next one.
+    {
+        TerminalController controller;
+        QSignalSpy spy(&controller, &TerminalController::flushReady);
+
+        controller.ingestOutput(QByteArrayLiteral("abc\xE2\x82"));
+        QVERIFY(spy.wait(1000));
+        QCOMPARE(spy.count(), 1);
+        QCOMPARE(spy.at(0).at(0).toByteArray(), QByteArrayLiteral("abc"));
+
+        controller.ingestOutput(QByteArrayLiteral("\xAC ok"));
+        QVERIFY(spy.wait(1000));
+        QCOMPARE(spy.count(), 2);
+        QCOMPARE(spy.at(1).at(0).toByteArray(), QByteArrayLiteral("\xE2\x82\xAC ok"));
+    }
+
+    // (2) When the pending buffer is NOTHING but the head of a character there
+    // is no batch to emit at all, and the timer firing must not produce an
+    // empty one either.
+    {
+        TerminalController controller;
+        QSignalSpy spy(&controller, &TerminalController::flushReady);
+
+        controller.ingestOutput(QByteArrayLiteral("\xF0\x9F"));
+        QVERIFY(!spy.wait(100));
+        QCOMPARE(spy.count(), 0);
+
+        controller.ingestOutput(QByteArrayLiteral("\x98\x80"));
+        QVERIFY(spy.wait(1000));
+        QCOMPARE(spy.count(), 1);
+        QCOMPARE(spy.at(0).at(0).toByteArray(), QByteArrayLiteral("\xF0\x9F\x98\x80"));
+    }
+
+    // (3) A terminal carries arbitrary bytes, not only text. Anything that
+    // cannot be the start of a character must go out immediately: holding it
+    // would stall a binary stream (a `cat` of a JPEG) behind a completion that
+    // is never coming.
+    {
+        TerminalController controller;
+        QSignalSpy spy(&controller, &TerminalController::flushReady);
+
+        // 0xFF is not a legal lead byte, and a lone 0x80 is an orphaned
+        // continuation byte with no lead at all.
+        controller.ingestOutput(QByteArrayLiteral("\xFF\xFE\x80"));
+        QVERIFY(spy.wait(1000));
+        QCOMPARE(spy.count(), 1);
+        QCOMPARE(spy.at(0).at(0).toByteArray(), QByteArrayLiteral("\xFF\xFE\x80"));
+    }
+
+    // (4) The same holds on the retained path: the rolling buffer of a hidden
+    // pane is built out of the same batches, so it never ends mid-character
+    // either.
+    {
+        TerminalController controller;
+        controller.setViewVisible(false);
+
+        controller.ingestOutput(QByteArrayLiteral("hi\xE2\x82"));
+        QTest::qWait(50);
+        QCOMPARE(controller.hiddenBuffer(), QByteArrayLiteral("hi"));
+    }
+}
+
+// WHY (1) above matters, end to end. ch::TerminalBridge decodes statefully, so
+// a character split across two batches is normally harmless: the decoder holds
+// the lead bytes and completes them from the next batch. It stops being
+// harmless when the continuation bytes are still only in the RETAINED buffer
+// and an overflow evicts them — the decoder then completes its half-character
+// from whatever survived the eviction and paints one wrong glyph. Never
+// emitting a half-character closes that off at the source, with no extra
+// signalling between the controller and the bridge.
+void TstTerminalController::anEvictionCannotOrphanHalfOfACharacterInTheDecoder()
+{
+    constexpr int kFlush = TerminalController::kFlushSizeBytes;
+    constexpr qsizetype kCap = TerminalController::kHiddenBufferMaxBytes;
+
+    TerminalController controller; // visible: a renderer is listening
+    QSignalSpy spy(&controller, &TerminalController::flushReady);
+
+    // A batch that reaches the size threshold and would end two bytes into a
+    // euro sign, so it goes straight out to the renderer.
+    QByteArray straddling(kFlush - 2, 'B');
+    straddling += QByteArrayLiteral("\xE2\x82");
+    controller.ingestOutput(straddling);
+    QCOMPARE(spy.count(), 1);
+
+    // The pane is hidden the moment after (a tab switch), so the euro sign's
+    // third byte and everything behind it is retained instead of emitted...
+    controller.setViewVisible(false);
+    controller.ingestOutput(QByteArrayLiteral("\xAC"));
+    // ...and then the remote floods the pane, overflowing the rolling buffer
+    // so its front — where that third byte sits — is evicted.
+    controller.ingestOutput(QByteArray(kCap, 'C'));
+    QCOMPARE(controller.hiddenBuffer().size(), kCap);
+
+    // The pane comes back and the retained buffer replays.
+    controller.setViewVisible(true);
+    QVERIFY(spy.count() > 1);
+
+    // Decode everything the controller emitted exactly as the bridge does:
+    // one stateful decoder, fed batch by batch in order.
+    auto decoder = QStringDecoder(QStringDecoder::Utf8);
+    QString rendered;
+    for (const QList<QVariant> &args : spy)
+        rendered += decoder.decode(args.at(0).toByteArray());
+
+    // No replacement character anywhere. Losing the oldest scrollback to an
+    // eviction is expected and documented; being left mid-character across it
+    // is not, and it is what puts a wrong glyph at the top of the replay.
+    QVERIFY(!rendered.contains(QChar(0xFFFD)));
+    // Every emitted byte was ASCII, so the decode is one character per byte:
+    // no half-character was ever handed over to begin with.
+    qsizetype emitted = 0;
+    for (const QList<QVariant> &args : spy)
+        emitted += args.at(0).toByteArray().size();
+    QCOMPARE(rendered.size(), emitted);
+}
+
+// Releasing the retained buffer is subject to the SAME credit window as an
+// ordinary flush. It used to hand the whole buffer over in one batch, which
+// could put up to kHiddenBufferMaxBytes into a renderer that had credit for a
+// fraction of it — the flow control's own bound broken by the mechanism that
+// exists to enforce it, and precisely the unbounded WebChannel/Chromium queue
+// kMaxUnacknowledgedBytes is there to prevent.
+void TstTerminalController::releasingRetainedOutputStaysInsideTheCreditWindow()
+{
+    constexpr qsizetype kCap = TerminalController::kHiddenBufferMaxBytes;
+    constexpr qsizetype kWindow = TerminalController::kMaxUnacknowledgedBytes;
+
+    // (1) A full rolling buffer replayed to a renderer with a full window of
+    // credit is handed over a window at a time, not all at once.
+    {
+        TerminalController controller;
+        controller.setViewVisible(false);
+
+        const QByteArray fill(kCap, 'A'); // no line feed: the exact-bound case
+        controller.ingestOutput(fill);
+        QCOMPARE(controller.hiddenBuffer().size(), kCap);
+
+        QSignalSpy spy(&controller, &TerminalController::flushReady);
+        controller.setViewVisible(true);
+
+        QCOMPARE(spy.count(), 1);
+        QCOMPARE(spy.at(0).at(0).toByteArray().size(), kWindow);
+        QCOMPARE(controller.unacknowledgedBytes(), static_cast<qint64>(kWindow));
+        QCOMPARE(controller.hiddenBuffer().size(), kCap - kWindow);
+
+        // Nothing is lost by cutting: the rest drains as the renderer
+        // acknowledges, in order, and reassembles into exactly what went in.
+        QByteArray delivered = spy.at(0).at(0).toByteArray();
+        while (!controller.hiddenBuffer().isEmpty()) {
+            const int before = spy.count();
+            controller.acknowledgeOutput(controller.unacknowledgedBytes());
+            QCOMPARE(spy.count(), before + 1);
+            QVERIFY(spy.at(before).at(0).toByteArray().size() <= kWindow);
+            delivered += spy.at(before).at(0).toByteArray();
+        }
+        QCOMPARE(delivered, fill);
+    }
+
+    // (2) The cut goes through the same resync rule the eviction uses, so it
+    // prefers a line feed just past the window. That is the only way a release
+    // may exceed the window, and it is bounded by the resync window — a couple
+    // of terminal lines, not a couple of megabytes.
+    {
+        TerminalController controller;
+        controller.setViewVisible(false);
+
+        QByteArray fill(kCap, 'A');
+        const qsizetype newline = kWindow + 10;
+        fill[newline] = '\n';
+        controller.ingestOutput(fill);
+
+        QSignalSpy spy(&controller, &TerminalController::flushReady);
+        controller.setViewVisible(true);
+
+        QCOMPARE(spy.count(), 1);
+        const QByteArray first = spy.at(0).at(0).toByteArray();
+        // Up to and including the line feed, and no further.
+        QCOMPARE(first.size(), newline + 1);
+        QVERIFY(first.size()
+                <= kWindow + TerminalController::kHiddenResyncWindowBytes);
     }
 }
 

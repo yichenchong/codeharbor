@@ -252,7 +252,7 @@ void TstLiveAgent::connectPool()
 bool TstLiveAgent::runRemote(const QString& command, QByteArray* out,
                              QString* err, int timeoutMs)
 {
-    SshChannelDevice device(&m_pool, SshConnectionPool::ChannelKind::Exec);
+    SshChannelDevice device(&m_pool);
     bool finished = false;
     connect(&device, &SshChannelDevice::readyRead, &device,
             [&]() { *out += device.readAll(); });
@@ -291,7 +291,8 @@ bool TstLiveAgent::fireHook(const QString& nativeEvent, const QString& tool,
     if (!summary.isEmpty())
         argv << q(QStringLiteral("OMP_SUMMARY=") + summary);
     // SPEC 6.5's "agent or hook error" arm: the harness marks the firing and
-    // the adapter maps it to `error` ahead of the native event name.
+    // the adapter maps it to `error` ahead of the native event name — except
+    // for a shutdown, which outranks the flag (SPEC 6.5 precedence).
     if (error)
         argv << q(QStringLiteral("OMP_ERROR=1"));
     argv << QStringLiteral("sh")
@@ -389,9 +390,7 @@ void TstLiveAgent::bridgeChannelWiresMonitor()
         + QStringLiteral(" echo \"ch-live wrapper=$$ bridge=$__ch_bridge\" 1>&2;")
         + QStringLiteral(" cat >/dev/null; kill $__ch_bridge 2>/dev/null");
 
-    m_bridge = new SshChannelDevice(&m_pool,
-                                    SshConnectionPool::ChannelKind::AgentStatus,
-                                    this);
+    m_bridge = new SshChannelDevice(&m_pool, this);
     connect(m_bridge, &SshChannelDevice::channelError, this,
             [this](const QString& text) { m_bridgeStderr += text; });
     QVERIFY(m_bridge->startExec(QStringLiteral("sh -c ") + q(relay)));
@@ -522,7 +521,8 @@ void TstLiveAgent::markSeenClearsBadgeAndRow()
 // monitor -> SessionsModel row state.
 //
 //   agent or hook error -> error     highest-priority row state there is
-//   session_shutdown    -> stopped   the terminal's last word
+//   session_shutdown    -> stopped   the terminal's last word, and the one
+//                                    mapping the error flag may NOT mask
 //
 // Error is also the state most easily got wrong in the direction the user
 // notices: a row that latches red, or an error that pops a desktop bubble the
@@ -533,8 +533,9 @@ void TstLiveAgent::errorAndShutdownReachTheRowState()
     const int notifiesBefore = m_notifySpy->count();
     const int unseenBefore = m_unseenSpy->count();
 
-    // OMP_ERROR=1 marks the firing; adapters/oh-my-pi.ts checks it BEFORE the
-    // native event name, so even an agent_end maps to error.
+    // OMP_ERROR=1 marks the firing; adapters/pi-family.ts (shared by the
+    // oh-my-pi and pi adapters) checks it BEFORE the native event name, so even
+    // an agent_end maps to error.
     QVERIFY(fireHook(QStringLiteral("agent_end"), QString(),
                      QStringLiteral("live gate: agent blew up"), true));
     QTRY_COMPARE_WITH_TIMEOUT(m_monitor.stateFor(m_dev, m_term),
@@ -555,6 +556,24 @@ void TstLiveAgent::errorAndShutdownReachTheRowState()
     // Error is a state, not a latch: the shutdown replaced it with no explicit
     // reset, and the row leaves Error for Idle (the pane is still connected, so
     // it is Idle rather than Disconnected).
+    QCOMPARE(asInt(modelRowState(liveTerminals())), asInt(SessionRowState::Idle));
+    QCOMPARE(m_notifySpy->count(), notifiesBefore);
+    QCOMPARE(m_unseenSpy->count(), unseenBefore);
+
+    // SPEC 6.5 precedence, the arm that matters most in practice: a producer
+    // that exported OMP_ERROR=1 once and never unset it. Every later firing
+    // carries the stale flag, INCLUDING the shutdown — and if the flag won
+    // there, the row would stay red for a session that is gone, because nothing
+    // after a shutdown can ever arrive to replace the state. Drive the terminal
+    // back into Error first so the shutdown is a real transition and not a
+    // repeat of the state it is already in.
+    QVERIFY(fireHook(QStringLiteral("agent_end"), QString(),
+                     QStringLiteral("live gate: agent blew up again"), true));
+    QTRY_COMPARE_WITH_TIMEOUT(m_monitor.stateFor(m_dev, m_term),
+                              asInt(AgentState::Error), kRelayTimeoutMs);
+    QVERIFY(fireHook(QStringLiteral("session_shutdown"), QString(), QString(), true));
+    QTRY_COMPARE_WITH_TIMEOUT(m_monitor.stateFor(m_dev, m_term),
+                              asInt(AgentState::Stopped), kRelayTimeoutMs);
     QCOMPARE(asInt(modelRowState(liveTerminals())), asInt(SessionRowState::Idle));
     QCOMPARE(m_notifySpy->count(), notifiesBefore);
     QCOMPARE(m_unseenSpy->count(), unseenBefore);

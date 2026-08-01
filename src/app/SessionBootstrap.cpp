@@ -770,15 +770,14 @@ bool SessionBootstrap::probeEndpoint(const QString& host, quint16 port,
     return false;
 }
 
-SshChannelDevice* SessionBootstrap::openChannelDevice(
-    SshConnectionPool::ChannelKind kind, const QString& command,
-    const QString& role)
+SshChannelDevice* SessionBootstrap::openChannelDevice(const QString& command,
+                                                      const QString& role)
 {
     // `role` only labels the long-lived diagnostics stream, which is wired by
     // wireChannelSignals() rather than here.
     Q_UNUSED(role);
 
-    auto* device = new SshChannelDevice(m_pool, kind, this);
+    auto* device = new SshChannelDevice(m_pool, this);
     // Scoped to the exec request and nothing else. startExec() reports failure
     // as a bare false and explains itself through channelError() a moment
     // earlier, so the explanation is captured here or lost. The long-lived
@@ -825,7 +824,7 @@ bool SessionBootstrap::runRemoteScript(const QString& script, int timeoutMs,
     // Stack-owned, and handed back to the pool by closeChannel() below rather
     // than left for the destructor: an SSH server caps concurrent channels per
     // connection, and this runs up to three times per connect.
-    SshChannelDevice device(m_pool, SshConnectionPool::ChannelKind::Exec);
+    SshChannelDevice device(m_pool);
     QString diagnostics;
     connect(&device, &SshChannelDevice::channelError, &device,
             [this, &diagnostics, role](const QString& text) {
@@ -1333,8 +1332,7 @@ bool SessionBootstrap::attemptWire()
     if (m_cancelRequested)
         return false;
 
-    m_rpcDevice = openChannelDevice(SshConnectionPool::ChannelKind::Rpc,
-                                    rpcCommand(m_nodePath, m_repoRoot),
+    m_rpcDevice = openChannelDevice(rpcCommand(m_nodePath, m_repoRoot),
                                     QStringLiteral("codeharbord"));
     if (!m_rpcDevice) {
         fail(withLastDiagnostic(
@@ -1350,15 +1348,15 @@ bool SessionBootstrap::attemptWire()
         // channel readable and writable forever, so nothing else in this file
         // would ever notice it: no EOF, no channelError(), no reconnect. The
         // heartbeat turns that silence into the ordinary transport-loss path,
-        // which the reconnect ladder below already handles, instead of an
-        // editor pane stuck on "saving…" for the rest of the session.
+        // which the reconnect ladder below already handles, instead of a
+        // viewer pane whose text editor sits on "saving…" for the rest of the
+        // session.
         // Idempotent, so re-wiring after a reconnect simply re-arms it.
         m_client->enableHeartbeat();
         m_client->setTransport(m_rpcDevice);
     }
 
-    m_agentDevice = openChannelDevice(SshConnectionPool::ChannelKind::AgentStatus,
-                                      bridgeCommand(m_nodePath, m_repoRoot),
+    m_agentDevice = openChannelDevice(bridgeCommand(m_nodePath, m_repoRoot),
                                       QStringLiteral("codeharbor-bridge"));
     if (!m_agentDevice) {
         fail(withLastDiagnostic(

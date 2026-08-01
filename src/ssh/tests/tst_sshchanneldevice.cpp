@@ -9,6 +9,26 @@
 using ch::SshChannelDevice;
 using ch::SshConnectionPool;
 
+namespace {
+
+// SshChannelDevice with the channel replaced by nothing at all: open, and able
+// to latch remote end-of-stream on command. That is the one state a server-free
+// test cannot otherwise reach — pump() only sets it after a real channel
+// reports EOF — and it is the state the QIODevice end-of-stream contract is
+// about. The higher layers fake channels the same way (src/app/tests).
+class OpenedChannelDevice : public SshChannelDevice {
+public:
+    OpenedChannelDevice()
+        : SshChannelDevice(nullptr)
+    {
+        QIODevice::open(QIODevice::ReadWrite | QIODevice::Unbuffered);
+    }
+
+    using SshChannelDevice::finishReadChannel;
+};
+
+} // namespace
+
 // The parts of SshChannelDevice that need no server: its QIODevice contract on
 // a device with no channel behind it, and the way it reports a refused start.
 // Everything that needs real remote bytes lives in the `live` gate
@@ -24,6 +44,7 @@ private slots:
     void startingOnADisconnectedPoolExplainsItself();
     void closeChannelIsIdempotentAndReportsTheEndExactlyOnce();
     void resizeIsRefusedWhenThereIsNoPty();
+    void aFinishedStreamReadsAsMinusOneNotZero();
 };
 
 // QIODevice::open() is the obvious thing for a caller to reach for, and on this
@@ -32,7 +53,7 @@ private slots:
 // every write — a hang with no error anywhere.
 void TstSshChannelDevice::openIsRefusedBecauseAChannelIsWhatOpensThisDevice()
 {
-    SshChannelDevice device(nullptr, SshConnectionPool::ChannelKind::Exec);
+    SshChannelDevice device(nullptr);
 
     QVERIFY(!device.open(QIODevice::ReadWrite));
     QVERIFY(!device.isOpen());
@@ -43,7 +64,7 @@ void TstSshChannelDevice::openIsRefusedBecauseAChannelIsWhatOpensThisDevice()
 
 void TstSshChannelDevice::startingWithoutAConnectionPoolExplainsItself()
 {
-    SshChannelDevice device(nullptr, SshConnectionPool::ChannelKind::Exec);
+    SshChannelDevice device(nullptr);
     QStringList errors;
     connect(&device, &SshChannelDevice::channelError, &device,
             [&errors](const QString& text) { errors << text; });
@@ -66,7 +87,7 @@ void TstSshChannelDevice::startingOnADisconnectedPoolExplainsItself()
     // A pool that never connected hands out no channels, which is the state
     // every start request lands in after an SSH drop.
     SshConnectionPool pool;
-    SshChannelDevice device(&pool, SshConnectionPool::ChannelKind::Pty);
+    SshChannelDevice device(&pool);
     QStringList errors;
     connect(&device, &SshChannelDevice::channelError, &device,
             [&errors](const QString& text) { errors << text; });
@@ -88,7 +109,7 @@ void TstSshChannelDevice::startingOnADisconnectedPoolExplainsItself()
 // failed set of requests all over again.
 void TstSshChannelDevice::closeChannelIsIdempotentAndReportsTheEndExactlyOnce()
 {
-    SshChannelDevice device(nullptr, SshConnectionPool::ChannelKind::Rpc);
+    SshChannelDevice device(nullptr);
     QSignalSpy finished(&device, &SshChannelDevice::readChannelFinished);
 
     device.closeChannel();
@@ -103,11 +124,46 @@ void TstSshChannelDevice::closeChannelIsIdempotentAndReportsTheEndExactlyOnce()
 
 void TstSshChannelDevice::resizeIsRefusedWhenThereIsNoPty()
 {
-    SshChannelDevice exec(nullptr, SshConnectionPool::ChannelKind::Exec);
+    SshChannelDevice exec(nullptr);
     QVERIFY(!exec.resizePty(80, 24));
     // Degenerate geometry is refused for the same reason and not by accident:
     // there is no channel, so there is nothing to resize either way.
     QVERIFY(!exec.resizePty(0, 0));
+}
+
+// QIODevice's two empty answers mean different things and every generic
+// consumer relies on the difference: 0 is "nothing buffered right now, wait for
+// readyRead()", -1 is "this stream is over". Answering 0 after the remote sent
+// EOF makes a finished channel indistinguishable from an idle one, so
+// QIODevice::atEnd()/readAll()/waitForReadyRead() loops written against the
+// plain interface — which is the whole point of being a QIODevice — wait
+// forever for bytes that cannot come.
+void TstSshChannelDevice::aFinishedStreamReadsAsMinusOneNotZero()
+{
+    OpenedChannelDevice device;
+    QVERIFY(device.isOpen());
+    QVERIFY(device.isReadable());
+
+    char byte = 0;
+    // Live but quiet: nothing buffered, more may still arrive.
+    QCOMPARE(device.read(&byte, 1), qint64(0));
+
+    QSignalSpy finished(&device, &SshChannelDevice::readChannelFinished);
+    device.finishReadChannel();
+    QCOMPARE(finished.size(), 1);
+    // The device deliberately stays open so anything already buffered is still
+    // readable; that is exactly why the read result has to carry the news.
+    QVERIFY(device.isOpen());
+
+    QCOMPARE(device.read(&byte, 1), qint64(-1));
+    QVERIFY(device.readAll().isEmpty());
+    QVERIFY(device.atEnd());
+
+    // Latching is once-only: a second finish must not announce the end again,
+    // and must not change the read answer.
+    device.finishReadChannel();
+    QCOMPARE(finished.size(), 1);
+    QCOMPARE(device.read(&byte, 1), qint64(-1));
 }
 
 QTEST_GUILESS_MAIN(TstSshChannelDevice)

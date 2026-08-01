@@ -39,9 +39,21 @@ test("unknown paths fall back to plaintext", () => {
     assert.equal(selectLanguage("/home/u/README", languages), "plaintext");
 });
 
-test("the basename is taken after the last path separator (both slash kinds)", () => {
-    assert.equal(selectLanguage("C:\\proj\\CMakeLists.txt", languages), "cmake");
+test("the basename is taken after the last slash", () => {
     assert.equal(selectLanguage("weird.txt/CMakeLists.txt", languages), "cmake");
+});
+
+test("a backslash is a filename character, not a path separator", () => {
+    // These paths are always POSIX paths on the remote server (SPEC 8.1), where
+    // a backslash is legal inside a name. Splitting on it would take the wrong
+    // basename and lose both the filename match and the extension.
+    assert.equal(selectLanguage("/srv/odd\\Dockerfile", languages), "plaintext");
+    assert.equal(selectLanguage("/srv/Dockerfile\\odd", languages), "plaintext");
+    assert.equal(selectLanguage("/srv/back\\slash.js", languages), "javascript");
+    assert.equal(selectLanguage("/srv/app.js\\notes", languages), "plaintext");
+    // A Windows-shaped string is just a very odd POSIX filename; it has no
+    // directory part at all, so the whole thing is the name.
+    assert.equal(selectLanguage("C:\\proj\\CMakeLists.txt", languages), "plaintext-lang");
 });
 
 test("filename match is case-insensitive, as it is in VS Code", () => {

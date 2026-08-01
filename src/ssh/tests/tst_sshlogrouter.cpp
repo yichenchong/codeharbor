@@ -1,5 +1,6 @@
 #include "SshConnectionPool.h"
 
+#include <QRegularExpression>
 #include <QSemaphore>
 #include <QString>
 #include <QTemporaryDir>
@@ -85,6 +86,7 @@ private slots:
     void aRouteDestroyedWhileRegisteredDeregistersCleanly();
     void nestedRoutesRestoreTheOuterRouteWhenTheInnerGoes();
     void concurrentRoutesOnTwoThreadsNeverSeeEachOthersLines();
+    void releasingARouteFromTheWrongThreadStopsItRoutingAnyway();
     void twoPoolsHandshakingConcurrentlyKeepSeparateTranscripts();
     void libsshActivityAfterAHandshakeNeverReachesThePoolsTranscript();
     void aPoolLeavesNoRouteBehindAfterAFailedHandshake();
@@ -527,6 +529,76 @@ void TstSshLogRouter::aThreadWithNoPreviousHookIsLeftWithAnInertOne()
              "libssh cannot uninstall a hook; the router's must remain");
     QCOMPARE(levelAfterRelease, int(SSH_LOG_NOLOG));
     QCOMPARE(linesAfterRelease, 0);
+    QCOMPARE(SshLogRouter::activeRouteCount(), 0);
+}
+
+// Releasing a route from a thread that did not take it is a contract
+// violation, and it used to be caught by nothing but Q_ASSERT_X — which is
+// compiled out of every release build. What survived into production was
+// silent: the route stayed in the owning thread's stack, so libssh lines kept
+// reaching a sink whose Route was on its way out, through a pointer that
+// ~Route() had already made dangling. The guard has to be a real runtime one:
+// the route stops routing whichever thread ends it, the owning thread's other
+// routes carry on, and the violation is reported rather than swallowed.
+void TstSshLogRouter::releasingARouteFromTheWrongThreadStopsItRoutingAnyway()
+{
+    QSemaphore routesTaken;
+    QSemaphore released;
+    QStringList outerLines;
+    QStringList innerLines;
+    int countWhileBothHeld = 0;
+    SshLogRouter::Route* innerRoute = nullptr;
+
+    QThread* const owner = QThread::create([&] {
+        SshLogRouter::Route outer(
+            [&outerLines](int, const char*, const char* buffer) {
+                outerLines << QString::fromUtf8(buffer ? buffer : "");
+            });
+        // Heap-allocated so the WRONG thread can end it while this thread is
+        // still inside the route's lifetime, which is the violation.
+        auto inner = std::make_unique<SshLogRouter::Route>(
+            [&innerLines](int, const char*, const char* buffer) {
+                innerLines << QString::fromUtf8(buffer ? buffer : "");
+            });
+        innerRoute = inner.get();
+        countWhileBothHeld = SshLogRouter::activeRouteCount();
+        emitLibsshLine(QStringLiteral("before-release"));
+
+        routesTaken.release();
+        released.acquire();
+
+        // The inner route was ended from the main thread. Its sink must be out
+        // of the picture, and the outer route must collect this line.
+        emitLibsshLine(QStringLiteral("after-release"));
+        inner.reset();  // the owning thread's own release: now a no-op
+        emitLibsshLine(QStringLiteral("after-owner-reset"));
+    });
+    owner->start();
+    routesTaken.acquire();
+
+    // The violation, committed from the main thread. It is reported, not
+    // swallowed: an assertion would have said nothing in a release build.
+    QTest::ignoreMessage(QtWarningMsg,
+                         QRegularExpression(QStringLiteral(
+                             "route taken on another thread was released")));
+    innerRoute->release();
+    // The route really is gone from the process-wide count, exactly once.
+    QCOMPARE(SshLogRouter::activeRouteCount(), 1);
+    released.release();
+    QVERIFY(owner->wait(60000));
+    delete owner;
+
+    QCOMPARE(countWhileBothHeld, 2);
+    // Only the line emitted while the inner route was genuinely live reached
+    // it. Everything after the wrong-thread release belongs to the outer route.
+    QCOMPARE(innerLines.size(), 1);
+    QVERIFY(innerLines.constLast().contains(QStringLiteral("before-release")));
+    QCOMPARE(outerLines.size(), 2);
+    QVERIFY(outerLines.at(0).contains(QStringLiteral("after-release")));
+    QVERIFY(outerLines.at(1).contains(QStringLiteral("after-owner-reset")));
+
+    // No double decrement from the owning thread's later release(), and that
+    // thread's libssh state went back with its own last route.
     QCOMPARE(SshLogRouter::activeRouteCount(), 0);
 }
 

@@ -28,6 +28,9 @@
 // Without both of them the hook emits NOTHING and explains why on stderr (see
 // missingCoordinates): an event carrying a blank id reaches the client as a
 // valid event that belongs to no Dev Session.
+// OMP_METADATA optionally carries a JSON object of free-form fields (a model
+// name, a turn counter, a run id) through to the client untouched; the bridge
+// merges it over the adapter's own derived metadata (see parseHookMetadata).
 // SPEC 6.4: a broken producer must never take down the agent. Any failure to
 // connect or write is swallowed (logged to stderr) and the process exits 0.
 
@@ -67,10 +70,43 @@ export interface BridgeMessage {
 }
 
 /**
+ * Decode $OMP_METADATA: a JSON object of free-form auxiliary fields the harness
+ * wants carried alongside the event (a model name, a turn counter, a run id).
+ * Returns undefined for absent, blank, unparseable, or non-object input.
+ *
+ * Free-form and opaque ON PURPOSE. The bridge merges it over the adapter's own
+ * derived metadata and the client parses it as a plain JSON object
+ * (AgentEvent.metadata), so a harness can add a field without a change on
+ * either side. That is what the bag is for; before this it could only be
+ * populated by a programmatic caller of toBridgeMessage(), which no installed
+ * hook is, so the declared field was unreachable from the one place hooks are
+ * actually configured.
+ *
+ * Never throws and never rejects the EVENT: metadata is optional, so bad
+ * metadata costs the metadata and nothing else (SPEC 6.4 — a broken producer
+ * must not break the agent). main() reports the loss on stderr, where the
+ * misconfiguration is actionable.
+ *
+ * A JSON array is rejected: the field is typed as a record on the wire and in
+ * the client's QJsonObject, and an array would be silently dropped downstream.
+ */
+export function parseHookMetadata(raw: string | undefined): Record<string, unknown> | undefined {
+    if (raw === undefined || raw.trim() === "") return undefined;
+    let parsed: unknown;
+    try {
+        parsed = JSON.parse(raw);
+    } catch {
+        return undefined;
+    }
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return undefined;
+    return parsed as Record<string, unknown>;
+}
+
+/**
  * Read a HookInput from process argv/env. The native event name is the first
  * positional argument (argv[2]), falling back to $OMP_HOOK_EVENT; session
- * coordinates and tool come from the environment so the same script serves
- * every hook.
+ * coordinates, tool and the free-form $OMP_METADATA bag come from the
+ * environment so the same script serves every hook.
  */
 export function readHookInput(
     argv: readonly string[] = process.argv,
@@ -94,6 +130,8 @@ export function readHookInput(
     if (env.OMP_TOOL) input.tool = env.OMP_TOOL;
     if (env.OMP_ERROR === "1" || env.OMP_ERROR === "true") input.error = true;
     if (env.OMP_SUMMARY) input.summary = env.OMP_SUMMARY;
+    const metadata = parseHookMetadata(env.OMP_METADATA);
+    if (metadata !== undefined) input.metadata = metadata;
     return input;
 }
 
@@ -161,7 +199,8 @@ export function emitHookEvent(
 
 const USAGE = "usage: node oh-my-pi-hook.ts <native-event>\n" +
     "  env: OMP_DEV_SESSION_ID, OMP_TERMINAL_ID,\n" +
-    "       [OMP_HOOK_EVENT], [OMP_TOOL], [OMP_ERROR], [OMP_SUMMARY]\n";
+    "       [OMP_HOOK_EVENT], [OMP_TOOL], [OMP_ERROR], [OMP_SUMMARY],\n" +
+    "       [OMP_METADATA] (a JSON object of free-form fields)\n";
 
 /**
  * Names the environment variables whose session coordinates are missing or
@@ -204,6 +243,15 @@ export async function main(
                 `unset or blank, so the event could not be attributed to a terminal\n${USAGE}`,
         );
         return;
+    }
+    // Metadata is optional, so bad metadata never blocks the event — but it is
+    // also invisible once dropped, and the harness author who wrote the JSON is
+    // standing right here. Say so, and still emit.
+    if ((env.OMP_METADATA ?? "").trim() !== "" && input.metadata === undefined) {
+        process.stderr.write(
+            "oh-my-pi-hook: ignoring OMP_METADATA: not a JSON object, so the " +
+                "event is emitted without it\n",
+        );
     }
     try {
         await emitHookEvent(input, resolveSocketPath(env));

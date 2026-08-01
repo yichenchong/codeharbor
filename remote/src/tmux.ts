@@ -172,6 +172,12 @@ async function run(runner: CommandRunner, argv: string[]): Promise<CommandResult
 // listSessions mints the marker with base64url so it can never contain a tab
 // (the field delimiter) or `#` (which tmux would read as a format directive).
 
+// A whole numeric field of the listing format: digits only, at least one, no
+// sign, no whitespace, nothing trailing. tmux emits `session_windows` and
+// `session_created` as plain non-negative decimals, so a field that does not
+// match is not a field this format produced.
+const INTEGER_FIELD = /^\d+$/;
+
 /**
  * Parse the tab-separated output of `tmux list-sessions -F LIST_SESSIONS_FORMAT`.
  * Unparseable lines are skipped rather than throwing: one odd line must not cost
@@ -195,9 +201,27 @@ export function parseSessions(stdout: string, marker = ""): TmuxSession[] {
         if (line === "") continue;
         const fields = line.split("\t");
         if (fields.length < 4) continue;
+        // STRICT field validation, not Number.parseInt's prefix scan. parseInt
+        // stops at the first character it cannot use, so "3abc" parsed as 3,
+        // "1753372800\u0000junk" as a valid timestamp, and " 7" as 7 — a record
+        // whose numeric fields are not numbers was accepted as if they were,
+        // with the garbage silently discarded. The whole point of parsing
+        // positionally is that fields 0-2 have exactly one shape each; a field
+        // that does not have it means the line is not a record this format
+        // produced, so drop the line rather than invent a value for it.
+        //
+        // Number.isSafeInteger is the second half: `session_created` is seconds
+        // since the epoch and a 20-digit field passes /^\d+$/ but lands beyond
+        // 2^53, where it silently rounds to a different instant.
+        if (!INTEGER_FIELD.test(fields[0]) || !INTEGER_FIELD.test(fields[1])) continue;
+        // `#{?session_attached,1,0}` emits exactly "1" or "0"; anything else is
+        // not this format's third field, and reading it as `=== "1"` would have
+        // reported a malformed record as a detached session that a later kill
+        // could act on.
+        if (fields[2] !== "0" && fields[2] !== "1") continue;
         const windows = Number.parseInt(fields[0], 10);
         const created = Number.parseInt(fields[1], 10);
-        if (!Number.isFinite(windows) || !Number.isFinite(created)) continue;
+        if (!Number.isSafeInteger(windows) || !Number.isSafeInteger(created)) continue;
         sessions.push({
             // Everything past the third tab is the name — see LIST_SESSIONS_FORMAT.
             name: fields.slice(3).join("\t"),

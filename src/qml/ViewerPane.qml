@@ -2,9 +2,12 @@ import QtQuick
 import QtQuick.Controls.Basic
 import "RemotePath.js" as RemotePath
 
-// A single viewer pane (SPEC 3.3, 7.5) — a leaf of the viewer split tree. It
-// asks the ViewerModel (`viewers`) to classify its URL and loads the matching
-// sub-view (source and markdown open in the Monaco editor, SPEC 8.1).
+// A single viewer pane (SPEC 3.3, 7.5) — a leaf of the viewer split tree, and a
+// BROWSER: it is addressed by a URL, keeps its own address bar and chrome, and
+// hands the resolved resource to a HANDLER. It asks the ViewerModel (`viewers`)
+// to classify its URL and loads the matching handler view (source and markdown
+// go to the Monaco editor handler, SPEC 8.1). No handler owns the pane, and an
+// unrecognised resource stays with the browser.
 //
 // THE PANE IS FILLED FROM HERE. Until now a viewer pane could only be filled by
 // something else handing it a URL, and nothing in the application did: the
@@ -260,6 +263,44 @@ Item {
     // about; empty when no probe is outstanding.
     property string probePath: ""
 
+    // The probe is BOUNDED. Nothing else un-wedges it: the header is drawn busy
+    // for as long as `probePath` is set, and the two replies that clear it are
+    // the only things that ever did. A file.listDirectory that never answers —
+    // an SSH session that dropped between the request and its reply, or a
+    // server that accepted the call and died — therefore left the pane spinning
+    // on an address the user could no longer submit again (submitAddress would
+    // just re-arm the same wait). Same shape and the same budget as
+    // TerminalPaneView's identity watchdog: generous next to one round trip, so
+    // a merely slow link never trips it, short enough that the pane stops lying
+    // while the user is still looking at it.
+    //
+    // Giving up opens the path as a FILE, exactly as onDirectoryError does: it
+    // is the answer that shows the user something, and the file's own view
+    // reports the real failure if the link is genuinely gone.
+    Timer {
+        id: probeWatchdog
+        // Named so a test can shorten the wait instead of sitting out twenty
+        // real seconds; the same seam every other named item here is.
+        objectName: "viewerProbeWatchdog"
+        interval: 20000
+        repeat: false
+        onTriggered: {
+            const path = pane.probePath;
+            pane.probePath = "";
+            if (path.length > 0)
+                pane.openRemotePath(path);
+        }
+    }
+
+    // One place that arms and disarms it, so no settle path can forget: every
+    // route out of a probe clears `probePath`.
+    onProbePathChanged: {
+        if (pane.probePath.length > 0)
+            probeWatchdog.restart();
+        else
+            probeWatchdog.stop();
+    }
+
     // Resolve whatever is in the address field and open it.
     function submitAddress() {
         const text = addressField.text.trim();
@@ -508,28 +549,16 @@ Item {
                 font.pixelSize: Theme.fontSizeSmall
             }
 
-            // An explicit ToolTip for the reason AppPaneHeader.Action gives:
-            // the attached one is drawn by the Basic style in that style's own
-            // light palette, so a hint about dark chrome arrives as a white box.
-            ToolTip {
+            // The module's one tooltip (AppToolTip.qml), for the reason
+            // AppPaneHeader.Action gives: the attached form is drawn by the
+            // Basic style in that style's own light palette, so a hint about
+            // dark chrome arrives as a white box.
+            AppToolTip {
                 id: outsideTip
                 x: 0
                 y: outsideMarker.height + 4
-                delay: 400
+                text: outsideMarker.hint
                 visible: outsideHover.hovered
-                padding: 6
-                contentItem: Label {
-                    textFormat: Text.PlainText
-                    text: outsideMarker.hint
-                    color: Theme.text
-                    font.pixelSize: Theme.fontSizeSmall
-                }
-                background: Rectangle {
-                    color: Theme.surfaceSunken
-                    border.color: Theme.border
-                    border.width: 1
-                    radius: Theme.radiusSmall
-                }
             }
         }
 
@@ -558,13 +587,21 @@ Item {
             case "directory": return directoryComponent;
             case "binary": return binaryComponent;
             case "empty": return emptyComponent;
-            // Source/text/markdown/structured open in the Monaco editor
-            // (SPEC 8.1/8.8). ViewerTextView remains a read-only fallback.
+            // Source/text/markdown/structured are a POSITIVE match for the
+            // Monaco editor handler (SPEC 8.1/8.8).
             case "text":
             case "markdown":
                 return editorComponent;
             default:
-                return textComponent;
+                // Unreachable: ViewerModel::viewKind() answers with exactly the
+                // seven words above, and this pane supplies "empty" itself. Kept
+                // as the metadata/download view all the same, never as a text
+                // handler: SPEC 3.3 makes this pane a BROWSER that delegates to
+                // handlers, so an unrecognised resource stays with the browser
+                // and gets the download/metadata treatment (SPEC 7.5) rather
+                // than being poured into the editor's read-only twin. A text
+                // handler is only ever reached on a positive match.
+                return binaryComponent;
             }
         }
     }
@@ -591,7 +628,6 @@ Item {
     }
 
     Component { id: webComponent; ViewerWebView { url: pane.effectiveUrl } }
-    Component { id: textComponent; ViewerTextView { url: pane.effectiveUrl } }
     Component { id: imageComponent; ViewerImageView { url: pane.effectiveUrl } }
     Component { id: pdfComponent; ViewerPdfView { url: pane.effectiveUrl } }
     Component {

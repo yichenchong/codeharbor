@@ -14,8 +14,14 @@ import type { HarnessAdapter, NativeEvent } from "./types.ts";
 export const claudeCodeAdapter: HarnessAdapter = {
     harness: "claude-code",
     map(native: NativeEvent): AgentState | null {
-        if (native.error === true) return "error";
         const hook = typeof native.hook === "string" ? native.hook : "";
+        // PRECEDENCE — `SessionEnd` outranks the error flag; see the same rule
+        // and the same reasoning in adapters/pi-family.ts. The session is over
+        // and observed to be over, so "stopped" is the terminal's last word and
+        // must not be maskable by a flag describing a live-but-broken agent —
+        // least of all by a producer that set the flag once and never unset it.
+        if (hook === "SessionEnd") return "stopped";
+        if (native.error === true) return "error";
         switch (hook) {
             case "SessionStart":
                 return "starting";
@@ -29,8 +35,6 @@ export const claudeCodeAdapter: HarnessAdapter = {
                 return "idle_unseen";
             case "SubagentStop":
                 return "running";
-            case "SessionEnd":
-                return "stopped";
             default:
                 return null;
         }

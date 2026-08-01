@@ -103,6 +103,16 @@ ApplicationWindow {
 
     // Persist the current region widths. viewer is the fill region (0 = fill),
     // so only the sidebar and terminal fixed widths are meaningful to store.
+    //
+    // `app.uiState` is NOT null-checked, here or at the three sites below that
+    // used to check it. It is a CONSTANT Q_PROPERTY backed by a UiStateStore
+    // built in AppController's own initialiser list (src/app/AppController.cpp),
+    // so it exists for as long as `app` does and can never become null. The
+    // guards were doing nothing except advertising a nullability the type does
+    // not have — which is worse than no guard, because the next reader has to
+    // go and check. `app.layouts` is a genuinely different case: it is an
+    // INJECTED QPointer that is null until setServices() runs, and every one of
+    // its uses is checked.
     function persistRegionWidths() {
         app.uiState.setRegionWidths(Math.round(sidebarRegion.width),
                                     0,
@@ -210,7 +220,7 @@ ApplicationWindow {
             // leaf. The empty value is deliberately NOT filtered: a focused pane
             // that was closed must clear the selection rather than leave a
             // command pointing at a pane that no longer exists.
-            onFocusedPaneIdChanged: if (app.uiState && app.activeSessionId.length > 0)
+            onFocusedPaneIdChanged: if (app.activeSessionId.length > 0)
                                         app.uiState.setSelectedPane(app.activeSessionId,
                                                                     focusedPaneId)
             // Persist WHAT a pane is showing, so reopening a Dev Session restores
@@ -233,7 +243,7 @@ ApplicationWindow {
             // window.retargetTerminals(), not bound here; see that function.
             SplitView.preferredWidth: 520
             SplitView.minimumWidth: 280
-            onFocusedPaneIdChanged: if (app.uiState && app.activeSessionId.length > 0)
+            onFocusedPaneIdChanged: if (app.activeSessionId.length > 0)
                                         app.uiState.setSelectedPane(app.activeSessionId,
                                                                     focusedPaneId)
             onSplitRequested: (orientation) => window.splitActivePane("terminal", orientation)
@@ -515,7 +525,7 @@ ApplicationWindow {
     // no such node, emitted an error and split nothing.
     function targetPaneId(region) {
         const tree = window.regionTree(region);
-        const selected = (app.activeSessionId.length > 0 && app.uiState)
+        const selected = app.activeSessionId.length > 0
                        ? app.uiState.selectedPane(app.activeSessionId) : "";
         if (selected && selected.length > 0 && window.treeHasPane(tree, selected))
             return selected;

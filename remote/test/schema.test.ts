@@ -4,7 +4,7 @@ import { DatabaseSync } from "node:sqlite";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
-import { WORKSPACE_SCHEMA_VERSION } from "../src/workspace.ts";
+import { WORKSPACE_SCHEMA_VERSION, applyConnectionPragmas } from "../src/workspace.ts";
 
 const schemaPath = fileURLToPath(new URL("../sql/schema.sql", import.meta.url));
 const schemaSql = readFileSync(schemaPath, "utf8");
@@ -21,14 +21,25 @@ const DOMAIN_TABLES = [
     "app_settings",
 ];
 
+// Every connection to a workspace database applies the shared pragmas first —
+// that is the rule applyConnectionPragmas documents, and it holds for the raw
+// DatabaseSync a test opens too. Following it here keeps this file honest about
+// the connection the daemon actually runs the DDL on, instead of exercising a
+// configuration that exists nowhere else.
 function loadSchema(): DatabaseSync {
     const db = new DatabaseSync(":memory:");
+    applyConnectionPragmas(db);
     db.exec(schemaSql);
     return db;
 }
 
-test("schema.sql loads into an in-memory database", () => {
+test("schema.sql loads into an in-memory database, on a properly configured connection", () => {
     const db = loadSchema();
+    // The standing rule (applyConnectionPragmas): the busy timeout is in force
+    // before any statement runs, DDL included. SQLite's default is 0, so this
+    // fails outright if the helper ever stops applying the pragmas.
+    const timeout = db.prepare("PRAGMA busy_timeout").get() as { timeout: number };
+    assert.equal(timeout.timeout, 5000);
     db.close();
 });
 

@@ -9,9 +9,10 @@
 // that can only kill the app can never assert that the app shuts down cleanly.
 //
 // This shim is LD_PRELOAD'ed into the *unmodified* binary and, CH_QUIT_AFTER_MS
-// after load, asks the application to quit through its own event loop. The app
-// then follows the exact path a window close takes: exec() returns, main()'s
-// objects are destroyed, QSettings flushes, the process exits 0.
+// after the application object comes up, asks the application to quit through
+// its own event loop. The app then follows the exact path a window close takes:
+// exec() returns, main()'s objects are destroyed, QSettings flushes, the
+// process exits 0.
 //
 // LD_PRELOAD applies to every program exec'd with it — wrapper processes such
 // as `env`, `timeout` or `sh`, and WebEngine's helper processes, all load this
@@ -32,31 +33,50 @@
 #ifdef __linux__
 
 #include <QCoreApplication>
-#include <QMetaObject>
-#include <Qt>
+#include <QObject>
+#include <QTimer>
 
 #include <errno.h> // program_invocation_short_name
 
-#include <chrono>
 #include <cstdlib>
 #include <cstring>
-#include <thread>
 
 namespace {
 
-void quitWhenUp(std::chrono::milliseconds delay)
+// Read once in install(), before any QCoreApplication exists; read again only
+// from armQuit() on the main thread. Never written concurrently.
+int g_quitAfterMs = 0;
+
+// Runs as a Qt pre-routine: QCoreApplication's constructor calls these from the
+// main thread, after it has published itself through QCoreApplication::self and
+// after it has created the thread's event dispatcher, so instance() is valid
+// here and a timer can be started.
+//
+// LIFETIME, and why this is not the earlier background thread. The first
+// version of this shim spawned a detached std::thread that polled
+// QCoreApplication::instance() and then called
+// QMetaObject::invokeMethod(app, "quit"). That is a use-after-free: nothing
+// stops the main thread from destroying the application between the poll that
+// reads the pointer and the dereference that uses it, and a second null check
+// cannot help because the pointer it re-reads can go stale just as fast. The
+// window is only closable by owning the lifetime rather than sampling it.
+//
+// So there is no second thread any more. The timer is created here, on the
+// application's own thread, as a CHILD of the application object. Two
+// consequences make the window not merely narrow but nonexistent: the timer
+// cannot outlive its parent (~QObject destroys children, and the timer is
+// stopped by its own destructor before the application's storage goes away),
+// and every access to the application happens on the thread that would be
+// doing the destroying, so there is no interleaving to lose.
+void armQuit()
 {
-    std::this_thread::sleep_for(delay);
-    // The application object is created inside main(), long after this shim's
-    // constructor runs, so wait for it rather than assuming it exists.
-    for (int i = 0; i < 600 && QCoreApplication::instance() == nullptr; ++i)
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
     QCoreApplication* app = QCoreApplication::instance();
     if (app == nullptr)
-        return;
-    // Queued: posting an event is the one cross-thread-safe way to reach the
-    // GUI thread, and it makes the quit happen on the app's own event loop.
-    QMetaObject::invokeMethod(app, "quit", Qt::QueuedConnection);
+        return; // Not reachable from a pre-routine; costs nothing to say so.
+    QTimer* timer = new QTimer(app);
+    timer->setSingleShot(true);
+    QObject::connect(timer, &QTimer::timeout, app, &QCoreApplication::quit);
+    timer->start(g_quitAfterMs);
 }
 
 __attribute__((constructor)) void install()
@@ -75,7 +95,14 @@ __attribute__((constructor)) void install()
     const long ms = std::strtol(spec, nullptr, 10);
     if (ms <= 0)
         return;
-    std::thread(quitWhenUp, std::chrono::milliseconds(ms)).detach();
+    // The timer takes an int; clamp rather than let a silly environment value
+    // wrap into a negative interval.
+    g_quitAfterMs = ms > 3600000 ? 3600000 : static_cast<int>(ms);
+
+    // Deferred to QCoreApplication's constructor: the app object is created
+    // inside main(), long after this shim's constructor runs, so the arming has
+    // to happen when the app announces itself rather than by polling for it.
+    qAddPreRoutine(&armQuit);
 }
 
 } // namespace

@@ -8,6 +8,17 @@ namespace ch {
 // Resolution type produced by the handler registry for a given URL/MIME/ext
 // (SPEC 7.5). The lightweight registry is the initial extensibility mechanism
 // in place of a full plugin system.
+//
+// Every value here is PRODUCED by resolve(); the enumeration is the registry's
+// output alphabet, not a wish list. SPEC 7.5's resolution algorithm is
+// browser-first — web navigation is the default disposition and a handler only
+// takes a resource when it positively claims it — and its four steps between
+// them mint exactly these values. "OpenExternally" used to sit here and was
+// never returned by any path: handing a file to the desktop's own application
+// is an ACTION the binary/download view offers (SPEC 7.5's "Binary | metadata
+// and download/open actions"), taken after resolution has already landed on
+// Download. It is not a disposition the browser can resolve a URL to, so it is
+// not one of these.
 enum class ViewerResolution {
     DirectWebNavigation,
     InternalHtmlRenderer,
@@ -16,7 +27,6 @@ enum class ViewerResolution {
     PdfViewer,
     DirectoryViewer,
     Download,
-    OpenExternally,
     Error,
 };
 

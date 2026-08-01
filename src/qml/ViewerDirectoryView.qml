@@ -34,10 +34,35 @@ Rectangle {
     // blank rectangle for a slow link as for a finished answer.
     property bool loading: false
 
+    // The `viewers` context property (ch::ViewerModel), resolved once and
+    // guarded exactly as ViewerPane and EditorPaneView guard it, and for the
+    // same reason: an unguarded lookup of a context property the host did not
+    // install THROWS a ReferenceError, and that aborts the whole binding pass
+    // building this view rather than producing an inert one.
+    readonly property var viewerModel: (typeof viewers !== "undefined") ? viewers : null
+
     // Remote path for file.listDirectory: strip the file:// scheme.
     function remotePath(u) {
         return RemotePath.fileUrlToPath(u.toString());
     }
+
+    // The listing this view has outstanding, and nothing else. Empty when there
+    // is none.
+    //
+    // Held as STATE, set when the request goes out and cleared the moment a
+    // reply settles it, rather than recomputed from `url` at reply time and
+    // matched against anything that happens to fit. ONE ViewerModel is shared
+    // by every viewer pane and they all listen on this one signal pair, so the
+    // loose form let ANOTHER pane's listing of this same directory land here:
+    // its answer silently replaced the rows under the user, and a
+    // directoryError raised for its request painted an error over a listing
+    // that had loaded perfectly well.
+    //
+    // The key is the path because ch::ViewerModel documents listDirectory as
+    // pane-INDEPENDENT (ViewerModel.h) — the answer for a path is the same for
+    // whoever asked — but a reply is still matched against what THIS view asked
+    // for, once.
+    property string requestedPath: ""
 
     // The directory being listed, WITHOUT the trailing slash that marked the URL
     // as a directory — the form child paths are built from. "/" keeps its slash
@@ -87,27 +112,45 @@ Rectangle {
         root.openRequested(row.kind === "directory" ? child + "/" : child);
     }
 
+    // Start listing the current URL, abandoning any listing still outstanding
+    // for the previous one. There is nothing to cancel model-side — unlike a
+    // text read, ch::ViewerModel keeps no per-listing bookkeeping to retire —
+    // so dropping the key is exactly what abandoning one means here.
     function reload() {
+        root.requestedPath = "";
         root.entries = [];
         root.errorText = "";
-        root.loading = root.url.toString().length > 0;
-        if (root.loading)
-            viewers.listDirectory(root.remotePath(root.url));
+        root.loading = false;
+        if (root.url.toString().length === 0 || !root.viewerModel)
+            return;
+        root.loading = true;
+        root.requestedPath = root.remotePath(root.url);
+        root.viewerModel.listDirectory(root.requestedPath);
     }
 
     onUrlChanged: reload()
     Component.onCompleted: reload()
 
+    // This reply belongs to the listing THIS view issued. Settling clears the
+    // key, so a later answer about the same directory — another pane's request,
+    // or this pane's own probe in ViewerPane — cannot disturb what is already
+    // on screen.
+    function ownsReply(path) {
+        return root.requestedPath.length > 0 && path === root.requestedPath;
+    }
+
     Connections {
-        target: viewers
+        target: root.viewerModel
         function onDirectoryListed(path, list) {
-            if (path === root.remotePath(root.url)) {
+            if (root.ownsReply(path)) {
+                root.requestedPath = "";
                 root.entries = list;
                 root.loading = false;
             }
         }
         function onDirectoryError(path, message) {
-            if (path === root.remotePath(root.url)) {
+            if (root.ownsReply(path)) {
+                root.requestedPath = "";
                 root.errorText = message;
                 root.loading = false;
             }

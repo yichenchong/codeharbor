@@ -130,6 +130,11 @@ Rectangle {
     // a ReferenceError; also the seam a test injects a stub through.
     property var factory: (typeof terminalFactory !== "undefined") ? terminalFactory : null
 
+    // The pane's OTHER injected object, `viewers` (ch::ViewerModel), which
+    // supplies the privileged WebEngine profile the WebChannel bridge needs.
+    // Guarded the same way, for the same reason.
+    property var viewerModel: (typeof viewers !== "undefined") ? viewers : null
+
     // Per-pane C++ objects, owned by this pane (destroyed with it).
     property var controller: pane.factory ? pane.factory.create(pane) : null
     property var bridge: pane.controller ? pane.factory.createBridge(pane.controller, pane) : null
@@ -582,7 +587,11 @@ Rectangle {
                 // profile deliberately does not — SPEC 7.3, "Browser Profiles",
                 // which is the section requiring the two-profile split). The
                 // bundle is trusted app code, so scripting is intentionally on.
-                profile: viewers.internalProfile()
+                // Resolved through the pane's guarded handle, not a bare
+                // `viewers` lookup: an unguarded lookup of a context property
+                // the host did not install throws, exactly as it would for
+                // `terminalFactory` above.
+                profile: pane.viewerModel ? pane.viewerModel.internalProfile() : null
                 settings.javascriptEnabled: true
                 settings.localContentCanAccessFileUrls: false
                 settings.localContentCanAccessRemoteUrls: false

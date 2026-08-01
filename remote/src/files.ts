@@ -8,13 +8,13 @@
 // resolves viewer types by extension in ViewerHandlerRegistry).
 
 import { promises as fsp, watch as fsWatch, constants as fsConstants } from "node:fs";
-import type { FSWatcher, Stats } from "node:fs";
+import type { Dirent, FSWatcher, Stats } from "node:fs";
 import type { FileHandle } from "node:fs/promises";
 import { EventEmitter } from "node:events";
 import { randomBytes } from "node:crypto";
 import path from "node:path";
 
-import { RPC_METHODS, RPC_REVISION_MISMATCH } from "./rpc-types.ts";
+import { RPC_METHODS, RPC_REVISION_MISMATCH, RPC_RESOURCE_LIMIT } from "./rpc-types.ts";
 import type {
     StatParams,
     StatResult,
@@ -69,6 +69,27 @@ export function isRevisionMismatch(err: unknown): err is RevisionMismatchError {
         err !== null &&
         "code" in err &&
         err.code === RPC_REVISION_MISMATCH
+    );
+}
+
+// Tagged error carrying the JSON-RPC resource-limit code (RPC_RESOURCE_LIMIT):
+// the request was valid, but answering it would blow a bound this service keeps.
+// Recognized by the dispatcher via the `code` field exactly like the revision
+// mismatch above, so codeharbord stays decoupled from this module's internals.
+export class ResourceLimitError extends Error {
+    readonly code = RPC_RESOURCE_LIMIT;
+    constructor(message: string) {
+        super(message);
+        this.name = "ResourceLimitError";
+    }
+}
+
+export function isResourceLimit(err: unknown): err is ResourceLimitError {
+    return (
+        typeof err === "object" &&
+        err !== null &&
+        "code" in err &&
+        err.code === RPC_RESOURCE_LIMIT
     );
 }
 
@@ -285,17 +306,59 @@ function assertRevisionMatches(filePath: string, expectedRevision: string, curre
 // lock (flock is non-portable and unavailable via fs/promises) to fence it out.
 const writeLocks = new Map<string, Promise<void>>();
 
+// Follow a symbolic-link chain by hand and return the path it ENDS at — the
+// node an ordinary open(..., O_CREAT) through `p` would create or truncate.
+//
+// fsp.realpath cannot do this: it fails with ENOENT the moment a component of
+// the chain is missing, and a DANGLING link is exactly the case that matters
+// here. Because the status check below follows links, a link whose target does
+// not exist reads as "no file at this path", so the atomic save took its create
+// path and renamed a fresh regular file OVER THE LINK — silently destroying a
+// symlink the user made, where a plain create through that same path would have
+// created the link's TARGET. Resolving the chain first makes the save write
+// through the link, matching open()'s semantics and leaving the link intact.
+//
+// The depth cap mirrors the kernel's own (Linux SYMLOOP_MAX is 40). A link cycle
+// (`ln -s a b; ln -s b a`) would otherwise spin this loop forever inside an RPC
+// handler; hitting the cap reports ELOOP, the same errno the kernel produces.
+const MAX_SYMLINK_DEPTH = 40;
+
+async function resolveLinkChain(p: string): Promise<string> {
+    let current = p;
+    for (let depth = 0; depth < MAX_SYMLINK_DEPTH; depth += 1) {
+        let link: string;
+        try {
+            link = await fsp.readlink(current);
+        } catch {
+            // Not a symlink (EINVAL), or nothing at this path at all (ENOENT):
+            // either way this is the end of the chain and the node to write.
+            return current;
+        }
+        // A link's body is relative to the directory HOLDING the link, not to
+        // the process cwd.
+        current = path.resolve(path.dirname(current), link);
+    }
+    throw Object.assign(new Error(`Too many levels of symbolic links: ${p}`), {
+        code: "ELOOP",
+    });
+}
+
 async function resolveWriteKey(p: string): Promise<string> {
+    // Key on the node the write will actually touch. That is where the symlink
+    // chain ends, because writeFileLocked writes THROUGH a link — so a write
+    // addressed to a link and a write addressed to its target serialize against
+    // each other instead of racing under two different keys.
+    const end = await resolveLinkChain(p).catch(() => p);
     try {
-        return await fsp.realpath(p);
+        return await fsp.realpath(end);
     } catch {
         // Create-only (file absent) or a missing component: key on the real
         // directory + basename so concurrent creates of the same new path still
         // serialize; fall back to a lexically resolved path if even that fails.
         try {
-            return path.join(await fsp.realpath(path.dirname(p)), path.basename(p));
+            return path.join(await fsp.realpath(path.dirname(end)), path.basename(end));
         } catch {
-            return path.resolve(p);
+            return path.resolve(end);
         }
     }
 }
@@ -361,11 +424,21 @@ async function writeFileLocked(params: WriteFileParams): Promise<WriteFileResult
     const buf = Buffer.from(params.content, encoding === "base64" ? "base64" : "utf-8");
 
     // Atomic save (SPEC 8.5): temp file in the same directory, flush, preserve
-    // mode when overwriting, then rename over the target. When the target is an
-    // existing symlink, resolve it to its real path so the rename replaces the
+    // mode when overwriting, then rename over the target. When the target is a
+    // symlink, resolve it to the file it names so the rename replaces the
     // linked-to file rather than severing the link — this also keeps the write
     // consistent with the revision guard above, which stat()'d through the link.
-    const target = existing ? await fsp.realpath(params.path) : params.path;
+    //
+    // BOTH branches resolve the link, for the same reason. An existing target is
+    // resolved with realpath, which also normalizes symlinked parent
+    // directories. A create needs resolveLinkChain instead, because realpath
+    // refuses a chain that dangles — and a DANGLING link is precisely the path
+    // that reaches the create branch, since statOrUndefined follows links and so
+    // reports "nothing here" for it. Writing the resolved end preserves the
+    // user's link and creates its target, exactly as a plain create through the
+    // link would; renaming over params.path would have replaced the link itself
+    // with a regular file and lost it with no error and no way back.
+    const target = existing ? await fsp.realpath(params.path) : await resolveLinkChain(params.path);
     const dir = path.dirname(target);
     const tmp = path.join(dir, tempName(path.basename(target)));
     // Creating a file whose parent directory does not exist yet must WORK, not
@@ -479,6 +552,32 @@ interface Subscription {
     closed?: boolean;
 }
 
+// Ceiling on LIVE watch subscriptions across the whole service.
+//
+// Every subscription holds an operating-system watch handle (an inotify watch on
+// Linux, a kqueue descriptor on macOS) plus an interval timer, and the table
+// holding them was unbounded. The producer is our own client, driven by the
+// files it currently has open, but "the client only opens a few" is not a bound
+// the server can verify: a client that leaks unwatch calls — or opens and closes
+// files for long enough — walks the table up until the process hits the per-user
+// inotify instance/watch limit, and then EVERY watch on the box (ours and other
+// software's) starts failing, for a daemon that is meant to be long-lived.
+//
+// 512 is deliberately EQUAL to MAX_PENDING_WATCH_EVENTS in codeharbord.ts, which
+// bounds the relay's coalescing queue. That queue coalesces per (subscription,
+// path) and a subscription watches exactly one path, so its length can never
+// exceed the number of live subscriptions — with the two numbers equal, the
+// relay's count bound is provably unreachable and its byte bound is the one that
+// can bite. A parity test pins the relationship.
+//
+// AT THE CAP the new watch is REFUSED with RPC_RESOURCE_LIMIT. Evicting the
+// oldest subscription instead would leave an open file silently unwatched
+// while it still believes it is being told about changes — showing stale content
+// as current, the one outcome SPEC 8.7 exists to prevent. A refusal is visible:
+// the file still opens and reads, only live change notification is missing, and
+// the client is told why.
+export const MAX_WATCH_SUBSCRIPTIONS = 512;
+
 // File-watch service (SPEC 8.7). fs.watch is the primary signal; a polling
 // interval is the fallback for filesystems where fs.watch is unreliable. Events
 // are delivered through an EventEmitter sink (onWatchEvent) so codeharbord can
@@ -513,13 +612,35 @@ export class FileWatchService {
     }
 
     async watch(params: WatchParams): Promise<WatchResult> {
+        // Checked AND reserved before the first await. The table insertion used
+        // to happen after two awaits, so a burst of concurrent watch calls could
+        // all pass one size check and overshoot the cap together; reserving the
+        // slot up front makes the bound hold under the concurrent dispatch
+        // codeharbord actually does.
+        if (this.subscriptions.size >= MAX_WATCH_SUBSCRIPTIONS) {
+            throw new ResourceLimitError(
+                `Cannot watch ${params.path}: this server already has ` +
+                    `${MAX_WATCH_SUBSCRIPTIONS} active file watches, which is its limit. ` +
+                    `Close some editors or viewers and try again.`,
+            );
+        }
         const id = `sub-${(this.counter += 1)}-${randomBytes(4).toString("hex")}`;
-        const existing = await statOrUndefined(params.path);
-        const sub: Subscription = {
-            id,
-            path: params.path,
-            lastRevision: existing ? revisionFrom(existing) : undefined,
-        };
+        const sub: Subscription = { id, path: params.path };
+        this.subscriptions.set(id, sub);
+        let existing: Stats | undefined;
+        try {
+            existing = await statOrUndefined(params.path);
+        } catch (err) {
+            // An unreadable path (EACCES, ELOOP) must not leave the reservation
+            // behind: the caller gets the error and no subscription exists.
+            this.subscriptions.delete(id);
+            throw err;
+        }
+        // closeAll() (the SSH channel dropped) may have released the reservation
+        // while we were stat'ing. Installing an OS watch handle now would leak
+        // exactly the handle this method exists to account for.
+        if (sub.closed || !this.subscriptions.has(id)) return { subscriptionId: id };
+        sub.lastRevision = existing ? revisionFrom(existing) : undefined;
 
         try {
             sub.watcher = fsWatch(params.path, () => {
@@ -538,7 +659,7 @@ export class FileWatchService {
         }, this.pollIntervalMs);
         sub.poll.unref?.();
 
-        this.subscriptions.set(id, sub);
+        // No re-insertion here: the slot was reserved above.
         return { subscriptionId: id };
     }
 
@@ -633,10 +754,70 @@ export const fileWatchService = new FileWatchService();
 // listDirectory (SPEC 7.5) is a registered RPC method (added after the initial
 // six for the viewer workstream). getMimeType below stays an internal helper.
 
+// Fixed JSON overhead of one DirectoryEntry: `{"name":,"kind":"directory"},` —
+// the quotes around the name are already counted by JSON.stringify above, and
+// "directory" is the longest kind nodeKind can report.
+const LISTING_ENTRY_ENVELOPE_BYTES = 29;
+
+// Ceiling on the SERIALIZED size of one listing's entries, in bytes.
+//
+// codeharbord frames every response as ONE JSON line, and both ends of the wire
+// treat a line past MAX_LINE_BYTES (16 MiB, codeharbord.ts, mirrored by
+// kMaxLineBytes in the C++ client) as a fault that drops the transport. A
+// directory with hundreds of thousands of entries serializes past that, so
+// listing it did not merely fail: the client's bounded reader tore down the SSH
+// channel, taking every terminal, editor and watch subscription in the session
+// with it, and the user saw a dropped connection with nothing naming the
+// directory that caused it.
+//
+// 15 MiB leaves a megabyte for the JSON-RPC envelope and the `path` field, so a
+// listing that passes this check cannot produce an over-cap line. A parity test
+// pins it below MAX_LINE_BYTES.
+//
+// Over the cap the request is REFUSED with RPC_RESOURCE_LIMIT rather than
+// answered with a truncated listing. A silently short listing is worse than an
+// error: the viewer would present it as the directory's complete contents, and a
+// user who does not see a file concludes it is not there. Reporting the real
+// entry count tells them what they are looking at and what to do instead.
+export const MAX_DIRECTORY_LISTING_BYTES = 15 * 1024 * 1024;
+
+/**
+ * Refuse a listing whose serialized entries would not fit in one transport
+ * frame. Exported as its own contract because the only honest end-to-end test
+ * of MAX_DIRECTORY_LISTING_BYTES would have to create tens of thousands of real
+ * files; this way the bound, the boundary and the message are all testable
+ * directly, and `listDirectory` keeps exactly one call site for it.
+ *
+ * Takes the dirents themselves rather than a name array so the production path
+ * does not copy half a million strings just to measure them.
+ */
+export function assertListingFits(
+    dirPath: string,
+    entries: readonly Pick<Dirent, "name">[],
+): void {
+    // Measure the reply BEFORE building it. The size comes from the SERIALIZED
+    // form of each name (JSON.stringify, not byte length) because escaping is
+    // what actually expands: a filename may hold any byte but NUL and `/`, and a
+    // control byte becomes the six characters \u00XX — so a byte-length estimate
+    // can be off by 6x on exactly the pathological input this bound exists for.
+    let bytes = 0;
+    for (const entry of entries) {
+        bytes += LISTING_ENTRY_ENVELOPE_BYTES + Buffer.byteLength(JSON.stringify(entry.name));
+        if (bytes > MAX_DIRECTORY_LISTING_BYTES) {
+            throw new ResourceLimitError(
+                `Cannot list ${dirPath}: it holds ${entries.length} entries, whose listing ` +
+                    `exceeds this server's ${MAX_DIRECTORY_LISTING_BYTES}-byte reply limit. ` +
+                    `Open a subdirectory, or use a terminal to inspect it.`,
+            );
+        }
+    }
+}
+
 export async function listDirectory(
     params: ListDirectoryParams,
 ): Promise<ListDirectoryResult> {
     const dirents = await fsp.readdir(params.path, { withFileTypes: true });
+    assertListingFits(params.path, dirents);
     return {
         path: params.path,
         entries: dirents.map((entry) => ({ name: entry.name, kind: nodeKind(entry) })),

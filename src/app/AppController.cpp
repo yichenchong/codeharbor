@@ -1002,12 +1002,35 @@ void AppController::refresh()
         // subtree that is gone is genuinely gone; retainDevSessions drops it as
         // a unit (never on terminal close, which would lose an unseen-completion
         // badge). Done before rebuildRows so the merge sees only live state.
+        //
+        // The same walk republishes every pane's harness (SPEC 6.6): the monitor
+        // has to know which panes run the adapterless "generic" harness, because
+        // those take their agent state from terminal output activity rather
+        // than from the wire, and this tree is where the harness column lives.
+        // AFTER the eviction, which drops the previous registrations with their
+        // Dev Session subtrees.
+        //
+        // ch::TerminalFactory registers a harness too, from the row it just
+        // resolved for a pane. That is NOT a duplicate of this walk and neither
+        // one can be dropped: this is the only registration a pane the user has
+        // never opened ever gets, and it is what re-registers everything after
+        // the eviction above; the factory's is the only one a pane that was
+        // resolved since the last refresh gets. setTerminalHarness is
+        // idempotent, so both running costs nothing.
         if (self->m_agentMonitor) {
             QSet<QString> liveDevSessions;
             for (const GroupNode& groupNode : self->m_lastNodes)
                 for (const SessionNode& sessionNode : groupNode.sessions)
                     liveDevSessions.insert(sessionNode.session.id.value);
             self->m_agentMonitor->retainDevSessions(liveDevSessions);
+            for (const GroupNode& groupNode : self->m_lastNodes) {
+                for (const SessionNode& sessionNode : groupNode.sessions) {
+                    for (const TerminalPane& pane : sessionNode.terminalPanes) {
+                        self->m_agentMonitor->setTerminalHarness(
+                            sessionNode.session.id.value, pane.id.value, pane.harness);
+                    }
+                }
+            }
         }
         const bool droppedActive = self->dropActiveSessionIfGone();
         self->rebuildRows();

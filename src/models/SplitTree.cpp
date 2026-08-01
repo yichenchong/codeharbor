@@ -8,52 +8,89 @@
 
 namespace ch {
 
-QJsonObject SplitNode::toJson() const
+namespace {
+
+// Writes `node` into `obj`, returning false if `node` is not a tree the parser
+// below would accept back: a split whose ratio count does not match its child
+// count, a ratio that is not finite and > 0, or nesting deeper than kMaxDepth.
+// The checks are deliberately the SAME ones parseNode() applies, and are
+// applied per node on the way down, so a single bad node anywhere in the tree
+// fails the whole serialization instead of yielding a half-written object.
+bool writeNode(const SplitNode &node, QJsonObject &obj, int depth)
 {
-    QJsonObject obj;
-    if (isLeaf()) {
+    if (depth > SplitNode::kMaxDepth)
+        return false;
+
+    if (node.isLeaf()) {
         obj[QStringLiteral("type")] = QStringLiteral("leaf");
-        obj[QStringLiteral("paneId")] = paneId;
+        obj[QStringLiteral("paneId")] = node.paneId;
         // Omitted when empty: an "open nothing" leaf must serialize exactly as
         // it did before this field existed, so upgrading the app does not
         // rewrite every stored layout and a downgrade still reads them.
-        if (!url.isEmpty())
-            obj[QStringLiteral("url")] = url;
+        if (!node.url.isEmpty())
+            obj[QStringLiteral("url")] = node.url;
         // Same rule, same reason: a viewer leaf and every terminal leaf written
         // before this field existed carry none, and must keep serializing
         // exactly as they did.
-        if (!terminalPaneId.isEmpty())
-            obj[QStringLiteral("terminalPaneId")] = terminalPaneId;
-        return obj;
+        if (!node.terminalPaneId.isEmpty())
+            obj[QStringLiteral("terminalPaneId")] = node.terminalPaneId;
+        return true;
+    }
+
+    // One ratio per child, each finite and > 0 - the parser's rule, checked
+    // here so the bad shape is never emitted in the first place.
+    if (node.ratios.size() != node.children.size())
+        return false;
+
+    QJsonArray ratioArray;
+    for (double ratio : node.ratios) {
+        if (!std::isfinite(ratio) || ratio <= 0.0)
+            return false;
+        ratioArray.append(ratio);
+    }
+
+    QJsonArray childArray;
+    for (const SplitNode &child : node.children) {
+        QJsonObject childObj;
+        if (!writeNode(child, childObj, depth + 1))
+            return false;
+        childArray.append(childObj);
     }
 
     obj[QStringLiteral("type")] = QStringLiteral("split");
-    obj[QStringLiteral("orientation")] = orientation == SplitOrientation::Vertical
+    obj[QStringLiteral("orientation")] =
+            node.orientation == SplitOrientation::Vertical
             ? QStringLiteral("vertical")
             : QStringLiteral("horizontal");
-
-    QJsonArray childArray;
-    for (const SplitNode &child : children)
-        childArray.append(child.toJson());
     obj[QStringLiteral("children")] = childArray;
-
-    QJsonArray ratioArray;
-    for (double ratio : ratios)
-        ratioArray.append(ratio);
     obj[QStringLiteral("ratios")] = ratioArray;
-
-    return obj;
+    return true;
 }
 
-namespace {
-
-// Hard cap on split-tree nesting depth. Split trees are persisted and may be
-// sourced from the remote server (SPEC 2.1 remote-first), so fromJson parses
-// data the client did not produce. Without a bound, adversarial or corrupt
-// deeply-nested JSON would recurse until the stack overflows and crashes the
-// process. Real layouts nest only a handful of levels; 256 is far beyond any
-// genuine use while still safely below the stack limit.
-constexpr int kMaxDepth = 256;
+// Bounded structural comparison; see the header for why running out of depth
+// answers "unequal" rather than recursing on.
+bool equalNode(const SplitNode &lhs, const SplitNode &rhs, int depth)
+{
+    if (depth > SplitNode::kMaxDepth)
+        return false;
+    // Compare only the fields tryToJson() persists for each node kind, so
+    // equality agrees with the JSON round-trip (see the header). A leaf and a
+    // split are never equal; a leaf's identity is its paneId, url and
+    // terminalPaneId; a split's is its orientation, ratios, and children.
+    if (lhs.isLeaf() != rhs.isLeaf())
+        return false;
+    if (lhs.isLeaf())
+        return lhs.paneId == rhs.paneId && lhs.url == rhs.url
+                && lhs.terminalPaneId == rhs.terminalPaneId;
+    if (lhs.orientation != rhs.orientation || lhs.ratios != rhs.ratios
+        || lhs.children.size() != rhs.children.size())
+        return false;
+    for (qsizetype i = 0; i < lhs.children.size(); ++i) {
+        if (!equalNode(lhs.children.at(i), rhs.children.at(i), depth + 1))
+            return false;
+    }
+    return true;
+}
 
 // Parses obj into out, returning false on ANY structural violation, including a
 // malformed nested subtree or nesting deeper than kMaxDepth. This lets fromJson
@@ -63,7 +100,7 @@ constexpr int kMaxDepth = 256;
 // unambiguous and only ever originates from a split.
 bool parseNode(const QJsonObject &obj, SplitNode &out, int depth)
 {
-    if (depth > kMaxDepth)
+    if (depth > SplitNode::kMaxDepth)
         return false;
 
     const QString type = obj.value(QStringLiteral("type")).toString();
@@ -136,6 +173,14 @@ bool parseNode(const QJsonObject &obj, SplitNode &out, int depth)
 
 } // namespace
 
+std::optional<QJsonObject> SplitNode::tryToJson() const
+{
+    QJsonObject obj;
+    if (!writeNode(*this, obj, 1))
+        return std::nullopt;
+    return obj;
+}
+
 std::optional<SplitNode> SplitNode::tryFromJson(const QJsonObject &obj)
 {
     SplitNode node;
@@ -151,17 +196,7 @@ SplitNode SplitNode::fromJson(const QJsonObject &obj)
 
 bool SplitNode::operator==(const SplitNode &other) const
 {
-    // Compare only the fields toJson() persists for each node kind, so equality
-    // agrees with the JSON round-trip (see the header). A leaf and a split are
-    // never equal; a leaf's identity is its paneId, url and terminalPaneId; a
-    // split's is its orientation, ratios, and children (recursively).
-    if (isLeaf() != other.isLeaf())
-        return false;
-    if (isLeaf())
-        return paneId == other.paneId && url == other.url
-                && terminalPaneId == other.terminalPaneId;
-    return orientation == other.orientation && ratios == other.ratios
-            && children == other.children;
+    return equalNode(*this, other, 1);
 }
 
 } // namespace ch

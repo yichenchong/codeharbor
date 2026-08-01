@@ -352,6 +352,10 @@ struct AppGraph {
         terminalFactory.setWorkspace(app.workspaceDb());
         QObject::connect(&app, &ch::AppController::serverIdChanged, &terminalFactory,
                          [this]() { terminalFactory.setServerId(app.serverId()); });
+        // SPEC 6.6, also as in main.cpp: the factory reports terminal-output
+        // activity to the monitor so a "generic" harness pane, which no adapter
+        // ever produces an event for, still gets an agent state.
+        terminalFactory.setAgentMonitor(&monitor);
 
         // --- main.cpp, line for line ------------------------------------
         wiredFromEnvironment = bootstrap.connectAndWireFromEnvironment();
@@ -627,7 +631,7 @@ QString TstColdStart::ladder(const QString& rung) const
 
 QByteArray TstColdStart::runExec(const QString& command, int timeoutMs)
 {
-    ch::SshChannelDevice device(&m_graph->pool, ch::SshConnectionPool::ChannelKind::Exec);
+    ch::SshChannelDevice device(&m_graph->pool);
     QByteArray out;
     bool finished = false;
     connect(&device, &ch::SshChannelDevice::readyRead, &device,

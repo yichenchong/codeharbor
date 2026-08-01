@@ -1,14 +1,10 @@
 #pragma once
 
-#include <QJsonValue>
 #include <QObject>
 #include <QPointer>
-#include <QSet>
 #include <QString>
 #include <QUrl>
 #include <QVariantList>
-
-#include <optional>
 
 // Full definition (not a forward declaration): m_client is a QPointer, whose
 // QObject static_cast needs the complete CodeharbordClient (a QObject) type.
@@ -27,8 +23,16 @@ class ViewerProfiles;
 // QML-facing facade over the viewer subsystem (exposed as the `viewers` context
 // property). It is the single object QML talks to: it classifies URLs (handler
 // registry), maps file <-> internal URLs, hands out the two WebEngine security
-// profiles, reads remote text files, and lists remote directories. It holds no
+// profiles, lists remote directories, and resolves remote paths. It holds no
 // view state.
+//
+// It deliberately has NO "read a text file" operation. SPEC 3.3/7.5 make the
+// viewer pane a browser that delegates to handlers, and the ONE text handler is
+// the Monaco editor (SPEC 8.1), which does its own reads through
+// EditorController. A second model-level text read existed only to feed a
+// second, read-only text pane that nothing resolved to; both were removed
+// together. See the removal note in docs/bug-hunt-2026-08-01.md, which also
+// records what happened to the VW1 fix that lived on that path.
 class ViewerModel : public QObject {
     Q_OBJECT
 public:
@@ -51,55 +55,30 @@ public:
     Q_INVOKABLE QString internalUrlFor(const QUrl &fileUrl);
     Q_INVOKABLE QUrl fileUrlFor(const QString &internalUrl) const;
 
+    // Keep an internal URL alive for as long as a pane is DISPLAYING it, and
+    // let it go again when the pane navigates away or is destroyed.
+    //
+    // The internal-URL table is LRU-bounded. Recency is refreshed when a URL is
+    // minted and when the browser resolves it, and a pane that loaded its image
+    // hours ago does neither again — so once a thousand other files have been
+    // opened, the address that pane is still showing ages out and its next
+    // reload fails on a URL that is visibly on screen. Retaining is the only
+    // way the table can learn "still displayed".
+    //
+    // CONTRACT: every retainInternalUrl() that returned true must be matched by
+    // exactly one releaseInternalUrl(). Retains are counted, so two panes
+    // showing the same file cannot unpin each other. retainInternalUrl()
+    // returns false when the address is unknown or malformed — nothing was
+    // pinned and nothing must be released. Failing to release costs one table
+    // entry, not the bound: eviction continues on the unpinned remainder.
+    Q_INVOKABLE bool retainInternalUrl(const QString &internalUrl);
+    Q_INVOKABLE void releaseInternalUrl(const QString &internalUrl);
+
     // The sandboxed external (http/https) profile and the privileged internal
     // profile. QML binds these to WebEngineView.profile. Never null once a
     // client is set.
     Q_INVOKABLE QQuickWebEngineProfile *externalProfile();
     Q_INVOKABLE QQuickWebEngineProfile *internalProfile();
-
-    // Asynchronously read a remote text file (SPEC 8.3). The read is capped at
-    // InternalUrlSchemeHandler::kMaxInlineReadBytes, the same bound the internal
-    // scheme handler applies; a larger file fails instead of being shown
-    // truncated. On success emits textFileRead(token, path, content); on
-    // failure, on a file over the cap, or without a client, textFileError.
-    //
-    // Returns the token identifying THIS read. Both reply signals carry it back,
-    // and cancelTextFile() takes it. That token — not the path — is a read's
-    // identity, because ONE ViewerModel is shared by every viewer pane and two
-    // panes may perfectly well be showing the SAME file: a path cannot tell
-    // those two reads apart, so anything keyed by path makes one pane's cancel
-    // or reload silently discard the other pane's reply and leave it loading
-    // forever.
-    //
-    // The token is a QString rather than a 64-bit integer because QML numbers
-    // are IEEE doubles and cannot represent large 64-bit values exactly; a
-    // string round-trips through QML unchanged, and callers only ever compare
-    // it for equality.
-    //
-    // Delivery is ALWAYS asynchronous — for EVERY outcome, not just the
-    // no-client one. A reply emitted before this function returned would carry
-    // a token the caller has not been given yet and could not match, so it
-    // would be discarded and the pane would wait for an answer that already
-    // came and went. That is not hypothetical: CodeharbordClient::call()
-    // invokes its callback synchronously whenever it cannot transmit (no
-    // transport bound, transport closed, write failed), which is precisely what
-    // a dropped SSH session looks like.
-    Q_INVOKABLE QString readTextFile(const QString &path);
-
-    // Drop the in-flight readTextFile identified by `token`, so its reply is
-    // ignored when it arrives. This cancels EXACTLY that one read: another
-    // pane's read — of a different file or of the very same file — is never
-    // touched. An unknown or empty token (what a caller passes when it has
-    // nothing outstanding) cancels nothing.
-    Q_INVOKABLE void cancelTextFile(const QString &token = QString());
-
-    // How many readTextFile calls are still awaiting a reply. Bookkeeping that
-    // outlived its request is otherwise invisible from outside the class, so
-    // this is what lets a test pin that entries never accumulate.
-    int inFlightTextReadCount() const
-    {
-        return static_cast<int>(m_liveTextReads.size());
-    }
 
     // Asynchronously list a remote directory (SPEC 7.5). On success emits
     // directoryListed with entries sorted (directories first, then by name),
@@ -128,10 +107,6 @@ public:
     Q_INVOKABLE void resolvePath(const QString &path, const QString &base);
 
 signals:
-    void textFileRead(const QString &token, const QString &path,
-                      const QString &content);
-    void textFileError(const QString &token, const QString &path,
-                       const QString &message);
     void directoryListed(const QString &path, const QVariantList &entries);
     void directoryError(const QString &path, const QString &message);
     // `path` echoes what was ASKED for (not the resolved spelling), so a pane
@@ -140,32 +115,31 @@ signals:
     void pathResolved(const QString &path, const QString &resolvedPath,
                       bool insideRepositoryRoot);
     void pathResolveError(const QString &path, const QString &message);
+    // A request the embedded browser made for an internal URL was refused, with
+    // the reason the WebEngine job interface could not carry: fail() takes only
+    // Chromium's coarse error enum, so without this an oversized image or PDF
+    // reaches the pane as a blank failed page with nothing to explain it.
+    // Forwarded verbatim from InternalUrlSchemeHandler::requestFailed().
+    // `internalUrl` is the codeharbor-internal:// address that failed; a pane
+    // matches it against the one it is showing, exactly as it matches a path.
+    void internalResourceError(const QUrl &internalUrl, const QString &message);
 
 private:
     ViewerProfiles *profiles();
 
-    // Turn one settled file.readFile reply into the textFileRead/textFileError
-    // the pane is waiting for, and retire its token. Always reached through a
-    // queued invocation, never straight from the RPC callback: see the
-    // asynchrony note on readTextFile().
-    void settleTextRead(const QString &token, const QString &path,
-                        const QJsonValue &result,
-                        const std::optional<RpcError> &error);
+    // Forward the internal scheme handler's failure reports onto
+    // internalResourceError. Idempotent: re-wiring the same or a new
+    // ViewerProfiles drops the previous connection first.
+    void wireProfileSignals();
 
     QPointer<CodeharbordClient> m_client;
     InternalUrlMap *m_map;
     ViewerProfiles *m_profiles = nullptr;
     bool m_ownsProfiles = false;
-    // Tokens of the readTextFile calls still in flight. A reply whose token is
-    // no longer here (cancelTextFile dropped it) is discarded; a reply that
-    // finds its token removes it, so this holds live reads and nothing else.
-    // Keyed by TOKEN, not by path: one hash slot per path cannot represent two
-    // concurrent reads of one file, which is ordinary usage the moment two
-    // panes show the same document.
-    QSet<QString> m_liveTextReads;
-    // Source of those tokens. Monotonic and never reset, so a token is never
-    // reused and a cancelled read can never be mistaken for a later one.
-    quint64 m_nextReadToken = 0;
+    // The live InternalUrlSchemeHandler::requestFailed forwarding connection,
+    // held so re-wiring can drop it without touching the old handler (which may
+    // already be gone with its ViewerProfiles).
+    QMetaObject::Connection m_handlerConnection;
 };
 
 } // namespace ch

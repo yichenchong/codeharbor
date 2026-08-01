@@ -196,6 +196,27 @@ export const RPC_REVISION_MISMATCH = -32001;
 // SQLite string.
 export const RPC_DATABASE_BUSY = -32002;
 
+// Implementation-defined server error code for a request that is perfectly
+// well-formed but whose ANSWER would exceed a server resource bound, so it was
+// refused outright and nothing was changed. Two conditions raise it today, both
+// in files.ts:
+//
+//   * file.listDirectory on a directory whose listing would not fit in one
+//     transport frame (MAX_DIRECTORY_LISTING_BYTES). Serializing it anyway put
+//     a line past MAX_LINE_BYTES on the wire, and BOTH ends drop the transport
+//     on an over-cap frame — so one huge directory cost the user the whole
+//     workspace connection, every terminal and every editor in it, with no
+//     message naming the directory.
+//   * file.watch past MAX_WATCH_SUBSCRIPTIONS live subscriptions, each of which
+//     holds an OS watch handle and a poll timer.
+//
+// Deliberately NOT -32603: nothing malfunctioned and nothing is half-applied.
+// Not -32602 either: the params are valid, the server simply will not answer at
+// that size. The C++ client has no special case for it and shows the message to
+// the USER verbatim, so both messages are phrased for a person and name the
+// limit that bit.
+export const RPC_RESOURCE_LIMIT = -32003;
+
 // JSON-RPC 2.0 reserved error codes. They live in this contract module rather
 // than in codeharbord.ts because the param guards in validate.ts tag their
 // errors with RPC_INVALID_PARAMS, and validate.ts is imported BY the modules

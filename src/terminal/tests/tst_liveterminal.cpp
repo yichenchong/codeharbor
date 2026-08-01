@@ -233,8 +233,7 @@ void TstLiveTerminal::ensureConnected()
 void TstLiveTerminal::attachPane(int cols, int rows, bool startBeforeTransport)
 {
     QVERIFY(!m_device);
-    m_device = new SshChannelDevice(&m_pool, SshConnectionPool::ChannelKind::Pty,
-                                    this);
+    m_device = new SshChannelDevice(&m_pool, this);
     connect(m_device, &SshChannelDevice::channelError, this,
             [this](const QString& text) { m_channelErrors += text; });
 
@@ -328,7 +327,7 @@ bool TstLiveTerminal::paneReportsSize(const QByteArray& tag, int cols, int rows,
 
 QByteArray TstLiveTerminal::runExec(const QString& command, int timeoutMs)
 {
-    SshChannelDevice device(&m_pool, SshConnectionPool::ChannelKind::Exec);
+    SshChannelDevice device(&m_pool);
     QByteArray out;
     bool finished = false;
     connect(&device, &SshChannelDevice::readyRead, &device,

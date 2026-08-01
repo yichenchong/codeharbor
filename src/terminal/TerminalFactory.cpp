@@ -2,6 +2,7 @@
 
 #include <QTimer>
 
+#include "AgentStatusMonitor.h"
 #include "Ids.h"
 #include "SessionState.h"
 #include "SshChannelDevice.h"
@@ -50,8 +51,13 @@ TerminalFactory::TerminalFactory(SshConnectionPool* pool, QObject* parent)
 TerminalController* TerminalFactory::create(QObject* owner)
 {
     // Parented to the pane: destroyed with it (no leaked flush timer, buffers
-    // or transport connections).
-    auto* controller = new TerminalController(owner);
+    // or transport connections). With no pane to parent to, the factory itself
+    // takes ownership rather than returning a free-floating QObject: this is a
+    // Q_INVOKABLE, so an unparented return value would be handed to QML with
+    // JavaScriptOwnership and collected at a moment nothing here controls,
+    // while a C++ caller that ignored the default would simply leak it. Same
+    // rule, and the same shape, as createBridge() below.
+    auto* controller = new TerminalController(owner ? owner : this);
 
     // The controller bounds the silent part of an attach itself and moves the
     // pane to Error when the window expires (TerminalController::kAttachTimeoutMs).
@@ -94,7 +100,7 @@ QString TerminalFactory::targetFor(TerminalController* controller) const
     return m_attached.value(controller).target;
 }
 
-void TerminalFactory::rememberTarget(TerminalController* controller, const QString& target)
+TerminalFactory::Attachment& TerminalFactory::entryFor(TerminalController* controller)
 {
     auto it = m_attached.find(controller);
     if (it == m_attached.end()) {
@@ -103,7 +109,94 @@ void TerminalFactory::rememberTarget(TerminalController* controller, const QStri
         connect(controller, &QObject::destroyed, this,
                 [this](QObject* dead) { m_attached.remove(dead); });
     }
-    it->target = target;
+    return it.value();
+}
+
+void TerminalFactory::rememberTarget(TerminalController* controller, const QString& target)
+{
+    entryFor(controller).target = target;
+}
+
+void TerminalFactory::setAgentMonitor(AgentStatusMonitor* monitor)
+{
+    m_agentMonitor = monitor;
+}
+
+void TerminalFactory::beginResolution(TerminalController* controller, const QString& key)
+{
+    Attachment& entry = entryFor(controller);
+    if (entry.pendingResolveKey == key)
+        return;
+    entry.pendingResolveKey = key;
+    // A DIFFERENT key means the pane has been pointed at another terminal. Its
+    // old channel may still be open and printing, and those bytes are no longer
+    // attributable: not to the terminal the pane has left, and not to the one
+    // whose answer has not arrived. Reporting stops until the new answer lands.
+    QObject::disconnect(entry.outputConnection);
+    entry.outputConnection = {};
+    entry.devSessionId.clear();
+    entry.terminalId.clear();
+}
+
+void TerminalFactory::clearAgentIdentity(TerminalController* controller)
+{
+    auto it = m_attached.find(controller);
+    if (it == m_attached.end())
+        return;
+    QObject::disconnect(it->outputConnection);
+    it->outputConnection = {};
+    it->devSessionId.clear();
+    it->terminalId.clear();
+}
+
+void TerminalFactory::bindAgentIdentity(TerminalController* controller,
+                                        const QString& devSessionId,
+                                        const QString& terminalId,
+                                        const QString& harness)
+{
+    if (!controller || devSessionId.isEmpty() || terminalId.isEmpty())
+        return;
+    Attachment& entry = entryFor(controller);
+    if (entry.devSessionId != devSessionId || entry.terminalId != terminalId) {
+        // Torn down and re-made rather than re-pointed. Re-pointing alone would
+        // be enough for the forwarding below, which re-reads the identity on
+        // every batch, but the connection is what carries the identity's
+        // lifetime: leaving one behind on a re-bind is how a pane ends up
+        // reporting each batch twice.
+        QObject::disconnect(entry.outputConnection);
+        entry.outputConnection = {};
+        entry.devSessionId = devSessionId;
+        entry.terminalId = terminalId;
+    }
+    if (!entry.outputConnection) {
+        // The identity is re-read from the entry on every batch rather than
+        // captured, so a pane that loses its identity mid-flight (a retarget,
+        // a failed re-resolution) stops reporting immediately instead of on the
+        // next disconnect.
+        entry.outputConnection =
+            connect(controller, &TerminalController::outputReceived, this, [this, controller]() {
+                if (!m_agentMonitor)
+                    return;
+                const auto it = m_attached.constFind(controller);
+                if (it == m_attached.constEnd() || it->terminalId.isEmpty())
+                    return;
+                // The FACT of output, never a byte of it.
+                m_agentMonitor->noteTerminalOutput(it->devSessionId, it->terminalId);
+            });
+    }
+    // Which harness the pane runs decides whether the monitor derives anything
+    // from that output at all, so it is registered here — with the answer that
+    // produced the identity, and therefore before the pane can have attached or
+    // printed anything under it.
+    //
+    // ch::AppController's workspace-refresh walk registers harnesses too. That
+    // is NOT a duplicate of this and neither one can be dropped: this is the
+    // only registration a pane resolved since the last refresh gets, and that
+    // walk is the only one panes the user has never opened get — and the only
+    // thing that re-registers anything after its own retainDevSessions()
+    // eviction. setTerminalHarness is idempotent, so both running costs nothing.
+    if (m_agentMonitor)
+        m_agentMonitor->setTerminalHarness(devSessionId, terminalId, harness);
 }
 
 QString TerminalFactory::tmuxKillSessionCommand(const QString& target)
@@ -145,9 +238,14 @@ void TerminalFactory::setServerId(const QString& serverId)
     if (m_serverId == serverId)
         return;
     m_serverId = serverId;
-    // Targets name rows on a SERVER. Carrying them to another one would hand a
-    // pane a target belonging to a workspace it is no longer looking at.
-    m_targets.clear();
+    // A remembered answer names rows on a SERVER — the tmux target AND the
+    // `terminal_panes` row id the pane reports its agent state under. Carrying
+    // either to another server would hand a pane something belonging to a
+    // workspace it is no longer looking at: the target attaches it to (or
+    // creates) a foreign shell, and the row id makes it report its output as
+    // some other workspace's terminal. Both go together, because they are two
+    // halves of one answer.
+    m_resolved.clear();
     // Same reasoning for the lookups that are still on the wire: they were
     // asked of the PREVIOUS server, so their answers name rows that mean
     // nothing here and must not be cached (the callback in resolveTarget()
@@ -181,7 +279,7 @@ ResolveTerminalPaneParams TerminalFactory::resolveParamsFor(const QString& serve
         // with. The slot label is deliberately NOT sent: the server would have
         // no use for it, and a caller reading this should not be able to
         // believe it is part of the question.
-        params.id = terminalPaneId;
+        params.id = TerminalId{terminalPaneId};
         return params;
     }
     // Legacy leaf: no row id was ever stored for it, so its slot label is the
@@ -222,8 +320,15 @@ bool TerminalFactory::resolveTarget(TerminalController* controller,
     // The row id when the leaf has one, the legacy slot address otherwise. Two
     // shapes in one map is safe: a UUID contains no "/", so no row id can ever
     // read as a "<devSession>/<label>" pair.
-    const bool byRow = !params.id.isEmpty();
-    const QString key = byRow ? params.id : paneKey(devSessionId, paneName);
+    const bool byRow = !params.id.value.isEmpty();
+    const QString key = byRow ? params.id.value : paneKey(devSessionId, paneName);
+    // Record which resolution this pane is now waiting on. NOTHING about its
+    // agent-status identity is decided here: the pane's identity comes from the
+    // server's ANSWER, and it is adopted in finishResolution() only if this is
+    // still the resolution the pane is waiting on when that answer arrives.
+    // Binding at request start instead is how a pane retargeted mid-lookup ends
+    // up reporting its old channel's bytes under the new pane's row id.
+    beginResolution(controller, key);
     // Waiting list first, so the delivery below has somebody to deliver to and
     // a second caller for the same pane joins the flight instead of starting a
     // second one. That is a bandwidth saving, NOT the correctness guarantee: it
@@ -233,13 +338,14 @@ bool TerminalFactory::resolveTarget(TerminalController* controller,
     const bool alreadyInFlight = m_resolving.contains(key);
     m_resolving[key].append(QPointer<TerminalController>(controller));
 
-    const QString cached = m_targets.value(key);
-    if (!cached.isEmpty()) {
+    const ResolvedPane cached = m_resolved.value(key);
+    if (!cached.target.isEmpty()) {
         // Posted, never emitted inline: the caller (TerminalPaneView) assigns
         // its "resolving" flag from this function's RETURN value, and an answer
         // delivered before that assignment would be overwritten by it.
+        const QString target = cached.target;
         QMetaObject::invokeMethod(
-            this, [this, key, cached]() { finishResolution(key, cached, QString()); },
+            this, [this, key, target]() { finishResolution(key, target, QString()); },
             Qt::QueuedConnection);
         return true;
     }
@@ -276,18 +382,31 @@ bool TerminalFactory::resolveTarget(TerminalController* controller,
                     QStringLiteral("the server returned this terminal without a tmux target"));
                 return;
             }
-            self->m_targets.insert(key, pane->tmuxTarget);
-            if (!byRow && !pane->id.value.isEmpty()) {
+            ResolvedPane answer;
+            answer.target = pane->tmuxTarget;
+            answer.terminalId = pane->id.value;
+            // The row's owner as the SERVER states it, not the devSessionId the
+            // question carried. They agree today — the lookup is scoped to a
+            // Dev Session — but the answer is the authority on which Dev
+            // Session the row it returned belongs to, and the identity a pane
+            // reports its agent state under must come from the same place its
+            // row id does. An answer missing either half yields no identity at
+            // all (bindAgentIdentity refuses it), which is the right failure:
+            // the pane still attaches, it just reports nothing.
+            answer.devSessionId = pane->devSessionId.value;
+            answer.harness = pane->harness;
+            self->m_resolved.insert(key, answer);
+            if (!byRow && !answer.terminalId.isEmpty()) {
                 // Remember the answer under the row id too, so the backfill
                 // this is about to trigger does not make the next attach pay
                 // for a second round trip under the new key.
-                self->m_targets.insert(pane->id.value, pane->tmuxTarget);
+                self->m_resolved.insert(answer.terminalId, answer);
             }
-            self->finishResolution(key, pane->tmuxTarget, QString());
+            self->finishResolution(key, answer.target, QString());
             // AFTER the waiters have their target: the backfill republishes the
             // layout, and the pane should already be attaching by then.
-            if (!byRow && !pane->id.value.isEmpty())
-                emit self->paneRowResolved(devSessionId, paneName, pane->id.value);
+            if (!byRow && !answer.terminalId.isEmpty())
+                emit self->paneRowResolved(devSessionId, paneName, answer.terminalId);
         });
     return true;
 }
@@ -300,9 +419,33 @@ void TerminalFactory::finishResolution(const QString& key, const QString& target
     // a failure does exactly that), and it must start a new flight rather than
     // append to the list being drained.
     const Waiters waiters = m_resolving.take(key);
+    // The answer this key produced, which is also where the waiting panes'
+    // agent-status identity comes from. Empty on a failure, and on the very
+    // first delivery of a legacy lookup that the server answered without a row.
+    const ResolvedPane answer = m_resolved.value(key);
     for (const QPointer<TerminalController>& waiter : waiters) {
         if (!waiter)
             continue;
+        // Identity is adopted HERE and nowhere else, and only for a pane whose
+        // LATEST request is the one being answered. A pane retargeted while
+        // this lookup was in flight is waiting on a different key by now, and
+        // this answer describes the terminal it has left; giving it that
+        // identity would report its bytes as the previous pane's. The pane also
+        // still appears in this waiting list, which is why the check is on the
+        // pane's own record rather than on the list.
+        const auto it = m_attached.constFind(waiter.data());
+        const bool stillWaitingOnThis =
+            it != m_attached.constEnd() && it->pendingResolveKey == key;
+        if (stillWaitingOnThis) {
+            // A failed resolution leaves NO identity behind: the pane is not
+            // entitled to report under the one its previous answer gave it, and
+            // it has not been given a new one.
+            if (target.isEmpty())
+                clearAgentIdentity(waiter);
+            else
+                bindAgentIdentity(waiter, answer.devSessionId, answer.terminalId,
+                                  answer.harness);
+        }
         if (target.isEmpty() && !message.isEmpty())
             emit error(waiter, message);
         emit targetResolved(waiter, target);
@@ -354,7 +497,7 @@ bool TerminalFactory::attach(TerminalController* controller,
     // all, belonging to a pane the user never touched.
     rememberTarget(controller, tmuxTarget);
 
-    auto* device = new SshChannelDevice(m_pool, SshConnectionPool::ChannelKind::Pty, controller);
+    auto* device = new SshChannelDevice(m_pool, controller);
     connect(device, &SshChannelDevice::channelError, this,
             [this, controller](const QString& message) { emit error(controller, message); });
 
@@ -402,6 +545,17 @@ bool TerminalFactory::attach(TerminalController* controller,
     // dangling write (the same rule kill() follows).
     if (auto it = m_attached.find(controller); it != m_attached.end())
         it->device = device;
+
+    // The pane now has a live channel, so SPEC 6.6 observation starts here: for
+    // a generic-harness pane this is "attached and silent", and any output age
+    // remembered from the channel this attach replaced is discarded with it.
+    // Read back out of the entry rather than carried down, for the same reason
+    // the device is written back above.
+    if (m_agentMonitor) {
+        const auto it = m_attached.constFind(controller);
+        if (it != m_attached.constEnd() && !it->terminalId.isEmpty())
+            m_agentMonitor->noteTerminalAttached(it->devSessionId, it->terminalId);
+    }
     return true;
 }
 
@@ -480,7 +634,7 @@ void TerminalFactory::kill(TerminalController* controller)
     // when another client got there first) would replace that with an alarming
     // message about a pane that is gone anyway. The refusal below is reported,
     // because that one means the command never ran at all.
-    auto* exec = new SshChannelDevice(m_pool, SshConnectionPool::ChannelKind::Exec, this);
+    auto* exec = new SshChannelDevice(m_pool, this);
     connect(exec, &SshChannelDevice::readChannelFinished, exec, &QObject::deleteLater);
     if (!exec->startExec(tmuxKillSessionCommand(target))) {
         // The target is kept here too: the command never ran, so the session is

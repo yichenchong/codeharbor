@@ -65,8 +65,8 @@ constexpr double kTimeScale = 0.001;
 // things being proven here.
 class FakeChannel : public SshChannelDevice {
 public:
-    explicit FakeChannel(SshConnectionPool::ChannelKind kind, QObject* parent)
-        : SshChannelDevice(nullptr, kind, parent)
+    explicit FakeChannel(QObject* parent)
+        : SshChannelDevice(nullptr, parent)
     {
         QIODevice::open(QIODevice::ReadWrite | QIODevice::Unbuffered);
     }
@@ -170,12 +170,11 @@ protected:
         return false;
     }
 
-    SshChannelDevice* openChannelDevice(SshConnectionPool::ChannelKind kind,
-                                        const QString&, const QString&) override
+    SshChannelDevice* openChannelDevice(const QString&, const QString&) override
     {
         if (!channelsOk)
             return nullptr;
-        auto* channel = new FakeChannel(kind, this);
+        auto* channel = new FakeChannel(this);
         channels.append(channel);
         return channel;
     }

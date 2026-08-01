@@ -26,6 +26,15 @@ constexpr int kInternalError = -32603;
 // (~11 MiB base64), so 16 MiB leaves headroom for that plus JSON overhead.
 constexpr int kMaxLineBytes = 16 * 1024 * 1024;
 
+// Hard cap on how many heartbeat probes may be unanswered at once: the live one
+// plus the abandoned-but-still-in-flight ones a re-arm leaves behind. Only
+// transport loss reclaims a retired probe, so without a cap a consumer that
+// re-arms repeatedly against a silent peer grows m_pending and
+// m_heartbeatProbeIds without bound. 4 is generous — reaching it needs three
+// configuration changes inside one round trip — and once there, silence is
+// already proven, so the tick counts a miss instead of adding a fifth id.
+constexpr qsizetype kMaxOutstandingProbes = 4;
+
 // True when `line` holds nothing but ASCII whitespace, i.e. it is a separator
 // rather than a frame. Deliberately allocation free: QByteArray::trimmed() would
 // copy the WHOLE line — megabytes for an inline file read — just to answer "is
@@ -128,6 +137,7 @@ void CodeharbordClient::setTransport(QIODevice* transport)
 
     m_transport = transport;
     m_readBuffer.clear();
+    m_readPos = 0;
     m_scanOffset = 0;
     m_closed = false;
 
@@ -342,25 +352,45 @@ void CodeharbordClient::onReadyRead()
     // otherwise the loop's next m_readBuffer access is a use-after-free.
     QPointer<CodeharbordClient> self(this);
 
-    // Consume every complete line. m_scanOffset remembers how far we have
-    // already searched for a '\n' and found none, so a single large message
-    // arriving in many small chunks is not re-scanned from the front on every
-    // readyRead (an O(n^2) trap otherwise). It indexes INTO m_readBuffer, so it
-    // is reset to 0 the moment that buffer is mutated at the front or dropped —
-    // see the resets below and in setTransport(). A trailing partial line stays
+    // Consume every complete line through a CURSOR pair held in members.
+    // m_readPos is the first unconsumed byte; m_scanOffset is how far past it
+    // we have already searched for a '\n' and found none, so a single large
+    // message arriving in many small chunks is not re-scanned from the front on
+    // every readyRead (an O(n^2) trap otherwise). A trailing partial line stays
     // buffered until the rest arrives on a later readyRead.
+    //
+    // Nothing derived from the buffer survives a processLine() call: no
+    // iterator, no pointer, no cached index. processLine() may spin a nested
+    // event loop that re-enters this function, and that nested call appends to
+    // m_readBuffer (reallocating it), consumes frames of its own and compacts.
+    // Because the consumption point lives in a member, the nested call advances
+    // the very cursor this loop re-reads on its next iteration, so a frame is
+    // dispatched exactly once no matter which nesting level reaches it. That
+    // property is the whole reason the cursor is a member: a consume offset
+    // local to this function, or a slice of the buffer held across the
+    // dispatch, lets the nested call re-process frames the outer loop had
+    // already logically consumed.
     //
     // qsizetype, not int: QByteArray indexes are 64-bit and m_readBuffer holds
     // whatever one readAll() handed us, which is only bounded by the cap check
     // BELOW — narrowing the index here would corrupt the split of a buffer that
     // grew past 2 GiB before that check ever ran.
-    qsizetype newline;
-    while ((newline = m_readBuffer.indexOf('\n', m_scanOffset)) != -1) {
-        QByteArray line = m_readBuffer.left(newline);
-        m_readBuffer.remove(0, newline + 1);
-        // The consumed prefix is gone, so the unscanned remainder starts at the
-        // front again.
-        m_scanOffset = 0;
+    for (;;) {
+        const qsizetype newline = m_readBuffer.indexOf('\n', m_scanOffset);
+        if (newline == -1)
+            break;
+        // A DEEP copy, not sliced()/left(): those share m_readBuffer's
+        // allocation, so a nested reader's append would have to detach the
+        // whole buffer — copying every byte still in it, per frame — and the
+        // frame handed to processLine() would be a live reference into a buffer
+        // that re-entrant code is free to mutate. One frame-sized allocation
+        // keeps the two independent.
+        QByteArray line(m_readBuffer.constData() + m_readPos,
+                        newline - m_readPos);
+        // Advance BEFORE dispatching: processLine() can re-enter, and the
+        // re-entrant reader must start after the frame we are about to hand out.
+        m_readPos = newline + 1;
+        m_scanOffset = m_readPos;
         if (line.endsWith('\r'))
             line.chop(1); // tolerate CRLF framing (SPEC 10.3 is newline-delimited)
         if (isBlankLine(line))
@@ -377,13 +407,18 @@ void CodeharbordClient::onReadyRead()
         // notifications AFTER the close and warn about ids we just swept.
         if (m_closed) {
             m_readBuffer.clear();
+            m_readPos = 0;
             m_scanOffset = 0;
             return;
         }
     }
     // No '\n' past m_scanOffset: the whole buffer has now been searched, so the
-    // next readyRead resumes from its end instead of from position zero.
+    // next readyRead resumes from its end instead of from the cursor.
     m_scanOffset = m_readBuffer.size();
+    // Everything before m_readPos has been dispatched; release it in one move.
+    // Done BEFORE the cap check so that check measures the unframed remainder
+    // rather than a buffer full of frames already delivered.
+    compactReadBuffer();
 
     // Guard against an unterminated line growing the buffer without bound: a
     // peer streaming megabytes with no '\n' is malformed. Drop the garbage and
@@ -396,6 +431,7 @@ void CodeharbordClient::onReadyRead()
         // may delete this client, and the release must not depend on surviving
         // the emit. Frees up to the cap (16 MiB) as a side effect.
         m_readBuffer.clear();
+        m_readPos = 0;
         m_scanOffset = 0;
         emit protocolWarning(
             QStringLiteral("RPC line exceeded %1 bytes without a newline; "
@@ -404,6 +440,16 @@ void CodeharbordClient::onReadyRead()
             return;
         onTransportClosed();
     }
+}
+
+void CodeharbordClient::compactReadBuffer()
+{
+    if (m_readPos == 0)
+        return;
+    m_readBuffer.remove(0, m_readPos);
+    // m_scanOffset is never behind the cursor, so this stays non-negative.
+    m_scanOffset -= m_readPos;
+    m_readPos = 0;
 }
 
 void CodeharbordClient::processLine(const QByteArray& line)
@@ -593,6 +639,7 @@ void CodeharbordClient::onTransportClosed()
     // a later rebind must never splice a dead producer's tail onto the first
     // frame of the new one.
     m_readBuffer.clear();
+    m_readPos = 0;
     m_scanOffset = 0;
     // Nothing left to probe: stop the timer and forget any outstanding probe
     // before failAllPending() dispatches its callback. m_closed is already
@@ -637,7 +684,7 @@ void CodeharbordClient::failAllPending(const RpcError& error)
     }
 }
 
-int CodeharbordClient::pendingCount() const
+qsizetype CodeharbordClient::pendingCount() const
 {
     // Probes are real m_pending entries — that is what keeps them off the
     // unknown-id warning path and gets them failed exactly once with everybody
@@ -650,7 +697,7 @@ int CodeharbordClient::pendingCount() const
     // out before dispatching, so a caller re-entering here mid-sweep sees an
     // empty m_pending while the probe callbacks that clear these ids have not
     // run yet.
-    int outstanding = static_cast<int>(m_pending.size());
+    qsizetype outstanding = m_pending.size();
     for (const qint64 id : m_heartbeatProbeIds) {
         if (m_pending.contains(id))
             --outstanding;
@@ -668,6 +715,19 @@ void CodeharbordClient::enableHeartbeat(int intervalMs, int missTolerance)
             QStringLiteral("enableHeartbeat(%1, %2): refused, heartbeat stays off")
                 .arg(intervalMs)
                 .arg(missTolerance));
+        return;
+    }
+
+    // Already running exactly this configuration: do NOTHING. restartHeartbeat()
+    // below is a re-arm, and a re-arm is not free — it zeroes the miss counter
+    // and retires the probe in flight, leaving that probe stranded in m_pending
+    // and m_heartbeatProbeIds until the transport dies. A consumer that
+    // re-enables periodically (or on every reconnect attempt) would therefore
+    // reset the silence measurement forever, so a peer that never answers would
+    // never be detected, while accumulating one abandoned probe per call. A
+    // configuration CHANGE still falls through: the old cadence has to go.
+    if (m_heartbeatTimer->isActive() && intervalMs == m_heartbeatIntervalMs &&
+        missTolerance == m_heartbeatMissTolerance) {
         return;
     }
     m_heartbeatIntervalMs = intervalMs;
@@ -703,7 +763,17 @@ void CodeharbordClient::onHeartbeatTick()
         return;
     }
 
-    if (m_heartbeatProbeOutstanding) {
+    // "A probe is already on the wire" is the live one, OR enough retired ones
+    // that issuing another would just grow m_pending/m_heartbeatProbeIds again.
+    // A retired probe is abandoned but still physically in flight and still
+    // occupying both collections until the peer answers it or the transport
+    // dies; against a peer that never answers, re-arming would otherwise strand
+    // one more of them forever, every time. Stopping at the cap loses nothing:
+    // kMaxOutstandingProbes unanswered probes are already conclusive evidence
+    // of silence, and the interval still counts as a miss below, so detection
+    // gets faster rather than slower.
+    if (m_heartbeatProbeOutstanding ||
+        m_heartbeatProbeIds.size() >= kMaxOutstandingProbes) {
         // The previous probe is still unanswered AND not one byte has arrived
         // from the peer since (onReadyRead() would have zeroed this counter).
         // Only ONE probe is ever in flight: piling on a fresh id every interval

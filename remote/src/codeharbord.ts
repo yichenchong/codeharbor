@@ -17,7 +17,7 @@ import { join as pathJoin } from "node:path";
 // Frozen file-method catalog (C1, docs/PLAN.md). RPC_METHODS/RPC_REVISION_MISMATCH
 // are re-exported so the wire names and error code stay linked to the transport.
 // The file.* handlers (incl. listDirectory) are registered from files.ts.
-import { fileMethods, fileWatchService, isRevisionMismatch } from "./files.ts";
+import { fileMethods, fileWatchService, isResourceLimit, isRevisionMismatch } from "./files.ts";
 // Workspace persistence method group (workstream P). `workspace.*` is P's own
 // method group and is deliberately absent from the frozen C1 file catalog.
 // serverIdentity() is this host's stable, persisted id, reported by server.info.
@@ -40,6 +40,7 @@ import {
     RPC_METHOD_NOT_FOUND,
     RPC_PARSE_ERROR,
     RPC_PING_METHOD,
+    RPC_RESOURCE_LIMIT,
     RPC_REVISION_MISMATCH,
     RPC_WATCH_EVENT_NOTIFICATION,
     RPC_WATCH_EVENTS_LOST_NOTIFICATION,
@@ -58,6 +59,7 @@ export {
 } from "./rpc-types.ts";
 export {
     RPC_DATABASE_BUSY,
+    RPC_RESOURCE_LIMIT,
     RPC_REVISION_MISMATCH,
     RPC_WATCH_EVENT_NOTIFICATION,
     RPC_WATCH_EVENTS_LOST_NOTIFICATION,
@@ -245,6 +247,18 @@ export async function dispatch(value: unknown): Promise<RpcResponse | null> {
                 jsonrpc: "2.0",
                 id,
                 error: { code: RPC_INVALID_PARAMS, message: err.message },
+            };
+        }
+        // A valid request whose answer would blow a server bound (a directory
+        // listing too big for one transport frame, or one watch too many). Not
+        // -32603 for the same reason as the busy code below: nothing
+        // malfunctioned and nothing was half-applied. The message already names
+        // the limit and what to do, and the client shows it verbatim.
+        if (isResourceLimit(err)) {
+            return {
+                jsonrpc: "2.0",
+                id,
+                error: { code: RPC_RESOURCE_LIMIT, message: err.message },
             };
         }
         // SQLite could not take the write lock before workspace.ts's busy
@@ -540,7 +554,27 @@ export function createWatchNotificationRelay(
     };
 }
 
-export function runStdio(): void {
+// Signals the daemon treats as "stop cleanly". SIGHUP is in the set because it
+// is what an ending SSH session delivers to the process it launched, which is
+// this daemon's most common way to be told to stop; SIGINT covers a hand-started
+// daemon under Ctrl-C; SIGTERM covers `kill` and every supervisor.
+export const SHUTDOWN_SIGNALS = ["SIGTERM", "SIGINT", "SIGHUP"] as const;
+
+// How long the shutdown backstop waits for in-flight work before forcing the
+// exit. Two seconds is beyond any handler that is making progress and well
+// inside the patience of a supervisor's own SIGTERM-then-SIGKILL window.
+export const SHUTDOWN_GRACE_MS = 2000;
+
+export interface StdioHandle {
+    /**
+     * Run the orderly shutdown now, exactly as an incoming SIGTERM would.
+     * Idempotent: every call after the first does nothing. Exposed so a test can
+     * exercise the path without signalling its own process.
+     */
+    shutdown: () => void;
+}
+
+export function runStdio(): StdioHandle {
     // The client half of the SSH channel can disappear at any moment, and the
     // next write then raises EPIPE as an 'error' event on stdout. Unhandled,
     // that event terminates the process with a stack trace; swallow it and let
@@ -656,6 +690,51 @@ export function runStdio(): void {
         // exit on its own once in-flight work settles.
         fileWatchService.closeAll();
     });
+    // SIGNALS. Until this existed, the ONLY orderly shutdown was stdin closing:
+    // a plain `kill` (or the SIGHUP an ending SSH session delivers, or Ctrl-C on
+    // a hand-started daemon) hit Node's default disposition and killed the
+    // process where it stood. That left the daemon's observable exit status as
+    // "died on a signal" rather than "exited 0", which is what a supervisor or a
+    // packaging script has to distinguish a clean stop from a crash-loop; it
+    // abandoned every fs.watch handle and poll timer instead of releasing them;
+    // and it discarded a response already handed to a stdout the SSH channel had
+    // not drained yet, so the client's pending call never completed.
+    //
+    // The handler runs the SAME path as stdin close and is IDEMPOTENT: a second
+    // signal (a supervisor's SIGTERM followed by an impatient one) does nothing
+    // at all. The listeners stay REGISTERED for that reason — deregistering them
+    // restores Node's default disposition, so the impatient second SIGTERM would
+    // kill the process mid-shutdown and turn the clean exit back into the
+    // signal death this exists to remove. Keeping them costs nothing: a signal
+    // listener does not hold the event loop open, so the process still exits by
+    // itself once the work below has released everything.
+    let shuttingDown = false;
+    const shutdown = (): void => {
+        if (shuttingDown) return;
+        shuttingDown = true;
+        // Releases every OS watch handle and poll timer, and announces each
+        // release so the relay drops its queued notifications with it.
+        fileWatchService.closeAll();
+        // Stop reading requests. Answering a new one while shutting down would
+        // start work whose reply cannot be guaranteed to reach the wire.
+        process.stdin.removeListener("data", feed);
+        if (!process.stdin.destroyed) process.stdin.destroy();
+        // Exit 0 rather than re-raising the signal: a signal-terminated exit is
+        // how a crash reports itself, and this is not one.
+        process.exitCode = 0;
+        // Installing a handler at all removes the default "die now", so this
+        // function is now solely responsible for the process ending. With the
+        // watch handles gone the event loop normally empties by itself and Node
+        // exits — but an in-flight handler (a large file.readFile) or a stdout
+        // the peer stopped draining can hold it open indefinitely, and a daemon
+        // that ignores SIGTERM is worse than one that dies rudely. The timer is
+        // UNREF'd on purpose, so it is exactly a backstop: it can only fire while
+        // something else is still keeping the loop alive, which is the only case
+        // where a forced exit is needed.
+        setTimeout(() => process.exit(0), SHUTDOWN_GRACE_MS).unref();
+    };
+    for (const signal of SHUTDOWN_SIGNALS) process.on(signal, shutdown);
+    return { shutdown };
 }
 
 if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {

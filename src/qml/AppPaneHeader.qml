@@ -137,28 +137,15 @@ Rectangle {
                  : action.hovered ? Theme.surfaceHover : "transparent"
         }
 
-        // An explicit ToolTip rather than the attached ToolTip.text: the shared
-        // one is drawn by the Basic style in the style's own light palette, so a
-        // hint about a dark header would arrive as a white box.
-        ToolTip {
+        // The module's one tooltip (AppToolTip.qml): the ATTACHED ToolTip.text
+        // form is drawn by the Basic style in that style's own light palette,
+        // so a hint about a dark header would arrive as a white box.
+        AppToolTip {
             id: actionTip
             x: 0
             y: action.height + 4
-            delay: 400
+            text: action.text
             visible: action.hovered && action.text.length > 0
-            padding: 6
-            contentItem: Label {
-                textFormat: Text.PlainText
-                text: action.text
-                color: Theme.text
-                font.pixelSize: Theme.fontSizeSmall
-            }
-            background: Rectangle {
-                color: Theme.surfaceSunken
-                border.color: Theme.border
-                border.width: 1
-                radius: Theme.radiusSmall
-            }
         }
     }
 

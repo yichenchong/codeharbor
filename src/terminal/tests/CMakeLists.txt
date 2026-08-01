@@ -3,12 +3,18 @@ target_link_libraries(tst_terminalcontroller PRIVATE Qt6::Test ch_terminal)
 add_test(NAME tst_terminalcontroller COMMAND tst_terminalcontroller)
 
 # Per-pane plumbing the QML terminal pane is built on: TerminalFactory
-# (ownership, attach refusal, kill command) + TerminalBridge (the WebChannel
-# face of a pane). No server needed — attaching a real PTY is the live gate
-# below.
+# (ownership, attach refusal, kill command, and which answer a pane may adopt
+# as its agent-status identity) + TerminalBridge (the WebChannel face of a
+# pane). No server needed — attaching a real PTY is the live gate below.
+#
+# Qt6::Network: the identity cases drive the REAL workspace repository over a
+# QLocalSocket pair, so the test can play the server and hold a lookup open
+# while the pane is retargeted. ch_terminal already carries ch_persistence and
+# ch_agent transitively.
 qt_add_executable(tst_terminalfactory tst_terminalfactory.cpp)
 target_link_libraries(tst_terminalfactory PRIVATE
     Qt6::Core
+    Qt6::Network
     Qt6::Test
     ch_terminal
     ch_ssh

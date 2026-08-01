@@ -520,8 +520,15 @@ Rectangle {
                 border.color: root.stateColor(root.connectionState)
 
                 HoverHandler { id: chipHover }
-                ToolTip.visible: chipHover.hovered
-                ToolTip.text: root.stateExplanation(root.connectionState)
+                // The module's one tooltip (AppToolTip.qml). The attached
+                // `ToolTip.text` form is drawn by the Basic style in that
+                // style's own light palette, so an explanation of this dark
+                // sheet's status chip arrived as a white box.
+                AppToolTip {
+                    objectName: "statusChipTip"
+                    visible: chipHover.hovered
+                    text: root.stateExplanation(root.connectionState)
+                }
 
                 Row {
                     id: chipRow

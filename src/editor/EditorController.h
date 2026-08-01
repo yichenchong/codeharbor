@@ -47,8 +47,8 @@ class EditorController : public QObject {
 public:
     explicit EditorController(CodeharbordClient* client, QString recoveryId,
                               QObject* parent = nullptr);
-    // Releases the active file.watch subscription (SPEC 8.7) so closing an
-    // editor pane never leaks a server-side watcher.
+    // Releases the active file.watch subscription (SPEC 8.7) so closing the
+    // viewer pane this controller serves never leaks a server-side watcher.
     ~EditorController() override;
 
     QString fileState() const { return toString(m_fileState); }
@@ -193,6 +193,11 @@ private:
     // reloads the USER asked for (the page's "Reload" affordance, a page that
     // reloaded and lost its buffer), where replacing the buffer IS the request.
     void reload(FileState transitional, bool discardLocalEdits = false);
+    // Put ONE file.writeFile on the wire and own its reply. Split out of save()
+    // so the reply can re-enter it for a save that was queued behind this one
+    // (see save(), and m_saveInFlight below). Callers guarantee m_client,
+    // a non-empty m_path and a writable buffer.
+    void issueSave(QString content, QString expectedRevision);
     // Emit contentLoaded, or hold it until the page reports ready() (see the
     // ready() slot). The held buffer is overwritten by a newer load, so a
     // reconnecting page always sees the LATEST content exactly once.
@@ -294,6 +299,36 @@ private:
     // and every reload() leave m_path equal. See the comment at that check for
     // why comparing loads STARTED is sufficient here.
 
+    // Saves are SERIALISED, never raced. The save key beats an SSH round trip
+    // easily, and two writes carrying the same expectedRevision end with the
+    // second refused for a change this very client made — a "file changed on
+    // disk" conflict over nobody else's edit. So at most one write is on the
+    // wire; a save() arriving during it either recognises its own bytes and
+    // rides the outcome of the write already sent, or parks its bytes in
+    // m_queuedSaveContent to be issued by that write's reply, guarded by the
+    // revision it produced. Latest buffer wins: an intermediate one the user
+    // has already typed past does not deserve a round trip.
+    //
+    // This lives here rather than in the page because CodeharbordClient
+    // GUARANTEES every pending callback fires — on a reply, on transport
+    // closure, on transport replacement and in its destructor — so
+    // m_saveInFlight cannot latch true and make the save key dead. A flag in
+    // the page has no such guarantee.
+    bool m_saveInFlight = false;
+    // Bumped by every write issued. A reply carrying a superseded generation
+    // (open() bumps it too) must not clear the flag or consume the queue: they
+    // belong to a later chain, possibly for another file.
+    quint64 m_saveGeneration = 0;
+    // The bytes of the write on the wire, so a second save of an UNCHANGED
+    // buffer is recognised as the same save and costs no second write (which
+    // would only move the file's mtime and wake every other watcher). QString is
+    // implicitly shared, so this holds a reference, not a copy.
+    QString m_inFlightSaveContent;
+    // Bytes a save() handed over while a write was on the wire. Dropped when
+    // that write FAILS: the pane reports the failure, stays dirty, and the
+    // page's Retry / Overwrite re-sends the buffer as it is at the click.
+    std::optional<QString> m_queuedSaveContent;
+
     // Where to go when a transport is bound again after a drop (see
     // onTransportClosed). Conflict / ExternallyModified / ReadOnly survive an
     // outage — the first two because the file on the server still diverges from
@@ -335,7 +370,7 @@ private:
     // snapshot holds OLDER text than the file now on the server, so the next open
     // offers to restore work the save had already superseded — and since the
     // recovery offer is now a real dialog (see the crash-recovery restore path in
-    // the editor pane) accepting it walks the buffer backwards.
+    // the viewer pane) accepting it walks the buffer backwards.
     //
     // clearRecovery() therefore records the intent instead of dropping it, and the
     // LAST outstanding snapshot write's reply carries it out once it knows what to

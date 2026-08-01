@@ -92,7 +92,8 @@ public:
     bool viewVisible() const;
     // Toggle renderer visibility (SPEC 5.4). While hidden, flushes accumulate
     // into the rolling buffer instead of the view; becoming visible replays the
-    // retained buffer once as a single batch.
+    // retained buffer, as one batch when the credit window has room for all of
+    // it and otherwise as successive batches driven by acknowledgeOutput().
     //
     // A visibility change also resets the unacknowledged-output account: a
     // renderer that is not listening owes nothing, and the renderer that
@@ -139,7 +140,7 @@ public:
 
     // Attach the PTY byte transport for this pane (SPEC 5.1/5.3), mirroring
     // CodeharbordClient::setTransport()/AgentStatusMonitor::setTransport(). In
-    // production this is a ch::SshChannelDevice opened with ChannelKind::Pty;
+    // production this is a ch::SshChannelDevice running a remote PTY;
     // the parameter stays a plain QIODevice so the controller is exercisable
     // against a QBuffer/QLocalSocket with no SSH session in sight.
     //
@@ -215,6 +216,21 @@ public:
 
 signals:
     void stateChanged(ch::TerminalState state);
+    // Non-empty output arrived from the remote PTY. Raised on INGEST, before
+    // any coalescing, buffering or flow control, and carrying no payload: it
+    // reports that the pane is producing, not what it produced.
+    //
+    // flushReady() cannot answer that question. It is silent for a hidden pane
+    // and for a pane held back on acknowledgements, both of which are still
+    // very much alive — so a consumer that wants liveness would conclude the
+    // opposite of the truth exactly when the user is not looking. This is the
+    // one thing every pane does whenever the remote says anything at all.
+    //
+    // Sole consumer today is ch::TerminalFactory, which forwards it to
+    // ch::AgentStatusMonitor::noteTerminalOutput() for SPEC 6.6 activity
+    // detection on the adapterless "generic" harness. Keep it payload-free:
+    // a consumer that wants the bytes wants flushReady().
+    void outputReceived();
     // A coalesced batch of output ready for the visible renderer (SPEC 5.5).
     // Every byte emitted here counts against kMaxUnacknowledgedBytes until the
     // renderer reports it consumed through acknowledgeOutput().
@@ -230,10 +246,27 @@ signals:
 private:
     void flush();
     void appendHidden(const QByteArray &batch);
-    // Hand the retained buffer to the view as one batch, if the view can take
-    // it (visible, and not already too far behind). The single place both the
-    // hidden->visible replay and the acknowledgement-driven release go through.
+    // Hand as much of the retained buffer to the view as the credit window
+    // allows, if the view can take it (visible, and not already too far
+    // behind). The single place both the hidden->visible replay and the
+    // acknowledgement-driven release go through.
     void releaseRetained();
+    // First offset at or after `from` that a cut of `buffer` can safely land
+    // on: the byte after the first line feed within kHiddenResyncWindowBytes,
+    // else the first byte that is not a UTF-8 continuation byte, else `from`
+    // plus the whole window. `from` past the end is answered with `from`.
+    //
+    // ONE definition, two callers: appendHidden() cuts here because the bytes
+    // before the cut are DESTROYED and the replay must not start inside a
+    // character or an escape sequence, and releaseRetained() cuts here because
+    // a batch that ends mid-sequence is a worse split than one that ends on a
+    // line feed. Two hand-written copies of this rule would drift.
+    static qsizetype resyncBoundary(const QByteArray &buffer, qsizetype from);
+    // Length of the trailing bytes of `data` that are the START of a multi-byte
+    // UTF-8 character whose continuation bytes have not arrived yet: 0..3.
+    // Zero when the data ends on a complete character, on ASCII, or on bytes
+    // that are not legal UTF-8 at all — a binary stream must never be held.
+    static qsizetype incompleteTrailingUtf8(const QByteArray &data);
     void onTransportReadyRead();
     void onTransportFinished();
     void onAttachTimeout();
@@ -243,7 +276,10 @@ private:
 
     TerminalState m_state = TerminalState::Unloaded;
     bool m_viewVisible = true;
-    QByteArray m_pending;   // coalesced output awaiting the next flush
+    // Coalesced output awaiting the next flush. Between flushes this holds at
+    // most the 0..3 trailing bytes of a multi-byte character flush() refused
+    // to split, plus whatever has arrived since.
+    QByteArray m_pending;
     QByteArray m_hidden;    // rolling buffer of output not yet released
     // Bytes handed to the renderer that it has not reported consuming. Signed
     // and 64-bit: acknowledgements come from the page, so the arithmetic must

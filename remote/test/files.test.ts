@@ -4,6 +4,8 @@ import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { EventEmitter } from "node:events";
+import { spawn } from "node:child_process";
+import { fileURLToPath } from "node:url";
 
 import {
     stat,
@@ -11,23 +13,34 @@ import {
     writeFile,
     resolvePath,
     listDirectory,
+    assertListingFits,
     getMimeType,
     revisionFrom,
     isRevisionMismatch,
+    fileWatchService,
     FileWatchService,
+    MAX_DIRECTORY_LISTING_BYTES,
+    MAX_WATCH_SUBSCRIPTIONS,
 } from "../src/files.ts";
 import {
     RPC_REVISION_MISMATCH,
+    RPC_RESOURCE_LIMIT,
     RPC_WATCH_EVENT_NOTIFICATION,
     RPC_WATCH_EVENTS_LOST_NOTIFICATION,
 } from "../src/rpc-types.ts";
 import {
     createWatchNotificationRelay,
     dispatch,
+    MAX_LINE_BYTES,
     MAX_PENDING_WATCH_EVENTS,
     RPC_INVALID_PARAMS,
 } from "../src/codeharbord.ts";
 import type { WatchEvent } from "../src/rpc-types.ts";
+
+// The daemon's CLI entry point, spawned as a real child by the shutdown tests
+// below: signal handling is process-wide, so it cannot be exercised in-process
+// without tearing down the test runner's own stdin.
+const DAEMON_ENTRY = fileURLToPath(new URL("../src/codeharbord.ts", import.meta.url));
 
 async function tmpDir(): Promise<string> {
     return fs.mkdtemp(path.join(os.tmpdir(), "codeharbord-files-"));
@@ -1216,4 +1229,259 @@ test("unwatch announces the released subscription so no queue outlives it", asyn
     assert.deepEqual(closed, [subscriptionId, second.subscriptionId]);
 
     await fs.rm(dir, { recursive: true, force: true });
+});
+
+// A dangling symlink reads as "nothing at this path" to the link-following
+// status check, so a create-only save took the create branch and renamed a
+// fresh regular file OVER the link — destroying a link the user made, with no
+// error and no way back. A plain `open(link, O_CREAT)` creates the link's
+// TARGET, and that is what the save must do too.
+test("writeFile through a dangling symlink creates the target and keeps the link", async () => {
+    const dir = await tmpDir();
+    const target = path.join(dir, "target.txt");
+    const link = path.join(dir, "link.txt");
+    await fs.symlink(target, link); // dangling: target does not exist yet
+
+    const created = await writeFile({ path: link, content: "through", expectedRevision: "" });
+    assert.equal(created.path, link);
+
+    // The link survived, still pointing where the user pointed it...
+    const linkStats = await fs.lstat(link);
+    assert.equal(linkStats.isSymbolicLink(), true, "the symlink was replaced by a regular file");
+    assert.equal(await fs.readlink(link), target);
+    // ...and the bytes landed in the file it names.
+    assert.equal(await fs.readFile(target, "utf-8"), "through");
+    // Nothing else was created, in particular no leftover temp file.
+    assert.deepEqual((await fs.readdir(dir)).sort(), ["link.txt", "target.txt"]);
+
+    // The revision the save returned is the one a stat through the link reports,
+    // so the very next save guards on the right token instead of conflicting.
+    const seen = await stat({ path: link });
+    assert.equal(seen.kind, "symlink");
+    assert.equal(seen.revision, created.revision);
+
+    // And the follow-up overwrite still writes through the link.
+    await writeFile({ path: link, content: "again", expectedRevision: created.revision });
+    assert.equal((await fs.lstat(link)).isSymbolicLink(), true);
+    assert.equal(await fs.readFile(target, "utf-8"), "again");
+
+    await fs.rm(dir, { recursive: true, force: true });
+});
+
+// Following the chain by hand is what makes the test above possible (realpath
+// refuses a dangling chain), and a hand-written follow must not spin on a cycle
+// inside an RPC handler. ELOOP is the errno the kernel reports for this.
+test("writeFile refuses a symbolic-link cycle instead of looping forever", async () => {
+    const dir = await tmpDir();
+    const a = path.join(dir, "a");
+    const b = path.join(dir, "b");
+    await fs.symlink(b, a);
+    await fs.symlink(a, b);
+
+    await withTimeout(
+        assert.rejects(
+            () => writeFile({ path: a, content: "x", expectedRevision: "" }),
+            (err: NodeJS.ErrnoException) => err.code === "ELOOP",
+        ),
+        5000,
+    );
+
+    await fs.rm(dir, { recursive: true, force: true });
+});
+
+// A listing longer than one transport frame did not merely fail: MAX_LINE_BYTES
+// is enforced by BOTH ends, so the client's bounded reader dropped the SSH
+// channel and took every terminal, editor and watch subscription in the session
+// with it — over a directory the user could not even identify from the failure.
+test("a listing too big for one transport frame is refused, not put on the wire", () => {
+    // The bound must leave room for the JSON-RPC envelope around the entries.
+    assert.ok(
+        MAX_DIRECTORY_LISTING_BYTES < MAX_LINE_BYTES,
+        `listing cap ${MAX_DIRECTORY_LISTING_BYTES} must stay under the ${MAX_LINE_BYTES}-byte frame cap`,
+    );
+
+    // Just under the cap passes: 40-byte names, sized so the total lands short.
+    const name = "n".repeat(40);
+    const perEntry = 40 + 2 + 29; // the name, its quotes, the entry envelope
+    const fits = Math.floor(MAX_DIRECTORY_LISTING_BYTES / perEntry);
+    assertListingFits("/big", Array.from({ length: fits }, () => ({ name })));
+
+    // A few entries more does not, and the refusal names the directory, the real
+    // entry count and the limit — everything the user needs to act.
+    const over = Array.from({ length: fits + 16 }, () => ({ name }));
+    assert.throws(
+        () => assertListingFits("/big", over),
+        (err: Error & { code?: number }) => {
+            assert.equal(err.code, RPC_RESOURCE_LIMIT);
+            assert.match(err.message, /\/big/);
+            assert.match(err.message, new RegExp(`${over.length} entries`));
+            return true;
+        },
+    );
+
+    // The measurement is of the SERIALIZED name, not its raw byte length: a
+    // control character costs the six characters \u0001 once escaped. The exact
+    // same COUNT of 40-byte names that fitted above is therefore refused when
+    // those bytes are control characters — which a byte-length estimate, off by
+    // 6x here, would have waved through onto the wire.
+    const escaped = Array.from({ length: fits }, () => ({ name: "\u0001".repeat(40) }));
+    assert.throws(
+        () => assertListingFits("/esc", escaped),
+        (err: Error & { code?: number }) => err.code === RPC_RESOURCE_LIMIT,
+    );
+});
+
+// Each subscription holds an OS watch handle plus a poll timer, and the table
+// holding them was unbounded: a client that leaks unwatch calls walks it up
+// until every watch on the host starts failing.
+test("watch refuses a new subscription past the live-subscription cap", async () => {
+    const dir = await tmpDir();
+    const file = path.join(dir, "capped.txt");
+    await fs.writeFile(file, "one");
+
+    const service = new FileWatchService();
+    service.pollIntervalMs = 1_000_000; // no polling wanted here, just the handles
+
+    const ids: string[] = [];
+    for (let i = 0; i < MAX_WATCH_SUBSCRIPTIONS; i += 1) {
+        ids.push((await service.watch({ path: file })).subscriptionId);
+    }
+    await assert.rejects(
+        () => service.watch({ path: file }),
+        (err: Error & { code?: number }) => {
+            assert.equal(err.code, RPC_RESOURCE_LIMIT);
+            assert.match(err.message, new RegExp(`${MAX_WATCH_SUBSCRIPTIONS} active file watches`));
+            return true;
+        },
+    );
+
+    // The cap counts LIVE subscriptions, not lifetime ones: releasing one makes
+    // room for the next, so an editor that closes a pane can open another.
+    service.unwatch({ subscriptionId: ids[0] });
+    const replacement = await service.watch({ path: file });
+    assert.equal(service.hasSubscription(replacement.subscriptionId), true);
+
+    service.closeAll();
+    await fs.rm(dir, { recursive: true, force: true });
+});
+
+// codeharbord dispatches request lines concurrently, so the cap has to hold
+// against a burst that is all in flight at once — the table insertion sits after
+// two awaits, and a size check that is not also a reservation lets every caller
+// in the burst pass it.
+test("a concurrent burst of watch calls cannot overshoot the cap", async () => {
+    const dir = await tmpDir();
+    const file = path.join(dir, "burst.txt");
+    await fs.writeFile(file, "one");
+
+    const service = new FileWatchService();
+    service.pollIntervalMs = 1_000_000;
+
+    const attempts = MAX_WATCH_SUBSCRIPTIONS + 64;
+    const settled = await Promise.allSettled(
+        Array.from({ length: attempts }, () => service.watch({ path: file })),
+    );
+    const granted = settled.filter((r) => r.status === "fulfilled");
+    assert.equal(granted.length, MAX_WATCH_SUBSCRIPTIONS);
+    for (const rejection of settled.filter((r) => r.status === "rejected")) {
+        const reason: unknown = rejection.reason;
+        assert.ok(reason instanceof Error && "code" in reason);
+        assert.equal(reason.code, RPC_RESOURCE_LIMIT);
+    }
+
+    service.closeAll();
+    await fs.rm(dir, { recursive: true, force: true });
+});
+
+// The wire half of the two bounds above: a resource limit must reach the client
+// as its own code with the server's message intact, not as -32603 "internal
+// error", which tells the user the server broke.
+test("file.watch past the cap answers with the resource-limit code, not internal error", async () => {
+    const dir = await tmpDir();
+    const file = path.join(dir, "rpc-cap.txt");
+    await fs.writeFile(file, "one");
+
+    // The dispatcher uses the module singleton, so every id taken here is given
+    // back before the test ends.
+    const previousInterval = fileWatchService.pollIntervalMs;
+    fileWatchService.pollIntervalMs = 1_000_000;
+    const taken: string[] = [];
+    try {
+        while (taken.length < MAX_WATCH_SUBSCRIPTIONS) {
+            taken.push((await fileWatchService.watch({ path: file })).subscriptionId);
+        }
+        const response = await dispatch({
+            jsonrpc: "2.0",
+            id: 1,
+            method: "file.watch",
+            params: { path: file },
+        });
+        assert.ok(response && "error" in response);
+        assert.equal(response.error.code, RPC_RESOURCE_LIMIT);
+        assert.match(response.error.message, /active file watches/);
+    } finally {
+        for (const subscriptionId of taken) fileWatchService.unwatch({ subscriptionId });
+        fileWatchService.pollIntervalMs = previousInterval;
+    }
+
+    await fs.rm(dir, { recursive: true, force: true });
+});
+
+// The daemon had no signal handlers at all: its only orderly shutdown was stdin
+// closing, so an ordinary `kill` (or the SIGHUP an ending SSH session delivers)
+// hit Node's default disposition and killed it where it stood, abandoning every
+// watch handle and reporting "died on a signal" to whatever supervises it.
+// Driven through a real child process, because installing a process-wide signal
+// handler is exactly the behaviour under test.
+async function runDaemonUntilSignalled(
+    signals: readonly NodeJS.Signals[],
+): Promise<{ code: number | null; signal: NodeJS.Signals | null }> {
+    const child = spawn(process.execPath, [DAEMON_ENTRY, "rpc", "--stdio"], {
+        stdio: ["pipe", "pipe", "pipe"],
+    });
+    const exited = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) => {
+        child.on("exit", (code, signal) => resolve({ code, signal }));
+    });
+    try {
+        // Serve one request first, so the signal lands on a daemon that is
+        // genuinely up rather than on a process still importing its modules.
+        const answered = new Promise<string>((resolve) => {
+            let buffered = "";
+            child.stdout.on("data", (chunk: Buffer) => {
+                buffered += chunk.toString("utf-8");
+                const newline = buffered.indexOf("\n");
+                if (newline >= 0) resolve(buffered.slice(0, newline));
+            });
+        });
+        child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id: 7, method: "ping" })}\n`);
+        assert.match(await withTimeout(answered, 20000), /"id":7/);
+
+        for (const signal of signals) child.kill(signal);
+        return await withTimeout(exited, 20000);
+    } finally {
+        if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+    }
+}
+
+test("SIGTERM shuts the daemon down cleanly instead of killing it", async () => {
+    const { code, signal } = await runDaemonUntilSignalled(["SIGTERM"]);
+    assert.equal(signal, null, "the daemon died on the signal instead of shutting down");
+    assert.equal(code, 0);
+});
+
+test("SIGHUP — what an ending SSH session sends — also shuts the daemon down cleanly", async () => {
+    const { code, signal } = await runDaemonUntilSignalled(["SIGHUP"]);
+    assert.equal(signal, null);
+    assert.equal(code, 0);
+});
+
+// A supervisor that does not see the process go immediately sends another
+// SIGTERM. The handler must stay installed and simply ignore it: deregistering
+// on the first signal restores the default disposition, and the second signal
+// would then kill the process mid-shutdown — reintroducing exactly the
+// signal-death this fix removes.
+test("a second signal during shutdown does not turn a clean exit into a kill", async () => {
+    const { code, signal } = await runDaemonUntilSignalled(["SIGTERM", "SIGTERM", "SIGINT"]);
+    assert.equal(signal, null);
+    assert.equal(code, 0);
 });

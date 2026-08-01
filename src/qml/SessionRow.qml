@@ -99,11 +99,19 @@ ItemDelegate {
         }
     }
 
-    ToolTip.visible: row.hovered
-    ToolTip.delay: 600
-    ToolTip.text: row.stale
-                  ? qsTr("%1 (last known \u2014 the link is down)").arg(row.stateWords(row.rowState))
-                  : row.stateWords(row.rowState)
+    // The module's one tooltip (AppToolTip.qml). The attached `ToolTip.text`
+    // form is drawn by the Basic style in that style's own light palette, so a
+    // hint about this dark sidebar arrived as a white box.
+    AppToolTip {
+        objectName: "sessionRowTip"
+        // Long enough that crossing the row on the way somewhere else does not
+        // flash it.
+        delay: 600
+        visible: row.hovered
+        text: row.stale
+              ? qsTr("%1 (last known \u2014 the link is down)").arg(row.stateWords(row.rowState))
+              : row.stateWords(row.rowState)
+    }
 
     // A screen reader gets nothing from this row otherwise: the delegate's own
     // `text` property is never used (the name arrives in `name`, a SessionsModel

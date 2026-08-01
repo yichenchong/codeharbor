@@ -231,7 +231,7 @@ bool TstLiveTerminalFactory::typeUntil(const QByteArray& command,
 
 QByteArray TstLiveTerminalFactory::runExec(const QString& command, int timeoutMs)
 {
-    SshChannelDevice device(&m_pool, SshConnectionPool::ChannelKind::Exec);
+    SshChannelDevice device(&m_pool);
     QByteArray out;
     bool finished = false;
     connect(&device, &SshChannelDevice::readyRead, &device,

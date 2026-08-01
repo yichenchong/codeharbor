@@ -175,7 +175,7 @@ void TstLiveSsh::execChannelDeliversStdout()
     ensureConnected();
     QCOMPARE(m_pool.state(), SshConnectionPool::State::Connected);
 
-    SshChannelDevice device(&m_pool, SshConnectionPool::ChannelKind::Exec);
+    SshChannelDevice device(&m_pool);
     ChannelSink sink;
     sink.attach(&device);
 
@@ -202,7 +202,7 @@ void TstLiveSsh::manyShortLivedChannelsReuseTheirSlots()
 
     constexpr int kChannelCount = 25;
     for (int i = 0; i < kChannelCount; ++i) {
-        SshChannelDevice device(&m_pool, SshConnectionPool::ChannelKind::Exec);
+        SshChannelDevice device(&m_pool);
         ChannelSink sink;
         sink.attach(&device);
 
@@ -234,7 +234,7 @@ void TstLiveSsh::ptyChannelRunsWithTheRequestedTerminalType()
     ensureConnected();
     QCOMPARE(m_pool.state(), SshConnectionPool::State::Connected);
 
-    SshChannelDevice device(&m_pool, SshConnectionPool::ChannelKind::Pty);
+    SshChannelDevice device(&m_pool);
     ChannelSink sink;
     sink.attach(&device);
 
@@ -265,7 +265,7 @@ void TstLiveSsh::rpcServerInfoOverSshChannel()
     const QString command = QStringLiteral("'%1' '%2/remote/src/codeharbord.ts' rpc --stdio")
                                 .arg(m_node, m_repo);
 
-    SshChannelDevice device(&m_pool, SshConnectionPool::ChannelKind::Rpc);
+    SshChannelDevice device(&m_pool);
     QString stderrText;
     QObject::connect(&device, &SshChannelDevice::channelError, &device,
                      [&stderrText](const QString& text) { stderrText += text; });
@@ -328,7 +328,7 @@ void TstLiveSsh::stderrStaysOutOfReadStream()
 
     // Exec (not Pty): a PTY would merge stderr into stdout at the kernel level
     // and the separation could not be observed at all.
-    SshChannelDevice device(&m_pool, SshConnectionPool::ChannelKind::Exec);
+    SshChannelDevice device(&m_pool);
     ChannelSink sink;
     sink.attach(&device);
 
@@ -735,7 +735,7 @@ void TstLiveSsh::deviceOutlivingItsSessionStopsCleanly()
     ensureConnected();
     QCOMPARE(m_pool.state(), SshConnectionPool::State::Connected);
 
-    SshChannelDevice device(&m_pool, SshConnectionPool::ChannelKind::Exec);
+    SshChannelDevice device(&m_pool);
     ChannelSink sink;
     sink.attach(&device);
 

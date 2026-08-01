@@ -23,6 +23,7 @@
 #include <QtTest/QtTest>
 
 #include <optional>
+#include <type_traits>
 
 using ch::CodeharbordClient;
 using ch::CreateGroupParams;
@@ -89,6 +90,9 @@ private slots:
     void resolveTerminalPaneSendsTheSlotAddressAndParsesTheRow();
     void resolveTerminalPaneAddressesARowByIdWithoutItsLabel();
     void setLayoutMalformedTreeDeliversRpcError();
+    void resolveTerminalPaneWithNoAddressFailsWithoutAskingTheServer();
+    void setLayoutRefusesATreeItCouldNotReadBack();
+    void workspaceDbCannotBeBuiltWithoutAClient();
     void updateOptionalsOmitUnsetAndSendEmptyStringsVerbatim();
     void liveCreateAndListOverProcess();
 
@@ -473,7 +477,7 @@ void TstWorkspaceDb::setLayoutSerializesInlineTree()
              QStringLiteral("s1"));
     QCOMPARE(params.value(QStringLiteral("region")).toString(),
              QStringLiteral("terminal"));
-    // The tree is an inline split-tree object mirroring SplitNode::toJson.
+    // The tree is an inline split-tree object mirroring SplitNode::tryToJson.
     const QJsonObject treeObj = params.value(QStringLiteral("tree")).toObject();
     QCOMPARE(treeObj.value(QStringLiteral("type")).toString(),
              QStringLiteral("split"));
@@ -1200,7 +1204,7 @@ void TstWorkspaceDb::resolveTerminalPaneAddressesARowByIdWithoutItsLabel()
     m_db->resolveTerminalPane(
         ch::ResolveTerminalPaneParams{.serverId = ch::ServerId{QStringLiteral("srv-1")},
                                       .devSessionId = ch::DevSessionId{QStringLiteral("s1")},
-                                      .id = QStringLiteral("row-uuid"),
+                                      .id = ch::TerminalId{QStringLiteral("row-uuid")},
                                       .name = QStringLiteral("terminal-2")},
         [](std::optional<ch::TerminalPane>, std::optional<RpcError>) {});
 
@@ -1208,6 +1212,112 @@ void TstWorkspaceDb::resolveTerminalPaneAddressesARowByIdWithoutItsLabel()
         readRequest().value(QStringLiteral("params")).toObject();
     QCOMPARE(params.value(QStringLiteral("id")).toString(), QStringLiteral("row-uuid"));
     QVERIFY(!params.contains(QStringLiteral("name")));
+}
+
+// Neither address is not a question: there is no row id and no slot label, so
+// there is nothing to look up. It used to go out as `name: ""`, asking the
+// server to find - or CREATE - a pane called "". The refusal happens here, with
+// nothing on the wire, and it arrives the way every other answer does: from the
+// event loop, after this method has returned, never re-entering the caller from
+// inside its own call.
+void TstWorkspaceDb::resolveTerminalPaneWithNoAddressFailsWithoutAskingTheServer()
+{
+    makePair();
+
+    bool fired = false;
+    std::optional<RpcError> err;
+    std::optional<ch::TerminalPane> pane;
+    m_db->resolveTerminalPane(
+        ch::ResolveTerminalPaneParams{
+            .serverId = ch::ServerId{QStringLiteral("srv-1")},
+            .devSessionId = ch::DevSessionId{QStringLiteral("s1")}},
+        [&](std::optional<ch::TerminalPane> p, std::optional<RpcError> e) {
+            pane = p;
+            err = e;
+            fired = true;
+        });
+
+    QVERIFY(!fired); // async like every other reply; no caller is re-entered
+    QTRY_VERIFY(fired);
+    QVERIFY(!pane.has_value());
+    QVERIFY(err.has_value());
+    QCOMPARE(err->code, -32602);
+    QVERIFY2(err->message.contains(
+                 QString::fromLatin1(ch::rpc::kMethodWorkspaceResolveTerminalPane)),
+             qPrintable(err->message));
+
+    // Nothing was asked of the server: no request frame, and no id burned.
+    m_clientSide->flush();
+    QVERIFY(!m_serverSide->waitForReadyRead(100));
+    QCOMPARE(m_serverSide->bytesAvailable(), 0);
+    QCOMPARE(m_client->pendingCount(), 0);
+}
+
+// A tree the client cannot read back must not be written. Storing one loses the
+// user's layout silently: setLayout reports success, and the loss only shows up
+// on the next launch, when getLayout maps the unreadable tree to "no layout".
+// The refusal is local, so the bad bytes never reach the server at all.
+void TstWorkspaceDb::setLayoutRefusesATreeItCouldNotReadBack()
+{
+    makePair();
+
+    SplitNode a;
+    a.paneId = QStringLiteral("pA");
+    SplitNode b;
+    b.paneId = QStringLiteral("pB");
+    SplitNode bad;
+    bad.children = {a, b};
+    bad.ratios = {1.0}; // one ratio for two children: fromJson refuses this
+
+    bool fired = false;
+    std::optional<RpcError> err;
+    std::optional<SplitNode> stored;
+    m_db->setLayout(ch::ServerId{QStringLiteral("srv-1")},
+                    ch::DevSessionId{QStringLiteral("s1")}, ch::Region::Viewer,
+                    bad,
+                    [&](std::optional<SplitNode> tree, std::optional<RpcError> e) {
+                        stored = tree;
+                        err = e;
+                        fired = true;
+                    });
+
+    QVERIFY(!fired); // async like every other reply
+    QTRY_VERIFY(fired);
+    QVERIFY(!stored.has_value());
+    QVERIFY(err.has_value());
+    QCOMPARE(err->code, -32602);
+    QVERIFY2(err->message.contains(kSetLayout), qPrintable(err->message));
+
+    m_clientSide->flush();
+    QVERIFY(!m_serverSide->waitForReadyRead(100));
+    QCOMPARE(m_serverSide->bytesAvailable(), 0);
+    QCOMPARE(m_client->pendingCount(), 0);
+
+    // The same call with a tree that DOES round-trip still goes out, so the
+    // check is selective rather than a blanket refusal.
+    bad.ratios = {1.0, 1.0};
+    m_db->setLayout(ch::ServerId{QStringLiteral("srv-1")},
+                    ch::DevSessionId{QStringLiteral("s1")}, ch::Region::Viewer,
+                    bad,
+                    [](std::optional<SplitNode>, std::optional<RpcError>) {});
+    const QJsonObject req = readRequest();
+    QCOMPARE(req.value(QStringLiteral("method")).toString(), kSetLayout);
+    QVERIFY(SplitNode::fromJson(req.value(QStringLiteral("params"))
+                                    .toObject()
+                                    .value(QStringLiteral("tree"))
+                                    .toObject())
+            == bad);
+}
+
+// The repository dereferences its client in every method, so there is no such
+// thing as a WorkspaceDb without one. A literal nullptr is refused by the
+// compiler; this pins that the deleted overload exists, because the mistake it
+// prevents is a crash inside whichever async method happened to run first,
+// arbitrarily far from the construction site that caused it.
+void TstWorkspaceDb::workspaceDbCannotBeBuiltWithoutAClient()
+{
+    QVERIFY(!(std::is_constructible_v<WorkspaceDb, std::nullptr_t>));
+    QVERIFY((std::is_constructible_v<WorkspaceDb, CodeharbordClient*>));
 }
 
 // setLayout has NO legitimate "there is no layout here" answer: it echoes the

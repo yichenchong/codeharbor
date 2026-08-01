@@ -27,11 +27,10 @@ enum class SplitOrientation { Horizontal, Vertical };
 // guarantee. This file has no in-place split/remove/move operations, but if any
 // are ever added, node lifetime and tree invariants must be re-examined here.
 //
-// Depth invariant: every in-memory SplitNode tree is kept within the same
-// nesting bound (kMaxDepth in SplitTree.cpp) that fromJson() enforces on parse.
-// fromJson() rejects deeper input, and layouts constructed in-memory nest only a
-// handful of levels, so toJson() and operator==, which recurse WITHOUT their own
-// depth guard, are safe: they only ever walk trees that already honor the bound.
+// Depth invariant: kMaxDepth below is the ONE nesting bound for this type. Every
+// recursive operation here — the parser, the writer and operator== — enforces
+// it, so no operation on a SplitNode can be driven into stack exhaustion by a
+// hostile or corrupt tree, whatever its provenance.
 struct SplitNode {
     QString paneId;
     // What this leaf has open (SPEC 4.5 pane content). Empty means "nothing
@@ -63,8 +62,27 @@ struct SplitNode {
 
     bool isLeaf() const { return children.isEmpty(); }
 
-    // Exact JSON round-trip. toJson()/fromJson() are inverses for any valid tree.
-    QJsonObject toJson() const;
+    // Hard cap on nesting depth, counting the root as level 1. Split trees are
+    // persisted and may arrive from the remote server (SPEC 2.1 remote-first),
+    // so they are not all this client's own work: without a bound, adversarial
+    // or corrupt deeply-nested input would recurse until the stack overflows
+    // and takes the process with it. Real layouts nest a handful of levels — a
+    // user splitting a region one level at a time — so 256 is far beyond any
+    // genuine use while staying well inside the stack a default thread gets.
+    static constexpr int kMaxDepth = 256;
+
+    // Serialize, or std::nullopt when this tree is not one tryFromJson() would
+    // accept back.
+    //
+    // THE WRITER AND THE READER AGREE, and this signature is what enforces it:
+    // a SplitNode is an aggregate, so nothing stops a caller assembling a split
+    // with the wrong number of ratios, a NaN/negative ratio, or nesting past
+    // kMaxDepth. Emitting such a tree would persist bytes that no client —
+    // including the one that wrote them — can ever load again, and the loss
+    // would only surface on the next launch. So the invalid shape is not
+    // written at all; the caller gets a clean std::nullopt to report instead.
+    // For every tree this does serialize, fromJson(*tryToJson()) == *this.
+    std::optional<QJsonObject> tryToJson() const;
 
     // Decode, or std::nullopt when `obj` is not a valid split tree.
     //
@@ -83,12 +101,18 @@ struct SplitNode {
     // callers to which a rejected tree and an empty leaf are the same thing.
     static SplitNode fromJson(const QJsonObject &obj);
 
-    // Structural equality mirroring toJson(): leaf identity is its paneId, url
-    // and terminalPaneId (orientation/ratios are meaningless and dropped for
+    // Structural equality mirroring tryToJson(): leaf identity is its paneId,
+    // url and terminalPaneId (orientation/ratios are meaningless and dropped for
     // leaves), while a split is defined by orientation, ratios, and children
     // (paneId, url and terminalPaneId are dropped). This keeps
-    // fromJson(toJson(x)) == x for any valid tree, which a defaulted
-    // operator== would break by comparing fields toJson() does not persist.
+    // fromJson(*tryToJson(x)) == x for any serializable tree, which a defaulted
+    // operator== would break by comparing fields tryToJson() does not persist.
+    //
+    // Bounded by kMaxDepth like every other recursion here: two nodes still
+    // nested deeper than that compare UNEQUAL rather than recursing on. No tree
+    // that deep can be parsed or serialized, so the guard only fires on a
+    // hand-assembled monster, and "unequal" is the safe verdict — it never
+    // claims two trees are the same on the strength of a walk we cut short.
     bool operator==(const SplitNode &other) const;
 };
 

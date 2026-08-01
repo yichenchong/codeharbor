@@ -4,8 +4,12 @@ import { ohMyPiAdapter } from "./oh-my-pi.ts";
 import { piAdapter } from "./pi.ts";
 import { claudeCodeAdapter } from "./claude-code.ts";
 
-// Static registry. "generic" has no adapter (fallback activity detection only,
-// SPEC 6.6), so the table is partial over Harness.
+// Static registry. "generic" has no adapter and never will: it names a harness
+// that publishes no lifecycle events, so there is nothing to map. Such a pane
+// gets its agent state from terminal-output activity instead, derived on the
+// CLIENT in ch::AgentStatusMonitor (SPEC 6.6) — the daemon has no per-pane
+// source of terminal output. So the table is partial over Harness, and
+// adapterFor() answering undefined is the whole of this side's handling.
 const registry: Partial<Record<Harness, HarnessAdapter>> = {
     "oh-my-pi": ohMyPiAdapter,
     pi: piAdapter,

@@ -18,6 +18,7 @@ Options:
   --set X.Y.Z    Use an explicit version instead of bumping a component.
   --push         Push the commit and tag to origin after creating them.
   --no-commit    Tag the current HEAD without a release commit or file edits.
+                 HEAD must already carry X.Y.Z; the tag is refused otherwise.
   --dry-run      Print the planned actions without changing anything.
   --allow-dirty  Proceed even if the version files have uncommitted changes.
   -h, --help     Show this help.
@@ -99,7 +100,12 @@ echo "Current version: $current"
 echo "New version:     $new  (tag $tag)"
 
 if [ "$DRY_RUN" -eq 1 ]; then
-    echo "[dry-run] would update version files, commit, and create annotated tag $tag"
+    if [ "$DO_COMMIT" -eq 1 ]; then
+        echo "[dry-run] would update version files, commit, and create annotated tag $tag"
+    else
+        echo "[dry-run] would create annotated tag $tag on the current HEAD," \
+             "which must already carry $new"
+    fi
     [ "$DO_PUSH" -eq 1 ] && echo "[dry-run] would push commit + $tag to origin"
     exit 0
 fi
@@ -200,6 +206,41 @@ fs.writeFileSync("package-lock.json",JSON.stringify(l,null,2)+"\n");
         echo "Committed version bump: ${changed[*]}"
     fi
 fi
+
+# A tag whose TREE carries a different version publishes a mislabelled release:
+# the binary, the daemon's `server.info` reply and the remote tarball all say
+# 0.1.8 under a release page called v0.2.0. Nothing downstream can undo it - a
+# tag is permanent, and the publish job's installer-filename assertion catches it
+# only after the cross-OS build has run, if it runs at all (that assertion covers
+# the Windows asset alone).
+#
+# So the tag is refused unless the commit it points at already carries $new
+# everywhere. This is what `--no-commit` used to be able to get wrong: it tags
+# HEAD without editing anything, which is right when HEAD is already the release
+# commit and wrong in every other case, and it could not tell the difference.
+#
+# The check reads the COMMITTED tree, not the working tree: the tag names a
+# commit, and an unrelated dirty edit (or --allow-dirty) must not be able to make
+# a bad HEAD look good. `git archive` extracts just the version files plus the
+# checker, so the same rules that gate CI decide this too - one implementation,
+# not two that can disagree.
+command -v tar >/dev/null || die "tar not found (needed to verify the tagged tree)"
+git rev-parse -q --verify HEAD >/dev/null || die "no commit to tag"
+
+verify_tree="$(mktemp -d)"
+trap 'rm -rf "$verify_tree"' EXIT
+git archive HEAD -- "${VERSION_FILES[@]}" .github/scripts/check-versions.mjs \
+    | tar -x -C "$verify_tree" \
+    || die "could not read the version files out of HEAD; refusing to tag $tag"
+
+head_version="$(node -e 'const s=require("fs").readFileSync(process.argv[1],"utf8");const m=s.match(/project\(CodeHarbor[\s\S]*?VERSION\s+(\d+\.\d+\.\d+)/);process.stdout.write(m?m[1]:"")' "$verify_tree/CMakeLists.txt")"
+if [ "$head_version" != "$new" ]; then
+    die "refusing to create $tag: the commit being tagged carries version '${head_version:-<unparseable>}', not $new.
+Tag a commit that carries $new - re-run without --no-commit to make one, or bump the files and commit them first."
+fi
+
+(cd "$verify_tree" && node .github/scripts/check-versions.mjs) \
+    || die "refusing to create $tag: the commit being tagged disagrees with itself about the version (see above)."
 
 git tag -a "$tag" -m "$tag"
 echo "Created annotated tag $tag"

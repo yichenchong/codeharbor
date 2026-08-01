@@ -113,9 +113,12 @@ that environment boundary. Do not paste a passphrase into logs or bug reports.
 Then create a group, add a Dev Session pointing at a project directory on the
 server, and you have terminals, an editor, and viewers against that project.
 
-> Verified for `v0.1.0` by installing the published artifacts: the downloaded
-> AppImage, pointed at an unpacked `codeharbor-remote.tar.gz`, connected over SSH
-> and launched both remote services from `dist/`. No source checkout involved.
+> **Install path last verified end to end at `v0.1.0`**, by installing the
+> published artifacts: the downloaded AppImage, pointed at an unpacked
+> `codeharbor-remote.tar.gz`, connected over SSH and launched both remote
+> services from `dist/`. No source checkout involved. Later releases have not
+> been re-verified that way, so this is a record of one dated run rather than a
+> statement about the current release.
 
 ## Keyboard shortcuts
 
@@ -129,7 +132,7 @@ shortcuts SPEC 15 originally suggested, in [`docs/SPEC.md`](docs/SPEC.md) — is
 | `Ctrl+Shift+O` | Connect to Server… |
 | `Ctrl+Shift+R` | Refresh Workspace |
 | `Ctrl+Shift+W` | Close Window (the window is frameless, so it has no close button) |
-| `Ctrl+S` | Save the file in the focused editor pane |
+| `Ctrl+S` | Save the file in the focused editor |
 
 Splitting and closing panes, killing a terminal's remote tmux session, disconnecting,
 and marking agent output seen are palette commands with no key sequence. There is no

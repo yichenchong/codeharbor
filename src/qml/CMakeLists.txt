@@ -23,6 +23,7 @@ qt_add_qml_module(codeharbor_qml
         AppTitleBar.qml
         AppSplitHandle.qml
         AppScrollBar.qml
+        AppToolTip.qml
         AppPaneHeader.qml
         SessionsSidebar.qml
         GroupHeader.qml
@@ -32,7 +33,6 @@ qt_add_qml_module(codeharbor_qml
         ViewerRegion.qml
         ViewerPane.qml
         ViewerWebView.qml
-        ViewerTextView.qml
         ViewerImageView.qml
         ViewerPdfView.qml
         ViewerDirectoryView.qml
@@ -73,12 +73,14 @@ target_link_libraries(codeharbor_qml PUBLIC
 # CMAKE_BUILD_TYPE at configure time, and the bundle IS built at configure time)
 # defaults to OFF and must use the override to get maps.
 #
-# Derived fresh on every configure rather than cached with option(). A cached
-# default would stick to whatever the build type was on the FIRST configure of a
-# directory, so re-configuring an existing Debug directory as Release would go on
-# embedding ~15 MB of maps in a binary labelled Release. An explicit
-# -DCODEHARBOR_WEB_SOURCEMAP=ON/OFF does persist — CMake puts it in the cache
-# before this file runs, so it is already DEFINED here and wins.
+# CODEHARBOR_WEB_SOURCEMAP itself is declared in the top-level CMakeLists.txt as
+# a tri-state cache STRING (AUTO/ON/OFF) so it is visible in `cmake -LH`, ccmake
+# and the IDE preset UIs, which is where both documents tell people to look. The
+# build-type default is NOT cached: AUTO is what sits in the cache, and the
+# effective value below is derived fresh on every configure, so re-configuring an
+# existing Debug directory as Release stops embedding maps instead of carrying a
+# cached ON forward into a binary labelled Release. An explicit ON/OFF is in the
+# cache before this file runs and wins.
 #
 # Both bundles are handled by this ONE function, called twice below: the two
 # blocks it replaced were near-identical, so a fix applied to one of them could
@@ -90,13 +92,19 @@ target_link_libraries(codeharbor_qml PUBLIC
 #   PANE      human name of the QML pane that loads it, used in messages
 #   FILES     dist file names to embed, relative to src/web/<DIR>/dist
 
-if(NOT DEFINED CODEHARBOR_WEB_SOURCEMAP)
+# The effective value the function below reads. Never write back to the cache
+# variable here: that would turn today's build type into tomorrow's sticky
+# default, which is the exact bug AUTO exists to avoid.
+set(_chb_sourcemap "${CODEHARBOR_WEB_SOURCEMAP}")
+if(_chb_sourcemap STREQUAL "AUTO" OR _chb_sourcemap STREQUAL "")
     if(CMAKE_BUILD_TYPE STREQUAL "Debug")
-        set(CODEHARBOR_WEB_SOURCEMAP ON)
+        set(_chb_sourcemap ON)
     else()
-        set(CODEHARBOR_WEB_SOURCEMAP OFF)
+        set(_chb_sourcemap OFF)
     endif()
 endif()
+message(STATUS "web bundles: source maps ${_chb_sourcemap}"
+               " (CODEHARBOR_WEB_SOURCEMAP=${CODEHARBOR_WEB_SOURCEMAP})")
 
 function(codeharbor_embed_web_bundle)
     cmake_parse_arguments(CHB "" "DIR;RESOURCE;LABEL;PANE" "FILES" ${ARGN})
@@ -142,7 +150,7 @@ function(codeharbor_embed_web_bundle)
         endforeach()
     endif()
 
-    # Flipping CODEHARBOR_WEB_SOURCEMAP changes what dist/ must CONTAIN without
+    # Flipping the source-map setting changes what dist/ must CONTAIN without
     # touching the mtime of a single input, so the timestamp comparison above
     # would happily keep a mapless bundle for a Debug configure — and then fail
     # the resource step below on a .map that was never built. Compare what is on
@@ -159,9 +167,9 @@ function(codeharbor_embed_web_bundle)
         endif()
     endforeach()
     foreach(_chb_map IN LISTS _chb_maps)
-        if(CODEHARBOR_WEB_SOURCEMAP AND NOT EXISTS ${_chb_dist}/${_chb_map})
+        if(_chb_sourcemap AND NOT EXISTS ${_chb_dist}/${_chb_map})
             set(_chb_stale TRUE)
-        elseif(NOT CODEHARBOR_WEB_SOURCEMAP AND EXISTS ${_chb_dist}/${_chb_map})
+        elseif(NOT _chb_sourcemap AND EXISTS ${_chb_dist}/${_chb_map})
             set(_chb_stale TRUE)
         endif()
     endforeach()
@@ -170,7 +178,7 @@ function(codeharbor_embed_web_bundle)
     # declared in package.json, so a developer can reproduce exactly what
     # configure ran by name instead of reverse-engineering it from here.
     set(_chb_npm_script build)
-    if(CODEHARBOR_WEB_SOURCEMAP)
+    if(_chb_sourcemap)
         set(_chb_npm_script build:sourcemap)
     endif()
 
@@ -234,7 +242,7 @@ function(codeharbor_embed_web_bundle)
         # so this EXISTS gate is what keeps a Debug configure whose bundle build
         # was skipped (no npm) or failed from piling a baffling missing-.map
         # error on top of the real cause.
-        if(CODEHARBOR_WEB_SOURCEMAP)
+        if(_chb_sourcemap)
             set(_chb_have_maps TRUE)
             foreach(_chb_map IN LISTS _chb_maps)
                 if(NOT EXISTS ${_chb_dist}/${_chb_map})

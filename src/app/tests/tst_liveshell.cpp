@@ -158,7 +158,7 @@ struct FreshView {
     QString stderrText;
 
     explicit FreshView(SshConnectionPool* pool)
-        : device(pool, SshConnectionPool::ChannelKind::Rpc)
+        : device(pool)
         , client()
         , controller(&client)
     {

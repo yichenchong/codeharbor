@@ -123,8 +123,15 @@ Node 23.6+).
   or [`aqtinstall`](https://github.com/miurahr/aqtinstall) (what CI uses) work on
   all three OSes.
 
-CI provisions the same set — see [`.github/workflows/ci.yml`](../.github/workflows/ci.yml)
-(`client` job installs Qt via `jurplel/install-qt-action` + `apt` for libssh/ninja).
+CI provisions the same set on **all three release platforms** — see
+[`.github/workflows/ci.yml`](../.github/workflows/ci.yml). Its `client` job is a
+matrix over `ubuntu-latest`, `windows-latest` and `macos-latest`: Qt via
+`jurplel/install-qt-action`, CMake and Ninja via `lukka/get-cmake`, and libssh via
+`apt` on Linux, Homebrew on macOS and vcpkg (in-tree overlay port) on Windows —
+the same per-OS provisioning `release.yml` uses, so a green run means the release
+build compiles on every platform it ships to. What CI does *not* do is package:
+`linuxdeploy`/`windeployqt`/`macdeployqt` and the Inno Setup installer stay
+release-only.
 
 ## Build & run
 
@@ -151,16 +158,22 @@ If a bundle is missing and cannot be built (no `npm` on `PATH`), configure
 loads nothing is never the default. Pass `-DCODEHARBOR_SKIP_WEB_BUNDLE=ON` to
 deliberately build a client with both panes inert.
 
-Source maps are a configure-time option, `CODEHARBOR_WEB_SOURCEMAP`, which defaults
-to **ON for a `Debug` configure and OFF otherwise**. When it is on, CMake runs each
-workspace's `build:sourcemap` script instead of `build` and embeds the resulting
-`*.js.map` / `*.css.map` alongside the bundle, so a JavaScript fault in the editor
-or terminal page resolves to the original TypeScript in WebEngine's developer tools
-instead of pointing into one minified line. The maps are not small — Monaco's three
-come to ~15 MB — which is exactly why a Release binary never contains them. A
-multi-config generator has no `CMAKE_BUILD_TYPE` at configure time (and the bundle
-is built at configure time), so it defaults to off; pass
-`-DCODEHARBOR_WEB_SOURCEMAP=ON`/`=OFF` to decide explicitly.
+Source maps are a configure-time cache variable, `CODEHARBOR_WEB_SOURCEMAP`, with
+three values: `AUTO` (the default), `ON` and `OFF`. `AUTO` means **ON for a
+`Debug` configure and OFF otherwise**, and is re-derived on every configure, so
+re-configuring an existing Debug directory as Release stops embedding maps rather
+than carrying the first configure's answer forward. It is declared in the
+top-level `CMakeLists.txt`, so it shows up in `cmake -LH`, `ccmake` and the IDE
+preset UIs with those three values offered. When it resolves to on, CMake runs
+each workspace's `build:sourcemap` script instead of `build` and embeds the
+resulting `*.js.map` / `*.css.map` alongside the bundle, so a JavaScript fault in
+the editor or terminal page resolves to the original TypeScript in WebEngine's
+developer tools instead of pointing into one minified line. The maps are not
+small — Monaco's three come to ~15 MB — which is exactly why a Release binary
+never contains them. A multi-config generator has no `CMAKE_BUILD_TYPE` at
+configure time (and the bundle is built at configure time), so `AUTO` resolves to
+off there; pass `-DCODEHARBOR_WEB_SOURCEMAP=ON`/`=OFF` to decide explicitly, which
+persists in the cache until it is set back to `AUTO`.
 
 Both build directories share the one `src/web/*/dist`, and the option changes what
 has to be in it, so switching between a Debug and a Release configure rebuilds both
@@ -435,13 +448,18 @@ The workflow's first real execution failed on **each** platform for a different
 reason — Linux could not resolve `libQt6SerialPort.so.6` while packaging, and
 Windows both failed to build the web bundle and looked for the executable in the
 wrong directory. A tag that fails leaves a permanent public tag with no release
-attached; a dispatch costs nothing.
+attached; a dispatch costs nothing. CI now compiles and tests the client on all
+three platforms per commit, so the *build* half of that class of failure is
+caught long before a tag — but packaging is still release-only, and packaging is
+where two of those three failures actually were.
 
-The dry run also **seeds the Windows vcpkg cache**. GitHub only lets a run
-restore a cache written by its own ref or by the default branch, so a cache
-written by a tag build is unreachable from every later tag. Seeding happens on
-`main` or not at all — which is why `v0.1.0` paid the full ~9.8 min to rebuild
-libssh from source.
+The dry run also **refreshes the Windows vcpkg cache** from a ref a tag can read.
+GitHub only lets a run restore a cache written by its own ref or by the default
+branch, so a cache written by a tag build is unreachable from every later tag.
+Every push to `main` now writes that entry as part of the CI client matrix's
+Windows leg, and a dispatch on `main` writes it too; a tag can only ever restore
+one of those — which is why `v0.1.0`, before either existed, paid the full
+~9.8 min to rebuild libssh from source.
 
 ### Building locally on each OS
 

@@ -12,7 +12,6 @@ import {
     readHookInput,
     type HookInput,
 } from "../src/hooks/oh-my-pi-hook.ts";
-import { FallbackActivityDetector } from "../src/adapters/fallback.ts";
 import { PassThrough } from "node:stream";
 import { resolveSocketPath, type AgentEvent } from "../src/events.ts";
 import {
@@ -61,6 +60,49 @@ test("readHookInput reads event from argv and coordinates from env", () => {
     assert.equal(input.terminalId, "term-9");
     assert.equal(input.tool, "ask");
     assert.equal(input.error, true);
+});
+
+// AG-N4. HookInput and BridgeMessage both declare a free-form metadata bag and
+// toBridgeMessage forwards it, but nothing ever populated it from a hook
+// invocation: only a programmatic caller could set it, and no installed hook is
+// one. $OMP_METADATA is the missing input.
+test("readHookInput carries a free-form metadata bag from OMP_METADATA (AG-N4)", () => {
+    const input = readHookInput(["node", "hook.ts", "agent_start"], {
+        OMP_DEV_SESSION_ID: "sess-9",
+        OMP_TERMINAL_ID: "term-9",
+        OMP_METADATA: '{"model":"pi-2","turn":7,"nested":{"a":[1,2]}}',
+    } as NodeJS.ProcessEnv);
+    assert.deepEqual(input.metadata, { model: "pi-2", turn: 7, nested: { a: [1, 2] } });
+    // ...and it reaches the wire message untouched.
+    assert.deepEqual(toBridgeMessage(input).metadata, {
+        model: "pi-2",
+        turn: 7,
+        nested: { a: [1, 2] },
+    });
+
+    // Metadata is OPTIONAL, so anything unusable costs the metadata and nothing
+    // else — never the event, never a throw (SPEC 6.4). A JSON array is
+    // unusable too: the field is a record on the wire and a QJsonObject in the
+    // client, so an array would be dropped further downstream where nobody
+    // could see it happen.
+    for (const raw of ["", "   ", "not json", "null", "7", '"str"', "[1,2]", "{"]) {
+        const degraded = readHookInput(["node", "hook.ts", "agent_start"], {
+            OMP_DEV_SESSION_ID: "sess-9",
+            OMP_TERMINAL_ID: "term-9",
+            OMP_METADATA: raw,
+        } as NodeJS.ProcessEnv);
+        assert.equal(degraded.metadata, undefined, `OMP_METADATA=${JSON.stringify(raw)}`);
+        assert.equal(degraded.event, "agent_start", `OMP_METADATA=${JSON.stringify(raw)}`);
+    }
+
+    // Absent stays absent rather than becoming an empty object: the wire field
+    // is optional and an empty bag is not the same as no bag.
+    const none = readHookInput(["node", "hook.ts", "agent_start"], {
+        OMP_DEV_SESSION_ID: "sess-9",
+        OMP_TERMINAL_ID: "term-9",
+    } as NodeJS.ProcessEnv);
+    assert.equal(none.metadata, undefined);
+    assert.ok(!("metadata" in toBridgeMessage(none)));
 });
 
 // Emit a hook event over a real socket and return the raw JSONL line the bridge
@@ -150,22 +192,27 @@ test("emitHookEvent -> bridge: unknown native event is a no-op (null)", async ()
     assert.equal(processBridgeLine(raw), null);
 });
 
-test("FallbackActivityDetector: starting, then running within threshold, idle after", () => {
-    const detector = new FallbackActivityDetector(2000);
-    // No output yet.
-    assert.equal(detector.state(0), "starting");
+// AG-N4, end to end: a metadata bag set in the harness's environment survives
+// the hook, the socket and the bridge's adapter merge, and arrives on the
+// AgentEvent the client parses. The adapter-derived `tool` is still there — the
+// bag adds to it, and only a same-named key overrides it, which is the existing
+// documented merge order.
+test("OMP_METADATA reaches the AgentEvent through the bridge (AG-N4)", async () => {
+    const input = readHookInput(["node", "hook.ts", "tool_call"], {
+        OMP_DEV_SESSION_ID: "sess-4",
+        OMP_TERMINAL_ID: "term-4",
+        OMP_TOOL: "ask",
+        OMP_METADATA: '{"model":"pi-2","tool":"overridden"}',
+    } as NodeJS.ProcessEnv);
+    const raw = await emitAndReceive(input);
 
-    detector.note(1000);
-    // Output 500ms ago -> within threshold -> running.
-    assert.equal(detector.state(1500), "running");
-    // Boundary: exactly at threshold is idle (strict less-than window).
-    assert.equal(detector.state(3000), "idle");
-    // Well past threshold -> idle.
-    assert.equal(detector.state(5000), "idle");
+    const decoded = JSON.parse(raw.trim());
+    assert.deepEqual(decoded.metadata, { model: "pi-2", tool: "overridden" });
 
-    // Fresh output revives the running state.
-    detector.note(5000);
-    assert.equal(detector.state(5100), "running");
+    const event = processBridgeLine(raw);
+    assert.ok(event, "bridge must map the message to an AgentEvent");
+    assert.equal(event.state, "waiting_input");
+    assert.deepEqual(event.metadata, { model: "pi-2", tool: "overridden" });
 });
 
 test("readHookInput falls back to OMP_HOOK_EVENT and ignores a false OMP_ERROR", () => {
@@ -263,6 +310,48 @@ test("main prints usage and touches no socket when the event name is missing", a
     });
     assert.equal(logged.length, 1);
     assert.match(logged[0], /^usage: /);
+});
+
+// AG-N4. Unusable metadata never blocks the event, but a silently dropped bag
+// is invisible — and the person who wrote the JSON is standing in the shell the
+// hook was launched from, which is the only place the mistake is actionable.
+// The event must still go out.
+test("main warns about unusable OMP_METADATA and emits anyway (AG-N4)", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ch-hook-meta-"));
+    const socketPath = resolveSocketPath({ XDG_RUNTIME_DIR: dir } as NodeJS.ProcessEnv);
+    const received = Promise.withResolvers<string>();
+    const server = net.createServer((socket) => {
+        const chunks: Buffer[] = [];
+        socket.on("data", (chunk) => chunks.push(chunk));
+        socket.on("end", () => received.resolve(Buffer.concat(chunks).toString("utf8")));
+    });
+    const listening = Promise.withResolvers<void>();
+    server.listen(socketPath, () => listening.resolve());
+    await listening.promise;
+
+    let logged: string[] = [];
+    try {
+        logged = await captureStderr(async () => {
+            await main(["node", "oh-my-pi-hook.ts", "agent_start"], {
+                XDG_RUNTIME_DIR: dir,
+                OMP_DEV_SESSION_ID: "sess-m",
+                OMP_TERMINAL_ID: "term-m",
+                OMP_METADATA: "[not, an, object]",
+            } as NodeJS.ProcessEnv);
+        });
+        const raw = await received.promise;
+        const decoded = JSON.parse(raw.trim());
+        assert.equal(decoded.devSessionId, "sess-m");
+        assert.deepEqual(decoded.native, { type: "agent_start" });
+        assert.ok(!("metadata" in decoded), "the unusable bag must not reach the wire");
+    } finally {
+        const closed = Promise.withResolvers<void>();
+        server.close(() => closed.resolve());
+        await closed.promise;
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
+    assert.equal(logged.length, 1);
+    assert.match(logged[0], /ignoring OMP_METADATA/);
 });
 
 // A hook whose environment lacks the session coordinates must NOT emit: the

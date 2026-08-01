@@ -555,6 +555,15 @@ void EditorController::open(QString path)
     m_recoveryWritesInFlight = 0;
     m_recoveryClearPending = false;
     ++m_recoveryGeneration;
+    // The save chain belongs to the file being left behind: a write still on the
+    // wire for it must not make a save on the NEW file queue behind it, and the
+    // bytes queued for it are not owed to the new one. Bumping the generation is
+    // what stops that write's reply from clearing the flag or consuming the
+    // queue of the chain started here.
+    ++m_saveGeneration;
+    m_saveInFlight = false;
+    m_inFlightSaveContent.clear();
+    m_queuedSaveContent.reset();
     // Read-only is per-FILE and re-derived below; carrying the previous file's
     // verdict over would either lock an editable file or, worse, leave an
     // unwritable one editable.
@@ -587,8 +596,27 @@ void EditorController::open(QString path)
                            return;
                        }
                        const QJsonObject obj = result.toObject();
-                       const QString content =
-                           obj.value(QStringLiteral("content")).toString();
+                       // base64 means the daemon's STRICT UTF-8 decode refused
+                       // these bytes and sent them exactly as they are
+                       // (remote/src/files.ts). Decode before showing anything:
+                       // the pane must display the file, with replacement
+                       // characters where the invalid sequences are, not a wall
+                       // of base64. The decode itself is rpc::decodeFileContent
+                       // (src/remote/RpcTypes.h), which lives with the reply
+                       // shape rather than here so the next consumer of a
+                       // file.readFile reply does not rediscover it.
+                       const std::optional<QString> decoded =
+                           rpc::decodeFileContent(obj);
+                       if (!decoded) {
+                           // A base64 payload that is not valid base64: a server
+                           // bug or a corrupted frame. Nothing legible exists to
+                           // show and the raw payload would be worse, so this is
+                           // an honest read failure. Nothing has been mutated
+                           // yet, so the pane keeps the file it had.
+                           self->setFileState(FileState::Error);
+                           return;
+                       }
+                       const QString content = *decoded;
                        const QString revision =
                            obj.value(QStringLiteral("revision")).toString();
                        self->m_revision = revision;
@@ -716,6 +744,34 @@ void EditorController::save(QString content, QString expectedRevision)
         return;
     }
 
+    // Two saves inside one round trip are ordinary: the save key is far faster
+    // than an SSH hop, so a user who presses it twice puts two writes on the
+    // wire carrying the SAME expectedRevision. The first replaces that revision
+    // and the second is refused against it, and the pane then reports "file
+    // changed on disk" for a change nobody but this client made. That is not a
+    // conflict, and the user must not be shown one for it.
+    //
+    // So the writes are serialised rather than raced. If one is already on the
+    // wire, this save either IS that write (identical bytes: the user pressed
+    // the key again on an unchanged buffer, and re-sending would only move the
+    // file's mtime and wake every other watcher for nothing) or it is the next
+    // one, queued and issued by that write's reply guarded by the revision it
+    // produces — which is the guard this save should have carried and could not
+    // know. Nothing is dropped and nothing new is shown: the pane stays in
+    // Saving until the last write of the chain answers, and that one reply is
+    // the single outcome the page sees.
+    if (m_saveInFlight) {
+        m_queuedSaveContent = content == m_inFlightSaveContent
+                                  ? std::nullopt
+                                  : std::optional<QString>(std::move(content));
+        return;
+    }
+
+    issueSave(std::move(content), std::move(expectedRevision));
+}
+
+void EditorController::issueSave(QString content, QString expectedRevision)
+{
     // The bytes handed to us are, by definition, not yet the bytes on the
     // server. Mark the buffer dirty for the duration of the write: if it fails,
     // or the session dies with it in flight, the buffer still holds work that is
@@ -728,15 +784,31 @@ void EditorController::save(QString content, QString expectedRevision)
     setFileState(FileState::Saving);
     const QString path = m_path;
     const quint64 loadGeneration = m_loadGeneration;
+    const quint64 saveGeneration = ++m_saveGeneration;
+    m_saveInFlight = true;
+    m_inFlightSaveContent = content;
 
     QPointer<EditorController> self(this);
     m_client->call(
         QString::fromLatin1(rpc::kMethodWriteFile),
         writeParams(path, content, expectedRevision),
-        [self, path, editSerial, loadGeneration](QJsonValue result,
-                                                std::optional<RpcError> error) {
+        [self, path, editSerial, loadGeneration, saveGeneration](
+            QJsonValue result, std::optional<RpcError> error) {
             if (!self)
                 return;
+            // This write is off the wire whatever its outcome, so the chain's
+            // bookkeeping is released FIRST — before any guard below returns
+            // early — or a superseded save would leave the flag latched and
+            // every later save would queue behind a write that already answered.
+            // Guarded by the generation because open() starts a fresh chain for
+            // the new file and may already have a write of its own outstanding;
+            // this reply must not clear that one's flag or steal its queue.
+            std::optional<QString> queued;
+            if (self->m_saveGeneration == saveGeneration) {
+                self->m_saveInFlight = false;
+                self->m_inFlightSaveContent.clear();
+                queued = std::exchange(self->m_queuedSaveContent, std::nullopt);
+            }
             // The pane switched files while the write was in flight. This
             // outcome belongs to a file this controller no longer holds, so it
             // must not re-baseline the new file's revision, clear the new file's
@@ -774,6 +846,18 @@ void EditorController::save(QString content, QString expectedRevision)
                 const QString newRevision =
                     result.toObject().value(QStringLiteral("revision")).toString();
                 self->m_revision = newRevision;
+                if (queued.has_value()) {
+                    // A second save arrived during this write carrying DIFFERENT
+                    // bytes, so the file is not the buffer yet. Nothing may be
+                    // reported saved, marked clean or have its recovery snapshot
+                    // retired on the strength of a write those bytes supersede.
+                    // Send them now, guarded by the revision this write just
+                    // produced — the guard the second save could not know — and
+                    // let ITS reply be the one outcome the page sees. The pane
+                    // is already in Saving and stays there.
+                    self->issueSave(std::move(*queued), newRevision);
+                    return;
+                }
                 // Anything typed while the write was in flight is NOT in the
                 // bytes that just landed, so the buffer is still dirty and the
                 // recovery snapshot holding those edits must survive
@@ -793,6 +877,11 @@ void EditorController::save(QString content, QString expectedRevision)
                                                     : FileState::Clean);
                 return;
             }
+            // The chain ends here: whatever was queued behind this write is
+            // dropped rather than fired at a server that just refused it. No
+            // work is lost — the buffer is still dirty, the failure is reported
+            // honestly below, and the page's Retry / Overwrite affordances
+            // re-send the buffer as it stands when they are clicked.
 
             // Stale revision: NEVER silently overwrite (SPEC 8.6). Surface the
             // current revision so the UI can offer reload/overwrite. Prefer the
@@ -1093,7 +1182,17 @@ void EditorController::reload(FileState transitional, bool discardLocalEdits)
             if (!discardLocalEdits && self->m_fileState == FileState::Saving)
                 return;
             const QJsonObject obj = result.toObject();
-            const QString content = obj.value(QStringLiteral("content")).toString();
+            // Same rule as open(): a base64 reply is the file's exact bytes,
+            // sent that way because the daemon's strict decoder refused them,
+            // and it is decoded before it is shown. Decided BEFORE anything is
+            // mutated, so an undecodable payload leaves the buffer, its
+            // revision and its recovery snapshot exactly as they were.
+            const std::optional<QString> decoded = rpc::decodeFileContent(obj);
+            if (!decoded) {
+                self->setFileState(FileState::Error);
+                return;
+            }
+            const QString content = *decoded;
             const QString revision = obj.value(QStringLiteral("revision")).toString();
             self->m_revision = revision;
             self->m_dirty = false;

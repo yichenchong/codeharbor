@@ -195,9 +195,11 @@ private:
     // Read the whole `servers` group into m_profiles/m_activeId.
     void load();
     // The `servers` group as it currently stands on disk, in the same order and
-    // shape load() produces (ordinal, then id; ports repaired; exactly the
-    // whitelisted fields plus id). Non-null `activeOut` receives the raw stored
-    // `servers/active`, which may name nothing that exists.
+    // shape load() produces (ordinal, then id; ports repaired; rows with a
+    // blank host or user skipped, because they are not connectable profiles and
+    // the save path would not have written them; exactly the whitelisted fields
+    // plus id). Non-null `activeOut` receives the raw stored `servers/active`,
+    // which may name nothing that exists.
     QVariantList readStoredProfiles(QString* activeOut) const;
     // Write one profile's keys at the given list position.
     void writeEntry(const QVariantMap& fields, int ordinal);
@@ -226,10 +228,9 @@ private:
     // True for the native per-user store, whose containing directory is ours to
     // lock down; false for a caller-supplied ini path, where only the file is.
     bool m_ownsDirectory = false;
-    // Guards against re-entering persist() from a slot: QLockFile is not
-    // recursive, so the inner write reuses the lock the outer call holds rather
-    // than waiting out the timeout against itself.
-    bool m_persisting = false;
+    // NO re-entrancy guard: nothing inside the locked region emits, so persist()
+    // can never be re-entered while the lock is held. See the INVARIANT comment
+    // on ServerProfiles::persist(), which is what keeps that true.
     // Whether the previous save had to go ahead unlocked, so saveDegraded() can
     // be edge-triggered rather than fired on every keystroke of an outage.
     bool m_lastSaveDegraded = false;

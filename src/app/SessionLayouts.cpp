@@ -5,8 +5,10 @@
 #include <QJsonValue>
 #include <QPointer>
 #include <QStringView>
+#include <QTimer>
 
 #include <cmath>
+#include <memory>
 #include <utility>
 
 namespace ch {
@@ -26,6 +28,15 @@ std::optional<SplitNode> parseVariantTree(const QVariant& value)
         return std::nullopt;
     return SplitNode::tryFromJson(json.toObject());
 }
+
+// DEPTH: none of the recursive walks below carries a bound of its own, and none
+// needs one. SplitNode::kMaxDepth is the ONE nesting bound for this type and it
+// is enforced at both ends - SplitNode::tryFromJson refuses a deeper tree on the
+// way in, tryToJson refuses to emit one on the way out - so every SplitNode that
+// reaches this file has already been through one of them, and markLegacyLeaves
+// only ever sees tryToJson output. A second guard here would duplicate an
+// invariant that already holds, and duplicating it is how the two get to
+// disagree.
 
 // Depth-first search for the leaf carrying `paneId`. On success `outNode` points
 // at the leaf, `outParent` at the branch holding it (nullptr when the leaf IS
@@ -48,6 +59,53 @@ bool locateLeaf(SplitNode& node, SplitNode* parent, int indexInParent,
             return true;
     }
     return false;
+}
+
+// Outcome of removing one leaf from a subtree.
+enum class DropOutcome {
+    NotFound,  // `paneId` is not in this subtree; nothing was touched
+    Removed,   // the leaf went; this subtree still holds at least one child
+    Emptied,   // this subtree has nothing left in it and must itself go
+};
+
+// Remove the leaf carrying `paneId` from the subtree rooted at `node`, then
+// repair the shape on the way back up: a branch left with ONE child is not a
+// split any more and is replaced by that child, and a branch left with NO
+// children reports Emptied so its own parent drops it too.
+//
+// The no-children case is reachable: SplitNode::tryFromJson accepts a split
+// with a single child, so a server another client also writes to can hand us
+// one. Removing that child used to leave a childless branch nested inside its
+// parent, which renders as a blank slot no pane can ever occupy. Collapsing
+// recursively means the only place an empty node can survive is the root, and
+// there it is the deliberate placeholder an emptied region keeps.
+DropOutcome dropLeafFrom(SplitNode& node, const QString& paneId)
+{
+    if (node.isLeaf())
+        return node.paneId == paneId ? DropOutcome::Emptied : DropOutcome::NotFound;
+    for (int i = 0; i < node.children.size(); ++i) {
+        const DropOutcome outcome = dropLeafFrom(node.children[i], paneId);
+        if (outcome == DropOutcome::NotFound)
+            continue;
+        if (outcome == DropOutcome::Emptied) {
+            node.children.removeAt(i);
+            // A tree off the wire is not required to carry one ratio per child
+            // (SplitNode fills the missing ones in), so this is guarded rather
+            // than assumed to be in step.
+            if (i < node.ratios.size())
+                node.ratios.removeAt(i);
+        }
+        if (node.children.isEmpty())
+            return DropOutcome::Emptied;
+        if (node.children.size() == 1) {
+            // Hoisted through a local: the survivor lives inside the very node
+            // being overwritten.
+            SplitNode survivor = std::move(node.children[0]);
+            node = std::move(survivor);
+        }
+        return DropOutcome::Removed;
+    }
+    return DropOutcome::NotFound;
 }
 
 // Does any LEAF of `node` satisfy `pred`? Short-circuits.
@@ -123,7 +181,7 @@ void collectLegacyTerminalSlots(const SplitNode& node, QSet<QString>& out)
         collectLegacyTerminalSlots(child, out);
 }
 
-// Mark the leaves in `obj` (a SplitNode::toJson() tree) that `legacy` names, so
+// Mark the leaves in `obj` (a SplitNode::tryToJson() tree) that `legacy` names, so
 // QML can tell "resolve this by its old label, once" from "your row is being
 // minted, wait". Applied to the published copy only - `obj` here is already
 // detached from the SplitNode, and the marker is never handed to setLayout.
@@ -187,6 +245,11 @@ void SessionLayouts::setServerId(QString serverId)
         load(QString());
     m_serverId = std::move(serverId);
     emit serverIdChanged();
+}
+
+void SessionLayouts::setTerminalMintTimeoutMs(int ms)
+{
+    m_mintTimeoutMs = qMax(0, ms);
 }
 
 int SessionLayouts::regionIndex(const QString& region)
@@ -258,17 +321,28 @@ SplitNode SessionLayouts::defaultTree(int index)
 
 void SessionLayouts::setTree(int index, SplitNode tree)
 {
-    setTreeQuietly(index, std::move(tree));
+    m_regions[index].tree = std::move(tree);
+    publishTree(index);
+}
+
+void SessionLayouts::setTreeQuietly(int index, SplitNode tree)
+{
+    m_regions[index].tree = std::move(tree);
+    publishTreeQuietly(index);
+}
+
+void SessionLayouts::publishTree(int index)
+{
+    publishTreeQuietly(index);
     if (index == kTerminal)
         emit terminalTreeChanged();
     else
         emit viewerTreeChanged();
 }
 
-void SessionLayouts::setTreeQuietly(int index, SplitNode tree)
+void SessionLayouts::publishTreeQuietly(int index)
 {
     RegionState& state = m_regions[index];
-    state.tree = std::move(tree);
     state.valid = true;
     // Burn the suffixes this tree carries HERE, the one funnel every tree
     // assignment goes through (a loaded tree, a QML-authored saveTree, a split,
@@ -279,13 +353,27 @@ void SessionLayouts::setTreeQuietly(int index, SplitNode tree)
     reservePaneSuffix(index, state.tree);
     // Publish the exact persisted wire shape; QML reads paneId/orientation/
     // children/ratios straight off this map.
-    QJsonObject published = state.tree.toJson();
+    const std::optional<QJsonObject> published = state.tree.tryToJson();
+    if (!published) {
+        // Not reachable while every tree that lands here comes from the parser,
+        // defaultTree() or the structural edits in this file, all of which keep
+        // SplitNode's invariant. If one ever stops doing so, the region reads as
+        // EMPTY and says why - the same verdict a tree the parser rejects gets -
+        // rather than QML being handed a layout it cannot render.
+        state.valid = false;
+        state.cache = QVariant();
+        emit error(QStringLiteral("SessionLayouts: %1 tree is not a valid split "
+                                  "tree; not shown")
+                       .arg(regionKey(index)));
+        return;
+    }
+    QJsonObject obj = *published;
     // Plus, for the terminal region only, the one field that is published but
     // never persisted: which id-less leaves are pre-migration leaves the pane
     // may resolve by label. See m_legacyTerminalSlots.
     if (index == kTerminal && !m_legacyTerminalSlots.isEmpty())
-        markLegacyLeaves(published, m_legacyTerminalSlots);
-    state.cache = published.toVariantMap();
+        markLegacyLeaves(obj, m_legacyTerminalSlots);
+    state.cache = obj.toVariantMap();
 }
 
 void SessionLayouts::clearTrees()
@@ -484,7 +572,7 @@ void SessionLayouts::saveTree(QString region, QVariant tree)
     const int index = regionIndex(region);
     if (index < 0 || !canEdit())
         return;
-    const std::optional<SplitNode> parsed = parseVariantTree(tree);
+    std::optional<SplitNode> parsed = parseVariantTree(tree);
     if (!parsed) {
         emit error(QStringLiteral(
             "SessionLayouts: %1 tree is not a valid split tree; not saved")
@@ -493,7 +581,7 @@ void SessionLayouts::saveTree(QString region, QVariant tree)
     }
     // Quiet: the caller already holds this tree (see the header's signal
     // discipline note).
-    setTreeQuietly(index, *parsed);
+    setTreeQuietly(index, std::move(*parsed));
     persist(index);
 }
 
@@ -557,7 +645,7 @@ void SessionLayouts::setRatios(QString region, QStringList pathIndexes,
     node->ratios = std::move(parsed);
     // Quiet: the drag already resized the panes; re-publishing the tree would
     // destroy and rebuild them.
-    setTreeQuietly(index, state.tree);
+    publishTreeQuietly(index);
     persist(index);
 }
 
@@ -623,7 +711,7 @@ QString SessionLayouts::splitPane(QString region, QString paneId,
 
     // Published straight away: the split has to feel instant, and the new pane
     // has real chrome to show while its identity is on the wire.
-    setTree(index, state.tree);
+    publishTree(index);
     if (index == kTerminal) {
         // The new leaf has no `terminal_panes` row yet, so it is PENDING and
         // persist() below will decline to write the tree until the mint lands.
@@ -634,6 +722,22 @@ QString SessionLayouts::splitPane(QString region, QString paneId,
     }
     persist(index);
     return newPaneId;
+}
+
+// Undo a terminal leaf whose row could not be minted, and say why. Shared by
+// the failed-answer path and the no-answer-at-all path so both leave exactly
+// the same state: no half-made pane, no id-less leaf on the server, and - the
+// point of the exercise - no PENDING leaf, so persist() may write the region
+// again.
+void SessionLayouts::abandonTerminalMint(const QString& paneId,
+                                         const QString& reason)
+{
+    emit error(reason);
+    if (!dropLeaf(kTerminal, paneId))
+        return;
+    publishTree(kTerminal);
+    if (canEdit())
+        persist(kTerminal);
 }
 
 void SessionLayouts::mintTerminalPaneRow(quint64 generation, const QString& paneId)
@@ -648,11 +752,17 @@ void SessionLayouts::mintTerminalPaneRow(quint64 generation, const QString& pane
     params.name = paneId;
     const QString devSessionId = m_devSessionId;
     QPointer<SessionLayouts> self(this);
+    // One mint, one outcome. Whichever of the answer and the deadline arrives
+    // first flips this and the other becomes a no-op; the flag is shared rather
+    // than a QTimer this object owns so a mint for a Dev Session that is long
+    // gone cannot be resurrected by a stray stop().
+    auto settled = std::make_shared<bool>(false);
     m_db->createTerminalPane(
-        params, [self, generation, paneId, devSessionId](std::optional<TerminalPane> pane,
-                                                         std::optional<RpcError> err) {
-            if (!self)
+        params, [self, generation, paneId, devSessionId, settled](
+                    std::optional<TerminalPane> pane, std::optional<RpcError> err) {
+            if (!self || *settled)
                 return;
+            *settled = true;
             // A load has taken over since. Its tree is authoritative and this
             // leaf may not even be in it; the row itself stays on the server,
             // enumerable through the Dev Session's terminal pane list, rather
@@ -662,17 +772,13 @@ void SessionLayouts::mintTerminalPaneRow(quint64 generation, const QString& pane
 
             SplitNode* leaf = self->findTerminalLeaf(paneId);
             if (err || !pane || pane->id.value.isEmpty()) {
-                emit self->error(
-                    err ? err->message
-                        : QStringLiteral("the server created this terminal without an id"));
                 // Take the half-made pane back out rather than leave one that
                 // can never attach and can never be told apart from a
                 // pre-migration leaf if anything later persisted it.
-                if (leaf && self->dropLeaf(kTerminal, paneId)) {
-                    self->setTree(kTerminal, self->m_regions[kTerminal].tree);
-                    if (self->canEdit())
-                        self->persist(kTerminal);
-                }
+                self->abandonTerminalMint(
+                    paneId,
+                    err ? err->message
+                        : QStringLiteral("the server created this terminal without an id"));
                 return;
             }
             // The pane was closed while its row was being minted. The row and
@@ -686,10 +792,38 @@ void SessionLayouts::mintTerminalPaneRow(quint64 generation, const QString& pane
             // field before it may resolve anything, and it reads it off the
             // tree. The regions re-home their panes rather than rebuild them,
             // so no live terminal is disturbed by the republish.
-            self->setTree(kTerminal, self->m_regions[kTerminal].tree);
+            self->publishTree(kTerminal);
             if (self->canEdit())
                 self->persist(kTerminal);
         });
+    if (m_mintTimeoutMs <= 0)
+        return; // opted out; the transport is then the only backstop
+    // The deadline. persist() declines to write the terminal region while ANY
+    // leaf is still waiting for its row, which is load-bearing (see there) but
+    // has no lower bound of its own: a request the peer simply never answers
+    // leaves the region unwritable for the rest of the session, so every later
+    // split, close, ratio drag and pane url is silently dropped. The transport
+    // does fail pending requests when it notices the peer has gone quiet, and
+    // that stays the primary and better-worded mechanism - this fires well
+    // after it (see kDefaultTerminalMintTimeoutMs) and only covers the case it
+    // cannot see: a healthy connection on which this one request was lost.
+    QTimer::singleShot(m_mintTimeoutMs, this,
+                       [self, generation, paneId, devSessionId, settled] {
+                           if (!self || *settled)
+                               return;
+                           *settled = true;
+                           if (self->m_generation != generation
+                               || self->m_devSessionId != devSessionId)
+                               return;
+                           self->abandonTerminalMint(
+                               paneId,
+                               QStringLiteral(
+                                   "SessionLayouts: the server never answered the "
+                                   "request to create terminal \"%1\" within %2 s; "
+                                   "the pane has been removed")
+                                   .arg(paneId)
+                                   .arg(self->m_mintTimeoutMs / 1000));
+                       });
 }
 
 SplitNode* SessionLayouts::findTerminalLeaf(const QString& paneId)
@@ -710,25 +844,15 @@ bool SessionLayouts::dropLeaf(int index, const QString& paneId)
     RegionState& state = m_regions[index];
     if (!state.valid)
         return false;
-    SplitNode* leaf = nullptr;
-    SplitNode* parent = nullptr;
-    int childIndex = -1;
-    if (!locateLeaf(state.tree, nullptr, -1, paneId, leaf, parent, childIndex))
+    const DropOutcome outcome = dropLeafFrom(state.tree, paneId);
+    if (outcome == DropOutcome::NotFound)
         return false;
-
-    if (!parent) {
-        // The region's only pane: a region always has a tree, so leave a single
-        // EMPTY leaf rather than an empty (unrenderable) tree.
+    if (outcome == DropOutcome::Emptied) {
+        // Nothing is left anywhere in the region: a region always has a tree,
+        // so leave a single EMPTY placeholder leaf rather than an empty (and
+        // unrenderable) one. Reached both when the closed pane WAS the root and
+        // when collapsing the parent chain consumed every branch above it.
         state.tree = SplitNode{};
-    } else {
-        parent->children.removeAt(childIndex);
-        parent->ratios.removeAt(childIndex);
-        if (parent->children.size() == 1) {
-            // A branch with one child is not a split any more; hoist the
-            // survivor (copied out before the assignment) into its place.
-            const SplitNode survivor = parent->children.at(0);
-            *parent = survivor;
-        }
     }
     // A closed slot may no longer resolve by its label: the permission belonged
     // to that leaf, and the next pane wearing this label is a different pane.
@@ -760,7 +884,7 @@ void SessionLayouts::bindTerminalPaneRow(const QString& devSessionId,
     // Quiet: the pane is already attached to this very row, and republishing
     // the terminal tree only to record what it just did would be churn. The
     // next load reads the id off the server.
-    setTreeQuietly(kTerminal, m_regions[kTerminal].tree);
+    publishTreeQuietly(kTerminal);
     persist(kTerminal);
 }
 
@@ -786,7 +910,7 @@ void SessionLayouts::closePane(QString region, QString paneId)
         return;
     }
 
-    setTree(index, state.tree);
+    publishTree(index);
     persist(index);
 }
 
@@ -825,7 +949,7 @@ void SessionLayouts::setPaneUrl(QString region, QString paneId, QString url)
     // Quiet: the pane is ALREADY showing this url. Re-publishing the tree would
     // rebuild the region's delegates and destroy the very pane that just opened
     // the file - the write would undo what it recorded.
-    setTreeQuietly(index, state.tree);
+    publishTreeQuietly(index);
     persist(index);
 }
 

@@ -99,7 +99,7 @@ QString sq(const QString& value)
 // produced it. `ok` reports whether the command ran to end-of-stream.
 QString runExec(SshConnectionPool& pool, const QString& command, bool* ok)
 {
-    SshChannelDevice device(&pool, SshConnectionPool::ChannelKind::Exec);
+    SshChannelDevice device(&pool);
     if (!device.startExec(command)) {
         if (ok)
             *ok = false;
@@ -206,8 +206,7 @@ void TstLiveReconnect::dropTheConnection()
 {
     // The killer rides on the same SSH connection it is about to kill; the
     // signal is delivered before sshd can tear the channel down.
-    auto killer = std::make_unique<SshChannelDevice>(
-        &m_pool, SshConnectionPool::ChannelKind::Exec);
+    auto killer = std::make_unique<SshChannelDevice>(&m_pool);
     // channelError carries remote stderr AND libssh faults, and the killer is
     // riding the connection it kills: "Socket error: disconnected" on this
     // channel is the expected outcome, not a complaint. Only the guard's own

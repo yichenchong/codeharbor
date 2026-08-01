@@ -103,6 +103,14 @@ int main(int argc, char *argv[])
                          terminalFactory.setServerId(appController.serverId());
                      });
 
+    // SPEC 6.6. The "generic" harness publishes no lifecycle events, so the
+    // bridge has no adapter for it and the monitor would otherwise never learn
+    // anything about such a pane. Its only observable is terminal output, and
+    // the factory is the one object that sees both the pane's terminal_panes
+    // row id and the PTY channel its bytes arrive on — so it reports the FACT
+    // of output (never the bytes) and the monitor derives running/idle from it.
+    terminalFactory.setAgentMonitor(&agentMonitor);
+
     // Self-migration for LEGACY layouts. A terminal leaf stored before layouts
     // carried a `terminal_panes` row id resolves once by its slot label; the
     // factory reports the row that found, and the id is written into the leaf

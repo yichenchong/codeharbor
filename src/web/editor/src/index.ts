@@ -28,7 +28,9 @@ import "monaco-editor/esm/vs/editor/edcore.main";
 import "monaco-editor/esm/vs/basic-languages/monaco.contribution";
 
 // Pure, DOM-free logic split out so it can be unit-tested without loading the
-// Monaco runtime this module imports above (see language.ts / recovery.ts).
+// Monaco runtime this module imports above (see buffer.ts / language.ts /
+// recovery.ts).
+import { bufferText } from "./buffer";
 import { selectLanguage } from "./language";
 import { RecoveryReporter } from "./recovery";
 
@@ -251,7 +253,10 @@ export function mountEditor(
     // the flush, and the save-cancels-the-snapshot rule (SPEC 8.7, WB4) live in
     // RecoveryReporter (recovery.ts) so they can be unit-tested with a fake
     // bridge and fake timer.
-    const reporter = new RecoveryReporter(bridge, () => editor.getValue());
+    // bufferText, never editor.getValue(): the bytes handed to the host are the
+    // bytes that get written to the remote file, so the file's byte-order mark
+    // and line endings must survive the trip (see buffer.ts).
+    const reporter = new RecoveryReporter(bridge, () => bufferText(editor));
 
     /**
      * Persist the buffer guarded by `revision` (SPEC 8.4/8.6). reporter.save()
@@ -292,7 +297,7 @@ export function mountEditor(
         // would re-flag the freshly loaded buffer as dirty.
         reporter.cancel();
         const model = editor.getModel();
-        if (model && model.getValue() === content) {
+        if (model && bufferText(editor) === content) {
             // Identical buffer (e.g. reload of unchanged file): just re-baseline.
             dirty = false;
             renderState();

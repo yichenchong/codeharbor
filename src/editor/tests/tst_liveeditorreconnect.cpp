@@ -273,8 +273,7 @@ bool TstLiveEditorReconnect::startSideShell()
     // ONE channel carries every out-of-band command: sshd caps concurrent
     // session channels per connection, and `sh -s` reads its command stream
     // from stdin and exits on EOF, so closing the channel reaps it.
-    m_sideShell = std::make_unique<SshChannelDevice>(
-        &m_sidePool, SshConnectionPool::ChannelKind::Exec);
+    m_sideShell = std::make_unique<SshChannelDevice>(&m_sidePool);
     connect(m_sideShell.get(), &QIODevice::readyRead, m_sideShell.get(),
             [this] { m_sideOut += m_sideShell->readAll(); });
     connect(m_sideShell.get(), &SshChannelDevice::channelError, m_sideShell.get(),
@@ -343,8 +342,7 @@ void TstLiveEditorReconnect::dropTheConnection()
 {
     // The killer rides the same SSH connection it is about to kill; the signal
     // is delivered before sshd can tear the channel down.
-    auto killer = std::make_unique<SshChannelDevice>(
-        &m_pool, SshConnectionPool::ChannelKind::Exec);
+    auto killer = std::make_unique<SshChannelDevice>(&m_pool);
     // channelError carries remote stderr AND libssh faults, and the killer is
     // riding the connection it kills: "Socket error: disconnected" here is the
     // expected outcome. Only the guard's own refusal means the drop missed.

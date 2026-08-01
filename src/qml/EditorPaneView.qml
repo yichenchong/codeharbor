@@ -5,9 +5,15 @@ import QtWebEngine
 import QtWebChannel
 import "RemotePath.js" as RemotePath
 
-// Remote editor pane (SPEC 8.1). Hosts the TRUSTED, app-owned Monaco editor
-// bundle (src/web/editor) in a WebEngineView and bridges it to the C++
-// EditorController over Qt WebChannel.
+// The EDITOR HANDLER (SPEC 8.1). Not a pane type of its own: SPEC 3.3 makes a
+// viewer pane a browser addressed by a URL, and a handler is something that
+// browser delegates a resolved resource to. ViewerPane keeps its own chrome —
+// header, address bar, outside-project marker — around this view for exactly
+// that reason, and this file must never grow chrome of its own or assume it
+// owns the pane. The name is historical; the concept is a delegate.
+//
+// It hosts the TRUSTED, app-owned Monaco editor bundle (src/web/editor) in a
+// WebEngineView and bridges it to the C++ EditorController over Qt WebChannel.
 //
 // SECURITY (SPEC 7.2/8.1): JavaScript is ENABLED here — unlike the untrusted
 // viewer WebEngineViews (image/pdf/binary) which disable it — because the page

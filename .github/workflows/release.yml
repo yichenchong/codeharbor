@@ -180,6 +180,20 @@ jobs:
         run: npm ci && npm run build
         shell: bash
 
+      # BD26: the release path must not be WEAKER than the ordinary one. ci.yml
+      # type-checks and tests both bundles; esbuild strips types without checking
+      # them, so a TS error anywhere in src/web/* passes the bundle build and
+      # would otherwise reach a published binary unreported. Tags are cut from
+      # `main`, which CI has gated - but a tag can be cut from any ref via
+      # workflow_dispatch, and "the other workflow already checked it" is not a
+      # check.
+      - name: Typecheck web bundles
+        run: npm run typecheck
+        shell: bash
+      - name: Test web bundles
+        run: npm test --workspace src/web/terminal --workspace src/web/editor
+        shell: bash
+
       # --- configure + build + test -------------------------------------------
       # CMake 3.21+ reads CMAKE_TOOLCHAIN_FILE from the environment (set by the
       # vcpkg step on Windows), so one command works on every OS. On Windows the
@@ -197,7 +211,11 @@ jobs:
         shell: bash
 
       - name: Test (release preset)
-        run: ctest --preset release-tests --verbose --output-on-failure --repeat until-pass:2
+        # No --output-on-failure: the `release-tests` test preset already sets
+        # output.outputOnFailure. --verbose (full output for every test, not only
+        # failures) and --repeat (one retry, for genuinely flaky WebEngine
+        # start-up on a cold runner) are the two things this line actually adds.
+        run: ctest --preset release-tests --verbose --repeat until-pass:2
         shell: bash
 
       # --- package a runnable artifact per OS ----------------------------------
@@ -379,6 +397,11 @@ jobs:
         run: |
           # npm ci requires an up-to-date package-lock.json (installs from it strictly).
           npm ci
+          # `npm run typecheck` explicitly, as ci.yml does. `npm run build` is a
+          # type checker only by accident of using tsc today; a switch to a
+          # transpile-only bundler here would silently drop the check from the
+          # release path while leaving it in the ordinary one.
+          npm run typecheck
           npm test
           npm run build
       - name: Package

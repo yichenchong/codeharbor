@@ -31,6 +31,21 @@ option(CODEHARBOR_BUILD_TESTS "Build C++ unit tests" ON)
 option(CODEHARBOR_SKIP_WEB_BUNDLE
        "Do not embed the Monaco/xterm.js bundles (produces an unshippable client)" OFF)
 
+# Source maps for the embedded web bundles, consumed by src/qml/CMakeLists.txt.
+# Declared here, like the option above, because README.md and docs/DEVELOPMENT.md
+# both advertise it on the command line and an undeclared cache variable is
+# invisible in `cmake -LH`, ccmake and the IDE preset UIs.
+#
+# It is a tri-state STRING, not an option(), and that is the whole point. A
+# cached boolean default would stick to whatever the build type was on the FIRST
+# configure of a directory, so re-configuring an existing Debug tree as Release
+# would go on embedding ~15 MB of maps in a binary labelled Release. AUTO is the
+# cached value in that case, and it is re-derived from CMAKE_BUILD_TYPE on every
+# configure; ON and OFF are explicit and persist, exactly as they did before.
+set(CODEHARBOR_WEB_SOURCEMAP "AUTO" CACHE STRING
+    "Embed JS source maps in the web bundles: ON, OFF, or AUTO (ON for a Debug configure, OFF otherwise)")
+set_property(CACHE CODEHARBOR_WEB_SOURCEMAP PROPERTY STRINGS AUTO ON OFF)
+
 # A compiler cache, if this machine happens to have one. It is a pure win when
 # present (an unchanged translation unit becomes a file copy) and costs nothing
 # when absent, so it is discovered rather than required: no flag to remember,
@@ -164,13 +179,22 @@ endif()
 if(CODEHARBOR_BUILD_TESTS)
     enable_testing()
 
-    # Fails if review/debug scaffolding (e.g. a deliberate MUTATION-TEST line
-    # left behind while proving a gate can fail) reaches the tree. Cheap, and it
+    # Fails if review/debug scaffolding (e.g. a deliberate mutation marker left
+    # behind while proving a gate can fail) reaches the tree. Cheap, and it
     # closes a hole that convention alone did not.
     if(UNIX)
         add_test(NAME tst_no_scaffolding
                  COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/no_scaffolding.sh
                          ${CMAKE_CURRENT_SOURCE_DIR})
+
+        # Refuses a release tag whose commit carries a different version. Runs
+        # entirely inside a throwaway git repository under TMPDIR, so it neither
+        # touches this checkout nor creates a tag in it. Skips (77) when git or
+        # node is absent rather than failing a build that never needed them.
+        add_test(NAME tst_bump_version_tag
+                 COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/bump_version_tag.sh
+                         ${CMAKE_CURRENT_SOURCE_DIR})
+        set_tests_properties(tst_bump_version_tag PROPERTIES SKIP_RETURN_CODE 77)
     endif()
 endif()
 

@@ -12,6 +12,7 @@
 
 namespace ch {
 
+class AgentStatusMonitor;
 class SshChannelDevice;
 class SshConnectionPool;
 
@@ -50,7 +51,8 @@ public:
     explicit TerminalFactory(SshConnectionPool* pool, QObject* parent = nullptr);
 
     // Create a controller owned by `owner` (the QML pane Item), so its buffers
-    // and timers are released when the pane is destroyed.
+    // and timers are released when the pane is destroyed. With no owner the
+    // factory adopts it, so the returned object is never unparented.
     Q_INVOKABLE ch::TerminalController* create(QObject* owner = nullptr);
 
     // WebChannel face for `controller`, owned by `owner` (the pane) as well.
@@ -59,7 +61,14 @@ public:
 
     // True when the shared SSH session can carry a new channel; false makes
     // attach() a no-op, so a pane can say "no server" instead of hanging.
-    Q_INVOKABLE bool connected() const;
+    //
+    // Virtual for ONE reason: it is the only environmental gate on
+    // resolveTarget(), and ch::SshConnectionPool cannot be brought to its
+    // Connected state without a real handshake against a real server. Every
+    // rule about which answer a pane may adopt as its identity therefore lived
+    // behind a door no unit test could open. A test subclass answers true and
+    // exercises the real resolution code; nothing in production overrides it.
+    Q_INVOKABLE virtual bool connected() const;
 
     // Resolve the SERVER-MINTED tmux target this pane's layout leaf owns, and
     // report it through targetResolved().
@@ -132,11 +141,25 @@ public:
     // and the server whose rows they are. Both are injected (main.cpp) rather
     // than constructed here: the repository is the application's, and the
     // server id is only known once server.info has answered. Ownership stays
-    // with the caller. Changing the server id forgets every remembered target —
-    // rows belong to a server, and a target read from one is meaningless on
-    // another.
+    // with the caller. Changing the server id forgets every remembered answer —
+    // rows belong to a server, so BOTH halves of a remembered answer, the tmux
+    // target and the `terminal_panes` row id that is the pane's agent-status
+    // identity, are meaningless on another one.
     void setWorkspace(WorkspaceDb* workspace);
     void setServerId(const QString& serverId);
+
+    // Feed SPEC 6.6 activity detection for the adapterless "generic" harness.
+    // Not owned; nullptr disables the reporting entirely, which is what every
+    // test that does not care about agent state gets.
+    //
+    // This class is where the two halves meet, and nowhere else does: it is the
+    // only place that knows a controller's `terminal_panes` row id (from
+    // resolveTarget) AND owns the PTY channel its bytes arrive on. So it is
+    // what tells ch::AgentStatusMonitor that a pane attached and that a pane
+    // produced output — the two observations a generic harness offers, since it
+    // publishes no lifecycle events for an adapter to map. Only the FACT of
+    // output crosses over, never a byte of it.
+    void setAgentMonitor(AgentStatusMonitor* monitor);
 
     // Open a PTY channel attached to the tmux session `tmuxTarget` and wire it
     // to `controller`. Re-attaching releases the previous channel first. False
@@ -218,12 +241,58 @@ private:
         // out from under us takes it along.
         QPointer<SshChannelDevice> device;
         QString target;
+        // The pane's agent-status identity: the Dev Session it belongs to and
+        // its `terminal_panes` row id, i.e. exactly the pair every AgentEvent
+        // is keyed by. BOTH are read off the server's answer and never off the
+        // request, and both are empty whenever this pane is not entitled to
+        // report output under any identity — before its first answer, while a
+        // retarget is in flight, and after a resolution failed.
+        QString devSessionId;
+        QString terminalId;
+        // The resolution key of this pane's MOST RECENT resolveTarget() call.
+        // An answer is adopted only if it carries this key. QML can retarget a
+        // pane while a lookup is in flight, and the superseded answer describes
+        // the terminal the pane has just left; adopting it is what made a
+        // retargeted pane attach to the previous Dev Session's shell.
+        QString pendingResolveKey;
+        // The TerminalController::outputReceived -> AgentStatusMonitor
+        // forwarding for this pane. Held rather than fired and forgotten so an
+        // identity change can tear it down and re-make it: a second connection
+        // left behind would report every batch twice, and one that outlived its
+        // identity would report bytes under a pane id this controller no longer
+        // owns.
+        QMetaObject::Connection outputConnection;
     };
 
-    // Create-or-update the pane's entry with the tmux target it is aiming at,
-    // wiring the destroyed() cleanup the first time. Never returns or keeps an
-    // iterator: callers re-find the entry after any call that can emit.
+    // The pane's entry, created (with its destroyed() cleanup) on first use.
+    // Never returned to a caller and never held across anything that can emit:
+    // a single insert rehashes m_attached and turns a held reference into a
+    // dangling write.
+    Attachment& entryFor(ch::TerminalController* controller);
+
+    // Create-or-update the pane's entry with the tmux target it is aiming at.
     void rememberTarget(ch::TerminalController* controller, const QString& target);
+
+    // Note that this controller is now waiting on resolution `key`, and drop
+    // the agent-status identity it was carrying if that is a DIFFERENT key from
+    // the one it was waiting on. Dropping it at the retarget rather than at the
+    // next delivery matters: the previous PTY channel is still attached and
+    // still emitting, and those bytes belong to neither the terminal the pane
+    // has left nor the one it has not been given yet.
+    void beginResolution(ch::TerminalController* controller, const QString& key);
+
+    // Give the pane the identity the server's answer named, and wire the
+    // output reporting for it. `harness` is the row's `harness` column, which
+    // is what decides whether the monitor derives state from output at all
+    // (only the adapterless "generic" harness does). Idempotent, and safe with
+    // no monitor set.
+    void bindAgentIdentity(ch::TerminalController* controller,
+                           const QString& devSessionId, const QString& terminalId,
+                           const QString& harness);
+
+    // Forget the pane's identity and tear down its output reporting, so nothing
+    // it prints from here on is attributed to anybody.
+    void clearAgentIdentity(ch::TerminalController* controller);
 
     // One pane's outstanding resolveTarget() calls: every controller waiting on
     // the same resolution key (a row id, or a legacy "<devSession>/<label>").
@@ -232,7 +301,9 @@ private:
 
     // Hand `target` (empty = failed) to everything waiting on `key` and forget
     // the key's in-flight state. `message` is reported through error() first,
-    // and only on failure.
+    // and only on failure. This is the SINGLE delivery point — a fresh answer,
+    // a cached one, and a server change all arrive here — and therefore also
+    // the single place a pane's agent-status identity is adopted.
     void finishResolution(const QString& key, const QString& target, const QString& message);
 
     SshConnectionPool* m_pool = nullptr;
@@ -246,14 +317,25 @@ private:
     // AppController declared above it.
     WorkspaceDb* m_workspace = nullptr;
     QString m_serverId;
-    // Resolution key -> server-minted tmux target: the `terminal_panes` row id
-    // for a pane addressed by id, or paneKey() for one addressed by its legacy
-    // slot label. A label-addressed answer is remembered under BOTH, so the
-    // backfill that follows it costs no second round trip. Kept across a
-    // disconnect on purpose: the rows are the server's and do not change while
-    // we are away, and re-reading them is exactly the round trip a reconnect
-    // should not pay.
-    QHash<QString, QString> m_targets;
+
+    // One resolution's answer, as the server gave it. Everything here names a
+    // row on ONE server, so the whole map is dropped by setServerId(): a target
+    // read from one workspace is meaningless in another, and so is a row id.
+    struct ResolvedPane {
+        QString target;        // terminal_panes.tmuxTarget
+        QString terminalId;    // terminal_panes.id
+        QString devSessionId;  // the row's owner, per the server, not per the request
+        QString harness;       // terminal_panes.harness; empty when the row has none
+    };
+    // Resolution key -> that answer: the `terminal_panes` row id for a pane
+    // addressed by id, or paneKey() for one addressed by its legacy slot label.
+    // A label-addressed answer is remembered under BOTH, so the backfill that
+    // follows it costs no second round trip. Kept across a DISCONNECT on
+    // purpose — the rows are the server's and do not change while we are away,
+    // and re-reading them is exactly the round trip a reconnect should not pay.
+    QHash<QString, ResolvedPane> m_resolved;
+    // SPEC 6.6 activity reporting sink; not owned, may be null.
+    QPointer<AgentStatusMonitor> m_agentMonitor;
     // Keys with a lookup or create in flight, and who is waiting on each.
     QHash<QString, Waiters> m_resolving;
 };

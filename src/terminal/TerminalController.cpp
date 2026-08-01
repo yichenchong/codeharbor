@@ -101,6 +101,10 @@ void TerminalController::ingestOutput(const QByteArray &bytes)
 {
     if (bytes.isEmpty())
         return; // empty output: nothing to buffer or flush
+    // Before the coalescing below, and unconditionally: this is the liveness
+    // signal, and a pane whose output is being buffered or held back is still
+    // producing (see the doc comment on outputReceived).
+    emit outputReceived();
     m_pending.append(bytes);
     if (m_pending.size() >= kFlushSizeBytes) {
         flush(); // size threshold reached first
@@ -210,13 +214,65 @@ const QByteArray &TerminalController::hiddenBuffer() const
     return m_hidden;
 }
 
+qsizetype TerminalController::incompleteTrailingUtf8(const QByteArray &data)
+{
+    const qsizetype size = data.size();
+    // A UTF-8 character is at most four bytes, so at most the last three can be
+    // the incomplete start of one.
+    const qsizetype scan = qMin<qsizetype>(3, size);
+    for (qsizetype back = 1; back <= scan; ++back) {
+        const auto byte = static_cast<unsigned char>(data[size - back]);
+        if ((byte & 0xC0) == 0x80)
+            continue; // continuation byte; the lead is further back
+        qsizetype needed = 0;
+        if ((byte & 0xE0) == 0xC0)
+            needed = 2;
+        else if ((byte & 0xF0) == 0xE0)
+            needed = 3;
+        else if ((byte & 0xF8) == 0xF0)
+            needed = 4;
+        // needed == 0 covers ASCII and every byte that is not a legal lead
+        // (0xF8..0xFF). Those are not a truncated character, they are simply
+        // not UTF-8, and holding them back would stall a binary stream forever.
+        return back < needed ? back : 0;
+    }
+    // Three continuation bytes with no lead among them: either a complete
+    // four-byte character or garbage. Either way nothing is pending.
+    return 0;
+}
+
 void TerminalController::flush()
 {
     m_flushTimer.stop();
     if (m_pending.isEmpty())
         return;
-    const QByteArray batch = std::move(m_pending);
-    m_pending.clear();
+
+    // A batch must not END in the middle of a multi-byte UTF-8 character, for
+    // the same reason the eviction cut must not START in the middle of one —
+    // this is that rule one level down, at the flush boundary instead of the
+    // eviction boundary, and it is enforced the same way: move the boundary to
+    // a point no sequence straddles.
+    //
+    // ch::TerminalBridge decodes statefully, so a split character is not
+    // corrupted by the split ITSELF: the decoder holds the lead bytes back and
+    // completes them from the next batch. The problem is what happens if that
+    // next batch never comes intact. Once the lead bytes have been emitted they
+    // are charged, delivered and gone, while their continuation bytes are still
+    // only in the retained buffer — where an overflow may evict them. The
+    // decoder then completes its half-character from whatever bytes follow the
+    // eviction and prints one wrong glyph. Keeping the fragment in m_pending
+    // instead means the character is emitted whole or not at all, so the
+    // decoder never carries state across a batch that could be truncated.
+    //
+    // This is not extra latency: the held-back bytes are exactly the bytes the
+    // decoder would have withheld anyway, and they are at most three.
+    const qsizetype partial = incompleteTrailingUtf8(m_pending);
+    if (partial == m_pending.size())
+        return; // nothing but the head of a character: wait for the rest
+
+    QByteArray batch = std::move(m_pending);
+    m_pending = batch.right(partial); // empty when partial == 0
+    batch.chop(partial);
 
     // Three reasons to retain instead of emit, and they share one buffer:
     //   * no renderer is listening (SPEC 5.4);
@@ -242,22 +298,62 @@ void TerminalController::releaseRetained()
         || m_unacknowledged >= kMaxUnacknowledgedBytes)
         return;
 
-    // The whole buffer goes in ONE batch, exactly as the hidden->visible replay
-    // always has. That overshoots kMaxUnacknowledgedBytes by up to the size of
-    // the buffer, which is fine and is the cheaper trade: the buffer is capped
-    // at kHiddenBufferMaxBytes, so the overshoot is bounded too, and splitting
-    // it would need a second place that decides where a safe cut lands — the
-    // one thing appendHidden() goes to some trouble to get right.
-    const QByteArray replay = std::move(m_hidden);
-    m_hidden.clear();
+    // Release only what the credit window still has room for. The whole buffer
+    // used to go in one batch, which overshot kMaxUnacknowledgedBytes by up to
+    // kHiddenBufferMaxBytes — a 2 MiB batch handed to a renderer that had
+    // credit for 8 KiB, i.e. the flow control's own bound broken by the
+    // mechanism that exists to enforce it.
+    //
+    // Nothing is DROPPED by cutting: the remainder stays retained, in order,
+    // and the next acknowledgement releases the next slice. So the escape
+    // boundary rule is not at stake here the way it is in appendHidden() —
+    // both halves reach xterm.js's stateful parser in sequence. The cut still
+    // goes through resyncBoundary(), which prefers a line feed, because a batch
+    // that ends on a line boundary is the tidier split of the two and it costs
+    // nothing to ask for it.
+    const qint64 allowance = kMaxUnacknowledgedBytes - m_unacknowledged; // > 0
+    QByteArray replay;
+    const qsizetype cut = m_hidden.size() <= allowance
+                              ? m_hidden.size()
+                              : resyncBoundary(m_hidden, static_cast<qsizetype>(allowance));
+    if (cut >= m_hidden.size()) {
+        replay = std::move(m_hidden);
+        m_hidden.clear();
+    } else {
+        replay = m_hidden.left(cut);
+        m_hidden.remove(0, cut);
+    }
     m_unacknowledged += replay.size();
     emit flushReady(replay);
+}
+
+qsizetype TerminalController::resyncBoundary(const QByteArray &buffer, qsizetype from)
+{
+    const char *bytes = buffer.constData();
+    const qsizetype limit = qMin(buffer.size(), from + kHiddenResyncWindowBytes);
+    if (from >= limit)
+        return from;
+
+    // Best case: a line feed. No escape sequence contains one and it is ASCII,
+    // so the byte after it starts both a fresh line and a fresh character.
+    if (const void *lf = std::memchr(bytes + from, '\n', static_cast<size_t>(limit - from)))
+        return static_cast<const char *>(lf) - bytes + 1;
+
+    // No line feed within the window (a pane drawing a full-screen TUI can go a
+    // long way without one). Settle for a character boundary: skip the UTF-8
+    // continuation bytes (10xxxxxx) that belong to the character being cut.
+    // That still cannot resurrect a decapitated escape sequence, but it does
+    // keep the replay free of replacement characters, and a lone stray escape
+    // fragment is a one-off smudge rather than a mis-decoded stream.
+    while (from < limit && (static_cast<unsigned char>(bytes[from]) & 0xC0) == 0x80)
+        ++from;
+    return from;
 }
 
 void TerminalController::appendHidden(const QByteArray &batch)
 {
     m_hidden.append(batch);
-    qsizetype drop = m_hidden.size() - kHiddenBufferMaxBytes;
+    const qsizetype drop = m_hidden.size() - kHiddenBufferMaxBytes;
     if (drop <= 0)
         return;
 
@@ -277,25 +373,7 @@ void TerminalController::appendHidden(const QByteArray &batch)
     // Move the cut forward to a point that cannot be inside either sequence,
     // dropping a few more bytes of the oldest scrollback than strictly needed
     // (tmux's own history covers anything older anyway, SPEC 5.4).
-    const char *bytes = m_hidden.constData();
-    const qsizetype limit = qMin(m_hidden.size(), drop + kHiddenResyncWindowBytes);
-
-    // Best case: a line feed. No escape sequence contains one and it is ASCII,
-    // so the byte after it starts both a fresh line and a fresh character.
-    if (const void *lf = std::memchr(bytes + drop, '\n', static_cast<size_t>(limit - drop))) {
-        m_hidden.remove(0, static_cast<const char *>(lf) - bytes + 1);
-        return;
-    }
-
-    // No line feed within the window (a pane drawing a full-screen TUI can go a
-    // long way without one). Settle for a character boundary: skip the UTF-8
-    // continuation bytes (10xxxxxx) that belong to the character being cut.
-    // That still cannot resurrect a decapitated escape sequence, but it does
-    // keep the replay free of replacement characters, and a lone stray escape
-    // fragment is a one-off smudge rather than a mis-decoded stream.
-    while (drop < limit && (static_cast<unsigned char>(bytes[drop]) & 0xC0) == 0x80)
-        ++drop;
-    m_hidden.remove(0, drop);
+    m_hidden.remove(0, resyncBoundary(m_hidden, drop));
 }
 
 void TerminalController::setState(TerminalState next)

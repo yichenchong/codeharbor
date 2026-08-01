@@ -14,10 +14,8 @@ constexpr int kChunkBytes = 16 * 1024;
 
 } // namespace
 
-SshChannelDevice::SshChannelDevice(SshConnectionPool* pool,
-                                   SshConnectionPool::ChannelKind kind,
-                                   QObject* parent)
-    : QIODevice(parent), m_pool(pool), m_kind(kind), m_pump(new QTimer(this))
+SshChannelDevice::SshChannelDevice(SshConnectionPool* pool, QObject* parent)
+    : QIODevice(parent), m_pool(pool), m_pump(new QTimer(this))
 {
     // Single-shot and re-armed by pump() so the interval can adapt between
     // "burst in flight" (0 ms) and "quiet" (kIdlePollMs) without the restart
@@ -83,14 +81,25 @@ qint64 SshChannelDevice::readData(char* data, qint64 maxSize)
         return 0;
     const qint64 count = qMin<qint64>(maxSize, m_readBuffer.size());
     if (count <= 0) {
-        // 0 means "nothing buffered right now" for a sequential device; the
-        // pump will emit readyRead() again when more arrives. Never -1: that
-        // would be reported as a device error to the reader.
-        return 0;
+        // QIODevice's contract distinguishes the two empty answers, and a
+        // generic consumer relies on it: 0 means "nothing buffered right now,
+        // ask again after readyRead()", -1 means "this stream is finished". A
+        // finished channel that keeps answering 0 reads as a permanently idle
+        // one, so QIODevice::atEnd()/readAll()/waitForReadyRead() loops written
+        // against the plain interface wait for bytes that can never come.
+        return m_remoteFinished ? -1 : 0;
     }
     std::memcpy(data, m_readBuffer.constData(), static_cast<size_t>(count));
     m_readBuffer.remove(0, count);
     return count;
+}
+
+void SshChannelDevice::finishReadChannel()
+{
+    if (m_remoteFinished)
+        return;
+    m_remoteFinished = true;
+    emit readChannelFinished();
 }
 
 QString SshChannelDevice::lastError() const
@@ -167,10 +176,7 @@ void SshChannelDevice::closeChannel()
     // reported exactly once. A consumer that keys its teardown on this signal
     // (CodeharbordClient fails every pending call from it) must not behave
     // differently just because the client was built without libssh.
-    if (!m_remoteFinished) {
-        m_remoteFinished = true;
-        emit readChannelFinished();
-    }
+    finishReadChannel();
 }
 
 qint64 SshChannelDevice::writeData(const char* data, qint64 maxSize)
@@ -204,7 +210,7 @@ bool SshChannelDevice::acquireChannel()
         failWith(QStringLiteral("no SSH connection pool"));
         return false;
     }
-    m_channel = m_pool->openChannel(m_kind);
+    m_channel = m_pool->openChannel();
     if (!m_channel) {
         failWith(QStringLiteral("could not open SSH channel"));
         return false;
@@ -256,12 +262,12 @@ bool SshChannelDevice::startPty(const QString& term, int cols, int rows,
     cols = qMax(1, cols);
     rows = qMax(1, rows);
 
-    // One pty-req per channel, issued here whatever ChannelKind this device was
-    // constructed with: the pool no longer negotiates a PTY of its own, so the
-    // terminal type asked for is the one the remote session actually gets. It
-    // used to be sent by openChannel(Pty) as ssh_channel_request_pty(), which
-    // hard-codes TERM=xterm — a pane asking for xterm-256color then silently ran
-    // a 16-colour terminal, and only the window size could still be applied.
+    // The channel's one pty-req, issued here: the pool never negotiates a PTY
+    // of its own, so the terminal type asked for is the one the remote session
+    // actually gets. It used to be sent by the pool as
+    // ssh_channel_request_pty(), which hard-codes TERM=xterm — a pane asking for
+    // xterm-256color then silently ran a 16-colour terminal, and only the window
+    // size could still be applied.
     const QByteArray termUtf8 =
         term.isEmpty() ? QByteArrayLiteral("xterm-256color") : term.toUtf8();
     if (ssh_channel_request_pty_size(m_channel, termUtf8.constData(), cols, rows)
@@ -317,10 +323,7 @@ void SshChannelDevice::closeChannel()
     if (isOpen())
         QIODevice::close();
 
-    if (!m_remoteFinished) {
-        m_remoteFinished = true;
-        emit readChannelFinished();
-    }
+    finishReadChannel();
 }
 
 qint64 SshChannelDevice::writeData(const char* data, qint64 maxSize)
@@ -443,10 +446,8 @@ void SshChannelDevice::pump()
     // Remote EOF: report the end of the read channel exactly once, after the
     // final bytes have been surfaced. The device stays open so buffered data is
     // still readable; the owner decides when to closeChannel().
-    if (self && (eof || !failure.isEmpty()) && !m_remoteFinished) {
-        m_remoteFinished = true;
-        emit readChannelFinished();
-    }
+    if (self && (eof || !failure.isEmpty()))
+        finishReadChannel();
 }
 
 #endif // CH_HAVE_LIBSSH

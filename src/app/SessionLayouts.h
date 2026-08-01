@@ -24,7 +24,7 @@ namespace ch {
 // the codeharbord database stays authoritative (SPEC 2.1).
 //
 // Tree shape: `viewerTree` / `terminalTree` are plain QVariantMaps produced by
-// SplitNode::toJson().toVariantMap(), i.e. EXACTLY the persisted wire shape
+// SplitNode::tryToJson().toVariantMap(), i.e. EXACTLY the persisted wire shape
 //     leaf   { "type": "leaf",  "paneId": "viewer-1" }
 //     branch { "type": "split", "orientation": "horizontal"|"vertical",
 //              "children": [ ... ], "ratios": [ 1, 1 ] }
@@ -111,7 +111,7 @@ public:
     Q_INVOKABLE void load(QString devSessionId);
 
     // Replace a region's tree with a QML-authored one and persist it. `tree`
-    // must be SplitNode::toJson()-shaped (see above); anything else is rejected
+    // must be SplitNode::tryToJson()-shaped (see above); anything else is rejected
     // via error() and changes nothing.
     Q_INVOKABLE void saveTree(QString region, QVariant tree);
 
@@ -144,16 +144,23 @@ public:
     // resolving by its slot label, because that is how a new pane used to end
     // up attached to a closed pane's still-running shell.
     //
-    // A mint that FAILS reports through error() and REMOVES the leaf again, so
-    // the user sees the split undone with a reason rather than a pane that can
-    // never come up - and so an id-less terminal leaf, which a later load would
-    // have to read as a legacy one, is not left behind on the server.
+    // A mint that FAILS - the server refuses it, answers without an id, or
+    // never answers at all within terminalMintTimeoutMs() - reports through
+    // error() and REMOVES the leaf again, so the user sees the split undone
+    // with a reason rather than a pane that can never come up; so an id-less
+    // terminal leaf, which a later load would have to read as a legacy one, is
+    // not left behind on the server; and so the region becomes writable again
+    // (persist() refuses to write a tree with a pending leaf in it).
     Q_INVOKABLE QString splitPane(QString region, QString paneId,
                                   QString orientation);
 
-    // Remove the leaf holding `paneId`, collapsing a branch left with a single
-    // child into that child. Closing the last pane of a region leaves a single
-    // EMPTY leaf (paneId ""), never an empty tree.
+    // Remove the leaf holding `paneId`, then repair the shape of every branch
+    // above it: one left with a single child is replaced by that child, and one
+    // left with NO children is dropped from its own parent in turn. That second
+    // case is reachable because a split with exactly one child is a legal
+    // persisted tree, and leaving the childless branch behind put a blank,
+    // permanently unoccupiable slot in the region. Closing the last pane of a
+    // region leaves a single EMPTY leaf (paneId ""), never an empty tree.
     Q_INVOKABLE void closePane(QString region, QString paneId);
 
     // Record what the leaf holding `paneId` currently has open, so reopening
@@ -184,6 +191,23 @@ public:
     void bindTerminalPaneRow(const QString& devSessionId, const QString& paneName,
                              const QString& terminalPaneId);
 
+    // How long a `terminal_panes` mint may go unanswered before the leaf that
+    // is waiting for it is taken back out (see splitPane). 0 disables the
+    // deadline and leaves the transport as the only backstop. Default
+    // kDefaultTerminalMintTimeoutMs.
+    void setTerminalMintTimeoutMs(int ms);
+    int terminalMintTimeoutMs() const { return m_mintTimeoutMs; }
+
+    // Deliberately far beyond any answer a healthy peer takes for what is one
+    // small INSERT: this is not a latency budget, it is the bound that stops an
+    // unanswered mint disabling the terminal region's writes for the rest of
+    // the session. It sits above CodeharbordClient's own silent-peer detection
+    // (kDefaultHeartbeatIntervalMs * kDefaultHeartbeatMisses = 60 s, which
+    // fails every pending request with the transport's own message) so that
+    // mechanism keeps first refusal, and this only covers what it cannot see: a
+    // connection that stays healthy while this one request goes missing.
+    static constexpr int kDefaultTerminalMintTimeoutMs = 90000;
+
 signals:
     void devSessionIdChanged();
     void serverIdChanged();
@@ -208,7 +232,7 @@ private:
     struct RegionState {
         SplitNode tree;      // meaningful only while `valid`
         bool valid = false;  // false -> the property reads as a null QVariant
-        QVariant cache;      // tree.toJson().toVariantMap(), kept in lockstep
+        QVariant cache;      // *tree.tryToJson() as a variant map, kept in lockstep
         // A local edit has already replaced this region's tree since the
         // in-flight load for it was issued, so that load's reply is history and
         // must not be applied. Without it, a getLayout answer that crossed a
@@ -250,6 +274,11 @@ private:
     // Store without emitting - for edits QML already applied (see the signal
     // discipline note above).
     void setTreeQuietly(int index, SplitNode tree);
+    // Refresh the variant cache from the slot's CURRENT tree - the common case
+    // by far, since almost every edit mutates the tree in place. Takes no tree
+    // precisely so no caller has to hand the member back to us by value.
+    void publishTree(int index);
+    void publishTreeQuietly(int index);
     void clearTrees();
     // Layout edits are only meaningful for a selected Dev Session on a known
     // server: setLayout needs both ids, and mutating the cache without being
@@ -290,13 +319,18 @@ private:
     // the mint was started under, so an answer for an abandoned Dev Session is
     // dropped rather than written into whatever tree is loaded now.
     void mintTerminalPaneRow(quint64 generation, const QString& paneId);
+    // Remove the terminal leaf `paneId` whose mint came to nothing, report
+    // `reason`, and republish/persist. Shared by the error answer and the
+    // deadline so the two cannot drift apart.
+    void abandonTerminalMint(const QString& paneId, const QString& reason);
     // Find the terminal leaf labelled `paneId` in the loaded terminal tree, or
     // nullptr. Terminal region only: a viewer leaf has no row to bind.
     SplitNode* findTerminalLeaf(const QString& paneId);
-    // Remove the leaf labelled `paneId` from a region, collapsing a branch left
-    // with one child into that child and leaving an emptied region with a single
-    // EMPTY leaf. False when the region holds no such leaf. Neither publishes
-    // nor persists; the caller decides both.
+    // Remove the leaf labelled `paneId` from a region, collapsing every branch
+    // the removal empties or leaves with a single child (see closePane) and
+    // leaving an emptied region with a single EMPTY leaf. False when the region
+    // holds no such leaf. Neither publishes nor persists; the caller decides
+    // both.
     bool dropLeaf(int index, const QString& paneId);
     // True while any terminal leaf is still waiting for the `terminal_panes`
     // row being minted for it. persist() refuses to write such a tree; see
@@ -314,6 +348,8 @@ private:
     // getLayout replies still outstanding for the current generation; `loaded`
     // fires when it reaches zero.
     int m_pendingLoads = 0;
+    // See setTerminalMintTimeoutMs().
+    int m_mintTimeoutMs = kDefaultTerminalMintTimeoutMs;
     // Terminal slot labels this client may resolve by NAME, i.e. the leaves of
     // a layout the SERVER handed us that carry no terminalPaneId. Those are
     // genuinely pre-migration leaves, and for them the label really is the

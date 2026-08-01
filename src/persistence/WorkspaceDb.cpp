@@ -376,6 +376,42 @@ RpcError malformedResult(const char* method, const char* expected)
     return error;
 }
 
+// -32602 is JSON-RPC 2.0's reserved "invalid params", and is what the server
+// answers for a request it refuses on shape. A request this class refuses
+// BEFORE sending it fails with the same code and the same method name, so a
+// caller sees one kind of error whether the refusal happened here or there.
+constexpr int kInvalidParamsCode = -32602;
+
+// `method` and `problem` are string literals with static storage; they are only
+// ever formatted into the message.
+RpcError invalidParams(const char* method, const char* problem)
+{
+    RpcError error;
+    error.code = kInvalidParamsCode;
+    error.message = QStringLiteral("invalid %1 params: %2")
+                        .arg(QString::fromLatin1(method),
+                             QString::fromLatin1(problem));
+    return error;
+}
+
+// Deliver a locally-detected failure on the SAME terms as a server one: later,
+// from the event loop, never inside the method the caller is still in. Every
+// method here is documented async and its callers are written for that — one
+// that took its callback synchronously would re-enter them halfway through
+// their own call to this class, a shape no other method has. The delivery is
+// posted to the borrowed client, which is the object the real reply would have
+// come from and outlives this repository by contract.
+template <typename Callback>
+void failAsync(QObject* context, Callback cb, RpcError error)
+{
+    QMetaObject::invokeMethod(
+        context,
+        [cb = std::move(cb), error = std::move(error)]() mutable {
+            cb(std::nullopt, std::move(error));
+        },
+        Qt::QueuedConnection);
+}
+
 // Response handler for every workspace.* method whose result is a single record
 // object: forwards a server error verbatim, rejects a non-object result, and
 // otherwise hands the decoded record to `cb`. `decode` maps the result object to
@@ -399,7 +435,13 @@ auto recordHandler(const char* method, Callback cb, Decode decode)
 
 } // namespace
 
-WorkspaceDb::WorkspaceDb(CodeharbordClient* client) : m_client(client) {}
+WorkspaceDb::WorkspaceDb(CodeharbordClient* client) : m_client(client)
+{
+    // Every method dereferences m_client unconditionally. Catch a null here,
+    // at the construction site that got it wrong, rather than at whichever
+    // async call happens to run first.
+    Q_ASSERT(m_client);
+}
 
 void WorkspaceDb::list(const ServerId& serverId, ListCallback cb)
 {
@@ -566,15 +608,31 @@ void WorkspaceDb::createTerminalPane(const CreateTerminalPaneParams& params,
 void WorkspaceDb::resolveTerminalPane(const ResolveTerminalPaneParams& params,
                                       TerminalPaneCallback cb)
 {
+    // The row id wins when it is there, because that is the leaf's own terminal
+    // and the label is only its historical stand-in; the label is deliberately
+    // not sent alongside it, so the server is never asked a question the caller
+    // did not mean.
+    const bool byRow = !params.id.value.isEmpty();
+    // With NEITHER address there is no question to ask. This used to go out as
+    // an empty `name`, i.e. "look up (or create) the pane called ''": the server
+    // refuses it, so the caller did get an error, but only after a round trip
+    // and phrased as though the empty name were a real request. Refuse it here,
+    // with the same code the server would have used.
+    if (!byRow && params.name.isEmpty()) {
+        failAsync(m_client, std::move(cb),
+                  invalidParams(rpc::kMethodWorkspaceResolveTerminalPane,
+                                R"(give one of "id" (the terminal pane row, the )"
+                                R"(normal case) or "name" (a layout slot label, )"
+                                R"(legacy layouts only); neither was set)"));
+        return;
+    }
+
     QJsonObject obj{
         {QStringLiteral("serverId"), params.serverId.value},
         {QStringLiteral("devSessionId"), params.devSessionId.value},
     };
-    // Exactly one addressing mode reaches the wire; the server rejects both or
-    // neither. The row id wins when it is there, because that is the leaf's own
-    // terminal and the label is only its historical stand-in.
-    if (!params.id.isEmpty())
-        obj[QStringLiteral("id")] = params.id;
+    if (byRow)
+        obj[QStringLiteral("id")] = params.id.value;
     else
         obj[QStringLiteral("name")] = params.name;
     // Omitted rather than sent as null when unset, like every other optional in
@@ -642,11 +700,22 @@ void WorkspaceDb::setLayout(const ServerId& serverId,
                             const DevSessionId& devSessionId, Region region,
                             const SplitNode& tree, LayoutCallback cb)
 {
+    // A tree tryToJson() refuses is one no client could ever load back
+    // (SplitTree.h): storing it would lose the user's layout silently, on the
+    // NEXT launch rather than now. Fail the write instead of performing it.
+    const std::optional<QJsonObject> treeJson = tree.tryToJson();
+    if (!treeJson) {
+        failAsync(m_client, std::move(cb),
+                  invalidParams(rpc::kMethodWorkspaceSetLayout,
+                                "`tree` is not a valid split tree"));
+        return;
+    }
+
     const QJsonObject params{
         {QStringLiteral("serverId"), serverId.value},
         {QStringLiteral("devSessionId"), devSessionId.value},
         {QStringLiteral("region"), regionKey(region)},
-        {QStringLiteral("tree"), tree.toJson()},
+        {QStringLiteral("tree"), *treeJson},
     };
     m_client->call(
         QString::fromLatin1(rpc::kMethodWorkspaceSetLayout), params,

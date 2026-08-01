@@ -12,6 +12,7 @@
 // src/remote/RpcTypes.h.
 
 import { DatabaseSync } from "node:sqlite";
+import type { StatementSync } from "node:sqlite";
 import { randomUUID } from "node:crypto";
 import { mkdirSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -648,6 +649,17 @@ const MIGRATIONS: ReadonlyArray<{
     { version: 4, apply: migrateDropTerminalPaneAddressUnique },
 ];
 
+// Quote a SQL IDENTIFIER: wrap it in double quotes and double any embedded
+// double quote, which is the only escape SQL defines. Not JSON.stringify —
+// that backslash-escapes a quote, and a backslash means nothing to SQLite, so
+// an index named `we"ird` came out as the syntax error `"we\"ird"` rather than
+// as a reference to that index. The names below are read back out of the
+// database's own catalogue, so this is the layer that has to be right about
+// them: a value that arrives from a query is not a literal we control.
+function quoteIdentifier(name: string): string {
+    return `"${name.replace(/"/g, '""')}"`;
+}
+
 // The unique index over exactly `columns` of `terminal_panes`, in order, or
 // null when the table does not enforce that combination. A table-level UNIQUE
 // shows up as an sqlite_autoindex, a migration-added one under its own name,
@@ -666,7 +678,7 @@ function terminalPaneUniqueIndexOver(db: DatabaseSync, columns: string[]): strin
     for (const index of indexes) {
         if (index.unique !== 1) continue;
         const found = db
-            .prepare(`PRAGMA index_info(${JSON.stringify(index.name)})`)
+            .prepare(`PRAGMA index_info(${quoteIdentifier(index.name)})`)
             .all() as unknown as Array<{ name: string | null }>;
         if (found.length !== columns.length) continue;
         if (found.every((c, i) => c.name === columns[i])) return index.name;
@@ -720,9 +732,17 @@ function terminalPaneUniqueIndexOver(db: DatabaseSync, columns: string[]): strin
 //     "<name>-dup-<short row id>", which is unique because the row id is — and
 //     kept, rather than deleted. It still owns a live tmux session and the
 //     user's running processes; deleting it would strand them under a name
-//     nothing can ever look up again. A renamed row simply stops answering the
-//     slot lookup: it is reachable through the sidebar and through the `tmux.*`
-//     adoption path, and the slot itself now resolves to exactly one row.
+//     nothing can ever look up again.
+//
+//     Still load-bearing even though v4 immediately makes duplicate labels
+//     legal again, and not merely as history: phase 4 below creates
+//     UNIQUE (dev_session_id, name), and that statement FAILS on a database
+//     that still holds two rows for one slot. Both steps run inside the
+//     migration runner's single transaction, so dropping this repair would
+//     roll the whole upgrade back and leave a v2 database unopenable. (The
+//     one-shot legacy by-label lookup is deterministic without it — it takes
+//     the oldest match by rowid — so it is phase 4, not that lookup, that
+//     this repair is actually for.)
 //
 //  4. CONSTRAIN, skipping whichever constraint the table already carries.
 function migrateTerminalPaneIdentity(db: DatabaseSync): void {
@@ -816,7 +836,7 @@ function migrateDropTerminalPaneAddressUnique(db: DatabaseSync): void {
     const index = terminalPaneUniqueIndexOver(db, ["dev_session_id", "name"]);
     if (index === null) return;
     if (!index.startsWith("sqlite_autoindex_")) {
-        db.exec(`DROP INDEX ${JSON.stringify(index)}`);
+        db.exec(`DROP INDEX ${quoteIdentifier(index)}`);
         return;
     }
     db.exec(`
@@ -859,35 +879,66 @@ function migrate(db: DatabaseSync): void {
         }
         return;
     }
-    // One transaction for the whole upgrade, so a step that throws half way
-    // leaves the database exactly as it was rather than at a version nobody
-    // wrote migrations for. (schema.sql's leading `PRAGMA foreign_keys = ON` is
-    // a no-op inside a transaction; openWorkspace already set it on this
-    // connection, so nothing is lost.)
-    db.exec("BEGIN IMMEDIATE");
+    // Foreign-key enforcement is turned OFF for the duration of the upgrade,
+    // and only for the upgrade.
+    //
+    // Schema v4 has to REBUILD terminal_panes (SQLite cannot drop a table-level
+    // UNIQUE), and SQLite's documented rebuild procedure requires it: copying
+    // the rows into the replacement table re-checks every foreign key, whereas
+    // an existing database is never re-checked — a constraint is evaluated only
+    // when a row is written. So a legacy database holding a pane row whose
+    // dev_session is gone opens fine today, and used to fail the rebuild's
+    // INSERT, roll the whole upgrade back, and become permanently unopenable by
+    // this build. Off, the rebuild is a pure copy: the orphan survives exactly
+    // as it survives every open today. That is deliberately preferred over
+    // deleting the row (loses the user's pane) or re-parenting it (invents a
+    // parent nobody chose), and over reporting a clear diagnostic, which would
+    // still leave the workspace unopenable.
+    //
+    // It must be set HERE, before BEGIN: `PRAGMA foreign_keys` is a documented
+    // no-op inside a transaction, which is exactly why the rebuild step cannot
+    // do it for itself. Nothing between here and COMMIT inserts a row that
+    // needs checking — the steps only run DDL and repair rows already present —
+    // and the previous setting is restored in `finally`, so every ordinary
+    // write afterwards is enforced again.
+    const foreignKeysWereOn =
+        (db.prepare("PRAGMA foreign_keys").get() as { foreign_keys: number } | undefined)
+            ?.foreign_keys === 1;
+    db.exec("PRAGMA foreign_keys = OFF");
     try {
-        for (const step of MIGRATIONS) {
-            if (step.version > from && step.version <= WORKSPACE_SCHEMA_VERSION) {
-                step.apply(db);
-            }
-        }
-        // schema.sql seeds the version row with INSERT OR IGNORE, which cannot
-        // advance an already-present row. Record the target version explicitly
-        // so a WORKSPACE_SCHEMA_VERSION bump is persisted (and migrate stops
-        // re-running steps on every open) rather than the stored version
-        // silently drifting from the DDL's hard-coded literal.
-        db.prepare("UPDATE schema_version SET version = ? WHERE id = 1").run(
-            WORKSPACE_SCHEMA_VERSION,
-        );
-        db.exec("COMMIT");
-    } catch (err) {
+        // One transaction for the whole upgrade, so a step that throws half way
+        // leaves the database exactly as it was rather than at a version nobody
+        // wrote migrations for. (schema.sql's leading `PRAGMA foreign_keys = ON`
+        // is a no-op inside a transaction, so it cannot re-enable enforcement
+        // behind the line above either.)
+        db.exec("BEGIN IMMEDIATE");
         try {
-            db.exec("ROLLBACK");
-        } catch {
-            // Already rolled back by the failure itself; the original error is
-            // the one worth reporting.
+            for (const step of MIGRATIONS) {
+                if (step.version > from && step.version <= WORKSPACE_SCHEMA_VERSION) {
+                    step.apply(db);
+                }
+            }
+            // schema.sql seeds the version row with INSERT OR IGNORE, which
+            // cannot advance an already-present row. Record the target version
+            // explicitly so a WORKSPACE_SCHEMA_VERSION bump is persisted (and
+            // migrate stops re-running steps on every open) rather than the
+            // stored version silently drifting from the DDL's hard-coded
+            // literal.
+            db.prepare("UPDATE schema_version SET version = ? WHERE id = 1").run(
+                WORKSPACE_SCHEMA_VERSION,
+            );
+            db.exec("COMMIT");
+        } catch (err) {
+            try {
+                db.exec("ROLLBACK");
+            } catch {
+                // Already rolled back by the failure itself; the original error
+                // is the one worth reporting.
+            }
+            throw err;
         }
-        throw err;
+    } finally {
+        if (foreignKeysWereOn) db.exec("PRAGMA foreign_keys = ON");
     }
 }
 
@@ -910,6 +961,22 @@ function schemaVersion(db: DatabaseSync): number {
     }
 }
 
+// The compiled form of the nested listing (see Workspace.listStatements).
+interface ListStatements {
+    groups: StatementSync;
+    sessions: StatementSync;
+    viewerPanes: StatementSync;
+    terminalPanes: StatementSync;
+    layouts: StatementSync;
+}
+
+// A table whose rows carry a `position` within a scope, and the column naming
+// that scope. Literal unions rather than plain strings because both are
+// interpolated into SQL — an identifier cannot be a bound parameter, so the
+// type is what keeps a caller-supplied name from ever reaching the query text.
+type OrderedTable = "groups" | "dev_sessions" | "viewer_panes" | "terminal_panes";
+type ScopeColumn = "server_id" | "group_id" | "dev_session_id";
+
 // A single workspace database connection with all CRUD operations (SPEC 4.2,
 // 11.1). Booleans are stored as 0/1 integers; deletes cascade manually because
 // the schema's foreign keys use the default NO ACTION (they reject, not
@@ -923,6 +990,20 @@ export class Workspace {
     // transaction of its own, so the value only ever toggles between the two
     // states and a counter invited a reader to expect otherwise.
     private inTransaction = false;
+    // The nested listing's five statements, compiled once per connection.
+    //
+    // list() runs one query for the groups, one per group for its sessions and
+    // three per session for its panes and layouts, and every one of them is the
+    // same SQL every time — so re-preparing them per call charges the whole read
+    // path a fresh SQL compilation per row of the sidebar. duplicateSession and
+    // packOrder already hoist their statements out of their loops for exactly
+    // this reason; this is the same fix on the side that runs far more often.
+    //
+    // Lazy rather than prepared in the constructor: a connection that only ever
+    // writes should not pay for them, and prepare() needs the tables to exist,
+    // which is a promise the constructor cannot make for a caller that did not
+    // come through openWorkspace().
+    private listStatements: ListStatements | undefined;
 
     constructor(db: DatabaseSync) {
         this.db = db;
@@ -994,6 +1075,12 @@ export class Workspace {
                     "INSERT INTO groups (id, server_id, name, position, collapsed, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
                 )
                 .run(id, params.serverId, params.name, position, params.collapsed ? 1 : 0, ts, ts);
+            // An explicit position is a placement REQUEST, not a raw column
+            // value: re-pack so the new row really is the Nth and no two rows
+            // share a position. See placeAt.
+            if (params.position !== undefined) {
+                this.placeAt("groups", "server_id", params.serverId, id, params.position, ts);
+            }
             return this.getGroup(id);
         });
     }
@@ -1071,6 +1158,9 @@ export class Workspace {
                     ts,
                     ts,
                 );
+            if (params.position !== undefined) {
+                this.placeAt("dev_sessions", "group_id", params.groupId, id, params.position, ts);
+            }
             return this.getSession(id);
         });
     }
@@ -1347,6 +1437,16 @@ export class Workspace {
                     ts,
                     ts,
                 );
+            if (params.position !== undefined) {
+                this.placeAt(
+                    "viewer_panes",
+                    "dev_session_id",
+                    params.devSessionId,
+                    id,
+                    params.position,
+                    ts,
+                );
+            }
             return this.getViewerPane(id);
         });
     }
@@ -1434,6 +1534,16 @@ export class Workspace {
                     ts,
                     ts,
                 );
+            if (params.position !== undefined) {
+                this.placeAt(
+                    "terminal_panes",
+                    "dev_session_id",
+                    params.devSessionId,
+                    id,
+                    params.position,
+                    ts,
+                );
+            }
             return this.getTerminalPane(id);
         });
     }
@@ -1684,14 +1794,34 @@ export class Workspace {
     // layouts}. Ordering is deterministic (position, then id) so a reopen of
     // the same database yields byte-identical output.
     list(serverId: string): GroupNode[] {
-        const rows = this.db
-            .prepare("SELECT * FROM groups WHERE server_id = ? ORDER BY position, id").all(serverId) as unknown as GroupRow[];
+        const rows = this.listing().groups.all(serverId) as unknown as GroupRow[];
         return rows.map((g) => ({ ...toGroup(g), sessions: this.listSessions(g.id) }));
     }
 
+    // Compile the listing's statements on first use and keep them; see
+    // listStatements.
+    private listing(): ListStatements {
+        return (this.listStatements ??= {
+            groups: this.db.prepare(
+                "SELECT * FROM groups WHERE server_id = ? ORDER BY position, id",
+            ),
+            sessions: this.db.prepare(
+                "SELECT * FROM dev_sessions WHERE group_id = ? ORDER BY position, id",
+            ),
+            viewerPanes: this.db.prepare(
+                "SELECT * FROM viewer_panes WHERE dev_session_id = ? ORDER BY position, id",
+            ),
+            terminalPanes: this.db.prepare(
+                "SELECT * FROM terminal_panes WHERE dev_session_id = ? ORDER BY position, id",
+            ),
+            layouts: this.db.prepare(
+                "SELECT region, tree FROM session_layouts WHERE dev_session_id = ?",
+            ),
+        });
+    }
+
     private listSessions(groupId: string): SessionNode[] {
-        const rows = this.db
-            .prepare("SELECT * FROM dev_sessions WHERE group_id = ? ORDER BY position, id").all(groupId) as unknown as SessionRow[];
+        const rows = this.listing().sessions.all(groupId) as unknown as SessionRow[];
         return rows.map((s) => this.sessionNode(s.id, s));
     }
 
@@ -1708,20 +1838,20 @@ export class Workspace {
     }
 
     private listViewerPanes(sessionId: string): ViewerPane[] {
-        const rows = this.db
-            .prepare("SELECT * FROM viewer_panes WHERE dev_session_id = ? ORDER BY position, id").all(sessionId) as unknown as ViewerPaneRow[];
+        const rows = this.listing().viewerPanes.all(sessionId) as unknown as ViewerPaneRow[];
         return rows.map(toViewerPane);
     }
 
     private listTerminalPanes(sessionId: string): TerminalPane[] {
-        const rows = this.db
-            .prepare("SELECT * FROM terminal_panes WHERE dev_session_id = ? ORDER BY position, id").all(sessionId) as unknown as TerminalPaneRow[];
+        const rows = this.listing().terminalPanes.all(sessionId) as unknown as TerminalPaneRow[];
         return rows.map(toTerminalPane);
     }
 
     private getLayouts(sessionId: string): SessionLayouts {
-        const rows = this.db
-            .prepare("SELECT region, tree FROM session_layouts WHERE dev_session_id = ?").all(sessionId) as unknown as Array<{ region: Region; tree: string }>;
+        const rows = this.listing().layouts.all(sessionId) as unknown as Array<{
+            region: Region;
+            tree: string;
+        }>;
         const layouts: SessionLayouts = { viewer: null, terminal: null };
         // A single corrupt tree must not fail the whole nested listing: skip it
         // (leaving that region null / self-healed) rather than throw (RW14).
@@ -1748,19 +1878,41 @@ export class Workspace {
         this.db.prepare("DELETE FROM dev_sessions WHERE id = ?").run(id);
     }
 
-    // Scope of an ordered, re-packable table: a server's groups, or a group's
-    // sessions. The table/column pairs are literal unions rather than plain
-    // strings because they are interpolated into SQL — an identifier cannot be a
-    // bound parameter, so the type is what keeps a caller-supplied name from
-    // ever reaching the query text.
+    // Ids of one ordered scope, in listing order. See OrderedTable on why the
+    // identifiers are literal unions.
     private orderedIds(
-        table: "groups" | "dev_sessions",
-        scopeColumn: "server_id" | "group_id",
+        table: OrderedTable,
+        scopeColumn: ScopeColumn,
         scopeValue: string,
     ): string[] {
         const rows = this.db
             .prepare(`SELECT id FROM ${table} WHERE ${scopeColumn} = ? ORDER BY position, id`).all(scopeValue) as unknown as Array<{ id: string }>;
         return rows.map((r) => r.id);
+    }
+
+    // Put a just-inserted row at index `index` of its scope and renumber the
+    // scope around it. Callers must already be inside a transaction.
+    //
+    // This is what makes "create at position N" mean something. Writing N into
+    // the new row's `position` column and stopping leaves the row TIED with
+    // whichever row already held N, and every listing query orders by
+    // `position, id`, so the tie is broken by UUID — the row the user just
+    // created at position 1 appears above or below its neighbour at random, and
+    // the two stay tied for every later read. moveSession was fixed for exactly
+    // this; creation has the same hole. An index past the end simply appends,
+    // which is the only sensible reading of "create at position 9" in a scope
+    // of three.
+    private placeAt(
+        table: OrderedTable,
+        scopeColumn: ScopeColumn,
+        scopeValue: string,
+        id: string,
+        index: number,
+        ts: number,
+    ): void {
+        const others = this.orderedIds(table, scopeColumn, scopeValue).filter((x) => x !== id);
+        others.splice(Math.min(index, others.length), 0, id);
+        this.packOrder(table, scopeColumn, scopeValue, others, ts);
     }
 
     // Renumber one scope to contiguous positions 0..n-1 in the caller's order.
@@ -1776,8 +1928,8 @@ export class Workspace {
     // by UUID, i.e. at random. A client that sends a filtered or stale list gets
     // its requested prefix and a still-packed scope instead of a shuffle.
     private packOrder(
-        table: "groups" | "dev_sessions",
-        scopeColumn: "server_id" | "group_id",
+        table: OrderedTable,
+        scopeColumn: ScopeColumn,
         scopeValue: string,
         orderedIds: readonly string[],
         ts: number,
@@ -1798,11 +1950,11 @@ export class Workspace {
     }
 
     // Next free position in a scope: one past the current maximum, so the first
-    // row of an empty scope lands on 0. See orderedIds on why the identifiers are
-    // literal unions.
+    // row of an empty scope lands on 0. See OrderedTable on why the identifiers
+    // are literal unions.
     private nextPosition(
-        table: "groups" | "dev_sessions" | "viewer_panes" | "terminal_panes",
-        scopeColumn: "server_id" | "group_id" | "dev_session_id",
+        table: OrderedTable,
+        scopeColumn: ScopeColumn,
         scopeValue: string,
     ): number {
         const row = this.db

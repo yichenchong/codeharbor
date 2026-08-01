@@ -624,8 +624,7 @@ bool TstLiveEditor::startRemoteShell()
     // the channel reaps it — the same stdin-driven lifetime
     // SessionBootstrap::bridgeCommand() relies on, because an exec channel
     // sends no SIGHUP.
-    m_execShell = std::make_unique<SshChannelDevice>(&m_pool,
-                                                     SshConnectionPool::ChannelKind::Exec);
+    m_execShell = std::make_unique<SshChannelDevice>(&m_pool);
     connect(m_execShell.get(), &QIODevice::readyRead, m_execShell.get(),
             [this] { m_execOut += m_execShell->readAll(); });
     connect(m_execShell.get(), &SshChannelDevice::channelError, m_execShell.get(),

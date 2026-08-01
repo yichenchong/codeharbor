@@ -1,14 +1,19 @@
 #pragma once
 
+#include <QByteArray>
+#include <QJsonObject>
 #include <QString>
+
+#include <optional>
 
 namespace ch::rpc {
 
 // C1 — RPC method catalog (docs/PLAN.md). C++ mirror of the frozen TypeScript
 // contract in remote/src/rpc-types.ts for the initial SPEC 8.3 editing file
 // method set. Header-only: the method-name and error-code constants bound by
-// the R-client workstream. Distinct from the server-side implementation in
-// remote/.
+// the R-client workstream, plus the one inline reader of a wire shape that more
+// than one consumer has to agree about (decodeFileContent, below). Distinct
+// from the server-side implementation in remote/.
 //
 // Revision tokens (SPEC 8.4) are OPAQUE strings minted by the server. The
 // client stores and echoes them verbatim as expectedRevision on writes and
@@ -30,6 +35,21 @@ inline constexpr int kRevisionMismatch = -32001;
 // carrying a message already written for a user to read.
 inline constexpr int kDatabaseBusy = -32002;
 
+// Application-level JSON-RPC error code for a request that is well-formed but
+// whose ANSWER would exceed a server resource bound, so the server refused it
+// outright and changed nothing. Mirrors RPC_RESOURCE_LIMIT in
+// remote/src/rpc-types.ts, which raises it for a file.listDirectory whose
+// listing would not fit in one transport frame and for a file.watch past the
+// live-subscription cap.
+//
+// No client code special-cases it and none should: the server's message names
+// the limit that bit and is written for a person, so the generic error path
+// carries it to the user unchanged. That the refusal exists at all is the
+// client's protection too — a listing serialized anyway put a line past
+// CodeharbordClient's 16 MiB cap, and going over that cap does not fail one
+// reply, it drops the whole transport.
+inline constexpr int kResourceLimit = -32003;
+
 // Stable wire method names for the initial file set (SPEC 8.3). These mirror the
 // values in RPC_METHODS in remote/src/rpc-types.ts.
 inline constexpr auto kMethodStat = "file.stat";
@@ -39,6 +59,51 @@ inline constexpr auto kMethodResolvePath = "file.resolvePath";
 inline constexpr auto kMethodWatch = "file.watch";
 inline constexpr auto kMethodUnwatch = "file.unwatch";
 inline constexpr auto kMethodListDirectory = "file.listDirectory";
+
+// Decode the {encoding, content} pair of a file.readFile result (SPEC 8.3) into
+// the text a consumer should display.
+//
+// The daemon decodes the file with a STRICT UTF-8 decoder and, when that
+// refuses, answers `encoding: "base64"` carrying the file's exact bytes
+// (remote/src/files.ts). A base64 reply is therefore not "some other kind of
+// file": it is the same file, sent losslessly because the decoder would have
+// had to guess. Every consumer must decode it before presenting it, or the user
+// is shown a wall of base64 instead of their file.
+//
+// It lives here, with the reply shape it decodes, rather than beside its
+// caller. TODAY it has ONE caller — both file.readFile replies in
+// ch::EditorController — and that is a fact about right now, not evidence of a
+// second user: ch::ViewerModel::settleTextRead read the same shape and decoded
+// it the same way until the viewer's text-read path was removed in this same
+// round, which is how the two came to disagree in the first place. Anything
+// that reads a file.readFile reply next needs this, and it must not be
+// rediscovered a third time. There is also nowhere else the two could have
+// shared it: ch_editor deliberately does not link ch_viewers (see
+// EditorController::kMaxEditableReadBytes) and both link ch_remote.
+//
+// Returns nullopt ONLY when a base64 payload is not valid base64 — a server bug
+// or a corrupted frame. Callers report that rather than rendering an empty
+// file. Invalid UTF-8 INSIDE a correctly encoded payload is not an error here:
+// it becomes U+FFFD, which is the honest read-only view of a file the strict
+// decoder refused.
+//
+// Decoding NEVER makes a buffer writable. Writability is derived by the caller
+// from the wire `encoding` (and `truncated`), never from the payload's shape,
+// so a decoded base64 buffer is still refused by the save path.
+inline std::optional<QString> decodeFileContent(const QJsonObject& readResult)
+{
+    const QString content =
+        readResult.value(QStringLiteral("content")).toString();
+    if (readResult.value(QStringLiteral("encoding")).toString()
+        != QLatin1String("base64"))
+        return content;
+    const auto decoded = QByteArray::fromBase64Encoding(
+        content.toUtf8(),
+        QByteArray::Base64Encoding | QByteArray::AbortOnBase64DecodingErrors);
+    if (!decoded)
+        return std::nullopt;
+    return QString::fromUtf8(*decoded);
+}
 
 // Server -> client notification method name for an active watch subscription
 // (SPEC 8.7). A NOTIFICATION name (no id, no response), deliberately NOT part

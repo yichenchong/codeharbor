@@ -1007,6 +1007,14 @@ function downgradeToV2(ws: Workspace): void {
     ws.db.prepare("UPDATE schema_version SET version = 2 WHERE id = 1").run();
 }
 
+// SQL identifier quoting, the same rule the source uses (quoteIdentifier in
+// remote/src/workspace.ts): an embedded double quote is DOUBLED, never
+// backslash-escaped. These helpers are handed index names straight out of the
+// catalogue, so they have to survive a name that contains one.
+function quotedIdentifier(name: string): string {
+    return `"${name.replace(/"/g, '""')}"`;
+}
+
 // Every unique index over exactly (tmux_target), however it was declared: a
 // table-level UNIQUE shows up as an sqlite_autoindex, the migration's as a
 // named one.
@@ -1019,7 +1027,7 @@ function uniqueTmuxTargetIndexes(ws: Workspace): string[] {
     for (const index of indexes) {
         if (index.unique !== 1) continue;
         const columns = ws.db
-            .prepare(`PRAGMA index_info("${index.name}")`)
+            .prepare(`PRAGMA index_info(${quotedIdentifier(index.name)})`)
             .all() as unknown as { name: string | null }[];
         if (columns.length === 1 && columns[0].name === "tmux_target") names.push(index.name);
     }
@@ -1196,7 +1204,7 @@ function uniqueAddressIndexes(ws: Workspace): string[] {
     for (const index of indexes) {
         if (index.unique !== 1) continue;
         const columns = ws.db
-            .prepare(`PRAGMA index_info("${index.name}")`)
+            .prepare(`PRAGMA index_info(${quotedIdentifier(index.name)})`)
             .all() as unknown as { name: string | null }[];
         if (
             columns.length === 2 &&
@@ -1359,9 +1367,14 @@ test("resolveTerminalPane by id never creates and is scoped to the Dev Session",
 });
 
 // v3 de-duplicated slot labels before constraining them, and v4 then dropped
-// the constraint again. The RENAMES are still what a v2 database gets, and they
-// are still what makes the legacy by-label lookup land on one row, so the repair
-// is pinned here even though the index it was preparing for no longer exists.
+// the constraint again, which makes the renames look like pure data damage in
+// hindsight. They are not, and this is re-verified: phase 4 of v3 creates
+// UNIQUE (dev_session_id, name), that statement fails outright on a database
+// still holding two rows for one slot, and both steps run inside the migration
+// runner's ONE transaction — so a v2 database with duplicate labels would roll
+// the whole upgrade back and never open. The repair is what a v2 database gets,
+// and it is pinned here even though the index it was preparing for no longer
+// exists.
 test("the v3 migration de-duplicates slot names, and v4 drops the index again", async () => {
     const dbPath = await tmpDbPath();
     const legacy = openWorkspace(dbPath);
@@ -1400,6 +1413,133 @@ test("the v3 migration de-duplicates slot names, and v4 drops the index again", 
         upgraded.resolveTerminalPane({ serverId: SERVER, devSessionId: s.id, name: "terminal-1" }).id,
         a.id,
     );
+    upgraded.close();
+
+    await cleanup(dbPath);
+});
+
+// A v3 database in the shape v4 has to REBUILD: the address rule arrived as a
+// table-level UNIQUE, i.e. an sqlite_autoindex, which SQLite cannot drop.
+// Rewind the stored version so the next open runs v4 for real.
+function downgradeToV3Autoindex(ws: Workspace): void {
+    ws.db.exec(`
+        ALTER TABLE terminal_panes RENAME TO terminal_panes_v3_tmp;
+        CREATE TABLE terminal_panes (
+            id                TEXT    NOT NULL PRIMARY KEY,
+            server_id         TEXT    NOT NULL,
+            dev_session_id    TEXT    NOT NULL,
+            name              TEXT    NOT NULL,
+            working_directory TEXT,
+            tmux_target       TEXT,
+            startup_command   TEXT,
+            harness           TEXT,
+            position          INTEGER NOT NULL DEFAULT 0,
+            created_at        INTEGER NOT NULL,
+            updated_at        INTEGER NOT NULL,
+            FOREIGN KEY (dev_session_id) REFERENCES dev_sessions (id),
+            UNIQUE (tmux_target),
+            UNIQUE (dev_session_id, name)
+        );
+        INSERT INTO terminal_panes SELECT * FROM terminal_panes_v3_tmp;
+        DROP TABLE terminal_panes_v3_tmp;
+    `);
+    ws.db.prepare("UPDATE schema_version SET version = 3 WHERE id = 1").run();
+}
+
+// A real database can hold a terminal pane whose Dev Session is gone: SQLite
+// checks a foreign key when the row is WRITTEN and never re-checks it, so
+// however the orphan arrived (a delete by an older build, a hand-edit, a
+// half-restored file), the daemon opens that database and serves it happily.
+// v4 then has to REBUILD terminal_panes, and the copy re-checks every key —
+// which used to fail the INSERT, roll the whole upgrade back and make the
+// database permanently unopenable by this build. What is at stake is not the
+// stale row: it is every OTHER row, because one orphaned pane took the user's
+// groups, sessions, panes and layouts with it.
+test("the v4 rebuild migrates a legacy database that contains an orphaned pane row", async () => {
+    const dbPath = await tmpDbPath();
+    const legacy = openWorkspace(dbPath);
+    const { group, session, terminal } = seed(legacy);
+    downgradeToV3Autoindex(legacy);
+    // Plant the orphan the way a real one exists on disk: unchecked, because
+    // enforcement only ever applied at the moment of the write.
+    legacy.db.exec("PRAGMA foreign_keys = OFF");
+    legacy.db
+        .prepare(
+            "INSERT INTO terminal_panes (id, server_id, dev_session_id, name, tmux_target, position, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .run("orphan-pane", SERVER, "dev-session-that-is-gone", "terminal-9", "ch_orphan", 0, 1, 1);
+    legacy.db.exec("PRAGMA foreign_keys = ON");
+    legacy.close();
+
+    // The whole point: this open must SUCCEED.
+    const upgraded = openWorkspace(dbPath);
+    const version = upgraded.db
+        .prepare("SELECT version FROM schema_version WHERE id = 1")
+        .get() as { version: number };
+    assert.equal(version.version, WORKSPACE_SCHEMA_VERSION);
+    // v4 did its actual job on the way through: the address rule is gone and
+    // the tmux_target rule was re-declared on the rebuilt table.
+    assert.deepEqual(uniqueAddressIndexes(upgraded), []);
+    assert.equal(uniqueTmuxTargetIndexes(upgraded).length, 1);
+    // Nothing was deleted or re-parented on the user's behalf. The orphan comes
+    // through the rebuild exactly as it came through every open before it.
+    const orphan = upgraded.db
+        .prepare("SELECT dev_session_id, name FROM terminal_panes WHERE id = 'orphan-pane'")
+        .get() as { dev_session_id: string; name: string } | undefined;
+    assert.equal(orphan?.dev_session_id, "dev-session-that-is-gone");
+    assert.equal(orphan?.name, "terminal-9");
+    // And the reachable workspace still reads back whole.
+    const groups = upgraded.list(SERVER);
+    assert.equal(groups.length, 1);
+    assert.equal(groups[0].id, group.id);
+    assert.equal(groups[0].sessions[0].id, session.id);
+    assert.deepEqual(
+        groups[0].sessions[0].terminalPanes.map((p) => p.id),
+        [terminal.id],
+    );
+    // Enforcement is off for the upgrade and only for the upgrade: an ordinary
+    // write that would create a NEW orphan is still rejected.
+    assert.throws(
+        () =>
+            upgraded.db
+                .prepare(
+                    "INSERT INTO terminal_panes (id, server_id, dev_session_id, name, position, created_at, updated_at) VALUES ('x', 's', 'nope', 'n', 0, 1, 1)",
+                )
+                .run(),
+        /FOREIGN KEY/,
+    );
+    upgraded.close();
+
+    await cleanup(dbPath);
+});
+
+// v4 finds the index it must drop by NAME, read back out of the catalogue, and
+// then interpolates that name into two further statements. A name is a SQL
+// IDENTIFIER: an embedded double quote is doubled. It used to be JSON-escaped,
+// which emits a backslash SQL has no idea what to do with — so a database
+// carrying such an index did not merely mis-handle it, it failed to open.
+test("the v4 migration drops an address index whose name contains a double quote", async () => {
+    const dbPath = await tmpDbPath();
+    const legacy = openWorkspace(dbPath);
+    const { session, terminal } = seed(legacy);
+    downgradeToV2(legacy);
+    legacy.db.exec(
+        'CREATE UNIQUE INDEX "odd""name_unique" ON terminal_panes (dev_session_id, name)',
+    );
+    // Stored at v3, so the next open runs v4 and nothing else.
+    legacy.db.prepare("UPDATE schema_version SET version = 3 WHERE id = 1").run();
+    assert.deepEqual(uniqueAddressIndexes(legacy), ['odd"name_unique']);
+    legacy.close();
+
+    const upgraded = openWorkspace(dbPath);
+    assert.deepEqual(uniqueAddressIndexes(upgraded), []);
+    // Dropped by name rather than by rebuilding the table, so the rows are
+    // untouched.
+    assert.deepEqual(
+        upgraded.list(SERVER)[0].sessions[0].terminalPanes.map((p) => p.id),
+        [terminal.id],
+    );
+    assert.equal(upgraded.getTerminalPane(terminal.id).devSessionId, session.id);
     upgraded.close();
 
     await cleanup(dbPath);
@@ -1503,6 +1643,82 @@ test("serverId is independent of the database's path", async () => {
 });
 
 // --- Re-pack robustness, layout upsert, cross-server moves, migration guard --
+
+// "Create at position N" is a placement REQUEST, not a raw column value.
+// Writing N straight into the new row's `position` left it TIED with whichever
+// row already held N, and every listing orders by (position, id) — so the tie
+// broke by UUID and the row the caller placed landed above or below its
+// neighbour at random, and stayed tied for every later read. moveSession was
+// fixed for exactly this; creation had the same hole, on all four ordered
+// tables.
+test("creating a row at an explicit position re-packs its scope instead of tying", async () => {
+    const dbPath = await tmpDbPath();
+    const ws = openWorkspace(dbPath);
+
+    const first = ws.createGroup({ serverId: SERVER, name: "A" });
+    const last = ws.createGroup({ serverId: SERVER, name: "B" });
+    const mid = ws.createGroup({ serverId: SERVER, name: "M", position: 1 });
+    assert.deepEqual(
+        ws.list(SERVER).map((g) => g.id),
+        [first.id, mid.id, last.id],
+    );
+    // Packed 0..n-1, so no two rows share a position and nothing depends on the
+    // id tie-break.
+    assert.deepEqual(
+        ws.list(SERVER).map((g) => g.position),
+        [0, 1, 2],
+    );
+    // A position past the end appends — the only sensible reading of "create at
+    // position 99" in a scope of three — rather than leaving a gap behind.
+    const appended = ws.createGroup({ serverId: SERVER, name: "Z", position: 99 });
+    assert.equal(ws.getGroup(appended.id).position, 3);
+
+    // The nested scopes have their own position column and the same hole.
+    const s1 = mkSession(ws, first.id, "S1");
+    const s2 = mkSession(ws, first.id, "S2");
+    const s0 = ws.createSession({
+        serverId: SERVER,
+        groupId: first.id,
+        name: "S0",
+        repositoryRoot: "/r",
+        position: 0,
+    });
+    assert.deepEqual(
+        ws.list(SERVER)[0].sessions.map((s) => s.id),
+        [s0.id, s1.id, s2.id],
+    );
+
+    const v1 = ws.createViewerPane({ serverId: SERVER, devSessionId: s0.id, url: "u1" });
+    const v0 = ws.createViewerPane({
+        serverId: SERVER,
+        devSessionId: s0.id,
+        url: "u0",
+        position: 0,
+    });
+    const t1 = ws.createTerminalPane({ serverId: SERVER, devSessionId: s0.id, name: "t1" });
+    const t0 = ws.createTerminalPane({
+        serverId: SERVER,
+        devSessionId: s0.id,
+        name: "t0",
+        position: 0,
+    });
+    const node = ws.list(SERVER)[0].sessions[0];
+    assert.deepEqual(
+        node.viewerPanes.map((p) => p.id),
+        [v0.id, v1.id],
+    );
+    assert.deepEqual(
+        node.terminalPanes.map((p) => p.id),
+        [t0.id, t1.id],
+    );
+    assert.deepEqual(
+        node.terminalPanes.map((p) => p.position),
+        [0, 1],
+    );
+
+    ws.close();
+    await cleanup(dbPath);
+});
 
 test("reorderGroups/reorderSessions keep the scope packed when the given order is partial", async () => {
     const dbPath = await tmpDbPath();

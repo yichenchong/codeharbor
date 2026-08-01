@@ -1,5 +1,6 @@
 #include "CodeharbordClient.h"
 #include "EditorController.h"
+#include "EditorFactory.h"
 #include "RpcTypes.h"
 
 #include <QCoreApplication>
@@ -18,6 +19,7 @@
 
 using ch::CodeharbordClient;
 using ch::EditorController;
+using ch::EditorFactory;
 
 namespace {
 
@@ -208,6 +210,13 @@ private slots:
     void aReportAfterASaveCancelsTheTruncateThatSaveDeferred();
     void aDeferredTruncateSurvivesTheSnapshotRetryChain();
     void aStaleSnapshotReplyDoesNotDisturbTheNextFilesBookkeeping();
+    void aSecondSaveOfTheSameBufferIsNotASecondWriteAndNotAConflict();
+    void aSecondSaveOfChangedBytesIsRewrittenAgainstTheRevisionItNowNeeds();
+    void aQueuedSaveIsDroppedWhenTheWriteItWaitedOnIsRefused();
+    void aSaveOnANewFileDoesNotJoinThePreviousFilesSaveChain();
+    void anUnownedControllerIsKeptAliveByTheFactory();
+    void aBase64ReadIsDecodedBeforeItReachesThePage();
+    void anUndecodableBase64ReadIsAReadFailure();
     void anExplicitReloadDiscardsTheRecoverySnapshotItThrewAway();
     void aPageReloadWithUnsavedWorkIsOfferedItsRecoverySnapshot();
     void reportContentDuringALoadIsIgnored();
@@ -2612,6 +2621,191 @@ void TstEditorController::aReportAfterASaveCancelsTheTruncateThatSaveDeferred()
     QCOMPARE(m_controller->fileState(), QStringLiteral("modified"));
 }
 
+// ---------------------------------------------------------------------------
+// Saves are SERIALISED, not raced (EditorController::save / issueSave).
+//
+// The save key beats an SSH round trip comfortably, so pressing it twice is an
+// ordinary thing to do. Racing the two writes made the second carry the SAME
+// expectedRevision as the first, which the first had just retired — so the
+// server refused it and the pane announced "file changed on disk" for a change
+// that was this client's own save. These four cases pin the four outcomes.
+
+// Twice on an UNCHANGED buffer: the write already on the wire IS this save, so
+// no second write is sent and the one reply answers both.
+void TstEditorController::aSecondSaveOfTheSameBufferIsNotASecondWriteAndNotAConflict()
+{
+    makePair();
+    openClean(QStringLiteral("/foo/f.txt"), QStringLiteral("hello"),
+              QStringLiteral("r1"));
+
+    QSignalSpy savedSpy(m_controller, &EditorController::saved);
+    QSignalSpy conflictSpy(m_controller, &EditorController::saveConflict);
+    QSignalSpy errorSpy(m_controller, &EditorController::saveError);
+
+    m_controller->save(QStringLiteral("world"), QStringLiteral("r1"));
+    const QJsonObject write = nextRequest();
+    QCOMPARE(method(write), kWriteFile);
+    QCOMPARE(reqExpectedRevision(write), QStringLiteral("r1"));
+
+    // Second press, same buffer, before the first answers.
+    m_controller->save(QStringLiteral("world"), QStringLiteral("r1"));
+    QVERIFY2(nextRequest(300).isEmpty(),
+             "a second save of an unchanged buffer put a second write on the "
+             "wire, guarded by the revision the first one is about to retire");
+
+    respondResult(reqId(write), {{"path", "/foo/f.txt"}, {"revision", "r2"}});
+
+    QTRY_COMPARE(savedSpy.count(), 1);
+    QCOMPARE(savedSpy.at(0).at(0).toString(), QStringLiteral("r2"));
+    QCOMPARE(conflictSpy.count(), 0);
+    QCOMPARE(errorSpy.count(), 0);
+    QTRY_COMPARE(m_controller->fileState(), QStringLiteral("clean"));
+    QCOMPARE(m_controller->revision(), QStringLiteral("r2"));
+    QVERIFY2(nextRequest(300).isEmpty(), "the coalesced save was sent after all");
+}
+
+// Twice with DIFFERENT bytes: the second save is real work, so it is issued —
+// but only once the first write has answered, and guarded by the revision that
+// write produced rather than the stale one the page could only have known.
+void TstEditorController::aSecondSaveOfChangedBytesIsRewrittenAgainstTheRevisionItNowNeeds()
+{
+    makePair();
+    openClean(QStringLiteral("/foo/f.txt"), QStringLiteral("hello"),
+              QStringLiteral("r1"));
+
+    QSignalSpy savedSpy(m_controller, &EditorController::saved);
+    QSignalSpy conflictSpy(m_controller, &EditorController::saveConflict);
+
+    m_controller->save(QStringLiteral("first"), QStringLiteral("r1"));
+    const QJsonObject write1 = nextRequest();
+    QCOMPARE(method(write1), kWriteFile);
+    QCOMPARE(reqContent(write1), QStringLiteral("first"));
+
+    // The user types and saves again inside the round trip. The page can only
+    // offer the revision it still believes in, which is the one write1 is about
+    // to replace.
+    m_controller->save(QStringLiteral("second"), QStringLiteral("r1"));
+    QVERIFY2(nextRequest(300).isEmpty(),
+             "the queued save raced the write it should have waited for");
+
+    respondResult(reqId(write1), {{"path", "/foo/f.txt"}, {"revision", "r2"}});
+
+    const QJsonObject write2 = nextRequest();
+    QCOMPARE(method(write2), kWriteFile);
+    QCOMPARE(reqPath(write2), QStringLiteral("/foo/f.txt"));
+    QCOMPARE(reqContent(write2), QStringLiteral("second"));
+    QCOMPARE(reqExpectedRevision(write2), QStringLiteral("r2"));
+
+    // The superseded write reported nothing: the file is not the buffer yet, so
+    // the page must not be told it is saved and the pane must stay in Saving.
+    QCOMPARE(savedSpy.count(), 0);
+    QCOMPARE(conflictSpy.count(), 0);
+    QCOMPARE(m_controller->fileState(), QStringLiteral("saving"));
+
+    respondResult(reqId(write2), {{"path", "/foo/f.txt"}, {"revision", "r3"}});
+
+    QTRY_COMPARE(savedSpy.count(), 1);
+    QCOMPARE(savedSpy.at(0).at(0).toString(), QStringLiteral("r3"));
+    QCOMPARE(conflictSpy.count(), 0);
+    QTRY_COMPARE(m_controller->fileState(), QStringLiteral("clean"));
+    QCOMPARE(m_controller->revision(), QStringLiteral("r3"));
+}
+
+// A genuine conflict — someone else moved the file — still reports exactly one
+// notice. The queued bytes are dropped rather than fired at a server that just
+// refused this pane's write; nothing is lost, because the buffer stays dirty and
+// the page's Overwrite/Retry re-send it as it stands at the click.
+void TstEditorController::aQueuedSaveIsDroppedWhenTheWriteItWaitedOnIsRefused()
+{
+    makePair();
+    openClean(QStringLiteral("/foo/f.txt"), QStringLiteral("hello"),
+              QStringLiteral("r1"));
+
+    QSignalSpy conflictSpy(m_controller, &EditorController::saveConflict);
+    QSignalSpy savedSpy(m_controller, &EditorController::saved);
+
+    m_controller->save(QStringLiteral("first"), QStringLiteral("r1"));
+    const QJsonObject write1 = nextRequest();
+    QCOMPARE(method(write1), kWriteFile);
+
+    m_controller->save(QStringLiteral("second"), QStringLiteral("r1"));
+
+    respondError(reqId(write1), ch::rpc::kRevisionMismatch,
+                 QStringLiteral("stale revision"),
+                 QJsonObject{{"currentRevision", "r9"}});
+
+    QTRY_COMPARE(conflictSpy.count(), 1);
+    QCOMPARE(conflictSpy.at(0).at(0).toString(), QStringLiteral("r9"));
+    QCOMPARE(savedSpy.count(), 0);
+    QCOMPARE(m_controller->fileState(), QStringLiteral("conflict"));
+    QCOMPARE(m_controller->revision(), QStringLiteral("r1"));
+    QVERIFY2(nextRequest(300).isEmpty(),
+             "the queued save was written on top of a refused revision, or "
+             "chased a second conflict of its own");
+}
+
+// The chain is per-FILE. A write still on the wire for the file the pane has
+// LEFT must neither hold the new file's saves back nor, when it finally answers,
+// release the new file's chain out from under it.
+void TstEditorController::aSaveOnANewFileDoesNotJoinThePreviousFilesSaveChain()
+{
+    makePair();
+    openClean(QStringLiteral("/foo/a.txt"), QStringLiteral("aaa"),
+              QStringLiteral("ra1"));
+
+    m_controller->save(QStringLiteral("a-edited"), QStringLiteral("ra1"));
+    const QJsonObject writeA = nextRequest();
+    QCOMPARE(method(writeA), kWriteFile);
+    QCOMPARE(reqPath(writeA), QStringLiteral("/foo/a.txt"));
+    // Deliberately left unanswered: /foo/a.txt's write is still on the wire.
+
+    m_controller->open(QStringLiteral("/foo/b.txt"));
+    const QJsonObject unwatch = nextRequest();
+    QCOMPARE(method(unwatch), kUnwatch);
+    const QJsonObject read = nextRequest();
+    QCOMPARE(method(read), kReadFile);
+    QCOMPARE(reqPath(read), QStringLiteral("/foo/b.txt"));
+    respondResult(reqId(read), {{"path", "/foo/b.txt"},
+                                {"encoding", "utf-8"},
+                                {"content", "bbb"},
+                                {"revision", "rb1"},
+                                {"truncated", false}});
+    serveWatchThenNoRecovery();
+
+    QSignalSpy savedSpy(m_controller, &EditorController::saved);
+
+    m_controller->save(QStringLiteral("b-edited"), QStringLiteral("rb1"));
+    const QJsonObject writeB1 = nextRequest();
+    QVERIFY2(method(writeB1) == kWriteFile,
+             "the new file's save queued behind a write belonging to the file "
+             "the pane had already left");
+    QCOMPARE(reqPath(writeB1), QStringLiteral("/foo/b.txt"));
+
+    // The abandoned file's write finally answers. It must decide nothing here.
+    respondResult(reqId(writeA), {{"path", "/foo/a.txt"}, {"revision", "ra2"}});
+    QTest::qWait(100);
+    QCOMPARE(savedSpy.count(), 0);
+    QCOMPARE(m_controller->revision(), QStringLiteral("rb1"));
+
+    // ...including releasing /foo/b.txt's chain: this third save must still
+    // queue behind writeB1, not go straight out guarded by the stale rb1.
+    m_controller->save(QStringLiteral("b-edited-again"), QStringLiteral("rb1"));
+    QVERIFY2(nextRequest(300).isEmpty(),
+             "the previous file's reply released the current file's save chain");
+
+    respondResult(reqId(writeB1), {{"path", "/foo/b.txt"}, {"revision", "rb2"}});
+    const QJsonObject writeB2 = nextRequest();
+    QCOMPARE(method(writeB2), kWriteFile);
+    QCOMPARE(reqPath(writeB2), QStringLiteral("/foo/b.txt"));
+    QCOMPARE(reqContent(writeB2), QStringLiteral("b-edited-again"));
+    QCOMPARE(reqExpectedRevision(writeB2), QStringLiteral("rb2"));
+    QCOMPARE(savedSpy.count(), 0);
+
+    respondResult(reqId(writeB2), {{"path", "/foo/b.txt"}, {"revision", "rb3"}});
+    QTRY_COMPARE(savedSpy.count(), 1);
+    QCOMPARE(savedSpy.at(0).at(0).toString(), QStringLiteral("rb3"));
+}
+
 // The mirror image: a reload the USER asked for (the page's conflict/error
 // "Reload" button calls requestReload) DOES replace the buffer — and must then
 // retire the crash-recovery snapshot of the edits it just threw away, or the
@@ -2727,6 +2921,147 @@ void TstEditorController::aPageReloadWithUnsavedWorkIsOfferedItsRecoverySnapshot
     QTRY_COMPARE(recoverySpy.count(), 1);
     QCOMPARE(recoverySpy.at(0).at(0).toString(),
              QStringLiteral("work only the page holds"));
+}
+
+// EditorFactory::create() is a Q_INVOKABLE, so a controller returned with no
+// parent reaches QML with JavaScriptOwnership and can be collected while a live
+// pane is still driving it. With no pane to parent to, the factory keeps it.
+void TstEditorController::anUnownedControllerIsKeptAliveByTheFactory()
+{
+    QPointer<EditorController> orphan;
+    QPointer<EditorController> owned;
+    QObject pane;
+    {
+        // A null client is enough here: the constructor only connects to one if
+        // it has one, and this case is about QObject ownership, not RPC.
+        EditorFactory factory(nullptr);
+        orphan = factory.create();
+        QVERIFY(orphan);
+        QCOMPARE(orphan->parent(), &factory);
+
+        // The empty paneId that goes with the default call has NO bearing on
+        // ownership. It only leaves the recovery key unset, which disables the
+        // per-pane snapshot until EditorPaneView pushes one in (SPEC 11.3) —
+        // exactly what setRecoveryId() exists for.
+        QVERIFY(orphan->recoveryId().isEmpty());
+        orphan->setRecoveryId(QStringLiteral("settled-later"));
+        QCOMPARE(orphan->recoveryId(), QStringLiteral("settled-later"));
+        QCOMPARE(orphan->parent(), &factory);
+
+        // A real pane still owns its own controller; the fallback is only for
+        // the null case.
+        owned = factory.create(&pane, QStringLiteral("pane-7"));
+        QVERIFY(owned);
+        QCOMPARE(owned->parent(), &pane);
+        QCOMPARE(owned->recoveryId(), QStringLiteral("pane-7"));
+    }
+
+    QVERIFY2(orphan.isNull(),
+             "the factory did not own the controller it returned unparented");
+    QVERIFY2(!owned.isNull(),
+             "the factory destroyed a controller a live pane owns");
+}
+
+// A file the daemon's STRICT UTF-8 decoder refused comes back base64 carrying
+// the file's exact bytes (remote/src/files.ts). Those bytes are what the user
+// asked to see: the pane must show the file with replacement characters where
+// the invalid sequences are, NOT the base64 text. It stays read-only and
+// unsaveable, because that is derived from the wire encoding and not from what
+// the payload turned out to contain.
+void TstEditorController::aBase64ReadIsDecodedBeforeItReachesThePage()
+{
+    makePair();
+
+    // "hello\xffworld\n" — valid base64, and NOT valid UTF-8 once decoded.
+    const QString encoded = QStringLiteral("aGVsbG//d29ybGQK");
+    const QString decoded = QStringLiteral("hello\uFFFDworld\n");
+
+    QSignalSpy contentSpy(m_controller, &EditorController::contentLoaded);
+
+    m_controller->ready();
+    m_controller->open(QStringLiteral("/foo/mixed.log"));
+    const QJsonObject read = nextRequest();
+    QCOMPARE(method(read), kReadFile);
+    respondResult(reqId(read), {{"path", "/foo/mixed.log"},
+                                {"encoding", "base64"},
+                                {"content", encoded},
+                                {"revision", "r1"},
+                                {"truncated", false}});
+
+    QTRY_COMPARE(contentSpy.count(), 1);
+    QVERIFY2(contentSpy.at(0).at(0).toString() != encoded,
+             "the raw base64 payload was pushed at the page as if it were the file");
+    QCOMPARE(contentSpy.at(0).at(0).toString(), decoded);
+    QCOMPARE(m_controller->revision(), QStringLiteral("r1"));
+
+    const QJsonObject watch = nextRequest();
+    QCOMPARE(method(watch), kWatch);
+    respondResult(reqId(watch), {{"subscriptionId", "sub1"}});
+    servePermissionStat(0644); // the FILE is writable; the BUFFER still is not
+    QTRY_COMPARE(m_controller->readOnly(), true);
+
+    // ...and the save path still refuses it, which is what keeps a decoded
+    // buffer (replacement characters and all) from ever being written back over
+    // the bytes it stands in for.
+    QSignalSpy errorSpy(m_controller, &EditorController::saveError);
+    m_controller->save(decoded, QStringLiteral("r1"));
+    QCOMPARE(errorSpy.count(), 1);
+    QVERIFY2(nextRequest(300).isEmpty(),
+             "a decoded base64 buffer was written back over the file");
+
+    // The reload path reads the same wire shape and must decode it too. The
+    // buffer is clean, so an external change re-reads on its own (SPEC 8.7).
+    contentSpy.clear();
+    sendNotification(kWatchEvent, {{"subscriptionId", "sub1"},
+                                   {"path", "/foo/mixed.log"},
+                                   {"event", "modified"},
+                                   {"revision", "r2"}});
+    const QJsonObject reread = nextRequest();
+    QCOMPARE(method(reread), kReadFile);
+    respondResult(reqId(reread), {{"path", "/foo/mixed.log"},
+                                  {"encoding", "base64"},
+                                  {"content", "YWdhaW7+/mFnYWluCg=="},
+                                  {"revision", "r2"},
+                                  {"truncated", false}});
+    servePermissionStat(0644);
+
+    QTRY_COMPARE(contentSpy.count(), 1);
+    QCOMPARE(contentSpy.at(0).at(0).toString(),
+             QStringLiteral("again\uFFFD\uFFFDagain\n"));
+    QCOMPARE(m_controller->readOnly(), true);
+}
+
+// A base64 payload that is not valid base64 is a server bug or a corrupted
+// frame: there is nothing legible to show, and showing the payload would be
+// worse than showing nothing. It is an honest read failure, and it must not
+// half-apply — the buffer, its revision and its recovery snapshot stay put.
+void TstEditorController::anUndecodableBase64ReadIsAReadFailure()
+{
+    makePair();
+    openClean(QStringLiteral("/foo/f.txt"), QStringLiteral("good"),
+              QStringLiteral("r1"));
+
+    QSignalSpy contentSpy(m_controller, &EditorController::contentLoaded);
+
+    sendNotification(kWatchEvent, {{"subscriptionId", "sub1"},
+                                   {"path", "/foo/f.txt"},
+                                   {"event", "modified"},
+                                   {"revision", "r2"}});
+    const QJsonObject read = nextRequest();
+    QCOMPARE(method(read), kReadFile);
+    respondResult(reqId(read), {{"path", "/foo/f.txt"},
+                                {"encoding", "base64"},
+                                {"content", "not %% base64 at all"},
+                                {"revision", "r2"},
+                                {"truncated", false}});
+
+    QTRY_COMPARE(m_controller->fileState(), QStringLiteral("error"));
+    QCOMPARE(contentSpy.count(), 0);
+    QVERIFY2(m_controller->revision() == QStringLiteral("r1"),
+             "an undecodable read re-baselined the buffer's save guard");
+    QVERIFY2(nextRequest(300).isEmpty(),
+             "an undecodable read still re-derived permissions or truncated the "
+             "recovery snapshot");
 }
 
 QTEST_GUILESS_MAIN(TstEditorController)

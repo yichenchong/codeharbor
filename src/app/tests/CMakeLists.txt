@@ -127,6 +127,29 @@ add_library(ch_headlessquit MODULE headlessquit.cpp)
 set_target_properties(ch_headlessquit PROPERTIES AUTOMOC OFF AUTOUIC OFF)
 target_link_libraries(ch_headlessquit PRIVATE Qt6::Core)
 
+# The shim's own gate. The live gate above only exercises it when an SSH
+# fixture is present, so without this a broken shim is invisible on most
+# machines. It is Linux-only for the same reason the shim is (LD_PRELOAD,
+# program_invocation_short_name, __attribute__((constructor))); off Linux the
+# shim compiles to an empty module and there is nothing to assert.
+if(LINUX)
+    add_executable(ch_headlessquit_host headlessquithost.cpp)
+    set_target_properties(ch_headlessquit_host PROPERTIES AUTOMOC OFF AUTOUIC OFF)
+    target_link_libraries(ch_headlessquit_host PRIVATE Qt6::Core Qt6::Gui)
+
+    qt_add_executable(tst_headlessquit tst_headlessquit.cpp)
+    target_link_libraries(tst_headlessquit PRIVATE Qt6::Test Qt6::Core)
+    target_compile_definitions(tst_headlessquit PRIVATE
+        CH_HEADLESSQUIT_SHIM="$<TARGET_FILE:ch_headlessquit>"
+        CH_HEADLESSQUIT_HOST="$<TARGET_FILE:ch_headlessquit_host>"
+        CH_HEADLESSQUIT_HOST_NAME="$<TARGET_FILE_NAME:ch_headlessquit_host>"
+    )
+    add_dependencies(tst_headlessquit ch_headlessquit ch_headlessquit_host)
+    add_test(NAME tst_headlessquit COMMAND tst_headlessquit)
+    # Three host launches, each bounded by the host's own 5 s watchdog.
+    set_tests_properties(tst_headlessquit PROPERTIES TIMEOUT 120)
+endif()
+
 qt_add_executable(tst_liveshell tst_liveshell.cpp)
 target_link_libraries(tst_liveshell PRIVATE
     ch_app

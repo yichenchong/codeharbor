@@ -19,6 +19,7 @@
 
 #include <cstring>
 #include <optional>
+#include <type_traits>
 #include <utility>
 
 using ch::CodeharbordClient;
@@ -204,6 +205,12 @@ private slots:
     void heartbeatStopsWhenTransportUnbound();
     void retiredProbeAnswerDoesNotClobberTheLiveProbe();
     void rebindFromInsideACallbackKeepsProbeBookkeepingStraight();
+    void reentrantFeedFromACallbackDispatchesEveryFrameOnce();
+    void aBurstOfFramesInOneReadIsRoutedOnce();
+    void pendingCountIsNotNarrowedToInt();
+    void reEnablingTheRunningHeartbeatIsANoOp();
+    void repeatedlyReEnablingCannotSuppressSilenceDetection();
+    void reArmingAgainstASilentPeerCannotPileUpProbes();
 
 private:
     void makePair();
@@ -2064,10 +2071,12 @@ void TstRpcClient::retiredProbeAnswerDoesNotClobberTheLiveProbe()
     QVERIFY2(retired != 0, "the heartbeat never armed");
     QCOMPARE(m_client->pendingCount(), 1);
 
-    // Re-arm on the live transport. Documented as idempotent, and this is what
-    // it costs: `retired` is now abandoned but still pending and still on the
-    // wire, so it must keep being excluded from pendingCount().
-    m_client->enableHeartbeat(20, 1000);
+    // Re-arm on the live transport. Re-arming needs a CHANGED configuration —
+    // re-enabling the one already running is a deliberate no-op, so that a
+    // consumer re-enabling on a loop cannot strand a probe per call — and this
+    // is what a real re-arm costs: `retired` is now abandoned but still pending
+    // and still on the wire, so it must keep being excluded from pendingCount().
+    m_client->enableHeartbeat(20, 999);
     QCOMPARE(m_client->pendingCount(), 1);
 
     const qint64 live = awaitPing(device);
@@ -2153,6 +2162,265 @@ void TstRpcClient::rebindFromInsideACallbackKeepsProbeBookkeepingStraight()
     }
     QCOMPARE(probes, 1);
     QCOMPARE(m_client->pendingCount(), 0); // the probe is still excluded
+    QCOMPARE(closedSpy.count(), 0);
+
+    m_client->setTransport(nullptr);
+}
+
+// --- read-buffer cursor ------------------------------------------------------
+//
+// onReadyRead() consumes frames through a cursor kept in members and compacts
+// the buffer ONCE per read instead of once per frame. The per-frame version was
+// quadratic in frames per read; the naive deferred version — a consume offset
+// local to onReadyRead(), or a reference into the buffer held across a dispatch
+// — is unsafe, because a response callback may re-enter the reader. These two
+// cases pin both halves.
+
+// THE RE-ENTRANCY CASE. One read delivers three responses. The first one's
+// callback issues a fourth request and hands the peer's answer over
+// synchronously, so a nested onReadyRead() runs while the outer loop still has
+// two frames of its own chunk unconsumed — and it runs against a buffer the
+// nested readAll() has just appended to, which reallocates it.
+//
+// Every frame must be dispatched EXACTLY ONCE regardless of which nesting level
+// reaches it. A reader that tracked consumption in a local, or held a slice of
+// the buffer across the dispatch, re-processes the frames the outer loop had
+// already logically consumed: those ids are gone from the pending map, so each
+// one becomes an "unknown id" protocol warning, which is what warnSpy pins.
+void TstRpcClient::reentrantFeedFromACallbackDispatchesEveryFrameOnce()
+{
+    ScriptedDevice device;
+    m_client->setTransport(&device);
+    QSignalSpy warnSpy(m_client, &CodeharbordClient::protocolWarning);
+
+    QList<QString> order;
+    qint64 nestedId = 0;
+    const qint64 a = m_client->call(
+        QStringLiteral("workspace.list"), QJsonValue(),
+        [&](QJsonValue, std::optional<RpcError> err) {
+            QVERIFY(!err.has_value());
+            order.append(QStringLiteral("a"));
+            // Re-enter the reader from inside the reader. deliver() announces
+            // synchronously, so this runs a whole nested onReadyRead() before
+            // the outer loop has looked at frames b and c.
+            nestedId = m_client->call(
+                QStringLiteral("file.readFile"), QJsonValue(),
+                [&](QJsonValue, std::optional<RpcError> nestedErr) {
+                    QVERIFY(!nestedErr.has_value());
+                    order.append(QStringLiteral("d"));
+                });
+            device.deliver(jsonLine(
+                {{"jsonrpc", "2.0"}, {"id", nestedId}, {"result", QJsonObject{}}}));
+        });
+    const qint64 b = m_client->call(
+        QStringLiteral("workspace.list"), QJsonValue(),
+        [&](QJsonValue, std::optional<RpcError> err) {
+            QVERIFY(!err.has_value());
+            order.append(QStringLiteral("b"));
+        });
+    const qint64 c = m_client->call(
+        QStringLiteral("workspace.list"), QJsonValue(),
+        [&](QJsonValue, std::optional<RpcError> err) {
+            QVERIFY(!err.has_value());
+            order.append(QStringLiteral("c"));
+        });
+    QCOMPARE(m_client->pendingCount(), 3);
+
+    // One chunk, three frames, one readyRead.
+    device.deliver(
+        jsonLine({{"jsonrpc", "2.0"}, {"id", a}, {"result", QJsonObject{}}}) +
+        jsonLine({{"jsonrpc", "2.0"}, {"id", b}, {"result", QJsonObject{}}}) +
+        jsonLine({{"jsonrpc", "2.0"}, {"id", c}, {"result", QJsonObject{}}}));
+
+    // Exactly once each, and nothing was re-dispatched: four callbacks, four
+    // distinct labels, no unknown-id warnings.
+    QCOMPARE(order.size(), 4);
+    QCOMPARE(order.count(QStringLiteral("a")), 1);
+    QCOMPARE(order.count(QStringLiteral("b")), 1);
+    QCOMPARE(order.count(QStringLiteral("c")), 1);
+    QCOMPARE(order.count(QStringLiteral("d")), 1);
+    QCOMPARE(warnSpy.count(), 0);
+    QCOMPARE(m_client->pendingCount(), 0);
+    QVERIFY(nestedId > c);
+
+    m_client->setTransport(nullptr);
+}
+
+// THE BULK CASE. A watch-event burst really does arrive as many frames in one
+// read, and deferring the compaction means the loop runs a long way with a
+// growing consumed prefix still physically in the buffer. This drives that path
+// with a chunk two orders of magnitude bigger than any hand-written case here:
+// every response must still be routed exactly once, and the buffer must be
+// empty at the end.
+//
+// Deliberately NOT a timing assertion. The recorded claim was that the old
+// per-frame remove() was quadratic; it is not. Qt 6's QArrayDataPointer::erase
+// has a front-erase fast path that only advances the data pointer, and
+// QByteArray::left() deep-copies rather than sharing, so nothing forced a
+// detach. Measured directly (80 000 frames, no JSON): 5 ms for the old
+// discipline against 2 ms for this one — a constant factor, both linear. A
+// wall-clock bound that the old code also passes is a flake, not a test.
+void TstRpcClient::aBurstOfFramesInOneReadIsRoutedOnce()
+{
+    ScriptedDevice device;
+    m_client->setTransport(&device);
+    QSignalSpy warnSpy(m_client, &CodeharbordClient::protocolWarning);
+
+    constexpr int kFrames = 20000;
+    int answered = 0;
+    QByteArray chunk;
+    for (int i = 0; i < kFrames; ++i) {
+        const qint64 id =
+            m_client->call(QStringLiteral("file.watch"), QJsonValue(),
+                           [&](QJsonValue, std::optional<RpcError> err) {
+                               QVERIFY(!err.has_value());
+                               ++answered;
+                           });
+        chunk += jsonLine({{"jsonrpc", "2.0"}, {"id", id}, {"result", i}});
+    }
+    QCOMPARE(m_client->pendingCount(), qsizetype(kFrames));
+
+    device.deliver(chunk); // one read, kFrames frames
+
+    QCOMPARE(answered, kFrames);
+    QCOMPARE(m_client->pendingCount(), qsizetype(0));
+    QCOMPARE(warnSpy.count(), 0);
+
+    // The deferred compaction really ran: a partial frame arriving now must be
+    // held on its own, not spliced onto 1.2 MB of already-dispatched bytes.
+    const qint64 tail =
+        m_client->call(QStringLiteral("file.watch"), QJsonValue(), nullptr);
+    device.deliver(QByteArray("{\"jsonrpc\":\"2.0\",\"id\":") +
+                   QByteArray::number(tail));
+    QCOMPARE(m_client->pendingCount(), qsizetype(1));
+    device.deliver(QByteArray(",\"result\":1}\n"));
+    QCOMPARE(m_client->pendingCount(), qsizetype(0));
+    QCOMPARE(warnSpy.count(), 0);
+
+    m_client->setTransport(nullptr);
+}
+
+// pendingCount() reports a container size, which is 64-bit. Returning `int`
+// narrowed it silently. There is no way to build two billion pending entries in
+// a test, so the contract is pinned where it actually lives: in the type.
+void TstRpcClient::pendingCountIsNotNarrowedToInt()
+{
+    static_assert(
+        std::is_same_v<decltype(std::declval<const CodeharbordClient&>()
+                                    .pendingCount()),
+                       qsizetype>,
+        "pendingCount() must not narrow QHash::size() to int");
+
+    ScriptedDevice device;
+    m_client->setTransport(&device);
+    const qint64 id =
+        m_client->call(QStringLiteral("workspace.list"), QJsonValue(), nullptr);
+    const qsizetype pending = m_client->pendingCount();
+    QCOMPARE(pending, qsizetype(1));
+    device.deliver(jsonLine({{"jsonrpc", "2.0"}, {"id", id}, {"result", 1}}));
+    QCOMPARE(m_client->pendingCount(), qsizetype(0));
+
+    m_client->setTransport(nullptr);
+}
+
+// --- heartbeat: bounded probe bookkeeping ------------------------------------
+//
+// A re-arm is not free: it retires the probe in flight, which stays in
+// m_pending and in the probe set until the peer answers it or the transport
+// dies, and it zeroes the miss counter. Re-enabling the configuration ALREADY
+// running must therefore do nothing at all.
+
+// Re-enabling the running configuration issues no new probe and abandons no old
+// one. Before the fix each call retired the live probe and the next tick minted
+// a successor, so this loop left eight stranded entries behind.
+void TstRpcClient::reEnablingTheRunningHeartbeatIsANoOp()
+{
+    ScriptedDevice device;
+    m_client->enableHeartbeat(20, 1000); // huge tolerance: no teardown here
+    m_client->setTransport(&device);
+
+    QSignalSpy closedSpy(m_client, &CodeharbordClient::transportClosed);
+
+    const qint64 probe = awaitPing(device);
+    QVERIFY2(probe != 0, "the heartbeat never armed");
+
+    for (int i = 0; i < 8; ++i) {
+        m_client->enableHeartbeat(20, 1000);
+        // Longer than the interval on purpose: a re-arm restarts the timer, so
+        // a wait of exactly one interval could race past the successor probe
+        // the old code issued and let this loop pass against it.
+        QTest::qWait(40);
+        QCOMPARE(countPings(device), 0);
+    }
+    QCOMPARE(closedSpy.count(), 0);
+
+    // And the ORIGINAL probe is still the live one, not a retired ghost:
+    // answering it releases the next.
+    answerPing(device, probe);
+    QVERIFY2(awaitPing(device) != 0, "the heartbeat stopped probing");
+
+    m_client->setTransport(nullptr);
+}
+
+// The purpose the bound has to preserve. A consumer that re-enables the
+// heartbeat on a loop — on every reconnect attempt, say — used to reset the
+// silence measurement AND restart the interval on every call, so against a peer
+// that never answers the timer never even reached its first tick and the
+// transport was never declared dead. The heartbeat existed and detected nothing.
+void TstRpcClient::repeatedlyReEnablingCannotSuppressSilenceDetection()
+{
+    ScriptedDevice device;
+    m_client->enableHeartbeat(20, 3); // ~60 ms of silence is fatal
+    m_client->setTransport(&device);
+
+    QSignalSpy closedSpy(m_client, &CodeharbordClient::transportClosed);
+
+    bool failed = false;
+    m_client->call(QStringLiteral("workspace.list"), QJsonValue(),
+                   [&](QJsonValue, std::optional<RpcError> err) {
+                       QVERIFY(err.has_value());
+                       failed = true;
+                   });
+
+    // Re-enable faster than the interval, for far longer than the whole
+    // detection budget. The peer answers nothing.
+    for (int i = 0; i < 60 && closedSpy.isEmpty(); ++i) {
+        m_client->enableHeartbeat(20, 3);
+        QTest::qWait(10);
+    }
+
+    QCOMPARE(closedSpy.count(), 1);
+    QVERIFY(failed);
+    QCOMPARE(m_client->pendingCount(), 0);
+}
+
+// And with a genuinely CHANGED configuration each time — which really must
+// re-arm — the probes left stranded on the wire are capped instead of growing
+// once per call. Nothing answers, so every probe issued here is still pending;
+// counting the ones written is counting the collections' growth directly.
+void TstRpcClient::reArmingAgainstASilentPeerCannotPileUpProbes()
+{
+    ScriptedDevice device;
+    m_client->enableHeartbeat(15, 1000); // huge tolerance: no teardown here
+    m_client->setTransport(&device);
+
+    QSignalSpy closedSpy(m_client, &CodeharbordClient::transportClosed);
+
+    int probes = 0;
+    for (int i = 0; i < 12; ++i) {
+        m_client->enableHeartbeat(15, 1000 + i); // a real re-arm every time
+        QTest::qWait(45);
+        probes += countPings(device);
+    }
+
+    QVERIFY2(probes <= 4,
+             qPrintable(QStringLiteral("12 re-arms against a silent peer left "
+                                       "%1 probes stranded in flight")
+                            .arg(probes)));
+    QVERIFY2(probes >= 1, "the heartbeat never armed at all");
+    // Caller traffic is still reported correctly: the stranded probes are all
+    // excluded, and the count cannot go negative.
+    QCOMPARE(m_client->pendingCount(), 0);
     QCOMPARE(closedSpy.count(), 0);
 
     m_client->setTransport(nullptr);

@@ -23,10 +23,11 @@
 // is reported back to ch::TerminalController through `onConsumed`, and the
 // controller emits at most ch::TerminalController::kMaxUnacknowledgedBytes of
 // unacknowledged output before it starts retaining the rest in its own rolling
-// buffer instead. So the backlog here is bounded by that window plus one
-// release batch — the protocol bounds it, not a limit invented in this file,
-// which is what keeps the "nothing is ever dropped here" property true: the
-// backlog holds exactly the bytes xterm.js has not consumed yet.
+// buffer instead. Releasing that buffer obeys the same window, so the backlog
+// here is bounded by roughly twice it — the protocol bounds it, not a limit
+// invented in this file, which is what keeps the "nothing is ever dropped here"
+// property true: the backlog holds exactly the bytes xterm.js has not consumed
+// yet.
 //
 // A renderer that stops acknowledging (wedged, crashed, mid-teardown) simply
 // stops receiving: the controller retains and evicts oldest-first, exactly as

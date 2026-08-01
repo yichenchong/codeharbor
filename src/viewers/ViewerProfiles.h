@@ -46,6 +46,15 @@ public:
     QQuickWebEngineProfile *externalProfile();
     QQuickWebEngineProfile *internalProfile();
 
+    // The internal profile's scheme handler, created on first use. Exposed so
+    // ViewerModel can forward its requestFailed() reports to QML: a pane whose
+    // image or PDF failed has no other way to learn WHY, because
+    // QWebEngineUrlRequestJob::fail() carries no text. Created independently of
+    // internalProfile() so the connection can be made before any profile is
+    // materialised; installing it into the profile stays internalProfile()'s
+    // job. Never null. Not owned by the caller.
+    InternalUrlSchemeHandler *internalSchemeHandler();
+
     // Isolation invariants (M3): the external profile must NOT carry the
     // internal scheme handler, the internal profile MUST. Reflect the current
     // state; creating the respective profile makes the answer meaningful.

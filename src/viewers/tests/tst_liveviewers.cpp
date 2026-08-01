@@ -199,28 +199,6 @@ Window {
 }
 )QML";
 
-constexpr auto kTextViewShell = R"QML(
-import QtQuick
-import QtQuick.Window
-
-Window {
-    id: win
-    width: 800
-    height: 500
-    visible: true
-
-    property url fileUrl: ""
-
-    Loader {
-        id: textLoader
-        objectName: "textLoader"
-        anchors.fill: parent
-        Component.onCompleted: setSource("qrc:/qt/qml/CodeHarbor/ViewerTextView.qml",
-                                         { url: win.fileUrl })
-    }
-}
-)QML";
-
 // ---------------------------------------------------------------------------
 // Tree walking. Structural, not name-based: the generated QML metaobjects are
 // called "ViewerPane_QMLTYPE_37" and friends. Both the QObject child list and
@@ -446,9 +424,6 @@ private slots:
     //      the live server agrees about what each entry is.
     void registryResolvesLiveRemoteUrls();
 
-    // (c2) A real text view populates from live file.readFile bytes.
-    void textViewPopulatesFromLiveServer();
-
     // (b) + (c3) + (d) The real recursive region lays out a genuine split whose
     //      panes populate from live file.listDirectory data and rasterise.
     //      Covers 2 and 3 children, both orientations, even and explicit ratios.
@@ -603,7 +578,7 @@ QString TstLiveViewers::dirUrl() const
 bool TstLiveViewers::remoteExec(const QString &command, QByteArray *stdoutText,
                                 QString *stderrText)
 {
-    SshChannelDevice device(&m_pool, SshConnectionPool::ChannelKind::Exec);
+    SshChannelDevice device(&m_pool);
     QByteArray out;
     QString err;
     bool finished = false;
@@ -751,43 +726,6 @@ void TstLiveViewers::registryResolvesLiveRemoteUrls()
     QCOMPARE(alphaKind, QStringLiteral("file"));
     QVERIFY(names.contains(QStringLiteral("ch-live-alpha.txt")));
     QVERIFY(names.contains(QStringLiteral("ch-live-beta.json")));
-}
-
-// ---------------------------------------------------------------------------
-// (c2) A real text view, populated by live file.readFile bytes.
-// ---------------------------------------------------------------------------
-void TstLiveViewers::textViewPopulatesFromLiveServer()
-{
-    QQmlComponent component(m_engine.get());
-    component.setData(QByteArray(kTextViewShell),
-                      QUrl(QStringLiteral("qrc:/tst_liveviewers/text.qml")));
-    QVERIFY2(!component.isError(), qPrintable(component.errorString()));
-
-    std::unique_ptr<QObject> root(component.createWithInitialProperties(
-        {{QStringLiteral("fileUrl"), QUrl::fromLocalFile(alphaPath())}}));
-    QVERIFY2(root != nullptr, qPrintable(component.errorString()));
-
-    QObject *loader = root->findChild<QObject *>(QStringLiteral("textLoader"));
-    QVERIFY(loader != nullptr);
-
-    QQuickItem *textView = nullptr;
-    QVERIFY2(waitFor(
-                 [&] {
-                     textView = qvariant_cast<QQuickItem *>(loader->property("item"));
-                     return textView != nullptr;
-                 },
-                 kExecTimeoutMs),
-             "ViewerTextView.qml never loaded");
-
-    QTRY_VERIFY_WITH_TIMEOUT(textView->property("content").toString().contains(m_marker),
-                             kRpcTimeoutMs);
-    QVERIFY2(textView->property("errorText").toString().isEmpty(),
-             qPrintable(textView->property("errorText").toString()));
-
-    const QString content = textView->property("content").toString();
-    qInfo("ViewerTextView content (%d chars): %s", static_cast<int>(content.size()),
-          qPrintable(QString(content).trimmed().replace(QLatin1Char('\n'), QLatin1String(" / "))));
-    QVERIFY(content.contains(QStringLiteral("these bytes crossed a real ssh channel")));
 }
 
 // ---------------------------------------------------------------------------

@@ -12,11 +12,18 @@ permissions:
 
 # A PR that is pushed to repeatedly would otherwise keep several full Qt +
 # WebEngine builds running against superseded commits. Supersede them instead.
-# Pushes to `main` are NOT cancelled: the windows-vcpkg-cache job below only
-# runs there, and cancelling it would leave the shared dependency cache cold.
+# Pushes to `main` are NOT cancelled: the Windows leg of the client matrix saves
+# the shared vcpkg dependency cache, and only a run on the default branch writes
+# a cache that a later release tag can restore. Cancelling those would leave that
+# cache cold and make every tag rebuild libssh from source.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # One Qt line for the whole workflow, kept equal to release.yml's QT_VERSION
+  # and >= the CMake floor (6.9): CI must compile what the release builds.
+  QT_VERSION: "6.9.*"
 
 jobs:
   remote:
@@ -55,16 +62,77 @@ jobs:
         working-directory: remote
         run: npm test
 
-  # Release tags cannot restore a cache written by another tag. Warm the
-  # Windows dependency cache on the default branch so release jobs do not
-  # rebuild OpenSSL from source on every tag.
-  windows-vcpkg-cache:
-    if: github.event_name == 'push'
-    name: windows (vcpkg cache)
-    runs-on: windows-latest
+  # BD26: the client is built and tested on ALL THREE release platforms, not just
+  # Linux. This project ships cross-OS binaries, and for a long time Windows and
+  # macOS were compiled for the first time only when a tag was pushed - the
+  # release workflow's first real run failed on each platform for a different
+  # reason, with the tag already permanent. A platform that CI never compiles is
+  # a platform whose release is a guess.
+  #
+  # The steps deliberately mirror .github/workflows/release.yml's `build` job so
+  # a green CI run means the release path compiles: same Qt, same CMake/Ninja,
+  # same per-OS libssh, same bundle build, same preset. What is NOT mirrored is
+  # packaging (linuxdeploy/windeployqt/macdeployqt, the Inno Setup installer) and
+  # the extra Qt modules only packaging needs - those stay release-only, and are
+  # the one thing a tag still exercises first.
+  client:
+    name: client (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # One platform's failure must not hide the other two: the whole point is
+      # to learn about every platform per commit, not the first one to break.
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, name: linux }
+          - { os: windows-latest, name: windows }
+          - { os: macos-latest, name: macos }
     steps:
       - uses: actions/checkout@v4
-      - name: Resolve cache key
+      - name: Install Qt ${{ env.QT_VERSION }}
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: ${{ env.QT_VERSION }}
+          # qtpositioning is NOT optional: Qt6WebEngineCore hard-depends on it, and
+          # without it find_package(Qt6 COMPONENTS WebEngineCore) fails at configure
+          # even though Qt6WebEngineCoreConfig.cmake is present.
+          modules: qtwebengine qtwebchannel qtpositioning
+          cache: true
+
+      # Pinned to the same version release.yml uses, for the same reason: a
+      # floating `latest` silently changes the CMake that gates every commit.
+      # It also supplies Ninja on all three runners, which is what the presets
+      # generate for.
+      - name: Install CMake + Ninja
+        uses: lukka/get-cmake@v4.2.3
+
+      # --- libssh per platform, as in release.yml ------------------------------
+      - name: Install libssh (Linux)
+        if: matrix.name == 'linux'
+        run: sudo apt-get update && sudo apt-get install -y libssh-dev
+
+      - name: Install libssh (macOS)
+        if: matrix.name == 'macos'
+        run: |
+          brew install libssh
+          echo "CMAKE_PREFIX_PATH=$(brew --prefix libssh):${CMAKE_PREFIX_PATH:-}" >> "$GITHUB_ENV"
+
+      # vcpkg builds libssh FROM SOURCE (~10 min), so it is cached. The key
+      # carries the runner IMAGE version - MSVC and the bundled vcpkg ship with
+      # the image, so a static key would restore a tree built by an older
+      # toolchain - and the PINNED libssh version, because vcpkg's registry port
+      # is 0.12.0, whose hybrid ML-KEM key exchange cannot pack its own client
+      # KEX init, and the build therefore takes libssh from the in-tree overlay
+      # port instead.
+      #
+      # This leg is also what SEEDS that cache for release tags: a run can only
+      # restore a cache written by its own ref or by the DEFAULT BRANCH, so a tag
+      # build can never reuse another tag's entry. Every push to `main` refreshes
+      # it here. (A separate `windows-vcpkg-cache` job used to do nothing else;
+      # it was folded into this matrix, which performs the same save as a side
+      # effect of a build that is worth running on its own.)
+      - name: Resolve cache key (Windows)
+        if: matrix.name == 'windows'
         id: imgver
         shell: pwsh
         run: |
@@ -72,20 +140,22 @@ jobs:
           echo "vcpkg=$env:VCPKG_INSTALLATION_ROOT" >> $env:GITHUB_OUTPUT
           $pin = (Get-Content packaging/vcpkg-ports/libssh/vcpkg.json | ConvertFrom-Json).version
           echo "libssh=$pin" >> $env:GITHUB_OUTPUT
+
       # cache/restore, NOT the combined `actions/cache` action: the combined one
       # registers its own post-job save under the same key, which then races the
       # explicit save step below and logs a "cache already exists" failure. The
-      # explicit save is the one we want, because it runs as soon as the build
-      # succeeds rather than at the very end of the job.
-      - name: Restore vcpkg libssh cache
+      # explicit save is the one we want, because it runs as soon as the
+      # dependency is built rather than at the very end of the job.
+      - name: Restore vcpkg libssh cache (Windows)
+        if: matrix.name == 'windows'
         id: vcpkg_cache
         uses: actions/cache/restore@v4
         with:
           path: ${{ steps.imgver.outputs.vcpkg }}\installed
           key: vcpkg-libssh-${{ steps.imgver.outputs.libssh }}-x64-windows-${{ steps.imgver.outputs.v }}
-      - name: Set up MSVC
-        uses: ilammy/msvc-dev-cmd@v1
-      - name: Install libssh via vcpkg
+
+      - name: Install libssh via vcpkg (Windows)
+        if: matrix.name == 'windows'
         shell: pwsh
         env:
           LIBSSH_PIN: ${{ steps.imgver.outputs.libssh }}
@@ -93,47 +163,41 @@ jobs:
           $ErrorActionPreference = "Stop"
           $root = $env:VCPKG_INSTALLATION_ROOT
           $header = "$root/installed/x64-windows/include/libssh/libssh_version.h"
-          if (Test-Path $header) {
+          function Get-InstalledLibssh {
+            if (-not (Test-Path $header)) { return $null }
             $text = Get-Content $header -Raw
             $parts = "MAJOR", "MINOR", "MICRO" | ForEach-Object {
               [regex]::Match($text, "LIBSSH_VERSION_$_\s+(\d+)").Groups[1].Value
             }
-            $present = $parts -join "."
-            if ($present -ne $env:LIBSSH_PIN) {
-              vcpkg remove libssh:x64-windows --recurse
-            }
+            return ($parts -join ".")
+          }
+          # A cache entry from before the pin (or a port bump) must not survive as
+          # an already-installed tree that `vcpkg install` would treat as a no-op.
+          $present = Get-InstalledLibssh
+          if ($present -and $present -ne $env:LIBSSH_PIN) {
+            Write-Host "Removing cached libssh $present (pin is $env:LIBSSH_PIN)"
+            vcpkg remove libssh:x64-windows --recurse
           }
           vcpkg install libssh:x64-windows "--overlay-ports=$(Resolve-Path packaging/vcpkg-ports)"
-          $text = Get-Content $header -Raw
-          $parts = "MAJOR", "MINOR", "MICRO" | ForEach-Object {
-            [regex]::Match($text, "LIBSSH_VERSION_$_\s+(\d+)").Groups[1].Value
+          $installed = Get-InstalledLibssh
+          if ($installed -ne $env:LIBSSH_PIN) {
+            throw "libssh $installed installed, expected $env:LIBSSH_PIN; 0.12.0 cannot complete an SSH handshake."
           }
-          if (($parts -join ".") -ne $env:LIBSSH_PIN) {
-            throw "cached libssh version is not the pinned version"
-          }
-      - name: Save vcpkg libssh cache
-        if: steps.vcpkg_cache.outputs.cache-hit != 'true'
+          Write-Host "libssh $installed"
+          echo "CMAKE_TOOLCHAIN_FILE=$root/scripts/buildsystems/vcpkg.cmake" >> $env:GITHUB_ENV
+
+      - name: Save vcpkg libssh cache (Windows)
+        if: matrix.name == 'windows' && steps.vcpkg_cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
           path: ${{ steps.imgver.outputs.vcpkg }}\installed
           key: vcpkg-libssh-${{ steps.imgver.outputs.libssh }}-x64-windows-${{ steps.imgver.outputs.v }}
 
-  client:
-    name: client (qt/cmake)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install Qt 6
-        uses: jurplel/install-qt-action@v4
-        with:
-          version: "6.9.*"
-          # qtpositioning is NOT optional: Qt6WebEngineCore hard-depends on it, and
-          # without it find_package(Qt6 COMPONENTS WebEngineCore) fails at configure
-          # even though Qt6WebEngineCoreConfig.cmake is present.
-          modules: qtwebengine qtwebchannel qtpositioning
-          cache: true
-      - name: Install build tooling
-        run: sudo apt-get update && sudo apt-get install -y ninja-build libssh-dev
+      # --- MSVC environment for the Ninja generator (Windows) ------------------
+      - name: Set up MSVC (Windows)
+        if: matrix.name == 'windows'
+        uses: ilammy/msvc-dev-cmd@v1
+
       # The Monaco and xterm.js bundles are gitignored build artifacts that
       # src/qml/CMakeLists.txt embeds as Qt resources AT CONFIGURE TIME. CMake
       # refuses to configure without them (FATAL_ERROR, unless
@@ -149,21 +213,34 @@ jobs:
       - name: Build web bundles (must precede CMake configure)
         # npm ci requires an up-to-date package-lock.json (installs from it strictly).
         run: npm ci && npm run build
+        shell: bash
       # BD24: type-check both web bundles. esbuild strips types without checking
       # them, so a TS error anywhere in src/web/* would otherwise reach a shipped
       # bundle unreported. The root workspaces script runs tsc --noEmit across the
       # editor and terminal packages; a type error here fails CI before configure.
       - name: Typecheck web bundles
         run: npm run typecheck
+        shell: bash
       # The web bundles ship real logic (Monaco language selection, unsaved-work
       # snapshots, terminal visibility) with node --test suites next to them.
       # Nothing ran them before: the `remote` job only tests remote/, and this
       # job only type-checked. A regression in either bundle reached a release.
       - name: Test web bundles
         run: npm test --workspace src/web/terminal --workspace src/web/editor
+        shell: bash
+
+      # CMake 3.21+ reads CMAKE_TOOLCHAIN_FILE from the environment (set by the
+      # vcpkg step on Windows), so one command works on every OS. On Windows the
+      # MSVC env from that step lets Ninja find cl.exe under bash.
       - name: Configure (release preset, tests on)
         run: cmake --preset release-tests
+        shell: bash
       - name: Build
         run: cmake --build --preset release-tests
+        shell: bash
+      # No --output-on-failure: the `release-tests` test preset already sets
+      # output.outputOnFailure, and repeating it on the command line is one more
+      # thing to keep in step with CMakePresets.json for no change in behaviour.
       - name: Test
-        run: ctest --preset release-tests --output-on-failure
+        run: ctest --preset release-tests
+        shell: bash

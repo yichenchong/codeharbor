@@ -164,11 +164,19 @@ ItemDelegate {
 
         Accessible.role: Accessible.Button
         Accessible.name: newSessionButton.actionText
-        ToolTip.text: newSessionButton.actionText
-        ToolTip.visible: newSessionButton.hovered
-        // Long enough that crossing the row on the way somewhere else does not
-        // flash it, matching the row tooltip in SessionRow.qml.
-        ToolTip.delay: 600
+
+        // The module's one tooltip (AppToolTip.qml). The attached
+        // `ToolTip.text` form is drawn by the Basic style in that style's own
+        // light palette, so a hint about this dark panel arrived as a white
+        // box. Named so tst_sidebar can read the hint back.
+        AppToolTip {
+            objectName: "newSessionButtonTip:" + header.itemId
+            text: newSessionButton.actionText
+            visible: newSessionButton.hovered
+            // Long enough that crossing the row on the way somewhere else does
+            // not flash it, matching the row tooltip in SessionRow.qml.
+            delay: 600
+        }
 
         contentItem: Label {
             text: newSessionButton.text

@@ -28,6 +28,15 @@ TerminalStatus terminal(TerminalState connection, AgentState agent)
     return TerminalStatus{TerminalId{QStringLiteral("t")}, connection, agent};
 }
 
+// Serialize a tree the test has built to be valid. tryToJson() refuses a tree
+// the parser would refuse (SplitTree.h); an empty object stands in for that
+// refusal here, and the parser rejects it too, so a writer that starts refusing
+// a legitimate tree fails the round-trip assertion rather than going unnoticed.
+QJsonObject wire(const SplitNode &node)
+{
+    return node.tryToJson().value_or(QJsonObject{});
+}
+
 } // namespace
 
 class TstModels : public QObject {
@@ -40,6 +49,7 @@ private slots:
     void sessionWithoutTerminalsIsDisconnected();
     void splitTreeRoundTripsNestedLayout();
     void splitTreeRejectsRatioMismatch();
+    void splitTreeOperationsAreDepthBounded();
     void splitTreeRejectsChildlessSplit();
     void splitTreeRejectsInvalidRatioValues();
     void modelSatisfiesItemModelInvariants();
@@ -220,7 +230,7 @@ void TstModels::splitTreeRoundTripsNestedLayout()
     root.children = {leafA, inner};
     root.ratios = {0.5, 0.5};
 
-    const QJsonObject json = root.toJson();
+    const QJsonObject json = wire(root);
     const SplitNode restored = SplitNode::fromJson(json);
 
     QVERIFY(restored == root);
@@ -231,6 +241,8 @@ void TstModels::splitTreeRoundTripsNestedLayout()
     QCOMPARE(restored.children.at(1).children.at(1).paneId, QStringLiteral("C"));
 }
 
+// The writer and the reader agree on what a valid tree is: a shape the parser
+// refuses is never emitted at all, so it can never be persisted and lost.
 void TstModels::splitTreeRejectsRatioMismatch()
 {
     SplitNode leafB;
@@ -243,10 +255,72 @@ void TstModels::splitTreeRejectsRatioMismatch()
     split.children = {leafB, leafC};
     split.ratios = {0.5}; // one ratio for two children
 
-    const SplitNode restored = SplitNode::fromJson(split.toJson());
-    QVERIFY(restored == SplitNode{});
-    QVERIFY(restored.isLeaf());
-    QVERIFY(restored.paneId.isEmpty());
+    QVERIFY(!split.tryToJson().has_value());
+
+    // The parser's OTHER ratio rules bind the writer identically.
+    split.ratios = {0.5, 0.5, 0.5}; // one too many
+    QVERIFY(!split.tryToJson().has_value());
+    split.ratios = {0.0, 1.0};
+    QVERIFY(!split.tryToJson().has_value());
+    split.ratios = {-1.0, 1.0};
+    QVERIFY(!split.tryToJson().has_value());
+    split.ratios = {std::numeric_limits<double>::quiet_NaN(), 1.0};
+    QVERIFY(!split.tryToJson().has_value());
+    split.ratios = {std::numeric_limits<double>::infinity(), 1.0};
+    QVERIFY(!split.tryToJson().has_value());
+
+    // A bad ratio anywhere fails the WHOLE tree, not just its own subtree: a
+    // partially written layout is not a layout.
+    SplitNode root;
+    root.orientation = SplitOrientation::Vertical;
+    root.children = {SplitNode{}, split};
+    root.ratios = {1.0, 1.0};
+    QVERIFY(!root.tryToJson().has_value());
+
+    // And once the ratios are legal, both directions work again.
+    split.ratios = {0.5, 0.5};
+    root.children = {SplitNode{}, split};
+    const std::optional<QJsonObject> json = root.tryToJson();
+    QVERIFY(json.has_value());
+    QVERIFY(SplitNode::fromJson(*json) == root);
+}
+
+// Every recursion over a SplitNode is bounded by the SAME limit the parser
+// enforces, so a hostile or corrupt tree cannot exhaust the stack through the
+// writer or through equality either. A tree at the limit still works.
+void TstModels::splitTreeOperationsAreDepthBounded()
+{
+    const auto chain = [](int levels) {
+        SplitNode node;
+        node.paneId = QStringLiteral("leaf");
+        for (int i = 1; i < levels; ++i) {
+            SplitNode split;
+            split.orientation = SplitOrientation::Vertical;
+            split.children = {node};
+            split.ratios = {1.0};
+            node = split;
+        }
+        return node;
+    };
+
+    // Exactly at the bound: serializes, parses back, compares equal.
+    const SplitNode atLimit = chain(SplitNode::kMaxDepth);
+    const std::optional<QJsonObject> json = atLimit.tryToJson();
+    QVERIFY(json.has_value());
+    QVERIFY(SplitNode::fromJson(*json) == atLimit);
+
+    // One level past it: the parser already refused this; the writer now
+    // refuses it too, returning a clean std::nullopt instead of recursing.
+    const SplitNode tooDeep = chain(SplitNode::kMaxDepth + 1);
+    QVERIFY(!tooDeep.tryToJson().has_value());
+
+    // Far past it, where an unbounded recursion is a stack overflow rather
+    // than merely a bad answer. Equality is bounded on the same rule: it stops
+    // and answers "unequal" rather than walking a tree this deep.
+    const SplitNode hostile = chain(4 * SplitNode::kMaxDepth);
+    QVERIFY(!hostile.tryToJson().has_value());
+    QVERIFY(!(hostile == hostile));
+    QVERIFY(atLimit == chain(SplitNode::kMaxDepth)); // the bound itself is fine
 }
 
 void TstModels::splitTreeRejectsChildlessSplit()
@@ -434,7 +508,7 @@ void TstModels::splitTreeRoundTripsSingleChildAndDeepNesting()
     single.orientation = SplitOrientation::Vertical;
     single.children = {onlyChild};
     single.ratios = {1.0};
-    QVERIFY(SplitNode::fromJson(single.toJson()) == single);
+    QVERIFY(SplitNode::fromJson(wire(single)) == single);
 
     // Deep nesting with a distinct orientation at each level must be preserved.
     SplitNode d;
@@ -460,7 +534,7 @@ void TstModels::splitTreeRoundTripsSingleChildAndDeepNesting()
     root.children = {a, level1};
     root.ratios = {0.5, 0.5};
 
-    const SplitNode restored = SplitNode::fromJson(root.toJson());
+    const SplitNode restored = SplitNode::fromJson(wire(root));
     QVERIFY(restored == root);
     QCOMPARE(restored.orientation, SplitOrientation::Horizontal);
     QCOMPARE(restored.children.at(1).orientation, SplitOrientation::Vertical);
@@ -468,8 +542,8 @@ void TstModels::splitTreeRoundTripsSingleChildAndDeepNesting()
     QCOMPARE(restored.children.at(1).children.at(1).children.at(1).paneId, QStringLiteral("D"));
 }
 
-// A leaf's orientation/ratios are meaningless and dropped by toJson(); equality
-// must therefore ignore them so fromJson(toJson(leaf)) == leaf holds even when a
+// A leaf's orientation/ratios are meaningless and dropped by tryToJson(); equality
+// must therefore ignore them so fromJson(*leaf.tryToJson()) == leaf holds even when a
 // leaf carries a non-default orientation. A defaulted operator== would fail this.
 void TstModels::splitTreeLeafOrientationRoundTrips()
 {
@@ -478,7 +552,7 @@ void TstModels::splitTreeLeafOrientationRoundTrips()
     leaf.orientation = SplitOrientation::Vertical; // dropped by toJson for leaves
     leaf.ratios = {0.25};                          // dropped by toJson for leaves
 
-    const SplitNode restored = SplitNode::fromJson(leaf.toJson());
+    const SplitNode restored = SplitNode::fromJson(wire(leaf));
     QVERIFY(restored.isLeaf());
     QCOMPARE(restored.paneId, QStringLiteral("solo"));
     QVERIFY(restored == leaf);
@@ -506,7 +580,7 @@ void TstModels::splitTreeRoundTripsLeafUrl()
     leaf.paneId = QStringLiteral("viewer-1");
     leaf.url = QStringLiteral("codeharbor-internal://file/a b/c%20d.txt#frag?q=1");
 
-    const SplitNode restored = SplitNode::fromJson(leaf.toJson());
+    const SplitNode restored = SplitNode::fromJson(wire(leaf));
     QVERIFY(restored.isLeaf());
     QCOMPARE(restored.url, leaf.url);
     QVERIFY(restored == leaf);
@@ -521,7 +595,7 @@ void TstModels::splitTreeRoundTripsLeafUrl()
     SplitNode split;
     split.children = {leaf, SplitNode{}};
     split.ratios = {0.5, 0.5};
-    const SplitNode deep = SplitNode::fromJson(split.toJson());
+    const SplitNode deep = SplitNode::fromJson(wire(split));
     QCOMPARE(deep.children.at(0).url, leaf.url);
 }
 
@@ -541,11 +615,11 @@ void TstModels::splitTreeWithoutUrlIsUnchangedByTheField()
 
     const SplitNode parsed = SplitNode::fromJson(legacy);
     QVERIFY(parsed.children.at(0).url.isEmpty());
-    QCOMPARE(QJsonDocument(parsed.toJson()).toJson(QJsonDocument::Compact),
+    QCOMPARE(QJsonDocument(wire(parsed)).toJson(QJsonDocument::Compact),
              QJsonDocument(legacy).toJson(QJsonDocument::Compact));
 }
 
-// A split's paneId is meaningless and dropped by toJson(); equality must ignore
+// A split's paneId is meaningless and dropped by tryToJson(); equality must ignore
 // it so the round-trip is exact for a split that happens to carry a stray paneId.
 void TstModels::splitTreeSplitPaneIdIgnoredOnRoundTrip()
 {
@@ -558,9 +632,9 @@ void TstModels::splitTreeSplitPaneIdIgnoredOnRoundTrip()
     split.children = {child};
     split.ratios = {1.0};
 
-    const SplitNode restored = SplitNode::fromJson(split.toJson());
+    const SplitNode restored = SplitNode::fromJson(wire(split));
     QVERIFY(!restored.isLeaf());
-    QVERIFY(restored.paneId.isEmpty()); // toJson never persists a split's paneId
+    QVERIFY(restored.paneId.isEmpty()); // tryToJson never persists a split's paneId
     QVERIFY(restored == split);
 }
 
@@ -574,7 +648,7 @@ void TstModels::splitTreeUnicodePaneIdRoundTrips()
     split.children = {leaf, SplitNode{}};
     split.ratios = {0.5, 0.5};
 
-    const SplitNode restored = SplitNode::fromJson(split.toJson());
+    const SplitNode restored = SplitNode::fromJson(wire(split));
     QVERIFY(restored == split);
     QCOMPARE(restored.children.at(0).paneId, leaf.paneId);
 }
@@ -609,7 +683,7 @@ void TstModels::splitTreeAcceptsModerateDepth()
         split.ratios = {1.0};
         node = split;
     }
-    QVERIFY(SplitNode::fromJson(node.toJson()) == node);
+    QVERIFY(SplitNode::fromJson(wire(node)) == node);
 }
 
 // index() must reject any column other than 0 (the model is single-column).
@@ -1211,7 +1285,7 @@ void TstModels::sessionsModelIsSingleColumn()
 }
 
 // url, like paneId, is persisted for LEAVES only: a split has no content of its
-// own. toJson() must drop a split's stray url and equality must ignore it, or a
+// own. tryToJson() must drop a split's stray url and equality must ignore it, or a
 // tree stops comparing equal to its own round-trip and SessionLayouts rewrites
 // the layout on every load.
 void TstModels::splitTreeSplitUrlIgnoredOnRoundTrip()
@@ -1226,7 +1300,7 @@ void TstModels::splitTreeSplitUrlIgnoredOnRoundTrip()
     split.children = {child};
     split.ratios = {1.0};
 
-    const QJsonObject json = split.toJson();
+    const QJsonObject json = wire(split);
     QVERIFY(!json.contains(QStringLiteral("url")));
 
     const SplitNode restored = SplitNode::fromJson(json);
@@ -1248,7 +1322,7 @@ void TstModels::splitTreeRoundTripsLeafTerminalPaneId()
     leaf.paneId = QStringLiteral("terminal-2");
     leaf.terminalPaneId = QStringLiteral("2f1c9a54-0b3e-4a77-9d21-6c8f0e5b1a44");
 
-    const QJsonObject json = leaf.toJson();
+    const QJsonObject json = wire(leaf);
     QCOMPARE(json.value(QStringLiteral("terminalPaneId")).toString(),
              leaf.terminalPaneId);
 
@@ -1267,8 +1341,8 @@ void TstModels::splitTreeRoundTripsLeafTerminalPaneId()
     SplitNode bare;
     bare.paneId = QStringLiteral("terminal-1");
     QVERIFY(bare.terminalPaneId.isEmpty());
-    QVERIFY(!bare.toJson().contains(QStringLiteral("terminalPaneId")));
-    QVERIFY(SplitNode::fromJson(bare.toJson()) == bare);
+    QVERIFY(!wire(bare).contains(QStringLiteral("terminalPaneId")));
+    QVERIFY(SplitNode::fromJson(wire(bare)) == bare);
     QVERIFY(bare == bare);
     QVERIFY(!(bare == leaf));
 
@@ -1276,7 +1350,7 @@ void TstModels::splitTreeRoundTripsLeafTerminalPaneId()
     SplitNode split;
     split.children = {leaf, bare};
     split.ratios = {1.0, 1.0};
-    const SplitNode deep = SplitNode::fromJson(split.toJson());
+    const SplitNode deep = SplitNode::fromJson(wire(split));
     QCOMPARE(deep.children.at(0).terminalPaneId, leaf.terminalPaneId);
     QVERIFY(deep.children.at(1).terminalPaneId.isEmpty());
     QVERIFY(deep == split);
@@ -1302,12 +1376,12 @@ void TstModels::splitTreeWithoutTerminalPaneIdIsUnchangedByTheField()
     const SplitNode parsed = SplitNode::fromJson(legacy);
     QVERIFY(parsed.children.at(0).terminalPaneId.isEmpty());
     QVERIFY(parsed.children.at(1).terminalPaneId.isEmpty());
-    QCOMPARE(QJsonDocument(parsed.toJson()).toJson(QJsonDocument::Compact),
+    QCOMPARE(QJsonDocument(wire(parsed)).toJson(QJsonDocument::Compact),
              QJsonDocument(legacy).toJson(QJsonDocument::Compact));
 }
 
 // terminalPaneId, like paneId and url, is persisted for LEAVES only: a split is
-// structure and owns no terminal. toJson() must drop a split's stray one and
+// structure and owns no terminal. tryToJson() must drop a split's stray one and
 // equality must ignore it, or a tree stops comparing equal to its own round trip
 // and SessionLayouts rewrites the layout on every load.
 void TstModels::splitTreeSplitTerminalPaneIdIgnoredOnRoundTrip()
@@ -1322,7 +1396,7 @@ void TstModels::splitTreeSplitTerminalPaneIdIgnoredOnRoundTrip()
     split.children = {child};
     split.ratios = {1.0};
 
-    const QJsonObject json = split.toJson();
+    const QJsonObject json = wire(split);
     QVERIFY(!json.contains(QStringLiteral("terminalPaneId")));
 
     const SplitNode restored = SplitNode::fromJson(json);

@@ -24,6 +24,7 @@
 #include "CodeharbordClient.h"
 #include "EditorController.h"
 #include "EditorFactory.h"
+#include "InternalUrlSchemeHandler.h"
 #include "SshConnectionPool.h"
 #include "TerminalController.h"
 #include "TerminalFactory.h"
@@ -181,6 +182,30 @@ bool isLeafPane(const QObject *object)
 bool isEditorPane(const QObject *object)
 {
     return object->metaObject()->indexOfProperty("remotePath") >= 0;
+}
+
+// ViewerDirectoryView is the only component carrying both of these.
+bool isDirectoryView(const QObject *object)
+{
+    const QMetaObject *mo = object->metaObject();
+    return mo->indexOfProperty("basePath") >= 0 && mo->indexOfProperty("rows") >= 0;
+}
+
+// ViewerImageView and ViewerPdfView, the two views that PIN the internal
+// address they are displaying. Exactly one of them is loaded in a pane at a
+// time, so a pane-scoped search finds the one under test.
+bool isPinningView(const QObject *object)
+{
+    const QMetaObject *mo = object->metaObject();
+    return mo->indexOfProperty("internalUrl") >= 0 && mo->indexOfProperty("retained") >= 0;
+}
+
+// ViewerBinaryView's Download affordance, the third place an internal address
+// is held: it is the only button in that view and it says so.
+bool isDownloadButton(QObject *object)
+{
+    return object->metaObject()->indexOfProperty("down") >= 0
+           && object->property("text").toString() == QLatin1String("Download");
 }
 
 // AppPaneHeader: the only component carrying this exact set. It is what makes a
@@ -534,6 +559,32 @@ private slots:
     // finding it is worth nothing unless the user is told and can take it back.
     void theEditorOffersToRestoreARecoveredBuffer();
     void discardingARecoveredBufferLeavesTheEditorShowingTheFile();
+
+    // THE PATH PROBE IS BOUNDED. A path typed with no trailing slash makes the
+    // pane ask the server "is this a directory?" and draw its header busy until
+    // the answer lands. Nothing else clears that state, so a reply that never
+    // arrives — a session that dropped between the request and its answer —
+    // left the pane spinning on an address for ever, with no way to ask again.
+    void theViewerPaneStopsWaitingForAProbeThatNeverAnswers();
+
+    // ONE ViewerModel serves every viewer pane, and they all listen on the same
+    // listing signals. A directory view that matched replies against whatever
+    // its URL happened to be at reply time therefore accepted answers to
+    // requests it never made — including another pane's failure, painted over
+    // a listing that had loaded perfectly well.
+    void theDirectoryListingTakesOnlyTheAnswerToItsOwnRequest();
+
+    // The internal-URL table is LRU-bounded, and recency is refreshed only when
+    // an address is minted or resolved. A pane still DISPLAYING an image does
+    // neither, so its address aged out from under it and the next reload failed
+    // on a URL visibly on screen. Retaining is the only signal that carries
+    // "still on screen"; the release has to happen on BOTH ways out.
+    void theViewsThatHoldAnInternalAddressPinItUntilTheyLetItGo();
+
+    // WebEngine's job interface carries only Chromium's coarse error enum, so a
+    // refused internal resource — an image over the inline cap, say — reached
+    // the pane as a blank failed page with nothing at all to explain it.
+    void aRefusedInternalResourceSaysWhyInsteadOfShowingABlankPage();
 
 private:
     // Load one qrc component into the harness window with `props` as its
@@ -1867,6 +1918,228 @@ void TstPaneIdentity::discardingARecoveredBufferLeavesTheEditorShowingTheFile()
     QCOMPARE(delivered.size(), 1);
     QVERIFY2(controller.reported().isEmpty(),
              "discarding the recovered buffer still marked the file dirty");
+}
+
+// ---------------------------------------------------------------------------
+void TstPaneIdentity::theViewerPaneStopsWaitingForAProbeThatNeverAnswers()
+{
+    QVERIFY(openRegion(QStringLiteral("ViewerRegion.qml"), leafNode(QStringLiteral("viewer-1")),
+                       /*terminal=*/false));
+    const auto panes = [this] { return collect(m_region, isLeafPane); };
+    QTRY_VERIFY(panes().size() == 1);
+    QObject *const pane = panes().constFirst();
+
+    QObject *const watchdog = childNamed(pane, QStringLiteral("viewerProbeWatchdog"));
+    QVERIFY2(watchdog,
+             "nothing bounds the path probe: a reply that never arrives leaves the pane "
+             "busy on an address for ever");
+    QVERIFY2(!watchdog->property("running").toBool(),
+             "the probe watchdog is armed with no probe outstanding");
+
+    // Twenty seconds is the shipped budget; what is under test is what happens
+    // when it runs out, not how long it is.
+    watchdog->setProperty("interval", 60);
+
+    const QList<QObject *> headers = collect(pane, isPaneHeader);
+    QCOMPARE(headers.size(), 1);
+    QObject *const header = headers.constFirst();
+
+    // A probe the server never answers. Written straight into the pane's own
+    // published record of what is outstanding rather than typed into the
+    // address bar: this fixture's client has no transport, so a real
+    // listDirectory fails before the test could observe the wait at all — and
+    // it is the WAIT, not the request, that was unbounded.
+    pane->setProperty("probePath", QStringLiteral("/srv/repos/app/thing"));
+    QVERIFY2(watchdog->property("running").toBool(),
+             "an outstanding probe does not arm the watchdog");
+    QVERIFY2(header->property("busy").toBool(),
+             "the pane does not show the probe as in flight");
+
+    QTRY_VERIFY2(pane->property("probePath").toString().isEmpty(),
+                 "the pane sat out its own watchdog and stayed busy");
+    QVERIFY2(!watchdog->property("running").toBool(), "the watchdog re-armed itself after firing");
+    QVERIFY2(!header->property("busy").toBool(), "the pane is still drawn busy after giving up");
+    // Giving up OPENS the path, as a file — the same answer a directoryError
+    // produces. A pane that silently forgot the question would be no better
+    // than one that waited for ever.
+    QCOMPARE(pane->property("url").toUrl(), QUrl(QStringLiteral("file:///srv/repos/app/thing")));
+
+    // A probe that settles normally disarms the watchdog instead of firing
+    // later over whatever the pane has moved on to.
+    pane->setProperty("probePath", QStringLiteral("/srv/repos/app/other"));
+    QVERIFY(watchdog->property("running").toBool());
+    pane->setProperty("probePath", QString());
+    QVERIFY2(!watchdog->property("running").toBool(), "a settled probe leaves its watchdog armed");
+}
+
+// ---------------------------------------------------------------------------
+void TstPaneIdentity::theDirectoryListingTakesOnlyTheAnswerToItsOwnRequest()
+{
+    QVERIFY(openRegion(QStringLiteral("ViewerRegion.qml"), leafNode(QStringLiteral("viewer-1")),
+                       /*terminal=*/false));
+    const auto panes = [this] { return collect(m_region, isLeafPane); };
+    QTRY_VERIFY(panes().size() == 1);
+    QObject *const pane = panes().constFirst();
+
+    const QString path = QStringLiteral("/srv/repos/app/");
+    pane->setProperty("url", QUrl(QStringLiteral("file:///srv/repos/app/")));
+    QTRY_COMPARE(pane->property("kind").toString(), QStringLiteral("directory"));
+
+    QList<QObject *> views;
+    QTRY_VERIFY((views = collect(pane, isDirectoryView)).size() == 1);
+    QObject *const view = views.constFirst();
+
+    QVERIFY2(view->metaObject()->indexOfProperty("requestedPath") >= 0,
+             "the directory view keeps no record of what it asked for, so it matches replies "
+             "against whatever its URL happens to be when one arrives");
+
+    // This fixture's client has no transport, so the view's own listDirectory
+    // fails immediately. That leaves a SETTLED view: it asked, it was answered,
+    // and it has nothing outstanding.
+    QTRY_VERIFY(!view->property("errorText").toString().isEmpty());
+    QVERIFY(!view->property("loading").toBool());
+    QCOMPARE(view->property("requestedPath").toString(), QString());
+    const QString settled = view->property("errorText").toString();
+
+    const QVariantList entries{
+        QVariantMap{{QStringLiteral("name"), QStringLiteral("README.md")},
+                    {QStringLiteral("kind"), QStringLiteral("file")}}};
+
+    // Another pane listing the same directory. ONE ViewerModel serves them all,
+    // so its reply arrives here too — and it answers nothing this view asked,
+    // so it must not replace what is on screen.
+    emit m_viewers.directoryListed(path, entries);
+    QCOMPARE(view->property("entries").toList().size(), 0);
+
+    // Nor may somebody else's failure be painted over a listing this view is
+    // perfectly happy with.
+    emit m_viewers.directoryError(path, QStringLiteral("permission denied"));
+    QCOMPARE(view->property("errorText").toString(), settled);
+
+    // The other direction: a reply the view IS waiting for is taken, and one
+    // for a different directory is not. `requestedPath` stands in for a request
+    // this transport-less fixture cannot leave outstanding on its own.
+    view->setProperty("requestedPath", path);
+    view->setProperty("loading", true);
+    emit m_viewers.directoryListed(QStringLiteral("/somewhere/else/"), entries);
+    QCOMPARE(view->property("entries").toList().size(), 0);
+    QVERIFY2(view->property("loading").toBool(),
+             "a listing of another directory settled this view");
+
+    emit m_viewers.directoryListed(path, entries);
+    QCOMPARE(view->property("entries").toList().size(), 1);
+    QVERIFY2(!view->property("loading").toBool(), "the view's own answer did not settle it");
+    QCOMPARE(view->property("requestedPath").toString(), QString());
+}
+
+// ---------------------------------------------------------------------------
+void TstPaneIdentity::theViewsThatHoldAnInternalAddressPinItUntilTheyLetItGo()
+{
+    QVERIFY(openRegion(QStringLiteral("ViewerRegion.qml"), leafNode(QStringLiteral("viewer-1")),
+                       /*terminal=*/false));
+    const auto panes = [this] { return collect(m_region, isLeafPane); };
+    QTRY_VERIFY(panes().size() == 1);
+    QObject *const pane = panes().constFirst();
+
+    ch::InternalUrlMap &map = ch::InternalUrlMap::shared();
+    const int pinnedBefore = map.retainedCount();
+
+    // --- the image view, which pins for as long as it is displaying ---------
+    pane->setProperty("url", QUrl(QStringLiteral("file:///srv/repos/app/logo.png")));
+    QTRY_COMPARE(pane->property("kind").toString(), QStringLiteral("image"));
+
+    QList<QObject *> views;
+    QTRY_VERIFY((views = collect(pane, isPinningView)).size() == 1);
+    QObject *const image = views.constFirst();
+
+    QTRY_VERIFY(!image->property("internalUrl").toUrl().toString().isEmpty());
+    const QString firstAddress = image->property("internalUrl").toUrl().toString();
+    QVERIFY2(image->property("retained").toBool(),
+             "the image view does not pin the address it is showing, so it ages out from "
+             "under a pane that is still displaying it");
+    QCOMPARE(map.retainedCount(), pinnedBefore + 1);
+
+    // Navigating to another image releases the old address and pins the new
+    // one: exactly one release per retain, so the count does not drift.
+    pane->setProperty("url", QUrl(QStringLiteral("file:///srv/repos/app/other.png")));
+    QTRY_VERIFY(image->property("internalUrl").toUrl().toString() != firstAddress);
+    QVERIFY(image->property("retained").toBool());
+    QCOMPARE(map.retainedCount(), pinnedBefore + 1);
+
+    // Swapping the handler out destroys the view. Without a release on
+    // destruction every image ever opened stays pinned for the life of the
+    // process, which is the bound the table exists to enforce.
+    pane->setProperty("url", QUrl(QStringLiteral("https://example.com/")));
+    QTRY_COMPARE(pane->property("kind").toString(), QStringLiteral("web"));
+    QTRY_COMPARE(map.retainedCount(), pinnedBefore);
+
+    // --- the download view, the third holder of an internal address ---------
+    pane->setProperty("url", QUrl(QStringLiteral("file:///srv/repos/app/archive.tar.gz")));
+    QTRY_COMPARE(pane->property("kind").toString(), QStringLiteral("binary"));
+
+    QList<QObject *> buttons;
+    QTRY_VERIFY((buttons = collect(pane, isDownloadButton)).size() == 1);
+    QObject *const download = buttons.constFirst();
+
+    QCOMPARE(map.retainedCount(), pinnedBefore);
+    QVERIFY(QMetaObject::invokeMethod(download, "clicked"));
+
+    QList<QObject *> binaries;
+    QTRY_VERIFY((binaries = collect(pane, [](QObject *object) {
+                     return object->metaObject()->indexOfProperty("pendingDownloadUrl") >= 0;
+                 })).size() == 1);
+    QObject *const binary = binaries.constFirst();
+    QVERIFY2(binary->property("retained").toBool(),
+             "the address a download is fetching is not pinned, so a busy session can evict "
+             "it between the click and the profile's callback");
+    QCOMPARE(map.retainedCount(), pinnedBefore + 1);
+
+    // Closing the view with a download still pending must not leak the pin.
+    pane->setProperty("url", QUrl(QStringLiteral("https://example.com/")));
+    QTRY_COMPARE(pane->property("kind").toString(), QStringLiteral("web"));
+    QTRY_COMPARE(map.retainedCount(), pinnedBefore);
+}
+
+// ---------------------------------------------------------------------------
+void TstPaneIdentity::aRefusedInternalResourceSaysWhyInsteadOfShowingABlankPage()
+{
+    QVERIFY(openRegion(QStringLiteral("ViewerRegion.qml"), leafNode(QStringLiteral("viewer-1")),
+                       /*terminal=*/false));
+    const auto panes = [this] { return collect(m_region, isLeafPane); };
+    QTRY_VERIFY(panes().size() == 1);
+    QObject *const pane = panes().constFirst();
+
+    pane->setProperty("url", QUrl(QStringLiteral("file:///srv/repos/app/manual.pdf")));
+    QTRY_COMPARE(pane->property("kind").toString(), QStringLiteral("pdf"));
+
+    QList<QObject *> views;
+    QTRY_VERIFY((views = collect(pane, isPinningView)).size() == 1);
+    QObject *const view = views.constFirst();
+    QTRY_VERIFY(!view->property("internalUrl").toUrl().toString().isEmpty());
+    const QUrl shown = view->property("internalUrl").toUrl();
+
+    QObject *const status = childNamed(view, QStringLiteral("pdfStatus"));
+    QVERIFY2(status, "the PDF view has nowhere to say a resource was refused");
+    QVERIFY(!status->property("visible").toBool());
+
+    // A refusal about something else entirely. The model is shared, so it
+    // arrives here too and must be ignored — the same rule the pane applies to
+    // its own replies.
+    emit m_viewers.internalResourceError(
+        QUrl(QStringLiteral("codeharbor-internal://file/not-this-one")),
+        QStringLiteral("someone else's problem"));
+    QVERIFY2(view->property("errorText").toString().isEmpty(),
+             "a refusal about another pane's resource was shown here");
+    QVERIFY(!status->property("visible").toBool());
+
+    const QString why =
+        QStringLiteral("this file is 42 MB, over the 8 MB limit for an inline read");
+    emit m_viewers.internalResourceError(shown, why);
+    QCOMPARE(view->property("errorText").toString(), why);
+    QTRY_VERIFY2(status->property("visible").toBool(),
+                 "the refusal never reached the screen");
+    QVERIFY2(status->property("text").toString().contains(why),
+             qPrintable(status->property("text").toString()));
 }
 
 // QTEST_MAIN cannot be used: registerUrlScheme() and QtWebEngineQuick::initialize()

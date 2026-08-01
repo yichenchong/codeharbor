@@ -168,23 +168,6 @@ private slots:
     void urlMappingBareId();
     void viewKindStringsMatchQmlContract();
     void viewerModelWithoutClientReportsErrors();
-
-    // ONE ViewerModel serves every viewer pane (it is a single QML context
-    // property), and two panes may be showing the SAME file, so a read's
-    // identity is its token and never its path. These pin that no pane can
-    // strand or cancel another pane's read, in either direction.
-    void textReadsOfDifferentPathsAreIndependent();
-    void cancelTextFileDropsOnlyItsOwnRead();
-    void twoConcurrentReadsOfOnePathBothSettle();
-    void cancelOfOneReadOfAPathLeavesTheOtherAlone();
-    void aRefreshingPaneCancelsItsOwnEarlierReadOfOnePath();
-    void textReadBookkeepingDoesNotLeak();
-    // What the text pane is told when the server's answer is not plain text.
-    void textReadFailureModes();
-    // A read the client cannot even put on the wire still has to reach the pane
-    // that asked for it, and reach it AFTER the token naming it.
-    void textReadOnADeadTransportStillReachesItsCaller();
-
     // The order and the shape of the entries the directory pane renders.
     void directoryListingIsSortedDirectoriesFirst();
 
@@ -193,6 +176,11 @@ private slots:
     // the signal the pane binds to.
     void resolvePathCarriesTheRepositoryRootFlag();
     void resolvePathFailuresLeaveTheFlagUndetermined();
+    void pinnedInternalUrlSurvivesEviction();
+    void pinsAreCountedAndReleasable();
+    void responseHeadersLetSvgStyleItself();
+    void refusalMessagesExplainThemselves();
+    void internalRequestFailuresReachQml();
 };
 
 void TstViewers::resolveByExtensionTable()
@@ -726,7 +714,7 @@ void TstViewers::viewKindStringsMatchQmlContract()
              QStringLiteral("pdf"));
     QCOMPARE(viewers.viewKind(QUrl(QStringLiteral("file:///p/sub/"))),
              QStringLiteral("directory"));
-    // Download / OpenExternally / Error all collapse onto the binary pane.
+    // Download and Error both collapse onto the binary pane.
     QCOMPARE(viewers.viewKind(QUrl(QStringLiteral("file:///p/blob.bin"))),
              QStringLiteral("binary"));
     QCOMPARE(viewers.viewKind(QUrl(QStringLiteral("ftp://host/x"))),
@@ -738,390 +726,31 @@ void TstViewers::viewerModelWithoutClientReportsErrors()
     // Before a Dev Session is connected there is no remote client. The QML
     // views bind unconditionally, so both calls must answer with an error
     // signal rather than doing nothing and leaving a permanently blank pane.
-    ViewerModel viewers;
-    QSignalSpy textErrors(&viewers, &ViewerModel::textFileError);
-    QSignalSpy dirErrors(&viewers, &ViewerModel::directoryError);
-    QSignalSpy textReads(&viewers, &ViewerModel::textFileRead);
-    QSignalSpy dirLists(&viewers, &ViewerModel::directoryListed);
-
-    const QString token = viewers.readTextFile(QStringLiteral("/p/README.md"));
-    viewers.listDirectory(QStringLiteral("/p"));
-
-    // The read failure is DEFERRED: emitting it from inside readTextFile would
-    // deliver a token the caller has not been handed yet and cannot match.
-    QVERIFY(!token.isEmpty());
-    QCOMPARE(textErrors.size(), 0);
-    QTRY_COMPARE(textErrors.size(), 1);
-    QCOMPARE(dirErrors.size(), 1);
-    QCOMPARE(textReads.size(), 0);
-    QCOMPARE(dirLists.size(), 0);
-    // The failing read names itself, so the view that issued it can tell the
-    // error is about its own request, and echoes the path for the same reason.
-    QCOMPARE(textErrors.first().at(0).toString(), token);
-    QCOMPARE(textErrors.first().at(1).toString(), QStringLiteral("/p/README.md"));
-    QCOMPARE(dirErrors.first().at(0).toString(), QStringLiteral("/p"));
-    // Even a read that never reached the wire is forgotten once it settles.
-    QCOMPARE(viewers.inFlightTextReadCount(), 0);
-}
-
-void TstViewers::textReadsOfDifferentPathsAreIndependent()
-{
-    // Two viewer panes, two files, one shared ViewerModel. Both reads are in
-    // flight at once and their replies can arrive in either order; each pane
-    // must get its own answer. A single global "latest read wins" counter drops
-    // the first pane's reply, leaving that pane stuck on "Loading…" forever
-    // with no error to show.
-    RpcPair pair;
-    QVERIFY(pair.listen());
-    ViewerModel viewers(pair.client());
-    QSignalSpy reads(&viewers, &ViewerModel::textFileRead);
-    QSignalSpy errors(&viewers, &ViewerModel::textFileError);
-
-    const QString tokenA = viewers.readTextFile(QStringLiteral("/p/a.txt"));
-    const QJsonObject requestA = pair.nextRequest();
-    QCOMPARE(requestA.value(QStringLiteral("method")).toString(),
-             QString::fromLatin1(ch::rpc::kMethodReadFile));
-    QCOMPARE(requestPath(requestA), QStringLiteral("/p/a.txt"));
-
-    const QString tokenB = viewers.readTextFile(QStringLiteral("/p/b.txt"));
-    const QJsonObject requestB = pair.nextRequest();
-    QCOMPARE(requestPath(requestB), QStringLiteral("/p/b.txt"));
-    QVERIFY(tokenA != tokenB);
-
-    // Out of order: the SECOND pane's file answers first.
-    pair.respondResult(requestB,
-                       readResult(QStringLiteral("/p/b.txt"), QStringLiteral("B")));
-    pair.respondResult(requestA,
-                       readResult(QStringLiteral("/p/a.txt"), QStringLiteral("A")));
-
-    QTRY_COMPARE(reads.size(), 2);
-    QCOMPARE(errors.size(), 0);
-    // Keyed by TOKEN: that is what a pane matches on, so that is what the test
-    // checks the content was attributed to.
-    QVariantMap byToken;
-    QVariantMap pathByToken;
-    for (const QList<QVariant> &args : reads) {
-        byToken.insert(args.at(0).toString(), args.at(2));
-        pathByToken.insert(args.at(0).toString(), args.at(1));
-    }
-    QCOMPARE(byToken.value(tokenA).toString(), QStringLiteral("A"));
-    QCOMPARE(byToken.value(tokenB).toString(), QStringLiteral("B"));
-    QCOMPARE(pathByToken.value(tokenA).toString(), QStringLiteral("/p/a.txt"));
-    QCOMPARE(pathByToken.value(tokenB).toString(), QStringLiteral("/p/b.txt"));
-    QCOMPARE(viewers.inFlightTextReadCount(), 0);
-}
-
-void TstViewers::cancelTextFileDropsOnlyItsOwnRead()
-{
-    // A pane whose URL clears cancels ITS read. Every other pane's read must
-    // survive: they share this one ViewerModel. This is the cross-path case.
-    RpcPair pair;
-    QVERIFY(pair.listen());
-    ViewerModel viewers(pair.client());
-    QSignalSpy reads(&viewers, &ViewerModel::textFileRead);
-    QSignalSpy errors(&viewers, &ViewerModel::textFileError);
-
-    const QString keepToken = viewers.readTextFile(QStringLiteral("/p/keep.txt"));
-    const QJsonObject keep = pair.nextRequest();
-    QCOMPARE(requestPath(keep), QStringLiteral("/p/keep.txt"));
-    const QString dropToken = viewers.readTextFile(QStringLiteral("/p/drop.txt"));
-    const QJsonObject drop = pair.nextRequest();
-    QCOMPARE(requestPath(drop), QStringLiteral("/p/drop.txt"));
-
-    viewers.cancelTextFile(dropToken);
-
-    pair.respondResult(drop, readResult(QStringLiteral("/p/drop.txt"),
-                                        QStringLiteral("dropped")));
-    pair.respondResult(keep, readResult(QStringLiteral("/p/keep.txt"),
-                                        QStringLiteral("kept")));
-
-    QTRY_COMPARE(reads.size(), 1);
-    QCOMPARE(reads.first().at(0).toString(), keepToken);
-    QCOMPARE(reads.first().at(1).toString(), QStringLiteral("/p/keep.txt"));
-    QCOMPARE(reads.first().at(2).toString(), QStringLiteral("kept"));
-    QCOMPARE(errors.size(), 0);
-
-    // Cancelling a token with nothing in flight — including the empty token a
-    // caller passes when it has nothing to cancel, and a token that already
-    // settled — disturbs nothing.
-    viewers.cancelTextFile();
-    viewers.cancelTextFile(keepToken);
-    viewers.cancelTextFile(QStringLiteral("not-a-token"));
-    viewers.readTextFile(QStringLiteral("/p/after.txt"));
-    const QJsonObject after = pair.nextRequest();
-    pair.respondResult(after, readResult(QStringLiteral("/p/after.txt"),
-                                         QStringLiteral("after")));
-    QTRY_COMPARE(reads.size(), 2);
-    QCOMPARE(reads.at(1).at(2).toString(), QStringLiteral("after"));
-}
-
-void TstViewers::twoConcurrentReadsOfOnePathBothSettle()
-{
-    // TWO PANES SHOWING THE SAME FILE. Nothing about that is exotic, and both
-    // panes must be answered. Bookkeeping keyed by path has one slot per file,
-    // so the second read overwrites the first and one of the two panes is left
-    // on "Loading…" with no content and no error.
-    RpcPair pair;
-    QVERIFY(pair.listen());
-    ViewerModel viewers(pair.client());
-    QSignalSpy reads(&viewers, &ViewerModel::textFileRead);
-    QSignalSpy errors(&viewers, &ViewerModel::textFileError);
-
-    const QString tokenA = viewers.readTextFile(QStringLiteral("/notes.md"));
-    const QJsonObject requestA = pair.nextRequest();
-    const QString tokenB = viewers.readTextFile(QStringLiteral("/notes.md"));
-    const QJsonObject requestB = pair.nextRequest();
-    // Same path, genuinely different reads: different RPC ids, different tokens.
-    QVERIFY(requestA.value(QStringLiteral("id")).toInt()
-            != requestB.value(QStringLiteral("id")).toInt());
-    QVERIFY(!tokenA.isEmpty());
-    QVERIFY(tokenA != tokenB);
-    QCOMPARE(viewers.inFlightTextReadCount(), 2);
-
-    // Answered out of order, as two independent server round trips may be.
-    pair.respondResult(requestB, readResult(QStringLiteral("/notes.md"),
-                                            QStringLiteral("for pane B")));
-    pair.respondResult(requestA, readResult(QStringLiteral("/notes.md"),
-                                            QStringLiteral("for pane A")));
-
-    QTRY_COMPARE(reads.size(), 2);
-    QCOMPARE(errors.size(), 0);
-    QVariantMap byToken;
-    for (const QList<QVariant> &args : reads) {
-        QCOMPARE(args.at(1).toString(), QStringLiteral("/notes.md"));
-        byToken.insert(args.at(0).toString(), args.at(2));
-    }
-    // Each caller's reply is attributed to ITS OWN token; neither was dropped
-    // as superseded by the other.
-    QCOMPARE(byToken.value(tokenA).toString(), QStringLiteral("for pane A"));
-    QCOMPARE(byToken.value(tokenB).toString(), QStringLiteral("for pane B"));
-    QCOMPARE(viewers.inFlightTextReadCount(), 0);
-}
-
-void TstViewers::cancelOfOneReadOfAPathLeavesTheOtherAlone()
-{
-    // THE BUG, exactly. Pane A and pane B both open /notes.md. Pane B navigates
-    // away before its reply lands and cancels its read. With bookkeeping keyed
-    // by path that cancel erases the ONE entry for /notes.md, so pane A's reply
-    // is dropped too and pane A hangs on "Loading…" forever.
-    RpcPair pair;
-    QVERIFY(pair.listen());
-    ViewerModel viewers(pair.client());
-    QSignalSpy reads(&viewers, &ViewerModel::textFileRead);
-    QSignalSpy errors(&viewers, &ViewerModel::textFileError);
-
-    const QString tokenA = viewers.readTextFile(QStringLiteral("/notes.md"));
-    const QJsonObject requestA = pair.nextRequest();
-    const QString tokenB = viewers.readTextFile(QStringLiteral("/notes.md"));
-    const QJsonObject requestB = pair.nextRequest();
-
-    viewers.cancelTextFile(tokenB);
-    QCOMPARE(viewers.inFlightTextReadCount(), 1);
-
-    pair.respondResult(requestB, readResult(QStringLiteral("/notes.md"),
-                                            QStringLiteral("abandoned")));
-    pair.respondResult(requestA, readResult(QStringLiteral("/notes.md"),
-                                            QStringLiteral("still wanted")));
-
-    // A is still delivered, under its own token.
-    QTRY_COMPARE(reads.size(), 1);
-    QCOMPARE(reads.first().at(0).toString(), tokenA);
-    QCOMPARE(reads.first().at(1).toString(), QStringLiteral("/notes.md"));
-    QCOMPARE(reads.first().at(2).toString(), QStringLiteral("still wanted"));
-    // B produces nothing at all — not a second read, not an error.
-    QTest::qWait(100);
-    QCOMPARE(reads.size(), 1);
-    QCOMPARE(errors.size(), 0);
-
-    // The mirror direction: the pane that cancels first is the other one.
-    reads.clear();
-    const QString tokenC = viewers.readTextFile(QStringLiteral("/notes.md"));
-    const QJsonObject requestC = pair.nextRequest();
-    const QString tokenD = viewers.readTextFile(QStringLiteral("/notes.md"));
-    const QJsonObject requestD = pair.nextRequest();
-    viewers.cancelTextFile(tokenC);
-    pair.respondResult(requestC, readResult(QStringLiteral("/notes.md"),
-                                            QStringLiteral("abandoned")));
-    pair.respondResult(requestD, readResult(QStringLiteral("/notes.md"),
-                                            QStringLiteral("still wanted too")));
-    QTRY_COMPARE(reads.size(), 1);
-    QCOMPARE(reads.first().at(0).toString(), tokenD);
-    QCOMPARE(reads.first().at(2).toString(), QStringLiteral("still wanted too"));
-    QCOMPARE(errors.size(), 0);
-    QCOMPARE(viewers.inFlightTextReadCount(), 0);
-}
-
-void TstViewers::aRefreshingPaneCancelsItsOwnEarlierReadOfOnePath()
-{
-    // One pane re-reading the SAME file (ViewerTextView.reload) must never end
-    // up showing the older answer. Supersession is no longer implicit — it
-    // cannot be, since a second read of a path is now a legitimate second
-    // reader — so the pane cancels the token it is holding before asking again,
-    // which is exactly what reload() does.
-    RpcPair pair;
-    QVERIFY(pair.listen());
-    ViewerModel viewers(pair.client());
-    QSignalSpy reads(&viewers, &ViewerModel::textFileRead);
-
-    const QString stale = viewers.readTextFile(QStringLiteral("/p/a.txt"));
-    const QJsonObject first = pair.nextRequest();
-    viewers.cancelTextFile(stale);
-    const QString fresh = viewers.readTextFile(QStringLiteral("/p/a.txt"));
-    const QJsonObject second = pair.nextRequest();
-    QVERIFY(first.value(QStringLiteral("id")).toInt()
-            != second.value(QStringLiteral("id")).toInt());
-    // Tokens come from one monotonic counter and are never reused, so the
-    // cancelled read can never be mistaken for the new one.
-    QVERIFY(stale != fresh);
-
-    pair.respondResult(second, readResult(QStringLiteral("/p/a.txt"),
-                                          QStringLiteral("newest")));
-    pair.respondResult(first, readResult(QStringLiteral("/p/a.txt"),
-                                         QStringLiteral("stale")));
-
-    QTRY_COMPARE(reads.size(), 1);
-    QCOMPARE(reads.first().at(0).toString(), fresh);
-    QCOMPARE(reads.first().at(2).toString(), QStringLiteral("newest"));
-    QTest::qWait(100);
-    QCOMPARE(reads.size(), 1);
-    QCOMPARE(viewers.inFlightTextReadCount(), 0);
-}
-
-void TstViewers::textReadBookkeepingDoesNotLeak()
-{
-    // The in-flight set is the model's only per-read state. An entry that
-    // outlives its request would accumulate for the lifetime of the
-    // application — one leak per file the user ever opens. Every way a read can
-    // end must clear it: success, server error, and cancellation.
-    RpcPair pair;
-    QVERIFY(pair.listen());
-    ViewerModel viewers(pair.client());
-    QSignalSpy reads(&viewers, &ViewerModel::textFileRead);
-    QSignalSpy errors(&viewers, &ViewerModel::textFileError);
-    QCOMPARE(viewers.inFlightTextReadCount(), 0);
-
-    const QString ok = viewers.readTextFile(QStringLiteral("/p/ok.txt"));
-    const QJsonObject okRequest = pair.nextRequest();
-    const QString bad = viewers.readTextFile(QStringLiteral("/p/bad.txt"));
-    const QJsonObject badRequest = pair.nextRequest();
-    const QString gone = viewers.readTextFile(QStringLiteral("/p/ok.txt"));
-    const QJsonObject goneRequest = pair.nextRequest();
-    QCOMPARE(viewers.inFlightTextReadCount(), 3);
-
-    viewers.cancelTextFile(gone);
-    QCOMPARE(viewers.inFlightTextReadCount(), 2);
-
-    pair.respondResult(okRequest, readResult(QStringLiteral("/p/ok.txt"),
-                                             QStringLiteral("fine")));
-    pair.respondError(badRequest, -32603, QStringLiteral("EACCES"));
-    // The cancelled read is still answered by the server; its reply must not
-    // resurrect an entry.
-    pair.respondResult(goneRequest, readResult(QStringLiteral("/p/ok.txt"),
-                                               QStringLiteral("ignored")));
-
-    QTRY_COMPARE(reads.size(), 1);
-    QTRY_COMPARE(errors.size(), 1);
-    QCOMPARE(reads.first().at(0).toString(), ok);
-    QCOMPARE(errors.first().at(0).toString(), bad);
-    QTest::qWait(100);
-    QCOMPARE(viewers.inFlightTextReadCount(), 0);
-}
-
-void TstViewers::textReadFailureModes()
-{
-    // Everything the text pane can be told other than "here is your file". Each
-    // must arrive as an ERROR carrying the read's token and path, never as an
-    // empty document: a blank pane is indistinguishable from an empty file.
-    RpcPair pair;
-    QVERIFY(pair.listen());
-    ViewerModel viewers(pair.client());
-    QSignalSpy reads(&viewers, &ViewerModel::textFileRead);
-    QSignalSpy errors(&viewers, &ViewerModel::textFileError);
-
-    // 1. The server refused the read: its message is surfaced verbatim.
-    const QString missing = viewers.readTextFile(QStringLiteral("/p/missing.txt"));
-    pair.respondError(pair.nextRequest(), -32603, QStringLiteral("ENOENT"));
-    QTRY_COMPARE(errors.size(), 1);
-    QCOMPARE(errors.at(0).at(0).toString(), missing);
-    QCOMPARE(errors.at(0).at(1).toString(), QStringLiteral("/p/missing.txt"));
-    QCOMPARE(errors.at(0).at(2).toString(), QStringLiteral("ENOENT"));
-
-    // 2. A file over the inline cap comes back as a PREFIX (truncated). Showing
-    //    it as though it were the whole file would be a lie, so it is an error.
-    const QString huge = viewers.readTextFile(QStringLiteral("/p/huge.log"));
-    pair.respondResult(pair.nextRequest(),
-                       readResult(QStringLiteral("/p/huge.log"),
-                                  QStringLiteral("first window"),
-                                  QStringLiteral("utf-8"), /*truncated=*/true));
-    QTRY_COMPARE(errors.size(), 2);
-    QCOMPARE(errors.at(1).at(0).toString(), huge);
-    QCOMPARE(errors.at(1).at(1).toString(), QStringLiteral("/p/huge.log"));
-
-    // 3. Base64 (a file the server could not decode as utf-8) is decoded here
-    //    so a near-text binary still shows something legible.
-    const QString bin = viewers.readTextFile(QStringLiteral("/p/bin.dat"));
-    pair.respondResult(pair.nextRequest(),
-                       readResult(QStringLiteral("/p/bin.dat"),
-                                  QStringLiteral("aGVsbG8="),
-                                  QStringLiteral("base64")));
-    QTRY_COMPARE(reads.size(), 1);
-    QCOMPARE(reads.at(0).at(0).toString(), bin);
-    QCOMPARE(reads.at(0).at(1).toString(), QStringLiteral("/p/bin.dat"));
-    QCOMPARE(reads.at(0).at(2).toString(), QStringLiteral("hello"));
-
-    // 4. A malformed base64 payload is reported, NOT rendered as an empty file.
-    const QString broken = viewers.readTextFile(QStringLiteral("/p/broken.dat"));
-    pair.respondResult(pair.nextRequest(),
-                       readResult(QStringLiteral("/p/broken.dat"),
-                                  QStringLiteral("not base64 at all!!"),
-                                  QStringLiteral("base64")));
-    QTRY_COMPARE(errors.size(), 3);
-    QCOMPARE(errors.at(2).at(0).toString(), broken);
-    QCOMPARE(errors.at(2).at(1).toString(), QStringLiteral("/p/broken.dat"));
-    QCOMPARE(reads.size(), 1);
-    QCOMPARE(viewers.inFlightTextReadCount(), 0);
-}
-
-void TstViewers::textReadOnADeadTransportStillReachesItsCaller()
-{
-    // A Dev Session whose SSH connection dropped leaves a CodeharbordClient
-    // that exists but has no usable transport. Its call() refuses the request
-    // and runs the callback THERE AND THEN, inside readTextFile(), before
-    // readTextFile() has returned the token that names the read.
     //
-    // The pane matches replies by token (ViewerTextView.ownsReply), and it only
-    // learns the token when readTextFile() returns. A failure emitted before
-    // that carries a token the pane has never heard of, so it throws its own
-    // error away and sits on "Loading…" for ever with nothing to show and
-    // nothing to retry. The reply must therefore always land after the token.
-    CodeharbordClient clientWithNoTransport;
-    ViewerModel viewers(&clientWithNoTransport);
-    QSignalSpy errors(&viewers, &ViewerModel::textFileError);
-    QSignalSpy reads(&viewers, &ViewerModel::textFileRead);
+    // Both answer SYNCHRONOUSLY, and that is deliberate rather than accidental.
+    // Each is identified by a PATH the caller already composed before calling,
+    // and every caller sets its matching state before it calls
+    // (ViewerDirectoryView.reload, ViewerPane.submitAddress /
+    // ViewerPane.checkRepoRoot), so a reply delivered inside the call is still
+    // matched correctly.
+    ViewerModel viewers;
+    QSignalSpy dirErrors(&viewers, &ViewerModel::directoryError);
+    QSignalSpy dirLists(&viewers, &ViewerModel::directoryListed);
+    QSignalSpy resolveErrors(&viewers, &ViewerModel::pathResolveError);
+    QSignalSpy resolved(&viewers, &ViewerModel::pathResolved);
 
-    const QString token = viewers.readTextFile(QStringLiteral("/p/a.txt"));
-    QVERIFY(!token.isEmpty());
-    // NOTHING may have been emitted yet: the caller only now holds the token.
-    QCOMPARE(errors.size(), 0);
-    QCOMPARE(viewers.inFlightTextReadCount(), 1);
+    viewers.listDirectory(QStringLiteral("/p"));
+    viewers.resolvePath(QStringLiteral("/p/README.md"), QStringLiteral("/p"));
 
-    QTRY_COMPARE(errors.size(), 1);
-    QCOMPARE(errors.first().at(0).toString(), token);
-    QCOMPARE(errors.first().at(1).toString(), QStringLiteral("/p/a.txt"));
-    QVERIFY(!errors.first().at(2).toString().isEmpty());
-    QCOMPARE(reads.size(), 0);
-    // The read settled, so its bookkeeping is gone: the deferral must not turn
-    // an unsendable read into a permanent in-flight entry.
-    QCOMPARE(viewers.inFlightTextReadCount(), 0);
-
-    // Cancelling before the deferred reply runs still suppresses it — the extra
-    // hop must not smuggle a cancelled read's failure onto a pane that has
-    // already navigated away.
-    const QString cancelled = viewers.readTextFile(QStringLiteral("/p/b.txt"));
-    viewers.cancelTextFile(cancelled);
-    QTest::qWait(50);
-    QCOMPARE(errors.size(), 1);
-    QCOMPARE(viewers.inFlightTextReadCount(), 0);
+    QCOMPARE(dirErrors.size(), 1);
+    QCOMPARE(resolveErrors.size(), 1);
+    QCOMPARE(dirLists.size(), 0);
+    QCOMPARE(resolved.size(), 0);
+    // Each failure echoes the path it is about, which is how a pane tells its
+    // own answer from another pane's on this shared model.
+    QCOMPARE(dirErrors.first().at(0).toString(), QStringLiteral("/p"));
+    QCOMPARE(resolveErrors.first().at(0).toString(),
+             QStringLiteral("/p/README.md"));
 }
 
 void TstViewers::directoryListingIsSortedDirectoriesFirst()
@@ -1289,6 +918,219 @@ void TstViewers::resolvePathFailuresLeaveTheFlagUndetermined()
     QVERIFY(!baseless.value(QStringLiteral("params"))
                  .toObject()
                  .contains(QStringLiteral("base")));
+}
+
+void TstViewers::pinnedInternalUrlSurvivesEviction()
+{
+    // A pane that is DISPLAYING a remote image holds its internal URL and never
+    // re-resolves it. Recency alone therefore cannot protect it: once cap other
+    // files have been opened, the address still on screen ages out and the
+    // pane's next reload fails on a URL the user can see. Pinning is the signal
+    // that carries "still displayed" into the table.
+    const QUrl shown(QStringLiteral("file:///p/shown.png"));
+
+    InternalUrlMap map(4);
+    const QString pinned = map.internalUrlFor(shown);
+    QVERIFY(map.retain(pinned));
+    QCOMPARE(map.retainedCount(), 1);
+
+    // Twenty other files pass through a table capped at four. Under plain LRU
+    // the displayed one is long gone.
+    for (int i = 0; i < 20; ++i)
+        map.internalUrlFor(QUrl(QStringLiteral("file:///p/other%1.txt").arg(i)));
+
+    // Still resolvable, which is what the pane's reload needs.
+    QCOMPARE(map.fileUrlFor(pinned), shown);
+    // And still the SAME id: re-minting must not hand the pane a second
+    // identity for a file it is already showing.
+    QCOMPARE(map.internalUrlFor(shown), pinned);
+
+    // The pin is an exemption for one entry, not a suspension of the bound: the
+    // unpinned remainder is still capped, so the table cannot grow with the
+    // number of files opened.
+    QCOMPARE(map.size(), map.maxEntries() + 1);
+
+    // Released, the entry is ordinary again and ordinary traffic evicts it.
+    map.release(pinned);
+    QCOMPARE(map.retainedCount(), 0);
+    // release() re-runs eviction at once, so the entry that was over the cap
+    // while pinned no longer is.
+    QCOMPARE(map.size(), map.maxEntries());
+    for (int i = 0; i < 5; ++i)
+        map.internalUrlFor(QUrl(QStringLiteral("file:///p/after%1.txt").arg(i)));
+    QVERIFY(!map.fileUrlFor(pinned).isValid());
+}
+
+void TstViewers::pinsAreCountedAndReleasable()
+{
+    // Two panes may show the same file. Pins are counted so one pane closing
+    // cannot unpin the other's still-visible resource.
+    const QUrl shared(QStringLiteral("file:///p/shared.png"));
+    InternalUrlMap map(1);
+    const QString url = map.internalUrlFor(shared);
+
+    QVERIFY(map.retain(url));
+    QVERIFY(map.retain(url));
+    QCOMPARE(map.retainedCount(), 1); // one entry, two holders
+
+    // The cap counts only unpinned entries, so a newly minted URL is never
+    // evicted the instant it is handed out just because the table is full of
+    // things panes are showing.
+    const QString pressure =
+        map.internalUrlFor(QUrl(QStringLiteral("file:///p/pressure.txt")));
+    QCOMPARE(map.fileUrlFor(pressure),
+             QUrl(QStringLiteral("file:///p/pressure.txt")));
+
+    map.release(url); // first pane closes
+    QCOMPARE(map.retainedCount(), 1); // the second pane still holds it
+    map.internalUrlFor(QUrl(QStringLiteral("file:///p/pressure2.txt")));
+    QCOMPARE(map.fileUrlFor(url), shared);
+
+    map.release(url); // second pane closes
+    QCOMPARE(map.retainedCount(), 0);
+    map.internalUrlFor(QUrl(QStringLiteral("file:///p/pressure3.txt")));
+    QVERIFY(!map.fileUrlFor(url).isValid());
+
+    // A release with no matching retain is a no-op, not an underflow that would
+    // let the next retain be cancelled by a stale one.
+    const QString again = map.internalUrlFor(shared);
+    map.release(again);
+    map.release(again);
+    QVERIFY(map.retain(again));
+    map.internalUrlFor(QUrl(QStringLiteral("file:///p/pressure4.txt")));
+    QCOMPARE(map.fileUrlFor(again), shared);
+
+    // Nothing is pinned by an address the table does not know, or by one whose
+    // authority the scheme handler would refuse — the caller is told so and
+    // must not then issue a release.
+    QVERIFY(!map.retain(QStringLiteral("codeharbor-internal://file/deadbeef")));
+    QVERIFY(!map.retain(QStringLiteral("codeharbor-internal://evil/")
+                        + again.mid(InternalUrlMap::prefix().size())));
+    QCOMPARE(map.retainedCount(), 1);
+}
+
+void TstViewers::responseHeadersLetSvgStyleItself()
+{
+    // The active-content lockdown must not also break the documents it is
+    // guarding. `default-src 'none'` alone forbids the <style> block and
+    // style="..." attributes INSIDE an SVG, so the most common active-content
+    // file a user opens here renders unstyled with nothing to say why.
+    const QMultiMap<QByteArray, QByteArray> svg =
+        InternalUrlSchemeHandler::responseHeadersFor(
+            QByteArrayLiteral("image/svg+xml"));
+    const QByteArray csp =
+        svg.value(QByteArrayLiteral("Content-Security-Policy"));
+    QVERIFY2(csp.contains(QByteArrayLiteral("style-src 'unsafe-inline'")),
+             qPrintable(QStringLiteral("CSP blocks the SVG's own styles: %1")
+                            .arg(QString::fromLatin1(csp))));
+    // The exfiltration defence is unchanged: no script, no subresource, no
+    // fetch, and the document still runs in a sandboxed opaque origin. Inline
+    // CSS cannot execute, and every channel it could smuggle bytes out through
+    // (background-image: url(), @import, font-src) is a resource load that
+    // default-src still refuses.
+    QVERIFY(csp.contains(QByteArrayLiteral("default-src 'none'")));
+    QVERIFY(csp.contains(QByteArrayLiteral("sandbox")));
+    QVERIFY(!csp.contains(QByteArrayLiteral("script-src")));
+    QVERIFY(!csp.contains(QByteArrayLiteral("'unsafe-eval'")));
+
+    // Inert types get no CSP at all, exactly as before.
+    const QMultiMap<QByteArray, QByteArray> png =
+        InternalUrlSchemeHandler::responseHeadersFor(
+            QByteArrayLiteral("image/png"));
+    QVERIFY(!png.contains(QByteArrayLiteral("Content-Security-Policy")));
+
+    // Both carry the sniffing guard, without which Chromium could reinterpret
+    // untrusted bytes as HTML and dodge the CSP gate entirely...
+    for (const QMultiMap<QByteArray, QByteArray> &headers : {svg, png}) {
+        QCOMPARE(headers.value(QByteArrayLiteral("X-Content-Type-Options")),
+                 QByteArrayLiteral("nosniff"));
+        // ...and both state that ranges are not served. Every reply is a whole
+        // buffer under an implicit 200; QWebEngineUrlRequestJob cannot answer
+        // 206, so honouring a Range would label a fragment as the complete
+        // resource. Saying "none" is the honest answer.
+        QCOMPARE(headers.value(QByteArrayLiteral("Accept-Ranges")),
+                 QByteArrayLiteral("none"));
+    }
+}
+
+void TstViewers::refusalMessagesExplainThemselves()
+{
+    using Failure = InternalUrlSchemeHandler::Failure;
+    // QWebEngineUrlRequestJob::fail() carries no text, so an oversized image or
+    // PDF used to reach the pane as a blank failed page. Every refusal now has
+    // a sentence, and none of them may be empty.
+    const QList<Failure> all = {
+        Failure::MethodNotAllowed, Failure::UnknownHost,
+        Failure::UnknownResource,  Failure::NotARemoteFile,
+        Failure::EmptyPath,        Failure::NoClient,
+        Failure::ReadFailed,       Failure::TooLarge,
+        Failure::UndecodableContent,
+    };
+    QSet<QString> seen;
+    for (Failure f : all) {
+        const QString message = InternalUrlSchemeHandler::failureMessage(f);
+        QVERIFY2(!message.isEmpty(), "a refusal with nothing to say");
+        seen.insert(message);
+    }
+    // Distinct causes must not collapse onto one sentence, or the pane cannot
+    // tell an evicted address from an unreadable file.
+    QCOMPARE(seen.size(), all.size());
+
+    // The one refusal with an actionable cause, so it is the one whose exact
+    // wording is worth pinning: the user is told the file is too big, not that
+    // "the file could not be displayed". Produced by the `truncated` branch of
+    // requestStarted()'s reply and shown verbatim by the pane through
+    // ViewerModel::internalResourceError. It used to have a twin in
+    // ViewerModel::settleTextRead and this assertion kept the two in step; that
+    // path was deleted with the read-only text view, so this is now the only
+    // producer of the sentence rather than one of two.
+    QCOMPARE(InternalUrlSchemeHandler::failureMessage(Failure::TooLarge),
+             QStringLiteral("file is too large to display inline"));
+
+    // A server error is quoted rather than swallowed, and an empty detail does
+    // not leave a dangling colon.
+    QVERIFY(InternalUrlSchemeHandler::failureMessage(Failure::ReadFailed,
+                                                     QStringLiteral("EACCES"))
+                .contains(QStringLiteral("EACCES")));
+    QVERIFY(!InternalUrlSchemeHandler::failureMessage(Failure::ReadFailed)
+                 .endsWith(QLatin1Char(':')));
+}
+
+void TstViewers::internalRequestFailuresReachQml()
+{
+    // The reason has to travel all the way to the pane, which only talks to
+    // ViewerModel. ViewerProfiles owns the handler, so the model forwards.
+    ViewerModel viewers;
+    auto *profiles = new ViewerProfiles(nullptr, &viewers);
+    viewers.setProfiles(profiles);
+    InternalUrlSchemeHandler *const handler = profiles->internalSchemeHandler();
+    QVERIFY(handler);
+
+    QSignalSpy failures(&viewers, &ViewerModel::internalResourceError);
+    const QUrl address(QStringLiteral("codeharbor-internal://file/abc123"));
+    emit handler->requestFailed(
+        address, InternalUrlSchemeHandler::Failure::TooLarge,
+        InternalUrlSchemeHandler::failureMessage(
+            InternalUrlSchemeHandler::Failure::TooLarge));
+    QCOMPARE(failures.size(), 1);
+    // The pane matches the address against the one it is showing, exactly as it
+    // matches a path on the other reply signals.
+    QCOMPARE(failures.at(0).at(0).toUrl(), address);
+    QCOMPARE(failures.at(0).at(1).toString(),
+             QStringLiteral("file is too large to display inline"));
+
+    // Re-pointing the model at other profiles must not leave the old handler
+    // forwarding as well: a pane would then see one failure reported twice.
+    auto *replacement = new ViewerProfiles(nullptr, &viewers);
+    viewers.setProfiles(replacement);
+    emit handler->requestFailed(address,
+                                InternalUrlSchemeHandler::Failure::NoClient,
+                                QStringLiteral("no remote client is connected"));
+    QCOMPARE(failures.size(), 1);
+    emit replacement->internalSchemeHandler()->requestFailed(
+        address, InternalUrlSchemeHandler::Failure::NoClient,
+        QStringLiteral("no remote client is connected"));
+    QCOMPARE(failures.size(), 2);
 }
 
 int main(int argc, char *argv[])

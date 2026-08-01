@@ -298,6 +298,40 @@ test("a MARKED line with too few fields is skipped, not half-parsed", async () =
     );
 });
 
+// Number.parseInt is a PREFIX scanner: it consumes what it can and ignores the
+// rest, so "3abc" became 3 and "1753372800junk" became a valid timestamp. A
+// record whose numeric fields are not numbers is not a record this format
+// produced; accepting it and silently discarding the tail means the listing the
+// client acts on (attach, kill) was assembled from data the parser did not
+// actually understand.
+test("a partly-numeric field is skipped, not read as its numeric prefix", () => {
+    const good = { name: "real", windows: 3, created: 1753372800, attached: true };
+    // Sanity: the well-formed record this varies from does parse.
+    assert.deepEqual(parseSessions("3\t1753372800\t1\treal"), [good]);
+
+    for (const line of [
+        "3abc\t1753372800\t1\tsneaky", // trailing garbage on the window count
+        "3\t1753372800junk\t1\tsneaky", // trailing garbage on the timestamp
+        " 3\t1753372800\t1\tsneaky", // leading whitespace parseInt skips
+        "+3\t1753372800\t1\tsneaky", // a sign parseInt accepts
+        "3.7\t1753372800\t1\tsneaky", // a fraction truncated to 3
+        "0x10\t1753372800\t1\tsneaky", // parseInt(_, 10) reads this as 0
+        "\t1753372800\t1\tsneaky", // an empty numeric field
+    ]) {
+        assert.deepEqual(parseSessions(line), [], line);
+    }
+
+    // `#{?session_attached,1,0}` emits exactly "1" or "0". Anything else was
+    // read as `=== "1"` — false — so a malformed record was reported as a real,
+    // detached session that a later kill could act on.
+    assert.deepEqual(parseSessions("3\t1753372800\tyes\tsneaky"), []);
+    assert.deepEqual(parseSessions("3\t1753372800\t\tsneaky"), []);
+
+    // A timestamp past 2^53 passes a digits-only check but rounds to a
+    // different instant the moment it becomes a JS number.
+    assert.deepEqual(parseSessions("3\t99999999999999999999\t1\tsneaky"), []);
+});
+
 // --- target names (SPEC 5.2) ------------------------------------------------
 //
 // A terminal pane's tmux target is minted once, on the server, and every client

@@ -2,6 +2,7 @@
 
 #include <QHash>
 #include <QList>
+#include <QMultiMap>
 #include <QMutex>
 #include <QObject>
 #include <QPointer>
@@ -64,20 +65,58 @@ public:
     // as recently used.
     QUrl fileUrlForId(const QString &id) const;
 
-    // Number of currently retained mappings, and the configured cap. For tests.
+    // Pin an entry against LRU eviction for as long as a pane is DISPLAYING it.
+    //
+    // Recency alone cannot express this. An entry is touched when it is minted
+    // and when the browser resolves it, and a pane that loaded its image hours
+    // ago does neither again — so after `maxEntries` other files are opened the
+    // identifier the pane is still showing ages out, and the pane's next reload
+    // (or the browser's next subresource fetch) fails with UrlNotFound on a URL
+    // that is visibly on screen. Pinning is the only signal that carries
+    // "still on screen" into the map.
+    //
+    // Reference counted: N retains need N releases, so two panes showing the
+    // same file cannot unpin each other. Accepts a full internal URL or a bare
+    // id, under the same authority rule as fileUrlFor(). Returns false — and
+    // pins nothing — for an unknown or malformed argument, so a caller can tell
+    // "kept alive" from "already gone".
+    //
+    // Pinned entries are neither evicted nor counted against the cap, which
+    // governs the unpinned remainder. Counting them would be worse than
+    // useless: with every entry pinned, a fresh mint would be evicted the
+    // instant it was handed out. The number of pins is bounded by the number of
+    // live panes, orders of magnitude below maxEntries, so a caller that leaks
+    // a retain costs one entry, not the bound.
+    bool retain(const QString &internalUrl);
+
+    // Undo one retain(). Releasing an entry that is not pinned does nothing;
+    // the entry becomes evictable again once its last pin is gone.
+    void release(const QString &internalUrl);
+
+    // Number of stored mappings, how many of them are pinned, and the
+    // configured cap. For tests.
     int size() const;
+    int retainedCount() const;
     int maxEntries() const { return m_maxEntries; }
 
 private:
+    // Id component of a full internal URL, or the argument itself when it is
+    // not a URL of this scheme (a bare id). Empty when the argument is an
+    // internal URL whose authority is not "file" — the one InternalUrlSchemeHandler
+    // refuses, and which every entry point here has to refuse identically.
+    static QString idOf(const QString &internalUrl);
+
     // Move `id` to the most-recently-used end. Requires m_mutex held.
     void touch(const QString &id) const;
-    // Evict least-recently-used entries while over the cap. Requires m_mutex.
+    // Evict least-recently-used UNPINNED entries while over the cap. Requires
+    // m_mutex.
     void evictIfNeeded();
 
     mutable QMutex m_mutex;
     QHash<QString, QString> m_fileToId; // file url string -> id
     QHash<QString, QUrl> m_idToFile;    // id -> original file url
     mutable QList<QString> m_lru;       // ids, front = LRU, back = MRU
+    QHash<QString, int> m_pins;         // id -> outstanding retain() count
     int m_maxEntries;
 };
 
@@ -96,7 +135,8 @@ public:
     // Upper bound on the bytes fetched for a single inline viewer render. A
     // file larger than this is failed (never truncated-and-served) so the RPC
     // frame stays bounded and no consumer receives partial content as if it
-    // were complete. ViewerModel::readTextFile applies the same cap.
+    // were complete. EditorController::kMaxEditableReadBytes is the matching
+    // cap on the text handler's own reads.
     static constexpr int kMaxInlineReadBytes = 8 * 1024 * 1024;
 
     // `client` performs the remote reads; `map` resolves opaque ids (defaults to
@@ -120,6 +160,49 @@ public:
     // Replies for such types are locked down with a restrictive CSP. Exposed so
     // the security gate is unit-testable without a live WebEngine job.
     static bool isActiveContentMime(const QByteArray &mime);
+
+    // Why a request was refused. QWebEngineUrlRequestJob::fail() takes only
+    // Chromium's coarse Error enum and carries NO text, so an oversized image
+    // or PDF reaches the pane as a bare failed page with nothing to explain it
+    // — unlike the text pane, which gets "file is too large to display inline"
+    // from ViewerModel. The reason travels out of band instead, on
+    // requestFailed(), which is the only channel the job interface leaves.
+    enum class Failure {
+        MethodNotAllowed,    // not a GET on the read-only origin
+        UnknownHost,         // authority other than "file"
+        UnknownResource,     // id not in the map (never minted, or evicted)
+        NotARemoteFile,      // id resolves to something that is not a file:// URL
+        EmptyPath,           // file:// URL naming no path at all
+        NoClient,            // no remote client bound
+        ReadFailed,          // file.readFile returned an error
+        TooLarge,            // file exceeds kMaxInlineReadBytes
+        UndecodableContent,  // base64 payload the server sent is malformed
+    };
+    Q_ENUM(Failure)
+
+    // Human-readable text for a Failure, in the same register as the messages
+    // the editor handler shows for the same conditions. `detail` (a server
+    // error message) is appended for ReadFailed when it is non-empty. Pure and
+    // static, so the wording is unit-testable without a live WebEngine job —
+    // which cannot be constructed outside Chromium.
+    static QString failureMessage(Failure reason,
+                                  const QString &detail = QString());
+
+    // The response headers accompanying every successful reply for `mime`
+    // (Content-Type itself excepted; reply() takes that separately). Exposed
+    // static for the same reason as isActiveContentMime(): a QWebEngineUrlRequestJob
+    // cannot be constructed in a unit test, so this is the only seam at which
+    // the security headers are checkable.
+    static QMultiMap<QByteArray, QByteArray>
+    responseHeadersFor(const QByteArray &mime);
+
+signals:
+    // A request for `internalUrl` was refused, with the reason the job
+    // interface could not carry. `message` is failureMessage(reason, ...).
+    // Emitted for EVERY fail() path in requestStarted(), immediately before the
+    // job is failed, so a pane can show why its image or PDF did not appear.
+    void requestFailed(const QUrl &internalUrl, Failure reason,
+                       const QString &message);
 
 private:
     QPointer<CodeharbordClient> m_client;

@@ -41,7 +41,8 @@ What it does (commit mode, the default):
    **A file that carries the release version must be added to both**, or it will
    drift with nothing to notice.
 4. Commits **only those files** as `Release vX.Y.Z`.
-5. Creates the annotated tag `vX.Y.Z`.
+5. Verifies that the commit about to be tagged really carries `X.Y.Z` — see
+   Safety — and creates the annotated tag `vX.Y.Z`.
 
 It **does not push by default** — it prints the push command. Pushing is what
 actually starts the release workflow.
@@ -52,7 +53,7 @@ actually starts the release workflow.
 |---|---|
 | `--set X.Y.Z` | Use an explicit version instead of bumping a component. |
 | `--push` | Push the release commit + tag to `origin` (triggers CI). |
-| `--no-commit` | Tag current HEAD without editing/committing version files. |
+| `--no-commit` | Tag current HEAD without editing/committing version files. HEAD must already carry the target version. |
 | `--dry-run` | Print the planned actions; change nothing. |
 | `--allow-dirty` | Proceed even if the version files have uncommitted edits. |
 
@@ -64,6 +65,16 @@ actually starts the release workflow.
   never clobbered.
 - Only the version files are staged — unrelated working-tree changes are left
   untouched.
+- **Aborts before tagging if the commit being tagged does not carry the tagged
+  version.** A tag is permanent, and one whose tree says 0.1.8 under a release
+  page called v0.2.0 publishes a binary, a daemon `server.info` reply and a
+  remote tarball that all announce the wrong release. The check reads the
+  COMMITTED tree (not the working tree, so `--allow-dirty` cannot mask it) and
+  runs `.github/scripts/check-versions.mjs` against it, so it applies the same
+  rules CI does. In commit mode this can only fail if a rewrite did not take; the
+  flag it really constrains is `--no-commit`, which tags HEAD as-is and
+  previously could not tell a release commit from any other. `tests/bump_version_tag.sh`
+  (ctest target `tst_bump_version_tag`) covers all four paths.
 
 ## Examples
 

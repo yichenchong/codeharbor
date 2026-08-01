@@ -586,11 +586,19 @@ Rectangle {
 
             Accessible.role: Accessible.Button
             Accessible.name: newGroupButton.actionText
-            ToolTip.text: newGroupButton.actionText
-            ToolTip.visible: newGroupButton.hovered
-            // Long enough that crossing the bar on the way somewhere else does
-            // not flash it, matching the row tooltip in SessionRow.qml.
-            ToolTip.delay: 600
+
+            // The module's one tooltip (AppToolTip.qml). The attached
+            // `ToolTip.text` form is drawn by the Basic style in that style's
+            // own light palette, so a hint about this dark panel arrived as a
+            // white box. Named so tst_sidebar can read the hint back.
+            AppToolTip {
+                objectName: "newGroupButtonTip"
+                text: newGroupButton.actionText
+                visible: newGroupButton.hovered
+                // Long enough that crossing the bar on the way somewhere else
+                // does not flash it, matching the row tooltip in SessionRow.qml.
+                delay: 600
+            }
 
             contentItem: Label {
                 text: newGroupButton.text

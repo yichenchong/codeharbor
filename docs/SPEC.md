@@ -157,7 +157,13 @@ There is no separate Project or Task entity in the initial model. Both use the D
 
 ### 3.3 Viewer Pane
 
-A **Viewer Pane** displays one URL or remote resource.
+A **Viewer Pane** is a web browser addressed by a URL. It has an address bar, navigation, and a security context,
+and it displays one URL or remote resource at a time.
+
+Everything else it can do — editing a source file, rendering Markdown, showing an image, a PDF, or a directory — is
+a *handler* the browser delegates to once a URL has resolved (§7.5). A viewer pane is therefore a browser that can
+also edit, not an editor that can also browse. The distinction is normative: it fixes what an unrecognised resource
+does (it stays with the browser), and it means no capability may assume it owns the pane.
 
 Viewer panes may contain:
 
@@ -524,6 +530,23 @@ session_shutdown         → stopped
 agent or hook error      → error
 ```
 
+PRECEDENCE. The error flag is not part of the event vocabulary — it is a separate marker
+the harness may set on any firing — so the mapping needs an order, and it is:
+
+1. A **shutdown** event (`session_shutdown`; `SessionEnd` for Claude Code) always maps to
+   `stopped`, whether or not the error flag is set. The session is over and observed to be
+   over, nothing further can ever arrive for that terminal, and `stopped` is therefore the
+   terminal's last word. A flag that could mask it would leave the sidebar row permanently
+   in `error` for a session that no longer exists — reachable by the ordinary mistake of a
+   producer that sets the flag once and never unsets it.
+2. Otherwise the **error flag** outranks the native event name: an `agent_end` that blew up
+   is an `error`, not a completion.
+3. Otherwise the table above applies.
+
+The same order holds for every adapter, not just Oh My Pi. Pi shares Oh My Pi's mapping
+outright (`remote/src/adapters/pi-family.ts`, used by both) and Claude Code implements the
+same rule over its own hook names.
+
 ### 6.6 Fallback Activity Detection
 
 Without a harness adapter, CodeHarbor may expose only coarse states. Those states are
@@ -536,13 +559,44 @@ running      output observed within the idle threshold
 idle         no output for longer than the idle threshold
 ```
 
-`FallbackActivityDetector` in `remote/src/adapters/fallback.ts` produces exactly these
-three for the `generic` harness; the full vocabulary is `AGENT_STATES` in
-`remote/src/events.ts`. Loss of the SSH channel is a TRANSPORT condition, reported by
-the client's own connection state, so there is deliberately no `disconnected` agent
-state here.
+The derivation lives on the CLIENT, in `ch::AgentStatusMonitor`
+(`src/agent/AgentStatusMonitor.{h,cpp}`), not in the daemon. The daemon has no per-pane
+source of terminal output: an adapter never sees a byte of it, and giving the daemon one
+would mean either a per-pane server-side tmux tap or a client-to-daemon stream duplicating
+every terminal byte back over SSH. The client already has the bytes —
+`ch::TerminalController` ingests them for the renderer — so `ch::TerminalFactory`, the one
+object that knows both a pane's `terminal_panes` row id and the PTY channel its bytes
+arrive on, reports the FACT of output (never its content) to the monitor, which derives
+the three states above. The full vocabulary is `AGENT_STATES` in `remote/src/events.ts`.
+
+Only a pane whose `terminal_panes.harness` column is literally `generic` takes its state
+this way. A pane with no harness configured is a plain shell, and treating a shell's
+output as agent activity would light up every terminal in the sidebar; a pane with an
+adapter harness gets its state from the wire, which is strictly better information.
+
+Loss of the SSH channel is a TRANSPORT condition, reported by the client's own connection
+state, so there is deliberately no `disconnected` agent state here.
 
 It must not pretend to reliably distinguish agent work, long-running commands, waiting for input, or completion.
+
+### 6.7 Silence Timeout
+
+A harness that is killed — or whose host reboots — emits no shutdown event, so the last
+state it reported would otherwise be kept for the lifetime of the client. After
+`ch::AgentStatusMonitor::kStaleTimeoutMs` (15 minutes) of silence on BOTH channels — no
+agent event and no terminal output — a pane is demoted to `unknown`.
+
+Three rules make that safe:
+
+- Only `starting` and `running` age. They are the states that assert a live agent is doing
+  something right now. `waiting_input` and `idle_unseen` are the user's to-do list and stay
+  true until somebody acts on them; `idle`, `stopped`, `error` and `unknown` assert no
+  liveness to withdraw.
+- The target is `unknown`, never `idle`. The client does not know whether a silent agent
+  died or is thinking, and `unknown` is the vocabulary's word for exactly that.
+- Terminal output refutes the silence for EVERY harness, not just `generic`. An agent that
+  is working almost always prints, so the window only elapses for a pane that has said
+  nothing at all on either channel.
 
 ---
 
@@ -607,7 +661,19 @@ The internal URL is an implementation detail.
 
 The initial extensibility mechanism is a lightweight handler registry.
 
-Possible resolution types:
+Resolution is browser-first. Web navigation is the default disposition, and a more specialised handler only takes a
+resource when it positively claims it:
+
+1. `http` and `https` always resolve to direct web navigation. No other handler may intercept them.
+2. `codeharbor-internal` resolves by explicit extension when it carries one, and renders as HTML otherwise.
+3. `file://` resolves by directory, then by extension, then by well-known filename. The text editor is reached only
+   on a positive match; it is never the fallback for an unrecognised resource.
+4. Anything unclaimed becomes a download or metadata view, never an editor buffer.
+
+A handler is therefore a delegate the browser hands a resource to, not a competing pane type.
+
+Possible resolution types — the complete set the four steps above can yield, one
+per line:
 
 ```text
 DirectWebNavigation
@@ -617,9 +683,13 @@ ImageViewer
 PdfViewer
 DirectoryViewer
 Download
-OpenExternally
 Error
 ```
+
+Opening a resource in the desktop's own application is **not** in that list. It is
+an action the download/metadata view offers once resolution has already landed on
+`Download` (see the Binary row below, and §4.3's viewer-region operations), not a
+disposition a URL can resolve to.
 
 Initial handlers:
 
@@ -639,6 +709,10 @@ Initial handlers:
 ## 8. Remote File Editing
 
 ### 8.1 Editor
+
+The text editor is one of the viewer pane's handlers (§7.5), not a separate kind of pane. A pane reaches it by
+navigating to a `file://` URL that resolves to text; the pane keeps its address bar, its history, and its identity
+throughout. Nothing in this section creates an "editor pane" as a distinct concept.
 
 Text-based remote files should be editable in an embedded editor, preferably Monaco Editor.
 
@@ -772,6 +846,7 @@ Polling may be used as a fallback.
 | Directory | remote directory browser |
 | Binary | metadata and download/open options |
 | Very large text file | streaming read-only viewer |
+| Anything not matched above | metadata and download view. The editor is reached on a positive match only, never as a fallback (§7.5). |
 
 ---
 
@@ -874,12 +949,20 @@ channel's stdin/stdout. The rules below are the ones the implementation
   succeeds, hits an unknown method, or throws. Server-initiated messages use the
   same id-less form — see the `file.watchEvent` notification in section 8.7.
 - **Application-level failures use JSON-RPC's implementation-defined
-  `-32000..-32099` range.** Exactly one code is defined so far: **`-32001`,
-  revision mismatch**, returned for a `file.writeFile` whose `expectedRevision` no
-  longer matches the file (sections 8.4 and 8.6). Its constant is
-  `RPC_REVISION_MISMATCH` in `remote/src/rpc-types.ts`, mirrored in C++ as
-  `kRevisionMismatch` in `src/remote/RpcTypes.h`; `remote/test/rpc-mirror.test.ts`
-  fails if the two sides drift apart.
+  `-32000..-32099` range.** Each code has a constant in `remote/src/rpc-types.ts`
+  mirrored in C++ in `src/remote/RpcTypes.h`, and `remote/test/rpc-mirror.test.ts`
+  fails if the two sides drift apart. Three are defined:
+  - **`-32001`, revision mismatch** (`RPC_REVISION_MISMATCH` / `kRevisionMismatch`),
+    returned for a `file.writeFile` whose `expectedRevision` no longer matches the
+    file (sections 8.4 and 8.6).
+  - **`-32002`, database busy** (`RPC_DATABASE_BUSY` / `kDatabaseBusy`), returned
+    for a workspace write that could not take the server database's write lock
+    before the busy timeout ran out (section 11.1).
+  - **`-32003`, resource limit** (`RPC_RESOURCE_LIMIT` / `kResourceLimit`),
+    returned when the parameters are valid and nothing was applied, but the server
+    refuses to answer at that size: a `file.listDirectory` whose serialized listing
+    would exceed 15 MiB, or a `file.watch` past 512 live subscriptions
+    (sections 8.3 and 8.7).
 
 ---
 
@@ -925,11 +1008,11 @@ The client must not store project repositories or project files.
 
 Unsaved buffers must be recoverable after client failure.
 
-Recovery snapshots are stored on the server, one file per editor pane, in a
-dedicated recovery directory under the server's user data location. The server
-reports that absolute directory in its `server.info` result as `recoveryDir`
-(`$XDG_DATA_HOME` or `~/.local/share`, plus `/codeharbor/recovery`); the client
-appends the pane's stable layout id:
+Recovery snapshots are stored on the server, one file per viewer pane holding an
+unsaved buffer, in a dedicated recovery directory under the server's user data
+location. The server reports that absolute directory in its `server.info` result
+as `recoveryDir` (`$XDG_DATA_HOME` or `~/.local/share`, plus
+`/codeharbor/recovery`); the client appends the pane's stable layout id:
 
 ```text
 <recoveryDir>/<paneId>
@@ -1078,8 +1161,8 @@ remote/
 │   ├── validate.ts           request-parameter validation helpers
 │   ├── events.ts             agent event schema + socket-path resolution
 │   ├── bridge.ts             agent event relay
-│   ├── adapters/             oh-my-pi.ts, pi.ts, claude-code.ts, fallback.ts,
-│   │                         types.ts, index.ts (the harness registry)
+│   ├── adapters/             oh-my-pi.ts, pi.ts (both over pi-family.ts),
+│   │                         claude-code.ts, types.ts, index.ts (the registry)
 │   └── hooks/                oh-my-pi-hook.ts (the native harness hook)
 └── sql/                      schema.sql, indexes.sql
 ```
@@ -1111,7 +1194,7 @@ Ctrl+Shift+P    Command palette
 Ctrl+Shift+O    Connect to Server…
 Ctrl+Shift+R    Refresh Workspace
 Ctrl+Shift+W    Close Window
-Ctrl+S          Save active remote file (inside a focused editor pane)
+Ctrl+S          Save active remote file (inside the focused editor)
 ```
 
 `Ctrl+Shift+P` opens the palette (`activationSequence` in
@@ -1120,8 +1203,8 @@ so it is `⌘⇧P` there). `Ctrl+Shift+O`, `Ctrl+Shift+R` and `Ctrl+Shift+W` are
 `shortcut` entries on the command list in `src/qml/Main.qml`, which the palette
 turns into real window-wide `Shortcut` objects, so they fire whether or not the
 palette is open. `Ctrl+S` is registered on the Monaco instance itself in
-`src/web/editor/src/index.ts`, so it applies to the focused editor pane rather
-than window-wide.
+`src/web/editor/src/index.ts`, so it applies to the focused editor rather than
+window-wide.
 
 Two of these deviate from the plain sequence this section originally suggested,
 for the same reason: a window-wide `Shortcut` is matched before the key ever
@@ -1144,7 +1227,7 @@ Originally suggested defaults, and how they were reconciled:
 | `Ctrl+P` Switch Dev Session | Not implemented — there is no session switcher. |
 | `Ctrl+Shift+T` New terminal | Not implemented as a key sequence; a new terminal pane comes from the palette's "Split Terminal Pane Horizontally/Vertically". |
 | `Ctrl+Shift+V` New viewer | Not implemented as a key sequence; a new viewer pane comes from the palette's "Split Viewer Pane Horizontally/Vertically". |
-| `Ctrl+S` Save active remote file | Implemented, in the editor pane. |
+| `Ctrl+S` Save active remote file | Implemented, in the viewer pane's text-editor handler (§8.1). |
 | `Ctrl+W` Close active pane | Not implemented as a key sequence; "Close Focused Viewer/Terminal Pane" are palette commands. Note `Ctrl+Shift+W` is **not** this — it closes the whole window. |
 | `Ctrl+Tab` Next pane | Not implemented. Pane focus is click-based today, so a "focus next pane" command would first have to be able to move focus (see `docs/PLAN.md`). |
 | `Alt+1..9` Select Dev Session | Not implemented. |
@@ -1269,5 +1352,7 @@ Because Oh My Pi is the primary daily driver, its adapter may be included in the
 CodeHarbor is a purpose-built remote development command center for switching between persistent repository- and task-oriented workspaces.
 
 It is not primarily a local IDE, terminal emulator, browser, remote desktop client, or tmux frontend.
+That statement is about the product as a whole. It is not a statement about the viewer pane, which **is**
+a web browser (§3.3) and is specified as one.
 
 It combines those elements into one remote-first workspace where projects, files, processes, and session state remain safely docked on the server while the user connects from any supported client platform.

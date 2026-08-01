@@ -15,6 +15,8 @@
 #include <QStringView>
 #include <QtTest/QtTest>
 
+#include <cstring>
+
 using ch::AgentState;
 using ch::AgentStatusMonitor;
 
@@ -42,6 +44,45 @@ QByteArray eventLine(const QString& state, const QString& dev = QStringLiteral("
 }
 
 int asInt(AgentState s) { return static_cast<int>(s); }
+
+// A transport that delivers readyRead SYNCHRONOUSLY from push(), so a slot can
+// re-enter the monitor's read handler deterministically. QLocalSocket cannot:
+// it suppresses a readyRead raised while one is already being delivered, and
+// QBuffer defers its own to the event loop.
+class SyncDevice : public QIODevice {
+public:
+    explicit SyncDevice(QObject* parent = nullptr) : QIODevice(parent)
+    {
+        open(QIODevice::ReadOnly);
+    }
+
+    void push(const QByteArray& bytes)
+    {
+        m_buf.append(bytes);
+        emit readyRead();
+    }
+
+    bool isSequential() const override { return true; }
+    qint64 bytesAvailable() const override
+    {
+        return m_buf.size() + QIODevice::bytesAvailable();
+    }
+
+protected:
+    qint64 readData(char* data, qint64 maxSize) override
+    {
+        const qint64 n = qMin<qint64>(maxSize, m_buf.size());
+        if (n > 0) {
+            std::memcpy(data, m_buf.constData(), static_cast<size_t>(n));
+            m_buf.remove(0, n);
+        }
+        return n;
+    }
+    qint64 writeData(const char*, qint64) override { return -1; }
+
+private:
+    QByteArray m_buf;
+};
 
 } // namespace
 
@@ -86,6 +127,18 @@ private slots:
     void retainDevSessionsIsSilentAndTotalWhenNothingIsLive();
     void markSeenForAnUnknownDevSessionIsSilent();
     void monitorWithoutATransportIsInert();
+
+    // AG-N6: the framing loop under a burst and under re-entrancy.
+    void manyEventsInOneReadAreFramedInOrder();
+    void reentrantFeedFromASlotIsFramedInOrder();
+    // AG-N2: a pane that goes silent.
+    void aSilentRunningTerminalIsDemotedToUnknown();
+    void terminalOutputRefutesTheSilenceTimeout();
+    void attentionStatesAndSettledStatesNeverAge();
+    // AG-N1: SPEC 6.6 activity detection for the generic harness.
+    void genericHarnessDerivesItsStateFromTerminalOutput();
+    void onlyTheGenericHarnessDerivesStateFromOutput();
+    void genericActivityRegistrationIsSilentUntilTheChannelAttaches();
 
 private:
     void makePair();
@@ -1232,6 +1285,307 @@ void TstAgentMonitor::monitorWithoutATransportIsInert()
     // Unbinding what was never bound is a no-op, not a crash.
     m_monitor->setTransport(nullptr);
     QCOMPARE(m_monitor->transport(), static_cast<QIODevice*>(nullptr));
+}
+
+// AG-N6. The per-line removal at the front of the read buffer was suspected of
+// being a quadratic shift; measurement says QByteArray's front-remove is O(1)
+// on Qt 6 and the offset rewrite is slower (see the note in onReadyRead). What
+// was missing was coverage: nothing drove a burst of many events through ONE
+// read, which is the shape the suspicion was about and the shape any future
+// rewrite of the loop would break first. Every line must arrive, in arrival
+// order, whatever the chunking.
+void TstAgentMonitor::manyEventsInOneReadAreFramedInOrder()
+{
+    makePair();
+    QSignalSpy stateSpy(m_monitor, &AgentStatusMonitor::agentStateChanged);
+
+    // Alternating states so every line is a real transition and the spy count
+    // is an exact record of what was framed.
+    constexpr int kLines = 2000;
+    QByteArray burst;
+    for (int i = 0; i < kLines; ++i) {
+        burst += eventLine(i % 2 == 0 ? QStringLiteral("running")
+                                      : QStringLiteral("idle"),
+                           QStringLiteral("dB"), QStringLiteral("tB"));
+    }
+    // A partial trailing line: the offset must not swallow it on compaction.
+    const QByteArray tail =
+        eventLine("waiting_input", QStringLiteral("dB"), QStringLiteral("tB"));
+    burst += tail.left(tail.size() / 2);
+
+    feed(burst);
+    QTRY_COMPARE(stateSpy.count(), kLines);
+    QCOMPARE(m_monitor->stateFor("dB", "tB"), asInt(AgentState::Idle));
+    for (int i = 0; i < kLines; ++i) {
+        QCOMPARE(stateSpy.at(i).at(2).toInt(),
+                 i % 2 == 0 ? asInt(AgentState::Running) : asInt(AgentState::Idle));
+    }
+
+    // The held-back half completes on the next read.
+    feed(tail.mid(tail.size() / 2));
+    QTRY_COMPARE(m_monitor->stateFor("dB", "tB"), asInt(AgentState::WaitingInput));
+}
+
+// AG-N6/AG-N7. The framing loop reaches slots, and a slot may drive another
+// delivery straight back into the handler. AG-N7 concluded there is no defect
+// here and did not add a guard, correctly — but it also left the invariant
+// untested. The re-entrant call appends to the END of the same buffer and the
+// loop frames from the FRONT, so the oldest complete line is always taken
+// first and no line is framed twice.
+//
+// Driven through SyncDevice rather than the socket pair on purpose. A
+// QLocalSocket suppresses a re-entrant readyRead (that is why the AG-N7 review
+// concluded the realistic re-entry path does not exist), so a socket cannot
+// exercise this at all; SyncDevice re-enters deterministically, which is what
+// the framing invariant deserves to be tested against.
+void TstAgentMonitor::reentrantFeedFromASlotIsFramedInOrder()
+{
+    SyncDevice device;
+    m_monitor->setTransport(&device);
+
+    QVector<int> observed;
+    bool reentered = false;
+    connect(m_monitor, &AgentStatusMonitor::agentStateChanged, this,
+            [&](const QString&, const QString&, int state) {
+                observed.append(state);
+                if (reentered)
+                    return;
+                reentered = true;
+                device.push(eventLine("stopped", QStringLiteral("dR2"),
+                                      QStringLiteral("tR2")));
+            });
+
+    QByteArray chunk;
+    chunk += eventLine("starting", QStringLiteral("dR2"), QStringLiteral("tR2"));
+    chunk += eventLine("running", QStringLiteral("dR2"), QStringLiteral("tR2"));
+    chunk += eventLine("waiting_input", QStringLiteral("dR2"),
+                       QStringLiteral("tR2"));
+    device.push(chunk);
+
+    const QVector<int> expected{asInt(AgentState::Starting),
+                                asInt(AgentState::Running),
+                                asInt(AgentState::WaitingInput),
+                                asInt(AgentState::Stopped)};
+    QCOMPARE(observed, expected);
+    QCOMPARE(m_monitor->stateFor("dR2", "tR2"), asInt(AgentState::Stopped));
+
+    // Unbind before the stack-allocated device dies under the monitor.
+    m_monitor->setTransport(nullptr);
+}
+
+// AG-N2. A harness that is killed — or whose host reboots — emits no shutdown
+// event, so the monitor's last word for that pane was "running" and it used to
+// keep it for the lifetime of the application: the sidebar reported work that
+// stopped hours ago. After the silence window the claim is withdrawn, and it is
+// withdrawn to Unknown rather than Idle, because "we no longer know" is exactly
+// what the client can honestly say.
+void TstAgentMonitor::aSilentRunningTerminalIsDemotedToUnknown()
+{
+    makePair();
+    m_monitor->setStaleTimeoutMs(120);
+    QSignalSpy stateSpy(m_monitor, &AgentStatusMonitor::agentStateChanged);
+
+    feed(eventLine("running", QStringLiteral("dS"), QStringLiteral("tS")));
+    QTRY_COMPARE(m_monitor->stateFor("dS", "tS"), asInt(AgentState::Running));
+
+    QTRY_COMPARE(m_monitor->stateFor("dS", "tS"), asInt(AgentState::Unknown));
+    QCOMPARE(stateSpy.count(), 2);
+    QCOMPARE(stateSpy.at(1).at(0).toString(), QStringLiteral("dS"));
+    QCOMPARE(stateSpy.at(1).at(1).toString(), QStringLiteral("tS"));
+    QCOMPARE(stateSpy.at(1).at(2).toInt(), asInt(AgentState::Unknown));
+
+    // Once demoted it stays demoted and stops emitting: Unknown does not age.
+    QTest::qWait(200);
+    QCOMPARE(stateSpy.count(), 2);
+
+    // Starting ages the same way — a harness that dies during launch never
+    // reaches running either.
+    feed(eventLine("starting", QStringLiteral("dS"), QStringLiteral("tS")));
+    QTRY_COMPARE(m_monitor->stateFor("dS", "tS"), asInt(AgentState::Starting));
+    QTRY_COMPARE(m_monitor->stateFor("dS", "tS"), asInt(AgentState::Unknown));
+
+    // The window is policy: 0 turns the demotion off entirely.
+    m_monitor->setStaleTimeoutMs(0);
+    feed(eventLine("running", QStringLiteral("dS"), QStringLiteral("tS")));
+    QTRY_COMPARE(m_monitor->stateFor("dS", "tS"), asInt(AgentState::Running));
+    QTest::qWait(300);
+    QCOMPARE(m_monitor->stateFor("dS", "tS"), asInt(AgentState::Running));
+}
+
+// AG-N2, the other half: the reason a silence timeout was previously judged
+// unsafe is that a long tool call looks exactly like a dead agent from here.
+// It does not, quite — an agent that is working almost always prints. Terminal
+// output is a sign of life for EVERY harness, not just the generic one, and it
+// restarts the window without the harness having to emit anything.
+void TstAgentMonitor::terminalOutputRefutesTheSilenceTimeout()
+{
+    makePair();
+    m_monitor->setStaleTimeoutMs(200);
+
+    feed(eventLine("running", QStringLiteral("dK"), QStringLiteral("tK")));
+    QTRY_COMPARE(m_monitor->stateFor("dK", "tK"), asInt(AgentState::Running));
+
+    // Well past the window in total, but never quiet for a whole window.
+    for (int i = 0; i < 8; ++i) {
+        QTest::qWait(60);
+        m_monitor->noteTerminalOutput(QStringLiteral("dK"), QStringLiteral("tK"));
+        QCOMPARE(m_monitor->stateFor("dK", "tK"), asInt(AgentState::Running));
+    }
+
+    // Output stops: now the window elapses.
+    QTRY_COMPARE(m_monitor->stateFor("dK", "tK"), asInt(AgentState::Unknown));
+}
+
+// AG-N2. Only the two states that claim a live agent is working right now may
+// age. waiting_input and idle_unseen are the user's to-do list: they stay true
+// until somebody acts on them, and expiring them would delete the one signal
+// this whole subsystem exists to raise. idle/stopped/error claim no liveness at
+// all, so there is nothing to withdraw.
+void TstAgentMonitor::attentionStatesAndSettledStatesNeverAge()
+{
+    makePair();
+    m_monitor->setStaleTimeoutMs(60);
+
+    struct Case {
+        const char* wire;
+        AgentState state;
+        const char* term;
+    };
+    const Case cases[] = {
+        {"waiting_input", AgentState::WaitingInput, "tW"},
+        {"idle_unseen", AgentState::IdleUnseen, "tU"},
+        {"idle", AgentState::Idle, "tI"},
+        {"stopped", AgentState::Stopped, "tP"},
+        {"error", AgentState::Error, "tE"},
+    };
+    for (const Case& c : cases) {
+        feed(eventLine(QString::fromLatin1(c.wire), QStringLiteral("dA"),
+                       QString::fromLatin1(c.term)));
+        QTRY_COMPARE(m_monitor->stateFor("dA", QString::fromLatin1(c.term)),
+                     asInt(c.state));
+    }
+
+    QTest::qWait(300);
+    for (const Case& c : cases) {
+        QCOMPARE(m_monitor->stateFor("dA", QString::fromLatin1(c.term)),
+                 asInt(c.state));
+    }
+    // The unseen badge in particular survives, since that is what a demoted
+    // idle_unseen would have thrown away.
+    QVERIFY(m_monitor->hasUnseen("dA"));
+}
+
+// AG-N1. The "generic" harness has no adapter, so the bridge relays nothing for
+// it and the wire path produces no state at all, end to end. SPEC 6.6 says a
+// coarse state is derived from terminal output instead — and the output is
+// already here, on the client, so the derivation is here too. Registration,
+// attach, output: the three things ch::TerminalFactory can see.
+void TstAgentMonitor::genericHarnessDerivesItsStateFromTerminalOutput()
+{
+    m_monitor->setFallbackIdleThresholdMs(80);
+    QSignalSpy stateSpy(m_monitor, &AgentStatusMonitor::agentStateChanged);
+
+    m_monitor->setTerminalHarness(QStringLiteral("dG"), QStringLiteral("tG"),
+                                  QStringLiteral("generic"));
+
+    // Attached but silent is SPEC 6.6's "starting".
+    m_monitor->noteTerminalAttached(QStringLiteral("dG"), QStringLiteral("tG"));
+    QCOMPARE(m_monitor->stateFor("dG", "tG"), asInt(AgentState::Starting));
+    QCOMPARE(stateSpy.count(), 1);
+
+    // Output within the quiet window is "running", and it is immediate: the
+    // user must not wait a tick to see a pane come alive.
+    m_monitor->noteTerminalOutput(QStringLiteral("dG"), QStringLiteral("tG"));
+    QCOMPARE(m_monitor->stateFor("dG", "tG"), asInt(AgentState::Running));
+    QCOMPARE(stateSpy.count(), 2);
+
+    // Further output inside the window is not a transition and says nothing.
+    m_monitor->noteTerminalOutput(QStringLiteral("dG"), QStringLiteral("tG"));
+    QCOMPARE(stateSpy.count(), 2);
+
+    // Quiet for longer than the threshold is "idle".
+    QTRY_COMPARE(m_monitor->stateFor("dG", "tG"), asInt(AgentState::Idle));
+
+    // ...and it comes back. A completion is never inferred: the fallback draws
+    // only from starting/running/idle, so no unseen badge and no notification
+    // can be raised from output activity.
+    m_monitor->noteTerminalOutput(QStringLiteral("dG"), QStringLiteral("tG"));
+    QCOMPARE(m_monitor->stateFor("dG", "tG"), asInt(AgentState::Running));
+    QVERIFY(!m_monitor->hasUnseen("dG"));
+
+    // A fresh channel forgets the previous one's output age.
+    m_monitor->noteTerminalAttached(QStringLiteral("dG"), QStringLiteral("tG"));
+    QCOMPARE(m_monitor->stateFor("dG", "tG"), asInt(AgentState::Starting));
+}
+
+// AG-N1. Only a pane the user configured as the "generic" harness takes its
+// state from output. A pane with no harness is a plain shell, and inferring "an
+// agent is running" from a shell printing a prompt would light up every
+// terminal in the sidebar; a pane with an adapter harness gets its state from
+// the wire, which is strictly better information.
+void TstAgentMonitor::onlyTheGenericHarnessDerivesStateFromOutput()
+{
+    makePair();
+    m_monitor->setFallbackIdleThresholdMs(80);
+    QSignalSpy stateSpy(m_monitor, &AgentStatusMonitor::agentStateChanged);
+
+    // Never registered at all: output invents no row for it.
+    m_monitor->noteTerminalAttached(QStringLiteral("dN"), QStringLiteral("tN"));
+    m_monitor->noteTerminalOutput(QStringLiteral("dN"), QStringLiteral("tN"));
+    QCOMPARE(m_monitor->stateFor("dN", "tN"), asInt(AgentState::Unknown));
+    QCOMPARE(stateSpy.count(), 0);
+
+    // Registered as a plain shell (no harness): still no row, still silent.
+    m_monitor->setTerminalHarness(QStringLiteral("dN"), QStringLiteral("tN"),
+                                  QString());
+    m_monitor->noteTerminalOutput(QStringLiteral("dN"), QStringLiteral("tN"));
+    QCOMPARE(m_monitor->stateFor("dN", "tN"), asInt(AgentState::Unknown));
+    QCOMPARE(stateSpy.count(), 0);
+
+    // An adapter harness keeps the state the wire gave it, however much the
+    // pane prints.
+    feed(eventLine("waiting_input", QStringLiteral("dN"), QStringLiteral("tO"),
+                   QStringLiteral("oh-my-pi")));
+    QTRY_COMPARE(m_monitor->stateFor("dN", "tO"), asInt(AgentState::WaitingInput));
+    m_monitor->setTerminalHarness(QStringLiteral("dN"), QStringLiteral("tO"),
+                                  QStringLiteral("oh-my-pi"));
+    m_monitor->noteTerminalAttached(QStringLiteral("dN"), QStringLiteral("tO"));
+    m_monitor->noteTerminalOutput(QStringLiteral("dN"), QStringLiteral("tO"));
+    QTest::qWait(200);
+    QCOMPARE(m_monitor->stateFor("dN", "tO"), asInt(AgentState::WaitingInput));
+}
+
+// AG-N1. AppController registers a harness for every pane in the workspace
+// tree, most of which are not open. Registration must therefore be pure
+// bookkeeping: a pane nobody has attached to has produced no observation, so it
+// has no derived state and no row of its own. Eviction takes the registration
+// with the Dev Session, like everything else.
+void TstAgentMonitor::genericActivityRegistrationIsSilentUntilTheChannelAttaches()
+{
+    QSignalSpy stateSpy(m_monitor, &AgentStatusMonitor::agentStateChanged);
+
+    m_monitor->setTerminalHarness(QStringLiteral("dQ"), QStringLiteral("tQ"),
+                                  QStringLiteral("generic"));
+    QCOMPARE(stateSpy.count(), 0);
+    QCOMPARE(m_monitor->stateFor("dQ", "tQ"), asInt(AgentState::Unknown));
+    // Registering twice is idempotent.
+    m_monitor->setTerminalHarness(QStringLiteral("dQ"), QStringLiteral("tQ"),
+                                  QStringLiteral("generic"));
+    QCOMPARE(stateSpy.count(), 0);
+
+    // Output before any attach is not activity on a channel we are watching.
+    m_monitor->noteTerminalOutput(QStringLiteral("dQ"), QStringLiteral("tQ"));
+    QCOMPARE(m_monitor->stateFor("dQ", "tQ"), asInt(AgentState::Unknown));
+    QCOMPARE(stateSpy.count(), 0);
+
+    // The Dev Session going away drops the registration with it, so a later
+    // output observation finds nothing to derive from.
+    m_monitor->noteTerminalAttached(QStringLiteral("dQ"), QStringLiteral("tQ"));
+    QCOMPARE(m_monitor->stateFor("dQ", "tQ"), asInt(AgentState::Starting));
+    m_monitor->retainDevSessions({});
+    QCOMPARE(m_monitor->stateFor("dQ", "tQ"), asInt(AgentState::Unknown));
+    m_monitor->noteTerminalOutput(QStringLiteral("dQ"), QStringLiteral("tQ"));
+    QCOMPARE(m_monitor->stateFor("dQ", "tQ"), asInt(AgentState::Unknown));
 }
 
 QTEST_MAIN(TstAgentMonitor)

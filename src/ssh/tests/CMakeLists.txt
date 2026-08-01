@@ -20,6 +20,19 @@ target_link_libraries(tst_sshauth PRIVATE
 
 add_test(NAME tst_sshauth COMMAND tst_sshauth)
 
+# SshConnectionPool's server-free halves: what its destructor is allowed to
+# announce, and the known-hosts policy it applies to a key the handshake has
+# already read off the wire — including the user declining an unknown one.
+qt_add_executable(tst_sshconnectionpool tst_sshconnectionpool.cpp)
+
+target_link_libraries(tst_sshconnectionpool PRIVATE
+    Qt6::Core
+    Qt6::Test
+    ch_ssh
+)
+
+add_test(NAME tst_sshconnectionpool COMMAND tst_sshconnectionpool)
+
 # The server-free half of SshChannelDevice: its QIODevice contract with no
 # channel behind it, and how a refused start is reported.
 qt_add_executable(tst_sshchanneldevice tst_sshchanneldevice.cpp)
@@ -68,6 +81,7 @@ if(WIN32)
     set_target_properties(
         tst_knownhosts
         tst_sshauth
+        tst_sshconnectionpool
         tst_sshchanneldevice
         tst_sshlogrouter
         tst_livessh

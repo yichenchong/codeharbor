@@ -8,8 +8,10 @@
 #include <QString>
 #include <QStringList>
 
+#include <atomic>
 #include <functional>
 #include <memory>
+#include <utility>
 
 #if CH_HAVE_LIBSSH
 #include <libssh/libssh.h>
@@ -66,14 +68,20 @@ namespace ch {
 // THREADING CONTRACT:
 //   * A Route MUST be taken and dropped on the same thread. That thread is the
 //     only one whose libssh lines it receives, and the only one whose libssh
-//     state it saves and restores. Asserted in release().
+//     state it saves and restores. ENFORCED at runtime in release(), not merely
+//     asserted: a release from another thread is refused with a warning, and
+//     the route is deactivated so no further line can reach a sink whose owner
+//     is going away. What cannot be repaired from the wrong thread is the
+//     OWNING thread's libssh state, which is thread-local and unreachable from
+//     anywhere else; it stays as it is until that thread drops its own last
+//     route, which costs verbosity and nothing else.
 //   * A Route's sink is invoked synchronously from inside libssh on that same
 //     thread and never on any other, so a sink needs no locking of its own —
 //     which is what lets a pool mutate its QString transcript and emit a Qt
 //     signal from it exactly as it did before this router existed.
 //   * All routing state is thread-local, so routes on different threads cannot
-//     race. The only cross-thread datum is the process-wide route count kept
-//     for the test seam below, which is atomic.
+//     race. The only cross-thread data are the process-wide route count kept
+//     for the test seam below and each route's active flag, both atomic.
 class SshLogRouter {
 public:
     // Receives one libssh log line: libssh's priority, the emitting libssh
@@ -93,13 +101,29 @@ public:
         Route& operator=(Route&&) = delete;
 
         // Stop receiving lines and drop this route's claim. Idempotent;
-        // ~Route() calls it.
+        // ~Route() calls it. See the THREADING CONTRACT above for what a
+        // release from the wrong thread does and does not repair.
         void release();
 
     private:
         friend class SshLogRouter;
-        Sink m_sink;
-        bool m_active = false;
+        // The routing target, held in a heap block SHARED with the owning
+        // thread's route stack rather than reached through a Route pointer.
+        // That is what makes a wrong-thread release safe: the block outlives
+        // this Route, so deactivating it cannot leave the owning thread's stack
+        // holding a pointer into a destroyed object.
+        struct Entry {
+            explicit Entry(Sink s) : sink(std::move(s)) {}
+            Sink sink;
+            // Cleared by whichever thread releases the route — possibly not the
+            // owning one — and read by the owning thread's dispatch(), which is
+            // also the only thread that removes the entry from its stack.
+            std::atomic<bool> active{true};
+        };
+        std::shared_ptr<Entry> m_entry;
+        // The thread that took this route: the only one whose libssh state it
+        // saved, and so the only one that may put that state back.
+        Qt::HANDLE m_thread = nullptr;
     };
 
     // Test seams. activeRouteCount() is process-wide; ownsThreadLoggingState()
@@ -116,6 +140,23 @@ private:
                          void* userdata);
     static void acquire(Route* route);
     static void release(Route* route);
+
+    // The routes active on the CALLING thread, innermost last. A stack rather
+    // than a single pointer so a route taken from inside another route's scope
+    // restores its parent when it goes; a list rather than a linked chain so a
+    // route released OUT of order removes exactly itself and nothing else.
+    //
+    // Entries, not Route pointers: an entry outlives the Route that created it,
+    // so a Route destroyed on the WRONG thread cannot leave this list holding a
+    // pointer into freed memory. Only the owning thread appends to or removes
+    // from its own list; another thread can at most clear an entry's atomic
+    // `active` flag.
+    static thread_local QList<std::shared_ptr<Route::Entry>> s_threadRoutes;
+
+    // Drop entries that no longer route anywhere, including any deactivated by
+    // a wrong-thread release. Only ever called on the owning thread, which is
+    // the only one allowed to touch the list itself.
+    static void pruneInactiveThreadRoutes();
 };
 
 // One authenticated SSH connection per configured server, multiplexing many
@@ -149,15 +190,6 @@ public:
         NotAvailable,  // compiled without libssh
     };
     Q_ENUM(State)
-
-    // Distinguishes the independent channels opened on the shared session.
-    enum class ChannelKind {
-        Pty,
-        Exec,
-        Rpc,
-        AgentStatus,
-    };
-    Q_ENUM(ChannelKind)
 
     enum class HostKeyDecision {
         Accept,  // trust the key and persist it into the known-hosts store
@@ -371,17 +403,27 @@ public:
     static void appendTranscriptLine(QString& transcript, const QString& line);
 
 
+    // Apply this client's known-hosts policy to a host key already read off the
+    // session, and report whether the connection may proceed. Split out of
+    // verifyHostKey(), which does nothing else but extract the key from libssh,
+    // so every verdict — including the user declining an unknown key — is
+    // exercisable without a live server. Emits errorOccurred() for every
+    // refusal, hostKeyMismatch() for a changed key, and adds an accepted unknown
+    // key to the store.
+    bool applyHostKeyPolicy(const QString& host, quint16 port,
+                            const QString& keyType, const QByteArray& keyBlob);
+
 #if CH_HAVE_LIBSSH
     // Open an independent channel on the shared session. Returns nullptr if not
-    // connected or the channel could not be opened. `kind` only labels the
-    // channel: no PTY is negotiated here even for ChannelKind::Pty, because a
-    // channel accepts exactly one pty-req and the terminal type and geometry are
-    // the caller's to choose (SshChannelDevice::startPty). The pool RETAINS
-    // ownership: channels MUST NOT outlive the session —
-    // disconnectFromHost()/closeSession() closes and frees every opened channel
-    // before freeing the session. Callers must not ssh_channel_free() a returned
-    // channel themselves; they hand it back with releaseChannel() instead.
-    ssh_channel openChannel(ChannelKind kind);
+    // connected, if the pool is being destroyed, or if the channel could not be
+    // opened. No PTY is negotiated here: a channel accepts exactly one pty-req
+    // and the terminal type and geometry are the caller's to choose
+    // (SshChannelDevice::startPty). The pool RETAINS ownership: channels MUST
+    // NOT outlive the session — disconnectFromHost()/closeSession() closes and
+    // frees every opened channel before freeing the session. Callers must not
+    // ssh_channel_free() a returned channel themselves; they hand it back with
+    // releaseChannel() instead.
+    ssh_channel openChannel();
 
     // Give a channel back: closes it if still open, frees it, and drops it from
     // the pool's list. Unknown or null handles are ignored, so a double release
@@ -402,6 +444,14 @@ signals:
     // Emitted immediately before the session's channels are freed, so anything
     // holding a channel handle (SshChannelDevice) can drop it first. Without it
     // a device that outlives its session keeps polling freed libssh memory.
+    //
+    // This is the ONE signal ~SshConnectionPool() emits, and the only one it is
+    // safe to: it runs from the body of the most-derived destructor, so every
+    // member and the QObject subobject are still alive, and the destructor sets
+    // m_destroying first so a handler cannot start a second teardown or a new
+    // handshake on a dying pool. stateChanged()/diagnosticLogChanged() are NOT
+    // emitted during destruction — those reach QML property bindings, which
+    // would re-read a pool that is going away for no benefit at all.
     void sessionClosing();
 
 private:
@@ -416,6 +466,10 @@ private:
 #endif
 
     State m_state = State::Disconnected;
+    // Set by the destructor before it tears the session down, so a slot reached
+    // from sessionClosing() cannot connect, disconnect or open a channel on a
+    // pool that is being destroyed.
+    bool m_destroying = false;
     KnownHosts m_knownHosts;
     HostKeyCallback m_hostKeyCallback;
     CredentialCallback m_credentialCallback;

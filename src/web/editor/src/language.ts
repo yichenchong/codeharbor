@@ -28,8 +28,14 @@ export interface LanguageInfo {
  * silently drop it to plaintext.
  */
 export function selectLanguage(path: string, languages: readonly LanguageInfo[]): string {
-    const slash = Math.max(path.lastIndexOf("/"), path.lastIndexOf("\\"));
-    const name = path.slice(slash + 1).toLowerCase();
+    // POSIX split, and ONLY POSIX: every path this page is given is a remote
+    // path on the Linux server the pane is attached to (SPEC 8.1), where a
+    // backslash is an ordinary character in a filename. Treating it as a
+    // separator truncates such a name at the last backslash, so `a\b.py`
+    // resolves on the basename `b.py` — right here by luck, wrong the moment
+    // the extension sits before the backslash (`weird.py\note`) or the whole
+    // name is a registered filename (`my\Dockerfile`).
+    const name = path.slice(path.lastIndexOf("/") + 1).toLowerCase();
     // A leading dot is part of the NAME, not an extension (".gitconfig"), so
     // only a dot after the first character starts one.
     const dot = name.lastIndexOf(".");

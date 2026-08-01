@@ -19,6 +19,7 @@
 #include <QtTest>
 
 #include <QAbstractItemModel>
+#include <QColor>
 #include <QGuiApplication>
 #include <QMutex>
 #include <QMutexLocker>
@@ -157,6 +158,17 @@ QString attachedString(QQuickItem *item, const QString &name)
     if (!property.isValid())
         return QString();
     return property.read().toString();
+}
+
+// Reads the hint carried by the module's own AppToolTip. The attached
+// `ToolTip.text` form is deliberately no longer used here — the Basic style
+// draws it in the style's light palette, i.e. a white box beside a dark panel —
+// so the hint now lives on a named child ToolTip object. A ToolTip is a Popup
+// and therefore not a QQuickItem, but declaring it inside an Item parents it to
+// that Item as a plain QObject, which is what makes findChild reach it.
+QObject *hintOf(QQuickItem *item, const QString &objectName)
+{
+    return item->findChild<QObject *>(objectName);
 }
 
 // A QtQuick.Controls Dialog sizes itself from its content item's IMPLICIT width.
@@ -391,6 +403,7 @@ private slots:
     void serverSettingsButtonEmitsRequest();
     void dialogContentFitsInsideItsDialog();
     void addButtonsAreLabelledWithoutAPointer();
+    void hintsAreDrawnInTheApplicationsOwnPalette();
     void longNamesAreElidedInsteadOfOverflowingTheSidebar();
     void rowMenuActionsReachTheWorkspace();
 
@@ -814,9 +827,14 @@ void TstSidebar::addButtonsAreLabelledWithoutAPointer()
     QVERIFY(alphaName != betaName);
 
     // The tooltip is a hint that repeats the name; it must never be the only
-    // place the sentence exists.
-    QCOMPARE(attachedString(addGroup, QStringLiteral("ToolTip.text")), groupName);
-    QCOMPARE(attachedString(addToAlpha, QStringLiteral("ToolTip.text")), alphaName);
+    // place the sentence exists. It is the module's own AppToolTip, not the
+    // attached form: see hintsAreDrawnInTheApplicationsOwnPalette below.
+    QObject *groupHint = hintOf(addGroup, QStringLiteral("newGroupButtonTip"));
+    QObject *alphaHint = hintOf(addToAlpha, QStringLiteral("newSessionButtonTip:g1"));
+    QVERIFY2(groupHint, "the add-group button carries no hint");
+    QVERIFY2(alphaHint, "the add-session button carries no hint");
+    QCOMPARE(groupHint->property("text").toString(), groupName);
+    QCOMPARE(alphaHint->property("text").toString(), alphaName);
 
     // Compact, but not smaller than a reliable pointer target.
     for (QQuickItem *button : {addGroup, addToAlpha}) {
@@ -829,6 +847,60 @@ void TstSidebar::addButtonsAreLabelledWithoutAPointer()
         QVERIFY2((button->property("focusPolicy").toInt() & Qt::TabFocus) != 0,
                  qPrintable(QStringLiteral("%1 is not reachable by Tab")
                                     .arg(button->objectName())));
+    }
+
+    QVERIFY2(fixture.warnings().isEmpty(), qPrintable(fixture.warnings().join(QLatin1Char('\n'))));
+}
+
+// Every hint in the sidebar has to be drawn in the application's own dark
+// palette. The attached `ToolTip.text` form is rendered by the Basic style's
+// shared tooltip, in the STYLE's palette — near-black text on white — so a hint
+// about this dark panel arrived as a white box, and the application ended up
+// with two tooltip appearances depending on which call site drew the hint.
+//
+// The gate is deliberately structural rather than a screenshot: the attached
+// form must be UNUSED (nothing left for the style to draw), and the hint that
+// replaced it must paint its own surface darker than its own text.
+void TstSidebar::hintsAreDrawnInTheApplicationsOwnPalette()
+{
+    SidebarFixture fixture(twoGroups());
+    expose(fixture);
+
+    struct Site {
+        const char *owner;
+        const char *hint;
+    };
+    const Site sites[] = {
+        { "newGroupButton", "newGroupButtonTip" },
+        { "newSessionButton:g1", "newSessionButtonTip:g1" },
+        { "sessionRow:s1", "sessionRowTip" },
+    };
+
+    for (const Site &site : sites) {
+        QQuickItem *owner = findByName(fixture.root(), QString::fromLatin1(site.owner));
+        QVERIFY2(owner, site.owner);
+
+        // Nothing may be left on the attached form: whatever is still there is
+        // what the Basic style would draw in its own light colours.
+        QCOMPARE(attachedString(owner, QStringLiteral("ToolTip.text")), QString());
+
+        QObject *hint = hintOf(owner, QString::fromLatin1(site.hint));
+        QVERIFY2(hint, site.hint);
+        QVERIFY2(!hint->property("text").toString().isEmpty(), site.hint);
+
+        auto *surface = hint->property("background").value<QQuickItem *>();
+        auto *label = hint->property("contentItem").value<QQuickItem *>();
+        QVERIFY2(surface && label, site.hint);
+
+        const QColor fill = surface->property("color").value<QColor>();
+        const QColor ink = label->property("color").value<QColor>();
+        QVERIFY2(fill.lightnessF() < ink.lightnessF(),
+                 qPrintable(QStringLiteral("%1 draws %2 text on a %3 plate")
+                                    .arg(QString::fromLatin1(site.hint),
+                                         ink.name(), fill.name())));
+        QVERIFY2(fill.lightnessF() < 0.5,
+                 qPrintable(QStringLiteral("%1 is a light plate (%2) on dark chrome")
+                                    .arg(QString::fromLatin1(site.hint), fill.name())));
     }
 
     QVERIFY2(fixture.warnings().isEmpty(), qPrintable(fixture.warnings().join(QLatin1Char('\n'))));

@@ -3,8 +3,9 @@
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
-#include <QStringList>
 #include <QScopeGuard>
+#include <QStringList>
+#include <QThread>
 // libssh version floor for this file and SshChannelDevice.cpp, audited symbol
 // by symbol against the upstream release headers:
 //   * Compile/link floor is 0.8.0, set by ONE symbol: ssh_get_server_publickey()
@@ -35,12 +36,6 @@ namespace ch {
 
 namespace {
 
-// The routes active on THIS thread, innermost last. A stack rather than a
-// single pointer so a route taken from inside another route's scope restores
-// its parent when it goes; a list rather than a linked chain so a route
-// released OUT of order removes exactly itself and nothing else.
-thread_local QList<SshLogRouter::Route*> t_threadRoutes;
-
 // Whether the router has installed its hook on THIS thread, and what this
 // thread's libssh logging state was beforehand. Thread-local because libssh's
 // own logging state is (see the SshLogRouter comment).
@@ -63,9 +58,8 @@ constexpr int kLibsshLogLevel = SSH_LOG_FUNCTIONS;
 } // namespace
 
 SshLogRouter::Route::Route(Sink sink)
-    : m_sink(std::move(sink))
+    : m_entry(std::make_shared<Entry>(std::move(sink)))
 {
-    m_active = true;
     SshLogRouter::acquire(this);
 }
 
@@ -79,11 +73,24 @@ void SshLogRouter::Route::release()
     SshLogRouter::release(this);
 }
 
+thread_local QList<std::shared_ptr<SshLogRouter::Route::Entry>>
+    SshLogRouter::s_threadRoutes;
+
+void SshLogRouter::pruneInactiveThreadRoutes()
+{
+    s_threadRoutes.removeIf(
+        [](const std::shared_ptr<Route::Entry>& entry) {
+            return !entry->active.load(std::memory_order_acquire);
+        });
+}
+
 void SshLogRouter::acquire(Route* route)
 {
     Q_ASSERT(route);
-    const bool firstOnThisThread = t_threadRoutes.isEmpty();
-    t_threadRoutes.append(route);
+    route->m_thread = QThread::currentThreadId();
+    pruneInactiveThreadRoutes();
+    const bool firstOnThisThread = s_threadRoutes.isEmpty();
+    s_threadRoutes.append(route->m_entry);
     g_activeRoutes.fetch_add(1, std::memory_order_relaxed);
     if (!firstOnThisThread)
         return;
@@ -107,18 +114,32 @@ void SshLogRouter::acquire(Route* route)
 void SshLogRouter::release(Route* route)
 {
     Q_ASSERT(route);
-    if (!route->m_active)
+    if (!route->m_entry)
         return;  // idempotent: ~Route() after an explicit release()
-    route->m_active = false;
-
-    const qsizetype index = t_threadRoutes.lastIndexOf(route);
-    Q_ASSERT_X(index >= 0, "SshLogRouter::release",
-               "a route must be released on the thread that took it");
-    if (index >= 0)
-        t_threadRoutes.removeAt(index);
+    const std::shared_ptr<Route::Entry> entry = std::move(route->m_entry);
+    // Stop routing to this sink before anything else: from here on dispatch()
+    // skips the entry whichever thread looks at it.
+    entry->active.store(false, std::memory_order_release);
     g_activeRoutes.fetch_sub(1, std::memory_order_relaxed);
 
-    if (!t_threadRoutes.isEmpty() || !t_ownsThreadState)
+    if (QThread::currentThreadId() != route->m_thread) {
+        // A REAL runtime guard, not an assertion that vanishes in a release
+        // build. The owning thread's route stack and its saved libssh state are
+        // thread-local and unreachable from here, so neither is touched: the
+        // entry above is already inert, the owning thread sweeps it out of its
+        // own stack on its next acquire/release, and that thread's libssh
+        // verbosity goes back when it drops its own last route. Warn, because a
+        // caller doing this is violating the documented threading contract and
+        // is silently keeping libssh noisy on another thread.
+        qWarning("SshLogRouter: a route taken on another thread was released "
+                 "here; the owning thread's libssh logging state cannot be "
+                 "restored from this one (see SshConnectionPool.h, THREADING "
+                 "CONTRACT). Routing for it has been stopped.");
+        return;
+    }
+
+    pruneInactiveThreadRoutes();
+    if (!s_threadRoutes.isEmpty() || !t_ownsThreadState)
         return;
 #if CH_HAVE_LIBSSH
     // Same order the per-handshake scope guard used: level, then user data,
@@ -147,11 +168,18 @@ void SshLogRouter::dispatch(int priority, const char* function,
     // cannot identify the session that emitted this line. See the class comment
     // — attribution is by thread.
     Q_UNUSED(userdata);
-    if (t_threadRoutes.isEmpty())
-        return;  // libssh work on a thread nobody asked for a transcript of
-    const Route* const route = t_threadRoutes.constLast();
-    if (route->m_sink)
-        route->m_sink(priority, function, buffer);
+    // Innermost ACTIVE route wins. An entry can be inert when its Route was
+    // released from another thread, which cannot remove it from this thread's
+    // stack; skipping it here is what stops a line reaching a sink whose owner
+    // has gone.
+    for (auto it = s_threadRoutes.crbegin(); it != s_threadRoutes.crend(); ++it) {
+        const Route::Entry& entry = **it;
+        if (!entry.active.load(std::memory_order_acquire))
+            continue;
+        if (entry.sink)
+            entry.sink(priority, function, buffer);
+        return;
+    }
 }
 
 int SshLogRouter::activeRouteCount()
@@ -222,7 +250,22 @@ SshConnectionPool::SshConnectionPool(QObject* parent)
 
 SshConnectionPool::~SshConnectionPool()
 {
-    disconnectFromHost();
+    // Set FIRST: closeSession() emits sessionClosing(), and a slot reached from
+    // it must not be able to connect, disconnect or open a channel on a pool
+    // that is being destroyed.
+    m_destroying = true;
+#if CH_HAVE_LIBSSH
+    closeSession();
+#endif
+    // Deliberately NOT disconnectFromHost(): its setState(Disconnected) emits
+    // stateChanged() from a destructor, and diagnosticLogChanged() is a
+    // Q_PROPERTY notification, so both reach ordinary slots and QML property
+    // bindings that would then read a pool that is going away. The state is
+    // still corrected in place, because it is observable from a slot invoked by
+    // the one signal this destructor does emit (see sessionClosing() in the
+    // header for why that one is safe).
+    if (m_state != State::NotAvailable)
+        m_state = State::Disconnected;
 }
 
 bool SshConnectionPool::libsshAvailable()
@@ -300,6 +343,55 @@ void SshConnectionPool::appendDiagnostic(const QString& message)
         return;
     appendTranscriptLine(m_diagnosticLog, line);
     emit diagnosticLogChanged();
+}
+
+bool SshConnectionPool::applyHostKeyPolicy(const QString& host, quint16 port,
+                                           const QString& keyType,
+                                           const QByteArray& keyBlob)
+{
+    const QString lookupHost = lookupHostFor(host, port);
+    switch (m_knownHosts.verify(lookupHost, keyType, keyBlob)) {
+    case KnownHosts::Verdict::Match:
+        return true;
+    case KnownHosts::Verdict::Mismatch:
+        emit hostKeyMismatch(host);
+        emit errorOccurred(
+            QStringLiteral("Host key changed for %1 — refusing connection")
+                .arg(host));
+        return false;  // hard refusal (SPEC 12.1)
+    case KnownHosts::Verdict::Unknown:
+        if (!m_hostKeyCallback) {
+            // Nothing here can be decided without asking, and there is nobody
+            // to ask. Say so: without this the connect failed with no
+            // errorOccurred() at all, so the caller (and the user) saw a state
+            // change to Error and no reason for it anywhere but the diagnostic
+            // transcript.
+            emit errorOccurred(
+                QStringLiteral("%1 presented an unknown %2 host key and there "
+                               "is no way to ask whether to trust it — "
+                               "refusing connection")
+                    .arg(host, keyType));
+            return false;
+        }
+        if (m_hostKeyCallback(host, keyType, keyBlob,
+                              KnownHosts::Verdict::Unknown)
+            == HostKeyDecision::Accept) {
+            m_knownHosts.add(lookupHost, keyType, keyBlob);
+            return true;
+        }
+        // The user declined. Report it: a refusal the user chose still has to
+        // say what stopped the connection, because the prompt and the failure
+        // are not necessarily the same moment — the pool abandons the attempt,
+        // the controller retries, and every OTHER refusal on this path is
+        // already reported. Leaving this one silent is what made a declined
+        // host key end in a bare Error state with no banner anywhere.
+        emit errorOccurred(
+            QStringLiteral("The %1 host key offered by %2 was not trusted — "
+                           "connection refused")
+                .arg(keyType, host));
+        return false;
+    }
+    return false;
 }
 
 #if !CH_HAVE_LIBSSH
@@ -546,6 +638,12 @@ bool SshConnectionPool::connectToHost(const QString& host, quint16 port,
                                       const QString& user,
                                       const QString& identityFile)
 {
+    // A slot reached from ~SshConnectionPool()'s sessionClosing() must not be
+    // able to start a fresh handshake: the session it allocated would never be
+    // freed, and the state it set would be overwritten moments later.
+    if (m_destroying)
+        return false;
+
     clearDiagnostics();
     appendDiagnostic(QStringLiteral("Starting SSH connection to %1:%2.")
                          .arg(host)
@@ -736,6 +834,11 @@ bool SshConnectionPool::connectToHost(const QString& host, quint16 port,
 
 void SshConnectionPool::disconnectFromHost()
 {
+    // The destructor already tore the session down and deliberately does not
+    // signal; a slot reached from its sessionClosing() asking for a disconnect
+    // must not put the stateChanged() emission back.
+    if (m_destroying)
+        return;
     closeSession();
     if (m_state != State::NotAvailable)
         setState(State::Disconnected);
@@ -820,39 +923,7 @@ bool SshConnectionPool::verifyHostKey(const QString& host)
     // form so a ported entry is found (and persisted) correctly. m_port, not
     // whatever ~/.ssh/config asked for: connectToHost() re-applies the profile's
     // port after parsing the config, so this is the port actually connected to.
-    const QString lookupHost = lookupHostFor(host, m_port);
-    switch (m_knownHosts.verify(lookupHost, keyType, keyBlob)) {
-    case KnownHosts::Verdict::Match:
-        return true;
-    case KnownHosts::Verdict::Mismatch:
-        emit hostKeyMismatch(host);
-        emit errorOccurred(
-            QStringLiteral("Host key changed for %1 — refusing connection")
-                .arg(host));
-        return false;  // hard refusal (SPEC 12.1)
-    case KnownHosts::Verdict::Unknown:
-        if (!m_hostKeyCallback) {
-            // Nothing here can be decided without asking, and there is nobody
-            // to ask. Say so: without this the connect failed with no
-            // errorOccurred() at all, so the caller (and the user) saw a state
-            // change to Error and no reason for it anywhere but the diagnostic
-            // transcript.
-            emit errorOccurred(
-                QStringLiteral("%1 presented an unknown %2 host key and there "
-                               "is no way to ask whether to trust it — "
-                               "refusing connection")
-                    .arg(host, keyType));
-            return false;
-        }
-        if (m_hostKeyCallback(host, keyType, keyBlob,
-                              KnownHosts::Verdict::Unknown)
-            == HostKeyDecision::Accept) {
-            m_knownHosts.add(lookupHost, keyType, keyBlob);
-            return true;
-        }
-        return false;
-    }
-    return false;
+    return applyHostKeyPolicy(host, m_port, keyType, keyBlob);
 }
 
 bool SshConnectionPool::authenticate(const QString& user)
@@ -864,20 +935,37 @@ bool SshConnectionPool::authenticate(const QString& user)
     // enough to query it after an auto-key failure: some libssh builds then
     // report no methods at all, silently skipping the passphrase callback.
     const int noneResult = ssh_userauth_none(m_session, nullptr);
-    if (noneResult == SSH_AUTH_SUCCESS)
-        return true;
     if (noneResult == SSH_AUTH_ERROR) {
         // Not a refusal: the request itself failed, which in a blocking session
         // means the transport is gone (the server dropped us right after key
         // exchange, MaxStartups, a firewall reset). Every rung below would then
         // fail identically — and the two rungs that need a secret would first
         // interrupt the user for a passphrase or password that can no longer be
-        // sent anywhere. Stop here instead.
+        // sent anywhere. Stop here instead. Checked before the classification
+        // below because classifyAuthResult() folds this into Refused, which is
+        // exactly the distinction that matters here.
         appendDiagnostic(
             QStringLiteral("The SSH connection failed before any "
                            "authentication method could be tried: %1")
                 .arg(QString::fromUtf8(ssh_get_error(m_session))));
         return false;
+    }
+    switch (classifyAuthResult(noneResult)) {
+    case AuthOutcome::Granted:
+        return true;
+    case AuthOutcome::Partial:
+        // `none` counted as a genuine first factor: the server ACCEPTED it and
+        // wants another method. Recorded like every other partial success, so a
+        // handshake that then runs out of rungs explains itself instead of
+        // lecturing the user about ssh-agent and identity files — advice that
+        // describes nothing that happened.
+        m_partialMethods << QStringLiteral("none");
+        appendDiagnostic(
+            QStringLiteral("The server accepted the 'none' authentication "
+                           "method and requires a further one."));
+        break;
+    case AuthOutcome::Refused:
+        break;
     }
 
     // Windows' built-in OpenSSH agent is a named pipe, but libssh expects an
@@ -1172,9 +1260,9 @@ QString SshConnectionPool::authenticationFailure() const
     return details.join(QLatin1Char(' '));
 }
 
-ssh_channel SshConnectionPool::openChannel(ChannelKind kind)
+ssh_channel SshConnectionPool::openChannel()
 {
-    if (m_state != State::Connected || !m_session)
+    if (m_destroying || m_state != State::Connected || !m_session)
         return nullptr;
 
     ssh_channel channel = ssh_channel_new(m_session);
@@ -1186,15 +1274,13 @@ ssh_channel SshConnectionPool::openChannel(ChannelKind kind)
         return nullptr;
     }
 
-    // No PTY is negotiated here, whatever `kind` says. ssh_channel_request_pty()
-    // hard-codes TERM=xterm at 80x24, and a pty-req may be sent only ONCE per
-    // channel, so requesting it here left SshChannelDevice::startPty() able to
-    // change only the window size — silently downgrading the TERM its caller
-    // asked for (the terminal panes ask for xterm-256color) to a 16-colour one.
-    // The device issues the single pty-req itself, with the terminal type and
-    // geometry it was given. `kind` remains the channel's label for the pool's
-    // own bookkeeping and diagnostics.
-    Q_UNUSED(kind);
+    // No PTY is negotiated here. ssh_channel_request_pty() hard-codes
+    // TERM=xterm at 80x24, and a pty-req may be sent only ONCE per channel, so
+    // requesting it here left SshChannelDevice::startPty() able to change only
+    // the window size — silently downgrading the TERM its caller asked for (the
+    // terminal panes ask for xterm-256color) to a 16-colour one. The device
+    // issues the single pty-req itself, with the terminal type and geometry it
+    // was given.
 
     // The pool owns the channel: track it so closeSession() frees it before the
     // session, preventing a double-free through ssh_free()'s channel teardown.

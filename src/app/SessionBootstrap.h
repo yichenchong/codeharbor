@@ -366,9 +366,8 @@ protected:
     virtual bool connectPool(const QString& host, quint16 port,
                              const QString& user,
                              const QString& identityFile);
-    virtual SshChannelDevice* openChannelDevice(
-        SshConnectionPool::ChannelKind kind, const QString& command,
-        const QString& role);
+    virtual SshChannelDevice* openChannelDevice(const QString& command,
+                                                const QString& role);
 
     // Bounded liveness pre-flight, run immediately before connectPool().
     //

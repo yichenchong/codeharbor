@@ -4,12 +4,14 @@
 #include "SessionState.h"
 
 #include <QByteArray>
+#include <QElapsedTimer>
 #include <QHash>
 #include <QIODevice>
 #include <QObject>
 #include <QPointer>
 #include <QSet>
 #include <QString>
+#include <QTimer>
 
 namespace ch {
 
@@ -72,6 +74,93 @@ public:
     // removed Dev Session has no live row, so nothing is emitted.
     void retainDevSessions(const QSet<QString>& liveDevSessionIds);
 
+    // ---- SPEC 6.6: activity detection for the adapterless "generic" harness
+    //
+    // The "generic" harness has no lifecycle adapter — adapterFor() in
+    // remote/src/adapters/index.ts deliberately answers nothing for it — so the
+    // bridge relays no event for one and everything above this line produces
+    // NOTHING at all for a generic pane, end to end. The only observable a
+    // generic harness offers is its terminal output.
+    //
+    // That output already exists on THIS side of the wire, in
+    // ch::TerminalController, one subsystem over. So the derivation lives here,
+    // fed by ch::TerminalFactory, which is the single place the client learns
+    // both halves of a pane's identity (its Dev Session and its terminal_panes
+    // row) and owns the PTY channel the bytes arrive on. Doing it remotely
+    // instead would need either a per-pane server-side tmux output tap or a
+    // client-to-daemon stream duplicating every terminal byte back over SSH —
+    // an enormous amount of machinery to answer "has this pane printed anything
+    // recently", which the client can already see.
+    //
+    // Three inputs, in the order a pane supplies them.
+
+    // Record which harness a pane runs, from its `terminal_panes.harness`
+    // column. Only the literal "generic" opts a pane into activity detection:
+    // a pane with no harness configured is a plain shell, and inferring "an
+    // agent is running" from a shell's output would light up every terminal in
+    // the sidebar. Registering a generic pane starts tracking it at
+    // AgentState::Unknown and emits nothing; registering any other harness only
+    // clears a previous generic registration, and never creates a row.
+    Q_INVOKABLE void setTerminalHarness(const QString& devSessionId,
+                                        const QString& terminalId,
+                                        const QString& harness);
+
+    // A PTY channel was attached to this pane: observation begins now, and any
+    // output age remembered from a previous attach is discarded with the
+    // channel that produced it. For a generic pane this is SPEC 6.6's "no
+    // output observed yet" arm, i.e. Starting. For every other harness it only
+    // refreshes the liveness clock the silence timeout below reads.
+    Q_INVOKABLE void noteTerminalAttached(const QString& devSessionId,
+                                          const QString& terminalId);
+
+    // Output was observed on this pane. For a generic pane that is SPEC 6.6's
+    // "output within the idle threshold" arm: Running, falling back to Idle
+    // once the pane has been quiet for kFallbackIdleThresholdMs. For every
+    // harness it also refutes the silence timeout: a pane that is printing is
+    // demonstrably alive, whatever its last lifecycle event claimed.
+    //
+    // Cheap by construction (two hash lookups and a clock read) because it sits
+    // on the terminal output path: the CONTENT of the output is never examined,
+    // only the fact that some arrived.
+    Q_INVOKABLE void noteTerminalOutput(const QString& devSessionId,
+                                        const QString& terminalId);
+
+    // Quiet window after which a generic pane with no output is Idle (SPEC 6.6).
+    static constexpr int kFallbackIdleThresholdMs = 2000;
+
+    // Silence window after which a pane that CLAIMS to be working is demoted to
+    // Unknown. A harness that is killed — or whose host reboots — emits no
+    // shutdown event, so without this the pane's last claim ("running") is kept
+    // for the lifetime of the application and the sidebar reports work that
+    // stopped hours ago.
+    //
+    // Only Starting and Running age. They are the two states that assert a live
+    // agent process is doing something right now, and they are the two the user
+    // reads as "come back later". WaitingInput and IdleUnseen are NOT aged: they
+    // are the user's to-do list, they stay true for as long as nobody acts on
+    // them, and expiring them would delete exactly the signal this subsystem
+    // exists to raise. Idle/Stopped/Error/Unknown assert no liveness at all.
+    //
+    // The demotion target is Unknown, never Idle. The client genuinely does not
+    // know whether a silent agent died or is thinking; Unknown says that, and
+    // Idle would be a claim it cannot support. Terminal output refutes the
+    // silence (see noteTerminalOutput), so the window only elapses for a pane
+    // that has said nothing on either channel.
+    //
+    // Fifteen minutes, deliberately generous: a single long tool call that
+    // prints nothing is real, and reporting a working agent as unknown is worse
+    // than being slow to notice a dead one.
+    static constexpr int kStaleTimeoutMs = 15 * 60 * 1000;
+
+    // Both windows are policy, not physics; a test compresses them to
+    // milliseconds instead of spending real minutes of suite time. Values at or
+    // below 0 are clamped to 0, which for the silence window means "never
+    // demote" and for the idle threshold means "quiet immediately".
+    void setFallbackIdleThresholdMs(int ms);
+    int fallbackIdleThresholdMs() const { return m_fallbackIdleThresholdMs; }
+    void setStaleTimeoutMs(int ms);
+    int staleTimeoutMs() const { return m_staleTimeoutMs; }
+
 signals:
     // A terminal's agent state changed. `state` is an int-valued ch::AgentState.
     // Also emitted the FIRST time a (devSessionId, terminalId) pair is observed,
@@ -80,6 +169,12 @@ signals:
     // agent state is unknown" is a real change of knowledge even though
     // stateFor() reports AgentState::Unknown for both. Never emitted for a
     // repeat of the state already recorded for that pair.
+    //
+    // Also carries the states this class DERIVES rather than receives: the
+    // SPEC 6.6 activity states for a generic pane, and the demotion of a silent
+    // pane to Unknown. Those are indistinguishable from a wire transition here
+    // on purpose — a consumer merges per-terminal agent state and must not care
+    // which observation produced it.
     void agentStateChanged(const QString& devSessionId,
                            const QString& terminalId, int state);
     // The Dev Session's unseen-completion flag flipped.
@@ -97,6 +192,28 @@ private:
     void processLine(const QByteArray& line);
     void applyEvent(const AgentEvent& ev);
 
+    // Everything known about one terminal pane's agent.
+    struct TerminalStatus {
+        AgentState state = AgentState::Unknown;
+        // Monotonic marks off m_clock, in ms. -1 means "never".
+        qint64 lastEventMs = -1;   // last agent event applied
+        qint64 lastOutputMs = -1;  // last terminal output observed
+        bool attached = false;     // a PTY channel is (or was) bound
+        bool generic = false;      // harness == "generic": SPEC 6.6 owns the state
+    };
+
+    // The pane's status, or nullptr when it has never been registered or
+    // observed. Deliberately non-creating: a bare output observation on a pane
+    // nobody registered must not invent a row for it.
+    TerminalStatus* findStatus(const QString& devSessionId, const QString& terminalId);
+
+    // Re-derive every pane's time-dependent state (SPEC 6.6 activity, and the
+    // silence demotion) and emit what changed.
+    void onAgeTick();
+    // Run the tick timer iff some pane's state can still change with time, at
+    // an interval fine enough for the shorter of the two windows.
+    void rearmAgeTimer();
+
     // QPointer so it auto-nulls if a caller-owned transport is destroyed while
     // the monitor outlives it; a raw pointer would dangle and setTransport()'s
     // disconnect() on the old transport would be a use-after-free.
@@ -106,16 +223,23 @@ private:
     // bytes up to the NEXT newline are that frame's tail, not an event, and are
     // dropped without being parsed. Cleared with m_readBuffer on rebind.
     bool m_discardingLine = false;
-    // devSessionId -> (terminalId -> current AgentState). Evicted only in whole
+    // devSessionId -> (terminalId -> status). Evicted only in whole
     // Dev Session subtrees by retainDevSessions(), called after the sidebar is
     // rebuilt from the server: ids are server-minted and never reused, so a Dev
     // Session the server no longer lists is genuinely gone and safe to drop.
     // NEVER evicted on terminal close, which would lose the raw IdleUnseen
     // state the sidebar's unseen badge is derived from.
-    QHash<QString, QHash<QString, AgentState>> m_states;
+    QHash<QString, QHash<QString, TerminalStatus>> m_states;
     // devSessionIds with an unseen completion pending markSeen(). Same
     // eviction: retainDevSessions() drops the flag with its Dev Session subtree.
     QSet<QString> m_unseen;
+    // Monotonic time source for both windows. Started in the constructor and
+    // never restarted: wall-clock readings would let a clock step (NTP, a
+    // suspend/resume) expire or freeze a window.
+    QElapsedTimer m_clock;
+    QTimer m_ageTimer;
+    int m_fallbackIdleThresholdMs = kFallbackIdleThresholdMs;
+    int m_staleTimeoutMs = kStaleTimeoutMs;
 };
 
 } // namespace ch
