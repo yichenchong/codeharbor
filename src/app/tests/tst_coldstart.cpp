@@ -660,6 +660,24 @@ QString TstColdStart::paneText() const
     QString text = m_rendered;
     if (m_terminalController)
         text += QString::fromUtf8(m_terminalController->hiddenBuffer());
+    // This is a REAL terminal: the pane negotiates xterm-256color, so a shell
+    // whose prompt is coloured writes colour and erase-to-end-of-line sequences
+    // in among its output, and they land in the middle of the very lines the
+    // steps below scrape. Nothing here is testing terminal rendering — the
+    // assertions want the text the remote printed — so drop the control
+    // sequences and keep the characters.
+    //
+    // Removed: CSI sequences (ESC [ … final byte), operating-system commands
+    // (ESC ] … BEL or ESC \), and the two-character escapes. Deliberately not a
+    // full parser; it only has to stop escape bytes reaching a QCOMPARE.
+    static const QRegularExpression csi(
+        QStringLiteral("\\x1B\\[[0-9;?<>=]*[ -/]*[@-~]"));
+    static const QRegularExpression osc(
+        QStringLiteral("\\x1B\\][^\\x07\\x1B]*(?:\\x07|\\x1B\\\\)"));
+    static const QRegularExpression twoChar(QStringLiteral("\\x1B[@-Z\\\\-_]"));
+    text.remove(csi);
+    text.remove(osc);
+    text.remove(twoChar);
     return text;
 }
 

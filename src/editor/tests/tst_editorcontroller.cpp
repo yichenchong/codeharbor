@@ -202,6 +202,8 @@ private slots:
     void editsDuringASaveSurviveTheSaveReply();
     void editsTypedDuringASystemReloadAreNotClobbered();
     void aSaveInFlightIsNotClobberedByASystemReload();
+    void aSaveReplyIsDroppedAfterAnExplicitReloadTookOverTheBuffer();
+    void aSaveConflictIsDroppedAfterASamePathReopenTookOverTheBuffer();
     void anExplicitReloadDiscardsTheRecoverySnapshotItThrewAway();
     void aPageReloadWithUnsavedWorkIsOfferedItsRecoverySnapshot();
     void reportContentDuringALoadIsIgnored();
@@ -2255,6 +2257,140 @@ void TstEditorController::aSaveInFlightIsNotClobberedByASystemReload()
     QCOMPARE(m_controller->fileState(), QStringLiteral("conflict"));
     QCOMPARE(m_controller->revision(), QStringLiteral("r1"));
     QCOMPARE(contentSpy.count(), 0);
+}
+
+// The third way a load and a save can collide, and the one the guards above do
+// NOT cover. The save callback's own check is `m_path != path`, and both an
+// open() of the SAME path and every reload() leave m_path equal — so a load that
+// really did take the buffer over is invisible to it.
+//
+// A reload the USER asked for is allowed to replace the buffer even with a save
+// in flight (that is what "discard my edits" means), so it commits: it adopts the
+// server's revision, marks the buffer clean and drops the recovery snapshot. The
+// write's reply then arrives describing bytes the pane has thrown away. Acting on
+// it would re-baseline the save guard to a revision that matches nothing on
+// screen, mark a buffer clean that nobody checked, clear the recovery snapshot of
+// the newly loaded buffer, and tell the page a save succeeded that it never asked
+// for. The load owns this pane from its commit onwards.
+void TstEditorController::aSaveReplyIsDroppedAfterAnExplicitReloadTookOverTheBuffer()
+{
+    makePair();
+    openClean(QStringLiteral("/foo/f.txt"), QStringLiteral("hello"),
+              QStringLiteral("r1"));
+
+    QSignalSpy savedSpy(m_controller, &EditorController::saved);
+    QSignalSpy contentSpy(m_controller, &EditorController::contentLoaded);
+    QSignalSpy conflictSpy(m_controller, &EditorController::saveConflict);
+
+    m_controller->save(QStringLiteral("the user's edits"), QStringLiteral("r1"));
+    const QJsonObject write = nextRequest();
+    QCOMPARE(method(write), kWriteFile);
+    QCOMPARE(reqExpectedRevision(write), QStringLiteral("r1"));
+    QCOMPARE(m_controller->fileState(), QStringLiteral("saving"));
+
+    // The user presses Reload while that write is still on the wire. Same path,
+    // so nothing in the save's callback can tell this happened.
+    m_controller->requestReload();
+    const QJsonObject read = nextRequest();
+    QCOMPARE(method(read), kReadFile);
+    QCOMPARE(reqPath(read), QStringLiteral("/foo/f.txt"));
+    respondResult(reqId(read), {{"path", "/foo/f.txt"},
+                                {"encoding", "utf-8"},
+                                {"content", "the server's bytes"},
+                                {"revision", "r9"},
+                                {"truncated", false}});
+
+    // The reload committed: the pane now holds the server's bytes at r9.
+    QTRY_COMPARE(contentSpy.count(), 1);
+    QCOMPARE(contentSpy.at(0).at(0).toString(), QStringLiteral("the server's bytes"));
+    QCOMPARE(m_controller->revision(), QStringLiteral("r9"));
+    QCOMPARE(m_controller->fileState(), QStringLiteral("clean"));
+    // reload() re-derives permissions after committing (a chmod reaches us as an
+    // ordinary external change), so answer that stat and leave the queue empty.
+    const QJsonObject stat = nextRequest();
+    QCOMPARE(method(stat), kStat);
+    respondResult(reqId(stat), {{"path", "/foo/f.txt"},
+                                {"revision", "r9"},
+                                {"writable", true}});
+    QTest::qWait(50);
+
+    // Only now does the write answer, and it answers SUCCESSFULLY — the worst
+    // case, because every branch of the success path rewrites pane state.
+    respondResult(reqId(write), {{"path", "/foo/f.txt"}, {"revision", "r2"}});
+    QTest::qWait(100);
+
+    QCOMPARE(savedSpy.count(), 0);
+    QCOMPARE(conflictSpy.count(), 0);
+    QCOMPARE(m_controller->revision(), QStringLiteral("r9"));
+    QCOMPARE(m_controller->fileState(), QStringLiteral("clean"));
+    QCOMPARE(contentSpy.count(), 1);
+    QVERIFY2(nextRequest(300).isEmpty(),
+             "the superseded save touched the reloaded buffer's bookkeeping "
+             "(a recovery-snapshot truncation or a permissions re-derive)");
+}
+
+// The same hole reached the other way: re-opening the file the pane is already
+// showing. open() bumps nothing the save callback inspects and leaves m_path
+// identical, so before the commit-serial guard the write's reply ran in full
+// against the freshly loaded buffer.
+//
+// This case answers the write with a CONFLICT rather than a success, because the
+// conflict path is two asynchronous hops (the write reply, then a stat to find
+// the current revision) and therefore gives a load two windows to land in, not
+// one. Reporting it would put the pane into `conflict` over a revision mismatch
+// that concerns bytes it no longer holds, with a page-level Reload/Overwrite
+// prompt the user cannot answer meaningfully.
+void TstEditorController::aSaveConflictIsDroppedAfterASamePathReopenTookOverTheBuffer()
+{
+    makePair();
+    openClean(QStringLiteral("/foo/f.txt"), QStringLiteral("hello"),
+              QStringLiteral("r1"));
+
+    QSignalSpy savedSpy(m_controller, &EditorController::saved);
+    QSignalSpy conflictSpy(m_controller, &EditorController::saveConflict);
+    QSignalSpy errorSpy(m_controller, &EditorController::saveError);
+    QSignalSpy contentSpy(m_controller, &EditorController::contentLoaded);
+
+    m_controller->save(QStringLiteral("the user's edits"), QStringLiteral("r1"));
+    const QJsonObject write = nextRequest();
+    QCOMPARE(method(write), kWriteFile);
+    QCOMPARE(m_controller->fileState(), QStringLiteral("saving"));
+
+    // Re-open the very same path while the write is in flight.
+    m_controller->open(QStringLiteral("/foo/f.txt"));
+    // Re-opening drops the previous subscription first (SPEC 8.7).
+    const QJsonObject unwatch = nextRequest();
+    QCOMPARE(method(unwatch), kUnwatch);
+    respondResult(reqId(unwatch), {});
+    const QJsonObject read = nextRequest();
+    QCOMPARE(method(read), kReadFile);
+    QCOMPARE(reqPath(read), QStringLiteral("/foo/f.txt"));
+    respondResult(reqId(read), {{"path", "/foo/f.txt"},
+                                {"encoding", "utf-8"},
+                                {"content", "the server's bytes"},
+                                {"revision", "r9"},
+                                {"truncated", false}});
+    QTRY_COMPARE(contentSpy.count(), 1);
+    serveWatchThenNoRecovery();
+    QCOMPARE(m_controller->revision(), QStringLiteral("r9"));
+    QCOMPARE(m_controller->fileState(), QStringLiteral("clean"));
+
+    // The write is refused as stale, WITHOUT a revision attached, so the
+    // controller would fall through to its stat hop.
+    respondError(reqId(write), ch::rpc::kRevisionMismatch,
+                 QStringLiteral("stale revision"), QJsonObject{});
+    QTest::qWait(100);
+
+    // Dropped at the first hop: no conflict, no error, no stat on the wire, and
+    // the reopened buffer's state is exactly as the load left it.
+    QCOMPARE(conflictSpy.count(), 0);
+    QCOMPARE(errorSpy.count(), 0);
+    QCOMPARE(savedSpy.count(), 0);
+    QCOMPARE(m_controller->revision(), QStringLiteral("r9"));
+    QCOMPARE(m_controller->fileState(), QStringLiteral("clean"));
+    QVERIFY2(nextRequest(300).isEmpty(),
+             "the superseded save chased a conflict revision for a buffer the "
+             "pane had already replaced");
 }
 
 // The mirror image: a reload the USER asked for (the page's conflict/error

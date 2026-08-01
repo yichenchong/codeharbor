@@ -722,12 +722,14 @@ void EditorController::save(QString content, QString expectedRevision)
 
     setFileState(FileState::Saving);
     const QString path = m_path;
+    const quint64 loadGeneration = m_loadGeneration;
 
     QPointer<EditorController> self(this);
     m_client->call(
         QString::fromLatin1(rpc::kMethodWriteFile),
         writeParams(path, content, expectedRevision),
-        [self, path, editSerial](QJsonValue result, std::optional<RpcError> error) {
+        [self, path, editSerial, loadGeneration](QJsonValue result,
+                                                std::optional<RpcError> error) {
             if (!self)
                 return;
             // The pane switched files while the write was in flight. This
@@ -735,6 +737,30 @@ void EditorController::save(QString content, QString expectedRevision)
             // must not re-baseline the new file's revision, clear the new file's
             // recovery snapshot, or report a save the page never asked for.
             if (self->m_path != path)
+                return;
+            // Same reasoning, for the case that check cannot see: a load STARTED
+            // while the write was in flight and left m_path equal, because it was
+            // an open() of the same path or a reload(). The pane's content, its
+            // revision and its FileState now belong to that load; this outcome
+            // describes bytes it replaced. Silent, exactly like the path check
+            // above — the load that superseded us already set this pane's state.
+            //
+            // Three ways in, all reachable: the page's Reload button
+            // (requestReload), a page reload that finds the buffer dirty (that
+            // path re-opens rather than reloads, so the recovery snapshot is
+            // offered back), and a host re-opening the file already on screen.
+            //
+            // This compares loads STARTED, not loads that committed, which is
+            // only safe because a load cannot start during a save without
+            // meaning to replace the buffer: every SYSTEM-initiated reload site
+            // is gated on !m_dirty, and save() holds m_dirty true for the whole
+            // write. If a system reload is ever allowed to begin while Saving,
+            // its reply is discarded by the guard in reload() without touching
+            // anything — and this check would then wrongly swallow the write's
+            // real outcome, which is the honest conflict that reply exists to
+            // report (see aSaveInFlightIsNotClobberedByASystemReload). Bump a
+            // separate counter at the two commit sites if that day comes.
+            if (self->m_loadGeneration != loadGeneration)
                 return;
             if (!error.has_value()) {
                 const QString newRevision =
@@ -789,8 +815,14 @@ void EditorController::save(QString content, QString expectedRevision)
                 }
                 self->m_client->call(
                     QString::fromLatin1(rpc::kMethodStat), readParams(path),
-                    [self, path](QJsonValue statRes, std::optional<RpcError> statErr) {
-                        if (!self || self->m_path != path)
+                    [self, path, loadGeneration](QJsonValue statRes,
+                                                 std::optional<RpcError> statErr) {
+                        // Same two checks as the write reply: this second hop
+                        // gives a load one more window in which to take the
+                        // buffer over, and a conflict over bytes the pane no
+                        // longer holds is not this pane's conflict.
+                        if (!self || self->m_path != path
+                            || self->m_loadGeneration != loadGeneration)
                             return;
                         const QString rev =
                             statErr.has_value()

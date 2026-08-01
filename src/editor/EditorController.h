@@ -282,6 +282,13 @@ private:
     // order, and applying the older one would show the wrong bytes and, worse,
     // adopt the wrong revision as the save guard.
     quint64 m_loadGeneration = 0;
+    // save() captures m_loadGeneration too, and its reply is DROPPED if that has
+    // moved: a write outcome must not re-baseline, mark clean, clear the recovery
+    // snapshot of, or report `saved` for a buffer some later load replaced. The
+    // m_path check next to it cannot see this, because open() on the SAME path
+    // and every reload() leave m_path equal. See the comment at that check for
+    // why comparing loads STARTED is sufficient here.
+
     // Where to go when a transport is bound again after a drop (see
     // onTransportClosed). Conflict / ExternallyModified / ReadOnly survive an
     // outage — the first two because the file on the server still diverges from
