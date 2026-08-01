@@ -235,7 +235,7 @@ jobs:
           # upstream rebuild or a poisoned download can no longer silently alter
           # the Linux toolchain; bump these hashes deliberately (from each
           # release asset's `digest`) when the tools are intentionally updated.
-          echo "e87ee0815d109282fdda73e34c2361d64d02b0ffaea3674b18f1fd1f6a687dcf  linuxdeploy-x86_64.AppImage" | sha256sum -c -
+          echo "421ca71d5c69ea97c6309276232990d43df1dcece0edfaa26bbf926ff96ed12e  linuxdeploy-x86_64.AppImage" | sha256sum -c -
           echo "be1b7e166bf9975cfb694ebe6759ba40502ffc6196440d3e64aa90c4dbd67e9f  linuxdeploy-plugin-qt-x86_64.AppImage" | sha256sum -c -
           chmod +x linuxdeploy*.AppImage
           export QML_SOURCES_PATHS=$PWD/src/qml

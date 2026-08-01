@@ -100,7 +100,8 @@ grep -q "carries version '0.1.8'" "$work/out1" \
 # CMakeLists says 0.2.0, the lock still says 0.1.8: exactly the drift that made
 # a release ship the wrong version inside its own package.json.
 make_repo 0.1.8
-sed -i 's/VERSION 0\.1\.8/VERSION 0.2.0/' CMakeLists.txt
+sed -i.bak 's/VERSION 0\.1\.8/VERSION 0.2.0/' CMakeLists.txt
+rm -f CMakeLists.txt.bak
 git commit -q -am "half a bump"
 if bash "$bump" --set 0.2.0 --no-commit >"$work/out2" 2>&1; then
     cat "$work/out2" >&2
@@ -125,9 +126,12 @@ git show "v0.2.0:remote/src/codeharbord.ts" | grep -q '"0.2.0"' \
 if bash "$bump" --set 0.3.0 --no-commit >"$work/out4" 2>&1; then
     fail "--no-commit tagged v0.3.0 on a tree that carries 0.2.0"
 fi
-sed -i 's/0\.2\.0/0.3.0/g' CMakeLists.txt package.json package-lock.json \
+sed -i.bak 's/0\.2\.0/0.3.0/g' CMakeLists.txt package.json package-lock.json \
     remote/package.json src/web/terminal/package.json \
     src/web/editor/package.json remote/src/codeharbord.ts
+rm -f CMakeLists.txt.bak package.json.bak package-lock.json.bak \
+    remote/package.json.bak src/web/terminal/package.json.bak \
+    src/web/editor/package.json.bak remote/src/codeharbord.ts.bak
 git commit -q -am "hand-rolled release commit at 0.3.0"
 bash "$bump" --set 0.3.0 --no-commit >"$work/out5" 2>&1 \
     || { cat "$work/out5" >&2; fail "--no-commit refused a HEAD that does carry 0.3.0"; }

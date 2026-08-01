@@ -1392,7 +1392,7 @@ void TstSessionLayouts::anAbsurdPaneCounterCannotHandOutALabelAlreadyOnScreen()
     // client-local setting does: a hand edit, a line half-written when the
     // machine went down, a config copied off another box.
     m_uiState->setNextPaneSuffix(QStringLiteral("s1"), QStringLiteral("viewer"),
-                                 std::numeric_limits<int>::max());
+                                 (std::numeric_limits<int>::max)());
 
     SessionLayouts layouts(m_db, m_uiState);
     layouts.setServerId(QStringLiteral("srv-1"));
