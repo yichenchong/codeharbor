@@ -81,6 +81,11 @@ target_link_libraries(tst_terminalpage PRIVATE
     ch_remote
     ch_models
     ch_ssh
+    # SessionBootstrap/AgentStatusMonitor/WorkspaceDb: the live case wires a real
+    # codeharbord over the SSH session and mints the pane's terminal_panes row,
+    # because a pane's identity IS that row (SPEC 5.2) and it cannot attach
+    # without one. ch_app brings ch_persistence with it.
+    ch_app
 )
 add_test(NAME tst_terminalpage COMMAND tst_terminalpage)
 set_tests_properties(tst_terminalpage PROPERTIES

@@ -23,12 +23,19 @@
 -- migrating, and that is what every runtime connection actually relies on.
 PRAGMA foreign_keys = ON;
 
+-- busy_timeout and journal_mode are deliberately NOT here. Both must be in
+-- force BEFORE the first statement of this script runs (a second daemon
+-- migrating concurrently has to wait, not fail), and journal_mode cannot be
+-- changed inside a transaction at all — which is exactly where the migration
+-- runner applies this file. applyConnectionPragmas() in
+-- remote/src/workspace.ts owns both, on every connection.
+
 -- Schema versioning ---------------------------------------------------------
 CREATE TABLE IF NOT EXISTS schema_version (
     id      INTEGER NOT NULL PRIMARY KEY CHECK (id = 1),
     version INTEGER NOT NULL
 );
-INSERT OR IGNORE INTO schema_version (id, version) VALUES (1, 2);
+INSERT OR IGNORE INTO schema_version (id, version) VALUES (1, 4);
 
 -- Server identity (SPEC 3.5) ------------------------------------------------
 --
@@ -92,6 +99,29 @@ CREATE TABLE IF NOT EXISTS viewer_panes (
     FOREIGN KEY (dev_session_id) REFERENCES dev_sessions (id)
 );
 
+-- ONE uniqueness rule, data integrity rather than optimization: `tmux_target`
+-- is the name of a remote tmux session, so two panes holding one target attach
+-- the SAME shell and mirror each other's keystrokes. NULL is still allowed, and
+-- SQLite permits any number of NULLs under UNIQUE — a pane with no session
+-- bound to it yet is a legitimate state.
+--
+-- (`dev_session_id`, `name`) is deliberately NOT unique, and schema v4 removed
+-- the rule that briefly made it so. `name` holds a layout slot LABEL
+-- ("terminal-1", "terminal-2", …) minted per client, and it is not the pane's
+-- identity — the row's own `id` is, carried in the layout leaf itself
+-- (SplitNode::terminalPaneId). Closing a pane deliberately keeps its row and
+-- its tmux session alive, so its label stays taken while the layout no longer
+-- shows it, and the next split on any client legitimately hands that same label
+-- to a brand new pane needing a brand new row. Enforcing uniqueness here would
+-- reject that perfectly correct pair of rows; keying identity on the label is
+-- what let a new pane adopt a closed pane's shell in the first place.
+--
+-- Being declared here covers FRESH databases only. An existing one gains the
+-- tmux_target rule as a unique index in the schema v3 migration (SQLite has no
+-- ALTER TABLE ADD CONSTRAINT); that step also repairs the duplicates such a
+-- database may already contain, and v4 undoes its address index. See
+-- migrateTerminalPaneIdentity and migrateDropTerminalPaneAddressUnique in
+-- remote/src/workspace.ts.
 CREATE TABLE IF NOT EXISTS terminal_panes (
     id                TEXT    NOT NULL PRIMARY KEY,
     server_id         TEXT    NOT NULL,
@@ -104,7 +134,8 @@ CREATE TABLE IF NOT EXISTS terminal_panes (
     position          INTEGER NOT NULL DEFAULT 0,
     created_at        INTEGER NOT NULL,
     updated_at        INTEGER NOT NULL,
-    FOREIGN KEY (dev_session_id) REFERENCES dev_sessions (id)
+    FOREIGN KEY (dev_session_id) REFERENCES dev_sessions (id),
+    UNIQUE (tmux_target)
 );
 
 -- Split layouts per region (SPEC 4.5) ---------------------------------------

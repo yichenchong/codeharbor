@@ -63,6 +63,23 @@ target_link_libraries(codeharbor_qml PUBLIC
 # Escape hatch for C++-only/offline work: -DCODEHARBOR_SKIP_WEB_BUNDLE=ON, which
 # downgrades this to a warning and yields a client whose pane is inert.
 #
+# Source maps are a build-type-driven option. Without one, a JavaScript fault in
+# either page shows up in the embedded browser's devtools as a stack trace into
+# a single minified line, which is unusable; with one, devtools shows the
+# original TypeScript. They are not free — Monaco's three maps alone are ~15 MB
+# — so they are ON for a Debug configure and OFF otherwise, and the shipped
+# Release binary does not grow by a byte. Override with
+# -DCODEHARBOR_WEB_SOURCEMAP=ON/OFF; a multi-config generator (which has no
+# CMAKE_BUILD_TYPE at configure time, and the bundle IS built at configure time)
+# defaults to OFF and must use the override to get maps.
+#
+# Derived fresh on every configure rather than cached with option(). A cached
+# default would stick to whatever the build type was on the FIRST configure of a
+# directory, so re-configuring an existing Debug directory as Release would go on
+# embedding ~15 MB of maps in a binary labelled Release. An explicit
+# -DCODEHARBOR_WEB_SOURCEMAP=ON/OFF does persist — CMake puts it in the cache
+# before this file runs, so it is already DEFINED here and wins.
+#
 # Both bundles are handled by this ONE function, called twice below: the two
 # blocks it replaced were near-identical, so a fix applied to one of them could
 # silently miss the other.
@@ -72,6 +89,15 @@ target_link_libraries(codeharbor_qml PUBLIC
 #   LABEL     human name of the bundle, used in configure messages
 #   PANE      human name of the QML pane that loads it, used in messages
 #   FILES     dist file names to embed, relative to src/web/<DIR>/dist
+
+if(NOT DEFINED CODEHARBOR_WEB_SOURCEMAP)
+    if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+        set(CODEHARBOR_WEB_SOURCEMAP ON)
+    else()
+        set(CODEHARBOR_WEB_SOURCEMAP OFF)
+    endif()
+endif()
+
 function(codeharbor_embed_web_bundle)
     cmake_parse_arguments(CHB "" "DIR;RESOURCE;LABEL;PANE" "FILES" ${ARGN})
 
@@ -116,6 +142,38 @@ function(codeharbor_embed_web_bundle)
         endforeach()
     endif()
 
+    # Flipping CODEHARBOR_WEB_SOURCEMAP changes what dist/ must CONTAIN without
+    # touching the mtime of a single input, so the timestamp comparison above
+    # would happily keep a mapless bundle for a Debug configure — and then fail
+    # the resource step below on a .map that was never built. Compare what is on
+    # disk against what was asked for as well.
+    #
+    # _chb_maps is derived from the caller's EXPLICIT file list, not from a glob
+    # of dist/: esbuild writes exactly one <output>.map beside each .js and .css
+    # it emits, so the names are known here without looking at the tree, and a
+    # stale leftover in dist/ can never sneak into the resource.
+    unset(_chb_maps)
+    foreach(_chb_file IN LISTS CHB_FILES)
+        if(_chb_file MATCHES "\\.(js|css)$")
+            list(APPEND _chb_maps ${_chb_file}.map)
+        endif()
+    endforeach()
+    foreach(_chb_map IN LISTS _chb_maps)
+        if(CODEHARBOR_WEB_SOURCEMAP AND NOT EXISTS ${_chb_dist}/${_chb_map})
+            set(_chb_stale TRUE)
+        elseif(NOT CODEHARBOR_WEB_SOURCEMAP AND EXISTS ${_chb_dist}/${_chb_map})
+            set(_chb_stale TRUE)
+        endif()
+    endforeach()
+
+    # A named npm script, not `npm run build -- --sourcemap`: the flag is then
+    # declared in package.json, so a developer can reproduce exactly what
+    # configure ran by name instead of reverse-engineering it from here.
+    set(_chb_npm_script build)
+    if(CODEHARBOR_WEB_SOURCEMAP)
+        set(_chb_npm_script build:sourcemap)
+    endif()
+
     if(_chb_stale AND NOT CODEHARBOR_SKIP_WEB_BUNDLE)
         # npm.cmd FIRST: on Windows find_program only auto-appends .com/.exe, so
         # a bare `npm` resolves the extensionless shell script, which
@@ -145,7 +203,7 @@ function(codeharbor_embed_web_bundle)
                 endif()
             endif()
             message(STATUS "CodeHarbor: building the ${CHB_LABEL} bundle (missing or stale)")
-            execute_process(COMMAND ${CODEHARBOR_NPM} run build --workspace src/web/${CHB_DIR}
+            execute_process(COMMAND ${CODEHARBOR_NPM} run ${_chb_npm_script} --workspace src/web/${CHB_DIR}
                             WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
                             RESULT_VARIABLE _chb_bundle_rc
                             OUTPUT_VARIABLE _chb_bundle_out
@@ -162,6 +220,29 @@ function(codeharbor_embed_web_bundle)
         foreach(_chb_file IN LISTS CHB_FILES)
             list(APPEND _chb_files ${_chb_dist}/${_chb_file})
         endforeach()
+        # Maps are embedded only when they were actually produced. qt_add_resources
+        # reads FILES at CONFIGURE time and hard-errors on one that is not there,
+        # so this EXISTS gate is what keeps a Debug configure whose bundle build
+        # was skipped (no npm) or failed from piling a baffling missing-.map
+        # error on top of the real cause.
+        if(CODEHARBOR_WEB_SOURCEMAP)
+            set(_chb_have_maps TRUE)
+            foreach(_chb_map IN LISTS _chb_maps)
+                if(NOT EXISTS ${_chb_dist}/${_chb_map})
+                    set(_chb_have_maps FALSE)
+                endif()
+            endforeach()
+            if(_chb_have_maps)
+                foreach(_chb_map IN LISTS _chb_maps)
+                    list(APPEND _chb_files ${_chb_dist}/${_chb_map})
+                endforeach()
+            else()
+                message(STATUS
+                    "CodeHarbor: ${CHB_LABEL} source maps were requested but are not "
+                    "in dist/; embedding the bundle without them (its devtools stack "
+                    "traces will point into minified code)")
+            endif()
+        endif()
         qt_add_resources(codeharbor_qml ${CHB_RESOURCE}
             PREFIX /codeharbor/web/${CHB_DIR}
             BASE ${_chb_dist}
@@ -182,7 +263,7 @@ function(codeharbor_embed_web_bundle)
             "not be built automatically.\n"
             "Build it, then re-run CMake:\n"
             "    npm install\n"
-            "    npm run build --workspace src/web/${CHB_DIR}\n"
+            "    npm run ${_chb_npm_script} --workspace src/web/${CHB_DIR}\n"
             "Or configure with -DCODEHARBOR_SKIP_WEB_BUNDLE=ON to build a client "
             "whose ${CHB_PANE} pane is intentionally inert.")
     endif()

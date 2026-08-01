@@ -87,6 +87,30 @@ int main(int argc, char *argv[])
     ch::EditorFactory editorFactory(&client);
     ch::TerminalFactory terminalFactory(&sshPool);
 
+    // A terminal's identity is a row in the SERVER's terminal_panes table, so
+    // the factory needs the workspace repository and the id of the server whose
+    // rows those are (SPEC 5.2). The repository is the AppController's and is
+    // declared above, so it outlives the factory; the server id is only known
+    // once server.info has answered, which is what the connection is for.
+    //
+    // Wired here, before the environment auto-connect below, for the same
+    // reason setEditorFactory() is: adoptServerIdentity() runs SYNCHRONOUSLY
+    // out of connectAndWire(), and a factory registered afterwards would miss
+    // the identity it is about to need.
+    terminalFactory.setWorkspace(appController.workspaceDb());
+    QObject::connect(&appController, &ch::AppController::serverIdChanged, &terminalFactory,
+                     [&appController, &terminalFactory]() {
+                         terminalFactory.setServerId(appController.serverId());
+                     });
+
+    // Self-migration for LEGACY layouts. A terminal leaf stored before layouts
+    // carried a `terminal_panes` row id resolves once by its slot label; the
+    // factory reports the row that found, and the id is written into the leaf
+    // and persisted. From then on that leaf is addressed by row id like every
+    // other, and the recyclable label is never used to name a shell again.
+    QObject::connect(&terminalFactory, &ch::TerminalFactory::paneRowResolved,
+                     &sessionLayouts, &ch::SessionLayouts::bindTerminalPaneRow);
+
     // Feed server.info.recoveryDir to the editor factory once a server identity
     // is adopted, so per-pane crash-recovery snapshots (SPEC 11.3) land under a
     // server-chosen remote path.

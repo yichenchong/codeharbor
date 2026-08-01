@@ -95,6 +95,12 @@ void TerminalBridge::notifyViewVisible(bool visible)
     applyVisibility();
 }
 
+void TerminalBridge::notifyOutputConsumed(int bytes)
+{
+    if (m_controller)
+        m_controller->acknowledgeOutput(bytes);
+}
+
 void TerminalBridge::ready()
 {
     m_rendererReady = true;
@@ -112,6 +118,14 @@ void TerminalBridge::ready()
     // that is very much on screen. The page's own observers correct this within
     // a frame if the pane really is hidden.
     m_viewVisible = true;
+    // A fresh renderer has consumed nothing and is owed nothing. Both sides of
+    // the account are cleared explicitly rather than left to the visibility
+    // change, because a page that vanished without reporting hidden (a crash, a
+    // navigation the pagehide handler did not survive) leaves the controller
+    // already visible — so its replacement's handshake is not a CHANGE, and the
+    // new renderer would inherit a debt it can never pay off.
+    m_undeliveredBytes = 0;
+    m_controller->resetOutputAcknowledgements();
     applyVisibility();
 }
 
@@ -125,11 +139,18 @@ void TerminalBridge::onFlushReady(const QByteArray& batch)
 {
     if (batch.isEmpty())
         return;
+    // Every byte the controller emitted is charged against the credit it gave
+    // us, whether or not this batch decodes to anything, so the weight is
+    // accumulated BEFORE the decode and carried forward when it does not.
+    m_undeliveredBytes += static_cast<int>(batch.size());
     // Stateful decode: a multi-byte sequence split across two flushes is held
     // back and completed by the next batch instead of becoming U+FFFD.
     const QString text = m_decoder.decode(batch);
-    if (!text.isEmpty())
-        emit write(text);
+    if (text.isEmpty())
+        return;
+    const int bytes = m_undeliveredBytes;
+    m_undeliveredBytes = 0;
+    emit write(text, bytes);
 }
 
 } // namespace ch

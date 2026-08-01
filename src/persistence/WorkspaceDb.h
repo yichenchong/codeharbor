@@ -108,6 +108,28 @@ struct CreateTerminalPaneParams {
     std::optional<int> position;
 };
 
+// Find the `terminal_panes` row ONE layout leaf owns. Exactly one of `id` and
+// `name` is given; anything else is refused by the server.
+//
+//   * `id` — the row's own identity, taken from the layout leaf
+//     (SplitNode::terminalPaneId). A pure lookup, and the normal case.
+//
+//   * `name` — a layout slot label ("terminal-1", …), lookup-or-CREATE, and
+//     ONLY for a leaf stored before layouts carried a row id, where the label
+//     is genuinely the historical key. The caller writes the answer's id back
+//     into the leaf, so a leaf takes this path once in its life.
+//
+// Deliberately narrow — it is a lookup key, not a row editor — so a caller
+// cannot use it to rewrite a pane it merely wanted to find. `workingDirectory`
+// applies only if the row has to be created.
+struct ResolveTerminalPaneParams {
+    ServerId serverId;
+    DevSessionId devSessionId;
+    QString id;
+    QString name;
+    std::optional<QString> workingDirectory;
+};
+
 struct UpdateTerminalPaneParams {
     TerminalId id;
     std::optional<QString> name;
@@ -143,8 +165,12 @@ class WorkspaceDb {
 public:
     // Informational only: the client runs no migrations (SPEC 11.2). Kept in
     // lockstep with remote/sql/schema.sql and WORKSPACE_SCHEMA_VERSION so the
-    // three move together.
-    static constexpr int kSchemaVersion = 2;
+    // three move together. 3 is where terminal_panes.tmux_target became UNIQUE:
+    // two panes on one target attach the same remote shell (SPEC 5.2). 4 drops
+    // v3's UNIQUE (dev_session_id, name): a slot label is not an identity, and
+    // a closed pane keeps its row and its label while a new pane takes the same
+    // label.
+    static constexpr int kSchemaVersion = 4;
 
     using ListCallback =
         std::function<void(QVector<GroupNode>, std::optional<RpcError>)>;
@@ -191,8 +217,27 @@ public:
     void deleteViewerPane(const ViewerPaneId& id, OkCallback cb);
 
     // Terminal panes.
+    //
+    // MINT a new row. This is what a newly created terminal layout leaf calls:
+    // the row it gets back is that leaf's terminal for good, and its id goes
+    // into the leaf (SplitNode::terminalPaneId). `name` is the slot LABEL and
+    // is not required to be free - a closed pane keeps its row and its label,
+    // and a new pane reusing that label wants a new terminal, not the old one
+    // (see remote/sql/schema.sql on why the pair is not unique).
     void createTerminalPane(const CreateTerminalPaneParams& params,
                             TerminalPaneCallback cb);
+    // FIND the row a layout leaf already owns (SPEC 5.2). This is how a
+    // terminal pane learns which remote tmux session is its own.
+    //
+    // By row id it is a pure lookup. By slot label — legacy layouts only — it
+    // is lookup-or-create, done atomically ON THE SERVER, and deliberately one
+    // call rather than list()+createTerminalPane(): two clients running that
+    // pair concurrently both see no row and both create one, giving a single
+    // slot two rows, two server-minted targets and two tmux sessions. The
+    // server does it inside one BEGIN IMMEDIATE transaction, so the two
+    // converge on one row and neither client needs a retry path.
+    void resolveTerminalPane(const ResolveTerminalPaneParams& params,
+                             TerminalPaneCallback cb);
     void updateTerminalPane(const UpdateTerminalPaneParams& params,
                             TerminalPaneCallback cb);
     void deleteTerminalPane(const TerminalId& id, OkCallback cb);

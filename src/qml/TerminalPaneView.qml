@@ -20,7 +20,9 @@ import QtWebChannel
 //   * `viewers`         — context property (ViewerModel): supplies the
 //     privileged WebEngine profile that permits a WebChannel bridge.
 //   * `devSessionId` / `workingDir` must be bound by whatever builds the split
-//     tree; they are what the pane's tmux target and cwd are made of (SPEC 5.2).
+//     tree. With `paneId` they name the pane's layout slot, which the factory
+//     resolves to the server row holding this pane's tmux target (SPEC 5.2);
+//     `workingDir` is the cwd a newly created session is rooted at.
 //
 // BUNDLE URL: `terminalBundleUrl` points at the packaged page
 // qrc:/codeharbor/web/terminal/index.html, embedded into the codeharbor_qml
@@ -39,11 +41,56 @@ Rectangle {
 
     // ---- split-tree identity ----
     property string paneId: ""
-    // Stable ids the tmux target is built from (SPEC 5.2). A terminal leaf's
-    // pane id IS its terminal id unless the host overrides it.
+    // Which Dev Session this pane belongs to, and which LAYOUT SLOT of it this
+    // pane occupies (SPEC 4.5). `terminalId` is the layout pane id —
+    // "terminal-1", "terminal-2", … from ch::SessionLayouts — and that is ALL
+    // it is: a slot LABEL. It is not the terminal's identity, it is recycled
+    // (closing a pane frees the label while its remote shell keeps running),
+    // and the tmux target is never built from it.
     property string devSessionId: ""
     property string terminalId: pane.paneId
     property string workingDir: ""
+
+    // The terminal's REAL identity: the id of its row in the server's
+    // `terminal_panes` table, carried in this pane's layout leaf
+    // (SplitNode::terminalPaneId) and minted by the server when the leaf was
+    // created. Never recycled, shared through the stored layout, so every
+    // client agrees which shell this pane owns.
+    //
+    // Empty means one of exactly two things, and `terminalLegacy` is what tells
+    // them apart:
+    //
+    //   * legacy — this leaf was stored before layouts carried row ids. The
+    //     slot label genuinely IS its historical key, so it may be resolved by
+    //     label ONCE; ch::SessionLayouts then writes the answer into the leaf.
+    //
+    //   * otherwise — the row is still being minted for a pane that was just
+    //     created. The pane attaches NOTHING until the id arrives. Falling back
+    //     to the label here is precisely how a new pane used to adopt a closed
+    //     pane's still-running shell, so the wait is deliberate and the safe
+    //     default is to wait: an unset property leaves a pane visibly stuck
+    //     rather than silently attached to the wrong terminal.
+    property string terminalPaneId: ""
+    property bool terminalLegacy: false
+
+    // The remote tmux session this pane attaches to, as minted by the server
+    // (SPEC 5.2). Empty until ch::TerminalFactory::resolveTarget() answers, and
+    // cleared whenever the pane is pointed at a different slot or Dev Session.
+    //
+    // Never composed here, and deliberately not composable here: layout pane
+    // ids recycle within a Dev Session, so a client that built its own target
+    // out of one could hand a brand new pane the name of a shell another client
+    // left running — and `tmux new-session -A` would silently attach it.
+    property string tmuxTarget: ""
+    // A resolveTarget() round trip is outstanding. Its answer arrives on the
+    // factory's targetResolved signal, which re-enters attachNow().
+    property bool resolving: false
+    // The slot the outstanding resolution was started FOR, as
+    // "<devSessionId>/<terminalId>". A pane can be pointed at another Dev
+    // Session while its lookup is still travelling, and the answer to the old
+    // question would otherwise be adopted as the new slot's target — which is
+    // two panes on one shell, the exact failure this whole path removes.
+    property string resolvingFor: ""
 
     // ---- focus reporting (SPEC 4.5) ----
     // The user is working in THIS pane. TerminalRegion connects this when it
@@ -91,13 +138,76 @@ Rectangle {
     readonly property bool live: pane.attached && pane.pageLoaded
                                  && pane.connectionState === "ready"
 
+    // This pane has no shell to attach and no way to name one: no tmux target
+    // yet, no `terminal_panes` row id, and no permission to fall back to its
+    // slot label. Somebody is expected to be minting a row for it right now
+    // (ch::SessionLayouts does, for every terminal leaf it creates), and the id
+    // arrives through `terminalPaneId`.
+    //
+    // A FUNCTION, deliberately, and not a derived property. The one caller that
+    // must never be wrong is onTerminalPaneIdChanged -> attachNow(), which runs
+    // from inside the notification for `terminalPaneId` itself: a bound property
+    // reading the same three inputs is refreshed by that same notification, and
+    // whether it has been refreshed BEFORE this handler runs is an ordering
+    // detail of the QML engine, not something this pane may depend on. Getting
+    // it wrong strands the pane for ever - it declines to attach because it
+    // still believes it has no identity, and nothing calls it again. Evaluated
+    // on demand, it cannot be stale.
+    function awaitingIdentity() {
+        return pane.tmuxTarget.length === 0 && pane.terminalPaneId.length === 0
+               && !pane.terminalLegacy
+    }
+    // The wait above ran out. Waiting is the RIGHT thing to do — resolving by
+    // the recyclable slot label instead is the defect this whole scheme removes
+    // — but it must not be unbounded AND silent. A mint that never answers, or
+    // a host that mints nothing at all, would otherwise leave the pane saying
+    // "setting up" for ever, with no way for the user to tell that nothing is
+    // coming and no Retry that could help (this pane genuinely has no identity
+    // and cannot invent one; only the host can mint another row). So the wait
+    // is bounded and then REPORTED. Still recoverable: a late id fires
+    // onTerminalPaneIdChanged and the pane attaches after all.
+    property bool identityStalled: false
+    Timer {
+        id: identityWatchdog
+        // Generous next to a mint's single round trip, so a merely slow server
+        // never trips it; short enough that a pane that will never come up says
+        // so while the user is still looking at it.
+        interval: 20000
+        repeat: false
+        onTriggered: {
+            pane.identityStalled = true
+            pane.statusText = qsTr("This terminal has no identity on the server yet, so there "
+                                   + "is nothing safe to attach to. Close the pane and split "
+                                   + "again once the server is reachable.")
+        }
+    }
+
+    // Leave the waiting state: the id arrived, or the pane was pointed
+    // somewhere else. attachNow() restarts the watchdog if the pane is still
+    // waiting after all.
+    function clearIdentityWait() {
+        identityWatchdog.stop()
+        pane.identityStalled = false
+    }
+
     // The pane is on its way up. `attaching` alone cannot answer this: it brackets
     // the SYNCHRONOUS factory.attach() call, so it is true for a blink and never
     // observably so. The slow part is the CONTROLLER's — opening the SSH channel
     // and running `tmux new-session -A` on it, which is where its multi-second
     // budget goes — and those are the two states it publishes while doing it
-    // (ch::toString(TerminalState), src/models/SessionState.cpp).
+    // (ch::toString(TerminalState), src/models/SessionState.cpp). `resolving` is
+    // the step before all of them: the server round trip that tells this pane
+    // WHICH tmux session is its own.
     readonly property bool comingUp: pane.attaching
+                                     || pane.resolving
+                                     // Spelled out rather than calling
+                                     // awaitingIdentity(): a binding must name
+                                     // the properties it depends on, or it is
+                                     // never re-evaluated when they change.
+                                     || (pane.tmuxTarget.length === 0
+                                         && pane.terminalPaneId.length === 0
+                                         && !pane.terminalLegacy
+                                         && !pane.identityStalled)
                                      || pane.connectionState === "opening_channel"
                                      || pane.connectionState === "attaching_tmux"
 
@@ -135,10 +245,25 @@ Rectangle {
     // the double attach silently. Not part of the pane's observable contract.
     property bool attaching: false
 
+    // The identity an outstanding resolution was started FOR: Dev Session, slot
+    // label and row id. Used to tell an answer meant for what this pane is NOW
+    // from one meant for what it was when the question was asked.
+    function slotKey() {
+        return pane.devSessionId + "/" + pane.terminalId + "/" + pane.terminalPaneId
+    }
+
     // Open (or re-open) this pane's PTY. Idempotent while attached; safe to call
     // from the host whenever the session or the SSH connection changes.
+    //
+    // TWO phases, because a terminal's identity lives on the server. The first
+    // call for a pane resolves its `terminal_panes` row to a tmux target and
+    // returns; the factory's targetResolved signal calls this function again
+    // with `tmuxTarget` filled in, and that call does the attaching. Once
+    // resolved, the target stays on the pane, so a reconnect or a Retry goes
+    // straight to the attach.
     function attachNow() {
-        if (pane.attaching || pane.attached || !pane.factory || !pane.controller)
+        if (pane.attaching || pane.attached || pane.resolving
+                || !pane.factory || !pane.controller)
             return
         if (pane.devSessionId.length === 0 || pane.terminalId.length === 0) {
             pane.statusText = qsTr("No Dev Session selected for this pane.")
@@ -146,6 +271,38 @@ Rectangle {
         }
         if (!pane.factory.connected()) {
             pane.statusText = qsTr("Not connected to a server.")
+            return
+        }
+        if (pane.tmuxTarget.length === 0) {
+            if (pane.awaitingIdentity()) {
+                // This pane's row is still being minted. Resolving by the slot
+                // label instead would be the old, unsafe key: labels are reused
+                // across clients, and `tmux new-session -A` would silently hand
+                // this brand new pane a shell some closed pane left running.
+                // ch::SessionLayouts republishes the tree with the id in it, and
+                // onTerminalPaneIdChanged brings us straight back here.
+                //
+                // Bounded, not for ever: attachNow() is re-entered from several
+                // handlers, so the watchdog is only STARTED, never restarted,
+                // and the window is measured from the first attempt.
+                if (!pane.identityStalled) {
+                    if (!identityWatchdog.running)
+                        identityWatchdog.start()
+                    pane.statusText = qsTr("Setting up this terminal on the server\u2026")
+                }
+                return
+            }
+            // Phase one. The factory answers on targetResolved (always
+            // asynchronously, so `resolving` is set before the answer can
+            // arrive); a false return means it refused outright and has already
+            // written the reason through error(). An EMPTY terminalPaneId here
+            // is the legacy case checked just above: resolve by label, once.
+            pane.resolvingFor = pane.slotKey()
+            pane.resolving = pane.factory.resolveTarget(pane.controller, pane.devSessionId,
+                                                        pane.terminalId, pane.terminalPaneId,
+                                                        pane.workingDir)
+            if (pane.resolving)
+                pane.statusText = qsTr("Finding this terminal on the server\u2026")
             return
         }
         // The renderer's fitted size when it has already mounted; 0 lets the
@@ -157,8 +314,8 @@ Rectangle {
         // pane permanently unattachable — including through its own Retry button.
         pane.attaching = true
         try {
-            pane.attached = pane.factory.attach(pane.controller, pane.devSessionId,
-                                                pane.terminalId, pane.workingDir, cols, rows)
+            pane.attached = pane.factory.attach(pane.controller, pane.tmuxTarget,
+                                                pane.workingDir, cols, rows)
         } finally {
             pane.attaching = false
         }
@@ -216,16 +373,51 @@ Rectangle {
     }
 
     // A pane retargeted at another session/terminal must follow it: drop the
-    // old PTY (the remote tmux session stays alive for whoever else wants it)
-    // and open the new one.
+    // old PTY (the remote tmux session stays alive for whoever else wants it),
+    // forget the target — it belongs to the slot this pane has just left, and
+    // attaching the new slot to it would put two panes on one shell — and open
+    // the new one.
     function retarget() {
         if (pane.attached)
             pane.detachNow()
+        pane.tmuxTarget = ""
+        // A lookup still in flight was asked about the slot this pane has just
+        // left. Stop waiting for it — `resolvingFor` is what makes its answer
+        // recognisable as stale when it does land — and ask the new question.
+        pane.resolving = false
+        // The new slot gets a fresh window, and a stalled report about the old
+        // one must not stick to it.
+        pane.clearIdentityWait()
         pane.attachNow()
     }
 
     onDevSessionIdChanged: pane.retarget()
     onTerminalIdChanged: pane.retarget()
+    // The last non-empty row id this pane was pointed at. A change from "" to a
+    // real id is this pane's identity ARRIVING (a freshly minted row, or a
+    // legacy leaf being backfilled while it is already attached to that very
+    // row), which must not tear down a live PTY. A change between two real ids
+    // is a genuine retarget onto a different terminal.
+    // Deliberately NOT bound to `terminalPaneId`: a binding would track it and
+    // every change would look like "no change".
+    property string boundTerminalPaneId: ""
+    onTerminalPaneIdChanged: {
+        const previous = pane.boundTerminalPaneId
+        pane.boundTerminalPaneId = pane.terminalPaneId
+        pane.clearIdentityWait()
+        if (previous.length > 0 && previous !== pane.terminalPaneId) {
+            pane.retarget()
+            return
+        }
+        // Was pending, now has a row: attachNow() is a no-op if this pane is
+        // already up, and the first real attempt if it was waiting.
+        pane.attachNow()
+    }
+    // A leaf the load marked as pre-migration may now resolve by its label.
+    onTerminalLegacyChanged: {
+        pane.clearIdentityWait()
+        pane.attachNow()
+    }
     // Deliberately NOT retarget() like the two above, and not an oversight: the
     // working directory only reaches the server as `tmux new-session -A -c <dir>`
     // (TerminalController), and tmux honours -c only when it CREATES the session.
@@ -247,6 +439,25 @@ Rectangle {
         function onError(controller, message) {
             if (controller === pane.controller)
                 pane.statusText = message
+        }
+        // The server's answer to resolveTarget(). An EMPTY target means the
+        // lookup failed; the reason has already arrived through onError above,
+        // so this only has to stop the pane waiting for an answer that is not
+        // coming — the Retry button then asks again.
+        function onTargetResolved(controller, target) {
+            if (controller !== pane.controller)
+                return
+            if (pane.resolvingFor !== pane.slotKey()) {
+                // Answer to a question this pane no longer has: it was pointed
+                // at another slot while the lookup travelled. Adopting it would
+                // attach this pane to the OTHER slot's shell.
+                return
+            }
+            pane.resolving = false
+            if (target.length === 0)
+                return
+            pane.tmuxTarget = target
+            pane.attachNow()
         }
     }
 
@@ -282,13 +493,13 @@ Rectangle {
 
         // terminalId is NOT server data: it is the client-minted layout pane id
         // (`terminalId: pane.paneId` above), handed out by
-        // ch::SessionLayouts::splitPane as "terminal-<n>". It names this pane's
-        // remote tmux session ("ch_<devSessionId>_<terminalId>", see
-        // src/terminal/TerminalController.cpp), so it must never be reused within
-        // a Dev Session: an id handed out twice re-attaches the earlier pane's
-        // surviving shell instead of starting a new one. Drawn as plain text
-        // anyway, since AppPaneHeader draws every title that way. A pane with no
-        // id yet says what it IS instead of nothing.
+        // ch::SessionLayouts::splitPane as "terminal-<n>". It is a LABEL for the
+        // slot, and only that — the pane's remote tmux session is named by the
+        // server (`tmuxTarget`), so a number reused after a pane was closed
+        // shows the user the same familiar label without any chance of adopting
+        // the closed pane's still-running shell. Drawn as plain text, since
+        // AppPaneHeader draws every title that way. A pane with no id yet says
+        // what it IS instead of nothing.
         title: pane.terminalId.length > 0 ? pane.terminalId : qsTr("Terminal")
         subtitle: pane.stateLabel
         active: pane.paneActive

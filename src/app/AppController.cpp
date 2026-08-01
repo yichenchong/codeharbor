@@ -191,6 +191,8 @@ void AppController::setConnection(SshConnectionPool* pool,
         disconnect(m_bootstrap, nullptr, this, nullptr);
     if (m_pool)
         disconnect(m_pool, nullptr, this, nullptr);
+    if (m_profiles)
+        disconnect(m_profiles, nullptr, this, nullptr);
 
     m_pool = pool;
     m_bootstrap = bootstrap;
@@ -205,6 +207,27 @@ void AppController::setConnection(SshConnectionPool* pool,
     if (m_pool) {
         connect(m_pool, &SshConnectionPool::diagnosticLogChanged, this,
                 &AppController::connectionDiagnosticsChanged);
+    }
+    if (m_profiles) {
+        // A profile save that could not take its interprocess lock still saves,
+        // but without the safeguard that stops a second copy of CodeHarbor from
+        // overwriting the server list. ServerProfiles hands up the cause; the
+        // sentence is built here because this is the surface that shows it.
+        //
+        // Tone is deliberate: it leads with "saved". Worded as a failure the
+        // user would retype a profile that is already on disk, which is worse
+        // than saying nothing. It goes to the ordinary non-blocking toast — this
+        // is a notice, not something to interrupt anybody with — and
+        // ServerProfiles only raises it once per outage, so a run of saves
+        // cannot turn it into a stutter.
+        connect(m_profiles, &ServerProfiles::saveDegraded, this,
+                [this](const QString& reason) {
+                    emit error(tr("Server profile saved, but without the "
+                                  "safeguard that keeps another copy of "
+                                  "CodeHarbor from overwriting your server "
+                                  "list: %1.")
+                                   .arg(reason));
+                });
     }
     if (m_bootstrap) {
         // The bootstrap reconnects on its own (backoff per SPEC 5.6); mirror its

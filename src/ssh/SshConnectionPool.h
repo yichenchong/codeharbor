@@ -9,12 +9,114 @@
 #include <QStringList>
 
 #include <functional>
+#include <memory>
 
 #if CH_HAVE_LIBSSH
 #include <libssh/libssh.h>
 #endif
 
 namespace ch {
+
+// Process-wide router for libssh's diagnostic logging, so that every component
+// that wants a transcript gets its OWN lines and only its own.
+//
+// WHAT LIBSSH ACTUALLY DOES — measured against the installed 0.11.3 library,
+// because all three of these contradict what the headers suggest:
+//   1. There is exactly ONE logging hook (ssh_set_log_callback), ONE user-data
+//      pointer (ssh_set_log_userdata) and ONE verbosity level
+//      (ssh_set_log_level) — not one per session. Whoever installs last wins,
+//      so two objects that each install their own around their own work
+//      overwrite each other and collect each other's lines.
+//   2. Those three are THREAD-LOCAL, not process-global: libssh declares them
+//      LIBSSH_THREAD, which is __thread wherever the compiler supports it. A
+//      callback installed on one thread is simply absent on every other, so
+//      installing once for the process silences every thread but the installer.
+//      (A libssh built without thread-local-storage support degrades to truly
+//      global; routing stays correct there because it is keyed by thread
+//      anyway, but the saved verbosity could then be another thread's.)
+//   3. ssh_set_log_callback(NULL) is REFUSED (returns SSH_ERROR) and leaves the
+//      current callback in place. A hook cannot be uninstalled once set, only
+//      replaced. This is why every caller that installs its own callback around
+//      a piece of work and then "restores" a previously-empty one in fact
+//      leaves its callback — and its user-data pointer — behind for good.
+//
+// The router therefore installs the hook ON EACH THREAD that takes a route, the
+// first time one is taken there, and restores that thread's previous verbosity
+// and user data when the last route on that thread is dropped. The previous
+// callback is put back too when there was one; when there was none, (3) makes
+// removal impossible, so the router's own hook stays installed and is INERT: it
+// forwards nothing while no route is active on that thread, and the restored
+// verbosity means libssh does not even format a line. Routes may be taken and
+// dropped in ANY order.
+//
+// ATTRIBUTION IS BY THREAD, NOT BY SESSION. The hook receives only a priority,
+// the emitting libssh function name, the formatted message and that one
+// user-data pointer — there is no session parameter. The per-session
+// log_function of ssh_callbacks_struct looks like the answer but is vestigial:
+// libssh routes every log line through the global hook and never calls it
+// (measured, not remembered). A line therefore cannot be traced back to the
+// session that produced it, so the router attributes each line to the innermost
+// route active ON THE THREAD THAT EMITTED IT. That is exact for
+// SshConnectionPool, whose handshake is synchronous and runs start to finish on
+// its caller's thread. Its one limitation, stated plainly: a DIFFERENT libssh
+// session driven on the same thread while a route is active there — reachable
+// only by re-entering libssh from inside one of the pool's own handshake
+// callbacks — is logged into that route.
+//
+// THREADING CONTRACT:
+//   * A Route MUST be taken and dropped on the same thread. That thread is the
+//     only one whose libssh lines it receives, and the only one whose libssh
+//     state it saves and restores. Asserted in release().
+//   * A Route's sink is invoked synchronously from inside libssh on that same
+//     thread and never on any other, so a sink needs no locking of its own —
+//     which is what lets a pool mutate its QString transcript and emit a Qt
+//     signal from it exactly as it did before this router existed.
+//   * All routing state is thread-local, so routes on different threads cannot
+//     race. The only cross-thread datum is the process-wide route count kept
+//     for the test seam below, which is atomic.
+class SshLogRouter {
+public:
+    // Receives one libssh log line: libssh's priority, the emitting libssh
+    // function name (may be null) and the formatted message (may be null).
+    using Sink = std::function<void(int priority, const char* function,
+                                    const char* buffer)>;
+
+    // One claim on libssh's logging state for the creating thread, and the
+    // routing target for that thread's log lines.
+    class Route {
+    public:
+        explicit Route(Sink sink);
+        ~Route();
+        Route(const Route&) = delete;
+        Route& operator=(const Route&) = delete;
+        Route(Route&&) = delete;
+        Route& operator=(Route&&) = delete;
+
+        // Stop receiving lines and drop this route's claim. Idempotent;
+        // ~Route() calls it.
+        void release();
+
+    private:
+        friend class SshLogRouter;
+        Sink m_sink;
+        bool m_active = false;
+    };
+
+    // Test seams. activeRouteCount() is process-wide; ownsThreadLoggingState()
+    // answers for the CALLING thread, which is the granularity libssh's state
+    // actually has. Together they show the state is neither restored while a
+    // route still needs it nor left raised after the last one goes.
+    static int activeRouteCount();
+    static bool ownsThreadLoggingState();
+
+private:
+    // libssh's logging hook. Deliberately spelled in plain C types so this
+    // declaration needs no libssh header: it matches ssh_logging_callback.
+    static void dispatch(int priority, const char* function, const char* buffer,
+                         void* userdata);
+    static void acquire(Route* route);
+    static void release(Route* route);
+};
 
 // One authenticated SSH connection per configured server, multiplexing many
 // independent channels: terminal PTYs, the codeharbord RPC channel, and the
@@ -254,6 +356,18 @@ public:
     // handshake. It is never persisted and excludes supplied credentials.
     QString diagnosticLog() const { return m_diagnosticLog; }
 
+    // Hard ceiling on the retained transcript. A handshake against a
+    // misbehaving server can emit libssh lines without bound, and the
+    // transcript is held in memory for the whole session.
+    static constexpr qsizetype kTranscriptCharacterLimit = 64 * 1024;
+
+    // Append one already-trimmed line to `transcript`, enforcing the cap above
+    // and the single, non-repeating "earlier diagnostics discarded" marker.
+    // Static and pure precisely so the cap is testable without a handshake:
+    // reaching it through a real connection would need a server that emits
+    // 64 KiB of log lines.
+    static void appendTranscriptLine(QString& transcript, const QString& line);
+
 
 #if CH_HAVE_LIBSSH
     // Open an independent channel on the shared session. Returns nullptr if not
@@ -287,8 +401,6 @@ signals:
 
 private:
     void clearDiagnostics();
-    static void libsshLog(int priority, const char* function,
-                          const char* buffer, void* userdata);
     void appendDiagnostic(const QString& message);
     void setState(State next);
 #if CH_HAVE_LIBSSH
@@ -310,6 +422,11 @@ private:
 #if CH_HAVE_LIBSSH
     ssh_session m_session = nullptr;
     QList<ssh_channel> m_channels;
+    // Held only for the duration of one synchronous connectToHost(), so the
+    // raised libssh log level is never left behind. Destroying the pool
+    // destroys the route too, which is what makes a pool that dies while
+    // registered deregister cleanly.
+    std::unique_ptr<SshLogRouter::Route> m_logRoute;
     // Names of the methods the server accepted with SSH_AUTH_PARTIAL during the
     // most recent handshake, so authenticationFailure() can say "your key was
     // accepted, the server also wants X" instead of a flat "authentication

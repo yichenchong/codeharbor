@@ -1,22 +1,24 @@
 #include <QtTest/QtTest>
 
-#include <QTemporaryDir>
+#include <QByteArray>
+#include <QCoreApplication>
 #include <QCryptographicHash>
 #include <QDir>
 #include <QDirIterator>
 #include <QFile>
-#include <QScopeGuard>
-#include <QSettings>
-#include <QVariantMap>
-#include <QPair>
-#include <QByteArray>
 #include <QIODevice>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QJsonValue>
+#include <QLockFile>
+#include <QPair>
+#include <QScopeGuard>
+#include <QSettings>
 #include <QSignalSpy>
 #include <QStandardPaths>
+#include <QTemporaryDir>
+#include <QVariantMap>
 
 #include <cstring>
 #include <functional>
@@ -368,6 +370,9 @@ private slots:
     void serverAtTheSchemaFloorIsAdoptedNormally();
     void uiStateStoreIgnoresCorruptWidths();
     void uiStateStoreRejectsAnEmptyDevSessionId();
+    // A profile save that could not take its interprocess lock has to reach the
+    // user, not stop at a signal nothing is connected to.
+    void aDegradedProfileSaveReachesTheShellsErrorToast();
 };
 
 // Two GroupNodes with sessions map to GroupRows preserving order, with the
@@ -1871,6 +1876,59 @@ void TstAppController::uiStateStoreRejectsAnEmptyDevSessionId()
     QVERIFY(file.open(QIODevice::ReadOnly | QIODevice::Text));
     const QString ini = QString::fromUtf8(file.readAll());
     QVERIFY2(!ini.contains(QStringLiteral("terminal-4")), qPrintable(ini));
+}
+
+// ServerProfiles serialises its saves against a second copy of the application
+// with a lock file, and when it cannot take that lock it saves anyway and says
+// so. "Says so" is only true if something is listening: an emitted signal with
+// no connection is discarded in silence, and the user would be told nothing.
+// This pins the whole path — blocked lock, degraded save, AppController::error,
+// which is what Main.qml's toast shows.
+void TstAppController::aDegradedProfileSaveReachesTheShellsErrorToast()
+{
+    ConnectFixture f;
+    QSignalSpy errors(&f.controller, &AppController::error);
+
+    // Hold the store's lock so the next save cannot have it. The suffix is the
+    // store's own (NOT plain ".lock", which belongs to QSettings' sync).
+    QLockFile blocker(f.dir.filePath(QStringLiteral("servers.ini.merge-lock")));
+    QVERIFY(blocker.tryLock(5000));
+
+    const QString id = f.profiles.addProfile(
+        {{QStringLiteral("name"), QStringLiteral("second box")},
+         {QStringLiteral("host"), QStringLiteral("10.0.0.9")},
+         {QStringLiteral("port"), 22},
+         {QStringLiteral("user"), QStringLiteral("yichen")}});
+    blocker.unlock();
+
+    // Saved, and reported exactly once.
+    QVERIFY(!id.isEmpty());
+    QCOMPARE(f.profiles.profile(id).value(QStringLiteral("host")).toString(),
+             QStringLiteral("10.0.0.9"));
+    QCOMPARE(errors.count(), 1);
+
+    const QString shown = errors.first().first().toString();
+    // Tone: it must read as a saved-but-unprotected notice. A message the user
+    // reads as a failure gets the profile retyped, which is worse than silence.
+    QVERIFY2(shown.startsWith(QStringLiteral("Server profile saved")), qPrintable(shown));
+    QVERIFY2(shown.contains(QStringLiteral("safeguard")), qPrintable(shown));
+    // ...carrying the cause ServerProfiles supplied, which names the holder.
+    QVERIFY2(shown.contains(QString::number(QCoreApplication::applicationPid())),
+             qPrintable(shown));
+    // Nothing in it depends on rich text: the toast's Label is PlainText.
+    QVERIFY2(!shown.contains(QLatin1Char('<')), qPrintable(shown));
+
+    // A save that gets the lock is silent, and re-arms the report.
+    f.profiles.updateProfile(id, {{QStringLiteral("host"), QStringLiteral("10.0.0.10")}});
+    QCOMPARE(errors.count(), 1);
+
+    // Re-injecting the same store must not stack a second connection, or every
+    // future notice would appear twice.
+    f.controller.setConnection(&f.pool, &f.boot, &f.profiles, nullptr);
+    QVERIFY(blocker.tryLock(5000));
+    f.profiles.updateProfile(id, {{QStringLiteral("host"), QStringLiteral("10.0.0.11")}});
+    blocker.unlock();
+    QCOMPARE(errors.count(), 2);
 }
 
 QTEST_GUILESS_MAIN(TstAppController)

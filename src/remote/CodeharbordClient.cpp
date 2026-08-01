@@ -1,10 +1,13 @@
 #include "CodeharbordClient.h"
 
+#include "RpcTypes.h"
+
 #include <QIODevice>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QMetaObject>
 #include <QPointer>
+#include <QTimer>
 
 #include <limits>
 
@@ -40,7 +43,13 @@ bool isBlankLine(const QByteArray& line)
 
 } // namespace
 
-CodeharbordClient::CodeharbordClient(QObject* parent) : QObject(parent) {}
+CodeharbordClient::CodeharbordClient(QObject* parent)
+    : QObject(parent), m_heartbeatTimer(new QTimer(this))
+{
+    m_heartbeatTimer->setSingleShot(false);
+    connect(m_heartbeatTimer, &QTimer::timeout, this,
+            &CodeharbordClient::onHeartbeatTick);
+}
 
 CodeharbordClient::~CodeharbordClient()
 {
@@ -71,6 +80,15 @@ CodeharbordClient::~CodeharbordClient()
     //    there is nothing left to do once it returns.
     m_destroying = true;
     m_closed = true;
+    // Stop the probe timer before anything below can dispatch a callback. It is
+    // a child QObject and would be deleted with us anyway, but a tick landing
+    // in onHeartbeatTick() midway through this destructor would call() on a
+    // dying client.
+    m_heartbeatTimer->stop();
+    // Retire the outstanding probe too: failAllPending() below runs its callback
+    // like any other, and it must not touch live state on the way out.
+    ++m_heartbeatGeneration;
+    m_heartbeatProbeOutstanding = false;
     if (m_transport) {
         m_transport->disconnect(this);
         m_transport = nullptr;
@@ -136,6 +154,16 @@ void CodeharbordClient::setTransport(QIODevice* transport)
         connect(m_transport, &QObject::destroyed, this,
                 &CodeharbordClient::onTransportDestroyed);
     }
+
+    // Before the sweep below: the probe outstanding on the transport we just let
+    // go is about to be failed like any other pending entry. restartHeartbeat()
+    // retires it by bumping the generation stamp, so when that callback runs —
+    // possibly LATE, after a nested event loop inside another swept callback has
+    // already let the timer send the next probe — it recognises itself as stale
+    // and does nothing. Resetting here also means the miss counter starts from
+    // zero against the NEW peer rather than inheriting the silence of the one
+    // that died.
+    restartHeartbeat();
 
     // Any callback invoked below may delete this client; stop touching members
     // the instant one does.
@@ -282,7 +310,15 @@ void CodeharbordClient::onReadyRead()
     if (!m_transport || m_closed)
         return;
 
+    const qsizetype bufferedBefore = m_readBuffer.size();
     m_readBuffer.append(m_transport->readAll());
+    // ANY bytes from the peer are proof of life, not just a ping reply. This is
+    // one serialized JSONL stream, so while the peer is midway through writing a
+    // multi-megabyte file.readFile frame its reply to our probe physically
+    // cannot arrive — waiting for the reply alone would tear down exactly the
+    // slow, healthy, large transfer the heartbeat is supposed to protect.
+    if (m_readBuffer.size() != bufferedBefore)
+        m_heartbeatMisses = 0;
 
     // processLine() invokes a user callback that may delete this client. Watch
     // for that with a QPointer and stop touching members the instant it fires,
@@ -514,6 +550,10 @@ void CodeharbordClient::onTransportClosed()
     // frame of the new one.
     m_readBuffer.clear();
     m_scanOffset = 0;
+    // Nothing left to probe: stop the timer and forget any outstanding probe
+    // before failAllPending() dispatches its callback. m_closed is already
+    // latched, so restartHeartbeat() cannot restart it here.
+    restartHeartbeat();
 
     RpcError error;
     error.code = kInternalError;
@@ -551,6 +591,158 @@ void CodeharbordClient::failAllPending(const RpcError& error)
         if (cb) // empty for a fire-and-forget call() with a null callback
             cb(QJsonValue(), error);
     }
+}
+
+int CodeharbordClient::pendingCount() const
+{
+    // Probes are real m_pending entries — that is what keeps them off the
+    // unknown-id warning path and gets them failed exactly once with everybody
+    // else — so they are subtracted back out here rather than never added.
+    // Usually one, briefly two when a restart retired a probe that has not been
+    // answered or swept yet.
+    //
+    // Intersected with m_pending rather than trusted blindly, which is what
+    // keeps this from going NEGATIVE inside failAllPending(): that moves the map
+    // out before dispatching, so a caller re-entering here mid-sweep sees an
+    // empty m_pending while the probe callbacks that clear these ids have not
+    // run yet.
+    int outstanding = static_cast<int>(m_pending.size());
+    for (const qint64 id : m_heartbeatProbeIds) {
+        if (m_pending.contains(id))
+            --outstanding;
+    }
+    return outstanding;
+}
+
+void CodeharbordClient::enableHeartbeat(int intervalMs, int missTolerance)
+{
+    // Refuse nonsense outright instead of clamping it: a zero or negative
+    // interval would either spin the event loop or silently mean "off", and a
+    // tolerance below one would declare the very first interval fatal.
+    if (intervalMs <= 0 || missTolerance < 1) {
+        emit protocolWarning(
+            QStringLiteral("enableHeartbeat(%1, %2): refused, heartbeat stays off")
+                .arg(intervalMs)
+                .arg(missTolerance));
+        return;
+    }
+    m_heartbeatIntervalMs = intervalMs;
+    m_heartbeatMissTolerance = missTolerance;
+    m_heartbeatTimer->setInterval(intervalMs);
+    // Live immediately when a transport is already bound, so the order in which
+    // a consumer calls enableHeartbeat() and setTransport() does not matter.
+    restartHeartbeat();
+}
+
+void CodeharbordClient::restartHeartbeat()
+{
+    m_heartbeatTimer->stop();
+    m_heartbeatMisses = 0;
+    // Retire the outstanding probe rather than forgetting it. m_heartbeatProbeIds
+    // is deliberately NOT cleared: on the enableHeartbeat() path nothing sweeps
+    // m_pending, so that probe is still in flight and must keep being excluded
+    // from pendingCount() until its callback runs. The generation bump is what
+    // makes that callback a no-op if it lands after a successor is live.
+    ++m_heartbeatGeneration;
+    m_heartbeatProbeOutstanding = false;
+    if (m_heartbeatIntervalMs > 0 && m_transport && !m_closed && !m_destroying)
+        m_heartbeatTimer->start();
+}
+
+void CodeharbordClient::onHeartbeatTick()
+{
+    // Belt and braces: every state change that invalidates the timer already
+    // stops it, but a tick queued before one of them landed would otherwise
+    // write into a corpse.
+    if (!m_transport || m_closed || m_destroying) {
+        m_heartbeatTimer->stop();
+        return;
+    }
+
+    if (m_heartbeatProbeOutstanding) {
+        // The previous probe is still unanswered AND not one byte has arrived
+        // from the peer since (onReadyRead() would have zeroed this counter).
+        // Only ONE probe is ever in flight: piling on a fresh id every interval
+        // would measure the same silence and merely leave more entries to
+        // abandon. Consecutive silent intervals are the measurement.
+        ++m_heartbeatMisses;
+        if (m_heartbeatMisses < m_heartbeatMissTolerance)
+            return;
+
+        // Last-gasp drain, for the same reason onTransportClosed() has one: the
+        // peer's answer may already be sitting on the transport with its
+        // readyRead() still queued behind this timeout. Killing a session over
+        // bytes we simply had not picked up yet would be the worst possible
+        // false positive. onReadyRead() zeroes the miss counter for any non-empty
+        // read, so that is the signal to check.
+        QPointer<CodeharbordClient> self(this);
+        if (m_transport->bytesAvailable() > 0) {
+            onReadyRead();
+            if (!self || m_closed)
+                return;
+            if (m_heartbeatMisses == 0)
+                return;
+        }
+        // The peer is dead or wedged. Take the ordinary transport-loss path
+        // rather than inventing a second kind of failure: every pending
+        // callback is failed exactly once with the standard synthetic transport
+        // error and transportClosed() is emitted, which is byte for byte what a
+        // real disconnect does and what SessionBootstrap's reconnect ladder
+        // already handles. onTransportClosed() stops this timer on the way
+        // through, via restartHeartbeat().
+        emit protocolWarning(
+            QStringLiteral("heartbeat: no response from peer for %1 consecutive "
+                           "intervals of %2 ms; treating transport as dead")
+                .arg(m_heartbeatMissTolerance)
+                .arg(m_heartbeatIntervalMs));
+        onTransportClosed();
+        return;
+    }
+
+    sendHeartbeatPing();
+}
+
+void CodeharbordClient::sendHeartbeatPing()
+{
+    // Stamp this probe before issuing it. The callback captures the stamp BY
+    // VALUE and refuses to touch the live state unless it still matches, which
+    // is the only way an out-of-order callback can be recognised: the request id
+    // does not exist until call() returns, and the callback must be handed to
+    // call() before that.
+    const quint64 generation = ++m_heartbeatGeneration;
+
+    // call() can fail the callback SYNCHRONOUSLY (an unwritable transport, a
+    // short write that latches the close), that callback may re-enter this
+    // client, and it may even delete it. Hence the QPointer, and hence reading
+    // the outcome out of m_pending afterwards instead of trusting the returned
+    // id: a probe recorded for a request that was never registered would never
+    // be cleared, and every later tick would count misses against a probe that
+    // is not on the wire.
+    QPointer<CodeharbordClient> self(this);
+    const qint64 id =
+        call(QString::fromLatin1(ch::rpc::kMethodPing), QJsonValue(),
+             [this, generation](QJsonValue, std::optional<RpcError>) {
+                 m_heartbeatProbeIds.remove(generation);
+                 // A retired probe's answer says nothing about the transport we
+                 // hold now — it may not even have come from the same peer — so
+                 // it neither clears the live probe nor resets the miss counter.
+                 if (generation != m_heartbeatGeneration)
+                     return;
+                 // Any answer at all — including a "method not found" from a
+                 // daemon too old to know the probe — proves the peer is reading
+                 // and writing.
+                 m_heartbeatProbeOutstanding = false;
+                 m_heartbeatMisses = 0;
+             });
+    if (!self)
+        return;
+    if (!m_pending.contains(id))
+        return; // call() already failed it synchronously; nothing is in flight
+    // Tracked for pendingCount() unconditionally, but treated as the LIVE probe
+    // only if nothing retired us while call() was running.
+    m_heartbeatProbeIds.insert(generation, id);
+    if (generation == m_heartbeatGeneration)
+        m_heartbeatProbeOutstanding = true;
 }
 
 } // namespace ch

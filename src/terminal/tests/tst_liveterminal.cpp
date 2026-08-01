@@ -18,12 +18,10 @@
 
 #include <functional>
 
-using ch::DevSessionId;
 using ch::KnownHosts;
 using ch::SshChannelDevice;
 using ch::SshConnectionPool;
 using ch::TerminalController;
-using ch::TerminalId;
 using ch::TerminalState;
 
 namespace {
@@ -140,19 +138,23 @@ void TstLiveTerminal::initTestCase()
     // Unique per run so repeat runs never collide and never inherit a stale
     // session: the pid pins concurrent runs apart, the clock tail pins
     // back-to-back runs of the same pid apart.
-    const TerminalId terminal{
+    const QString terminalRowId =
         QStringLiteral("t%1x%2")
             .arg(QCoreApplication::applicationPid())
-            .arg(QDateTime::currentMSecsSinceEpoch() % 1000000)};
-    const DevSessionId devSession{QStringLiteral("live")};
+            .arg(QDateTime::currentMSecsSinceEpoch() % 1000000);
 
-    // The production helpers build both the target and the attach-or-create
-    // command (SPEC 5.2); the live gate must exercise them, not a hand-rolled
-    // tmux invocation.
-    m_sessionName = TerminalController::tmuxTarget(devSession, terminal);
+    // The target is minted the way codeharbord mints it — `ch_<devSessionId>_
+    // <terminal pane row id>` (mintTmuxTarget in remote/src/workspace.ts) — but
+    // it is minted HERE rather than fetched, because this gate has no workspace
+    // database: it drives the controller and a raw PTY channel directly, one
+    // layer below ch::TerminalFactory (which is what tst_liveterminalfactory
+    // covers). What matters for this test is that a real tmux session comes up
+    // under a real name and survives a detach; the production helper that
+    // builds the attach command around that name is still the one under test.
+    m_sessionName = QStringLiteral("ch_live_") + terminalRowId;
     m_attachCommand =
-        TerminalController::tmuxNewSessionCommand(devSession, terminal, m_repo);
-    m_marker = QByteArrayLiteral("CH_LIVE_MARKER_") + terminal.value.toLatin1();
+        TerminalController::tmuxNewSessionCommand(m_sessionName, m_repo);
+    m_marker = QByteArrayLiteral("CH_LIVE_MARKER_") + terminalRowId.toLatin1();
 
     connect(&m_controller, &TerminalController::flushReady, this,
             [this](const QByteArray& batch) { m_out += batch; });

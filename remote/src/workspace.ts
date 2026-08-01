@@ -29,12 +29,20 @@ import {
     optionalBoolean,
     requireOneOf,
     requireDefined,
+    InvalidParamsError,
 } from "./validate.ts";
+import { isSafeTmuxTarget, tmuxSafeName, TMUX_TARGET_MAX_LENGTH } from "./tmux.ts";
 
 // Current schema version. Mirrors schema_version in remote/sql/schema.sql and
 // WorkspaceDb::kSchemaVersion (bump all three together — see schema.sql header).
 // Bumped 1 -> 2 for the server_identity singleton (SPEC 3.5).
-export const WORKSPACE_SCHEMA_VERSION = 2;
+// Bumped 2 -> 3 for UNIQUE (tmux_target) on terminal_panes: two panes sharing
+// one target attach the SAME remote shell and mirror each other's keystrokes.
+// Bumped 3 -> 4 to REMOVE the UNIQUE (dev_session_id, name) v3 had added: a
+// layout slot label is not a terminal's identity (the row id in the layout leaf
+// is), and a closed pane keeps its row and its label while a new pane
+// legitimately takes the same label.
+export const WORKSPACE_SCHEMA_VERSION = 4;
 
 // The authoritative DDL (C2). Read relative to this module so it resolves the
 // same whether invoked from src/ or from a built dist/ alongside sql/.
@@ -210,6 +218,30 @@ export interface CreateTerminalPaneParams {
     position?: number;
 }
 
+// Find the `terminal_panes` row one layout leaf owns, creating it only on the
+// legacy path below. Exactly ONE of `id` and `name` must be given.
+//
+//   * `id` — the row's own identity, carried in the layout leaf
+//     (SplitNode::terminalPaneId). Pure lookup: the row was minted when the
+//     leaf was created and is never invented here. This is the normal path.
+//
+//   * `name` — a layout slot LABEL, and lookup-or-CREATE. Only for leaves
+//     stored before layouts carried a row id, where the label genuinely IS the
+//     historical key. The label is not unique (see remote/sql/schema.sql), so
+//     this resolves the OLDEST row bearing it: a legacy leaf predates every row
+//     a later mint could have added under the same label. The client writes the
+//     answer's id back into the leaf, so a given leaf takes this path once.
+export interface ResolveTerminalPaneParams {
+    serverId: string;
+    devSessionId: string;
+    id?: string;
+    name?: string;
+    // Only used when the row has to be CREATED: it is where a brand new tmux
+    // session is rooted. An existing pane keeps the directory it was made with,
+    // because `tmux new-session -c` applies only at creation anyway.
+    workingDirectory?: string | null;
+}
+
 export interface UpdateTerminalPaneParams {
     id: string;
     name?: string;
@@ -352,17 +384,34 @@ function toTerminalPane(r: TerminalPaneRow): TerminalPane {
     };
 }
 
-// Rewrite the leaf paneIds of a split tree (SPEC 4.5) through an old->new id
+// Rewrite the pane references of a split tree (SPEC 4.5) through an old->new id
 // map, leaving structure and any unmapped ids untouched. Used by
 // duplicateSession so a copied layout references the copied panes, not the
 // originals. Shape matches SplitNode::toJson in src/models/SplitTree.cpp:
-// leaves are { type: "leaf", paneId }, splits carry a children[] array.
+// leaves are { type: "leaf", paneId, terminalPaneId? }, splits carry a
+// children[] array.
+//
+// `terminalPaneId` is remapped for the same reason and it matters MORE than
+// paneId does: it names the `terminal_panes` row whose tmux session the leaf
+// attaches to. A copy that kept the original's row ids would put the duplicate
+// and the original on the SAME remote shells — every keystroke mirrored — even
+// though duplicateSession went to the trouble of inserting fresh rows with
+// freshly minted targets for exactly the opposite outcome.
 function remapPaneIds(node: unknown, idMap: Record<string, string>): unknown {
     if (node === null || typeof node !== "object") return node;
     const n = node as Record<string, unknown>;
     if (n.type === "leaf") {
         const paneId = typeof n.paneId === "string" ? n.paneId : "";
-        return { ...n, paneId: idMap[paneId] ?? paneId };
+        const leaf: Record<string, unknown> = { ...n, paneId: idMap[paneId] ?? paneId };
+        if (typeof n.terminalPaneId === "string" && n.terminalPaneId !== "") {
+            // An unmapped row id would name a row in ANOTHER Dev Session, which
+            // resolveTerminalPane refuses. Dropping the field instead lets the
+            // copied leaf mint a row of its own on first use.
+            const mapped = idMap[n.terminalPaneId];
+            if (mapped === undefined) delete leaf.terminalPaneId;
+            else leaf.terminalPaneId = mapped;
+        }
+        return leaf;
     }
     if (n.type === "split" && Array.isArray(n.children)) {
         return { ...n, children: n.children.map((child) => remapPaneIds(child, idMap)) };
@@ -371,17 +420,21 @@ function remapPaneIds(node: unknown, idMap: Record<string, string>): unknown {
 }
 
 // Remove the leaf that references `paneId` from a split tree (SPEC 4.5),
-// repairing structure so no surviving leaf points at a deleted pane. Returns
-// the rewritten node, or null when the whole subtree drained (the caller then
-// substitutes a single empty leaf). A split left with exactly one child
-// promotes that child in place; surviving children keep parallel, renormalized
-// ratios — SplitNode::toJson / parseNode in src/models/SplitTree.cpp require
-// one finite, positive ratio per child. Shape matches remapPaneIds above.
+// repairing structure so no surviving leaf points at a deleted pane. Matches
+// either the leaf's own `paneId` or its `terminalPaneId`, because deleting a
+// `terminal_panes` row strands a leaf naming it just as surely (the callers
+// pass a row id, which for a terminal leaf is the field that holds one).
+// Returns the rewritten node, or null when the whole subtree drained (the
+// caller then substitutes a single empty leaf). A split left with exactly one
+// child promotes that child in place; surviving children keep parallel,
+// renormalized ratios — SplitNode::toJson / parseNode in
+// src/models/SplitTree.cpp require one finite, positive ratio per child. Shape
+// matches remapPaneIds above.
 function removePaneFromTree(node: unknown, paneId: string): unknown | null {
     if (node === null || typeof node !== "object") return node;
     const n = node as Record<string, unknown>;
     if (n.type === "leaf") {
-        return n.paneId === paneId ? null : node;
+        return n.paneId === paneId || n.terminalPaneId === paneId ? null : node;
     }
     if (n.type === "split" && Array.isArray(n.children)) {
         const ratios = Array.isArray(n.ratios) ? n.ratios : [];
@@ -403,6 +456,125 @@ function removePaneFromTree(node: unknown, paneId: string): unknown | null {
     return node;
 }
 
+// --- tmux targets (SPEC 5.2) ------------------------------------------------
+//
+// THE one place a terminal pane's tmux target is minted. It used to be two:
+// this module minted one for every copied pane in duplicateSession, while the
+// desktop client independently built `ch_<devSessionId>_<layoutPaneId>` of its
+// own and attached to it without ever writing a row. Two minting sites meant
+// the client's ids were the ones that actually reached tmux, and those recycled
+// — a layout pane id is `terminal-1`, `terminal-2`, … per Dev Session, so a
+// second client machine that had never seen `terminal-2` re-minted it and
+// attached the FIRST machine's still-running shell (closing a pane deliberately
+// leaves its shell alive). The client now looks its row up here and uses this
+// value verbatim, so an identity is minted exactly once, from a row id that is
+// never reused, and holds across machines.
+//
+// Both inputs are server-minted UUIDs, so the result is inside the safe set by
+// construction; the check is a guard against a future caller feeding this
+// something else, not a validation of user input. It throws rather than
+// rewriting because a rewritten target would be minted here and stored, while
+// the caller went on believing in the value it asked for.
+function mintTmuxTarget(devSessionId: string, paneId: string): string {
+    const target = `ch_${devSessionId}_${paneId}`;
+    if (!isSafeTmuxTarget(target)) {
+        throw new Error(`refusing to mint an unusable tmux target: ${target}`);
+    }
+    return target;
+}
+
+// Gate for a tmux target supplied by a CLIENT (createTerminalPane /
+// updateTerminalPane). Rejected, never rewritten: the client is still there to
+// be told, and a silent rewrite would leave it attaching to the session it
+// asked for while the row — and therefore every other client, and the kill
+// command — named a different one. Tagged invalid-params so the dispatcher
+// answers -32602: the payload is at fault, not the server.
+function requireSafeTmuxTarget(target: string, method: string): string {
+    if (!isSafeTmuxTarget(target)) {
+        throw new InvalidParamsError(
+            `${method}: tmuxTarget must be 1-${TMUX_TARGET_MAX_LENGTH} characters of [A-Za-z0-9_-]; ` +
+                "tmux reads ':' and '.' as session/window/pane separators and rewrites them in " +
+                `session names, so ${JSON.stringify(target)} could never name this pane's session`,
+        );
+    }
+    return target;
+}
+
+// How long a statement waits for another connection's write lock before giving
+// up. SQLite's default is ZERO — the loser of any contention fails instantly —
+// and several codeharbord processes genuinely share one database file (see
+// serverId()), so the default turns every real collision into a client-visible
+// error.
+//
+// Five seconds is chosen against both ends:
+//   * Long enough. Every write here is a handful of indexed row operations
+//     inside one BEGIN IMMEDIATE — single-digit milliseconds. Five seconds
+//     absorbs hundreds of queued transactions, far more than a handful of
+//     daemons can produce, plus the one genuinely slow case (a first-open
+//     migration rewriting terminal_panes).
+//   * Short enough. A writer that is actually stuck (a crashed process holding
+//     a lock, a hung network filesystem) must surface as an error rather than
+//     hang the client's RPC forever. The daemon answers requests one at a time,
+//     so a stall here also delays the client's heartbeat reply; at 5s the
+//     daemon can miss at most one probe of the client's 15s/4-miss heartbeat
+//     (src/remote/CodeharbordClient.h), so waiting can never be mistaken for a
+//     dead peer. And the heartbeat is the backstop that tears down a truly
+//     wedged transport, so this value does not have to guard against infinity.
+const DB_BUSY_TIMEOUT_MS = 5000;
+
+/**
+ * Apply the connection-level settings every workspace connection needs, in the
+ * order they need to be applied. Call this on EVERY connection to a workspace
+ * database — the daemon's, and any raw DatabaseSync a test opens — immediately
+ * after constructing it and before running any statement: DDL contends too, so
+ * a second daemon starting while the first is migrating must wait rather than
+ * fail, and that window opens before `migrate()` is ever called.
+ */
+export function applyConnectionPragmas(db: DatabaseSync): void {
+    db.exec(`PRAGMA busy_timeout = ${DB_BUSY_TIMEOUT_MS};`);
+    try {
+        // Write-ahead logging, because this is a multi-PROCESS workload:
+        // in WAL a reader never blocks the writer and the writer never blocks
+        // readers, so most of the contention above is removed at the source
+        // instead of merely waited out. The mode is recorded IN THE DATABASE
+        // FILE, so a database created before this change is converted on its
+        // first open by a build carrying this code and stays WAL afterwards —
+        // including for older codeharbord builds, which read it fine (every
+        // SQLite since 3.7.0 understands WAL) and simply do not benefit.
+        //
+        // Wrapped because WAL needs a shared-memory file (-shm) beside the
+        // database, which some network filesystems cannot provide, and a
+        // workspace can plausibly live on one. On failure node:sqlite THROWS an
+        // ERR_SQLITE_ERROR (verified: "attempt to write a readonly database"
+        // when the directory is not writable) and the journal mode is left at
+        // whatever it was. Rollback journalling plus the busy timeout above is
+        // exactly the pre-WAL behaviour, which is correct if slower under
+        // contention — a daemon that refuses to start would be far worse.
+        //
+        // A no-op for ":memory:": SQLite reports journal_mode "memory" there and
+        // silently ignores the request (verified) — no throw, no output, so the
+        // in-memory tests are unaffected.
+        db.exec("PRAGMA journal_mode = WAL;");
+    } catch {
+        // Deliberately not fatal, and deliberately not logged: stderr is the
+        // daemon's log channel and this would print on every open of a
+        // workspace whose filesystem simply cannot do WAL.
+    }
+}
+
+// SQLITE_BUSY / SQLITE_LOCKED, i.e. the busy timeout above ran out and this
+// write never touched the database. Reported as its own RPC code rather than
+// "internal error": nothing malfunctioned, the caller merely lost a race and
+// may retry. Extended result codes (SQLITE_BUSY_SNAPSHOT = 517, and friends)
+// carry the primary code in their low byte, hence the mask.
+export function isDatabaseBusy(err: unknown): boolean {
+    if (!(err instanceof Error) || !("errcode" in err)) return false;
+    const errcode: unknown = err.errcode;
+    if (typeof errcode !== "number") return false;
+    const primary = errcode & 0xff;
+    return primary === 5 || primary === 6;
+}
+
 /**
  * Open (creating if needed) the workspace database at `dbPath` and bring it up
  * to WORKSPACE_SCHEMA_VERSION. The migration runner applies schema.sql only
@@ -421,6 +593,10 @@ export function openWorkspace(dbPath: string): Workspace {
     }
     const db = new DatabaseSync(dbPath);
     try {
+        // Before the foreign-key pragma, before migrate(), before the index
+        // DDL: every one of those is a statement that can contend with another
+        // daemon, so the busy timeout has to already be in force.
+        applyConnectionPragmas(db);
         db.exec("PRAGMA foreign_keys = ON;");
         migrate(db);
         // After migrate(), never before: the indexed tables must exist first.
@@ -460,7 +636,210 @@ const MIGRATIONS: ReadonlyArray<{
     // row. (A future step that alters an existing table cannot do this: CREATE
     // TABLE IF NOT EXISTS never adds a column, so it must spell out its ALTERs.)
     { version: 2, apply: (db) => db.exec(schemaSql) },
+    // v3 makes a terminal pane's IDENTITY enforceable: unique tmux_target and
+    // unique (dev_session_id, name). It is the one step so far that has to
+    // REPAIR data before it can add its constraints, so it is a named function
+    // rather than a re-run of the DDL.
+    { version: 3, apply: migrateTerminalPaneIdentity },
+    // v4 takes half of v3 back: (dev_session_id, name) is not an identity, so
+    // the constraint rejected a legitimate new pane that reused a freed label.
+    { version: 4, apply: migrateDropTerminalPaneAddressUnique },
 ];
+
+// The unique index over exactly `columns`, in order, or null when the table
+// does not enforce that pair. A table-level UNIQUE shows up as an
+// sqlite_autoindex, a migration-added one under its own name, and both answer
+// PRAGMA index_list. Asking rather than using CREATE UNIQUE INDEX IF NOT
+// EXISTS: that only matches on the index NAME, so on a FRESH database (where
+// step v1 applied a schema.sql whose CREATE TABLE already carries the
+// constraint) it would add a second index over the same columns and charge
+// every write for it twice. The NAME, not just a yes/no, because v4 has to
+// remove one of these again and how it does that depends on which kind it is.
+function uniqueIndexOver(db: DatabaseSync, columns: string[]): string | null {
+    const indexes = db.prepare("PRAGMA index_list(terminal_panes)").all() as unknown as Array<{
+        name: string;
+        unique: number;
+    }>;
+    for (const index of indexes) {
+        if (index.unique !== 1) continue;
+        const found = db
+            .prepare(`PRAGMA index_info(${JSON.stringify(index.name)})`)
+            .all() as unknown as Array<{ name: string | null }>;
+        if (found.length !== columns.length) continue;
+        if (found.every((c, i) => c.name === columns[i])) return index.name;
+    }
+    return null;
+}
+
+// Schema v3: make a terminal pane's identity unique, in both of the ways it is
+// addressed.
+//
+//   * tmux_target. Two panes sharing one attach the SAME remote tmux session,
+//     so every keystroke typed in one appears in the other and the two fight
+//     over the terminal size.
+//
+//   * (dev_session_id, name). `name` holds the layout pane id, and it is how a
+//     client resolves a layout slot to its row. Two rows for one slot means two
+//     minted targets, hence two tmux sessions where the user has one pane —
+//     which the tmux_target rule cannot catch, because those two targets are
+//     not equal.
+//
+// Nothing stopped either before. Fresh databases get both from schema.sql's
+// CREATE TABLE; this step is what an EXISTING v1/v2 database goes through, and
+// SQLite has no ALTER TABLE ADD CONSTRAINT, so each constraint arrives as a
+// unique INDEX instead (identical enforcement — a table-level UNIQUE is itself
+// implemented as one).
+//
+// Four phases, in this order, because each can create work for the next:
+//
+//  1. REPAIR targets. A stored target containing `:` or `.` never named a real
+//     session: tmux rewrites both to `_` when it creates one (see tmuxSafeName).
+//     The stored value is corrected to the name tmux actually used, so the pane
+//     finally points at its own long-running shell instead of missing it.
+//
+//  2. DE-DUPLICATE targets. Phase 1 can itself collide two rows (`a.b` and
+//     `a_b`), and a pre-v3 database may simply contain duplicates. The FIRST row
+//     by rowid keeps the contested target — it is the oldest, so it is the one
+//     whose shell the longest-lived pane is attached to — and every later row is
+//     re-minted onto its own canonical `ch_<dev_session_id>_<id>`. Re-minting
+//     rather than nulling is deliberate: a null target is a pane with no shell
+//     at all, whereas a fresh target is a pane that opens its own on the next
+//     attach, which is what the user asked for when they made two panes. Should
+//     even the canonical mint be taken (only reachable if some other row was
+//     hand-written to exactly that string), the row falls back to NULL — SQLite
+//     permits any number of NULLs under UNIQUE — and the pane mints a target on
+//     its next attach rather than blocking the whole upgrade.
+//
+//  3. DE-DUPLICATE names, by the SAME rule and for the same reason: the oldest
+//     row keeps the contested slot name, because it is the one whose shell has
+//     been running longest and therefore the one a client resolving that slot
+//     should keep getting. Each later row is RENAMED — to
+//     "<name>-dup-<short row id>", which is unique because the row id is — and
+//     kept, rather than deleted. It still owns a live tmux session and the
+//     user's running processes; deleting it would strand them under a name
+//     nothing can ever look up again. A renamed row simply stops answering the
+//     slot lookup: it is reachable through the sidebar and through the `tmux.*`
+//     adoption path, and the slot itself now resolves to exactly one row.
+//
+//  4. CONSTRAIN, skipping whichever constraint the table already carries.
+function migrateTerminalPaneIdentity(db: DatabaseSync): void {
+    const targeted = db
+        .prepare(
+            "SELECT rowid AS rowid, id, dev_session_id, tmux_target FROM terminal_panes WHERE tmux_target IS NOT NULL ORDER BY rowid",
+        )
+        .all() as unknown as Array<{
+        rowid: number;
+        id: string;
+        dev_session_id: string;
+        tmux_target: string;
+    }>;
+    const assignTarget = db.prepare("UPDATE terminal_panes SET tmux_target = ? WHERE rowid = ?");
+    const takenTargets = new Set<string>();
+    for (const row of targeted) {
+        const repaired = tmuxSafeName(row.tmux_target);
+        let next: string | null = repaired;
+        if (takenTargets.has(repaired)) {
+            const minted = mintTmuxTarget(row.dev_session_id, row.id);
+            next = takenTargets.has(minted) ? null : minted;
+        }
+        if (next !== null) takenTargets.add(next);
+        if (next !== row.tmux_target) assignTarget.run(next, row.rowid);
+    }
+
+    const named = db
+        .prepare(
+            "SELECT rowid AS rowid, id, dev_session_id, name FROM terminal_panes ORDER BY rowid",
+        )
+        .all() as unknown as Array<{
+        rowid: number;
+        id: string;
+        dev_session_id: string;
+        name: string;
+    }>;
+    const assignName = db.prepare("UPDATE terminal_panes SET name = ? WHERE rowid = ?");
+    const takenNames = new Set<string>();
+    for (const row of named) {
+        const address = `${row.dev_session_id}/${row.name}`;
+        if (!takenNames.has(address)) {
+            takenNames.add(address);
+            continue;
+        }
+        // The row id is a UUID, so its first segment is unique among these rows
+        // in every practical sense; the loop below closes even that gap.
+        let renamed = `${row.name}-dup-${row.id.slice(0, 8)}`;
+        for (let n = 2; takenNames.has(`${row.dev_session_id}/${renamed}`); n++) {
+            renamed = `${row.name}-dup-${row.id.slice(0, 8)}-${n}`;
+        }
+        takenNames.add(`${row.dev_session_id}/${renamed}`);
+        assignName.run(renamed, row.rowid);
+    }
+
+    if (uniqueIndexOver(db, ["tmux_target"]) === null) {
+        db.exec(
+            "CREATE UNIQUE INDEX terminal_panes_tmux_target_unique ON terminal_panes (tmux_target)",
+        );
+    }
+    if (uniqueIndexOver(db, ["dev_session_id", "name"]) === null) {
+        db.exec(
+            "CREATE UNIQUE INDEX terminal_panes_address_unique ON terminal_panes (dev_session_id, name)",
+        );
+    }
+}
+
+// Schema v4: undo v3's UNIQUE (dev_session_id, name).
+//
+// v3 read `name` as a pane's ADDRESS — the client resolved a layout slot to its
+// row through (dev_session_id, name), so two rows for one slot were two tmux
+// sessions for one pane. That premise is gone. A terminal is identified by its
+// row id, which the layout leaf now carries (SplitNode::terminalPaneId), and
+// `name` is only a slot LABEL. Labels are minted per client and are recycled:
+// closing a pane deliberately keeps its row and its remote shell alive, so its
+// label stays taken while the layout stops showing it, and the very next split
+// legitimately mints a NEW row wanting the SAME label. Under v3 that insert
+// failed, which is why the rule has to go rather than merely stop being relied
+// on. Duplicated labels are now expected and harmless: nothing resolves by
+// label except the one-shot legacy path, which takes the oldest match.
+//
+// Two shapes to remove, because v3 could arrive either way:
+//
+//   * A NAMED index, on a database upgraded from v2 — dropped directly.
+//
+//   * An sqlite_autoindex, on a database first created while schema.sql still
+//     declared the table-level UNIQUE. SQLite cannot drop a table constraint,
+//     so the table is rebuilt without it and the rows are copied across. The
+//     UNIQUE (tmux_target) rule is re-declared on the new table: THAT one still
+//     holds, and dropping the old table takes its index with it.
+function migrateDropTerminalPaneAddressUnique(db: DatabaseSync): void {
+    const index = uniqueIndexOver(db, ["dev_session_id", "name"]);
+    if (index === null) return;
+    if (!index.startsWith("sqlite_autoindex_")) {
+        db.exec(`DROP INDEX ${JSON.stringify(index)}`);
+        return;
+    }
+    db.exec(`
+        CREATE TABLE terminal_panes_v4 (
+            id                TEXT    NOT NULL PRIMARY KEY,
+            server_id         TEXT    NOT NULL,
+            dev_session_id    TEXT    NOT NULL,
+            name              TEXT    NOT NULL,
+            working_directory TEXT,
+            tmux_target       TEXT,
+            startup_command   TEXT,
+            harness           TEXT,
+            position          INTEGER NOT NULL DEFAULT 0,
+            created_at        INTEGER NOT NULL,
+            updated_at        INTEGER NOT NULL,
+            FOREIGN KEY (dev_session_id) REFERENCES dev_sessions (id),
+            UNIQUE (tmux_target)
+        );
+        INSERT INTO terminal_panes_v4
+            SELECT id, server_id, dev_session_id, name, working_directory, tmux_target,
+                   startup_command, harness, position, created_at, updated_at
+            FROM terminal_panes;
+        DROP TABLE terminal_panes;
+        ALTER TABLE terminal_panes_v4 RENAME TO terminal_panes;
+    `);
+}
 
 function migrate(db: DatabaseSync): void {
     const from = schemaVersion(db);
@@ -872,7 +1251,7 @@ export class Workspace {
             for (const t of terminalRows) {
                 const newId = randomUUID();
                 terminalIdMap[t.id] = newId;
-                const tmuxTarget = `ch_${newSessionId}_${newId}`;
+                const tmuxTarget = mintTmuxTarget(newSessionId, newId);
                 insertTerminal.run(
                     newId,
                     source.server_id,
@@ -998,6 +1377,14 @@ export class Workspace {
 
     // Read-then-write (parent lookup + nextPosition + INSERT), so it runs in a
     // transaction for the same reason createGroup does.
+    //
+    // A pane is born WITH a tmux target unless the caller names one. That is
+    // what makes this row the pane's identity: the desktop client creates the
+    // row and attaches to whatever `tmuxTarget` comes back, so it never has to
+    // (and no longer does) invent a session name of its own. A caller-supplied
+    // target is still honoured — adopting a tmux session that already exists on
+    // the host is a real workflow (see the tmux.* method group) — but it is
+    // checked, because it ends up in a `-t '=<target>'` argument.
     createTerminalPane(params: CreateTerminalPaneParams): TerminalPane {
         return this.transaction(() => {
             const id = randomUUID();
@@ -1008,6 +1395,10 @@ export class Workspace {
             const position =
                 params.position ??
                 this.nextPosition("terminal_panes", "dev_session_id", params.devSessionId);
+            const tmuxTarget =
+                params.tmuxTarget === undefined || params.tmuxTarget === null
+                    ? mintTmuxTarget(params.devSessionId, id)
+                    : requireSafeTmuxTarget(params.tmuxTarget, "workspace.createTerminalPane");
             this.db
                 .prepare(
                     "INSERT INTO terminal_panes (id, server_id, dev_session_id, name, working_directory, tmux_target, startup_command, harness, position, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -1018,7 +1409,7 @@ export class Workspace {
                     params.devSessionId,
                     params.name,
                     params.workingDirectory ?? null,
-                    params.tmuxTarget ?? null,
+                    tmuxTarget,
                     params.startupCommand ?? null,
                     params.harness ?? null,
                     position,
@@ -1026,6 +1417,89 @@ export class Workspace {
                     ts,
                 );
             return this.getTerminalPane(id);
+        });
+    }
+
+    // Find the row one layout leaf owns, in ONE transaction (SPEC 5.2). This is
+    // how a client learns which remote tmux session a terminal pane owns.
+    //
+    // BY ID — the normal path. The layout leaf carries the row id
+    // (SplitNode::terminalPaneId), minted when the leaf was created, so this is
+    // a pure lookup: a row id is never recycled and never invented here, which
+    // is what makes it impossible for a brand new pane to name an older pane's
+    // shell. A leaf naming a row that no longer exists is an error, not an
+    // invitation to create one: the client would silently get a different
+    // terminal than the one its layout says it owns.
+    //
+    // BY NAME — the legacy path, lookup-or-CREATE, for leaves written before
+    // layouts carried a row id. It exists as a server method precisely because
+    // the client cannot do it safely itself: `list` then `createTerminalPane`
+    // is two round trips, and two clients opening the same Dev Session at the
+    // same moment both see no row in the first and both insert in the second.
+    // That is two rows, two minted targets and two tmux sessions for one pane —
+    // a race UNIQUE (tmux_target) cannot catch, because the two targets differ.
+    // transaction() issues BEGIN IMMEDIATE, so the write lock is taken BEFORE
+    // the SELECT. Two codeharbord processes (one per client SSH session, both
+    // on the same database file) therefore serialise here: the loser's SELECT
+    // runs after the winner's INSERT is committed and finds the row.
+    //
+    // The label is no longer unique (schema v4), so the by-name lookup takes
+    // the OLDEST row bearing it. A legacy leaf predates every row a later mint
+    // could have added under the same label, so the oldest is the one that leaf
+    // has always meant. `rowid` orders by insertion and, unlike created_at, can
+    // never tie.
+    //
+    // A row found with no tmux target gets one minted now rather than being
+    // handed back unusable — the pane would have nothing to attach, and the
+    // client is deliberately incapable of minting one for itself.
+    resolveTerminalPane(params: ResolveTerminalPaneParams): TerminalPane {
+        const id = params.id ?? "";
+        const name = params.name ?? "";
+        // Exactly one addressing mode. Enforced here rather than only at the
+        // dispatcher so an in-process caller gets the rule too: both would leave
+        // the caller guessing which one answered, and neither would fall through
+        // to a create with an empty name.
+        if ((id === "") === (name === "")) {
+            throw new InvalidParamsError(
+                'workspace.resolveTerminalPane: give exactly one of "id" (the terminal pane row, ' +
+                    'the normal case) or "name" (a layout slot label, legacy layouts only)',
+            );
+        }
+        return this.transaction(() => {
+            const existing =
+                id !== ""
+                    ? (this.db
+                          .prepare(
+                              "SELECT * FROM terminal_panes WHERE id = ? AND dev_session_id = ?",
+                          )
+                          .get(id, params.devSessionId) as TerminalPaneRow | undefined)
+                    : (this.db
+                          .prepare(
+                              "SELECT * FROM terminal_panes WHERE dev_session_id = ? AND name = ? ORDER BY rowid LIMIT 1",
+                          )
+                          .get(params.devSessionId, name) as TerminalPaneRow | undefined);
+            if (existing) {
+                if (existing.tmux_target !== null) return toTerminalPane(existing);
+                const minted = mintTmuxTarget(existing.dev_session_id, existing.id);
+                this.db
+                    .prepare(
+                        "UPDATE terminal_panes SET tmux_target = ?, updated_at = ? WHERE id = ?",
+                    )
+                    .run(minted, Date.now(), existing.id);
+                return this.getTerminalPane(existing.id);
+            }
+            if (id !== "") {
+                throw new InvalidParamsError(
+                    `workspace.resolveTerminalPane: no terminal pane ${JSON.stringify(id)} ` +
+                        `in dev session ${JSON.stringify(params.devSessionId)}`,
+                );
+            }
+            return this.createTerminalPane({
+                serverId: params.serverId,
+                devSessionId: params.devSessionId,
+                name,
+                workingDirectory: params.workingDirectory ?? null,
+            });
         });
     }
 
@@ -1044,7 +1518,12 @@ export class Workspace {
             const name = params.name ?? current.name;
             const workingDirectory =
                 params.workingDirectory !== undefined ? params.workingDirectory : current.workingDirectory;
-            const tmuxTarget = params.tmuxTarget !== undefined ? params.tmuxTarget : current.tmuxTarget;
+            const tmuxTarget =
+                params.tmuxTarget !== undefined
+                    ? params.tmuxTarget === null
+                        ? null
+                        : requireSafeTmuxTarget(params.tmuxTarget, "workspace.updateTerminalPane")
+                    : current.tmuxTarget;
             const startupCommand =
                 params.startupCommand !== undefined ? params.startupCommand : current.startupCommand;
             const harness = params.harness !== undefined ? params.harness : current.harness;
@@ -1505,6 +1984,17 @@ export const WORKSPACE_METHODS: Record<RpcWorkspaceMethodName, (params: unknown)
         optionalString(o, "harness", M.createTerminalPane);
         optionalNumber(o, "position", M.createTerminalPane);
         return workspace().createTerminalPane(p as CreateTerminalPaneParams);
+    },
+    [M.resolveTerminalPane]: (p) => {
+        const o = requireObject(p, M.resolveTerminalPane);
+        requireString(o, "serverId", M.resolveTerminalPane);
+        requireString(o, "devSessionId", M.resolveTerminalPane);
+        // Types only. Which of `id`/`name` must be present is the method's own
+        // rule (it is a public in-process API too), enforced there.
+        optionalString(o, "id", M.resolveTerminalPane);
+        optionalString(o, "name", M.resolveTerminalPane);
+        optionalString(o, "workingDirectory", M.resolveTerminalPane);
+        return workspace().resolveTerminalPane(p as ResolveTerminalPaneParams);
     },
     [M.updateTerminalPane]: (p) => {
         const o = requireObject(p, M.updateTerminalPane);

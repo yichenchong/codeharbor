@@ -151,6 +151,34 @@ If a bundle is missing and cannot be built (no `npm` on `PATH`), configure
 loads nothing is never the default. Pass `-DCODEHARBOR_SKIP_WEB_BUNDLE=ON` to
 deliberately build a client with both panes inert.
 
+Source maps are a configure-time option, `CODEHARBOR_WEB_SOURCEMAP`, which defaults
+to **ON for a `Debug` configure and OFF otherwise**. When it is on, CMake runs each
+workspace's `build:sourcemap` script instead of `build` and embeds the resulting
+`*.js.map` / `*.css.map` alongside the bundle, so a JavaScript fault in the editor
+or terminal page resolves to the original TypeScript in WebEngine's developer tools
+instead of pointing into one minified line. The maps are not small — Monaco's three
+come to ~15 MB — which is exactly why a Release binary never contains them. A
+multi-config generator has no `CMAKE_BUILD_TYPE` at configure time (and the bundle
+is built at configure time), so it defaults to off; pass
+`-DCODEHARBOR_WEB_SOURCEMAP=ON`/`=OFF` to decide explicitly.
+
+Both build directories share the one `src/web/*/dist`, and the option changes what
+has to be in it, so switching between a Debug and a Release configure rebuilds both
+bundles. In a clone that has both `build/dev/` and `build/release/`, re-run
+`cmake --preset dev` — not just `cmake --build --preset dev` — after configuring
+`release`, or the dev build will look for map files the release configure just
+removed.
+
+By hand the same builds are `npm run build:sourcemap --workspace src/web/editor`
+(equivalently `node build.mjs --sourcemap`, or `CODEHARBOR_WEB_SOURCEMAP=1
+node build.mjs`) and plain `npm run build` for the mapless variant. Either script
+writes into a fresh `src/web/<name>/dist.tmp/` and swaps it into place only after
+every step has succeeded: a build that fails midway leaves the previous `dist/`
+exactly as it was rather than leaving CMake with no bundle to embed, and a build
+that succeeds leaves no renamed or deleted output behind. Both builds are
+reproducible — rebuilding an unchanged tree, with or without maps, produces
+byte-identical files.
+
 Presets are defined in [`CMakePresets.json`](../CMakePresets.json): `dev`
 (Debug + tests, `build/dev/`), `release` (Release, tests off, `build/release/`)
 and `release-tests` (Release **with** tests, also `build/release/` — it is what
@@ -161,6 +189,90 @@ deliberately share one binary directory; switching between them reconfigures it.
 > Running the GUI needs a display. On a headless box use an X/Wayland session or
 > `xvfb-run ./build/dev/src/app/codeharbor`. WebEngine may need
 > `--no-sandbox` in constrained containers.
+
+### Build speed
+
+A full clean Debug build with tests takes about **13½ minutes** on the reference
+box (2 cores, 7 GB RAM, `ninja -j2`, GCC 15.2, Qt 6.9). Every number below was
+measured there, from clean scratch trees; on a machine with more cores the
+absolute figures shrink but the proportions hold.
+
+**Install a compiler cache — it is the one large lever.** CMake looks for
+`ccache` and then `sccache` at configure time and wires whichever it finds into
+`CMAKE_C_COMPILER_LAUNCHER` / `CMAKE_CXX_COMPILER_LAUNCHER` automatically. There
+is nothing to pass and nothing to remember; the configure output says which way
+it went:
+
+```
+-- compiler cache: /usr/bin/ccache
+-- compiler cache: not found (looked for ccache, sccache); builds are uncached. …
+```
+
+`sudo apt install ccache` (or `brew install ccache`) and re-run `cmake --preset dev`
+is the whole procedure. An explicit `-DCMAKE_CXX_COMPILER_LAUNCHER=…` still wins,
+so this never fights a deliberate choice.
+
+**Where the time actually goes.** Summing every compile/link edge of a clean
+`dev` build (1985 seconds of work, which `-j2` turns into ~13½ minutes of wall
+clock):
+
+| Bucket | Edge-seconds | Share |
+| --- | --- | --- |
+| 35 test executables, one translation unit each | 767 | 39% |
+| `qmlcachegen` units for the QML module | 321 | 16% |
+| AUTOMOC/AUTOGEN steps | ~200 | 10% |
+| module library objects (all of `src/*/*.cpp`) | 282 | 14% |
+| `mocs_compilation.cpp` for every target | 80 | 4% |
+| **all linking, including the 36 executables** | **~40** | **2%** |
+
+The two things people reach for first are therefore the wrong two things here.
+The linker is not the problem — 40 seconds of 1985. And the C++ *the project
+wrote* is a minority of the build: the test executables and the generated QML
+cache units together are over half of it.
+
+**Precompiled headers were measured and rejected — do not re-add them without
+re-measuring.** Roughly 60% of a Qt-heavy translation unit is re-parsing Qt
+headers (`-fsyntax-only` on `src/viewers/ViewerModel.h` alone is 3.08 s of the
+4.97 s it takes to compile `ViewerModel.cpp`), so per-module
+`target_precompile_headers` looks like an obvious win, and on the files it
+touches it delivers: module library objects went 282 s → 177 s (−37%) and
+`mocs_compilation.cpp` 80 s → 43 s (−46%). It still did not pay:
+
+* Generating six module PCHs cost **115 seconds and 1.2 GB of `.gch`** on every
+  clean tree — about what it saved. Three clean builds measured 13:31.6
+  (baseline), 13:26.6 (PCH on) and 13:37.2 (same tree, PCH off): all within the
+  ±5% noise of a loaded 2-core box, i.e. **no clean-build improvement at all**.
+* A PCH only amortises over a target with roughly four or more objects. The
+  small modules measured *worse* with one (`ch_persistence` +15 s, `ch_remote`
+  +12 s).
+* It cannot touch the two biggest buckets. Test executables are one translation
+  unit each, so a per-target PCH costs more to build than the single file saves,
+  and sharing one between sibling tests (`target_precompile_headers REUSE_FROM`)
+  fails for a subtler reason: the tests carry different `-D` flags
+  (`CH_REPO_ROOT`, `CH_CONNECTSHEET_QML`, …), which silently invalidates a shared
+  GCC PCH — 5 of the 6 targets in `src/qml/tests` got no speedup whatsoever.
+* The only real win was the incremental loop (touch a widely included project
+  header, rebuild): 6:13 → 5:52. Not worth 1.2 GB and a mechanism that can hide
+  a missing `#include`.
+
+**`CODEHARBOR_TEST_MINIMAL_DEBUGINFO`** (default **OFF**) is the one knob that
+did pay. It compiles the `tst_*` executables with `-g1` — line tables and
+function boundaries, no local variables or type descriptions — which measured
+15.2 s → 11.7 s (≈23%) for `tst_qmlload.cpp`, the largest test translation unit.
+It is off by default on purpose: the reason to want a debugger in this tree is
+almost always a failing test, and `-g1` removes exactly what that session needs.
+Turn it on while grinding a build loop, off when you are about to step through
+something:
+
+```bash
+cmake --preset dev -DCODEHARBOR_TEST_MINIMAL_DEBUGINFO=ON
+```
+
+Only `tst_*` executables are affected, and only in `Debug`/`RelWithDebInfo`; the
+application binary and every packaged artifact are byte-for-byte unaffected.
+
+Unity builds are deliberately not offered: they interact badly with Qt's
+meta-object compilation and hide missing includes.
 
 ### Remote workspace (Node)
 

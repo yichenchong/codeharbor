@@ -19,6 +19,11 @@ QJsonObject SplitNode::toJson() const
         // rewrite every stored layout and a downgrade still reads them.
         if (!url.isEmpty())
             obj[QStringLiteral("url")] = url;
+        // Same rule, same reason: a viewer leaf and every terminal leaf written
+        // before this field existed carry none, and must keep serializing
+        // exactly as they did.
+        if (!terminalPaneId.isEmpty())
+            obj[QStringLiteral("terminalPaneId")] = terminalPaneId;
         return obj;
     }
 
@@ -70,6 +75,11 @@ bool parseNode(const QJsonObject &obj, SplitNode &out, int depth)
         // url, the same tolerance paneId gets: a leaf's content is not worth
         // rejecting a whole layout over.
         out.url = obj.value(QStringLiteral("url")).toString();
+        // Absent means "this leaf has no server row bound to it" - either a
+        // viewer leaf, or a terminal leaf from a layout stored before the field
+        // existed. ch::SessionLayouts is what tells those two apart and decides
+        // what to do; the parser only reports what is there.
+        out.terminalPaneId = obj.value(QStringLiteral("terminalPaneId")).toString();
         return true;
     }
 
@@ -143,12 +153,13 @@ bool SplitNode::operator==(const SplitNode &other) const
 {
     // Compare only the fields toJson() persists for each node kind, so equality
     // agrees with the JSON round-trip (see the header). A leaf and a split are
-    // never equal; a leaf's identity is its paneId; a split's is its
-    // orientation, ratios, and children (recursively).
+    // never equal; a leaf's identity is its paneId, url and terminalPaneId; a
+    // split's is its orientation, ratios, and children (recursively).
     if (isLeaf() != other.isLeaf())
         return false;
     if (isLeaf())
-        return paneId == other.paneId && url == other.url;
+        return paneId == other.paneId && url == other.url
+                && terminalPaneId == other.terminalPaneId;
     return orientation == other.orientation && ratios == other.ratios
             && children == other.children;
 }

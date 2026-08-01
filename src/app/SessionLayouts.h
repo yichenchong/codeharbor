@@ -5,6 +5,7 @@
 #include "WorkspaceDb.h"
 
 #include <QObject>
+#include <QSet>
 #include <QString>
 #include <QStringList>
 #include <QVariant>
@@ -30,6 +31,18 @@ namespace ch {
 // so QML consumes them directly as `node`. Every tree published to QML has been
 // through SplitNode::tryFromJson, so a malformed persisted or QML-authored tree
 // can never reach the regions: it is rejected with error() instead.
+//
+// A terminal leaf carries one more persisted field, "terminalPaneId": the
+// server's row id for that pane's terminal (SplitNode::terminalPaneId), which
+// is what TerminalPaneView resolves its tmux target from.
+//
+// The published terminal tree carries ONE field that is NOT persisted and never
+// reaches the server: "terminalLegacy": true on a leaf whose row id is missing
+// because the layout predates the field. It is the pane's permission to resolve
+// by its slot label, the old and recyclable key, exactly once. A leaf with
+// neither an id nor that marker is waiting for a row to be minted and must
+// attach nothing meanwhile. SplitNode::tryFromJson drops the marker like any
+// unknown key, so a tree that comes back through saveTree() cannot persist it.
 //
 // Both trees read as a NULL QVariant until a load resolves (and again while a
 // load for a different Dev Session is in flight). That is deliberate: the QML
@@ -113,12 +126,28 @@ public:
     // ("horizontal" | "vertical") with the original pane first and a new,
     // equally sized pane second. Returns the new paneId ("<region>-<n>", n taken
     // from the never-decreasing per-(Dev Session, region) counter in
-    // UiStateStore, so an id is never minted twice for one Dev Session), or an
+    // UiStateStore, so a LABEL is never shown twice for one Dev Session), or an
     // empty string when nothing was changed.
     //
     // Passing the empty paneId of the placeholder leaf an emptied region is
     // left with FILLS it in place instead of splitting it: that placeholder is
     // not a pane, and it is the only handle QML has on a region with no panes.
+    //
+    // TERMINAL REGION: the new leaf also needs a `terminal_panes` row of its
+    // own, and that is a server round trip. It is NOT waited for. The leaf is
+    // published (and persisted) immediately with no terminalPaneId so the split
+    // is instant, the row is minted in the background, and its id is written
+    // into the leaf when it lands. Until then the leaf is PENDING and the pane
+    // attaches nothing at all: it is published to QML without the
+    // `terminalLegacy` marker below, which is precisely the state that means
+    // "wait, your identity is coming". It deliberately does NOT fall back to
+    // resolving by its slot label, because that is how a new pane used to end
+    // up attached to a closed pane's still-running shell.
+    //
+    // A mint that FAILS reports through error() and REMOVES the leaf again, so
+    // the user sees the split undone with a reason rather than a pane that can
+    // never come up - and so an id-less terminal leaf, which a later load would
+    // have to read as a legacy one, is not left behind on the server.
     Q_INVOKABLE QString splitPane(QString region, QString paneId,
                                   QString orientation);
 
@@ -136,6 +165,24 @@ public:
     // restored url onto every pane they mint, so the common call is an echo of
     // what is already stored and must cost neither an RPC nor an error.
     Q_INVOKABLE void setPaneUrl(QString region, QString paneId, QString url);
+
+    // Bind the terminal leaf labelled `paneName` to the `terminal_panes` row
+    // `terminalPaneId`, and persist the tree. This is the self-migration step
+    // for a LEGACY layout: a leaf stored before layouts carried a row id
+    // resolves once by its slot label, and ch::TerminalFactory reports what
+    // that found through here, so the leaf never has to ask by label again -
+    // which matters because a label is recyclable and a row id is not.
+    //
+    // Silent and free in every other case: a different Dev Session, an unknown
+    // pane (it was closed while the lookup travelled), or a leaf that already
+    // carries this id. That last one is what makes it happen ONCE rather than
+    // on every attach.
+    //
+    // Persisted through the same path every other edit uses, so it also retires
+    // any getLayout still on the wire (RegionState::superseded): a backfill is
+    // a local edit, and a crossing server reply must not revert it.
+    void bindTerminalPaneRow(const QString& devSessionId, const QString& paneName,
+                             const QString& terminalPaneId);
 
 signals:
     void devSessionIdChanged();
@@ -215,19 +262,46 @@ private:
     // "viewer" / "terminal" for the region slot - both the pane-id prefix (with
     // a "-" appended) and the per-region key half of the persisted counter.
     static QString regionKey(int index);
-    // Burn every "<region>-<n>" suffix `tree` carries so none of them can ever
-    // be minted again for this Dev Session, and answer the next free one.
+    // Burn every "<region>-<n>" suffix `tree` carries so none of them is ever
+    // shown twice for this Dev Session, and answer the next free one.
     //
     // Returns max(stored counter, highest suffix in `tree` + 1) and stores that
-    // when it moved. Consulting the TREE as well as the counter is what makes an
-    // existing Dev Session safe: one created before the counter existed, or one
-    // whose settings file was cleared, reads the default 1 and would otherwise
-    // mint an id its own layout is already showing. Consulting the COUNTER as
-    // well as the tree is what fixes the recycling bug: a closed pane is gone
-    // from the tree but its suffix stays burnt, so splitting again cannot re-mint
-    // the id that names its remote tmux session (see UiStateStore's comment) and
-    // silently re-attach the closed shell.
+    // when it moved. This is a LABELLING aid and nothing more. It keeps the
+    // numbers the user sees stable and non-confusing within one client: a
+    // closed pane is gone from the tree but its suffix stays burnt, so the next
+    // split shows a number that is not already on screen and not one the user
+    // just closed. Consulting the TREE as well as the counter covers a Dev
+    // Session created before the counter existed, or one whose settings file
+    // was cleared, which would otherwise start again at 1 and put two panes on
+    // screen wearing the same label.
+    //
+    // It is NOT a safety mechanism and must not be mistaken for one. A terminal
+    // is identified by the `terminal_panes` row id its layout leaf carries
+    // (SplitNode::terminalPaneId), minted by the server and never recycled.
+    // This counter is client-LOCAL — a second machine keeps its own, starts
+    // wherever the shared tree leaves it, and will happily re-issue a label a
+    // closed pane's row still wears — so it never could guard identity, which
+    // is exactly the defect that moved identity into the leaf.
     int reservePaneSuffix(int index, const SplitNode& tree);
+
+    // Ask the server for a `terminal_panes` row for the terminal leaf labelled
+    // `paneId`, and write its id into that leaf when the answer lands. Until
+    // then the leaf is pending (see splitPane). `generation` is the load stamp
+    // the mint was started under, so an answer for an abandoned Dev Session is
+    // dropped rather than written into whatever tree is loaded now.
+    void mintTerminalPaneRow(quint64 generation, const QString& paneId);
+    // Find the terminal leaf labelled `paneId` in the loaded terminal tree, or
+    // nullptr. Terminal region only: a viewer leaf has no row to bind.
+    SplitNode* findTerminalLeaf(const QString& paneId);
+    // Remove the leaf labelled `paneId` from a region, collapsing a branch left
+    // with one child into that child and leaving an emptied region with a single
+    // EMPTY leaf. False when the region holds no such leaf. Neither publishes
+    // nor persists; the caller decides both.
+    bool dropLeaf(int index, const QString& paneId);
+    // True while any terminal leaf is still waiting for the `terminal_panes`
+    // row being minted for it. persist() refuses to write such a tree; see
+    // there for why that is load-bearing rather than tidiness.
+    bool hasPendingTerminalLeaf() const;
 
     WorkspaceDb* m_db = nullptr;
     UiStateStore* m_uiState = nullptr;
@@ -240,6 +314,20 @@ private:
     // getLayout replies still outstanding for the current generation; `loaded`
     // fires when it reaches zero.
     int m_pendingLoads = 0;
+    // Terminal slot labels this client may resolve by NAME, i.e. the leaves of
+    // a layout the SERVER handed us that carry no terminalPaneId. Those are
+    // genuinely pre-migration leaves, and for them the label really is the
+    // historical key, so the fallback is correct exactly once per leaf -
+    // bindTerminalPaneRow() then writes the answer in and drops the label from
+    // here.
+    //
+    // Everything NOT in this set and without an id is PENDING (its row is being
+    // minted) and resolves nothing at all. That is the fail-safe direction: a
+    // marker that goes missing leaves a pane visibly stuck instead of silently
+    // adopting whatever shell happens to wear its label. Published to QML as
+    // `terminalLegacy` on the leaf; never persisted, because it is a statement
+    // about what THIS client has learned, not about the layout.
+    QSet<QString> m_legacyTerminalSlots;
 };
 
 } // namespace ch

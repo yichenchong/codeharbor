@@ -165,6 +165,12 @@ private:
     // transition. The ONLY writer of m_readOnly.
     void setReadOnly(bool readOnly);
     void updateReadOnly() { setReadOnly(m_pathReadOnly || m_bufferReadOnly); }
+    // True when a file.watchEventsLost payload names this pane's own live
+    // subscription id. Every malformed shape answers false; see the definition.
+    bool watchLossNamesThisPane(const QJsonValue& params) const;
+    // Shared reaction to "the file may have changed under us", used by both
+    // watch notifications: re-read a clean buffer, only FLAG a dirty one.
+    void applyExternalChange();
     // Ask the server what the current path looks like and re-derive
     // m_pathReadOnly from the answer, then run `then` — whether the stat
     // succeeded or not, so a caller can chain work behind it. The one case that

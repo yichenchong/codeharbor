@@ -4,6 +4,7 @@
 
 #include <QCoreApplication>
 #include <QDeadlineTimer>
+#include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QJsonValue>
@@ -135,6 +136,8 @@ const auto kWatch = QString::fromLatin1(ch::rpc::kMethodWatch);
 const auto kUnwatch = QString::fromLatin1(ch::rpc::kMethodUnwatch);
 const auto kStat = QString::fromLatin1(ch::rpc::kMethodStat);
 const auto kWatchEvent = QString::fromLatin1(ch::rpc::kWatchEventNotification);
+const auto kWatchEventsLost =
+    QString::fromLatin1(ch::rpc::kWatchEventsLostNotification);
 
 } // namespace
 
@@ -154,6 +157,16 @@ private slots:
     void saveConflictFallsBackToStat();
     void externalChangeWhileCleanReloads();
     void externalChangeWhileDirtyDoesNotReload();
+
+    // SPEC 8.7 / file.watchEventsLost: the daemon dropped watch notifications
+    // for this subscription because our end of the channel stalled, so the
+    // buffer is known-stale and must be re-read — under exactly the rules an
+    // ordinary change obeys, and only for OUR subscription id.
+    void lostWatchEventsForThisSubscriptionReload();
+    void lostWatchEventsWhileDirtyOnlyFlagTheBuffer();
+    void lostWatchEventsForAnotherSubscriptionAreIgnored();
+    void malformedWatchLossPayloadsAreNoOps();
+    void lostWatchEventsAfterUnwatchingAreIgnored();
     void recoverySnapshotWrittenAndOfferedOnReopen();
     void unwatchIssuedOnDestruction();
     void reopenUnwatchesPreviousSubscription();
@@ -560,6 +573,176 @@ void TstEditorController::externalChangeWhileDirtyDoesNotReload()
     QVERIFY(none.isEmpty());
     QCOMPARE(contentSpy.count(), 0);
     QCOMPARE(m_controller->revision(), QStringLiteral("r1"));
+}
+
+// The daemon dropped watch events for OUR subscription. No path, no revision
+// and no event kind survive that, so the only honest reaction is to re-read the
+// watched file — the same re-read an ordinary change triggers.
+void TstEditorController::lostWatchEventsForThisSubscriptionReload()
+{
+    makePair();
+    openClean(QStringLiteral("/foo/f.txt"), QStringLiteral("hello"),
+              QStringLiteral("r1"));
+
+    QSignalSpy contentSpy(m_controller, &EditorController::contentLoaded);
+    QSignalSpy stateSpy(m_controller, &EditorController::fileStateChanged);
+
+    sendNotification(kWatchEventsLost,
+                     {{"subscriptionIds", QJsonArray{QStringLiteral("sub1")}}});
+
+    const QJsonObject read = nextRequest();
+    QCOMPARE(method(read), kReadFile);
+    QCOMPARE(reqPath(read), QStringLiteral("/foo/f.txt"));
+    respondResult(reqId(read), {{"path", "/foo/f.txt"},
+                                {"encoding", "utf-8"},
+                                {"content", "the change we never heard about"},
+                                {"revision", "r7"},
+                                {"truncated", false}});
+    servePermissionStat();
+
+    QTRY_COMPARE(contentSpy.count(), 1);
+    QCOMPARE(contentSpy.at(0).at(0).toString(),
+             QStringLiteral("the change we never heard about"));
+    QCOMPARE(m_controller->revision(), QStringLiteral("r7"));
+    QTRY_COMPARE(m_controller->fileState(), QStringLiteral("clean"));
+
+    QStringList seen;
+    for (const auto& args : stateSpy)
+        seen << args.at(0).toString();
+    QVERIFY(seen.contains(QStringLiteral("externally_modified")));
+    QVERIFY(seen.contains(QStringLiteral("clean")));
+}
+
+// A lost-events notification must never cost the user unsaved work: against a
+// dirty buffer it takes the same route an ordinary change takes — flag the pane
+// externally modified and let the user resolve it — and issues no read at all.
+void TstEditorController::lostWatchEventsWhileDirtyOnlyFlagTheBuffer()
+{
+    makePair();
+    openClean(QStringLiteral("/foo/f.txt"), QStringLiteral("hello"),
+              QStringLiteral("r1"));
+
+    m_controller->reportContent(QStringLiteral("local edits"));
+    const QJsonObject rec = nextRequest();
+    QCOMPARE(method(rec), kWriteFile);
+    QCOMPARE(reqPath(rec), recoveryFilePath());
+    respondResult(reqId(rec), {{"path", reqPath(rec)}, {"revision", "rec1"}});
+    QCOMPARE(m_controller->fileState(), QStringLiteral("modified"));
+
+    QSignalSpy contentSpy(m_controller, &EditorController::contentLoaded);
+
+    sendNotification(kWatchEventsLost,
+                     {{"subscriptionIds", QJsonArray{QStringLiteral("sub1")}}});
+
+    // Exactly what externalChangeWhileDirtyDoesNotReload asserts for the
+    // ordinary change path.
+    QTRY_COMPARE(m_controller->fileState(), QStringLiteral("externally_modified"));
+    const QJsonObject none = nextRequest(300);
+    QVERIFY(none.isEmpty());
+    QCOMPARE(contentSpy.count(), 0);
+    QCOMPARE(m_controller->revision(), QStringLiteral("r1"));
+}
+
+// One daemon serves every pane, so the notification names subscriptions this
+// controller does not own. Those are somebody else's problem: no read, no state
+// change here.
+void TstEditorController::lostWatchEventsForAnotherSubscriptionAreIgnored()
+{
+    makePair();
+    openClean(QStringLiteral("/foo/f.txt"), QStringLiteral("hello"),
+              QStringLiteral("r1"));
+
+    QSignalSpy contentSpy(m_controller, &EditorController::contentLoaded);
+
+    sendNotification(kWatchEventsLost,
+                     {{"subscriptionIds", QJsonArray{QStringLiteral("sub-someone-else"),
+                                                     QStringLiteral("sub99")}}});
+
+    const QJsonObject none = nextRequest(300);
+    QVERIFY(none.isEmpty());
+    QCOMPARE(contentSpy.count(), 0);
+    QCOMPARE(m_controller->fileState(), QStringLiteral("clean"));
+    QCOMPARE(m_controller->revision(), QStringLiteral("r1"));
+}
+
+// Untrusted bytes off a socket. Every broken shape is inert, and the controller
+// is still listening afterwards — the final valid notification proves the
+// silence above was rejection, not a wedged handler.
+void TstEditorController::malformedWatchLossPayloadsAreNoOps()
+{
+    makePair();
+    openClean(QStringLiteral("/foo/f.txt"), QStringLiteral("hello"),
+              QStringLiteral("r1"));
+
+    QSignalSpy contentSpy(m_controller, &EditorController::contentLoaded);
+
+    sendNotification(kWatchEventsLost, {});                         // field missing
+    sendNotification(kWatchEventsLost, {{"subscriptionIds", "sub1"}}); // not an array
+    sendNotification(kWatchEventsLost,
+                     {{"subscriptionIds", QJsonObject{{"0", "sub1"}}}}); // object
+    sendNotification(kWatchEventsLost, {{"subscriptionIds", QJsonArray{}}}); // empty
+    sendNotification(kWatchEventsLost,
+                     {{"subscriptionIds", QJsonArray{7, QJsonValue()}}}); // non-strings
+
+    const QJsonObject none = nextRequest(300);
+    QVERIFY(none.isEmpty());
+    QCOMPARE(contentSpy.count(), 0);
+    QCOMPARE(m_controller->fileState(), QStringLiteral("clean"));
+
+    sendNotification(kWatchEventsLost,
+                     {{"subscriptionIds", QJsonArray{QStringLiteral("sub1")}}});
+    const QJsonObject read = nextRequest();
+    QCOMPARE(method(read), kReadFile);
+}
+
+// The subscription this pane held is released when it switches files, so the
+// id the daemon reports as lost is no longer ours. Acting on it would re-read a
+// file this pane no longer shows.
+void TstEditorController::lostWatchEventsAfterUnwatchingAreIgnored()
+{
+    makePair();
+    openClean(QStringLiteral("/foo/a.txt"), QStringLiteral("A"),
+              QStringLiteral("r1")); // subscribes "sub1"
+
+    m_controller->open(QStringLiteral("/foo/b.txt"));
+
+    const QJsonObject unwatch = nextRequest();
+    QCOMPARE(method(unwatch), kUnwatch);
+    QCOMPARE(reqSubscriptionId(unwatch), QStringLiteral("sub1"));
+
+    const QJsonObject read = nextRequest();
+    QCOMPARE(method(read), kReadFile);
+    respondResult(reqId(read), {{"path", "/foo/b.txt"},
+                                {"encoding", "utf-8"},
+                                {"content", "B"},
+                                {"revision", "r2"},
+                                {"truncated", false}});
+    const QJsonObject watch = nextRequest();
+    QCOMPARE(method(watch), kWatch);
+    respondResult(reqId(watch), {{"subscriptionId", "sub2"}});
+    servePermissionStat();
+    const QJsonObject recStat = nextRequest();
+    QCOMPARE(method(recStat), kStat);
+    QCOMPARE(reqPath(recStat), recoveryFilePath());
+    respondError(reqId(recStat), -32002, QStringLiteral("ENOENT"));
+    QTRY_COMPARE(m_controller->fileState(), QStringLiteral("clean"));
+
+    QSignalSpy contentSpy(m_controller, &EditorController::contentLoaded);
+
+    // The released id: inert.
+    sendNotification(kWatchEventsLost,
+                     {{"subscriptionIds", QJsonArray{QStringLiteral("sub1")}}});
+    const QJsonObject none = nextRequest(300);
+    QVERIFY(none.isEmpty());
+    QCOMPARE(contentSpy.count(), 0);
+    QCOMPARE(m_controller->fileState(), QStringLiteral("clean"));
+
+    // The live one still works, so the pane is not simply deaf.
+    sendNotification(kWatchEventsLost,
+                     {{"subscriptionIds", QJsonArray{QStringLiteral("sub2")}}});
+    const QJsonObject reread = nextRequest();
+    QCOMPARE(method(reread), kReadFile);
+    QCOMPARE(reqPath(reread), QStringLiteral("/foo/b.txt"));
 }
 
 void TstEditorController::recoverySnapshotWrittenAndOfferedOnReopen()

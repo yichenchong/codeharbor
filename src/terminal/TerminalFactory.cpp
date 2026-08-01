@@ -9,11 +9,12 @@
 
 namespace {
 
-// The pane's tmux target is app-minted, but it still reaches a remote shell as
-// part of a command string, so it is interpolated with the same POSIX
-// single-quote rule the hardened helpers use (see the identical rule in
-// TerminalController.cpp and SessionBootstrap.cpp): wrap in single quotes and
-// rewrite every embedded quote as '\'' so nothing can break out of the quoting.
+// The pane's tmux target is server-minted and validated there against tmux's
+// own grammar, but it still reaches a remote shell as part of a command string,
+// so it is interpolated with the same POSIX single-quote rule the hardened
+// helpers use (see the identical rule in TerminalController.cpp and
+// SessionBootstrap.cpp): wrap in single quotes and rewrite every embedded quote
+// as '\'' so nothing can break out of the quoting.
 // The attach command itself is NOT built here — TerminalController's own
 // tmuxNewSessionCommand() produces it (SPEC 5.2).
 QString shellSingleQuote(const QString& value)
@@ -128,9 +129,164 @@ QString TerminalFactory::tmuxKillSessionCommand(const QString& target)
         .arg(shellSingleQuote(QLatin1Char('=') + target));
 }
 
+QString TerminalFactory::paneKey(const QString& devSessionId, const QString& paneName)
+{
+    // `/` cannot appear in a UUID, so no pair of ids can collide on it.
+    return devSessionId + QLatin1Char('/') + paneName;
+}
+
+void TerminalFactory::setWorkspace(WorkspaceDb* workspace)
+{
+    m_workspace = workspace;
+}
+
+void TerminalFactory::setServerId(const QString& serverId)
+{
+    if (m_serverId == serverId)
+        return;
+    m_serverId = serverId;
+    // Targets name rows on a SERVER. Carrying them to another one would hand a
+    // pane a target belonging to a workspace it is no longer looking at.
+    m_targets.clear();
+}
+
+ResolveTerminalPaneParams TerminalFactory::resolveParamsFor(const QString& serverId,
+                                                            const QString& devSessionId,
+                                                            const QString& paneName,
+                                                            const QString& terminalPaneId,
+                                                            const QString& workingDir)
+{
+    ResolveTerminalPaneParams params;
+    params.serverId = ServerId{serverId};
+    params.devSessionId = DevSessionId{devSessionId};
+    if (!terminalPaneId.isEmpty()) {
+        // Pure lookup on the row that IS this terminal. It was minted when the
+        // layout leaf was created and a row id is never recycled, so there is
+        // nothing to create here and nothing a reused label could confuse it
+        // with. The slot label is deliberately NOT sent: the server would have
+        // no use for it, and a caller reading this should not be able to
+        // believe it is part of the question.
+        params.id = terminalPaneId;
+        return params;
+    }
+    // Legacy leaf: no row id was ever stored for it, so its slot label is the
+    // historical key and the server does lookup-or-create in ONE call.
+    // Deliberately not list-then-create: those are two round trips, and between
+    // them another client can insert the very row this one is about to create.
+    params.name = paneName;
+    // Only meaningful when the row is created: `tmux new-session -c` roots a
+    // session at creation and is ignored on attach, so an existing pane keeps
+    // the directory it was born with.
+    if (!workingDir.isEmpty())
+        params.workingDirectory = workingDir;
+    return params;
+}
+
+bool TerminalFactory::resolveTarget(TerminalController* controller,
+                                    const QString& devSessionId,
+                                    const QString& paneName,
+                                    const QString& terminalPaneId,
+                                    const QString& workingDir)
+{
+    if (!controller)
+        return false;
+    if (devSessionId.isEmpty() || paneName.isEmpty()) {
+        emit error(controller, QStringLiteral("no Dev Session for this pane"));
+        return false;
+    }
+    // A lookup and a create both travel over the same SSH session the PTY would
+    // use, so refuse for the same reason attach() does. Inventing a target here
+    // is exactly the bug this whole path replaces.
+    if (!connected() || !m_workspace || m_serverId.isEmpty()) {
+        emit error(controller, QStringLiteral("no SSH connection"));
+        return false;
+    }
+
+    const ResolveTerminalPaneParams params =
+        resolveParamsFor(m_serverId, devSessionId, paneName, terminalPaneId, workingDir);
+    // The row id when the leaf has one, the legacy slot address otherwise. Two
+    // shapes in one map is safe: a UUID contains no "/", so no row id can ever
+    // read as a "<devSession>/<label>" pair.
+    const bool byRow = !params.id.isEmpty();
+    const QString key = byRow ? params.id : paneKey(devSessionId, paneName);
+    // Waiting list first, so the delivery below has somebody to deliver to and
+    // a second caller for the same pane joins the flight instead of starting a
+    // second one. That is a bandwidth saving, NOT the correctness guarantee: it
+    // only covers this process. Two client machines racing the same LEGACY slot
+    // are made safe on the server, by workspace.resolveTerminalPane doing its
+    // lookup-or-create in one BEGIN IMMEDIATE transaction.
+    const bool alreadyInFlight = m_resolving.contains(key);
+    m_resolving[key].append(QPointer<TerminalController>(controller));
+
+    const QString cached = m_targets.value(key);
+    if (!cached.isEmpty()) {
+        // Posted, never emitted inline: the caller (TerminalPaneView) assigns
+        // its "resolving" flag from this function's RETURN value, and an answer
+        // delivered before that assignment would be overwritten by it.
+        QMetaObject::invokeMethod(
+            this, [this, key, cached]() { finishResolution(key, cached, QString()); },
+            Qt::QueuedConnection);
+        return true;
+    }
+    if (alreadyInFlight)
+        return true;
+
+    QPointer<TerminalFactory> self(this);
+    m_workspace->resolveTerminalPane(
+        params, [self, key, byRow, devSessionId, paneName](std::optional<TerminalPane> pane,
+                                                           std::optional<RpcError> err) {
+            if (!self)
+                return;
+            if (err) {
+                self->finishResolution(key, QString(), err->message);
+                return;
+            }
+            if (!pane || pane->tmuxTarget.isEmpty()) {
+                // The server owns the mint and fills a missing target in the
+                // same transaction, so this cannot happen against a codeharbord
+                // of this generation. Reported rather than papered over: the
+                // alternatives are a pane that silently attaches nothing, or a
+                // client that starts minting names of its own again.
+                self->finishResolution(
+                    key, QString(),
+                    QStringLiteral("the server returned this terminal without a tmux target"));
+                return;
+            }
+            self->m_targets.insert(key, pane->tmuxTarget);
+            if (!byRow && !pane->id.value.isEmpty()) {
+                // Remember the answer under the row id too, so the backfill
+                // this is about to trigger does not make the next attach pay
+                // for a second round trip under the new key.
+                self->m_targets.insert(pane->id.value, pane->tmuxTarget);
+            }
+            self->finishResolution(key, pane->tmuxTarget, QString());
+            // AFTER the waiters have their target: the backfill republishes the
+            // layout, and the pane should already be attaching by then.
+            if (!byRow && !pane->id.value.isEmpty())
+                emit self->paneRowResolved(devSessionId, paneName, pane->id.value);
+        });
+    return true;
+}
+
+void TerminalFactory::finishResolution(const QString& key, const QString& target,
+                                       const QString& message)
+{
+    // Taken out of the map BEFORE anything is emitted: a pane that hears its
+    // answer is free to call straight back into resolveTarget() (a retry after
+    // a failure does exactly that), and it must start a new flight rather than
+    // append to the list being drained.
+    const Waiters waiters = m_resolving.take(key);
+    for (const QPointer<TerminalController>& waiter : waiters) {
+        if (!waiter)
+            continue;
+        if (target.isEmpty() && !message.isEmpty())
+            emit error(waiter, message);
+        emit targetResolved(waiter, target);
+    }
+}
+
 bool TerminalFactory::attach(TerminalController* controller,
-                             const QString& devSessionId,
-                             const QString& terminalId,
+                             const QString& tmuxTarget,
                              const QString& workingDir,
                              int cols,
                              int rows)
@@ -139,6 +295,13 @@ bool TerminalFactory::attach(TerminalController* controller,
         return false;
     if (!connected()) {
         emit error(controller, QStringLiteral("no SSH connection"));
+        return false;
+    }
+    if (tmuxTarget.isEmpty()) {
+        // The pane has not been resolved against the server yet. Refused rather
+        // than defaulted: every locally-plausible default is a name some other
+        // pane may already be using.
+        emit error(controller, QStringLiteral("no tmux target for this pane"));
         return false;
     }
 
@@ -154,13 +317,9 @@ bool TerminalFactory::attach(TerminalController* controller,
     const int lines = rows > 0 ? rows
                                : (controller->rows() > 0 ? controller->rows() : kDefaultRows);
 
-    const DevSessionId devSession{devSessionId};
-    const TerminalId terminal{terminalId};
-    // Both come from the hardened SPEC 5.2 helpers: stable ids, shell-safe
-    // quoting. Nothing about the command is assembled here.
-    const QString target = TerminalController::tmuxTarget(devSession, terminal);
-    const QString command =
-        TerminalController::tmuxNewSessionCommand(devSession, terminal, workingDir);
+    // Shell-safe quoting, from the hardened SPEC 5.2 helper. Nothing about the
+    // command is assembled here, and nothing about the TARGET is decided here.
+    const QString command = TerminalController::tmuxNewSessionCommand(tmuxTarget, workingDir);
 
     // Record the tmux target BEFORE anything below can fail. targetFor() is
     // what kill() destroys, and it has to name the session THIS pane is now
@@ -169,7 +328,7 @@ bool TerminalFactory::attach(TerminalController* controller,
     // failed to open its channel would still answer kill() with the PREVIOUS
     // attach's target — and kill() would destroy a tmux session, processes and
     // all, belonging to a pane the user never touched.
-    rememberTarget(controller, target);
+    rememberTarget(controller, tmuxTarget);
 
     auto* device = new SshChannelDevice(m_pool, SshConnectionPool::ChannelKind::Pty, controller);
     connect(device, &SshChannelDevice::channelError, this,

@@ -32,6 +32,20 @@ target_link_libraries(tst_sshchanneldevice PRIVATE
 
 add_test(NAME tst_sshchanneldevice COMMAND tst_sshchanneldevice)
 
+# libssh's diagnostic logging is process-global. SshLogRouter owns that state on
+# behalf of every pool; this covers the half of it that needs no SSH server:
+# install/restore refcounting, out-of-order release, per-thread attribution, and
+# the transcript cap.
+qt_add_executable(tst_sshlogrouter tst_sshlogrouter.cpp)
+
+target_link_libraries(tst_sshlogrouter PRIVATE
+    Qt6::Core
+    Qt6::Test
+    ch_ssh
+)
+
+add_test(NAME tst_sshlogrouter COMMAND tst_sshlogrouter)
+
 # LIVE gate (docs/PLAN.md S): exercises the real SSH spine against a real sshd.
 # Registered unconditionally and labelled `live`; the test QSKIPs when
 # CH_LIVE_SSH is unset so the default `ctest` run stays green everywhere.

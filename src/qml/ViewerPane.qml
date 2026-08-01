@@ -186,6 +186,60 @@ Item {
         }
     }
 
+    // ---- outside the repository root (SPEC 9) ------------------------------
+    //
+    // A path outside the Dev Session's repository root is ALLOWED and stays
+    // fully openable — SPEC 9 requires exactly that — but the UI has to SAY so.
+    // A Dev Session exists to scope work to one repository, and every path here
+    // lives on a remote server where the user has no file manager giving them
+    // context, so an out-of-project file that looks identical to an in-project
+    // one invites edits to the wrong file. Nothing below confines anything; it
+    // only labels.
+    //
+    // Tri-state, because "not determined yet" is a real answer and must show
+    // NOTHING rather than guess either way: "" (unknown) | "inside" | "outside".
+    property string repoRootState: ""
+
+    readonly property bool outsideRepository: pane.repoRootState === "outside"
+
+    // The path worth asking about: a remote path, and only when there is a Dev
+    // Session for it to be outside OF. displayPath is the address ITSELF for an
+    // https:// page or an internal URL, neither of which starts with "/", so
+    // those ask nothing and stay unmarked — a web page is not "outside the
+    // repository root" and marking it would be noise. An empty pane has an
+    // empty displayPath and likewise asks nothing.
+    readonly property string repoCheckTarget:
+        (pane.sessionRoot.length > 0 && pane.displayPath.length > 0
+         && pane.displayPath.charAt(0) === "/") ? pane.displayPath : ""
+
+    // What the outstanding file.resolvePath was asked about, and what a reply is
+    // matched against so an answer about a path the pane has already navigated
+    // away from cannot label the new one. The base is kept too: the answer
+    // depends on it as much as on the path, so switching Dev Session re-asks
+    // even while the pane keeps showing the same file.
+    property string repoCheckPath: ""
+    property string repoCheckBase: ""
+
+    // Ask, unless this exact question is already asked and answered. The guard
+    // is what lets the call be driven from several handlers (and from
+    // Component.onCompleted, since a pane can be born already showing a file)
+    // without spending a round trip per handler.
+    function checkRepoRoot() {
+        if (pane.repoCheckTarget === pane.repoCheckPath
+                && pane.sessionRoot === pane.repoCheckBase)
+            return;
+        pane.repoCheckPath = pane.repoCheckTarget;
+        pane.repoCheckBase = pane.sessionRoot;
+        // Whatever was known was known about a different path.
+        pane.repoRootState = "";
+        if (pane.repoCheckPath.length === 0 || !pane.viewerModel)
+            return;
+        pane.viewerModel.resolvePath(pane.repoCheckPath, pane.repoCheckBase);
+    }
+
+    onRepoCheckTargetChanged: pane.checkRepoRoot()
+    onSessionRootChanged: pane.checkRepoRoot()
+
     // ---- address entry -----------------------------------------------------
 
     // A path typed WITHOUT a trailing slash is ambiguous: only the server knows
@@ -245,6 +299,21 @@ Item {
             pane.probePath = "";
             pane.openRemotePath(path);
         }
+        // Same rule as the probe above: `viewers` is shared by every pane, so a
+        // reply is only this pane's if it names the path this pane asked about.
+        function onPathResolved(path, resolvedPath, insideRepositoryRoot) {
+            if (path !== pane.repoCheckPath)
+                return;
+            pane.repoRootState = insideRepositoryRoot ? "inside" : "outside";
+        }
+        function onPathResolveError(path, message) {
+            if (path !== pane.repoCheckPath)
+                return;
+            // Undetermined. Shown as nothing at all: claiming "inside" would
+            // hide a real out-of-project file and claiming "outside" would
+            // slander an ordinary one.
+            pane.repoRootState = "";
+        }
     }
 
     // Put the cursor in the address bar. Reached from the header title, so
@@ -261,7 +330,10 @@ Item {
     onDisplayPathChanged: if (!addressField.activeFocus)
                               addressField.text = pane.displayPath
 
-    Component.onCompleted: addressField.text = pane.displayPath
+    Component.onCompleted: {
+        addressField.text = pane.displayPath;
+        pane.checkRepoRoot();
+    }
 
     // ---- chrome ------------------------------------------------------------
 
@@ -325,7 +397,7 @@ Item {
 
             anchors.left: parent.left
             anchors.leftMargin: 6
-            anchors.right: goButton.left
+            anchors.right: outsideMarker.left
             anchors.rightMargin: 4
             anchors.verticalCenter: parent.verticalCenter
             height: parent.height - 6
@@ -358,6 +430,73 @@ Item {
                 addressField.deselect();
                 pane.forceActiveFocus();
                 event.accepted = true;
+            }
+        }
+
+        // The SPEC 9 marker. Quiet by design — beside the address rather than a
+        // banner, and in no way blocking: being outside the repository root is
+        // a legitimate state the user is allowed to be in, just an easy one to
+        // be in by accident. Zero-width while hidden, so an in-project pane's
+        // address field is exactly as wide as it was before.
+        Rectangle {
+            id: outsideMarker
+            objectName: "viewerOutsideRepoMarker"
+
+            // The full sentence, said once: the hover tooltip and the screen
+            // reader description are the same words.
+            readonly property string hint:
+                qsTr("This path is outside the project's repository root.")
+
+            anchors.right: goButton.left
+            anchors.verticalCenter: parent.verticalCenter
+            visible: pane.outsideRepository
+            width: visible ? outsideLabel.implicitWidth + 12 : 0
+            height: 18
+            radius: Theme.radiusSmall
+            color: "transparent"
+            border.width: 1
+            border.color: Theme.warning
+
+            // The chip is colour plus three small words; neither reaches a
+            // screen reader on its own, exactly as the sidebar's status dot
+            // does not (see the Accessible block in SessionRow.qml).
+            Accessible.role: Accessible.StaticText
+            Accessible.name: qsTr("Outside the project")
+            Accessible.description: outsideMarker.hint
+
+            HoverHandler { id: outsideHover }
+
+            Label {
+                id: outsideLabel
+                anchors.centerIn: parent
+                textFormat: Text.PlainText
+                text: qsTr("outside project")
+                color: Theme.warning
+                font.pixelSize: Theme.fontSizeSmall
+            }
+
+            // An explicit ToolTip for the reason AppPaneHeader.Action gives:
+            // the attached one is drawn by the Basic style in that style's own
+            // light palette, so a hint about dark chrome arrives as a white box.
+            ToolTip {
+                id: outsideTip
+                x: 0
+                y: outsideMarker.height + 4
+                delay: 400
+                visible: outsideHover.hovered
+                padding: 6
+                contentItem: Label {
+                    textFormat: Text.PlainText
+                    text: outsideMarker.hint
+                    color: Theme.text
+                    font.pixelSize: Theme.fontSizeSmall
+                }
+                background: Rectangle {
+                    color: Theme.surfaceSunken
+                    border.color: Theme.border
+                    border.width: 1
+                    radius: Theme.radiusSmall
+                }
             }
         }
 

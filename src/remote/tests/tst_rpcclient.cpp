@@ -9,14 +9,17 @@
 #include <QLocalServer>
 #include <QLocalSocket>
 #include <QProcess>
+#include <QProcessEnvironment>
 #include <QSignalSpy>
 #include <QStandardPaths>
+#include <QTemporaryDir>
 #include <QString>
 #include <QtTest/QtTest>
 #include <QScopeGuard>
 
 #include <cstring>
 #include <optional>
+#include <utility>
 
 using ch::CodeharbordClient;
 using ch::RpcError;
@@ -53,6 +56,8 @@ public:
         emit readyRead();
     }
     void setShortWrite(bool on) { m_shortWrite = on; }
+    // Everything the client has written since the last call, as raw wire bytes.
+    QByteArray takeWritten() { return std::exchange(m_out, QByteArray()); }
 
     bool isSequential() const override { return true; }
     qint64 bytesAvailable() const override
@@ -68,15 +73,73 @@ protected:
         m_in.remove(0, n);
         return n;
     }
-    qint64 writeData(const char*, qint64 maxSize) override
+    qint64 writeData(const char* data, qint64 maxSize) override
     {
-        return m_shortWrite ? maxSize / 2 : maxSize;
+        const qint64 n = m_shortWrite ? maxSize / 2 : maxSize;
+        m_out.append(data, n);
+        return n;
     }
 
 private:
     QByteArray m_in;
+    QByteArray m_out;
     bool m_shortWrite = false;
 };
+
+// The JSON-RPC ids of every `ping` frame the client has written since the last
+// call, in order, WITHOUT answering any of them. Any other frame the client
+// wrote is consumed and ignored — the tests that care about those read them
+// from takeWritten() themselves.
+QList<qint64> takePingIds(ScriptedDevice& device)
+{
+    QList<qint64> ids;
+    const QList<QByteArray> lines = device.takeWritten().split('\n');
+    for (const QByteArray& line : lines) {
+        if (line.isEmpty())
+            continue;
+        const QJsonObject request = QJsonDocument::fromJson(line).object();
+        if (request.value(QStringLiteral("method")).toString() ==
+            QLatin1String(ch::rpc::kMethodPing))
+            ids.append(request.value(QStringLiteral("id")).toInteger());
+    }
+    return ids;
+}
+
+// Answer one probe by id, exactly as a live daemon's keepalive handler would.
+void answerPing(ScriptedDevice& device, qint64 id)
+{
+    device.deliver(jsonLine({{"jsonrpc", "2.0"},
+                             {"id", id},
+                             {"result", QJsonObject{{"pong", true}}}}));
+}
+
+// Answer every probe written since the last call, and report how many.
+int answerPings(ScriptedDevice& device)
+{
+    const QList<qint64> ids = takePingIds(device);
+    for (const qint64 id : ids)
+        answerPing(device, id);
+    return static_cast<int>(ids.size());
+}
+
+// How many probes the client has written since the last call, answering none.
+int countPings(ScriptedDevice& device)
+{
+    return static_cast<int>(takePingIds(device).size());
+}
+
+// Spin the event loop until the client writes a probe, and return its id. Fails
+// the calling test (returns 0) if none appears within `budgetMs`.
+qint64 awaitPing(ScriptedDevice& device, int budgetMs = 2000)
+{
+    for (int waited = 0; waited < budgetMs; waited += 10) {
+        const QList<qint64> ids = takePingIds(device);
+        if (!ids.isEmpty())
+            return ids.first();
+        QTest::qWait(10);
+    }
+    return 0;
+}
 
 } // namespace
 
@@ -131,6 +194,13 @@ private slots:
     void shortWriteFailsCallAndClosesTransport();
     void transportBoundFiresOnlyForNonNullBind();
     void liveServerInfoOverProcess();
+    void heartbeatAnsweredKeepsClientAliveAndOffThePendingCount();
+    void heartbeatSilentPeerFailsPendingOnceAndClosesOnce();
+    void silentPeerIsNotKilledWithTheHeartbeatDisabled();
+    void heartbeatSparesASlowButLivePeer();
+    void heartbeatStopsWhenTransportUnbound();
+    void retiredProbeAnswerDoesNotClobberTheLiveProbe();
+    void rebindFromInsideACallbackKeepsProbeBookkeepingStraight();
 
 private:
     void makePair();
@@ -1562,6 +1632,19 @@ void TstRpcClient::liveServerInfoOverProcess()
         if (m_client && m_client->transport())
             m_client->setTransport(nullptr);
     });
+    // Point the child at a throwaway database. Without this it inherits an
+    // unset CODEHARBOR_DB and codeharbord opens the DEVELOPER'S real workspace
+    // database under ~/.local/share, which makes this case order-dependent,
+    // lets it fail for reasons unrelated to the transport it is testing (a
+    // stored schema version newer than this build's is correctly refused), and
+    // means a test writes to real user data. tst_workspacedb's sibling process
+    // case already isolates itself this way; the two had drifted apart.
+    QTemporaryDir dbDir;
+    QVERIFY(dbDir.isValid());
+    QProcessEnvironment envp = QProcessEnvironment::systemEnvironment();
+    envp.insert(QStringLiteral("CODEHARBOR_DB"),
+                dbDir.filePath(QStringLiteral("ws.db")));
+    proc.setProcessEnvironment(envp);
     proc.setProgram(node);
     proc.setArguments({QStringLiteral(CH_REPO_ROOT "/remote/src/codeharbord.ts"),
                        QStringLiteral("rpc"), QStringLiteral("--stdio")});
@@ -1591,6 +1674,366 @@ void TstRpcClient::liveServerInfoOverProcess()
     proc.terminate();
     if (!proc.waitForFinished(2000))
         proc.kill();
+}
+
+// --- transport heartbeat -----------------------------------------------------
+//
+// The heartbeat exists for the failure the rest of this file cannot produce: a
+// transport that stays open, readable and writable while the peer behind it has
+// stopped answering. There is no EOF, no disconnected(), no write error — every
+// mechanism the client already had is silent — so without a heartbeat every
+// pending caller waits forever, which in the app is an editor pane stuck on
+// "saving…" for the rest of the session.
+//
+// All four use ScriptedDevice, whose writeData() now records the bytes, so the
+// test can see the probes and decide whether to answer them. Intervals are
+// compressed to tens of milliseconds; production runs at
+// kDefaultHeartbeatIntervalMs / kDefaultHeartbeatMisses.
+
+// A peer that answers probes is left alone forever, and the probe traffic is
+// invisible: it never lands in pendingCount(), never produces a warning, and
+// never disturbs an ordinary request travelling beside it.
+void TstRpcClient::heartbeatAnsweredKeepsClientAliveAndOffThePendingCount()
+{
+    ScriptedDevice device;
+    // Enabled BEFORE the bind on purpose: the order must not matter.
+    m_client->enableHeartbeat(50, 4);
+    m_client->setTransport(&device);
+
+    QSignalSpy closedSpy(m_client, &CodeharbordClient::transportClosed);
+    QSignalSpy warnSpy(m_client, &CodeharbordClient::protocolWarning);
+
+    // An ordinary request the peer takes its time over — the long transfer the
+    // heartbeat must never kill.
+    QJsonValue result;
+    bool fired = false;
+    const qint64 id = m_client->call(
+        QStringLiteral("file.readFile"), QJsonObject{{"path", "/big"}},
+        [&](QJsonValue r, std::optional<RpcError> err) {
+            QVERIFY(!err.has_value());
+            result = r;
+            fired = true;
+        });
+    QCOMPARE(m_client->pendingCount(), 1);
+
+    // Ten intervals — two and a half times the whole death budget — of a peer
+    // that answers nothing but the probes.
+    int probes = 0;
+    for (int i = 0; i < 10; ++i) {
+        QTest::qWait(50);
+        probes += answerPings(device);
+        QCOMPARE(m_client->pendingCount(), 1); // the probe is never counted
+        QVERIFY(!fired);
+    }
+    QVERIFY2(probes >= 5, "the heartbeat never actually probed");
+    QCOMPARE(closedSpy.count(), 0);
+    QCOMPARE(warnSpy.count(), 0); // probe replies are never "unknown ids"
+
+    // And the slow request still completes normally afterwards.
+    device.deliver(jsonLine({{"jsonrpc", "2.0"},
+                             {"id", id},
+                             {"result", QJsonObject{{"content", "B"}}}}));
+    QVERIFY(fired);
+    QCOMPARE(result.toObject().value("content").toString(), QStringLiteral("B"));
+    QCOMPARE(m_client->pendingCount(), 0);
+    QCOMPARE(closedSpy.count(), 0);
+
+    m_client->setTransport(nullptr);
+}
+
+// The case the whole feature exists for: the transport stays perfectly healthy
+// and the peer simply stops answering. Every pending callback must be failed
+// EXACTLY once with the standard synthetic transport error, and transportClosed()
+// must be emitted exactly once — the same observable behaviour as a real
+// disconnect, which is what SessionBootstrap's reconnect ladder acts on.
+void TstRpcClient::heartbeatSilentPeerFailsPendingOnceAndClosesOnce()
+{
+    ScriptedDevice device;
+    m_client->enableHeartbeat(30, 3);
+    m_client->setTransport(&device);
+
+    QSignalSpy closedSpy(m_client, &CodeharbordClient::transportClosed);
+
+    int failures = 0;
+    std::optional<RpcError> last;
+    for (int i = 0; i < 3; ++i) {
+        m_client->call(QStringLiteral("workspace.list"), QJsonValue(),
+                       [&](QJsonValue, std::optional<RpcError> err) {
+                           QVERIFY(err.has_value());
+                           last = err;
+                           ++failures;
+                       });
+    }
+    QCOMPARE(m_client->pendingCount(), 3);
+
+    QTRY_VERIFY_WITH_TIMEOUT(closedSpy.count() == 1, 5000);
+    QCOMPARE(failures, 3);
+    QVERIFY(last.has_value());
+    QCOMPARE(last->code, -32603);
+    QCOMPARE(last->message,
+             QStringLiteral("transport closed with request pending"));
+    QCOMPARE(m_client->pendingCount(), 0);
+
+    // The probe really was sent before the client gave up on it, and the client
+    // stays latched dead rather than closing again every interval.
+    QVERIFY(countPings(device) >= 1);
+    QTest::qWait(200);
+    QCOMPARE(closedSpy.count(), 1);
+    QCOMPARE(failures, 3);
+    QCOMPARE(countPings(device), 0); // the timer really stopped
+
+    m_client->setTransport(nullptr);
+}
+
+// The control for the case above, and the proof that the heartbeat is what
+// produces it: identical script, heartbeat never enabled. Nothing happens — the
+// three callers hang, which is exactly the bug being fixed.
+void TstRpcClient::silentPeerIsNotKilledWithTheHeartbeatDisabled()
+{
+    ScriptedDevice device;
+    m_client->setTransport(&device); // no enableHeartbeat()
+
+    QSignalSpy closedSpy(m_client, &CodeharbordClient::transportClosed);
+
+    int failures = 0;
+    for (int i = 0; i < 3; ++i) {
+        m_client->call(QStringLiteral("workspace.list"), QJsonValue(),
+                       [&](QJsonValue, std::optional<RpcError>) { ++failures; });
+    }
+
+    // Longer than the 90 ms budget the previous test dies inside of.
+    QTest::qWait(400);
+    QCOMPARE(closedSpy.count(), 0);
+    QCOMPARE(failures, 0);
+    QCOMPARE(m_client->pendingCount(), 3);
+    QCOMPARE(countPings(device), 0); // and no probe was ever written
+
+    m_client->setTransport(nullptr);
+    QCOMPARE(failures, 3); // detach is still what rescues them today
+}
+
+// A peer midway through writing one huge frame cannot answer a probe: this is a
+// single serialized JSONL stream, so its reply physically cannot be interleaved
+// into the frame it is still emitting. Bytes — any bytes — are therefore the
+// liveness evidence, not probe replies. Without that rule the heartbeat would
+// tear down precisely the slow multi-megabyte file.readFile the no-timeout
+// design exists to protect.
+void TstRpcClient::heartbeatSparesASlowButLivePeer()
+{
+    ScriptedDevice device;
+    m_client->enableHeartbeat(30, 3);
+    m_client->setTransport(&device);
+
+    QSignalSpy closedSpy(m_client, &CodeharbordClient::transportClosed);
+
+    QJsonValue result;
+    bool fired = false;
+    const qint64 id = m_client->call(
+        QStringLiteral("file.readFile"), QJsonObject{{"path", "/big"}},
+        [&](QJsonValue r, std::optional<RpcError> err) {
+            QVERIFY(!err.has_value());
+            result = r;
+            fired = true;
+        });
+
+    // Dribble one frame out in newline-less pieces, far past the 90 ms budget.
+    // No probe is ever answered, no complete message is ever routed.
+    const QByteArray frame = jsonLine({{"jsonrpc", "2.0"},
+                                       {"id", id},
+                                       {"result", QJsonObject{{"content", "B"}}}});
+    for (qsizetype i = 0; i < frame.size() - 1; ++i) {
+        device.deliver(frame.mid(i, 1));
+        QTest::qWait(20);
+        QVERIFY2(closedSpy.count() == 0,
+                 "a peer that is still sending bytes was declared dead");
+        QVERIFY(!fired);
+    }
+
+    // The final newline completes it and the caller is answered normally.
+    device.deliver(frame.right(1));
+    QVERIFY(fired);
+    QCOMPARE(result.toObject().value("content").toString(), QStringLiteral("B"));
+    QCOMPARE(closedSpy.count(), 0);
+
+    m_client->setTransport(nullptr);
+}
+
+// Unbinding must stop the timer. The device is a stack object the caller is
+// free to destroy the moment it is detached, so a tick that survived the unbind
+// would probe through a dangling pointer — and one that merely "closed" an
+// already-detached client would emit a disconnect the consumer never had.
+void TstRpcClient::heartbeatStopsWhenTransportUnbound()
+{
+    QSignalSpy closedSpy(m_client, &CodeharbordClient::transportClosed);
+    // A deliberately huge miss tolerance: this case is about the TIMER'S
+    // LIFETIME, not about detection, and a peer that answers nothing must not
+    // die mid-test and mask the thing being asserted.
+    {
+        ScriptedDevice device;
+        m_client->enableHeartbeat(20, 500);
+        m_client->setTransport(&device);
+        QTest::qWait(80);
+        QVERIFY2(countPings(device) >= 1, "the heartbeat never armed");
+
+        // Detach, then watch the device that is STILL ALIVE but no longer bound.
+        // Not one further probe may be written to it.
+        m_client->setTransport(nullptr);
+        QTest::qWait(200); // ten intervals
+        QCOMPARE(countPings(device), 0);
+    } // device destroyed while the client lives on
+
+    // More intervals still, now with the device freed: a tick that had survived
+    // the unbind would dereference a dangling pointer here.
+    QTest::qWait(200);
+    QCOMPARE(closedSpy.count(), 0);
+    QCOMPARE(m_client->pendingCount(), 0);
+
+    // Rebinding re-arms it against the NEW transport — the reconnect case.
+    ScriptedDevice revived;
+    m_client->setTransport(&revived);
+    bool probed = false;
+    for (int i = 0; i < 20 && !probed; ++i) {
+        QTest::qWait(20);
+        probed = answerPings(revived) >= 1;
+    }
+    QVERIFY2(probed, "the heartbeat did not re-arm on the new transport");
+    QCOMPARE(closedSpy.count(), 0);
+
+    m_client->setTransport(nullptr);
+}
+
+// A probe's callback can run when that probe is no longer the one being awaited,
+// and it must then do NOTHING. Two routes reach that state; this is the one that
+// can be driven deterministically.
+//
+// Re-arming the heartbeat on a LIVE transport retires the probe in flight — it
+// stays in the pending map and stays on the wire, because nothing swept it — and
+// the next tick issues its successor. When the peer finally answers the RETIRED
+// probe, a callback that cannot tell the two apart clears the live one. The
+// damage: the one-probe-in-flight invariant breaks (the next tick sends a third
+// probe while the second is still outstanding), pendingCount() stops excluding
+// the right entry, and the miss counter starts measuring the wrong silence —
+// which can produce either a spurious teardown or a missed one.
+//
+// The other route is a rebind whose pending-sweep callbacks spin a nested event
+// loop; the case below covers that shape, and the same generation stamp fixes
+// both.
+void TstRpcClient::retiredProbeAnswerDoesNotClobberTheLiveProbe()
+{
+    ScriptedDevice device;
+    // A huge miss tolerance: this case is about the bookkeeping, and the peer
+    // deliberately leaves probes unanswered for many intervals.
+    m_client->enableHeartbeat(20, 1000);
+    m_client->setTransport(&device);
+
+    QSignalSpy closedSpy(m_client, &CodeharbordClient::transportClosed);
+    QSignalSpy warnSpy(m_client, &CodeharbordClient::protocolWarning);
+
+    // One ordinary caller, so pendingCount() has something real to report.
+    bool callerFired = false;
+    const qint64 callerId =
+        m_client->call(QStringLiteral("workspace.list"), QJsonValue(),
+                       [&](QJsonValue, std::optional<RpcError> err) {
+                           QVERIFY(!err.has_value());
+                           callerFired = true;
+                       });
+
+    const qint64 retired = awaitPing(device);
+    QVERIFY2(retired != 0, "the heartbeat never armed");
+    QCOMPARE(m_client->pendingCount(), 1);
+
+    // Re-arm on the live transport. Documented as idempotent, and this is what
+    // it costs: `retired` is now abandoned but still pending and still on the
+    // wire, so it must keep being excluded from pendingCount().
+    m_client->enableHeartbeat(20, 1000);
+    QCOMPARE(m_client->pendingCount(), 1);
+
+    const qint64 live = awaitPing(device);
+    QVERIFY2(live != 0, "the re-arm did not issue a successor probe");
+    QVERIFY(live != retired);
+    QCOMPARE(m_client->pendingCount(), 1); // both probes excluded
+
+    // The peer answers the RETIRED probe, late. `live` is still unanswered.
+    answerPing(device, retired);
+    QCOMPARE(m_client->pendingCount(), 1);
+    QCOMPARE(warnSpy.count(), 0); // routed normally, never an "unknown id"
+
+    // THE ASSERTION. `live` is still outstanding, so the client must keep
+    // waiting on it. A third probe here would mean the retired answer was taken
+    // as an answer for `live`.
+    for (int i = 0; i < 8; ++i) {
+        QTest::qWait(20);
+        QCOMPARE(countPings(device), 0);
+    }
+    QCOMPARE(closedSpy.count(), 0);
+
+    // And the heartbeat is not wedged: answering the LIVE probe does release the
+    // next one.
+    answerPing(device, live);
+    QVERIFY2(awaitPing(device) != 0, "the heartbeat stopped probing");
+
+    // The ordinary caller was untouched throughout.
+    QVERIFY(!callerFired);
+    device.deliver(jsonLine({{"jsonrpc", "2.0"}, {"id", callerId}, {"result", 1}}));
+    QVERIFY(callerFired);
+    QCOMPARE(m_client->pendingCount(), 0);
+
+    m_client->setTransport(nullptr);
+}
+
+// The other route to the same hole, and a reentrancy-safety case in its own
+// right. setTransport() retires the old probe, then sweeps the old pending map;
+// any callback in that sweep may spin a nested event loop, in which the timer
+// fires and puts the successor probe on the NEW transport — so the sweep can
+// reach the retired probe's callback after its successor is already live.
+//
+// Honest about its limits: failAllPending() iterates a QHash, so whether the
+// nested loop runs BEFORE or AFTER the retired probe's callback is not something
+// a test can pin down. This case therefore does not reliably TRIGGER the hole
+// (the case above does, deterministically) — what it reliably asserts is that
+// rebinding from inside a swept callback, with the timer firing underneath,
+// leaves the probe bookkeeping intact and touches nothing freed.
+void TstRpcClient::rebindFromInsideACallbackKeepsProbeBookkeepingStraight()
+{
+    ScriptedDevice first;
+    ScriptedDevice second;
+    m_client->enableHeartbeat(20, 1000);
+    m_client->setTransport(&first);
+
+    QSignalSpy closedSpy(m_client, &CodeharbordClient::transportClosed);
+
+    QVERIFY2(awaitPing(first) != 0, "the heartbeat never armed");
+
+    // A caller whose failure callback rebinds and then lets the event loop run,
+    // so the heartbeat can probe the new transport mid-sweep.
+    int swept = 0;
+    m_client->call(QStringLiteral("workspace.list"), QJsonValue(),
+                   [&](QJsonValue, std::optional<RpcError> err) {
+                       QVERIFY(err.has_value());
+                       ++swept;
+                       QTest::qWait(60); // three intervals, nested
+                   });
+    QCOMPARE(m_client->pendingCount(), 1);
+
+    // The rebind. Its sweep fails both the caller above and the probe on
+    // `first`, in an order the QHash chooses.
+    m_client->setTransport(&second);
+    QCOMPARE(swept, 1);
+    QCOMPARE(m_client->pendingCount(), 0);
+
+    // Exactly ONE probe may ever be in flight on the new transport. Nothing
+    // answers it, so across many intervals the client must send it once and then
+    // wait — a second probe would mean a retired callback cleared the live one.
+    int probes = countPings(second);
+    for (int i = 0; i < 10; ++i) {
+        QTest::qWait(20);
+        probes += countPings(second);
+    }
+    QCOMPARE(probes, 1);
+    QCOMPARE(m_client->pendingCount(), 0); // the probe is still excluded
+    QCOMPARE(closedSpy.count(), 0);
+
+    m_client->setTransport(nullptr);
 }
 
 QTEST_GUILESS_MAIN(TstRpcClient)

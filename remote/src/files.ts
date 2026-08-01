@@ -425,6 +425,7 @@ export function resolvePath(params: ResolvePathParams): ResolvePathResult {
 }
 
 type WatchCallback = (event: WatchEvent) => void;
+type WatchClosedCallback = (subscriptionId: string) => void;
 
 interface Subscription {
     id: string;
@@ -461,6 +462,22 @@ export class FileWatchService {
     onWatchEvent(callback: WatchCallback): () => void {
         this.emitter.on("event", callback);
         return () => this.emitter.off("event", callback);
+    }
+
+    // Announce that a subscription is gone (unwatch, or closeAll when the SSH
+    // channel drops). codeharbord's notification relay may be holding queued
+    // events for it while the client's end of the channel is stalled; without
+    // this signal that queue would outlive its only possible consumer.
+    onWatchClosed(callback: WatchClosedCallback): () => void {
+        this.emitter.on("closed", callback);
+        return () => this.emitter.off("closed", callback);
+    }
+
+    // Whether `id` is still an active subscription. The relay consults this
+    // before queueing or delivering, so an event that was already in flight
+    // when the client unwatched is never handed to a subscriber that is gone.
+    hasSubscription(id: string): boolean {
+        return this.subscriptions.has(id);
     }
 
     async watch(params: WatchParams): Promise<WatchResult> {
@@ -500,6 +517,9 @@ export class FileWatchService {
             sub.watcher?.close();
             clearInterval(sub.poll);
             this.subscriptions.delete(params.subscriptionId);
+            // Emitted only for a subscription that actually existed, so a
+            // duplicate unwatch (or closeAll after unwatch) is silent.
+            this.emitter.emit("closed", params.subscriptionId);
         }
         return { ok: true };
     }

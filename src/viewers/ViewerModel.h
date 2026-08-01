@@ -95,6 +95,27 @@ public:
     // each a {name, kind} map; on failure or without a client, directoryError.
     Q_INVOKABLE void listDirectory(const QString &path);
 
+    // Asynchronously ask where `path` resolves and whether it lands inside
+    // `base`, the Dev Session's repository root (SPEC 9). On success emits
+    // pathResolved(path, resolvedPath, insideRepositoryRoot); on failure or
+    // without a client, pathResolveError.
+    //
+    // SPEC 9 allows paths outside the root and this call does NOT change that:
+    // the flag is a UI hint the pane shows as a marker, never a gate. The
+    // server's flag is lexical (see resolvePath in remote/src/files.ts), so it
+    // costs no filesystem access.
+    //
+    // `base` is passed rather than left to the server's default (its own
+    // working directory), because "the project" is the ACTIVE Dev Session's
+    // repository root and only the client knows which session a pane belongs
+    // to. An empty `base` is omitted from the request.
+    //
+    // Keyed by path like listDirectory and deliberately not by a token: unlike
+    // a file read, the answer for one path is the same for every pane that
+    // asks, so a second pane receiving the first pane's reply learns exactly
+    // what it would have been told anyway.
+    Q_INVOKABLE void resolvePath(const QString &path, const QString &base);
+
 signals:
     void textFileRead(const QString &token, const QString &path,
                       const QString &content);
@@ -102,6 +123,12 @@ signals:
                        const QString &message);
     void directoryListed(const QString &path, const QVariantList &entries);
     void directoryError(const QString &path, const QString &message);
+    // `path` echoes what was ASKED for (not the resolved spelling), so a pane
+    // can tell an answer about the file it is showing from an answer about the
+    // file it has since navigated away from.
+    void pathResolved(const QString &path, const QString &resolvedPath,
+                      bool insideRepositoryRoot);
+    void pathResolveError(const QString &path, const QString &message);
 
 private:
     ViewerProfiles *profiles();

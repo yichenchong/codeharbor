@@ -11,6 +11,7 @@
 #include <QLocalSocket>
 #include <QQmlComponent>
 #include <QQmlEngine>
+#include <QSet>
 #include <QSignalSpy>
 #include <QString>
 #include <QTemporaryDir>
@@ -54,6 +55,40 @@ QJsonObject leaf(const QString& paneId)
     return QJsonObject{{"type", "leaf"}, {"paneId", paneId}};
 }
 
+// A terminal leaf bound to its server-minted `terminal_panes` row. That id is
+// the pane's identity; the paneId beside it is only a slot label.
+QJsonObject terminalLeaf(const QString& paneId, const QString& rowId)
+{
+    return QJsonObject{{"type", "leaf"}, {"paneId", paneId}, {"terminalPaneId", rowId}};
+}
+
+// How a leaf with no row id is PUBLISHED after being loaded from the server:
+// marked as pre-migration, i.e. allowed to resolve by its label exactly once.
+// The marker is client-side only and never persisted.
+QJsonObject legacyLeaf(const QString& paneId)
+{
+    return QJsonObject{{"type", "leaf"}, {"paneId", paneId}, {"terminalLegacy", true}};
+}
+
+// The row id the fake server hands back for a mint of `paneId`. Deterministic
+// so a test can predict the tree that results.
+QString rowIdFor(const QString& paneId)
+{
+    return QStringLiteral("row-") + paneId;
+}
+
+// A workspace.createTerminalPane / resolveTerminalPane result row. Only `id`
+// and `tmuxTarget` are read by the client.
+QJsonObject terminalPaneRow(const QString& paneId)
+{
+    return QJsonObject{{"id", rowIdFor(paneId)},
+                       {"serverId", "srv-1"},
+                       {"devSessionId", "s1"},
+                       {"name", paneId},
+                       {"tmuxTarget", QStringLiteral("ch_s1_") + rowIdFor(paneId)},
+                       {"position", 0}};
+}
+
 QJsonObject split(const QString& orientation, const QJsonArray& children,
                   const QJsonArray& ratios)
 {
@@ -67,6 +102,53 @@ QJsonObject split(const QString& orientation, const QJsonArray& children,
 QJsonObject layoutRow(const QJsonObject& tree)
 {
     return QJsonObject{{"id", "layout-1"}, {"tree", tree}};
+}
+
+// The terminal region default AFTER its two rows have been minted: two stacked
+// leaves, each bound to the row the fake server handed back.
+QJsonObject seededTerminalTree()
+{
+    return QJsonObject{
+        {"type", "split"},
+        {"orientation", "vertical"},
+        {"children",
+         QJsonArray{terminalLeaf(QStringLiteral("terminal-1"),
+                                 rowIdFor(QStringLiteral("terminal-1"))),
+                    terminalLeaf(QStringLiteral("terminal-2"),
+                                 rowIdFor(QStringLiteral("terminal-2")))}},
+        {"ratios", QJsonArray{1, 1}}};
+}
+
+// Every leaf's terminalPaneId, depth first, one entry per leaf (empty for a
+// leaf that carries none). The live case cannot spell a server-minted UUID out
+// in a literal, so it asserts on these instead.
+QStringList terminalRowIds(const QJsonObject& node)
+{
+    const QJsonArray children = node.value(QStringLiteral("children")).toArray();
+    if (children.isEmpty())
+        return {node.value(QStringLiteral("terminalPaneId")).toString()};
+    QStringList ids;
+    for (const QJsonValue& child : children)
+        ids += terminalRowIds(child.toObject());
+    return ids;
+}
+
+// The same tree with every leaf's terminalPaneId taken out, so the STRUCTURE -
+// slot labels, orientation, ratios - can be compared against a literal while
+// the ids the server chose are asserted separately.
+QJsonObject withoutRowIds(const QJsonObject& node)
+{
+    QJsonObject stripped = node;
+    const QJsonArray children = node.value(QStringLiteral("children")).toArray();
+    if (children.isEmpty()) {
+        stripped.remove(QStringLiteral("terminalPaneId"));
+        return stripped;
+    }
+    QJsonArray rebuilt;
+    for (const QJsonValue& child : children)
+        rebuilt.append(withoutRowIds(child.toObject()));
+    stripped[QStringLiteral("children")] = rebuilt;
+    return stripped;
 }
 
 } // namespace
@@ -99,6 +181,9 @@ private slots:
     void splitAfterCloseNeverReusesThePaneId();
     void refillingAnEmptiedRegionNeverReusesThePaneId();
     void paneNumberingIsPerDevSessionAndSurvivesRestart();
+    void legacyTerminalLeafIsBackfilledOnceAndPersisted();
+    void aFailedTerminalMintReportsAndTakesTheHalfMadePaneBack();
+    void aPaneCreatedAfterOneWithTheSameLabelWasClosedGetsItsOwnRow();
     void liveLayoutRoundTripOverSsh();
 
 private:
@@ -193,8 +278,13 @@ QJsonObject TstSessionLayouts::nextRequest()
     // reads either, so a reader that dropped the tail of its read would lose the
     // second request.
     while (!m_rxBuffer.contains('\n') && !deadline.hasExpired()) {
+        // The client side needs the event loop to see a response we already
+        // wrote: a request can be the CONSEQUENCE of one (a mint reply is what
+        // releases the layout write), and waiting on the server socket alone
+        // would never deliver it.
+        QCoreApplication::processEvents(QEventLoop::AllEvents, 10);
         if (m_serverSide->bytesAvailable() > 0
-            || m_serverSide->waitForReadyRead(50))
+            || m_serverSide->waitForReadyRead(10))
             m_rxBuffer += m_serverSide->readAll();
     }
     const qsizetype newline = m_rxBuffer.indexOf('\n');
@@ -257,16 +347,35 @@ void TstSessionLayouts::completeLoad(SessionLayouts& layouts,
     QCOMPARE(loadedSpy.at(0).at(0).toString(), sessionId);
 
     // A region the server had no row for is SEEDED: applyLoadedTree adopts the
-    // region default and immediately persists it, so two stacked terminals
-    // survive a restart instead of being re-derived until something else saves a
-    // tree. Answer those writes here; the case that asserts on them is
+    // region default and persists it, so two stacked terminals survive a restart
+    // instead of being re-derived until something else saves a tree. Answer
+    // those writes here; the case that asserts on them is
     // terminalDefaultIsTwoStackedPanesAndIsPersisted().
-    int seeds = 0;
-    if (viewerTree.isNull())
-        ++seeds;
-    if (terminalTree.isNull())
-        ++seeds;
-    for (int i = 0; i < seeds; ++i) {
+    if (viewerTree.isNull()) {
+        const QJsonObject seed = nextRequest();
+        QCOMPARE(seed.value(QStringLiteral("method")).toString(),
+                 QStringLiteral("workspace.setLayout"));
+        const QJsonObject params = seed.value(QStringLiteral("params")).toObject();
+        respondResult(seed.value(QStringLiteral("id")).toInt(),
+                      layoutRow(params.value(QStringLiteral("tree")).toObject()));
+    }
+    if (terminalTree.isNull()) {
+        // Both leaves of the seeded terminal default are BRAND NEW panes, so
+        // each mints its own terminal_panes row first. The layout write is held
+        // back until the last id lands: an id-less terminal leaf on the server
+        // is indistinguishable from a pre-migration one, and must never be
+        // written.
+        for (const QString& label :
+             {QStringLiteral("terminal-1"), QStringLiteral("terminal-2")}) {
+            const QJsonObject mint = nextRequest();
+            QCOMPARE(mint.value(QStringLiteral("method")).toString(),
+                     QStringLiteral("workspace.createTerminalPane"));
+            QCOMPARE(mint.value(QStringLiteral("params")).toObject()
+                         .value(QStringLiteral("name")).toString(),
+                     label);
+            respondResult(mint.value(QStringLiteral("id")).toInt(),
+                          terminalPaneRow(label));
+        }
         const QJsonObject seed = nextRequest();
         QCOMPARE(seed.value(QStringLiteral("method")).toString(),
                  QStringLiteral("workspace.setLayout"));
@@ -297,13 +406,13 @@ void TstSessionLayouts::loadWithoutPersistedLayoutSeedsTheRegionDefaults()
     QCOMPARE(layouts.devSessionId(), QStringLiteral("s1"));
     QCOMPARE(compact(asObject(layouts.viewerTree())),
              compact(leaf(QStringLiteral("viewer-1"))));
+    // Each seeded terminal leaf carries the id of the row minted for it. That
+    // id is the pane's identity; the "terminal-N" beside it is only a label.
     QCOMPARE(compact(asObject(layouts.terminalTree())),
-             compact(split(QStringLiteral("vertical"),
-                           {leaf(QStringLiteral("terminal-1")),
-                            leaf(QStringLiteral("terminal-2"))},
-                           {1, 1})));
+             compact(seededTerminalTree()));
     QCOMPARE(viewerSpy.count(), 1);
-    QCOMPARE(terminalSpy.count(), 1);
+    // Once for the default itself, then once per row id written into it.
+    QCOMPARE(terminalSpy.count(), 3);
 
     // completeLoad() already consumed one seed write per region; nothing else
     // reaches the server on a plain selection.
@@ -335,53 +444,83 @@ void TstSessionLayouts::terminalDefaultIsTwoStackedPanesAndIsPersisted()
     QTRY_COMPARE(loadedSpy.count(), 1);
 
     // "vertical" stacks children top to bottom, so terminal-1 is the upper pane.
+    // Published immediately, with no row ids yet: the panes are on screen while
+    // their identities are still on the wire.
     const QJsonObject stacked = split(QStringLiteral("vertical"),
                                       {leaf(QStringLiteral("terminal-1")),
                                        leaf(QStringLiteral("terminal-2"))},
                                       {1, 1});
     QCOMPARE(compact(asObject(layouts.terminalTree())), compact(stacked));
 
-    // Both defaults are WRITTEN, not merely held in memory. This is the whole
-    // point: without the write, the first thing that saves a tree (a QML
-    // fallback node, a ratio drag on the other region) decides what the session
-    // looks like after a restart.
-    QJsonObject terminalSeed;
-    int seedCount = 0;
-    for (int i = 0; i < 2; ++i) {
-        const QJsonObject seed = nextRequest();
-        QCOMPARE(seed.value(QStringLiteral("method")).toString(),
-                 QStringLiteral("workspace.setLayout"));
-        const QJsonObject params = seed.value(QStringLiteral("params")).toObject();
-        QCOMPARE(params.value(QStringLiteral("serverId")).toString(),
+    // The viewer default is written straight away. The terminal default is NOT:
+    // both its leaves are brand new panes with no `terminal_panes` row yet, and
+    // an id-less terminal leaf on the server is indistinguishable from one
+    // written before layouts carried ids - which a later load would then resolve
+    // by its recyclable label. So the mints go first.
+    const QJsonObject viewerSeed = nextRequest();
+    QCOMPARE(viewerSeed.value(QStringLiteral("method")).toString(),
+             QStringLiteral("workspace.setLayout"));
+    const QJsonObject viewerParams =
+        viewerSeed.value(QStringLiteral("params")).toObject();
+    QCOMPARE(viewerParams.value(QStringLiteral("region")).toString(),
+             QStringLiteral("viewer"));
+    respondResult(viewerSeed.value(QStringLiteral("id")).toInt(),
+                  layoutRow(viewerParams.value(QStringLiteral("tree")).toObject()));
+
+    for (const QString& label :
+         {QStringLiteral("terminal-1"), QStringLiteral("terminal-2")}) {
+        const QJsonObject mint = nextRequest();
+        QCOMPARE(mint.value(QStringLiteral("method")).toString(),
+                 QStringLiteral("workspace.createTerminalPane"));
+        const QJsonObject mintParams =
+            mint.value(QStringLiteral("params")).toObject();
+        QCOMPARE(mintParams.value(QStringLiteral("serverId")).toString(),
                  QStringLiteral("srv-1"));
-        QCOMPARE(params.value(QStringLiteral("devSessionId")).toString(),
+        QCOMPARE(mintParams.value(QStringLiteral("devSessionId")).toString(),
                  QStringLiteral("s1"));
-        if (params.value(QStringLiteral("region")).toString()
-            == QStringLiteral("terminal"))
-            terminalSeed = params.value(QStringLiteral("tree")).toObject();
-        ++seedCount;
-        respondResult(seed.value(QStringLiteral("id")).toInt(),
-                      layoutRow(params.value(QStringLiteral("tree")).toObject()));
+        QCOMPARE(mintParams.value(QStringLiteral("name")).toString(), label);
+        respondResult(mint.value(QStringLiteral("id")).toInt(),
+                      terminalPaneRow(label));
     }
-    QCOMPARE(seedCount, 2);
-    QCOMPARE(compact(terminalSeed), compact(stacked));
+
+    // Only once BOTH ids are in does the terminal default reach the server, and
+    // it reaches it with those ids in the tree.
+    const QJsonObject terminalSeedReq = nextRequest();
+    QCOMPARE(terminalSeedReq.value(QStringLiteral("method")).toString(),
+             QStringLiteral("workspace.setLayout"));
+    const QJsonObject terminalParams =
+        terminalSeedReq.value(QStringLiteral("params")).toObject();
+    QCOMPARE(terminalParams.value(QStringLiteral("serverId")).toString(),
+             QStringLiteral("srv-1"));
+    QCOMPARE(terminalParams.value(QStringLiteral("devSessionId")).toString(),
+             QStringLiteral("s1"));
+    QCOMPARE(terminalParams.value(QStringLiteral("region")).toString(),
+             QStringLiteral("terminal"));
+    const QJsonObject terminalSeed =
+        terminalParams.value(QStringLiteral("tree")).toObject();
+    QCOMPARE(compact(terminalSeed), compact(seededTerminalTree()));
+    respondResult(terminalSeedReq.value(QStringLiteral("id")).toInt(),
+                  layoutRow(terminalSeed));
     QCOMPARE(errorSpy.count(), 0);
+    QVERIFY(noMoreRequests());
 
     // Idempotent: the seed created the row, so reopening the session loads it
-    // and writes nothing at all.
+    // and writes nothing at all. Its leaves already carry row ids, so nothing
+    // is minted and nothing is marked as pre-migration either.
     SessionLayouts reopened(m_db, m_uiState);
     reopened.setServerId(QStringLiteral("srv-1"));
     completeLoad(reopened, QStringLiteral("s1"),
                  layoutRow(leaf(QStringLiteral("viewer-1"))),
-                 layoutRow(stacked));
-    QCOMPARE(compact(asObject(reopened.terminalTree())), compact(stacked));
+                 layoutRow(seededTerminalTree()));
+    QCOMPARE(compact(asObject(reopened.terminalTree())),
+             compact(seededTerminalTree()));
     QVERIFY(noMoreRequests());
 
-    // Pane numbering continues past the second default pane instead of minting
-    // a "terminal-2" that already exists. The counter is consulted alongside the
-    // tree, and a Dev Session seeded before the counter existed has none stored,
-    // so this is also the case that proves the tree half of that maximum still
-    // guards an existing layout.
+    // Pane LABELLING continues past the second default pane instead of showing
+    // a "terminal-2" that is already on screen. The counter is consulted
+    // alongside the tree, and a Dev Session seeded before the counter existed
+    // has none stored, so this is also the case that proves the tree half of
+    // that maximum still guards an existing layout.
     QCOMPARE(reopened.splitPane(QStringLiteral("terminal"),
                                 QStringLiteral("terminal-2"),
                                 QStringLiteral("horizontal")),
@@ -536,22 +675,35 @@ void TstSessionLayouts::closeLastPaneYieldsEmptyLeaf()
     // Splitting the placeholder REFILLS the region with a single pane rather
     // than branching it against a permanently dead half.
     //
-    // The suffix does NOT restart at 1, even though no "terminal-<n>" leaf is
-    // left in the tree. "terminal-1" names the remote tmux session of the pane
-    // that was just closed, and that session is deliberately left running (the
-    // client detaches instead of killing it), so re-minting the id would attach
-    // the closed shell - its scrollback, its working directory and any process
-    // still in it - and silently ignore the working directory the new pane asked
-    // for. The persisted counter remembers the id is spent.
+    // The LABEL does not restart at 1, even though no "terminal-<n>" leaf is
+    // left in the tree: the persisted counter remembers that "terminal-1" was
+    // spent, so the user is not shown a number they just closed. That is all the
+    // counter does now. What stops the new pane from adopting the closed pane's
+    // still-running shell is the row id below, minted fresh for this leaf.
     QCOMPARE(layouts.splitPane(QStringLiteral("terminal"), QString(),
                                QStringLiteral("horizontal")),
              QStringLiteral("terminal-2"));
+    // Published at once, with no row id yet - and, crucially, with no
+    // "terminalLegacy" marker either, so the pane waits instead of resolving by
+    // the label it happens to wear.
     QCOMPARE(compact(asObject(layouts.terminalTree())),
              compact(leaf(QStringLiteral("terminal-2"))));
+
+    const QJsonObject mint = nextRequest();
+    QCOMPARE(mint.value(QStringLiteral("method")).toString(),
+             QStringLiteral("workspace.createTerminalPane"));
+    respondResult(mint.value(QStringLiteral("id")).toInt(),
+                  terminalPaneRow(QStringLiteral("terminal-2")));
+
     const QJsonObject refillReq = nextRequest();
+    QCOMPARE(refillReq.value(QStringLiteral("method")).toString(),
+             QStringLiteral("workspace.setLayout"));
+    const QJsonObject bound = terminalLeaf(QStringLiteral("terminal-2"),
+                                           rowIdFor(QStringLiteral("terminal-2")));
     QCOMPARE(compact(refillReq.value(QStringLiteral("params")).toObject()
                          .value(QStringLiteral("tree")).toObject()),
-             compact(leaf(QStringLiteral("terminal-2"))));
+             compact(bound));
+    QCOMPARE(compact(asObject(layouts.terminalTree())), compact(bound));
 }
 
 void TstSessionLayouts::ratiosPersistedAtNestedPath()
@@ -707,8 +859,11 @@ void TstSessionLayouts::staleLoadReplyIsDropped()
     QCOMPARE(loadedSpy.at(0).at(0).toString(), QStringLiteral("s2"));
     QCOMPARE(compact(asObject(layouts.viewerTree())),
              compact(leaf(QStringLiteral("fresh-1"))));
+    // The terminal leaf came from the SERVER with no row id, so it is a
+    // pre-migration leaf and is published with the marker that lets it resolve
+    // by its label once.
     QCOMPARE(compact(asObject(layouts.terminalTree())),
-             compact(leaf(QStringLiteral("fresh-2"))));
+             compact(legacyLeaf(QStringLiteral("fresh-2"))));
 }
 
 // The reverse of staleLoadReplyIsDropped(): here the LOAD is the stale one. A
@@ -780,7 +935,12 @@ void TstSessionLayouts::editDuringAnInFlightLoadIsNotReverted()
     QTRY_COMPARE(loadedSpy.count(), 1);
 
     QCOMPARE(compact(asObject(layouts.viewerTree())), compact(edited));
-    QCOMPARE(compact(asObject(layouts.terminalTree())), compact(freshTerminal));
+    // Adopted verbatim, plus the pre-migration marker on each id-less leaf.
+    QCOMPARE(compact(asObject(layouts.terminalTree())),
+             compact(split(QStringLiteral("horizontal"),
+                           {legacyLeaf(QStringLiteral("terminal-1")),
+                            legacyLeaf(QStringLiteral("terminal-9"))},
+                           {2, 3})));
     QCOMPARE(errorSpy.count(), 0);
     // Nothing was re-written: the stale answer neither reached the tree nor the
     // server.
@@ -824,6 +984,17 @@ void TstSessionLayouts::aSeedingLoadReplyNeverOverwritesASavedTree()
     QTRY_COMPARE(loadedSpy.count(), 1);
 
     QCOMPARE(compact(asObject(layouts.viewerTree())), compact(authored));
+
+    // The terminal region WAS seeded, so its two brand new panes mint their
+    // rows before its layout may be written.
+    for (const QString& label :
+         {QStringLiteral("terminal-1"), QStringLiteral("terminal-2")}) {
+        const QJsonObject mint = nextRequest();
+        QCOMPARE(mint.value(QStringLiteral("method")).toString(),
+                 QStringLiteral("workspace.createTerminalPane"));
+        respondResult(mint.value(QStringLiteral("id")).toInt(),
+                      terminalPaneRow(label));
+    }
 
     // Exactly one further write reaches the server, and it is the TERMINAL
     // default: the viewer region was never seeded over.
@@ -1111,7 +1282,15 @@ void TstSessionLayouts::refillingAnEmptiedRegionNeverReusesThePaneId()
     QCOMPARE(layouts.splitPane(QStringLiteral("terminal"), QString(),
                                QStringLiteral("horizontal")),
              QStringLiteral("terminal-3"));
-    nextRequest();
+    // A refilled region's pane is a NEW pane: it mints its own row rather than
+    // resolving anything by the label it wears.
+    const QJsonObject mint = nextRequest();
+    QCOMPARE(mint.value(QStringLiteral("method")).toString(),
+             QStringLiteral("workspace.createTerminalPane"));
+    respondResult(mint.value(QStringLiteral("id")).toInt(),
+                  terminalPaneRow(QStringLiteral("terminal-3")));
+    nextRequest(); // the setLayout that follows the last id landing
+
     QCOMPARE(layouts.splitPane(QStringLiteral("terminal"),
                                QStringLiteral("terminal-3"),
                                QStringLiteral("horizontal")),
@@ -1189,6 +1368,229 @@ void TstSessionLayouts::paneNumberingIsPerDevSessionAndSurvivesRestart()
              QStringLiteral("viewer-2"));
 }
 
+// SELF-MIGRATION. A terminal leaf stored before layouts carried a row id has
+// nothing but its slot label, so ch::TerminalFactory resolves it by that label
+// once and reports the row it found back through bindTerminalPaneRow(). The id
+// then goes into the leaf and is persisted, and the recyclable label is never
+// used to name a shell again. It must happen exactly ONCE: the factory caches
+// its answer and re-reports it on a reconnect, and a write per attach would be
+// an RPC storm for nothing.
+void TstSessionLayouts::legacyTerminalLeafIsBackfilledOnceAndPersisted()
+{
+    makePair();
+    SessionLayouts layouts(m_db, m_uiState);
+    layouts.setServerId(QStringLiteral("srv-1"));
+
+    const QJsonObject storedTerminal =
+        split(QStringLiteral("vertical"),
+              {leaf(QStringLiteral("terminal-1")), leaf(QStringLiteral("terminal-2"))},
+              {1, 1});
+    completeLoad(layouts, QStringLiteral("s1"),
+                 layoutRow(leaf(QStringLiteral("viewer-1"))),
+                 layoutRow(storedTerminal));
+
+    QSignalSpy errorSpy(&layouts, &SessionLayouts::error);
+    QSignalSpy terminalSpy(&layouts, &SessionLayouts::terminalTreeChanged);
+
+    // Both leaves come back marked: they carry no row id and the SERVER is where
+    // they came from, which is the only way a leaf earns permission to be
+    // resolved by its label.
+    QCOMPARE(compact(asObject(layouts.terminalTree())),
+             compact(split(QStringLiteral("vertical"),
+                           {legacyLeaf(QStringLiteral("terminal-1")),
+                            legacyLeaf(QStringLiteral("terminal-2"))},
+                           {1, 1})));
+
+    layouts.bindTerminalPaneRow(QStringLiteral("s1"), QStringLiteral("terminal-2"),
+                                QStringLiteral("row-abc"));
+
+    const QJsonObject migrated =
+        split(QStringLiteral("vertical"),
+              {legacyLeaf(QStringLiteral("terminal-1")),
+               terminalLeaf(QStringLiteral("terminal-2"), QStringLiteral("row-abc"))},
+              {1, 1});
+    const QJsonObject req = nextRequest();
+    QCOMPARE(req.value(QStringLiteral("method")).toString(),
+             QStringLiteral("workspace.setLayout"));
+    const QJsonObject persisted = req.value(QStringLiteral("params")).toObject()
+                                      .value(QStringLiteral("tree")).toObject();
+    // The marker is a client-side statement and must never reach the server.
+    QCOMPARE(compact(persisted),
+             compact(split(QStringLiteral("vertical"),
+                           {leaf(QStringLiteral("terminal-1")),
+                            terminalLeaf(QStringLiteral("terminal-2"),
+                                         QStringLiteral("row-abc"))},
+                           {1, 1})));
+    respondResult(req.value(QStringLiteral("id")).toInt(), layoutRow(persisted));
+    QCOMPARE(compact(asObject(layouts.terminalTree())), compact(migrated));
+    // Quiet: the pane is already attached to that very row, so republishing the
+    // tree would only churn the region.
+    QCOMPARE(terminalSpy.count(), 0);
+
+    // ONCE. The same answer again, and an answer for a leaf that is already
+    // bound, both cost nothing.
+    layouts.bindTerminalPaneRow(QStringLiteral("s1"), QStringLiteral("terminal-2"),
+                                QStringLiteral("row-abc"));
+    layouts.bindTerminalPaneRow(QStringLiteral("s1"), QStringLiteral("terminal-2"),
+                                QStringLiteral("row-different"));
+    // Wrong Dev Session, and a pane closed while the lookup travelled: silent.
+    layouts.bindTerminalPaneRow(QStringLiteral("s2"), QStringLiteral("terminal-1"),
+                                QStringLiteral("row-elsewhere"));
+    layouts.bindTerminalPaneRow(QStringLiteral("s1"), QStringLiteral("gone"),
+                                QStringLiteral("row-gone"));
+    QVERIFY(noMoreRequests());
+    QCOMPARE(errorSpy.count(), 0);
+    QCOMPARE(compact(asObject(layouts.terminalTree())), compact(migrated));
+}
+
+// A mint that fails must not leave a pane the user can never bring up, and must
+// not leave an id-less terminal leaf anywhere near the server: on a later load
+// that leaf would be indistinguishable from a pre-migration one and would be
+// resolved by its recyclable label. So the half-made pane is taken back out and
+// the reason is surfaced.
+void TstSessionLayouts::aFailedTerminalMintReportsAndTakesTheHalfMadePaneBack()
+{
+    makePair();
+    SessionLayouts layouts(m_db, m_uiState);
+    layouts.setServerId(QStringLiteral("srv-1"));
+    const QJsonObject stored =
+        terminalLeaf(QStringLiteral("terminal-1"), QStringLiteral("row-one"));
+    completeLoad(layouts, QStringLiteral("s1"),
+                 layoutRow(leaf(QStringLiteral("viewer-1"))), layoutRow(stored));
+
+    QSignalSpy errorSpy(&layouts, &SessionLayouts::error);
+    QCOMPARE(layouts.splitPane(QStringLiteral("terminal"),
+                               QStringLiteral("terminal-1"),
+                               QStringLiteral("horizontal")),
+             QStringLiteral("terminal-2"));
+
+    const QJsonObject mint = nextRequest();
+    QCOMPARE(mint.value(QStringLiteral("method")).toString(),
+             QStringLiteral("workspace.createTerminalPane"));
+    respondError(mint.value(QStringLiteral("id")).toInt(), -32000,
+                 QStringLiteral("terminal pane create failed"));
+
+    QTRY_COMPARE(errorSpy.count(), 1);
+    QCOMPARE(errorSpy.at(0).at(0).toString(),
+             QStringLiteral("terminal pane create failed"));
+    // The split is undone: the branch collapses back onto the survivor.
+    QTRY_COMPARE(compact(asObject(layouts.terminalTree())), compact(stored));
+
+    // Only now does anything reach the server, and it is the corrected tree -
+    // never one carrying the id-less leaf.
+    const QJsonObject write = nextRequest();
+    QCOMPARE(write.value(QStringLiteral("method")).toString(),
+             QStringLiteral("workspace.setLayout"));
+    QCOMPARE(compact(write.value(QStringLiteral("params")).toObject()
+                         .value(QStringLiteral("tree")).toObject()),
+             compact(stored));
+}
+
+// THE regression the whole scheme exists to remove, end to end in the client.
+//
+// Client A has terminal-1 and terminal-2 and closes terminal-2. Closing keeps
+// the row and the remote tmux session alive on purpose, so the shell is still
+// running; the shared layout, though, no longer mentions terminal-2. Client B
+// then splits. Its slot counter is client-LOCAL, it has never heard of the
+// closed pane, and the tree it loaded tops out at terminal-1 - so it mints the
+// label "terminal-2" all over again.
+//
+// Under the old scheme that pane resolved (devSession, "terminal-2"), found A's
+// surviving row and attached A's closed shell: old scrollback, old working
+// directory, whatever was still running. Here it must get a row of its own.
+void TstSessionLayouts::aPaneCreatedAfterOneWithTheSameLabelWasClosedGetsItsOwnRow()
+{
+    makePair();
+
+    // --- Client A ---------------------------------------------------------
+    const QJsonObject closedRow =
+        terminalLeaf(QStringLiteral("terminal-2"), QStringLiteral("row-A-terminal-2"));
+    const QJsonObject survivor =
+        terminalLeaf(QStringLiteral("terminal-1"), QStringLiteral("row-A-terminal-1"));
+    {
+        SessionLayouts clientA(m_db, m_uiState);
+        clientA.setServerId(QStringLiteral("srv-1"));
+        completeLoad(clientA, QStringLiteral("s1"),
+                     layoutRow(leaf(QStringLiteral("viewer-1"))),
+                     layoutRow(split(QStringLiteral("vertical"), {survivor, closedRow},
+                                     {1, 1})));
+        clientA.closePane(QStringLiteral("terminal"), QStringLiteral("terminal-2"));
+        const QJsonObject afterClose = nextRequest();
+        QCOMPARE(afterClose.value(QStringLiteral("method")).toString(),
+                 QStringLiteral("workspace.setLayout"));
+        // The row is NOT deleted - nothing in the client ever deletes one - so
+        // the closed pane's shell and scrollback stay recoverable. Only the
+        // LAYOUT forgets it.
+        QCOMPARE(compact(afterClose.value(QStringLiteral("params")).toObject()
+                             .value(QStringLiteral("tree")).toObject()),
+                 compact(survivor));
+        respondResult(afterClose.value(QStringLiteral("id")).toInt(),
+                      layoutRow(survivor));
+    }
+
+    // --- Client B, a different machine ------------------------------------
+    // A fresh settings file IS the second machine: the slot counter lives there
+    // and is client-local, which is exactly why it cannot guard identity.
+    m_settingsDir = std::make_unique<QTemporaryDir>();
+    QVERIFY(m_settingsDir->isValid());
+    delete m_uiState;
+    m_uiState = new UiStateStore(settingsPath());
+
+    SessionLayouts clientB(m_db, m_uiState);
+    clientB.setServerId(QStringLiteral("srv-1"));
+    completeLoad(clientB, QStringLiteral("s1"),
+                 layoutRow(leaf(QStringLiteral("viewer-1"))), layoutRow(survivor));
+
+    // B has no memory of the closed pane and the tree does not mention it, so
+    // it hands out the very label A's surviving row still wears.
+    QCOMPARE(clientB.splitPane(QStringLiteral("terminal"),
+                               QStringLiteral("terminal-1"),
+                               QStringLiteral("horizontal")),
+             QStringLiteral("terminal-2"));
+
+    // And that is now harmless, because the label is not what is asked for. The
+    // pane MINTS a row. It does not resolve (devSession, "terminal-2"), which is
+    // the call that would have returned A's closed row.
+    const QJsonObject mint = nextRequest();
+    QCOMPARE(mint.value(QStringLiteral("method")).toString(),
+             QStringLiteral("workspace.createTerminalPane"));
+    QVERIFY(mint.value(QStringLiteral("method")).toString()
+            != QStringLiteral("workspace.resolveTerminalPane"));
+    respondResult(mint.value(QStringLiteral("id")).toInt(),
+                  QJsonObject{{"id", "row-B-new"},
+                              {"serverId", "srv-1"},
+                              {"devSessionId", "s1"},
+                              {"name", "terminal-2"},
+                              {"tmuxTarget", "ch_s1_row-B-new"},
+                              {"position", 1}});
+
+    // A DIFFERENT row, and therefore a different tmux target: the new pane
+    // cannot be attached to the shell A left running.
+    const QJsonObject expected =
+        split(QStringLiteral("horizontal"),
+              {survivor,
+               terminalLeaf(QStringLiteral("terminal-2"), QStringLiteral("row-B-new"))},
+              {1, 1});
+    QTRY_COMPARE(compact(asObject(clientB.terminalTree())), compact(expected));
+    const QString newRow = asObject(clientB.terminalTree())
+                               .value(QStringLiteral("children")).toArray().at(1)
+                               .toObject().value(QStringLiteral("terminalPaneId")).toString();
+    QCOMPARE(newRow, QStringLiteral("row-B-new"));
+    QVERIFY(newRow != QStringLiteral("row-A-terminal-2"));
+    // Same label, different identity - which is the whole point.
+    QCOMPARE(asObject(clientB.terminalTree())
+                 .value(QStringLiteral("children")).toArray().at(1)
+                 .toObject().value(QStringLiteral("paneId")).toString(),
+             closedRow.value(QStringLiteral("paneId")).toString());
+
+    const QJsonObject write = nextRequest();
+    QCOMPARE(write.value(QStringLiteral("method")).toString(),
+             QStringLiteral("workspace.setLayout"));
+    QCOMPARE(compact(write.value(QStringLiteral("params")).toObject()
+                         .value(QStringLiteral("tree")).toObject()),
+             compact(expected));
+}
+
 // LIVE (docs/PLAN.md): the same flow against the REAL Node codeharbord reached
 // over the real SSH fixture. Proves a layout split persists into the server's
 // SQLite and comes back byte-identical to a freshly constructed bridge - the
@@ -1252,13 +1654,27 @@ void TstSessionLayouts::liveLayoutRoundTripOverSsh()
     layouts.load(sessionId);
     QTRY_VERIFY_WITH_TIMEOUT(loadedSpy.count() == 1, 15000);
     QCOMPARE(errorSpy.count(), 0);
+    // The seeded terminal default: two stacked panes, each bound to a
+    // `terminal_panes` row the SERVER minted. The ids are UUIDs codeharbord
+    // chose, so the literal pins everything except them and they get their own
+    // assertions below.
     const QJsonObject stacked = split(QStringLiteral("vertical"),
                                       {leaf(QStringLiteral("terminal-1")),
                                        leaf(QStringLiteral("terminal-2"))},
                                       {1, 1});
     QCOMPARE(compact(asObject(layouts.viewerTree())),
              compact(leaf(QStringLiteral("viewer-1"))));
-    QCOMPARE(compact(asObject(layouts.terminalTree())), compact(stacked));
+    // The default is published before its rows are minted, so wait for the ids
+    // rather than racing them.
+    QTRY_VERIFY_WITH_TIMEOUT(!terminalRowIds(asObject(layouts.terminalTree()))
+                                  .contains(QString()),
+                             15000);
+    QCOMPARE(compact(withoutRowIds(asObject(layouts.terminalTree()))),
+             compact(stacked));
+    const QStringList seededIds = terminalRowIds(asObject(layouts.terminalTree()));
+    QCOMPARE(seededIds.size(), 2);
+    // Two panes, two rows: a shared id would be two panes on ONE remote shell.
+    QVERIFY(seededIds.at(0) != seededIds.at(1));
 
     // The seeded default really landed in the server's SQLite: a fresh bridge
     // (which is what a relaunched app is) reads the two stacked terminals back
@@ -1268,7 +1684,15 @@ void TstSessionLayouts::liveLayoutRoundTripOverSsh()
     QSignalSpy afterSeedSpy(&afterSeed, &SessionLayouts::loaded);
     afterSeed.load(sessionId);
     QTRY_VERIFY_WITH_TIMEOUT(afterSeedSpy.count() == 1, 15000);
-    QCOMPARE(compact(asObject(afterSeed.terminalTree())), compact(stacked));
+    QCOMPARE(compact(withoutRowIds(asObject(afterSeed.terminalTree()))),
+             compact(stacked));
+    // THE assertion this case exists for now: the ids come back IDENTICAL. The
+    // relaunched app does not merely see two panes in the right shape, it sees
+    // the same two terminals - the server-minted identity is what persisted,
+    // and nothing was re-derived or re-minted on the way back. A fresh bridge
+    // must also not mint anything of its own here: these leaves already have
+    // ids, so it has nothing to create.
+    QCOMPARE(terminalRowIds(asObject(afterSeed.terminalTree())), seededIds);
 
     // Split both regions; each split is a real workspace.setLayout write.
     QCOMPARE(layouts.splitPane(QStringLiteral("viewer"),
@@ -1280,9 +1704,19 @@ void TstSessionLayouts::liveLayoutRoundTripOverSsh()
                                QStringLiteral("terminal-1"),
                                QStringLiteral("horizontal")),
              QStringLiteral("terminal-3"));
+    // The new leaf is published at once and its row is minted behind it; the
+    // layout write is deliberately held back until the id lands, so waiting for
+    // three bound leaves is also what makes the reload below deterministic.
+    QTRY_VERIFY_WITH_TIMEOUT(terminalRowIds(asObject(layouts.terminalTree())).size() == 3
+                                 && !terminalRowIds(asObject(layouts.terminalTree()))
+                                         .contains(QString()),
+                             15000);
     layouts.setRatios(QStringLiteral("viewer"), {}, {2.0, 3.0});
     const QByteArray viewerBefore = compact(asObject(layouts.viewerTree()));
     const QByteArray terminalBefore = compact(asObject(layouts.terminalTree()));
+    // The split minted a THIRD row rather than reusing either default's.
+    const QStringList afterSplitIds = terminalRowIds(asObject(layouts.terminalTree()));
+    QCOMPARE(QSet<QString>(afterSplitIds.begin(), afterSplitIds.end()).size(), 3);
 
     // A fresh bridge stands in for a relaunched app. codeharbord serves the
     // stdio stream in order, so the writes above are already committed.

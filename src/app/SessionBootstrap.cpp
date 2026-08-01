@@ -1301,8 +1301,20 @@ bool SessionBootstrap::attemptWire()
         return false;
     }
     wireChannelSignals(m_rpcDevice, QStringLiteral("codeharbord"));
-    if (m_client)
+    if (m_client) {
+        // Turn the transport heartbeat on HERE, at the one place in the shipped
+        // app that binds a real SSH channel to the client. A wedged
+        // `codeharbord` — a stuck handler, a filesystem call that never
+        // returns, a half-open channel libssh has not noticed — leaves the
+        // channel readable and writable forever, so nothing else in this file
+        // would ever notice it: no EOF, no channelError(), no reconnect. The
+        // heartbeat turns that silence into the ordinary transport-loss path,
+        // which the reconnect ladder below already handles, instead of an
+        // editor pane stuck on "saving…" for the rest of the session.
+        // Idempotent, so re-wiring after a reconnect simply re-arms it.
+        m_client->enableHeartbeat();
         m_client->setTransport(m_rpcDevice);
+    }
 
     m_agentDevice = openChannelDevice(SshConnectionPool::ChannelKind::AgentStatus,
                                       bridgeCommand(m_nodePath, m_repoRoot),

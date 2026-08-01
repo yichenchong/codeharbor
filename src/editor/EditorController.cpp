@@ -3,6 +3,7 @@
 #include "CodeharbordClient.h"
 #include "RpcTypes.h"
 
+#include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QPointer>
@@ -1008,22 +1009,40 @@ void EditorController::reload(FileState transitional, bool discardLocalEdits)
         });
 }
 
-void EditorController::onNotification(const QString& method, const QJsonValue& params)
+// True when a file.watchEventsLost payload names THIS pane's live
+// subscription. Everything here is untrusted bytes off a socket, so every step
+// is a shape check: a non-object params, a missing or non-array
+// `subscriptionIds`, an empty array, non-string elements and ids we never
+// minted all answer false. So does an empty m_watchSubscriptionId — no
+// subscription is held (never subscribed, already unwatched, or the transport
+// died and took the id with it), and an empty id must never be "matched" by an
+// empty or absent entry in the payload.
+//
+// Matching is by SUBSCRIPTION ID, unlike the file.watchEvent handler below,
+// which deliberately matches by PATH: this notification carries no path at all,
+// and the subscription id is the only key the daemon sends
+// (RPC_WATCH_EVENTS_LOST_NOTIFICATION in remote/src/rpc-types.ts).
+bool EditorController::watchLossNamesThisPane(const QJsonValue& params) const
 {
-    if (method != QString::fromLatin1(rpc::kWatchEventNotification))
-        return;
-    const QJsonObject obj = params.toObject();
-    if (obj.value(QStringLiteral("path")).toString() != m_path)
-        return;
+    if (m_watchSubscriptionId.isEmpty())
+        return false;
+    const QJsonValue ids = params.toObject().value(QStringLiteral("subscriptionIds"));
+    if (!ids.isArray())
+        return false;
+    const QJsonArray array = ids.toArray();
+    for (const QJsonValue& id : array) {
+        if (id.isString() && id.toString() == m_watchSubscriptionId)
+            return true;
+    }
+    return false;
+}
 
-    // Ignore the echo of our own write: the event revision matches the baseline
-    // we just adopted, so there is nothing external to reconcile. A "deleted"
-    // event carries NO revision at all (reconcile() in remote/src/files.ts), so
-    // it can never be mistaken for that echo and always falls through below.
-    const QString eventRevision = obj.value(QStringLiteral("revision")).toString();
-    if (!eventRevision.isEmpty() && eventRevision == m_revision)
-        return;
-
+// The single answer to "the file behind this buffer may no longer be what we
+// hold": re-read it, unless that would destroy unsaved work. Shared by both
+// watch notifications so the two can never drift apart, and reached only after
+// each has decided the news is about THIS pane.
+void EditorController::applyExternalChange()
+{
     if (m_dirty) {
         // Unsaved local edits: do NOT clobber them. Flag the divergence and let
         // the UI resolve it (SPEC 8.7). An existing Conflict is NOT downgraded:
@@ -1048,7 +1067,50 @@ void EditorController::onNotification(const QString& method, const QJsonValue& p
     // took the path cannot match either) rather than an unguarded create that
     // silently resurrects a deleted file. Recreating it stays the user's explicit
     // choice, made through the page's overwrite affordance.
+    //
+    // reload() is a SYSTEM-initiated reload (discardLocalEdits stays false), so
+    // bytes that arrive after the user has typed into the round trip are dropped
+    // and the pane is merely flagged — the dirty branch above, one moment later.
     reload(FileState::ExternallyModified);
+}
+
+void EditorController::onNotification(const QString& method, const QJsonValue& params)
+{
+    // Events for this subscription were DROPPED by the daemon's bounded
+    // notification queue, so our picture of the file is known-stale and no
+    // revision, path or event kind survives to reason about: the only correct
+    // reaction is to re-read (RpcTypes.h, kWatchEventsLostNotification).
+    //
+    // Ordering: a re-read already in flight is not a reason to skip this one.
+    // That read was issued BEFORE the loss was reported, so its bytes may
+    // predate the changes the daemon dropped. reload() bumps m_loadGeneration,
+    // which retires the older read's reply, and issues a fresh one — the pane
+    // always ends up re-reading after the loss. A loss arriving next to an
+    // ordinary change notification therefore costs at most one extra round trip
+    // and can never leave the pane worse off than either alone: both funnel
+    // into applyExternalChange(), whose only two outcomes are "re-read" and
+    // "flag a dirty buffer", and neither is weakened by repetition.
+    if (method == QString::fromLatin1(rpc::kWatchEventsLostNotification)) {
+        if (watchLossNamesThisPane(params))
+            applyExternalChange();
+        return;
+    }
+
+    if (method != QString::fromLatin1(rpc::kWatchEventNotification))
+        return;
+    const QJsonObject obj = params.toObject();
+    if (obj.value(QStringLiteral("path")).toString() != m_path)
+        return;
+
+    // Ignore the echo of our own write: the event revision matches the baseline
+    // we just adopted, so there is nothing external to reconcile. A "deleted"
+    // event carries NO revision at all (reconcile() in remote/src/files.ts), so
+    // it can never be mistaken for that echo and always falls through below.
+    const QString eventRevision = obj.value(QStringLiteral("revision")).toString();
+    if (!eventRevision.isEmpty() && eventRevision == m_revision)
+        return;
+
+    applyExternalChange();
 }
 
 } // namespace ch

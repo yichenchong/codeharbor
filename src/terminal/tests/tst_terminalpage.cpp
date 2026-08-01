@@ -20,14 +20,18 @@
 // WebEngine at all — the same rule as tst_webengine_headless, since that is a
 // property of the machine, not of this code.
 
+#include "AgentStatusMonitor.h"
 #include "CodeharbordClient.h"
-#include "KnownHosts.h"
+#include "Ids.h"
+#include "SessionBootstrap.h"
 #include "SessionState.h"
 #include "SshConnectionPool.h"
 #include "TerminalController.h"
 #include "TerminalFactory.h"
 #include "ViewerModel.h"
 #include "ViewerProfiles.h"
+#include "WorkspaceDb.h"
+#include "WorkspaceTypes.h"
 
 #include <QtTest/QtTest>
 
@@ -54,6 +58,7 @@
 #include <QtWebEngineQuick/QtWebEngineQuick>
 
 #include <memory>
+#include <optional>
 
 using ch::SshConnectionPool;
 using ch::TerminalController;
@@ -92,10 +97,15 @@ Window {
         anchors.fill: parent
     }
 
-    function openPane(devSessionId, terminalId, workingDir) {
+    // `terminalPaneId` is the pane's identity: the id of its row in the
+    // server's `terminal_panes` table. A pane without one has nothing safe to
+    // attach to and deliberately waits, so the live case mints a real row and
+    // passes it here — which is exactly the shape production builds a pane in.
+    function openPane(devSessionId, terminalId, workingDir, terminalPaneId) {
         paneLoader.setSource("qrc:/qt/qml/CodeHarbor/TerminalPaneView.qml",
                              { paneId: terminalId, devSessionId: devSessionId,
-                               terminalId: terminalId, workingDir: workingDir })
+                               terminalId: terminalId, workingDir: workingDir,
+                               terminalPaneId: terminalPaneId ? terminalPaneId : "" })
         return paneLoader.status === Loader.Ready
             ? "ready" : ("loader-status=" + paneLoader.status)
     }
@@ -236,7 +246,6 @@ private:
     // shows up on xterm's screen. The retype matters: the first keystrokes can
     // land before the shell inside a freshly created tmux session has readline.
     bool pasteUntilScreenContains(const QString& line, const QString& needle, int timeoutMs);
-    void connectLivePool();
 
     ch::CodeharbordClient m_client;
     ch::ViewerProfiles m_profiles{&m_client};
@@ -271,7 +280,12 @@ void TstTerminalPage::initTestCase()
     QVERIFY(QMetaObject::invokeMethod(m_window.get(), "openPane", Q_RETURN_ARG(QVariant, opened),
                                       Q_ARG(QVariant, QStringLiteral("dev-page")),
                                       Q_ARG(QVariant, QStringLiteral("term-page")),
-                                      Q_ARG(QVariant, QStringLiteral("/tmp"))));
+                                      Q_ARG(QVariant, QStringLiteral("/tmp")),
+                                      // No row id: these three cases are about the
+                                      // renderer and the bridge, and the pool is
+                                      // deliberately disconnected, so the pane never
+                                      // gets as far as needing an identity.
+                                      Q_ARG(QVariant, QString())));
     QCOMPARE(opened.toString(), QStringLiteral("ready"));
 
     QVariant controller;
@@ -436,50 +450,18 @@ bool TstTerminalPage::pasteUntilScreenContains(const QString& line, const QStrin
     return false;
 }
 
-void TstTerminalPage::connectLivePool()
-{
-    if (m_pool.state() == SshConnectionPool::State::Connected)
-        return;
-
-    QString knownHostsPath = qEnvironmentVariable("CH_LIVE_KNOWN_HOSTS");
-    if (knownHostsPath.isEmpty())
-        knownHostsPath = QDir::temp().filePath(QStringLiteral("ch_live_terminal_page_known_hosts"));
-
-    // First-use trust, exactly like SessionBootstrap: load the store, accept an
-    // unknown key once, write it back. A Mismatch never reaches the callback.
-    ch::KnownHosts hosts;
-    QFile store(knownHostsPath);
-    if (store.open(QIODevice::ReadOnly | QIODevice::Text))
-        hosts = ch::KnownHosts::parse(QString::fromUtf8(store.readAll()));
-    store.close();
-    m_pool.setKnownHosts(hosts);
-    m_pool.setHostKeyCallback([](const QString&, const QString&, const QByteArray&,
-                                 ch::KnownHosts::Verdict) {
-        return SshConnectionPool::HostKeyDecision::Accept;
-    });
-
-    QString failure;
-    const auto conn = connect(&m_pool, &SshConnectionPool::errorOccurred,
-                              [&failure](const QString& text) { failure += text; });
-    const bool ok = m_pool.connectToHost(qEnvironmentVariable("CH_LIVE_HOST"),
-                                         static_cast<quint16>(
-                                             qEnvironmentVariable("CH_LIVE_PORT").toUInt()),
-                                         qEnvironmentVariable("CH_LIVE_USER"));
-    disconnect(conn);
-    QVERIFY2(ok, qPrintable(QStringLiteral("connectToHost failed: %1").arg(failure)));
-
-    QDir().mkpath(QFileInfo(knownHostsPath).absolutePath());
-    QFile out(knownHostsPath);
-    if (out.open(QIODevice::WriteOnly | QIODevice::Truncate))
-        out.write(m_pool.knownHosts().serialize());
-}
-
 // (4) The whole slice in one go: a REAL remote shell rendered by the REAL pane.
 // The pane attaches through its own attachNow() (the button a user presses),
 // the PTY runs a real tmux session on the fixture server, and the command is
 // "typed" into xterm from the PAGE — so the marker on screen can only have come
 // from the remote shell, through libssh, the controller, the bridge and
 // xterm.js.
+//
+// The pane is built the way production builds one: its layout leaf carries a
+// `terminal_panes` row id (SPEC 5.2), minted here against the real codeharbord,
+// and the pane resolves its tmux target FROM that row. A pane with no row id
+// has no identity and deliberately attaches nothing — so the factory is given a
+// real workspace and server id, exactly as main.cpp gives it one.
 void TstTerminalPage::livePaneRendersARealRemoteShell()
 {
     if (qEnvironmentVariableIsEmpty("CH_LIVE_SSH"))
@@ -487,19 +469,73 @@ void TstTerminalPage::livePaneRendersARealRemoteShell()
     if (!SshConnectionPool::libsshAvailable())
         QSKIP("built without libssh; live pane gate skipped");
 
-    connectLivePool();
+    // Connects the SSH session AND wires codeharbord over it, because this case
+    // needs both: the PTY channel for the shell, and the workspace RPC for the
+    // pane's identity.
+    ch::AgentStatusMonitor monitor;
+    ch::SessionBootstrap boot(&m_pool, &m_client, &monitor);
+    boot.setReconnectEnabled(false); // reconnect would fight the teardown below
+    QVERIFY2(boot.connectAndWireFromEnvironment(),
+             "connectAndWireFromEnvironment failed");
     QCOMPARE(m_pool.state(), SshConnectionPool::State::Connected);
 
-    // Unique per run so repeat runs never inherit a stale tmux session.
-    const QString terminalId = QStringLiteral("p%1x%2")
-                                   .arg(QCoreApplication::applicationPid())
-                                   .arg(QDateTime::currentMSecsSinceEpoch() % 1000000);
-    const QString devSessionId = QStringLiteral("livepage");
+    ch::WorkspaceDb db(&m_client);
+    const QString serverId =
+        QStringLiteral("tst-tp-%1").arg(QCoreApplication::applicationPid());
+
+    std::optional<ch::Group> group;
+    std::optional<ch::RpcError> failure;
+    db.createGroup(ch::CreateGroupParams{.serverId = ch::ServerId{serverId},
+                                         .name = QStringLiteral("tst_terminalpage")},
+                   [&](std::optional<ch::Group> g, std::optional<ch::RpcError> e) {
+                       group = g;
+                       failure = e;
+                   });
+    QTRY_VERIFY_WITH_TIMEOUT(group.has_value() || failure.has_value(), 15000);
+    QVERIFY2(group.has_value(), qPrintable(failure ? failure->message : QString()));
+
+    std::optional<ch::DevSession> session;
+    db.createSession(ch::CreateSessionParams{.serverId = ch::ServerId{serverId},
+                                             .groupId = group->id,
+                                             .name = QStringLiteral("pane probe"),
+                                             .repositoryRoot =
+                                                 qEnvironmentVariable("CH_LIVE_REPO")},
+                     [&](std::optional<ch::DevSession> s, std::optional<ch::RpcError> e) {
+                         session = s;
+                         failure = e;
+                     });
+    QTRY_VERIFY_WITH_TIMEOUT(session.has_value() || failure.has_value(), 15000);
+    QVERIFY2(session.has_value(), qPrintable(failure ? failure->message : QString()));
+
+    // The pane's identity. Unique per run by construction — a row id is minted
+    // fresh and never recycled — so repeat runs cannot inherit a stale tmux
+    // session, which is what the hand-rolled unique label used to be for.
+    const QString terminalId = QStringLiteral("terminal-1");
+    std::optional<ch::TerminalPane> row;
+    db.createTerminalPane(
+        ch::CreateTerminalPaneParams{.serverId = ch::ServerId{serverId},
+                                     .devSessionId = session->id,
+                                     .name = terminalId},
+        [&](std::optional<ch::TerminalPane> p, std::optional<ch::RpcError> e) {
+            row = p;
+            failure = e;
+        });
+    QTRY_VERIFY_WITH_TIMEOUT(row.has_value() || failure.has_value(), 15000);
+    QVERIFY2(row.has_value(), qPrintable(failure ? failure->message : QString()));
+    QVERIFY(!row->id.value.isEmpty());
+    // The server minted the tmux target from the row id; the client never
+    // composes one.
+    QVERIFY(!row->tmuxTarget.isEmpty());
+
+    m_factory.setWorkspace(&db);
+    m_factory.setServerId(serverId);
+
     QVariant setSession;
     QVERIFY(QMetaObject::invokeMethod(
         m_window.get(), "openPane", Q_RETURN_ARG(QVariant, setSession),
-        Q_ARG(QVariant, devSessionId), Q_ARG(QVariant, terminalId),
-        Q_ARG(QVariant, qEnvironmentVariable("CH_LIVE_REPO"))));
+        Q_ARG(QVariant, session->id.value), Q_ARG(QVariant, terminalId),
+        Q_ARG(QVariant, qEnvironmentVariable("CH_LIVE_REPO")),
+        Q_ARG(QVariant, row->id.value)));
     QCOMPARE(setSession.toString(), QStringLiteral("ready"));
 
     // A fresh pane means a fresh controller and a fresh page.
@@ -508,9 +544,14 @@ void TstTerminalPage::livePaneRendersARealRemoteShell()
                                       Q_RETURN_ARG(QVariant, controller)));
     m_controller = controller.value<TerminalController*>();
     QVERIFY(m_controller != nullptr);
+
+    // Resolving the row is a round trip, so the attach happens on the answer
+    // rather than inside openPane(). What must be true is that the pane ends up
+    // attached to the target the SERVER minted for its row — not to anything
+    // the client composed, and not to a target derived from the slot label.
+    QTRY_VERIFY_WITH_TIMEOUT(!m_factory.targetFor(m_controller).isEmpty(), 20000);
     m_liveTarget = m_factory.targetFor(m_controller);
-    QVERIFY2(!m_liveTarget.isEmpty(),
-             "the pane did not attach through terminalFactory on completion");
+    QCOMPARE(m_liveTarget, row->tmuxTarget);
 
     QVariant loaded;
     QTRY_VERIFY_WITH_TIMEOUT(
@@ -525,10 +566,11 @@ void TstTerminalPage::livePaneRendersARealRemoteShell()
                        kProbeTimeoutMs),
              "the live pane never reported Ready to the page");
 
-    const QString marker = QStringLiteral("CH_PANE_MARKER_") + terminalId;
+    const QString marker = QStringLiteral("CH_PANE_MARKER_") + row->id.value.left(8);
     // printf, not echo: the pasted line carries "%s_%s", the OUTPUT carries the
     // joined marker, so xterm echoing our own keystrokes cannot satisfy this.
-    const QString command = QStringLiteral("printf '%s_%s\\n' CH_PANE MARKER_") + terminalId;
+    const QString command =
+        QStringLiteral("printf '%s_%s\\n' CH_PANE MARKER_") + row->id.value.left(8);
     QVERIFY2(pasteUntilScreenContains(command, marker, 60000),
              qPrintable(QStringLiteral("the remote marker %1 never appeared on the pane's screen")
                             .arg(marker)));
@@ -545,10 +587,19 @@ void TstTerminalPage::livePaneRendersARealRemoteShell()
              qPrintable(QStringLiteral("the remote PTY never reported %1").arg(expected)));
     qInfo().noquote() << "remote tmux client size matches the renderer:" << expected;
 
-    // Leave nothing running on the fixture: the pane's own kill path.
+    // Leave nothing running on the fixture: the pane's own kill path, then the
+    // rows it was built from.
     QVERIFY(QMetaObject::invokeMethod(m_window.get(), "paneKill"));
     QTest::qWait(1000);
     m_liveTarget.clear();
+
+    bool cleaned = false;
+    db.deleteGroup(group->id, [&](std::optional<ch::RpcError>) { cleaned = true; });
+    QTRY_VERIFY_WITH_TIMEOUT(cleaned, 15000);
+    // `db` and `boot` are locals: the factory must not outlive them holding a
+    // dangling repository.
+    m_factory.setWorkspace(nullptr);
+    boot.disconnectSession();
 }
 
 int main(int argc, char* argv[])

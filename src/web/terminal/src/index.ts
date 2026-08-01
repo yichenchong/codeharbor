@@ -20,11 +20,24 @@ export interface TerminalBridge {
     /** Report view visibility so the controller can suspend/resume the
      *  renderer while output keeps buffering (SPEC 5.4). */
     notifyViewVisible(visible: boolean): void;
+    /** Report that the emulator has consumed `bytes` worth of what write()
+     *  delivered — the flow-control half of the contract (SPEC 5.4/5.5).
+     *
+     *  The C++ controller emits at most a bounded amount of unacknowledged
+     *  output (ch::TerminalController::kMaxUnacknowledgedBytes) and retains the
+     *  rest in the same rolling buffer it uses for a hidden pane, so a runaway
+     *  remote process cannot queue an unbounded amount of data in the
+     *  WebChannel transport and in Chromium. `bytes` is the count the C++ side
+     *  attached to the batch, echoed back unchanged: this page holds decoded
+     *  text and cannot recover the PTY byte count from it. */
+    notifyOutputConsumed(bytes: number): void;
 }
 
 export interface TerminalHost {
-    /** Called by C++ with a batch of terminal output bytes (SPEC 5.1). */
-    write(data: string): void;
+    /** Called by C++ with a batch of terminal output (SPEC 5.1). `bytes` is how
+     *  many PTY bytes the text was decoded from; it is acknowledged back to C++
+     *  once the emulator has consumed it. */
+    write(data: string, bytes: number): void;
     /** Called by C++ with the current connection lifecycle state; the value is
      *  a ch::TerminalState string from SessionState.h (SPEC 5.6). */
     setConnectionState(state: string): void;
@@ -213,10 +226,12 @@ export function mountTerminal(element: HTMLElement, bridge: TerminalBridge): Ter
 
     // Terminal output goes through the coalescing writer rather than straight
     // into term.write(): see writer.ts for why an unthrottled write() can throw
-    // and wedge the pane on a large burst.
-    const writer = new CoalescingWriter({
-        write: (data, done) => term.write(data, done),
-    });
+    // and wedge the pane on a large burst, and why the acknowledgement below is
+    // what keeps its backlog bounded instead of merely moving the growth here.
+    const writer = new CoalescingWriter(
+        { write: (data, done) => term.write(data, done) },
+        (bytes) => bridge.notifyOutputConsumed(bytes),
+    );
 
     // dispose() can be reached twice — a host that tears the pane down
     // explicitly still has the "pagehide" handler registered in
@@ -228,11 +243,14 @@ export function mountTerminal(element: HTMLElement, bridge: TerminalBridge): Ter
     let disposed = false;
 
     return {
-        write(data: string): void {
+        write(data: string, bytes: number): void {
+            // Not acknowledged: a disposed renderer consumed nothing, and the
+            // controller has already been told this pane is hidden, so these
+            // bytes are its problem to retain and replay to the next renderer.
             if (disposed) {
                 return;
             }
-            writer.write(data);
+            writer.write(data, bytes);
         },
         setConnectionState(state: string): void {
             if (disposed) {
@@ -285,15 +303,16 @@ export interface Signal<F extends (...args: never[]) => void> {
 
 /**
  * The QWebChannel proxy for the C++ ch::TerminalBridge. Its SLOTS are the
- * frozen TerminalBridge half (JS -> C++); WebChannel cannot call a JS function,
+ * TerminalBridge half (JS -> C++); WebChannel cannot call a JS function,
  * so the TerminalHost half (C++ -> JS) arrives as SIGNALS which this page wires
  * onto the host returned by mountTerminal().
  */
 export interface TerminalChannelObject extends TerminalBridge {
     /** ch::TerminalState as a string (SPEC 5.6), cached by qwebchannel.js. */
     connectionState: string;
-    /** A coalesced batch of terminal output, UTF-8 decoded by C++ -> host.write. */
-    write: Signal<(data: string) => void>;
+    /** A coalesced batch of terminal output, UTF-8 decoded by C++, with the PTY
+     *  byte count it was decoded from -> host.write. */
+    write: Signal<(data: string, bytes: number) => void>;
     /** Lifecycle transition -> host.setConnectionState. */
     connectionStateChanged: Signal<(state: string) => void>;
     /** The app asked for the visible screen buffer to be dropped -> host.clear. */
@@ -359,7 +378,7 @@ export function connectTerminal(element: HTMLElement): void {
         // during teardown. An anonymous arrow could never be unsubscribed, and
         // qwebchannel.js keeps every connected handler alive on the proxy for
         // as long as the channel exists.
-        const onWrite = (data: string): void => host.write(data);
+        const onWrite = (data: string, bytes: number): void => host.write(data, bytes);
         const onConnectionStateChanged = (state: string): void => host.setConnectionState(state);
         const onClearRequested = (): void => host.clear();
         bridge.write.connect(onWrite);

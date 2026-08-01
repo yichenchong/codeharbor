@@ -11,6 +11,7 @@
 
 #include <QBuffer>
 #include <QByteArray>
+#include <QHash>
 #include <QMetaMethod>
 #include <QMetaObject>
 #include <QMetaProperty>
@@ -18,14 +19,19 @@
 #include <QSignalSpy>
 #include <QString>
 #include <QStringList>
+#include <QVector>
 
 #include <limits>
+#include <utility>
 
+#include "Ids.h"
 #include "SessionState.h"
 #include "SshConnectionPool.h"
 #include "TerminalBridge.h"
 #include "TerminalController.h"
 #include "TerminalFactory.h"
+#include "WorkspaceDb.h"
+#include "WorkspaceTypes.h"
 
 using namespace ch;
 
@@ -54,6 +60,10 @@ private slots:
     void createParentsTheControllerToThePane();
     void createBridgeWrapsTheControllerAndDiesWithThePane();
     void attachWithoutAConnectionFailsAndReportsWhy();
+    void attachWithoutATargetIsRefused();
+    void resolveTargetWithoutAServerRefuses();
+    void paneKeysAddressOneSlotOfOneDevSession();
+    void resolveAddressesAPaneByItsRowIdAndNeverByItsLabel();
     void detachAndKillWithoutAnAttachmentAreNoOps();
     void killCommandQuotesAdversarialTargets();
     void attachCommandQuotesAdversarialIdsAndWorkingDir();
@@ -65,6 +75,7 @@ private slots:
     void bridgeRetainsOutputForAHiddenPaneAndAcrossAPageReload();
     void bridgeIsInertOnceItsControllerIsDestroyed();
     void bridgeDecodesUtf8SplitAcrossFlushes();
+    void bridgeCarriesByteWeightAndFeedsAcknowledgementsBack();
     void bridgeReportsStateTransitionsAsStrings();
     void bridgeClearIsAViewOnlyRequest();
     void attachStallIsReportedAsAPaneMessage();
@@ -130,8 +141,8 @@ void TstTerminalFactory::attachWithoutAConnectionFailsAndReportsWhy()
     TerminalController* controller = factory.create(&pane);
 
     QVERIFY(!factory.connected());
-    QVERIFY(!factory.attach(controller, QStringLiteral("dev-1"),
-                            QStringLiteral("term-1"), QStringLiteral("/home/u"), 80, 24));
+    QVERIFY(!factory.attach(controller, QStringLiteral("ch_dev-1_term-1"),
+                            QStringLiteral("/home/u"), 80, 24));
 
     QCOMPARE(errors.count(), 1);
     QCOMPARE(errors.at(0).at(0).value<TerminalController*>(), controller);
@@ -148,13 +159,150 @@ void TstTerminalFactory::attachWithoutAConnectionFailsAndReportsWhy()
     TerminalFactory poolless(nullptr);
     QSignalSpy poollessErrors(&poolless, &TerminalFactory::error);
     QVERIFY(!poolless.connected());
-    QVERIFY(!poolless.attach(controller, QStringLiteral("dev-1"),
-                             QStringLiteral("term-1"), QString(), 80, 24));
+    QVERIFY(!poolless.attach(controller, QStringLiteral("ch_dev-1_term-1"), QString(), 80, 24));
     QCOMPARE(poollessErrors.count(), 1);
     // A null controller is refused without reporting an error against nobody.
-    QVERIFY(!poolless.attach(nullptr, QStringLiteral("dev-1"),
-                             QStringLiteral("term-1"), QString(), 80, 24));
+    QVERIFY(!poolless.attach(nullptr, QStringLiteral("ch_dev-1_term-1"), QString(), 80, 24));
     QCOMPARE(poollessErrors.count(), 1);
+}
+
+// A pane that has not been resolved against the server yet has no target, and
+// there is no longer anything the factory could put in its place: the identity
+// is a server row. Refusing is the whole point — every locally plausible
+// default ("ch_" + the layout pane id, say) is a name some OTHER pane may
+// already be attached to, which is how two panes end up mirroring one shell.
+void TstTerminalFactory::attachWithoutATargetIsRefused()
+{
+    SshConnectionPool pool;
+    TerminalFactory factory(&pool);
+    QSignalSpy errors(&factory, &TerminalFactory::error);
+
+    QObject pane;
+    TerminalController* controller = factory.create(&pane);
+
+    QVERIFY(!factory.attach(controller, QString(), QStringLiteral("/home/u"), 80, 24));
+    QCOMPARE(errors.count(), 1);
+    QVERIFY(factory.targetFor(controller).isEmpty());
+    QVERIFY(controller->state() == TerminalState::Unloaded);
+}
+
+// resolveTarget() reaches the server for a row, so with no connection it has to
+// refuse exactly as attach() does — and, above all, it must not answer with a
+// locally composed target. A refusal returns false, so the pane knows no answer
+// is coming and can offer Retry instead of waiting for ever.
+void TstTerminalFactory::resolveTargetWithoutAServerRefuses()
+{
+    SshConnectionPool pool;
+    TerminalFactory factory(&pool);
+    QSignalSpy errors(&factory, &TerminalFactory::error);
+    QSignalSpy resolved(&factory, &TerminalFactory::targetResolved);
+
+    QObject pane;
+    TerminalController* controller = factory.create(&pane);
+
+    QVERIFY(!factory.connected());
+    QVERIFY(!factory.resolveTarget(controller, QStringLiteral("dev-1"),
+                                   QStringLiteral("terminal-1"), QStringLiteral("row-1"),
+                                   QStringLiteral("/home/u")));
+    QCOMPARE(errors.count(), 1);
+    QCOMPARE(errors.at(0).at(0).value<TerminalController*>(), controller);
+    QCOMPARE(resolved.count(), 0);
+
+    // A pane with no Dev Session cannot be addressed at all, however it is
+    // considered, and a null controller reports against nobody.
+    QVERIFY(!factory.resolveTarget(controller, QString(), QStringLiteral("terminal-1"),
+                                   QStringLiteral("row-1"), QString()));
+    QCOMPARE(errors.count(), 2);
+    QVERIFY(!factory.resolveTarget(nullptr, QStringLiteral("dev-1"),
+                                   QStringLiteral("terminal-1"), QStringLiteral("row-1"),
+                                   QString()));
+    QCOMPARE(errors.count(), 2);
+
+    // Nothing was answered: a refusal is not a resolution, and a pane must
+    // never be handed a target that did not come from the server.
+    QCOMPARE(resolved.count(), 0);
+}
+
+// The address a pane resolution is keyed by. It is a PAIR — Dev Session plus
+// layout pane id — and both halves matter: layout pane ids are minted per Dev
+// Session, so "terminal-1" exists in every one of them and naming a terminal by
+// the id alone would hand one session's pane another session's shell. The
+// separator must also not be forgeable out of the parts, or two different
+// addresses could collapse onto one cache entry.
+void TstTerminalFactory::paneKeysAddressOneSlotOfOneDevSession()
+{
+    QCOMPARE(TerminalFactory::paneKey(QStringLiteral("dev-a"), QStringLiteral("terminal-1")),
+             QStringLiteral("dev-a/terminal-1"));
+    QVERIFY(TerminalFactory::paneKey(QStringLiteral("dev-a"), QStringLiteral("terminal-1"))
+            != TerminalFactory::paneKey(QStringLiteral("dev-b"), QStringLiteral("terminal-1")));
+    QVERIFY(TerminalFactory::paneKey(QStringLiteral("dev-a"), QStringLiteral("terminal-1"))
+            != TerminalFactory::paneKey(QStringLiteral("dev-a"), QStringLiteral("terminal-10")));
+    // The join is unambiguous because of what the LEFT half is, not because of
+    // any escaping: a Dev Session id is a server-minted UUID, so it cannot
+    // contain the separator and the key can only be cut in one place. Pinned
+    // here so a future key format keeps that property in mind.
+    const QString devSessionId = QStringLiteral("2f1c9a30-4c1b-4e3e-8d0e-6a1f9b2c3d4e");
+    QVERIFY(!devSessionId.contains(QLatin1Char('/')));
+    QCOMPARE(TerminalFactory::paneKey(devSessionId, QStringLiteral("terminal-1"))
+                 .left(devSessionId.size()),
+             devSessionId);
+}
+
+// THE fix, stated as a contract. A layout leaf that carries a `terminal_panes`
+// row id is addressed by that id and by nothing else — the slot label must not
+// even reach the server, because the label recycles: closing a pane leaves its
+// row and its remote shell alive, and the next split on any client can mint the
+// same label for a brand new pane. A leaf with NO row id predates the field, so
+// its label genuinely is its historical key and lookup-or-create by label is
+// correct for it exactly once.
+void TstTerminalFactory::resolveAddressesAPaneByItsRowIdAndNeverByItsLabel()
+{
+    const QString server = QStringLiteral("srv-1");
+    const QString session = QStringLiteral("2f1c9a30-4c1b-4e3e-8d0e-6a1f9b2c3d4e");
+    const QString row = QStringLiteral("8ad0b1c2-1111-4222-8333-944455556666");
+
+    const ResolveTerminalPaneParams byRow = TerminalFactory::resolveParamsFor(
+        server, session, QStringLiteral("terminal-2"), row, QStringLiteral("/home/u"));
+    QCOMPARE(byRow.serverId.value, server);
+    QCOMPARE(byRow.devSessionId.value, session);
+    QCOMPARE(byRow.id, row);
+    // Not merely unused — ABSENT. A row lookup cannot create, so a working
+    // directory would be a promise the server never keeps, and the label must
+    // not look like part of the question.
+    QVERIFY(byRow.name.isEmpty());
+    QVERIFY(!byRow.workingDirectory.has_value());
+
+    const ResolveTerminalPaneParams byLabel = TerminalFactory::resolveParamsFor(
+        server, session, QStringLiteral("terminal-2"), QString(), QStringLiteral("/home/u"));
+    QVERIFY(byLabel.id.isEmpty());
+    QCOMPARE(byLabel.name, QStringLiteral("terminal-2"));
+    // Only this path can create a row, and only a created tmux session honours
+    // `-c <dir>`.
+    QVERIFY(byLabel.workingDirectory.has_value());
+    QCOMPARE(*byLabel.workingDirectory, QStringLiteral("/home/u"));
+
+    // An empty working directory is omitted rather than sent as "", so the
+    // server applies its own default.
+    QVERIFY(!TerminalFactory::resolveParamsFor(server, session,
+                                               QStringLiteral("terminal-2"), QString(),
+                                               QString())
+                 .workingDirectory.has_value());
+
+    // Two panes wearing the SAME label but owning different rows ask different
+    // questions. Under the old label-keyed scheme they asked the same one, and
+    // the second pane was handed the first pane's shell.
+    const QString otherRow = QStringLiteral("cafe0000-2222-4333-8444-955566667777");
+    QVERIFY(TerminalFactory::resolveParamsFor(server, session,
+                                              QStringLiteral("terminal-2"), row, QString())
+                .id
+            != TerminalFactory::resolveParamsFor(server, session,
+                                                 QStringLiteral("terminal-2"), otherRow,
+                                                 QString())
+                   .id);
+    // And the cache keys those two produce cannot collide with each other, nor
+    // with a legacy slot address: a row id is a UUID and carries no "/".
+    QVERIFY(!row.contains(QLatin1Char('/')));
+    QVERIFY(row != TerminalFactory::paneKey(session, QStringLiteral("terminal-2")));
 }
 
 void TstTerminalFactory::detachAndKillWithoutAnAttachmentAreNoOps()
@@ -227,12 +375,11 @@ void TstTerminalFactory::killCommandQuotesAdversarialTargets()
     QCOMPARE(TerminalFactory::tmuxKillSessionCommand(QStringLiteral("-a")),
              QStringLiteral("tmux kill-session -t '=-a'"));
 
-    // The real minted target is what actually reaches this function, so run one
-    // through the same helper the factory uses: hostile ids stay inside the
-    // quoted, exact-matched argument.
-    const QString minted = TerminalController::tmuxTarget(
-        DevSessionId{QStringLiteral("*")}, TerminalId{QStringLiteral("t1'; id; '")});
-    QCOMPARE(TerminalFactory::tmuxKillSessionCommand(minted),
+    // A hostile target can no longer be MINTED — codeharbord validates what it
+    // stores against tmux's own grammar — but a target still crosses a machine
+    // boundary before it reaches a remote shell, so the escaping stays and
+    // stays tested.
+    QCOMPARE(TerminalFactory::tmuxKillSessionCommand(QStringLiteral("ch_*_t1'; id; '")),
              QStringLiteral("tmux kill-session -t '=ch_*_t1'\\''; id; '\\'''"));
 }
 
@@ -250,28 +397,24 @@ void TstTerminalFactory::killCommandQuotesAdversarialTargets()
 // and the `-t` target with one.
 void TstTerminalFactory::attachCommandQuotesAdversarialIdsAndWorkingDir()
 {
-    QCOMPARE(TerminalController::tmuxNewSessionCommand(
-                 DevSessionId{QStringLiteral("dev")}, TerminalId{QStringLiteral("t1")},
-                 QStringLiteral("/srv/repo")),
+    QCOMPARE(TerminalController::tmuxNewSessionCommand(QStringLiteral("ch_dev_t1"),
+                                                       QStringLiteral("/srv/repo")),
              QStringLiteral("tmux new-session -A -s 'ch_dev_t1' -c '/srv/repo'"
                             " \\; set-option -t '=ch_dev_t1:' mouse on"));
 
     // A working directory is the field most likely to carry a real quote, and
     // the one a user can type. Breaking out of it would run `id` on the host.
     QCOMPARE(TerminalController::tmuxNewSessionCommand(
-                 DevSessionId{QStringLiteral("dev")}, TerminalId{QStringLiteral("t1")},
-                 QStringLiteral("/tmp/x'; id; echo '")),
+                 QStringLiteral("ch_dev_t1"), QStringLiteral("/tmp/x'; id; echo '")),
              QStringLiteral("tmux new-session -A -s 'ch_dev_t1' "
                             "-c '/tmp/x'\\''; id; echo '\\'''"
                             " \\; set-option -t '=ch_dev_t1:' mouse on"));
 
-    // Ids arrive from server data: a quote in either one must not escape, and
-    // the two must not be able to merge into one another's field. The id reaches
-    // the command TWICE now — as the new session's name and as the target of the
-    // mouse option — so both copies are checked.
+    // The target arrives from the server: a quote in it must not escape. It
+    // reaches the command TWICE — as the new session's name and as the target
+    // of the mouse option — so both copies are checked.
     QCOMPARE(TerminalController::tmuxNewSessionCommand(
-                 DevSessionId{QStringLiteral("d'; rm -rf ~; '")},
-                 TerminalId{QStringLiteral("t`whoami`")}, QStringLiteral("/w")),
+                 QStringLiteral("ch_d'; rm -rf ~; '_t`whoami`"), QStringLiteral("/w")),
              QStringLiteral("tmux new-session -A -s 'ch_d'\\''; rm -rf ~; '\\''_t`whoami`' "
                             "-c '/w'"
                             " \\; set-option -t "
@@ -281,8 +424,7 @@ void TstTerminalFactory::attachCommandQuotesAdversarialIdsAndWorkingDir()
     // getopt, and a newline is inert inside the quotes: neither adds a word to
     // the command.
     const QString command = TerminalController::tmuxNewSessionCommand(
-        DevSessionId{QStringLiteral("dev")}, TerminalId{QStringLiteral("t1")},
-        QStringLiteral("-rf /\nrm -rf ~"));
+        QStringLiteral("ch_dev_t1"), QStringLiteral("-rf /\nrm -rf ~"));
     QCOMPARE(command,
              QStringLiteral("tmux new-session -A -s 'ch_dev_t1' -c '-rf /\nrm -rf ~'"
                             " \\; set-option -t '=ch_dev_t1:' mouse on"));
@@ -359,12 +501,14 @@ void TstTerminalFactory::bridgeExposesNoRemoteTargetingSlots()
     }
     callable.sort();
 
-    // The frozen contract, and nothing else. requestClear() is Q_INVOKABLE for
-    // the app side and is a view-only operation; the rest is this pane's own
-    // input, geometry, visibility and mount handshake. No attach, no kill, no
-    // detach, no tmux target, no working directory, no session id.
+    // The contract, and nothing else. requestClear() is Q_INVOKABLE for the app
+    // side and is a view-only operation; the rest is this pane's own input,
+    // geometry, visibility, mount handshake and output-consumption report. No
+    // attach, no kill, no detach, no tmux target, no working directory, no
+    // session id.
     QCOMPARE(callable,
-             QStringList({QStringLiteral("notifyViewVisible"), QStringLiteral("ready"),
+             QStringList({QStringLiteral("notifyOutputConsumed"),
+                          QStringLiteral("notifyViewVisible"), QStringLiteral("ready"),
                           QStringLiteral("requestClear"), QStringLiteral("resize"),
                           QStringLiteral("sendInput")}));
 
@@ -379,9 +523,9 @@ void TstTerminalFactory::bridgeExposesNoRemoteTargetingSlots()
                           QStringLiteral("rows")}));
 }
 
-// The three frozen TerminalBridge slots the page calls, each landing on the
-// controller: keystrokes on the transport, geometry recorded, visibility
-// toggled.
+// The TerminalBridge slots the page calls, each landing on the controller:
+// keystrokes on the transport, geometry recorded, visibility toggled. (The
+// fourth, notifyOutputConsumed(), has its own test below.)
 void TstTerminalFactory::bridgeForwardsInputResizeAndVisibility()
 {
     QObject pane;
@@ -591,6 +735,65 @@ void TstTerminalFactory::bridgeDecodesUtf8SplitAcrossFlushes()
     QTRY_COMPARE(writes.count(), 1);
     QCOMPARE(writes.at(0).at(0).toString(), QString::fromUtf8("\xE2\x9C\x94 done"));
     QVERIFY(!writes.at(0).at(0).toString().contains(QChar(0xFFFD)));
+    // The two bytes of the batch that decoded to nothing are carried onto this
+    // one, so the page can acknowledge all eight bytes the controller charged
+    // against its flow-control window. Losing them would leak the controller's
+    // credit away one truncated glyph at a time until the pane stopped
+    // receiving output altogether.
+    QCOMPARE(writes.at(0).at(1).toInt(), 8);
+}
+
+// The flow-control loop across the bridge: what write() advertises as the byte
+// weight of a batch is what the page hands back, and handing it back is what
+// releases the output the controller retained.
+void TstTerminalFactory::bridgeCarriesByteWeightAndFeedsAcknowledgementsBack()
+{
+    QObject pane;
+    TerminalFactory factory(nullptr);
+    TerminalController* controller = factory.create(&pane);
+    TerminalBridge* bridge = factory.createBridge(controller, &pane);
+    bridge->ready();
+    QSignalSpy writes(bridge, &TerminalBridge::write);
+
+    // Run the renderer's credit down to zero without acknowledging anything.
+    const QByteArray chunk(TerminalController::kFlushSizeBytes, 'A');
+    const int batches =
+        TerminalController::kMaxUnacknowledgedBytes / TerminalController::kFlushSizeBytes;
+    for (int i = 0; i < batches; ++i)
+        controller->ingestOutput(chunk);
+    QCOMPARE(writes.count(), batches);
+    // Every batch advertised its own byte weight, which is what the page echoes.
+    QCOMPARE(writes.at(0).at(1).toInt(), TerminalController::kFlushSizeBytes);
+
+    // Past the window the pane retains instead of emitting at a renderer that
+    // is demonstrably not keeping up.
+    controller->ingestOutput(QByteArrayLiteral("held back"));
+    QTRY_COMPARE(controller->hiddenBuffer(), QByteArrayLiteral("held back"));
+    QCOMPARE(writes.count(), batches);
+
+    // The page reports it consumed one batch; the retained bytes are released.
+    bridge->notifyOutputConsumed(TerminalController::kFlushSizeBytes);
+    QCOMPARE(writes.count(), batches + 1);
+    QCOMPARE(writes.at(batches).at(0).toString(), QStringLiteral("held back"));
+    QCOMPARE(writes.at(batches).at(1).toInt(), 9);
+    QVERIFY(controller->hiddenBuffer().isEmpty());
+
+    // A renderer that DIES without reporting hidden — a crash, or a navigation
+    // its pagehide handler did not survive — leaves the controller believing a
+    // renderer is there and owing a full window. The replacement's handshake
+    // must clear that, or the new page would sit blank forever behind a debt it
+    // can never pay: it is not a visibility CHANGE, so nothing else would.
+    for (int i = 0; i < batches; ++i)
+        controller->ingestOutput(chunk);
+    controller->ingestOutput(QByteArrayLiteral("stranded"));
+    QTRY_VERIFY(controller->hiddenBuffer().endsWith(QByteArrayLiteral("stranded")));
+    const QByteArray stranded = controller->hiddenBuffer();
+
+    const int before = writes.count();
+    bridge->ready(); // the replacement page mounts; no hidden report preceded it
+    QCOMPARE(writes.count(), before + 1);
+    QCOMPARE(writes.at(before).at(0).toString(), QString::fromUtf8(stranded));
+    QVERIFY(controller->hiddenBuffer().isEmpty());
 }
 
 // The page renders the SPEC 5.6 lifecycle; it receives it as the ch::TerminalState

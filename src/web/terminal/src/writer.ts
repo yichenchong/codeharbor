@@ -18,9 +18,19 @@
 // small chunks the bridge delivers. xterm.js' own pending-data counter
 // therefore never grows past one chunk and the 50 MB ceiling is unreachable.
 //
-// No data is ever dropped: the backlog holds exactly the bytes xterm.js has not
-// consumed yet, which is the same data that would otherwise be sitting inside
-// xterm.js' own queue.
+// WHAT BOUNDS THE BACKLOG: this class does not drop anything and does not need
+// to, because the C++ side will not keep sending. Every chunk the sink consumes
+// is reported back to ch::TerminalController through `onConsumed`, and the
+// controller emits at most ch::TerminalController::kMaxUnacknowledgedBytes of
+// unacknowledged output before it starts retaining the rest in its own rolling
+// buffer instead. So the backlog here is bounded by that window plus one
+// release batch — the protocol bounds it, not a limit invented in this file,
+// which is what keeps the "nothing is ever dropped here" property true: the
+// backlog holds exactly the bytes xterm.js has not consumed yet.
+//
+// A renderer that stops acknowledging (wedged, crashed, mid-teardown) simply
+// stops receiving: the controller retains and evicts oldest-first, exactly as
+// it does for a hidden pane, and picks up again when acknowledgements resume.
 
 /** The sink this writer drives — xterm.js' Terminal.write(data, callback), or a
  *  fake in tests. `done` MUST be invoked once the sink has consumed `data`. */
@@ -28,38 +38,59 @@ export interface WriteSink {
     write(data: string, done: () => void): void;
 }
 
+/** Called with the byte weight of a chunk the sink has finished consuming, so
+ *  the C++ controller can release the next one (bridge.notifyOutputConsumed).
+ *  The weight is the PTY byte count C++ attached to the batch, never a length
+ *  measured here: the text is decoded, and re-measuring it would drift on
+ *  output that is not valid UTF-8. */
+export type ConsumedCallback = (bytes: number) => void;
+
 export class CoalescingWriter {
     private readonly sink: WriteSink;
+    private readonly onConsumed: ConsumedCallback;
     /** Output that has arrived but has not been handed to the sink yet. */
     private backlog = "";
+    /** Summed byte weight of the batches making up `backlog`. */
+    private backlogBytes = 0;
     /** True while the sink still owes us a `done` for the last chunk. */
     private inFlight = false;
     /** Set by close(); every later write is discarded (the sink is gone). */
     private closed = false;
 
-    constructor(sink: WriteSink) {
+    constructor(sink: WriteSink, onConsumed: ConsumedCallback) {
         this.sink = sink;
+        this.onConsumed = onConsumed;
     }
 
-    /** Bytes waiting for the sink to catch up. Exposed for tests/diagnostics. */
+    /** Characters waiting for the sink to catch up. Exposed for tests/diagnostics. */
     get backlogSize(): number {
         return this.backlog.length;
     }
 
-    /** Queue terminal output. Returns immediately; the sink is fed as it drains. */
-    write(data: string): void {
+    /** Queue terminal output. Returns immediately; the sink is fed as it drains.
+     *  `bytes` is the batch's PTY byte weight, reported back through
+     *  `onConsumed` once the sink has consumed it. */
+    write(data: string, bytes: number): void {
         if (this.closed || data.length === 0) {
             return;
         }
         this.backlog += data;
+        this.backlogBytes += bytes;
         this.pump();
     }
 
     /** The sink is being disposed. Refuse further writes and drop the backlog so
-     *  a `done` arriving during teardown cannot write into a dead terminal. */
+     *  a `done` arriving during teardown cannot write into a dead terminal.
+     *
+     *  Nothing is acknowledged on the way out, deliberately: the pane reports
+     *  itself hidden as part of the same teardown, which resets the controller's
+     *  account and moves it back to retaining output for whichever renderer
+     *  shows up next. An acknowledgement here would only credit a renderer that
+     *  no longer exists. */
     close(): void {
         this.closed = true;
         this.backlog = "";
+        this.backlogBytes = 0;
     }
 
     private pump(): void {
@@ -67,10 +98,20 @@ export class CoalescingWriter {
             return;
         }
         const chunk = this.backlog;
+        const bytes = this.backlogBytes;
         this.backlog = "";
+        this.backlogBytes = 0;
         this.inFlight = true;
         this.sink.write(chunk, () => {
             this.inFlight = false;
+            // Acknowledge BEFORE pumping: the C++ side may answer the
+            // acknowledgement by releasing what it retained, and that arrives
+            // as another write() into this same writer. Doing it in this order
+            // means the released batch joins a backlog that is already drained
+            // rather than one this pump is halfway through.
+            if (!this.closed) {
+                this.onConsumed(bytes);
+            }
             this.pump();
         });
     }

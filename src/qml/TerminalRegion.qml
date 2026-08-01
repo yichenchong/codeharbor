@@ -22,6 +22,15 @@ import QtQuick.Controls.Basic
 // The cache is the sole owner: sweepPanes() destroys exactly the panes whose
 // paneId has left the tree, and nothing else may destroy one — no other code is
 // in a position to tell "this pane moved" from "this pane was closed".
+//
+// A paneId addresses a SLOT IN THIS LAYOUT and nothing else. It is not the
+// terminal's identity: the LEAF carries that, as `terminalPaneId` — the id of
+// the pane's row in the server's `terminal_panes` table, minted by the server,
+// never recycled and shared through the stored layout (see
+// TerminalPaneView.terminalPaneId). That is why the labels may keep being
+// recycled per Dev Session — ch::SessionLayouts hands out "terminal-1",
+// "terminal-2", … so they stay short and stable — without a recycled number
+// ever re-attaching a shell some earlier pane left running.
 Rectangle {
     id: region
     color: Theme.surfaceSunken
@@ -306,7 +315,9 @@ Rectangle {
             return;
         const pane = region.paneOwner.takePane(key, paneHost,
                                                { devSessionId: region.devSessionId,
-                                                 workingDir: region.workingDir });
+                                                 workingDir: region.workingDir,
+                                                 terminalPaneId: region.leafTerminalPaneId(),
+                                                 terminalLegacy: region.leafTerminalLegacy() });
         if (!pane)
             return;
         region.shownPaneId = key;
@@ -314,9 +325,27 @@ Rectangle {
         region.applyPaneContext();
     }
 
+    // The server-minted `terminal_panes` row id this leaf owns
+    // (SplitNode::terminalPaneId), or "" when it has none. THE pane's identity:
+    // paneId beside it is a recyclable slot label and names nothing remote.
+    function leafTerminalPaneId() {
+        return region.node && region.node.terminalPaneId
+               ? String(region.node.terminalPaneId) : "";
+    }
+
+    // Published by ch::SessionLayouts, never persisted: this id-less leaf was
+    // stored before layouts carried row ids, so it — and only it — may resolve
+    // by its slot label, once. An id-less leaf WITHOUT this is a pane whose row
+    // is still being minted, and it must attach nothing until the id lands.
+    function leafTerminalLegacy() {
+        return region.node ? region.node.terminalLegacy === true : false;
+    }
+
     // The session context is this REGION's, not the pane's own: a borrowed pane
     // follows whichever leaf is showing it, and keeps following that leaf when
-    // the session or the working directory changes underneath it.
+    // the session or the working directory changes underneath it. The leaf's
+    // terminal identity travels the same way, so a pane picks up the row id the
+    // moment ch::SessionLayouts republishes the tree carrying it.
     function applyPaneContext() {
         if (!region.showingPane)
             return;
@@ -325,6 +354,8 @@ Rectangle {
             return;
         pane.devSessionId = region.devSessionId;
         pane.workingDir = region.workingDir;
+        pane.terminalLegacy = region.leafTerminalLegacy();
+        pane.terminalPaneId = region.leafTerminalPaneId();
     }
 
     // Stop showing this region's pane. The pane outlives the layout node that

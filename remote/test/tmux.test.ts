@@ -4,6 +4,9 @@ import assert from "node:assert/strict";
 import {
     LIST_SESSIONS_FORMAT,
     SPAWN_FAILED,
+    TMUX_TARGET_MAX_LENGTH,
+    isSafeTmuxTarget,
+    tmuxSafeName,
     parseSessions,
     listSessions,
     sessionExists,
@@ -293,4 +296,59 @@ test("a MARKED line with too few fields is skipped, not half-parsed", async () =
         (await listSessions(tmux.run)).map((session) => session.name),
         ["real"],
     );
+});
+
+// --- target names (SPEC 5.2) ------------------------------------------------
+//
+// A terminal pane's tmux target is minted once, on the server, and every client
+// then uses it verbatim as a session name and as a `-t '=<target>'` argument.
+// Whether a given string can survive that round trip is tmux's grammar, not a
+// matter of taste, so it gets its own tests.
+
+test("isSafeTmuxTarget accepts what the server mints", () => {
+    // The real shape: `ch_` plus two UUIDs. Nothing else the product produces
+    // ever reaches tmux as a session name.
+    assert.equal(
+        isSafeTmuxTarget("ch_2f1c9a30-4c1b-4e3e-8d0e-6a1f9b2c3d4e_8b7a6c5d-4e3f-2a1b-9c8d-7e6f5a4b3c2d"),
+        true,
+    );
+    assert.equal(isSafeTmuxTarget("ch_a"), true);
+    assert.equal(isSafeTmuxTarget("ch-a_B9"), true);
+    assert.equal(isSafeTmuxTarget("x".repeat(TMUX_TARGET_MAX_LENGTH)), true);
+});
+
+test("isSafeTmuxTarget refuses anything tmux reads as structure", () => {
+    // `:` and `.` are the session/window/pane separators, so `-t 'ch_a:0'`
+    // addresses window 0 of session `ch_a`. tmux will not even let a session
+    // hold them: it rewrites both to `_` at creation time.
+    assert.equal(isSafeTmuxTarget("ch_a:0"), false);
+    assert.equal(isSafeTmuxTarget("ch_a.1"), false);
+    // `$`, `@` and `%` introduce tmux's own session/window/pane ids, `=` is the
+    // exact-match prefix, and `*`/`?` are its fnmatch wildcards — each of them
+    // makes a target resolve to something other than the name as typed.
+    for (const bad of ["$3", "@1", "%2", "=ch_a", "ch_*", "ch_?"]) {
+        assert.equal(isSafeTmuxTarget(bad), false, `expected ${bad} to be unsafe`);
+    }
+    // Whitespace, control characters and the empty name have no business in a
+    // session name either; the empty one is what tmux itself rejects outright.
+    for (const bad of ["", " ", "ch a", "ch\ta", "ch\na", "ch\u0007a"]) {
+        assert.equal(isSafeTmuxTarget(bad), false, `expected ${JSON.stringify(bad)} to be unsafe`);
+    }
+    // A bound, so a target cannot be stored here and truncated into a different
+    // session's name somewhere downstream.
+    assert.equal(isSafeTmuxTarget("x".repeat(TMUX_TARGET_MAX_LENGTH + 1)), false);
+});
+
+// This mirrors tmux's session_check_name(), verified against tmux 3.6:
+// `tmux new-session -s 'ch_a.b:c'` creates a session whose #{session_name} is
+// `ch_a_b_c`. Repairing a stored target this way is therefore not a retarget —
+// it is the stored value finally naming the session tmux made.
+test("tmuxSafeName rewrites exactly the two characters tmux rewrites", () => {
+    assert.equal(tmuxSafeName("ch_a.b:c"), "ch_a_b_c");
+    assert.equal(tmuxSafeName("ch_plain"), "ch_plain");
+    assert.equal(isSafeTmuxTarget(tmuxSafeName("ch_a.b:c")), true);
+    // It repairs the tmux grammar and nothing else: a name carrying a space is
+    // still not a target this server will accept, it is simply not this
+    // function's business.
+    assert.equal(tmuxSafeName("ch a.b"), "ch a_b");
 });

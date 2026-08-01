@@ -59,6 +59,64 @@ const TMUX_BINARY = process.env.CODEHARBOR_TMUX ?? "tmux";
 // result rather than an error.
 const TMUX_TIMEOUT_MS = 10_000;
 
+// --- tmux target names (SPEC 5.2) -------------------------------------------
+//
+// A tmux TARGET is not free-form text. Every `-t` argument is read with the
+// grammar `session:window.pane`, so a `:` or a `.` inside a name is STRUCTURE:
+// `-t 'ch_a:0'` addresses window 0 of session `ch_a`, not a session called
+// `ch_a:0`. tmux does not even let such a session exist — session_check_name()
+// rewrites both characters to `_` at creation time. Verified against the tmux
+// 3.6 on this host: `tmux new-session -s 'ch_a.b:c'` produces a session whose
+// `#{session_name}` reads back `ch_a_b_c`. A stored target carrying either
+// character therefore names a session that CANNOT exist, so the exact-match
+// form (`-t '=<target>'`, which attach and kill both use) misses it outright,
+// while an un-anchored form resolves to whatever session the prefix happens to
+// hit — somebody else's shell.
+//
+// The accepted set is a WHITELIST rather than a blacklist of those two
+// characters, because several more are meaningful in a target position: `$`,
+// `@` and `%` introduce tmux's session/window/pane ids, `=` is its exact-match
+// prefix, `*` and `?` are its fnmatch wildcards, a leading `-` reads as an
+// option, and control characters come back vis-escaped in tmux's output (see
+// the listing parser below). Everything CodeHarbor mints is `ch_` plus two
+// UUIDs, which fits this set with room to spare.
+const TMUX_TARGET_SAFE = /^[A-Za-z0-9_-]+$/;
+
+// Longest target accepted. Nothing in tmux's grammar hangs on it; it is a bound
+// so an absurd name cannot be stored, shipped through a command line and then
+// truncated somewhere downstream into a DIFFERENT session's name. `ch_` plus
+// two 36-character UUIDs is 75 characters, so this leaves ample headroom.
+export const TMUX_TARGET_MAX_LENGTH = 200;
+
+/**
+ * Is `target` usable verbatim as a tmux session name and as an exact-match
+ * `-t '=<target>'` argument? See TMUX_TARGET_SAFE for what "usable" excludes.
+ */
+export function isSafeTmuxTarget(target: string): boolean {
+    return (
+        target.length > 0 &&
+        target.length <= TMUX_TARGET_MAX_LENGTH &&
+        TMUX_TARGET_SAFE.test(target)
+    );
+}
+
+/**
+ * Apply tmux's OWN session-name normalization to `name`: `:` and `.` become
+ * `_`, exactly as session_check_name() does when the session is created.
+ *
+ * This is deliberately a REWRITE and not a rejection, and it has exactly one
+ * caller: the schema v3 migration repairing targets already in the database. A
+ * stored `ch_a.b` never named a real session — tmux created `ch_a_b` — so the
+ * rewrite does not retarget the pane, it makes the stored value finally name
+ * the session that has been there all along. New values coming in over RPC are
+ * REJECTED instead (see Workspace.createTerminalPane): there the caller still
+ * exists to be told, and silently handing back a target different from the one
+ * it asked for would leave it attaching to one session and killing another.
+ */
+export function tmuxSafeName(name: string): string {
+    return name.replace(/[:.]/g, "_");
+}
+
 // Machine-readable listing format. The NAME COMES LAST on purpose: a tmux
 // session name may contain the field delimiter (and spaces, and `:`), so the
 // numeric/boolean fields are parsed positionally from the front and everything

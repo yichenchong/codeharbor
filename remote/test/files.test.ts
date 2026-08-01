@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { EventEmitter } from "node:events";
 
 import {
     stat,
@@ -15,8 +16,17 @@ import {
     isRevisionMismatch,
     FileWatchService,
 } from "../src/files.ts";
-import { RPC_REVISION_MISMATCH } from "../src/rpc-types.ts";
-import { dispatch, RPC_INVALID_PARAMS } from "../src/codeharbord.ts";
+import {
+    RPC_REVISION_MISMATCH,
+    RPC_WATCH_EVENT_NOTIFICATION,
+    RPC_WATCH_EVENTS_LOST_NOTIFICATION,
+} from "../src/rpc-types.ts";
+import {
+    createWatchNotificationRelay,
+    dispatch,
+    MAX_PENDING_WATCH_EVENTS,
+    RPC_INVALID_PARAMS,
+} from "../src/codeharbord.ts";
 import type { WatchEvent } from "../src/rpc-types.ts";
 
 async function tmpDir(): Promise<string> {
@@ -916,6 +926,244 @@ test("file.readFile rejects a non-integer or negative offset/length", async () =
     const result = await readFile({ path: file, offset: 2, length: 3 });
     assert.equal(result.content, "234");
     assert.equal(result.truncated, true);
+
+    await fs.rm(dir, { recursive: true, force: true });
+});
+
+// --- Bounded watch-notification relay ---------------------------------------
+//
+// The daemon writes watch notifications to stdout, which SSH forwards. When the
+// client's end stalls, an unchecked write() lets Node buffer without bound and
+// a churning directory eventually kills the daemon — taking the whole workspace
+// connection with it. createWatchNotificationRelay bounds that queue, coalesces
+// per (subscription, path), and reports whatever it still had to drop.
+
+// A stand-in for stdout whose stall is under the test's control: while
+// `stalled`, write() reports a full buffer exactly as a real stream does (the
+// chunk is still accepted — that is what an unbounded internal buffer IS), and
+// drain() releases it. No wall clock anywhere.
+function fakeOut(): {
+    out: NodeJS.WritableStream;
+    lines: string[];
+    stall: () => void;
+    drain: () => void;
+} {
+    const emitter = new EventEmitter();
+    const lines: string[] = [];
+    let stalled = false;
+    const out = {
+        write(chunk: string): boolean {
+            lines.push(chunk);
+            return !stalled;
+        },
+        on(event: string, handler: () => void): unknown {
+            emitter.on(event, handler);
+            return out;
+        },
+    } as unknown as NodeJS.WritableStream;
+    return {
+        out,
+        lines,
+        stall: () => {
+            stalled = true;
+        },
+        drain: () => {
+            stalled = false;
+            emitter.emit("drain");
+        },
+    };
+}
+
+function relayEvent(subscriptionId: string, filePath: string, revision: string): WatchEvent {
+    return { subscriptionId, path: filePath, event: "modified", revision };
+}
+
+// Parse the relay's output lines into (method, params) pairs.
+function parseLines(lines: string[]): { method: string; params: Record<string, unknown> }[] {
+    return lines.map((line) => {
+        const message = JSON.parse(line) as {
+            method: string;
+            params: Record<string, unknown>;
+        };
+        return { method: message.method, params: message.params };
+    });
+}
+
+test("a stalled consumer cannot grow the relay's queue past its bound", () => {
+    const sink = fakeOut();
+    // Every subscription is live, so nothing is dropped for being unknown: the
+    // bound is the only thing that can stop the queue growing.
+    const live = new Set<string>();
+    const relay = createWatchNotificationRelay(sink.out, (id) => live.has(id));
+
+    sink.stall();
+    // Far more DISTINCT subscriptions than the bound allows — distinct keys are
+    // the only thing coalescing cannot absorb.
+    const total = MAX_PENDING_WATCH_EVENTS * 3;
+    for (let i = 0; i < total; i += 1) {
+        const id = `sub-${i}`;
+        live.add(id);
+        relay.deliver(relayEvent(id, `/w/${i}.txt`, `r${i}`));
+    }
+
+    // The first delivery went out before the stall was observed (its write is
+    // what reports the full buffer); everything after it is queued, capped.
+    assert.equal(sink.lines.length, 1);
+    assert.ok(
+        relay.pendingCount() <= MAX_PENDING_WATCH_EVENTS,
+        `queued ${relay.pendingCount()} notifications, above the ${MAX_PENDING_WATCH_EVENTS} bound`,
+    );
+});
+
+test("the relay coalesces a burst for one path into a single latest notification", () => {
+    const sink = fakeOut();
+    const live = new Set(["sub-1"]);
+    const relay = createWatchNotificationRelay(sink.out, (id) => live.has(id));
+
+    sink.stall();
+    // A build rewriting one watched file thousands of times. Each notification
+    // only says "re-read this path", so the newest one carries everything the
+    // older ones did — and its revision is the current on-disk one.
+    for (let i = 0; i < 5000; i += 1) {
+        relay.deliver(relayEvent("sub-1", "/w/a.txt", `r${i}`));
+    }
+    assert.equal(relay.pendingCount(), 1);
+
+    sink.drain();
+    const messages = parseLines(sink.lines);
+    // One pre-stall write plus one coalesced flush; no loss report, because
+    // coalescing lost no information.
+    assert.equal(messages.length, 2);
+    assert.ok(messages.every((m) => m.method === RPC_WATCH_EVENT_NOTIFICATION));
+    assert.equal((messages[1]?.params as unknown as WatchEvent).revision, "r4999");
+    assert.equal(relay.pendingCount(), 0);
+});
+
+test("the relay reports lost events only when the bound actually dropped some", () => {
+    const sink = fakeOut();
+    const live = new Set<string>();
+    const relay = createWatchNotificationRelay(sink.out, (id) => live.has(id));
+
+    // Exactly fill the queue: one pre-stall write plus MAX queued entries.
+    sink.stall();
+    for (let i = 0; i <= MAX_PENDING_WATCH_EVENTS; i += 1) {
+        const id = `sub-${i}`;
+        live.add(id);
+        relay.deliver(relayEvent(id, `/w/${i}.txt`, "r1"));
+    }
+    assert.equal(relay.pendingCount(), MAX_PENDING_WATCH_EVENTS);
+
+    // Nothing has been dropped yet, so draining here must produce watch events
+    // and NO loss report: a spurious "you lost changes" forces the client into
+    // pointless re-reads and erodes the signal's meaning.
+    sink.drain();
+    assert.equal(
+        parseLines(sink.lines).filter(
+            (m) => m.method === RPC_WATCH_EVENTS_LOST_NOTIFICATION,
+        ).length,
+        0,
+    );
+
+    // Now overflow it for real: refill to the bound, then push one more event
+    // for a subscription that has no queued entry to coalesce into.
+    sink.lines.length = 0;
+    sink.stall();
+    for (let i = 0; i <= MAX_PENDING_WATCH_EVENTS; i += 1) {
+        relay.deliver(relayEvent(`sub-${i}`, `/w/${i}.txt`, "r2"));
+    }
+    live.add("sub-overflow");
+    relay.deliver(relayEvent("sub-overflow", "/w/overflow.txt", "r2"));
+    assert.equal(relay.pendingCount(), MAX_PENDING_WATCH_EVENTS);
+
+    sink.drain();
+    const lost = parseLines(sink.lines).filter(
+        (m) => m.method === RPC_WATCH_EVENTS_LOST_NOTIFICATION,
+    );
+    assert.equal(lost.length, 1);
+    assert.deepEqual(lost[0]?.params.subscriptionIds, ["sub-overflow"]);
+
+    // And the report is not repeated once delivered.
+    sink.lines.length = 0;
+    sink.stall();
+    relay.deliver(relayEvent("sub-overflow", "/w/overflow.txt", "r3"));
+    sink.drain();
+    assert.equal(
+        parseLines(sink.lines).filter(
+            (m) => m.method === RPC_WATCH_EVENTS_LOST_NOTIFICATION,
+        ).length,
+        0,
+    );
+});
+
+test("a cancelled subscription's queued events and loss record are discarded", () => {
+    const sink = fakeOut();
+    const live = new Set(["sub-keep", "sub-drop"]);
+    const relay = createWatchNotificationRelay(sink.out, (id) => live.has(id));
+
+    // The first delivery is the one that observes the stall, so stall first and
+    // spend it on a subscription neither assertion below depends on.
+    sink.stall();
+    relay.deliver(relayEvent("sub-keep", "/w/keep.txt", "r0"));
+    relay.deliver(relayEvent("sub-drop", "/w/drop.txt", "r1"));
+    relay.deliver(relayEvent("sub-keep", "/w/keep.txt", "r1"));
+    assert.equal(relay.pendingCount(), 2);
+
+    // The client unwatches while its events are still queued behind the stall.
+    live.delete("sub-drop");
+    relay.forget("sub-drop");
+    assert.equal(relay.pendingCount(), 1);
+
+    sink.drain();
+    const delivered = parseLines(sink.lines).map(
+        (m) => (m.params as unknown as WatchEvent).subscriptionId,
+    );
+    assert.deepEqual(delivered, ["sub-keep", "sub-keep"]);
+});
+
+test("the relay queues nothing for a subscription that no longer exists", () => {
+    const sink = fakeOut();
+    const live = new Set(["sub-live"]);
+    const relay = createWatchNotificationRelay(sink.out, (id) => live.has(id));
+
+    sink.stall();
+    relay.deliver(relayEvent("sub-live", "/w/live.txt", "r0"));
+    // An event still in flight inside the service when the client unwatched.
+    relay.deliver(relayEvent("sub-gone", "/w/gone.txt", "r1"));
+    assert.equal(relay.pendingCount(), 0);
+
+    sink.drain();
+    const delivered = parseLines(sink.lines).map(
+        (m) => (m.params as unknown as WatchEvent).subscriptionId,
+    );
+    assert.deepEqual(delivered, ["sub-live"]);
+});
+
+test("unwatch announces the released subscription so no queue outlives it", async () => {
+    const dir = await tmpDir();
+    const file = path.join(dir, "announced.txt");
+    await fs.writeFile(file, "one");
+
+    const service = new FileWatchService();
+    service.pollIntervalMs = 25;
+    const closed: string[] = [];
+    service.onWatchClosed((id) => closed.push(id));
+
+    const { subscriptionId } = await service.watch({ path: file });
+    assert.equal(service.hasSubscription(subscriptionId), true);
+
+    service.unwatch({ subscriptionId });
+    assert.equal(service.hasSubscription(subscriptionId), false);
+    assert.deepEqual(closed, [subscriptionId]);
+
+    // A second unwatch has nothing to release and must stay silent, so the
+    // relay is never asked to forget a subscription id twice.
+    service.unwatch({ subscriptionId });
+    assert.deepEqual(closed, [subscriptionId]);
+
+    // closeAll is the client-disconnect path: it announces every live handle.
+    const second = await service.watch({ path: file });
+    service.closeAll();
+    assert.deepEqual(closed, [subscriptionId, second.subscriptionId]);
 
     await fs.rm(dir, { recursive: true, force: true });
 });

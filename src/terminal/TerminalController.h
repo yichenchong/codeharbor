@@ -1,6 +1,5 @@
 #pragma once
 
-#include "Ids.h"
 #include "SessionState.h"
 
 #include <QByteArray>
@@ -38,6 +37,25 @@ public:
     // 4 KiB is a couple of full-width terminal lines: far more than any escape
     // sequence, far less than the buffer it trims.
     static constexpr int kHiddenResyncWindowBytes = 4 * 1024;
+    // Upper bound on output that has been emitted to the renderer but not yet
+    // acknowledged as consumed (see acknowledgeOutput()). Past it, flushes are
+    // retained in the SAME rolling buffer the hidden case uses instead of being
+    // emitted, which is what stops a runaway remote process (`yes`, a `cat` of a
+    // large log) from queueing an unbounded amount of data in the WebChannel
+    // transport and inside Chromium.
+    //
+    // 512 KiB, chosen from both ends:
+    //   * It must never stall ordinary work. A full-screen redraw is the
+    //     largest single thing a terminal does, and the worst case is bounded:
+    //     a 300x100 grid is 30k cells, and even at ~10 bytes of SGR per cell
+    //     that is ~300 KB. Interactive echo and a compiler's diagnostics are
+    //     orders of magnitude below that. So a user never waits on an
+    //     acknowledgement for anything they would notice.
+    //   * It must actually bound memory. 512 KiB is a quarter of the rolling
+    //     buffer, so the worst case per pane is that buffer plus this window
+    //     plus one release batch — a few megabytes, not "however fast the
+    //     remote can print".
+    static constexpr int kMaxUnacknowledgedBytes = 512 * 1024;
     // Upper bound on the SILENT part of an attach (SPEC 5.6). A pane leaves
     // OpeningChannel/AttachingTmux when the remote PTY produces its first bytes
     // — that is what "tmux has drawn itself" looks like from this side, and it is
@@ -75,11 +93,49 @@ public:
     // Toggle renderer visibility (SPEC 5.4). While hidden, flushes accumulate
     // into the rolling buffer instead of the view; becoming visible replays the
     // retained buffer once as a single batch.
+    //
+    // A visibility change also resets the unacknowledged-output account: a
+    // renderer that is not listening owes nothing, and the renderer that
+    // becomes visible (a fresh page after a reload, say) never saw whatever the
+    // previous one was handed.
     void setViewVisible(bool visible);
 
     // Feed raw output drained from the SSH PTY channel into the buffer. Bytes
-    // are coalesced and released via flushReady() per the SPEC 5.5 policy.
+    // are coalesced and released via flushReady() per the SPEC 5.5 policy, and
+    // withheld once too much of what was already released is unacknowledged
+    // (see acknowledgeOutput()).
     void ingestOutput(const QByteArray &bytes);
+
+    // The renderer consumed `bytes` of what flushReady() handed it (SPEC 5.4).
+    // This is the OTHER half of the flow control: flushReady() is free to run
+    // ahead of the renderer only up to kMaxUnacknowledgedBytes, and this is what
+    // brings the outstanding amount back down and releases what was retained
+    // meanwhile.
+    //
+    // The count is in the same PTY bytes flushReady() emitted, not in decoded
+    // characters, because ch::TerminalBridge tells the page the byte weight of
+    // each batch and the page echoes it back — an exact round trip that cannot
+    // drift on output that is not valid UTF-8.
+    //
+    // Acknowledgements are ADVISORY, and deliberately so: they arrive from a
+    // page that may be wedged, crashed, or lying. Over-acknowledging only
+    // relaxes this pane's own flow control, under-acknowledging (or never
+    // acknowledging at all) degrades to exactly the hidden-pane behaviour —
+    // the bounded rolling buffer with oldest-first eviction. Neither stalls the
+    // read pump: ingestOutput() keeps draining the transport either way.
+    void acknowledgeOutput(qint64 bytes);
+    // Bytes emitted to the renderer and not yet acknowledged.
+    qint64 unacknowledgedBytes() const;
+    // The renderer was REPLACED (a page reload, a re-mount). Forget what the
+    // previous one owed and release whatever is retained to the new one.
+    //
+    // setViewVisible() does this too, and covers the ordinary reload, where the
+    // outgoing page reports hidden on its way out. This exists for the reload
+    // that does NOT: a page that vanishes without a word leaves the controller
+    // believing it is visible, so the mount handshake of its replacement is not
+    // a visibility CHANGE and would otherwise hand the new renderer the old
+    // one's debt — and with it a pane that never receives another byte.
+    void resetOutputAcknowledgements();
 
     // Attach the PTY byte transport for this pane (SPEC 5.1/5.3), mirroring
     // CodeharbordClient::setTransport()/AgentStatusMonitor::setTransport(). In
@@ -110,7 +166,10 @@ public:
     int columns() const;
     int rows() const;
 
-    // Bytes retained while hidden and not yet replayed to the view.
+    // Bytes retained and not yet released to the view: everything flushed while
+    // the pane was hidden, plus everything withheld from a visible pane that is
+    // too far behind on acknowledgements. One buffer, one eviction rule, both
+    // cases.
     const QByteArray &hiddenBuffer() const;
 
     // Drive the lifecycle state machine (SPEC 5.6); emits stateChanged() only on
@@ -131,25 +190,34 @@ public:
     // hand-written copies of the list would drift apart unnoticed.
     static bool isLiveState(TerminalState state);
 
-    // Stable tmux target for a pane: ch_<devSessionId>_<terminalId> (SPEC 5.2).
-    // Stable IDs are used rather than user-facing display names.
-    static QString tmuxTarget(const DevSessionId &devSession, const TerminalId &terminal);
-    // Attach-or-create command for the pane's tmux target rooted at workingDir
-    // (SPEC 5.2):
+    // Attach-or-create command for the tmux session `target`, rooted at
+    // workingDir (SPEC 5.2):
     //   tmux new-session -A -s '<target>' -c '<workingDir>' \; \
     //       set-option -t '=<target>:' mouse on
+    //
+    // `target` is NOT minted here, and deliberately no longer can be. It is the
+    // `tmuxTarget` column of this pane's row in the server's `terminal_panes`
+    // table, minted once by codeharbord from that row's UUID id (see
+    // mintTmuxTarget in remote/src/workspace.ts) and read back by
+    // ch::TerminalFactory. This class used to derive it as
+    // `ch_<devSessionId>_<terminalId>` from the LAYOUT pane id, which recycles
+    // per Dev Session — so two client machines sharing a Dev Session each
+    // re-minted `terminal-2` and the second one attached the first one's
+    // still-running shell. There is now exactly one minting site, and it is on
+    // the server. This function's only job is to build the command.
+    //
     // The second tmux command switches mouse reporting on for THIS SESSION ONLY
     // (never `-g`, which would reconfigure every tmux session the user owns), so
     // a wheel turn reaches tmux's own scrollback instead of being translated
     // into cursor keys by the renderer. See the implementation for the full
     // reasoning and the tmux 3.6 verification.
-    static QString tmuxNewSessionCommand(const DevSessionId &devSession,
-                                         const TerminalId &terminal,
-                                         const QString &workingDir);
+    static QString tmuxNewSessionCommand(const QString &target, const QString &workingDir);
 
 signals:
     void stateChanged(ch::TerminalState state);
     // A coalesced batch of output ready for the visible renderer (SPEC 5.5).
+    // Every byte emitted here counts against kMaxUnacknowledgedBytes until the
+    // renderer reports it consumed through acknowledgeOutput().
     void flushReady(QByteArray batch);
     // kAttachTimeoutMs elapsed with the pane still in OpeningChannel or
     // AttachingTmux. The pane has ALREADY been moved to Error when this is
@@ -162,6 +230,10 @@ signals:
 private:
     void flush();
     void appendHidden(const QByteArray &batch);
+    // Hand the retained buffer to the view as one batch, if the view can take
+    // it (visible, and not already too far behind). The single place both the
+    // hidden->visible replay and the acknowledgement-driven release go through.
+    void releaseRetained();
     void onTransportReadyRead();
     void onTransportFinished();
     void onAttachTimeout();
@@ -172,7 +244,11 @@ private:
     TerminalState m_state = TerminalState::Unloaded;
     bool m_viewVisible = true;
     QByteArray m_pending;   // coalesced output awaiting the next flush
-    QByteArray m_hidden;    // rolling buffer retained while hidden
+    QByteArray m_hidden;    // rolling buffer of output not yet released
+    // Bytes handed to the renderer that it has not reported consuming. Signed
+    // and 64-bit: acknowledgements come from the page, so the arithmetic must
+    // survive a nonsense value without wrapping (it is clamped at zero).
+    qint64 m_unacknowledged = 0;
     QTimer m_flushTimer;
     // Watchdog for the silent part of an attach; armed and disarmed by
     // setState() so every host that drives the state machine is bounded, not

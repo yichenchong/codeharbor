@@ -17,13 +17,13 @@ class TerminalController;
 // can only publish SLOTS, INVOKABLES, PROPERTIES and SIGNALS, and it cannot
 // call a JS function at all. TerminalController's API is a plain C++ API
 // (sendInput takes bytes, visibility is setViewVisible, output arrives as
-// flushReady) — none of it is reachable from, or shaped like, the frozen
+// flushReady) — none of it is reachable from, or shaped like, the
 // TerminalBridge/TerminalHost contract in src/web/terminal/src/index.ts. This
 // class is the translation, and nothing more:
 //
-//   JS -> C++ (the frozen TerminalBridge interface) ... the slots below
-//   C++ -> JS (the frozen TerminalHost callbacks) .... the signals below
-//     write(data)               -> host.write(data)
+//   JS -> C++ (the TerminalBridge interface) ....... the slots below
+//   C++ -> JS (the TerminalHost callbacks) ......... the signals below
+//     write(data, bytes)        -> host.write(data, bytes)
 //     connectionStateChanged(s) -> host.setConnectionState(s)
 //     clearRequested()          -> host.clear()
 //
@@ -31,6 +31,18 @@ class TerminalController;
 // UTF-8 decoder: TerminalController flushes on a size/time threshold (SPEC 5.5)
 // and will happily cut a multi-byte sequence in half, which a per-batch
 // QString::fromUtf8() would turn into replacement characters mid-glyph.
+//
+// FLOW CONTROL (the second argument of write(), and notifyOutputConsumed()):
+// the controller only runs a bounded distance ahead of the renderer
+// (ch::TerminalController::kMaxUnacknowledgedBytes) and retains the rest, so
+// the page has to say when it has actually consumed something. It cannot count
+// that itself in the unit the controller buffers in — it holds decoded text,
+// not PTY bytes, and re-encoding would drift on output that is not valid UTF-8
+// — so write() carries the byte weight of the batch and the page echoes it back
+// through notifyOutputConsumed(). Bytes whose batch decoded to nothing (a
+// multi-byte sequence split across two flushes) are carried forward onto the
+// next batch that does produce text, so every emitted byte is accounted for
+// exactly once.
 //
 // The renderer only exists once the page has mounted, so the controller is put
 // in the SPEC 5.4 hidden state at construction: everything the pane emits
@@ -43,10 +55,10 @@ class TerminalController;
 // tmux-target or working-directory argument anywhere on it — a pane's remote
 // target is chosen by the QML host through ch::TerminalFactory, which the page
 // cannot see. What is left is the renderer's own view state (input bytes into
-// THIS pane's PTY, its geometry, its visibility, its mount handshake), so the
-// worst a compromised page can do is drive the terminal its user is already
-// looking at. The one value that leaves the process is the geometry, and it is
-// bounded below.
+// THIS pane's PTY, its geometry, its visibility, its mount handshake, and how
+// much output it has consumed), so the worst a compromised page can do is
+// drive the terminal its user is already looking at. The one value that leaves
+// the process is the geometry, and it is bounded below.
 
 class TerminalBridge : public QObject {
     Q_OBJECT
@@ -79,7 +91,7 @@ public:
     Q_INVOKABLE void requestClear();
 
 public slots:
-    // ---- the frozen TerminalBridge contract (called by the page) ----
+    // ---- the TerminalBridge contract (called by the page) ----
     void sendInput(const QString& data);
     // Bounded: see kMaxDimension. Anything at or below it is passed through
     // untouched, including the non-positive values an unmounted renderer
@@ -89,17 +101,30 @@ public slots:
     // only half of the controller's visibility: the other half is whether a
     // renderer exists at all — see applyVisibility().
     void notifyViewVisible(bool visible);
+    // The renderer finished consuming a batch write() handed it, and reports
+    // back the byte weight that batch carried. See the FLOW CONTROL note above:
+    // this is what releases the controller's next batch.
+    //
+    // SECURITY: unvalidated on purpose beyond the controller's own clamping.
+    // The number is not a length, an index, or an allocation size — it only
+    // moves this pane's own flow-control credit. A page that lies loosens or
+    // tightens the backpressure on the terminal it is already rendering and
+    // nothing else; the memory bound that survives either way is the
+    // controller's rolling buffer.
+    void notifyOutputConsumed(int bytes);
     // Mount handshake; optional on the JS side (`ready?()`).
     void ready();
 
 signals:
-    // ---- the frozen TerminalHost callbacks (consumed by the page) ----
-    void write(const QString& data);
+    // ---- the TerminalHost callbacks (consumed by the page) ----
+    // `bytes` is how many PTY bytes `data` was decoded from, to be echoed back
+    // through notifyOutputConsumed() once the renderer has consumed it.
+    void write(const QString& data, int bytes);
     void connectionStateChanged(const QString& state);
     void clearRequested();
 
-    // The RENDERER reported a new cols x rows. Not part of the frozen page
-    // contract; the QML pane uses it to attach at the right size.
+    // The RENDERER reported a new cols x rows. Not part of the page contract;
+    // the QML pane uses it to attach at the right size.
     //
     // FOOTGUN: src/qml/TerminalPaneView.qml answers this signal by calling
     // attachNow(). It must therefore stay a report of what the PAGE asked for
@@ -132,6 +157,12 @@ private:
     // the bridge depending on teardown order.
     QPointer<TerminalController> m_controller;
     QStringDecoder m_decoder{QStringDecoder::Utf8};
+    // Byte weight of batches whose decode produced no text yet (the tail of a
+    // multi-byte sequence split across two flushes), waiting to be charged to
+    // the next write() that does carry text. Without this the page could never
+    // acknowledge those bytes and the controller's credit would leak away one
+    // truncated glyph at a time.
+    int m_undeliveredBytes = 0;
     bool m_rendererReady = false;
     // Last visibility reported by the page or the QML pane. True by default:
     // a pane is shown unless something says otherwise, and QML only reports on

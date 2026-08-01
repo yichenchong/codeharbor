@@ -560,6 +560,31 @@ void WorkspaceDb::createTerminalPane(const CreateTerminalPaneParams& params,
                                  std::move(cb), parseTerminalPane));
 }
 
+void WorkspaceDb::resolveTerminalPane(const ResolveTerminalPaneParams& params,
+                                      TerminalPaneCallback cb)
+{
+    QJsonObject obj{
+        {QStringLiteral("serverId"), params.serverId.value},
+        {QStringLiteral("devSessionId"), params.devSessionId.value},
+    };
+    // Exactly one addressing mode reaches the wire; the server rejects both or
+    // neither. The row id wins when it is there, because that is the leaf's own
+    // terminal and the label is only its historical stand-in.
+    if (!params.id.isEmpty())
+        obj[QStringLiteral("id")] = params.id;
+    else
+        obj[QStringLiteral("name")] = params.name;
+    // Omitted rather than sent as null when unset, like every other optional in
+    // this file: the server then applies its own default instead of being told
+    // to store an explicit nothing.
+    if (params.workingDirectory)
+        obj[QStringLiteral("workingDirectory")] = *params.workingDirectory;
+    m_client->call(QString::fromLatin1(rpc::kMethodWorkspaceResolveTerminalPane),
+                   obj,
+                   recordHandler(rpc::kMethodWorkspaceResolveTerminalPane,
+                                 std::move(cb), parseTerminalPane));
+}
+
 void WorkspaceDb::updateTerminalPane(const UpdateTerminalPaneParams& params,
                                      TerminalPaneCallback cb)
 {

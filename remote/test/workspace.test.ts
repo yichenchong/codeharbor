@@ -4,8 +4,16 @@ import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import { spawn } from "node:child_process";
+import { fileURLToPath } from "node:url";
 
-import { openWorkspace, WORKSPACE_SCHEMA_VERSION, WORKSPACE_METHODS } from "../src/workspace.ts";
+import {
+    applyConnectionPragmas,
+    isDatabaseBusy,
+    openWorkspace,
+    WORKSPACE_SCHEMA_VERSION,
+    WORKSPACE_METHODS,
+} from "../src/workspace.ts";
 import type { Workspace } from "../src/workspace.ts";
 
 // A fresh temp-file database path (never :memory:) so the reopen tests exercise
@@ -969,6 +977,513 @@ test("the v2 migration adds server_identity to a v1 database without losing rows
     await cleanup(dbPath);
 });
 
+// --- tmux targets: one minting site, safe by construction, unique (v3) ------
+
+// Rebuild terminal_panes the way schema v2 declared it — no UNIQUE on
+// tmux_target — and rewind the stored version, so the next open has the v3
+// migration's real job to do. SQLite cannot drop a constraint, so the table is
+// re-created and the rows copied across, which is exactly what a v2 database
+// looks like on disk.
+function downgradeToV2(ws: Workspace): void {
+    ws.db.exec(`
+        ALTER TABLE terminal_panes RENAME TO terminal_panes_v2_tmp;
+        CREATE TABLE terminal_panes (
+            id                TEXT    NOT NULL PRIMARY KEY,
+            server_id         TEXT    NOT NULL,
+            dev_session_id    TEXT    NOT NULL,
+            name              TEXT    NOT NULL,
+            working_directory TEXT,
+            tmux_target       TEXT,
+            startup_command   TEXT,
+            harness           TEXT,
+            position          INTEGER NOT NULL DEFAULT 0,
+            created_at        INTEGER NOT NULL,
+            updated_at        INTEGER NOT NULL,
+            FOREIGN KEY (dev_session_id) REFERENCES dev_sessions (id)
+        );
+        INSERT INTO terminal_panes SELECT * FROM terminal_panes_v2_tmp;
+        DROP TABLE terminal_panes_v2_tmp;
+    `);
+    ws.db.prepare("UPDATE schema_version SET version = 2 WHERE id = 1").run();
+}
+
+// Every unique index over exactly (tmux_target), however it was declared: a
+// table-level UNIQUE shows up as an sqlite_autoindex, the migration's as a
+// named one.
+function uniqueTmuxTargetIndexes(ws: Workspace): string[] {
+    const names: string[] = [];
+    const indexes = ws.db.prepare("PRAGMA index_list(terminal_panes)").all() as unknown as {
+        name: string;
+        unique: number;
+    }[];
+    for (const index of indexes) {
+        if (index.unique !== 1) continue;
+        const columns = ws.db
+            .prepare(`PRAGMA index_info("${index.name}")`)
+            .all() as unknown as { name: string | null }[];
+        if (columns.length === 1 && columns[0].name === "tmux_target") names.push(index.name);
+    }
+    return names;
+}
+
+// The whole point of moving identity to the server: the client no longer names
+// a pane's tmux session, it reads the name off the row it created. A pane that
+// came back with a null target would send the client straight back to inventing
+// `ch_<devSessionId>_<layoutPaneId>` — the recycling bug this replaces.
+test("createTerminalPane mints a tmux target from the row id when none is given", async () => {
+    const dbPath = await tmpDbPath();
+    const ws = openWorkspace(dbPath);
+    const g = ws.createGroup({ serverId: SERVER, name: "G" });
+    const s = ws.createSession({ serverId: SERVER, groupId: g.id, name: "S", repositoryRoot: "/r" });
+
+    const first = ws.createTerminalPane({ serverId: SERVER, devSessionId: s.id, name: "terminal-1" });
+    const second = ws.createTerminalPane({ serverId: SERVER, devSessionId: s.id, name: "terminal-2" });
+
+    assert.equal(first.tmuxTarget, `ch_${s.id}_${first.id}`);
+    assert.equal(second.tmuxTarget, `ch_${s.id}_${second.id}`);
+    assert.notEqual(first.tmuxTarget, second.tmuxTarget);
+    // A layout slot label recycles per Dev Session, and two clients each keep
+    // their own counter — so `terminal-1` will be asked for again by somebody
+    // who has never seen this row. That is now ALLOWED and makes a SEPARATE
+    // row: closing a pane keeps its row and its remote shell alive, so the
+    // label is free in the layout while the old shell is still running, and a
+    // new pane asking for that label wants a new terminal, not the old one.
+    // Identity is the row id the layout leaf carries, never the label. (v3
+    // enforced UNIQUE (dev_session_id, name) here and rejected this create;
+    // v4 removed it — see WORKSPACE_SCHEMA_VERSION.)
+    const relabelled = ws.createTerminalPane({ serverId: SERVER, devSessionId: s.id, name: "terminal-1" });
+    assert.notEqual(relabelled.id, first.id);
+    assert.notEqual(relabelled.tmuxTarget, first.tmuxTarget);
+
+    ws.close();
+    await cleanup(dbPath);
+});
+
+// tmux reads `:` and `.` as the session/window/pane separators, and refuses to
+// store them in a session name at all (it rewrites both to `_`). A target
+// carrying one names a session that cannot exist, so `-t '=<target>'` misses it
+// and an unanchored match can land on a different session entirely. The caller
+// is told rather than quietly given a different target than it asked for.
+test("createTerminalPane and updateTerminalPane reject a structurally unsafe tmux target", async () => {
+    const dbPath = await tmpDbPath();
+    const ws = openWorkspace(dbPath);
+    const g = ws.createGroup({ serverId: SERVER, name: "G" });
+    const s = ws.createSession({ serverId: SERVER, groupId: g.id, name: "S", repositoryRoot: "/r" });
+
+    for (const bad of ["ch_a:0", "ch_a.1", "", "ch_a b", "=ch_a", "ch_*", "$3", "ch_a\n9"]) {
+        assert.throws(
+            () => ws.createTerminalPane({ serverId: SERVER, devSessionId: s.id, name: "t", tmuxTarget: bad }),
+            /tmuxTarget must be/,
+            `expected ${JSON.stringify(bad)} to be refused`,
+        );
+    }
+    // Refused before the INSERT: no half-made row is left behind.
+    assert.deepEqual(ws.list(SERVER)[0].sessions[0].terminalPanes, []);
+
+    const t = ws.createTerminalPane({ serverId: SERVER, devSessionId: s.id, name: "t" });
+    assert.throws(() => ws.updateTerminalPane({ id: t.id, tmuxTarget: "ch_a:0" }), /tmuxTarget must be/);
+    assert.equal(ws.getTerminalPane(t.id).tmuxTarget, t.tmuxTarget);
+    // Explicitly clearing the binding is still allowed: a pane with no remote
+    // session is a legitimate state, and SQLite permits many NULLs under UNIQUE.
+    assert.equal(ws.updateTerminalPane({ id: t.id, tmuxTarget: null }).tmuxTarget, null);
+
+    ws.close();
+    await cleanup(dbPath);
+});
+
+// Two panes on one target attach the SAME remote shell: each sees the other's
+// keystrokes and they fight over the terminal size. The database refuses it.
+test("terminal_panes.tmux_target is UNIQUE, and many NULLs are still allowed", async () => {
+    const dbPath = await tmpDbPath();
+    const ws = openWorkspace(dbPath);
+    const g = ws.createGroup({ serverId: SERVER, name: "G" });
+    const s = ws.createSession({ serverId: SERVER, groupId: g.id, name: "S", repositoryRoot: "/r" });
+    assert.equal(uniqueTmuxTargetIndexes(ws).length, 1);
+
+    const a = ws.createTerminalPane({ serverId: SERVER, devSessionId: s.id, name: "a", tmuxTarget: "ch_shared" });
+    assert.throws(
+        () => ws.createTerminalPane({ serverId: SERVER, devSessionId: s.id, name: "b", tmuxTarget: "ch_shared" }),
+        /UNIQUE constraint failed: terminal_panes.tmux_target/,
+    );
+    // Retargeting an existing pane onto a taken target is the same collision
+    // reached from the other direction, and is refused the same way.
+    const b = ws.createTerminalPane({ serverId: SERVER, devSessionId: s.id, name: "b" });
+    assert.throws(
+        () => ws.updateTerminalPane({ id: b.id, tmuxTarget: "ch_shared" }),
+        /UNIQUE constraint failed: terminal_panes.tmux_target/,
+    );
+    assert.equal(ws.getTerminalPane(a.id).tmuxTarget, "ch_shared");
+
+    const n1 = ws.createTerminalPane({ serverId: SERVER, devSessionId: s.id, name: "n1" });
+    const n2 = ws.createTerminalPane({ serverId: SERVER, devSessionId: s.id, name: "n2" });
+    ws.updateTerminalPane({ id: n1.id, tmuxTarget: null });
+    ws.updateTerminalPane({ id: n2.id, tmuxTarget: null });
+    assert.equal(ws.getTerminalPane(n1.id).tmuxTarget, null);
+    assert.equal(ws.getTerminalPane(n2.id).tmuxTarget, null);
+
+    ws.close();
+    await cleanup(dbPath);
+});
+
+test("the v3 migration repairs and de-duplicates tmux targets before constraining them", async () => {
+    const dbPath = await tmpDbPath();
+    const legacy = openWorkspace(dbPath);
+    const g = legacy.createGroup({ serverId: SERVER, name: "G" });
+    const s = legacy.createSession({ serverId: SERVER, groupId: g.id, name: "S", repositoryRoot: "/r" });
+    const a = legacy.createTerminalPane({ serverId: SERVER, devSessionId: s.id, name: "a" });
+    const b = legacy.createTerminalPane({ serverId: SERVER, devSessionId: s.id, name: "b" });
+    const c = legacy.createTerminalPane({ serverId: SERVER, devSessionId: s.id, name: "c" });
+    const d = legacy.createTerminalPane({ serverId: SERVER, devSessionId: s.id, name: "d" });
+    downgradeToV2(legacy);
+    // What a v2 database could hold and v3 cannot: two rows on one target (the
+    // mirrored-keystrokes bug), a target tmux would have rewritten (`.`), and a
+    // row deliberately left unbound.
+    const set = legacy.db.prepare("UPDATE terminal_panes SET tmux_target = ? WHERE id = ?");
+    set.run("ch_shared", a.id);
+    set.run("ch_shared", b.id);
+    set.run("ch_dotted.name", c.id);
+    set.run(null, d.id);
+    assert.deepEqual(uniqueTmuxTargetIndexes(legacy), []);
+    legacy.close();
+
+    const upgraded = openWorkspace(dbPath);
+    const version = upgraded.db
+        .prepare("SELECT version FROM schema_version WHERE id = 1")
+        .get() as { version: number };
+    assert.equal(version.version, WORKSPACE_SCHEMA_VERSION);
+    assert.equal(uniqueTmuxTargetIndexes(upgraded).length, 1);
+
+    // The OLDEST row keeps the contested target: it is the one whose shell has
+    // been running longest, so the pane the user has been working in is the one
+    // that stays attached to it.
+    assert.equal(upgraded.getTerminalPane(a.id).tmuxTarget, "ch_shared");
+    // The loser is re-minted onto its own canonical target rather than nulled,
+    // so it opens a shell of its own on the next attach instead of having none.
+    assert.equal(upgraded.getTerminalPane(b.id).tmuxTarget, `ch_${s.id}_${b.id}`);
+    // `.` is rewritten to `_` — the name tmux ACTUALLY created the session
+    // under, so this row stops missing its own long-running shell.
+    assert.equal(upgraded.getTerminalPane(c.id).tmuxTarget, "ch_dotted_name");
+    // An unbound pane stays unbound; nothing is invented for it.
+    assert.equal(upgraded.getTerminalPane(d.id).tmuxTarget, null);
+    // Every row survived, names and all.
+    assert.deepEqual(
+        upgraded.list(SERVER)[0].sessions[0].terminalPanes.map((p) => p.name),
+        ["a", "b", "c", "d"],
+    );
+    // And the constraint is live from here on.
+    assert.throws(
+        () => upgraded.createTerminalPane({ serverId: SERVER, devSessionId: s.id, name: "e", tmuxTarget: "ch_shared" }),
+        /UNIQUE constraint failed: terminal_panes.tmux_target/,
+    );
+    upgraded.close();
+
+    // Reopening is a no-op: no second index, no further rewriting.
+    const again = openWorkspace(dbPath);
+    assert.equal(uniqueTmuxTargetIndexes(again).length, 1);
+    assert.equal(again.getTerminalPane(a.id).tmuxTarget, "ch_shared");
+    again.close();
+
+    await cleanup(dbPath);
+});
+
+// Same shape as uniqueTmuxTargetIndexes, for the pane's OTHER identity.
+function uniqueAddressIndexes(ws: Workspace): string[] {
+    const names: string[] = [];
+    const indexes = ws.db.prepare("PRAGMA index_list(terminal_panes)").all() as unknown as {
+        name: string;
+        unique: number;
+    }[];
+    for (const index of indexes) {
+        if (index.unique !== 1) continue;
+        const columns = ws.db
+            .prepare(`PRAGMA index_info("${index.name}")`)
+            .all() as unknown as { name: string | null }[];
+        if (
+            columns.length === 2 &&
+            columns[0].name === "dev_session_id" &&
+            columns[1].name === "name"
+        ) {
+            names.push(index.name);
+        }
+    }
+    return names;
+}
+
+// The method the desktop client actually calls to learn which remote tmux
+// session a terminal pane owns. Everything hangs off it being lookup-or-create
+// rather than create: the pane asks the identical question on its first attach,
+// on every reconnect and after every restart, and must get the same row.
+test("resolveTerminalPane creates a slot's row once and answers with it for ever after", async () => {
+    const dbPath = await tmpDbPath();
+    let ws = openWorkspace(dbPath);
+    const g = ws.createGroup({ serverId: SERVER, name: "G" });
+    const s = ws.createSession({ serverId: SERVER, groupId: g.id, name: "S", repositoryRoot: "/r" });
+
+    const first = ws.resolveTerminalPane({
+        serverId: SERVER,
+        devSessionId: s.id,
+        name: "terminal-1",
+        workingDirectory: "/r",
+    });
+    assert.equal(first.name, "terminal-1");
+    assert.equal(first.workingDirectory, "/r");
+    assert.equal(first.tmuxTarget, `ch_${s.id}_${first.id}`);
+
+    // Asked again: the SAME row, not a second one. This is the reconnect case.
+    const again = ws.resolveTerminalPane({ serverId: SERVER, devSessionId: s.id, name: "terminal-1" });
+    assert.equal(again.id, first.id);
+    assert.equal(again.tmuxTarget, first.tmuxTarget);
+
+    // A different slot of the same Dev Session is a different terminal.
+    const second = ws.resolveTerminalPane({ serverId: SERVER, devSessionId: s.id, name: "terminal-2" });
+    assert.notEqual(second.id, first.id);
+    assert.notEqual(second.tmuxTarget, first.tmuxTarget);
+
+    // The same slot NAME in another Dev Session is also a different terminal:
+    // layout pane ids are minted per Dev Session, so "terminal-1" exists in all
+    // of them and must never be treated as one shared terminal.
+    const other = ws.createSession({ serverId: SERVER, groupId: g.id, name: "S2", repositoryRoot: "/r" });
+    const elsewhere = ws.resolveTerminalPane({ serverId: SERVER, devSessionId: other.id, name: "terminal-1" });
+    assert.notEqual(elsewhere.tmuxTarget, first.tmuxTarget);
+
+    // Across a restart the identity is still the row's, which is the whole
+    // point: the tmux session survives the client, so the name for it must too.
+    ws.close();
+    ws = openWorkspace(dbPath);
+    assert.equal(
+        ws.resolveTerminalPane({ serverId: SERVER, devSessionId: s.id, name: "terminal-1" }).tmuxTarget,
+        first.tmuxTarget,
+    );
+    assert.equal(ws.list(SERVER)[0].sessions.find((x) => x.id === s.id)?.terminalPanes.length, 2);
+
+    // A row somehow left with no target does not come back unusable: the client
+    // is deliberately incapable of minting one, so the server fills it in.
+    ws.updateTerminalPane({ id: first.id, tmuxTarget: null });
+    const healed = ws.resolveTerminalPane({ serverId: SERVER, devSessionId: s.id, name: "terminal-1" });
+    assert.equal(healed.id, first.id);
+    assert.equal(healed.tmuxTarget, `ch_${s.id}_${first.id}`);
+
+    ws.close();
+    await cleanup(dbPath);
+});
+
+// THE regression this whole scheme exists to remove, at the storage layer.
+// Closing a terminal pane deliberately leaves its row and its remote tmux
+// session alive, so the slot LABEL it wore is free in the layout while the old
+// shell is still running. The next split — on this client or another one, whose
+// label counter has never heard of the closed pane — legitimately asks for that
+// same label and wants a NEW terminal. v3 refused that insert, because it read
+// the label as an address. v4 removed the rule: identity is the row id the
+// layout leaf carries, and duplicate labels within one Dev Session are normal.
+test("two terminal panes of one Dev Session may share a slot label", async () => {
+    const dbPath = await tmpDbPath();
+    const ws = openWorkspace(dbPath);
+    const g = ws.createGroup({ serverId: SERVER, name: "G" });
+    const s = ws.createSession({ serverId: SERVER, groupId: g.id, name: "S", repositoryRoot: "/r" });
+    assert.deepEqual(uniqueAddressIndexes(ws), []);
+
+    const closed = ws.createTerminalPane({ serverId: SERVER, devSessionId: s.id, name: "terminal-2" });
+    const fresh = ws.createTerminalPane({ serverId: SERVER, devSessionId: s.id, name: "terminal-2" });
+    // Different rows, different shells. This is the acceptance criterion: a
+    // pane created after another pane with the same label was closed must never
+    // land on the closed pane's tmux session.
+    assert.notEqual(fresh.id, closed.id);
+    assert.notEqual(fresh.tmuxTarget, closed.tmuxTarget);
+    // Both rows remain enumerable, so the closed pane's work is recoverable
+    // rather than lost.
+    const panes = ws.list(SERVER)[0].sessions[0].terminalPanes;
+    assert.deepEqual(panes.map((p) => p.id).sort(), [closed.id, fresh.id].sort());
+
+    // Addressing BY ROW ID keeps the two apart, which is the only addressing a
+    // current client uses.
+    assert.equal(
+        ws.resolveTerminalPane({ serverId: SERVER, devSessionId: s.id, id: fresh.id }).tmuxTarget,
+        fresh.tmuxTarget,
+    );
+    // The legacy by-label path is deterministic under duplicates: the OLDEST
+    // row wins, because a leaf with no row id predates every later mint.
+    assert.equal(
+        ws.resolveTerminalPane({ serverId: SERVER, devSessionId: s.id, name: "terminal-2" }).id,
+        closed.id,
+    );
+    // Renaming a pane onto a taken label is allowed for the same reason.
+    // Nothing in the client renames a terminal pane today.
+    const other = ws.createTerminalPane({ serverId: SERVER, devSessionId: s.id, name: "terminal-9" });
+    assert.equal(ws.updateTerminalPane({ id: other.id, name: "terminal-2" }).name, "terminal-2");
+
+    ws.close();
+    await cleanup(dbPath);
+});
+
+// Resolving by row id is a pure LOOKUP: it never creates. A leaf naming a row
+// that is gone must be reported, not silently handed a different terminal, and
+// a row belonging to another Dev Session is not this leaf's to attach.
+test("resolveTerminalPane by id never creates and is scoped to the Dev Session", async () => {
+    const dbPath = await tmpDbPath();
+    const ws = openWorkspace(dbPath);
+    const g = ws.createGroup({ serverId: SERVER, name: "G" });
+    const s = ws.createSession({ serverId: SERVER, groupId: g.id, name: "S", repositoryRoot: "/r" });
+    const other = ws.createSession({ serverId: SERVER, groupId: g.id, name: "S2", repositoryRoot: "/r" });
+    const t = ws.createTerminalPane({ serverId: SERVER, devSessionId: s.id, name: "terminal-1" });
+
+    assert.equal(ws.resolveTerminalPane({ serverId: SERVER, devSessionId: s.id, id: t.id }).id, t.id);
+    assert.throws(
+        () => ws.resolveTerminalPane({ serverId: SERVER, devSessionId: other.id, id: t.id }),
+        /no terminal pane/,
+    );
+    assert.throws(
+        () => ws.resolveTerminalPane({ serverId: SERVER, devSessionId: s.id, id: "does-not-exist" }),
+        /no terminal pane/,
+    );
+    assert.equal(ws.list(SERVER)[0].sessions[0].terminalPanes.length, 1);
+
+    // Neither addressing mode, or both, is a caller bug rather than a guess.
+    assert.throws(
+        () => ws.resolveTerminalPane({ serverId: SERVER, devSessionId: s.id }),
+        /exactly one of/,
+    );
+    assert.throws(
+        () => ws.resolveTerminalPane({ serverId: SERVER, devSessionId: s.id, id: t.id, name: "terminal-1" }),
+        /exactly one of/,
+    );
+
+    // A row found without a tmux target still gets one minted, on this path too.
+    ws.updateTerminalPane({ id: t.id, tmuxTarget: null });
+    assert.equal(
+        ws.resolveTerminalPane({ serverId: SERVER, devSessionId: s.id, id: t.id }).tmuxTarget,
+        `ch_${s.id}_${t.id}`,
+    );
+
+    ws.close();
+    await cleanup(dbPath);
+});
+
+// v3 de-duplicated slot labels before constraining them, and v4 then dropped
+// the constraint again. The RENAMES are still what a v2 database gets, and they
+// are still what makes the legacy by-label lookup land on one row, so the repair
+// is pinned here even though the index it was preparing for no longer exists.
+test("the v3 migration de-duplicates slot names, and v4 drops the index again", async () => {
+    const dbPath = await tmpDbPath();
+    const legacy = openWorkspace(dbPath);
+    const g = legacy.createGroup({ serverId: SERVER, name: "G" });
+    const s = legacy.createSession({ serverId: SERVER, groupId: g.id, name: "S", repositoryRoot: "/r" });
+    const a = legacy.createTerminalPane({ serverId: SERVER, devSessionId: s.id, name: "a" });
+    const b = legacy.createTerminalPane({ serverId: SERVER, devSessionId: s.id, name: "b" });
+    const c = legacy.createTerminalPane({ serverId: SERVER, devSessionId: s.id, name: "c" });
+    downgradeToV2(legacy);
+    // A v2 database could hold two rows for one layout slot, because nothing
+    // stopped two clients from both creating one.
+    legacy.db.prepare("UPDATE terminal_panes SET name = ? WHERE id = ?").run("terminal-1", a.id);
+    legacy.db.prepare("UPDATE terminal_panes SET name = ? WHERE id = ?").run("terminal-1", b.id);
+    legacy.db.prepare("UPDATE terminal_panes SET name = ? WHERE id = ?").run("terminal-1", c.id);
+    assert.deepEqual(uniqueAddressIndexes(legacy), []);
+    legacy.close();
+
+    const upgraded = openWorkspace(dbPath);
+    // v4 removed the address index; only the tmux_target rule is left.
+    assert.deepEqual(uniqueAddressIndexes(upgraded), []);
+
+    // The OLDEST row keeps the contested slot: it is the one whose shell has
+    // been running longest, so it is the one the slot should keep resolving to.
+    assert.equal(upgraded.getTerminalPane(a.id).name, "terminal-1");
+    // The later rows are RENAMED, not deleted: each still owns a live tmux
+    // session and the user's running processes, and deleting the row would
+    // strand them under a name nothing could ever look up again.
+    assert.equal(upgraded.getTerminalPane(b.id).name, `terminal-1-dup-${b.id.slice(0, 8)}`);
+    assert.equal(upgraded.getTerminalPane(c.id).name, `terminal-1-dup-${c.id.slice(0, 8)}`);
+    // Every row survived, and each kept its own tmux session.
+    const panes = upgraded.list(SERVER)[0].sessions[0].terminalPanes;
+    assert.equal(panes.length, 3);
+    assert.equal(new Set(panes.map((p) => p.tmuxTarget)).size, 3);
+    // The slot now resolves to exactly one row — the survivor.
+    assert.equal(
+        upgraded.resolveTerminalPane({ serverId: SERVER, devSessionId: s.id, name: "terminal-1" }).id,
+        a.id,
+    );
+    upgraded.close();
+
+    await cleanup(dbPath);
+});
+
+// THE race this method exists for, driven against two REAL codeharbord
+// processes sharing one database file — which is exactly the production shape:
+// each client's SSH session spawns its own daemon, and each daemon opens its
+// own SQLite connection. Two clients opening the same Dev Session at the same
+// moment used to each list, each see no row for "terminal-1", and each create
+// one: two rows, two server-minted targets, two tmux sessions for one pane.
+//
+// The requests are written to both daemons before either answer is read, so the
+// two are genuinely in flight together; transaction()'s BEGIN IMMEDIATE takes
+// the write lock before the SELECT, so the loser reads after the winner's
+// commit and finds the row instead of inserting a second one.
+test("two concurrent daemons resolving one slot converge on one row", async () => {
+    const dbPath = await tmpDbPath();
+    const seed = openWorkspace(dbPath);
+    const g = seed.createGroup({ serverId: SERVER, name: "G" });
+    const s = seed.createSession({ serverId: SERVER, groupId: g.id, name: "S", repositoryRoot: "/r" });
+    seed.close();
+
+    const daemon = fileURLToPath(new URL("../src/codeharbord.ts", import.meta.url));
+    const spawnDaemon = () =>
+        spawn(process.execPath, [daemon, "rpc", "--stdio"], {
+            env: { ...process.env, CODEHARBOR_DB: dbPath },
+            stdio: ["pipe", "pipe", "inherit"],
+        });
+
+    // One request per daemon, both written before either reply is awaited.
+    const request =
+        JSON.stringify({
+            jsonrpc: "2.0",
+            id: 1,
+            method: "workspace.resolveTerminalPane",
+            params: { serverId: SERVER, devSessionId: s.id, name: "terminal-1" },
+        }) + "\n";
+
+    const daemons = [spawnDaemon(), spawnDaemon()];
+    const replies = daemons.map(
+        (proc) =>
+            new Promise<Record<string, unknown>>((resolve, reject) => {
+                let buffered = "";
+                proc.stdout.setEncoding("utf8");
+                proc.stdout.on("data", (chunk: string) => {
+                    buffered += chunk;
+                    const end = buffered.indexOf("\n");
+                    if (end >= 0) resolve(JSON.parse(buffered.slice(0, end)));
+                });
+                proc.on("error", reject);
+                proc.on("exit", () => reject(new Error("daemon exited before answering")));
+            }),
+    );
+    for (const proc of daemons) proc.stdin.write(request);
+
+    const answers = await Promise.all(replies);
+    for (const proc of daemons) {
+        proc.stdin.end();
+        proc.kill();
+    }
+
+    // Neither client was told to retry, and neither got an error.
+    for (const answer of answers) {
+        assert.equal(answer.error, undefined, JSON.stringify(answer.error));
+    }
+    const panes = answers.map((a) => a.result as { id: string; tmuxTarget: string });
+    // ONE row, ONE tmux session — both clients are pointed at the same terminal.
+    assert.equal(panes[0].id, panes[1].id);
+    assert.equal(panes[0].tmuxTarget, panes[1].tmuxTarget);
+
+    // And the database agrees: the slot has exactly one row, not two.
+    const after = openWorkspace(dbPath);
+    const rows = after.list(SERVER)[0].sessions[0].terminalPanes;
+    assert.deepEqual(
+        rows.map((p) => p.name),
+        ["terminal-1"],
+    );
+    assert.equal(rows[0].tmuxTarget, panes[0].tmuxTarget);
+    after.close();
+
+    await cleanup(dbPath);
+});
+
 test("serverId is independent of the database's path", async () => {
     const dbPath = await tmpDbPath();
     const ws = openWorkspace(dbPath);
@@ -1438,6 +1953,10 @@ test("openWorkspace closes the connection when it refuses a newer database", asy
     // fresh connection and reopen normally. A still-open handle from the failed
     // attempt would have left the file locked.
     const repair = new DatabaseSync(dbPath);
+    // Every connection to a workspace database gets the same treatment, tests
+    // included: without the busy timeout this one write would fail outright if
+    // anything else held the lock.
+    applyConnectionPragmas(repair);
     repair.prepare("UPDATE schema_version SET version = ? WHERE id = 1").run(
         WORKSPACE_SCHEMA_VERSION,
     );
@@ -1445,6 +1964,217 @@ test("openWorkspace closes the connection when it refuses a newer database", asy
     const reopened = openWorkspace(dbPath);
     assert.equal(typeof reopened.serverId(), "string");
     reopened.close();
+
+    await cleanup(dbPath);
+});
+
+// Contention that the BEGIN IMMEDIATE work assumed but nothing enforced: two
+// daemon processes writing to one database file at the same time. SQLite's
+// default busy timeout is ZERO, so before applyConnectionPragmas() the loser of
+// every collision failed instantly and the client was told the SERVER broke.
+//
+// Each daemon is handed a whole batch of createGroup requests before either
+// daemon's first reply is read, so the two are writing simultaneously for the
+// whole run rather than trading one request each.
+test("two daemons writing at once all succeed, and positions stay packed", async () => {
+    const dbPath = await tmpDbPath();
+    openWorkspace(dbPath).close();
+
+    const daemonPath = fileURLToPath(new URL("../src/codeharbord.ts", import.meta.url));
+    const PER_DAEMON = 25;
+
+    // A daemon plus a reader that lets the test wait for the Nth reply. Both
+    // daemons must be up before either starts writing: spawning is much slower
+    // than a row insert, so an unsynchronized pair can finish its whole burst
+    // before the other has opened the database and never contend at all.
+    const daemons = [0, 1].map((n) => {
+        const proc = spawn(process.execPath, [daemonPath, "rpc", "--stdio"], {
+            env: { ...process.env, CODEHARBOR_DB: dbPath },
+            stdio: ["pipe", "pipe", "inherit"],
+        });
+        const replies: Record<string, unknown>[] = [];
+        const waiters: Array<{ want: number; settle: () => void }> = [];
+        let failure: Error | undefined;
+        let buffered = "";
+        const wake = () => {
+            for (let i = waiters.length - 1; i >= 0; i--) {
+                if (failure || replies.length >= waiters[i].want) waiters.splice(i, 1)[0].settle();
+            }
+        };
+        proc.stdout.setEncoding("utf8");
+        proc.stdout.on("data", (chunk: string) => {
+            buffered += chunk;
+            for (let end = buffered.indexOf("\n"); end >= 0; end = buffered.indexOf("\n")) {
+                replies.push(JSON.parse(buffered.slice(0, end)));
+                buffered = buffered.slice(end + 1);
+            }
+            wake();
+        });
+        const fail = () => {
+            failure = new Error(`daemon ${n} exited before answering`);
+            wake();
+        };
+        proc.on("error", fail);
+        proc.on("exit", fail);
+        const until = (want: number) =>
+            new Promise<void>((resolve, reject) => {
+                waiters.push({ want, settle: () => (failure ? reject(failure) : resolve()) });
+                wake();
+            });
+        return { proc, replies, until, tag: `d${n}` };
+    });
+
+    // The barrier: `ping` needs no database, so answering it proves only that
+    // the process is running and reading its stdin — exactly what we need
+    // before releasing the writes.
+    for (const d of daemons) {
+        d.proc.stdin.write(JSON.stringify({ jsonrpc: "2.0", id: 0, method: "ping" }) + "\n");
+    }
+    await Promise.all(daemons.map((d) => d.until(1)));
+
+    // Both bursts released without awaiting anything in between, so each
+    // daemon's whole batch is queued while the other is still writing.
+    for (const d of daemons) {
+        let batch = "";
+        for (let i = 1; i <= PER_DAEMON; i++) {
+            batch +=
+                JSON.stringify({
+                    jsonrpc: "2.0",
+                    id: i,
+                    method: "workspace.createGroup",
+                    params: { serverId: SERVER, name: `${d.tag}-${i}` },
+                }) + "\n";
+        }
+        d.proc.stdin.write(batch);
+    }
+    await Promise.all(daemons.map((d) => d.until(PER_DAEMON + 1)));
+
+    const answers = daemons.flatMap((d) => d.replies.slice(1));
+    for (const d of daemons) {
+        d.proc.stdin.end();
+        d.proc.kill();
+    }
+
+    // Not one of the fifty writes was refused. A "database is locked" here is
+    // the whole defect: valid work rejected because the loser did not wait.
+    for (const answer of answers) {
+        assert.equal(answer.error, undefined, JSON.stringify(answer.error));
+    }
+
+    // Every write landed, and the read-then-write inside createGroup stayed
+    // serialized: positions are exactly 0..49 with no duplicate and no hole, so
+    // no two concurrent inserts read the same maximum. A duplicate position is
+    // an ordering the user sees as groups shuffling between listings.
+    const after = openWorkspace(dbPath);
+    const groups = after.list(SERVER);
+    assert.equal(groups.length, 2 * PER_DAEMON);
+    const positions = after.db
+        .prepare("SELECT position FROM groups WHERE server_id = ? ORDER BY position")
+        .all(SERVER) as unknown as Array<{ position: number }>;
+    assert.deepEqual(
+        positions.map((row) => row.position),
+        Array.from({ length: 2 * PER_DAEMON }, (_, i) => i),
+    );
+    // And the listing order agrees with those positions.
+    assert.deepEqual(
+        groups.map((g) => g.position),
+        Array.from({ length: 2 * PER_DAEMON }, (_, i) => i),
+    );
+    after.close();
+
+    await cleanup(dbPath);
+});
+
+// The two settings applyConnectionPragmas() exists for, asserted on the real
+// thing. WAL is the reason concurrent readers and the writer stop blocking each
+// other at all; the busy timeout is the fallback for the write lock they still
+// share.
+test("a file-backed workspace runs in WAL with a non-zero busy timeout", async () => {
+    const dbPath = await tmpDbPath();
+    const ws = openWorkspace(dbPath);
+    const mode = ws.db.prepare("PRAGMA journal_mode").get() as unknown as {
+        journal_mode: string;
+    };
+    assert.equal(mode.journal_mode, "wal");
+    const busy = ws.db.prepare("PRAGMA busy_timeout").get() as unknown as { timeout: number };
+    assert.ok(busy.timeout > 0, `busy_timeout is ${busy.timeout}; SQLite's zero default never waits`);
+    ws.close();
+
+    // The journal mode is recorded in the FILE, so reopening an existing
+    // database must find it already set and everything written before the
+    // switch must still be readable — a mode change is not a migration and must
+    // not disturb the schema version or the rows.
+    const seeded = openWorkspace(dbPath);
+    const g = seeded.createGroup({ serverId: SERVER, name: "G" });
+    seeded.close();
+    const reopened = openWorkspace(dbPath);
+    const remode = reopened.db.prepare("PRAGMA journal_mode").get() as unknown as {
+        journal_mode: string;
+    };
+    assert.equal(remode.journal_mode, "wal");
+    assert.equal(reopened.list(SERVER)[0].id, g.id);
+    const version = reopened.db
+        .prepare("SELECT version FROM schema_version WHERE id = 1")
+        .get() as unknown as { version: number };
+    assert.equal(version.version, WORKSPACE_SCHEMA_VERSION);
+    reopened.close();
+
+    await cleanup(dbPath);
+});
+
+// WAL does not exist for an in-memory database and SQLite quietly ignores the
+// request there. Several tests (and schema.test.ts) open ":memory:", so this
+// pins that adopting WAL cannot make them throw or drop into an unexpected
+// mode — while the busy timeout, which IS meaningful everywhere, still applies.
+test("an in-memory workspace is unaffected by the WAL pragma", () => {
+    const ws = openWorkspace(":memory:");
+    const mode = ws.db.prepare("PRAGMA journal_mode").get() as unknown as {
+        journal_mode: string;
+    };
+    assert.equal(mode.journal_mode, "memory");
+    const busy = ws.db.prepare("PRAGMA busy_timeout").get() as unknown as { timeout: number };
+    assert.ok(busy.timeout > 0);
+    // Still a working database, which is the point of the graceful path.
+    assert.equal(ws.createGroup({ serverId: SERVER, name: "G" }).position, 0);
+    ws.close();
+});
+
+// The predicate the dispatcher branches on to answer RPC_DATABASE_BUSY instead
+// of -32603. It reads SQLite's numeric result code rather than matching on the
+// message text, so this drives a REAL contention failure rather than a
+// hand-built Error: a fabricated one could keep passing after node:sqlite
+// changed how it reports the failure, which is exactly the drift that would put
+// "internal error" back in front of users.
+test("isDatabaseBusy recognizes a real lock failure and nothing else", async () => {
+    const dbPath = await tmpDbPath();
+    const holder = openWorkspace(dbPath);
+    const loser = new DatabaseSync(dbPath);
+    // No busy timeout on this one: it must fail instantly instead of waiting
+    // out a lock the single-threaded test will never release in the meantime.
+    loser.exec("PRAGMA busy_timeout = 0;");
+    holder.db.exec("BEGIN IMMEDIATE");
+    assert.throws(
+        () => loser.exec("BEGIN IMMEDIATE"),
+        (err: unknown) => {
+            assert.ok(isDatabaseBusy(err), `not recognized as contention: ${String(err)}`);
+            return true;
+        },
+    );
+    holder.db.exec("ROLLBACK");
+    loser.close();
+
+    // A constraint violation is a genuine rejection of the request and must NOT
+    // be dressed up as "retry, someone else is writing".
+    const g = holder.createGroup({ serverId: SERVER, name: "G" });
+    assert.throws(
+        () =>
+            holder.db
+                .prepare("INSERT INTO groups (id, server_id, name, position, collapsed, created_at, updated_at) VALUES (?, ?, ?, ?, 0, 0, 0)")
+                .run(g.id, SERVER, "dup", 1),
+        (err: unknown) => isDatabaseBusy(err) === false,
+    );
+    assert.equal(isDatabaseBusy(new Error("database is locked")), false);
+    holder.close();
 
     await cleanup(dbPath);
 });

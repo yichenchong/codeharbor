@@ -14,9 +14,10 @@ namespace ch {
 // so they survive restarts. This is purely local presentation state and is never
 // sent to the codeharbord host.
 //
-// One entry here is load-bearing rather than cosmetic: the pane-id counter is
-// what stops a pane id - and therefore a remote tmux session name - from being
-// handed out twice. See setNextPaneSuffix().
+// One entry here used to be load-bearing for correctness and is now cosmetic:
+// the pane-id counter keeps layout slot labels stable and non-repeating. It no
+// longer names a remote tmux session — the server does (SPEC 5.2) — so it can
+// no longer hand two panes the same shell. See setNextPaneSuffix().
 //
 // Storage keys:
 //   layout/sidebarWidth, layout/viewerWidth, layout/terminalWidth
@@ -58,14 +59,24 @@ public:
     Q_INVOKABLE QString selectedPane(QString devSessionId) const;
 
     // The next "<region>-<n>" suffix to mint for one (Dev Session, region)
-    // pair. Persisted because a pane id must never be handed out twice within a
-    // Dev Session - not after the pane holding it was closed, and not after a
-    // restart either. A terminal pane's layout pane id IS the name of its remote
-    // tmux session (src/terminal/TerminalController.cpp builds
-    // "ch_<devSessionId>_<paneId>", attached with `tmux new-session -A`), so
-    // handing the same id out twice silently re-attaches the closed pane's old
-    // shell - its scrollback, its working directory and whatever is still
-    // running in it - instead of starting the new shell the user asked for.
+    // pair. Persisted so a pane id is not handed out twice within a Dev
+    // Session — not after the pane holding it was closed, and not after a
+    // restart either.
+    //
+    // This is about LABELS and layout bookkeeping, and NOTHING else. It is not
+    // a safety mechanism and must not be read as one. A terminal pane's layout
+    // pane id used to BE the name of its remote tmux session (the client built
+    // "ch_<devSessionId>_<paneId>" and attached it with `tmux new-session -A`),
+    // so a reused number silently re-attached a closed pane's old shell — and
+    // this counter, being client-local, could never stop a SECOND machine from
+    // re-minting the same number. Identity moved out of the label entirely: a
+    // terminal is the `terminal_panes` row whose id its LAYOUT LEAF carries
+    // (SplitNode::terminalPaneId), server-minted, never recycled and shared
+    // through the stored tree, so every client agrees. A recycled number can no
+    // longer address anybody's shell even in principle. The counter stays
+    // because the numbers are what the user reads on a pane header and what
+    // viewer pane ids are keyed by, and a Dev Session that shows two panes both
+    // labelled "terminal-1" is its own kind of wrong.
     //
     // Per region as well as per Dev Session: the two regions number
     // independently ("viewer-1" and "terminal-1" coexist), and two Dev Sessions
@@ -78,8 +89,8 @@ public:
     // "<region>-0") and never to a number below one already in the tree.
     // SessionLayouts additionally takes the maximum of this counter and the
     // highest suffix its loaded tree carries, so a Dev Session that predates
-    // this counter - or one whose settings file was cleared - still cannot mint
-    // an id that collides with a pane it already shows.
+    // this counter - or one whose settings file was cleared - still cannot
+    // label a new pane with a number a pane already on screen is wearing.
     //
     // An empty devSessionId is not a Dev Session and is handled exactly as
     // setSelectedPane()/setActiveSession() handle theirs: reads answer the

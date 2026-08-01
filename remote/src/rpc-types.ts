@@ -143,11 +143,58 @@ export type RpcMethodName = (typeof RPC_METHODS)[RpcMethodKey];
 // (codeharbord.ts) and the C++ client (RpcTypes.h).
 export const RPC_WATCH_EVENT_NOTIFICATION = "file.watchEvent";
 
+// Transport keepalive. Not an application method and not part of any group:
+// the C++ client (CodeharbordClient::enableHeartbeat) sends it on a timer to
+// answer "is the peer still reading and writing?", and drops the transport when
+// several consecutive probes go unanswered. The handler lives in codeharbord's
+// static method map next to server.info, and is keyed off THIS constant so the
+// dispatch table and the contract cannot drift. Kept as the bare name `ping`
+// rather than moved into the `server.` group: it is the wire name every
+// already-deployed daemon answers, and the keepalive is precisely the call that
+// must work before the client knows anything about the peer.
+export const RPC_PING_METHOD = "ping";
+
+// Server -> client notification: watch notifications for these subscriptions
+// were DROPPED and will never be delivered. The daemon writes notifications to
+// a stdout the SSH channel drains; when that consumer stalls the daemon queues
+// pending notifications, and that queue is bounded (MAX_PENDING_WATCH_EVENTS /
+// MAX_PENDING_WATCH_BYTES in codeharbord.ts) so a churning directory cannot
+// grow it until the process is killed. Coalescing absorbs the common case, but
+// once the bound is genuinely reached events are discarded — and a client that
+// silently misses a change shows stale content while believing it is current,
+// which is worse than being told. This notification is that telling: for each
+// listed subscription the client MUST re-read the watched path rather than
+// trust its cached copy. It is a NOTIFICATION name (no id, no response), so
+// like RPC_WATCH_EVENT_NOTIFICATION it is deliberately absent from RPC_METHODS.
+export const RPC_WATCH_EVENTS_LOST_NOTIFICATION = "file.watchEventsLost";
+
+// Params of RPC_WATCH_EVENTS_LOST_NOTIFICATION. Only subscriptions still live
+// at the moment the notification is written are listed: an unwatched
+// subscription has no consumer left to inform.
+export interface WatchEventsLost {
+    subscriptionIds: string[];
+}
+
 // Implementation-defined server error code (JSON-RPC 2.0 reserves -32000..-32099
 // for such errors) for a writeFile whose expectedRevision no longer matches the
 // file's current revision. The server rejects the write rather than silently
 // overwriting concurrent changes (SPEC 8.4 / 8.6).
 export const RPC_REVISION_MISMATCH = -32001;
+
+// Implementation-defined server error code for a workspace write that could not
+// take the database's write lock before workspace.ts's busy timeout ran out.
+// Deliberately NOT -32603: nothing in the server malfunctioned and nothing was
+// half-applied — several codeharbord processes share one database file (SPEC
+// 3.5 / workspace.ts serverId), the caller simply lost a race, and the request
+// can be retried verbatim. Also not -32602: the params were perfectly valid.
+// The C++ client has NO special case for this code, BY DECISION rather than by
+// omission: with the busy timeout in force this is close to unreachable, and an
+// automatic client retry would invent a new failure mode (a write repeated
+// after a partial effect) for a case that should not happen. The generic path —
+// show the server's message to the user — is the right handling for a rare
+// transient, so codeharbord phrases that message as an instruction, not as a
+// SQLite string.
+export const RPC_DATABASE_BUSY = -32002;
 
 // JSON-RPC 2.0 reserved error codes. They live in this contract module rather
 // than in codeharbord.ts because the param guards in validate.ts tag their
@@ -240,6 +287,11 @@ export const RPC_WORKSPACE_METHODS = {
     updateViewerPane: "workspace.updateViewerPane",
     deleteViewerPane: "workspace.deleteViewerPane",
     createTerminalPane: "workspace.createTerminalPane",
+    // Lookup-or-create for ONE layout slot, in one server-side transaction.
+    // Not a convenience wrapper over list + createTerminalPane: two clients
+    // running that pair concurrently both see no row and both create one, which
+    // is two tmux sessions for one slot. Only the server can make it atomic.
+    resolveTerminalPane: "workspace.resolveTerminalPane",
     updateTerminalPane: "workspace.updateTerminalPane",
     deleteTerminalPane: "workspace.deleteTerminalPane",
     getLayout: "workspace.getLayout",

@@ -31,6 +31,47 @@ option(CODEHARBOR_BUILD_TESTS "Build C++ unit tests" ON)
 option(CODEHARBOR_SKIP_WEB_BUNDLE
        "Do not embed the Monaco/xterm.js bundles (produces an unshippable client)" OFF)
 
+# A compiler cache, if this machine happens to have one. It is a pure win when
+# present (an unchanged translation unit becomes a file copy) and costs nothing
+# when absent, so it is discovered rather than required: no flag to remember,
+# and installing ccache later is picked up by the next configure. An explicit
+# -DCMAKE_CXX_COMPILER_LAUNCHER=... on the command line still wins.
+#
+# ccache first: it is what the documented Linux/macOS setups have. sccache is
+# the fallback because it is the one that is usually already installed on a
+# machine that also builds Rust. C is listed alongside CXX even though this
+# project() declares only CXX - a dependency added later that enables C should
+# get the same treatment without anyone having to remember this block.
+if(NOT CMAKE_CXX_COMPILER_LAUNCHER)
+    find_program(CODEHARBOR_COMPILER_CACHE NAMES ccache sccache)
+    if(CODEHARBOR_COMPILER_CACHE)
+        set(CMAKE_C_COMPILER_LAUNCHER "${CODEHARBOR_COMPILER_CACHE}")
+        set(CMAKE_CXX_COMPILER_LAUNCHER "${CODEHARBOR_COMPILER_CACHE}")
+        message(STATUS "compiler cache: ${CODEHARBOR_COMPILER_CACHE}")
+    else()
+        message(STATUS "compiler cache: not found (looked for ccache, sccache);"
+                       " builds are uncached. Installing either one needs no"
+                       " further configuration.")
+    endif()
+endif()
+
+# Debug information for the test executables, traded against build time. There
+# are 35 of them, one translation unit each, and together they are the single
+# largest bucket in a Debug build of this tree (767 s of 1985 s of compile work
+# measured on a 2-core box). Dropping them from `-g` to `-g1` - line tables and
+# function boundaries, no local variable or type descriptions - measured 15.2 s
+# -> 11.7 s for tst_qmlload.cpp, about 23%.
+#
+# OFF by default, deliberately. When anyone actually reaches for a debugger here
+# it is almost always a failing TEST they are stepping through, and what -g1
+# throws away is exactly what that session needs: the local variables and type
+# descriptions. So this is a knob a developer turns on while grinding a build
+# loop, not a default that quietly degrades everyone's gdb session. Neither the
+# application binary nor a packaged artifact is affected either way - only
+# `tst_*` targets are touched, and only in a config that has debug info at all.
+option(CODEHARBOR_TEST_MINIMAL_DEBUGINFO
+       "Compile tst_* with -g1 (line tables only, no local variables) for faster test builds" OFF)
+
 # Qt 6.9+ is required: QQuickWebEngineProfile's (storageName, parent) constructor
 # arrived in 6.9, and it is the only profile-creation form that does not emit the
 # "use WebEngineProfilePrototype" deprecation warning that tst_qmlload treats as a
@@ -134,3 +175,33 @@ if(CODEHARBOR_BUILD_TESTS)
 endif()
 
 add_subdirectory(src)
+
+# CODEHARBOR_TEST_MINIMAL_DEBUGINFO, applied here rather than in each of the ten
+# src/*/tests/CMakeLists.txt: the test targets all exist by now, so one walk of
+# the build system reaches every `tst_*` and keeps reaching new ones nobody has
+# written yet. -g1 is appended AFTER the config's own -g, and GCC/Clang take the
+# last debug-level flag on the command line, so it wins without editing
+# CMAKE_CXX_FLAGS_DEBUG (which would hit the application too).
+#
+# The generator expression restricts it to the configs that carry debug info at
+# all: adding -g1 to a Release test build would ADD information rather than
+# remove it. MSVC has no equivalent spelling, so it is simply not offered there.
+function(_codeharbor_minimal_test_debuginfo dir)
+    get_property(_subdirs DIRECTORY "${dir}" PROPERTY SUBDIRECTORIES)
+    foreach(_subdir IN LISTS _subdirs)
+        _codeharbor_minimal_test_debuginfo("${_subdir}")
+    endforeach()
+    get_property(_targets DIRECTORY "${dir}" PROPERTY BUILDSYSTEM_TARGETS)
+    foreach(_target IN LISTS _targets)
+        # AUTOMOC contributes a `tst_<name>_autogen` UTILITY target alongside each
+        # test, and target_compile_options is an error on one of those.
+        get_target_property(_type ${_target} TYPE)
+        if(_target MATCHES "^tst_" AND _type STREQUAL "EXECUTABLE")
+            target_compile_options(${_target} PRIVATE
+                $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<OR:$<CONFIG:Debug>,$<CONFIG:RelWithDebInfo>>>:-g1>)
+        endif()
+    endforeach()
+endfunction()
+if(CODEHARBOR_TEST_MINIMAL_DEBUGINFO AND NOT MSVC)
+    _codeharbor_minimal_test_debuginfo("${CMAKE_CURRENT_SOURCE_DIR}")
+endif()

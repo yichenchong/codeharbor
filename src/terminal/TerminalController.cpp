@@ -69,13 +69,32 @@ void TerminalController::setViewVisible(bool visible)
     if (m_viewVisible == visible)
         return;
     m_viewVisible = visible;
-    if (visible && !m_hidden.isEmpty()) {
-        // Replay everything retained while hidden as one batch, then reset the
-        // rolling buffer so tmux history covers anything older (SPEC 5.4/5.5).
-        const QByteArray replay = std::move(m_hidden);
-        m_hidden.clear();
-        emit flushReady(replay);
-    }
+    // Whatever the outgoing renderer was handed and never acknowledged is gone
+    // with it, and the incoming one never saw any of it. Starting the account
+    // at zero is what lets a reloaded page resynchronise: it gets the retained
+    // buffer replayed and a full window of credit, instead of inheriting a
+    // debt run up by the page it replaced. (releaseRetained() is a no-op on the
+    // way to hidden, which is what makes this one call cover both directions.)
+    resetOutputAcknowledgements();
+}
+
+void TerminalController::acknowledgeOutput(qint64 bytes)
+{
+    if (bytes <= 0)
+        return;
+    m_unacknowledged = qMax<qint64>(0, m_unacknowledged - bytes);
+    releaseRetained();
+}
+
+qint64 TerminalController::unacknowledgedBytes() const
+{
+    return m_unacknowledged;
+}
+
+void TerminalController::resetOutputAcknowledgements()
+{
+    m_unacknowledged = 0;
+    releaseRetained();
 }
 
 void TerminalController::ingestOutput(const QByteArray &bytes)
@@ -198,10 +217,41 @@ void TerminalController::flush()
         return;
     const QByteArray batch = std::move(m_pending);
     m_pending.clear();
-    if (m_viewVisible)
-        emit flushReady(batch);
-    else
+
+    // Three reasons to retain instead of emit, and they share one buffer:
+    //   * no renderer is listening (SPEC 5.4);
+    //   * the renderer is too far behind on acknowledgements — emitting more
+    //     would queue it in the WebChannel transport and in Chromium, which is
+    //     memory nobody bounds;
+    //   * something is ALREADY retained. This one is about ORDER, not volume:
+    //     the retained bytes are older, so a batch emitted past them would
+    //     reach the terminal out of sequence.
+    if (!m_viewVisible || m_unacknowledged >= kMaxUnacknowledgedBytes
+        || !m_hidden.isEmpty()) {
         appendHidden(batch);
+        return;
+    }
+
+    m_unacknowledged += batch.size();
+    emit flushReady(batch);
+}
+
+void TerminalController::releaseRetained()
+{
+    if (!m_viewVisible || m_hidden.isEmpty()
+        || m_unacknowledged >= kMaxUnacknowledgedBytes)
+        return;
+
+    // The whole buffer goes in ONE batch, exactly as the hidden->visible replay
+    // always has. That overshoots kMaxUnacknowledgedBytes by up to the size of
+    // the buffer, which is fine and is the cheaper trade: the buffer is capped
+    // at kHiddenBufferMaxBytes, so the overshoot is bounded too, and splitting
+    // it would need a second place that decides where a safe cut lands — the
+    // one thing appendHidden() goes to some trouble to get right.
+    const QByteArray replay = std::move(m_hidden);
+    m_hidden.clear();
+    m_unacknowledged += replay.size();
+    emit flushReady(replay);
 }
 
 void TerminalController::appendHidden(const QByteArray &batch)
@@ -304,18 +354,9 @@ bool TerminalController::isLiveState(TerminalState state)
     return false;
 }
 
-QString TerminalController::tmuxTarget(const DevSessionId &devSession,
-                                       const TerminalId &terminal)
-{
-    return QStringLiteral("ch_%1_%2").arg(devSession.value, terminal.value);
-}
-
-QString TerminalController::tmuxNewSessionCommand(const DevSessionId &devSession,
-                                                  const TerminalId &terminal,
+QString TerminalController::tmuxNewSessionCommand(const QString &target,
                                                   const QString &workingDir)
 {
-    const QString target = tmuxTarget(devSession, terminal);
-
     // TWO tmux commands in ONE invocation, separated by an escaped semicolon:
     // the shell unescapes `\;` into a literal `;` argument, which is tmux's own
     // command separator (a bare `;` would end the shell command instead).

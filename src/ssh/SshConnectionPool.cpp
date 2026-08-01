@@ -26,8 +26,143 @@
 #include <libssh/callbacks.h>
 #endif
 
+#include <atomic>
+#include <memory>
+#include <utility>
+
 
 namespace ch {
+
+namespace {
+
+// The routes active on THIS thread, innermost last. A stack rather than a
+// single pointer so a route taken from inside another route's scope restores
+// its parent when it goes; a list rather than a linked chain so a route
+// released OUT of order removes exactly itself and nothing else.
+thread_local QList<SshLogRouter::Route*> t_threadRoutes;
+
+// Whether the router has installed its hook on THIS thread, and what this
+// thread's libssh logging state was beforehand. Thread-local because libssh's
+// own logging state is (see the SshLogRouter comment).
+thread_local bool t_ownsThreadState = false;
+
+// Process-wide, for the test seam only: nothing about routing consults it.
+std::atomic<int> g_activeRoutes{0};
+
+#if CH_HAVE_LIBSSH
+thread_local ssh_logging_callback t_previousLogCallback = nullptr;
+thread_local void* t_previousLogUserdata = nullptr;
+thread_local int t_previousLogLevel = SSH_LOG_NOLOG;
+
+// The verbosity the transcript is worth reading at. Unchanged from the level
+// connectToHost() used to install directly: anything lower drops the key
+// exchange and authentication steps that make a failed handshake diagnosable.
+constexpr int kLibsshLogLevel = SSH_LOG_FUNCTIONS;
+#endif
+
+} // namespace
+
+SshLogRouter::Route::Route(Sink sink)
+    : m_sink(std::move(sink))
+{
+    m_active = true;
+    SshLogRouter::acquire(this);
+}
+
+SshLogRouter::Route::~Route()
+{
+    release();
+}
+
+void SshLogRouter::Route::release()
+{
+    SshLogRouter::release(this);
+}
+
+void SshLogRouter::acquire(Route* route)
+{
+    Q_ASSERT(route);
+    const bool firstOnThisThread = t_threadRoutes.isEmpty();
+    t_threadRoutes.append(route);
+    g_activeRoutes.fetch_add(1, std::memory_order_relaxed);
+    if (!firstOnThisThread)
+        return;
+#if CH_HAVE_LIBSSH
+    // Capture what this thread had before the router touched it, so the last
+    // release puts it back instead of leaving a permanently raised log level
+    // behind.
+    t_previousLogCallback = ssh_get_log_callback();
+    t_previousLogUserdata = ssh_get_log_userdata();
+    t_previousLogLevel = ssh_get_log_level();
+    ssh_set_log_callback(&SshLogRouter::dispatch);
+    // The router routes by thread and never reads libssh's user-data pointer,
+    // but it must not leave another component's pointer visible behind its own
+    // callback either.
+    ssh_set_log_userdata(nullptr);
+    ssh_set_log_level(kLibsshLogLevel);
+#endif
+    t_ownsThreadState = true;
+}
+
+void SshLogRouter::release(Route* route)
+{
+    Q_ASSERT(route);
+    if (!route->m_active)
+        return;  // idempotent: ~Route() after an explicit release()
+    route->m_active = false;
+
+    const qsizetype index = t_threadRoutes.lastIndexOf(route);
+    Q_ASSERT_X(index >= 0, "SshLogRouter::release",
+               "a route must be released on the thread that took it");
+    if (index >= 0)
+        t_threadRoutes.removeAt(index);
+    g_activeRoutes.fetch_sub(1, std::memory_order_relaxed);
+
+    if (!t_threadRoutes.isEmpty() || !t_ownsThreadState)
+        return;
+#if CH_HAVE_LIBSSH
+    // Same order the per-handshake scope guard used: level, then user data,
+    // then callback, so the previous callback is never briefly paired with this
+    // router's verbosity.
+    ssh_set_log_level(t_previousLogLevel);
+    ssh_set_log_userdata(t_previousLogUserdata);
+    // libssh REFUSES a null callback (ssh_set_log_callback returns SSH_ERROR
+    // and keeps the current one), so a thread that had no hook cannot be given
+    // its emptiness back. Leaving dispatch() installed is harmless and is the
+    // only option: with no route on this thread it forwards nothing, and the
+    // restored verbosity means libssh does not even format a line.
+    if (t_previousLogCallback)
+        ssh_set_log_callback(t_previousLogCallback);
+    t_previousLogCallback = nullptr;
+    t_previousLogUserdata = nullptr;
+    t_previousLogLevel = SSH_LOG_NOLOG;
+#endif
+    t_ownsThreadState = false;
+}
+
+void SshLogRouter::dispatch(int priority, const char* function,
+                            const char* buffer, void* userdata)
+{
+    // Deliberately ignored: libssh hands back its one user-data pointer, which
+    // cannot identify the session that emitted this line. See the class comment
+    // — attribution is by thread.
+    Q_UNUSED(userdata);
+    if (t_threadRoutes.isEmpty())
+        return;  // libssh work on a thread nobody asked for a transcript of
+    const Route* const route = t_threadRoutes.constLast();
+    if (route->m_sink)
+        route->m_sink(priority, function, buffer);
+}
+
+int SshLogRouter::activeRouteCount()
+{
+    return g_activeRoutes.load(std::memory_order_relaxed);
+}
+
+bool SshLogRouter::ownsThreadLoggingState()
+{
+    return t_ownsThreadState;
+}
 
 
 QString SshConnectionPool::lookupHostFor(const QString& host, quint16 port)
@@ -140,35 +275,31 @@ void SshConnectionPool::clearDiagnostics()
     emit diagnosticLogChanged();
 }
 
+void SshConnectionPool::appendTranscriptLine(QString& transcript,
+                                             const QString& line)
+{
+    if (!transcript.isEmpty())
+        transcript += QLatin1Char('\n');
+    transcript += line;
+    if (transcript.size() <= kTranscriptCharacterLimit)
+        return;
+    // Drop from the FRONT, then re-prepend the marker. The marker always sits
+    // at the very front, and the next overflow always removes strictly more
+    // characters than the marker is long (the appended line plus its newline),
+    // so the old marker is consumed before a new one is written: however many
+    // times the transcript has been truncated, it carries exactly one marker.
+    transcript.remove(0, transcript.size() - kTranscriptCharacterLimit);
+    transcript.prepend(
+        QStringLiteral("… earlier SSH diagnostics discarded …\n"));
+}
+
 void SshConnectionPool::appendDiagnostic(const QString& message)
 {
-    constexpr qsizetype maximumCharacters = 64 * 1024;
     const QString line = message.trimmed();
     if (line.isEmpty())
         return;
-
-    if (!m_diagnosticLog.isEmpty())
-        m_diagnosticLog += QLatin1Char('\n');
-    m_diagnosticLog += line;
-    if (m_diagnosticLog.size() > maximumCharacters) {
-        m_diagnosticLog.remove(0, m_diagnosticLog.size() - maximumCharacters);
-        m_diagnosticLog.prepend(
-            QStringLiteral("… earlier SSH diagnostics discarded …\n"));
-    }
+    appendTranscriptLine(m_diagnosticLog, line);
     emit diagnosticLogChanged();
-}
-
-void SshConnectionPool::libsshLog(int priority, const char* function,
-                                  const char* buffer, void* userdata)
-{
-    auto* const pool = static_cast<SshConnectionPool*>(userdata);
-    if (!pool || !buffer)
-        return;
-    pool->appendDiagnostic(
-        QStringLiteral("libssh[%1] %2: %3")
-            .arg(priority)
-            .arg(QString::fromUtf8(function ? function : "unknown"),
-                 QString::fromUtf8(buffer)));
 }
 
 #if !CH_HAVE_LIBSSH
@@ -414,22 +545,24 @@ bool SshConnectionPool::connectToHost(const QString& host, quint16 port,
         return false;
     }
 
-    // libssh exposes only a process-global logging callback. SSH handshakes
-    // here are synchronous, so restore the pre-existing callback and level
-    // before this attempt returns.
-    const ssh_logging_callback previousLogCallback = ssh_get_log_callback();
-    void* const previousLogUserdata = ssh_get_log_userdata();
-    const int previousLogLevel = ssh_get_log_level();
-    ssh_set_log_callback(&SshConnectionPool::libsshLog);
-    ssh_set_log_userdata(this);
-    ssh_set_log_level(SSH_LOG_FUNCTIONS);
-    const auto restoreLibsshLogging = qScopeGuard([previousLogCallback,
-                                                    previousLogUserdata,
-                                                    previousLogLevel] {
-        ssh_set_log_level(previousLogLevel);
-        ssh_set_log_userdata(previousLogUserdata);
-        ssh_set_log_callback(previousLogCallback);
-    });
+    // libssh's logging state is process-global, so it is owned by SshLogRouter
+    // rather than installed here: two pools handshaking at once would otherwise
+    // overwrite each other's callback and cross-contaminate their transcripts.
+    // The route lives only for this synchronous attempt — the scope guard below
+    // drops it before every return path, so the raised log level is never left
+    // behind — and the pool's destructor drops it too, should the pool die
+    // while holding one.
+    m_logRoute = std::make_unique<SshLogRouter::Route>(
+        [this](int priority, const char* function, const char* buffer) {
+            if (!buffer)
+                return;
+            appendDiagnostic(
+                QStringLiteral("libssh[%1] %2: %3")
+                    .arg(priority)
+                    .arg(QString::fromUtf8(function ? function : "unknown"),
+                         QString::fromUtf8(buffer)));
+        });
+    const auto dropLogRoute = qScopeGuard([this] { m_logRoute.reset(); });
 
     // Option failures are invisible in libssh's later return values: a private
     // key that never reached the session looks exactly like a key the server

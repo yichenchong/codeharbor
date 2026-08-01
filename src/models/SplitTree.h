@@ -41,6 +41,22 @@ struct SplitNode {
     // existed - a pane's content rides along with the structure it belongs to
     // instead of needing a second, separately reconciled store.
     QString url;
+    // The server-minted `terminal_panes.id` this leaf's terminal belongs to
+    // (SPEC 5.2), and the ONLY thing that identifies a terminal. Empty on a
+    // viewer leaf, and empty on a terminal leaf stored before this field
+    // existed - see ch::SessionLayouts for what happens then. Persisted ONLY
+    // for leaves and ONLY when non-empty, on the same rule as `url`, so a tree
+    // written before the field serializes byte-identically after it.
+    //
+    // Why it is HERE, in the layout, rather than derived from `paneId`: the
+    // pane id is a slot LABEL minted per client ("terminal-1", "terminal-2", …)
+    // and it is recycled - closing a pane leaves the row and its tmux session
+    // alive on purpose, and the next split on any client may hand the freed
+    // label to a brand new pane. Keying a terminal on the label therefore lets
+    // a new pane silently adopt a closed pane's shell. A row id is minted by
+    // the server, never reused, and travels to every client inside the shared
+    // tree, so all of them agree on which shell a leaf owns.
+    QString terminalPaneId;
     SplitOrientation orientation = SplitOrientation::Horizontal;
     QVector<SplitNode> children;
     QVector<double> ratios;
@@ -67,12 +83,12 @@ struct SplitNode {
     // callers to which a rejected tree and an empty leaf are the same thing.
     static SplitNode fromJson(const QJsonObject &obj);
 
-    // Structural equality mirroring toJson(): leaf identity is its paneId and
-    // url (orientation/ratios are meaningless and dropped for leaves), while a
-    // split is defined by orientation, ratios, and children (paneId and url are
-    // dropped). This keeps fromJson(toJson(x)) == x for any valid tree, which a
-    // defaulted operator== would break by comparing fields toJson() does not
-    // persist.
+    // Structural equality mirroring toJson(): leaf identity is its paneId, url
+    // and terminalPaneId (orientation/ratios are meaningless and dropped for
+    // leaves), while a split is defined by orientation, ratios, and children
+    // (paneId, url and terminalPaneId are dropped). This keeps
+    // fromJson(toJson(x)) == x for any valid tree, which a defaulted
+    // operator== would break by comparing fields toJson() does not persist.
     bool operator==(const SplitNode &other) const;
 };
 

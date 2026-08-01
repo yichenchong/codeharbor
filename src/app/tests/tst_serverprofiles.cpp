@@ -13,15 +13,20 @@
 
 #include <QtTest/QtTest>
 
+#include <QCoreApplication>
 #include <QDir>
+#include <QElapsedTimer>
 #include <QFile>
 #include <QFileInfo>
 #include <QJSValue>
+#include <QLockFile>
 #include <QMetaMethod>
 #include <QMetaObject>
 #include <QMetaProperty>
 #include <QMutex>
 #include <QMutexLocker>
+#include <QProcess>
+#include <QProcessEnvironment>
 #include <QQmlContext>
 #include <QQmlEngine>
 #include <QQmlError>
@@ -30,7 +35,9 @@
 #include <QSettings>
 #include <QSignalSpy>
 #include <QStringList>
+#include <QSysInfo>
 #include <QTemporaryDir>
+#include <QThread>
 #include <QUuid>
 #include <QVariantList>
 #include <QVariantMap>
@@ -102,6 +109,32 @@ QStringList namesOf(const QVariantList& profiles)
         names.append(entry.toMap().value(QStringLiteral("name")).toString());
     return names;
 }
+
+// A SECOND WRITER: another copy of the application, or the user's own text
+// editor, putting a profile into the same ini file while a ServerProfiles
+// instance is alive and knows nothing about it. Raw QSettings, exactly the
+// documented layout, so nothing about the store's own writer is assumed.
+// `extra` adds keys outside the seven-field whitelist, which a hand edit can.
+void writeProfileBehindOurBack(const QString& path, const QString& id,
+                               const QString& name, int ordinal,
+                               const QVariantMap& extra = QVariantMap())
+{
+    QSettings raw(path, QSettings::IniFormat);
+    const QString prefix = QStringLiteral("servers/") + id + QLatin1Char('/');
+    raw.setValue(prefix + QStringLiteral("name"), name);
+    raw.setValue(prefix + QStringLiteral("host"), name + QStringLiteral(".example"));
+    raw.setValue(prefix + QStringLiteral("port"), 2200);
+    raw.setValue(prefix + QStringLiteral("user"), QStringLiteral("otheruser"));
+    raw.setValue(prefix + QStringLiteral("ordinal"), ordinal);
+    for (auto it = extra.cbegin(); it != extra.cend(); ++it)
+        raw.setValue(prefix + it.key(), it.value());
+    raw.sync();
+}
+
+// The permission bits nobody but the owner may have on the profile store.
+constexpr QFile::Permissions kForbiddenModeBits =
+    QFile::ReadGroup | QFile::WriteGroup | QFile::ExeGroup | QFile::ReadOther
+    | QFile::WriteOther | QFile::ExeOther;
 
 // A QML `var` signal argument arrives as a QJSValue, not a QVariantMap.
 QVariantMap asMap(const QVariant& value)
@@ -211,6 +244,15 @@ private slots:
     void insertionOrderSurvivesReload();
     void handEditedStoreIsRepairedOnLoad();
     void secretsInTheCallersMapNeverReachTheStore();
+    void aSecondWritersProfileSurvivesEveryMutation();
+    void aDeletionIsNeverResurrectedByTheMerge();
+    void aConflictingEditIsLastWriteWins();
+    void aMergeLeaksNoSecretAndNoWiderPermissions();
+    void twoWritersRacingInSeparateProcessesLoseNothing();
+    void interprocessWriterChild(); // helper for the case above; skipped alone
+    void aSaveThatCannotTakeTheLockStillSavesAndSaysSo();
+    void aStaleLockFromADeadHolderDoesNotWedgeTheStore();
+    void aFirstRunWithNoConfigDirectoryLocksSilently();
 
     // ---- ConnectSheet.qml ----
     void sheetLoadsSilentlyAndExposesItsApi();
@@ -738,6 +780,496 @@ void TstServerProfiles::secretsInTheCallersMapNeverReachTheStore()
     QVERIFY(!reopened.profile(id).contains(QStringLiteral("password")));
     QCOMPARE(reopened.profile(id).value(QStringLiteral("identityFile")).toString(),
              keyFile);
+}
+
+// A profile is hand-entered configuration: losing one is losing user data, and
+// the user gets no error and no hint that it happened. The store reads the file
+// once and rewrites the whole `servers` group from memory, so before merging
+// every write destroyed anything a second writer had added since construction —
+// two open windows, or an editor open on the file. Every mutation path
+// (add/update/remove/select, and the ordinal rewrite a removal implies) goes
+// through the same persist(), so all of them are exercised here.
+void TstServerProfiles::aSecondWritersProfileSurvivesEveryMutation()
+{
+    const QString path = iniPath(QStringLiteral("secondwriter.ini"));
+    ServerProfiles store(path);
+    const QString a = store.addProfile(
+        profileFields(QStringLiteral("a"), QStringLiteral("ha"), 22, QStringLiteral("u")));
+    const QString b = store.addProfile(
+        profileFields(QStringLiteral("b"), QStringLiteral("hb"), 22, QStringLiteral("u")));
+
+    // Window B adds a server. Ordinal 0 is what a second instance really writes
+    // for its first profile, so this also proves our own order still wins.
+    const QString outsider = QStringLiteral("11111111-2222-3333-4444-555555555555");
+    writeProfileBehindOurBack(path, outsider, QStringLiteral("fromWindowB"), 0);
+
+    // ---- add ---- (this is the case that fails against the pre-merge store)
+    const QString c = store.addProfile(
+        profileFields(QStringLiteral("c"), QStringLiteral("hc"), 22, QStringLiteral("u")));
+    QVERIFY(!c.isEmpty());
+    {
+        ServerProfiles reader(path);
+        QCOMPARE(namesOf(reader.profiles()),
+                 QStringList({QStringLiteral("a"), QStringLiteral("b"),
+                              QStringLiteral("c"), QStringLiteral("fromWindowB")}));
+        // Kept verbatim, not just by name.
+        const QVariantMap kept = reader.profile(outsider);
+        QCOMPARE(kept.value(QStringLiteral("host")).toString(),
+                 QStringLiteral("fromWindowB.example"));
+        QCOMPARE(kept.value(QStringLiteral("user")).toString(), QStringLiteral("otheruser"));
+        QCOMPARE(kept.value(QStringLiteral("port")).toInt(), 2200);
+    }
+    // Merging is a write-time rule, not synchronisation: this instance does NOT
+    // adopt the other window's profile into the list it shows.
+    QCOMPARE(namesOf(store.profiles()),
+             QStringList({QStringLiteral("a"), QStringLiteral("b"), QStringLiteral("c")}));
+
+    // ---- update ----
+    store.updateProfile(b, QVariantMap{{QStringLiteral("host"), QStringLiteral("hb2")}});
+    {
+        ServerProfiles reader(path);
+        QCOMPARE(namesOf(reader.profiles()),
+                 QStringList({QStringLiteral("a"), QStringLiteral("b"),
+                              QStringLiteral("c"), QStringLiteral("fromWindowB")}));
+    }
+
+    // ---- select ----
+    store.setActiveId(c);
+    {
+        ServerProfiles reader(path);
+        QCOMPARE(idsOf(reader.profiles()), QStringList({a, b, c, outsider}));
+        QCOMPARE(reader.activeId(), c);
+    }
+
+    // ---- remove, which also reorders: every survivor's ordinal is rewritten ----
+    store.removeProfile(a);
+    {
+        ServerProfiles reader(path);
+        QCOMPARE(idsOf(reader.profiles()), QStringList({b, c, outsider}));
+    }
+
+    // A second outsider is kept too. Outsiders keep the order the FILE gives
+    // them, not the order they happened to arrive in: this one carries ordinal
+    // 1 (window B's second slot) while the first outsider carries the ordinal 2
+    // our last merge gave it, so the file's own order puts the newcomer first.
+    // What matters is that it is deterministic and that neither is dropped.
+    const QString outsider2 = QStringLiteral("22222222-3333-4444-5555-666666666666");
+    writeProfileBehindOurBack(path, outsider2, QStringLiteral("alsoWindowB"), 1);
+    store.updateProfile(c, QVariantMap{{QStringLiteral("name"), QStringLiteral("c2")}});
+    ServerProfiles reader(path);
+    QCOMPARE(idsOf(reader.profiles()), QStringList({b, c, outsider2, outsider}));
+    QCOMPARE(namesOf(reader.profiles()),
+             QStringList({QStringLiteral("b"), QStringLiteral("c2"),
+                          QStringLiteral("alsoWindowB"), QStringLiteral("fromWindowB")}));
+}
+
+// The subtle half, and the reason a plain union of memory and file is wrong. The
+// other window's copy of the list predates our deletion, so the deleted profile
+// is still in the file when we merge — and "keep what I do not know about" would
+// bring it back. A profile the user deleted staying deleted matters as much as
+// one they typed staying present.
+// It passes trivially against a store that simply overwrites everything; it is
+// here to stop the merge from ever being written as a union of file and memory.
+void TstServerProfiles::aDeletionIsNeverResurrectedByTheMerge()
+{
+    const QString path = iniPath(QStringLiteral("nodeleteundo.ini"));
+    ServerProfiles store(path);
+    const QString a = store.addProfile(
+        profileFields(QStringLiteral("a"), QStringLiteral("ha"), 22, QStringLiteral("u")));
+    const QString b = store.addProfile(
+        profileFields(QStringLiteral("b"), QStringLiteral("hb"), 22, QStringLiteral("u")));
+
+    store.removeProfile(a);
+    QCOMPARE(idsOf(store.profiles()), QStringList({b}));
+
+    // Window B, still holding `a` in its own memory, writes it back out.
+    writeProfileBehindOurBack(path, a, QStringLiteral("a"), 0);
+    {
+        // It really is back in the file — an untainted third reader sees it.
+        // (Order is by stored ordinal then id, which is not interesting here.)
+        ServerProfiles bystander(path);
+        QCOMPARE(bystander.profiles().size(), 2);
+        QVERIFY(idsOf(bystander.profiles()).contains(a));
+        QVERIFY(idsOf(bystander.profiles()).contains(b));
+    }
+
+    // Our next write must not mistake it for somebody else's new profile...
+    const QString c = store.addProfile(
+        profileFields(QStringLiteral("c"), QStringLiteral("hc"), 22, QStringLiteral("u")));
+    {
+        ServerProfiles reader(path);
+        QCOMPARE(idsOf(reader.profiles()), QStringList({b, c}));
+    }
+
+    // ...and it stays gone however many times it reappears and whatever we do
+    // next: the deletion is remembered for the lifetime of this instance.
+    writeProfileBehindOurBack(path, a, QStringLiteral("a"), 0);
+    store.updateProfile(b, QVariantMap{{QStringLiteral("host"), QStringLiteral("hb2")}});
+    writeProfileBehindOurBack(path, a, QStringLiteral("a"), 0);
+    store.removeProfile(c);
+    ServerProfiles reader(path);
+    QCOMPARE(idsOf(reader.profiles()), QStringList({b}));
+}
+
+// The documented conflict rule (see the CONCURRENT WRITERS block in
+// ServerProfiles.h): a profile this instance holds is written from OUR memory,
+// whole. The write in progress is the later one, so it wins; there are no
+// per-field timestamps in a hand-editable ini and the user's own most recent
+// action is the best tiebreak available. The consequence is deliberate and
+// pinned here in both directions.
+void TstServerProfiles::aConflictingEditIsLastWriteWins()
+{
+    const QString path = iniPath(QStringLiteral("conflict.ini"));
+    ServerProfiles store(path);
+    const QString id = store.addProfile(profileFields(QStringLiteral("box"),
+                                                      QStringLiteral("h1"), 22,
+                                                      QStringLiteral("u")));
+    const QString other = store.addProfile(
+        profileFields(QStringLiteral("other"), QStringLiteral("h2"), 22, QStringLiteral("u")));
+
+    // Window B edits the SAME profile: new name, new host, new user, new port.
+    writeProfileBehindOurBack(path, id, QStringLiteral("editedElsewhere"), 0);
+
+    // We then edit it ourselves. Our whole profile replaces theirs — the edit we
+    // carry applies, and every field we did not touch reverts to what THIS
+    // instance believes, not what they wrote.
+    store.updateProfile(id, QVariantMap{{QStringLiteral("port"), 2022}});
+    {
+        ServerProfiles reader(path);
+        const QVariantMap won = reader.profile(id);
+        QCOMPARE(won.value(QStringLiteral("name")).toString(), QStringLiteral("box"));
+        QCOMPARE(won.value(QStringLiteral("host")).toString(), QStringLiteral("h1"));
+        QCOMPARE(won.value(QStringLiteral("user")).toString(), QStringLiteral("u"));
+        QCOMPARE(won.value(QStringLiteral("port")).toInt(), 2022);
+        QCOMPARE(reader.profiles().size(), 2); // one profile, not two rival copies
+    }
+
+    // The rule is per WRITE, not per profile: a write about something else still
+    // rewrites every profile we hold, so their edit is lost then too. Stated
+    // plainly because it is the price of the rule, not an accident.
+    writeProfileBehindOurBack(path, id, QStringLiteral("editedAgainElsewhere"), 0);
+    store.updateProfile(other, QVariantMap{{QStringLiteral("host"), QStringLiteral("h2b")}});
+    {
+        ServerProfiles reader(path);
+        QCOMPARE(reader.profile(id).value(QStringLiteral("name")).toString(),
+                 QStringLiteral("box"));
+    }
+
+    // The selection is last-write-wins on the same terms, and the invariant
+    // holds through it: `active` still names a profile that exists. (Our own
+    // selection is unchanged, so it takes an unrelated mutation to write it —
+    // a store that changes nothing writes nothing, and then the other writer's
+    // selection simply stands.)
+    {
+        QSettings raw(path, QSettings::IniFormat);
+        raw.setValue(QStringLiteral("servers/active"), other);
+        raw.sync();
+    }
+    QCOMPARE(store.activeId(), id);
+    store.updateProfile(other, QVariantMap{{QStringLiteral("host"), QStringLiteral("h2c")}});
+    ServerProfiles reader(path);
+    QCOMPARE(reader.activeId(), id);
+    QVERIFY(!reader.profile(reader.activeId()).isEmpty());
+}
+
+// Both security properties of this class have to survive the merge path, which
+// is a SECOND place where profile fields get written. A hand edit can put a
+// `password` key straight into the file; carrying an unknown key forward "for
+// compatibility" would mean the store copying a secret it refuses to accept from
+// its own API. And the merge must not be a way to end up with a store other
+// accounts can read — or, worse, edit to redirect `host` at a machine they own.
+void TstServerProfiles::aMergeLeaksNoSecretAndNoWiderPermissions()
+{
+    const QString path = iniPath(QStringLiteral("mergesecurity.ini"));
+    const QString secret = QStringLiteral("hunter2-from-the-other-writer");
+
+    ServerProfiles store(path);
+    const QString mine = store.addProfile(
+        profileFields(QStringLiteral("mine"), QStringLiteral("hm"), 22, QStringLiteral("u")));
+    QVERIFY(!mine.isEmpty());
+    QVERIFY(!(QFile::permissions(path) & kForbiddenModeBits)); // narrow to begin with
+
+    // A second writer adds a profile and, in the same file, a password key.
+    const QString outsider = QStringLiteral("33333333-4444-5555-6666-777777777777");
+    writeProfileBehindOurBack(path, outsider, QStringLiteral("fromWindowB"), 0,
+                             QVariantMap{{QStringLiteral("password"), secret}});
+    // A second QSettings writer over the same file is expected to leave the mode
+    // alone; assert it rather than assume it, since a rewrite that recreated the
+    // file would silently reopen it to the umask default.
+    QVERIFY2(!(QFile::permissions(path) & kForbiddenModeBits),
+             "a second settings writer widened the store's permissions");
+    // And even when it does not — a hand edit through an editor that recreates
+    // the file will — the merge must narrow it back, not inherit it.
+    QVERIFY(QFile::setPermissions(path, QFile::ReadOwner | QFile::WriteOwner
+                                            | QFile::ReadGroup | QFile::WriteGroup
+                                            | QFile::ReadOther));
+
+    store.updateProfile(mine, QVariantMap{{QStringLiteral("host"), QStringLiteral("hm2")}});
+
+    // The outsider's profile survived...
+    ServerProfiles reader(path);
+    QCOMPARE(namesOf(reader.profiles()),
+             QStringList({QStringLiteral("mine"), QStringLiteral("fromWindowB")}));
+    // ...with exactly the whitelist and nothing else...
+    QCOMPARE(reader.profile(outsider).keys(),
+             QStringList({QStringLiteral("host"), QStringLiteral("id"),
+                          QStringLiteral("identityFile"), QStringLiteral("name"),
+                          QStringLiteral("nodePath"), QStringLiteral("port"),
+                          QStringLiteral("repoRoot"), QStringLiteral("user")}));
+    // ...and the secret the merge could have copied forward is gone from disk.
+    QFile file(path);
+    QVERIFY(file.open(QIODevice::ReadOnly | QIODevice::Text));
+    const QString ini = QString::fromUtf8(file.readAll());
+    QVERIFY2(!ini.contains(secret), qPrintable(ini));
+    QVERIFY2(!ini.contains(QStringLiteral("password")), qPrintable(ini));
+    // The write narrowed the mode back to owner-only.
+    QVERIFY2(!(QFile::permissions(path) & kForbiddenModeBits),
+             qPrintable(QString::number(static_cast<uint>(QFile::permissions(path)), 16)));
+}
+
+// Merging closes the gap only when the merge is not itself interleaved. Two
+// processes can both re-read, both compute the same merged list, and both write
+// it: whoever finishes second has never seen the profile the other just added,
+// and it is gone. This is the case the class comment promises cannot happen, and
+// the only way to prove it is with two real processes — two ServerProfiles in
+// ONE process share Qt's per-file QSettings cache, so they cannot reproduce it.
+//
+// The child is this same test binary re-run with a single function name and the
+// ini path in the environment. Both sides add the same number of profiles; the
+// parent does not start until the child says it is about to, so the writes
+// genuinely overlap. Nothing may be missing at the end.
+void TstServerProfiles::twoWritersRacingInSeparateProcessesLoseNothing()
+{
+    constexpr int kEach = 60;
+    const QString path = iniPath(QStringLiteral("race.ini"));
+    const QString ready = path + QStringLiteral(".child-ready");
+
+    QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
+    env.insert(QStringLiteral("CH_PROFILE_CHILD_INI"), path);
+    env.insert(QStringLiteral("CH_PROFILE_CHILD_READY"), ready);
+    env.insert(QStringLiteral("CH_PROFILE_CHILD_COUNT"), QString::number(kEach));
+
+    QProcess child;
+    child.setProcessEnvironment(env);
+    child.setProcessChannelMode(QProcess::MergedChannels);
+    child.start(QCoreApplication::applicationFilePath(),
+                QStringList({QStringLiteral("interprocessWriterChild")}));
+    QVERIFY2(child.waitForStarted(30000), qPrintable(child.errorString()));
+
+    QElapsedTimer rendezvous;
+    rendezvous.start();
+    while (!QFile::exists(ready) && rendezvous.elapsed() < 30000)
+        QThread::msleep(1);
+    QVERIFY2(QFile::exists(ready), "the child never reached its first write");
+
+    ServerProfiles store(path);
+    QStringList mine;
+    for (int i = 0; i < kEach; ++i) {
+        const QString name = QStringLiteral("parent-%1").arg(i);
+        QVERIFY(!store.addProfile(profileFields(name, QStringLiteral("hp"), 22,
+                                                QStringLiteral("u")))
+                     .isEmpty());
+        mine.append(name);
+    }
+
+    QVERIFY2(child.waitForFinished(120000), qPrintable(child.errorString()));
+    QVERIFY2(child.exitCode() == 0, qPrintable(QString::fromLocal8Bit(child.readAll())));
+
+    ServerProfiles reader(path);
+    const QStringList names = namesOf(reader.profiles());
+    for (const QString& name : std::as_const(mine))
+        QVERIFY2(names.contains(name), qPrintable(QStringLiteral("lost %1").arg(name)));
+    for (int i = 0; i < kEach; ++i) {
+        const QString name = QStringLiteral("child-%1").arg(i);
+        QVERIFY2(names.contains(name), qPrintable(QStringLiteral("lost %1").arg(name)));
+    }
+    QCOMPARE(names.size(), 2 * kEach);
+    // The race left no lock file behind and did not widen the store.
+    QVERIFY(!QFile::exists(path + QStringLiteral(".merge-lock")));
+    QVERIFY(!(QFile::permissions(path) & kForbiddenModeBits));
+}
+
+// The other half of the case above, running in its own process.
+void TstServerProfiles::interprocessWriterChild()
+{
+    const QString path = qEnvironmentVariable("CH_PROFILE_CHILD_INI");
+    if (path.isEmpty())
+        QSKIP("helper: driven by twoWritersRacingInSeparateProcessesLoseNothing");
+
+    ServerProfiles store(path);
+    {
+        QFile ready(qEnvironmentVariable("CH_PROFILE_CHILD_READY"));
+        QVERIFY(ready.open(QIODevice::WriteOnly));
+    }
+    const int count = qEnvironmentVariable("CH_PROFILE_CHILD_COUNT").toInt();
+    for (int i = 0; i < count; ++i) {
+        QVERIFY(!store.addProfile(profileFields(QStringLiteral("child-%1").arg(i),
+                                                QStringLiteral("hc"), 22,
+                                                QStringLiteral("u")))
+                     .isEmpty());
+    }
+}
+
+// What happens when the lock cannot be had at all. The decision (documented in
+// ServerProfiles.h) is to save anyway and say so: throwing away the profile the
+// user just typed is a certain loss taken to avoid an unlikely one, and doing
+// the unlocked write quietly would make the class comment a lie. Both halves are
+// pinned here — the profile IS saved, and saveDegraded() names the holder — plus
+// the fact that the wait is bounded, because this runs on the UI thread.
+void TstServerProfiles::aSaveThatCannotTakeTheLockStillSavesAndSaysSo()
+{
+    const QString path = iniPath(QStringLiteral("lockedout.ini"));
+    const QString lockPath = path + QStringLiteral(".merge-lock");
+
+    ServerProfiles store(path);
+    QSignalSpy degraded(&store, &ServerProfiles::saveDegraded);
+    const QString first = store.addProfile(profileFields(
+        QStringLiteral("first"), QStringLiteral("h1"), 22, QStringLiteral("u")));
+    QVERIFY(!first.isEmpty());
+    QCOMPARE(degraded.count(), 0);
+    // An ordinary save leaves no lock file lying in the user's config directory.
+    QVERIFY(!QFile::exists(lockPath));
+
+    // Somebody else takes it and does not let go. This process is alive and owns
+    // the lock file, so it is not stale by any measure and the wait runs out.
+    QLockFile blocker(lockPath);
+    QVERIFY(blocker.tryLock(5000));
+
+    QElapsedTimer waited;
+    waited.start();
+    const QString second = store.addProfile(profileFields(
+        QStringLiteral("second"), QStringLiteral("h2"), 22, QStringLiteral("u")));
+    const qint64 elapsed = waited.elapsed();
+
+    QVERIFY2(!second.isEmpty(), "the user's profile was refused instead of saved");
+    QCOMPARE(degraded.count(), 1);
+    const QString reason = degraded.first().first().toString();
+    // The CAUSE, not a finished sentence: AppController owns the wording the
+    // user reads. It names the holder, which here is this very process.
+    QVERIFY2(reason.contains(QStringLiteral("holding it")), qPrintable(reason));
+    QVERIFY2(reason.contains(QString::number(QCoreApplication::applicationPid())),
+             qPrintable(reason));
+    // Bounded: it waited for the timeout and then gave up, rather than hanging.
+    QVERIFY2(elapsed >= 1000 && elapsed < 15000,
+             qPrintable(QStringLiteral("waited %1 ms").arg(elapsed)));
+
+    // Edge-triggered: the second and third blocked save say nothing. A profile
+    // sheet saves on every field commit, and one toast per keystroke would bury
+    // the message it repeats.
+    QVERIFY(!store.addProfile(profileFields(QStringLiteral("third"),
+                                            QStringLiteral("h3"), 22,
+                                            QStringLiteral("u")))
+                 .isEmpty());
+    store.updateProfile(first, QVariantMap{{QStringLiteral("host"),
+                                            QStringLiteral("h1b")}});
+    QCOMPARE(degraded.count(), 1);
+
+    blocker.unlock();
+    ServerProfiles reader(path);
+    QCOMPARE(namesOf(reader.profiles()),
+             QStringList({QStringLiteral("first"), QStringLiteral("second"),
+                          QStringLiteral("third")}));
+    QVERIFY(!(QFile::permissions(path) & kForbiddenModeBits));
+
+    // A save that DOES get the lock is silent and re-arms the report, so the
+    // next outage is announced instead of being swallowed for the session.
+    store.addProfile(profileFields(QStringLiteral("fourth"), QStringLiteral("h4"), 22,
+                                   QStringLiteral("u")));
+    QCOMPARE(degraded.count(), 1);
+    QVERIFY(blocker.tryLock(5000));
+    store.addProfile(profileFields(QStringLiteral("fifth"), QStringLiteral("h5"), 22,
+                                   QStringLiteral("u")));
+    QCOMPARE(degraded.count(), 2);
+    blocker.unlock();
+}
+
+// A process killed mid-save leaves its lock file behind. If that wedged the
+// store, every later save would sit through the timeout and take the degraded
+// path forever — the store would be permanently broken by one crash. QLockFile
+// records the holder's pid, so a lock whose holder is gone is recognised and
+// cleared; this pins that, using a pid that really is dead (a process this test
+// ran and reaped) rather than a made-up number.
+void TstServerProfiles::aStaleLockFromADeadHolderDoesNotWedgeTheStore()
+{
+    const QString path = iniPath(QStringLiteral("stalelock.ini"));
+    const QString lockPath = path + QStringLiteral(".merge-lock");
+
+    ServerProfiles store(path);
+    QSignalSpy degraded(&store, &ServerProfiles::saveDegraded);
+    QVERIFY(!store.addProfile(profileFields(QStringLiteral("first"), QStringLiteral("h1"),
+                                            22, QStringLiteral("u")))
+                 .isEmpty());
+
+    QProcess corpse;
+    corpse.start(QCoreApplication::applicationFilePath(),
+                 QStringList({QStringLiteral("interprocessWriterChild")}));
+    QVERIFY2(corpse.waitForStarted(30000), qPrintable(corpse.errorString()));
+    const qint64 deadPid = corpse.processId();
+    QVERIFY(corpse.waitForFinished(30000));
+    QVERIFY(deadPid > 0);
+
+    // QLockFile's format: pid, application name, hostname, one per line. Written
+    // world-writable, the way a crashed older build or a text editor would.
+    {
+        QFile stale(lockPath);
+        QVERIFY(stale.open(QIODevice::WriteOnly));
+        stale.write(QByteArray::number(deadPid) + "\nghost\n"
+                    + QSysInfo::machineHostName().toUtf8() + "\n");
+        stale.close();
+        QVERIFY(stale.setPermissions(QFile::ReadOwner | QFile::WriteOwner
+                                     | QFile::ReadGroup | QFile::WriteGroup
+                                     | QFile::ReadOther | QFile::WriteOther));
+    }
+
+    QElapsedTimer waited;
+    waited.start();
+    QVERIFY(!store.addProfile(profileFields(QStringLiteral("second"), QStringLiteral("h2"),
+                                            22, QStringLiteral("u")))
+                 .isEmpty());
+    const qint64 elapsed = waited.elapsed();
+
+    // Cleared, not waited out: no degraded save, and nowhere near the timeout.
+    QCOMPARE(degraded.count(), 0);
+    QVERIFY2(elapsed < 1000, qPrintable(QStringLiteral("waited %1 ms").arg(elapsed)));
+    // The dead holder's world-writable lock file is gone, not inherited.
+    QVERIFY(!QFile::exists(lockPath));
+    QVERIFY(!(QFile::permissions(path) & kForbiddenModeBits));
+
+    ServerProfiles reader(path);
+    QCOMPARE(namesOf(reader.profiles()),
+             QStringList({QStringLiteral("first"), QStringLiteral("second")}));
+}
+
+// The case every new installation hits, and the one the lock broke: on a first
+// run ~/.config/CodeHarbor does not exist yet. QSettings creates it lazily, when
+// it first writes — which is after the lock is taken — and QLockFile cannot make
+// its lock file in a directory that is not there, so the very first save of the
+// very first profile took the degraded path and told the user their server list
+// was saved without its safeguard. On a clean first run there is provably no
+// second writer: the lock must succeed and nothing may be said.
+void TstServerProfiles::aFirstRunWithNoConfigDirectoryLocksSilently()
+{
+    // Two levels deep and absent, the way a fresh XDG config path is.
+    const QString directory = m_dir.filePath(QStringLiteral("fresh/CodeHarbor"));
+    const QString path = directory + QStringLiteral("/CodeHarbor.conf");
+    QVERIFY(!QFileInfo::exists(directory));
+
+    ServerProfiles store(path);
+    QSignalSpy degraded(&store, &ServerProfiles::saveDegraded);
+    const QString id = store.addProfile(profileFields(
+        QStringLiteral("first ever"), QStringLiteral("h1"), 22, QStringLiteral("u")));
+
+    QVERIFY(!id.isEmpty());
+    QVERIFY2(degraded.isEmpty(),
+             qPrintable(degraded.isEmpty() ? QString()
+                                           : degraded.first().first().toString()));
+    // It really saved, and the ordinary post-conditions hold on the new store.
+    QVERIFY(QFileInfo::exists(path));
+    QVERIFY(!QFile::exists(path + QStringLiteral(".merge-lock")));
+    QVERIFY(!(QFile::permissions(path) & kForbiddenModeBits));
+    ServerProfiles reader(path);
+    QCOMPARE(namesOf(reader.profiles()), QStringList({QStringLiteral("first ever")}));
+    QCOMPARE(reader.activeId(), id);
 }
 
 // ---------------------------------------------------------------------------

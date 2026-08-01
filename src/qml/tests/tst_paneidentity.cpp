@@ -132,6 +132,10 @@ Window {
             win.jsFinished = true
         })
     }
+
+    // Accessible.name is an attached QML property with no reachable C++
+    // accessor, so the reading has to be taken from inside the document.
+    function accessibleName(item) { return item ? String(item.Accessible.name) : "" }
 }
 )QML";
 
@@ -305,6 +309,34 @@ QVariantMap branchNode(const QString &orientation, const QVariantList &children)
                        {QStringLiteral("ratios"), QVariantList{1.0, 1.0}}};
 }
 
+// The `app` context property, cut down to the one thing a viewer pane reads out
+// of it: the ACTIVE Dev Session's repository root. That root is what "outside
+// the project" (SPEC 9) is measured against, so without it a pane has nothing
+// to be outside OF and asks nothing. Mirrors AppController's property name and
+// its NOTIFY-on-session-change shape.
+class RepoRootApp : public QObject
+{
+    Q_OBJECT
+    Q_PROPERTY(QString activeSessionRepoRoot READ activeSessionRepoRoot
+                       NOTIFY activeSessionChanged)
+
+public:
+    QString activeSessionRepoRoot() const { return m_repoRoot; }
+
+    void setActiveSessionRepoRoot(const QString &root)
+    {
+        if (m_repoRoot == root)
+            return;
+        m_repoRoot = root;
+        emit activeSessionChanged();
+    }
+
+signals:
+    void activeSessionChanged();
+
+private:
+    QString m_repoRoot;
+};
 } // namespace
 
 class TstPaneIdentity : public QObject
@@ -360,6 +392,12 @@ private slots:
     void theAddressBarOpensAUrlAsGiven();
     void theAddressBarPercentEncodesADelimiterInAFileName();
 
+    // OUTSIDE THE REPOSITORY ROOT (SPEC 9). A path outside the Dev Session's
+    // repository root is allowed and stays openable, but the pane has to SAY
+    // so: without a marker, /etc/hosts and a file in another checkout entirely
+    // wear exactly the chrome of a file in the project the session is scoped to.
+    void theViewerPaneMarksAPathOutsideTheRepositoryRoot();
+
     // DEFAULT TERMINAL LAYOUT (SPEC 4.4/4.5). A Dev Session opens with two
     // stacked terminal panes, so both have to come up sized and attachable from
     // the FIRST frame — the case the one-shot sizing latch gets wrong most
@@ -388,10 +426,16 @@ private:
     // the pane's function directly, so the field's own Enter wiring is part of
     // what is under test.
     void enterAddress(QObject *paneObject, const QString &text);
+    // Accessible.name of an item, read from inside the harness document (it is
+    // an attached QML property with no C++ accessor).
+    QString accessibleNameOf(QObject *item);
 
     ch::CodeharbordClient m_client;
     ch::ViewerProfiles m_profiles{&m_client};
     ch::ViewerModel m_viewers{&m_client};
+    // The `app` context property. Empty by default, so every OTHER test sees a
+    // pane with no Dev Session behind it, exactly as before this existed.
+    RepoRootApp m_app;
     ch::EditorFactory m_editorFactory{&m_client};
     // Never connected: attach() refuses, so the pane shows its "not connected"
     // chrome. Identity is about the objects, not about a remote shell — the
@@ -412,12 +456,14 @@ void TstPaneIdentity::initTestCase()
     m_engine->rootContext()->setContextProperty(QStringLiteral("editorFactory"), &m_editorFactory);
     m_engine->rootContext()->setContextProperty(QStringLiteral("terminalFactory"),
                                                 &m_terminalFactory);
+    m_engine->rootContext()->setContextProperty(QStringLiteral("app"), &m_app);
 }
 
 void TstPaneIdentity::cleanup()
 {
     m_region = nullptr;
     m_shell.reset();
+    m_app.setActiveSessionRepoRoot(QString());
     QTest::qWait(50);
 }
 
@@ -1141,6 +1187,17 @@ void TstPaneIdentity::enterAddress(QObject *paneObject, const QString &text)
     QTest::keyClick(window, Qt::Key_Return);
 }
 
+QString TstPaneIdentity::accessibleNameOf(QObject *item)
+{
+    QVariant name;
+    if (!item
+        || !QMetaObject::invokeMethod(m_shell.get(), "accessibleName",
+                                      Q_RETURN_ARG(QVariant, name),
+                                      Q_ARG(QVariant, QVariant::fromValue(item))))
+        return QString();
+    return name.toString();
+}
+
 void TstPaneIdentity::theAddressBarOpensARemotePath()
 {
     QVERIFY(openRegion(QStringLiteral("ViewerRegion.qml"), leafNode(QStringLiteral("viewer-1")),
@@ -1217,6 +1274,95 @@ void TstPaneIdentity::theAddressBarPercentEncodesADelimiterInAFileName()
     // ...and it decodes back to the path the user typed, which is what the RPC
     // layer is handed.
     QCOMPARE(pane->property("url").toUrl().toLocalFile(), QStringLiteral("/tmp/notes#1.txt"));
+}
+
+// ---------------------------------------------------------------------------
+// (9b) SPEC 9: "Paths outside the repository root are allowed, but the UI
+// should indicate that the file is outside the project." The allowing half has
+// always worked. This is the indicating half — the pane asking, and the marker
+// following the pane across navigations.
+// ---------------------------------------------------------------------------
+void TstPaneIdentity::theViewerPaneMarksAPathOutsideTheRepositoryRoot()
+{
+    m_app.setActiveSessionRepoRoot(QStringLiteral("/srv/repos/app"));
+    QVERIFY(openRegion(QStringLiteral("ViewerRegion.qml"), leafNode(QStringLiteral("viewer-1")),
+                       /*terminal=*/false));
+    const auto panes = [this] { return collect(m_region, isLeafPane); };
+    QTRY_VERIFY(panes().size() == 1);
+    QTest::qWait(kSettleMs);
+    QObject *const pane = panes().constFirst();
+
+    QObject *const marker = childNamed(pane, QStringLiteral("viewerOutsideRepoMarker"));
+    QVERIFY2(marker, "the viewer pane carries no out-of-project marker");
+
+    // The remote client here is never connected, so every real file.resolvePath
+    // fails and the pane is left with NO answer. That is the honest unknown
+    // case and it must show nothing rather than guess either way.
+    QCOMPARE(pane->property("repoRootState").toString(), QString());
+    QVERIFY2(!marker->property("visible").toBool(),
+             "an undetermined path is marked as outside the project");
+
+    // A file inside the session's repository root. Extensionless on purpose:
+    // it resolves to the lightweight binary view instead of spinning up a
+    // Monaco page this test has no interest in.
+    const QString insidePath = QStringLiteral("/srv/repos/app/notes");
+    pane->setProperty("url", QUrl(QStringLiteral("file:///srv/repos/app/notes")));
+    QTRY_COMPARE(pane->property("repoCheckPath").toString(), insidePath);
+    emit m_viewers.pathResolved(insidePath, insidePath, /*insideRepositoryRoot=*/true);
+    QCOMPARE(pane->property("repoRootState").toString(), QStringLiteral("inside"));
+    QVERIFY2(!marker->property("visible").toBool(),
+             "a file inside the repository root is marked as outside it");
+
+    // Navigating to a file in nobody's project. The pane opens it — SPEC 9
+    // requires that — and the previous answer is dropped the moment the address
+    // changes, so the marker can never describe the file before this one.
+    const QString outsidePath = QStringLiteral("/etc/hosts");
+    pane->setProperty("url", QUrl(QStringLiteral("file:///etc/hosts")));
+    QTRY_COMPARE(pane->property("repoCheckPath").toString(), outsidePath);
+    QCOMPARE(pane->property("repoRootState").toString(), QString());
+    QVERIFY(!marker->property("visible").toBool());
+
+    emit m_viewers.pathResolved(outsidePath, outsidePath, /*insideRepositoryRoot=*/false);
+    QCOMPARE(pane->property("repoRootState").toString(), QStringLiteral("outside"));
+    QVERIFY2(marker->property("visible").toBool(),
+             "an out-of-project file gets exactly the chrome of an in-project one");
+    // Colour and three small words reach nobody using a screen reader.
+    QVERIFY2(!accessibleNameOf(marker).isEmpty(), "the marker has no accessible name");
+    // ...and it has to be on screen, not a zero-width item that reports
+    // `visible` while drawing nothing.
+    auto *const markerItem = qobject_cast<QQuickItem *>(marker);
+    QVERIFY(markerItem);
+    QVERIFY2(markerItem->width() > 8 && markerItem->height() > 8,
+             qPrintable(QStringLiteral("the marker has no area: %1x%2")
+                            .arg(markerItem->width())
+                            .arg(markerItem->height())));
+
+    // ONE ViewerModel serves every pane, so a reply about a path this pane is
+    // no longer showing must not relabel it.
+    emit m_viewers.pathResolved(insidePath, insidePath, /*insideRepositoryRoot=*/true);
+    QCOMPARE(pane->property("repoRootState").toString(), QStringLiteral("outside"));
+
+    // ...and back in again.
+    pane->setProperty("url", QUrl(QStringLiteral("file:///srv/repos/app/notes")));
+    QTRY_COMPARE(pane->property("repoCheckPath").toString(), insidePath);
+    emit m_viewers.pathResolved(insidePath, insidePath, /*insideRepositoryRoot=*/true);
+    QCOMPARE(pane->property("repoRootState").toString(), QStringLiteral("inside"));
+    QVERIFY(!marker->property("visible").toBool());
+
+    // A web page is not "outside the repository root": nothing is asked and
+    // nothing is shown.
+    pane->setProperty("url", QUrl(QStringLiteral("https://example.com/docs")));
+    QTRY_COMPARE(pane->property("repoCheckPath").toString(), QString());
+    QCOMPARE(pane->property("repoRootState").toString(), QString());
+    QVERIFY2(!marker->property("visible").toBool(),
+             "a web page is marked as outside the project");
+
+    // A pane showing nothing at all, with no Dev Session behind it either.
+    m_app.setActiveSessionRepoRoot(QString());
+    pane->setProperty("url", QUrl());
+    QTRY_COMPARE(pane->property("repoCheckPath").toString(), QString());
+    QCOMPARE(pane->property("repoRootState").toString(), QString());
+    QVERIFY(!marker->property("visible").toBool());
 }
 
 // ---------------------------------------------------------------------------

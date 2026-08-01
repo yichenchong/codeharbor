@@ -20,6 +20,16 @@ namespace ch::rpc {
 // no longer matches the file's current revision (SPEC 8.4 / 8.6).
 inline constexpr int kRevisionMismatch = -32001;
 
+// Application-level JSON-RPC error code for a workspace write that lost the
+// race for the server's database write lock and gave up waiting. Mirrors
+// RPC_DATABASE_BUSY in remote/src/rpc-types.ts. NOT an internal server error:
+// nothing was applied and the user is simply asked to try again. No client code
+// special-cases it and none should: the busy timeout on the server side makes
+// this close to unreachable, and an automatic retry here would repeat a write
+// whose effect is unknown. It reaches the user through the generic error path,
+// carrying a message already written for a user to read.
+inline constexpr int kDatabaseBusy = -32002;
+
 // Stable wire method names for the initial file set (SPEC 8.3). These mirror the
 // values in RPC_METHODS in remote/src/rpc-types.ts.
 inline constexpr auto kMethodStat = "file.stat";
@@ -36,10 +46,35 @@ inline constexpr auto kMethodListDirectory = "file.listDirectory";
 // remote/src/rpc-types.ts.
 inline constexpr auto kWatchEventNotification = "file.watchEvent";
 
+// Server -> client notification: watch notifications for one or more
+// subscriptions were DROPPED by the daemon because the client's end of the SSH
+// channel stalled long enough to fill the daemon's bounded notification queue.
+// Params: { "subscriptionIds": [ ... ] }. The listed subscriptions' watched
+// paths MUST be re-read; their cached contents may be stale. Mirrors
+// RPC_WATCH_EVENTS_LOST_NOTIFICATION in remote/src/rpc-types.ts.
+inline constexpr auto kWatchEventsLostNotification = "file.watchEventsLost";
+
 // --- Server introspection ---------------------------------------------------
 //
 // Mirrors the `server.info` handler in remote/src/codeharbord.ts.
 inline constexpr auto kMethodServerInfo = "server.info";
+
+// --- transport liveness ------------------------------------------------------
+//
+// Mirrors RPC_PING_METHOD in remote/src/rpc-types.ts, which keys the `ping`
+// handler in remote/src/codeharbord.ts's static method map.
+//
+// Deliberately UNGROUPED, and deliberately not renamed to `server.ping`. This
+// is not an application method: nothing about the workspace, the filesystem or
+// tmux is being asked. It is the transport keepalive
+// CodeharbordClient::enableHeartbeat() sends to answer one question — "is the
+// peer still reading and writing?" — and its bare name is the wire name every
+// already-deployed `codeharbord` answers. Renaming it into the `server.` group
+// would break the probe against every server older than this change for no gain
+// (the heartbeat is the one call that must work before we know anything about
+// the peer), so it is pinned as a singleton alongside kMethodServerInfo in
+// remote/test/rpc-mirror.test.ts instead of joining a group.
+inline constexpr auto kMethodPing = "ping";
 
 // --- tmux session discovery (SPEC 10.2) -------------------------------------
 //
@@ -89,6 +124,12 @@ inline constexpr auto kMethodWorkspaceDeleteViewerPane =
     "workspace.deleteViewerPane";
 inline constexpr auto kMethodWorkspaceCreateTerminalPane =
     "workspace.createTerminalPane";
+// Lookup-or-create for ONE layout slot, in one server-side transaction (SPEC
+// 5.2). Deliberately not list + createTerminalPane on the client: two clients
+// running that pair concurrently both see no row and both create one, which is
+// two tmux sessions for a single terminal pane.
+inline constexpr auto kMethodWorkspaceResolveTerminalPane =
+    "workspace.resolveTerminalPane";
 inline constexpr auto kMethodWorkspaceUpdateTerminalPane =
     "workspace.updateTerminalPane";
 inline constexpr auto kMethodWorkspaceDeleteTerminalPane =

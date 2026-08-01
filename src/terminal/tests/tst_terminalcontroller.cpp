@@ -89,9 +89,13 @@ private slots:
     void emptyOutputNeverFlushes();
     void hiddenDrainRetainsCapAndEvictsOldest();
     void hiddenBufferReplaysOnBecomingVisible();
+    void visibleOutputPastTheAckWindowIsRetainedNotEmitted();
+    void acknowledgementsReleaseRetainedOutputInOrder();
+    void aRendererThatNeverAcknowledgesDegradesToTheRollingBuffer();
+    void aRendererThatResumesAcknowledgingRecovers();
+    void visibilityChangesResetTheAcknowledgementAccount();
     void stateTransitionsEmitInOrder();
     void unchangedStateDoesNotEmit();
-    void tmuxTargetFormat();
     void tmuxNewSessionCommandFormat();
     void tmuxNewSessionCommandEnablesMouseForThisSessionOnly();
     void tmuxNewSessionCommandEscapesShellMetacharacters();
@@ -227,6 +231,173 @@ void TstTerminalController::hiddenBufferReplaysOnBecomingVisible()
     QVERIFY(controller.hiddenBuffer().isEmpty());
 }
 
+namespace {
+
+// Emit until exactly kMaxUnacknowledgedBytes is outstanding, acknowledging
+// nothing. Shared by the flow-control tests below, which all start from a
+// renderer that is at its credit limit.
+void fillTheAckWindow(TerminalController &controller)
+{
+    const QByteArray chunk(TerminalController::kFlushSizeBytes, 'A');
+    const int batches =
+        TerminalController::kMaxUnacknowledgedBytes / TerminalController::kFlushSizeBytes;
+    for (int i = 0; i < batches; ++i)
+        controller.ingestOutput(chunk);
+    QCOMPARE(controller.unacknowledgedBytes(),
+             static_cast<qint64>(TerminalController::kMaxUnacknowledgedBytes));
+    QVERIFY(controller.hiddenBuffer().isEmpty());
+}
+
+} // namespace
+
+// The core of the flow control: a VISIBLE pane stops emitting once too much of
+// what it already emitted is unacknowledged, and what it withholds goes into
+// the same rolling buffer a hidden pane uses. Without this the controller emits
+// unconditionally and a runaway remote process queues an unbounded amount of
+// data in the WebChannel transport and inside Chromium.
+void TstTerminalController::visibleOutputPastTheAckWindowIsRetainedNotEmitted()
+{
+    TerminalController controller; // visible by default: a renderer is listening
+    QSignalSpy spy(&controller, &TerminalController::flushReady);
+
+    fillTheAckWindow(controller);
+    const int batches =
+        TerminalController::kMaxUnacknowledgedBytes / TerminalController::kFlushSizeBytes;
+    QCOMPARE(spy.count(), batches); // everything inside the window went straight out
+
+    // One batch past the window. It must be RETAINED, not emitted.
+    const QByteArray over(TerminalController::kFlushSizeBytes, 'B');
+    controller.ingestOutput(over);
+    QCOMPARE(spy.count(), batches);
+    QCOMPARE(controller.hiddenBuffer(), over);
+    QCOMPARE(controller.unacknowledgedBytes(),
+             static_cast<qint64>(TerminalController::kMaxUnacknowledgedBytes));
+}
+
+// Acknowledgements are what release it again, and the release must preserve
+// the byte stream exactly: same bytes, same order, no batch dropped and none
+// delivered twice.
+void TstTerminalController::acknowledgementsReleaseRetainedOutputInOrder()
+{
+    TerminalController controller;
+    fillTheAckWindow(controller);
+
+    QSignalSpy spy(&controller, &TerminalController::flushReady);
+
+    // Five distinguishable batches, all produced while the renderer is at its
+    // limit, so all of them are retained.
+    QByteArray expected;
+    for (char label = '0'; label < '5'; ++label) {
+        const QByteArray batch(TerminalController::kFlushSizeBytes, label);
+        controller.ingestOutput(batch);
+        expected += batch;
+    }
+    QCOMPARE(spy.count(), 0);
+    QCOMPARE(controller.hiddenBuffer(), expected);
+
+    // A no-op acknowledgement is exactly that: nothing was consumed, so the
+    // window is still full and nothing is released.
+    controller.acknowledgeOutput(0);
+    QCOMPARE(spy.count(), 0);
+
+    // A real one releases everything retained, once, as a single batch.
+    controller.acknowledgeOutput(TerminalController::kFlushSizeBytes);
+    QCOMPARE(spy.count(), 1);
+    QCOMPARE(spy.at(0).at(0).toByteArray(), expected);
+    QVERIFY(controller.hiddenBuffer().isEmpty());
+
+    // A second acknowledgement of the same size must not re-deliver anything:
+    // the buffer is empty, and the released batch was charged to the account.
+    controller.acknowledgeOutput(TerminalController::kFlushSizeBytes);
+    QCOMPARE(spy.count(), 1);
+
+    // A nonsense acknowledgement from a page that over-reports cannot drive the
+    // account negative; it only hands this pane back its full credit.
+    controller.acknowledgeOutput(1'000'000'000);
+    QCOMPARE(controller.unacknowledgedBytes(), static_cast<qint64>(0));
+}
+
+// A renderer that never acknowledges (crashed, wedged, or a WebEngineView whose
+// page is gone) must not stall the read pump and must not leak. It degrades to
+// exactly the hidden-pane behaviour: the bounded rolling buffer with
+// oldest-first eviction, while the transport keeps being drained.
+void TstTerminalController::aRendererThatNeverAcknowledgesDegradesToTheRollingBuffer()
+{
+    TerminalController controller;
+    FakeChannel channel;
+    controller.setTransport(&channel);
+    fillTheAckWindow(controller);
+
+    // Four times the rolling buffer, pushed through the real transport path.
+    const QByteArray chunk(TerminalController::kHiddenBufferMaxBytes / 8, 'x');
+    for (int i = 0; i < 32; ++i)
+        channel.pushRemote(chunk);
+
+    // The pump never stalled: every byte the channel offered was claimed.
+    QCOMPARE(channel.bytesAvailable(), static_cast<qint64>(0));
+    // And memory did not grow with the output: the buffer is at its cap, not at
+    // the 8 MiB the remote produced.
+    QCOMPARE(controller.hiddenBuffer().size(),
+             static_cast<qsizetype>(TerminalController::kHiddenBufferMaxBytes));
+}
+
+// ...and when the renderer comes back, it resynchronises: the retained buffer
+// is replayed and normal flow resumes.
+void TstTerminalController::aRendererThatResumesAcknowledgingRecovers()
+{
+    TerminalController controller;
+    fillTheAckWindow(controller);
+
+    QSignalSpy spy(&controller, &TerminalController::flushReady);
+    const QByteArray stalled(TerminalController::kFlushSizeBytes, 'S');
+    controller.ingestOutput(stalled);
+    QCOMPARE(spy.count(), 0);
+
+    // The page starts answering again.
+    controller.acknowledgeOutput(TerminalController::kMaxUnacknowledgedBytes);
+    QCOMPARE(spy.count(), 1);
+    QCOMPARE(spy.at(0).at(0).toByteArray(), stalled);
+
+    // The released batch is itself charged to the account, so a healthy
+    // renderer has to keep acknowledging — and once it does, output flows
+    // straight through again.
+    controller.acknowledgeOutput(stalled.size());
+    QCOMPARE(controller.unacknowledgedBytes(), static_cast<qint64>(0));
+
+    const QByteArray live(TerminalController::kFlushSizeBytes, 'L');
+    controller.ingestOutput(live);
+    QCOMPARE(spy.count(), 2);
+    QCOMPARE(spy.at(1).at(0).toByteArray(), live);
+    QVERIFY(controller.hiddenBuffer().isEmpty());
+}
+
+// The flow control composes with the visibility logic rather than fighting it.
+// A renderer that is replaced (a page reload: hidden on the way out, visible
+// again on the mount handshake) starts with a clean account — otherwise the new
+// page would inherit the debt of the one it replaced and the pane would stay
+// blank behind a renderer that is plainly on screen.
+void TstTerminalController::visibilityChangesResetTheAcknowledgementAccount()
+{
+    TerminalController controller;
+    fillTheAckWindow(controller);
+
+    QSignalSpy spy(&controller, &TerminalController::flushReady);
+    controller.setViewVisible(false);
+    QCOMPARE(controller.unacknowledgedBytes(), static_cast<qint64>(0));
+
+    const QByteArray missed(TerminalController::kFlushSizeBytes, 'M');
+    controller.ingestOutput(missed);
+    QCOMPARE(spy.count(), 0);
+    QCOMPARE(controller.hiddenBuffer(), missed);
+
+    // The replay happens on the handshake even though the previous renderer
+    // never acknowledged a single byte.
+    controller.setViewVisible(true);
+    QCOMPARE(spy.count(), 1);
+    QCOMPARE(spy.at(0).at(0).toByteArray(), missed);
+    QCOMPARE(controller.unacknowledgedBytes(), static_cast<qint64>(missed.size()));
+}
+
 // The lifecycle emits stateChanged in the SPEC 5.6 transition order.
 void TstTerminalController::stateTransitionsEmitInOrder()
 {
@@ -260,22 +431,21 @@ void TstTerminalController::unchangedStateDoesNotEmit()
     QCOMPARE(spy.count(), 0);
 }
 
-// Stable tmux target: ch_<devSessionId>_<terminalId> (SPEC 5.2).
-void TstTerminalController::tmuxTargetFormat()
-{
-    const QString target = TerminalController::tmuxTarget(
-        DevSessionId{QStringLiteral("dev1")}, TerminalId{QStringLiteral("term1")});
-    QCOMPARE(target, QStringLiteral("ch_dev1_term1"));
-}
-
 // Attach-or-create command formatting (SPEC 5.2). The invocation carries TWO
 // tmux commands separated by an escaped semicolon: the attach itself, and the
 // mouse-reporting option that makes the wheel scroll tmux's history.
+//
+// The target is now a PARAMETER, not something this class derives. It used to
+// be built here as `ch_<devSessionId>_<terminalId>` from the layout pane id, and
+// that made the client a second minting site for a terminal's identity beside
+// the server's — with recycling layout ids, which is how two client machines
+// ended up attaching one shell. The one minting site is codeharbord's
+// mintTmuxTarget(); this function only formats a command around whatever it is
+// given.
 void TstTerminalController::tmuxNewSessionCommandFormat()
 {
     const QString command = TerminalController::tmuxNewSessionCommand(
-        DevSessionId{QStringLiteral("dev1")}, TerminalId{QStringLiteral("term1")},
-        QStringLiteral("/home/dev/project"));
+        QStringLiteral("ch_dev1_term1"), QStringLiteral("/home/dev/project"));
     QCOMPARE(command,
              QStringLiteral("tmux new-session -A -s 'ch_dev1_term1' -c '/home/dev/project'"
                             " \\; set-option -t '=ch_dev1_term1:' mouse on"));
@@ -290,8 +460,7 @@ void TstTerminalController::tmuxNewSessionCommandFormat()
 void TstTerminalController::tmuxNewSessionCommandEnablesMouseForThisSessionOnly()
 {
     const QString command = TerminalController::tmuxNewSessionCommand(
-        DevSessionId{QStringLiteral("dev1")}, TerminalId{QStringLiteral("term1")},
-        QStringLiteral("/w"));
+        QStringLiteral("ch_dev1_term1"), QStringLiteral("/w"));
 
     // The option is set, and it is set on this session's target.
     QVERIFY(command.contains(QStringLiteral("set-option -t '=ch_dev1_term1:' mouse on")));
@@ -311,8 +480,7 @@ void TstTerminalController::tmuxNewSessionCommandEnablesMouseForThisSessionOnly(
 void TstTerminalController::tmuxNewSessionCommandEscapesShellMetacharacters()
 {
     const QString command = TerminalController::tmuxNewSessionCommand(
-        DevSessionId{QStringLiteral("dev1")}, TerminalId{QStringLiteral("term1")},
-        QStringLiteral("/home/dev/it's here; rm -rf /"));
+        QStringLiteral("ch_dev1_term1"), QStringLiteral("/home/dev/it's here; rm -rf /"));
     QCOMPARE(command,
              QStringLiteral("tmux new-session -A -s 'ch_dev1_term1' "
                             "-c '/home/dev/it'\\''s here; rm -rf /'"
@@ -326,29 +494,31 @@ void TstTerminalController::tmuxNewSessionCommandEscapesShellMetacharacters()
 void TstTerminalController::tmuxNewSessionCommandEscapesSubstitutionBacktickNewline()
 {
     const QString command = TerminalController::tmuxNewSessionCommand(
-        DevSessionId{QStringLiteral("dev1")}, TerminalId{QStringLiteral("term1")},
-        QStringLiteral("/w/$(rm -rf ~)`whoami`\nnext"));
+        QStringLiteral("ch_dev1_term1"), QStringLiteral("/w/$(rm -rf ~)`whoami`\nnext"));
     QCOMPARE(command,
              QStringLiteral("tmux new-session -A -s 'ch_dev1_term1' "
                             "-c '/w/$(rm -rf ~)`whoami`\nnext'"
                             " \\; set-option -t '=ch_dev1_term1:' mouse on"));
 }
 
-// Adversarial dev-session / terminal IDs carrying a quote and metacharacters
-// are embedded verbatim into the raw tmux target, then single-quote escaped as
-// a whole for the shell command, so a quote in an ID cannot break out of the
-// quoting and inject a command (SPEC 5.2 hardening).
+// An adversarial TARGET — one carrying a quote and shell metacharacters — is
+// single-quote escaped as a whole, in both places it appears, so a quote in it
+// cannot break out of the quoting and inject a command (SPEC 5.2 hardening).
+//
+// This used to feed adversarial dev-session and terminal IDS through the
+// deleted tmuxTarget() helper. Those inputs can no longer reach here: the target
+// is minted by codeharbord and validated against tmux's own grammar there
+// (isSafeTmuxTarget in remote/src/tmux.ts rejects everything below), so a string
+// like this is now impossible rather than merely escaped. The escaping is still
+// tested, and still on purpose: it is the last line of defence for a value that
+// crosses a machine boundary before it reaches a remote shell, and it must not
+// quietly rot away behind the new validation.
 void TstTerminalController::tmuxCommandEscapesAdversarialIds()
 {
-    const DevSessionId dev{QStringLiteral("dev'; rm -rf / #")};
-    const TerminalId term{QStringLiteral("t`whoami`$(id)")};
-
-    // The identity helper keeps IDs verbatim; escaping is the command's job.
-    QCOMPARE(TerminalController::tmuxTarget(dev, term),
-             QStringLiteral("ch_dev'; rm -rf / #_t`whoami`$(id)"));
+    const QString target = QStringLiteral("ch_dev'; rm -rf / #_t`whoami`$(id)");
 
     const QString command =
-        TerminalController::tmuxNewSessionCommand(dev, term, QStringLiteral("/w"));
+        TerminalController::tmuxNewSessionCommand(target, QStringLiteral("/w"));
     QCOMPARE(command,
              QStringLiteral("tmux new-session -A -s "
                             "'ch_dev'\\''; rm -rf / #_t`whoami`$(id)' -c '/w'"

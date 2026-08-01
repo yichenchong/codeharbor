@@ -86,6 +86,8 @@ private slots:
     void reorderSessionsSerializesGroupIdAndIdArray();
     void moveSessionToGroupSerializesParams();
     void createTerminalPaneSerializesOptionalsAndParsesRecord();
+    void resolveTerminalPaneSendsTheSlotAddressAndParsesTheRow();
+    void resolveTerminalPaneAddressesARowByIdWithoutItsLabel();
     void liveCreateAndListOverProcess();
 
 private:
@@ -1114,6 +1116,96 @@ void TstWorkspaceDb::createTerminalPaneSerializesOptionalsAndParsesRecord()
     QCOMPARE(created->position, 2);
     // Documented narrowing: a null nullable-text column decodes to "".
     QVERIFY(created->startupCommand.isEmpty());
+}
+
+// The LEGACY half of the call every terminal pane makes before it can attach.
+// It must go out as the RESOLVE method — the atomic server-side
+// lookup-or-create — and never as list + create, which two clients can run into
+// two rows for one layout slot. `name` is the layout slot label, which is the
+// lookup key only for a leaf stored before layouts carried a row id; nothing
+// else may be sent, because this call must not be able to overwrite a pane it
+// merely wanted to find.
+void TstWorkspaceDb::resolveTerminalPaneSendsTheSlotAddressAndParsesTheRow()
+{
+    makePair();
+
+    bool fired = false;
+    std::optional<ch::TerminalPane> resolved;
+    m_db->resolveTerminalPane(
+        ch::ResolveTerminalPaneParams{.serverId = ch::ServerId{QStringLiteral("srv-1")},
+                                      .devSessionId = ch::DevSessionId{QStringLiteral("s1")},
+                                      .name = QStringLiteral("terminal-2"),
+                                      .workingDirectory = QStringLiteral("/home/me/repo")},
+        [&](std::optional<ch::TerminalPane> pane, std::optional<RpcError>) {
+            resolved = pane;
+            fired = true;
+        });
+
+    const QJsonObject req = readRequest();
+    QCOMPARE(req.value(QStringLiteral("method")).toString(),
+             QString::fromLatin1(ch::rpc::kMethodWorkspaceResolveTerminalPane));
+    const QJsonObject params = req.value(QStringLiteral("params")).toObject();
+    QCOMPARE(params.value(QStringLiteral("serverId")).toString(), QStringLiteral("srv-1"));
+    QCOMPARE(params.value(QStringLiteral("devSessionId")).toString(), QStringLiteral("s1"));
+    QCOMPARE(params.value(QStringLiteral("name")).toString(), QStringLiteral("terminal-2"));
+    QCOMPARE(params.value(QStringLiteral("workingDirectory")).toString(),
+             QStringLiteral("/home/me/repo"));
+    // The client cannot propose an identity: minting is the server's, once.
+    QVERIFY(!params.contains(QStringLiteral("tmuxTarget")));
+    QVERIFY(!params.contains(QStringLiteral("position")));
+    QVERIFY(!params.contains(QStringLiteral("harness")));
+
+    m_serverSide->write(jsonLine(
+        {{"jsonrpc", "2.0"},
+         {"id", req.value(QStringLiteral("id")).toInt()},
+         {"result", QJsonObject{{"id", "row-uuid"}, {"serverId", "srv-1"},
+                                {"devSessionId", "s1"}, {"name", "terminal-2"},
+                                {"workingDirectory", "/home/me/repo"},
+                                {"tmuxTarget", "ch_s1_row-uuid"},
+                                {"startupCommand", QJsonValue(QJsonValue::Null)},
+                                {"harness", QJsonValue(QJsonValue::Null)},
+                                {"position", 1}}}}));
+    m_serverSide->flush();
+    QTRY_VERIFY(fired);
+    QVERIFY(resolved.has_value());
+    // The target the pane will attach: the server's, read back verbatim.
+    QCOMPARE(resolved->tmuxTarget, QStringLiteral("ch_s1_row-uuid"));
+    QCOMPARE(resolved->name, QStringLiteral("terminal-2"));
+
+    // The working directory is omitted when the caller has none, so the server
+    // applies its own default instead of being told to store an explicit null.
+    bool secondFired = false;
+    m_db->resolveTerminalPane(
+        ch::ResolveTerminalPaneParams{.serverId = ch::ServerId{QStringLiteral("srv-1")},
+                                      .devSessionId = ch::DevSessionId{QStringLiteral("s1")},
+                                      .name = QStringLiteral("terminal-3")},
+        [&](std::optional<ch::TerminalPane>, std::optional<RpcError>) { secondFired = true; });
+    const QJsonObject bare =
+        readRequest().value(QStringLiteral("params")).toObject();
+    QVERIFY(!bare.contains(QStringLiteral("workingDirectory")));
+    Q_UNUSED(secondFired);
+}
+
+// The NORMAL half: a leaf that carries its `terminal_panes` row id is addressed
+// by that id, and the recyclable slot label does not go out at all. Sending
+// both would leave the server choosing, and sending the label alone is the
+// defect this replaces — a label freed by a closed pane is re-minted by another
+// client, and lookup-or-create hands the new pane the closed pane's shell.
+void TstWorkspaceDb::resolveTerminalPaneAddressesARowByIdWithoutItsLabel()
+{
+    makePair();
+
+    m_db->resolveTerminalPane(
+        ch::ResolveTerminalPaneParams{.serverId = ch::ServerId{QStringLiteral("srv-1")},
+                                      .devSessionId = ch::DevSessionId{QStringLiteral("s1")},
+                                      .id = QStringLiteral("row-uuid"),
+                                      .name = QStringLiteral("terminal-2")},
+        [](std::optional<ch::TerminalPane>, std::optional<RpcError>) {});
+
+    const QJsonObject params =
+        readRequest().value(QStringLiteral("params")).toObject();
+    QCOMPARE(params.value(QStringLiteral("id")).toString(), QStringLiteral("row-uuid"));
+    QVERIFY(!params.contains(QStringLiteral("name")));
 }
 
 QTEST_GUILESS_MAIN(TstWorkspaceDb)

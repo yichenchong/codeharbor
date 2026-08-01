@@ -179,6 +179,12 @@ private slots:
     void textReadBookkeepingDoesNotLeak();
     // What the text pane is told when the server's answer is not plain text.
     void textReadFailureModes();
+
+    // SPEC 9: an out-of-project path stays openable, but the pane has to be
+    // TOLD it is out of project. These pin the flag's trip from the reply to
+    // the signal the pane binds to.
+    void resolvePathCarriesTheRepositoryRootFlag();
+    void resolvePathFailuresLeaveTheFlagUndetermined();
 };
 
 void TstViewers::resolveByExtensionTable()
@@ -981,6 +987,108 @@ void TstViewers::textReadFailureModes()
     QCOMPARE(errors.at(2).at(1).toString(), QStringLiteral("/p/broken.dat"));
     QCOMPARE(reads.size(), 1);
     QCOMPARE(viewers.inFlightTextReadCount(), 0);
+}
+
+void TstViewers::resolvePathCarriesTheRepositoryRootFlag()
+{
+    // The viewer pane marks a file that lives outside the Dev Session's
+    // repository root (SPEC 9). The flag is the server's to compute; this is
+    // the wire trip that carries it, including the `base` that decides what
+    // "the project" even is.
+    RpcPair pair;
+    QVERIFY(pair.listen());
+    ViewerModel viewers(pair.client());
+    QSignalSpy resolved(&viewers, &ViewerModel::pathResolved);
+    QSignalSpy failures(&viewers, &ViewerModel::pathResolveError);
+
+    viewers.resolvePath(QStringLiteral("/srv/repos/app/src/main.cpp"),
+                        QStringLiteral("/srv/repos/app"));
+    const QJsonObject inside = pair.nextRequest();
+    QCOMPARE(inside.value(QStringLiteral("method")).toString(),
+             QString::fromLatin1(ch::rpc::kMethodResolvePath));
+    QCOMPARE(requestPath(inside), QStringLiteral("/srv/repos/app/src/main.cpp"));
+    // The base is the ACTIVE session's root, never the server's own working
+    // directory: without it the server answers about the wrong project.
+    QCOMPARE(inside.value(QStringLiteral("params"))
+                 .toObject()
+                 .value(QStringLiteral("base"))
+                 .toString(),
+             QStringLiteral("/srv/repos/app"));
+    pair.respondResult(
+        inside,
+        QJsonObject{{QStringLiteral("path"),
+                     QStringLiteral("/srv/repos/app/src/main.cpp")},
+                    {QStringLiteral("insideRepositoryRoot"), true}});
+    QTRY_COMPARE(resolved.size(), 1);
+    // The ASKED-for path is echoed, which is what a pane matches its own
+    // outstanding question against.
+    QCOMPARE(resolved.at(0).at(0).toString(),
+             QStringLiteral("/srv/repos/app/src/main.cpp"));
+    QCOMPARE(resolved.at(0).at(1).toString(),
+             QStringLiteral("/srv/repos/app/src/main.cpp"));
+    QCOMPARE(resolved.at(0).at(2).toBool(), true);
+
+    // The same call for a path in nobody's project. It is answered, not
+    // refused: SPEC 9 allows it to be opened and this call never gates it.
+    viewers.resolvePath(QStringLiteral("/etc/hosts"),
+                        QStringLiteral("/srv/repos/app"));
+    const QJsonObject outside = pair.nextRequest();
+    QCOMPARE(requestPath(outside), QStringLiteral("/etc/hosts"));
+    pair.respondResult(
+        outside, QJsonObject{{QStringLiteral("path"), QStringLiteral("/etc/hosts")},
+                             {QStringLiteral("insideRepositoryRoot"), false}});
+    QTRY_COMPARE(resolved.size(), 2);
+    QCOMPARE(resolved.at(1).at(0).toString(), QStringLiteral("/etc/hosts"));
+    QCOMPARE(resolved.at(1).at(2).toBool(), false);
+
+    QCOMPARE(failures.size(), 0);
+}
+
+void TstViewers::resolvePathFailuresLeaveTheFlagUndetermined()
+{
+    // Every way the question can go unanswered must arrive as an error, so the
+    // pane shows NOTHING. A false invented here would brand an ordinary
+    // in-project file as foreign; a true would hide a real out-of-project one.
+    ViewerModel offline;
+    QSignalSpy offlineResolved(&offline, &ViewerModel::pathResolved);
+    QSignalSpy offlineFailures(&offline, &ViewerModel::pathResolveError);
+    offline.resolvePath(QStringLiteral("/etc/hosts"), QStringLiteral("/srv/app"));
+    QCOMPARE(offlineFailures.size(), 1);
+    QCOMPARE(offlineFailures.at(0).at(0).toString(), QStringLiteral("/etc/hosts"));
+    QCOMPARE(offlineResolved.size(), 0);
+
+    RpcPair pair;
+    QVERIFY(pair.listen());
+    ViewerModel viewers(pair.client());
+    QSignalSpy resolved(&viewers, &ViewerModel::pathResolved);
+    QSignalSpy failures(&viewers, &ViewerModel::pathResolveError);
+
+    // 1. The server refused: its message is surfaced verbatim.
+    viewers.resolvePath(QStringLiteral("/p/a.txt"), QStringLiteral("/p"));
+    pair.respondError(pair.nextRequest(), -32603, QStringLiteral("EACCES"));
+    QTRY_COMPARE(failures.size(), 1);
+    QCOMPARE(failures.at(0).at(0).toString(), QStringLiteral("/p/a.txt"));
+    QCOMPARE(failures.at(0).at(1).toString(), QStringLiteral("EACCES"));
+
+    // 2. A reply that simply does not carry the flag (an older daemon). An
+    //    absent JSON value reads as false, so defaulting would report EVERY
+    //    file as outside the project; it is a failure instead.
+    viewers.resolvePath(QStringLiteral("/p/b.txt"), QStringLiteral("/p"));
+    pair.respondResult(pair.nextRequest(),
+                       QJsonObject{{QStringLiteral("path"),
+                                    QStringLiteral("/p/b.txt")}});
+    QTRY_COMPARE(failures.size(), 2);
+    QCOMPARE(failures.at(1).at(0).toString(), QStringLiteral("/p/b.txt"));
+    QCOMPARE(resolved.size(), 0);
+
+    // 3. Without a base the parameter is omitted rather than sent empty: an
+    //    empty base resolves against the filesystem root, and everything is
+    //    inside THAT.
+    viewers.resolvePath(QStringLiteral("/p/c.txt"), QString());
+    const QJsonObject baseless = pair.nextRequest();
+    QVERIFY(!baseless.value(QStringLiteral("params"))
+                 .toObject()
+                 .contains(QStringLiteral("base")));
 }
 
 int main(int argc, char *argv[])

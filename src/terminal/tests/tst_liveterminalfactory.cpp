@@ -122,12 +122,19 @@ void TstLiveTerminalFactory::initTestCase()
 
     // Unique per run: the pid pins concurrent runs apart, the clock tail pins
     // back-to-back runs of the same pid apart.
+    //
+    // The target is minted here in codeharbord's own shape (`ch_<devSessionId>_
+    // <terminal pane row id>`, mintTmuxTarget in remote/src/workspace.ts) and
+    // handed straight to attach(). In production the same string is READ from
+    // the pane's `terminal_panes` row, which needs a workspace database this
+    // gate has no business standing up: what it exercises is the attach path
+    // below the resolution — a real PTY channel, a real tmux session, detach
+    // and kill against the real server.
     m_devSessionId = QStringLiteral("livefactory");
     m_terminalId = QStringLiteral("t%1x%2")
                        .arg(QCoreApplication::applicationPid())
                        .arg(QDateTime::currentMSecsSinceEpoch() % 1000000);
-    m_target = TerminalController::tmuxTarget(ch::DevSessionId{m_devSessionId},
-                                              ch::TerminalId{m_terminalId});
+    m_target = QStringLiteral("ch_%1_%2").arg(m_devSessionId, m_terminalId);
     m_marker = QStringLiteral("CH_FACTORY_MARKER_") + m_terminalId;
 
     // Exactly the QML pane's shape: one factory, a pane object owning the
@@ -263,7 +270,7 @@ void TstLiveTerminalFactory::factoryAttachDeliversRemoteMarkerThroughTheBridge()
     ensureConnected();
     QVERIFY(m_factory->connected());
 
-    QVERIFY2(m_factory->attach(m_controller, m_devSessionId, m_terminalId, m_repo, 100, 30),
+    QVERIFY2(m_factory->attach(m_controller, m_target, m_repo, 100, 30),
              qPrintable(m_factoryErrors));
 
     // The factory recorded what it attached, which is what kill() destroys.
@@ -322,7 +329,7 @@ void TstLiveTerminalFactory::detachReleasesTheChannelButKeepsTheRemoteSession()
     // Re-attaching through the factory returns to the SAME session, and the
     // scrollback tmux kept proves it is the same pane, not a fresh one.
     m_rendered.clear();
-    QVERIFY2(m_factory->attach(m_controller, m_devSessionId, m_terminalId, m_repo, 100, 30),
+    QVERIFY2(m_factory->attach(m_controller, m_target, m_repo, 100, 30),
              qPrintable(m_factoryErrors));
     QTRY_VERIFY_WITH_TIMEOUT(!m_rendered.isEmpty(), kAttachTimeoutMs);
     QVERIFY2(typeUntil(

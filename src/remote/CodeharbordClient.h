@@ -11,6 +11,8 @@
 #include <functional>
 #include <optional>
 
+class QTimer;
+
 namespace ch {
 
 // A JSON-RPC 2.0 error object returned by the remote peer (SPEC 10.3). `data`
@@ -34,6 +36,10 @@ struct RpcError {
 // exercisable without SSH: production wires a dedicated SSH RPC channel from the
 // connection pool, tests wire a QBuffer or QLocalSocket pair. Distinct from the
 // server-side implementation in remote/.
+//
+// Liveness: there are no per-request deadlines, but an optional transport-level
+// HEARTBEAT (enableHeartbeat()) detects a peer that has stopped answering at
+// all. See enableHeartbeat() for exactly what that does and does not cover.
 class CodeharbordClient : public QObject {
     Q_OBJECT
 public:
@@ -98,14 +104,74 @@ public:
     //
     // There is deliberately NO per-request timeout: on a transport that stays
     // healthy the callback waits for the peer for as long as it takes, which is
-    // what a multi-megabyte file.readFile over a slow link needs. The flip side
-    // is that a server which accepts a request and never answers it keeps the
-    // callback pending until the transport goes away, so a caller that needs a
-    // deadline must impose its own.
+    // what a multi-megabyte file.readFile over a slow link needs. A single
+    // deadline cannot serve both that and a sub-millisecond workspace.list, so
+    // a caller that genuinely needs one must still impose its own.
+    //
+    // What DOES bound the wait is enableHeartbeat(): with it on, a peer that has
+    // stopped answering anything is detected within a bounded time and every
+    // pending callback is failed through the transport-loss path. That covers
+    // "the daemon is dead or wedged"; it does NOT cover "this one reply was lost
+    // while the connection stayed healthy" — see enableHeartbeat().
     qint64 call(const QString& method, const QJsonValue& params, ResponseCallback cb);
 
-    // Number of requests awaiting a response.
-    int pendingCount() const { return static_cast<int>(m_pending.size()); }
+    // Number of CALLER requests awaiting a response. An outstanding heartbeat
+    // probe is deliberately excluded: it is this client's own traffic rather
+    // than anyone's call(), and counting it would make the number jitter with
+    // the timer under every consumer that reasons about it.
+    int pendingCount() const;
+
+    // Default heartbeat interval, in milliseconds. 15 s is chosen from both
+    // ends: it is more than an order of magnitude above the round trip of even
+    // a bad link (a satellite or mobile hop answers a 50-byte probe in well
+    // under a second) and above the multi-second stalls a busy daemon can take
+    // on one large synchronous filesystem call, so a healthy-but-slow peer is
+    // never mistaken for a dead one; and it is small enough that the whole
+    // detection budget below still fits inside the time a user will sit staring
+    // at "saving…" before deciding the app is broken. The probe itself costs
+    // ~50 bytes each way, which is free on any link worth using.
+    static constexpr int kDefaultHeartbeatIntervalMs = 15000;
+    // Default number of CONSECUTIVE silent intervals tolerated before the
+    // transport is declared dead. 4 puts detection at roughly 60 s of total
+    // silence. One or two would turn a single dropped probe, a garbage-collect
+    // pause, or a moment of head-of-line blocking behind a large frame into a
+    // spurious session teardown — and a teardown is expensive here, because it
+    // fails every in-flight call and forces SessionBootstrap's reconnect ladder.
+    // 60 s is still two orders of magnitude better than the ~2 h a default TCP
+    // keepalive would take to notice the same half-open connection.
+    static constexpr int kDefaultHeartbeatMisses = 4;
+
+    // Turn on the transport-level heartbeat. While a transport is bound, a
+    // `ping` request (ch::rpc::kMethodPing) is sent every `intervalMs`; after
+    // `missTolerance` consecutive intervals in which NOTHING at all was read
+    // from the peer, the transport is treated as lost — every pending callback
+    // is failed with the same synthetic transport error a real disconnect
+    // produces and transportClosed() is emitted — which is exactly the path
+    // SessionBootstrap's reconnect ladder already handles.
+    //
+    // ALWAYS on, never gated on the connection being idle: a request in flight
+    // is not evidence the peer is alive, it is precisely the case being
+    // detected. Conversely, ANY bytes arriving from the peer reset the miss
+    // counter, not just ping replies — the frames of a slow multi-megabyte
+    // file.readFile are proof of life, and because this is one serialized JSONL
+    // stream the ping reply cannot be interleaved into the middle of that frame
+    // anyway. A working large transfer therefore cannot be killed by the
+    // heartbeat. The probe is this client's own traffic: it never appears in
+    // pendingCount(), and it can never be reported as an orphaned or unknown
+    // response.
+    //
+    // WHAT THIS DOES NOT GUARANTEE. It bounds "the peer is dead or wedged". It
+    // does NOT bound one lost reply: if the daemon drops or forgets a single
+    // response while its event loop keeps answering pings, that one caller still
+    // waits forever. Nothing here turns a per-connection liveness check into a
+    // per-request deadline.
+    //
+    // The defaults above are the production setting; the parameters exist so
+    // tests can compress a 60 s budget into milliseconds. Non-positive values
+    // are refused (the heartbeat stays off) rather than silently corrected.
+    // Called while a transport is already bound, the heartbeat starts at once.
+    void enableHeartbeat(int intervalMs = kDefaultHeartbeatIntervalMs,
+                         int missTolerance = kDefaultHeartbeatMisses);
 
 signals:
     // Server -> client notification: a message with a method name and NO id
@@ -158,10 +224,22 @@ private slots:
     // (already half-destroyed) device pointer before the close path can touch
     // it.
     void onTransportDestroyed();
+    // The heartbeat interval elapsed: send the next probe, or — if the previous
+    // one is still unanswered and nothing at all has been read since — count a
+    // miss and, at the tolerance, declare the transport lost.
+    void onHeartbeatTick();
 
 private:
     void processLine(const QByteArray& line);
     void failAllPending(const RpcError& error);
+    void sendHeartbeatPing();
+    // Start the heartbeat timer if it is configured and a live transport is
+    // bound, stop it otherwise, and RETIRE whatever probe was outstanding —
+    // retire, not forget: the probe may still be sitting in m_pending, and its
+    // callback must stay harmless rather than be mistaken for an answer about
+    // the transport we just moved to. Called from every place the bound/closed
+    // state changes, so the timer can never outlive its transport.
+    void restartHeartbeat();
 
     // QPointer, not a raw pointer: the transport is owned by the CALLER and can
     // be destroyed while still bound. A raw pointer would dangle, and the next
@@ -189,6 +267,48 @@ private:
     // setTransport() refuse outright while this is set, so every callback the
     // destructor dispatches ends the interaction instead of starting a new one.
     bool m_destroying = false;
+    // Owned via the QObject parent (allocated in the constructor, like
+    // SessionBootstrap's reconnect timer). Null-interval means "never
+    // configured": the heartbeat is opt-in, and SessionBootstrap::wireChannels()
+    // is what opts production in.
+    QTimer* m_heartbeatTimer = nullptr;
+    int m_heartbeatIntervalMs = 0;
+    int m_heartbeatMissTolerance = kDefaultHeartbeatMisses;
+    // Consecutive intervals in which NOTHING was read from the peer. Reset by
+    // onReadyRead() on any non-empty chunk, not merely by a ping reply, so a
+    // slow large transfer counts as the proof of life it is.
+    int m_heartbeatMisses = 0;
+    // Monotonic stamp identifying the probe currently being awaited. Bumped for
+    // every probe sent AND by restartHeartbeat(). This is what makes an OLD
+    // probe's callback harmless: the callback captures its own generation by
+    // value and does nothing unless it still matches.
+    //
+    // It has to be a stamp rather than the request id, because the id does not
+    // exist until call() returns and the callback has to be handed TO call().
+    // And it has to exist at all because a probe's callback can genuinely run
+    // while a NEWER probe is live: setTransport() retires the old probe, then
+    // sweeps the old pending map, and any callback in that sweep may spin a
+    // nested event loop (Qt allows it) in which the heartbeat timer fires and
+    // sends the next probe — so the sweep can reach the retired probe's
+    // callback after its successor is already on the wire. Clearing the live
+    // probe there would break the one-probe-in-flight invariant, corrupt
+    // pendingCount(), and leave the miss counter measuring the wrong thing.
+    quint64 m_heartbeatGeneration = 0;
+    // True while the CURRENT-generation probe is unanswered. A retired probe's
+    // answer never clears this, and never resets m_heartbeatMisses either: it
+    // is evidence about a transport we have already let go. Liveness on the
+    // transport we actually hold is covered by onReadyRead()'s reset for any
+    // inbound bytes.
+    bool m_heartbeatProbeOutstanding = false;
+    // Generation -> request id, for every probe still sitting in m_pending: the
+    // live one plus any retired by a restart that has not been answered or
+    // swept yet. Exists ONLY so pendingCount() can report caller requests — the
+    // probe deliberately goes through the ordinary call() path, which is what
+    // keeps it off the "response for unknown/duplicate id" warning and gets it
+    // failed exactly once with everybody else. Entries are removed by the
+    // probe's own callback, which call() guarantees fires exactly once, so this
+    // can neither leak nor go stale.
+    QHash<quint64, qint64> m_heartbeatProbeIds;
 };
 
 } // namespace ch

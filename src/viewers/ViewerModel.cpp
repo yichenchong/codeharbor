@@ -260,4 +260,45 @@ void ViewerModel::listDirectory(const QString &path)
         });
 }
 
+void ViewerModel::resolvePath(const QString &path, const QString &base)
+{
+    if (!m_client) {
+        emit pathResolveError(path,
+                              QStringLiteral("no remote client is connected"));
+        return;
+    }
+
+    QJsonObject params{{QStringLiteral("path"), path}};
+    // Omitted rather than sent empty: an empty `base` would resolve against the
+    // filesystem root on the server side, and every path is inside THAT.
+    if (!base.isEmpty())
+        params.insert(QStringLiteral("base"), base);
+    QPointer<ViewerModel> guard(this);
+    m_client->call(
+        QString::fromLatin1(rpc::kMethodResolvePath), params,
+        [guard, path](QJsonValue result, std::optional<RpcError> error) {
+            if (!guard)
+                return;
+            if (error) {
+                emit guard->pathResolveError(path, error->message);
+                return;
+            }
+            const QJsonObject obj = result.toObject();
+            const QJsonValue inside =
+                obj.value(QStringLiteral("insideRepositoryRoot"));
+            // A server that did not answer the question is reported as a
+            // FAILURE, never defaulted: toBool() on an absent value is false,
+            // which would mark every file as outside the project.
+            if (!inside.isBool()) {
+                emit guard->pathResolveError(
+                    path,
+                    QStringLiteral("reply carried no insideRepositoryRoot flag"));
+                return;
+            }
+            emit guard->pathResolved(
+                path, obj.value(QStringLiteral("path")).toString(),
+                inside.toBool());
+        });
+}
+
 } // namespace ch

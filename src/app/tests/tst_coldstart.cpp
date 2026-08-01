@@ -345,6 +345,14 @@ struct AppGraph {
         QObject::connect(&app, &ch::AppController::error, &app,
                          [this](const QString& text) { appErrors << stamped(text); });
 
+        // Before the auto-connect, exactly as in main.cpp: a terminal pane's
+        // identity is a row in the SERVER's terminal_panes table, so the
+        // factory needs the workspace repository and the adopted server id
+        // before the first pane tries to attach.
+        terminalFactory.setWorkspace(app.workspaceDb());
+        QObject::connect(&app, &ch::AppController::serverIdChanged, &terminalFactory,
+                         [this]() { terminalFactory.setServerId(app.serverId()); });
+
         // --- main.cpp, line for line ------------------------------------
         wiredFromEnvironment = bootstrap.connectAndWireFromEnvironment();
 
@@ -534,24 +542,31 @@ void TstColdStart::cleanupTestCase()
     if (m_graph->pool.state() == ch::SshConnectionPool::State::Connected) {
         if (m_terminalController)
             m_graph->terminalFactory.kill(m_terminalController);
-        // BOTH default panes: a new Dev Session now comes up with terminal-1
-        // above terminal-2 (SessionLayouts::defaultTree), so a single-target
-        // kill would leave the lower pane's tmux session running on the shared
-        // fixture forever.
+        // EVERY tmux session this Dev Session owns. A new Dev Session comes up
+        // with terminal-1 above terminal-2 (SessionLayouts::defaultTree), and
+        // killing only the pane the test drove would leave the other one
+        // running on the shared fixture forever.
+        //
+        // The names cannot be derived here any more: a target is minted by the
+        // server from its pane ROW's UUID (mintTmuxTarget in
+        // remote/src/workspace.ts), which this test never sees. What every one
+        // of them does share is the prefix `ch_<devSessionId>_`, so tmux is
+        // asked for its own list and the matching names are reaped exactly.
+        // The prefix match happens in grep, not in tmux's `-t`: a target is
+        // fnmatched, and `-t 'ch_<id>_*'` would kill by pattern. Each kill
+        // therefore names one session with the `=` exact-match sigil.
         if (!m_sessionId.isEmpty()) {
-            const QStringList paneIds{QStringLiteral("terminal-1"),
-                                      QStringLiteral("terminal-2")};
-            for (const QString& paneId : paneIds) {
-                const QString target = ch::TerminalController::tmuxTarget(
-                    ch::DevSessionId{m_sessionId}, ch::TerminalId{paneId});
-                qInfo().noquote()
-                    << "cleanup tmux:" << paneId
-                    << runExec(QStringLiteral("tmux kill-session -t '%1' >/dev/null 2>&1; "
-                                              "tmux has-session -t '%1' >/dev/null 2>&1 "
-                                              "&& echo ALIVE || echo GONE")
-                                   .arg(target))
-                           .trimmed();
-            }
+            qInfo().noquote()
+                << "cleanup tmux sessions still alive:"
+                << runExec(QStringLiteral(
+                               "tmux list-sessions -F '#{session_name}' 2>/dev/null "
+                               "| grep '^ch_%1_' "
+                               "| while read -r s; do "
+                               "tmux kill-session -t \"=$s\" >/dev/null 2>&1; done; "
+                               "tmux list-sessions -F '#{session_name}' 2>/dev/null "
+                               "| grep -c '^ch_%1_'")
+                               .arg(m_sessionId))
+                       .trimmed();
         }
         if (!m_remoteFile.isEmpty()) {
             runExec(QStringLiteral("rm -f '%1'; "
@@ -1119,10 +1134,21 @@ void TstColdStart::step5_terminalPaneRunsARemoteShell()
                        .arg(m_terminalPane->property("statusText").toString(), factoryErrors)),
         kAttachTimeoutMs);
 
-    const QString expectedTarget = ch::TerminalController::tmuxTarget(
-        ch::DevSessionId{m_sessionId},
-        ch::TerminalId{m_terminalPane->property("terminalId").toString()});
-    QCOMPARE(m_graph->terminalFactory.targetFor(m_terminalController), expectedTarget);
+    // The target the pane attached is the SERVER's, not one this client
+    // composed. It cannot be recomputed here, so it is checked for the two
+    // things that matter: the factory is aiming at exactly what the pane holds
+    // (that is what kill() destroys), and the value is minted from the pane's
+    // `terminal_panes` ROW id rather than from its layout pane id.
+    const QString paneTarget = m_terminalPane->property("tmuxTarget").toString();
+    QVERIFY2(!paneTarget.isEmpty(), "the pane attached without a server-minted tmux target");
+    QCOMPARE(m_graph->terminalFactory.targetFor(m_terminalController), paneTarget);
+    const QString devSessionPrefix = QStringLiteral("ch_%1_").arg(m_sessionId);
+    QVERIFY2(paneTarget.startsWith(devSessionPrefix), qPrintable(paneTarget));
+    // The layout pane id ("terminal-1") recycles per Dev Session and per
+    // client, so a target ending in it would be the old, colliding scheme.
+    QVERIFY2(!paneTarget.endsWith(QLatin1Char('_')
+                                  + m_terminalPane->property("terminalId").toString()),
+             qPrintable(paneTarget));
     QVERIFY(m_terminalController->transport() != nullptr);
 
     // Real bytes from a real shell.
@@ -1174,10 +1200,13 @@ void TstColdStart::step5_terminalPaneRunsARemoteShell()
                             .arg(needle, factoryErrors, paneText().right(600))));
     qInfo().noquote() << "remote shell answered through the pane bridge";
 
-    // The remote really owns a tmux session under the pane's target.
-    QCOMPARE(runExec(QStringLiteral("tmux has-session -t '%1' >/dev/null 2>&1 "
+    // The remote really owns a tmux session under the pane's target. Pinned
+    // with tmux's `=` exact-match sigil, because a bare `-t` falls back to
+    // prefix and then fnmatch matching, and a prefix hit on a sibling pane's
+    // session would report ALIVE for a session this pane never opened.
+    QCOMPARE(runExec(QStringLiteral("tmux has-session -t '=%1' >/dev/null 2>&1 "
                                     "&& echo ALIVE || echo GONE")
-                         .arg(expectedTarget))
+                         .arg(paneTarget))
                  .trimmed(),
              QByteArray("ALIVE"));
 

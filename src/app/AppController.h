@@ -115,10 +115,14 @@ public:
     void submitCredential(QString secret);
 
     // Oldest codeharbord this client can drive. 4 is where `server.info` began
-    // reporting `serverId` (SPEC 3.5); against anything older the id comes back
-    // empty, every workspace row is keyed to "" and the user gets a healthy SSH
-    // session with a permanently empty sidebar. See adoptServerIdentity().
-    static constexpr int kMinimumServerSchemaVersion = 4;
+    // reporting `serverId` (SPEC 3.5); 5 is where the workspace group gained
+    // `workspace.resolveTerminalPane`, without which no terminal pane can learn
+    // which remote tmux session is its own (SPEC 5.2); 6 is where that call
+    // began addressing a pane by its `terminal_panes` row id, which is what the
+    // layout leaf now carries and what every terminal here asks with. Against
+    // anything older the user gets a healthy SSH session with a permanently
+    // empty sidebar, or terminals that never attach. See adoptServerIdentity().
+    static constexpr int kMinimumServerSchemaVersion = 6;
 
     // Make a Dev Session current: loads both region layouts and remembers it so
     // the next launch reopens the same session.

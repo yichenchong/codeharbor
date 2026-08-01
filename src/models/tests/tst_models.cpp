@@ -70,6 +70,9 @@ private slots:
     void sessionsModelSessionIndicesAreScopedToTheirGroup();
     void sessionsModelIsSingleColumn();
     void splitTreeSplitUrlIgnoredOnRoundTrip();
+    void splitTreeRoundTripsLeafTerminalPaneId();
+    void splitTreeWithoutTerminalPaneIdIsUnchangedByTheField();
+    void splitTreeSplitTerminalPaneIdIgnoredOnRoundTrip();
     void workspaceValueTypesCompareEveryField();
 };
 
@@ -1231,6 +1234,102 @@ void TstModels::splitTreeSplitUrlIgnoredOnRoundTrip()
     QVERIFY(restored == split);
     // The child's url, by contrast, is preserved.
     QCOMPARE(restored.children.at(0).url, child.url);
+}
+
+// A terminal leaf's identity is the server's `terminal_panes` row id, and it
+// rides in the leaf so every client sharing the layout agrees which remote
+// shell that leaf owns. It has to survive the round trip exactly, and it has to
+// count towards equality: two leaves naming different rows are different panes,
+// and treating them as equal would let a reload silently adopt the wrong shell.
+void TstModels::splitTreeRoundTripsLeafTerminalPaneId()
+{
+    SplitNode leaf;
+    leaf.paneId = QStringLiteral("terminal-2");
+    leaf.terminalPaneId = QStringLiteral("2f1c9a54-0b3e-4a77-9d21-6c8f0e5b1a44");
+
+    const QJsonObject json = leaf.toJson();
+    QCOMPARE(json.value(QStringLiteral("terminalPaneId")).toString(),
+             leaf.terminalPaneId);
+
+    const SplitNode restored = SplitNode::fromJson(json);
+    QVERIFY(restored.isLeaf());
+    QCOMPARE(restored.terminalPaneId, leaf.terminalPaneId);
+    QVERIFY(restored == leaf);
+
+    // Two leaves differing ONLY in the row id are not the same pane.
+    SplitNode other = leaf;
+    other.terminalPaneId = QStringLiteral("8ad0b1c2-1111-4222-8333-944455556666");
+    QVERIFY(!(other == leaf));
+
+    // A leaf that never had one compares equal to itself and to its own round
+    // trip, so an existing layout is not seen as changed by the new field.
+    SplitNode bare;
+    bare.paneId = QStringLiteral("terminal-1");
+    QVERIFY(bare.terminalPaneId.isEmpty());
+    QVERIFY(!bare.toJson().contains(QStringLiteral("terminalPaneId")));
+    QVERIFY(SplitNode::fromJson(bare.toJson()) == bare);
+    QVERIFY(bare == bare);
+    QVERIFY(!(bare == leaf));
+
+    // It survives nesting, which is where a split puts it.
+    SplitNode split;
+    split.children = {leaf, bare};
+    split.ratios = {1.0, 1.0};
+    const SplitNode deep = SplitNode::fromJson(split.toJson());
+    QCOMPARE(deep.children.at(0).terminalPaneId, leaf.terminalPaneId);
+    QVERIFY(deep.children.at(1).terminalPaneId.isEmpty());
+    QVERIFY(deep == split);
+}
+
+// Backwards compatibility: every terminal layout already stored on a server
+// predates the row id. Reading one must not invent an id, and re-writing it must
+// not change a byte - otherwise the first launch after an upgrade rewrites every
+// saved layout, and (worse) a leaf could no longer be recognised as the
+// pre-migration leaf that it is.
+void TstModels::splitTreeWithoutTerminalPaneIdIsUnchangedByTheField()
+{
+    const QJsonObject legacy = QJsonDocument::fromJson(R"({
+        "type": "split",
+        "orientation": "vertical",
+        "ratios": [1, 1],
+        "children": [
+            {"type": "leaf", "paneId": "terminal-1"},
+            {"type": "leaf", "paneId": "terminal-2"}
+        ]
+    })").object();
+
+    const SplitNode parsed = SplitNode::fromJson(legacy);
+    QVERIFY(parsed.children.at(0).terminalPaneId.isEmpty());
+    QVERIFY(parsed.children.at(1).terminalPaneId.isEmpty());
+    QCOMPARE(QJsonDocument(parsed.toJson()).toJson(QJsonDocument::Compact),
+             QJsonDocument(legacy).toJson(QJsonDocument::Compact));
+}
+
+// terminalPaneId, like paneId and url, is persisted for LEAVES only: a split is
+// structure and owns no terminal. toJson() must drop a split's stray one and
+// equality must ignore it, or a tree stops comparing equal to its own round trip
+// and SessionLayouts rewrites the layout on every load.
+void TstModels::splitTreeSplitTerminalPaneIdIgnoredOnRoundTrip()
+{
+    SplitNode child;
+    child.paneId = QStringLiteral("terminal-1");
+    child.terminalPaneId = QStringLiteral("row-1");
+
+    SplitNode split;
+    split.terminalPaneId = QStringLiteral("ignored-on-splits");
+    split.orientation = SplitOrientation::Horizontal;
+    split.children = {child};
+    split.ratios = {1.0};
+
+    const QJsonObject json = split.toJson();
+    QVERIFY(!json.contains(QStringLiteral("terminalPaneId")));
+
+    const SplitNode restored = SplitNode::fromJson(json);
+    QVERIFY(!restored.isLeaf());
+    QVERIFY(restored.terminalPaneId.isEmpty());
+    QVERIFY(restored == split);
+    // The child's row id, by contrast, is preserved.
+    QCOMPARE(restored.children.at(0).terminalPaneId, child.terminalPaneId);
 }
 
 // Defaulted equality on the persisted value types has to compare EVERY member:

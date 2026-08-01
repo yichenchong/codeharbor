@@ -19,13 +19,20 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
 import {
+    RPC_DATABASE_BUSY,
     RPC_METHODS,
     RPC_REVISION_MISMATCH,
     RPC_TMUX_METHODS,
     RPC_WORKSPACE_METHODS,
+    RPC_PING_METHOD,
     RPC_WATCH_EVENT_NOTIFICATION,
+    RPC_WATCH_EVENTS_LOST_NOTIFICATION,
 } from "../src/rpc-types.ts";
-import { RPC_SCHEMA_VERSION, MAX_LINE_BYTES } from "../src/codeharbord.ts";
+import {
+    RPC_SCHEMA_VERSION,
+    MAX_LINE_BYTES,
+    dispatch,
+} from "../src/codeharbord.ts";
 import { WORKSPACE_METHODS } from "../src/workspace.ts";
 import { fileMethods } from "../src/files.ts";
 import { TMUX_METHODS } from "../src/tmux.ts";
@@ -68,10 +75,12 @@ test("RpcTypes.h yields a non-trivial set of wire-name constants", () => {
 });
 
 test("file.* method names match between rpc-types.ts and RpcTypes.h", () => {
-    // The watch-event NOTIFICATION shares the file. prefix but is not a request
-    // method, so it is excluded here and pinned on its own below.
+    // The two file.* NOTIFICATION names share the prefix but are not request
+    // methods, so they are excluded here and pinned on their own below.
     const cpp = headerGroup("file").filter(
-        (v) => v !== RPC_WATCH_EVENT_NOTIFICATION,
+        (v) =>
+            v !== RPC_WATCH_EVENT_NOTIFICATION &&
+            v !== RPC_WATCH_EVENTS_LOST_NOTIFICATION,
     );
     assert.deepEqual(cpp, tsGroup(RPC_METHODS));
 });
@@ -89,9 +98,17 @@ test("singleton wire names match between rpc-types.ts and RpcTypes.h", () => {
         CPP_CONSTANTS.get("kWatchEventNotification"),
         RPC_WATCH_EVENT_NOTIFICATION,
     );
+    assert.equal(
+        CPP_CONSTANTS.get("kWatchEventsLostNotification"),
+        RPC_WATCH_EVENTS_LOST_NOTIFICATION,
+    );
     // server.info has no TypeScript table (it is a built-in in codeharbord.ts's
     // static method map), so its name is pinned directly.
     assert.equal(CPP_CONSTANTS.get("kMethodServerInfo"), "server.info");
+    // Same for the transport keepalive: `ping` is a built-in in that same map,
+    // is not an application method, and belongs to no group — see the comment
+    // on kMethodPing in RpcTypes.h for why it keeps its bare, ungrouped name.
+    assert.equal(CPP_CONSTANTS.get("kMethodPing"), RPC_PING_METHOD);
 });
 
 // Catches a name added to the C++ header under a prefix no TypeScript table
@@ -102,7 +119,9 @@ test("RpcTypes.h declares no wire name outside a known group", () => {
         ...Object.values(RPC_TMUX_METHODS),
         ...Object.values(RPC_WORKSPACE_METHODS),
         RPC_WATCH_EVENT_NOTIFICATION,
+        RPC_WATCH_EVENTS_LOST_NOTIFICATION,
         "server.info",
+        RPC_PING_METHOD,
     ]);
     const unexpected = [...CPP_CONSTANTS.entries()]
         .filter(([name, value]) => name.startsWith("kMethod") && !known.has(value))
@@ -128,6 +147,26 @@ test("every file.* and tmux.* contract name has a server handler", () => {
     assert.deepEqual(Object.keys(TMUX_METHODS).sort(), tsGroup(RPC_TMUX_METHODS));
 });
 
+// `ping` is not in a spread-in table, so the two tests above cannot see it.
+// Dispatch it for real instead: the C++ client's heartbeat drops the transport
+// (failing every in-flight call and announcing a disconnect) when consecutive
+// probes go unanswered, so a server that answered this with "method not found"
+// — an error response, but still a response — would keep the session alive by
+// accident, and a server that answered nothing at all would tear down healthy
+// sessions every interval.
+test("the keepalive method really dispatches to a success result", async () => {
+    const response = await dispatch({
+        jsonrpc: "2.0",
+        id: 1,
+        method: RPC_PING_METHOD,
+    });
+    assert.deepEqual(response, {
+        jsonrpc: "2.0",
+        id: 1,
+        result: { pong: true },
+    });
+});
+
 // Method names are not the only duplicated contract: the application-level
 // error code travels the same wire and is written out twice as well. A server
 // that rejects a stale write with a code the client does not recognize turns a
@@ -142,6 +181,25 @@ test("the revision-mismatch error code matches between TypeScript and C++", () =
         RPC_REVISION_MISMATCH <= -32000 && RPC_REVISION_MISMATCH >= -32099,
         `${RPC_REVISION_MISMATCH} is outside the reserved server-error range`,
     );
+});
+
+// Same contract, second error code. A workspace write that lost the race for
+// the database write lock reports RPC_DATABASE_BUSY instead of -32603, so the
+// client is not told the server malfunctioned over a retryable collision. No
+// C++ call site branches on it YET — it reaches the user through the generic
+// error path — but the constant is mirrored now so the two sides cannot drift
+// before one does.
+test("the database-busy error code matches between TypeScript and C++", () => {
+    const declared = /^inline constexpr int kDatabaseBusy\s*=\s*(-?\d+);/m.exec(header);
+    assert.ok(declared, "RpcTypes.h must declare kDatabaseBusy");
+    assert.equal(Number(declared[1]), RPC_DATABASE_BUSY);
+    assert.ok(
+        RPC_DATABASE_BUSY <= -32000 && RPC_DATABASE_BUSY >= -32099,
+        `${RPC_DATABASE_BUSY} is outside the reserved server-error range`,
+    );
+    // Two distinct conditions must never collapse onto one code: the client
+    // special-cases -32001 as "the file changed under you".
+    assert.notEqual(RPC_DATABASE_BUSY, RPC_REVISION_MISMATCH);
 });
 
 // The third copy of the schema-version contract. RPC_SCHEMA_VERSION lives in

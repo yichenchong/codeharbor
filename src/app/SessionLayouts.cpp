@@ -1,5 +1,6 @@
 #include "SessionLayouts.h"
 
+#include <QJsonArray>
 #include <QJsonObject>
 #include <QJsonValue>
 #include <QPointer>
@@ -49,6 +50,31 @@ bool locateLeaf(SplitNode& node, SplitNode* parent, int indexInParent,
     return false;
 }
 
+// Does any LEAF of `node` satisfy `pred`? Short-circuits.
+template <typename Predicate>
+bool anyLeaf(const SplitNode& node, Predicate pred)
+{
+    if (node.isLeaf())
+        return pred(node);
+    for (const SplitNode& child : node.children) {
+        if (anyLeaf(child, pred))
+            return true;
+    }
+    return false;
+}
+
+// Every non-empty leaf paneId in the tree, in depth-first order.
+void collectLeafPaneIds(const SplitNode& node, QStringList& out)
+{
+    if (node.isLeaf()) {
+        if (!node.paneId.isEmpty())
+            out.append(node.paneId);
+        return;
+    }
+    for (const SplitNode& child : node.children)
+        collectLeafPaneIds(child, out);
+}
+
 // Highest n over every "<prefix>n" leaf paneId in the tree, or 0 when none
 // matches. Makes the generated ids deterministic for a given tree.
 void collectMaxPaneSuffix(const SplitNode& node, const QString& prefix,
@@ -65,6 +91,42 @@ void collectMaxPaneSuffix(const SplitNode& node, const QString& prefix,
     }
     for (const SplitNode& child : node.children)
         collectMaxPaneSuffix(child, prefix, highest);
+}
+
+// Every terminal leaf in `node` that carries no row id, i.e. every leaf this
+// client is allowed to resolve by its slot label. Only ever fed a tree the
+// SERVER sent: a leaf minted here gets its id from a mint, and one still
+// waiting for that mint must NOT be mistaken for a pre-migration leaf.
+void collectLegacyTerminalSlots(const SplitNode& node, QSet<QString>& out)
+{
+    if (node.isLeaf()) {
+        if (node.terminalPaneId.isEmpty() && !node.paneId.isEmpty())
+            out.insert(node.paneId);
+        return;
+    }
+    for (const SplitNode& child : node.children)
+        collectLegacyTerminalSlots(child, out);
+}
+
+// Mark the leaves in `obj` (a SplitNode::toJson() tree) that `legacy` names, so
+// QML can tell "resolve this by its old label, once" from "your row is being
+// minted, wait". Applied to the published copy only - `obj` here is already
+// detached from the SplitNode, and the marker is never handed to setLayout.
+void markLegacyLeaves(QJsonObject& obj, const QSet<QString>& legacy)
+{
+    const QJsonArray children = obj.value(QStringLiteral("children")).toArray();
+    if (children.isEmpty()) {
+        if (legacy.contains(obj.value(QStringLiteral("paneId")).toString()))
+            obj[QStringLiteral("terminalLegacy")] = true;
+        return;
+    }
+    QJsonArray marked;
+    for (const QJsonValue& value : children) {
+        QJsonObject child = value.toObject();
+        markLegacyLeaves(child, legacy);
+        marked.append(child);
+    }
+    obj[QStringLiteral("children")] = marked;
 }
 
 } // namespace
@@ -187,15 +249,25 @@ void SessionLayouts::setTreeQuietly(int index, SplitNode tree)
     // a close, a ratio drag). Doing it at mint time only would not be enough:
     // closePane() removes the pane from the tree, so by the time the next split
     // looked at the tree the closed pane's suffix would look free again - and
-    // re-minting it re-attaches that pane's still-running remote tmux session.
+    // the user would be shown a label they had just closed.
     reservePaneSuffix(index, state.tree);
     // Publish the exact persisted wire shape; QML reads paneId/orientation/
     // children/ratios straight off this map.
-    state.cache = state.tree.toJson().toVariantMap();
+    QJsonObject published = state.tree.toJson();
+    // Plus, for the terminal region only, the one field that is published but
+    // never persisted: which id-less leaves are pre-migration leaves the pane
+    // may resolve by label. See m_legacyTerminalSlots.
+    if (index == kTerminal && !m_legacyTerminalSlots.isEmpty())
+        markLegacyLeaves(published, m_legacyTerminalSlots);
+    state.cache = published.toVariantMap();
 }
 
 void SessionLayouts::clearTrees()
 {
+    // The set names slots of the CURRENT Dev Session's terminal layout. Carrying
+    // it into another session would grant a same-named slot there permission to
+    // resolve by label, which is the one thing that must be earned per leaf.
+    m_legacyTerminalSlots.clear();
     for (int index = 0; index < kRegionCount; ++index) {
         RegionState& state = m_regions[index];
         if (!state.valid)
@@ -280,14 +352,40 @@ void SessionLayouts::applyLoadedTree(quint64 generation, int index,
         // clients racing both write the identical default.
         const bool seeding = !tree;
         SplitNode next = tree ? std::move(*tree) : defaultTree(index);
+        // Which terminal leaves may resolve by their slot LABEL. Recomputed
+        // from scratch on every adopted server tree, and ONLY from a server
+        // tree: a leaf the server has with no row id was written before layouts
+        // carried one, so its label really is its historical key. A leaf we
+        // seeded or split ourselves is not in here and never becomes so - it
+        // waits for the row being minted for it (see persist()).
+        if (index == kTerminal) {
+            QSet<QString> legacy;
+            if (!seeding)
+                collectLegacyTerminalSlots(next, legacy);
+            m_legacyTerminalSlots = std::move(legacy);
+        }
+
         RegionState& state = m_regions[index];
         if (!state.valid || !(state.tree == next))
             setTree(index, std::move(next));
         // Not canEdit(): a load with no server selected yet is not a misuse and
         // must not raise an error. The in-memory default still stands, and the
         // first real edit persists it as before.
-        if (seeding && !m_devSessionId.isEmpty() && !m_serverId.isEmpty())
+        if (seeding && !m_devSessionId.isEmpty() && !m_serverId.isEmpty()) {
+            // Every terminal leaf of a freshly seeded default is brand new and
+            // needs a row of its own. persist() will hold the write back until
+            // the last of them lands, so the default reaches the server with
+            // its ids already in it rather than as id-less leaves a later load
+            // would have to read as pre-migration ones.
+            if (index == kTerminal) {
+                // Not "slots": that is a Qt keyword macro.
+                QStringList labels;
+                collectLeafPaneIds(m_regions[index].tree, labels);
+                for (const QString& label : labels)
+                    mintTerminalPaneRow(generation, label);
+            }
             persist(index);
+        }
     }
 
     if (m_pendingLoads > 0 && --m_pendingLoads == 0)
@@ -309,6 +407,21 @@ bool SessionLayouts::canEdit()
     return true;
 }
 
+// Is any terminal leaf still waiting for its `terminal_panes` row? A leaf is
+// pending when it has no row id AND is not a pre-migration leaf this client has
+// permission to resolve by label. The empty placeholder leaf an emptied region
+// keeps is not a pane and never pending.
+bool SessionLayouts::hasPendingTerminalLeaf() const
+{
+    const RegionState& state = m_regions[kTerminal];
+    if (!state.valid)
+        return false;
+    return anyLeaf(state.tree, [this](const SplitNode& leaf) {
+        return !leaf.paneId.isEmpty() && leaf.terminalPaneId.isEmpty()
+                && !m_legacyTerminalSlots.contains(leaf.paneId);
+    });
+}
+
 void SessionLayouts::persist(int index)
 {
     // Callers gate on canEdit(), so both ids are set here.
@@ -317,6 +430,15 @@ void SessionLayouts::persist(int index)
     // its answer predates this tree and applying it would undo the edit being
     // persisted right now.
     m_regions[index].superseded = true;
+    // THE invariant that makes the whole scheme decidable: an id-less terminal
+    // leaf on the SERVER always means "written before layouts carried row ids",
+    // and is therefore always safe to resolve by its slot label once. A leaf
+    // whose row is merely still being minted looks identical on the wire, so it
+    // must never get there - otherwise a reload would read it as pre-migration
+    // and hand it whatever shell wears its label. The mint's own persist writes
+    // this tree, ratio drags and all, the moment the last id lands.
+    if (index == kTerminal && hasPendingTerminalLeaf())
+        return;
     QPointer<SessionLayouts> self(this);
     m_db->setLayout(ServerId{m_serverId}, DevSessionId{m_devSessionId},
                     regionEnum(index), m_regions[index].tree,
@@ -468,31 +590,100 @@ QString SessionLayouts::splitPane(QString region, QString paneId,
         *leaf = std::move(branch);
     }
 
+    // Published straight away: the split has to feel instant, and the new pane
+    // has real chrome to show while its identity is on the wire.
     setTree(index, state.tree);
+    if (index == kTerminal) {
+        // The new leaf has no `terminal_panes` row yet, so it is PENDING and
+        // persist() below will decline to write the tree until the mint lands.
+        // Nothing about this pane resolves in the meantime - notably it does
+        // NOT fall back to its slot label, which is how a recycled label used
+        // to hand a new pane a closed pane's still-running shell.
+        mintTerminalPaneRow(m_generation, newPaneId);
+    }
     persist(index);
     return newPaneId;
 }
 
-void SessionLayouts::closePane(QString region, QString paneId)
+void SessionLayouts::mintTerminalPaneRow(quint64 generation, const QString& paneId)
 {
-    const int index = regionIndex(region);
-    if (index < 0 || !canEdit())
-        return;
-    RegionState& state = m_regions[index];
-    if (!state.valid) {
-        emit error(QStringLiteral(
-            "SessionLayouts: %1 layout not loaded; close ignored").arg(region));
-        return;
-    }
+    CreateTerminalPaneParams params;
+    params.serverId = ServerId{m_serverId};
+    params.devSessionId = DevSessionId{m_devSessionId};
+    // The row's `name` is this leaf's slot LABEL, and only a label: it is not
+    // required to be free, and nothing resolves by it except a pre-migration
+    // leaf. It is sent so the row is legible in the Dev Session's terminal pane
+    // list rather than being an anonymous UUID.
+    params.name = paneId;
+    const QString devSessionId = m_devSessionId;
+    QPointer<SessionLayouts> self(this);
+    m_db->createTerminalPane(
+        params, [self, generation, paneId, devSessionId](std::optional<TerminalPane> pane,
+                                                         std::optional<RpcError> err) {
+            if (!self)
+                return;
+            // A load has taken over since. Its tree is authoritative and this
+            // leaf may not even be in it; the row itself stays on the server,
+            // enumerable through the Dev Session's terminal pane list, rather
+            // than being deleted from under a shell that may already be running.
+            if (self->m_generation != generation || self->m_devSessionId != devSessionId)
+                return;
 
+            SplitNode* leaf = self->findTerminalLeaf(paneId);
+            if (err || !pane || pane->id.value.isEmpty()) {
+                emit self->error(
+                    err ? err->message
+                        : QStringLiteral("the server created this terminal without an id"));
+                // Take the half-made pane back out rather than leave one that
+                // can never attach and can never be told apart from a
+                // pre-migration leaf if anything later persisted it.
+                if (leaf && self->dropLeaf(kTerminal, paneId)) {
+                    self->setTree(kTerminal, self->m_regions[kTerminal].tree);
+                    if (self->canEdit())
+                        self->persist(kTerminal);
+                }
+                return;
+            }
+            // The pane was closed while its row was being minted. The row and
+            // its tmux session stay: closing a pane never destroys either.
+            if (!leaf)
+                return;
+            if (!leaf->terminalPaneId.isEmpty())
+                return; // already bound; nothing to publish
+            leaf->terminalPaneId = pane->id.value;
+            // Republished, not quiet: the pane is waiting for exactly this
+            // field before it may resolve anything, and it reads it off the
+            // tree. The regions re-home their panes rather than rebuild them,
+            // so no live terminal is disturbed by the republish.
+            self->setTree(kTerminal, self->m_regions[kTerminal].tree);
+            if (self->canEdit())
+                self->persist(kTerminal);
+        });
+}
+
+SplitNode* SessionLayouts::findTerminalLeaf(const QString& paneId)
+{
+    RegionState& state = m_regions[kTerminal];
+    if (!state.valid || paneId.isEmpty())
+        return nullptr;
     SplitNode* leaf = nullptr;
     SplitNode* parent = nullptr;
     int childIndex = -1;
-    if (!locateLeaf(state.tree, nullptr, -1, paneId, leaf, parent, childIndex)) {
-        emit error(QStringLiteral("SessionLayouts: no %1 pane \"%2\" to close")
-                       .arg(region, paneId));
-        return;
-    }
+    if (!locateLeaf(state.tree, nullptr, -1, paneId, leaf, parent, childIndex))
+        return nullptr;
+    return leaf;
+}
+
+bool SessionLayouts::dropLeaf(int index, const QString& paneId)
+{
+    RegionState& state = m_regions[index];
+    if (!state.valid)
+        return false;
+    SplitNode* leaf = nullptr;
+    SplitNode* parent = nullptr;
+    int childIndex = -1;
+    if (!locateLeaf(state.tree, nullptr, -1, paneId, leaf, parent, childIndex))
+        return false;
 
     if (!parent) {
         // The region's only pane: a region always has a tree, so leave a single
@@ -507,6 +698,61 @@ void SessionLayouts::closePane(QString region, QString paneId)
             const SplitNode survivor = parent->children.at(0);
             *parent = survivor;
         }
+    }
+    // A closed slot may no longer resolve by its label: the permission belonged
+    // to that leaf, and the next pane wearing this label is a different pane.
+    if (index == kTerminal)
+        m_legacyTerminalSlots.remove(paneId);
+    return true;
+}
+
+void SessionLayouts::bindTerminalPaneRow(const QString& devSessionId,
+                                         const QString& paneName,
+                                         const QString& terminalPaneId)
+{
+    if (devSessionId != m_devSessionId || terminalPaneId.isEmpty())
+        return;
+    SplitNode* leaf = findTerminalLeaf(paneName);
+    // Unknown pane (closed while the lookup travelled), or already bound. The
+    // second case is what makes this happen once per leaf instead of on every
+    // attach: the factory answers from its cache on a reconnect, and the leaf
+    // already carries the id by then.
+    if (!leaf || leaf->terminalPaneId == terminalPaneId)
+        return;
+    if (!leaf->terminalPaneId.isEmpty())
+        return; // bound to a DIFFERENT row; a stale answer must not retarget it
+    leaf->terminalPaneId = terminalPaneId;
+    // This leaf has spent its one legal use of the old key.
+    m_legacyTerminalSlots.remove(paneName);
+    if (!canEdit())
+        return;
+    // Quiet: the pane is already attached to this very row, and republishing
+    // the terminal tree only to record what it just did would be churn. The
+    // next load reads the id off the server.
+    setTreeQuietly(kTerminal, m_regions[kTerminal].tree);
+    persist(kTerminal);
+}
+
+void SessionLayouts::closePane(QString region, QString paneId)
+{
+    const int index = regionIndex(region);
+    if (index < 0 || !canEdit())
+        return;
+    RegionState& state = m_regions[index];
+    if (!state.valid) {
+        emit error(QStringLiteral(
+            "SessionLayouts: %1 layout not loaded; close ignored").arg(region));
+        return;
+    }
+
+    // Deliberately layout-only. The pane's `terminal_panes` row and its remote
+    // tmux session are LEFT ALONE: a closed pane's shell keeps running so the
+    // user can come back to it, and the row keeps it enumerable in the Dev
+    // Session's terminal pane list. Nothing here deletes either.
+    if (!dropLeaf(index, paneId)) {
+        emit error(QStringLiteral("SessionLayouts: no %1 pane \"%2\" to close")
+                       .arg(region, paneId));
+        return;
     }
 
     setTree(index, state.tree);
