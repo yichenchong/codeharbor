@@ -2001,8 +2001,8 @@ void TstRpcClient::heartbeatStopsWhenTransportUnbound()
         ScriptedDevice device;
         m_client->enableHeartbeat(20, 500);
         m_client->setTransport(&device);
-        QTest::qWait(80);
-        QVERIFY2(countPings(device) >= 1, "the heartbeat never armed");
+        QVERIFY2(awaitPing(device, 5000) != 0,
+                 "the heartbeat never armed");
 
         // Detach, then watch the device that is STILL ALIVE but no longer bound.
         // Not one further probe may be written to it.

@@ -213,7 +213,7 @@ jobs:
       - name: Test (release preset)
         # Keep the preset's output-on-failure setting explicit: child-process
         # tests must show their diagnostic output on native runners.
-        run: ctest --preset release-tests --verbose --output-on-failure --repeat until-pass:2
+        run: ctest --preset release-tests --output-on-failure --repeat until-pass:2
         shell: bash
 
       # --- package a runnable artifact per OS ----------------------------------

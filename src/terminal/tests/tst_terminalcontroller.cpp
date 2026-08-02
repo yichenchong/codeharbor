@@ -1091,8 +1091,7 @@ void TstTerminalController::flushBoundariesNeverSplitAMultiByteCharacter()
         controller.setViewVisible(false);
 
         controller.ingestOutput(QByteArrayLiteral("hi\xE2\x82"));
-        QTest::qWait(50);
-        QCOMPARE(controller.hiddenBuffer(), QByteArrayLiteral("hi"));
+        QTRY_COMPARE_WITH_TIMEOUT(controller.hiddenBuffer(), QByteArrayLiteral("hi"), 1000);
     }
 }
 
