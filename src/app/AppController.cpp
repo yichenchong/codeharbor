@@ -58,6 +58,7 @@ AppController::AppController(CodeharbordClient* client, QObject* parent)
     , m_db(std::make_unique<WorkspaceDb>(client))
     , m_sessionsModel(new SessionsModel(this))
     , m_uiState(new UiStateStore(QString(), this))
+    , m_settings(new AppSettings(QString(), this))
 {
     // Once the sidebar has authoritative rows, reopen whatever Dev Session the
     // user was last in (no-op if one is already active or none was remembered).

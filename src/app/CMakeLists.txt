@@ -11,6 +11,8 @@ qt_add_library(ch_app STATIC
     SessionLayouts.cpp
     UiStateStore.h
     UiStateStore.cpp
+    AppSettings.h
+    AppSettings.cpp
     Notifier.h
     Notifier.cpp
 )

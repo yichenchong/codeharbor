@@ -7,6 +7,17 @@ target_link_libraries(tst_appcontroller PRIVATE
 )
 add_test(NAME tst_appcontroller COMMAND tst_appcontroller)
 
+# Client-local user preferences (the Settings window's model). Pure QSettings
+# over a scratch .ini per case, so it needs no display, no server and no
+# fixture.
+qt_add_executable(tst_appsettings tst_appsettings.cpp)
+target_link_libraries(tst_appsettings PRIVATE
+    ch_app
+    Qt6::Test
+    Qt6::Core
+)
+add_test(NAME tst_appsettings COMMAND tst_appsettings)
+
 # Connection profiles (SPEC 4.1/12.1) plus the QML sheet that edits them. The
 # sheet is loaded straight from the source tree — it is not in the QML module
 # yet — so the path is compiled in; Quick/QuickControls2 provide the QQuickView

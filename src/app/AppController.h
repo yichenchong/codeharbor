@@ -7,6 +7,7 @@
 #include "WorkspaceDb.h"
 #include "WorkspaceTypes.h"
 #include "UiStateStore.h"
+#include "AppSettings.h"
 #include "ServerProfiles.h"
 #include "SessionLayouts.h"
 #include "SessionBootstrap.h"
@@ -39,6 +40,10 @@ class AppController : public QObject {
     Q_OBJECT
     Q_PROPERTY(ch::SessionsModel* sessionsModel READ sessionsModel CONSTANT)
     Q_PROPERTY(ch::UiStateStore* uiState READ uiState CONSTANT)
+    // User preferences (the Settings window). Client-local, created with the
+    // controller and alive for its whole life, so QML may bind straight to
+    // `app.settings.<name>` without a null check.
+    Q_PROPERTY(ch::AppSettings* settings READ settings CONSTANT)
     Q_PROPERTY(QString serverId READ serverId WRITE setServerId NOTIFY serverIdChanged)
     // Connection surface (workstream U integration). These are null until
     // setConnection() injects them, so a test constructing a bare AppController
@@ -57,6 +62,7 @@ public:
 
     SessionsModel* sessionsModel() const { return m_sessionsModel; }
     UiStateStore* uiState() const { return m_uiState; }
+    AppSettings* settings() const { return m_settings; }
 
     QString serverId() const { return m_serverId.value; }
     void setServerId(const QString& serverId);
@@ -229,6 +235,7 @@ private:
     std::unique_ptr<WorkspaceDb> m_db;
     SessionsModel* m_sessionsModel = nullptr;
     UiStateStore* m_uiState = nullptr;
+    AppSettings* m_settings = nullptr;
     ServerId m_serverId;
     // Monotonic stamp so a stale (out-of-order) refresh result never overwrites
     // a newer one; see refresh().
