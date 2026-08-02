@@ -136,6 +136,18 @@ constexpr QFile::Permissions kForbiddenModeBits =
     QFile::ReadGroup | QFile::WriteGroup | QFile::ExeGroup | QFile::ReadOther
     | QFile::WriteOther | QFile::ExeOther;
 
+bool privatePermissionsHold(const QString& path)
+{
+#ifdef Q_OS_WIN
+    // Windows uses ACLs rather than POSIX owner/group/other mode bits; Qt's
+    // QFile::Permissions view cannot prove the POSIX invariant there.
+    Q_UNUSED(path);
+    return true;
+#else
+    return !(QFile::permissions(path) & kForbiddenModeBits);
+#endif
+}
+
 // A QML `var` signal argument arrives as a QJSValue, not a QVariantMap.
 QVariantMap asMap(const QVariant& value)
 {
@@ -1076,7 +1088,7 @@ void TstServerProfiles::aMergeLeaksNoSecretAndNoWiderPermissions()
     const QString mine = store.addProfile(
         profileFields(QStringLiteral("mine"), QStringLiteral("hm"), 22, QStringLiteral("u")));
     QVERIFY(!mine.isEmpty());
-    QVERIFY(!(QFile::permissions(path) & kForbiddenModeBits)); // narrow to begin with
+    QVERIFY(privatePermissionsHold(path)); // narrow to begin with
 
     // A second writer adds a profile and, in the same file, a password key.
     const QString outsider = QStringLiteral("33333333-4444-5555-6666-777777777777");
@@ -1085,7 +1097,7 @@ void TstServerProfiles::aMergeLeaksNoSecretAndNoWiderPermissions()
     // A second QSettings writer over the same file is expected to leave the mode
     // alone; assert it rather than assume it, since a rewrite that recreated the
     // file would silently reopen it to the umask default.
-    QVERIFY2(!(QFile::permissions(path) & kForbiddenModeBits),
+    QVERIFY2(privatePermissionsHold(path),
              "a second settings writer widened the store's permissions");
     // And even when it does not — a hand edit through an editor that recreates
     // the file will — the merge must narrow it back, not inherit it.
@@ -1112,7 +1124,7 @@ void TstServerProfiles::aMergeLeaksNoSecretAndNoWiderPermissions()
     QVERIFY2(!ini.contains(secret), qPrintable(ini));
     QVERIFY2(!ini.contains(QStringLiteral("password")), qPrintable(ini));
     // The write narrowed the mode back to owner-only.
-    QVERIFY2(!(QFile::permissions(path) & kForbiddenModeBits),
+    QVERIFY2(privatePermissionsHold(path),
              qPrintable(QString::number(static_cast<uint>(QFile::permissions(path)), 16)));
 }
 
@@ -1175,7 +1187,7 @@ void TstServerProfiles::twoWritersRacingInSeparateProcessesLoseNothing()
     QCOMPARE(names.size(), 2 * kEach);
     // The race left no lock file behind and did not widen the store.
     QVERIFY(!QFile::exists(path + QStringLiteral(".merge-lock")));
-    QVERIFY(!(QFile::permissions(path) & kForbiddenModeBits));
+    QVERIFY(privatePermissionsHold(path));
 }
 
 // The other half of the case above, running in its own process.
@@ -1258,7 +1270,7 @@ void TstServerProfiles::aSaveThatCannotTakeTheLockStillSavesAndSaysSo()
     QCOMPARE(namesOf(reader.profiles()),
              QStringList({QStringLiteral("first"), QStringLiteral("second"),
                           QStringLiteral("third")}));
-    QVERIFY(!(QFile::permissions(path) & kForbiddenModeBits));
+    QVERIFY(privatePermissionsHold(path));
 
     // A save that DOES get the lock is silent and re-arms the report, so the
     // next outage is announced instead of being swallowed for the session.
@@ -1322,7 +1334,7 @@ void TstServerProfiles::aStaleLockFromADeadHolderDoesNotWedgeTheStore()
     QVERIFY2(elapsed < 1000, qPrintable(QStringLiteral("waited %1 ms").arg(elapsed)));
     // The dead holder's world-writable lock file is gone, not inherited.
     QVERIFY(!QFile::exists(lockPath));
-    QVERIFY(!(QFile::permissions(path) & kForbiddenModeBits));
+    QVERIFY(privatePermissionsHold(path));
 
     ServerProfiles reader(path);
     QCOMPARE(namesOf(reader.profiles()),
@@ -1355,7 +1367,7 @@ void TstServerProfiles::aFirstRunWithNoConfigDirectoryLocksSilently()
     // It really saved, and the ordinary post-conditions hold on the new store.
     QVERIFY(QFileInfo::exists(path));
     QVERIFY(!QFile::exists(path + QStringLiteral(".merge-lock")));
-    QVERIFY(!(QFile::permissions(path) & kForbiddenModeBits));
+    QVERIFY(privatePermissionsHold(path));
     ServerProfiles reader(path);
     QCOMPARE(namesOf(reader.profiles()), QStringList({QStringLiteral("first ever")}));
     QCOMPARE(reader.activeId(), id);

@@ -211,11 +211,9 @@ jobs:
         shell: bash
 
       - name: Test (release preset)
-        # No --output-on-failure: the `release-tests` test preset already sets
-        # output.outputOnFailure. --verbose (full output for every test, not only
-        # failures) and --repeat (one retry, for genuinely flaky WebEngine
-        # start-up on a cold runner) are the two things this line actually adds.
-        run: ctest --preset release-tests --verbose --repeat until-pass:2
+        # Keep the preset's output-on-failure setting explicit: child-process
+        # tests must show their diagnostic output on native runners.
+        run: ctest --preset release-tests --verbose --output-on-failure --repeat until-pass:2
         shell: bash
 
       # --- package a runnable artifact per OS ----------------------------------
