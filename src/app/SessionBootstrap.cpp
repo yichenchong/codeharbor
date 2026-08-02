@@ -18,6 +18,7 @@
 #include <QTimer>
 
 #include <cmath>
+#include <utility>
 
 namespace ch {
 
@@ -241,6 +242,16 @@ void SessionBootstrap::setRemoteArtifactUrl(const QString& url)
 QString SessionBootstrap::remoteArtifactUrl() const
 {
     return m_artifactUrl.isEmpty() ? defaultRemoteArtifactUrl() : m_artifactUrl;
+}
+
+void SessionBootstrap::requestRemoteUpgrade()
+{
+    m_forceUpgrade = true;
+}
+
+void SessionBootstrap::cancelRemoteUpgrade()
+{
+    m_forceUpgrade = false;
 }
 
 QString SessionBootstrap::defaultRemoteArtifactUrl()
@@ -623,6 +634,12 @@ void SessionBootstrap::disconnectSession()
     if (m_pool)
         m_pool->disconnectFromHost();
     m_tearingDown = false;
+    // An upgrade nobody is connecting for any more is not owed to the next
+    // connect. A request survives a FAILED attempt on purpose — the retry (the
+    // same attempt resumed after a host-key or credential prompt, or a rung of
+    // the ladder) is still the user's upgrade — but an explicit teardown is
+    // them giving up on it.
+    m_forceUpgrade = false;
     m_attempt = 0;
     setState(State::Disconnected);
 }
@@ -952,6 +969,10 @@ bool SessionBootstrap::ensureRemoteService()
     // attempt, Reconnecting for a rung of the ladder. Restored on every exit so
     // provisioning never relabels the attempt it interrupted.
     const State resume = m_state;
+    // Consumed here and cleared whatever happens below, so a forced upgrade
+    // that fails (or that the user cancels) applies to THIS attempt only and
+    // never turns every later reconnect into a reinstall.
+    const bool forced = std::exchange(m_forceUpgrade, false);
 
     QString report;
     QString reportError;
@@ -970,6 +991,22 @@ bool SessionBootstrap::ensureRemoteService()
         // only defensible answer is to carry on down the exec path that worked
         // before this feature existed. Refusing to connect because a probe
         // failed would turn servers that work today into unreachable ones.
+        if (forced) {
+            // The user asked us to write to their server and we cannot even
+            // read what is there, so nothing is written. Loud, not a
+            // diagnostic: an update that silently did not happen is worse than
+            // one that says so. The connect still proceeds, because the
+            // installation that was already there may well work.
+            emit upgradeFailed(
+                tr("Could not update the CodeHarbor remote service on %1: the "
+                   "server did not report what it has (%2). Nothing was changed "
+                   "under \"%3\".")
+                    .arg(m_host,
+                         reportError.isEmpty() ? tr("no report came back")
+                                               : reportError,
+                         m_repoRoot));
+            return true;
+        }
         emit channelDiagnostic(
             role, QStringLiteral("could not read the server's prerequisites "
                                  "(%1); connecting without provisioning")
@@ -997,17 +1034,20 @@ bool SessionBootstrap::ensureRemoteService()
     const QString url = remoteArtifactUrl();
     const bool nodeOk = nodeVersionIsSupported(info.nodeVersion);
 
-    // Two reasons to install, and only two:
-    //   * nothing usable is there at all; or
+    // Three reasons to install:
+    //   * nothing usable is there at all;
     //   * the copy WE installed is not the one this client would install now,
     //     which is how a client upgrade drags the remote side along instead of
-    //     driving a service from another release.
-    // An install with NO marker belongs to a human — a git checkout, a
-    // hand-unpacked tarball — and is never overwritten. An incompatible one of
-    // those is still caught, by AppController's kMinimumServerSchemaVersion
-    // check against server.info, which reports it without destroying the tree.
+    //     driving a service from another release; or
+    //   * the user asked for one outright (requestRemoteUpgrade()).
+    // Without that third reason, an install with NO marker belongs to a human —
+    // a git checkout, a hand-unpacked tarball — and is never overwritten. An
+    // incompatible one of those is still caught, by AppController's
+    // kMinimumServerSchemaVersion check against server.info, which reports it
+    // without destroying the tree.
     const bool needsInstall =
-        info.entry.isEmpty() || (!info.marker.isEmpty() && info.marker != url);
+        forced || info.entry.isEmpty()
+        || (!info.marker.isEmpty() && info.marker != url);
 
     if (!needsInstall) {
         if (!nodeOk) {
@@ -1024,6 +1064,31 @@ bool SessionBootstrap::ensureRemoteService()
                           .arg(info.entry));
         }
         return true;
+    }
+
+    // ---- the one place a forced upgrade stops -----------------------------
+    //
+    // A service is running from a SOURCE CHECKOUT when the entry point the
+    // server reported is not the release layout's `<root>/dist/codeharbord.js`
+    // but one of the checkout paths under `<root>/remote/`. Unpacking a release
+    // tarball there would not replace that checkout: it would drop a `dist/`
+    // beside it that entryCandidates() then PREFERS, so the user's own build
+    // silently stops being what runs, inside a directory they maintain. Say so
+    // instead, and name the two ways forward.
+    //
+    // Restricted to the forced path rather than left unconditional: an ordinary
+    // connect must keep behaving exactly as it did, and the only way it reaches
+    // an install at all with an entry already present is a marker of our own
+    // naming a different release, which by construction is the release layout.
+    const QString releaseEntry =
+        entryCandidates(m_repoRoot, QStringLiteral("codeharbord")).at(0);
+    if (forced && !info.entry.isEmpty() && info.entry != releaseEntry) {
+        fail(tr("\"%1\" on %2 is a source checkout, not an installed release: it "
+                "runs %3. Update it there (git pull, then build), or point this "
+                "profile's repository root at a directory of its own to install "
+                "releases into. Nothing was changed.")
+                .arg(m_repoRoot, m_host, info.entry));
+        return false;
     }
 
     // ---- everything below writes to somebody else's machine ---------------
@@ -1053,35 +1118,48 @@ bool SessionBootstrap::ensureRemoteService()
                 .arg(m_repoRoot, m_host));
         return false;
     }
+    // "has no service" is a lie during an upgrade, where one is running right
+    // now; the missing prerequisite is the same either way, so only the lead-in
+    // changes.
+    const QString lacks =
+        info.entry.isEmpty()
+            ? tr("%1 has no CodeHarbor remote service under \"%2\"")
+                  .arg(m_host, m_repoRoot)
+            : tr("The CodeHarbor remote service under \"%2\" on %1 cannot be "
+                 "updated")
+                  .arg(m_host, m_repoRoot);
     if (url.isEmpty()) {
-        fail(tr("%1 has no CodeHarbor remote service under \"%2\", and this build "
-                "cannot tell which release matches it (it reports no version). "
-                "Unpack codeharbor-remote.tar.gz there yourself, or set "
-                "CH_REMOTE_ARTIFACT_URL to the tarball to install.")
-                .arg(m_host, m_repoRoot));
+        fail(tr("%1, and this build cannot tell which release matches it (it "
+                "reports no version). Unpack codeharbor-remote.tar.gz there "
+                "yourself, or set CH_REMOTE_ARTIFACT_URL to the tarball to "
+                "install.")
+                .arg(lacks));
         return false;
     }
     const QString staged = stagedArtifactPath(url);
     if (staged.isEmpty() && info.fetcher == QLatin1String("none")) {
-        fail(tr("%1 has no CodeHarbor remote service under \"%2\", and neither "
-                "curl nor wget is installed there to download %3. Install one of "
-                "them, or unpack codeharbor-remote.tar.gz into \"%2\" by hand, or "
-                "stage the tarball on the server and set CH_REMOTE_ARTIFACT_URL "
-                "to its path.")
-                .arg(m_host, m_repoRoot, url));
+        fail(tr("%1, and neither curl nor wget is installed there to download "
+                "%2. Install one of them, or unpack codeharbor-remote.tar.gz "
+                "into \"%3\" by hand, or stage the tarball on the server and set "
+                "CH_REMOTE_ARTIFACT_URL to its path.")
+                .arg(lacks, url, m_repoRoot));
         return false;
     }
     if (!info.tar) {
-        fail(tr("%1 has no CodeHarbor remote service under \"%2\" and no `tar` to "
-                "unpack one. Install tar there, or unpack "
-                "codeharbor-remote.tar.gz into \"%2\" by hand.")
-                .arg(m_host, m_repoRoot));
+        fail(tr("%1: there is no `tar` there to unpack one. Install tar, or "
+                "unpack codeharbor-remote.tar.gz into \"%2\" by hand.")
+                .arg(lacks, m_repoRoot));
         return false;
     }
 
     setState(State::Provisioning);
-    emit provisioning(tr("Installing the CodeHarbor remote service into %1 on %2")
-                          .arg(m_repoRoot, m_host));
+    emit provisioning(info.entry.isEmpty()
+                          ? tr("Installing the CodeHarbor remote service into "
+                               "%1 on %2")
+                                .arg(m_repoRoot, m_host)
+                          : tr("Updating the CodeHarbor remote service in %1 on "
+                               "%2")
+                                .arg(m_repoRoot, m_host));
 
     QString installLog;
     QString installError;

@@ -484,6 +484,69 @@ void TstLiveReconnect::provisionsAnEmptyLocationThenWires()
                                 QStringLiteral(" | ")))));
     QVERIFY2(serverInfoAnswers(&detail), qPrintable(detail));
 
+    // ---- phase 4: a requested upgrade, against a checkout-shaped install ---
+    //
+    // The staged tarball unpacks `remote/src/...`, which is the SOURCE layout,
+    // so what sits at `target` now is indistinguishable from a git checkout:
+    // its entry point is not the release layout's `dist/codeharbord.js`. A
+    // user-requested upgrade must refuse it by name and write nothing, because
+    // unpacking a release beside a checkout leaves the checkout in place but no
+    // longer the thing that runs.
+    //
+    // Proven against a real server rather than only in the unit gate because
+    // the entry point being compared is the one the server's own sh reported.
+    // The marker is what says "this install is ours". Removing it makes this
+    // exactly the hand-unpacked install a user creates by following README.md.
+    // Done while phase 3's session is still up, because runExec() needs a live
+    // pool.
+    execOk = false;
+    const QString unmarked =
+        runExec(m_pool,
+                QStringLiteral("rm -f %1 && echo MARKER_GONE")
+                    .arg(sq(SessionBootstrap::releaseMarkerPath(target))),
+                &execOk);
+    QVERIFY(execOk);
+    QVERIFY2(unmarked.contains(QStringLiteral("MARKER_GONE")),
+             qPrintable(unmarked));
+
+    m_bootstrap->disconnectSession();
+    m_bootstrapErrors.clear();
+    m_provisioningReports.clear();
+
+    m_bootstrap->requestRemoteUpgrade();
+    QVERIFY2(!m_bootstrap->connectAndWire(host, port, user, node, target,
+                                          identity),
+             "a requested upgrade overwrote a source-layout installation");
+    QCOMPARE(m_bootstrapErrors.size(), 1);
+    const QString refusal = m_bootstrapErrors.at(0);
+    QVERIFY2(refusal.contains(QStringLiteral("source checkout")),
+             qPrintable(refusal));
+    QVERIFY2(refusal.contains(QStringLiteral("Nothing was changed")),
+             qPrintable(refusal));
+    QVERIFY2(m_provisioningReports.isEmpty(),
+             qPrintable(m_provisioningReports.join(QStringLiteral(" | "))));
+    // Spent, so the next connect is an ordinary one.
+    QVERIFY(!m_bootstrap->remoteUpgradeRequested());
+
+    // Nothing was written: no release layout appeared and no marker came back.
+    m_pool.disconnectFromHost();
+    m_bootstrapErrors.clear();
+    QVERIFY2(m_bootstrap->connectAndWire(host, port, user, node, target,
+                                         identity),
+             qPrintable(why()));
+    execOk = false;
+    const QString after =
+        runExec(m_pool,
+                QStringLiteral("[ -e %1 ] && echo RELEASE_LAYOUT; [ -e %2 ] && "
+                               "echo MARKER_BACK; echo SWEPT")
+                    .arg(sq(target + QStringLiteral("/dist")),
+                         sq(SessionBootstrap::releaseMarkerPath(target))),
+                &execOk);
+    QVERIFY(execOk);
+    QVERIFY2(!after.contains(QStringLiteral("RELEASE_LAYOUT")), qPrintable(after));
+    QVERIFY2(!after.contains(QStringLiteral("MARKER_BACK")), qPrintable(after));
+    QVERIFY2(serverInfoAnswers(&detail), qPrintable(detail));
+
     QVERIFY2(m_bootstrapErrors.isEmpty(), qPrintable(why()));
 }
 

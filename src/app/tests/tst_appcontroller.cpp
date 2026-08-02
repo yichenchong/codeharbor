@@ -380,6 +380,13 @@ private slots:
     // A server at the schema floor that still names no identity is as
     // undrivable as one that is too old, and must be refused the same way.
     void serverThatReportsNoIdentityIsRefusedRatherThanLeftConnected();
+    // The user-facing "update the server" action: it has to arm the bootstrap
+    // and then actually dial, and its failure has to reach the user even though
+    // the connect it rides on succeeds.
+    void upgradingTheRemoteServiceArmsTheBootstrapAndConnects();
+    void anUpgradeWithNoServerChosenSaysSoInsteadOfDialling();
+    void anUpgradeThatDidNotHappenIsReportedEvenWhenTheConnectSucceeds();
+    void anAbandonedUpgradeDoesNotAmbushTheNextOrdinaryConnect();
 };
 
 // Two GroupNodes with sessions map to GroupRows preserving order, with the
@@ -2019,6 +2026,134 @@ void TstAppController::serverThatReportsNoIdentityIsRefusedRatherThanLeftConnect
     // toast.
     QTRY_COMPARE(f.controller.connectionState(), QStringLiteral("failed"));
     QCOMPARE(f.controller.connectionError(), message);
+}
+
+// "Update server" has to do two things or it does nothing: arm the bootstrap's
+// one-shot install request, and then actually dial. Arming without connecting
+// leaves the request to ambush whatever the user connects to next; connecting
+// without arming is an ordinary connect, which by design never replaces an
+// installation the client did not make.
+void TstAppController::upgradingTheRemoteServiceArmsTheBootstrapAndConnects()
+{
+    ConnectFixture f;
+    f.boot.connectOk = true;
+    bool armedAtDialTime = false;
+    f.boot.duringConnect = [&f, &armedAtDialTime] {
+        armedAtDialTime = f.boot.remoteUpgradeRequested();
+    };
+
+    f.controller.upgradeRemoteService(f.profileId);
+
+    QCOMPARE(f.boot.connectCalls, 1);
+    QVERIFY2(armedAtDialTime,
+             "the connect ran without the upgrade request armed");
+}
+
+// With no profile chosen there is nothing to update, and dialling "" would
+// report "No such server profile", which describes neither what the user did
+// nor what to do next.
+void TstAppController::anUpgradeWithNoServerChosenSaysSoInsteadOfDialling()
+{
+    ConnectFixture f;
+    f.profiles.removeProfile(f.profileId);
+    f.profiles.setActiveId(QString());
+    QSignalSpy errorSpy(&f.controller, &AppController::error);
+
+    f.controller.upgradeRemoteService(QString());
+
+    QCOMPARE(f.boot.connectCalls, 0);
+    QCOMPARE(errorSpy.count(), 1);
+    const QString message = errorSpy.at(0).at(0).toString();
+    QVERIFY2(message.contains(QStringLiteral("Choose a server")),
+             qPrintable(message));
+}
+
+// The failure mode this whole signal exists for. An upgrade that could not run
+// is reported on an attempt that then CONNECTS, and AppController holds — then
+// discards — the bootstrap's ordinary error() for exactly that case. Routed
+// through error() instead, the user would be told nothing and would believe
+// their server had been updated.
+void TstAppController::anUpgradeThatDidNotHappenIsReportedEvenWhenTheConnectSucceeds()
+{
+    ConnectFixture f;
+    f.boot.connectOk = true;
+    QSignalSpy errorSpy(&f.controller, &AppController::error);
+    // Emitted from inside the connect, which is where ensureRemoteService()
+    // raises it: m_connecting is set, which is the state that swallows error().
+    f.boot.duringConnect = [&f] {
+        emit f.boot.upgradeFailed(QStringLiteral("nothing was changed here"));
+    };
+
+    f.controller.upgradeRemoteService(f.profileId);
+
+    // Reported despite arriving while m_connecting is set, which is precisely
+    // when the bootstrap's ordinary error() is held back. Anything the rest of
+    // the attempt reports afterwards is a separate, later toast; this one is
+    // FIRST and it is not the connection's.
+    QVERIFY(!errorSpy.isEmpty());
+    QCOMPARE(errorSpy.at(0).at(0).toString(),
+             QStringLiteral("nothing was changed here"));
+}
+
+// Every way a connect chain can be abandoned has to spend the upgrade request
+// with it. The request is a one-shot "replace the service on that server", it
+// survives a PARKED prompt on purpose (the retry is the same user action), and
+// so an abandonment that forgot to clear it would leave the next ordinary
+// Connect — possibly to a different profile — reinstalling unasked.
+void TstAppController::anAbandonedUpgradeDoesNotAmbushTheNextOrdinaryConnect()
+{
+    // (a) The user rejects the host key.
+    {
+        ConnectFixture f;
+        f.boot.duringConnect = [&f] { offerUnknownHostKey(f.pool); };
+        f.controller.upgradeRemoteService(f.profileId);
+        QCOMPARE(f.controller.connectionState(), QStringLiteral("hostkey"));
+        // Still armed while the answer is outstanding: the accept path retries
+        // the same attempt, and that retry is still the upgrade.
+        QVERIFY(f.boot.remoteUpgradeRequested());
+
+        f.controller.resolveHostKey(false);
+        QVERIFY2(!f.boot.remoteUpgradeRequested(),
+                 "a rejected host key left the upgrade armed for the next connect");
+    }
+
+    // (b) The user cancels the credential prompt.
+    {
+        ConnectFixture f;
+        f.boot.duringConnect = [&f] {
+            f.pool.credentialCallback()(
+                QStringLiteral("yichen"),
+                SshConnectionPool::CredentialKind::Password);
+        };
+        f.controller.upgradeRemoteService(f.profileId);
+        QCOMPARE(f.controller.connectionState(), QStringLiteral("credential"));
+        QVERIFY(f.boot.remoteUpgradeRequested());
+
+        f.controller.submitCredential(QString(), QStringLiteral("password"));
+        QVERIFY2(!f.boot.remoteUpgradeRequested(),
+                 "a cancelled credential prompt left the upgrade armed");
+    }
+
+    // (c) The chain simply fails, with no prompt to park on.
+    {
+        ConnectFixture f;
+        f.boot.connectOk = false;
+        f.controller.upgradeRemoteService(f.profileId);
+        QCOMPARE(f.controller.connectionState(), QStringLiteral("failed"));
+        QVERIFY2(!f.boot.remoteUpgradeRequested(),
+                 "a failed upgrade chain left the request armed");
+    }
+
+    // (d) The user disconnects instead.
+    {
+        ConnectFixture f;
+        f.boot.duringConnect = [&f] { offerUnknownHostKey(f.pool); };
+        f.controller.upgradeRemoteService(f.profileId);
+        QVERIFY(f.boot.remoteUpgradeRequested());
+        f.controller.disconnectServer();
+        QVERIFY2(!f.boot.remoteUpgradeRequested(),
+                 "Disconnect left the upgrade armed");
+    }
 }
 
 QTEST_GUILESS_MAIN(TstAppController)

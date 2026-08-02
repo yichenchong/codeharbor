@@ -642,6 +642,10 @@ private slots:
     // window has become unusable in a way no other test would notice.
     void titleBarMaximiseButtonTogglesTheWindowState();
     void titleBarButtonsAreNamedAndCloseIsWired();
+
+    // The one control in the sheet that WRITES to the server: it has to be
+    // wired to a profile and, like Connect, unreachable behind a prompt.
+    void sheetUpdateServerButtonNamesItsProfile();
 };
 
 // The states ch::AppController publishes, read out of the SOURCE rather than
@@ -819,8 +823,10 @@ void TstUxShell::sheetChromeIsDisabledWhileAPromptIsUp()
     auto *closeButton = qobject_cast<QQuickItem *>(surface.child(QStringLiteral("closeButton")));
     auto *connectButton =
             qobject_cast<QQuickItem *>(surface.child(QStringLiteral("connectButton")));
+    auto *upgradeButton =
+            qobject_cast<QQuickItem *>(surface.child(QStringLiteral("upgradeButton")));
     auto *profileList = qobject_cast<QQuickItem *>(surface.child(QStringLiteral("profileList")));
-    QVERIFY(closeButton && connectButton && profileList);
+    QVERIFY(closeButton && connectButton && upgradeButton && profileList);
     QVERIFY(closeButton->isEnabled());
 
     root->setProperty("pendingHostKey",
@@ -833,6 +839,9 @@ void TstUxShell::sheetChromeIsDisabledWhileAPromptIsUp()
              "Close is still reachable behind the host-key prompt: dismissing the sheet there "
              "abandons a connect attempt that is waiting for the answer");
     QVERIFY2(!connectButton->isEnabled(), "Connect is still reachable behind the host-key prompt");
+    QVERIFY2(!upgradeButton->isEnabled(),
+             "Update server is still reachable behind the host-key prompt: it tears the "
+             "parked attempt down and reinstalls the service under it");
     QVERIFY2(!profileList->isEnabled(), "the profile list is still usable behind the prompt");
 
     // ...while the panel that must be answered stays live.
@@ -858,6 +867,42 @@ void TstUxShell::sheetChromeIsDisabledWhileAPromptIsUp()
     root->setProperty("pendingCredential", QVariant());
     settle(40);
     QVERIFY(closeButton->isEnabled());
+
+    QVERIFY2(surface.warnings.isEmpty(), qPrintable(surface.warningReport()));
+}
+
+// The button is the only way most people will ever update the service on their
+// server, and it must carry the profile the sheet is showing: an upgrade
+// request with an empty id installs onto whatever profile happens to be active,
+// which is not necessarily the one on screen.
+void TstUxShell::sheetUpdateServerButtonNamesItsProfile()
+{
+    Surface surface(moduleUrl(QStringLiteral("ConnectSheet.qml")), QSize(900, 560));
+    QVERIFY(surface.expose());
+    QQuickItem *root = surface.root();
+    QVERIFY(root);
+
+    auto *upgradeButton =
+            qobject_cast<QQuickItem *>(surface.child(QStringLiteral("upgradeButton")));
+    QVERIFY(upgradeButton);
+
+    // Nothing selected: there is no server to install onto, so the button is
+    // dead rather than firing a request with an empty id.
+    root->setProperty("profiles", QVariantList());
+    settle(40);
+    QVERIFY2(!upgradeButton->isEnabled(),
+             "Update server is live with no profile to update");
+
+    root->setProperty("profiles", twoProfiles());
+    root->setProperty("activeId", QStringLiteral("id-b"));
+    settle(40);
+    QVERIFY(upgradeButton->isEnabled());
+
+    QSignalSpy requested(root, SIGNAL(upgradeRequested(QString)));
+    QMetaObject::invokeMethod(upgradeButton, "clicked");
+    settle(40);
+    QCOMPARE(requested.size(), 1);
+    QCOMPARE(requested.at(0).at(0).toString(), QStringLiteral("id-b"));
 
     QVERIFY2(surface.warnings.isEmpty(), qPrintable(surface.warningReport()));
 }

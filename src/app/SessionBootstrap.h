@@ -245,6 +245,28 @@ public:
     void setRemoteArtifactUrl(const QString& url);
     QString remoteArtifactUrl() const;
 
+    // Arm a ONE-SHOT forced reinstall for the next connect attempt. This is the
+    // "update the server from the client" action: ensureRemoteService() then
+    // installs remoteArtifactUrl() even when the location already holds a
+    // working service and even when it carries no release marker.
+    //
+    // Why a flag consumed by the next connect rather than a method of its own:
+    // an install runs over an authenticated SSH session, needs the same
+    // host-key and credential chain, the same cancellation handling and the
+    // same progress reporting as provisioning already has, and must be followed
+    // by a wire against the service it just installed. Reconnecting IS all of
+    // that, so the upgrade is one extra bit on the path that already does it.
+    //
+    // Marker-less installs are included on purpose, and only here. The connect
+    // path never overwrites a directory a person populated by hand, because
+    // nobody asked it to; this is the user asking, for one attempt. The one
+    // location still refused is a git checkout — see ensureRemoteService().
+    void requestRemoteUpgrade();
+    // Drop an armed request that will never be spent (the connect chain it was
+    // made for ended without reaching the install).
+    void cancelRemoteUpgrade();
+    bool remoteUpgradeRequested() const { return m_forceUpgrade; }
+
     // The release asset matching THIS client, or an empty string when the
     // client does not know its own version (QCoreApplication::applicationVersion
     // is unset - true of a test host, never of the shipped binary, which
@@ -357,6 +379,17 @@ signals:
     // being indistinguishable, on screen, from a hung application. A
     // provisioning FAILURE goes to error() like every other failure.
     void provisioning(const QString& message);
+    // A requested upgrade (requestRemoteUpgrade()) did NOT happen, on an
+    // attempt that is otherwise going fine and will connect.
+    //
+    // Separate from error() because error() is HELD while a connect attempt is
+    // in flight — an expected refusal (an unknown host key) must not paint a
+    // toast — and dropped when that attempt then succeeds. This message is the
+    // opposite case: the connect succeeds and the thing the user actually asked
+    // for is the part that failed, so it must survive exactly the path that
+    // discards a held connect error. AppController routes it straight to a
+    // toast.
+    void upgradeFailed(const QString& message);
 
 protected:
     // Test seams. The two side-effecting steps of one wire attempt, isolated so
@@ -483,6 +516,10 @@ private:
     // Explicit remoteArtifactUrl() override; empty means "use
     // defaultRemoteArtifactUrl()".
     QString m_artifactUrl;
+    // One-shot: set by requestRemoteUpgrade(), consumed (and always cleared) by
+    // the next ensureRemoteService(). Cleared unconditionally so a failed or
+    // cancelled upgrade cannot keep reinstalling on every later reconnect.
+    bool m_forceUpgrade = false;
     int m_attempt = 0;
     int m_maxAttempts = kDefaultMaxReconnectAttempts;
     double m_timeScale = 1.0;

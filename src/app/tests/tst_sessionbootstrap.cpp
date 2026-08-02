@@ -384,6 +384,10 @@ private slots:
     void theInstalledReleaseIsTiedToTheClientVersion();
     void provisioningStaysInsideTheChosenDirectory();
     void theReportIsReadBackFieldForField();
+    void aRequestedUpgradeReplacesAnInstallWeDidNotMake();
+    void aRequestedUpgradeRefusesASourceCheckout();
+    void aRequestedUpgradeAppliesToOneAttemptOnly();
+    void aRequestedUpgradeThatCannotInspectSaysSo();
 };
 
 // A cold wire walks Disconnected -> Connecting -> Wired exactly once and hands
@@ -1909,6 +1913,123 @@ void TstSessionBootstrap::theReportIsReadBackFieldForField()
     QVERIFY(SessionBootstrap::stagedArtifactPath(
                 QStringLiteral("https://example.invalid/a.tar.gz"))
                 .isEmpty());
+}
+
+// The upgrade the USER asked for is the one case that replaces an installation
+// this client did not create: a hand-unpacked release tarball, which is exactly
+// what README.md tells people to make. Without this, following the documented
+// install left a server that could never be updated from the client.
+void TstSessionBootstrap::aRequestedUpgradeReplacesAnInstallWeDidNotMake()
+{
+    Harness h;
+    h.boot.setRemoteArtifactUrl(artifactUrl());
+    // A working install in the RELEASE layout with no marker: nobody's connect
+    // would touch it (anInstallWeDidNotMakeIsNeverOverwritten pins that).
+    h.boot.fakeScript(true, inspectionReport(QStringLiteral("v24.16.0"),
+                                             installedEntry()));
+    h.boot.fakeScript(true, installLog());
+    h.boot.fakeScript(true, inspectionReport(QStringLiteral("v24.16.0"),
+                                             installedEntry(), artifactUrl()));
+    QSignalSpy errorSpy(&h.boot, &SessionBootstrap::error);
+    QSignalSpy progressSpy(&h.boot, &SessionBootstrap::provisioning);
+
+    h.boot.requestRemoteUpgrade();
+    QVERIFY(h.boot.remoteUpgradeRequested());
+    QVERIFY(h.wire());
+
+    QVERIFY2(errorSpy.isEmpty(),
+             qPrintable(errorSpy.value(0).value(0).toString()));
+    // Inspect, install, verify — the install really ran, against this client's
+    // own release URL.
+    QCOMPARE(h.boot.scriptsRun.size(), 3);
+    QVERIFY2(h.boot.scriptsRun.at(1).contains(artifactUrl()),
+             qPrintable(h.boot.scriptsRun.at(1)));
+    // The user is told this is an UPDATE, not a first install: something was
+    // already there and saying "Installing" about a replacement is a lie the
+    // progress line is the only place to catch.
+    QVERIFY(!progressSpy.isEmpty());
+    QVERIFY2(progressSpy.at(0).at(0).toString().contains(
+                 QStringLiteral("Updating")),
+             qPrintable(progressSpy.at(0).at(0).toString()));
+}
+
+// ...and the one place it stops. A service running out of a source checkout is
+// not replaced: unpacking a release beside it would leave the checkout in place
+// but no longer running, inside a directory its owner maintains.
+void TstSessionBootstrap::aRequestedUpgradeRefusesASourceCheckout()
+{
+    Harness h;
+    h.boot.setRemoteArtifactUrl(artifactUrl());
+    const QString checkout =
+        QStringLiteral("/srv/codeharbor/remote/src/codeharbord.ts");
+    h.boot.fakeScript(true,
+                      inspectionReport(QStringLiteral("v24.16.0"), checkout));
+    QSignalSpy errorSpy(&h.boot, &SessionBootstrap::error);
+
+    h.boot.requestRemoteUpgrade();
+    QVERIFY(!h.wire());
+    QCOMPARE(errorSpy.size(), 1);
+    const QString message = errorSpy.at(0).at(0).toString();
+    QVERIFY2(message.contains(checkout), qPrintable(message));
+    QVERIFY2(message.contains(QStringLiteral("Nothing was changed")),
+             qPrintable(message));
+    // Refused after the inspection and before anything was written.
+    QCOMPARE(h.boot.scriptsRun.size(), 1);
+}
+
+// The request is spent by the attempt it was made for. A flag that survived
+// would turn every later reconnect — including each rung of the automatic
+// ladder — into a fresh download and unpack of the same release.
+void TstSessionBootstrap::aRequestedUpgradeAppliesToOneAttemptOnly()
+{
+    Harness h;
+    h.boot.setRemoteArtifactUrl(artifactUrl());
+    h.boot.fakeScript(true, inspectionReport(QStringLiteral("v24.16.0"),
+                                             installedEntry()));
+    h.boot.fakeScript(true, installLog());
+    h.boot.fakeScript(true, inspectionReport(QStringLiteral("v24.16.0"),
+                                             installedEntry(), artifactUrl()));
+    h.boot.requestRemoteUpgrade();
+    QVERIFY(h.wire());
+    QVERIFY(!h.boot.remoteUpgradeRequested());
+    QCOMPARE(h.boot.scriptsRun.size(), 3);
+
+    // Second attempt, nothing requested: the marker now matches, so the only
+    // remote command is the inspection.
+    h.boot.disconnectSession();
+    h.boot.fakeScript(true, inspectionReport(QStringLiteral("v24.16.0"),
+                                             installedEntry(), artifactUrl()));
+    QVERIFY(h.wire());
+    QCOMPARE(h.boot.scriptsRun.size(), 4);
+}
+
+// A connect whose inspection cannot run carries on silently, by design. An
+// UPGRADE that cannot run must not: the user asked for a change to their
+// server, and nothing was written.
+void TstSessionBootstrap::aRequestedUpgradeThatCannotInspectSaysSo()
+{
+    Harness h;
+    h.boot.setRemoteArtifactUrl(artifactUrl());
+    h.boot.fakeScript(false, QString(), QStringLiteral("channel refused"));
+    QSignalSpy errorSpy(&h.boot, &SessionBootstrap::error);
+    QSignalSpy upgradeSpy(&h.boot, &SessionBootstrap::upgradeFailed);
+
+    h.boot.requestRemoteUpgrade();
+    // Still connects: the installation that is already there may work fine.
+    QVERIFY(h.wire());
+    QCOMPARE(h.boot.state(), State::Wired);
+    // NOT error(): AppController holds error() for the duration of a connect
+    // attempt and drops it when the attempt succeeds, which this one does, so
+    // routing it there would show the user nothing at all.
+    QVERIFY(errorSpy.isEmpty());
+    QCOMPARE(upgradeSpy.size(), 1);
+    const QString message = upgradeSpy.at(0).at(0).toString();
+    QVERIFY2(message.contains(QStringLiteral("channel refused")),
+             qPrintable(message));
+    QVERIFY2(message.contains(QStringLiteral("Nothing was changed")),
+             qPrintable(message));
+    QVERIFY(!h.boot.remoteUpgradeRequested());
+    QCOMPARE(h.boot.scriptsRun.size(), 1);
 }
 
 // Guiless: nothing here needs a display, and QTEST_MAIN would pull in

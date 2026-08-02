@@ -296,6 +296,12 @@ void AppController::setConnection(SshConnectionPool* pool,
                     if (changed)
                         emit connectionStateChanged();
                 });
+        // Straight to the toast, deliberately bypassing the hold above: this
+        // fires on an attempt that goes on to SUCCEED, and the hold's success
+        // path throws its message away. What failed is the thing the user
+        // asked for, not the connection.
+        connect(m_bootstrap, &SessionBootstrap::upgradeFailed, this,
+                [this](const QString& message) { emit error(message); });
     }
     emit connectionChanged();
     emit connectionDiagnosticsChanged();
@@ -329,6 +335,34 @@ void AppController::connectToProfile(QString profileId)
     // A user-initiated connect starts a FRESH chain: nothing a previous chain
     // gathered may be replayed at this one.
     m_credentials.clear();
+    startConnect(profileId, QString());
+}
+
+void AppController::upgradeRemoteService(QString profileId)
+{
+    if (!m_bootstrap || !m_profiles)
+        return;
+    // Same guard as connectToProfile(), and for the same reason: a second
+    // attempt while one is in flight (or parked on a host-key or credential
+    // prompt) would race two sessions onto one pool. Arming the bootstrap here
+    // and then not connecting would also leave the flag set for whichever
+    // attempt eventually runs, turning an ignored click into a surprise
+    // reinstall.
+    if (m_connecting)
+        return;
+    if (profileId.isEmpty())
+        profileId = m_profiles->activeId();
+    if (profileId.isEmpty() || m_profiles->profile(profileId).isEmpty()) {
+        emit error(tr("Choose a server before updating its CodeHarbor remote "
+                      "service."));
+        return;
+    }
+
+    // The install replaces the very files the live session is running from, so
+    // the session goes first. This also clears the chain, which is why the arm
+    // below comes after it.
+    disconnectServer();
+    m_bootstrap->requestRemoteUpgrade();
     startConnect(profileId, QString());
 }
 
@@ -440,6 +474,12 @@ void AppController::startConnect(const QString& profileId,
     // next one.
     m_credentials.clear();
     m_pendingProfileId.clear();
+    // Including an upgrade request the chain never got to spend. It survives a
+    // parked prompt above — the retry that follows is the same user action —
+    // but this is the chain ENDING, and an armed request left behind would turn
+    // whatever the user connects to next into an unasked-for reinstall.
+    if (m_bootstrap)
+        m_bootstrap->cancelRemoteUpgrade();
     // A genuine failure: report it now that we know it was not the host-key path.
     if (!m_heldConnectError.isEmpty()) {
         const QString held = m_heldConnectError;
@@ -580,6 +620,11 @@ void AppController::resolveHostKey(bool accept)
         m_credentials.clear();
         m_pendingProfileId.clear();
         m_heldConnectError.clear();
+        // Including an armed upgrade: this chain is over without reaching the
+        // install, and a request left behind would make the user's NEXT
+        // ordinary connect reinstall the remote service unasked.
+        if (m_bootstrap)
+            m_bootstrap->cancelRemoteUpgrade();
         setConnectionState(QStringLiteral("disconnected"));
         return;
     }
@@ -627,6 +672,10 @@ void AppController::submitCredential(QString secret, QString kind)
         m_credentials.clear();
         m_pendingProfileId.clear();
         m_heldConnectError.clear();
+        // Same as the rejected host key above: the upgrade this chain was
+        // carrying dies with the chain, not with whatever is connected next.
+        if (m_bootstrap)
+            m_bootstrap->cancelRemoteUpgrade();
         setConnectionState(QStringLiteral("disconnected"));
         return;
     }
@@ -751,8 +800,10 @@ void AppController::adoptServerIdentity()
                            const QString message =
                                tr("Server too old: codeharbord %1 speaks "
                                   "workspace schema %2, but this client needs "
-                                  "schema %3 or newer. Update the CodeHarbor "
-                                  "remote on that host and reconnect.")
+                                  "schema %3 or newer. Use \"Update server\" in "
+                                  "the connect sheet to install the matching "
+                                  "release, or update the CodeHarbor remote on "
+                                  "that host yourself and reconnect.")
                                    .arg(remoteVersion.isEmpty()
                                             ? tr("(version not reported)")
                                             : remoteVersion)

@@ -101,6 +101,19 @@ public:
     Q_INVOKABLE void connectToProfile(QString profileId);
     Q_INVOKABLE void disconnectServer();
 
+    // Install the release matching THIS client onto the server behind
+    // `profileId` (empty means the profile the connect surface is on: the
+    // active one), then connect to it. This is the user-facing "update the
+    // server" action, and the only one that replaces a remote installation the
+    // client did not create — the connect path deliberately leaves those alone.
+    //
+    // Implemented as "arm the bootstrap, then run the ordinary connect", which
+    // is what gives it the host-key prompt, the credential prompt, the progress
+    // reporting, the cancellation handling and the wire-and-verify tail for
+    // free. A session that is up is dropped first: the service about to be
+    // overwritten is the one serving it.
+    Q_INVOKABLE void upgradeRemoteService(QString profileId = QString());
+
     // Answer a hostKeyPrompt. Accepting trusts the key and retries the connect;
     // there is no nested event loop anywhere in this flow (the first attempt is
     // refused, the user decides, and we reconnect), so the UI can never be

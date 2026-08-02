@@ -68,6 +68,32 @@ there is no `npm install` and no `node_modules`. You get `dist/`, `sql/` and
 `package.json`, and nothing needs to be running — the client starts
 `codeharbord` over SSH on demand and it exits when you disconnect.
 
+You can also skip this step entirely: point a profile's **Repository root** at a
+directory that does not exist yet and the client installs the matching release
+there on the first connect.
+
+### Updating the server
+
+The client and the service are released together, and the client only drives the
+release that matches it. Two things keep them in step:
+
+- **Automatically.** When a client installed the service itself, upgrading the
+  client makes the next connect replace the copy on the server with the matching
+  release. Nothing to do.
+- **On demand.** Open **Server…**, select the profile, and press **Update
+  server**. This installs the release matching this client into that profile's
+  repository root and reconnects. Use it when the server was set up by hand (the
+  `curl … | tar -xz` above), which the automatic path deliberately never
+  overwrites, or after a client update if you want to force the issue.
+
+Both need `tar` plus either `curl` or `wget` on the server. Without outbound
+network access, stage `codeharbor-remote.tar.gz` on the server and set
+`CH_REMOTE_ARTIFACT_URL` to its path — it is copied instead of downloaded. Set
+the same variable to an internal mirror URL to install from there.
+
+A **git checkout** is never overwritten by either path. **Update server** on one
+says so and changes nothing: update it with `git pull` and a build instead.
+
 ### 2. The client
 
 | Platform | Asset | Notes |

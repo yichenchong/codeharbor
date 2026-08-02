@@ -399,6 +399,7 @@ ApplicationWindow {
         diagnosticText: app.sshDiagnostics
 
         onConnectRequested: (profileId) => app.connectToProfile(profileId)
+        onUpgradeRequested: (profileId) => app.upgradeRemoteService(profileId)
         onProfileSaved: (fields) => {
             if (!app.serverProfiles)
                 return;
@@ -635,6 +636,10 @@ ApplicationWindow {
           invoke: () => { connectSheet.shown = true; } },
         { id: "server.disconnect", title: qsTr("Disconnect from Server"),
           invoke: () => app.disconnectServer() },
+        // No profile argument: the controller uses the active profile, which is
+        // the one the palette user is looking at in the sidebar.
+        { id: "server.upgrade", title: qsTr("Update Remote Service on Server"),
+          invoke: () => app.upgradeRemoteService("") },
         // Ctrl+Shift+R, not Ctrl+R: a global Shortcut is matched before the key
         // reaches the focused item, and Ctrl+R is reverse-history-search in every
         // shell a terminal pane hosts (and reload in a WebEngineView). Same rule

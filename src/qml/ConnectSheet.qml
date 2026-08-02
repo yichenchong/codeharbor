@@ -33,6 +33,7 @@ import CodeHarbor
 //
 // Outputs
 //   connectRequested(profileId)  connect using that stored profile
+//   upgradeRequested(profileId)  install this client's matching remote release
 //   profileSaved(fields)         create (fields.id === "") or update a profile
 //   profileRemoved(id)           delete that profile
 //   credentialSubmitted(secret, kind) answer pending credential; "" cancels
@@ -52,6 +53,7 @@ Rectangle {
     property var pendingCredential: null
 
     signal connectRequested(string profileId)
+    signal upgradeRequested(string profileId)
     signal profileSaved(var fields)
     signal profileRemoved(string id)
     signal hostKeyDecision(bool accept)
@@ -215,6 +217,11 @@ Rectangle {
     function connectNow() {
         if (root.editingId !== "")
             root.connectRequested(root.editingId);
+    }
+
+    function upgradeNow() {
+        if (root.editingId !== "")
+            root.upgradeRequested(root.editingId);
     }
 
     function removeSelected() {
@@ -1075,6 +1082,24 @@ Rectangle {
                     text: qsTr("Save")
                     enabled: root.formValid()
                     onClicked: root.save()
+                }
+                SheetButton {
+                    objectName: "upgradeButton"
+                    text: qsTr("Update server")
+                    enabled: root.editingId !== ""
+                    onClicked: root.upgradeNow()
+
+                    HoverHandler { id: upgradeHover }
+                    AppToolTip {
+                        objectName: "upgradeButtonTip"
+                        visible: upgradeHover.hovered
+                        // Says what it WRITES and where, because this is the
+                        // one button in the sheet that changes the server.
+                        text: qsTr("Install the CodeHarbor service release that "
+                                   + "matches this client into the repository "
+                                   + "root on the server, then connect. A source "
+                                   + "checkout there is left alone.")
+                    }
                 }
                 SheetButton {
                     objectName: "connectButton"
