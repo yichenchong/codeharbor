@@ -41,7 +41,8 @@ make_repo() {
     version="$1"
     rm -rf "$work/repo"
     mkdir -p "$work/repo/remote/src" "$work/repo/src/web/terminal" \
-             "$work/repo/src/web/editor" "$work/repo/.github/scripts"
+             "$work/repo/src/web/editor" "$work/repo/src/web/markdown" \
+             "$work/repo/.github/scripts"
     cd "$work/repo"
     cat >CMakeLists.txt <<EOF
 cmake_minimum_required(VERSION 3.25)
@@ -54,7 +55,7 @@ EOF
   "name": "codeharbor-workspace",
   "version": "$version",
   "private": true,
-  "workspaces": ["remote", "src/web/terminal", "src/web/editor"]
+  "workspaces": ["remote", "src/web/terminal", "src/web/editor", "src/web/markdown"]
 }
 EOF
     cat >package-lock.json <<EOF
@@ -66,11 +67,12 @@ EOF
     "": { "name": "codeharbor-workspace", "version": "$version" },
     "remote": { "version": "$version" },
     "src/web/terminal": { "version": "$version" },
-    "src/web/editor": { "version": "$version" }
+    "src/web/editor": { "version": "$version" },
+    "src/web/markdown": { "version": "$version" }
   }
 }
 EOF
-    for ws in remote src/web/terminal src/web/editor; do
+    for ws in remote src/web/terminal src/web/editor src/web/markdown; do
         printf '{\n  "name": "%s",\n  "version": "%s"\n}\n' \
             "$(basename "$ws")" "$version" >"$ws/package.json"
     done
@@ -128,10 +130,12 @@ if bash "$bump" --set 0.3.0 --no-commit >"$work/out4" 2>&1; then
 fi
 sed -i.bak 's/0\.2\.0/0.3.0/g' CMakeLists.txt package.json package-lock.json \
     remote/package.json src/web/terminal/package.json \
-    src/web/editor/package.json remote/src/codeharbord.ts
+    src/web/editor/package.json src/web/markdown/package.json \
+    remote/src/codeharbord.ts
 rm -f CMakeLists.txt.bak package.json.bak package-lock.json.bak \
     remote/package.json.bak src/web/terminal/package.json.bak \
-    src/web/editor/package.json.bak remote/src/codeharbord.ts.bak
+    src/web/editor/package.json.bak src/web/markdown/package.json.bak \
+    remote/src/codeharbord.ts.bak
 git commit -q -am "hand-rolled release commit at 0.3.0"
 bash "$bump" --set 0.3.0 --no-commit >"$work/out5" 2>&1 \
     || { cat "$work/out5" >&2; fail "--no-commit refused a HEAD that does carry 0.3.0"; }
