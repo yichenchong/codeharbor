@@ -135,6 +135,8 @@ set_tests_properties(tst_webengine_headless PROPERTIES
     ENVIRONMENT "${CODEHARBOR_QML_TEST_ENV}"
     TIMEOUT 180
 )
+set_tests_properties(tst_webengine_headless PROPERTIES
+    FIXTURES_REQUIRED codeharbor_live_fixture)
 
 # Command palette + global shortcuts (SPEC 15), and the module's colour gate.
 #

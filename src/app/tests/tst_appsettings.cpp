@@ -27,6 +27,8 @@ private slots:
     void aPixelRatioOfZeroMeansFollowTheScreen();
     void toolbarOrderDropsEmptyAndRepeatedIds();
     void writingTheSameValueIsSilent();
+    void viewerDefaultsStoreAndNormalise();
+    void viewerDefaultsRejectMalformedAndIncompatibleEntries();
     void genericPairsCannotEscapeTheirGroup();
     void valuesSurviveAReopen();
     void resetRestoresDefaultsAndAnnouncesWhatMoved();
@@ -163,6 +165,71 @@ void TstAppSettings::writingTheSameValueIsSilent()
     QCOMPARE(fontSpy.count(), 1);
 }
 
+void TstAppSettings::viewerDefaultsStoreAndNormalise()
+{
+    const QString path = scratchIni(m_dir, QStringLiteral("viewerdefaults"));
+    AppSettings s(path);
+    QSignalSpy changed(&s, &AppSettings::viewerDefaultsChanged);
+
+    QVERIFY(s.setViewerDefault(QStringLiteral(".MD"), QStringLiteral("text")));
+    QVERIFY(s.setViewerDefault(QStringLiteral("JSON"), QStringLiteral("binary")));
+    QCOMPARE(s.viewerDefaults(),
+             (QVariantMap{{QStringLiteral("json"), QStringLiteral("binary")},
+                          {QStringLiteral("md"), QStringLiteral("text")}}));
+    QCOMPARE(changed.count(), 2);
+
+    AppSettings reopened(path);
+    QCOMPARE(reopened.viewerDefaults(), s.viewerDefaults());
+    QSettings raw(path, QSettings::IniFormat);
+    QCOMPARE(raw.value(QStringLiteral("settings/viewerDefaults/md")).toString(),
+             QStringLiteral("text"));
+}
+
+void TstAppSettings::viewerDefaultsRejectMalformedAndIncompatibleEntries()
+{
+    const QString path = scratchIni(m_dir, QStringLiteral("viewerinvalid"));
+    AppSettings s(path);
+
+    QVERIFY(!s.setViewerDefault(QStringLiteral("png"),
+                                QStringLiteral("markdown")));
+    QVERIFY(!s.setViewerDefault(QStringLiteral("pdf"),
+                                QStringLiteral("image")));
+    QVERIFY(!s.setViewerDefault(QStringLiteral("md"),
+                                QStringLiteral("no-such-kind")));
+    QVERIFY(s.viewerDefaults().isEmpty());
+
+    // The setter accepts a dot for typed input, but every malformed value is
+    // dropped before it reaches the plain-text store. A well-formed extension
+    // unknown to the registry remains useful for the generic text/binary
+    // handlers.
+    QVariantMap mixed;
+    mixed.insert(QStringLiteral(""), QStringLiteral("text"));
+    mixed.insert(QStringLiteral(".md"), QStringLiteral("text"));
+    mixed.insert(QStringLiteral("has-dash"), QStringLiteral("text"));
+    mixed.insert(QString(65, QLatin1Char('x')), QStringLiteral("text"));
+    mixed.insert(QStringLiteral("png"), QStringLiteral("pdf"));
+    mixed.insert(QStringLiteral("future"), QStringLiteral("text"));
+    mixed.insert(QStringLiteral("json"), 7);
+    s.setViewerDefaults(mixed);
+    QCOMPARE(s.viewerDefaults(),
+             (QVariantMap{{QStringLiteral("future"), QStringLiteral("text")},
+                          {QStringLiteral("md"), QStringLiteral("text")}}));
+
+    // Hand-edited leading-dot keys and wrong value types are rejected on read,
+    // and do not disturb the valid entry beside them.
+    QSettings raw(path, QSettings::IniFormat);
+    raw.setValue(QStringLiteral("settings/viewerDefaults/.md"),
+                 QStringLiteral("binary"));
+    raw.setValue(QStringLiteral("settings/viewerDefaults/also"),
+                 QStringLiteral("nonsense"));
+    raw.setValue(QStringLiteral("settings/viewerDefaults/wrong"), 42);
+    raw.sync();
+    AppSettings reread(path);
+    QCOMPARE(reread.viewerDefaults(),
+             (QVariantMap{{QStringLiteral("future"), QStringLiteral("text")},
+                          {QStringLiteral("md"), QStringLiteral("text")}}));
+}
+
 // '/' is the separator that keeps a group's keys inside its own subtree. A pair
 // carrying one could be spelt to land on a validated appearance key and write
 // it without passing that key's validation.
@@ -225,25 +292,27 @@ void TstAppSettings::resetRestoresDefaultsAndAnnouncesWhatMoved()
     AppSettings s(path);
     s.setTheme(QStringLiteral("light"));
     s.setTerminalFontSize(21);
+    QVERIFY(s.setViewerDefault(QStringLiteral("md"), QStringLiteral("text")));
     s.setValue(QStringLiteral("tmux"), QStringLiteral("prefix"),
                QStringLiteral("C-a"));
 
     QSignalSpy themeSpy(&s, &AppSettings::themeChanged);
     QSignalSpy fontSpy(&s, &AppSettings::terminalFontSizeChanged);
     QSignalSpy paletteSpy(&s, &AppSettings::groupPaletteChanged);
-
+    QSignalSpy viewerSpy(&s, &AppSettings::viewerDefaultsChanged);
     s.resetToDefaults();
 
     QCOMPARE(s.theme(), QStringLiteral("dark"));
     QCOMPARE(s.terminalFontSize(), AppSettings::kDefaultTerminalFontSize);
+    QVERIFY(s.viewerDefaults().isEmpty());
     QVERIFY(s.value(QStringLiteral("tmux"), QStringLiteral("prefix"))
                 .toString()
                 .isEmpty());
     QCOMPARE(themeSpy.count(), 1);
     QCOMPARE(fontSpy.count(), 1);
+    QCOMPARE(viewerSpy.count(), 1);
     // The palette was never changed, so nothing moved and nothing is announced.
     QCOMPARE(paletteSpy.count(), 0);
-
     // UiStateStore shares this file. Its keys live outside `settings/` and a
     // preferences reset must not take the user's window layout with it.
     {

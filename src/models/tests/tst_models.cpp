@@ -72,6 +72,7 @@ private slots:
     void aggregateRowStateCoversEveryInputCombination();
     void stateStringsArePinnedWireValues();
     void sessionsModelRoleNamesCoverEveryServedRole();
+    void sessionsModelFiltersArchivedAndPinnedTogether();
     void splitTreeRejectsNonObjectChildAndNonNumericRatio();
     void startingAgentCountsAsRunning();
     void agentStateWireWordsMatchRemoteEventsTs();
@@ -923,7 +924,8 @@ void TstModels::sessionsModelRoleNamesCoverEveryServedRole()
                                  SessionsModel::CollapsedRole,
                                  SessionsModel::IdRole,
                                  SessionsModel::GroupIdRole,
-                                 SessionsModel::PinnedRole};
+                                 SessionsModel::PinnedRole,
+                                 SessionsModel::ArchivedRole};
     QCOMPARE(names.size(), served.size());
     for (int role : served) {
         QVERIFY2(names.contains(role), "roleNames() omits a role that data() serves");
@@ -939,6 +941,8 @@ void TstModels::sessionsModelRoleNamesCoverEveryServedRole()
     QCOMPARE(names.value(SessionsModel::CollapsedRole), QByteArrayLiteral("collapsed"));
     QCOMPARE(names.value(SessionsModel::IdRole), QByteArrayLiteral("itemId"));
     QCOMPARE(names.value(SessionsModel::GroupIdRole), QByteArrayLiteral("groupId"));
+    QCOMPARE(names.value(SessionsModel::PinnedRole), QByteArrayLiteral("pinned"));
+    QCOMPARE(names.value(SessionsModel::ArchivedRole), QByteArrayLiteral("archived"));
 
     // Group rows carry no subtitle or aggregate state; session rows carry no
     // collapsed flag; nobody serves a role the model never declared.
@@ -951,6 +955,62 @@ void TstModels::sessionsModelRoleNamesCoverEveryServedRole()
     // Qt::DisplayRole is an alias for the row's name on both row kinds.
     QCOMPARE(model.data(group, Qt::DisplayRole).toString(), QStringLiteral("G"));
     QCOMPARE(model.data(session, Qt::DisplayRole).toString(), QStringLiteral("S"));
+}
+// Archived visibility and pin visibility are independent filters. Showing
+// archived rows never bypasses "only pinned", and clearing that filter still
+// leaves archived rows hidden by default.
+void TstModels::sessionsModelFiltersArchivedAndPinnedTogether()
+{
+    SessionsModel model;
+    const auto session = [](const QString &id, bool archived, bool pinned) {
+        SessionRow row;
+        row.session.id = DevSessionId{id};
+        row.session.name = id;
+        row.session.archived = archived;
+        row.session.pinned = pinned;
+        return row;
+    };
+    GroupRow group;
+    group.group.id = GroupId{QStringLiteral("g")};
+    group.group.name = QStringLiteral("G");
+    group.sessions = {
+        session(QStringLiteral("active"), false, false),
+        session(QStringLiteral("archived"), true, false),
+        session(QStringLiteral("pinned"), false, true),
+        session(QStringLiteral("pinned-archived"), true, true),
+    };
+
+    model.setGroups({group});
+    QCOMPARE(model.rowCount(model.index(0, 0)), 2);
+    QCOMPARE(model.data(model.index(0, 0, model.index(0, 0)), SessionsModel::NameRole)
+                 .toString(),
+             QStringLiteral("active"));
+    QCOMPARE(model.data(model.index(1, 0, model.index(0, 0)), SessionsModel::NameRole)
+                 .toString(),
+             QStringLiteral("pinned"));
+    QVERIFY(model.hasSessions());
+    QVERIFY(model.hasUnarchivedSessions());
+
+    model.setShowArchived(true);
+    QCOMPARE(model.rowCount(model.index(0, 0)), 4);
+    QCOMPARE(model.data(model.index(1, 0, model.index(0, 0)), SessionsModel::ArchivedRole)
+                 .toBool(),
+             true);
+
+    model.setPinnedOnly(true);
+    QCOMPARE(model.rowCount(model.index(0, 0)), 2);
+    QCOMPARE(model.data(model.index(0, 0, model.index(0, 0)), SessionsModel::NameRole)
+                 .toString(),
+             QStringLiteral("pinned"));
+    QCOMPARE(model.data(model.index(1, 0, model.index(0, 0)), SessionsModel::NameRole)
+                 .toString(),
+             QStringLiteral("pinned-archived"));
+
+    model.setShowArchived(false);
+    QCOMPARE(model.rowCount(model.index(0, 0)), 1);
+    QCOMPARE(model.data(model.index(0, 0, model.index(0, 0)), SessionsModel::NameRole)
+                 .toString(),
+             QStringLiteral("pinned"));
 }
 
 // Two rejection branches in SplitTree.cpp's parser that no other case reaches: a

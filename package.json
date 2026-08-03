@@ -6,7 +6,8 @@
   "workspaces": [
     "remote",
     "src/web/terminal",
-    "src/web/editor"
+    "src/web/editor",
+    "src/web/markdown"
   ],
   "scripts": {
     "test": "npm run test --workspaces --if-present",

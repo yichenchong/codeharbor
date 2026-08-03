@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!--
+  CodeHarbor Markdown page (SPEC 7.5, 8.1). This is app-owned code served from
+  qrc:/codeharbor/web/markdown/index.html. The document bytes are fetched from
+  the read-only codeharbor-internal scheme, sanitised by markdown.js, and only
+  then inserted into #ch-markdown-root.
+
+  SECURITY: this page runs on the privileged INTERNAL profile because it is an
+  app-owned page that must read the controlled internal scheme and mint opaque
+  internal URLs for relative images. The page itself is the only script allowed
+  to run. Markdown content is never a script source, style source, frame, or
+  network destination. There is deliberately no unsafe-inline/unsafe-eval in
+  script-src, and no frame-src/child-src allowance: default-src 'none' denies
+  those content embedding paths.
+-->
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' qrc:; style-src 'self' 'unsafe-inline'; connect-src codeharbor-internal:; img-src codeharbor-internal:; media-src codeharbor-internal:; font-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'">
+<title>CodeHarbor Markdown</title>
+<link rel="stylesheet" href="markdown.css">
+</head>
+<body>
+<div id="ch-markdown-status" role="status" aria-live="polite"></div>
+<main id="ch-markdown-root" class="ch-markdown" tabindex="0"></main>
+<script src="qrc:///qtwebchannel/qwebchannel.js"></script>
+<script src="markdown.js"></script>
+</body>
+</html>

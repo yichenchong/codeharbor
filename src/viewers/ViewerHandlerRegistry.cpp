@@ -85,7 +85,7 @@ ViewerResolution ViewerHandlerRegistry::resolveByExtension(const QString &ext)
 {
     const QString e = ext.toLower();
 
-    // Markdown renders through the internal HTML renderer (SPEC 7.5).
+    // Markdown uses the dedicated sanitized internal renderer (SPEC 7.5).
     if (e == QLatin1String("md") || e == QLatin1String("markdown"))
         return ViewerResolution::InternalHtmlRenderer;
 
@@ -234,10 +234,17 @@ QStringList ViewerHandlerRegistry::applicableViewKinds(const QUrl &url)
     switch (resolution) {
     case ViewerResolution::InternalHtmlRenderer:
     case ViewerResolution::TextEditor: {
+        const QString ext = extensionOf(path);
+        // Markdown has TWO real handlers and the user picks between them: the
+        // rendered document (the default) and the source in the editor. Listing
+        // the renderer first is what makes it the default, because the menu
+        // marks the first entry - see `defaultKind` in ViewerDirectoryView.qml.
+        if (ext == QLatin1String("md") || ext == QLatin1String("markdown"))
+            return {QStringLiteral("markdown"), QStringLiteral("editor"),
+                    QStringLiteral("text")};
         QStringList kinds = {QStringLiteral("editor"), QStringLiteral("text")};
         // HTML is positively claimed by the editor, but it can also be shown
         // as a rendered document through the privileged internal profile.
-        const QString ext = extensionOf(path);
         if (ext == QLatin1String("html") || ext == QLatin1String("htm"))
             kinds.append(QStringLiteral("web"));
         return kinds;

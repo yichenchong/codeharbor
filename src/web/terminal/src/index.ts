@@ -362,11 +362,18 @@ export function mountTerminal(element: HTMLElement, bridge: TerminalBridge): Ter
     type TerminalPageApi = typeof pageWindow & {
         applyTheme?: (roles: unknown) => void;
         codeharborSetTerminalPreferences?: (fontPoints: number, pixelRatio: number) => void;
+        codeharborFocusTerminal?: () => void;
         codeharborTerminalDiagnostics?: () => Record<string, unknown>;
     };
     const pageApi = pageWindow as TerminalPageApi;
     const applyPagePreferences = (fontPoints: number, preferredRatio: number): void => {
         applyPreferences({ fontSize: fontPoints, pixelRatio: preferredRatio });
+    };
+    const focusTerminal = (): void => {
+        term.focus();
+        const textarea = surface.querySelector(".xterm-helper-textarea");
+        if (textarea instanceof HTMLTextAreaElement)
+            textarea.focus();
     };
     const terminalDiagnostics = (): Record<string, unknown> => {
         const canvas = surface.querySelector("canvas");
@@ -390,6 +397,7 @@ export function mountTerminal(element: HTMLElement, bridge: TerminalBridge): Ter
     };
     pageApi.applyTheme = applyPageTheme;
     pageApi.codeharborSetTerminalPreferences = applyPagePreferences;
+    pageApi.codeharborFocusTerminal = focusTerminal;
     pageApi.codeharborTerminalDiagnostics = terminalDiagnostics;
 
 
@@ -425,6 +433,9 @@ export function mountTerminal(element: HTMLElement, bridge: TerminalBridge): Ter
             surface.removeEventListener("contextmenu", suppressContextMenu);
             if (pageApi.codeharborSetTerminalPreferences === applyPagePreferences) {
                 delete pageApi.codeharborSetTerminalPreferences;
+            }
+            if (pageApi.codeharborFocusTerminal === focusTerminal) {
+                delete pageApi.codeharborFocusTerminal;
             }
             if (pageApi.codeharborTerminalDiagnostics === terminalDiagnostics) {
                 delete pageApi.codeharborTerminalDiagnostics;

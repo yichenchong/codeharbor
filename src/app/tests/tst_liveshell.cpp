@@ -312,12 +312,11 @@ private:
     QString m_configHome;
     QString m_rpcCommand;
 
-    // Unique per run: the workspace database is shared with whatever else uses
-    // this host, and every row carries a server_id (SPEC 3.5). Scoping the run
-    // to its own serverId keeps it invisible to (and isolated from) real data,
-    // and makes cleanupTestCase's "delete every group of this serverId" exact.
+    // Unique per run: every row created below is recorded by its server id.
+    // Cleanup never sweeps by a test-shaped name or by a broad server query.
     QString m_serverId;
     QString m_prefix;
+    QStringList m_createdGroupIds;
 
     // Latest AppController::error message, cleared before each operation that
     // is expected to succeed so a server-side failure fails fast and verbatim.
@@ -433,25 +432,25 @@ void TstLiveShell::initTestCase()
 
 void TstLiveShell::cleanupTestCase()
 {
-    // Remove everything this run created: deleteGroup cascades its sessions.
-    if (m_client.transport() != nullptr && !m_serverId.isEmpty()) {
-        m_freshView.reset();
-        RawRpc listed;
-        if (listed.call(m_client, QStringLiteral("workspace.list"),
-                        {{QStringLiteral("serverId"), m_serverId}})) {
-            const QJsonArray groups = listed.result.toArray();
-            for (const QJsonValue& group : groups) {
+    QStringList cleanupFailures;
+    if (!m_createdGroupIds.isEmpty()) {
+        if (m_client.transport() == nullptr) {
+            cleanupFailures
+                << QStringLiteral("SSH transport is down; groups not deleted: %1")
+                       .arg(m_createdGroupIds.join(QStringLiteral(", ")));
+        } else {
+            m_freshView.reset();
+            for (const QString& groupId : m_createdGroupIds) {
                 RawRpc removed;
-                removed.call(m_client, QStringLiteral("workspace.deleteGroup"),
-                             {{QStringLiteral("id"),
-                               group.toObject().value(QStringLiteral("id")).toString()}});
+                if (!removed.call(m_client, QStringLiteral("workspace.deleteGroup"),
+                                  {{QStringLiteral("id"), groupId}})) {
+                    cleanupFailures
+                        << QStringLiteral("group %1: %2")
+                               .arg(groupId,
+                                    removed.diagnostic(
+                                        QStringLiteral("workspace.deleteGroup")));
+                }
             }
-        }
-        RawRpc verify;
-        if (verify.call(m_client, QStringLiteral("workspace.list"),
-                        {{QStringLiteral("serverId"), m_serverId}})) {
-            qInfo() << "cleanup: rows left for" << m_serverId << "="
-                    << verify.result.toArray().size();
         }
     }
 
@@ -459,6 +458,11 @@ void TstLiveShell::cleanupTestCase()
     m_controller.reset();
     m_bootstrap.reset();
     m_pool.disconnectFromHost();
+
+    QVERIFY2(cleanupFailures.isEmpty(),
+             qPrintable(QStringLiteral(
+                            "live workspace cleanup failed; rows may remain: %1")
+                            .arg(cleanupFailures.join(QStringLiteral(" | ")))));
 }
 
 bool TstLiveShell::waitForRefresh(int previousCount, int timeoutMs)
@@ -509,6 +513,7 @@ void TstLiveShell::liveReadPathPopulatesSidebar()
              qPrintable(alpha.diagnostic(QStringLiteral("createGroup"))));
     m_alphaGroupId = alpha.result.toObject().value(QStringLiteral("id")).toString();
     QVERIFY(!m_alphaGroupId.isEmpty());
+    m_createdGroupIds << m_alphaGroupId;
 
     RawRpc beta;
     QVERIFY2(beta.call(m_client, QStringLiteral("workspace.createGroup"),
@@ -517,6 +522,7 @@ void TstLiveShell::liveReadPathPopulatesSidebar()
                         {QStringLiteral("collapsed"), true}}),
              qPrintable(beta.diagnostic(QStringLiteral("createGroup"))));
     m_betaGroupId = beta.result.toObject().value(QStringLiteral("id")).toString();
+    m_createdGroupIds << m_betaGroupId;
 
     RawRpc one;
     QVERIFY2(one.call(m_client, QStringLiteral("workspace.createSession"),
@@ -613,6 +619,7 @@ void TstLiveShell::liveCrudRoundTripPersistsServerSide()
     const QString crudGroupId =
         model->data(model->index(crudRow, 0), SessionsModel::IdRole).toString();
     QVERIFY(!crudGroupId.isEmpty());
+    m_createdGroupIds << crudGroupId;
 
     // --- createSession ------------------------------------------------------
     const QString serviceName = m_prefix + QStringLiteral("-svc");

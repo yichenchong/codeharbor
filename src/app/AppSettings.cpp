@@ -1,8 +1,10 @@
 #include "AppSettings.h"
 
+#include "ViewerKinds.h"
+
+#include <QMetaType>
 #include <QSet>
 #include <QSettings>
-
 #include <algorithm>
 
 namespace ch {
@@ -20,10 +22,11 @@ const QString kFontSizeKey =
     QStringLiteral("settings/appearance/terminalFontSize");
 const QString kPixelRatioKey =
     QStringLiteral("settings/appearance/terminalPixelRatio");
+const QString kViewerDefaultsGroup =
+    QStringLiteral("settings/viewerDefaults");
 
 const QString kDefaultTheme = QStringLiteral("dark");
 const QString kDefaultPalette = QStringLiteral("plain");
-
 // The set of names each choice preference accepts. A stored value outside the
 // set is a hand-edited file or a preference written by a NEWER build, and both
 // have the same right answer: fall back to the default rather than hand a
@@ -69,6 +72,63 @@ QStringList sanitiseOrder(const QStringList& order)
         seen.insert(id);
         clean.append(id);
     }
+    return clean;
+}
+
+// A stored key is stricter than a typed UI value: a leading dot is rejected
+// when it comes from the hand-editable file, while ViewerKinds accepts one for
+// the convenience setter used by the settings page.
+QString storedExtension(const QString& raw)
+{
+    const QString trimmed = raw.trimmed();
+    if (trimmed.startsWith(QLatin1Char('.')))
+        return {};
+    return ViewerKinds::normaliseExtension(trimmed);
+}
+
+bool isStringVariant(const QVariant& value)
+{
+    return value.isValid() && value.metaType().id() == QMetaType::QString;
+}
+
+QVariantMap sanitiseViewerDefaults(const QVariantMap& input)
+{
+    QVariantMap clean;
+    for (auto it = input.cbegin(); it != input.cend(); ++it) {
+        const QString extension = ViewerKinds::normaliseExtension(it.key());
+        if (extension.isEmpty() || !isStringVariant(it.value()))
+            continue;
+        const QString kind = it.value().toString();
+        if (!ViewerKinds::canAssign(extension, kind))
+            continue;
+        clean.insert(extension, kind);
+    }
+    return clean;
+}
+
+QVariantMap readViewerDefaults(QSettings& settings)
+{
+    QVariantMap clean;
+    settings.beginGroup(kViewerDefaultsGroup);
+    const QStringList keys = settings.childKeys();
+    for (const QString& rawKey : keys) {
+        const QString extension = storedExtension(rawKey);
+        if (extension.isEmpty())
+            continue;
+        const QVariant rawValue = settings.value(rawKey);
+        if (!isStringVariant(rawValue))
+            continue;
+        const QString kind = rawValue.toString();
+        if (!ViewerKinds::canAssign(extension, kind))
+            continue;
+
+        // If a hand-edited file contains both `MD` and `md`, prefer the
+        // canonical spelling regardless of QSettings' key ordering.
+        if (!clean.contains(extension)
+            || rawKey.trimmed() == extension)
+            clean.insert(extension, kind);
+    }
+    settings.endGroup();
     return clean;
 }
 
@@ -201,6 +261,63 @@ void AppSettings::setTerminalPixelRatio(qreal ratio)
     emit terminalPixelRatioChanged();
 }
 
+QVariantMap AppSettings::viewerDefaults() const
+{
+    return readViewerDefaults(*m_settings);
+}
+
+QHash<QString, QString> AppSettings::viewerDefaultKinds() const
+{
+    QHash<QString, QString> result;
+    const QVariantMap map = viewerDefaults();
+    for (auto it = map.cbegin(); it != map.cend(); ++it)
+        result.insert(it.key(), it.value().toString());
+    return result;
+}
+
+void AppSettings::setViewerDefaults(const QVariantMap& defaults)
+{
+    const QVariantMap clean = sanitiseViewerDefaults(defaults);
+    if (clean == viewerDefaults())
+        return;
+
+    m_settings->remove(kViewerDefaultsGroup);
+    for (auto it = clean.cbegin(); it != clean.cend(); ++it)
+        m_settings->setValue(kViewerDefaultsGroup + QLatin1Char('/') + it.key(),
+                             it.value());
+    emit viewerDefaultsChanged();
+}
+
+bool AppSettings::setViewerDefault(const QString& extension,
+                                   const QString& kind)
+{
+    const QString canonical = ViewerKinds::normaliseExtension(extension);
+    if (canonical.isEmpty() || !ViewerKinds::canAssign(canonical, kind))
+        return false;
+
+    QVariantMap next = viewerDefaults();
+    if (next.value(canonical).toString() == kind
+        && next.contains(canonical))
+        return true;
+    next.insert(canonical, kind);
+    setViewerDefaults(next);
+    return true;
+}
+
+bool AppSettings::clearViewerDefault(const QString& extension)
+{
+    const QString canonical = ViewerKinds::normaliseExtension(extension);
+    if (canonical.isEmpty())
+        return false;
+
+    QVariantMap next = viewerDefaults();
+    if (!next.contains(canonical))
+        return false;
+    next.remove(canonical);
+    setViewerDefaults(next);
+    return true;
+}
+
 QVariant AppSettings::value(const QString& group, const QString& key,
                             const QVariant& fallback) const
 {
@@ -238,6 +355,7 @@ void AppSettings::resetToDefaults()
     const QStringList toolbar = toolbarOrder();
     const int fontSize = terminalFontSize();
     const qreal pixelRatio = terminalPixelRatio();
+    const QVariantMap viewerDefaults = this->viewerDefaults();
 
     // The whole subtree, so the generic groups go too. Anything outside
     // `settings/` (UiStateStore's own keys share this file) is untouched.
@@ -255,6 +373,8 @@ void AppSettings::resetToDefaults()
         emit terminalFontSizeChanged();
     if (!qFuzzyCompare(pixelRatio + 1.0, terminalPixelRatio() + 1.0))
         emit terminalPixelRatioChanged();
+    if (!viewerDefaults.isEmpty() && this->viewerDefaults().isEmpty())
+        emit viewerDefaultsChanged();
     // Generic pairs have no per-key record of what existed, so one blanket
     // notification with empty names says "re-read everything".
     emit settingChanged(QString(), QString());

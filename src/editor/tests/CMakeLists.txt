@@ -64,6 +64,8 @@ set_tests_properties(tst_liveeditor PROPERTIES
     ENVIRONMENT "${CODEHARBOR_LIVE_EDITOR_TEST_ENV}"
     TIMEOUT 900
 )
+set_tests_properties(tst_liveeditor PROPERTIES
+    FIXTURES_REQUIRED codeharbor_live_fixture)
 
 # LIVE gate for an OPEN EDITOR across a dropped-and-restored SSH session
 # (SPEC 5.6 + 8.7). file.watch subscriptions live inside the codeharbord
@@ -95,6 +97,8 @@ set_tests_properties(tst_liveeditorreconnect PROPERTIES
     LABELS live
     TIMEOUT 600
 )
+set_tests_properties(tst_liveeditorreconnect PROPERTIES
+    FIXTURES_REQUIRED codeharbor_live_fixture)
 
 # Console-mode on Windows, for the same reason as src/app/tests: qt_add_executable
 # marks executables as GUI subsystem, which on Windows swallows QTest's stdout and

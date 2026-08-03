@@ -70,6 +70,14 @@ Rectangle {
         renameDialog.open()
     }
 
+    function beginKill() {
+        // The request is emitted only after the user accepts the confirmation,
+        // but activation still happens first so the host records this pane as
+        // the source of the destructive action.
+        pane.paneActivated(pane.paneId)
+        killDialog.open()
+    }
+
     function commitRename(value) {
         const title = pane.normalizeCustomTitle(value)
         // Update the live pane before the persistence request: the user should
@@ -146,12 +154,12 @@ Rectangle {
     // a pane cannot see its siblings.
     property bool paneActive: false
 
-    // The user asked to close this pane, from its own header. Closing a pane is
-    // a LAYOUT change (SessionLayouts::closePane collapses the parent branch),
-    // which only the host can make, so the pane asks rather than acts. The region
-    // relays it as `closePaneRequested`. Note this is NOT killSession(): closing
-    // a pane deliberately leaves the remote tmux session running.
+    // Pane-header requests carry this pane's id all the way to Main.qml. Closing
+    // leaves the remote session running; killing is separate and confirmed
+    // below because it ends the remote tmux session and its processes.
+    signal splitRequested(string paneId, string orientation)
     signal closeRequested(string paneId)
+    signal killRequested(string paneId)
 
     // The host persists the proposed title in SessionLayouts. The pane also
     // applies the normalized value locally so the header changes before the
@@ -172,6 +180,12 @@ Rectangle {
     // headless QML shell used by tests, where no application context exists.
     property var settingsObject: (typeof app !== "undefined" && app && app.settings)
                                  ? app.settings : null
+
+    // A restore may arrive before the xterm page has mounted. Keep the request
+    // until the page is ready, but cancel it when the region gives focus to a
+    // different pane so a late load cannot fight the user's click.
+    property bool focusPending: false
+    onPaneActiveChanged: if (!pane.paneActive) pane.focusPending = false
 
 
     // Per-pane C++ objects, owned by this pane (destroyed with it).
@@ -580,20 +594,49 @@ Rectangle {
 
         actions: [
             AppPaneHeader.Action {
+                objectName: "terminalSplitHorizontalButton"
+                toolbarId: "pane.split.horizontal"
+                text: qsTr("Split this pane side by side")
+                glyph: "\u25eb"
+                onClicked: {
+                    pane.paneActivated(pane.paneId)
+                    pane.splitRequested(pane.paneId, "horizontal")
+                }
+            },
+            AppPaneHeader.Action {
+                objectName: "terminalSplitVerticalButton"
+                toolbarId: "pane.split.vertical"
+                text: qsTr("Split this pane top and bottom")
+                glyph: "\u229f"
+                onClicked: {
+                    pane.paneActivated(pane.paneId)
+                    pane.splitRequested(pane.paneId, "vertical")
+                }
+            },
+            AppPaneHeader.Action {
+                objectName: "terminalCloseButton"
+                toolbarId: "pane.close"
                 text: qsTr("Close this pane")
                 glyph: "\u00d7"
                 onClicked: {
-                    // Report focus first: the host closes the pane the user is
-                    // in, so this pane has to BE that pane by the time the
-                    // request arrives.
+                    // Activation precedes the request so this pane's id, not a
+                    // remembered fallback, is the one the host closes.
                     pane.paneActivated(pane.paneId)
                     pane.closeRequested(pane.paneId)
                 }
             },
             AppPaneHeader.Action {
+                objectName: "terminalRenameButton"
                 text: qsTr("Rename this pane")
                 glyph: "R"
                 onClicked: pane.beginRename()
+            },
+            AppPaneHeader.Action {
+                objectName: "terminalKillButton"
+                toolbarId: "terminal.kill"
+                text: qsTr("Kill this terminal's remote session")
+                glyph: "\u2620"
+                onClicked: pane.beginKill()
             }
         ]
     }
@@ -629,6 +672,61 @@ Rectangle {
         onAccepted: pane.commitRename(renameField.text)
     }
 
+    // Killing is deliberately confirmed here, at the pane that owns the
+    // destructive action. Declining or dismissing the dialog emits no request.
+    AppDialog {
+        id: killDialog
+        objectName: "terminalPaneKillDialog"
+        title: qsTr("Kill terminal session")
+        modal: true
+        standardButtons: Dialog.Ok | Dialog.Cancel
+        anchors.centerIn: Overlay.overlay
+        width: 400
+
+        ColumnLayout {
+            implicitWidth: 360
+
+            Label {
+                objectName: "terminalPaneKillMessage"
+                Layout.fillWidth: true
+                textFormat: Text.PlainText
+                wrapMode: Text.WordWrap
+                text: qsTr("Kill the remote tmux session for \"%1\"? Running processes will be lost.")
+                      .arg(pane.customTitle.length > 0
+                           ? pane.customTitle
+                           : (pane.terminalId.length > 0
+                              ? pane.terminalId : qsTr("this terminal")))
+            }
+        }
+
+        onAccepted: pane.killRequested(pane.paneId)
+    }
+
+
+    // ---- keyboard focus handoff --------------------------------------------
+
+    // The xterm page owns keyboard focus inside Chromium. QML focus on this
+    // rectangle only changes the shell's bookkeeping, so the explicit web
+    // entrypoint below calls xterm.js' own focus method.
+    function acceptFocus() {
+        pane.focusPending = true;
+        pane.forceActiveFocus();
+        pane.focusTerminalPage();
+    }
+
+    function focusTerminalPage() {
+        if (!pane.focusPending || !pane.paneActive
+                || !pane.pageLoaded || !viewLoader.item)
+            return;
+        viewLoader.item.runJavaScript(
+            "(function () {"
+          + "if (typeof window.codeharborFocusTerminal === 'function') "
+          + "window.codeharborFocusTerminal();"
+          + "})()");
+        pane.focusPending = false;
+    }
+
+    // ---- keyboard focus handoff --------------------------------------------
 
     // Push the two client-local terminal preferences into the trusted page.
     // WebEngineView is a separate JavaScript world from QML, so a direct
@@ -758,6 +856,7 @@ Rectangle {
                         pane.pageLoaded = true
                         Qt.callLater(pane.applyTerminalTheme)
                         Qt.callLater(pane.applyTerminalSettings)
+                        Qt.callLater(pane.focusTerminalPage)
                     } else if (request.status === WebEngineView.LoadFailedStatus) {
                         pane.pageLoaded = false
                         pane.statusText = qsTr("The terminal renderer failed to load: %1")

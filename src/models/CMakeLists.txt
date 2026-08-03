@@ -10,6 +10,8 @@ qt_add_library(ch_models STATIC
     SessionsModel.cpp
     GroupPalette.h
     GroupPalette.cpp
+    ViewerKinds.h
+    ViewerKinds.cpp
 )
 
 target_include_directories(ch_models PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})

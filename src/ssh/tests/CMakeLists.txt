@@ -73,6 +73,8 @@ target_link_libraries(tst_livessh PRIVATE
 
 add_test(NAME tst_livessh COMMAND tst_livessh)
 set_tests_properties(tst_livessh PROPERTIES LABELS live)
+set_tests_properties(tst_livessh PROPERTIES
+    FIXTURES_REQUIRED codeharbor_live_fixture)
 
 # Console-mode on Windows, for the same reason as src/app/tests: qt_add_executable
 # marks executables as GUI subsystem, which on Windows swallows QTest's stdout and

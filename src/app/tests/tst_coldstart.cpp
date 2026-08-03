@@ -540,6 +540,7 @@ void TstColdStart::cleanupTestCase()
     if (!m_graph)
         return;
 
+    QString cleanupFailure;
     // Everything this run created goes away, and the remote is asked whether it
     // did. Terminal panes first: the tmux session outlives the client on
     // purpose, so nothing else would ever reap it.
@@ -579,12 +580,31 @@ void TstColdStart::cleanupTestCase()
         }
         if (!m_groupId.isEmpty()) {
             RawRpc removed;
-            removed.call(m_graph->client, QStringLiteral("workspace.deleteGroup"),
-                         {{QStringLiteral("id"), m_groupId}});
+            if (!removed.call(m_graph->client, QStringLiteral("workspace.deleteGroup"),
+                              {{QStringLiteral("id"), m_groupId}})) {
+                QString detail;
+                if (!removed.done) {
+                    detail = QStringLiteral("no response within timeout");
+                } else if (removed.error) {
+                    detail = QStringLiteral("rpc error %1 %2")
+                                 .arg(removed.error->code)
+                                 .arg(removed.error->message);
+                } else {
+                    detail = QStringLiteral("unknown cleanup failure");
+                }
+                cleanupFailure =
+                    QStringLiteral("cleanup failed deleting group %1: %2")
+                        .arg(m_groupId, detail);
+            }
         }
+    } else if (!m_groupId.isEmpty()) {
+        cleanupFailure = QStringLiteral(
+                             "cleanup could not delete group %1: SSH transport is down")
+                             .arg(m_groupId);
     }
 
     m_graph.reset();
+    QVERIFY2(cleanupFailure.isEmpty(), qPrintable(cleanupFailure));
 }
 
 void TstColdStart::buildGraph()

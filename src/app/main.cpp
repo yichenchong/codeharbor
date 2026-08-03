@@ -72,6 +72,14 @@ int main(int argc, char *argv[])
     ch::ViewerProfiles profiles(&client);
     ch::ViewerModel viewers(&client);
     viewers.setProfiles(&profiles);
+    // ch_viewers deliberately does not link ch_app; push the validated,
+    // client-local preference across that library boundary here.
+    viewers.setDefaultKinds(appController.settings()->viewerDefaultKinds());
+    QObject::connect(appController.settings(), &ch::AppSettings::viewerDefaultsChanged,
+                     &viewers, [&appController, &viewers]() {
+                         viewers.setDefaultKinds(
+                             appController.settings()->viewerDefaultKinds());
+                     });
 
     // Connection spine the UI drives: stored server profiles (client-local, the
     // only way to reach a server before one is reachable) and the per-session

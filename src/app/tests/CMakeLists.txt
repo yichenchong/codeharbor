@@ -64,6 +64,8 @@ target_link_libraries(tst_sessionlayouts PRIVATE
 )
 add_test(NAME tst_sessionlayouts COMMAND tst_sessionlayouts)
 set_tests_properties(tst_sessionlayouts PROPERTIES LABELS live TIMEOUT 120)
+set_tests_properties(tst_sessionlayouts PROPERTIES
+    FIXTURES_REQUIRED codeharbor_live_fixture)
 
 # SessionBootstrap's connection-state machine and reconnect ladder (SPEC 5.6),
 # plus the bounded connect pre-flight and the GUI-responsiveness cases that
@@ -97,6 +99,8 @@ target_link_libraries(tst_livereconnect PRIVATE
 )
 add_test(NAME tst_livereconnect COMMAND tst_livereconnect)
 set_tests_properties(tst_livereconnect PROPERTIES LABELS live TIMEOUT 300)
+set_tests_properties(tst_livereconnect PROPERTIES
+    FIXTURES_REQUIRED codeharbor_live_fixture)
 
 # Notifier (a Phase 4 deliverable in SPEC 16; it has no section of its own).
 # tst_notifier forces a bus-less environment in its own main() so it exercises
@@ -198,6 +202,8 @@ set_tests_properties(tst_liveshell PROPERTIES
     ENVIRONMENT "QT_QPA_PLATFORM=offscreen;QT_QUICK_BACKEND=software;QTWEBENGINE_CHROMIUM_FLAGS=--disable-gpu --no-sandbox --disable-dev-shm-usage"
     TIMEOUT 300
 )
+set_tests_properties(tst_liveshell PROPERTIES
+    FIXTURES_REQUIRED codeharbor_live_fixture)
 
 # THE COLD-START ACCEPTANCE GATE (tst_coldstart.cpp): a fresh config dir, the
 # real qrc Main.qml on top of main.cpp's exact object graph, and the whole
@@ -241,6 +247,8 @@ set_tests_properties(tst_coldstart PROPERTIES
     ENVIRONMENT "QT_QPA_PLATFORM=offscreen;QT_QUICK_BACKEND=software;QTWEBENGINE_CHROMIUM_FLAGS=--disable-gpu --no-sandbox --disable-dev-shm-usage"
     TIMEOUT 900
 )
+set_tests_properties(tst_coldstart PROPERTIES
+    FIXTURES_REQUIRED codeharbor_live_fixture)
 
 # Bounded client/remote diagnostics: caps, handler chaining, filters and the
 # destruction race around Qt's process-wide message callback.

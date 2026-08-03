@@ -39,6 +39,7 @@ qt_add_qml_module(codeharbor_qml
         ViewerDirectoryView.qml
         ViewerBinaryView.qml
         EditorPaneView.qml
+        ViewerMarkdownView.qml
         CommandPalette.qml
         ConnectSheet.qml
         SettingsWindow.qml
@@ -136,7 +137,8 @@ function(codeharbor_embed_web_bundle)
     # edits to the files themselves. The staleness comparison underneath is
     # untouched — for a tree whose file set has not changed the glob yields
     # exactly the same list as before.
-    file(GLOB_RECURSE _chb_inputs CONFIGURE_DEPENDS ${_chb_src}/src/*.ts)
+    file(GLOB_RECURSE _chb_inputs CONFIGURE_DEPENDS
+         ${_chb_src}/src/*.ts ${_chb_src}/src/*.css)
     list(APPEND _chb_inputs
          ${_chb_src}/build.mjs
          ${_chb_src}/index.html
@@ -307,6 +309,16 @@ codeharbor_embed_web_bundle(
     LABEL "xterm.js terminal"
     PANE terminal
     FILES index.html terminal.js terminal.css
+)
+
+# The rendered Markdown page, loaded by ViewerMarkdownView.qml from
+# qrc:/codeharbor/web/markdown/index.html.
+codeharbor_embed_web_bundle(
+    DIR markdown
+    RESOURCE ch_markdown_bundle
+    LABEL "Markdown renderer"
+    PANE markdown
+    FILES index.html markdown.js markdown.css
 )
 
 if(CODEHARBOR_BUILD_TESTS)

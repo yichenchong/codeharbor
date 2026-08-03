@@ -161,6 +161,7 @@ Rectangle {
 
     function kindLabel(kind) {
         switch (kind) {
+        case "markdown": return qsTr("Markdown");
         case "editor": return qsTr("Editor");
         case "text": return qsTr("Text");
         case "image": return qsTr("Image");

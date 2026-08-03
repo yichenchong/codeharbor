@@ -76,6 +76,16 @@ ApplicationWindow {
         ratios: [0.5, 0.5]
     })
 
+    // A layout load is asynchronous. Keep the restore tied to both the Dev
+    // Session id and SessionLayouts generation so an answer for a session the
+    // user already left can never focus a same-named pane in the new session.
+    property string focusRestoreSessionId: ""
+    property double focusRestoreGeneration: 0
+    property int focusRestoreViewerSerial: 0
+    property int focusRestoreTerminalSerial: 0
+    property int focusRestoreAttempts: 0
+    property bool focusRestoreArmed: false
+
     // Point the terminal region at the active Dev Session, WORKING DIRECTORY
     // FIRST.
     //
@@ -89,16 +99,144 @@ ApplicationWindow {
     // Writing both here, in order, makes the pane see the directory before the id
     // it attaches on. (The pane-side fix, adopting a late working directory, is
     // TerminalPaneView's; this removes the race from the host regardless.)
+
+    function focusRestoreStampCurrent() {
+        return window.focusRestoreArmed
+            && window.focusRestoreSessionId.length > 0
+            && String(app.activeSessionId) === window.focusRestoreSessionId
+            && app.layouts
+            && Number(app.layouts.generation) === window.focusRestoreGeneration;
+    }
+
+    function scheduleFocusRestore() {
+        if (!window.focusRestoreArmed || focusRestoreTimer.running)
+            return;
+        focusRestoreTimer.start();
+    }
+
+    function armFocusRestore() {
+        focusRestoreTimer.stop();
+        window.focusRestoreArmed = false;
+        window.focusRestoreSessionId = String(app.activeSessionId || "");
+        if (window.focusRestoreSessionId.length === 0 || !app.layouts)
+            return;
+        window.focusRestoreGeneration = Number(app.layouts.generation);
+        window.focusRestoreViewerSerial = Number(viewerRegion.userFocusSerial);
+        window.focusRestoreTerminalSerial = Number(terminalRegion.userFocusSerial);
+        window.focusRestoreAttempts = 0;
+        window.focusRestoreArmed = true;
+        if (app.layouts.viewerTree && app.layouts.terminalTree)
+            window.scheduleFocusRestore();
+    }
+
+    function tryRestoreFocus() {
+        if (!window.focusRestoreArmed)
+            return;
+        if (!window.focusRestoreStampCurrent()) {
+            window.focusRestoreArmed = false;
+            return;
+        }
+        // A click while the layout was loading is newer than the remembered
+        // pane. Drop this restore instead of moving the keyboard away from it.
+        if (Number(viewerRegion.userFocusSerial) !== window.focusRestoreViewerSerial
+                || Number(terminalRegion.userFocusSerial)
+                   !== window.focusRestoreTerminalSerial) {
+            window.focusRestoreArmed = false;
+            return;
+        }
+        const viewerTree = app.layouts.viewerTree;
+        const terminalTree = app.layouts.terminalTree;
+        // Main.qml's fallback panes are deliberately visible while the two
+        // server reads are in flight. They are not the authoritative trees,
+        // so wait for both before restoring.
+        if (!viewerTree || !terminalTree)
+            return;
+
+        const remembered = app.uiState.selectedPane(window.focusRestoreSessionId);
+        let targetRegion = "viewer";
+        let targetPane = "";
+        // Determine the region by tree membership, not by the current
+        // "<region>-N" spelling. SplitNode accepts persisted pane labels, and
+        // the tree is the existing guarantee that an id belongs to a region.
+        if (remembered.length > 0 && window.treeHasPane(viewerTree, remembered)) {
+            targetRegion = "viewer";
+            targetPane = remembered;
+        } else if (remembered.length > 0
+                   && window.treeHasPane(terminalTree, remembered)) {
+            targetRegion = "terminal";
+            targetPane = remembered;
+        } else {
+            // The remembered pane was closed or the setting is empty. The
+            // accepted fallback is the first viewer pane, silently.
+            targetRegion = "viewer";
+            targetPane = window.firstPaneId(viewerTree, "viewer-1");
+        }
+
+        const target = targetRegion === "viewer" ? viewerRegion : terminalRegion;
+        if (!target.focusPane(targetPane)) {
+            // Recursive Loader delegates can materialise one turn after the
+            // `loaded` signal. Retry without changing the remembered choice.
+            window.focusRestoreAttempts += 1;
+            if (window.focusRestoreAttempts < 200)
+                window.scheduleFocusRestore();
+            else
+                window.focusRestoreArmed = false;
+            return;
+        }
+        // focusPane() is synchronous, but check the stamp and user serials
+        // again before recording a fallback. A user event cannot be allowed to
+        // be overwritten by this final bookkeeping step.
+        if (!window.focusRestoreStampCurrent()
+                || Number(viewerRegion.userFocusSerial) !== window.focusRestoreViewerSerial
+                || Number(terminalRegion.userFocusSerial)
+                   !== window.focusRestoreTerminalSerial) {
+            window.focusRestoreArmed = false;
+            return;
+        }
+        app.uiState.setSelectedPane(window.focusRestoreSessionId, targetPane);
+        window.focusRestoreArmed = false;
+    }
+
+    function handleLayoutsLoaded(sessionId) {
+        if (!window.focusRestoreArmed
+                || String(sessionId) !== window.focusRestoreSessionId
+                || !window.focusRestoreStampCurrent())
+            return;
+        window.scheduleFocusRestore();
+    }
     function retargetTerminals() {
         terminalRegion.workingDir = app.activeSessionRepoRoot;
         terminalRegion.devSessionId = app.activeSessionId;
     }
 
-    Component.onCompleted: window.retargetTerminals()
+    Component.onCompleted: {
+        window.retargetTerminals();
+        window.armFocusRestore();
+    }
 
     Connections {
         target: app
-        function onActiveSessionChanged() { window.retargetTerminals(); }
+        function onActiveSessionChanged() {
+            window.retargetTerminals();
+            window.armFocusRestore();
+        }
+    }
+
+    Timer {
+        id: focusRestoreTimer
+        interval: 0
+        repeat: false
+        onTriggered: window.tryRestoreFocus()
+    }
+
+    Connections {
+        target: app.layouts
+        enabled: app.layouts !== null
+        function onLoaded(sessionId) {
+            window.handleLayoutsLoaded(sessionId);
+        }
+        function onViewerTreeChanged() { window.scheduleFocusRestore(); }
+        function onTerminalTreeChanged() { window.scheduleFocusRestore(); }
     }
 
     // Persist the current region widths. viewer is the fill region (0 = fill),
@@ -212,17 +350,15 @@ ApplicationWindow {
             hostStampsWrites: true
             SplitView.fillWidth: true
             SplitView.minimumWidth: 320
-            // The region header's own split/close buttons, and every pane's
-            // header close button, arrive here: a region cannot publish a tree,
-            // so it raises a REQUEST and the host runs the same command the
-            // palette does. Without these handlers those buttons are drawn,
-            // hovered, pressed — and do nothing at all.
-            onSplitRequested: (orientation) => window.splitActivePane("viewer", orientation)
+            // Every pane header names its own target. The host runs the same
+            // layout operations as the command palette, but receives the pane
+            // id instead of resolving a remembered/fallback pane.
+            onSplitRequested: (paneId, orientation) =>
+                window.splitActivePane("viewer", orientation, paneId)
             onClosePaneRequested: (paneId) => window.closeRequestedPane("viewer", paneId)
-            // A divider INSIDE the region was dragged. Persisted per Dev Session
-            onSplitRequestedForSession: (sessionId, generation, orientation) =>
+            onSplitRequestedForSession: (sessionId, generation, paneId, orientation) =>
                 window.splitActivePaneForSession("viewer", sessionId,
-                                                 generation, orientation)
+                                                 generation, orientation, paneId)
             onClosePaneRequestedForSession: (sessionId, generation, paneId) =>
                 window.closeRequestedPaneForSession("viewer", sessionId,
                                                     generation, paneId)
@@ -243,7 +379,8 @@ ApplicationWindow {
             // leaf. The empty value is deliberately NOT filtered: a focused pane
             // that was closed must clear the selection rather than leave a
             // command pointing at a pane that no longer exists.
-            onFocusedPaneIdChanged: if (app.activeSessionId.length > 0)
+            onFocusedPaneIdChanged: if (!viewerRegion.focusResetting
+                                        && app.activeSessionId.length > 0)
                                         app.uiState.setSelectedPane(app.activeSessionId,
                                                                     focusedPaneId)
             // Persist WHAT a pane is showing, so reopening a Dev Session restores
@@ -275,14 +412,16 @@ ApplicationWindow {
             hostStampsWrites: true
             SplitView.preferredWidth: 520
             SplitView.minimumWidth: 280
-            onFocusedPaneIdChanged: if (app.activeSessionId.length > 0)
+            onFocusedPaneIdChanged: if (!terminalRegion.focusResetting
+                                        && app.activeSessionId.length > 0)
                                         app.uiState.setSelectedPane(app.activeSessionId,
                                                                     focusedPaneId)
-            onSplitRequested: (orientation) => window.splitActivePane("terminal", orientation)
+            onSplitRequested: (paneId, orientation) =>
+                window.splitActivePane("terminal", orientation, paneId)
             onClosePaneRequested: (paneId) => window.closeRequestedPane("terminal", paneId)
-            onSplitRequestedForSession: (sessionId, generation, orientation) =>
+            onSplitRequestedForSession: (sessionId, generation, paneId, orientation) =>
                 window.splitActivePaneForSession("terminal", sessionId,
-                                                 generation, orientation)
+                                                 generation, orientation, paneId)
             onClosePaneRequestedForSession: (sessionId, generation, paneId) =>
                 window.closeRequestedPaneForSession("terminal", sessionId,
                                                     generation, paneId)
@@ -294,8 +433,11 @@ ApplicationWindow {
             onPaneTitleReportedForSession: (sessionId, generation, paneId, title) =>
                 app.layouts.setPaneTitleForSession(sessionId, generation,
                                                    "terminal", paneId, title)
-            // Destructive, and the only route to it besides the palette command.
-            onKillTerminalRequested: window.killActiveTerminal()
+            // The pane asks only after its AppDialog confirmation. The stamped
+            // path also rejects a callback from an old session or layout.
+            onKillTerminalRequested: (paneId) => window.killActiveTerminal(paneId)
+            onKillTerminalRequestedForSession: (sessionId, generation, paneId) =>
+                window.killActiveTerminalForSession(sessionId, generation, paneId)
             onSplitRatiosAdjusted: (pathIndexes, ratios) =>
                 window.persistSplitRatios("terminal", pathIndexes, ratios)
             // Persist the display title without republishing the tree: the
@@ -665,11 +807,14 @@ ApplicationWindow {
     // Stamped region callbacks are the production path. C++ drops a callback
     // whose session or generation no longer matches, before it can target a
     // same-named pane in the newly selected session.
-    function splitActivePaneForSession(region, sessionId, generation, orientation) {
+    function splitActivePaneForSession(region, sessionId, generation, orientation,
+                                       paneId) {
         if (!app.layouts || String(sessionId).length === 0)
             return;
+        const target = paneId === undefined
+                     ? window.targetPaneId(region) : paneId;
         app.layouts.splitPaneForSession(sessionId, generation, region,
-                                        window.targetPaneId(region), orientation);
+                                        target, orientation);
     }
 
     function closeActivePaneForSession(region, sessionId, generation) {
@@ -705,19 +850,17 @@ ApplicationWindow {
     }
 
 
-    function splitActivePane(region, orientation) {
+    // Palette commands call this without a pane id and therefore retain the
+    // remembered-pane/first-leaf target resolution. Pane headers pass their id
+    // explicitly, so no fallback lookup can redirect the request.
+    function splitActivePane(region, orientation, paneId) {
         if (!app.layouts || app.activeSessionId.length === 0) {
             window.notifyUser(qsTr("Select a Dev Session before splitting a pane."));
             return;
         }
-        // Pane focus IS tracked now: each region reports the pane the user last
-        // clicked (ViewerRegion/TerminalRegion.focusedPaneId), and the handlers on
-        // those regions record it via UiStateStore.setSelectedPane, so
-        // targetPaneId()'s selected-pane branch is live and a split lands on the
-        // pane the user was working in. Detection is click-based: focus moved
-        // purely by keyboard does not report, so a future "focus next pane"
-        // command must tell the region directly rather than rely on this.
-        app.layouts.splitPane(region, window.targetPaneId(region), orientation);
+        const target = paneId === undefined
+                     ? window.targetPaneId(region) : paneId;
+        app.layouts.splitPane(region, target, orientation);
     }
 
     // Close the pane the user last worked in. SessionLayouts collapses the parent
@@ -761,26 +904,25 @@ ApplicationWindow {
         app.layouts.setRatios(region, pathIndexes, ratios);
     }
 
-    // End the focused terminal's REMOTE tmux session. Closing or detaching a pane
-    // deliberately leaves the remote shell running - that is what tmux is for - so
-    // this is the only way to actually stop it, and it is destructive.
-    function killActiveTerminal() {
+    // End a terminal pane's REMOTE tmux session. Pane headers pass their own
+    // pane id; the command palette calls this without one and keeps its
+    // remembered-pane/first-leaf resolution.
+    function killActiveTerminal(requestedPaneId) {
         if (app.activeSessionId.length === 0) {
             window.notifyUser(qsTr("No active Dev Session."));
             return;
         }
-        const paneId = window.targetPaneId("terminal");
+        const paneId = requestedPaneId === undefined
+                     ? window.targetPaneId("terminal") : requestedPaneId;
         const pane = terminalRegion.paneCache ? terminalRegion.paneCache[paneId] : null;
         if (!pane) {
             window.notifyUser(qsTr("No live terminal pane to kill."));
             return;
         }
         // killSession() reports whether the kill actually reached the server: it
-        // deliberately refuses (and keeps the remote session alive) when there is
-        // no SSH connection, so announcing success unconditionally — which this
-        // used to do — told the user their processes were gone while they were
-        // still running. The pane's own sentence is the better message in that
-        // case, because it names the session that survived.
+        // deliberately refuses (and keeps the remote session alive) when there
+        // is no SSH connection, so announcing success unconditionally would
+        // tell the user their processes were gone while they were still running.
         if (pane.killSession()) {
             window.notifyUser(qsTr("Killed the remote tmux session for \"%1\".").arg(paneId));
         } else {
@@ -788,6 +930,17 @@ ApplicationWindow {
                               ? pane.statusText
                               : qsTr("Could not kill the remote session for \"%1\".").arg(paneId));
         }
+    }
+
+    // A pane callback carries the session and layout generation it belonged to.
+    // Kill has no SessionLayouts write method of its own, so reject stale stamps
+    // here before looking up a possibly same-named pane in the live cache.
+    function killActiveTerminalForSession(sessionId, generation, paneId) {
+        if (!app.layouts || String(sessionId).length === 0
+                || String(sessionId) !== String(app.activeSessionId)
+                || Number(generation) !== Number(app.layouts.generation))
+            return;
+        window.killActiveTerminal(paneId);
     }
 
     readonly property var paletteCommands: [

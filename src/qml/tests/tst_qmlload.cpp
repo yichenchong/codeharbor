@@ -824,17 +824,10 @@ void TstQmlLoad::regionLeafNodeProducesSinglePane()
     QVERIFY2(fixture.allWarnings().isEmpty(), qPrintable(fixture.warningReport()));
 }
 
-// A region draws the pane commands (split, close, and for terminals "Kill") in
-// its own header, and every pane draws a close button in its per-pane header.
-// None of them can DO anything: a region cannot publish a split tree, so each
-// one raises a request and the host — Main.qml, which owns ch::SessionLayouts —
-// carries it out. If the host is not listening, all of those buttons still draw,
-// still hover and still animate their press, and nothing whatsoever happens.
-// That is invisible to every other test here, because the tree is structurally
-// perfect either way.
-//
-// Driven by emitting the region's own signals (invoking a signal through the
-// meta-object emits it), which is exactly what the header buttons do.
+// Every pane header owns its split, close and terminal-kill requests. The
+// region relays them to Main.qml, which owns ch::SessionLayouts and the terminal
+// cache. Driven by emitting the region's own signals (invoking a signal through
+// the meta-object emits it), which is exactly what the pane header relay does.
 //
 // With no Dev Session loaded — this fixture has no transport, so there is none —
 // each command's FIRST act is to refuse and say why in the shell's toast. That
@@ -857,29 +850,38 @@ void TstQmlLoad::regionRequestsReachTheHost()
     struct Case {
         QObject *region;
         const char *signalName;
-        QVariant argument;   // invalid = no argument
+        QString paneId;
+        QString orientation;
+        bool hasOrientation;
         const char *expected;
         const char *what;
     };
     const Case cases[] = {
-        {viewerRegion, "splitRequested", QStringLiteral("horizontal"),
+        {viewerRegion, "splitRequested", QStringLiteral("viewer-2"),
+         QStringLiteral("horizontal"), true,
          "Select a Dev Session before splitting a pane.", "viewer split"},
-        {viewerRegion, "closePaneRequested", QString(),
+        {viewerRegion, "closePaneRequested", QStringLiteral("viewer-2"),
+         QString(), false,
          "Select a Dev Session before closing a pane.", "viewer close"},
-        {terminalRegion, "splitRequested", QStringLiteral("vertical"),
+        {terminalRegion, "splitRequested", QStringLiteral("terminal-2"),
+         QStringLiteral("vertical"), true,
          "Select a Dev Session before splitting a pane.", "terminal split"},
-        {terminalRegion, "closePaneRequested", QStringLiteral("terminal-1"),
+        {terminalRegion, "closePaneRequested", QStringLiteral("terminal-2"),
+         QString(), false,
          "Select a Dev Session before closing a pane.", "terminal close"},
-        {terminalRegion, "killTerminalRequested", QVariant(),
+        {terminalRegion, "killTerminalRequested", QStringLiteral("terminal-2"),
+         QString(), false,
          "No active Dev Session.", "terminal kill"},
     };
 
     for (const Case &testCase : cases) {
         toast->setProperty("text", QString());
-        const bool emitted = testCase.argument.isValid()
+        const bool emitted = testCase.hasOrientation
                 ? QMetaObject::invokeMethod(testCase.region, testCase.signalName,
-                                            Q_ARG(QString, testCase.argument.toString()))
-                : QMetaObject::invokeMethod(testCase.region, testCase.signalName);
+                                            Q_ARG(QString, testCase.paneId),
+                                            Q_ARG(QString, testCase.orientation))
+                : QMetaObject::invokeMethod(testCase.region, testCase.signalName,
+                                            Q_ARG(QString, testCase.paneId));
         QVERIFY2(emitted, qPrintable(QStringLiteral("no %1 signal to emit for the %2 request")
                                          .arg(QLatin1String(testCase.signalName),
                                               QLatin1String(testCase.what))));
@@ -891,6 +893,39 @@ void TstQmlLoad::regionRequestsReachTheHost()
                                      toast->property("text").toString(),
                                      QLatin1String(testCase.expected))));
     }
+
+    // Stamped requests must preserve the pane id alongside the session and
+    // layout generation. This catches a handler that still resolves a target
+    // through targetPaneId() or silently drops the new argument.
+    QSignalSpy splitStamped(
+        viewerRegion, SIGNAL(splitRequestedForSession(QString, double, QString, QString)));
+    QVERIFY2(splitStamped.isValid(), "viewer split stamp signal is missing");
+    QVERIFY(QMetaObject::invokeMethod(
+        viewerRegion, "splitRequestedForSession",
+        Q_ARG(QString, QStringLiteral("dev-session-7")),
+        Q_ARG(double, 42.0),
+        Q_ARG(QString, QStringLiteral("viewer-2")),
+        Q_ARG(QString, QStringLiteral("vertical"))));
+    QCOMPARE(splitStamped.size(), 1);
+    const QList<QVariant> splitStamp = splitStamped.constFirst();
+    QCOMPARE(splitStamp.at(0).toString(), QStringLiteral("dev-session-7"));
+    QCOMPARE(splitStamp.at(1).toDouble(), 42.0);
+    QCOMPARE(splitStamp.at(2).toString(), QStringLiteral("viewer-2"));
+    QCOMPARE(splitStamp.at(3).toString(), QStringLiteral("vertical"));
+
+    QSignalSpy killStamped(
+        terminalRegion, SIGNAL(killTerminalRequestedForSession(QString, double, QString)));
+    QVERIFY2(killStamped.isValid(), "terminal kill stamp signal is missing");
+    QVERIFY(QMetaObject::invokeMethod(
+        terminalRegion, "killTerminalRequestedForSession",
+        Q_ARG(QString, QStringLiteral("dev-session-8")),
+        Q_ARG(double, 43.0),
+        Q_ARG(QString, QStringLiteral("terminal-2"))));
+    QCOMPARE(killStamped.size(), 1);
+    const QList<QVariant> killStamp = killStamped.constFirst();
+    QCOMPARE(killStamp.at(0).toString(), QStringLiteral("dev-session-8"));
+    QCOMPARE(killStamp.at(1).toDouble(), 43.0);
+    QCOMPARE(killStamp.at(2).toString(), QStringLiteral("terminal-2"));
 
     // The ratio report has no visible effect without a loaded layout (setRatios
     // is deliberately quiet), so what is asserted here is that the host's handler

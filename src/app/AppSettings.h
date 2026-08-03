@@ -1,6 +1,7 @@
 #pragma once
 
 #include <QObject>
+#include <QHash>
 #include <QString>
 #include <QStringList>
 #include <QVariant>
@@ -37,6 +38,7 @@ namespace ch {
 //   settings/appearance/toolbarOrder
 //   settings/appearance/terminalFontSize
 //   settings/appearance/terminalPixelRatio
+//   settings/viewerDefaults/<extension>
 //   settings/<group>/<key>            (generic, for groups with no named
 //                                      property yet - server, tmux)
 class AppSettings : public QObject {
@@ -78,6 +80,12 @@ class AppSettings : public QObject {
     Q_PROPERTY(qreal terminalPixelRatio READ terminalPixelRatio WRITE
                    setTerminalPixelRatio NOTIFY terminalPixelRatioChanged)
 
+    // User-selected defaults for file extensions. The map is exposed to QML as
+    // extension -> canonical viewer kind; the persisted representation remains
+    // one plain-text ini key per extension so a person can safely edit it.
+    Q_PROPERTY(QVariantMap viewerDefaults READ viewerDefaults
+                   WRITE setViewerDefaults NOTIFY viewerDefaultsChanged)
+
 public:
     // Empty iniPath -> the native per-user store (org "CodeHarbor", app
     // "CodeHarbor"), i.e. the same file UiStateStore uses. Non-empty iniPath ->
@@ -112,6 +120,16 @@ public:
     qreal terminalPixelRatio() const;
     void setTerminalPixelRatio(qreal ratio);
 
+    QVariantMap viewerDefaults() const;
+    void setViewerDefaults(const QVariantMap& defaults);
+
+    // C++ wiring uses a strongly typed copy, while QML uses viewerDefaults and
+    // the two granular invokables below.
+    QHash<QString, QString> viewerDefaultKinds() const;
+    Q_INVOKABLE bool setViewerDefault(const QString& extension,
+                                      const QString& kind);
+    Q_INVOKABLE bool clearViewerDefault(const QString& extension);
+
     // Generic access for settings groups that have no named property yet (the
     // server and tmux groups). `group` and `key` must both be non-empty and
     // must not contain '/', so a caller cannot reach outside the `settings/`
@@ -133,6 +151,7 @@ signals:
     void toolbarOrderChanged();
     void terminalFontSizeChanged();
     void terminalPixelRatioChanged();
+    void viewerDefaultsChanged();
     // One signal for the generic pairs, carrying what moved: a settings pane
     // binding to `value(group, key)` has nothing else to re-evaluate on.
     void settingChanged(const QString& group, const QString& key);

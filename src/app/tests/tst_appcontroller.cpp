@@ -149,6 +149,22 @@ QByteArray listWithRepoRootFrame(int id, const QString& groupName,
                            {"result", QJsonArray{group}}};
     return QJsonDocument(resp).toJson(QJsonDocument::Compact) + '\n';
 }
+QByteArray listWithSessionFrame(int id, const QString& groupName,
+                                const QString& sessionId, bool archived,
+                                bool pinned = false)
+{
+    const QJsonObject session{{"id", sessionId},
+                              {"name", sessionId},
+                              {"archived", archived},
+                              {"pinned", pinned}};
+    const QJsonObject group{{"id", groupName},
+                            {"name", groupName},
+                            {"sessions", QJsonArray{session}}};
+    const QJsonObject resp{{"jsonrpc", "2.0"},
+                           {"id", id},
+                           {"result", QJsonArray{group}}};
+    return QJsonDocument(resp).toJson(QJsonDocument::Compact) + '\n';
+}
 
 // One framed (newline-terminated) AgentEvent JSONL line for the monitor.
 QByteArray agentEventLine(const QString& state, const QString& dev,
@@ -336,6 +352,11 @@ private slots:
     void staleRefreshResultDoesNotClobberNewer();
     void refreshErrorEmitsErrorVerbatim();
     void mutationSuccessChainsRefresh();
+    void deleteGroupSendsRequestAndRefreshes();
+    void deleteGroupErrorEmitsErrorWithoutRefresh();
+    void deleteSessionErrorEmitsErrorWithoutRefresh();
+    void archiveSessionSendsArchivedAndRefreshes();
+    void archiveSessionErrorEmitsErrorWithoutRefresh();
     void refreshResultAfterControllerDestroyedIsNoop();
     void agentMonitorMergesStateIntoSidebar();
     void terminalConnectionStateMergesIntoSidebar();
@@ -343,15 +364,18 @@ private slots:
     void markSeenClearsFinishedUnseenBadge();
     void vanishedActiveSessionIsRetiredEverywhere();
     void staleOrFailedRefreshNeverRetiresActiveSession();
+    // The sidebar's filters hide rows; they must never narrow what the
+    // controller BELIEVES exists on the server.
+    void sidebarFiltersDoNotNarrowTheAuthoritativeTree();
+    // Archiving the currently open session must retire its layout and
+    // per-server remembered id before the row is hidden.
+    void archivingActiveSessionRetiresItThroughChainedRefresh();
     void deletingActiveSessionRetiresItThroughChainedRefresh();
     void disconnectRetiresActiveSessionButStillRemembersIt();
     void refreshWithoutATransportIsASilentNoOp();
     void serverSideRepoRootChangeNotifiesActiveSession();
     void switchingServerDropsTheActiveSessionButKeepsItRemembered();
 
-    // An UNKNOWN host key must be REFUSED and put to the user (SPEC 12.1), and
-    // the approval must be spendable exactly once, on the very key that was
-    // shown, for the whole retry chain that follows.
     void hostKeyPromptParksTheAttemptAndAcceptRetriesWithItPinned();
     void rejectedHostKeyEndsTheAttemptAndLeavesNothingPinned();
     void hostKeyApprovalSurvivesTheCredentialRetryInTheSameChain();
@@ -454,6 +478,7 @@ void TstAppController::uiStateStorePersistsAcrossInstances()
         UiStateStore store(iniPath);
         store.setRegionWidths(200, 0, 400);
         store.setSelectedPane(QStringLiteral("s1"), QStringLiteral("p9"));
+        store.setShowArchived(true);
     }
 
     UiStateStore reopened(iniPath);
@@ -461,6 +486,7 @@ void TstAppController::uiStateStorePersistsAcrossInstances()
     QCOMPARE(reopened.viewerWidth(), 0);
     QCOMPARE(reopened.terminalWidth(), 400);
     QCOMPARE(reopened.selectedPane(QStringLiteral("s1")), QStringLiteral("p9"));
+    QVERIFY(reopened.showArchived());
 }
 
 // Documented defaults when nothing has been written.
@@ -474,6 +500,7 @@ void TstAppController::uiStateStoreDocumentedDefaults()
     QCOMPARE(store.sidebarWidth(), 260);
     QCOMPARE(store.viewerWidth(), 0);
     QCOMPARE(store.terminalWidth(), 520);
+    QVERIFY(!store.showArchived());
     QVERIFY(store.selectedPane(QStringLiteral("unknown")).isEmpty());
 }
 
@@ -694,6 +721,159 @@ void TstAppController::mutationSuccessChainsRefresh()
         listReq.value(QStringLiteral("id")).toInt(), QStringLiteral("New")));
 
     QCOMPARE(controller.sessionsModel()->rowCount(), 1);
+}
+void TstAppController::deleteGroupSendsRequestAndRefreshes()
+{
+    FakeTransport transport;
+    CodeharbordClient client;
+    AppController controller(&client);
+    client.setTransport(&transport);
+
+    controller.deleteGroup(QStringLiteral("g1"));
+    const QJsonObject deleteReq = takeRequest(transport);
+    QCOMPARE(deleteReq.value(QStringLiteral("method")).toString(),
+             QStringLiteral("workspace.deleteGroup"));
+    QCOMPARE(deleteReq.value(QStringLiteral("params")).toObject()
+                 .value(QStringLiteral("id"))
+                 .toString(),
+             QStringLiteral("g1"));
+
+    const QJsonObject ack{{"jsonrpc", "2.0"},
+                          {"id", deleteReq.value(QStringLiteral("id")).toInt()},
+                          {"result", true}};
+    transport.deliver(QJsonDocument(ack).toJson(QJsonDocument::Compact) + '\n');
+
+    const QJsonObject refreshReq = takeRequest(transport);
+    QCOMPARE(refreshReq.value(QStringLiteral("method")).toString(),
+             QStringLiteral("workspace.list"));
+    transport.deliver(listResultFrame(
+        refreshReq.value(QStringLiteral("id")).toInt(), QStringLiteral("remaining")));
+    QCOMPARE(controller.sessionsModel()->rowCount(), 1);
+    QCOMPARE(controller.sessionsModel()
+                 ->data(controller.sessionsModel()->index(0, 0), SessionsModel::NameRole)
+                 .toString(),
+             QStringLiteral("remaining"));
+}
+
+void TstAppController::deleteGroupErrorEmitsErrorWithoutRefresh()
+{
+    FakeTransport transport;
+    CodeharbordClient client;
+    AppController controller(&client);
+    client.setTransport(&transport);
+
+    controller.refresh();
+    const QJsonObject listReq = takeRequest(transport);
+    transport.deliver(listResultFrame(
+        listReq.value(QStringLiteral("id")).toInt(), QStringLiteral("g1")));
+    QCOMPARE(controller.sessionsModel()->rowCount(), 1);
+    transport.takeSent();
+
+    QSignalSpy errors(&controller, &AppController::error);
+    controller.deleteGroup(QStringLiteral("g1"));
+    const int deleteId = takeRequest(transport).value(QStringLiteral("id")).toInt();
+    transport.deliver(errorFrame(deleteId, -32000, QStringLiteral("group is locked")));
+
+    QCOMPARE(errors.count(), 1);
+    QCOMPARE(errors.at(0).at(0).toString(), QStringLiteral("group is locked"));
+    QCOMPARE(controller.sessionsModel()->rowCount(), 1);
+    QVERIFY(transport.takeSent().isEmpty());
+}
+
+void TstAppController::deleteSessionErrorEmitsErrorWithoutRefresh()
+{
+    FakeTransport transport;
+    CodeharbordClient client;
+    AppController controller(&client);
+    client.setTransport(&transport);
+
+    controller.refresh();
+    const QJsonObject listReq = takeRequest(transport);
+    transport.deliver(listWithSessionFrame(
+        listReq.value(QStringLiteral("id")).toInt(), QStringLiteral("g1"),
+        QStringLiteral("s1"), false));
+    QCOMPARE(controller.sessionsModel()->rowCount(), 1);
+    transport.takeSent();
+
+    QSignalSpy errors(&controller, &AppController::error);
+    controller.deleteSession(QStringLiteral("s1"));
+    const int deleteId = takeRequest(transport).value(QStringLiteral("id")).toInt();
+    transport.deliver(errorFrame(deleteId, -32000, QStringLiteral("session is locked")));
+
+    QCOMPARE(errors.count(), 1);
+    QCOMPARE(errors.at(0).at(0).toString(), QStringLiteral("session is locked"));
+    QCOMPARE(controller.sessionsModel()->rowCount(), 1);
+    QVERIFY(transport.takeSent().isEmpty());
+}
+// Archiving and unarchiving use the existing workspace.updateSession field,
+// then rebuild the sidebar from the server's authoritative list. The default
+// model filter hides the archived row until the unarchive refresh restores it.
+void TstAppController::archiveSessionSendsArchivedAndRefreshes()
+{
+    FakeTransport transport;
+    CodeharbordClient client;
+    AppController controller(&client);
+    client.setTransport(&transport);
+
+    controller.archiveSession(QStringLiteral("s1"));
+    const QJsonObject archiveReq = takeRequest(transport);
+    QCOMPARE(archiveReq.value(QStringLiteral("method")).toString(),
+             QStringLiteral("workspace.updateSession"));
+    const QJsonObject archiveParams = archiveReq.value(QStringLiteral("params")).toObject();
+    QCOMPARE(archiveParams.value(QStringLiteral("id")).toString(), QStringLiteral("s1"));
+    QCOMPARE(archiveParams.value(QStringLiteral("archived")).toBool(), true);
+
+    const QJsonObject archivedAck{{"jsonrpc", "2.0"},
+                                  {"id", archiveReq.value(QStringLiteral("id")).toInt()},
+                                  {"result", QJsonObject{{"id", "s1"},
+                                                         {"name", "s1"},
+                                                         {"archived", true}}}};
+    transport.deliver(QJsonDocument(archivedAck).toJson(QJsonDocument::Compact) + '\n');
+    const QJsonObject archiveRefresh = takeRequest(transport);
+    QCOMPARE(archiveRefresh.value(QStringLiteral("method")).toString(),
+             QStringLiteral("workspace.list"));
+    transport.deliver(listWithSessionFrame(
+        archiveRefresh.value(QStringLiteral("id")).toInt(), QStringLiteral("g"),
+        QStringLiteral("s1"), true));
+    QCOMPARE(controller.sessionsModel()->rowCount(), 0);
+    QVERIFY(controller.sessionsModel()->hasSessions());
+
+    controller.unarchiveSession(QStringLiteral("s1"));
+    const QJsonObject unarchiveReq = takeRequest(transport);
+    const QJsonObject unarchiveParams = unarchiveReq.value(QStringLiteral("params")).toObject();
+    QCOMPARE(unarchiveParams.value(QStringLiteral("archived")).toBool(), false);
+    const QJsonObject unarchiveAck{{"jsonrpc", "2.0"},
+                                   {"id", unarchiveReq.value(QStringLiteral("id")).toInt()},
+                                   {"result", QJsonObject{{"id", "s1"},
+                                                          {"name", "s1"},
+                                                          {"archived", false}}}};
+    transport.deliver(QJsonDocument(unarchiveAck).toJson(QJsonDocument::Compact) + '\n');
+    const QJsonObject unarchiveRefresh = takeRequest(transport);
+    transport.deliver(listWithSessionFrame(
+        unarchiveRefresh.value(QStringLiteral("id")).toInt(), QStringLiteral("g"),
+        QStringLiteral("s1"), false));
+    QCOMPARE(controller.sessionsModel()->rowCount(), 1);
+    const QModelIndex group = controller.sessionsModel()->index(0, 0);
+    const QModelIndex session = controller.sessionsModel()->index(0, 0, group);
+    QCOMPARE(controller.sessionsModel()->data(session, SessionsModel::ArchivedRole).toBool(),
+             false);
+}
+
+void TstAppController::archiveSessionErrorEmitsErrorWithoutRefresh()
+{
+    FakeTransport transport;
+    CodeharbordClient client;
+    AppController controller(&client);
+    client.setTransport(&transport);
+    QSignalSpy errors(&controller, &AppController::error);
+
+    controller.archiveSession(QStringLiteral("s1"));
+    const int id = takeRequest(transport).value(QStringLiteral("id")).toInt();
+    transport.deliver(errorFrame(id, -32000, QStringLiteral("archive denied")));
+
+    QCOMPARE(errors.count(), 1);
+    QCOMPARE(errors.at(0).at(0).toString(), QStringLiteral("archive denied"));
+    QVERIFY(transport.takeSent().isEmpty());
 }
 
 // A late response after the controller is destroyed must be a no-op: the shared
@@ -1071,6 +1251,51 @@ void TstAppController::staleOrFailedRefreshNeverRetiresActiveSession()
              QStringLiteral("s1"));
 }
 
+// The sidebar can hide rows two ways - "only pinned" and hiding archived ones -
+// and both are presentation choices on THIS machine. Neither may change what the
+// controller believes the server holds, because two decisions read that belief:
+// whether the open Dev Session still exists, and how many sessions a group
+// deletion would destroy. The refresh used to pass the pin filter to the server,
+// so with the filter on an unpinned session looked deleted and a group looked
+// smaller than it was.
+void TstAppController::sidebarFiltersDoNotNarrowTheAuthoritativeTree()
+{
+    ActiveSessionFixture f;
+    f.deliverTreeWithS1();
+    f.activateAndLoadS1();
+    QCOMPARE(f.controller.activeSessionId(), QStringLiteral("s1"));
+
+    // Hide everything: s1 is neither pinned nor shown as archived.
+    f.controller.sessionsModel()->setPinnedOnly(true);
+    f.controller.uiState()->setShowArchived(false);
+    f.transport.takeSent();
+
+    QSignalSpy activeSpy(&f.controller, &AppController::activeSessionChanged);
+    f.controller.refresh();
+    const QJsonObject listReq = takeRequest(f.transport);
+
+    // The request itself must not carry a filter.
+    const QJsonObject params =
+        listReq.value(QStringLiteral("params")).toObject();
+    QVERIFY2(!params.value(QStringLiteral("pinnedOnly")).toBool(),
+             "the sidebar's pin filter must not be sent to the server");
+
+    f.transport.deliver(listWithSessionFrame(
+        listReq.value(QStringLiteral("id")).toInt(), QStringLiteral("g"),
+        QStringLiteral("s1"), false, false));
+
+    // The row is hidden from the sidebar...
+    QCOMPARE(f.controller.sessionsModel()->rowCount(), 0);
+    // ...but the session is still open, still loaded, and still remembered.
+    QCOMPARE(f.controller.activeSessionId(), QStringLiteral("s1"));
+    QCOMPARE(f.layouts.devSessionId(), QStringLiteral("s1"));
+    QCOMPARE(activeSpy.count(), 0);
+    QCOMPARE(f.controller.uiState()->activeSession(QStringLiteral("srv")),
+             QStringLiteral("s1"));
+    // ...and a group deletion would still report the session it destroys.
+    QCOMPARE(f.controller.sessionCountForGroup(QStringLiteral("g")), 1);
+}
+
 // The same retirement must happen on THIS client's own deletion, which reaches
 // it by a different route: deleteSession chains refreshOnSuccess -> refresh(),
 // so the tree that no longer holds the session is the chained one.
@@ -1097,6 +1322,47 @@ void TstAppController::deletingActiveSessionRetiresItThroughChainedRefresh()
     QCOMPARE(f.layouts.devSessionId(), QString());
     QCOMPARE(f.controller.uiState()->activeSession(QStringLiteral("srv")),
              QString());
+}
+// Archiving an open session retires the active layout immediately after the
+// server acknowledges the mutation. The follow-up authoritative refresh then
+// hides the archived row without leaving panes or a remembered active id.
+void TstAppController::archivingActiveSessionRetiresItThroughChainedRefresh()
+{
+    ActiveSessionFixture f;
+    f.deliverTreeWithS1();
+    f.activateAndLoadS1();
+    QCOMPARE(f.controller.activeSessionId(), QStringLiteral("s1"));
+    QVERIFY(!f.layouts.viewerTree().isNull());
+    f.transport.takeSent();
+
+    QSignalSpy activeSpy(&f.controller, &AppController::activeSessionChanged);
+    f.controller.archiveSession(QStringLiteral("s1"));
+    const QJsonObject archiveReq = takeRequest(f.transport);
+    QCOMPARE(archiveReq.value(QStringLiteral("method")).toString(),
+             QStringLiteral("workspace.updateSession"));
+    QCOMPARE(archiveReq.value(QStringLiteral("params")).toObject()
+                 .value(QStringLiteral("archived")).toBool(),
+             true);
+    const QJsonObject ack{{"jsonrpc", "2.0"},
+                          {"id", archiveReq.value(QStringLiteral("id")).toInt()},
+                          {"result", QJsonObject{{"id", "s1"},
+                                                 {"name", "s1"},
+                                                 {"archived", true}}}};
+    f.transport.deliver(QJsonDocument(ack).toJson(QJsonDocument::Compact) + '\n');
+
+    QCOMPARE(f.controller.activeSessionId(), QString());
+    QCOMPARE(f.layouts.devSessionId(), QString());
+    QVERIFY(f.layouts.viewerTree().isNull());
+    QCOMPARE(f.controller.uiState()->activeSession(QStringLiteral("srv")),
+             QString());
+    QCOMPARE(activeSpy.count(), 1);
+
+    const QJsonObject refreshReq = takeRequest(f.transport);
+    f.transport.deliver(listWithSessionFrame(
+        refreshReq.value(QStringLiteral("id")).toInt(), QStringLiteral("g"),
+        QStringLiteral("s1"), true));
+    QCOMPARE(f.controller.sessionsModel()->rowCount(), 0);
+    QVERIFY(f.controller.sessionsModel()->hasSessions());
 }
 
 // Disconnect must land on a clear empty state, not a half-live shell still

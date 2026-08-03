@@ -587,12 +587,24 @@ void TstTerminalPage::livePaneRendersARealRemoteShell()
     QTest::qWait(1000);
 
     bool cleaned = false;
-    db.deleteGroup(group->id, [&](std::optional<ch::RpcError>) { cleaned = true; });
-    QTRY_VERIFY_WITH_TIMEOUT(cleaned, 15000);
+    std::optional<ch::RpcError> cleanupError;
+    db.deleteGroup(group->id, [&](std::optional<ch::RpcError> error) {
+        cleanupError = error;
+        cleaned = true;
+    });
+    QString cleanupFailure;
+    if (!QTest::qWaitFor([&] { return cleaned; }, 15000)) {
+        cleanupFailure = QStringLiteral("cleanup timed out deleting group %1")
+                             .arg(group->id.value);
+    } else if (cleanupError) {
+        cleanupFailure = QStringLiteral("cleanup failed deleting group %1: %2")
+                             .arg(group->id.value, cleanupError->message);
+    }
     // `db` and `boot` are locals: the factory must not outlive them holding a
     // dangling repository.
     m_factory.setWorkspace(nullptr);
     boot.disconnectSession();
+    QVERIFY2(cleanupFailure.isEmpty(), qPrintable(cleanupFailure));
 }
 
 int main(int argc, char* argv[])

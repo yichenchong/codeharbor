@@ -5,9 +5,9 @@ import "RemotePath.js" as RemotePath
 // A single viewer pane (SPEC 3.3, 7.5) — a leaf of the viewer split tree, and a
 // BROWSER: it is addressed by a URL, keeps its own address bar and chrome, and
 // hands the resolved resource to a HANDLER. It asks the ViewerModel (`viewers`)
-// to classify its URL and loads the matching handler view (source and markdown
-// go to the Monaco editor handler, SPEC 8.1). No handler owns the pane, and an
-// unrecognised resource stays with the browser.
+// to classify its URL and loads the matching handler view (rendered Markdown,
+// Monaco source/text, image, PDF, directory, or binary). No handler owns the
+// pane, and an unrecognised resource stays with the browser.
 //
 // THE PANE IS FILLED FROM HERE. Until now a viewer pane could only be filled by
 // something else handing it a URL, and nothing in the application did: the
@@ -33,6 +33,13 @@ Item {
     // focus is a property of the REGION — exactly one of its panes has it — and
     // a pane cannot see its siblings.
     property bool paneActive: false
+
+    // A restore may arrive before the handler's WebEngineView has finished
+    // materialising. Keep the request until a view exists, but cancel it as
+    // soon as the region gives focus to another pane so a late page callback
+    // cannot fight a user's click.
+    property bool focusPending: false
+    onPaneActiveChanged: if (!pane.paneActive) pane.focusPending = false
 
     // ---- browser navigation history ----------------------------------------
     //
@@ -176,6 +183,67 @@ Item {
     // guessing at the region's first leaf.
     signal paneActivated(string paneId)
 
+    // Find a handler's actual WebEngineView. Viewer handlers wrap the view in
+    // small QML items, and the editor's Monaco page keeps its view one level
+    // deeper still. The QML item itself having focus is not enough for a page,
+    // so the restore walks to the browser surface and focuses its DOM input too.
+    function focusableWebView(item) {
+        if (!item)
+            return null;
+        if (typeof item.runJavaScript === "function")
+            return item;
+        if (item.item) {
+            const nested = pane.focusableWebView(item.item);
+            if (nested)
+                return nested;
+        }
+        if (item.children) {
+            for (let i = 0; i < item.children.length; ++i) {
+                const nested = pane.focusableWebView(item.children[i]);
+                if (nested)
+                    return nested;
+            }
+        }
+        return null;
+    }
+
+    // Accept a focus restore from the owning region. This is intentionally not
+    // paneActivated: it is programmatic and must not be mistaken for a user's
+    // click while Main.qml is guarding against late restores.
+    function acceptFocus() {
+        pane.focusPending = true;
+        pane.forceActiveFocus();
+        pane.focusContent();
+    }
+
+    function focusContent() {
+        if (!pane.focusPending || !pane.paneActive)
+            return;
+        const handler = contentLoader.item;
+        if (handler && typeof handler.forceActiveFocus === "function")
+            handler.forceActiveFocus();
+        const view = pane.focusableWebView(handler);
+        if (!view) {
+            if (handler)
+                pane.focusPending = false;
+            return;
+        }
+        // textarea. Other viewer pages have no such input and simply retain the
+        // WebEngineView focus above.
+        view.runJavaScript(
+            "(function () {"
+          + "var e = document.querySelector('.monaco-editor textarea.inputarea,"
+          + " .xterm-helper-textarea');"
+          + "if (e) e.focus();"
+          + "})()");
+        pane.focusPending = false;
+    }
+
+    Connections {
+        target: contentLoader
+        function onLoaded() { pane.focusContent(); }
+    }
+
     // ---- content reporting (SPEC 4.5) --------------------------------------
     // What this pane has open. The host records it in this pane's split-tree
     // leaf (SessionLayouts::setPaneUrl), which is what makes reopening a Dev
@@ -200,10 +268,9 @@ Item {
     // registered handler) use the same toast path as layout/controller errors.
     signal messageRequested(string message)
 
-    // The user asked to close this pane, from its own header. Closing a pane is
-    // a LAYOUT change (SessionLayouts::closePane collapses the parent branch),
-    // which only the host can make, so the pane asks rather than acts. The
-    // region relays it as `closePaneRequested`.
+    // The pane header's split and close actions name this pane explicitly. The
+    // region relays both requests to Main.qml under its session/layout stamp.
+    signal splitRequested(string paneId, string orientation)
     signal closeRequested(string paneId)
     function reportUrl() {
         // An unnamed pane is not addressable. The empty paneId is also a real
@@ -258,15 +325,17 @@ Item {
         pane.forcedKind = "";
         pane.url = pane.fileUrlFor(path);
     }
-    // A link inside an external WebEngine page is still ordinary pane
-    // navigation. Keep only HTTP(S) addresses: remote file views use an
-    // internal implementation URL that must never enter browser history.
+    // A link inside a WebEngine handler is still ordinary pane navigation.
+    // Remote file links become the pane's canonical file:// address; HTTP(S)
+    // links switch to the external-profile web handler.
     function openWebNavigation(address) {
         const target = String(address || "");
-        if (!/^https?:\/\//i.test(target) || target === pane.url.toString())
+        if (target === pane.url.toString())
             return;
-        pane.forcedKind = "";
-        pane.url = target;
+        if (/^file:\/\//i.test(target) || /^https?:\/\//i.test(target)) {
+            pane.forcedKind = "";
+            pane.url = target;
+        }
     }
 
 
@@ -275,6 +344,10 @@ Item {
         case "editor":
         case "text":
             return "text";
+        // The rendered Markdown document is a handler in its own right, so
+        // "Open as -> Markdown" has to be accepted here as well as
+        // "Open as -> Editor", which is how the SOURCE of a .md file is read.
+        case "markdown":
         case "image":
         case "pdf":
         case "binary":
@@ -371,6 +444,10 @@ Item {
             return pane.forcedKind;
         if (pane.effectiveUrl.toString().length === 0 || !pane.viewerModel)
             return "empty";
+        // Invokable calls do not establish a QML binding dependency by
+        // themselves. Reading this notify-backed revision makes already-open
+        // panes re-evaluate when the user changes a default.
+        pane.viewerModel.viewKindsRevision;
         return pane.viewerModel.viewKind(pane.effectiveUrl);
     }
     // The address as the user reads it: a remote path for a file:// URL
@@ -413,7 +490,7 @@ Item {
         case "image": return qsTr("image");
         case "pdf": return qsTr("PDF");
         case "binary": return qsTr("binary");
-        case "markdown":
+        case "markdown": return qsTr("Markdown");
         case "text": return qsTr("editor");
         default: return "";
         }
@@ -656,12 +733,33 @@ Item {
 
         actions: [
             AppPaneHeader.Action {
+                objectName: "viewerSplitHorizontalButton"
+                toolbarId: "pane.split.horizontal"
+                text: qsTr("Split this pane side by side")
+                glyph: "\u25eb"
+                onClicked: {
+                    pane.paneActivated(pane.paneId);
+                    pane.splitRequested(pane.paneId, "horizontal");
+                }
+            },
+            AppPaneHeader.Action {
+                objectName: "viewerSplitVerticalButton"
+                toolbarId: "pane.split.vertical"
+                text: qsTr("Split this pane top and bottom")
+                glyph: "\u229f"
+                onClicked: {
+                    pane.paneActivated(pane.paneId);
+                    pane.splitRequested(pane.paneId, "vertical");
+                }
+            },
+            AppPaneHeader.Action {
+                objectName: "viewerCloseButton"
+                toolbarId: "pane.close"
                 text: qsTr("Close this pane")
                 glyph: "\u00d7"
                 onClicked: {
-                    // Report focus first: the host closes the pane the user is
-                    // in, so this pane has to BE that pane by the time the
-                    // request arrives.
+                    // Report focus first: the host closes the pane this
+                    // request names, not a remembered fallback pane.
                     pane.paneActivated(pane.paneId);
                     pane.closeRequested(pane.paneId);
                 }
@@ -902,11 +1000,10 @@ Item {
             case "directory": return directoryComponent;
             case "binary": return binaryComponent;
             case "empty": return emptyComponent;
-            // Source/text/markdown/structured are a POSITIVE match for the
-            // Monaco editor handler (SPEC 8.1/8.8).
-            case "text":
-            case "markdown":
-                return editorComponent;
+            // Markdown is rendered through its own sanitising page; text stays
+            // on Monaco so "Open as -> Editor" remains the source-edit path.
+            case "markdown": return markdownComponent;
+            case "text": return editorComponent;
             default:
                 // Unreachable: ViewerModel::viewKind() answers with exactly the
                 // seven words above, and this pane supplies "empty" itself. Kept
@@ -975,6 +1072,13 @@ Item {
         }
     }
     Component { id: binaryComponent; ViewerBinaryView { url: pane.effectiveUrl } }
+    Component {
+        id: markdownComponent
+        ViewerMarkdownView {
+            url: pane.effectiveUrl
+            onNavigated: (address) => pane.openWebNavigation(address)
+        }
+    }
     Component { id: editorComponent; EditorPaneView { fileUrl: pane.effectiveUrl; recoveryPaneId: pane.paneId } }
 
     // Nothing open AND no Dev Session to fall back on. A pane a user can land on

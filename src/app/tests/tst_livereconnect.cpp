@@ -1,29 +1,33 @@
 // LIVE gates for SessionBootstrap against the real fixture (SPEC 5.6, 10.1).
 //
-// 1. survivesADroppedConnection: a real SSH session is really dropped, and the
-//    app really comes back. The unit gate (tst_sessionbootstrap) drives the
-//    state machine through test seams; this one drives nothing. It wires the
-//    production bootstrap against the fixture, kills the connection from the
-//    remote end, and then requires a fresh handshake, a fresh codeharbord and a
-//    working RPC round-trip on the other side of the backoff — none of which the
-//    seam-driven test can prove.
+// survivesADroppedConnection: a real SSH session is really dropped, and the
+// app really comes back. The unit gate (tst_sessionbootstrap) drives the state
+// machine through test seams; this one drives nothing. It wires the production
+// bootstrap against the fixture, kills the connection from the remote end, and
+// then requires a fresh handshake, a fresh codeharbord and a working RPC
+// round-trip on the other side of the backoff — none of which the seam-driven
+// test can prove.
 //
-// 2. provisionsAnEmptyLocationThenWires: a server with NOTHING installed at the
-//    configured location is brought up by the client itself. The unit gate can
-//    prove the decision tree with canned answers, but only a real server proves
-//    that the scripts this client sends actually run under its sh, that the
-//    archive unpacks into something launchable, and that codeharbord then
-//    answers over the channel. It installs into a throwaway directory and
-//    removes it again.
+// provisionsAnEmptyLocationThenWires: a server with NOTHING installed at the
+// configured location is brought up by the client itself. The unit gate can
+// prove the decision tree with canned answers, but only a real server proves
+// that the scripts this client sends actually run under its sh, that the
+// archive unpacks into something launchable, and that codeharbord then answers
+// over the channel. It installs into a throwaway directory and removes it
+// again.
 //
-// How the drop in (1) is made, and why it is safe next to other live tests: the
-// kill runs on an Exec channel of OUR OWN session and targets that channel's
-// parent, which is the per-connection `sshd-session: <user>@notty` process. It is
-// therefore scoped to this test's TCP connection — never the shared fixture
-// listener, never another test's session — and the target's command line is
-// checked to contain "sshd" before any signal is sent. Killing remote
-// codeharbord processes by name was rejected for exactly this reason: it would
-// shoot down concurrent live tests.
+// The CTest fixture setup test asks a real SSH session what CODEHARBOR_DB is
+// set to before any live-labelled target runs. Database isolation is kept out
+// of this reconnect executable so there is one hard gate rather than two
+// checks with different failure behavior.
+// How the connection drop is made, and why it is safe next to other live
+// tests: the kill runs on an Exec channel of OUR OWN session and targets that
+// channel's parent, which is the per-connection `sshd-session: <user>@notty`
+// process. It is therefore scoped to this test's TCP connection — never the
+// shared fixture listener, never another test's session — and the target's
+// command line is checked to contain "sshd" before any signal is sent.
+// Killing remote codeharbord processes by name was rejected for exactly this
+// reason: it would shoot down concurrent live tests.
 
 #include "AgentStatusMonitor.h"
 #include "CodeharbordClient.h"
@@ -129,7 +133,6 @@ private slots:
     void initTestCase();
     void cleanupTestCase();
 
-    void theFixtureIsolatesTheWorkspaceDatabase();
     void survivesADroppedConnection();
     void provisionsAnEmptyLocationThenWires();
 
@@ -233,61 +236,6 @@ void TstLiveReconnect::dropTheConnection()
                             .arg(killerStderr)));
 }
 
-// The live gates run a REAL codeharbord as this user, and its workspace database
-// defaults to the ONE the installed server uses. A fixture that does not override
-// that path therefore migrates the developer's own workspace to whatever schema
-// version the tree under test carries, and the installed server then refuses to
-// start at all ("workspace schema is newer than the build supports") until it is
-// upgraded too. That happened; this is the guard so it cannot happen quietly.
-//
-// Checked by asking the SERVER what it sees, over the same SSH session the daemon
-// is launched on, because that is the environment that actually decides - not the
-// environment this test process happens to have.
-void TstLiveReconnect::theFixtureIsolatesTheWorkspaceDatabase()
-{
-    if (!m_live)
-        QSKIP("live gate not armed");
-
-    const QString host = env("CH_LIVE_HOST");
-    const quint16 port = static_cast<quint16>(env("CH_LIVE_PORT").toUInt());
-    const QString user = env("CH_LIVE_USER");
-    const QString identity = env("CH_LIVE_IDENTITY");
-
-    // Its OWN pool, with its own host-key answer. The shared m_pool is the one
-    // the later cases drive through SessionBootstrap, which installs the
-    // host-key callback itself; borrowing it here would either be refused (the
-    // pool declines an unknown key when no callback is set) or would leave it
-    // connected and pre-answered for a case that means to start cold.
-    SshConnectionPool probe;
-    probe.setHostKeyCallback([](const QString&, const QString&,
-                                const QByteArray&, ch::KnownHosts::Verdict) {
-        // A throwaway fixture on loopback, and this probe reads one environment
-        // variable: accepting is the whole point, and nothing here is persisted.
-        return SshConnectionPool::HostKeyDecision::Accept;
-    });
-    QVERIFY2(probe.connectToHost(host, port, user, identity),
-             qPrintable(probe.diagnosticLog()));
-
-    bool ok = false;
-    const QString reported =
-        runExec(probe,
-                QStringLiteral("printf 'DB=%s\\n' \"${CODEHARBOR_DB-}\""), &ok);
-    QVERIFY2(ok, "could not ask the fixture what CODEHARBOR_DB it sets");
-
-    const QString value =
-        reported.section(QStringLiteral("DB="), 1).trimmed();
-    QVERIFY2(!value.isEmpty(),
-             "the live fixture does not set CODEHARBOR_DB, so codeharbord would "
-             "open the workspace database of the server installed on this "
-             "machine and migrate it. Add a SetEnv line to the fixture's "
-             "sshd_config (see docs/DEVELOPMENT.md, Live gates).");
-    QVERIFY2(!value.contains(QStringLiteral("/.local/share/codeharbor/")),
-             qPrintable(QStringLiteral(
-                            "the live fixture points CODEHARBOR_DB at the real "
-                            "workspace database (%1); it must be a throwaway file")
-                            .arg(value)));
-    probe.disconnectFromHost();
-}
 
 void TstLiveReconnect::survivesADroppedConnection()
 {

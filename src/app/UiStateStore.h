@@ -22,8 +22,8 @@ namespace ch {
 // Storage keys:
 //   layout/sidebarWidth, layout/viewerWidth, layout/terminalWidth
 //   sidebar/pinnedOnly
+//   sidebar/showArchived
 //   selectedPane/<devSessionId>
-//   session/<serverId>/active
 //   paneSuffix/<devSessionId>/<region>
 class UiStateStore : public QObject {
     Q_OBJECT
@@ -113,6 +113,12 @@ public:
     // appear empty by silently enabling a filter.
     Q_INVOKABLE void setPinnedOnly(bool pinnedOnly);
     Q_INVOKABLE bool pinnedOnly() const;
+
+    // Whether archived sessions are shown is also client-local presentation
+    // state. It is independent of which sessions are archived on the server,
+    // and defaults to false so a normal sidebar does not fill with old work.
+    Q_INVOKABLE void setShowArchived(bool showArchived);
+    Q_INVOKABLE bool showArchived() const;
 
     // The Dev Session the user was last working in ON A GIVEN SERVER, so a
     // relaunch reopens it instead of an empty shell. Client-local: which

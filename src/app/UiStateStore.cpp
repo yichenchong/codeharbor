@@ -15,7 +15,7 @@ const QString kSidebarKey = QStringLiteral("layout/sidebarWidth");
 const QString kViewerKey = QStringLiteral("layout/viewerWidth");
 const QString kTerminalKey = QStringLiteral("layout/terminalWidth");
 const QString kPinnedOnlyKey = QStringLiteral("sidebar/pinnedOnly");
-
+const QString kShowArchivedKey = QStringLiteral("sidebar/showArchived");
 // A stored value, or `fallback` when the key is absent, holds something that is
 // not a whole number, or is smaller than `minimum`.
 //
@@ -133,6 +133,22 @@ void UiStateStore::setPinnedOnly(bool pinnedOnly)
 bool UiStateStore::pinnedOnly() const
 {
     return storedBool(*m_settings, kPinnedOnlyKey, false);
+}
+
+void UiStateStore::setShowArchived(bool showArchived)
+{
+    // As with pinnedOnly, avoid rewriting the settings file when the sidebar
+    // reapplies its persisted value during startup, but flush a real toggle
+    // before returning so an immediate restart keeps the user's choice.
+    if (showArchived == this->showArchived())
+        return;
+    m_settings->setValue(kShowArchivedKey, showArchived);
+    m_settings->sync();
+}
+
+bool UiStateStore::showArchived() const
+{
+    return storedBool(*m_settings, kShowArchivedKey, false);
 }
 
 void UiStateStore::setSelectedPane(QString devSessionId, QString paneId)

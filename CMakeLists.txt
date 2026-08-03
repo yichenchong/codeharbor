@@ -186,7 +186,7 @@ if(CODEHARBOR_BUILD_TESTS)
         add_test(NAME tst_no_scaffolding
                  COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/no_scaffolding.sh
                          ${CMAKE_CURRENT_SOURCE_DIR})
-
+        add_subdirectory(tests)
         # Refuses a release tag whose commit carries a different version. Runs
         # entirely inside a throwaway git repository under TMPDIR, so it neither
         # touches this checkout nor creates a tag in it. Skips (77) when git or

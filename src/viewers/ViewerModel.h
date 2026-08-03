@@ -1,6 +1,6 @@
 #pragma once
 
-#include <QObject>
+#include <QHash>
 #include <QPointer>
 #include <QString>
 #include <QStringList>
@@ -36,6 +36,8 @@ class ViewerProfiles;
 // records what happened to the VW1 fix that lived on that path.
 class ViewerModel : public QObject {
     Q_OBJECT
+    Q_PROPERTY(quint64 viewKindsRevision READ viewKindsRevision
+                   NOTIFY viewKindsRevisionChanged)
 public:
     // `client` performs remote file.* calls; `map` mints/resolves internal URLs
     // (defaults to InternalUrlMap::shared(), shared with the scheme handler).
@@ -48,7 +50,19 @@ public:
     // own ViewerProfiles from `client`, so QML always has working profiles.
     void setProfiles(ViewerProfiles *profiles);
 
+    // AppSettings lives in ch_app, which cannot be a dependency of this
+    // library. The application therefore pushes a plain validated map across
+    // this boundary.
+    void setDefaultKinds(const QHash<QString, QString>& defaults);
+    quint64 viewKindsRevision() const { return m_viewKindsRevision; }
+
     Q_INVOKABLE QString viewKind(const QUrl &url) const;
+
+    // The settings page asks the model for the same handler-assignability rule
+    // that validates a persisted preference; QML does not duplicate it.
+    Q_INVOKABLE QStringList validViewKindsForExtension(
+        const QString& extension) const;
+
 
     // Same registry claims as viewKind(), expressed as the user-facing
     // "Open as" vocabulary. The first entry is the default.
@@ -112,15 +126,10 @@ public:
     // `base` is passed rather than left to the server's default (its own
     // working directory), because "the project" is the ACTIVE Dev Session's
     // repository root and only the client knows which session a pane belongs
-    // to. An empty `base` is omitted from the request.
-    //
-    // Keyed by path like listDirectory and deliberately not by a token: unlike
-    // a file read, the answer for one path is the same for every pane that
-    // asks, so a second pane receiving the first pane's reply learns exactly
-    // what it would have been told anyway.
     Q_INVOKABLE void resolvePath(const QString &path, const QString &base);
 
 signals:
+    void viewKindsRevisionChanged();
     void directoryListed(const QString &path, const QVariantList &entries);
     void directoryError(const QString &path, const QString &message);
     // `path` echoes what was ASKED for (not the resolved spelling), so a pane
@@ -154,6 +163,8 @@ private:
     // held so re-wiring can drop it without touching the old handler (which may
     // already be gone with its ViewerProfiles).
     QMetaObject::Connection m_handlerConnection;
+    QHash<QString, QString> m_defaultKinds;
+    quint64 m_viewKindsRevision = 0;
 };
 
 } // namespace ch

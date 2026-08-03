@@ -139,24 +139,27 @@ release-only.
 
 ```bash
 npm install                   # once: web-asset workspaces
-npm run build                 # Monaco + xterm.js bundles -> src/web/*/dist/
+npm run build                 # Monaco + xterm.js + Markdown bundles -> src/web/*/dist/
 cmake --preset dev            # configure (Debug, Ninja, build/dev/)
 cmake --build --preset dev    # build -> build/dev/src/app/codeharbor
 ./build/dev/src/app/codeharbor
 ```
 
-The Monaco and xterm.js bundles are gitignored build artifacts that CMake embeds
-as `qrc:/codeharbor/web/editor/index.html` and
-`qrc:/codeharbor/web/terminal/index.html` (see `src/qml/CMakeLists.txt`). CMake
-builds them for you at **configure** time when either is missing or older than its
+There are three web bundles — the Monaco editor, the xterm.js terminal, and the
+Markdown renderer — all gitignored build artifacts that CMake embeds as
+`qrc:/codeharbor/web/editor/index.html`,
+`qrc:/codeharbor/web/terminal/index.html` and
+`qrc:/codeharbor/web/markdown/index.html` (see `src/qml/CMakeLists.txt`). CMake
+builds them for you at **configure** time when any is missing or older than its
 sources — so `npm install` above is the only real prerequisite, and editing
-`src/web/editor/**` or `src/web/terminal/**` re-triggers the rebuild on the next
-configure.
+`src/web/editor/**`, `src/web/terminal/**` or `src/web/markdown/**` re-triggers
+the rebuild on the next configure.
 
 If a bundle is missing and cannot be built (no `npm` on `PATH`), configure
-**fails** with the command to run: a client whose editor or terminal pane silently
-loads nothing is never the default. Pass `-DCODEHARBOR_SKIP_WEB_BUNDLE=ON` to
-deliberately build a client with both panes inert.
+**fails** with the command to run: a client whose editor, terminal or Markdown
+pane silently loads nothing is never the default. Pass
+`-DCODEHARBOR_SKIP_WEB_BUNDLE=ON` to deliberately build a client with those panes
+inert.
 
 Source maps are a configure-time cache variable, `CODEHARBOR_WEB_SOURCEMAP`, with
 three values: `AUTO` (the default), `ON` and `OFF`. `AUTO` means **ON for a
@@ -346,9 +349,27 @@ default (portable) suite:
 | `tst_openas` | The explorer's "Open as" menu: only applicable handlers offered, and "open in new pane" leaving the first pane alone |
 | `tst_ui_polish` | The shared scrollbar's fit/overflow states and the viewer pane's cursor neutrality |
 
-`tst_paneidentity` also gained the viewer navigation cases (history truncation,
-disabled ends, reload of non-web content, Home with and without a session), and
-`tst_sessionlayouts` the pane-title and fast-session-switch cases.
+Existing targets that gained coverage in the same period:
+
+- `tst_paneidentity` — viewer navigation (history truncation, disabled ends,
+  reload of non-web content, Home with and without a session), per-pane header
+  actions naming their own pane, the kill confirmation, and restoring the pane the
+  user was last working in (including the stale-stamp drop and the missing-pane
+  fallback).
+- `tst_sessionlayouts` — pane titles and fast Dev Session switching.
+- `tst_appcontroller` — archiving, deleting a session and a group, and that the
+  sidebar's filters never narrow the tree the controller treats as authoritative.
+- `tst_models` — filtered rows, and that a terminal-state update still emits
+  row-local changes instead of resetting the whole sidebar.
+- `tst_sidebar` / `tst_uxshell` — the archive and delete affordances, their
+  confirmations naming their subject, declining them, and the empty-state wording
+  when every session is archived.
+- `tst_viewers` / `tst_appsettings` — the per-file-type default handler: resolution
+  order, which handlers may be assigned to which type, and that an unset mapping
+  changes nothing.
+- `src/web/markdown` — its own `node --test` suite, including the sanitiser cases
+  (script tags, event-handler attributes, `javascript:` links, frames) and
+  relative image resolution.
 
 `-L desktop` currently holds one target, `tst_notifierlive`, which delivers a real
 notification through `org.freedesktop.Notifications`. It needs a session bus AND a
@@ -386,33 +407,53 @@ Environment contract:
 Standing up a throwaway `sshd` fixture (no root, no changes to your `~/.ssh`):
 
 ```bash
-D=tests/live/.fixture && mkdir -p $D          # gitignored: it holds real private keys
-ssh-keygen -q -t ed25519 -f $D/hostkey -N ''
-ssh-keygen -q -t ed25519 -f $D/id -N ''
-cat $D/id.pub > $D/authorized_keys && chmod 600 $D/authorized_keys $D/id
-printf 'Port 2222\nListenAddress 127.0.0.1\nHostKey %s/hostkey\nAuthorizedKeysFile %s/authorized_keys\nPidFile %s/sshd.pid\nUsePAM no\nStrictModes no\nPasswordAuthentication no\nAllowUsers %s\nSubsystem sftp internal-sftp\nSetEnv CODEHARBOR_DB=%s/workspace.sqlite\n' \
-  "$PWD/$D" "$PWD/$D" "$PWD/$D" "$(whoami)" "$PWD/$D" > $D/sshd_config
-
+tests/live/generate-fixture.sh                  # keys + sshd_config in tests/live/.fixture/
+D=tests/live/.fixture
 /usr/sbin/sshd -D -e -f $PWD/$D/sshd_config &   # unprivileged; logs to stderr
 ssh-agent -a $PWD/$D/agent.sock &
 SSH_AUTH_SOCK=$PWD/$D/agent.sock ssh-add $D/id
 ```
 
-**That `SetEnv CODEHARBOR_DB` line is not optional.** The live gates run a REAL
-`codeharbord` as you, and its workspace database defaults to
-`~/.local/share/codeharbor/codeharbor.sqlite` — the same file the server INSTALLED
-on this machine uses. Without the override, a live run migrates that database to
-whatever schema version the working tree carries, and the installed server then
-refuses to start (`workspace schema is newer than the build supports`) until it is
-upgraded to match. `CODEHARBOR_DB` is the documented override (see `workspace()` in
-`remote/src/workspace.ts`) and the fixture points it at a throwaway file inside
-itself. `tst_livereconnect`'s first case asks the server what it actually sees and
-fails with these instructions if the override is missing or points at the real
-database, so a mis-built fixture cannot eat your workspace quietly.
+The generator is committed; its output is git-ignored, because it holds real
+private keys. Re-running it is safe, and it is also the repair for a fixture whose
+config has gone stale — it rewrites `sshd_config` in place, so restart the fixture
+`sshd` afterwards.
 
-If it has already happened, the workspace itself is fine — the migration only adds
-columns. Upgrade the installed server (`Update server` in the client, or unpack a
-newer `codeharbor-remote.tar.gz` over it) and it opens again.
+**Why a generator rather than a recipe to copy.** The config it writes contains
+`SetEnv CODEHARBOR_DB=<fixture>/workspace.sqlite`, and that line is load-bearing.
+The live gates run a REAL `codeharbord` as you, and its workspace database
+defaults to `~/.local/share/codeharbor/codeharbor.sqlite` — the same file the
+server INSTALLED on this machine uses, which is to say your own workspace.
+Without the override, a live run creates its test groups and sessions in your
+real sidebar AND migrates that database to whatever schema the working tree
+carries, after which the installed server refuses to start (`workspace schema is
+newer than the build supports`) until it is upgraded. This document used to print
+the `printf` that generates the config; the line was twice omitted while copying
+it by hand, and real workspace rows had to be removed afterwards. A recipe that
+quietly damages real data when mistyped is a fault in the recipe.
+
+Two guards now stand in front of it:
+
+- `tst_live_fixture_isolation` is a CTest SETUP fixture that every `live` target
+  requires. It opens a session through the fixture and asks which
+  `CODEHARBOR_DB` the daemon will actually see — not merely whether a line
+  appears in a file — and fails with repair instructions when the answer is empty
+  or points at the real database. Because it is a setup fixture, a failure means
+  the live targets do not run at all rather than running against your workspace.
+  With `CH_LIVE_SSH` unset it passes quietly and needs no SSH server.
+- The four targets that create workspace rows (`tst_sessionlayouts`,
+  `tst_liveshell`, `tst_coldstart`, `tst_terminalpage`) delete exactly the ids
+  they created, and now FAIL when that cleanup does not succeed, naming the id
+  they could not remove. Cleanup errors used to be ignored, which is how
+  leftovers accumulated unnoticed.
+
+If rows have already been left behind, remove them by the id the failing test
+reported. Do NOT sweep by name: "delete every group whose name looks like a test"
+is how somebody eventually deletes a real session.
+
+If the schema migration has already happened, the workspace itself is fine — the
+migration only adds columns. Upgrade the installed server (`Update server` in the
+client, or unpack a newer `codeharbor-remote.tar.gz` over it) and it opens again.
 
 Then run them. Every variable below is REQUIRED and none of them has a default:
 omit `CH_LIVE_SSH` and every gate QSKIPs, which reports as a green run that

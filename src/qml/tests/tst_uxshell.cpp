@@ -155,6 +155,42 @@ ch::GroupRow makeGroup(const QString &id, const QString &name,
 
 } // namespace
 
+// The real controller exposes client-local filter state through UiStateStore.
+// Keep the shell fixture's surface identical so a model preconfigured to show
+// archived sessions is not reset by SessionsSidebar's completion sync.
+class StubUiState : public QObject
+{
+    Q_OBJECT
+
+public:
+    explicit StubUiState(ch::SessionsModel *model, QObject *parent = nullptr)
+        : QObject(parent), m_model(model)
+    {
+    }
+
+    Q_INVOKABLE bool pinnedOnly() const
+    {
+        return m_model && m_model->pinnedOnly();
+    }
+    Q_INVOKABLE void setPinnedOnly(bool value)
+    {
+        if (m_model)
+            m_model->setPinnedOnly(value);
+    }
+    Q_INVOKABLE bool showArchived() const
+    {
+        return m_model && m_model->showArchived();
+    }
+    Q_INVOKABLE void setShowArchived(bool value)
+    {
+        if (m_model)
+            m_model->setShowArchived(value);
+    }
+
+private:
+    ch::SessionsModel *m_model = nullptr;
+};
+
 // The slice of ch::AppController the sidebar reads. Mirrors tst_sidebar's stub
 // and adds the connection surface the status footer binds to.
 class ShotApp : public QObject
@@ -163,14 +199,18 @@ class ShotApp : public QObject
     Q_PROPERTY(QAbstractItemModel *sessionsModel READ sessionsModel CONSTANT)
     Q_PROPERTY(QString connectionState READ connectionState NOTIFY connectionStateChanged)
     Q_PROPERTY(QString activeSessionId READ activeSessionId NOTIFY activeSessionChanged)
+    Q_PROPERTY(QObject *uiState READ uiState CONSTANT)
 
 public:
     explicit ShotApp(QAbstractItemModel *model, QObject *parent = nullptr)
-        : QObject(parent), m_model(model)
+        : QObject(parent),
+          m_model(model),
+          m_uiState(qobject_cast<ch::SessionsModel *>(model), this)
     {
     }
 
     QAbstractItemModel *sessionsModel() const { return m_model; }
+    QObject *uiState() const { return const_cast<StubUiState *>(&m_uiState); }
 
     QString connectionState() const { return m_connectionState; }
     void setConnectionState(const QString &state)
@@ -190,21 +230,62 @@ public:
     Q_INVOKABLE void createGroup(QString) {}
     Q_INVOKABLE void renameGroup(QString, QString) {}
     Q_INVOKABLE void setGroupCollapsed(QString, bool) {}
+    Q_INVOKABLE void deleteGroup(QString id)
+    {
+        m_lastDeleteGroupId = id;
+        m_deleteGroupCalls++;
+    }
     Q_INVOKABLE void reorderGroups(QStringList) {}
     Q_INVOKABLE void createSession(QString, QString, QString) {}
     Q_INVOKABLE void renameSession(QString, QString) {}
     Q_INVOKABLE void duplicateSession(QString) {}
     Q_INVOKABLE void moveSession(QString, QString, int) {}
-    Q_INVOKABLE void deleteSession(QString) {}
-    Q_INVOKABLE void reorderSessions(QString, QStringList) {}
-
+    Q_INVOKABLE void deleteSession(QString id)
+    {
+        m_lastDeleteSessionId = id;
+        m_deleteSessionCalls++;
+    }
+    Q_INVOKABLE int sessionCountForGroup(QString id) const
+    {
+        return m_sessionCounts.value(id, 0);
+    }
+    void setAuthoritativeSessionCount(const QString &id, int count)
+    {
+        m_sessionCounts.insert(id, count);
+    }
+    QString lastDeleteGroupId() const { return m_lastDeleteGroupId; }
+    int deleteGroupCalls() const { return m_deleteGroupCalls; }
+    QString lastDeleteSessionId() const { return m_lastDeleteSessionId; }
+    int deleteSessionCalls() const { return m_deleteSessionCalls; }
+    Q_INVOKABLE void archiveSession(QString id)
+    {
+        m_lastArchiveId = id;
+        m_archiveCalls++;
+    }
+    Q_INVOKABLE void unarchiveSession(QString id)
+    {
+        m_lastArchiveId = id;
+        m_unarchiveCalls++;
+    }
+    QString lastArchiveId() const { return m_lastArchiveId; }
+    int archiveCalls() const { return m_archiveCalls; }
+    int unarchiveCalls() const { return m_unarchiveCalls; }
 signals:
     void connectionStateChanged();
     void activeSessionChanged();
 
 private:
     QAbstractItemModel *m_model = nullptr;
+    StubUiState m_uiState;
     QString m_connectionState = QStringLiteral("disconnected");
+    QHash<QString, int> m_sessionCounts;
+    QString m_lastDeleteGroupId;
+    int m_deleteGroupCalls = 0;
+    QString m_lastDeleteSessionId;
+    int m_deleteSessionCalls = 0;
+    QString m_lastArchiveId;
+    int m_archiveCalls = 0;
+    int m_unarchiveCalls = 0;
     QString m_activeSessionId;
 };
 
@@ -637,7 +718,6 @@ int renderShots()
 class TstUxShell : public QObject
 {
     Q_OBJECT
-
 private slots:
     // ConnectSheet: the status chip has to speak the vocabulary AppController
     // actually publishes, or a failed/reconnecting link reads as "idle".
@@ -653,6 +733,10 @@ private slots:
     // sheet is closed, so it needs a word for every state the app publishes.
     void sidebarFooterNamesEveryConnectionState_data();
     void sidebarFooterNamesEveryConnectionState();
+    void sidebarArchiveButtonCallsArchiveAndUnarchive();
+    void sidebarDeleteActionsAreConfirmedAndNamed();
+    void sidebarArchiveFilterToggleIsNamedAndChangesModel();
+    void sidebarArchiveEmptyStateExplainsArchivedSessions();
 
     // A long RPC error must be readable and the banner must be dismissible,
     // then come back for the next failure.
@@ -983,6 +1067,185 @@ void TstUxShell::sidebarFooterNamesEveryConnectionState()
     }
 
     QVERIFY2(surface.warnings.isEmpty(), qPrintable(surface.warningReport()));
+}
+void TstUxShell::sidebarArchiveButtonCallsArchiveAndUnarchive()
+{
+    {
+        ch::SessionsModel model;
+        model.setGroups({makeGroup(QStringLiteral("g"), QStringLiteral("G"),
+                                   {{QStringLiteral("s"), ch::SessionRowState::Idle}})});
+        ShotApp app(&model);
+        app.setConnectionState(QStringLiteral("connected"));
+        Surface surface(moduleUrl(QStringLiteral("SessionsSidebar.qml")),
+                        QSize(320, 620), &app);
+        QVERIFY(surface.expose());
+        settle(40);
+
+        QObject *archive = surface.child(QStringLiteral("archiveButton:s"));
+        QVERIFY2(archive, "the row has no archive action");
+        QCOMPARE(textOf(surface.child(QStringLiteral("archivedMarker:s"))), QString());
+        QMetaObject::invokeMethod(archive, "clicked");
+        QCOMPARE(app.archiveCalls(), 1);
+        QCOMPARE(app.lastArchiveId(), QStringLiteral("s"));
+        QVERIFY(surface.warnings.isEmpty());
+    }
+
+    ch::SessionsModel model;
+    auto archivedGroups = makeGroup(
+        QStringLiteral("g"), QStringLiteral("G"),
+        {{QStringLiteral("s"), ch::SessionRowState::Idle}});
+    archivedGroups.sessions[0].session.archived = true;
+    model.setGroups({archivedGroups});
+    model.setShowArchived(true);
+    ShotApp app(&model);
+    app.setConnectionState(QStringLiteral("connected"));
+    Surface surface(moduleUrl(QStringLiteral("SessionsSidebar.qml")),
+                    QSize(320, 620), &app);
+    QVERIFY(surface.expose());
+    settle(40);
+    // The remembered filter state is read before the sidebar synchronises the
+    // model; construction must not silently turn it back off.
+    QVERIFY(model.showArchived());
+    QObject *unarchive = surface.child(QStringLiteral("archiveButton:s"));
+    QVERIFY2(unarchive, "the archived row has no unarchive action");
+    QCOMPARE(textOf(surface.child(QStringLiteral("archivedMarker:s"))),
+             QStringLiteral("\u25a3"));
+    QMetaObject::invokeMethod(unarchive, "clicked");
+    QCOMPARE(app.unarchiveCalls(), 1);
+    QCOMPARE(app.lastArchiveId(), QStringLiteral("s"));
+    QVERIFY(surface.warnings.isEmpty());
+}
+void TstUxShell::sidebarDeleteActionsAreConfirmedAndNamed()
+{
+    ch::SessionsModel model;
+    auto group = makeGroup(
+        QStringLiteral("g"), QStringLiteral("Client work"),
+        {{QStringLiteral("s-visible"), ch::SessionRowState::Idle},
+         {QStringLiteral("s-archived-a"), ch::SessionRowState::Idle},
+         {QStringLiteral("s-archived-b"), ch::SessionRowState::Idle}});
+    // Only the first row is visible under the normal archive filter. The
+    // authoritative count still has to include the two hidden rows because a
+    // group deletion destroys all three.
+    group.sessions[1].session.archived = true;
+    group.sessions[2].session.archived = true;
+    model.setGroups({group});
+
+    ShotApp app(&model);
+    app.setAuthoritativeSessionCount(QStringLiteral("g"), 3);
+    app.setConnectionState(QStringLiteral("connected"));
+    Surface surface(moduleUrl(QStringLiteral("SessionsSidebar.qml")),
+                    QSize(360, 620), &app);
+    QVERIFY(surface.expose());
+    settle(40);
+
+    QObject *sessionDelete =
+        surface.child(QStringLiteral("deleteButton:s-visible"));
+    QVERIFY2(sessionDelete, "the Dev Session row has no delete button");
+    QCOMPARE(sessionDelete->property("actionText").toString(),
+             QStringLiteral("Delete s-visible"));
+    QVERIFY((sessionDelete->property("focusPolicy").toInt() & int(Qt::TabFocus)) != 0);
+    QVERIFY(sessionDelete->property("width").toReal() >= 24);
+    QVERIFY(sessionDelete->property("height").toReal() >= 24);
+
+    QMetaObject::invokeMethod(sessionDelete, "clicked");
+    settle(40);
+    QObject *sessionDialog =
+        surface.child(QStringLiteral("deleteSessionDialog:s-visible"));
+    QObject *sessionMessage =
+        surface.child(QStringLiteral("deleteSessionMessage:s-visible"));
+    QVERIFY2(sessionDialog && sessionDialog->property("visible").toBool(),
+             "deleting a Dev Session did not open its confirmation");
+    QVERIFY(sessionMessage);
+    QVERIFY(sessionMessage->property("text").toString().contains(
+        QStringLiteral("s-visible")));
+    QMetaObject::invokeMethod(sessionDialog, "reject");
+    settle(40);
+    QCOMPARE(app.deleteSessionCalls(), 0);
+
+    // Accepting is the only path that reaches the host mutation.
+    QMetaObject::invokeMethod(sessionDelete, "clicked");
+    settle(20);
+    QMetaObject::invokeMethod(sessionDialog, "accept");
+    settle(20);
+    QCOMPARE(app.deleteSessionCalls(), 1);
+    QCOMPARE(app.lastDeleteSessionId(), QStringLiteral("s-visible"));
+
+    QObject *groupDelete = surface.child(QStringLiteral("deleteGroupButton:g"));
+    QVERIFY2(groupDelete, "the group header has no delete button");
+    QCOMPARE(groupDelete->property("actionText").toString(),
+             QStringLiteral("Delete group \"Client work\""));
+    QVERIFY((groupDelete->property("focusPolicy").toInt() & int(Qt::TabFocus)) != 0);
+    QVERIFY(groupDelete->property("width").toReal() >= 24);
+    QVERIFY(groupDelete->property("height").toReal() >= 24);
+
+    QMetaObject::invokeMethod(groupDelete, "clicked");
+    settle(40);
+    QObject *groupDialog = surface.child(QStringLiteral("deleteGroupDialog:g"));
+    QObject *groupMessage = surface.child(QStringLiteral("deleteGroupMessage:g"));
+    QVERIFY2(groupDialog && groupDialog->property("visible").toBool(),
+             "deleting a group did not open its confirmation");
+    QVERIFY(groupMessage);
+    const QString confirmation = groupMessage->property("text").toString();
+    QVERIFY(confirmation.contains(QStringLiteral("Client work")));
+    QVERIFY(confirmation.contains(QStringLiteral("3 sessions")));
+    QMetaObject::invokeMethod(groupDialog, "reject");
+    settle(40);
+    QCOMPARE(app.deleteGroupCalls(), 0);
+
+    QMetaObject::invokeMethod(groupDelete, "clicked");
+    settle(20);
+    QMetaObject::invokeMethod(groupDialog, "accept");
+    settle(20);
+    QCOMPARE(app.deleteGroupCalls(), 1);
+    QCOMPARE(app.lastDeleteGroupId(), QStringLiteral("g"));
+
+    QVERIFY2(surface.warnings.isEmpty(), qPrintable(surface.warningReport()));
+}
+
+void TstUxShell::sidebarArchiveFilterToggleIsNamedAndChangesModel()
+{
+    ch::SessionsModel model;
+    model.setGroups({makeGroup(QStringLiteral("g"), QStringLiteral("G"),
+                               {{QStringLiteral("s"), ch::SessionRowState::Idle}})});
+    ShotApp app(&model);
+    app.setConnectionState(QStringLiteral("connected"));
+    Surface surface(moduleUrl(QStringLiteral("SessionsSidebar.qml")),
+                    QSize(320, 620), &app);
+    QVERIFY(surface.expose());
+    settle(40);
+
+    QObject *toggle = surface.child(QStringLiteral("archiveFilterButton"));
+    QVERIFY2(toggle, "the sidebar has no show-archived toggle");
+    QCOMPARE(toggle->property("actionText").toString(),
+             QStringLiteral("Show archived sessions"));
+    QMetaObject::invokeMethod(toggle, "clicked");
+    settle(40);
+    QVERIFY(model.showArchived());
+    QCOMPARE(toggle->property("actionText").toString(),
+             QStringLiteral("Hide archived sessions"));
+    QVERIFY(surface.warnings.isEmpty());
+}
+
+void TstUxShell::sidebarArchiveEmptyStateExplainsArchivedSessions()
+{
+    ch::SessionsModel model;
+    auto archivedGroups = makeGroup(
+        QStringLiteral("g"), QStringLiteral("G"),
+        {{QStringLiteral("s"), ch::SessionRowState::Idle}});
+    archivedGroups.sessions[0].session.archived = true;
+    model.setGroups({archivedGroups});
+    ShotApp app(&model);
+    app.setConnectionState(QStringLiteral("connected"));
+    Surface surface(moduleUrl(QStringLiteral("SessionsSidebar.qml")),
+                    QSize(320, 620), &app);
+    QVERIFY(surface.expose());
+    settle(40);
+
+    QCOMPARE(textOf(surface.child(QStringLiteral("sidebarEmptyTitle"))),
+             QStringLiteral("All your sessions are archived"));
+    QCOMPARE(textOf(surface.child(QStringLiteral("sidebarEmptyHint"))),
+             QStringLiteral("Show archived sessions to see them here."));
+    QVERIFY(surface.warnings.isEmpty());
 }
 
 void TstUxShell::sheetErrorIsReadableAndDismissible()

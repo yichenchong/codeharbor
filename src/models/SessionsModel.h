@@ -37,7 +37,9 @@ struct GroupRow {
 
 class SessionsModel : public QAbstractItemModel {
     Q_OBJECT
-    Q_PROPERTY(bool pinnedOnly READ pinnedOnly WRITE setPinnedOnly NOTIFY pinnedOnlyChanged)
+    Q_PROPERTY(bool showArchived READ showArchived WRITE setShowArchived NOTIFY showArchivedChanged)
+    Q_PROPERTY(bool hasSessions READ hasSessions NOTIFY sessionPresenceChanged)
+    Q_PROPERTY(bool hasUnarchivedSessions READ hasUnarchivedSessions NOTIFY sessionPresenceChanged)
 
 public:
     enum Roles {
@@ -49,6 +51,7 @@ public:
         IdRole,                      // ch id string of the row (group or session)
         GroupIdRole,                 // containing group's id (own id for groups)
         PinnedRole,                  // workspace-owned session pin state
+        ArchivedRole,                // workspace-owned archived state
     };
 
     explicit SessionsModel(QObject *parent = nullptr);
@@ -61,6 +64,17 @@ public:
     // so switching the filter does not require another server read.
     bool pinnedOnly() const { return pinnedOnly_; }
     void setPinnedOnly(bool pinnedOnly);
+
+    // Whether archived sessions are included in the visible tree. This is a
+    // client-local presentation choice; the source rows remain intact.
+    bool showArchived() const { return showArchived_; }
+    void setShowArchived(bool showArchived);
+
+    // Presence in the authoritative source tree, independent of the active
+    // filters. These let the sidebar explain "all sessions are archived"
+    // instead of presenting a filtered-empty workspace as a new one.
+    bool hasSessions() const;
+    bool hasUnarchivedSessions() const;
 
     // Incrementally refresh live per-terminal agent/connection state WITHOUT a
     // full model reset. `groups` must mirror the current structure (same group
@@ -87,15 +101,17 @@ public:
     QHash<int, QByteArray> roleNames() const override;
 signals:
     void pinnedOnlyChanged();
+    void showArchivedChanged();
+    void sessionPresenceChanged();
 
 private:
     // Keep the authoritative refresh result separate from the filtered view:
-    // toggling a client-local filter must not discard unpinned rows that should
-    // reappear when the filter is turned off.
+    // toggling either client-local filter must not discard rows that should
+    // reappear when that filter is turned off.
     QVector<GroupRow> allGroups_;
     QVector<GroupRow> groups_;
     bool pinnedOnly_ = false;
-
+    bool showArchived_ = false;
 
 };
 } // namespace ch

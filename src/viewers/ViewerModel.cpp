@@ -4,6 +4,7 @@
 #include "InternalUrlSchemeHandler.h"
 #include "RpcTypes.h"
 #include "ViewerHandlerRegistry.h"
+#include "ViewerKinds.h"
 #include "ViewerProfiles.h"
 
 #include <QDesktopServices>
@@ -46,6 +47,20 @@ QString viewKindFor(ViewerResolution resolution)
     // with the browser and becomes a download/metadata view, never a text
     // buffer.
     return QStringLiteral("binary");
+}
+
+QString extensionForFileUrl(const QUrl& url)
+{
+    if (url.scheme().compare(QLatin1String("file"), Qt::CaseInsensitive) != 0)
+        return {};
+    const QString path = url.path();
+    if (path.endsWith(QLatin1Char('/')))
+        return {};
+    const int slash = path.lastIndexOf(QLatin1Char('/'));
+    const int dot = path.lastIndexOf(QLatin1Char('.'));
+    if (dot <= slash + 1 || dot == path.size() - 1)
+        return {};
+    return ViewerKinds::normaliseExtension(path.mid(dot + 1));
 }
 
 // One remote directory entry on its way to the {name, kind} map QML consumes.
@@ -96,6 +111,23 @@ void ViewerModel::setProfiles(ViewerProfiles *profiles)
     wireProfileSignals();
 }
 
+void ViewerModel::setDefaultKinds(const QHash<QString, QString>& defaults)
+{
+    QHash<QString, QString> clean;
+    for (auto it = defaults.cbegin(); it != defaults.cend(); ++it) {
+        const QString extension = ViewerKinds::normaliseExtension(it.key());
+        if (extension.isEmpty()
+            || !ViewerKinds::canAssign(extension, it.value()))
+            continue;
+        clean.insert(extension, it.value());
+    }
+    if (clean == m_defaultKinds)
+        return;
+    m_defaultKinds = std::move(clean);
+    ++m_viewKindsRevision;
+    emit viewKindsRevisionChanged();
+}
+
 ViewerProfiles *ViewerModel::profiles()
 {
     if (!m_profiles) {
@@ -124,14 +156,36 @@ void ViewerModel::wireProfileSignals()
                 });
 }
 
+QStringList ViewerModel::validViewKindsForExtension(
+    const QString& extension) const
+{
+    return ViewerKinds::assignableForExtension(extension);
+}
+
 QString ViewerModel::viewKind(const QUrl &url) const
 {
+    const QString extension = extensionForFileUrl(url);
+    if (!extension.isEmpty()) {
+        const QString configured = m_defaultKinds.value(extension);
+        if (!configured.isEmpty())
+            return configured;
+    }
     return viewKindFor(ViewerHandlerRegistry::resolve(url));
 }
 
 QStringList ViewerModel::applicableViewKinds(const QUrl &url) const
 {
-    return ViewerHandlerRegistry::applicableViewKinds(url);
+    QStringList kinds = ViewerHandlerRegistry::applicableViewKinds(url);
+    const QString extension = extensionForFileUrl(url);
+    if (extension.isEmpty())
+        return kinds;
+    const QString configured = m_defaultKinds.value(extension);
+    if (configured.isEmpty())
+        return kinds;
+
+    kinds.removeAll(configured);
+    kinds.prepend(configured);
+    return kinds;
 }
 
 bool ViewerModel::isValidApplicationScheme(const QString &scheme) const

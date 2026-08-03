@@ -7,7 +7,7 @@ import QtQuick.Layouts
 // workspace mutations wired to app.* invokables, addressed by the row's ch id.
 // Left click selects and activates the session; dragging the row hands the
 // drop resolution to the sidebar (`host`), which is what talks to app.*.
-// Role names consumed: name, subtitle, rowState, pinned, itemId, groupId.
+// Role names consumed: name, subtitle, rowState, pinned, archived, itemId, groupId.
 ItemDelegate {
     id: row
 
@@ -16,6 +16,7 @@ ItemDelegate {
     required property string subtitle
     required property int rowState
     required property bool pinned
+    required property bool archived
     required property string itemId  // this session's ch id (SessionsModel role)
     required property string groupId // containing group's ch id (for moves)
     // The SessionsSidebar that instantiated this row: registry, drag state and
@@ -119,10 +120,11 @@ ItemDelegate {
     // glyph and silhouette — carries no text at all.
     Accessible.role: Accessible.ListItem
     Accessible.name: row.name
-    Accessible.description: row.subtitle.length > 0
-                            ? qsTr("%1 \u2014 %2").arg(row.stateWords(row.rowState))
-                                                  .arg(row.subtitle)
-                            : row.stateWords(row.rowState)
+    Accessible.description: (row.archived ? qsTr("Archived") + qsTr(" \u2014 ") : "")
+                            + (row.subtitle.length > 0
+                               ? qsTr("%1 \u2014 %2").arg(row.stateWords(row.rowState))
+                                                     .arg(row.subtitle)
+                               : row.stateWords(row.rowState))
 
     // Selection wins over hover; the source row of a live drag dims so the
     // floating proxy reads as the thing being moved.
@@ -180,6 +182,21 @@ ItemDelegate {
                 font.bold: true
             }
         }
+        // Archived is a separate marker from the status dot and pin star: the
+        // box glyph remains visible when archived rows are shown and uses the
+        // muted text role rather than any status colour.
+        Label {
+            id: archivedMarker
+            objectName: "archivedMarker:" + row.itemId
+            width: 14
+            text: row.archived ? "\u25a3" : ""
+            color: Theme.textDim
+            font.pixelSize: Theme.fontSizeLabel
+            horizontalAlignment: Text.AlignHCenter
+            verticalAlignment: Text.AlignVCenter
+            visible: row.archived
+            anchors.verticalCenter: parent.verticalCenter
+        }
 
         Column {
             spacing: 2
@@ -195,7 +212,9 @@ ItemDelegate {
             // from the Row's implicit width, which is derived from these very
             // children and would be a cycle.
             width: Math.max(0, parent.width - parent.leftPadding - dot.width
-                            - parent.spacing - pinButton.width - parent.spacing - 8)
+                            - archivedMarker.width - parent.spacing
+                            - pinButton.width - archiveButton.width - deleteButton.width
+                            - parent.spacing * 4 - 8)
 
             Label {
                 width: parent.width
@@ -256,6 +275,91 @@ ItemDelegate {
             }
             onClicked: if (row.host) row.host.togglePinned(row.itemId, !row.pinned)
         }
+        // Archive is deliberately a box/return glyph rather than a star, so
+        // this action cannot be confused with the pin marker beside it.
+        Button {
+            id: archiveButton
+            objectName: "archiveButton:" + row.itemId
+            width: 24
+            height: 24
+            implicitWidth: 24
+            implicitHeight: 24
+            padding: 0
+            anchors.verticalCenter: parent.verticalCenter
+            text: row.archived ? "\u21a9" : "\u25a3"
+
+            readonly property string actionText:
+                row.archived ? qsTr("Unarchive %1").arg(row.name)
+                             : qsTr("Archive %1").arg(row.name)
+            Accessible.role: Accessible.Button
+            Accessible.name: archiveButton.actionText
+
+            AppToolTip {
+                objectName: "archiveButtonTip:" + row.itemId
+                text: archiveButton.actionText
+                visible: archiveButton.hovered
+                delay: 600
+            }
+
+            contentItem: Label {
+                text: archiveButton.text
+                color: archiveButton.down ? Theme.accent : Theme.text
+                font.pixelSize: Theme.fontSizeTitle
+                horizontalAlignment: Text.AlignHCenter
+                verticalAlignment: Text.AlignVCenter
+            }
+            background: Rectangle {
+                radius: Theme.radiusSmall
+                color: archiveButton.down ? Theme.surfaceRaised
+                     : archiveButton.hovered ? Theme.surfaceHover : "transparent"
+                border.width: archiveButton.visualFocus ? 2 : 1
+                border.color: archiveButton.visualFocus ? Theme.accent : Theme.borderSubtle
+            }
+            onClicked: if (row.host) row.host.toggleArchived(row.itemId, !row.archived)
+        }
+        // Delete is the destructive sibling of pin and archive: it gets its
+        // own pointer/keyboard target, red treatment and named hint, while the
+        // row itself remains the selection and drag surface.
+        Button {
+            id: deleteButton
+            objectName: "deleteButton:" + row.itemId
+            width: 24
+            height: 24
+            implicitWidth: 24
+            implicitHeight: 24
+            padding: 0
+            focusPolicy: Qt.StrongFocus
+            anchors.verticalCenter: parent.verticalCenter
+            text: "\u2715"
+
+            readonly property string actionText:
+                qsTr("Delete %1").arg(row.name)
+            Accessible.role: Accessible.Button
+            Accessible.name: deleteButton.actionText
+
+            AppToolTip {
+                objectName: "deleteButtonTip:" + row.itemId
+                text: deleteButton.actionText
+                visible: deleteButton.hovered
+                delay: 600
+            }
+
+            contentItem: Label {
+                text: deleteButton.text
+                color: deleteButton.down ? Theme.textOnAccent : Theme.danger
+                font.pixelSize: Theme.fontSizeTitle
+                horizontalAlignment: Text.AlignHCenter
+                verticalAlignment: Text.AlignVCenter
+            }
+            background: Rectangle {
+                radius: Theme.radiusSmall
+                color: deleteButton.down ? Theme.danger
+                     : deleteButton.hovered ? Theme.surfaceHover : "transparent"
+                border.width: deleteButton.visualFocus ? 2 : 1
+                border.color: deleteButton.visualFocus ? Theme.accent : Theme.danger
+            }
+            onClicked: deleteDialog.open()
+        }
     }
 
     TapHandler {
@@ -307,8 +411,12 @@ ItemDelegate {
             onTriggered: if (row.host) row.host.moveSessionToTop(row.itemId, row.groupId)
         }
         MenuItem {
+            text: row.archived ? qsTr("Unarchive") : qsTr("Archive")
+            onTriggered: if (row.host) row.host.toggleArchived(row.itemId, !row.archived)
+        }
+        MenuItem {
             text: qsTr("Delete")
-            onTriggered: if (row.host) row.host.deleteSession(row.itemId)
+            onTriggered: deleteDialog.open()
         }
     }
 
@@ -358,5 +466,29 @@ ItemDelegate {
             if (row.host && renameField.text.length > 0)
                 row.host.renameSession(row.itemId, renameField.text);
         }
+    }
+    AppDialog {
+        id: deleteDialog
+        objectName: "deleteSessionDialog:" + row.itemId
+        title: qsTr("Delete Dev Session")
+        modal: true
+        standardButtons: Dialog.Ok | Dialog.Cancel
+        anchors.centerIn: Overlay.overlay
+        width: 400
+
+        ColumnLayout {
+            implicitWidth: 360
+
+            Label {
+                objectName: "deleteSessionMessage:" + row.itemId
+                Layout.fillWidth: true
+                textFormat: Text.PlainText
+                wrapMode: Text.WordWrap
+                text: qsTr("Delete the Dev Session \"%1\"? This permanently destroys it and cannot be undone.")
+                      .arg(row.name)
+            }
+        }
+
+        onAccepted: if (row.host) row.host.deleteSession(row.itemId)
     }
 }

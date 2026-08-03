@@ -13,6 +13,7 @@ Rectangle {
     property bool shown: false
     property string selectedGroup: "appearance"
     property var toolbarItems: []
+    property var viewerDefaultEntries: []
     property var profileEntries: []
     property string selectedProfileId: ""
     property string profileName: ""
@@ -138,6 +139,44 @@ Rectangle {
         return app.settings || null;
     }
 
+    function validViewerKindsForExtension(extension) {
+        if (typeof viewers === "undefined" || !viewers
+                || typeof viewers.validViewKindsForExtension !== "function")
+            return [];
+        return viewers.validViewKindsForExtension(String(extension || ""));
+    }
+
+    function syncViewerDefaults() {
+        var settings = root.settingsObject();
+        var stored = settings ? settings.viewerDefaults : {};
+        var keys = Object.keys(stored || {});
+        keys.sort();
+        var rows = [];
+        for (var i = 0; i < keys.length; ++i) {
+            rows.push({ extension: keys[i], kind: String(stored[keys[i]]) });
+        }
+        root.viewerDefaultEntries = rows;
+    }
+
+    function viewerKindLabel(kind) {
+        switch (String(kind)) {
+        case "web": return qsTr("Web page");
+        case "markdown": return qsTr("Rendered Markdown");
+        case "text": return qsTr("Source editor");
+        case "image": return qsTr("Image");
+        case "pdf": return qsTr("PDF");
+        case "directory": return qsTr("Directory");
+        case "binary": return qsTr("Binary");
+        default: return String(kind);
+        }
+    }
+
+    function removeViewerDefault(extension) {
+        var settings = root.settingsObject();
+        if (settings)
+            settings.clearViewerDefault(String(extension || ""));
+    }
+
     // Reconciliation is a VIEW of the stored order against the buttons this
     // build has; it is not a user choice and must not be written back. Saving
     // it here meant merely opening the app (or this pane) rewrote the settings
@@ -171,6 +210,10 @@ Rectangle {
         case "nav.forward": return qsTr("Forward");
         case "nav.reload": return qsTr("Reload");
         case "nav.home": return qsTr("Home");
+        case "pane.split.horizontal": return qsTr("Split side by side");
+        case "pane.split.vertical": return qsTr("Split top and bottom");
+        case "pane.close": return qsTr("Close pane");
+        case "terminal.kill": return qsTr("Kill terminal session");
         default: return String(id);
         }
     }
@@ -244,18 +287,21 @@ Rectangle {
     onShownChanged: {
         if (root.shown) {
             root.reconcileToolbar();
+            root.syncViewerDefaults();
             root.syncProfiles();
             root.forceActiveFocus();
         }
     }
     Component.onCompleted: {
         root.reconcileToolbar();
+        root.syncViewerDefaults();
         root.syncProfiles();
     }
 
     Connections {
         target: root.settingsObject()
         function onToolbarOrderChanged() { root.reconcileToolbar(); }
+        function onViewerDefaultsChanged() { root.syncViewerDefaults(); }
     }
     Connections {
         target: ToolbarRegistry
@@ -329,6 +375,7 @@ Rectangle {
                 Repeater {
                     model: [
                         { key: "appearance", label: qsTr("Appearance") },
+                        { key: "viewerDefaults", label: qsTr("File viewers") },
                         { key: "server", label: qsTr("Server") },
                         { key: "tmux", label: qsTr("Tmux") }
                     ]
@@ -382,7 +429,10 @@ Rectangle {
             anchors.margins: 18
             sourceComponent: root.selectedGroup === "appearance"
                              ? appearancePane
-                             : root.selectedGroup === "server" ? serverPane : tmuxPane
+                             : root.selectedGroup === "viewerDefaults"
+                               ? viewerDefaultsPane
+                               : root.selectedGroup === "server"
+                                 ? serverPane : tmuxPane
         }
     }
     Component {
@@ -628,6 +678,160 @@ Rectangle {
 
     function pixelRatioForIndex(index) {
         return [0, 1, 1.5, 2, 3, 4][index] || 0;
+    }
+
+    Component {
+        id: viewerDefaultsPane
+
+        Flickable {
+            objectName: "viewerDefaultsPane"
+            clip: true
+            contentWidth: width
+            contentHeight: viewerDefaultsColumn.implicitHeight
+            boundsBehavior: Flickable.StopAtBounds
+
+            Column {
+                id: viewerDefaultsColumn
+                width: parent.width
+                spacing: 12
+
+                Label {
+                    text: qsTr("File viewers")
+                    color: Theme.text
+                    font.bold: true
+                    font.pixelSize: Theme.fontSizeTitle
+                }
+                Label {
+                    width: parent.width
+                    wrapMode: Text.WordWrap
+                    text: qsTr("Choose the default viewer for a file extension. Changes apply to panes that are already open.")
+                    color: Theme.textDim
+                    font.pixelSize: Theme.fontSizeBody
+                }
+
+                Row {
+                    spacing: 8
+                    TextField {
+                        id: viewerExtensionInput
+                        objectName: "viewerDefaultExtensionInput"
+                        width: 190
+                        implicitHeight: 30
+                        color: Theme.text
+                        placeholderText: qsTr("Extension, for example md")
+                        placeholderTextColor: Theme.textDim
+                        selectByMouse: true
+                        font.pixelSize: Theme.fontSizeBody
+                        background: Rectangle {
+                            color: Theme.surfaceSunken
+                            radius: Theme.radiusSmall
+                            border.width: viewerExtensionInput.activeFocus ? 2 : 1
+                            border.color: viewerExtensionInput.activeFocus
+                                          ? Theme.accent : Theme.borderSubtle
+                        }
+                    }
+                    ChoiceBox {
+                        id: viewerKindChoice
+                        objectName: "viewerDefaultKindChoice"
+                        implicitWidth: 220
+                        textRole: "label"
+                        model: {
+                            var kinds =
+                                    root.validViewerKindsForExtension(
+                                        viewerExtensionInput.text);
+                            var choices = [];
+                            for (var i = 0; i < kinds.length; ++i)
+                                choices.push({
+                                    value: String(kinds[i]),
+                                    label: root.viewerKindLabel(kinds[i])
+                                });
+                            return choices;
+                        }
+                        currentIndex: model.length > 0 ? 0 : -1
+                    }
+                    SheetButton {
+                        objectName: "viewerDefaultAddButton"
+                        text: qsTr("Add or update")
+                        enabled: viewerKindChoice.model.length > 0
+                        onClicked: {
+                            var settings = root.settingsObject();
+                            var choices = viewerKindChoice.model || [];
+                            var index = viewerKindChoice.currentIndex;
+                            if (!settings || index < 0 || index >= choices.length)
+                                return;
+                            if (settings.setViewerDefault(
+                                        viewerExtensionInput.text,
+                                        String(choices[index].value))) {
+                                viewerExtensionInput.text = "";
+                                root.syncViewerDefaults();
+                            }
+                        }
+                    }
+                }
+
+                Label {
+                    visible: viewerExtensionInput.text.length > 0
+                             && viewerKindChoice.model.length === 0
+                    text: qsTr("Use letters and numbers only; specialised viewers are offered only for compatible file types.")
+                    color: Theme.warning
+                    font.pixelSize: Theme.fontSizeSmall
+                    wrapMode: Text.WordWrap
+                }
+
+                Label {
+                    visible: root.viewerDefaultEntries.length === 0
+                    text: qsTr("No customised file viewers.")
+                    color: Theme.textDim
+                    font.pixelSize: Theme.fontSizeBody
+                }
+                Rectangle {
+                    objectName: "viewerDefaultsList"
+                    width: Math.min(parent.width, 620)
+                    height: Math.max(36, Math.min(4 * 38,
+                                                    root.viewerDefaultEntries.length * 38))
+                    color: Theme.surfaceSunken
+                    border.width: 1
+                    border.color: Theme.borderSubtle
+                    ListView {
+                        id: viewerDefaultsList
+                        anchors.fill: parent
+                        anchors.margins: 2
+                        clip: true
+                        model: root.viewerDefaultEntries
+                        delegate: Rectangle {
+                            required property var modelData
+                            required property int index
+                            width: viewerDefaultsList.width - 4
+                            height: 36
+                            color: index % 2 === 0
+                                   ? Theme.surfaceSunken : Theme.surfaceDeep
+                            Label {
+                                anchors.left: parent.left
+                                anchors.leftMargin: 10
+                                anchors.right: removeButton.left
+                                anchors.verticalCenter: parent.verticalCenter
+                                text: "." + modelData.extension + "  \u2014  "
+                                      + root.viewerKindLabel(modelData.kind)
+                                color: Theme.text
+                                font.pixelSize: Theme.fontSizeBody
+                                elide: Text.ElideRight
+                            }
+                            SheetButton {
+                                id: removeButton
+                                objectName: "viewerDefaultRemove:"
+                                            + modelData.extension
+                                anchors.right: parent.right
+                                anchors.rightMargin: 4
+                                anchors.verticalCenter: parent.verticalCenter
+                                text: qsTr("Remove")
+                                implicitHeight: 26
+                                onClicked: root.removeViewerDefault(
+                                               modelData.extension)
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     Component {

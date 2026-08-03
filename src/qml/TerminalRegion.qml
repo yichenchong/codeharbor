@@ -81,39 +81,26 @@ Rectangle {
     // would be a second title strip in the middle of the column.
     readonly property bool isRootRegion: !region.rootRegion
 
-    // ---- region actions (SPEC 4.4/4.5) -------------------------------------
+    // ---- pane actions (SPEC 4.4/4.5) ---------------------------------------
     //
-    // The region header exposes the pane commands that used to be reachable ONLY
-    // through the command palette. The logic behind them is the host's — it owns
-    // ch::SessionLayouts, and a region cannot publish a tree — so the header
-    // raises a request per action and the host (Main.qml) runs it:
+    // A pane header cannot publish a split tree, collapse a layout or end a
+    // remote session itself. It raises a request and the host (Main.qml) runs
+    // the operation for the pane id it names.
     //
-    //   splitRequested("horizontal" | "vertical") -> splitActivePane("terminal", …)
-    //   closePaneRequested(paneId)                -> closeActivePane("terminal")
-    //   killTerminalRequested()                   -> killActiveTerminal()
-    //
-    // `paneId` is the pane the request is ABOUT: a pane's own header close button
-    // names itself, while the region header passes the focused pane (which is ""
-    // when nothing has been touched, meaning "whichever pane the host would pick
-    // anyway"). All three are emitted by the ROOT region only, because that is
-    // where takePane() wires the panes and where `focusedPaneId` lives.
-    //
-    // Killing is destructive and deliberately NOT done here: ending the remote
-    // tmux session is TerminalPaneView.killSession(), which the host already
-    // reaches through the pane cache, and it also warns the user afterwards.
-    // Production-only stamped counterparts. Legacy signals remain for the
-    // standalone component tests, never for Main.qml's configured host.
+    // Both plain and stamped variants remain available: standalone component
+    // tests use the plain signals, while production uses the immutable session
+    // and layout-generation stamp to reject delayed callbacks.
     signal splitRequestedForSession(string sessionId, double generation,
-                                    string orientation)
+                                    string paneId, string orientation)
     signal closePaneRequestedForSession(string sessionId, double generation,
                                          string paneId)
+    signal killTerminalRequestedForSession(string sessionId, double generation,
+                                           string paneId)
     signal paneTitleReportedForSession(string sessionId, double generation,
                                        string paneId, string title)
-    signal splitRequested(string orientation)
+    signal splitRequested(string paneId, string orientation)
     signal closePaneRequested(string paneId)
-    signal killTerminalRequested()
-    // Forward title edits from the pane to Main.qml, which owns the
-    // SessionLayouts persistence bridge.
+    signal killTerminalRequested(string paneId)
     signal paneTitleReported(string paneId, string title)
 
     // A handle INSIDE this region was dragged, so the branch at `pathIndexes`
@@ -215,6 +202,14 @@ Rectangle {
             pane.closeRequested.connect(id =>
                 region.reportForPane(id, (sessionId, generation) =>
                     region.paneOwner.notePaneCloseForSession(
+                        sessionId, generation, id)));
+            pane.splitRequested.connect((id, orientation) =>
+                region.reportForPane(id, (sessionId, generation) =>
+                    region.paneOwner.notePaneSplitForSession(
+                        sessionId, generation, id, orientation)));
+            pane.killRequested.connect(id =>
+                region.reportForPane(id, (sessionId, generation) =>
+                    region.paneOwner.notePaneKillForSession(
                         sessionId, generation, id)));
             pane.titleChangedRequested.connect((id, title) =>
                 region.reportForPane(id, (sessionId, generation) =>
@@ -337,12 +332,72 @@ Rectangle {
     // only leaf is the placeholder has nothing else a command could target, so
     // the host's first-leaf fallback picks that very pane.
     property string focusedPaneId: ""
+    // Counts real user focus reports, including a second click on the already
+    // focused pane. Main.qml snapshots this counter before a layout load and
+    // drops a pending restore when the user interacts while that load is in
+    // flight. Programmatic focusPane() deliberately does not increment it.
+    property int userFocusSerial: 0
+    // Resetting a tree clears the in-memory focus, but that transition is not a
+    // user choice and must not overwrite the selected pane saved for the new
+    // session before its tree arrives.
+    property bool focusResetting: false
+
+    function firstPaneId(n) {
+        if (!n)
+            return "";
+        if (n.children && n.children.length > 0)
+            return region.firstPaneId(n.children[0]);
+        return region.paneKeyOf(n);
+    }
+
+    function hasPane(n, paneId) {
+        if (!n)
+            return false;
+        if (!n.children || n.children.length === 0)
+            return region.paneKeyOf(n) === paneId;
+        for (let i = 0; i < n.children.length; ++i) {
+            if (region.hasPane(n.children[i], paneId))
+                return true;
+        }
+        return false;
+    }
+
+    // Give keyboard focus back to the requested pane. An empty request means
+    // the first leaf in this region, which is also the silent fallback used
+    // when a remembered pane is no longer in the session's tree. Returning
+    // false means the tree has arrived but its recursive Loader has not
+    // materialised the pane yet; Main.qml retries rather than dropping focus.
+    function focusPane(paneId) {
+        const owner = region.paneOwner;
+        if (owner !== region)
+            return owner.focusPane(paneId);
+        let requested = paneId === undefined || paneId === null
+                        || String(paneId).length === 0
+                      ? region.firstPaneId(region.node)
+                      : String(paneId);
+        let pane = owner.paneCache[requested];
+        if (!pane && !region.hasPane(region.node, requested)) {
+            requested = region.firstPaneId(region.node);
+            pane = owner.paneCache[requested];
+        }
+        if (!pane)
+            return false;
+        owner.focusedPaneId = requested;
+        owner.applyFocusFlags();
+        if (typeof pane.acceptFocus === "function")
+            pane.acceptFocus();
+        else if (typeof pane.forceActiveFocus === "function")
+            pane.forceActiveFocus();
+        return true;
+    }
 
     // A pane reporting that the user is working in it. Only ever reached on the
     // owner, because takePane() — where it is connected — is only ever called
-    // on the owner. Re-focusing the focused pane assigns the same string, which
-    // QML does not report as a change, so the host is not woken for a no-op.
+    // on the owner. Re-focusing the focused pane assigns the same string, so
+    // the host is not woken for a no-op, but the serial still records the click
+    // so a restore waiting on a layout cannot fight it.
     function noteFocus(paneId) {
+        region.userFocusSerial += 1;
         region.focusedPaneId = paneId;
         region.applyFocusFlags();
     }
@@ -359,6 +414,26 @@ Rectangle {
             cache[key].paneActive = (key === region.focusedPaneId);
     }
 
+    // A pane asking to be split from its own header. Relayed rather than acted
+    // on: changing a split tree is a layout operation only the host can publish.
+    function notePaneSplit(paneId, orientation) {
+        if (region.hostStampsWrites)
+            return; // production uses the immutable callback stamp below
+        region.splitRequested(paneId, orientation);
+    }
+
+    function notePaneSplitForSession(sessionId, generation, paneId, orientation) {
+        if (region.hostStampsWrites) {
+            if (String(sessionId).length === 0)
+                return; // production has no selected session to stamp
+            region.splitRequestedForSession(String(sessionId),
+                                            Number(generation),
+                                            paneId, orientation);
+            return;
+        }
+        region.splitRequested(paneId, orientation);
+    }
+
     // A pane asking to be closed from its own header. Relayed rather than acted
     // on: closing a pane is a layout change only the host can publish, and it
     // deliberately leaves the remote tmux session running.
@@ -371,12 +446,29 @@ Rectangle {
     function notePaneCloseForSession(sessionId, generation, paneId) {
         if (region.hostStampsWrites) {
             if (String(sessionId).length === 0)
-                return; // production has no selected session to stamp
+                return; // production uses the immutable callback stamp below
             region.closePaneRequestedForSession(String(sessionId),
                                                 Number(generation), paneId);
             return;
         }
         region.closePaneRequested(paneId);
+    }
+
+    function notePaneKill(paneId) {
+        if (region.hostStampsWrites)
+            return; // production uses the immutable callback stamp below
+        region.killTerminalRequested(paneId);
+    }
+
+    function notePaneKillForSession(sessionId, generation, paneId) {
+        if (region.hostStampsWrites) {
+            if (String(sessionId).length === 0)
+                return; // production has no selected session to stamp
+            region.killTerminalRequestedForSession(String(sessionId),
+                                                   Number(generation), paneId);
+            return;
+        }
+        region.killTerminalRequested(paneId);
     }
 
     function notePaneTitle(paneId, title) {
@@ -397,29 +489,6 @@ Rectangle {
         region.paneTitleReported(paneId, title);
     }
 
-    function requestSplit(orientation) {
-        if (region.hostStampsWrites) {
-            if (region.devSessionId.length === 0)
-                return; // production has no selected session to stamp
-            region.splitRequestedForSession(region.devSessionId,
-                                            region.layoutGeneration,
-                                            orientation);
-            return;
-        }
-        region.splitRequested(orientation);
-    }
-
-    function requestClose(paneId) {
-        if (region.hostStampsWrites) {
-            if (region.devSessionId.length === 0)
-                return; // production has no selected session to stamp
-            region.closePaneRequestedForSession(region.devSessionId,
-                                                region.layoutGeneration,
-                                                paneId);
-            return;
-        }
-        region.closePaneRequested(paneId);
-    }
 
     // ---- this region's own leaf --------------------------------------------
 
@@ -535,7 +604,9 @@ Rectangle {
             return; // only the owner holds the cache
         region.destroyAllPanes();
         region.paneStamps = ({});
+        region.focusResetting = true;
         region.focusedPaneId = "";
+        region.focusResetting = false;
     }
 
     onDevSessionIdChanged: {
@@ -567,16 +638,14 @@ Rectangle {
         TerminalPaneView {}
     }
 
-    // The region header (SPEC 4.4): the column's own title strip, carrying the
-    // pane commands that were previously reachable only from the command palette.
+    // The region header (SPEC 4.4): the column's own title strip. Pane
+    // management controls live in each pane's header, so this strip is only the
+    // region label and its divider.
     // Root region ONLY — see `isRootRegion`.
     //
     // PANE IDENTITY: this is a child of the REGION, not of a pane, and it is
-    // never re-parented. It is therefore on the safe side of the line drawn in
-    // the comment at the top of this file: the panes below it are re-homed
-    // between layout positions and this strip is not part of what moves. The
-    // per-pane header is the opposite case and lives inside TerminalPaneView, so
-    // it travels WITH the pane and its live PTY.
+    // never re-parented. The per-pane header is the opposite case and lives
+    // inside TerminalPaneView, so it travels WITH the pane and its live PTY.
     Rectangle {
         id: regionHeader
         anchors.left: parent.left
@@ -604,45 +673,6 @@ Rectangle {
             font.bold: true
         }
 
-        Row {
-            anchors.right: parent.right
-            anchors.rightMargin: 6
-            anchors.verticalCenter: parent.verticalCenter
-            spacing: 2
-
-            AppPaneHeader.Action {
-                text: qsTr("Split the focused pane side by side")
-                glyph: "\u25eb"
-                onClicked: region.requestSplit("horizontal")
-            }
-            AppPaneHeader.Action {
-                text: qsTr("Split the focused pane top and bottom")
-                glyph: "\u229f"
-                onClicked: region.requestSplit("vertical")
-            }
-            AppPaneHeader.Action {
-                text: qsTr("Close the focused pane")
-                glyph: "\u00d7"
-                onClicked: region.requestClose(region.focusedPaneId)
-            }
-            // Spelled out rather than given a glyph: this ends the remote shell
-            // and everything running in it, and a one-character button is the
-            // wrong affordance for something irreversible.
-            AppPaneHeader.Action {
-                id: killAction
-                text: qsTr("End the focused terminal's remote session")
-                onClicked: region.killTerminalRequested()
-
-                contentItem: Label {
-                    textFormat: Text.PlainText
-                    text: qsTr("Kill")
-                    color: killAction.hovered ? Theme.danger : Theme.textDim
-                    font.pixelSize: Theme.fontSizeSmall
-                    horizontalAlignment: Text.AlignHCenter
-                    verticalAlignment: Text.AlignVCenter
-                }
-            }
-        }
     }
 
     // Everything the region header does NOT occupy, and the one parent every

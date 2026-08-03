@@ -514,12 +514,13 @@ private slots:
     // session brings back the right split with a set of blank panes in it.
     void openingAFileInAPaneIsReportedToTheHost();
 
-    // HEADERS (SPEC 4.3/4.4). Both regions now put an AppPaneHeader INSIDE every
-    // pane, which is the one place a header could break the invariant this file
-    // exists to defend: a header the region owned would have to be rebuilt to
-    // follow a pane across a split, and rebuilding is what destroys the pane.
+    // PANE ACTIONS. Every header action must name its own pane, even when the
+    // remembered-pane fallback would otherwise choose the first leaf.
+    void paneHeaderRequestsNameTheirOwnPane();
+    void terminalKillRequiresConfirmation();
     void paneHeaderTravelsWithThePaneAcrossASplit();
     void terminalCustomTitleAppearsAndClearsInTheHeader();
+
     // The header is also the pane's focus indicator, so the region's focus has to
     // reach it or the mark is decoration.
     void theFocusedPaneIsTheOnlyOneMarkedActive();
@@ -1256,6 +1257,84 @@ void TstPaneIdentity::aClickInsideTheLivePageReportsFocusAndStillReachesThePage(
                        QStringLiteral("true"), kProbeTimeoutMs),
              "the focus sniffer SWALLOWED the click: the region learned which pane the user is "
              "in, but the terminal page never saw the press");
+}
+
+// ---------------------------------------------------------------------------
+// PANE ACTIONS. A header action must carry the pane it belongs to, rather than
+// asking Main.qml to resolve the remembered pane or the first leaf.
+// ---------------------------------------------------------------------------
+void TstPaneIdentity::paneHeaderRequestsNameTheirOwnPane()
+{
+    QVERIFY(openRegion(QStringLiteral("ViewerRegion.qml"),
+                       branchNode(QStringLiteral("horizontal"),
+                                  QVariantList{leafNode(QStringLiteral("viewer-1")),
+                                               leafNode(QStringLiteral("viewer-2"))}),
+                       /*terminal=*/false));
+    const auto panes = [this] { return collect(m_region, isLeafPane); };
+    QTRY_VERIFY(panes().size() == 2);
+    QTest::qWait(kSettleMs);
+    QCOMPARE(m_region->property("focusedPaneId").toString(), QString());
+
+    QObject *const second = paneWithId(m_region, QStringLiteral("viewer-2"));
+    QVERIFY(second);
+    QObject *const splitButton = childNamed(second, QStringLiteral("viewerSplitHorizontalButton"));
+    QObject *const closeButton = childNamed(second, QStringLiteral("viewerCloseButton"));
+    QVERIFY2(splitButton, "the viewer pane has no side-by-side split button");
+    QVERIFY2(closeButton, "the viewer pane has no close button");
+
+    QSignalSpy splitRequested(m_region, SIGNAL(splitRequested(QString, QString)));
+    QVERIFY(splitRequested.isValid());
+    QVERIFY(QMetaObject::invokeMethod(splitButton, "clicked"));
+    QTRY_COMPARE(splitRequested.size(), 1);
+    QCOMPARE(m_region->property("focusedPaneId").toString(), QStringLiteral("viewer-2"));
+    const QList<QVariant> splitArgs = splitRequested.constFirst();
+    QCOMPARE(splitArgs.at(0).toString(), QStringLiteral("viewer-2"));
+    QCOMPARE(splitArgs.at(1).toString(), QStringLiteral("horizontal"));
+
+    // The second pane is still present because this standalone test does not
+    // publish a replacement tree. The close request must still name it.
+    QSignalSpy closeRequested(m_region, SIGNAL(closePaneRequested(QString)));
+    QVERIFY(closeRequested.isValid());
+    QVERIFY(QMetaObject::invokeMethod(closeButton, "clicked"));
+    QTRY_COMPARE(closeRequested.size(), 1);
+    QCOMPARE(closeRequested.constFirst().constFirst().toString(),
+             QStringLiteral("viewer-2"));
+}
+
+void TstPaneIdentity::terminalKillRequiresConfirmation()
+{
+    QVERIFY(openRegion(QStringLiteral("TerminalRegion.qml"),
+                       branchNode(QStringLiteral("vertical"),
+                                  QVariantList{leafNode(QStringLiteral("terminal-1")),
+                                               leafNode(QStringLiteral("terminal-2"))}),
+                       /*terminal=*/true));
+    const auto panes = [this] { return collect(m_region, isLeafPane); };
+    QTRY_VERIFY(panes().size() == 2);
+    QTest::qWait(kSettleMs);
+
+    QObject *const second = paneWithId(m_region, QStringLiteral("terminal-2"));
+    QVERIFY(second);
+    QObject *const killButton = childNamed(second, QStringLiteral("terminalKillButton"));
+    QVERIFY2(killButton, "the terminal pane has no kill button");
+    QSignalSpy killRequested(m_region, SIGNAL(killTerminalRequested(QString)));
+    QVERIFY(killRequested.isValid());
+
+    // Declining the dialog emits no request.
+    QVERIFY(QMetaObject::invokeMethod(killButton, "clicked"));
+    QObject *const dialog = childNamed(second, QStringLiteral("terminalPaneKillDialog"));
+    QVERIFY2(dialog, "the terminal kill button did not open its confirmation dialog");
+    QTRY_VERIFY(dialog->property("visible").toBool());
+    QVERIFY(QMetaObject::invokeMethod(dialog, "reject"));
+    QTest::qWait(50);
+    QCOMPARE(killRequested.size(), 0);
+
+    // Accepting the same dialog emits exactly the named pane id.
+    QVERIFY(QMetaObject::invokeMethod(killButton, "clicked"));
+    QTRY_VERIFY(dialog->property("visible").toBool());
+    QVERIFY(QMetaObject::invokeMethod(dialog, "accept"));
+    QTRY_COMPARE(killRequested.size(), 1);
+    QCOMPARE(killRequested.constFirst().constFirst().toString(),
+             QStringLiteral("terminal-2"));
 }
 
 // ---------------------------------------------------------------------------

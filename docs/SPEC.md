@@ -299,6 +299,30 @@ Sidebar operations:
 
 Duplicating a Dev Session should copy viewer definitions, terminal definitions, split layouts, repository root, and task metadata, while generating new tmux targets.
 
+**Archiving and deleting are different, and the difference must be obvious in the
+interface.** Archiving is reversible and destroys nothing: the session keeps its
+panes, layouts and terminal identities, and simply leaves the sidebar's default
+view. The archived bit lives on the SERVER, so a session archived on one machine
+is archived everywhere; whether archived rows are currently SHOWN is client-local
+presentation state (§11.2), because one machine choosing to hide rows must not
+hide them for anybody else. An archived row that is shown is marked as archived,
+distinguishably from the pin marker.
+
+Deleting is permanent. Deleting a Dev Session destroys its panes and layouts with
+it; deleting a GROUP destroys every session inside it, because the server removes
+the group's sessions and their panes and layouts in one transaction. Both are
+therefore confirmed before anything happens, and the confirmation NAMES its
+subject — a group's confirmation states how many sessions will be destroyed with
+it, counted from the authoritative workspace rather than from the filtered
+sidebar, so hidden rows are included in the number. A deletion the server refuses
+leaves the row where it is and reports the failure; the row must never disappear
+optimistically and reappear on the next refresh.
+
+Both filters are presentation only. Neither may narrow what the client believes
+the workspace contains: the same tree answers "does the open Dev Session still
+exist" and "how much would this deletion destroy", and a filtered answer to either
+is a correctness fault, not a cosmetic one.
+
 ### 4.3 Viewer Region
 
 The viewer region contains one or more viewer panes arranged using a recursive split tree.
@@ -342,6 +366,16 @@ Possible operations:
 - **Kill terminal:** explicitly kill the remote tmux session.
 - **Reconnect:** reattach to the same tmux target.
 
+**Pane controls belong to the PANE.** Splitting, closing and killing are offered
+on each pane's own header, and each acts on the pane whose header was used. They
+are deliberately not region-level controls acting on "the focused pane": with
+several panes open, the pane a region-level button would act on is a guess, and a
+wrong guess splits or closes something the user was not looking at. The command
+palette still carries the same operations for keyboard use, and only there — where
+no pane was named — does the remembered pane decide the target. Killing a terminal
+destroys running remote work, so it is confirmed before it happens; closing a pane
+is not, because it leaves the tmux session alive.
+
 ### 4.5 Split Trees
 
 The viewer and terminal regions each use an independent recursive split-tree model.
@@ -363,10 +397,23 @@ discarded silently — replaying it would corrupt the tree the user is now looki
 user did anything about. A write stamped for the CURRENT session that arrives before its tree does is queued and
 applied when the tree lands. A region whose layout genuinely cannot be loaded still reports that, as before.
 
+**The pane the user was last working in is remembered per Dev Session**, and
+restored when that session is opened again, so reopening a session puts the
+keyboard back where it was — including inside a terminal, where the user can carry
+on typing without clicking first. Because a terminal is a web page and its focus
+is the page's own state, restoring focus means driving it into the page, not
+merely marking a QML item focused. The remembered pane is client-local (§11.2):
+it describes what somebody was doing at this desk. A restore is stamped like any
+other layout operation and is dropped if the user has since switched away, it
+waits for the region's tree to arrive rather than firing into an empty region, and
+it never overrides a pane the user has clicked in the meantime. A remembered pane
+that no longer exists falls back to the first viewer pane silently — a closed pane
+is not an error.
+
 ### 4.6 Settings
 
 Preferences live in one surface with a group list on the left and the selected group's controls on the right,
-reachable from the command palette. Groups: **Appearance**, **Server**, **Tmux**.
+reachable from the command palette. Groups: **Appearance**, **File Types**, **Server**, **Tmux**.
 
 Appearance owns:
 
@@ -383,6 +430,14 @@ Appearance owns:
   buttons a given build actually has (unknown ids ignored, missing ones appended), so the setting survives a
   build that adds or removes one. Reconciliation is a view, never a write: only the user reordering persists.
 - **Terminal text size** and **rendering resolution** (§5.1).
+
+File Types owns which handler opens which file extension (§7.5). An empty mapping
+means "use the built-in defaults", which is the shipped behaviour; the page lists
+what the user has customised and lets them add and remove a mapping, offering only
+the handlers that can actually display the type in question. The store is a plain
+text file a person can edit, so junk in it — an unknown handler word, a malformed
+extension, a wrong value type — is rejected or normalised on the way in rather
+than trusted.
 
 Server exposes the stored connection profiles and the actions that already exist for them (connect, disconnect,
 update the remote service). Tmux exposes the options that genuinely reach the remote side. No control in this
@@ -810,6 +865,32 @@ Initial handlers:
 | Directory | remote directories |
 | Binary | metadata and download/open actions |
 
+**Markdown renders; it does not open in the editor.** A `.md` file resolves to a
+rendered document, and its SOURCE is reached by "Open as -> Editor" (§4.3), which
+is also how it is changed. The renderer is a web document like the terminal and
+editor surfaces, and it follows the active theme live (§4.6).
+
+Markdown from the server is UNTRUSTED input: it may contain raw HTML, script
+tags, event-handler attributes and `javascript:` or `data:` URLs. The rendered
+HTML is therefore sanitised with a maintained sanitiser before it reaches the
+document, the page's content policy forbids inline and injected script outright,
+and the page may reach nothing but the internal scheme it was served from — no
+network, no filesystem, no embedded frames. Sanitising strips the offending
+construct and keeps rendering the rest: a document with one stray tag must stay
+readable. The page's bridge to the application is deliberately minimal, and in
+particular exposes no "read any path" call.
+
+**Default handler per file type.** The table above is the DEFAULT mapping, not a
+fixed one: the user may set which handler opens which file extension (§4.6). The
+resolution order is an explicit "Open as" choice first, then the user's mapping,
+then the built-in table. Only handlers that can actually display a file type may
+be chosen for it — any extension may be opened as text or as a binary/metadata
+view, while the display-specific handlers are offered only where they genuinely
+claim the type, so a mapping cannot produce a broken pane. Extensions the built-in
+table has never heard of are still mappable, because that is the case the setting
+exists for. Changing the mapping applies to panes already open, not only to the
+next file opened.
+
 ---
 
 ## 8. Remote File Editing
@@ -1097,10 +1178,12 @@ server_settings
 app_settings
 ```
 
-The `dev_sessions` table carries a `pinned` flag (§4.2). It arrived with schema version 5; a version 4 database
-gains the column with a default of "not pinned", so nothing already stored is lost and every existing session
-simply starts unpinned. The version is mirrored in the client by `WorkspaceDb::kSchemaVersion`, and the two must
-be bumped together — a one-sided bump makes client and server refuse each other.
+The `dev_sessions` table carries `pinned` (§4.2) and `archived` (§4.2). `pinned` arrived with schema version 5; a
+version 4 database gains the column with a default of "not pinned", so nothing already stored is lost and every
+existing session simply starts unpinned. The workspace schema version is stated in the server's schema file, in
+the daemon, and in the client's `WorkspaceDb::kSchemaVersion`, and those must move together; only the daemon
+migrates, and the client's copy records what it expects to find. Note this is NOT the version that gates
+compatibility — that is the separate RPC schema version (§10.3).
 
 ### 11.2 Local State
 
@@ -1110,8 +1193,9 @@ The client may store only:
 - window geometry and region widths;
 - client display preferences (theme, group-colour palette, toolbar order, terminal text size and rendering
   resolution) — see §4.6;
-- which Dev Session was last open, per server, and which pane was last selected;
-- whether the sidebar's pin filter is on;
+- which Dev Session was last open, per server, and which pane the user was last working in (§4.5);
+- whether the sidebar's pin filter is on, and whether archived sessions are shown;
+- which handler opens which file type (§4.6);
 - SSH-agent or credential-store references;
 - browser cookies and cache;
 - temporary reconnect state.

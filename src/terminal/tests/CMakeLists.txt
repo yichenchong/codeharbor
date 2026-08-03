@@ -34,6 +34,8 @@ target_link_libraries(tst_liveterminal PRIVATE
 )
 add_test(NAME tst_liveterminal COMMAND tst_liveterminal)
 set_tests_properties(tst_liveterminal PROPERTIES LABELS live)
+set_tests_properties(tst_liveterminal PROPERTIES
+    FIXTURES_REQUIRED codeharbor_live_fixture)
 
 # LIVE gate: the production attach path (TerminalFactory -> real PTY channel ->
 # real tmux -> TerminalBridge), including detach/kill against the real server.
@@ -47,6 +49,8 @@ target_link_libraries(tst_liveterminalfactory PRIVATE
 )
 add_test(NAME tst_liveterminalfactory COMMAND tst_liveterminalfactory)
 set_tests_properties(tst_liveterminalfactory PROPERTIES LABELS live)
+set_tests_properties(tst_liveterminalfactory PROPERTIES
+    FIXTURES_REQUIRED codeharbor_live_fixture)
 
 # The packaged xterm.js page inside the REAL TerminalPaneView, over a REAL
 # QWebChannel. Needs no server, but it needs Chromium: labelled `live` and
@@ -99,6 +103,8 @@ set_tests_properties(tst_terminalpage PROPERTIES
     ENVIRONMENT "${CODEHARBOR_TERMINAL_PAGE_TEST_ENV}"
     TIMEOUT 300
 )
+set_tests_properties(tst_terminalpage PROPERTIES
+    FIXTURES_REQUIRED codeharbor_live_fixture)
 
 # Console-mode on Windows, for the same reason as src/app/tests: qt_add_executable
 # marks executables as GUI subsystem, which on Windows swallows QTest's stdout and

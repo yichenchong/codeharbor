@@ -2146,11 +2146,24 @@ void TstSessionLayouts::liveLayoutRoundTripOverSsh()
     QCOMPARE(compact(asObject(reloaded.terminalTree())), terminalBefore);
     QCOMPARE(errorSpy.count(), 0);
 
-    // Leave the shared fixture database as we found it.
+    // Leave the group this run created, and make a timeout or server-side
+    // rejection visible instead of silently carrying rows into the next run.
     bool cleaned = false;
-    db.deleteGroup(group->id, [&](std::optional<RpcError>) { cleaned = true; });
-    QTRY_VERIFY_WITH_TIMEOUT(cleaned, 15000);
+    std::optional<RpcError> cleanupError;
+    db.deleteGroup(group->id, [&](std::optional<RpcError> error) {
+        cleanupError = error;
+        cleaned = true;
+    });
+    QString cleanupFailure;
+    if (!QTest::qWaitFor([&] { return cleaned; }, 15000)) {
+        cleanupFailure = QStringLiteral("cleanup timed out deleting group %1")
+                             .arg(group->id.value);
+    } else if (cleanupError) {
+        cleanupFailure = QStringLiteral("cleanup failed deleting group %1: %2")
+                             .arg(group->id.value, cleanupError->message);
+    }
     boot.disconnectSession();
+    QVERIFY2(cleanupFailure.isEmpty(), qPrintable(cleanupFailure));
 }
 
 QTEST_GUILESS_MAIN(TstSessionLayouts)

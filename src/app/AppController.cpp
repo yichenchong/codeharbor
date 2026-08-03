@@ -983,12 +983,22 @@ bool AppController::sessionExists(const QString& devSessionId) const
     return false;
 }
 
+bool AppController::sessionIsArchived(const QString& devSessionId) const
+{
+    for (const GroupNode& group : m_lastNodes)
+        for (const SessionNode& session : group.sessions)
+            if (session.session.id.value == devSessionId)
+                return session.session.archived;
+    return false;
+}
+
 bool AppController::dropActiveSessionIfGone()
 {
-    // Empty is the resting state, not a loss; and a session still in the tree
-    // is simply fine. Both make this a no-op, so the transition below happens
-    // exactly once and never thrashes on subsequent refreshes.
-    if (m_activeSessionId.isEmpty() || sessionExists(m_activeSessionId))
+    // An archived session is unavailable to the normal sidebar just like a
+    // deleted one. Retire it before rebuilding the filtered model so panes
+    // never remain on screen for a row the sidebar no longer exposes.
+    if (m_activeSessionId.isEmpty()
+        || (sessionExists(m_activeSessionId) && !sessionIsArchived(m_activeSessionId)))
         return false;
 
     clearActiveSession(/*forget=*/true);
@@ -1011,7 +1021,6 @@ void AppController::clearActiveSession(bool forget)
     if (m_layouts)
         m_layouts->load(QString());
 }
-
 void AppController::restoreActiveSession()
 {
     // Never fight the user: once anything is active, the remembered id has
@@ -1022,11 +1031,11 @@ void AppController::restoreActiveSession()
     if (remembered.isEmpty())
         return;
     // The remembered session may be gone (deleted here before the id was
-    // forgotten, or from another client). Activating it would load a phantom:
-    // both getLayout calls error, the toast fires on every launch, and the
-    // terminal region attaches panes to a Dev Session the server has never
-    // heard of. Forget it instead of reopening it.
-    if (!sessionExists(remembered)) {
+    // forgotten, or from another client), or archived and therefore hidden
+    // from the normal sidebar. Activating either would load a phantom/hidden
+    // session and leave panes on screen with no visible row. Forget it instead
+    // of reopening it.
+    if (!sessionExists(remembered) || sessionIsArchived(remembered)) {
         m_uiState->setActiveSession(m_serverId.value, QString());
         return;
     }
@@ -1142,6 +1151,16 @@ void AppController::refresh()
     // worth surfacing even if superseded).
     const quint64 generation = ++m_refreshGeneration;
     QPointer<AppController> self(this);
+    // Deliberately NOT filtered on the server. The sidebar's "only pinned" and
+    // "show archived" switches are presentation state (SPEC 11.2), and
+    // SessionsModel already hides the rows they hide. Asking the server for a
+    // FILTERED tree as well made `m_lastNodes` - the copy every other decision
+    // in this class reads - stop describing the workspace: with the pin filter
+    // on, an unpinned Dev Session looked deleted, so sessionExists() reported
+    // false and dropActiveSessionIfGone() retired the session the user was
+    // working in, and sessionCountForGroup() undercounted the sessions a group
+    // deletion would destroy. One authoritative tree, filtered only for
+    // display.
     m_db->list(m_serverId, [self, generation](QVector<GroupNode> nodes,
                                               std::optional<RpcError> err) {
         if (!self)
@@ -1199,7 +1218,7 @@ void AppController::refresh()
         if (droppedActive || self->activeSessionRepoRoot() != repoRootBefore)
             emit self->activeSessionChanged();
         emit self->refreshed();
-    }, m_sessionsModel->pinnedOnly());
+    });
 }
 
 void AppController::createGroup(QString name)
@@ -1224,6 +1243,19 @@ void AppController::setGroupCollapsed(QString id, bool collapsed)
     params.id = GroupId{std::move(id)};
     params.collapsed = collapsed;
     m_db->updateGroup(params, refreshOnSuccess<std::optional<Group>>());
+}
+void AppController::deleteGroup(QString id)
+{
+    m_db->deleteGroup(GroupId{std::move(id)}, refreshOnSuccess<>());
+}
+
+int AppController::sessionCountForGroup(QString id) const
+{
+    for (const GroupNode& group : m_lastNodes) {
+        if (group.group.id.value == id)
+            return static_cast<int>(group.sessions.size());
+    }
+    return 0;
 }
 
 void AppController::reorderGroups(QStringList orderedIds)
@@ -1258,6 +1290,42 @@ void AppController::setSessionPinned(QString id, bool pinned)
     params.id = DevSessionId{std::move(id)};
     params.pinned = pinned;
     m_db->updateSession(params, refreshOnSuccess<std::optional<DevSession>>());
+}
+void AppController::updateSessionArchived(QString id, bool archived)
+{
+    UpdateSessionParams params;
+    params.id = DevSessionId{std::move(id)};
+    params.archived = archived;
+    const QString sessionId = params.id.value;
+    QPointer<AppController> self(this);
+    m_db->updateSession(
+        params,
+        [self, sessionId, archived](std::optional<DevSession>,
+                                    std::optional<RpcError> err) {
+            if (!self)
+                return;
+            if (self->reportIfError(err))
+                return;
+            // An archived active session would disappear under the default
+            // filter while its panes remained live. Retire the active context
+            // on the acknowledged archive, just as deletion retires it once
+            // the authoritative refresh confirms the row is gone.
+            if (archived && self->m_activeSessionId == sessionId) {
+                self->clearActiveSession(/*forget=*/true);
+                emit self->activeSessionChanged();
+            }
+            self->refresh();
+        });
+}
+
+void AppController::archiveSession(QString id)
+{
+    updateSessionArchived(std::move(id), true);
+}
+
+void AppController::unarchiveSession(QString id)
+{
+    updateSessionArchived(std::move(id), false);
 }
 
 void AppController::duplicateSession(QString id)

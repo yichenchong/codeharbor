@@ -986,8 +986,9 @@ void TstSidebar::rowMenuActionsReachTheWorkspace()
     QVERIFY(row);
     fixture.app.clearCalls();
 
-    const QStringList entries{QStringLiteral("Duplicate"), QStringLiteral("Move to top"),
-                              QStringLiteral("Delete")};
+    // Delete is deliberately absent from this loop: it is destructive, so it
+    // opens a confirmation instead of calling straight through. Exercised below.
+    const QStringList entries{QStringLiteral("Duplicate"), QStringLiteral("Move to top")};
     for (const QString &entry : entries) {
         QObject *item = menuItemNamed(row, entry);
         QVERIFY2(item, qPrintable(QStringLiteral("the session row has no \"%1\" action")
@@ -999,8 +1000,39 @@ void TstSidebar::rowMenuActionsReachTheWorkspace()
     // s2 sits in Alpha, so "move to top" is position 0 of g1.
     QCOMPARE(fixture.app.calls(),
              (QStringList{QStringLiteral("duplicateSession(s2)"),
-                          QStringLiteral("moveSession(s2,g1,0)"),
-                          QStringLiteral("deleteSession(s2)")}));
+                          QStringLiteral("moveSession(s2,g1,0)")}));
+
+    // Deleting asks first. Opening the question must destroy nothing, declining
+    // must destroy nothing, and the question has to NAME the session so it
+    // cannot be confused with another row's.
+    fixture.app.clearCalls();
+    QObject *const deleteEntry = menuItemNamed(row, QStringLiteral("Delete"));
+    QVERIFY2(deleteEntry, "the session row has no \"Delete\" action");
+    QObject *const deleteDialog =
+        row->findChild<QObject *>(QStringLiteral("deleteSessionDialog:s2"));
+    QVERIFY(deleteDialog);
+    QVERIFY(QMetaObject::invokeMethod(deleteEntry, "triggered"));
+    QTest::qWait(50);
+    QVERIFY2(fixture.app.calls().isEmpty(),
+             "opening the confirmation already deleted the session");
+    QObject *const deleteMessage =
+        row->findChild<QObject *>(QStringLiteral("deleteSessionMessage:s2"));
+    QVERIFY(deleteMessage);
+    QVERIFY2(deleteMessage->property("text").toString().contains(
+                 QStringLiteral("s2"), Qt::CaseInsensitive),
+             qPrintable(QStringLiteral("the confirmation does not name the session: %1")
+                                .arg(deleteMessage->property("text").toString())));
+    QMetaObject::invokeMethod(deleteDialog, "reject");
+    QTest::qWait(50);
+    QVERIFY2(fixture.app.calls().isEmpty(), "declining the confirmation still deleted");
+
+    // Ask again and agree this time: the accepted path is a separate journey
+    // through the menu, not a second answer to a question already dismissed.
+    QVERIFY(QMetaObject::invokeMethod(deleteEntry, "triggered"));
+    QTest::qWait(50);
+    QMetaObject::invokeMethod(deleteDialog, "accept");
+    QTest::qWait(50);
+    QCOMPARE(fixture.app.calls(), (QStringList{QStringLiteral("deleteSession(s2)")}));
 
     // Rename is the one entry that goes through a dialog first.
     fixture.app.clearCalls();

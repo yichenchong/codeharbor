@@ -1,5 +1,6 @@
 import QtQuick
 import QtQuick.Controls.Basic
+import QtQuick.Layouts
 
 // Sidebar group header (SPEC 4.2): group name with a collapse chevron. Bound to
 // a SessionsModel group row via role names (name, collapsed, itemId). Clicking
@@ -13,6 +14,10 @@ ItemDelegate {
     required property string name
     required property bool collapsed
     required property string itemId // group's ch id (SessionsModel itemId role)
+    // Count from the last authoritative workspace tree, not the filtered
+    // sidebar model: a group delete also destroys archived/unpinned sessions
+    // that may currently be hidden.
+    property int sessionCount: 0
 
     // The SessionsSidebar that instantiated this header; null-guarded so the
     // header stays usable standalone.
@@ -50,13 +55,20 @@ ItemDelegate {
     width: parent ? parent.width : implicitWidth
     height: 32
 
-    // Where this header's own text has to stop: the add-session button pinned
-    // to the right edge, or that edge itself while the button is hidden. The
-    // button is a child of the HEADER rather than of the content row, so it is
-    // not part of what the row lays out around.
-    readonly property real contentRightEdge:
-        newSessionButton.visible ? newSessionButton.x : header.width - 8
-
+    // Where this header's own text has to stop: the LEFTMOST of the buttons
+    // pinned to the right edge, or that edge itself while both are hidden. The
+    // buttons are children of the HEADER rather than of the content row, so they
+    // are not part of what the row lays out around. Taking the delete button
+    // alone was not enough - the add-session button sits to its left, so a long
+    // group name ran underneath it.
+    readonly property real contentRightEdge: {
+        var edge = header.width - 8;
+        if (deleteGroupButton.visible)
+            edge = Math.min(edge, deleteGroupButton.x - 4);
+        if (newSessionButton.visible)
+            edge = Math.min(edge, newSessionButton.x - 4);
+        return edge;
+    }
     // Without this a screen reader announces an unnamed item: the delegate's own
     // `text` property is unused (the name arrives in `name`, a SessionsModel
     // role) and the collapse state is drawn as a chevron glyph.
@@ -159,9 +171,8 @@ ItemDelegate {
         // Reachable without a pointer: Tab lands here, and the accessible name
         // below is what a screen reader announces.
         focusPolicy: Qt.StrongFocus
-        anchors.right: parent.right
-        anchors.rightMargin: 8
-        anchors.verticalCenter: parent.verticalCenter
+        anchors.right: deleteGroupButton.left
+        anchors.rightMargin: 4
 
         // The label is a bare "+", so this sentence is the button's only real
         // name — and it has to name the GROUP, because there is one of these per
@@ -207,6 +218,81 @@ ItemDelegate {
         // also fold the group away. Asserted by
         // tst_sidebar::newSessionButtonTargetsItsGroupWithoutCollapsing.
         onClicked: if (header.host) header.host.requestNewSession(header.itemId)
+    }
+    // Deleting a group is destructive because the server permanently removes
+    // every Dev Session inside it. Keep this beside the add action, but give it
+    // a distinct danger treatment and a keyboard-focusable target.
+    Button {
+        id: deleteGroupButton
+        objectName: "deleteGroupButton:" + header.itemId
+        implicitWidth: 24
+        implicitHeight: 24
+        width: 24
+        height: 24
+        padding: 0
+        focusPolicy: Qt.StrongFocus
+        anchors.right: parent.right
+        anchors.rightMargin: 8
+        anchors.verticalCenter: parent.verticalCenter
+        text: "\u2715"
+
+        readonly property string actionText:
+            qsTr("Delete group \"%1\"").arg(header.name)
+        Accessible.role: Accessible.Button
+        Accessible.name: deleteGroupButton.actionText
+
+        AppToolTip {
+            objectName: "deleteGroupButtonTip:" + header.itemId
+            text: deleteGroupButton.actionText
+            visible: deleteGroupButton.hovered
+            delay: 600
+        }
+
+        contentItem: Label {
+            text: deleteGroupButton.text
+            color: deleteGroupButton.down ? Theme.textOnAccent : Theme.danger
+            font.pixelSize: Theme.fontSizeTitle
+            horizontalAlignment: Text.AlignHCenter
+            verticalAlignment: Text.AlignVCenter
+        }
+        background: Rectangle {
+            radius: Theme.radiusSmall
+            color: deleteGroupButton.down ? Theme.danger
+                 : deleteGroupButton.hovered ? Theme.surfaceHover : "transparent"
+            border.width: deleteGroupButton.visualFocus ? 2 : 1
+            border.color: deleteGroupButton.visualFocus ? Theme.accent : Theme.danger
+        }
+        onClicked: deleteDialog.open()
+    }
+
+    AppDialog {
+        id: deleteDialog
+        objectName: "deleteGroupDialog:" + header.itemId
+        title: qsTr("Delete group")
+        modal: true
+        standardButtons: Dialog.Ok | Dialog.Cancel
+        anchors.centerIn: Overlay.overlay
+        width: 400
+
+        ColumnLayout {
+            implicitWidth: 360
+
+            Label {
+                objectName: "deleteGroupMessage:" + header.itemId
+                Layout.fillWidth: true
+                textFormat: Text.PlainText
+                wrapMode: Text.WordWrap
+                text: header.sessionCount > 0
+                      ? qsTr("Delete group \"%1\"? This permanently destroys the group and all %2 %3 inside it. This cannot be undone.")
+                            .arg(header.name)
+                            .arg(header.sessionCount)
+                            .arg(header.sessionCount === 1 ? qsTr("session") : qsTr("sessions"))
+                      : qsTr("Delete group \"%1\"? This permanently destroys the empty group. This cannot be undone.")
+                            .arg(header.name)
+            }
+        }
+
+        onAccepted: if (header.host) header.host.deleteGroup(header.itemId)
     }
 
     // Selecting the header first is what makes the toggle unambiguous: the

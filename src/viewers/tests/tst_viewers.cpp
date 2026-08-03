@@ -167,12 +167,14 @@ private slots:
     void urlMappingRemintAfterEviction();
     void urlMappingBareId();
     void viewKindStringsMatchQmlContract();
+    void viewerDefaultKindsResolveBeforeBuiltIns();
+    void viewerDefaultKindsNotifyAlreadyOpenPanes();
+    void validViewKindsMatchHandlerCapabilities();
     void viewerModelWithoutClientReportsErrors();
     // The order and the shape of the entries the directory pane renders.
     void directoryListingIsSortedDirectoriesFirst();
     void openAsKindsFollowRegistryClaims();
     void applicationSchemeValidationAndEscaping();
-
     // SPEC 9: an out-of-project path stays openable, but the pane has to be
     // TOLD it is out of project. These pin the flag's trip from the reply to
     // the signal the pane binds to.
@@ -772,6 +774,93 @@ void TstViewers::viewKindStringsMatchQmlContract()
              QStringLiteral("binary"));
     QCOMPARE(viewers.viewKind(QUrl(QStringLiteral("ftp://host/x"))),
              QStringLiteral("binary"));
+}
+
+void TstViewers::viewerDefaultKindsResolveBeforeBuiltIns()
+{
+    ViewerModel viewers;
+
+    // The untouched model keeps every shipped registry answer byte-for-byte.
+    QCOMPARE(viewers.viewKind(QUrl(QStringLiteral("file:///p/readme.md"))),
+             QStringLiteral("markdown"));
+    QCOMPARE(viewers.viewKind(QUrl(QStringLiteral("file:///p/logo.png"))),
+             QStringLiteral("image"));
+    QCOMPARE(viewers.viewKind(QUrl(QStringLiteral("file:///p/page"))),
+             QStringLiteral("binary"));
+    QCOMPARE(viewers.viewKind(QUrl(QStringLiteral("https://example.test/a.md"))),
+             QStringLiteral("web"));
+    QCOMPARE(viewers.viewKind(QUrl(QStringLiteral("file:///p/folder/"))),
+             QStringLiteral("directory"));
+
+    viewers.setDefaultKinds(
+        QHash<QString, QString>{{QStringLiteral("MD"), QStringLiteral("text")},
+                                {QStringLiteral("png"), QStringLiteral("text")},
+                                {QStringLiteral("bin"), QStringLiteral("text")},
+                                {QStringLiteral("pdf"), QStringLiteral("image")}});
+    QCOMPARE(viewers.viewKind(QUrl(QStringLiteral("file:///p/readme.md"))),
+             QStringLiteral("text"));
+    QCOMPARE(viewers.viewKind(QUrl(QStringLiteral("file:///p/logo.png"))),
+             QStringLiteral("text"));
+    QCOMPARE(viewers.viewKind(QUrl(QStringLiteral("file:///p/file.bin"))),
+             QStringLiteral("text"));
+    // An invalid pairing is discarded rather than creating a broken pane.
+    QCOMPARE(viewers.viewKind(QUrl(QStringLiteral("file:///p/manual.pdf"))),
+             QStringLiteral("pdf"));
+    // Non-file URLs, directories, and extensionless paths do not consult the
+    // extension map.
+    QCOMPARE(viewers.viewKind(QUrl(QStringLiteral("https://example.test/a.md"))),
+             QStringLiteral("web"));
+    QCOMPARE(viewers.viewKind(QUrl(QStringLiteral("file:///p/folder/"))),
+             QStringLiteral("directory"));
+}
+
+void TstViewers::viewerDefaultKindsNotifyAlreadyOpenPanes()
+{
+    ViewerModel viewers;
+    QSignalSpy changed(&viewers, &ViewerModel::viewKindsRevisionChanged);
+    const QUrl markdown(QStringLiteral("file:///p/readme.md"));
+
+    QCOMPARE(viewers.viewKind(markdown), QStringLiteral("markdown"));
+    viewers.setDefaultKinds(
+        QHash<QString, QString>{{QStringLiteral("md"), QStringLiteral("text")}});
+    QCOMPARE(changed.count(), 1);
+    QCOMPARE(viewers.viewKind(markdown), QStringLiteral("text"));
+
+    // A QML binding can use the first applicable item as its "(default)"
+    // marker. The user's choice therefore outranks the registry's old answer.
+    const QStringList kinds = viewers.applicableViewKinds(markdown);
+    QVERIFY(!kinds.isEmpty());
+    QCOMPARE(kinds.first(), QStringLiteral("text"));
+
+    viewers.setDefaultKinds(
+        QHash<QString, QString>{{QStringLiteral("md"), QStringLiteral("text")}});
+    QCOMPARE(changed.count(), 1);
+    viewers.setDefaultKinds({});
+    QCOMPARE(changed.count(), 2);
+    QCOMPARE(viewers.viewKind(markdown), QStringLiteral("markdown"));
+}
+
+void TstViewers::validViewKindsMatchHandlerCapabilities()
+{
+    ViewerModel viewers;
+    const QStringList markdown =
+        viewers.validViewKindsForExtension(QStringLiteral("md"));
+    QVERIFY(markdown.contains(QStringLiteral("markdown")));
+    QVERIFY(markdown.contains(QStringLiteral("text")));
+    QVERIFY(markdown.contains(QStringLiteral("binary")));
+
+    const QStringList image =
+        viewers.validViewKindsForExtension(QStringLiteral("png"));
+    QVERIFY(image.contains(QStringLiteral("image")));
+    QVERIFY(image.contains(QStringLiteral("text")));
+    QVERIFY(image.contains(QStringLiteral("binary")));
+    QVERIFY(!image.contains(QStringLiteral("pdf")));
+
+    const QStringList unknown =
+        viewers.validViewKindsForExtension(QStringLiteral("zig"));
+    QCOMPARE(unknown,
+             QStringList({QStringLiteral("text"), QStringLiteral("binary")}));
+    QVERIFY(viewers.validViewKindsForExtension(QStringLiteral("")).isEmpty());
 }
 
 void TstViewers::viewerModelWithoutClientReportsErrors()

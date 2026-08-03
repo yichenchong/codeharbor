@@ -8,7 +8,7 @@ import QtQuick.Layouts
 // app.sessionsModel (a two-level QAbstractItemModel) via a nested DelegateModel:
 // the top level renders GroupHeader rows, each of which nests its group's
 // SessionRow children (hidden while the group is collapsed). Role names
-// consumed: name, subtitle, rowState, pinned, collapsed, itemId, groupId.
+// consumed: name, subtitle, rowState, pinned, archived, collapsed, itemId, groupId.
 //
 // Drag-and-drop contract (SPEC 4.2): the sidebar NEVER reorders the model
 // itself. A drop calls the matching app.* invokable with the INDEX/ordering the
@@ -34,13 +34,17 @@ Rectangle {
     property bool currentIsGroup: false
     // Last selected Dev Session; drives the row highlight.
     property string selectedSessionId: ""
-    // Client-local presentation filter. The pinned bit on each session comes
-    // from the server, but whether to hide unpinned rows belongs to this
-    // sidebar and is persisted by UiStateStore.
+    // Client-local presentation filters. Pin/archive bits on each session come
+    // from the server, but whether to hide those rows belongs to this sidebar
+    // and is persisted by UiStateStore.
     property bool pinnedOnly:
         (app && app.uiState && typeof app.uiState.pinnedOnly === "function")
             ? app.uiState.pinnedOnly() : false
+    property bool showArchived:
+        (app && app.uiState && typeof app.uiState.showArchived === "function")
+            ? app.uiState.showArchived() : false
     property bool pinFilterReady: false
+    property bool archiveFilterReady: false
     // Live drag state, read by the delegates for their drag affordances.
     property string dragKind: "" // "", "session" or "group"
     property var dragItem: null  // the SessionRow / GroupHeader being dragged
@@ -136,23 +140,37 @@ Rectangle {
         }
     }
 
-    function applyPinnedFilter() {
-        if (app && app.sessionsModel)
+    function applySessionFilters() {
+        if (app && app.sessionsModel) {
             app.sessionsModel.pinnedOnly = sidebar.pinnedOnly
-        if (app && app.uiState && typeof app.uiState.setPinnedOnly === "function")
-            app.uiState.setPinnedOnly(sidebar.pinnedOnly)
+            app.sessionsModel.showArchived = sidebar.showArchived
+        }
+        if (app && app.uiState) {
+            if (typeof app.uiState.setPinnedOnly === "function")
+                app.uiState.setPinnedOnly(sidebar.pinnedOnly)
+            if (typeof app.uiState.setShowArchived === "function")
+                app.uiState.setShowArchived(sidebar.showArchived)
+        }
     }
 
     Component.onCompleted: {
-        applyPinnedFilter()
+        applySessionFilters()
         pinFilterReady = true
+        archiveFilterReady = true
         app.refresh()
     }
 
     onPinnedOnlyChanged: {
         if (!pinFilterReady)
             return
-        applyPinnedFilter()
+        applySessionFilters()
+        app.refresh()
+    }
+
+    onShowArchivedChanged: {
+        if (!archiveFilterReady)
+            return
+        applySessionFilters()
         app.refresh()
     }
 
@@ -415,11 +433,37 @@ Rectangle {
         if (app && typeof app.setSessionPinned === "function")
             app.setSessionPinned(sessionId, pinned)
     }
+    function toggleArchived(sessionId, archived) {
+        if (!app)
+            return
+        if (archived) {
+            if (typeof app.archiveSession === "function")
+                app.archiveSession(sessionId)
+        } else if (typeof app.unarchiveSession === "function") {
+            app.unarchiveSession(sessionId)
+        }
+    }
     function duplicateSession(sessionId) {
         app.duplicateSession(sessionId);
     }
     function moveSessionToTop(sessionId, groupId) {
         app.moveSession(sessionId, groupId, 0);
+    }
+    function sessionCountForGroup(groupId) {
+        // AppController counts from m_lastNodes, the unfiltered authoritative
+        // tree. The fallback keeps this sidebar usable with the small QML
+        // harness stubs, whose model only exposes the visible tree.
+        if (app && typeof app.sessionCountForGroup === "function")
+            return Number(app.sessionCountForGroup(groupId));
+        var entry = groupEntry(groupId);
+        if (!entry || !app || !app.sessionsModel)
+            return 0;
+        var parentIndex = app.sessionsModel.index(entry.header.index, 0);
+        return app.sessionsModel.rowCount(parentIndex);
+    }
+    function deleteGroup(groupId) {
+        if (app && typeof app.deleteGroup === "function")
+            app.deleteGroup(groupId);
     }
     function deleteSession(sessionId) {
         app.deleteSession(sessionId);
@@ -611,7 +655,7 @@ Rectangle {
         Button {
             id: pinFilterButton
             objectName: "pinFilterButton"
-            anchors.right: newGroupButton.left
+            anchors.right: archiveFilterButton.left
             anchors.rightMargin: 6
             anchors.verticalCenter: parent.verticalCenter
             implicitWidth: 24
@@ -650,6 +694,50 @@ Rectangle {
                 border.color: pinFilterButton.visualFocus ? Theme.accent : Theme.borderSubtle
             }
             onClicked: sidebar.pinnedOnly = !sidebar.pinnedOnly
+        }
+        Button {
+            id: archiveFilterButton
+            objectName: "archiveFilterButton"
+            anchors.right: newGroupButton.left
+            anchors.rightMargin: 6
+            anchors.verticalCenter: parent.verticalCenter
+            implicitWidth: 24
+            implicitHeight: 24
+            width: 24
+            height: 24
+            padding: 0
+            focusPolicy: Qt.StrongFocus
+            // A box glyph is intentionally different from the pin star.
+            text: "\u25a3"
+
+            readonly property string actionText:
+                sidebar.showArchived ? qsTr("Hide archived sessions")
+                                     : qsTr("Show archived sessions")
+            Accessible.role: Accessible.Button
+            Accessible.name: archiveFilterButton.actionText
+
+            AppToolTip {
+                objectName: "archiveFilterButtonTip"
+                text: archiveFilterButton.actionText
+                visible: archiveFilterButton.hovered
+                delay: 600
+            }
+
+            contentItem: Label {
+                text: archiveFilterButton.text
+                color: archiveFilterButton.down ? Theme.accent : Theme.text
+                font.pixelSize: Theme.fontSizeTitle
+                horizontalAlignment: Text.AlignHCenter
+                verticalAlignment: Text.AlignVCenter
+            }
+            background: Rectangle {
+                radius: Theme.radiusSmall
+                color: archiveFilterButton.down ? Theme.surfaceRaised
+                     : archiveFilterButton.hovered ? Theme.surfaceHover : "transparent"
+                border.width: archiveFilterButton.visualFocus ? 2 : 1
+                border.color: archiveFilterButton.visualFocus ? Theme.accent : Theme.borderSubtle
+            }
+            onClicked: sidebar.showArchived = !sidebar.showArchived
         }
 
         Button {
@@ -725,8 +813,8 @@ Rectangle {
     }
 
     // Nothing to show. WHICH nothing matters: a fresh install has no server to
-    // ask, while a connected one may simply have no groups yet, and the two
-    // need different next steps.
+    // ask, a connected workspace may have no sessions, and a default archive
+    // filter may simply be hiding all of the sessions that do exist.
     Column {
         id: sidebarEmptyState
         objectName: "sidebarEmptyState"
@@ -737,7 +825,11 @@ Rectangle {
 
         readonly property bool serverReachable: sidebar.linkState === ""
                                                 || sidebar.linkState === "connected"
-
+        readonly property bool allSessionsArchived:
+            !sidebar.pinnedOnly && !sidebar.showArchived
+            && app && app.sessionsModel
+            && app.sessionsModel.hasSessions
+            && !app.sessionsModel.hasUnarchivedSessions
         Label {
             anchors.horizontalCenter: parent.horizontalCenter
             text: sidebarEmptyState.serverReachable ? "\u2637" : "\u26a0"
@@ -750,9 +842,10 @@ Rectangle {
             horizontalAlignment: Text.AlignHCenter
             text: sidebarEmptyState.serverReachable
                   ? (sidebar.pinnedOnly ? qsTr("No pinned sessions")
-                                         : qsTr("No sessions yet"))
+                     : sidebarEmptyState.allSessionsArchived
+                       ? qsTr("All your sessions are archived")
+                       : qsTr("No sessions yet"))
                   : qsTr("No server")
-            color: Theme.text
             font.pixelSize: Theme.fontSizeLabel
         }
         Label {
@@ -761,11 +854,12 @@ Rectangle {
             horizontalAlignment: Text.AlignHCenter
             wrapMode: Text.WordWrap
             text: sidebarEmptyState.serverReachable
-                  ? (sidebar.pinnedOnly
-                     ? qsTr("Pin a session to see it here.")
-                     : qsTr("Press the \u201c+\u201d at the top of this panel to add a group, then add a Dev Session to it."))
+                  ? (sidebarEmptyState.allSessionsArchived
+                     ? qsTr("Show archived sessions to see them here.")
+                     : sidebar.pinnedOnly
+                       ? qsTr("Pin a session to see it here.")
+                       : qsTr("Press the \u201c+\u201d at the top of this panel to add a group, then add a Dev Session to it."))
                   : qsTr("Connect to the machine that holds your checkout, and its groups and Dev Sessions appear here.")
-            color: Theme.textDim
             font.pixelSize: 11
         }
     }
@@ -879,6 +973,7 @@ Rectangle {
                 name: groupBlock.name
                 collapsed: groupBlock.collapsed
                 itemId: groupBlock.itemId
+                sessionCount: sidebar.sessionCountForGroup(groupBlock.itemId)
             }
 
             // Collapsed groups hide their sessions (SPEC 4.2).

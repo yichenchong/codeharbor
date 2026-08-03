@@ -62,6 +62,8 @@ set_tests_properties(tst_liveviewers PROPERTIES
     ENVIRONMENT "${CODEHARBOR_LIVE_VIEWER_TEST_ENV}"
     TIMEOUT 900
 )
+set_tests_properties(tst_liveviewers PROPERTIES
+    FIXTURES_REQUIRED codeharbor_live_fixture)
 
 # Console-mode on Windows, for the same reason as src/app/tests: qt_add_executable
 # marks executables as GUI subsystem, which on Windows swallows QTest's stdout and

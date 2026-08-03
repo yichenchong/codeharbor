@@ -171,12 +171,18 @@ public:
     Q_INVOKABLE void createGroup(QString name);
     Q_INVOKABLE void renameGroup(QString id, QString name);
     Q_INVOKABLE void setGroupCollapsed(QString id, bool collapsed);
+    Q_INVOKABLE void deleteGroup(QString id);
+    // Count the sessions in the last authoritative tree, including rows hidden
+    // by client-local pin/archive filters. The group confirmation uses this
+    // before issuing the destructive RPC.
+    Q_INVOKABLE int sessionCountForGroup(QString id) const;
     Q_INVOKABLE void reorderGroups(QStringList orderedIds);
-
     // Session mutations.
     Q_INVOKABLE void createSession(QString groupId, QString name, QString repoRoot);
     Q_INVOKABLE void renameSession(QString id, QString name);
     Q_INVOKABLE void setSessionPinned(QString id, bool pinned);
+    Q_INVOKABLE void archiveSession(QString id);
+    Q_INVOKABLE void unarchiveSession(QString id);
     Q_INVOKABLE void duplicateSession(QString id);
     Q_INVOKABLE void moveSession(QString id, QString groupId, int position);
     Q_INVOKABLE void deleteSession(QString id);
@@ -312,12 +318,17 @@ private:
     void restoreActiveSession();
     // Is `devSessionId` present in the last authoritative tree we read?
     bool sessionExists(const QString& devSessionId) const;
+    // Is the session present but archived in the last authoritative tree?
+    bool sessionIsArchived(const QString& devSessionId) const;
     // The active Dev Session vanished from the authoritative tree (deleted
-    // here, or by another client): forget it everywhere it is remembered.
-    // Returns true when it actually dropped one, so the caller can emit
-    // activeSessionChanged exactly ONCE for the whole refresh rather than
-    // thrashing it. Deliberately does NOT emit anything itself.
+    // here, archived here, or by another client): forget it everywhere it is
+    // remembered. Returns true when it actually dropped one, so the caller can
+    // emit activeSessionChanged exactly ONCE for the whole refresh rather than
+    // thrashing it.
     bool dropActiveSessionIfGone();
+    // Send the existing workspace.updateSession archived field, report errors
+    // through the common helper, and refresh from authoritative state.
+    void updateSessionArchived(QString id, bool archived);
     // Tear down the active-session context: the id and both SessionLayouts
     // region trees. `forget` also drops the remembered session for THIS server,
     // which is right when the session is GONE and wrong when it is merely

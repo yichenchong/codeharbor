@@ -168,10 +168,19 @@ There is no Dev Session switcher shortcut and no "focus next pane" shortcut.
 
 A few things worth knowing about the shipped client:
 
-- **Settings** (`Ctrl+,`) has Appearance, Server and Tmux groups. Appearance carries
-  the Dark/Light theme, the palette that tints Dev Session group names, the order of
-  the viewer's toolbar buttons, and the terminal's text size and rendering
-  resolution.
+- **Settings** (`Ctrl+,`) has Appearance, File Types, Server and Tmux groups.
+  Appearance carries the Dark/Light theme, the palette that tints Dev Session group
+  names, the order of the viewer's toolbar buttons, and the terminal's text size and
+  rendering resolution. File Types is where you choose which viewer opens which kind
+  of file — for example open `.md` in the editor instead of the renderer.
+- **Markdown files render**, with headings, tables, code blocks and task lists,
+  themed to match the app. "Open as → Editor" gives you the source to edit.
+- **Split, close and kill are on each pane's own header**, so they act on the pane
+  you are looking at rather than on whichever pane the app thinks is focused. The
+  same commands remain in the palette for keyboard use. Killing a terminal asks
+  first, because it destroys running remote work.
+- **Reopening a Dev Session puts the keyboard back where you left it.** If you were
+  typing in a terminal, you can keep typing without clicking first.
 - **Viewer panes navigate like a browser**: Back, Forward, Reload and Home beside the
   address field, with a history per pane. The address field opens on Enter.
 - **The explorer can open a file with a specific viewer** ("Open as"), in place or in
@@ -180,6 +189,12 @@ A few things worth knowing about the shipped client:
   layout, so it is there after a restart and on another machine.
 - **Dev Sessions can be pinned**, and the sidebar can be filtered to show only pinned
   ones. Pins live on the server; the filter is local to the machine.
+- **Dev Sessions can be archived** to get them out of the sidebar without losing
+  them, and shown again with a toolbar toggle. Archiving is stored on the server;
+  whether archived rows are visible is local to the machine.
+- **Sessions and groups can be deleted.** Both ask first and name what they are
+  about to destroy; deleting a group also states how many sessions go with it.
+  Deleting is permanent — archiving is the reversible option.
 - **Copy and paste work in terminals** with the usual terminal shortcuts.
 - **Several servers can be saved** and switched between; closing the app leaves the
   remote tmux sessions running, so a reconnect finds the shells where they were.
