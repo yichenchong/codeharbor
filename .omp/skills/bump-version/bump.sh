@@ -117,7 +117,8 @@ fi
 MANIFEST_FILES=(package.json
                 remote/package.json
                 src/web/terminal/package.json
-                src/web/editor/package.json)
+                src/web/editor/package.json
+                src/web/markdown/package.json)
 
 # EVERY file that carries the release version, in the order they are rewritten.
 # This is the list the dirty guard and the existence check work from, so a file
