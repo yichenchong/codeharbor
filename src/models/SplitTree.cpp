@@ -34,6 +34,12 @@ bool writeNode(const SplitNode &node, QJsonObject &obj, int depth)
         // exactly as they did.
         if (!node.terminalPaneId.isEmpty())
             obj[QStringLiteral("terminalPaneId")] = node.terminalPaneId;
+        const QString customTitle = SplitNode::normalizeCustomTitle(node.customTitle);
+        // Empty means "use the generated paneId label". Omitting it keeps old
+        // layouts byte-stable while persisting non-empty custom titles beside
+        // the leaf's existing content and identity fields.
+        if (!customTitle.isEmpty())
+            obj[QStringLiteral("customTitle")] = customTitle;
         return true;
     }
 
@@ -75,13 +81,16 @@ bool equalNode(const SplitNode &lhs, const SplitNode &rhs, int depth)
         return false;
     // Compare only the fields tryToJson() persists for each node kind, so
     // equality agrees with the JSON round-trip (see the header). A leaf and a
-    // split are never equal; a leaf's identity is its paneId, url and
-    // terminalPaneId; a split's is its orientation, ratios, and children.
+    // split are never equal; a leaf's identity is its paneId, url,
+    // terminalPaneId and normalized customTitle; a split's is its orientation,
+    // ratios, and children.
     if (lhs.isLeaf() != rhs.isLeaf())
         return false;
     if (lhs.isLeaf())
         return lhs.paneId == rhs.paneId && lhs.url == rhs.url
-                && lhs.terminalPaneId == rhs.terminalPaneId;
+                && lhs.terminalPaneId == rhs.terminalPaneId
+                && SplitNode::normalizeCustomTitle(lhs.customTitle)
+                    == SplitNode::normalizeCustomTitle(rhs.customTitle);
     if (lhs.orientation != rhs.orientation || lhs.ratios != rhs.ratios
         || lhs.children.size() != rhs.children.size())
         return false;
@@ -102,9 +111,7 @@ bool parseNode(const QJsonObject &obj, SplitNode &out, int depth)
 {
     if (depth > SplitNode::kMaxDepth)
         return false;
-
     const QString type = obj.value(QStringLiteral("type")).toString();
-
     if (type == QStringLiteral("leaf")) {
         out = SplitNode{};
         out.paneId = obj.value(QStringLiteral("paneId")).toString();
@@ -117,6 +124,11 @@ bool parseNode(const QJsonObject &obj, SplitNode &out, int depth)
         // existed. ch::SessionLayouts is what tells those two apart and decides
         // what to do; the parser only reports what is there.
         out.terminalPaneId = obj.value(QStringLiteral("terminalPaneId")).toString();
+        // Normalize server-supplied titles on the way in. This keeps a
+        // hand-edited or older layout from bypassing the same whitespace and
+        // size limits applied by SessionLayouts::setPaneTitle().
+        out.customTitle = SplitNode::normalizeCustomTitle(
+            obj.value(QStringLiteral("customTitle")).toString());
         return true;
     }
 

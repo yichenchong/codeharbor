@@ -303,7 +303,7 @@ Rectangle {
         case "hostkey": return Theme.warning;
         case "credential": return Theme.warning;
         case "provisioning": return Theme.warning;
-        case "reconnecting": return "#fab387";
+        case "reconnecting": return Theme.statusReconnecting();
         case "failed": return Theme.danger;
         default: return Theme.textDim;
         }
@@ -412,14 +412,14 @@ Rectangle {
 
         Label {
             id: fieldLabel
-            color: "#a6adc8"
+            color: Theme.statusText()
             font.pixelSize: 11
         }
         TextField {
             id: fieldInput
             width: field.width
             color: Theme.text
-            placeholderTextColor: "#585b70"
+            placeholderTextColor: Theme.textPlaceholder()
             selectByMouse: true
             font.pixelSize: Theme.fontSizeLabel
             background: Rectangle {
@@ -455,7 +455,7 @@ Rectangle {
 
         contentItem: Label {
             text: button.text
-            color: button.enabled ? Theme.text : "#585b70"
+            color: button.enabled ? Theme.text : Theme.textPlaceholder()
             font.pixelSize: Theme.fontSizeBody
             horizontalAlignment: Text.AlignHCenter
             verticalAlignment: Text.AlignVCenter
@@ -465,7 +465,7 @@ Rectangle {
             radius: Theme.radiusSmall
             color: !button.enabled ? Theme.surfaceHover
                  : button.down ? Theme.border
-                 : button.hovered ? "#3a3a52" : Theme.surfaceRaised
+                 : button.hovered ? Theme.controlHoverSurface() : Theme.surfaceRaised
             // Two pixels and a bright edge: the focus ring has to be legible at
             // a glance, not a one-pixel difference against #45475a.
             border.width: button.visualFocus ? 2 : 1
@@ -653,7 +653,7 @@ Rectangle {
         // Grows to fit: an ssh failure is a whole sentence naming a host, a
         // port and a reason, and one elided line of it tells nobody anything.
         height: visible ? Math.max(40, errorLabel.implicitHeight + 20) : 0
-        color: "#3a1d28"
+        color: Theme.errorSurface()
 
         // A red wash is the only thing separating this from the rest of the
         // sheet; the rule and the glyph say "error" without relying on hue.
@@ -970,7 +970,7 @@ Rectangle {
                     width: form.width
                     visible: root.profileList().length === 0
                     wrapMode: Text.WordWrap
-                    color: "#a6adc8"
+                    color: Theme.statusText()
                     font.pixelSize: Theme.fontSizeBody
                     text: qsTr("CodeHarbor edits a checkout that lives on another machine, over SSH. "
                                + "Describe that machine below — its address, your login, and the "
@@ -1121,7 +1121,7 @@ Rectangle {
         anchors.fill: parent
         anchors.margins: 1
         radius: Theme.radiusMedium
-        color: "#e61e1e2e"
+        color: Theme.modalOverlaySurface()
         visible: root.pendingHostKey ? true : false
 
         // Swallow every click so the sheet underneath stays untouchable while
@@ -1232,7 +1232,7 @@ Rectangle {
         anchors.fill: parent
         anchors.margins: 1
         radius: Theme.radiusMedium
-        color: "#e61e1e2e"
+        color: Theme.modalOverlaySurface()
         visible: root.pendingCredential ? true : false
 
         // Swallow every click so the sheet underneath stays untouchable while
@@ -1292,7 +1292,7 @@ Rectangle {
                     inputMethodHints: Qt.ImhHiddenText | Qt.ImhSensitiveData
                                       | Qt.ImhNoAutoUppercase | Qt.ImhNoPredictiveText
                     color: Theme.text
-                    placeholderTextColor: "#585b70"
+                    placeholderTextColor: Theme.textPlaceholder()
                     placeholderText: root.textOf(root.pendingCredential, "prompt") === ""
                                      ? qsTr("Password or key passphrase")
                                      : root.textOf(root.pendingCredential, "prompt")

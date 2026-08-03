@@ -104,6 +104,11 @@ Item {
     // property change during initial binding evaluation cannot navigate early.
     property bool started: false
 
+    // The trusted bundle installs `window.applyTheme` while its script loads.
+    // Keep this false until WebEngine reports success so a theme change during
+    // navigation cannot run JavaScript against the previous document.
+    property bool pageReady: false
+
     // The ONE document this view may ever hold (the navigation guard below).
     // Compared as a STRING: `request.url` arrives as a QUrl and
     // `editorBundleUrl` as a QML url, and only their normalized text is
@@ -125,6 +130,18 @@ Item {
         if (fragment >= 0)
             text = text.substring(0, fragment)
         return text
+    }
+    // Theme.roles is a plain JavaScript object, so JSON is the one unambiguous
+    // boundary between QML values and the page's applyTheme(roles) function.
+    // The page validates each role and keeps its own dark fallback; this call
+    // therefore remains safe if a future palette grows a role the old bundle
+    // does not know yet.
+    function applyTheme() {
+        if (!root.pageReady)
+            return
+        const roles = JSON.stringify(Theme.roles)
+        view.runJavaScript("if (typeof window.applyTheme === 'function')"
+                           + " window.applyTheme(" + roles + ");")
     }
 
     WebChannel {
@@ -150,6 +167,21 @@ Item {
         // has any reason to open a window, and Monaco's built-in link opener
         // reaches for exactly it on a URL found in remote file text.
         settings.javascriptCanOpenWindows: false
+
+        // Theme handoff belongs to the pane because the QML singleton is the
+        // source of truth and the page is recreated whenever the language hint
+        // changes. A failed/stopped load clears the guard so a later theme
+        // change cannot run against a stale document.
+        onLoadingChanged: function(request) {
+            if (request.status === WebEngineView.LoadSucceededStatus) {
+                root.pageReady = true
+                root.applyTheme()
+            } else if (request.status === WebEngineView.LoadStartedStatus
+                       || request.status === WebEngineView.LoadFailedStatus
+                       || request.status === WebEngineView.LoadStoppedStatus) {
+                root.pageReady = false
+            }
+        }
 
         // SECURITY (SPEC 7.2): this view carries the WebChannel, and Qt injects
         // qt.webChannelTransport into EVERY document it loads — so a document
@@ -179,6 +211,13 @@ Item {
 
         // NOT bound to editorBundleUrl: navigation is driven by navigate()
         // below so it can never start before registerObject("editor").
+    }
+
+    Connections {
+        target: Theme
+        function onRolesChanged() {
+            root.applyTheme()
+        }
     }
 
     // ---- observable file state (SPEC 8.2) --------------------------------
@@ -223,7 +262,7 @@ Item {
         // #45222c / #3a2f1e are dim FILLS behind danger/warning text and have no
         // Theme role (Theme.danger and Theme.warning are the text colours, far
         // too bright to fill with). Same pair TerminalPaneView's banner uses.
-        color: root.conflicted ? "#45222c" : "#3a2f1e"
+        color: root.conflicted ? Theme.errorSurface() : Theme.warningSurface()
 
         Label {
             objectName: "editorStateBannerLabel"

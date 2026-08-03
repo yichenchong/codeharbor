@@ -6,6 +6,7 @@
 #include "ViewerHandlerRegistry.h"
 #include "ViewerProfiles.h"
 
+#include <QDesktopServices>
 #include <QJsonArray>
 #include <QJsonObject>
 #include <QJsonValue>
@@ -126,6 +127,29 @@ void ViewerModel::wireProfileSignals()
 QString ViewerModel::viewKind(const QUrl &url) const
 {
     return viewKindFor(ViewerHandlerRegistry::resolve(url));
+}
+
+QStringList ViewerModel::applicableViewKinds(const QUrl &url) const
+{
+    return ViewerHandlerRegistry::applicableViewKinds(url);
+}
+
+bool ViewerModel::isValidApplicationScheme(const QString &scheme) const
+{
+    return ViewerHandlerRegistry::isValidApplicationScheme(scheme);
+}
+
+bool ViewerModel::openWithApplication(const QString &scheme,
+                                      const QString &remotePath) const
+{
+    const QUrl target = ViewerHandlerRegistry::applicationUrl(scheme, remotePath);
+    if (!target.isValid())
+        return false;
+    // This is the ONLY client path that sends a remote-derived path to the
+    // local desktop. applicationUrl() already made it a single escaped URL
+    // path; QDesktopServices receives that URL object, never a shell command
+    // or an interpolated command-line string.
+    return QDesktopServices::openUrl(target);
 }
 
 QString ViewerModel::internalUrlFor(const QUrl &fileUrl)

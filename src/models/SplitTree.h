@@ -56,6 +56,22 @@ struct SplitNode {
     // the server, never reused, and travels to every client inside the shared
     // tree, so all of them agree on which shell a leaf owns.
     QString terminalPaneId;
+    // Optional user-chosen title for a terminal leaf. Empty means the UI falls
+    // back to the generated paneId label. It lives in the layout leaf so every
+    // client sharing the server-side tree sees the same title without changing
+    // the server-minted terminalPaneId identity.
+    QString customTitle;
+    // Keep persisted titles bounded: a pane header is compact, and allowing an
+    // unbounded value here would make a user-controlled layout grow forever.
+    static constexpr int kMaxCustomTitleLength = 128;
+    static QString normalizeCustomTitle(QString title)
+    {
+        title = title.trimmed();
+        if (title.size() > kMaxCustomTitleLength)
+            title.truncate(kMaxCustomTitleLength);
+        return title;
+    }
+    
     SplitOrientation orientation = SplitOrientation::Horizontal;
     QVector<SplitNode> children;
     QVector<double> ratios;
@@ -102,11 +118,12 @@ struct SplitNode {
     static SplitNode fromJson(const QJsonObject &obj);
 
     // Structural equality mirroring tryToJson(): leaf identity is its paneId,
-    // url and terminalPaneId (orientation/ratios are meaningless and dropped for
-    // leaves), while a split is defined by orientation, ratios, and children
-    // (paneId, url and terminalPaneId are dropped). This keeps
-    // fromJson(*tryToJson(x)) == x for any serializable tree, which a defaulted
-    // operator== would break by comparing fields tryToJson() does not persist.
+    // url, terminalPaneId and customTitle (orientation/ratios are meaningless
+    // and dropped for leaves), while a split is defined by orientation, ratios,
+    // and children (paneId, url, terminalPaneId and customTitle are dropped).
+    // This keeps fromJson(*tryToJson(x)) == x for any serializable tree, which a
+    // defaulted operator== would break by comparing fields tryToJson() does not
+    // persist.
     //
     // Bounded by kMaxDepth like every other recursion here: two nodes still
     // nested deeper than that compare UNEQUAL rather than recursing on. No tree

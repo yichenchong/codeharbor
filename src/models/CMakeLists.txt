@@ -8,6 +8,8 @@ qt_add_library(ch_models STATIC
     SplitTree.cpp
     SessionsModel.h
     SessionsModel.cpp
+    GroupPalette.h
+    GroupPalette.cpp
 )
 
 target_include_directories(ch_models PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})

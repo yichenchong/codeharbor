@@ -19,6 +19,80 @@ QString shellSingleQuote(const QString &value)
     escaped.replace(QLatin1Char('\''), QStringLiteral("'\\''"));
     return QLatin1Char('\'') + escaped + QLatin1Char('\'');
 }
+enum class EscapeState {
+    Normal,
+    Escape,
+    Csi,
+    String,
+    StringEscape,
+};
+
+struct EscapeScanner {
+    EscapeState state = EscapeState::Normal;
+    qsizetype start = -1;
+
+    bool consume(unsigned char byte, qsizetype index)
+    {
+        switch (state) {
+        case EscapeState::Normal:
+            if (byte == 0x1b) {
+                state = EscapeState::Escape;
+                start = index;
+            }
+            return false;
+        case EscapeState::Escape:
+            if (byte == '[') {
+                state = EscapeState::Csi;
+            } else if (byte == ']' || byte == 'P' || byte == 'X' || byte == '^'
+                       || byte == '_') {
+                state = EscapeState::String;
+            } else if (byte == 0x1b) {
+                start = index;
+                state = EscapeState::Escape;
+            } else {
+                state = EscapeState::Normal;
+                start = -1;
+                return true;
+            }
+            return false;
+        case EscapeState::Csi:
+            if (byte >= 0x40 && byte <= 0x7e) {
+                state = EscapeState::Normal;
+                start = -1;
+                return true;
+            }
+            if (byte == 0x1b) {
+                state = EscapeState::Escape;
+                start = index;
+            }
+            return false;
+        case EscapeState::String:
+            if (byte == 0x07) {
+                state = EscapeState::Normal;
+                start = -1;
+                return true;
+            }
+            if (byte == 0x1b)
+                state = EscapeState::StringEscape;
+            return false;
+        case EscapeState::StringEscape:
+            if (byte == '\\') {
+                state = EscapeState::Normal;
+                start = -1;
+                return true;
+            }
+            state = byte == 0x1b ? EscapeState::StringEscape : EscapeState::String;
+            return false;
+        }
+        return false;
+    }
+};
+
+bool isUtf8Continuation(unsigned char byte)
+{
+    return (byte & 0xc0) == 0x80;
+}
+
 } // namespace
 
 namespace ch {
@@ -240,6 +314,46 @@ qsizetype TerminalController::incompleteTrailingUtf8(const QByteArray &data)
     // four-byte character or garbage. Either way nothing is pending.
     return 0;
 }
+qsizetype TerminalController::incompleteTrailingEscape(const QByteArray &data)
+{
+    EscapeScanner scanner;
+    for (qsizetype index = 0; index < data.size(); ++index)
+        scanner.consume(static_cast<unsigned char>(data.at(index)), index);
+    if (scanner.state == EscapeState::Normal || scanner.start < 0)
+        return 0;
+    return data.size() - scanner.start;
+}
+
+qsizetype TerminalController::safePrefixBoundary(const QByteArray &buffer,
+                                                 qsizetype maxBytes)
+{
+    if (maxBytes <= 0 || buffer.isEmpty())
+        return 0;
+    if (maxBytes >= buffer.size())
+        return buffer.size();
+
+    EscapeScanner scanner;
+    qsizetype boundary = 0;
+    const qsizetype limit = qMin(maxBytes, buffer.size());
+    for (qsizetype index = 0; index < buffer.size(); ++index) {
+        const auto byte = static_cast<unsigned char>(buffer.at(index));
+        const bool completed = scanner.consume(byte, index);
+        const qsizetype candidate = index + 1;
+        if (candidate > limit)
+            break;
+        if (completed) {
+            boundary = candidate;
+            continue;
+        }
+        if (scanner.state == EscapeState::Normal
+            && (candidate == buffer.size()
+                || !isUtf8Continuation(
+                    static_cast<unsigned char>(buffer.at(candidate)))))
+            boundary = candidate;
+    }
+    return boundary;
+}
+
 
 void TerminalController::flush()
 {
@@ -247,26 +361,14 @@ void TerminalController::flush()
     if (m_pending.isEmpty())
         return;
 
-    // A batch must not END in the middle of a multi-byte UTF-8 character, for
-    // the same reason the eviction cut must not START in the middle of one —
-    // this is that rule one level down, at the flush boundary instead of the
-    // eviction boundary, and it is enforced the same way: move the boundary to
-    // a point no sequence straddles.
-    //
-    // ch::TerminalBridge decodes statefully, so a split character is not
-    // corrupted by the split ITSELF: the decoder holds the lead bytes back and
-    // completes them from the next batch. The problem is what happens if that
-    // next batch never comes intact. Once the lead bytes have been emitted they
-    // are charged, delivered and gone, while their continuation bytes are still
-    // only in the retained buffer — where an overflow may evict them. The
-    // decoder then completes its half-character from whatever bytes follow the
-    // eviction and prints one wrong glyph. Keeping the fragment in m_pending
-    // instead means the character is emitted whole or not at all, so the
-    // decoder never carries state across a batch that could be truncated.
-    //
-    // This is not extra latency: the held-back bytes are exactly the bytes the
-    // decoder would have withheld anyway, and they are at most three.
-    const qsizetype partial = incompleteTrailingUtf8(m_pending);
+    // A batch must not END in the middle of a multi-byte UTF-8 character or an
+    // ANSI escape sequence. The bridge can decode a split UTF-8 character
+    // statefully, but an escape sequence has parser state that xterm.js cannot
+    // recover if its tail is retained or evicted separately. Holding the
+    // incomplete suffix here makes every emitted batch independently safe.
+    const qsizetype utf8Partial = incompleteTrailingUtf8(m_pending);
+    const qsizetype escapePartial = incompleteTrailingEscape(m_pending);
+    const qsizetype partial = qMax(utf8Partial, escapePartial);
     if (partial == m_pending.size())
         return; // nothing but the head of a character: wait for the rest
 
@@ -316,6 +418,8 @@ void TerminalController::releaseRetained()
     const qsizetype cut = m_hidden.size() <= allowance
                               ? m_hidden.size()
                               : resyncBoundary(m_hidden, static_cast<qsizetype>(allowance));
+    if (cut <= 0)
+        return;
     if (cut >= m_hidden.size()) {
         replay = std::move(m_hidden);
         m_hidden.clear();
@@ -326,28 +430,69 @@ void TerminalController::releaseRetained()
     m_unacknowledged += replay.size();
     emit flushReady(replay);
 }
-
 qsizetype TerminalController::resyncBoundary(const QByteArray &buffer, qsizetype from)
 {
-    const char *bytes = buffer.constData();
     const qsizetype limit = qMin(buffer.size(), from + kHiddenResyncWindowBytes);
     if (from >= limit)
         return from;
 
-    // Best case: a line feed. No escape sequence contains one and it is ASCII,
-    // so the byte after it starts both a fresh line and a fresh character.
-    if (const void *lf = std::memchr(bytes + from, '\n', static_cast<size_t>(limit - from)))
-        return static_cast<const char *>(lf) - bytes + 1;
+    EscapeScanner scanner;
+    qsizetype safe = -1;
+    qsizetype lineFeed = -1;
 
-    // No line feed within the window (a pane drawing a full-screen TUI can go a
-    // long way without one). Settle for a character boundary: skip the UTF-8
-    // continuation bytes (10xxxxxx) that belong to the character being cut.
-    // That still cannot resurrect a decapitated escape sequence, but it does
-    // keep the replay free of replacement characters, and a lone stray escape
-    // fragment is a one-off smudge rather than a mis-decoded stream.
-    while (from < limit && (static_cast<unsigned char>(bytes[from]) & 0xC0) == 0x80)
-        ++from;
-    return from;
+    for (qsizetype index = 0; index < buffer.size(); ++index) {
+        const auto byte = static_cast<unsigned char>(buffer.at(index));
+        const EscapeState before = scanner.state;
+        if (index == from && before == EscapeState::Normal
+            && !isUtf8Continuation(byte)) {
+            safe = from;
+        }
+        const qsizetype sequenceStart = scanner.start;
+        const bool completed = scanner.consume(byte, index);
+        const qsizetype candidate = index + 1;
+
+        if (completed && candidate >= from) {
+            // A sequence that crosses the nominal resync window is still
+            // emitted as a whole. The window bounds ordinary scrolling data;
+            // it must not turn a long OSC title into literal terminal text.
+            if (candidate <= limit || sequenceStart < from) {
+                if (safe < 0)
+                    safe = candidate;
+                if (byte == '\n' && before == EscapeState::Normal)
+                    lineFeed = candidate;
+                if (candidate > limit)
+                    break;
+            }
+            continue;
+        }
+
+        if (candidate < from || candidate > limit)
+            continue;
+        if (scanner.state == EscapeState::Normal
+            && (candidate == buffer.size()
+                || !isUtf8Continuation(
+                    static_cast<unsigned char>(buffer.at(candidate))))) {
+            if (safe < 0)
+                safe = candidate;
+            if (byte == '\n')
+                lineFeed = candidate;
+        }
+    }
+
+    if (lineFeed >= from)
+        return lineFeed;
+    if (safe >= from)
+        return safe;
+
+    // No line feed or complete escape boundary within the window. Settle for
+    // the first UTF-8 boundary, retaining the old bounded eviction behavior
+    // for a stream made entirely of continuation bytes.
+    qsizetype fallback = from;
+    while (fallback < limit
+           && isUtf8Continuation(static_cast<unsigned char>(buffer.at(fallback)))) {
+        ++fallback;
+    }
+    return fallback;
 }
 
 void TerminalController::appendHidden(const QByteArray &batch)

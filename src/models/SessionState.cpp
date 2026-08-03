@@ -70,14 +70,19 @@ SessionRowState aggregateRowState(bool anyError,
                                   bool anyWaitingInput,
                                   bool anyRunning,
                                   bool anyFinishedUnseen,
-                                  bool anyConnected)
+                                  bool anyConnected,
+                                  bool anyDisconnected)
 {
     if (anyError) return SessionRowState::Error;
     if (anyWaitingInput) return SessionRowState::WaitingForInput;
     if (anyRunning) return SessionRowState::Running;
     if (anyFinishedUnseen) return SessionRowState::FinishedUnseen;
     if (anyConnected) return SessionRowState::Idle;
-    return SessionRowState::Disconnected;
+    if (anyDisconnected) return SessionRowState::Disconnected;
+    // No pane has reported a lost live connection. This includes an empty
+    // session and panes that are still Unloaded/opening, for which "disconnected"
+    // would claim a lifecycle transition the client has never observed.
+    return SessionRowState::Idle;
 }
 
 } // namespace ch

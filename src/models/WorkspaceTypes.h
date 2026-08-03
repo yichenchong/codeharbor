@@ -37,6 +37,7 @@ struct DevSession {
     QString taskDescription;
     int position = 0;
     bool archived = false;
+    bool pinned = false;
 
     bool operator==(const DevSession &) const = default;
 };

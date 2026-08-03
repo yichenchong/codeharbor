@@ -21,6 +21,7 @@ namespace ch {
 //
 // Storage keys:
 //   layout/sidebarWidth, layout/viewerWidth, layout/terminalWidth
+//   sidebar/pinnedOnly
 //   selectedPane/<devSessionId>
 //   session/<serverId>/active
 //   paneSuffix/<devSessionId>/<region>
@@ -101,6 +102,17 @@ public:
     Q_INVOKABLE void setNextPaneSuffix(QString devSessionId, QString region,
                                        int suffix);
     Q_INVOKABLE int nextPaneSuffix(QString devSessionId, QString region) const;
+
+    // The sessions-sidebar pin filter is presentation state, not a workspace
+    // mutation: a second client may see the same pinned sessions but chooses
+    // independently whether to hide the others. It persists so a restart does
+    // not unexpectedly switch the user's view back to every session.
+    //
+    // Missing or unreadable values default to false. Showing all sessions is
+    // the safe fallback: a malformed settings file must not make the workspace
+    // appear empty by silently enabling a filter.
+    Q_INVOKABLE void setPinnedOnly(bool pinnedOnly);
+    Q_INVOKABLE bool pinnedOnly() const;
 
     // The Dev Session the user was last working in ON A GIVEN SERVER, so a
     // relaunch reopens it instead of an empty shell. Client-local: which

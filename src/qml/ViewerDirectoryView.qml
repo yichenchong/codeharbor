@@ -25,7 +25,15 @@ Rectangle {
     // Session reopens on the same file (SessionLayouts::setPaneUrl).
     signal openRequested(string path)
 
-    color: Theme.surface
+    // Open-as requests carry the explicit handler choice and whether the user
+    // asked for a new split. Keeping this as a signal leaves pane identity and
+    // layout persistence in ViewerPane/Main rather than making the listing a
+    // second pane manager.
+    signal openAsRequested(string path, string kind, bool inNewPane)
+    signal openWithRequested(string path, string scheme)
+    signal messageRequested(string message)
+
+    property var customSchemeRow: null
 
     property var entries: []
     property string errorText: ""
@@ -99,6 +107,14 @@ Rectangle {
     }
 
     // Turn an activated row into the path the pane should open.
+    function pathFor(row) {
+        if (!row || row.kind === "parent")
+            return "";
+        // "/" is its own separator: "/" + "etc" must not become "//etc".
+        const base = root.basePath === "/" ? "" : root.basePath;
+        return base + "/" + row.name + (row.kind === "directory" ? "/" : "");
+    }
+
     function activate(row) {
         if (!row)
             return;
@@ -106,10 +122,94 @@ Rectangle {
             root.openRequested(root.parentPath === "/" ? "/" : root.parentPath + "/");
             return;
         }
-        // "/" is its own separator: "/" + "etc" must not become "//etc".
-        const base = root.basePath === "/" ? "" : root.basePath;
-        const child = base + "/" + row.name;
-        root.openRequested(row.kind === "directory" ? child + "/" : child);
+        root.openRequested(root.pathFor(row));
+    }
+
+    function fallbackKinds(row) {
+        if (!row || row.kind === "parent")
+            return [];
+        if (row.kind === "directory")
+            return [ "directory" ];
+        const lower = String(row.name).toLowerCase();
+        const dot = lower.lastIndexOf(".");
+        const ext = dot > 0 ? lower.substring(dot + 1) : "";
+        if (ext === "png" || ext === "jpg" || ext === "jpeg" || ext === "gif"
+                || ext === "svg" || ext === "webp" || ext === "bmp")
+            return [ "image" ];
+        if (ext === "pdf")
+            return [ "pdf" ];
+        if (ext === "txt" || ext === "md" || ext === "markdown"
+                || ext === "js" || ext === "ts" || ext === "qml"
+                || ext === "json" || ext === "yaml" || ext === "yml"
+                || ext === "html" || ext === "htm" || ext === "css")
+            return [ "editor", "text" ];
+        return [ "binary" ];
+    }
+
+    function applicableKinds(row) {
+        if (!row || row.kind === "parent")
+            return [];
+        const url = RemotePath.pathToFileUrl(root.pathFor(row));
+        if (root.viewerModel
+                && typeof root.viewerModel.applicableViewKinds === "function") {
+            const kinds = root.viewerModel.applicableViewKinds(url);
+            if (kinds && kinds.length > 0)
+                return kinds;
+        }
+        return root.fallbackKinds(row);
+    }
+
+    function kindLabel(kind) {
+        switch (kind) {
+        case "editor": return qsTr("Editor");
+        case "text": return qsTr("Text");
+        case "image": return qsTr("Image");
+        case "pdf": return qsTr("PDF");
+        case "binary": return qsTr("Binary");
+        case "directory": return qsTr("Directory");
+        case "web": return qsTr("Web");
+        default: return kind;
+        }
+    }
+
+    function showCustomScheme(row) {
+        root.customSchemeRow = row;
+        customSchemeField.text = "";
+        customSchemeDialog.open();
+    }
+    function validCustomScheme(scheme) {
+        if (!/^[A-Za-z][A-Za-z0-9+.-]*$/.test(scheme))
+            return false;
+        const lower = scheme.toLowerCase();
+        return lower !== "codeharbor-internal" && lower !== "http"
+               && lower !== "https" && lower !== "file";
+    }
+
+    function submitCustomScheme() {
+        const row = root.customSchemeRow;
+        const scheme = customSchemeField.text.trim();
+        if (!row || row.kind === "parent")
+            return true;
+
+        const valid = root.viewerModel
+                      && typeof root.viewerModel.isValidApplicationScheme === "function"
+                      ? root.viewerModel.isValidApplicationScheme(scheme)
+                      : root.validCustomScheme(scheme);
+        if (!valid) {
+            root.messageRequested(qsTr("Invalid application scheme. Use a name "
+                                       + "starting with a letter, followed by "
+                                       + "letters, digits, '+', '-' or '.'."));
+            return false;
+        }
+        if (!root.viewerModel
+                || typeof root.viewerModel.openWithApplication !== "function"
+                || !root.viewerModel.openWithApplication(scheme, root.pathFor(row))) {
+            root.messageRequested(qsTr("No desktop application accepted %1://.")
+                                  .arg(scheme));
+            return false;
+        }
+        root.customSchemeRow = null;
+        return true;
     }
 
     // Start listing the current URL, abandoning any listing still outstanding
@@ -159,6 +259,7 @@ Rectangle {
 
     ListView {
         id: list
+        objectName: "directoryList"
         anchors.fill: parent
         clip: true
         model: root.rows
@@ -177,9 +278,14 @@ Rectangle {
 
             readonly property bool isParent: entry.modelData.kind === "parent"
             readonly property bool isDirectory: entry.modelData.kind === "directory"
+            readonly property var openAsKinds: root.applicableKinds(entry.modelData)
+            readonly property string defaultKind:
+                entry.openAsKinds.length > 0 ? String(entry.openAsKinds[0]) : ""
+            readonly property string rowPath: root.pathFor(entry.modelData)
 
             width: entry.ListView.view ? entry.ListView.view.width : 0
             height: 26
+            focusPolicy: Qt.StrongFocus
             text: entry.isParent
                   ? "\u2191 .."
                   : entry.isDirectory ? entry.modelData.name + "/"
@@ -192,6 +298,18 @@ Rectangle {
                 cursorShape: Qt.PointingHandCursor
             }
 
+            // A context-menu key (or Shift+F10, which keyboards commonly use
+            // when they omit a dedicated Menu key) is the non-pointer route.
+            Keys.onPressed: function(event) {
+                if (!entry.isParent
+                        && (event.key === Qt.Key_Menu
+                            || (event.key === Qt.Key_F10
+                                && (event.modifiers & Qt.ShiftModifier)))) {
+                    contextMenu.popup();
+                    event.accepted = true;
+                }
+            }
+
             contentItem: Label {
                 // Remote file names are data, never markup.
                 textFormat: Text.PlainText
@@ -200,12 +318,144 @@ Rectangle {
                 font.pixelSize: Theme.fontSizeLabel
                 elide: Text.ElideRight
                 verticalAlignment: Text.AlignVCenter
+                // `openAsButton` is an id, reachable from here directly; it is
+                // not a property of the delegate.
+                rightPadding: openAsButton.visible ? openAsButton.width + 8 : 0
             }
+
+            // A small, focusable affordance makes Open as reachable even on a
+            // keyboard without a context-menu key.
+            AppPaneHeader.Action {
+                id: openAsButton
+                objectName: "openAsButton"
+                anchors.right: parent.right
+                anchors.rightMargin: 4
+                anchors.verticalCenter: parent.verticalCenter
+                text: qsTr("Open as")
+                glyph: "\u2026"
+                focusPolicy: Qt.TabFocus
+                visible: !entry.isParent && entry.openAsKinds.length > 0
+                onClicked: contextMenu.popup()
+            }
+
+            TapHandler {
+                acceptedButtons: Qt.RightButton
+                onTapped: if (!entry.isParent) contextMenu.popup()
+            }
+
             background: Rectangle {
                 color: entry.hovered ? Theme.surfaceHover : "transparent"
             }
+
+            Menu {
+                id: contextMenu
+                objectName: "directoryContextMenu"
+
+                // Instantiator, not Repeater: a Menu keeps its entries in a
+                // content MODEL, and a Repeater's items are never added to it -
+                // they are created and then belong to nothing, so the menu
+                // renders empty. Instantiator hands each created object over
+                // explicitly, which is the supported way to build menu entries
+                // from data.
+                Menu {
+                    id: openAsMenu
+                    objectName: "openAsSubmenu"
+                    title: qsTr("Open as")
+                    enabled: entry.openAsKinds.length > 0
+                    Instantiator {
+                        model: entry.openAsKinds
+                        onObjectAdded: (index, object) => openAsMenu.insertItem(index, object)
+                        onObjectRemoved: (index, object) => openAsMenu.removeItem(object)
+                        delegate: MenuItem {
+                            required property var modelData
+                            readonly property string viewerKind: String(modelData)
+                            checkable: true
+                            checked: viewerKind === entry.defaultKind
+                            text: root.kindLabel(viewerKind)
+                                   + (checked ? qsTr(" (default)") : "")
+                            onTriggered: root.openAsRequested(entry.rowPath, viewerKind, false)
+                        }
+                    }
+                }
+
+                MenuSeparator {}
+
+                // The short command uses the item's default handler. The
+                // submenu below keeps alternate handler choices available in a
+                // new pane too, rather than silently changing the current one.
+                MenuItem {
+                    text: qsTr("Open in new pane")
+                    enabled: entry.defaultKind.length > 0
+                    onTriggered: root.openAsRequested(entry.rowPath,
+                                                       entry.defaultKind, true)
+                }
+
+                Menu {
+                    id: openAsNewPaneMenu
+                    objectName: "openAsNewPaneSubmenu"
+                    title: qsTr("Open as in new pane")
+                    enabled: entry.openAsKinds.length > 0
+                    Instantiator {
+                        model: entry.openAsKinds
+                        onObjectAdded: (index, object) =>
+                            openAsNewPaneMenu.insertItem(index, object)
+                        onObjectRemoved: (index, object) =>
+                            openAsNewPaneMenu.removeItem(object)
+                        delegate: MenuItem {
+                            required property var modelData
+                            readonly property string viewerKind: String(modelData)
+                            text: root.kindLabel(viewerKind)
+                            onTriggered: root.openAsRequested(entry.rowPath,
+                                                               viewerKind, true)
+                        }
+                    }
+                }
+
+                MenuItem {
+                    text: qsTr("Open with\u2026")
+                    enabled: !entry.isParent
+                    onTriggered: root.showCustomScheme(entry.modelData)
+                }
+            }
         }
     }
+    AppDialog {
+        id: customSchemeDialog
+        objectName: "customApplicationSchemeDialog"
+        title: qsTr("Open with\u2026")
+        modal: true
+        standardButtons: Dialog.Ok | Dialog.Cancel
+        anchors.centerIn: Overlay.overlay
+        width: 380
+
+        Column {
+            width: parent.width
+            spacing: 8
+
+            Label {
+                width: parent.width
+                wrapMode: Text.WordWrap
+                text: qsTr("Enter the application scheme to handle this remote path "
+                           + "(for example, my-editor).")
+                color: Theme.textDim
+            }
+            TextField {
+                id: customSchemeField
+                objectName: "customApplicationSchemeField"
+                width: parent.width
+                placeholderText: qsTr("application scheme")
+                onAccepted: customSchemeDialog.accept()
+            }
+        }
+
+        onOpened: {
+            customSchemeField.text = "";
+            customSchemeField.forceActiveFocus();
+        }
+        onAccepted: if (!root.submitCustomScheme()) customSchemeDialog.open()
+        onRejected: root.customSchemeRow = null
+    }
+
 
     // One place for every "there is nothing to list" answer, so the pane always
     // says which of them it is instead of showing an empty box.

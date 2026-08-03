@@ -79,6 +79,7 @@ struct CreateSessionParams {
     std::optional<QString> taskDescription;
     std::optional<int> position;
     std::optional<bool> archived;
+    std::optional<bool> pinned;
 };
 
 struct UpdateSessionParams {
@@ -89,6 +90,7 @@ struct UpdateSessionParams {
     std::optional<QString> taskDescription;
     std::optional<int> position;
     std::optional<bool> archived;
+    std::optional<bool> pinned;
 };
 
 struct MoveSessionParams {
@@ -210,8 +212,9 @@ public:
     // two panes on one target attach the same remote shell (SPEC 5.2). 4 drops
     // v3's UNIQUE (dev_session_id, name): a slot label is not an identity, and
     // a closed pane keeps its row and its label while a new pane takes the same
-    // label.
-    static constexpr int kSchemaVersion = 4;
+    // label. 5 adds the server-owned Dev Session pinned bit with a false
+    // default for every existing row.
+    static constexpr int kSchemaVersion = 5;
 
     using ListCallback =
         std::function<void(QVector<GroupNode>, std::optional<RpcError>)>;
@@ -234,9 +237,10 @@ public:
     // unconditionally.
     WorkspaceDb(std::nullptr_t) = delete;
 
-    // Nested read: groups -> sessions -> {viewerPanes, terminalPanes, layouts}.
-    void list(const ServerId& serverId, ListCallback cb);
-
+    // Nested read. `pinnedOnly` is a read predicate for the client-local
+    // sidebar filter; the session's pinned bit remains server-owned state.
+    void list(const ServerId& serverId, ListCallback cb,
+              bool pinnedOnly = false);
     // Groups.
     void createGroup(const CreateGroupParams& params, GroupCallback cb);
     void updateGroup(const UpdateGroupParams& params, GroupCallback cb);

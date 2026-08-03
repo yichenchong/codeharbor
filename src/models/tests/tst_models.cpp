@@ -14,6 +14,7 @@
 #include <limits>
 #include <utility>
 
+#include "GroupPalette.h"
 #include "SessionState.h"
 #include "SessionsModel.h"
 #include "SplitTree.h"
@@ -46,7 +47,7 @@ private slots:
     void buildsWorkspaceTree();
     void modelExposesGroupsAndSessions();
     void emptyGroupHasNoSessions();
-    void sessionWithoutTerminalsIsDisconnected();
+    void sessionWithoutTerminalsIsIdle();
     void splitTreeRoundTripsNestedLayout();
     void splitTreeRejectsRatioMismatch();
     void splitTreeOperationsAreDepthBounded();
@@ -67,7 +68,7 @@ private slots:
     void sessionsModelRejectsNonZeroColumn();
     void sessionsModelDataOnInvalidIndex();
     void sessionsModelSetGroupsTwiceResets();
-    void aggregateRowStateAllFalseIsDisconnected();
+    void aggregateRowStateNoInformationIsIdle();
     void aggregateRowStateCoversEveryInputCombination();
     void stateStringsArePinnedWireValues();
     void sessionsModelRoleNamesCoverEveryServedRole();
@@ -83,8 +84,14 @@ private slots:
     void splitTreeRoundTripsLeafTerminalPaneId();
     void splitTreeWithoutTerminalPaneIdIsUnchangedByTheField();
     void splitTreeSplitTerminalPaneIdIgnoredOnRoundTrip();
+    void splitTreeCustomTitleRoundTripsAndIsBounded();
     void workspaceValueTypesCompareEveryField();
     void updateTerminalStatesFinishesEveryRowBeforeSignalling();
+    void oklchRoundTripsSrgb();
+    void paletteRejectsTooSmallRequest();
+    void paletteOnlyAppendsToSeed();
+    void paletteGenerationIsDeterministic();
+    void groupNameHashIsStableAndInRange();
 };
 
 // Group -> DevSession -> viewer + terminal panes tree.
@@ -190,10 +197,13 @@ void TstModels::emptyGroupHasNoSessions()
     QVERIFY(!model.index(0, 0, groupIndex).isValid());
 }
 
-void TstModels::sessionWithoutTerminalsIsDisconnected()
+// A session with no panes has never had a terminal to lose, so it is neutral
+// Idle rather than Disconnected. The latter is reserved for an observed live
+// terminal whose channel later reported a loss.
+void TstModels::sessionWithoutTerminalsIsIdle()
 {
     QCOMPARE(static_cast<int>(SessionsModel::aggregateSessionState({})),
-             static_cast<int>(SessionRowState::Disconnected));
+             static_cast<int>(SessionRowState::Idle));
 
     SessionsModel model;
     SessionRow s;
@@ -206,7 +216,7 @@ void TstModels::sessionWithoutTerminalsIsDisconnected()
 
     const QModelIndex sessionIndex = model.index(0, 0, model.index(0, 0));
     QCOMPARE(model.data(sessionIndex, SessionsModel::RowStateRole).toInt(),
-             static_cast<int>(SessionRowState::Disconnected));
+             static_cast<int>(SessionRowState::Idle));
 }
 
 // VerticalSplit[ leaf A, HorizontalSplit[ leaf B, leaf C ] ] round-trips exactly.
@@ -745,47 +755,52 @@ void TstModels::sessionsModelSetGroupsTwiceResets()
     QCOMPARE(model.rowCount(model.index(1, 0)), 1);
 }
 
-// Terminals present but none in any notable state (e.g. unloaded/unknown) reduce
-// to Disconnected, matching the empty-set case (SPEC 4.2 lowest priority).
-void TstModels::aggregateRowStateAllFalseIsDisconnected()
+// A persisted pane that has never been opened reports Unloaded, which is not a
+// disconnection. A Ready pane is live and neutral, while Disconnected is only
+// reached after that live pane reports its channel loss.
+void TstModels::aggregateRowStateNoInformationIsIdle()
 {
-    const QVector<TerminalStatus> terminals = {
-        terminal(TerminalState::Unloaded, AgentState::Unknown),
-        terminal(TerminalState::Disconnected, AgentState::Stopped),
-    };
-    QCOMPARE(static_cast<int>(SessionsModel::aggregateSessionState(terminals)),
+    QCOMPARE(static_cast<int>(SessionsModel::aggregateSessionState(
+                 {terminal(TerminalState::Unloaded, AgentState::Unknown)})),
+             static_cast<int>(SessionRowState::Idle));
+    QCOMPARE(static_cast<int>(SessionsModel::aggregateSessionState(
+                 {terminal(TerminalState::Ready, AgentState::Idle)})),
+             static_cast<int>(SessionRowState::Idle));
+    QCOMPARE(static_cast<int>(SessionsModel::aggregateSessionState(
+                 {terminal(TerminalState::Disconnected, AgentState::Stopped)})),
              static_cast<int>(SessionRowState::Disconnected));
 
-    // anyWaitingInput without anyError still yields WaitingForInput.
+    // A higher-priority agent condition still wins over a lost connection.
     QCOMPARE(static_cast<int>(SessionsModel::aggregateSessionState(
                  {terminal(TerminalState::Disconnected, AgentState::WaitingInput)})),
              static_cast<int>(SessionRowState::WaitingForInput));
 }
 
-// The precedence reducer has five boolean inputs, so its behaviour is fully
-// described by 32 cases; the scenario tests above only sample a handful of them
-// through SessionsModel::aggregateSessionState. Enumerate all 32 against an
-// independent restatement of the SPEC 4.2 order, written lowest-priority-first
-// so it shares no structure with the implementation's highest-priority-first
-// early returns. Any swapped pair of levels fails here.
+// The precedence reducer has six boolean inputs, so its behaviour is fully
+// described by 64 cases. The final input marks a real lost connection; when it
+// is false and no higher-priority condition exists, absence of information
+// falls back to Idle rather than Disconnected.
 void TstModels::aggregateRowStateCoversEveryInputCombination()
 {
-    for (int mask = 0; mask < 32; ++mask) {
+    for (int mask = 0; mask < 64; ++mask) {
         const bool anyError = (mask & 1) != 0;
         const bool anyWaitingInput = (mask & 2) != 0;
         const bool anyRunning = (mask & 4) != 0;
         const bool anyFinishedUnseen = (mask & 8) != 0;
         const bool anyConnected = (mask & 16) != 0;
+        const bool anyDisconnected = (mask & 32) != 0;
 
-        SessionRowState expected = SessionRowState::Disconnected;
+        SessionRowState expected = anyDisconnected ? SessionRowState::Disconnected
+                                                    : SessionRowState::Idle;
         if (anyConnected) expected = SessionRowState::Idle;
         if (anyFinishedUnseen) expected = SessionRowState::FinishedUnseen;
         if (anyRunning) expected = SessionRowState::Running;
         if (anyWaitingInput) expected = SessionRowState::WaitingForInput;
         if (anyError) expected = SessionRowState::Error;
 
-        const SessionRowState got = aggregateRowState(
-                anyError, anyWaitingInput, anyRunning, anyFinishedUnseen, anyConnected);
+        const SessionRowState got = aggregateRowState(anyError, anyWaitingInput,
+                                                       anyRunning, anyFinishedUnseen,
+                                                       anyConnected, anyDisconnected);
         QVERIFY2(got == expected,
                  qPrintable(QStringLiteral("mask %1: got %2, expected %3")
                                     .arg(mask)
@@ -907,7 +922,8 @@ void TstModels::sessionsModelRoleNamesCoverEveryServedRole()
                                  SessionsModel::IsGroupRole,
                                  SessionsModel::CollapsedRole,
                                  SessionsModel::IdRole,
-                                 SessionsModel::GroupIdRole};
+                                 SessionsModel::GroupIdRole,
+                                 SessionsModel::PinnedRole};
     QCOMPARE(names.size(), served.size());
     for (int role : served) {
         QVERIFY2(names.contains(role), "roleNames() omits a role that data() serves");
@@ -1406,6 +1422,48 @@ void TstModels::splitTreeSplitTerminalPaneIdIgnoredOnRoundTrip()
     // The child's row id, by contrast, is preserved.
     QCOMPARE(restored.children.at(0).terminalPaneId, child.terminalPaneId);
 }
+// Custom titles are optional leaf content, not pane identity. Normalize them
+// at the tree's serialization boundary so both hand-built trees and server
+// replies obey the same trim/size contract as SessionLayouts::setPaneTitle().
+void TstModels::splitTreeCustomTitleRoundTripsAndIsBounded()
+{
+    SplitNode leaf;
+    leaf.paneId = QStringLiteral("terminal-7");
+    leaf.terminalPaneId = QStringLiteral("row-7");
+    leaf.customTitle = QStringLiteral("  Build shell  ");
+
+    const QJsonObject titled = wire(leaf);
+    QCOMPARE(titled.value(QStringLiteral("customTitle")).toString(),
+             QStringLiteral("Build shell"));
+    const SplitNode restored = SplitNode::fromJson(titled);
+    QCOMPARE(restored.customTitle, QStringLiteral("Build shell"));
+    QCOMPARE(restored.paneId, leaf.paneId);
+    QCOMPARE(restored.terminalPaneId, leaf.terminalPaneId);
+    QVERIFY(restored == leaf);
+
+    // A title that is too long is clipped before it reaches the layout wire,
+    // keeping the compact header and the server-side tree bounded.
+    leaf.customTitle = QString(SplitNode::kMaxCustomTitleLength + 20, QLatin1Char('x'));
+    const QJsonObject bounded = wire(leaf);
+    const QString boundedTitle =
+        bounded.value(QStringLiteral("customTitle")).toString();
+    QCOMPARE(boundedTitle.size(), SplitNode::kMaxCustomTitleLength);
+    const SplitNode boundedRestored = SplitNode::fromJson(bounded);
+    QCOMPARE(boundedRestored.customTitle, boundedTitle);
+    QCOMPARE(boundedRestored.paneId, QStringLiteral("terminal-7"));
+    QCOMPARE(boundedRestored.terminalPaneId, QStringLiteral("row-7"));
+
+    // Clearing is represented by whitespace only and therefore removes the
+    // optional field; the generated pane label remains untouched.
+    leaf.customTitle = QStringLiteral(" \t\n ");
+    const QJsonObject cleared = wire(leaf);
+    QVERIFY(!cleared.contains(QStringLiteral("customTitle")));
+    const SplitNode clearedRestored = SplitNode::fromJson(cleared);
+    QVERIFY(clearedRestored.customTitle.isEmpty());
+    QCOMPARE(clearedRestored.paneId, QStringLiteral("terminal-7"));
+    QCOMPARE(clearedRestored.terminalPaneId, QStringLiteral("row-7"));
+}
+
 
 // Defaulted equality on the persisted value types has to compare EVERY member:
 // these structs are diffed to decide whether a change needs writing back, so a
@@ -1527,6 +1585,72 @@ void TstModels::updateTerminalStatesFinishesEveryRowBeforeSignalling()
     const int error = static_cast<int>(SessionRowState::Error);
     QCOMPARE(s1AtSignal, QVector<int>({error, error}));
     QCOMPARE(s2AtSignal, QVector<int>({error, error}));
+}
+
+void TstModels::oklchRoundTripsSrgb()
+{
+    const auto rgb = [](int red, int green, int blue) {
+        return SrgbColor{red / 255.0, green / 255.0, blue / 255.0};
+    };
+    const QVector<SrgbColor> samples{rgb(0, 0, 0),       rgb(255, 255, 255),
+                                     rgb(0x7a, 0xa2, 0xf7), rgb(0xbb, 0x9a, 0xf7),
+                                     rgb(0x9e, 0xce, 0x6a), rgb(0xf7, 0x76, 0x8e),
+                                     rgb(0x12, 0x34, 0x56)};
+
+    for (const SrgbColor &sample : samples) {
+        const SrgbColor roundTrip =
+                GroupPalette::oklchToSrgb(GroupPalette::srgbToOklch(sample));
+        QVERIFY(std::abs(roundTrip.red - sample.red) < 0.0025);
+        QVERIFY(std::abs(roundTrip.green - sample.green) < 0.0025);
+        QVERIFY(std::abs(roundTrip.blue - sample.blue) < 0.0025);
+    }
+}
+
+void TstModels::paletteRejectsTooSmallRequest()
+{
+    const QVector<SrgbColor> seed = GroupPalette::tokyoNightSeed();
+    QCOMPARE(seed.size(), 5);
+
+    // The generator's Q_ASSERT is for programmer mistakes; this preflight is
+    // the safe check used by the QML-facing cache for editable preferences.
+    QVERIFY(!GroupPalette::canGenerate(seed, seed.size() - 1));
+    QVERIFY(!GroupPalette::canGenerate(seed, seed.size()));
+    QVERIFY(GroupPalette::canGenerate(seed, seed.size() + 1));
+}
+
+void TstModels::paletteOnlyAppendsToSeed()
+{
+    const QVector<SrgbColor> seed = GroupPalette::tokyoNightSeed();
+    const QVector<SrgbColor> expanded = GroupPalette::generatePalette(seed, 13);
+
+    QCOMPARE(expanded.size(), 13);
+    QCOMPARE(expanded.mid(0, seed.size()), seed);
+    for (int i = seed.size(); i < expanded.size(); ++i) {
+        QVERIFY(expanded.at(i).red >= 0.0 && expanded.at(i).red <= 1.0);
+        QVERIFY(expanded.at(i).green >= 0.0 && expanded.at(i).green <= 1.0);
+        QVERIFY(expanded.at(i).blue >= 0.0 && expanded.at(i).blue <= 1.0);
+    }
+}
+
+void TstModels::paletteGenerationIsDeterministic()
+{
+    const QVector<SrgbColor> seed = GroupPalette::tokyoNightSeed();
+    QCOMPARE(GroupPalette::generatePalette(seed, 17),
+             GroupPalette::generatePalette(seed, 17));
+}
+
+void TstModels::groupNameHashIsStableAndInRange()
+{
+    constexpr int paletteSize = 23;
+    const QStringList names{QStringLiteral("Work"), QStringLiteral("Personal"),
+                            QStringLiteral("研究"), QStringLiteral(""), QStringLiteral("Work")};
+
+    for (const QString &name : names) {
+        const int first = GroupPalette::stableIndexForName(name, paletteSize);
+        QCOMPARE(first, GroupPalette::stableIndexForName(name, paletteSize));
+        QVERIFY(first >= 0);
+        QVERIFY(first < paletteSize);
+    }
 }
 
 QTEST_GUILESS_MAIN(TstModels)

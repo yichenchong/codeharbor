@@ -170,6 +170,8 @@ private slots:
     void viewerModelWithoutClientReportsErrors();
     // The order and the shape of the entries the directory pane renders.
     void directoryListingIsSortedDirectoriesFirst();
+    void openAsKindsFollowRegistryClaims();
+    void applicationSchemeValidationAndEscaping();
 
     // SPEC 9: an out-of-project path stays openable, but the pane has to be
     // TOLD it is out of project. These pin the flag's trip from the reply to
@@ -390,6 +392,57 @@ void TstViewers::resolveUrlTable()
     QCOMPARE(ViewerHandlerRegistry::resolve(QUrl(QStringLiteral("ftp://host/x"))),
              ViewerResolution::Error);
 }
+void TstViewers::openAsKindsFollowRegistryClaims()
+{
+    QCOMPARE(ViewerHandlerRegistry::applicableViewKinds(
+                 QUrl(QStringLiteral("file:///repo/main.cpp"))),
+             QStringList({QStringLiteral("editor"), QStringLiteral("text")}));
+    QCOMPARE(ViewerHandlerRegistry::applicableViewKinds(
+                 QUrl(QStringLiteral("file:///repo/index.html"))),
+             QStringList({QStringLiteral("editor"), QStringLiteral("text"),
+                          QStringLiteral("web")}));
+    QCOMPARE(ViewerHandlerRegistry::applicableViewKinds(
+                 QUrl(QStringLiteral("file:///repo/logo.png"))),
+             QStringList({QStringLiteral("image")}));
+    QCOMPARE(ViewerHandlerRegistry::applicableViewKinds(
+                 QUrl(QStringLiteral("file:///repo/archive.bin"))),
+             QStringList({QStringLiteral("binary")}));
+    QCOMPARE(ViewerHandlerRegistry::applicableViewKinds(
+                 QUrl(QStringLiteral("file:///repo/src/"))),
+             QStringList({QStringLiteral("directory")}));
+    QCOMPARE(ViewerHandlerRegistry::applicableViewKinds(
+                 QUrl(QStringLiteral("https://example.test/"))),
+             QStringList({QStringLiteral("web")}));
+}
+
+void TstViewers::applicationSchemeValidationAndEscaping()
+{
+    for (const QString &scheme :
+         {QStringLiteral("zed"), QStringLiteral("my-app"),
+          QStringLiteral("org.example.viewer"), QStringLiteral("x+tool2")})
+        QVERIFY(ViewerHandlerRegistry::isValidApplicationScheme(scheme));
+
+    for (const QString &scheme :
+         {QString(), QStringLiteral("1app"), QStringLiteral("-app"),
+          QStringLiteral("app_name"), QStringLiteral("app://"),
+          QStringLiteral("http"), QStringLiteral("FILE"),
+          QStringLiteral("codeharbor-internal")})
+        QVERIFY2(!ViewerHandlerRegistry::isValidApplicationScheme(scheme),
+                 qPrintable(scheme));
+
+    const QUrl escaped = ViewerHandlerRegistry::applicationUrl(
+        QStringLiteral("my-app"),
+        QStringLiteral("/srv/repo/notes #1?draft=1%done"));
+    QVERIFY(escaped.isValid());
+    QCOMPARE(escaped.scheme(), QStringLiteral("my-app"));
+    QCOMPARE(escaped.path(), QStringLiteral("/srv/repo/notes #1?draft=1%done"));
+    QVERIFY(escaped.query().isEmpty());
+    QVERIFY(escaped.fragment().isEmpty());
+    QVERIFY(!ViewerHandlerRegistry::applicationUrl(
+                 QStringLiteral("codeharbor-internal"),
+                 QStringLiteral("/srv/repo/file")).isValid());
+}
+
 
 void TstViewers::urlMappingRoundTrip()
 {

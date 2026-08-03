@@ -1,8 +1,8 @@
 #pragma once
 
 #include <QString>
+#include <QStringList>
 #include <QUrl>
-
 namespace ch {
 
 // Resolution type produced by the handler registry for a given URL/MIME/ext
@@ -48,6 +48,22 @@ public:
     // well-known text NAMES — "Makefile", ".gitignore", "Dockerfile.dev",
     // ".env.local" — matched case-insensitively. Unknown schemes -> Error.
     static ViewerResolution resolve(const QUrl &url);
+
+    // The explorer's "Open as" menu is derived from the same positive claims
+    // as resolve(), not from a second extension table. The returned strings
+    // are the QML viewer-kind vocabulary: "editor", "text", "image", "pdf",
+    // "binary", "directory", or "web". The first item is the default.
+    static QStringList applicableViewKinds(const QUrl &url);
+
+    // Application schemes are user/plugin input, so they are stricter than
+    // QUrl's permissive parsing. The built-in CodeHarbor scheme and ordinary
+    // browser/file schemes are reserved and never handed to the desktop.
+    static bool isValidApplicationScheme(const QString &scheme);
+
+    // Build the URL handed to a desktop application handler. `remotePath` is
+    // data from the remote server; setPath() performs URL escaping rather than
+    // concatenating it into a scheme string.
+    static QUrl applicationUrl(const QString &scheme, const QString &remotePath);
 
     // Classify a bare file extension (without the leading dot, case
     // insensitive). Unknown / known-binary extensions resolve to Download.

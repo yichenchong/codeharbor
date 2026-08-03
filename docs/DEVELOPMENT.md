@@ -308,6 +308,25 @@ echo '{"jsonrpc":"2.0","id":1,"method":"server.info"}' | node src/codeharbord.ts
 node src/bridge.ts
 ```
 
+**Schema changes.** Two different version numbers exist and they mean different
+things.
+
+The WORKSPACE DATABASE is at version 5 (the session `pinned` flag). It is stated in
+three places that must move together: `remote/sql/schema.sql`,
+`WORKSPACE_SCHEMA_VERSION` in `remote/src/workspace.ts`, and
+`WorkspaceDb::kSchemaVersion` in `src/persistence/WorkspaceDb.h`. Only the daemon
+migrates; the client's copy is a record of what the schema is expected to be, and
+tests on both sides pin it. A new column also needs a migration step for databases
+already in the field: version 5 adds `pinned` with a default of 0, so an existing
+database keeps every row and simply starts unpinned. Indexes are the exception and
+belong in `remote/sql/indexes.sql`, which is applied on every open rather than only
+on migration.
+
+The RPC schema is separate and IS the compatibility gate: `RPC_SCHEMA_VERSION` in
+`remote/src/codeharbord.ts` (currently 6) against
+`AppController::kMinimumServerSchemaVersion`. A client refuses a server whose RPC
+schema is older than it needs, which is the "Server too old" path.
+
 ## Test suites
 
 ```bash
@@ -315,6 +334,21 @@ ctest --preset dev                 # default: unit + integration, no external de
 ctest --preset dev -L live         # live gates (need a real SSH server, see below)
 ctest --preset dev -L desktop      # desktop-only proofs (need a session bus)
 ```
+
+Targets added with the settings, pin, log and viewer-navigation work, all in the
+default (portable) suite:
+
+| Target | Covers |
+|---|---|
+| `tst_appsettings` | The client-local preferences store: defaults, validation of a hand-edited file, clamping, and that a reset leaves window-layout state alone |
+| `tst_logbuffer` | The bounded diagnostics buffer: entry and byte caps, chaining to a previously installed message handler, filtering, and logging while a buffer is destroyed |
+| `tst_logview` | The log surface, including a message emitted while it was closed still being there when it opens |
+| `tst_openas` | The explorer's "Open as" menu: only applicable handlers offered, and "open in new pane" leaving the first pane alone |
+| `tst_ui_polish` | The shared scrollbar's fit/overflow states and the viewer pane's cursor neutrality |
+
+`tst_paneidentity` also gained the viewer navigation cases (history truncation,
+disabled ends, reload of non-web content, Home with and without a session), and
+`tst_sessionlayouts` the pane-title and fast-session-switch cases.
 
 `-L desktop` currently holds one target, `tst_notifierlive`, which delivers a real
 notification through `org.freedesktop.Notifications`. It needs a session bus AND a

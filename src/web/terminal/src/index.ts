@@ -4,6 +4,7 @@
 // resize events are forwarded back.
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
+import { WebglAddon } from "@xterm/addon-webgl";
 // Side-effect import: esbuild pulls xterm's stylesheet out of the JS graph into
 // dist/terminal.css, which the packaged page links (see build.mjs).
 import "@xterm/xterm/css/xterm.css";
@@ -11,6 +12,23 @@ import "@xterm/xterm/css/xterm.css";
 import { isRendererVisible } from "./visibility";
 // Output flow control, likewise DOM-free and unit-tested (see writer.ts).
 import { CoalescingWriter } from "./writer";
+// Input pacing keeps large pastes bounded and preserves ANSI sequence boundaries.
+import { TerminalInputWriter } from "./input";
+// User settings are applied to the live xterm instance rather than rebuilding the page.
+import {
+    applyTerminalPreferences,
+    type TerminalPreferenceValues,
+} from "./preferences";
+import {
+    createDevicePixelRatioController,
+    type DevicePixelRatioController,
+} from "./dpr";
+import {
+    applyThemeToDocument,
+    defaultThemeRoles,
+    type ThemeRoles,
+    xtermTheme,
+} from "./theme";
 
 export interface TerminalBridge {
     /** Forward user keystrokes to the remote PTY (SPEC 5.1). */
@@ -50,6 +68,15 @@ export interface TerminalHost {
 }
 
 export function mountTerminal(element: HTMLElement, bridge: TerminalBridge): TerminalHost {
+    // xterm's canvas/WebGL renderer reads window.devicePixelRatio when it is
+    // constructed. Keep the browser value as the default and expose a guarded
+    // override for the explicit AppSettings value.
+    const pageWindow = element.ownerDocument.defaultView;
+    if (!pageWindow) {
+        throw new Error("terminal page has no window");
+    }
+    const pixelRatio: DevicePixelRatioController =
+        createDevicePixelRatioController(pageWindow);
     // MOUSE REPORTING: the tmux session this pane attaches to is created with
     // `mouse on` scoped to that session (see
     // ch::TerminalController::tmuxNewSessionCommand), so tmux asks this page to
@@ -68,6 +95,7 @@ export function mountTerminal(element: HTMLElement, bridge: TerminalBridge): Ter
     // own selection — so no override is added here. Paste is unaffected: it
     // arrives as a browser paste event on xterm.js's hidden textarea, never as a
     // mouse report.
+    let activeTheme: ThemeRoles = { ...defaultThemeRoles };
     const term = new Terminal({
         cursorBlink: true,
         fontFamily: "monospace",
@@ -82,10 +110,9 @@ export function mountTerminal(element: HTMLElement, bridge: TerminalBridge): Ter
         // small rather than the 5000 it held while xterm.js was believed to own
         // the history: every line costs memory per pane, and there can be many
         // panes.
-        scrollback: 500,
-        // Mirrors Theme.surfaceSunken / Theme.text in src/qml/Theme.qml, which
-        // has no import path into this page: change both together.
-        theme: { background: "#11111b", foreground: "#cdd6f4" },
+        // The host may replace this immediately after page load through
+        // window.applyTheme(); these dark roles are the standalone fallback.
+        theme: xtermTheme(activeTheme),
         // SECURITY: terminal output is fully attacker-controlled — every byte
         // here came off the remote PTY. xterm.js parses OSC 8 hyperlinks out of
         // that stream, and with NO linkHandler configured its built-in default
@@ -119,11 +146,92 @@ export function mountTerminal(element: HTMLElement, bridge: TerminalBridge): Ter
     surface.className = "ch-terminal-surface";
     element.appendChild(surface);
 
+    function applyPageTheme(input: unknown): void {
+        activeTheme = applyThemeToDocument(element.ownerDocument, input);
+        term.options.theme = xtermTheme(activeTheme);
+    }
+    applyPageTheme(activeTheme);
     term.open(surface);
+    // xterm 5 uses the DOM renderer unless an addon replaces it. The DOM
+    // fallback is useful on hosts without WebGL, but it cannot correct a
+    // device-pixel/content-box mismatch. Prefer WebGL so the canvas backing
+    // store is sized in physical pixels; the addon observes the actual device
+    // content box and redraws instead of stretching a low-resolution surface.
+    let renderer = "dom";
+    try {
+        term.loadAddon(new WebglAddon());
+        renderer = "webgl";
+    } catch (error) {
+        // WebGL2 is unavailable in some software-only WebEngine builds. Keep
+        // the DOM renderer usable there rather than making a terminal vanish.
+        console.warn("CodeHarbor terminal WebGL renderer unavailable", error);
+    }
 
-    // Forward user keystrokes to the remote PTY (SPEC 5.1). fit() never emits
-    // onData, so this listener's ordering is independent of the size handshake.
-    term.onData((data) => bridge.sendInput(data));
+    // There is deliberately no application context menu. xterm's own
+    // right-click handler still selects a word and prepares the textarea for a
+    // native copy, while this listener prevents Chromium's empty menu from
+    // appearing on top of the terminal.
+    const suppressContextMenu = (event: MouseEvent): void => {
+        event.preventDefault();
+    };
+    surface.addEventListener("contextmenu", suppressContextMenu);
+
+    const input = new TerminalInputWriter({
+        sendInput: (data) => bridge.sendInput(data),
+    });
+
+
+    // Explicit terminal shortcuts are needed for Ctrl+Shift+C: xterm's
+    // keyboard mapper intentionally leaves that combination to the host, and
+    // Chromium otherwise treats it as an empty browser command. Cmd+C on macOS
+    // follows the same path. Paste is intentionally left to xterm's native
+    // Clipboard handler, which brackets the text when the remote application
+    // enabled bracketed-paste mode and handles X11 middle-click selection.
+    const copySelection = (): boolean => {
+        if (!term.hasSelection()) {
+            return false;
+        }
+        const text = term.getSelection();
+        if (text.length === 0) {
+            return false;
+        }
+        const textarea = surface.querySelector(".xterm-helper-textarea");
+        let copied = false;
+        if (textarea instanceof HTMLTextAreaElement) {
+            textarea.value = text;
+            textarea.select();
+            try {
+                copied = element.ownerDocument.execCommand("copy");
+            } catch {
+                copied = false;
+            }
+        }
+        if (!copied && pageWindow.navigator.clipboard) {
+            void pageWindow.navigator.clipboard.writeText(text).catch(() => {});
+            copied = true;
+        }
+        return copied;
+    };
+    const isMac = pageWindow.navigator.userAgent.includes("Mac");
+    term.attachCustomKeyEventHandler((event) => {
+        if (event.type !== "keydown") {
+            return true;
+        }
+        const key = event.key.toLowerCase();
+        const copyShortcut = isMac
+            ? event.metaKey && !event.ctrlKey && !event.altKey && key === "c"
+            : event.ctrlKey && event.shiftKey && !event.altKey && key === "c";
+        if (copyShortcut) {
+            copySelection();
+            return false;
+        }
+        // Do not intercept paste: the browser emits a trusted paste event for
+        // Ctrl+Shift+V / Cmd+V, and xterm's handler is where bracketed paste
+        // markers are added. Intercepting the key and reading navigator.clipboard
+        // would lose the X11 primary-selection middle-click path.
+        return true;
+    });
+    term.onData((data) => input.write(data));
 
     // Re-fit the terminal to the surface, but ONLY while the surface actually
     // has a box on screen.
@@ -144,6 +252,16 @@ export function mountTerminal(element: HTMLElement, bridge: TerminalBridge): Ter
         }
         fit.fit();
     }
+    const applyPreferences = (values: TerminalPreferenceValues): TerminalPreferenceValues =>
+        applyTerminalPreferences(
+            term,
+            fit,
+            surface.clientWidth > 0 && surface.clientHeight > 0,
+            bridge,
+            values,
+            (ratio) => pixelRatio.set(ratio),
+        );
+
 
     // Initial-size ordering invariant: fit() FIRST (with no onResize listener
     // attached), THEN attach onResize, THEN send the fitted size exactly once.
@@ -241,6 +359,39 @@ export function mountTerminal(element: HTMLElement, bridge: TerminalBridge): Ter
     // disposed: xterm.js' write buffer has no disposal guard of its own, so a
     // single late batch of output would throw inside the signal dispatch.
     let disposed = false;
+    type TerminalPageApi = typeof pageWindow & {
+        applyTheme?: (roles: unknown) => void;
+        codeharborSetTerminalPreferences?: (fontPoints: number, pixelRatio: number) => void;
+        codeharborTerminalDiagnostics?: () => Record<string, unknown>;
+    };
+    const pageApi = pageWindow as TerminalPageApi;
+    const applyPagePreferences = (fontPoints: number, preferredRatio: number): void => {
+        applyPreferences({ fontSize: fontPoints, pixelRatio: preferredRatio });
+    };
+    const terminalDiagnostics = (): Record<string, unknown> => {
+        const canvas = surface.querySelector("canvas");
+        const canvasRect = canvas?.getBoundingClientRect();
+        return {
+            renderer,
+            windowDevicePixelRatio: pageWindow.devicePixelRatio,
+            actualDevicePixelRatio: pixelRatio.state.actual,
+            effectiveDevicePixelRatio: pixelRatio.state.effective,
+            surfaceCssPixels: {
+                width: surface.clientWidth,
+                height: surface.clientHeight,
+            },
+            canvasCssPixels: canvasRect
+                ? { width: canvasRect.width, height: canvasRect.height }
+                : null,
+            canvasDevicePixels: canvas
+                ? { width: canvas.width, height: canvas.height }
+                : null,
+        };
+    };
+    pageApi.applyTheme = applyPageTheme;
+    pageApi.codeharborSetTerminalPreferences = applyPagePreferences;
+    pageApi.codeharborTerminalDiagnostics = terminalDiagnostics;
+
 
     return {
         write(data: string, bytes: number): void {
@@ -270,6 +421,15 @@ export function mountTerminal(element: HTMLElement, bridge: TerminalBridge): Ter
                 return;
             }
             disposed = true;
+            input.close();
+            surface.removeEventListener("contextmenu", suppressContextMenu);
+            if (pageApi.codeharborSetTerminalPreferences === applyPagePreferences) {
+                delete pageApi.codeharborSetTerminalPreferences;
+            }
+            if (pageApi.codeharborTerminalDiagnostics === terminalDiagnostics) {
+                delete pageApi.codeharborTerminalDiagnostics;
+            }
+            pixelRatio.restore();
             writer.close();
             resizeObserver.disconnect();
             visibilityObserver.disconnect();

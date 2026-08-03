@@ -45,7 +45,9 @@ import { isSafeTmuxTarget, tmuxSafeName, TMUX_TARGET_MAX_LENGTH } from "./tmux.t
 // layout slot label is not a terminal's identity (the row id in the layout leaf
 // is), and a closed pane keeps its row and its label while a new pane
 // legitimately takes the same label.
-export const WORKSPACE_SCHEMA_VERSION = 4;
+// Bumped 4 -> 5 to persist Dev Session pin state. The migration only adds the
+// NOT NULL column with a false default, so existing sessions remain unpinned.
+export const WORKSPACE_SCHEMA_VERSION = 5;
 
 // The authoritative DDL (C2). Read relative to this module so it resolves the
 // same whether invoked from src/ or from a built dist/ alongside sql/.
@@ -87,6 +89,7 @@ export interface Session {
     taskDescription: string | null;
     position: number;
     archived: boolean;
+    pinned: boolean;
     createdAt: number;
     updatedAt: number;
 }
@@ -175,6 +178,7 @@ export interface CreateSessionParams {
     taskDescription?: string | null;
     position?: number;
     archived?: boolean;
+    pinned?: boolean;
 }
 
 export interface UpdateSessionParams {
@@ -185,6 +189,7 @@ export interface UpdateSessionParams {
     taskDescription?: string | null;
     position?: number;
     archived?: boolean;
+    pinned?: boolean;
 }
 
 export interface MoveSessionParams {
@@ -289,6 +294,7 @@ interface SessionRow {
     task_description: string | null;
     position: number;
     archived: number;
+    pinned: number;
     created_at: number;
     updated_at: number;
 }
@@ -352,6 +358,7 @@ function toSession(r: SessionRow): Session {
         taskDescription: r.task_description,
         position: r.position,
         archived: r.archived !== 0,
+        pinned: r.pinned !== 0,
         createdAt: r.created_at,
         updatedAt: r.updated_at,
     };
@@ -639,14 +646,31 @@ const MIGRATIONS: ReadonlyArray<{
     // row. (A future step that alters an existing table cannot do this: CREATE
     // TABLE IF NOT EXISTS never adds a column, so it must spell out its ALTERs.)
     { version: 2, apply: (db) => db.exec(schemaSql) },
-    // v3 makes a terminal pane's IDENTITY enforceable: unique tmux_target and
-    // unique (dev_session_id, name). It is the one step so far that has to
-    // REPAIR data before it can add its constraints, so it is a named function
-    // rather than a re-run of the DDL.
-    { version: 3, apply: migrateTerminalPaneIdentity },
-    // v4 takes half of v3 back: (dev_session_id, name) is not an identity, so
-    // the constraint rejected a legitimate new pane that reused a freed label.
-    { version: 4, apply: migrateDropTerminalPaneAddressUnique },
+    // v3 makes a terminal pane's identity enforceable: unique tmux_target and
+    // unique (dev_session_id, name), repairing legacy collisions first.
+    { version: 3, apply: (db) => migrateTerminalPaneIdentity(db) },
+    // v4 removes the unique (dev_session_id, name) constraint again. A pane
+    // label is not a terminal identity, so multiple rows may legitimately
+    // reuse it after a pane is closed and a new one is created.
+    { version: 4, apply: (db) => migrateDropTerminalPaneAddressUnique(db) },
+    // v5 adds the workspace-owned Dev Session pin bit. ALTER TABLE is
+    // intentionally explicit: CREATE TABLE IF NOT EXISTS cannot add a column
+    // to a database that already has dev_sessions, and every old row must stay
+    // visible as unpinned. Fresh databases already received the column from
+    // schema.sql in v1, so this step checks before altering them.
+    {
+        version: 5,
+        apply: (db) => {
+            const columns = db
+                .prepare("PRAGMA table_info(dev_sessions)")
+                .all() as unknown as Array<{ name: string }>;
+            if (!columns.some((column) => column.name === "pinned")) {
+                db.exec(
+                    "ALTER TABLE dev_sessions ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0",
+                );
+            }
+        },
+    },
 ];
 
 // Quote a SQL IDENTIFIER: wrap it in double quotes and double any embedded
@@ -964,7 +988,9 @@ function schemaVersion(db: DatabaseSync): number {
 // The compiled form of the nested listing (see Workspace.listStatements).
 interface ListStatements {
     groups: StatementSync;
+    groupsPinned: StatementSync;
     sessions: StatementSync;
+    sessionsPinned: StatementSync;
     viewerPanes: StatementSync;
     terminalPanes: StatementSync;
     layouts: StatementSync;
@@ -990,7 +1016,8 @@ export class Workspace {
     // transaction of its own, so the value only ever toggles between the two
     // states and a counter invited a reader to expect otherwise.
     private inTransaction = false;
-    // The nested listing's five statements, compiled once per connection.
+    // The nested listing's seven statements (all/pinned groups and sessions,
+    // plus three pane/layout lookups), compiled once per connection.
     //
     // list() runs one query for the groups, one per group for its sessions and
     // three per session for its panes and layouts, and every one of them is the
@@ -1143,7 +1170,7 @@ export class Workspace {
                 params.position ?? this.nextPosition("dev_sessions", "group_id", params.groupId);
             this.db
                 .prepare(
-                    "INSERT INTO dev_sessions (id, server_id, group_id, name, repository_root, default_working_directory, task_description, position, archived, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO dev_sessions (id, server_id, group_id, name, repository_root, default_working_directory, task_description, position, archived, pinned, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 )
                 .run(
                     id,
@@ -1155,6 +1182,7 @@ export class Workspace {
                     params.taskDescription ?? null,
                     position,
                     params.archived ? 1 : 0,
+                    params.pinned ? 1 : 0,
                     ts,
                     ts,
                 );
@@ -1187,9 +1215,10 @@ export class Workspace {
                 params.taskDescription !== undefined ? params.taskDescription : current.taskDescription;
             const position = params.position ?? current.position;
             const archived = params.archived ?? current.archived;
+            const pinned = params.pinned ?? current.pinned;
             this.db
                 .prepare(
-                    "UPDATE dev_sessions SET name = ?, repository_root = ?, default_working_directory = ?, task_description = ?, position = ?, archived = ?, updated_at = ? WHERE id = ?",
+                    "UPDATE dev_sessions SET name = ?, repository_root = ?, default_working_directory = ?, task_description = ?, position = ?, archived = ?, pinned = ?, updated_at = ? WHERE id = ?",
                 )
                 .run(
                     name,
@@ -1198,6 +1227,7 @@ export class Workspace {
                     taskDescription,
                     position,
                     archived ? 1 : 0,
+                    pinned ? 1 : 0,
                     Date.now(),
                     params.id,
                 );
@@ -1299,7 +1329,7 @@ export class Workspace {
             const position = this.nextPosition("dev_sessions", "group_id", source.group_id);
             this.db
                 .prepare(
-                    "INSERT INTO dev_sessions (id, server_id, group_id, name, repository_root, default_working_directory, task_description, position, archived, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO dev_sessions (id, server_id, group_id, name, repository_root, default_working_directory, task_description, position, archived, pinned, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 )
                 .run(
                     newSessionId,
@@ -1311,6 +1341,7 @@ export class Workspace {
                     source.task_description,
                     position,
                     source.archived,
+                    source.pinned,
                     ts,
                     ts,
                 );
@@ -1793,9 +1824,17 @@ export class Workspace {
     // The nested tree groups -> sessions -> {viewerPanes, terminalPanes,
     // layouts}. Ordering is deterministic (position, then id) so a reopen of
     // the same database yields byte-identical output.
-    list(serverId: string): GroupNode[] {
-        const rows = this.listing().groups.all(serverId) as unknown as GroupRow[];
-        return rows.map((g) => ({ ...toGroup(g), sessions: this.listSessions(g.id) }));
+    //
+    // The nested listing's result may be narrowed to pinned sessions for a
+    // client-local sidebar filter. The predicate is read-only; `pinned` itself
+    // remains in the server-owned session row.
+    list(serverId: string, pinnedOnly = false): GroupNode[] {
+        const listing = this.listing();
+        const rows = (pinnedOnly ? listing.groupsPinned : listing.groups).all(serverId) as unknown as GroupRow[];
+        return rows.map((g) => ({
+            ...toGroup(g),
+            sessions: this.listSessions(g.id, pinnedOnly),
+        }));
     }
 
     // Compile the listing's statements on first use and keep them; see
@@ -1805,8 +1844,14 @@ export class Workspace {
             groups: this.db.prepare(
                 "SELECT * FROM groups WHERE server_id = ? ORDER BY position, id",
             ),
+            groupsPinned: this.db.prepare(
+                "SELECT * FROM groups WHERE server_id = ? AND EXISTS (SELECT 1 FROM dev_sessions WHERE dev_sessions.group_id = groups.id AND dev_sessions.pinned <> 0) ORDER BY position, id",
+            ),
             sessions: this.db.prepare(
                 "SELECT * FROM dev_sessions WHERE group_id = ? ORDER BY position, id",
+            ),
+            sessionsPinned: this.db.prepare(
+                "SELECT * FROM dev_sessions WHERE group_id = ? AND pinned <> 0 ORDER BY position, id",
             ),
             viewerPanes: this.db.prepare(
                 "SELECT * FROM viewer_panes WHERE dev_session_id = ? ORDER BY position, id",
@@ -1820,11 +1865,11 @@ export class Workspace {
         });
     }
 
-    private listSessions(groupId: string): SessionNode[] {
-        const rows = this.listing().sessions.all(groupId) as unknown as SessionRow[];
+    private listSessions(groupId: string, pinnedOnly: boolean): SessionNode[] {
+        const statement = pinnedOnly ? this.listing().sessionsPinned : this.listing().sessions;
+        const rows = statement.all(groupId) as unknown as SessionRow[];
         return rows.map((s) => this.sessionNode(s.id, s));
     }
-
     private sessionNode(sessionId: string, row?: SessionRow): SessionNode {
         const session = row
             ? toSession(row)
@@ -2056,7 +2101,9 @@ export const WORKSPACE_METHODS: Record<RpcWorkspaceMethodName, (params: unknown)
     // with a success and an unchanged row.
     [M.list]: (p) => {
         const o = requireObject(p, M.list);
-        return workspace().list(requireString(o, "serverId", M.list));
+        const serverId = requireString(o, "serverId", M.list);
+        optionalBoolean(o, "pinnedOnly", M.list);
+        return workspace().list(serverId, (o.pinnedOnly as boolean | undefined) ?? false);
     },
     [M.createGroup]: (p) => {
         const o = requireObject(p, M.createGroup);
@@ -2095,6 +2142,7 @@ export const WORKSPACE_METHODS: Record<RpcWorkspaceMethodName, (params: unknown)
         optionalString(o, "taskDescription", M.createSession);
         optionalIndex(o, "position", M.createSession);
         optionalBoolean(o, "archived", M.createSession);
+        optionalBoolean(o, "pinned", M.createSession);
         return workspace().createSession(p as CreateSessionParams);
     },
     [M.updateSession]: (p) => {
@@ -2106,6 +2154,7 @@ export const WORKSPACE_METHODS: Record<RpcWorkspaceMethodName, (params: unknown)
         optionalString(o, "taskDescription", M.updateSession);
         optionalIndex(o, "position", M.updateSession);
         optionalBoolean(o, "archived", M.updateSession);
+        optionalBoolean(o, "pinned", M.updateSession);
         return workspace().updateSession(p as UpdateSessionParams);
     },
     [M.deleteSession]: (p) => {

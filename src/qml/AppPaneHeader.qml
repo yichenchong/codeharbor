@@ -61,6 +61,10 @@ Rectangle {
     // inert title, which is why the title is styled as text rather than as a
     // button.
     signal titleActivated()
+    // A terminal caller uses this gesture to open its rename editor. Viewer
+    // callers leave it unhandled, so their single-click title behavior stays
+    // unchanged.
+    signal titleRenameRequested()
 
     implicitHeight: Theme.paneHeaderHeight
     color: Theme.surfaceRaised
@@ -108,16 +112,36 @@ Rectangle {
         id: action
 
         property string glyph: ""
+        // Stable toolbar ids are declared at the affordance, not inferred from
+        // its glyph or position. A viewer pane can therefore register the same
+        // action even when it is hosted outside this header's action list.
+        property string toolbarId: ""
+
+        Component.onCompleted: {
+            if (action.toolbarId.length > 0)
+                ToolbarRegistry.registerButton(action.toolbarId);
+        }
+        Component.onDestruction: {
+            if (action.toolbarId.length > 0)
+                ToolbarRegistry.unregisterButton(action.toolbarId);
+        }
 
         // Never takes focus: these sit on top of a terminal or an editor, and a
         // header button that stole the keyboard would send the user's next
-        // keystroke to a button instead of to their shell.
+        // keystroke to their shell.
         focusPolicy: Qt.NoFocus
         topPadding: 0
         bottomPadding: 0
         leftPadding: 6
         rightPadding: 6
         implicitHeight: 20
+        background: Rectangle {
+            radius: Theme.radiusSmall
+            color: action.down ? Theme.surfaceSelected
+                 : action.hovered ? Theme.surfaceHover : "transparent"
+            border.width: action.visualFocus ? 2 : 0
+            border.color: Theme.accent
+        }
 
         contentItem: Label {
             // Titles and states can carry remote text; a glyph is ours. Both go
@@ -131,11 +155,6 @@ Rectangle {
             verticalAlignment: Text.AlignVCenter
         }
 
-        background: Rectangle {
-            radius: Theme.radiusSmall
-            color: action.down ? Theme.surfaceSelected
-                 : action.hovered ? Theme.surfaceHover : "transparent"
-        }
 
         // The module's one tooltip (AppToolTip.qml): the ATTACHED ToolTip.text
         // form is drawn by the Basic style in that style's own light palette,
@@ -235,5 +254,6 @@ Rectangle {
         anchors.top: parent.top
         anchors.bottom: parent.bottom
         onClicked: header.titleActivated()
+        onDoubleClicked: header.titleRenameRequested()
     }
 }

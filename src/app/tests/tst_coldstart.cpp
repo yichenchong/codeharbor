@@ -1007,14 +1007,24 @@ void TstColdStart::step4_workspaceAndSessionActivation()
 
     m_graph->app.createGroup(m_groupName);
     QTRY_VERIFY_WITH_TIMEOUT(refreshed.count() > 0, kOpTimeoutMs);
-    QTRY_VERIFY_WITH_TIMEOUT(model->rowCount() > 0, kOpTimeoutMs);
 
-    int groupRow = -1;
-    for (int g = 0; g < model->rowCount(); ++g) {
-        if (model->data(model->index(g, 0), ch::SessionsModel::NameRole).toString()
-            == m_groupName)
-            groupRow = g;
-    }
+    // Wait for THIS group, not merely for a non-empty sidebar. The workspace on
+    // the fixture is not wiped between runs, so groups left by an earlier run
+    // satisfy a "some rows exist" wait immediately - long before the group just
+    // created has made its round trip - and the search below then runs against
+    // a sidebar that does not contain it yet.
+    const auto rowOfGroup = [model, this] {
+        for (int g = 0; g < model->rowCount(); ++g) {
+            if (model->data(model->index(g, 0), ch::SessionsModel::NameRole)
+                    .toString()
+                == m_groupName) {
+                return g;
+            }
+        }
+        return -1;
+    };
+    QTRY_VERIFY_WITH_TIMEOUT(rowOfGroup() >= 0, kOpTimeoutMs);
+    const int groupRow = rowOfGroup();
     QVERIFY2(groupRow >= 0, qPrintable(QStringLiteral("group %1 not in the sidebar")
                                            .arg(m_groupName)));
     m_groupId = model->data(model->index(groupRow, 0), ch::SessionsModel::IdRole).toString();

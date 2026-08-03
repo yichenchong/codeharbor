@@ -14,6 +14,7 @@ constexpr int kFirstPaneSuffix = 1;
 const QString kSidebarKey = QStringLiteral("layout/sidebarWidth");
 const QString kViewerKey = QStringLiteral("layout/viewerWidth");
 const QString kTerminalKey = QStringLiteral("layout/terminalWidth");
+const QString kPinnedOnlyKey = QStringLiteral("sidebar/pinnedOnly");
 
 // A stored value, or `fallback` when the key is absent, holds something that is
 // not a whole number, or is smaller than `minimum`.
@@ -37,6 +38,22 @@ int storedInt(const QSettings& settings, const QString& key, int fallback,
     if (!ok || value < minimum)
         return fallback;
     return value;
+}
+// QSettings can return a native bool or the textual form written by an INI
+// editor. Accept only the two explicit values; QVariant::toBool() would turn
+// arbitrary non-empty garbage into true and make a damaged settings file hide
+// the whole sidebar.
+bool storedBool(const QSettings& settings, const QString& key, bool fallback)
+{
+    const QVariant raw = settings.value(key);
+    if (!raw.isValid())
+        return fallback;
+    const QString text = raw.toString().trimmed().toLower();
+    if (text == QStringLiteral("true") || text == QStringLiteral("1"))
+        return true;
+    if (text == QStringLiteral("false") || text == QStringLiteral("0"))
+        return false;
+    return fallback;
 }
 
 QString selectedPaneKey(const QString& devSessionId)
@@ -95,6 +112,27 @@ int UiStateStore::viewerWidth() const
 int UiStateStore::terminalWidth() const
 {
     return storedInt(*m_settings, kTerminalKey, kDefaultTerminalWidth, 1);
+}
+
+void UiStateStore::setPinnedOnly(bool pinnedOnly)
+{
+    // Writing a value that did not change would rewrite the settings file on
+    // every launch: the sidebar re-applies its filter when it is created, so an
+    // unconditional write turns "the user changed nothing" into a modified
+    // config on disk. That is observable - a relaunch test watches this file's
+    // timestamp precisely to prove a no-op launch leaves it alone.
+    if (pinnedOnly == this->pinnedOnly())
+        return;
+    m_settings->setValue(kPinnedOnlyKey, pinnedOnly);
+    // A discrete toolbar choice, not a drag stream; flush it before returning
+    // so a restart cannot reopen the sidebar in the wrong mode after the
+    // process exits immediately.
+    m_settings->sync();
+}
+
+bool UiStateStore::pinnedOnly() const
+{
+    return storedBool(*m_settings, kPinnedOnlyKey, false);
 }
 
 void UiStateStore::setSelectedPane(QString devSessionId, QString paneId)

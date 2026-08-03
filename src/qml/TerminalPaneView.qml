@@ -1,4 +1,5 @@
 import QtQuick
+import QtQuick.Layouts
 import QtQuick.Controls.Basic
 import QtWebEngine
 import QtWebChannel
@@ -49,6 +50,33 @@ Rectangle {
     // and the tmux target is never built from it.
     property string devSessionId: ""
     property string terminalId: pane.paneId
+    // Optional user-chosen title stored in the terminal layout leaf. It never
+    // participates in slot lookup or tmux identity: an empty value falls back
+    // to the client-generated terminalId label.
+    property string customTitle: ""
+    // Keep this in lock-step with SplitNode::kMaxCustomTitleLength. The cap is
+    // intentionally small because this compact header should remain readable
+    // and layout payloads should not grow without bound.
+    readonly property int maxCustomTitleLength: 128
+
+    function normalizeCustomTitle(value) {
+        var title = String(value === undefined || value === null ? "" : value).trim()
+        return title.length > pane.maxCustomTitleLength
+               ? title.substring(0, pane.maxCustomTitleLength) : title
+    }
+
+    function beginRename() {
+        pane.paneActivated(pane.paneId)
+        renameDialog.open()
+    }
+
+    function commitRename(value) {
+        const title = pane.normalizeCustomTitle(value)
+        // Update the live pane before the persistence request: the user should
+        // not wait for a remote round trip to see the title they just entered.
+        pane.customTitle = title
+        pane.titleChangedRequested(pane.paneId, title)
+    }
     property string workingDir: ""
 
     // The terminal's REAL identity: the id of its row in the server's
@@ -125,6 +153,11 @@ Rectangle {
     // a pane deliberately leaves the remote tmux session running.
     signal closeRequested(string paneId)
 
+    // The host persists the proposed title in SessionLayouts. The pane also
+    // applies the normalized value locally so the header changes before the
+    // asynchronous layout write returns.
+    signal titleChangedRequested(string paneId, string title)
+
     // The `terminalFactory` context property, resolved once. Guarded so a host
     // that does not install it (a bare QML load) gets inert chrome rather than
     // a ReferenceError; also the seam a test injects a stub through.
@@ -134,6 +167,12 @@ Rectangle {
     // supplies the privileged WebEngine profile the WebChannel bridge needs.
     // Guarded the same way, for the same reason.
     property var viewerModel: (typeof viewers !== "undefined") ? viewers : null
+    // User preferences are client-local and exposed by AppController as
+    // app.settings. The guarded lookup keeps this component loadable in the
+    // headless QML shell used by tests, where no application context exists.
+    property var settingsObject: (typeof app !== "undefined" && app && app.settings)
+                                 ? app.settings : null
+
 
     // Per-pane C++ objects, owned by this pane (destroyed with it).
     property var controller: pane.factory ? pane.factory.create(pane) : null
@@ -527,15 +566,17 @@ Rectangle {
         // slot, and only that — the pane's remote tmux session is named by the
         // server (`tmuxTarget`), so a number reused after a pane was closed
         // shows the user the same familiar label without any chance of adopting
-        // the closed pane's still-running shell. Drawn as plain text, since
-        // AppPaneHeader draws every title that way. A pane with no id yet says
-        // what it IS instead of nothing.
-        title: pane.terminalId.length > 0 ? pane.terminalId : qsTr("Terminal")
+        // the closed pane's still-running shell. A custom title is display-only
+        // and never replaces this label in identity or lookup code.
+        title: pane.customTitle.length > 0
+               ? pane.customTitle
+               : (pane.terminalId.length > 0 ? pane.terminalId : qsTr("Terminal"))
         subtitle: pane.stateLabel
         active: pane.paneActive
         // `comingUp`, not `attaching`: the latter is a blink around a synchronous
         // call, so the dot never actually appeared while the pane was coming up.
         busy: pane.comingUp
+        onTitleRenameRequested: pane.beginRename()
 
         actions: [
             AppPaneHeader.Action {
@@ -548,8 +589,92 @@ Rectangle {
                     pane.paneActivated(pane.paneId)
                     pane.closeRequested(pane.paneId)
                 }
+            },
+            AppPaneHeader.Action {
+                text: qsTr("Rename this pane")
+                glyph: "R"
+                onClicked: pane.beginRename()
             }
         ]
+    }
+    AppDialog {
+        id: renameDialog
+        objectName: "terminalPaneRenameDialog"
+        title: qsTr("Rename terminal pane")
+        modal: true
+        standardButtons: Dialog.Ok | Dialog.Cancel
+        anchors.centerIn: Overlay.overlay
+        width: renameField.Layout.preferredWidth + leftPadding + rightPadding
+
+        onOpened: {
+            renameField.text = pane.customTitle
+            renameField.forceActiveFocus()
+            renameField.selectAll()
+        }
+
+        ColumnLayout {
+            implicitWidth: 300
+            spacing: 8
+
+            TextField {
+                id: renameField
+                objectName: "terminalPaneRenameField"
+                Layout.preferredWidth: 300
+                text: pane.customTitle
+                placeholderText: qsTr("Pane title")
+                maximumLength: pane.maxCustomTitleLength
+            }
+        }
+
+        onAccepted: pane.commitRename(renameField.text)
+    }
+
+
+    // Push the two client-local terminal preferences into the trusted page.
+    // WebEngineView is a separate JavaScript world from QML, so a direct
+    // binding cannot reach xterm; the page installs this tiny function during
+    // mount and keeps the terminal instance alive while it applies settings.
+    function applyTerminalSettings() {
+        if (!pane.settingsObject || !pane.pageLoaded || !viewLoader.item)
+            return
+        const fontPoints = Number(pane.settingsObject.terminalFontSize)
+        const pixelRatio = Number(pane.settingsObject.terminalPixelRatio)
+        if (!isFinite(fontPoints) || !isFinite(pixelRatio))
+            return
+        const script = "(function () {"
+                     + "if (typeof window.codeharborSetTerminalPreferences === 'function') "
+                     + "window.codeharborSetTerminalPreferences("
+                     + fontPoints + "," + pixelRatio + ");"
+                     + "})()"
+        viewLoader.item.runJavaScript(script)
+    }
+
+    // Theme.roles is the one palette payload shared by the QML shell and both
+    // trusted web bundles. WebEngine has a separate JavaScript world, so pass
+    // a JSON object rather than attempting a direct binding. The page keeps a
+    // dark standalone default and makes this operation safe to repeat.
+    function applyTerminalTheme() {
+        if (!pane.pageLoaded || !viewLoader.item || !Theme.roles)
+            return
+        const roles = JSON.stringify(Theme.roles)
+        if (!roles)
+            return
+        const script = "(function (roles) {"
+                     + "if (typeof window.applyTheme === 'function') "
+                     + "window.applyTheme(roles);"
+                     + "})(" + roles + ")"
+        viewLoader.item.runJavaScript(script)
+    }
+
+    Connections {
+        target: Theme
+        function onRolesChanged() { pane.applyTerminalTheme() }
+    }
+
+    Connections {
+        target: pane.settingsObject
+        function onTerminalFontSizeChanged() { pane.applyTerminalSettings() }
+        function onTerminalPixelRatioChanged() { pane.applyTerminalSettings() }
     }
 
     WebChannel {
@@ -631,6 +756,8 @@ Rectangle {
                 onLoadingChanged: function(request) {
                     if (request.status === WebEngineView.LoadSucceededStatus) {
                         pane.pageLoaded = true
+                        Qt.callLater(pane.applyTerminalTheme)
+                        Qt.callLater(pane.applyTerminalSettings)
                     } else if (request.status === WebEngineView.LoadFailedStatus) {
                         pane.pageLoaded = false
                         pane.statusText = qsTr("The terminal renderer failed to load: %1")
@@ -728,7 +855,7 @@ Rectangle {
                     // has no Theme role; Theme.surfaceHover is the DARKER row
                     // hover, so substituting it here would invert the state.
                     color: attachButton.down ? Theme.border
-                         : attachButton.hovered ? "#3a3a52" : Theme.surfaceRaised
+                         : attachButton.hovered ? Theme.controlHoverSurface() : Theme.surfaceRaised
                     border.width: attachButton.visualFocus ? 2 : 1
                     border.color: attachButton.visualFocus ? Theme.accent : Theme.border
                 }
@@ -749,7 +876,7 @@ Rectangle {
         // #45222c / #3a2f1e are dim FILLS behind danger/warning text and have no
         // Theme role (Theme.danger and Theme.warning are the text colours, far
         // too bright to fill with).
-        color: pane.connectionState === "error" ? "#45222c" : "#3a2f1e"
+        color: pane.connectionState === "error" ? Theme.errorSurface() : Theme.warningSurface()
         visible: pane.pageLoaded && !pane.live
 
         Row {

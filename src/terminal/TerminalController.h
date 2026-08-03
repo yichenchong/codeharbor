@@ -252,16 +252,19 @@ private:
     // acknowledgement-driven release go through.
     void releaseRetained();
     // First offset at or after `from` that a cut of `buffer` can safely land
-    // on: the byte after the first line feed within kHiddenResyncWindowBytes,
-    // else the first byte that is not a UTF-8 continuation byte, else `from`
-    // plus the whole window. `from` past the end is answered with `from`.
-    //
-    // ONE definition, two callers: appendHidden() cuts here because the bytes
-    // before the cut are DESTROYED and the replay must not start inside a
-    // character or an escape sequence, and releaseRetained() cuts here because
-    // a batch that ends mid-sequence is a worse split than one that ends on a
-    // line feed. Two hand-written copies of this rule would drift.
+    // on: a line feed outside an ANSI string, else the first complete ANSI
+    // sequence boundary, else a UTF-8 character boundary. Bounded so the
+    // rolling eviction scan stays cheap; retained output is never cut inside
+    // an escape sequence.
     static qsizetype resyncBoundary(const QByteArray &buffer, qsizetype from);
+    // Largest safe prefix no longer than `maxBytes`. Used by credit-window
+    // replay, where moving a boundary FORWARD could exceed the advertised
+    // unacknowledged-byte limit.
+    static qsizetype safePrefixBoundary(const QByteArray &buffer, qsizetype maxBytes);
+    // Length of the trailing bytes of `data` that form an incomplete ANSI
+    // escape sequence. The bytes stay pending until the sequence is complete,
+    // just like an incomplete UTF-8 character.
+    static qsizetype incompleteTrailingEscape(const QByteArray &data);
     // Length of the trailing bytes of `data` that are the START of a multi-byte
     // UTF-8 character whose continuation bytes have not arrived yet: 0..3.
     // Zero when the data ends on a complete character, on ASCII, or on bytes

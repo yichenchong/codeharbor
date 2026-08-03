@@ -384,9 +384,10 @@ void SessionLayouts::clearTrees()
     m_legacyTerminalSlots.clear();
     for (int index = 0; index < kRegionCount; ++index) {
         RegionState& state = m_regions[index];
-        if (!state.valid)
-            continue; // already null; no redundant signal
+        const bool wasValid = state.valid;
         state = RegionState{};
+        if (!wasValid)
+            continue; // already null; no redundant signal
         if (index == kTerminal)
             emit terminalTreeChanged();
         else
@@ -400,6 +401,7 @@ void SessionLayouts::load(QString devSessionId)
     // Bump first: any reply still on the wire now belongs to a superseded
     // generation and will be dropped by applyLoadedTree.
     const quint64 generation = ++m_generation;
+    emit generationChanged();
     m_devSessionId = std::move(devSessionId);
     m_pendingLoads = 0;
     if (sessionChanged) {
@@ -408,14 +410,19 @@ void SessionLayouts::load(QString devSessionId)
         // in flight, and must not be edited into the new session either.
         clearTrees();
     }
-    if (m_devSessionId.isEmpty())
+    if (m_devSessionId.isEmpty()) {
+        clearPendingWrites();
         return; // deselection: nothing to fetch
+    }
 
     m_pendingLoads = kRegionCount;
     // A deliberate reload adopts whatever the server has, so no earlier edit
     // may veto it; only an edit made from HERE ON supersedes these replies.
-    for (RegionState& state : m_regions)
+    for (RegionState& state : m_regions) {
+        state.loading = true;
+        state.pendingWrites.clear();
         state.superseded = false;
+    }
     QPointer<SessionLayouts> self(this);
     const DevSessionId sessionId{m_devSessionId};
     for (int index = 0; index < kRegionCount; ++index) {
@@ -435,13 +442,20 @@ void SessionLayouts::applyLoadedTree(quint64 generation, int index,
                                      std::optional<SplitNode> tree,
                                      std::optional<RpcError> err)
 {
-    // A real server error is worth surfacing even when superseded (same rule as
-    // AppController::refresh).
+    // Surface transport failures even when the request belongs to a session
+    // already abandoned, but do not touch the CURRENT slot until the stamp is
+    // known to be current. A late old-session reply used to clear `loading`
+    // here; the next gesture then saw a null tree as unloadable instead of
+    // queueing behind the new session's still-pending load.
     if (err)
         emit error(err->message);
     if (generation != m_generation)
         return; // a newer load() has taken over; drop this reply entirely
 
+    RegionState& state = m_regions[index];
+    state.loading = false;
+    if (err)
+        state.pendingWrites.clear();
     // `superseded`: an edit was persisted while this getLayout was on the wire,
     // so its answer is older than the tree QML is already showing. Applying it
     // would revert the edit - and on the seeding branch below would replace it
@@ -479,7 +493,6 @@ void SessionLayouts::applyLoadedTree(quint64 generation, int index,
             m_legacyTerminalSlots = std::move(legacy);
         }
 
-        RegionState& state = m_regions[index];
         if (!state.valid || !(state.tree == next))
             setTree(index, std::move(next));
         // Not canEdit(): a load with no server selected yet is not a misuse and
@@ -501,6 +514,11 @@ void SessionLayouts::applyLoadedTree(quint64 generation, int index,
             persist(index);
         }
     }
+    // A current-session gesture that arrived while this region was null is
+    // replayed only after the authoritative tree (or the seeded default) is in
+    // place. Any pane/path that disappeared is silently stale and is dropped.
+    if (!err)
+        flushPendingWrites(index);
 
     if (m_pendingLoads > 0 && --m_pendingLoads == 0)
         emit loaded(m_devSessionId);
@@ -519,6 +537,94 @@ bool SessionLayouts::canEdit()
         return false;
     }
     return true;
+}
+
+SessionLayouts::WriteDecision SessionLayouts::prepareWrite(
+    int index, const QString& devSessionId, quint64 generation)
+{
+    // Check the stamp BEFORE canEdit() or any tree lookup. A delayed signal from
+    // a session the user left is not a current misuse and must not produce the
+    // "layout not loaded" toast; more importantly, it must never inspect a
+    // same-named pane in the new session.
+    if (devSessionId != m_devSessionId || generation != m_generation)
+        return WriteDecision::Drop;
+    if (!canEdit())
+        return WriteDecision::Reject;
+    if (!m_regions[index].valid && m_regions[index].loading)
+        return WriteDecision::Queue;
+    return WriteDecision::Apply;
+}
+
+void SessionLayouts::queueWrite(int index, PendingWrite write)
+{
+    RegionState& state = m_regions[index];
+    // URL, title and ratio reports are continuous gestures. Keeping only the
+    // report for one target prevents a fast switch from replaying every
+    // intermediate mouse position when the load resolves. Structural actions
+    // remain ordered because each click is a separate user intent.
+    if (write.kind == PendingWriteKind::PaneUrl
+        || write.kind == PendingWriteKind::PaneTitle
+        || write.kind == PendingWriteKind::Ratios) {
+        for (auto it = state.pendingWrites.rbegin();
+             it != state.pendingWrites.rend(); ++it) {
+            const bool sameTarget =
+                ((write.kind == PendingWriteKind::PaneUrl
+                  || write.kind == PendingWriteKind::PaneTitle)
+                 && it->kind == write.kind && it->paneId == write.paneId)
+                || (write.kind == PendingWriteKind::Ratios
+                    && it->kind == write.kind
+                    && it->pathIndexes == write.pathIndexes);
+            if (sameTarget) {
+                *it = std::move(write);
+                return;
+            }
+        }
+    }
+    state.pendingWrites.push_back(std::move(write));
+}
+
+void SessionLayouts::clearPendingWrites()
+{
+    for (RegionState& state : m_regions)
+        state.pendingWrites.clear();
+}
+
+void SessionLayouts::flushPendingWrites(int index)
+{
+    RegionState& state = m_regions[index];
+    if (state.pendingWrites.isEmpty())
+        return;
+    QVector<PendingWrite> pending = std::move(state.pendingWrites);
+    state.pendingWrites.clear();
+    for (const PendingWrite& write : pending) {
+        switch (write.kind) {
+        case PendingWriteKind::Ratios:
+            setRatiosStamped(m_devSessionId, m_generation, regionKey(index),
+                             write.pathIndexes, write.ratios, true);
+            break;
+        case PendingWriteKind::Split:
+            // A queued split cannot return its new pane id synchronously. The
+            // UI has no pane to focus until the tree is published, so replay it
+            // as a fire-and-forget intent and let the normal tree signal select
+            // the resulting pane.
+            splitPaneStamped(m_devSessionId, m_generation, regionKey(index),
+                             write.paneId, write.orientation, true);
+            break;
+        case PendingWriteKind::Close:
+            closePaneStamped(m_devSessionId, m_generation, regionKey(index),
+                             write.paneId, true);
+            break;
+        case PendingWriteKind::PaneUrl:
+            setPaneUrlStamped(m_devSessionId, m_generation, regionKey(index),
+                              write.paneId, write.url, true);
+            break;
+        case PendingWriteKind::PaneTitle:
+            setPaneTitleStamped(m_devSessionId, m_generation,
+                                regionKey(index), write.paneId, write.title,
+                                true);
+            break;
+        }
+    }
 }
 
 // Is any terminal leaf still waiting for its `terminal_panes` row? A leaf is
@@ -567,10 +673,30 @@ void SessionLayouts::persist(int index)
                     });
 }
 
+void SessionLayouts::saveTreeForSession(QString devSessionId,
+                                        quint64 generation, QString region,
+                                        QVariant tree)
+{
+    saveTreeStamped(devSessionId, generation, region, tree);
+}
+
 void SessionLayouts::saveTree(QString region, QVariant tree)
 {
+    // Compatibility wrapper for C++ tests; production QML uses the stamped
+    // entry point so a delayed signal cannot be mistaken for current intent.
+    saveTreeStamped(m_devSessionId, m_generation, region, tree);
+}
+
+void SessionLayouts::saveTreeStamped(const QString& devSessionId,
+                                     quint64 generation, const QString& region,
+                                     const QVariant& tree)
+{
     const int index = regionIndex(region);
-    if (index < 0 || !canEdit())
+    if (index < 0)
+        return;
+    if (devSessionId != m_devSessionId || generation != m_generation)
+        return; // stale authored tree; never inspect the current session
+    if (!canEdit())
         return;
     std::optional<SplitNode> parsed = parseVariantTree(tree);
     if (!parsed) {
@@ -579,50 +705,100 @@ void SessionLayouts::saveTree(QString region, QVariant tree)
                        .arg(region));
         return;
     }
-    // Quiet: the caller already holds this tree (see the header's signal
-    // discipline note).
+    // A full authored tree is itself authoritative user intent, even while
+    // getLayout is outstanding. It replaces the null/fallback state now and
+    // retires that reply rather than waiting and risking a revert.
     setTreeQuietly(index, std::move(*parsed));
     persist(index);
 }
 
+void SessionLayouts::setRatiosForSession(QString devSessionId,
+                                         quint64 generation, QString region,
+                                         QStringList pathIndexes,
+                                         QVariantList ratios)
+{
+    setRatiosStamped(devSessionId, generation, region, pathIndexes, ratios, false);
+}
+QString SessionLayouts::setPaneTitleForSession(QString devSessionId,
+                                               quint64 generation,
+                                               QString region, QString paneId,
+                                               QString title)
+{
+    return setPaneTitleStamped(devSessionId, generation, region, paneId, title,
+                               false);
+}
+
+
 void SessionLayouts::setRatios(QString region, QStringList pathIndexes,
                                QVariantList ratios)
 {
+    // Compatibility wrapper for C++ tests; production QML uses the stamped
+    // entry point so a delayed drag cannot be mistaken for current intent.
+    setRatiosStamped(m_devSessionId, m_generation, region, pathIndexes, ratios,
+                     false);
+}
+
+void SessionLayouts::setRatiosStamped(const QString& devSessionId,
+                                      quint64 generation, const QString& region,
+                                      const QStringList& pathIndexes,
+                                      const QVariantList& ratios, bool replay)
+{
     const int index = regionIndex(region);
-    if (index < 0 || !canEdit())
+    if (index < 0)
         return;
-    RegionState& state = m_regions[index];
-    if (!state.valid) {
-        emit error(QStringLiteral(
-            "SessionLayouts: %1 layout not loaded; ratios ignored").arg(region));
+    const WriteDecision decision =
+        prepareWrite(index, devSessionId, generation);
+    if (decision == WriteDecision::Drop || decision == WriteDecision::Reject)
+        return;
+    if (decision == WriteDecision::Queue) {
+        // The branch count is unknown until the server tree arrives, but the
+        // values themselves are still user input and must be checked now.
+        for (const QVariant& value : ratios) {
+            bool ok = false;
+            const double ratio = value.toDouble(&ok);
+            if (!ok || !std::isfinite(ratio) || ratio <= 0.0) {
+                emit error(QStringLiteral(
+                    "SessionLayouts: invalid %1 ratio \"%2\"")
+                               .arg(region, value.toString()));
+                return;
+            }
+        }
+        PendingWrite write;
+        write.kind = PendingWriteKind::Ratios;
+        write.pathIndexes = pathIndexes;
+        write.ratios = ratios;
+        queueWrite(index, std::move(write));
         return;
     }
 
-    // Walk the index path from the root to the branch being resized.
+    RegionState& state = m_regions[index];
     SplitNode* node = &state.tree;
     for (const QString& step : pathIndexes) {
         bool ok = false;
         const int childIndex = step.toInt(&ok);
         if (!ok || node->isLeaf() || childIndex < 0
             || childIndex >= node->children.size()) {
-            emit error(QStringLiteral(
-                "SessionLayouts: no %1 node at path [%2]")
-                           .arg(region, pathIndexes.join(QLatin1Char(','))));
+            if (!replay)
+                emit error(QStringLiteral(
+                    "SessionLayouts: no %1 node at path [%2]")
+                               .arg(region, pathIndexes.join(QLatin1Char(','))));
             return;
         }
         node = &node->children[childIndex];
     }
     if (node->isLeaf()) {
-        emit error(QStringLiteral(
-            "SessionLayouts: %1 node at path [%2] is a leaf and has no ratios")
-                       .arg(region, pathIndexes.join(QLatin1Char(','))));
+        if (!replay)
+            emit error(QStringLiteral(
+                "SessionLayouts: %1 node at path [%2] is a leaf and has no ratios")
+                           .arg(region, pathIndexes.join(QLatin1Char(','))));
         return;
     }
     if (ratios.size() != node->children.size()) {
-        emit error(QStringLiteral("SessionLayouts: expected %1 %2 ratios, got %3")
-                       .arg(node->children.size())
-                       .arg(region)
-                       .arg(ratios.size()));
+        if (!replay)
+            emit error(QStringLiteral("SessionLayouts: expected %1 %2 ratios, got %3")
+                           .arg(node->children.size())
+                           .arg(region)
+                           .arg(ratios.size()));
         return;
     }
 
@@ -634,9 +810,10 @@ void SessionLayouts::setRatios(QString region, QStringList pathIndexes,
         // Same rule SplitNode::fromJson enforces: a non-finite or non-positive
         // ratio yields broken geometry and would not survive a round-trip.
         if (!ok || !std::isfinite(ratio) || ratio <= 0.0) {
-            emit error(QStringLiteral(
-                "SessionLayouts: invalid %1 ratio \"%2\"")
-                           .arg(region, value.toString()));
+            if (!replay)
+                emit error(QStringLiteral(
+                    "SessionLayouts: invalid %1 ratio \"%2\"")
+                               .arg(region, value.toString()));
             return;
         }
         parsed.append(ratio);
@@ -649,31 +826,60 @@ void SessionLayouts::setRatios(QString region, QStringList pathIndexes,
     persist(index);
 }
 
+QString SessionLayouts::splitPaneForSession(QString devSessionId,
+                                            quint64 generation, QString region,
+                                            QString paneId, QString orientation)
+{
+    return splitPaneStamped(devSessionId, generation, region, paneId,
+                            orientation, false);
+}
+
 QString SessionLayouts::splitPane(QString region, QString paneId,
                                   QString orientation)
 {
+    // Compatibility wrapper for C++ tests; production QML uses the stamped
+    // entry point so a delayed command cannot be mistaken for current intent.
+    return splitPaneStamped(m_devSessionId, m_generation, region, paneId,
+                            orientation, false);
+}
+
+QString SessionLayouts::splitPaneStamped(const QString& devSessionId,
+                                         quint64 generation,
+                                         const QString& region,
+                                         const QString& paneId,
+                                         const QString& orientation, bool replay)
+{
     const int index = regionIndex(region);
-    if (index < 0 || !canEdit())
+    if (index < 0)
+        return {};
+    const WriteDecision decision =
+        prepareWrite(index, devSessionId, generation);
+    if (decision == WriteDecision::Drop || decision == WriteDecision::Reject)
         return {};
     const bool vertical = orientation == QStringLiteral("vertical");
     if (!vertical && orientation != QStringLiteral("horizontal")) {
-        emit error(QStringLiteral(
-            "SessionLayouts: unknown orientation \"%1\"").arg(orientation));
+        if (!replay)
+            emit error(QStringLiteral(
+                "SessionLayouts: unknown orientation \"%1\"").arg(orientation));
         return {};
     }
-    RegionState& state = m_regions[index];
-    if (!state.valid) {
-        emit error(QStringLiteral(
-            "SessionLayouts: %1 layout not loaded; split ignored").arg(region));
+    if (decision == WriteDecision::Queue) {
+        PendingWrite write;
+        write.kind = PendingWriteKind::Split;
+        write.paneId = paneId;
+        write.orientation = orientation;
+        queueWrite(index, std::move(write));
         return {};
     }
 
+    RegionState& state = m_regions[index];
     SplitNode* leaf = nullptr;
     SplitNode* parent = nullptr;
     int childIndex = -1;
     if (!locateLeaf(state.tree, nullptr, -1, paneId, leaf, parent, childIndex)) {
-        emit error(QStringLiteral("SessionLayouts: no %1 pane \"%2\" to split")
-                       .arg(region, paneId));
+        if (!replay)
+            emit error(QStringLiteral("SessionLayouts: no %1 pane \"%2\" to split")
+                           .arg(region, paneId));
         return {};
     }
 
@@ -888,15 +1094,43 @@ void SessionLayouts::bindTerminalPaneRow(const QString& devSessionId,
     persist(kTerminal);
 }
 
+void SessionLayouts::closePaneForSession(QString devSessionId,
+                                          quint64 generation, QString region,
+                                          QString paneId)
+{
+    closePaneStamped(devSessionId, generation, region, paneId, false);
+}
+
 void SessionLayouts::closePane(QString region, QString paneId)
 {
+    // Compatibility wrapper for C++ tests; production QML uses the stamped
+    // entry point so a delayed close cannot be mistaken for current intent.
+    closePaneStamped(m_devSessionId, m_generation, region, paneId, false);
+}
+
+void SessionLayouts::closePaneStamped(const QString& devSessionId,
+                                      quint64 generation, const QString& region,
+                                      const QString& paneId, bool replay)
+{
     const int index = regionIndex(region);
-    if (index < 0 || !canEdit())
+    if (index < 0)
         return;
+    const WriteDecision decision =
+        prepareWrite(index, devSessionId, generation);
+    if (decision == WriteDecision::Drop || decision == WriteDecision::Reject)
+        return;
+    if (decision == WriteDecision::Queue) {
+        PendingWrite write;
+        write.kind = PendingWriteKind::Close;
+        write.paneId = paneId;
+        queueWrite(index, std::move(write));
+        return;
+    }
     RegionState& state = m_regions[index];
     if (!state.valid) {
-        emit error(QStringLiteral(
-            "SessionLayouts: %1 layout not loaded; close ignored").arg(region));
+        if (!replay)
+            emit error(QStringLiteral(
+                "SessionLayouts: %1 layout not loaded; close ignored").arg(region));
         return;
     }
 
@@ -905,8 +1139,9 @@ void SessionLayouts::closePane(QString region, QString paneId)
     // user can come back to it, and the row keeps it enumerable in the Dev
     // Session's terminal pane list. Nothing here deletes either.
     if (!dropLeaf(index, paneId)) {
-        emit error(QStringLiteral("SessionLayouts: no %1 pane \"%2\" to close")
-                       .arg(region, paneId));
+        if (!replay)
+            emit error(QStringLiteral("SessionLayouts: no %1 pane \"%2\" to close")
+                           .arg(region, paneId));
         return;
     }
 
@@ -914,15 +1149,45 @@ void SessionLayouts::closePane(QString region, QString paneId)
     persist(index);
 }
 
+void SessionLayouts::setPaneUrlForSession(QString devSessionId,
+                                           quint64 generation, QString region,
+                                           QString paneId, QString url)
+{
+    setPaneUrlStamped(devSessionId, generation, region, paneId, url, false);
+}
+
 void SessionLayouts::setPaneUrl(QString region, QString paneId, QString url)
+{
+    // Compatibility wrapper for C++ tests; production QML uses the stamped
+    // entry point so a delayed pane event cannot be mistaken for current intent.
+    setPaneUrlStamped(m_devSessionId, m_generation, region, paneId, url, false);
+}
+
+void SessionLayouts::setPaneUrlStamped(const QString& devSessionId,
+                                       quint64 generation, const QString& region,
+                                       const QString& paneId, const QString& url,
+                                       bool replay)
 {
     const int index = regionIndex(region);
     if (index < 0)
         return;
+    const WriteDecision decision =
+        prepareWrite(index, devSessionId, generation);
+    if (decision == WriteDecision::Drop || decision == WriteDecision::Reject)
+        return;
+    if (decision == WriteDecision::Queue) {
+        PendingWrite write;
+        write.kind = PendingWriteKind::PaneUrl;
+        write.paneId = paneId;
+        write.url = url;
+        queueWrite(index, std::move(write));
+        return;
+    }
     RegionState& state = m_regions[index];
     if (!state.valid) {
-        emit error(QStringLiteral(
-            "SessionLayouts: %1 layout not loaded; pane url ignored").arg(region));
+        if (!replay)
+            emit error(QStringLiteral(
+                "SessionLayouts: %1 layout not loaded; pane url ignored").arg(region));
         return;
     }
 
@@ -930,27 +1195,86 @@ void SessionLayouts::setPaneUrl(QString region, QString paneId, QString url)
     SplitNode* parent = nullptr;
     int childIndex = -1;
     if (!locateLeaf(state.tree, nullptr, -1, paneId, leaf, parent, childIndex)) {
-        emit error(QStringLiteral("SessionLayouts: no %1 pane \"%2\" to record a url for")
-                       .arg(region, paneId));
+        if (!replay)
+            emit error(QStringLiteral(
+                "SessionLayouts: no %1 pane \"%2\" to record a url for")
+                           .arg(region, paneId));
         return;
     }
 
-    // Checked BEFORE canEdit(): every pane the regions mint re-asserts the url
-    // it was restored with, so an unchanged url is the normal case, not an edit.
-    // Treating it as one would spend an RPC per pane on every session open, and
-    // would report a spurious "no server selected" for a pane merely echoing
-    // what is already stored.
+    // Checked BEFORE any persistence: every pane the regions mint re-asserts
+    // the url it was restored with, so an unchanged url is the normal case, not
+    // an edit. Treating it as one would spend an RPC per pane on every open.
     if (leaf->url == url)
         return;
-    if (!canEdit())
-        return;
-
-    leaf->url = std::move(url);
+    leaf->url = url;
     // Quiet: the pane is ALREADY showing this url. Re-publishing the tree would
     // rebuild the region's delegates and destroy the very pane that just opened
     // the file - the write would undo what it recorded.
     publishTreeQuietly(index);
     persist(index);
+}
+
+QString SessionLayouts::setPaneTitleStamped(const QString& devSessionId,
+                                            quint64 generation,
+                                            const QString& region,
+                                            const QString& paneId,
+                                            const QString& title,
+                                            bool replay)
+{
+    const int index = regionIndex(region);
+    if (index < 0)
+        return {};
+    const WriteDecision decision =
+        prepareWrite(index, devSessionId, generation);
+    if (decision == WriteDecision::Drop || decision == WriteDecision::Reject)
+        return {};
+    const QString normalized = SplitNode::normalizeCustomTitle(title);
+    if (decision == WriteDecision::Queue) {
+        PendingWrite write;
+        write.kind = PendingWriteKind::PaneTitle;
+        write.paneId = paneId;
+        write.title = normalized;
+        queueWrite(index, std::move(write));
+        return normalized;
+    }
+
+    RegionState& state = m_regions[index];
+    if (!state.valid) {
+        if (!replay)
+            emit error(QStringLiteral(
+                "SessionLayouts: %1 layout not loaded; pane title ignored")
+                           .arg(region));
+        return {};
+    }
+
+    SplitNode* leaf = nullptr;
+    SplitNode* parent = nullptr;
+    int childIndex = -1;
+    if (!locateLeaf(state.tree, nullptr, -1, paneId, leaf, parent, childIndex)) {
+        if (!replay)
+            emit error(QStringLiteral(
+                "SessionLayouts: no %1 pane \"%2\" to set a title for")
+                           .arg(region, paneId));
+        return {};
+    }
+    if (leaf->customTitle == normalized)
+        return normalized;
+
+    // Only the display field changes. The layout slot and server-minted row id
+    // stay untouched so a rename can never retarget a running terminal.
+    leaf->customTitle = normalized;
+    publishTreeQuietly(index);
+    persist(index);
+    return normalized;
+}
+
+QString SessionLayouts::setPaneTitle(QString region, QString paneId, QString title)
+{
+    // Compatibility wrapper for C++ tests; production QML uses the stamped
+    // entry point so a delayed pane event cannot be mistaken for current intent.
+    return setPaneTitleStamped(m_devSessionId, m_generation, region, paneId, title,
+                               false);
 }
 
 } // namespace ch

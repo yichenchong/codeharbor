@@ -147,6 +147,10 @@ ApplicationWindow {
         visible: window.customChrome
         height: titleBar.visible ? titleBar.implicitHeight : 0
         win: window
+        // The production context supplies the Windows-only native style and
+        // hit-test bridge. `typeof` keeps headless QML fixtures, which mirror
+        // the older context-property set, on the ordinary portable path.
+        nativeHelper: typeof windowChrome === "undefined" ? null : windowChrome
         title: window.appName
         sessionLabel: window.sessionLabel
     }
@@ -201,6 +205,11 @@ ApplicationWindow {
             node: (app.layouts && app.layouts.viewerTree)
                   ? app.layouts.viewerTree
                   : window.viewerFallbackNode
+            // Production writes carry the session/load stamp captured by the
+            // region or pane. The region's legacy signals remain test-only.
+            sessionId: app.activeSessionId
+            layoutGeneration: app.layouts ? app.layouts.generation : 0
+            hostStampsWrites: true
             SplitView.fillWidth: true
             SplitView.minimumWidth: 320
             // The region header's own split/close buttons, and every pane's
@@ -211,6 +220,20 @@ ApplicationWindow {
             onSplitRequested: (orientation) => window.splitActivePane("viewer", orientation)
             onClosePaneRequested: (paneId) => window.closeRequestedPane("viewer", paneId)
             // A divider INSIDE the region was dragged. Persisted per Dev Session
+            onSplitRequestedForSession: (sessionId, generation, orientation) =>
+                window.splitActivePaneForSession("viewer", sessionId,
+                                                 generation, orientation)
+            onClosePaneRequestedForSession: (sessionId, generation, paneId) =>
+                window.closeRequestedPaneForSession("viewer", sessionId,
+                                                    generation, paneId)
+            onSplitRatiosAdjustedForSession: (sessionId, generation,
+                                              pathIndexes, ratios) =>
+                window.persistSplitRatiosForSession("viewer", sessionId,
+                                                    generation, pathIndexes,
+                                                    ratios)
+            onPaneUrlReportedForSession: (sessionId, generation, paneId, url) =>
+                window.persistPaneUrlForSession(sessionId, generation,
+                                                "viewer", paneId, url)
             // (SPEC 4.5) so the proportions the user set survive a reopen; the
             // regions already restore them.
             onSplitRatiosAdjusted: (pathIndexes, ratios) =>
@@ -231,6 +254,13 @@ ApplicationWindow {
                 if (app.layouts && app.activeSessionId.length > 0)
                     app.layouts.setPaneUrl("viewer", paneId, url);
             }
+            onOpenInNewPaneRequested: (paneId, url, kind) =>
+                window.openViewerInNewPane(paneId, url, kind)
+            onMessageRequested: (message) => window.notifyUser(message)
+            onOpenInNewPaneRequestedForSession: (sessionId, generation,
+                                                 paneId, url, kind) =>
+                window.openViewerInNewPaneForSession(sessionId, generation,
+                                                    paneId, url, kind)
         }
 
         TerminalRegion {
@@ -241,6 +271,8 @@ ApplicationWindow {
                   : window.terminalFallbackNode
             // devSessionId/workingDir are pushed as an ORDERED PAIR by
             // window.retargetTerminals(), not bound here; see that function.
+            layoutGeneration: app.layouts ? app.layouts.generation : 0
+            hostStampsWrites: true
             SplitView.preferredWidth: 520
             SplitView.minimumWidth: 280
             onFocusedPaneIdChanged: if (app.activeSessionId.length > 0)
@@ -248,10 +280,35 @@ ApplicationWindow {
                                                                     focusedPaneId)
             onSplitRequested: (orientation) => window.splitActivePane("terminal", orientation)
             onClosePaneRequested: (paneId) => window.closeRequestedPane("terminal", paneId)
+            onSplitRequestedForSession: (sessionId, generation, orientation) =>
+                window.splitActivePaneForSession("terminal", sessionId,
+                                                 generation, orientation)
+            onClosePaneRequestedForSession: (sessionId, generation, paneId) =>
+                window.closeRequestedPaneForSession("terminal", sessionId,
+                                                    generation, paneId)
+            onSplitRatiosAdjustedForSession: (sessionId, generation,
+                                              pathIndexes, ratios) =>
+                window.persistSplitRatiosForSession("terminal", sessionId,
+                                                    generation, pathIndexes,
+                                                    ratios)
+            onPaneTitleReportedForSession: (sessionId, generation, paneId, title) =>
+                app.layouts.setPaneTitleForSession(sessionId, generation,
+                                                   "terminal", paneId, title)
             // Destructive, and the only route to it besides the palette command.
             onKillTerminalRequested: window.killActiveTerminal()
             onSplitRatiosAdjusted: (pathIndexes, ratios) =>
                 window.persistSplitRatios("terminal", pathIndexes, ratios)
+            // Persist the display title without republishing the tree: the
+            // terminal item already applied it locally, and its identity is
+            // still the unchanged server row id in the leaf. Stamp the write
+            // with the current session/generation so a delayed header event
+            // cannot edit a newly selected session.
+            onPaneTitleReported: (paneId, title) => {
+                if (app.layouts && app.activeSessionId.length > 0)
+                    app.layouts.setPaneTitleForSession(app.activeSessionId,
+                                                       app.layouts.generation,
+                                                       "terminal", paneId, title);
+            }
         }
     }
 
@@ -442,6 +499,24 @@ ApplicationWindow {
         }
     }
 
+    LogView {
+        id: logView
+        anchors.fill: parent
+        z: 900
+        visible: shown
+        property bool shown: false
+        logBuffer: app.logBuffer
+        onDismissed: shown = false
+    }
+    SettingsWindow {
+        id: settingsWindow
+        anchors.fill: parent
+        z: 910
+        visible: shown
+        property bool shown: false
+        onDismissed: shown = false
+    }
+
     Connections {
         target: app
         // An unknown host key refused the connect; surface the fingerprint and
@@ -546,6 +621,90 @@ ApplicationWindow {
         return n;
     }
 
+    // Open a directory target in a NEW viewer pane. SessionLayouts remains the
+    // sole creator of split leaves; ViewerRegion only applies the target to the
+    // freshly published pane so the original pane's content and identity stay
+    // untouched.
+    function openViewerInNewPane(sourcePaneId, url, kind) {
+        if (!app.layouts || app.activeSessionId.length === 0) {
+            window.notifyUser(qsTr("Select a Dev Session before opening a new pane."));
+            return;
+        }
+        const tree = window.regionTree("viewer");
+        const source = sourcePaneId && window.treeHasPane(tree, sourcePaneId)
+                       ? sourcePaneId : window.targetPaneId("viewer");
+        const newPaneId = app.layouts.splitPane("viewer", source, "horizontal");
+        if (!newPaneId)
+            return;
+        if (!viewerRegion.openPaneTarget(newPaneId, url, kind)) {
+            window.notifyUser(qsTr("Could not open that target in a new pane."));
+            return;
+        }
+        viewerRegion.noteFocus(newPaneId);
+    }
+
+    function openViewerInNewPaneForSession(sessionId, generation, sourcePaneId,
+                                           url, kind) {
+        if (!app.layouts || String(sessionId).length === 0)
+            return;
+        const tree = window.regionTree("viewer");
+        const source = sourcePaneId && window.treeHasPane(tree, sourcePaneId)
+                       ? sourcePaneId : window.firstPaneId(tree, "viewer-1");
+        const newPaneId = app.layouts.splitPaneForSession(
+            sessionId, generation, "viewer", source, "horizontal");
+        if (!newPaneId)
+            return;
+        if (String(sessionId) !== String(app.activeSessionId))
+            return; // C++ normally drops this; never touch a different cache.
+        if (!viewerRegion.openPaneTarget(newPaneId, url, kind)) {
+            window.notifyUser(qsTr("Could not open that target in a new pane."));
+            return;
+        }
+        viewerRegion.noteFocus(newPaneId);
+    }
+    // Stamped region callbacks are the production path. C++ drops a callback
+    // whose session or generation no longer matches, before it can target a
+    // same-named pane in the newly selected session.
+    function splitActivePaneForSession(region, sessionId, generation, orientation) {
+        if (!app.layouts || String(sessionId).length === 0)
+            return;
+        app.layouts.splitPaneForSession(sessionId, generation, region,
+                                        window.targetPaneId(region), orientation);
+    }
+
+    function closeActivePaneForSession(region, sessionId, generation) {
+        if (!app.layouts || String(sessionId).length === 0)
+            return;
+        app.layouts.closePaneForSession(sessionId, generation, region,
+                                        window.targetPaneId(region));
+    }
+
+    function closeRequestedPaneForSession(region, sessionId, generation, paneId) {
+        if (!app.layouts || String(sessionId).length === 0)
+            return;
+        if (paneId.length === 0) {
+            window.closeActivePaneForSession(region, sessionId, generation);
+            return;
+        }
+        app.layouts.closePaneForSession(sessionId, generation, region, paneId);
+    }
+
+    function persistSplitRatiosForSession(region, sessionId, generation,
+                                          pathIndexes, ratios) {
+        if (!app.layouts || String(sessionId).length === 0)
+            return;
+        app.layouts.setRatiosForSession(sessionId, generation, region,
+                                        pathIndexes, ratios);
+    }
+
+    function persistPaneUrlForSession(sessionId, generation, region, paneId, url) {
+        if (!app.layouts || String(sessionId).length === 0)
+            return;
+        app.layouts.setPaneUrlForSession(sessionId, generation, region,
+                                         paneId, url);
+    }
+
+
     function splitActivePane(region, orientation) {
         if (!app.layouts || app.activeSessionId.length === 0) {
             window.notifyUser(qsTr("Select a Dev Session before splitting a pane."));
@@ -636,6 +795,10 @@ ApplicationWindow {
           invoke: () => { connectSheet.shown = true; } },
         { id: "server.disconnect", title: qsTr("Disconnect from Server"),
           invoke: () => app.disconnectServer() },
+        { id: "app.logs", title: qsTr("Show Log"),
+          invoke: () => { logView.shown = true; } },
+        { id: "app.settings", title: qsTr("Settings…"), shortcut: "Ctrl+,",
+          invoke: () => { settingsWindow.shown = true; } },
         // No profile argument: the controller uses the active profile, which is
         // the one the palette user is looking at in the sidebar.
         { id: "server.upgrade", title: qsTr("Update Remote Service on Server"),

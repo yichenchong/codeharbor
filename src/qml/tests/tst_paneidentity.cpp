@@ -190,6 +190,14 @@ bool isDirectoryView(const QObject *object)
     const QMetaObject *mo = object->metaObject();
     return mo->indexOfProperty("basePath") >= 0 && mo->indexOfProperty("rows") >= 0;
 }
+// ViewerBinaryView exposes the download state but no directory/editor state.
+// This lets the reload contract use a non-WebEngine content kind without
+// depending on a remote server or a Chromium page load.
+bool isBinaryView(const QObject *object)
+{
+    return object->metaObject()->indexOfProperty("downloadRequested") >= 0;
+}
+
 
 // ViewerImageView and ViewerPdfView, the two views that PIN the internal
 // address they are displaying. Exactly one of them is loaded in a pane at a
@@ -316,12 +324,15 @@ QString pathText(const QVariantList &path)
     return QLatin1Char('[') + parts.join(QLatin1Char(',')) + QLatin1Char(']');
 }
 
-QVariantMap leafNode(const QString &paneId, const QString &url = QString())
+QVariantMap leafNode(const QString &paneId, const QString &url = QString(),
+                     const QString &customTitle = QString())
 {
     QVariantMap leaf{{QStringLiteral("paneId"), paneId},
                      {QStringLiteral("children"), QVariantList{}}};
     if (!url.isEmpty())
         leaf.insert(QStringLiteral("url"), url);
+    if (!customTitle.isEmpty())
+        leaf.insert(QStringLiteral("customTitle"), customTitle);
     return leaf;
 }
 
@@ -508,6 +519,7 @@ private slots:
     // exists to defend: a header the region owned would have to be rebuilt to
     // follow a pane across a split, and rebuilding is what destroys the pane.
     void paneHeaderTravelsWithThePaneAcrossASplit();
+    void terminalCustomTitleAppearsAndClearsInTheHeader();
     // The header is also the pane's focus indicator, so the region's focus has to
     // reach it or the mark is decoration.
     void theFocusedPaneIsTheOnlyOneMarkedActive();
@@ -518,6 +530,10 @@ private slots:
     void theAddressBarOpensARemotePath();
     void theAddressBarOpensAUrlAsGiven();
     void theAddressBarPercentEncodesADelimiterInAFileName();
+    void navigationTruncatesForwardHistoryAfterFreshAddress();
+    void navigationButtonsAreDisabledAtHistoryEnds();
+    void reloadRefreshesNonWebContent();
+    void homeUsesTheActiveSessionRootAndDisablesWithoutOne();
 
     // OUTSIDE THE REPOSITORY ROOT (SPEC 9). A path outside the Dev Session's
     // repository root is allowed and stays openable, but the pane has to SAY
@@ -1298,6 +1314,35 @@ void TstPaneIdentity::paneHeaderTravelsWithThePaneAcrossASplit()
     QCOMPARE(freshHeaders.constFirst()->property("title").toString(),
              QStringLiteral("terminal-2"));
 }
+void TstPaneIdentity::terminalCustomTitleAppearsAndClearsInTheHeader()
+{
+    const QVariantMap titled =
+        leafNode(QStringLiteral("terminal-1"), QString(),
+                 QStringLiteral("Build shell"));
+    QVERIFY(openRegion(QStringLiteral("TerminalRegion.qml"), titled,
+                       /*terminal=*/true));
+
+    const auto panes = [this] { return collect(m_region, isLeafPane); };
+    QTRY_VERIFY(panes().size() == 1);
+    QTest::qWait(kSettleMs);
+
+    QObject *const pane = panes().constFirst();
+    const QList<QObject *> headers = collect(pane, isPaneHeader);
+    QCOMPARE(headers.size(), 1);
+    QObject *const header = headers.constFirst();
+    // The region receives the same trimmed title that SessionLayouts publishes
+    // from a persisted leaf; the custom title wins over the generated slot label.
+    QCOMPARE(header->property("title").toString(), QStringLiteral("Build shell"));
+    QCOMPARE(pane->property("paneId").toString(), QStringLiteral("terminal-1"));
+
+    // Clearing the optional field must reveal the generated label without
+    // changing the pane object or its slot identity.
+    setNode(leafNode(QStringLiteral("terminal-1")));
+    QTRY_COMPARE(header->property("title").toString(),
+                 QStringLiteral("terminal-1"));
+    QCOMPARE(paneWithId(m_region, QStringLiteral("terminal-1")), pane);
+}
+
 
 // The header's `active` mark is the only thing on screen that answers "where
 // will the next split land". It is pushed from the region (applyFocusFlags), so
@@ -1461,6 +1506,163 @@ void TstPaneIdentity::theAddressBarPercentEncodesADelimiterInAFileName()
     // layer is handed.
     QCOMPARE(pane->property("url").toUrl().toLocalFile(), QStringLiteral("/tmp/notes#1.txt"));
 }
+
+void TstPaneIdentity::navigationTruncatesForwardHistoryAfterFreshAddress()
+{
+    const QString first = QStringLiteral("file:///tmp/first.bin");
+    QVERIFY(openRegion(QStringLiteral("ViewerRegion.qml"),
+                       leafNode(QStringLiteral("viewer-1"), first), /*terminal=*/false));
+    const auto panes = [this] { return collect(m_region, isLeafPane); };
+    QTRY_VERIFY(panes().size() == 1);
+    QObject *const pane = panes().constFirst();
+    QTRY_VERIFY(pane->property("navigationReady").toBool());
+
+
+    const QString second = QStringLiteral("file:///tmp/second.bin");
+    const QString third = QStringLiteral("file:///tmp/third.bin");
+    const QString replacement = QStringLiteral("file:///tmp/replacement.bin");
+    pane->setProperty("url", QUrl(second));
+    pane->setProperty("url", QUrl(third));
+    QTRY_COMPARE(pane->property("navigationIndex").toInt(), 2);
+    QCOMPARE(asList(pane->property("navigationHistory")),
+             (QVariantList{first, second, third}));
+
+    QVERIFY(QMetaObject::invokeMethod(pane, "goBack"));
+    QTRY_COMPARE(pane->property("url").toUrl(), QUrl(second));
+    QCOMPARE(pane->property("navigationIndex").toInt(), 1);
+
+    // A fresh address from the middle of the list discards only the forward
+    // branch. Keeping the old third address here would make Forward revisit a
+    // page the user deliberately replaced.
+    pane->setProperty("url", QUrl(replacement));
+    QTRY_COMPARE(pane->property("navigationIndex").toInt(), 2);
+    QCOMPARE(asList(pane->property("navigationHistory")),
+             (QVariantList{first, second, replacement}));
+    QVERIFY(!pane->property("canGoForward").toBool());
+}
+
+void TstPaneIdentity::navigationButtonsAreDisabledAtHistoryEnds()
+{
+    QVERIFY(openRegion(QStringLiteral("ViewerRegion.qml"),
+                       leafNode(QStringLiteral("viewer-1"),
+                                QStringLiteral("file:///tmp/only.bin")),
+                       /*terminal=*/false));
+    const auto panes = [this] { return collect(m_region, isLeafPane); };
+    QTRY_VERIFY(panes().size() == 1);
+    QObject *const pane = panes().constFirst();
+    QTRY_VERIFY(pane->property("navigationReady").toBool());
+
+    QObject *const back = childNamed(pane, QStringLiteral("viewerBackButton"));
+    QObject *const forward = childNamed(pane, QStringLiteral("viewerForwardButton"));
+    QObject *const reload = childNamed(pane, QStringLiteral("viewerReloadButton"));
+    QObject *const home = childNamed(pane, QStringLiteral("viewerHomeButton"));
+    QVERIFY(back);
+    QVERIFY(forward);
+    QVERIFY(reload);
+    QVERIFY(home);
+
+    // The first address has nowhere to go in either direction. Disabled
+    // controls must also leave the Tab chain, not merely ignore a click.
+    QTRY_VERIFY(!pane->property("canGoBack").toBool());
+    QVERIFY(!pane->property("canGoForward").toBool());
+    QVERIFY(!back->property("enabled").toBool());
+    QVERIFY(!forward->property("enabled").toBool());
+    QCOMPARE(back->property("focusPolicy").toInt() & Qt::TabFocus, 0);
+    QCOMPARE(forward->property("focusPolicy").toInt() & Qt::TabFocus, 0);
+
+    pane->setProperty("url", QUrl(QStringLiteral("file:///tmp/next.bin")));
+    QTRY_VERIFY(pane->property("canGoBack").toBool());
+    QVERIFY(!pane->property("canGoForward").toBool());
+    QVERIFY(back->property("enabled").toBool());
+    QVERIFY(!forward->property("enabled").toBool());
+    QVERIFY((back->property("focusPolicy").toInt() & Qt::TabFocus) != 0);
+    QCOMPARE(forward->property("focusPolicy").toInt() & Qt::TabFocus, 0);
+
+    QVERIFY(QMetaObject::invokeMethod(pane, "goBack"));
+    QTRY_COMPARE(pane->property("url").toUrl(),
+                 QUrl(QStringLiteral("file:///tmp/only.bin")));
+    QVERIFY(!back->property("enabled").toBool());
+    QVERIFY(forward->property("enabled").toBool());
+    QCOMPARE(back->property("focusPolicy").toInt() & Qt::TabFocus, 0);
+    QVERIFY((forward->property("focusPolicy").toInt() & Qt::TabFocus) != 0);
+}
+
+void TstPaneIdentity::reloadRefreshesNonWebContent()
+{
+    const QString address = QStringLiteral("file:///tmp/reload.bin");
+    QVERIFY(openRegion(QStringLiteral("ViewerRegion.qml"),
+                       leafNode(QStringLiteral("viewer-1"), address),
+                       /*terminal=*/false));
+    const auto panes = [this] { return collect(m_region, isLeafPane); };
+    QTRY_VERIFY(panes().size() == 1);
+    QObject *const pane = panes().constFirst();
+    QTRY_VERIFY(pane->property("navigationReady").toBool());
+
+    QTRY_VERIFY2(collect(pane, isBinaryView).size() == 1,
+                 "the reload test did not resolve to the binary content handler");
+    QObject *const original = collect(pane, isBinaryView).constFirst();
+    original->setProperty("errorText", QStringLiteral("stale content"));
+    QVERIFY(QMetaObject::invokeMethod(pane, "reloadCurrent"));
+
+    // The binary handler has no page-level reload primitive. ViewerPane must
+    // still re-fetch its current resource by recreating that handler, not by
+    // silently assigning the same URL and leaving stale state on screen.
+    // Wait for a DIFFERENT handler object, not merely for one to exist: the old
+    // one is still on screen for an event-loop turn, so a check that only
+    // counts handlers passes against the stale item and reads its stale state.
+    QTRY_VERIFY2(collect(pane, isBinaryView).size() == 1
+                     && collect(pane, isBinaryView).constFirst() != original,
+                 "the binary handler was never recreated by the reload");
+    QObject *const refreshed = collect(pane, isBinaryView).constFirst();
+    QCOMPARE(refreshed->property("errorText").toString(), QString());
+    QCOMPARE(pane->property("url").toUrl(), QUrl(address));
+}
+
+void TstPaneIdentity::homeUsesTheActiveSessionRootAndDisablesWithoutOne()
+{
+    QVERIFY(openRegion(QStringLiteral("ViewerRegion.qml"),
+                       leafNode(QStringLiteral("viewer-1")),
+                       /*terminal=*/false));
+    const auto panes = [this] { return collect(m_region, isLeafPane); };
+    QTRY_VERIFY(panes().size() == 1);
+    QObject *const paneWithoutSession = panes().constFirst();
+    QTRY_VERIFY(paneWithoutSession->property("navigationReady").toBool());
+
+    QObject *const homeWithoutSession =
+        childNamed(paneWithoutSession, QStringLiteral("viewerHomeButton"));
+    QVERIFY(homeWithoutSession);
+    QVERIFY(!paneWithoutSession->property("canGoHome").toBool());
+    QVERIFY(!homeWithoutSession->property("enabled").toBool());
+    QCOMPARE(homeWithoutSession->property("focusPolicy").toInt() & Qt::TabFocus, 0);
+
+    // Rebuild the fixture so the new pane starts at the active Dev Session's
+    // repository root, exactly the same location Home is required to select.
+    cleanup();
+    m_app.setActiveSessionRepoRoot(QStringLiteral("/srv/repos/app"));
+    QVERIFY(openRegion(QStringLiteral("ViewerRegion.qml"),
+                       leafNode(QStringLiteral("viewer-1")),
+                       /*terminal=*/false));
+    QTRY_VERIFY(panes().size() == 1);
+    QObject *const pane = panes().constFirst();
+    QTRY_VERIFY(pane->property("navigationReady").toBool());
+
+    QObject *const home = childNamed(pane, QStringLiteral("viewerHomeButton"));
+    QVERIFY(home);
+    QTRY_VERIFY(pane->property("canGoHome").toBool());
+    QVERIFY(home->property("enabled").toBool());
+    QVERIFY((home->property("focusPolicy").toInt() & Qt::TabFocus) != 0);
+    QCOMPARE(pane->property("effectiveUrl").toUrl(),
+             QUrl(QStringLiteral("file:///srv/repos/app/")));
+
+    pane->setProperty("url", QUrl(QStringLiteral("file:///tmp/away.bin")));
+    QTRY_COMPARE(pane->property("url").toUrl(),
+                 QUrl(QStringLiteral("file:///tmp/away.bin")));
+    QVERIFY(QMetaObject::invokeMethod(pane, "goHome"));
+    QTRY_COMPARE(pane->property("url").toUrl(), QUrl());
+    QCOMPARE(pane->property("effectiveUrl").toUrl(),
+             QUrl(QStringLiteral("file:///srv/repos/app/")));
+}
+
 
 // ---------------------------------------------------------------------------
 // (9b) SPEC 9: "Paths outside the repository root are allowed, but the UI

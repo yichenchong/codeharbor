@@ -10,6 +10,7 @@
 #include <QStringList>
 #include <QVariant>
 #include <QVariantList>
+#include <QVector>
 
 #include <optional>
 
@@ -76,6 +77,10 @@ class SessionLayouts : public QObject {
     // QML can bind it to AppController::serverId.
     Q_PROPERTY(QString serverId READ serverId WRITE setServerId
                    NOTIFY serverIdChanged)
+    // The stamp travels with every QML-originated layout edit. It is separate
+    // from the Dev Session id because a deliberate reload of the SAME session
+    // also makes older queued gestures history.
+    Q_PROPERTY(quint64 generation READ generation NOTIFY generationChanged)
     Q_PROPERTY(QVariant viewerTree READ viewerTree NOTIFY viewerTreeChanged)
     Q_PROPERTY(QVariant terminalTree READ terminalTree NOTIFY terminalTreeChanged)
 
@@ -98,21 +103,45 @@ public:
     // new server's key.
     void setServerId(QString serverId);
 
+    quint64 generation() const { return m_generation; }
+
     QVariant viewerTree() const;
     QVariant terminalTree() const;
-
     // Fetch both regions for `devSessionId`. Switching sessions clears both
     // trees to null immediately. An empty id clears and issues no request.
     //
     // Concurrent/repeated calls are safe: each load is stamped with a monotonic
     // generation and only the newest one may touch the trees, so a late reply
     // for an abandoned Dev Session is dropped (errors are still surfaced
-    // verbatim, superseded or not - the same rule AppController::refresh uses).
     Q_INVOKABLE void load(QString devSessionId);
 
-    // Replace a region's tree with a QML-authored one and persist it. `tree`
-    // must be SplitNode::tryToJson()-shaped (see above); anything else is rejected
-    // via error() and changes nothing.
+    // Production QML MUST use the stamped entry points below. The session id
+    // and generation are captured when a gesture starts, so a reply or signal
+    // from a Dev Session the user has already left is dropped before it can
+    // inspect or mutate the current tree. The short methods further below stay
+    // only for C++ tests and old standalone callers that have no QML stamp.
+    Q_INVOKABLE void saveTreeForSession(QString devSessionId, quint64 generation,
+                                        QString region, QVariant tree);
+    Q_INVOKABLE void setRatiosForSession(QString devSessionId, quint64 generation,
+                                         QString region, QStringList pathIndexes,
+                                         QVariantList ratios);
+    Q_INVOKABLE QString splitPaneForSession(QString devSessionId,
+                                             quint64 generation, QString region,
+                                             QString paneId, QString orientation);
+    Q_INVOKABLE void closePaneForSession(QString devSessionId, quint64 generation,
+                                         QString region, QString paneId);
+    Q_INVOKABLE void setPaneUrlForSession(QString devSessionId,
+                                          quint64 generation, QString region,
+                                          QString paneId, QString url);
+    Q_INVOKABLE QString setPaneTitleForSession(QString devSessionId,
+                                               quint64 generation,
+                                               QString region, QString paneId,
+                                               QString title);
+
+    // Unstamped compatibility entry point. Production callers must not use
+    // this: it intentionally stamps the call with whatever session is current
+    // at invocation and therefore cannot prove where a delayed signal came
+    // from. Existing C++ tests use it to exercise the core tree operations.
     Q_INVOKABLE void saveTree(QString region, QVariant tree);
 
     // Persist drag-adjusted ratios for ONE branch node, addressed by an index
@@ -172,6 +201,17 @@ public:
     // restored url onto every pane they mint, so the common call is an echo of
     // what is already stored and must cost neither an RPC nor an error.
     Q_INVOKABLE void setPaneUrl(QString region, QString paneId, QString url);
+    // Set or clear the optional display title on the terminal leaf identified by
+    // its slot label. Input is trimmed and capped at SplitNode's bound; an empty
+    // result removes the field and makes the header show the generated label.
+    // This is a display-only edit: paneId and terminalPaneId remain untouched.
+    //
+    // Like setPaneUrl(), a write made while this region's current load is in
+    // flight follows the load/write ordering rule: it is queued for the current
+    // session/generation and replayed only if that pane still exists. A genuine
+    // load error reports the existing unloadable-layout error instead.
+    Q_INVOKABLE QString setPaneTitle(QString region, QString paneId,
+                                     QString title);
 
     // Bind the terminal leaf labelled `paneName` to the `terminal_panes` row
     // `terminalPaneId`, and persist the tree. This is the self-migration step
@@ -211,6 +251,7 @@ public:
 signals:
     void devSessionIdChanged();
     void serverIdChanged();
+    void generationChanged();
     void viewerTreeChanged();
     void terminalTreeChanged();
     // Server-forwarded RPC message, verbatim (SPEC 10.3), or a locally detected
@@ -229,10 +270,36 @@ private:
     static constexpr int kTerminal = 1;
     static constexpr int kRegionCount = 2;
 
+    enum class PendingWriteKind {
+        Ratios,
+        Split,
+        Close,
+        PaneUrl,
+        PaneTitle,
+    };
+
+    struct PendingWrite {
+        PendingWriteKind kind = PendingWriteKind::Close;
+        QString paneId;
+        QString orientation;
+        QStringList pathIndexes;
+        QVariantList ratios;
+        QString url;
+        QString title;
+    };
+
     struct RegionState {
         SplitNode tree;      // meaningful only while `valid`
         bool valid = false;  // false -> the property reads as a null QVariant
         QVariant cache;      // *tree.tryToJson() as a variant map, kept in lockstep
+        // True only while this generation's getLayout answer is outstanding.
+        // A current-session edit is queued during this window; an edit carrying
+        // another stamp is stale and is dropped before it can inspect this tree.
+        bool loading = false;
+        // Edits received before the current tree arrived. They are local user
+        // intent, not server replies, so they may be replayed only for this
+        // generation and only after their pane/path still exists.
+        QVector<PendingWrite> pendingWrites;
         // A local edit has already replaced this region's tree since the
         // in-flight load for it was issued, so that load's reply is history and
         // must not be applied. Without it, a getLayout answer that crossed a
@@ -243,6 +310,41 @@ private:
         // and by clearTrees().
         bool superseded = false;
     };
+    // Return Drop for a stale session/generation stamp, Queue for a current
+    // edit that arrived before this region's first successful load, and Apply
+    // once a real tree is available. Rejection (no selected session/server)
+    // emits the existing misuse error. Stale is deliberately silent: the user
+    // already moved on, so replaying or reporting that old gesture would make
+    // the new session look broken.
+    enum class WriteDecision {
+        Apply,
+        Queue,
+        Drop,
+        Reject,
+    };
+    WriteDecision prepareWrite(int index, const QString& devSessionId,
+                               quint64 generation);
+    void queueWrite(int index, PendingWrite write);
+    void flushPendingWrites(int index);
+    void clearPendingWrites();
+    void saveTreeStamped(const QString& devSessionId, quint64 generation,
+                         const QString& region, const QVariant& tree);
+    void setRatiosStamped(const QString& devSessionId, quint64 generation,
+                          const QString& region, const QStringList& pathIndexes,
+                          const QVariantList& ratios, bool replay);
+    QString splitPaneStamped(const QString& devSessionId, quint64 generation,
+                             const QString& region, const QString& paneId,
+                             const QString& orientation, bool replay);
+    void closePaneStamped(const QString& devSessionId, quint64 generation,
+                          const QString& region, const QString& paneId,
+                          bool replay);
+    void setPaneUrlStamped(const QString& devSessionId, quint64 generation,
+                           const QString& region, const QString& paneId,
+                           const QString& url, bool replay);
+    QString setPaneTitleStamped(const QString& devSessionId,
+                                quint64 generation, const QString& region,
+                                const QString& paneId, const QString& title,
+                                bool replay);
 
     // "viewer"/"terminal" -> kViewer/kTerminal; -1 (after emitting error) for
     // anything else.

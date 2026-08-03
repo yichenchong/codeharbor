@@ -15,6 +15,12 @@ qt_add_library(ch_app STATIC
     AppSettings.cpp
     Notifier.h
     Notifier.cpp
+    WindowChromeNative.h
+    WindowChromeNative.cpp
+    LogBuffer.h
+    LogBuffer.cpp
+    GroupPaletteService.h
+    GroupPaletteService.cpp
 )
 
 target_include_directories(ch_app PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
@@ -29,6 +35,7 @@ target_link_libraries(ch_app PUBLIC
     ch_remote
     ch_ssh
     ch_agent
+    ch_terminal
     # AppController forwards server.info.recoveryDir to the per-pane editor
     # factory (SPEC 11.3 crash recovery); it references ch::EditorFactory.
     ch_editor

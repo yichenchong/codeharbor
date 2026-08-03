@@ -292,6 +292,13 @@ export type RpcTmuxMethodName = (typeof RPC_TMUX_METHODS)[RpcTmuxMethodKey];
 // remote/test/rpc-mirror.test.ts parses that header and fails if the two sides
 // disagree, so a rename here without the matching C++ edit is caught at test
 // time rather than at runtime as a method-not-found against a live server.
+export interface WorkspaceListParams {
+    serverId: string;
+    // This is a client-local presentation choice. It is accepted here only as
+    // a read predicate; the stored session pin itself remains workspace state.
+    pinnedOnly?: boolean;
+}
+
 export const RPC_WORKSPACE_METHODS = {
     list: "workspace.list",
     createGroup: "workspace.createGroup",

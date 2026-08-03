@@ -49,6 +49,13 @@ Rectangle {
     // stays detached while devSessionId is empty.
     property string devSessionId: ""
     property string workingDir: ""
+    // Production Main.qml forwards these immutable values with every write.
+    // The generation distinguishes a deliberate reload of the same session
+    // from the load that a delayed terminal callback originally observed.
+    property double layoutGeneration: 0
+    // Main.qml sets this for production. Leaving it false is only for the
+    // standalone QML component tests, which exercise legacy signals directly.
+    property bool hostStampsWrites: false
 
     // The region holding the pane cache — the ROOT of this tree. A nested region
     // is handed it through setSource(); a root region has none and is its own.
@@ -94,9 +101,20 @@ Rectangle {
     // Killing is destructive and deliberately NOT done here: ending the remote
     // tmux session is TerminalPaneView.killSession(), which the host already
     // reaches through the pane cache, and it also warns the user afterwards.
+    // Production-only stamped counterparts. Legacy signals remain for the
+    // standalone component tests, never for Main.qml's configured host.
+    signal splitRequestedForSession(string sessionId, double generation,
+                                    string orientation)
+    signal closePaneRequestedForSession(string sessionId, double generation,
+                                         string paneId)
+    signal paneTitleReportedForSession(string sessionId, double generation,
+                                       string paneId, string title)
     signal splitRequested(string orientation)
     signal closePaneRequested(string paneId)
     signal killTerminalRequested()
+    // Forward title edits from the pane to Main.qml, which owns the
+    // SessionLayouts persistence bridge.
+    signal paneTitleReported(string paneId, string title)
 
     // A handle INSIDE this region was dragged, so the branch at `pathIndexes`
     // now has these child fractions (one per child, each > 0, summing to 1).
@@ -109,9 +127,26 @@ Rectangle {
     // regions hand their reading up through reportRatios() on the owner, so the
     // host has exactly one signal to listen to per region.
     signal splitRatiosAdjusted(var pathIndexes, var ratios)
+    signal splitRatiosAdjustedForSession(string sessionId, double generation,
+                                         var pathIndexes, var ratios)
 
     function reportRatios(pathIndexes, ratios) {
-        region.splitRatiosAdjusted(pathIndexes, ratios);
+        const owner = region.paneOwner;
+        reportRatiosForSession(owner.devSessionId, owner.layoutGeneration,
+                               pathIndexes, ratios);
+    }
+
+    function reportRatiosForSession(sessionId, generation, pathIndexes, ratios) {
+        const owner = region.paneOwner;
+        if (owner.hostStampsWrites) {
+            if (String(sessionId).length === 0)
+                return; // production has no selected session to stamp
+            owner.splitRatiosAdjustedForSession(String(sessionId),
+                                                Number(generation),
+                                                pathIndexes, ratios);
+            return;
+        }
+        owner.splitRatiosAdjusted(pathIndexes, ratios);
     }
 
     function isLeaf(n) {
@@ -125,17 +160,22 @@ Rectangle {
         return !n || n.paneId === undefined || n.paneId === null ? "" : String(n.paneId);
     }
 
-    // ---- pane cache (the OWNER's copy of this state is the live one) -------
+    // ---- pane cache (the OWNER's copy of this state) -------
 
     // paneId -> pane Item. Mutated in place; nothing binds to it.
     property var paneCache: ({})
+    // paneId -> { sessionId, generation }: which session's tree the pane is
+    // currently part of. Beside the cache and for the same reason - one Item is
+    // reused across sessions, so where its reports belong is not a property of
+    // the Item itself.
+    property var paneStamps: ({})
 
     // Where a pane waits between homes, so it never goes parentless and never
     // leaves the window — an Item pulled out of its window is detached from the
     // scene graph, and a pane is a live web page, not a rectangle. Zero OPACITY
-    // rather than `visible: false`, because a pane that is merely being moved
-    // has not become hidden: TerminalPaneView reports its visibility to the
-    // renderer, which stops flushing output at a pane it believes nobody sees.
+    // rather than `visible: false`, because TerminalPaneView reports its
+    // visibility to the renderer, which stops flushing output at a pane it
+    // believes nobody sees.
     Item {
         id: parkingLot
         opacity: 0
@@ -165,12 +205,29 @@ Rectangle {
             // Item is re-parented, never rebuilt, so the connection (and the id
             // it reports) outlive the republish that moved it.
             pane.paneActivated.connect(region.noteFocus);
-            // The pane's own header close button. Wired here for the same reason
-            // as the focus report above: the pane outlives every republish, so
-            // the wire has to be made once, at mint time, on the object that
-            // survives.
-            pane.closeRequested.connect(region.notePaneClose);
+            // The stamp these reports travel under lives in `paneStamps`, keyed
+            // by pane id, and is refreshed every time the pane is taken into a
+            // tree rather than frozen here. Pane ids are per-Dev-Session labels
+            // ("terminal-1" exists in most sessions), so the cache hands the
+            // SAME Item to the next session; a frozen stamp would make every
+            // later close or rename from that pane look stale and be dropped
+            // for good.
+            pane.closeRequested.connect(id =>
+                region.reportForPane(id, (sessionId, generation) =>
+                    region.paneOwner.notePaneCloseForSession(
+                        sessionId, generation, id)));
+            pane.titleChangedRequested.connect((id, title) =>
+                region.reportForPane(id, (sessionId, generation) =>
+                    region.paneOwner.notePaneTitleForSession(
+                        sessionId, generation, id, title)));
         }
+        // Refreshed on EVERY take, not only at mint: this is the moment the
+        // pane joins whatever tree is on screen now, and therefore the moment
+        // its reports start belonging to that session.
+        region.paneOwner.paneStamps[paneId] = {
+            sessionId: String(region.paneOwner.devSessionId),
+            generation: Number(region.paneOwner.layoutGeneration)
+        };
         if (pane.parent !== host) {
             pane.anchors.fill = null;
             pane.parent = host;
@@ -180,6 +237,21 @@ Rectangle {
         // wearing that mark, and a brand-new one must not wear it.
         region.applyFocusFlags();
         return pane;
+    }
+
+    // Deliver a pane's report under the stamp that pane currently carries. No
+    // stamp means no tree has taken the pane, and an empty session means there
+    // is nothing a write could be addressed to; both drop the report rather
+    // than reading the root's current session, which is exactly how one
+    // session's command would land on another's layout.
+    function reportForPane(paneId, deliver) {
+        // An unstamped pane is one no tree has taken yet; it has nothing to
+        // report about. Otherwise deliver under the pane's own stamp and let
+        // the owner decide what an empty session means - in production it
+        // drops the write, and in a standalone region (a test with no session)
+        // it falls back to the unstamped report.
+        const stamp = region.paneOwner.paneStamps[paneId];
+        deliver(stamp ? stamp.sessionId : "", stamp ? stamp.generation : 0);
     }
 
     // Take a pane out of the layout WITHOUT destroying it. Only the region that
@@ -218,6 +290,7 @@ Rectangle {
                 continue;
             const pane = cache[key];
             delete cache[key];
+            delete region.paneStamps[key];
             pane.destroy();
             // The pane the user was working in has been CLOSED. Leaving its id
             // as the focus would aim the next split/close command at a pane
@@ -238,6 +311,7 @@ Rectangle {
         for (const key in cache) {
             const pane = cache[key];
             delete cache[key];
+            delete region.paneStamps[key];
             pane.destroy();
         }
     }
@@ -289,6 +363,61 @@ Rectangle {
     // on: closing a pane is a layout change only the host can publish, and it
     // deliberately leaves the remote tmux session running.
     function notePaneClose(paneId) {
+        if (region.hostStampsWrites)
+            return; // production uses the callback stamp below
+        region.closePaneRequested(paneId);
+    }
+
+    function notePaneCloseForSession(sessionId, generation, paneId) {
+        if (region.hostStampsWrites) {
+            if (String(sessionId).length === 0)
+                return; // production has no selected session to stamp
+            region.closePaneRequestedForSession(String(sessionId),
+                                                Number(generation), paneId);
+            return;
+        }
+        region.closePaneRequested(paneId);
+    }
+
+    function notePaneTitle(paneId, title) {
+        if (region.hostStampsWrites)
+            return; // production uses the callback stamp below
+        region.paneTitleReported(paneId, title);
+    }
+
+    function notePaneTitleForSession(sessionId, generation, paneId, title) {
+        if (region.hostStampsWrites) {
+            if (String(sessionId).length === 0)
+                return; // production has no selected session to stamp
+            region.paneTitleReportedForSession(String(sessionId),
+                                               Number(generation),
+                                               paneId, title);
+            return;
+        }
+        region.paneTitleReported(paneId, title);
+    }
+
+    function requestSplit(orientation) {
+        if (region.hostStampsWrites) {
+            if (region.devSessionId.length === 0)
+                return; // production has no selected session to stamp
+            region.splitRequestedForSession(region.devSessionId,
+                                            region.layoutGeneration,
+                                            orientation);
+            return;
+        }
+        region.splitRequested(orientation);
+    }
+
+    function requestClose(paneId) {
+        if (region.hostStampsWrites) {
+            if (region.devSessionId.length === 0)
+                return; // production has no selected session to stamp
+            region.closePaneRequestedForSession(region.devSessionId,
+                                                region.layoutGeneration,
+                                                paneId);
+            return;
+        }
         region.closePaneRequested(paneId);
     }
 
@@ -316,6 +445,7 @@ Rectangle {
         const pane = region.paneOwner.takePane(key, paneHost,
                                                { devSessionId: region.devSessionId,
                                                  workingDir: region.workingDir,
+                                                 customTitle: region.leafCustomTitle(),
                                                  terminalPaneId: region.leafTerminalPaneId(),
                                                  terminalLegacy: region.leafTerminalLegacy() });
         if (!pane)
@@ -331,6 +461,12 @@ Rectangle {
     function leafTerminalPaneId() {
         return region.node && region.node.terminalPaneId
                ? String(region.node.terminalPaneId) : "";
+    }
+    // The optional display title follows the same leaf as the row id, but is
+    // intentionally absent from every identity lookup and tmux operation.
+    function leafCustomTitle() {
+        return region.node && region.node.customTitle
+               ? String(region.node.customTitle) : "";
     }
 
     // Published by ch::SessionLayouts, never persisted: this id-less leaf was
@@ -359,6 +495,9 @@ Rectangle {
         // that saw the new id while still holding the old directory would open
         // its shell in the previous session's checkout, and the directory
         // arriving a line later could no longer move it.
+        // The title is display state from the same leaf, independent of the
+        // server row identity and the slot label.
+        pane.customTitle = region.leafCustomTitle();
         pane.workingDir = region.workingDir;
         pane.devSessionId = region.devSessionId;
         pane.terminalLegacy = region.leafTerminalLegacy();
@@ -384,7 +523,31 @@ Rectangle {
         region.syncPane();
     }
 
-    onDevSessionIdChanged: region.applyPaneContext()
+    // A Dev Session change replaces the whole tree, and a terminal pane belongs
+    // to the session that opened it: it holds a live PTY channel and its own
+    // scrollback. Pane ids are per-session labels, so "terminal-1" usually
+    // exists on both sides of a switch and sweepPanes() - which only drops ids
+    // that LEFT the tree - would otherwise hand the next session the previous
+    // one's shell. Dropping them here also closes the window in which a report
+    // from an old pane could still be delivered.
+    function resetPanesForNewTree() {
+        if (region.rootRegion)
+            return; // only the owner holds the cache
+        region.destroyAllPanes();
+        region.paneStamps = ({});
+        region.focusedPaneId = "";
+    }
+
+    onDevSessionIdChanged: {
+        region.resetPanesForNewTree();
+        region.applyPaneContext();
+    }
+
+    // A reload of the SAME session bumps the generation without changing the
+    // session id, and a reloaded tree can name the same panes, so no take would
+    // run and the old panes and their stamps would survive into a tree they no
+    // longer belong to.
+    onLayoutGenerationChanged: region.resetPanesForNewTree()
     onWorkingDirChanged: region.applyPaneContext()
 
     Component.onCompleted: {
@@ -450,17 +613,17 @@ Rectangle {
             AppPaneHeader.Action {
                 text: qsTr("Split the focused pane side by side")
                 glyph: "\u25eb"
-                onClicked: region.splitRequested("horizontal")
+                onClicked: region.requestSplit("horizontal")
             }
             AppPaneHeader.Action {
                 text: qsTr("Split the focused pane top and bottom")
                 glyph: "\u229f"
-                onClicked: region.splitRequested("vertical")
+                onClicked: region.requestSplit("vertical")
             }
             AppPaneHeader.Action {
                 text: qsTr("Close the focused pane")
                 glyph: "\u00d7"
-                onClicked: region.closePaneRequested(region.focusedPaneId)
+                onClicked: region.requestClose(region.focusedPaneId)
             }
             // Spelled out rather than given a glyph: this ends the remote shell
             // and everything running in it, and a one-character button is the
@@ -545,6 +708,10 @@ Rectangle {
             // siblings still bound and resizing on a different rule. After this
             // one-shot, drag handles own the sizes.
             property bool ratiosApplied: false
+            // Capture the stamp when the drag starts. If a session switch lands
+            // before release, the write still names the tree that was resized.
+            property string resizeSessionId: ""
+            property double resizeGeneration: 0
 
             function applyRatios() {
                 if (ratiosApplied || width <= 0 || height <= 0
@@ -573,11 +740,14 @@ Rectangle {
             // The write side of `ratios` (SPEC 4.5). SplitView.resizing is true
             // only while a handle is under the pointer, so this fires exactly
             // once, when a drag FINISHES — the same discipline Main.qml uses for
-            // the outer region widths. A binding-driven size change (a window
-            // resize, a republish re-applying stored ratios) must never be
-            // written back: it would overwrite the user's own proportions with
-            // whatever the current window happens to allow.
+            // Zero-argument on purpose: the stamp a drag reports under is the
+            // one captured when the drag STARTED (see onResizingChanged), not
+            // whatever is current when it ends, and keeping it on the split
+            // rather than in the signature means no caller can report a drag
+            // under the wrong session by passing the wrong pair.
             function publishRatios() {
+                const sessionId = split.resizeSessionId;
+                const generation = split.resizeGeneration;
                 const count = childRepeater.count;
                 if (count < 2)
                     return;
@@ -601,10 +771,18 @@ Rectangle {
                 const ratios = [];
                 for (let k = 0; k < sizes.length; ++k)
                     ratios.push(sizes[k] / total);
-                region.paneOwner.reportRatios(region.nodePath, ratios);
+                region.paneOwner.reportRatiosForSession(
+                    sessionId, generation, region.nodePath, ratios);
             }
 
-            onResizingChanged: if (!resizing) split.publishRatios()
+            onResizingChanged: {
+                if (resizing) {
+                    split.resizeSessionId = region.paneOwner.devSessionId;
+                    split.resizeGeneration = region.paneOwner.layoutGeneration;
+                } else {
+                    split.publishRatios();
+                }
+            }
 
             // Every republish re-applies the node's persisted ratios. The
             // Repeater below is keyed on the child COUNT, so it no longer
@@ -651,8 +829,14 @@ Rectangle {
                                                        rootRegion: region.paneOwner,
                                                        nodePath: region.nodePath.concat(
                                                            [String(childLoader.index)]),
-                                                       devSessionId: Qt.binding(() => region.devSessionId),
-                                                       workingDir: Qt.binding(() => region.workingDir) })
+                                                       devSessionId: Qt.binding(
+                                                           () => region.paneOwner.devSessionId),
+                                                       workingDir: Qt.binding(
+                                                           () => region.workingDir),
+                                                       layoutGeneration: Qt.binding(
+                                                           () => region.paneOwner.layoutGeneration),
+                                                       hostStampsWrites: Qt.binding(
+                                                           () => region.paneOwner.hostStampsWrites) })
                     onChildNodeChanged: if (item) item.node = childLoader.childNode
                 }
             }

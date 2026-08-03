@@ -234,6 +234,13 @@ signals:
     // by row id already knows the answer and emits nothing.
     void paneRowResolved(const QString& devSessionId, const QString& paneName,
                          const QString& terminalPaneId);
+    // Per-pane connection lifecycle, keyed by the server-reported Dev Session
+    // and terminal_panes row ids. The server id is included so AppController
+    // can reject a queued signal from a pane that belonged to a previous
+    // server after a profile switch; neither client profile ids nor layout
+    // labels are valid substitutes for this identity.
+    void terminalStateChanged(const QString& serverId, const QString& devSessionId,
+                              const QString& terminalId, ch::TerminalState state);
 
 private:
     struct Attachment {
@@ -248,6 +255,10 @@ private:
         // report output under any identity — before its first answer, while a
         // retarget is in flight, and after a resolution failed.
         QString devSessionId;
+        // The server whose row ids are held above. It is captured at bind time:
+        // m_serverId can move to a different profile while a retiring
+        // controller is still emitting its final Disconnected transition.
+        QString serverId;
         QString terminalId;
         // The resolution key of this pane's MOST RECENT resolveTarget() call.
         // An answer is adopted only if it carries this key. QML can retarget a

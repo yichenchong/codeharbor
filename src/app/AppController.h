@@ -12,8 +12,10 @@
 #include "SessionLayouts.h"
 #include "SessionBootstrap.h"
 #include "SshConnectionPool.h"
+#include "LogBuffer.h"
 
 #include <QObject>
+#include <QHash>
 #include <QPair>
 #include <QPointer>
 #include <QString>
@@ -27,6 +29,7 @@
 namespace ch {
 
 class EditorFactory;
+class TerminalFactory;
 
 
 // Top-level application controller (SPEC 4.1, workstream U). Owns the client
@@ -39,6 +42,7 @@ class EditorFactory;
 class AppController : public QObject {
     Q_OBJECT
     Q_PROPERTY(ch::SessionsModel* sessionsModel READ sessionsModel CONSTANT)
+    Q_PROPERTY(ch::LogBuffer* logBuffer READ logBuffer CONSTANT)
     Q_PROPERTY(ch::UiStateStore* uiState READ uiState CONSTANT)
     // User preferences (the Settings window). Client-local, created with the
     // controller and alive for its whole life, so QML may bind straight to
@@ -63,6 +67,7 @@ public:
     SessionsModel* sessionsModel() const { return m_sessionsModel; }
     UiStateStore* uiState() const { return m_uiState; }
     AppSettings* settings() const { return m_settings; }
+    LogBuffer* logBuffer() const { return m_logBuffer; }
 
     QString serverId() const { return m_serverId.value; }
     void setServerId(const QString& serverId);
@@ -75,6 +80,12 @@ public:
     // the last known workspace tree and pushes them incrementally (a targeted
     // dataChanged(), not a full model reset).
     void setAgentMonitor(AgentStatusMonitor* monitor);
+    // Wire the per-pane terminal factory (workstream T). Ownership stays with
+    // main.cpp. TerminalFactory reports only server-resolved terminal_panes
+    // identities; AppController keeps the current server's state map and
+    // merges it into each authoritative workspace row without inventing
+    // client-side terminal identities.
+    void setTerminalFactory(TerminalFactory* factory);
 
     // Wire the per-pane editor factory (workstream E). Ownership stays with the
     // caller (main.cpp); nullptr is safe. Lets adoptServerIdentity() forward the
@@ -165,6 +176,7 @@ public:
     // Session mutations.
     Q_INVOKABLE void createSession(QString groupId, QString name, QString repoRoot);
     Q_INVOKABLE void renameSession(QString id, QString name);
+    Q_INVOKABLE void setSessionPinned(QString id, bool pinned);
     Q_INVOKABLE void duplicateSession(QString id);
     Q_INVOKABLE void moveSession(QString id, QString groupId, int position);
     Q_INVOKABLE void deleteSession(QString id);
@@ -236,6 +248,11 @@ private:
     SessionsModel* m_sessionsModel = nullptr;
     UiStateStore* m_uiState = nullptr;
     AppSettings* m_settings = nullptr;
+    // One transient buffer is shared by the Qt message handler and the remote
+    // connection signals. It is owned by the controller so every QML graph and
+    // every headless test sees the same history, including messages emitted
+    // while the log sheet is closed.
+    LogBuffer* m_logBuffer = nullptr;
     ServerId m_serverId;
     // Monotonic stamp so a stale (out-of-order) refresh result never overwrites
     // a newer one; see refresh().
@@ -243,6 +260,12 @@ private:
     // Live agent-status monitor (SPEC 6.4), not owned; set via setAgentMonitor.
     // When non-null its per-terminal state is merged into the sidebar rows.
     AgentStatusMonitor* m_agentMonitor = nullptr;
+    // Per-pane terminal lifecycle reported by TerminalFactory. The outer key is
+    // the server's Dev Session id and the inner key is the server's
+    // terminal_panes row id; both are cleared on a server switch so an old
+    // profile can never repaint a new profile's sidebar.
+    QHash<QString, QHash<QString, TerminalState>> m_terminalStates;
+    QPointer<TerminalFactory> m_terminalFactory;
     // Per-pane editor factory (workstream E), not owned; set via
     // setEditorFactory. Receives the server's recovery directory on connect.
     //
@@ -271,7 +294,12 @@ private:
     QPointer<ServerProfiles> m_profiles;
     QPointer<SessionLayouts> m_layouts;
 
+    // Last pool transcript already copied into m_logBuffer. The pool exposes a
+    // whole bounded string rather than per-line signals, so this suffix guard
+    // avoids duplicating old lines on every diagnosticLogChanged notification.
+    QString m_lastSshDiagnostics;
     void setConnectionState(const QString& state, const QString& error = QString());
+    void syncSshDiagnostics();
     // Ask the SERVER for its identity and adopt it as serverId (see
     // connectToProfile), then restore the last active session.
     void adoptServerIdentity();

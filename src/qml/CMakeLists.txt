@@ -8,7 +8,7 @@ qt_add_library(codeharbor_qml STATIC)
 # here must agree with the `pragma Singleton` at the top of the file — if either
 # side is missing, `import CodeHarbor` still succeeds and `Theme.x` silently
 # resolves to undefined, which in QML is a blank colour rather than an error.
-set_source_files_properties(Theme.qml PROPERTIES QT_QML_SINGLETON_TYPE TRUE)
+set_source_files_properties(Theme.qml ToolbarRegistry.qml PROPERTIES QT_QML_SINGLETON_TYPE TRUE)
 
 qt_add_qml_module(codeharbor_qml
     URI CodeHarbor
@@ -18,6 +18,7 @@ qt_add_qml_module(codeharbor_qml
     OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/CodeHarbor
     QML_FILES
         Theme.qml
+        ToolbarRegistry.qml
         RemotePath.js
         Main.qml
         AppTitleBar.qml
@@ -40,6 +41,8 @@ qt_add_qml_module(codeharbor_qml
         EditorPaneView.qml
         CommandPalette.qml
         ConnectSheet.qml
+        SettingsWindow.qml
+        LogView.qml
         AppDialog.qml
 )
 

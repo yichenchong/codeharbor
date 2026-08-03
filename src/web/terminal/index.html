@@ -30,8 +30,22 @@
        TOGETHER — a change to Theme.qml that is not reflected here leaves this
        page in the old palette. The role each literal stands for is named beside
        it. */
+    :root {
+        /* Built-in dark fallback: applyTheme() replaces these on first load. */
+        --ch-surface-sunken: #11111b;
+        --ch-surface-deep: #181825;
+        --ch-border-subtle: #313244;
+        --ch-status-text: #a6adc8;
+        --ch-error-surface: #45222c;
+        --ch-danger: #f38ba8;
+        --ch-warning-surface: #3a2f1e;
+        --ch-warning: #f9e2af;
+        --ch-border: #45475a;
+        --ch-text-dim: #6c7086;
+        --ch-text: #cdd6f4;
+    }
     html, body { height: 100%; margin: 0; padding: 0; overflow: hidden; }
-    body { background: #11111b; color: #cdd6f4; } /* surfaceSunken, text */
+    body { background: var(--ch-surface-sunken); color: var(--ch-text, #cdd6f4); } /* surfaceSunken, text */
     /* Column layout: a status strip that only appears when the pane is NOT
        live, above a surface that takes all remaining height. FitAddon measures
        the surface, so it needs a definite height — hence flex:1 + min-height:0. */
@@ -39,10 +53,9 @@
     .ch-terminal-status {
         flex: 0 0 auto;
         padding: 2px 8px;
-        background: #181825;              /* surfaceDeep */
-        border-bottom: 1px solid #313244; /* borderSubtle */
-        color: #a6adc8;                   /* no Theme role: one step brighter
-                                             than textDim, kept as it was */
+        background: var(--ch-surface-deep);          /* surfaceDeep */
+        border-bottom: 1px solid var(--ch-border-subtle); /* borderSubtle */
+        color: var(--ch-status-text);                /* statusText */
         font: 11px/1.6 monospace;
     }
     /* A live shell must not lose a row to chrome; every other state stays
@@ -50,14 +63,14 @@
     .ch-terminal-status[data-state="ready"] { display: none; }
     /* The two alert backgrounds are darkened blends with no Theme role of their
        own; the foregrounds are Theme.danger and Theme.warning. */
-    .ch-terminal-status[data-state="error"] { background: #45222c; color: #f38ba8; }
+    .ch-terminal-status[data-state="error"] { background: var(--ch-error-surface); color: var(--ch-danger); }
     /* The six values this attribute can ever hold are exactly
        ch::toString(ch::TerminalState): unloaded, opening_channel,
        attaching_tmux, ready, disconnected, error. Session-level progress
        (connecting/authenticating/reconnecting) is tracked once for the whole
        application and never reaches a pane (see SessionState.h), so there is
        deliberately no rule for it. */
-    .ch-terminal-status[data-state="disconnected"] { background: #3a2f1e; color: #f9e2af; }
+    .ch-terminal-status[data-state="disconnected"] { background: var(--ch-warning-surface); color: var(--ch-warning); }
     .ch-terminal-surface { flex: 1 1 auto; min-height: 0; }
 
     /* ---- scrollbars ----------------------------------------------------
@@ -79,10 +92,10 @@
     ::-webkit-scrollbar-track { background: transparent; }
     ::-webkit-scrollbar-corner { background: transparent; }
     ::-webkit-scrollbar-thumb {
-        background: #45475a;  /* border */
+        background: var(--ch-border);  /* border */
         border-radius: 4px;   /* radiusSmall */
     }
-    ::-webkit-scrollbar-thumb:hover { background: #6c7086; } /* textDim */
+    ::-webkit-scrollbar-thumb:hover { background: var(--ch-text-dim); } /* textDim */
 </style>
 </head>
 <body>

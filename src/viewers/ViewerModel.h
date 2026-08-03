@@ -3,6 +3,7 @@
 #include <QObject>
 #include <QPointer>
 #include <QString>
+#include <QStringList>
 #include <QUrl>
 #include <QVariantList>
 
@@ -47,11 +48,25 @@ public:
     // own ViewerProfiles from `client`, so QML always has working profiles.
     void setProfiles(ViewerProfiles *profiles);
 
-    // Map a URL to the QML view kind that should render it:
-    //   "web" | "markdown" | "text" | "image" | "pdf" | "directory" | "binary".
     Q_INVOKABLE QString viewKind(const QUrl &url) const;
 
-    // Opaque internal URL for a remote file URL, and its inverse.
+    // Same registry claims as viewKind(), expressed as the user-facing
+    // "Open as" vocabulary. The first entry is the default.
+    Q_INVOKABLE QStringList applicableViewKinds(const QUrl &url) const;
+
+    // Strict validation for a user/plugin-provided desktop application scheme.
+    Q_INVOKABLE bool isValidApplicationScheme(const QString &scheme) const;
+
+    // Hand a remote path to the desktop handler registered for `scheme`.
+    // Returns false for invalid/reserved schemes, malformed targets, or when
+    // the desktop reports that no handler accepted the URL.
+    Q_INVOKABLE bool openWithApplication(const QString &scheme,
+                                         const QString &remotePath) const;
+    // Mint the opaque internal URL used by privileged WebEngine handlers for a
+    // remote file URL, and resolve that URL back when a handler needs the
+    // original address. These are the model-facing half of InternalUrlMap;
+    // keeping them here makes the QML handlers use the same shared map as the
+    // scheme handler rather than creating a second mapping.
     Q_INVOKABLE QString internalUrlFor(const QUrl &fileUrl);
     Q_INVOKABLE QUrl fileUrlFor(const QString &internalUrl) const;
 
@@ -73,7 +88,6 @@ public:
     // entry, not the bound: eviction continues on the unpinned remainder.
     Q_INVOKABLE bool retainInternalUrl(const QString &internalUrl);
     Q_INVOKABLE void releaseInternalUrl(const QString &internalUrl);
-
     // The sandboxed external (http/https) profile and the privileged internal
     // profile. QML binds these to WebEngineView.profile. Never null once a
     // client is set.

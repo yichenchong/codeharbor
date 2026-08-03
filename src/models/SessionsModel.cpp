@@ -1,4 +1,5 @@
 #include "SessionsModel.h"
+#include <algorithm>
 
 #include <limits>
 #include <utility>
@@ -20,34 +21,68 @@ SessionsModel::SessionsModel(QObject *parent)
 void SessionsModel::setGroups(QVector<GroupRow> groups)
 {
     beginResetModel();
-    groups_ = std::move(groups);
+    allGroups_ = std::move(groups);
+    groups_.clear();
+    groups_.reserve(allGroups_.size());
+    for (const GroupRow &group : allGroups_) {
+        if (!pinnedOnly_) {
+            groups_.append(group);
+            continue;
+        }
+        GroupRow filtered = group;
+        filtered.sessions.erase(
+            std::remove_if(filtered.sessions.begin(), filtered.sessions.end(),
+                           [](const SessionRow &session) {
+                               return !session.session.pinned;
+                           }),
+            filtered.sessions.end());
+        if (!filtered.sessions.isEmpty())
+            groups_.append(std::move(filtered));
+    }
     endResetModel();
+}
+
+void SessionsModel::setPinnedOnly(bool pinnedOnly)
+{
+    if (pinnedOnly_ == pinnedOnly)
+        return;
+    pinnedOnly_ = pinnedOnly;
+    setGroups(allGroups_);
+    emit pinnedOnlyChanged();
 }
 
 void SessionsModel::updateTerminalStates(QVector<GroupRow> groups)
 {
     // An agent-status change never alters the sidebar's structure, only the
-    // per-terminal state that feeds each session's aggregate badge. If the
-    // structure has drifted from what we hold (group/session count or id order
-    // differs), the assumption is void and a full reset is the only safe path.
-    if (groups.size() != groups_.size()) {
+    // per-terminal state that feeds each session's aggregate badge. Compare
+    // against the unfiltered source because a pinned-only view intentionally
+    // omits rows that still receive live state updates.
+    if (groups.size() != allGroups_.size()) {
         setGroups(std::move(groups));
         return;
     }
     for (qsizetype gi = 0; gi < groups.size(); ++gi) {
-        if (groups.at(gi).group.id.value != groups_.at(gi).group.id.value
-            || groups.at(gi).sessions.size() != groups_.at(gi).sessions.size()) {
+        if (groups.at(gi).group.id.value != allGroups_.at(gi).group.id.value
+            || groups.at(gi).sessions.size() != allGroups_.at(gi).sessions.size()) {
             setGroups(std::move(groups));
             return;
         }
         const QVector<SessionRow> &newSessions = groups.at(gi).sessions;
-        const QVector<SessionRow> &oldSessions = groups_.at(gi).sessions;
+        const QVector<SessionRow> &oldSessions = allGroups_.at(gi).sessions;
         for (qsizetype si = 0; si < newSessions.size(); ++si) {
             if (newSessions.at(si).session.id.value != oldSessions.at(si).session.id.value) {
                 setGroups(std::move(groups));
                 return;
             }
         }
+    }
+
+    // A filtered model can gain or lose visible rows when a refresh changes a
+    // session's pin bit. Rebuild it from the authoritative response rather than
+    // attempting to emit row-local signals for indices that no longer exist.
+    if (pinnedOnly_) {
+        setGroups(std::move(groups));
+        return;
     }
 
     // Structure matches: adopt the new terminal state in place, then emit a
@@ -62,7 +97,7 @@ void SessionsModel::updateTerminalStates(QVector<GroupRow> groups)
     QVector<QModelIndex> changedRows;
     for (qsizetype gi = 0; gi < groups.size(); ++gi) {
         const QModelIndex groupIndex = index(static_cast<int>(gi), 0, QModelIndex());
-        QVector<SessionRow> &sessions = groups_[gi].sessions;
+        QVector<SessionRow> &sessions = allGroups_[gi].sessions;
         QVector<SessionRow> &incoming = groups[gi].sessions;
         for (qsizetype si = 0; si < sessions.size(); ++si) {
             const SessionRowState before = aggregateSessionState(sessions.at(si).terminals);
@@ -71,6 +106,7 @@ void SessionsModel::updateTerminalStates(QVector<GroupRow> groups)
                 changedRows.append(index(static_cast<int>(si), 0, groupIndex));
         }
     }
+    groups_ = allGroups_;
     for (const QModelIndex &row : std::as_const(changedRows))
         emit dataChanged(row, row, {RowStateRole});
 }
@@ -82,6 +118,7 @@ SessionRowState SessionsModel::aggregateSessionState(const QVector<TerminalStatu
     bool anyRunning = false;
     bool anyFinishedUnseen = false;
     bool anyConnected = false;
+    bool anyDisconnected = false;
 
     for (const TerminalStatus &t : terminals) {
         if (t.connection == TerminalState::Error || t.agent == AgentState::Error)
@@ -94,9 +131,12 @@ SessionRowState SessionsModel::aggregateSessionState(const QVector<TerminalStatu
             anyFinishedUnseen = true;
         if (t.connection == TerminalState::Ready)
             anyConnected = true;
+        if (t.connection == TerminalState::Disconnected)
+            anyDisconnected = true;
     }
 
-    return aggregateRowState(anyError, anyWaitingInput, anyRunning, anyFinishedUnseen, anyConnected);
+    return aggregateRowState(anyError, anyWaitingInput, anyRunning,
+                             anyFinishedUnseen, anyConnected, anyDisconnected);
 }
 
 QModelIndex SessionsModel::index(int row, int column, const QModelIndex &parent) const
@@ -178,6 +218,8 @@ QVariant SessionsModel::data(const QModelIndex &index, int role) const
         return session.session.id.value;
     case GroupIdRole:
         return groupEntry.group.id.value;
+    case PinnedRole:
+        return session.session.pinned;
     default:
         return {};
     }
@@ -198,6 +240,7 @@ QHash<int, QByteArray> SessionsModel::roleNames() const
         {CollapsedRole, "collapsed"},
         {IdRole, "itemId"},
         {GroupIdRole, "groupId"},
+        {PinnedRole, "pinned"},
     };
 }
 

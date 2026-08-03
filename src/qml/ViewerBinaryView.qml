@@ -130,7 +130,7 @@ Rectangle {
             // #585b70 is a step between Theme.textDim and Theme.textFaint and
             // has no Theme role; kept so the path stays quieter than the caption
             // above it.
-            color: "#585b70"
+            color: Theme.textPlaceholder()
             font.pixelSize: 11
             elide: Text.ElideMiddle
             Layout.fillWidth: true
@@ -157,7 +157,7 @@ Rectangle {
             background: Rectangle {
                 radius: Theme.radiusSmall
                 color: downloadButton.down ? Theme.border
-                     : downloadButton.hovered ? "#3a3a52" : Theme.surfaceRaised
+                     : downloadButton.hovered ? Theme.controlHoverSurface() : Theme.surfaceRaised
                 border.width: downloadButton.visualFocus ? 2 : 1
                 border.color: downloadButton.visualFocus ? Theme.accent : Theme.border
             }

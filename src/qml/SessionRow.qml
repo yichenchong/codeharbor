@@ -7,7 +7,7 @@ import QtQuick.Layouts
 // workspace mutations wired to app.* invokables, addressed by the row's ch id.
 // Left click selects and activates the session; dragging the row hands the
 // drop resolution to the sidebar (`host`), which is what talks to app.*.
-// Role names consumed: name, subtitle, rowState, itemId, groupId.
+// Role names consumed: name, subtitle, rowState, pinned, itemId, groupId.
 ItemDelegate {
     id: row
 
@@ -15,9 +15,9 @@ ItemDelegate {
     required property string name
     required property string subtitle
     required property int rowState
+    required property bool pinned
     required property string itemId  // this session's ch id (SessionsModel role)
     required property string groupId // containing group's ch id (for moves)
-
     // The SessionsSidebar that instantiated this row: registry, drag state and
     // selection cursor all live there. Null-guarded everywhere so the row stays
     // usable standalone.
@@ -138,9 +138,9 @@ ItemDelegate {
             anchors.top: parent.top
             anchors.bottom: parent.bottom
             width: 3
-            // The inactive rail is a mid-grey the theme has no role for yet, so
-            // it stays a literal.
-            color: row.active ? Theme.accent : "#585b70"
+            // The inactive rail is a presentation shade; Theme keeps it
+            // visible but restrained in either light or dark mode.
+            color: row.active ? Theme.accent : Theme.inactiveRail()
             visible: row.active || row.selected
         }
 
@@ -195,7 +195,7 @@ ItemDelegate {
             // from the Row's implicit width, which is derived from these very
             // children and would be a cycle.
             width: Math.max(0, parent.width - parent.leftPadding - dot.width
-                            - parent.spacing - 8)
+                            - parent.spacing - pinButton.width - parent.spacing - 8)
 
             Label {
                 width: parent.width
@@ -212,6 +212,49 @@ ItemDelegate {
                 elide: Text.ElideRight
                 visible: text.length > 0
             }
+        }
+        // The pin is an action on the row, not part of its selection gesture.
+        // Keeping it as a child control gives it its own pointer and keyboard
+        // target while the rest of the row remains draggable/selectable.
+        Button {
+            id: pinButton
+            objectName: "pinButton:" + row.itemId
+            width: 24
+            height: 24
+            implicitWidth: 24
+            implicitHeight: 24
+            padding: 0
+            anchors.verticalCenter: parent.verticalCenter
+            text: row.pinned ? "\u2605" : "\u2606" // filled / outline star
+
+            readonly property string actionText:
+                row.pinned ? qsTr("Unpin %1").arg(row.name)
+                           : qsTr("Pin %1").arg(row.name)
+            Accessible.role: Accessible.Button
+            Accessible.name: pinButton.actionText
+
+            AppToolTip {
+                objectName: "pinButtonTip:" + row.itemId
+                text: pinButton.actionText
+                visible: pinButton.hovered
+                delay: 600
+            }
+
+            contentItem: Label {
+                text: pinButton.text
+                color: pinButton.down ? Theme.accent : Theme.text
+                font.pixelSize: Theme.fontSizeTitle
+                horizontalAlignment: Text.AlignHCenter
+                verticalAlignment: Text.AlignVCenter
+            }
+            background: Rectangle {
+                radius: Theme.radiusSmall
+                color: pinButton.down ? Theme.surfaceRaised
+                     : pinButton.hovered ? Theme.surfaceHover : "transparent"
+                border.width: pinButton.visualFocus ? 2 : 1
+                border.color: pinButton.visualFocus ? Theme.accent : Theme.borderSubtle
+            }
+            onClicked: if (row.host) row.host.togglePinned(row.itemId, !row.pinned)
         }
     }
 

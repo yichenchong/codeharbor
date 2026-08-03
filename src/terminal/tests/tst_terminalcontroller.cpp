@@ -116,6 +116,7 @@ private slots:
     void resizeRejectsNonPositiveGeometry();
     void hiddenEvictionResumesOnACleanBoundary();
     void flushBoundariesNeverSplitAMultiByteCharacter();
+    void flushBoundariesNeverSplitAnAnsiEscape();
     void anEvictionCannotOrphanHalfOfACharacterInTheDecoder();
     void releasingRetainedOutputStaysInsideTheCreditWindow();
 };
@@ -1094,6 +1095,26 @@ void TstTerminalController::flushBoundariesNeverSplitAMultiByteCharacter()
         QTRY_COMPARE_WITH_TIMEOUT(controller.hiddenBuffer(), QByteArrayLiteral("hi"), 1000);
     }
 }
+// ANSI controls carry parser state across bytes. A size-triggered flush must
+// keep an incomplete control in the pending buffer so xterm never receives a
+// prefix in one batch and a tail in another.
+void TstTerminalController::flushBoundariesNeverSplitAnAnsiEscape()
+{
+    TerminalController controller;
+    QSignalSpy spy(&controller, &TerminalController::flushReady);
+
+    QByteArray prefix(TerminalController::kFlushSizeBytes - 4, 'x');
+    prefix += QByteArrayLiteral("\x1b[31");
+    controller.ingestOutput(prefix);
+    QCOMPARE(spy.count(), 1);
+    QVERIFY(!spy.at(0).at(0).toByteArray().contains('\x1b'));
+
+    controller.ingestOutput(QByteArrayLiteral("mred"));
+    QVERIFY(spy.wait(1000));
+    QCOMPARE(spy.count(), 2);
+    QVERIFY(spy.at(1).at(0).toByteArray().contains(QByteArrayLiteral("\x1b[31m")));
+}
+
 
 // WHY (1) above matters, end to end. ch::TerminalBridge decodes statefully, so
 // a character split across two batches is normally harmless: the decoder holds

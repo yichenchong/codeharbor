@@ -61,6 +61,7 @@ DevSession parseSession(const QJsonObject& obj)
         obj.value(QStringLiteral("taskDescription")).toString();
     session.position = obj.value(QStringLiteral("position")).toInt();
     session.archived = obj.value(QStringLiteral("archived")).toBool();
+    session.pinned = obj.value(QStringLiteral("pinned")).toBool();
     return session;
 }
 
@@ -246,6 +247,8 @@ QJsonObject serializeCreateSession(const CreateSessionParams& params)
         obj[QStringLiteral("position")] = *params.position;
     if (params.archived)
         obj[QStringLiteral("archived")] = *params.archived;
+    if (params.pinned)
+        obj[QStringLiteral("pinned")] = *params.pinned;
     return obj;
 }
 
@@ -265,6 +268,8 @@ QJsonObject serializeUpdateSession(const UpdateSessionParams& params)
         obj[QStringLiteral("position")] = *params.position;
     if (params.archived)
         obj[QStringLiteral("archived")] = *params.archived;
+    if (params.pinned)
+        obj[QStringLiteral("pinned")] = *params.pinned;
     return obj;
 }
 
@@ -443,9 +448,12 @@ WorkspaceDb::WorkspaceDb(CodeharbordClient* client) : m_client(client)
     Q_ASSERT(m_client);
 }
 
-void WorkspaceDb::list(const ServerId& serverId, ListCallback cb)
+void WorkspaceDb::list(const ServerId& serverId, ListCallback cb,
+                       bool pinnedOnly)
 {
-    const QJsonObject params{{QStringLiteral("serverId"), serverId.value}};
+    QJsonObject params{{QStringLiteral("serverId"), serverId.value}};
+    if (pinnedOnly)
+        params[QStringLiteral("pinnedOnly")] = true;
     m_client->call(
         QString::fromLatin1(rpc::kMethodWorkspaceList), params,
         [cb = std::move(cb)](QJsonValue result, std::optional<RpcError> error) {

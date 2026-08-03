@@ -31,8 +31,8 @@
 #include "CodeharbordClient.h"
 #include "SessionsModel.h"
 #include "AgentStatusMonitor.h"
-#include "AgentEvent.h"
 #include "SessionState.h"
+#include "TerminalFactory.h"
 
 using namespace ch;
 
@@ -338,6 +338,7 @@ private slots:
     void mutationSuccessChainsRefresh();
     void refreshResultAfterControllerDestroyedIsNoop();
     void agentMonitorMergesStateIntoSidebar();
+    void terminalConnectionStateMergesIntoSidebar();
     void refreshDoesNotWipeAgentDerivedState();
     void markSeenClearsFinishedUnseenBadge();
     void vanishedActiveSessionIsRetiredEverywhere();
@@ -721,8 +722,8 @@ void TstAppController::refreshResultAfterControllerDestroyedIsNoop()
 // A live agent state fed to the monitor must surface in the sidebar: after a
 // refresh populates a session with a terminal pane, an agentStateChanged event
 // re-derives the row and its aggregate reflects the new AgentState. Before any
-// event the terminal's agent is Unknown and its connection defaults to
-// Unloaded, so the aggregate is Disconnected.
+// event the terminal's agent is Unknown and its connection is Unloaded, so the
+// aggregate is neutral Idle rather than a claimed disconnect.
 void TstAppController::agentMonitorMergesStateIntoSidebar()
 {
     FakeTransport transport;
@@ -747,7 +748,7 @@ void TstAppController::agentMonitorMergesStateIntoSidebar()
         const QModelIndex session = model->index(0, 0, group);
         return model->data(session, SessionsModel::RowStateRole).toInt();
     };
-    QCOMPARE(sessionState(), static_cast<int>(SessionRowState::Disconnected));
+    QCOMPARE(sessionState(), static_cast<int>(SessionRowState::Idle));
 
     // Feed a running state for that (session, terminal); the monitor's
     // agentStateChanged drives rebuildRows() and the badge appears.
@@ -755,6 +756,60 @@ void TstAppController::agentMonitorMergesStateIntoSidebar()
                                           QStringLiteral("sess-1"),
                                           QStringLiteral("term-1")));
     QCOMPARE(sessionState(), static_cast<int>(SessionRowState::Running));
+}
+// A connected terminal must reach the same sidebar aggregate that a real
+// TerminalFactory emits. The old controller only merged agent state, so this
+// test stayed Disconnected even after the pane was Ready.
+void TstAppController::terminalConnectionStateMergesIntoSidebar()
+{
+    CodeharbordClient client;
+    AppController controller(&client);
+    // Seed the server key without issuing a request: setServerId() is allowed
+    // to run before a transport is wired, and the subsequent refresh is the
+    // one request this test answers.
+    controller.setServerId(QStringLiteral("srv-1"));
+
+    TerminalFactory factory(nullptr);
+    factory.setServerId(QStringLiteral("srv-1"));
+    controller.setTerminalFactory(&factory);
+
+    FakeTransport transport;
+    client.setTransport(&transport);
+    controller.refresh();
+    const QJsonObject request = takeRequest(transport);
+    transport.deliver(listWithTerminalFrame(
+        request.value(QStringLiteral("id")).toInt(), QStringLiteral("G"),
+        QStringLiteral("sess-1"), QStringLiteral("term-1")));
+
+    SessionsModel* model = controller.sessionsModel();
+    const auto sessionState = [model]() {
+        const QModelIndex group = model->index(0, 0);
+        const QModelIndex session = model->index(0, 0, group);
+        return model->data(session, SessionsModel::RowStateRole).toInt();
+    };
+    QCOMPARE(sessionState(), static_cast<int>(SessionRowState::Idle));
+
+    // Ready is a live pane and must not be mistaken for a missing/disconnected
+    // terminal. This assertion fails against the old agent-only merge.
+    emit factory.terminalStateChanged(QStringLiteral("srv-1"),
+                                      QStringLiteral("sess-1"),
+                                      QStringLiteral("term-1"),
+                                      TerminalState::Ready);
+    QCOMPARE(sessionState(), static_cast<int>(SessionRowState::Idle));
+
+    // Once that live pane actually loses its channel, Disconnected is correct.
+    emit factory.terminalStateChanged(QStringLiteral("srv-1"),
+                                      QStringLiteral("sess-1"),
+                                      QStringLiteral("term-1"),
+                                      TerminalState::Disconnected);
+    QCOMPARE(sessionState(), static_cast<int>(SessionRowState::Disconnected));
+
+    // A queued event stamped with the previous server cannot repaint this one.
+    emit factory.terminalStateChanged(QStringLiteral("old-server"),
+                                      QStringLiteral("sess-1"),
+                                      QStringLiteral("term-1"),
+                                      TerminalState::Ready);
+    QCOMPARE(sessionState(), static_cast<int>(SessionRowState::Disconnected));
 }
 
 // A subsequent refresh with the SAME tree must not wipe the agent-derived
@@ -808,10 +863,9 @@ void TstAppController::refreshDoesNotWipeAgentDerivedState()
 // the terminal's raw agent state as IdleUnseen, so without the AppController
 // downgrade the row would stay stuck in FinishedUnseen and the badge would
 // never clear. rebuildRows() must downgrade IdleUnseen -> Idle for the row when
-// hasUnseen(dev) is false, so the FinishedUnseen badge is cleared. (The row
-// falls to Disconnected here because the terminal's connection state — owned by
-// the terminal workstream and merged separately — is Unloaded in this harness;
-// the point under test is that the FinishedUnseen badge is gone.)
+// hasUnseen(dev) is false, so the FinishedUnseen badge is cleared. The terminal
+// itself remains Unloaded in this harness, which is neutral Idle rather than a
+// claimed disconnect.
 void TstAppController::markSeenClearsFinishedUnseenBadge()
 {
     FakeTransport transport;
@@ -850,7 +904,7 @@ void TstAppController::markSeenClearsFinishedUnseenBadge()
     QVERIFY(!monitor.hasUnseen(QStringLiteral("sess-1")));
     QVERIFY(sessionState() != static_cast<int>(SessionRowState::FinishedUnseen));
     QCOMPARE(sessionState(),
-             static_cast<int>(SessionRowState::Disconnected));
+             static_cast<int>(SessionRowState::Idle));
     // The monitor's per-terminal raw state is unchanged (only the row is
     // downgraded); this is what proves the fix lives in rebuildRows, not the
     // monitor.

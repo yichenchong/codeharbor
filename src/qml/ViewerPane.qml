@@ -34,6 +34,141 @@ Item {
     // a pane cannot see its siblings.
     property bool paneActive: false
 
+    // ---- browser navigation history ----------------------------------------
+    //
+    // A pane is a browser even when its current handler is a directory, image,
+    // PDF, binary download, or editor. The address bar therefore owns the
+    // navigation state rather than leaving it to whichever handler happens to
+    // be loaded. Keeping the list on this Item is what makes a split and a
+    // session-layout re-render harmless: ViewerRegion re-parents this exact
+    // object instead of rebuilding it.
+    property var navigationHistory: []
+    property int navigationIndex: -1
+    property bool navigationReady: false
+    property bool navigationMoveInProgress: false
+    // Toggling this property destroys and recreates the handler Loader on
+    // reload. It is intentionally pane-local: a reload must not disturb a
+    // sibling pane's WebEngine profile or its own handler state.
+    property bool contentActive: true
+
+    readonly property bool canGoBack: pane.navigationIndex > 0
+    readonly property bool canGoForward:
+        pane.navigationIndex >= 0
+        && pane.navigationIndex < pane.navigationHistory.length - 1
+    readonly property bool canGoHome: pane.sessionRoot.length > 0
+    readonly property bool canReload: pane.effectiveUrl.toString().length > 0
+
+    function defaultAddressForRoot(rootPath) {
+        const root = String(rootPath || "");
+        if (root.length === 0)
+            return "";
+        return pane.fileUrlFor(root.charAt(root.length - 1) === "/" ? root : root + "/")
+                   .toString();
+    }
+
+    // The URL property deliberately stays empty for an untouched pane so the
+    // pane still follows the active session's root. History stores the
+    // CONCRETE address that was shown, however, so a root entry remains an
+    // honest browser location if the active session changes later.
+    function currentNavigationAddress() {
+        const opened = pane.url.toString();
+        return opened.length > 0 ? opened : pane.defaultAddressForRoot(pane.sessionRoot);
+    }
+
+    function initializeNavigationHistory() {
+        if (pane.navigationHistory.length > 0 || pane.navigationReady === false)
+            return;
+        pane.navigationHistory = [pane.currentNavigationAddress()];
+        pane.navigationIndex = 0;
+    }
+
+    // Record only a new navigation. Reload and history traversal deliberately
+    // bypass this function, while a fresh address entry or directory-row click
+    // arrives through urlChanged and truncates the forward branch here.
+    function recordNavigation(address) {
+        if (!pane.navigationReady || pane.navigationMoveInProgress)
+            return;
+        const value = String(address || "");
+        const history = pane.navigationHistory.slice(0);
+        if (pane.navigationIndex >= 0
+                && pane.navigationIndex < history.length
+                && history[pane.navigationIndex] === value)
+            return;
+        if (pane.navigationIndex >= 0 && pane.navigationIndex < history.length - 1)
+            history.splice(pane.navigationIndex + 1);
+        history.push(value);
+        pane.navigationHistory = history;
+        pane.navigationIndex = history.length - 1;
+    }
+
+    // A default-root entry follows the active session only while the pane is
+    // still in its empty-url state. Existing entries remain untouched, which
+    // preserves the pane's history across a session switch without turning an
+    // old address into a new current entry.
+    function refreshDefaultHistory() {
+        if (!pane.navigationReady || pane.url.toString().length > 0
+                || pane.navigationIndex < 0
+                || pane.navigationIndex >= pane.navigationHistory.length)
+            return;
+        const history = pane.navigationHistory.slice(0);
+        history[pane.navigationIndex] = pane.defaultAddressForRoot(pane.sessionRoot);
+        pane.navigationHistory = history;
+    }
+
+    function goBack() {
+        if (!pane.canGoBack)
+            return;
+        const targetIndex = pane.navigationIndex - 1;
+        const target = pane.navigationHistory[targetIndex];
+        pane.navigationMoveInProgress = true;
+        pane.navigationIndex = targetIndex;
+        pane.forcedKind = "";
+        pane.url = String(target || "");
+        pane.navigationMoveInProgress = false;
+    }
+
+    function goForward() {
+        if (!pane.canGoForward)
+            return;
+        const targetIndex = pane.navigationIndex + 1;
+        const target = pane.navigationHistory[targetIndex];
+        pane.navigationMoveInProgress = true;
+        pane.navigationIndex = targetIndex;
+        pane.forcedKind = "";
+        pane.url = String(target || "");
+        pane.navigationMoveInProgress = false;
+    }
+
+    function goHome() {
+        if (!pane.canGoHome)
+            return;
+        // Keep an untouched pane in its follow-the-session form. If the user
+        // explicitly opened the root, clearing url restores that same visual
+        // location while retaining one concrete root entry in history.
+        const target = pane.defaultAddressForRoot(pane.sessionRoot);
+        if (pane.currentNavigationAddress() === target && pane.url.toString().length === 0)
+            return;
+        pane.forcedKind = "";
+        pane.url = "";
+    }
+
+    // Prefer a handler's own reload operation when it has one: directory
+    // listings and web pages can re-fetch without throwing away their live
+    // object. The Loader fallback covers every other content kind, including
+    // internal image/PDF resources and the binary metadata view.
+    function reloadCurrent() {
+        if (!pane.canReload)
+            return;
+        const handler = contentLoader.item;
+        if (handler && typeof handler.reload === "function") {
+            handler.reload();
+            return;
+        }
+        pane.contentActive = false;
+        reloadTimer.restart();
+    }
+
+
     // ---- focus reporting (SPEC 4.5) ----------------------------------------
     // The user is working in THIS pane. ViewerRegion connects this when it
     // mints the pane (takePane) and republishes it as the root region's
@@ -56,12 +191,20 @@ Item {
     // this signal is how those arrive.
     signal urlOpened(string paneId, string url)
 
+    // A directory row chose a target for another viewer pane. The region relays
+    // this to Main.qml, which calls SessionLayouts::splitPane and therefore
+    // preserves the existing pane-identity/persistence path.
+    signal openInNewPaneRequested(string paneId, string url, string kind)
+
+    // Shell-level failures (invalid custom schemes, or a desktop with no
+    // registered handler) use the same toast path as layout/controller errors.
+    signal messageRequested(string message)
+
     // The user asked to close this pane, from its own header. Closing a pane is
     // a LAYOUT change (SessionLayouts::closePane collapses the parent branch),
     // which only the host can make, so the pane asks rather than acts. The
     // region relays it as `closePaneRequested`.
     signal closeRequested(string paneId)
-
     function reportUrl() {
         // An unnamed pane is not addressable. The empty paneId is also a real
         // key (the placeholder leaf of an emptied region), but the two are
@@ -82,10 +225,16 @@ Item {
     // to be asked about first), and leaving that fragment sitting in the bar
     // would have the pane claim to be showing something it is not.
     onUrlChanged: {
+        pane.recordNavigation(pane.currentNavigationAddress());
         pane.reportUrl();
         pane.syncAddressField(true);
     }
     onPaneIdChanged: pane.reportUrl()
+
+    // Session-root changes alter what an empty-url pane displays, but they are
+    // not user navigations. Keep the current concrete root entry aligned while
+    // leaving every older address in the pane's history intact.
+    onDefaultUrlChanged: pane.refreshDefaultHistory()
 
     // ---- remote paths <-> file:// URLs -------------------------------------
 
@@ -106,7 +255,72 @@ Item {
     // Open a remote path in THIS pane. A trailing slash means a directory, which
     // is what ViewerHandlerRegistry::resolve() reads to pick the listing view.
     function openRemotePath(path) {
+        pane.forcedKind = "";
         pane.url = pane.fileUrlFor(path);
+    }
+    // A link inside an external WebEngine page is still ordinary pane
+    // navigation. Keep only HTTP(S) addresses: remote file views use an
+    // internal implementation URL that must never enter browser history.
+    function openWebNavigation(address) {
+        const target = String(address || "");
+        if (!/^https?:\/\//i.test(target) || target === pane.url.toString())
+            return;
+        pane.forcedKind = "";
+        pane.url = target;
+    }
+
+
+    function normalizedForcedKind(kind) {
+        switch (String(kind)) {
+        case "editor":
+        case "text":
+            return "text";
+        case "image":
+        case "pdf":
+        case "binary":
+        case "directory":
+        case "web":
+            return String(kind);
+        default:
+            return "";
+        }
+    }
+
+    // Apply an explicit handler choice to a URL. The registry remains the
+    // source of defaults; this override exists only for the user action that
+    // requested "Open as".
+    function openUrlWithKind(targetUrl, requestedKind) {
+        const selected = pane.normalizedForcedKind(requestedKind);
+        if (selected.length === 0) {
+            pane.messageRequested(qsTr("That viewer cannot display this target."));
+            return false;
+        }
+        pane.forcedKind = selected;
+        pane.url = targetUrl;
+        return true;
+    }
+
+    function requestOpenAs(path, requestedKind, inNewPane) {
+        const targetUrl = pane.fileUrlFor(path);
+        if (inNewPane) {
+            pane.openInNewPaneRequested(pane.paneId, targetUrl, requestedKind);
+            return;
+        }
+        pane.openUrlWithKind(targetUrl, requestedKind);
+    }
+
+    function requestOpenWith(path, scheme) {
+        if (!pane.viewerModel
+                || typeof pane.viewerModel.isValidApplicationScheme !== "function"
+                || !pane.viewerModel.isValidApplicationScheme(scheme)) {
+            pane.messageRequested(qsTr("Invalid application scheme."));
+            return;
+        }
+        if (typeof pane.viewerModel.openWithApplication !== "function"
+                || !pane.viewerModel.openWithApplication(scheme, path)) {
+            pane.messageRequested(qsTr("No desktop application accepted %1://.")
+                                  .arg(scheme));
+        }
     }
 
     // ---- the session's repository root, as an empty pane's default ---------
@@ -145,13 +359,21 @@ Item {
     // would abort the binding pass building the pane.
     readonly property var viewerModel: (typeof viewers !== "undefined") ? viewers : null
 
+    // "Open as" is a transient handler override. The persisted URL remains
+    // canonical, so reopening a session still follows the registry's default;
+    // ordinary navigation clears this override before assigning a new URL.
+    property string forcedKind: ""
+
     // View kind for the current URL: "web" | "markdown" | "text" | "image" |
     // "pdf" | "directory" | "binary" (nothing to show -> a neutral placeholder).
-    property string kind: (pane.effectiveUrl.toString().length === 0 || !pane.viewerModel)
-                          ? "empty"
-                          : pane.viewerModel.viewKind(pane.effectiveUrl)
-
-    // The address as the user reads and edits it: a remote path for a file:// URL
+    property string kind: {
+        if (pane.forcedKind.length > 0)
+            return pane.forcedKind;
+        if (pane.effectiveUrl.toString().length === 0 || !pane.viewerModel)
+            return "empty";
+        return pane.viewerModel.viewKind(pane.effectiveUrl);
+    }
+    // The address as the user reads it: a remote path for a file:// URL
     // and the address itself for anything else.
     readonly property string displayPath: pane.remotePathOf(pane.effectiveUrl)
 
@@ -308,6 +530,7 @@ Item {
             // Emptying the address clears the pane, which is how a user gets
             // back to the session-root default.
             pane.probePath = "";
+            pane.forcedKind = "";
             pane.url = "";
             return;
         }
@@ -315,6 +538,7 @@ Item {
         // file:// URL a user pasted out of this very field).
         if (/^[a-zA-Z][a-zA-Z0-9+.\-]*:\/\//.test(text)) {
             pane.probePath = "";
+            pane.forcedKind = "";
             pane.url = text;
             return;
         }
@@ -402,10 +626,10 @@ Item {
             addressField.text = pane.shownPath();
     }
 
-    onDisplayPathChanged: pane.syncAddressField(false)
-
     Component.onCompleted: {
         addressField.text = pane.displayPath;
+        pane.navigationReady = true;
+        pane.initializeNavigationHistory();
         pane.checkRepoRoot();
     }
 
@@ -521,9 +745,9 @@ Item {
             readonly property string hint:
                 qsTr("This path is outside the project's repository root.")
 
-            anchors.right: goButton.left
-            anchors.verticalCenter: parent.verticalCenter
             visible: pane.outsideRepository
+            anchors.right: navigationControls.left
+            anchors.verticalCenter: parent.verticalCenter
             width: visible ? outsideLabel.implicitWidth + 12 : 0
             height: 18
             radius: Theme.radiusSmall
@@ -561,20 +785,111 @@ Item {
                 visible: outsideHover.hovered
             }
         }
-
-        AppPaneHeader.Action {
-            id: goButton
+        // Enter remains the submit path; this row uses the field's trailing
+        // chrome for browser navigation without making the keyboard contract
+        // pointer-dependent.
+        Row {
+            id: navigationControls
+            objectName: "viewerNavigationControls"
             anchors.right: parent.right
             anchors.rightMargin: 4
             anchors.verticalCenter: parent.verticalCenter
-            text: qsTr("Open this address")
-            glyph: "\u21b5"
-            onClicked: pane.submitAddress()
+            spacing: 2
+
+            Repeater {
+                model: ToolbarRegistry.ordered(
+                    ["nav.back", "nav.forward", "nav.reload", "nav.home"])
+
+                delegate: Loader {
+                    required property string modelData
+                    sourceComponent: {
+                        switch (modelData) {
+                        case "nav.back": return backAction;
+                        case "nav.forward": return forwardAction;
+                        case "nav.reload": return reloadAction;
+                        case "nav.home": return homeAction;
+                        default: return null;
+                        }
+                    }
+                }
+            }
         }
+
+        Component {
+            id: backAction
+            AppPaneHeader.Action {
+                id: backButton
+                objectName: "viewerBackButton"
+                toolbarId: "nav.back"
+                text: qsTr("Back")
+                glyph: "\u2190"
+                enabled: pane.canGoBack
+                focusPolicy: enabled ? Qt.StrongFocus : Qt.NoFocus
+                Accessible.role: Accessible.Button
+                Accessible.name: text
+                onClicked: pane.goBack()
+            }
+        }
+
+        Component {
+            id: forwardAction
+            AppPaneHeader.Action {
+                id: forwardButton
+                objectName: "viewerForwardButton"
+                toolbarId: "nav.forward"
+                text: qsTr("Forward")
+                glyph: "\u2192"
+                enabled: pane.canGoForward
+                focusPolicy: enabled ? Qt.StrongFocus : Qt.NoFocus
+                Accessible.role: Accessible.Button
+                Accessible.name: text
+                onClicked: pane.goForward()
+            }
+        }
+
+        Component {
+            id: reloadAction
+            AppPaneHeader.Action {
+                id: reloadButton
+                objectName: "viewerReloadButton"
+                toolbarId: "nav.reload"
+                text: qsTr("Reload")
+                glyph: "\u21bb"
+                enabled: pane.canReload
+                focusPolicy: enabled ? Qt.StrongFocus : Qt.NoFocus
+                Accessible.role: Accessible.Button
+                Accessible.name: text
+                onClicked: pane.reloadCurrent()
+            }
+        }
+
+        Component {
+            id: homeAction
+            AppPaneHeader.Action {
+                id: homeButton
+                objectName: "viewerHomeButton"
+                toolbarId: "nav.home"
+                text: qsTr("Home")
+                glyph: "\u2302"
+                enabled: pane.canGoHome
+                focusPolicy: enabled ? Qt.StrongFocus : Qt.NoFocus
+                Accessible.role: Accessible.Button
+                Accessible.name: text
+                onClicked: pane.goHome()
+            }
+        }
+    }
+
+    Timer {
+        id: reloadTimer
+        interval: 0
+        repeat: false
+        onTriggered: pane.contentActive = true
     }
 
     Loader {
         id: contentLoader
+        active: pane.contentActive
         anchors.left: parent.left
         anchors.right: parent.right
         anchors.top: addressBar.bottom
@@ -621,13 +936,28 @@ Item {
     MouseArea {
         anchors.fill: parent
         acceptedButtons: Qt.AllButtons
+        // This area only observes presses; it must not touch the cursor. Qt
+        // documents `cursorShape: undefined` as "do not change the shape on
+        // entering this area", which is exactly the behaviour wanted: the
+        // cursor of whatever is underneath - a web page's own CSS cursor, the
+        // editor's I-beam - reaches the user instead of this full-pane click
+        // sniffer's arrow. hoverEnabled stays off for the same reason.
+        cursorShape: undefined
+        hoverEnabled: false
         onPressed: function(mouse) {
             pane.paneActivated(pane.paneId);
             mouse.accepted = false;
         }
     }
 
-    Component { id: webComponent; ViewerWebView { url: pane.effectiveUrl } }
+    Component {
+        id: webComponent
+        ViewerWebView {
+            url: pane.effectiveUrl
+            remoteFile: pane.effectiveUrl.toString().indexOf("file://") === 0
+            onNavigated: (address) => pane.openWebNavigation(address)
+        }
+    }
     Component { id: imageComponent; ViewerImageView { url: pane.effectiveUrl } }
     Component { id: pdfComponent; ViewerPdfView { url: pane.effectiveUrl } }
     Component {
@@ -637,6 +967,11 @@ Item {
             // Clicking a row navigates THIS pane: into a sub-directory, up to a
             // parent, or into a file's own viewer.
             onOpenRequested: (path) => pane.openRemotePath(path)
+            onOpenAsRequested: (path, kind, inNewPane) =>
+                pane.requestOpenAs(path, kind, inNewPane)
+            onOpenWithRequested: (path, scheme) =>
+                pane.requestOpenWith(path, scheme)
+            onMessageRequested: (message) => pane.messageRequested(message)
         }
     }
     Component { id: binaryComponent; ViewerBinaryView { url: pane.effectiveUrl } }

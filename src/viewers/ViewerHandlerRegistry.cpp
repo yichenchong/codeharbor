@@ -217,5 +217,85 @@ ViewerResolution ViewerHandlerRegistry::resolve(const QUrl &url)
 
     return ViewerResolution::Error;
 }
+QStringList ViewerHandlerRegistry::applicableViewKinds(const QUrl &url)
+{
+    const QString scheme = url.scheme().toLower();
+    if (scheme == QLatin1String("http") || scheme == QLatin1String("https"))
+        return {QStringLiteral("web")};
+
+    if (scheme != QLatin1String("file"))
+        return {};
+
+    const QString path = url.path();
+    if (path.endsWith(QLatin1Char('/')))
+        return {QStringLiteral("directory")};
+
+    const ViewerResolution resolution = resolve(url);
+    switch (resolution) {
+    case ViewerResolution::InternalHtmlRenderer:
+    case ViewerResolution::TextEditor: {
+        QStringList kinds = {QStringLiteral("editor"), QStringLiteral("text")};
+        // HTML is positively claimed by the editor, but it can also be shown
+        // as a rendered document through the privileged internal profile.
+        const QString ext = extensionOf(path);
+        if (ext == QLatin1String("html") || ext == QLatin1String("htm"))
+            kinds.append(QStringLiteral("web"));
+        return kinds;
+    }
+    case ViewerResolution::ImageViewer:
+        return {QStringLiteral("image")};
+    case ViewerResolution::PdfViewer:
+        return {QStringLiteral("pdf")};
+    case ViewerResolution::Download:
+        return {QStringLiteral("binary")};
+    case ViewerResolution::DirectWebNavigation:
+    case ViewerResolution::DirectoryViewer:
+    case ViewerResolution::Error:
+        return {};
+    }
+    return {};
+}
+
+bool ViewerHandlerRegistry::isValidApplicationScheme(const QString &scheme)
+{
+    if (scheme.isEmpty() || !((scheme.front() >= QLatin1Char('a')
+                               && scheme.front() <= QLatin1Char('z'))
+                              || (scheme.front() >= QLatin1Char('A')
+                                  && scheme.front() <= QLatin1Char('Z'))))
+        return false;
+
+    for (qsizetype i = 1; i < scheme.size(); ++i) {
+        const QChar c = scheme.at(i);
+        if (!((c >= QLatin1Char('a') && c <= QLatin1Char('z'))
+              || (c >= QLatin1Char('A') && c <= QLatin1Char('Z'))
+              || (c >= QLatin1Char('0') && c <= QLatin1Char('9'))
+              || c == QLatin1Char('+') || c == QLatin1Char('-')
+              || c == QLatin1Char('.')))
+            return false;
+    }
+
+    const QString lower = scheme.toLower();
+    return lower != QLatin1String("codeharbor-internal")
+           && lower != QLatin1String("http")
+           && lower != QLatin1String("https")
+           && lower != QLatin1String("file");
+}
+
+QUrl ViewerHandlerRegistry::applicationUrl(const QString &scheme,
+                                            const QString &remotePath)
+{
+    if (!isValidApplicationScheme(scheme) || remotePath.isEmpty())
+        return {};
+
+    // SECURITY: remotePath is server data and may contain spaces, '#', '?',
+    // percent signs, or even a string resembling another URL. setPath() treats
+    // it as ONE URL path and escapes delimiters; concatenating it after
+    // "<scheme>://" would let those characters become a query, fragment, or
+    // second scheme before the desktop handler receives the URL.
+    QUrl url;
+    url.setScheme(scheme);
+    url.setPath(remotePath, QUrl::DecodedMode);
+    return url;
+}
 
 } // namespace ch

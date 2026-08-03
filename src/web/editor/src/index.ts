@@ -107,6 +107,120 @@ export interface MountOptions {
     path?: string;
 }
 
+// The host pushes Theme.roles after the page loads. Keeping a complete,
+// validated default here is important for the short interval before that first
+// push and for standalone bundle tests that do not have a QML host at all.
+export type ThemeRoleName =
+    | "surface"
+    | "surfaceDeep"
+    | "surfaceSunken"
+    | "surfaceRaised"
+    | "surfaceHover"
+    | "surfaceSelected"
+    | "border"
+    | "borderSubtle"
+    | "text"
+    | "textDim"
+    | "textFaint"
+    | "textOnAccent"
+    | "accent"
+    | "success"
+    | "warning"
+    | "danger"
+    | "busy";
+
+export type EditorThemeRoles = Partial<Record<ThemeRoleName, string>>;
+
+const defaultThemeRoles: Record<ThemeRoleName, string> = {
+    surface: "#1e1e2e",
+    surfaceDeep: "#181825",
+    surfaceSunken: "#11111b",
+    surfaceRaised: "#313244",
+    surfaceHover: "#232338",
+    surfaceSelected: "#313244",
+    border: "#45475a",
+    borderSubtle: "#313244",
+    text: "#cdd6f4",
+    textDim: "#6c7086",
+    textFaint: "#45475a",
+    textOnAccent: "#11111b",
+    accent: "#89b4fa",
+    success: "#a6e3a1",
+    warning: "#f9e2af",
+    danger: "#f38ba8",
+    busy: "#cba6f7",
+};
+
+const themeRoleNames = Object.keys(defaultThemeRoles) as ThemeRoleName[];
+let activeThemeRoles: Record<ThemeRoleName, string> = { ...defaultThemeRoles };
+let mountedEditor: monaco.editor.IStandaloneCodeEditor | null = null;
+
+function isThemeColor(value: unknown): value is string {
+    return typeof value === "string" && /^#[0-9a-fA-F]{6}$/.test(value);
+}
+
+function normaliseThemeRoles(input: unknown): Record<ThemeRoleName, string> {
+    const candidate = input && typeof input === "object"
+        ? input as Record<string, unknown>
+        : {};
+    const next = { ...defaultThemeRoles };
+    for (const role of themeRoleNames) {
+        if (isThemeColor(candidate[role]))
+            next[role] = candidate[role];
+    }
+    return next;
+}
+
+function cssVariableName(role: ThemeRoleName): string {
+    return `--ch-${role.replace(/[A-Z]/g, (letter) => `-${letter.toLowerCase()}`)}`;
+}
+
+function defineMonacoTheme(roles: Record<ThemeRoleName, string>): void {
+    monaco.editor.defineTheme("codeharbor-dark", {
+        base: "vs-dark",
+        inherit: true,
+        rules: [],
+        colors: {
+            "editor.background": roles.surfaceSunken,
+            "editorGutter.background": roles.surfaceSunken,
+            "editorLineNumber.foreground": roles.textFaint,
+            "editorLineNumber.activeForeground": roles.text,
+            "minimap.background": roles.surfaceSunken,
+            "scrollbarSlider.background": roles.border,
+            "scrollbarSlider.hoverBackground": roles.textDim,
+            "scrollbarSlider.activeBackground": roles.accent,
+            "minimapSlider.background": roles.borderSubtle,
+            "minimapSlider.hoverBackground": roles.border,
+            "minimapSlider.activeBackground": roles.textDim,
+        },
+    });
+    if (mountedEditor)
+        monaco.editor.setTheme("codeharbor-dark");
+}
+
+declare global {
+    interface Window {
+        applyTheme?: (roles: unknown) => void;
+    }
+}
+
+/**
+ * Apply the host's Theme.roles object to both the page CSS and Monaco. The
+ * input is intentionally validated role-by-role: a malformed handoff must
+ * preserve a readable editor instead of turning one bad value into a blank
+ * surface or an invalid CSS declaration.
+ */
+export function applyTheme(roles: unknown): void {
+    activeThemeRoles = normaliseThemeRoles(roles);
+    const root = document.documentElement;
+    for (const role of themeRoleNames)
+        root.style.setProperty(cssVariableName(role), activeThemeRoles[role]);
+    defineMonacoTheme(activeThemeRoles);
+}
+
+window.applyTheme = applyTheme;
+applyTheme(defaultThemeRoles);
+
 /**
  * Resolve a Monaco language id for the pane's remote path from the live
  * registration list. The precedence rule (exact filename beats extension) and
@@ -161,34 +275,11 @@ export function mountEditor(
     element.appendChild(editorEl);
 
     // Monaco does NOT use browser scrollbars for the editor: it draws its own,
-    // sized by these options and coloured by the theme's scrollbarSlider colours
-    // (defined in "codeharbor-dark" below). The page's stylesheet
-    // (../index.html) covers only the scrollbars Chromium draws, so both halves
-    // are needed for a pane with no foreign-looking scrollbar left in it.
-    monaco.editor.defineTheme("codeharbor-dark", {
-        // Inherit vs-dark's ~hundreds of syntax rules and widget colours; only
-        // the surfaces and the scrollbar are restated, so the editor stops being
-        // a lighter grey rectangle inside a Catppuccin window.
-        base: "vs-dark",
-        inherit: true,
-        rules: [],
-        // COLOUR MIRROR: these are copies of roles in src/qml/Theme.qml, which
-        // cannot be imported into a web page. Keep them in step by hand, together
-        // with the stylesheet in ../index.html.
-        colors: {
-            "editor.background": "#11111b",                  // surfaceSunken
-            "editorGutter.background": "#11111b",             // surfaceSunken
-            "editorLineNumber.foreground": "#45475a",         // textFaint
-            "editorLineNumber.activeForeground": "#cdd6f4",   // text
-            "minimap.background": "#11111b",                  // surfaceSunken
-            "scrollbarSlider.background": "#45475a",          // border
-            "scrollbarSlider.hoverBackground": "#6c7086",     // textDim
-            "scrollbarSlider.activeBackground": "#89b4fa",    // accent
-            "minimapSlider.background": "#313244",            // borderSubtle
-            "minimapSlider.hoverBackground": "#45475a",       // border
-            "minimapSlider.activeBackground": "#6c7086",      // textDim
-        },
-    });
+    // sized by these options and coloured by the active theme's
+    // scrollbarSlider roles. The page's stylesheet (../index.html) covers only
+    // the scrollbars Chromium draws, so both halves are needed for a pane with
+    // no foreign-looking scrollbar left in it.
+    defineMonacoTheme(activeThemeRoles);
 
     const editor = monaco.editor.create(editorEl, {
         value: "",
@@ -215,6 +306,7 @@ export function mountEditor(
             useShadows: false,
         },
     });
+    mountedEditor = editor;
 
     // The revision the current buffer was loaded (or last saved) at; every save
     // is guarded by it (SPEC 8.4/8.6). Empty until the first contentLoaded.
@@ -434,7 +526,11 @@ export function mountEditor(
     // a flush here would call getValue() on a dead model. This handler exists so
     // that a host disposing the editor directly (not through the returned host)
     // at least does not leave a timer that would fire on that dead editor.
-    editor.onDidDispose(() => reporter.cancel());
+    editor.onDidDispose(() => {
+        reporter.cancel();
+        if (mountedEditor === editor)
+            mountedEditor = null;
+    });
 
     // The file state and read-only flag reached before this page finished
     // loading are already in the property cache, so the label and the editor's

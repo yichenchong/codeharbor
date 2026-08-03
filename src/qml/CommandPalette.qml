@@ -266,7 +266,7 @@ Item {
             placeholderText: qsTr("Type a command\u2026")
             // #585b70 is a step between Theme.textDim and Theme.textFaint and
             // has no Theme role.
-            placeholderTextColor: "#585b70"
+            placeholderTextColor: Theme.textPlaceholder()
             color: Theme.text
             selectByMouse: true
             leftPadding: 12

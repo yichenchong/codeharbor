@@ -12,7 +12,7 @@
 -- Indexes need no version gate anyway. They hold no data, change no row, and
 -- every statement below is idempotent, so openWorkspace() executes this file on
 -- EVERY open. That is what actually makes an existing database gain them, and it
--- costs four no-op statements per connection once they exist.
+-- costs five no-op statements per connection once they exist.
 --
 -- Each index covers a column that only ever appears as an equality lookup or a
 -- join key in Workspace's queries (listing a group's sessions, a session's
@@ -23,6 +23,13 @@ CREATE INDEX IF NOT EXISTS idx_groups_server_id
 
 CREATE INDEX IF NOT EXISTS idx_dev_sessions_group_id
     ON dev_sessions (group_id);
+-- The sidebar's optional pinned-only listing filters by both group and pinned
+-- state. Keep the group-only index above for the unfiltered listing and use
+-- this composite index for the filtered path; the latter is client-local UI
+-- state, but the server still avoids scanning every session when asked for the
+-- current view.
+CREATE INDEX IF NOT EXISTS idx_dev_sessions_group_pinned
+    ON dev_sessions (group_id, pinned);
 
 CREATE INDEX IF NOT EXISTS idx_viewer_panes_dev_session_id
     ON viewer_panes (dev_session_id);

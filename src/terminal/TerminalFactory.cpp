@@ -79,6 +79,15 @@ TerminalController* TerminalFactory::create(QObject* owner)
                                         "Try Retry.")
                              .arg(waited, target));
     });
+    connect(controller, &TerminalController::stateChanged, this,
+            [this, controller](TerminalState state) {
+                const auto it = m_attached.constFind(controller);
+                if (it == m_attached.constEnd() || it->serverId.isEmpty()
+                    || it->devSessionId.isEmpty() || it->terminalId.isEmpty())
+                    return;
+                emit terminalStateChanged(it->serverId, it->devSessionId,
+                                           it->terminalId, state);
+            });
 
     return controller;
 }
@@ -124,18 +133,37 @@ void TerminalFactory::setAgentMonitor(AgentStatusMonitor* monitor)
 
 void TerminalFactory::beginResolution(TerminalController* controller, const QString& key)
 {
-    Attachment& entry = entryFor(controller);
-    if (entry.pendingResolveKey == key)
+    entryFor(controller);
+    auto it = m_attached.find(controller);
+    if (it == m_attached.end() || it->pendingResolveKey == key)
         return;
-    entry.pendingResolveKey = key;
+    it->pendingResolveKey = key;
     // A DIFFERENT key means the pane has been pointed at another terminal. Its
     // old channel may still be open and printing, and those bytes are no longer
     // attributable: not to the terminal the pane has left, and not to the one
     // whose answer has not arrived. Reporting stops until the new answer lands.
-    QObject::disconnect(entry.outputConnection);
-    entry.outputConnection = {};
-    entry.devSessionId.clear();
-    entry.terminalId.clear();
+    const QString oldServerId = it->serverId;
+    const QString oldDevSessionId = it->devSessionId;
+    const QString oldTerminalId = it->terminalId;
+    if (!oldServerId.isEmpty() && !oldDevSessionId.isEmpty()
+        && !oldTerminalId.isEmpty()) {
+        emit terminalStateChanged(oldServerId, oldDevSessionId, oldTerminalId,
+                                  TerminalState::Unloaded);
+    }
+    // The signal above is deliberately allowed to re-enter QML. Re-find the
+    // entry and only clear the identity if the same request still owns it; a
+    // re-entrant retarget may already have installed a newer identity.
+    it = m_attached.find(controller);
+    if (it == m_attached.end() || it->pendingResolveKey != key
+        || it->serverId != oldServerId || it->devSessionId != oldDevSessionId
+        || it->terminalId != oldTerminalId) {
+        return;
+    }
+    QObject::disconnect(it->outputConnection);
+    it->outputConnection = {};
+    it->serverId.clear();
+    it->devSessionId.clear();
+    it->terminalId.clear();
 }
 
 void TerminalFactory::clearAgentIdentity(TerminalController* controller)
@@ -143,11 +171,26 @@ void TerminalFactory::clearAgentIdentity(TerminalController* controller)
     auto it = m_attached.find(controller);
     if (it == m_attached.end())
         return;
+    const QString oldServerId = it->serverId;
+    const QString oldDevSessionId = it->devSessionId;
+    const QString oldTerminalId = it->terminalId;
+    if (!oldServerId.isEmpty() && !oldDevSessionId.isEmpty()
+        && !oldTerminalId.isEmpty()) {
+        emit terminalStateChanged(oldServerId, oldDevSessionId, oldTerminalId,
+                                  TerminalState::Unloaded);
+    }
+    it = m_attached.find(controller);
+    if (it == m_attached.end() || it->serverId != oldServerId
+        || it->devSessionId != oldDevSessionId || it->terminalId != oldTerminalId) {
+        return;
+    }
     QObject::disconnect(it->outputConnection);
     it->outputConnection = {};
+    it->serverId.clear();
     it->devSessionId.clear();
     it->terminalId.clear();
 }
+
 
 void TerminalFactory::bindAgentIdentity(TerminalController* controller,
                                         const QString& devSessionId,
@@ -157,7 +200,13 @@ void TerminalFactory::bindAgentIdentity(TerminalController* controller,
     if (!controller || devSessionId.isEmpty() || terminalId.isEmpty())
         return;
     Attachment& entry = entryFor(controller);
-    if (entry.devSessionId != devSessionId || entry.terminalId != terminalId) {
+    const bool identityChanged = entry.serverId != m_serverId
+        || entry.devSessionId != devSessionId || entry.terminalId != terminalId;
+    if (identityChanged) {
+        // beginResolution() already published Unloaded for an identity it
+        // replaced. Keeping this branch free of another signal is deliberate:
+        // terminalStateChanged may re-enter QML and invalidate m_attached
+        // references while this bind is still installing its new identity.
         // Torn down and re-made rather than re-pointed. Re-pointing alone would
         // be enough for the forwarding below, which re-reads the identity on
         // every batch, but the connection is what carries the identity's
@@ -165,6 +214,7 @@ void TerminalFactory::bindAgentIdentity(TerminalController* controller,
         // reporting each batch twice.
         QObject::disconnect(entry.outputConnection);
         entry.outputConnection = {};
+        entry.serverId = m_serverId;
         entry.devSessionId = devSessionId;
         entry.terminalId = terminalId;
     }
@@ -197,6 +247,13 @@ void TerminalFactory::bindAgentIdentity(TerminalController* controller,
     // eviction. setTerminalHarness is idempotent, so both running costs nothing.
     if (m_agentMonitor)
         m_agentMonitor->setTerminalHarness(devSessionId, terminalId, harness);
+    if (identityChanged) {
+        const auto it = m_attached.constFind(controller);
+        if (it != m_attached.constEnd() && !it->serverId.isEmpty()) {
+            emit terminalStateChanged(it->serverId, it->devSessionId, it->terminalId,
+                                      controller->state());
+        }
+    }
 }
 
 QString TerminalFactory::tmuxKillSessionCommand(const QString& target)
@@ -237,6 +294,13 @@ void TerminalFactory::setServerId(const QString& serverId)
 {
     if (m_serverId == serverId)
         return;
+    // Controllers can outlive the QML pane that is being replaced during a
+    // profile switch. Remove their old server identity before changing the
+    // factory's current id, so late stateChanged signals cannot be relabelled
+    // as belonging to the new server.
+    const QList<QObject*> controllers = m_attached.keys();
+    for (QObject* object : controllers)
+        clearAgentIdentity(static_cast<TerminalController*>(object));
     m_serverId = serverId;
     // A remembered answer names rows on a SERVER — the tmux target AND the
     // `terminal_panes` row id the pane reports its agent state under. Carrying

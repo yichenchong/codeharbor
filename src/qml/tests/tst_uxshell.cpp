@@ -232,12 +232,18 @@ public:
         emit visibilityChanged();
     }
 
+    Q_INVOKABLE bool startSystemMove()
+    {
+        ++m_moveCalls;
+        m_moveVisibility = m_visibility;
+        return true;
+    }
+
     Q_INVOKABLE void close() { ++m_closeCalls; }
-    // The bar calls this on a drag; it must exist or the drag would raise a
-    // TypeError the warning net would then report.
-    Q_INVOKABLE bool startSystemMove() { return true; }
 
     int closeCalls() const { return m_closeCalls; }
+    int moveCalls() const { return m_moveCalls; }
+    int moveVisibility() const { return m_moveVisibility; }
 
 signals:
     void visibilityChanged();
@@ -245,6 +251,30 @@ signals:
 private:
     int m_visibility = int(QWindow::Windowed);
     int m_closeCalls = 0;
+    int m_moveCalls = 0;
+    int m_moveVisibility = int(QWindow::Windowed);
+};
+
+class StubNativeHelper : public QObject
+{
+    Q_OBJECT
+
+public:
+    Q_INVOKABLE void registerMaximizeButton(QObject *window, QObject *button)
+    {
+        ++m_registerCalls;
+        m_window = window;
+        m_button = button;
+    }
+
+    int registerCalls() const { return m_registerCalls; }
+    QObject *window() const { return m_window; }
+    QObject *button() const { return m_button; }
+
+private:
+    int m_registerCalls = 0;
+    QObject *m_window = nullptr;
+    QObject *m_button = nullptr;
 };
 
 namespace {
@@ -642,6 +672,7 @@ private slots:
     // window has become unusable in a way no other test would notice.
     void titleBarMaximiseButtonTogglesTheWindowState();
     void titleBarButtonsAreNamedAndCloseIsWired();
+    void titleBarDragUsesTheSystemMoveOperation();
 
     // The one control in the sheet that WRITES to the server: it has to be
     // wired to a profile and, like Connect, unreachable behind a prompt.
@@ -1101,6 +1132,67 @@ void TstUxShell::titleBarMaximiseButtonTogglesTheWindowState()
     QVERIFY(QMetaObject::invokeMethod(bar, "toggleMaximised"));
     settle(60);
     QCOMPARE(stub.visibility(), int(QWindow::Maximized));
+
+    // Drive the real pointer gesture as well: the drag threshold must not turn
+    // an ordinary double-click into a move operation.
+    stub.setVisibility(int(QWindow::Windowed));
+    QTest::mouseDClick(&surface.view, Qt::LeftButton, Qt::NoModifier, QPoint(120, 15));
+    settle(60);
+    QCOMPARE(stub.visibility(), int(QWindow::Maximized));
+    QTest::mouseDClick(&surface.view, Qt::LeftButton, Qt::NoModifier, QPoint(120, 15));
+    settle(60);
+    QCOMPARE(stub.visibility(), int(QWindow::Windowed));
+
+    QVERIFY2(surface.warnings.isEmpty(), qPrintable(surface.warningReport()));
+}
+
+void TstUxShell::titleBarDragUsesTheSystemMoveOperation()
+{
+    StubWindow stub;
+    StubNativeHelper helper;
+    Surface surface(titleBarHarness(), QSize(640, 120), QStringLiteral("stubWindow"), &stub);
+    QVERIFY2(surface.root(), qPrintable(surface.componentError()));
+    QVERIFY(surface.expose());
+    settle(60);
+
+    QObject *bar = surface.child(QStringLiteral("titleBar"));
+    QVERIFY(bar);
+    bar->setProperty("nativeHelper",
+                     QVariant::fromValue(static_cast<QObject *>(&helper)));
+    settle(20);
+    QCOMPARE(helper.registerCalls(), 1);
+    QCOMPARE(helper.window(), static_cast<QObject *>(&stub));
+    QVERIFY(helper.button());
+    QCOMPARE(helper.button()->objectName(), QStringLiteral("maximiseButton"));
+
+    const QPoint start(120, 15);
+    QTest::mousePress(&surface.view, Qt::LeftButton, Qt::NoModifier, start);
+    QTest::mouseMove(&surface.view, start + QPoint(2, 0));
+    settle(20);
+    QCOMPARE(stub.moveCalls(), 0);
+
+    // The first movement beyond Qt's drag threshold must hand the pointer to
+    // the window manager, rather than changing Window.x/y from QML. The stub
+    // records the call because the offscreen platform cannot perform a native
+    // move itself.
+    QTest::mouseMove(&surface.view, start + QPoint(40, 0));
+    settle(60);
+    QCOMPARE(stub.moveCalls(), 1);
+    QCOMPARE(stub.moveVisibility(), int(QWindow::Windowed));
+    QTest::mouseRelease(&surface.view, Qt::LeftButton, Qt::NoModifier,
+                        start + QPoint(40, 0));
+
+    // A maximised window must be restored before the same system move begins;
+    // otherwise the platform has no window rectangle it can move.
+    stub.setVisibility(int(QWindow::Maximized));
+    QTest::mousePress(&surface.view, Qt::LeftButton, Qt::NoModifier, start);
+    QTest::mouseMove(&surface.view, start + QPoint(40, 0));
+    settle(60);
+    QCOMPARE(stub.moveCalls(), 2);
+    QCOMPARE(stub.moveVisibility(), int(QWindow::Windowed));
+    QCOMPARE(stub.visibility(), int(QWindow::Windowed));
+    QTest::mouseRelease(&surface.view, Qt::LeftButton, Qt::NoModifier,
+                        start + QPoint(40, 0));
 
     QVERIFY2(surface.warnings.isEmpty(), qPrintable(surface.warningReport()));
 }

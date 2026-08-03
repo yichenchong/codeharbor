@@ -241,6 +241,16 @@ set_tests_properties(tst_coldstart PROPERTIES
     ENVIRONMENT "QT_QPA_PLATFORM=offscreen;QT_QUICK_BACKEND=software;QTWEBENGINE_CHROMIUM_FLAGS=--disable-gpu --no-sandbox --disable-dev-shm-usage"
     TIMEOUT 900
 )
+
+# Bounded client/remote diagnostics: caps, handler chaining, filters and the
+# destruction race around Qt's process-wide message callback.
+qt_add_executable(tst_logbuffer tst_logbuffer.cpp)
+target_link_libraries(tst_logbuffer PRIVATE
+    ch_app
+    Qt6::Test
+    Qt6::Core
+)
+add_test(NAME tst_logbuffer COMMAND tst_logbuffer)
 # Console-mode on Windows for every plain QTest target here. qt_add_executable
 # marks executables as GUI subsystem, which on Windows swallows QTest's stdout
 # and stderr — a failing assertion then reports nothing at all through ctest.
@@ -249,6 +259,7 @@ set_tests_properties(tst_coldstart PROPERTIES
 if(WIN32)
     set_target_properties(
         tst_appcontroller
+        tst_logbuffer
         tst_notifier
         tst_notifierlive
         tst_sessionbootstrap

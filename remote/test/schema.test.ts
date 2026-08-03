@@ -103,6 +103,38 @@ test("schema_version seeds a single row at WORKSPACE_SCHEMA_VERSION, idempotentl
     assert.equal(count.n, 1);
     db.close();
 });
+test("dev_sessions carries a durable pin bit defaulting to false", () => {
+    const db = loadSchema();
+    const columns = db
+        .prepare("SELECT name, dflt_value, \"notnull\" AS nn FROM pragma_table_info('dev_sessions')")
+        .all() as Array<{ name: string; dflt_value: string | null; nn: number }>;
+    const pinned = columns.find((column) => column.name === "pinned");
+    assert.equal(pinned?.name, "pinned");
+    assert.equal(pinned?.dflt_value, "0");
+    assert.equal(pinned?.nn, 1);
+
+    db.exec(
+        "INSERT INTO groups (id, server_id, name, position, collapsed, created_at, updated_at) VALUES ('g', 's', 'G', 0, 0, 1, 1)",
+    );
+    db.exec(
+        "INSERT INTO dev_sessions (id, server_id, group_id, name, repository_root, position, archived, created_at, updated_at) VALUES ('d1', 's', 'g', 'S1', '/r', 0, 0, 1, 1)",
+    );
+    db.exec(
+        "INSERT INTO dev_sessions (id, server_id, group_id, name, repository_root, position, archived, pinned, created_at, updated_at) VALUES ('d2', 's', 'g', 'S2', '/r', 1, 0, 1, 1, 1)",
+    );
+    const rows = db
+        .prepare("SELECT id, pinned FROM dev_sessions ORDER BY id")
+        .all() as Array<{ id: string; pinned: number }>;
+    assert.deepEqual(
+        rows.map((row) => ({ id: row.id, pinned: row.pinned })),
+        [
+            { id: "d1", pinned: 0 },
+            { id: "d2", pinned: 1 },
+        ],
+    );
+    db.close();
+});
+
 
 test("every domain table carries server_id (SPEC 3.5)", () => {
     const db = loadSchema();

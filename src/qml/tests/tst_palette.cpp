@@ -90,6 +90,45 @@ private:
     QStringList m_order;
 };
 
+class ThemeSettingsProbe : public QObject
+{
+    Q_OBJECT
+    Q_PROPERTY(QString theme READ theme WRITE setTheme NOTIFY themeChanged)
+
+public:
+    QString theme() const { return m_theme; }
+    void setTheme(const QString &theme)
+    {
+        if (m_theme == theme)
+            return;
+        m_theme = theme;
+        emit themeChanged();
+    }
+
+signals:
+    void themeChanged();
+
+private:
+    QString m_theme = QStringLiteral("dark");
+};
+
+class ThemeAppProbe : public QObject
+{
+    Q_OBJECT
+    Q_PROPERTY(QObject *settings READ settings CONSTANT)
+
+public:
+    explicit ThemeAppProbe(ThemeSettingsProbe *settings)
+        : m_settings(settings)
+    {
+    }
+
+    QObject *settings() const { return m_settings; }
+
+private:
+    ThemeSettingsProbe *m_settings = nullptr;
+};
+
 namespace {
 
 // The command set used by every test but the empty-list one. Chosen so the
@@ -375,6 +414,7 @@ private slots:
     // The module's colour vocabulary. Both of these fail for the same underlying
     // reason a mis-registered singleton would, which is why they live together.
     void themeSingletonPublishesEveryColourRole();
+    void themeSwitchChangesRole();
     void noQmlFileSpellsOutAThemeColour();
 
     // RemotePath.js: the module's one conversion between a remote POSIX path and
@@ -712,6 +752,35 @@ void TstPalette::themeSingletonPublishesEveryColourRole()
         QVERIFY2(roles.value(role).isValid(),
                  qPrintable(QStringLiteral("Theme.%1 is not a valid colour").arg(role)));
     }
+}
+
+void TstPalette::themeSwitchChangesRole()
+{
+    ThemeSettingsProbe settings;
+    ThemeAppProbe appProbe(&settings);
+    QQmlEngine engine;
+    engine.rootContext()->setContextProperty(QStringLiteral("app"), &appProbe);
+
+    QQmlComponent component(&engine);
+    component.setData(QByteArrayLiteral("import QtQuick\n"
+                                        "import CodeHarbor\n"
+                                        "QtObject {\n"
+                                        "    property color surface: Theme.surface\n"
+                                        "    property string themeName: Theme.themeName\n"
+                                        "}\n"),
+                      QUrl(QStringLiteral("qrc:/chtest/ThemeSwitchProbe.qml")));
+    const std::unique_ptr<QObject> probe(component.create());
+    QVERIFY2(probe != nullptr, qPrintable(component.errorString()));
+
+    const QColor dark = probe->property("surface").value<QColor>();
+    QCOMPARE(dark, QColor(QStringLiteral("#1e1e2e")));
+    QCOMPARE(probe->property("themeName").toString(), QStringLiteral("dark"));
+
+    settings.setTheme(QStringLiteral("light"));
+    QTRY_COMPARE(probe->property("surface").value<QColor>(),
+                 QColor(QStringLiteral("#eff1f5")));
+    QCOMPARE(probe->property("themeName").toString(), QStringLiteral("light"));
+    QVERIFY(dark != probe->property("surface").value<QColor>());
 }
 
 // Colour drift gate. A hex literal that spells out a colour Theme already names is

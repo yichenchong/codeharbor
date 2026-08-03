@@ -37,6 +37,7 @@ struct GroupRow {
 
 class SessionsModel : public QAbstractItemModel {
     Q_OBJECT
+    Q_PROPERTY(bool pinnedOnly READ pinnedOnly WRITE setPinnedOnly NOTIFY pinnedOnlyChanged)
 
 public:
     enum Roles {
@@ -47,12 +48,19 @@ public:
         CollapsedRole,               // group collapsed flag, groups only
         IdRole,                      // ch id string of the row (group or session)
         GroupIdRole,                 // containing group's id (own id for groups)
+        PinnedRole,                  // workspace-owned session pin state
     };
 
     explicit SessionsModel(QObject *parent = nullptr);
 
     // Replace the entire sidebar contents.
     void setGroups(QVector<GroupRow> groups);
+
+    // Whether the model exposes only pinned sessions and groups containing one.
+    // This is a client-local presentation choice; the source rows remain intact
+    // so switching the filter does not require another server read.
+    bool pinnedOnly() const { return pinnedOnly_; }
+    void setPinnedOnly(bool pinnedOnly);
 
     // Incrementally refresh live per-terminal agent/connection state WITHOUT a
     // full model reset. `groups` must mirror the current structure (same group
@@ -77,9 +85,17 @@ public:
     int columnCount(const QModelIndex &parent = QModelIndex()) const override;
     QVariant data(const QModelIndex &index, int role = Qt::DisplayRole) const override;
     QHash<int, QByteArray> roleNames() const override;
+signals:
+    void pinnedOnlyChanged();
 
 private:
+    // Keep the authoritative refresh result separate from the filtered view:
+    // toggling a client-local filter must not discard unpinned rows that should
+    // reappear when the filter is turned off.
+    QVector<GroupRow> allGroups_;
     QVector<GroupRow> groups_;
-};
+    bool pinnedOnly_ = false;
 
+
+};
 } // namespace ch

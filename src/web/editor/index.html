@@ -22,18 +22,28 @@
 <title>CodeHarbor Editor</title>
 <link rel="stylesheet" href="editor.css">
 <style>
-    /* COLOUR MIRROR: every colour in this stylesheet is a copy of a role in
-       src/qml/Theme.qml, which is the application's one colour vocabulary. There
-       is no import path from QML into a web page, so the two must be edited
-       TOGETHER — a change to Theme.qml that is not reflected here leaves this
-       page in the old palette. The role each literal stands for is named beside
-       it. The same values appear once more in src/web/terminal/index.html and in
-       the "codeharbor-dark" Monaco theme in src/index.ts. */
+    /* COLOUR MIRROR: these variables are the roles published by
+       src/qml/Theme.qml. The values below are the standalone dark fallback;
+       EditorPaneView calls window.applyTheme(Theme.roles) after the page loads
+       and again when the user's appearance setting changes. Keeping defaults
+       here means a page never flashes an unstyled white document and remains
+       usable in a standalone bundle test without a QML host. */
+    :root {
+        --ch-surface-sunken: #11111b;
+        --ch-surface-deep: #181825;
+        --ch-surface-raised: #313244;
+        --ch-border: #45475a;
+        --ch-border-subtle: #313244;
+        --ch-text: #cdd6f4;
+        --ch-text-dim: #6c7086;
+        --ch-accent: #89b4fa;
+        --ch-warning: #f9e2af;
+    }
     html, body { height: 100%; margin: 0; padding: 0; overflow: hidden; }
     /* surfaceSunken / text: the same pair the terminal page uses, so an editor
        pane and a terminal pane read as the same application rather than as a
        terminal beside a transplanted VS Code. */
-    body { background: #11111b; color: #cdd6f4; }
+    body { background: var(--ch-surface-sunken); color: var(--ch-text); }
     /* Column layout: a thin status strip above a surface that takes all
        remaining height. Monaco lays itself out from the surface's box, so that
        box needs a definite height — hence flex:1 + min-height:0. The script
@@ -46,15 +56,15 @@
         align-items: center;
         gap: 8px;
         padding: 2px 8px;
-        background: #181825;              /* surfaceDeep */
-        border-bottom: 1px solid #313244; /* borderSubtle */
-        color: #cdd6f4;                   /* text */
+        background: var(--ch-surface-deep);
+        border-bottom: 1px solid var(--ch-border-subtle);
+        color: var(--ch-text);
         font: 12px/1.6 system-ui, sans-serif;
     }
     /* Pushed to the far end of the strip; shown by the script as display:flex.
        The notice only ever appears for a FAILED save (conflict or error), so it
        carries Theme.warning as its text colour. */
-    .ch-editor-notice { margin-left: auto; gap: 6px; align-items: center; color: #f9e2af; }
+    .ch-editor-notice { margin-left: auto; gap: 6px; align-items: center; color: var(--ch-warning); }
     /* Without these the Reload / Overwrite / Retry buttons the script creates
        fall back to Chromium's native button chrome — a light grey slab with a
        bevel, on a dark status strip, in an application that styles every other
@@ -62,15 +72,15 @@
        page mirrors. */
     .ch-editor-notice button {
         font: inherit;
-        color: #cdd6f4;                 /* text */
-        background: #313244;            /* surfaceRaised */
-        border: 1px solid #45475a;      /* border */
+        color: var(--ch-text);
+        background: var(--ch-surface-raised);
+        border: 1px solid var(--ch-border);
         border-radius: 4px;             /* radiusSmall */
         padding: 0 8px;
         cursor: pointer;
     }
-    .ch-editor-notice button:hover { background: #45475a; }        /* border */
-    .ch-editor-notice button:focus-visible { outline: 1px solid #89b4fa; } /* accent */
+    .ch-editor-notice button:hover { background: var(--ch-border); }
+    .ch-editor-notice button:focus-visible { outline: 1px solid var(--ch-accent); }
     .ch-editor-surface { flex: 1 1 auto; min-height: 0; }
 
     /* ---- scrollbars ----------------------------------------------------
@@ -95,10 +105,10 @@
     ::-webkit-scrollbar-track { background: transparent; }
     ::-webkit-scrollbar-corner { background: transparent; }
     ::-webkit-scrollbar-thumb {
-        background: #45475a;  /* border */
+        background: var(--ch-border);
         border-radius: 4px;   /* radiusSmall */
     }
-    ::-webkit-scrollbar-thumb:hover { background: #6c7086; } /* textDim */
+    ::-webkit-scrollbar-thumb:hover { background: var(--ch-text-dim); }
 </style>
 </head>
 <body>

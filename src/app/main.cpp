@@ -10,6 +10,8 @@
 #include "EditorFactory.h"
 #include "TerminalFactory.h"
 #include "Notifier.h"
+#include "GroupPaletteService.h"
+#include "WindowChromeNative.h"
 
 #include <QGuiApplication>
 #include <QQmlApplicationEngine>
@@ -129,6 +131,7 @@ int main(int argc, char *argv[])
     // Registering the factory afterwards left the recoveryDir handoff racing
     // that response.
     appController.setEditorFactory(&editorFactory);
+    appController.setTerminalFactory(&terminalFactory);
 
     // A normal desktop launch stays server-less: this returns immediately unless
     // CH_LIVE_SSH is set (with CH_LIVE_HOST/PORT/USER/NODE/REPO), so the UI still
@@ -149,6 +152,18 @@ int main(int argc, char *argv[])
     QObject::connect(&agentMonitor, &ch::AgentStatusMonitor::notify, &notifier,
                      &ch::Notifier::notify);
 
+    // GroupPaletteService is a pure deterministic colour service, but QML
+    // needs one long-lived instance to cache the expanded palette and each
+    // name's index. It is declared above the engine so every binding sees a
+    // live object until the engine has finished destroying those bindings.
+
+    // Windows' frameless shell needs its native snap styles and maximise
+    // hit-test bridge. The helper is a no-op elsewhere, but it still follows
+    // the same lifetime rule as every object exposed to QML.
+    ch::WindowChromeNative windowChrome;
+    ch::GroupPaletteService groupPalette;
+
+
     // The engine is declared LAST, so it is destroyed FIRST. That is load
     // bearing, not stylistic: every context property below is a stack object in
     // this scope, and a QML binding re-evaluated against one of them after it
@@ -165,6 +180,8 @@ int main(int argc, char *argv[])
     // publishing either one again as a root context property would advertise a
     // second, unread way into the same object and invite bindings to it.
     engine.rootContext()->setContextProperty(QStringLiteral("app"), &appController);
+    engine.rootContext()->setContextProperty(QStringLiteral("groupPalette"), &groupPalette);
+    engine.rootContext()->setContextProperty(QStringLiteral("windowChrome"), &windowChrome);
     engine.rootContext()->setContextProperty(QStringLiteral("viewers"), &viewers);
     engine.rootContext()->setContextProperty(QStringLiteral("agentMonitor"), &agentMonitor);
     engine.rootContext()->setContextProperty(QStringLiteral("editorFactory"), &editorFactory);

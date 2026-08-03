@@ -22,6 +22,14 @@ ItemDelegate {
                                      && host.currentId === header.itemId
     readonly property bool dragging: host !== null && host.dragItem === header
 
+    // A missing palette service has the same meaning as the "plain" palette:
+    // this delegate remains usable in a headless harness and keeps today's
+    // un-tinted text instead of treating a missing object as black.
+    readonly property color groupTint:
+        host !== null && host.groupColorFor !== undefined
+            ? host.groupColorFor(header.name, host.groupPaletteName, host.groupPaletteSize)
+            : Theme.text
+
     objectName: "groupHeader:" + itemId
 
     Component.onCompleted: if (host) host.registerHeader(header)
@@ -58,10 +66,9 @@ ItemDelegate {
                                              : qsTr("Expanded group")
 
     background: Rectangle {
-        // The selected wash is a shade between Theme.surfaceDeep and
-        // Theme.surfaceRaised that the theme has no role for yet, so it stays a
-        // literal here rather than becoming a silent colour change.
-        color: header.selected ? "#2a2a40" : Theme.surfaceDeep
+        // This is presentation-only rather than a public role, but it still
+        // follows the active theme so light mode does not retain a dark wash.
+        color: header.selected ? Theme.groupSelectedSurface() : Theme.surfaceDeep
         opacity: header.dragging ? 0.4 : 1.0
 
         // Keyboard focus ring. The selected wash alone is a 10% lightness step
@@ -93,7 +100,9 @@ ItemDelegate {
         }
         Label {
             text: header.name
-            color: Theme.text
+            // The tint is derived from this group's own name. Plain/unknown
+            // palettes return Theme.text, preserving the historical pixels.
+            color: header.groupTint
             font.bold: true
             font.pixelSize: Theme.fontSizeLabel
             elide: Text.ElideRight

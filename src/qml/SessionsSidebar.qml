@@ -8,7 +8,7 @@ import QtQuick.Layouts
 // app.sessionsModel (a two-level QAbstractItemModel) via a nested DelegateModel:
 // the top level renders GroupHeader rows, each of which nests its group's
 // SessionRow children (hidden while the group is collapsed). Role names
-// consumed: name, subtitle, rowState, collapsed, itemId, groupId.
+// consumed: name, subtitle, rowState, pinned, collapsed, itemId, groupId.
 //
 // Drag-and-drop contract (SPEC 4.2): the sidebar NEVER reorders the model
 // itself. A drop calls the matching app.* invokable with the INDEX/ordering the
@@ -34,13 +34,39 @@ Rectangle {
     property bool currentIsGroup: false
     // Last selected Dev Session; drives the row highlight.
     property string selectedSessionId: ""
-
+    // Client-local presentation filter. The pinned bit on each session comes
+    // from the server, but whether to hide unpinned rows belongs to this
+    // sidebar and is persisted by UiStateStore.
+    property bool pinnedOnly:
+        (app && app.uiState && typeof app.uiState.pinnedOnly === "function")
+            ? app.uiState.pinnedOnly() : false
+    property bool pinFilterReady: false
     // Live drag state, read by the delegates for their drag affordances.
     property string dragKind: "" // "", "session" or "group"
     property var dragItem: null  // the SessionRow / GroupHeader being dragged
     property var dropTarget: null // {groupId,index[,append]} | {index} | null
 
     activeFocusOnTab: true
+
+    // Palette preferences are read here so the header binding depends on the
+    // settings' NOTIFY signals. The groupPalette service itself is optional in
+    // small QML harnesses; its absence follows the same plain-palette rule as
+    // an unknown palette name.
+    readonly property string groupPaletteName:
+        (app && app.settings && app.settings.groupPalette !== undefined)
+            ? String(app.settings.groupPalette) : "plain"
+    readonly property int groupPaletteSize:
+        (app && app.settings && app.settings.groupPaletteSize !== undefined)
+            ? Number(app.settings.groupPaletteSize) : 5
+
+    function groupColorFor(name, paletteName, paletteSize) {
+        if (paletteName !== "tokyonight")
+            return Theme.text;
+        if (typeof groupPalette === "undefined" || !groupPalette)
+            return Theme.text;
+        return Theme.groupTextColor(
+                    groupPalette.colorFor(String(name), paletteName, Number(paletteSize)));
+    }
 
     // ---------------------------------------------------------------------
     // Link state
@@ -78,9 +104,9 @@ Rectangle {
         case "provisioning":
         case "hostkey": return Theme.warning;
         // "Reconnecting" needs to read as worse than "connecting" but not as
-        // final as "failed". The theme has no role for that middle step yet, so
-        // this one stays a literal.
-        case "reconnecting": return "#fab387";
+        // final as "failed"; the active theme supplies its middle-severity
+        // status tint.
+        case "reconnecting": return Theme.statusReconnecting();
         case "failed": return Theme.danger;
         default: return Theme.textDim;
         }
@@ -110,7 +136,26 @@ Rectangle {
         }
     }
 
-    Component.onCompleted: app.refresh()
+    function applyPinnedFilter() {
+        if (app && app.sessionsModel)
+            app.sessionsModel.pinnedOnly = sidebar.pinnedOnly
+        if (app && app.uiState && typeof app.uiState.setPinnedOnly === "function")
+            app.uiState.setPinnedOnly(sidebar.pinnedOnly)
+    }
+
+    Component.onCompleted: {
+        applyPinnedFilter()
+        pinFilterReady = true
+        app.refresh()
+    }
+
+    onPinnedOnlyChanged: {
+        if (!pinFilterReady)
+            return
+        applyPinnedFilter()
+        app.refresh()
+    }
+
 
     // ---------------------------------------------------------------------
     // Delegate registry
@@ -366,6 +411,10 @@ Rectangle {
     function renameSession(sessionId, name) {
         app.renameSession(sessionId, name);
     }
+    function togglePinned(sessionId, pinned) {
+        if (app && typeof app.setSessionPinned === "function")
+            app.setSessionPinned(sessionId, pinned)
+    }
     function duplicateSession(sessionId) {
         app.duplicateSession(sessionId);
     }
@@ -560,6 +609,50 @@ Rectangle {
             anchors.verticalCenter: parent.verticalCenter
         }
         Button {
+            id: pinFilterButton
+            objectName: "pinFilterButton"
+            anchors.right: newGroupButton.left
+            anchors.rightMargin: 6
+            anchors.verticalCenter: parent.verticalCenter
+            implicitWidth: 24
+            implicitHeight: 24
+            width: 24
+            height: 24
+            padding: 0
+            focusPolicy: Qt.StrongFocus
+            text: sidebar.pinnedOnly ? "\u2605" : "\u2606"
+
+            readonly property string actionText:
+                sidebar.pinnedOnly ? qsTr("Show all sessions")
+                                    : qsTr("Show pinned sessions only")
+            Accessible.role: Accessible.Button
+            Accessible.name: pinFilterButton.actionText
+
+            AppToolTip {
+                objectName: "pinFilterButtonTip"
+                text: pinFilterButton.actionText
+                visible: pinFilterButton.hovered
+                delay: 600
+            }
+
+            contentItem: Label {
+                text: pinFilterButton.text
+                color: pinFilterButton.down ? Theme.accent : Theme.text
+                font.pixelSize: Theme.fontSizeTitle
+                horizontalAlignment: Text.AlignHCenter
+                verticalAlignment: Text.AlignVCenter
+            }
+            background: Rectangle {
+                radius: Theme.radiusSmall
+                color: pinFilterButton.down ? Theme.surfaceRaised
+                     : pinFilterButton.hovered ? Theme.surfaceHover : "transparent"
+                border.width: pinFilterButton.visualFocus ? 2 : 1
+                border.color: pinFilterButton.visualFocus ? Theme.accent : Theme.borderSubtle
+            }
+            onClicked: sidebar.pinnedOnly = !sidebar.pinnedOnly
+        }
+
+        Button {
             id: newGroupButton
             objectName: "newGroupButton"
             text: "+"
@@ -655,8 +748,10 @@ Rectangle {
             objectName: "sidebarEmptyTitle"
             width: parent.width
             horizontalAlignment: Text.AlignHCenter
-            text: sidebarEmptyState.serverReachable ? qsTr("No sessions yet")
-                                                    : qsTr("No server")
+            text: sidebarEmptyState.serverReachable
+                  ? (sidebar.pinnedOnly ? qsTr("No pinned sessions")
+                                         : qsTr("No sessions yet"))
+                  : qsTr("No server")
             color: Theme.text
             font.pixelSize: Theme.fontSizeLabel
         }
@@ -666,7 +761,9 @@ Rectangle {
             horizontalAlignment: Text.AlignHCenter
             wrapMode: Text.WordWrap
             text: sidebarEmptyState.serverReachable
-                  ? qsTr("Press the \u201c+\u201d at the top of this panel to add a group, then add a Dev Session to it.")
+                  ? (sidebar.pinnedOnly
+                     ? qsTr("Pin a session to see it here.")
+                     : qsTr("Press the \u201c+\u201d at the top of this panel to add a group, then add a Dev Session to it."))
                   : qsTr("Connect to the machine that holds your checkout, and its groups and Dev Sessions appear here.")
             color: Theme.textDim
             font.pixelSize: 11
@@ -753,10 +850,9 @@ Rectangle {
                 anchors.verticalCenter: parent.verticalCenter
                 width: Math.max(0, parent.width - 18)
                 text: sidebar.linkWords(sidebar.linkState)
-                // The resting colour of this line is a step brighter than
-                // Theme.textDim and a step below Theme.text; the theme has no
-                // role for it yet, so it stays a literal.
-                color: sidebar.stale ? Theme.warning : "#a6adc8"
+                // The ordinary status label is a presentation shade, so Theme
+                // changes it with the rest of the footer.
+                color: sidebar.stale ? Theme.warning : Theme.statusText()
                 font.pixelSize: 11
                 elide: Text.ElideRight
             }
@@ -823,9 +919,9 @@ Rectangle {
             y: sidebar.dropHighlightY - dropOverlay.y
             width: dropOverlay.width
             height: sidebar.dropHighlightHeight
-            // A violet-tinted wash used nowhere else; the theme has no role for
-            // it yet, so it stays a literal.
-            color: "#302a4a"
+            // This violet-tinted wash follows the active theme rather than
+            // leaving a dark drop surface behind in light mode.
+            color: Theme.dropHighlightSurface()
             border.color: Theme.accent
             border.width: 1
         }

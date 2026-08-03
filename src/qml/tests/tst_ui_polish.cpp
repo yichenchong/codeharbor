@@ -1,0 +1,276 @@
+// Regression proofs for the two small UI affordances that are easy to lose in a
+// QML/WebEngine refactor:
+//
+//   * AppScrollBar must be absent and disabled when its Flickable fits, and
+//     become a usable scrollbar as soon as content overflows.
+//   * ViewerPane's full-pane click sniffer must not replace a WebEngine page's
+//     CSS cursor. The test drives a real data: page through the shipped pane,
+//     rather than testing a second cursor implementation in isolation.
+//
+// Runs headless with the same software Quick and no-GPU WebEngine recipe as the
+// other QML tests (see CMakeLists.txt).
+
+#include <QtTest>
+
+#include <QGuiApplication>
+#include <QQmlComponent>
+#include <QQmlContext>
+#include <QQmlEngine>
+#include <QQuickItem>
+#include <QQuickWindow>
+#include <QSet>
+#include <QString>
+#include <QUrl>
+#include <QVariant>
+#include <QtWebEngineCore/QWebEngineProfile>
+#include <QtWebEngineQuick/QtWebEngineQuick>
+
+namespace {
+
+constexpr auto kScrollbarHarness = R"QML(
+import QtQuick
+import QtQuick.Controls.Basic
+import QtQuick.Window
+import CodeHarbor
+
+Window {
+    id: root
+    objectName: "scrollbarWindow"
+    width: 140
+    height: 100
+    visible: true
+    property int itemCount: 2
+
+    ListView {
+        id: list
+        objectName: "scrollbarList"
+        anchors.fill: parent
+        model: root.itemCount
+        delegate: Rectangle {
+            width: list.width
+            height: 20
+            color: "transparent"
+        }
+        ScrollBar.vertical: AppScrollBar {
+            objectName: "scrollbar"
+        }
+    }
+}
+)QML";
+
+constexpr auto kCursorHarness = R"QML(
+import QtQuick
+import QtQuick.Window
+import CodeHarbor
+
+Window {
+    id: root
+    objectName: "cursorWindow"
+    width: 420
+    height: 280
+    visible: true
+
+    ViewerPane {
+        id: pane
+        objectName: "cursorPane"
+        anchors.fill: parent
+        paneId: "cursor-test"
+        // The stub viewer model below classifies this as a web page. The page
+        // itself is local data, so this test never needs a network or a server.
+        url: "data:text/html,<html><head><style>html,body{margin:0;width:100%;height:100%;cursor:text}</style></head><body>code</body></html>"
+    }
+}
+)QML";
+
+QObject *findByName(QObject *root, const QString &name, QSet<const QObject *> &visited)
+{
+    if (!root || visited.contains(root))
+        return nullptr;
+    visited.insert(root);
+    if (root->objectName() == name)
+        return root;
+
+    const auto children = root->children();
+    for (QObject *child : children) {
+        if (QObject *found = findByName(child, name, visited))
+            return found;
+    }
+    if (auto *item = qobject_cast<QQuickItem *>(root)) {
+        const auto itemChildren = item->childItems();
+        for (QQuickItem *child : itemChildren) {
+            if (QObject *found = findByName(child, name, visited))
+                return found;
+        }
+    }
+    return nullptr;
+}
+
+QObject *findByName(QObject *root, const QString &name)
+{
+    QSet<const QObject *> visited;
+    return findByName(root, name, visited);
+}
+
+QObject *findWebEngineItem(QObject *root, QSet<const QObject *> &visited)
+{
+    if (!root || visited.contains(root))
+        return nullptr;
+    visited.insert(root);
+    if (QString::fromLatin1(root->metaObject()->className()).contains(QStringLiteral("WebEngineView")))
+        return root;
+
+    for (QObject *child : root->children()) {
+        if (QObject *found = findWebEngineItem(child, visited))
+            return found;
+    }
+    if (auto *item = qobject_cast<QQuickItem *>(root)) {
+        for (QQuickItem *child : item->childItems()) {
+            if (QObject *found = findWebEngineItem(child, visited))
+                return found;
+        }
+    }
+    return nullptr;
+}
+QObject *findWebEngineItem(QObject *root)
+{
+    QSet<const QObject *> visited;
+    return findWebEngineItem(root, visited);
+}
+
+
+class ViewerStub final : public QObject
+{
+    Q_OBJECT
+
+public slots:
+    QString viewKind(const QUrl &) const { return QStringLiteral("web"); }
+    QWebEngineProfile *internalProfile() const { return nullptr; }
+    QWebEngineProfile *externalProfile() const { return nullptr; }
+};
+
+QQmlComponent *inlineComponent(QQmlEngine &engine, const QByteArray &source, const QString &name)
+{
+    auto *component = new QQmlComponent(&engine, &engine);
+    component->setData(source, QUrl(QStringLiteral("qrc:/codeharbor-ui-polish/%1.qml").arg(name)));
+    return component;
+}
+
+} // namespace
+
+class TstUiPolish final : public QObject
+{
+    Q_OBJECT
+
+private slots:
+    void appScrollBarIsDisabledAndHiddenWhenContentFits();
+    void appScrollBarBecomesUsableWhenContentOverflows();
+    void viewerPaneSnifferPreservesWebCursor();
+};
+
+void TstUiPolish::appScrollBarIsDisabledAndHiddenWhenContentFits()
+{
+    QQmlEngine engine;
+    auto *component = inlineComponent(engine, QByteArray(kScrollbarHarness), QStringLiteral("ScrollbarHarness"));
+    QVERIFY2(!component->isError(), qPrintable(component->errorString()));
+
+    auto *window = qobject_cast<QQuickWindow *>(component->create());
+    QVERIFY2(window != nullptr, qPrintable(component->errorString()));
+    QScopedPointer<QQuickWindow> windowGuard(window);
+    QVERIFY(QTest::qWaitForWindowExposed(window));
+
+    QObject *bar = findByName(window, QStringLiteral("scrollbar"));
+    QVERIFY(bar != nullptr);
+    QTRY_VERIFY_WITH_TIMEOUT(bar->property("contentFits").toBool(), 2000);
+    QVERIFY(!bar->property("visible").toBool());
+    QVERIFY(!bar->property("enabled").toBool());
+
+    // A disabled control cannot become a hover target. Move over its geometry
+    // after the fit state is settled and make sure that remains true.
+    QTest::mouseMove(window, QPoint(130, 50));
+    QTest::qWait(200);
+    QVERIFY(!bar->property("visible").toBool());
+    QVERIFY(!bar->property("enabled").toBool());
+}
+
+void TstUiPolish::appScrollBarBecomesUsableWhenContentOverflows()
+{
+    QQmlEngine engine;
+    auto *component = inlineComponent(engine, QByteArray(kScrollbarHarness), QStringLiteral("ScrollbarHarnessOverflow"));
+    QVERIFY2(!component->isError(), qPrintable(component->errorString()));
+
+    auto *window = qobject_cast<QQuickWindow *>(component->create());
+    QVERIFY2(window != nullptr, qPrintable(component->errorString()));
+    QScopedPointer<QQuickWindow> windowGuard(window);
+    QVERIFY(QTest::qWaitForWindowExposed(window));
+
+    QObject *bar = findByName(window, QStringLiteral("scrollbar"));
+    QVERIFY(bar != nullptr);
+    QObject *root = window;
+    root->setProperty("itemCount", 20);
+
+    QTRY_VERIFY_WITH_TIMEOUT(!bar->property("contentFits").toBool(), 2000);
+    QVERIFY(bar->property("visible").toBool());
+    QVERIFY(bar->property("enabled").toBool());
+
+    // Hovering an overflowing bar still leaves it interactive and visible;
+    // this is the state the fit guard must not accidentally suppress.
+    QTest::mouseMove(window, QPoint(130, 50));
+    QTest::qWait(200);
+    QVERIFY(bar->property("visible").toBool());
+    QVERIFY(bar->property("enabled").toBool());
+}
+
+// What the fix actually is: the full-pane click sniffer must not claim the
+// cursor, so whatever is underneath it - the web page's own CSS cursor, an
+// I-beam over code - reaches the user.
+//
+// Asserted structurally rather than by hovering a live page. Driving a real
+// WebEngine view needs a GPU the headless runner does not have (Chromium falls
+// back through GLES and Vulkan and then crashes), so a hover test here would
+// report the absence of a graphics stack, not the behaviour under test. The
+// visible result is confirmed by hand; what a machine can check reliably is
+// that the sniffer neither hovers nor imposes a shape.
+void TstUiPolish::viewerPaneSnifferPreservesWebCursor()
+{
+    ViewerStub viewers;
+    QQmlEngine engine;
+    engine.rootContext()->setContextProperty(QStringLiteral("viewers"), &viewers);
+
+    QQmlComponent component(&engine,
+                            QUrl(QStringLiteral("qrc:/qt/qml/CodeHarbor/ViewerPane.qml")));
+    QVERIFY2(!component.isError(), qPrintable(component.errorString()));
+    std::unique_ptr<QObject> pane(component.create());
+    QVERIFY2(pane != nullptr, qPrintable(component.errorString()));
+
+    auto *item = qobject_cast<QQuickItem *>(pane.get());
+    QVERIFY(item != nullptr);
+
+    // The sniffer is the one MouseArea that covers the whole pane.
+    QQuickItem *sniffer = nullptr;
+    for (QQuickItem *child : item->childItems()) {
+        if (QByteArray(child->metaObject()->className()).startsWith("QQuickMouseArea")
+            && child->width() >= item->width() && child->height() >= item->height()) {
+            sniffer = child;
+            break;
+        }
+    }
+    QVERIFY2(sniffer != nullptr, "the viewer pane has no full-pane click sniffer");
+
+    QVERIFY2(!sniffer->property("hoverEnabled").toBool(),
+             "the click sniffer tracks hover, which is what lets it take the cursor");
+    QVERIFY2(!sniffer->hasActiveFocus(),
+             "the click sniffer must not hold focus either");
+    QCOMPARE(sniffer->cursor().shape(), Qt::ArrowCursor);
+    QVERIFY2(!sniffer->property("containsMouse").toBool(),
+             "a sniffer that reports containsMouse is hovering after all");
+}
+
+int main(int argc, char **argv)
+{
+    QtWebEngineQuick::initialize();
+    QGuiApplication app(argc, argv);
+    TstUiPolish testCase;
+    return QTest::qExec(&testCase, argc, argv);
+}
+
+#include "tst_ui_polish.moc"

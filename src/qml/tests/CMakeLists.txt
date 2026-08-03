@@ -204,3 +204,66 @@ set_tests_properties(tst_uxshell PROPERTIES
     ENVIRONMENT "${CODEHARBOR_QML_TEST_ENV}"
     TIMEOUT 180
 )
+
+
+# Focused regression gate for the shared scrollbar and the ViewerPane/WebEngine
+# cursor handoff. The latter uses a local data: page, not the unavailable live
+# SSH fixture, so it stays in the ordinary headless suite.
+qt_add_executable(tst_ui_polish tst_ui_polish.cpp)
+
+target_link_libraries(tst_ui_polish PRIVATE
+    Qt6::Test
+    Qt6::Core
+    Qt6::Gui
+    Qt6::Qml
+    Qt6::Quick
+    Qt6::QuickControls2
+    Qt6::WebEngineQuick
+    codeharbor_qmlplugin
+)
+
+add_test(NAME tst_ui_polish COMMAND tst_ui_polish)
+set_tests_properties(tst_ui_polish PROPERTIES
+    ENVIRONMENT "${CODEHARBOR_QML_TEST_ENV}"
+    TIMEOUT 180
+)
+
+# Log pane regression: a remote diagnostic emitted while the sheet is closed
+# remains in the one shared buffer and appears when the sheet opens.
+qt_add_executable(tst_logview tst_logview.cpp)
+target_link_libraries(tst_logview PRIVATE
+    ch_app
+    Qt6::Test
+    Qt6::Core
+    Qt6::Gui
+    Qt6::Qml
+    Qt6::Quick
+    Qt6::QuickControls2
+    codeharbor_qmlplugin
+)
+add_test(NAME tst_logview COMMAND tst_logview)
+set_tests_properties(tst_logview PROPERTIES
+    ENVIRONMENT "${CODEHARBOR_QML_TEST_ENV}"
+    TIMEOUT 120
+)
+
+# Open-as explorer regression: the real directory menu only offers handlers
+# claimed by the registry, and the existing viewer split path keeps the first
+# pane alive while a second pane receives the target.
+qt_add_executable(tst_openas tst_openas.cpp)
+target_link_libraries(tst_openas PRIVATE
+    Qt6::Test
+    Qt6::Core
+    Qt6::Gui
+    Qt6::Qml
+    Qt6::Quick
+    Qt6::QuickControls2
+    Qt6::WebEngineQuick
+    codeharbor_qmlplugin
+    ch_viewers
+)
+add_test(NAME tst_openas COMMAND tst_openas)
+set_tests_properties(tst_openas PROPERTIES
+    ENVIRONMENT "${CODEHARBOR_QML_TEST_ENV}"
+    TIMEOUT 180
+)

@@ -437,10 +437,19 @@ test("updateSession keeps unset fields but clears explicit nulls (undefined vs n
     s = ws.updateSession({ id: session.id, archived: true });
     assert.equal(s.archived, true);
     s = ws.updateSession({ id: session.id, archived: false });
-    assert.equal(s.archived, false);
-
+    // The workspace-owned pin survives both the update round-trip and a
+    // second connection's filtered read.
+    s = ws.updateSession({ id: session.id, pinned: true });
+    assert.equal(s.pinned, true);
+    assert.equal(ws.list(SERVER, true).at(0)?.sessions[0].pinned, true);
     ws.close();
+
+    const reopened = openWorkspace(dbPath);
+    assert.equal(reopened.getSession(session.id)?.pinned, true);
+    assert.equal(reopened.list(SERVER, true).at(0)?.sessions[0].id, session.id);
+    reopened.close();
     await cleanup(dbPath);
+
 });
 
 test("updateViewerPane/updateTerminalPane clear nullable fields on null, keep on omit", async () => {
@@ -976,6 +985,34 @@ test("the v2 migration adds server_identity to a v1 database without losing rows
     upgraded.close();
     await cleanup(dbPath);
 });
+test("the v5 migration adds an unpinned default to a v4 database without losing sessions", async () => {
+    const dbPath = await tmpDbPath();
+    const legacy = openWorkspace(dbPath);
+    const { group, session } = seed(legacy);
+    legacy.db.exec("DROP INDEX idx_dev_sessions_group_pinned");
+    legacy.db.exec("ALTER TABLE dev_sessions DROP COLUMN pinned");
+    legacy.db
+        .prepare("UPDATE dev_sessions SET task_description = ? WHERE id = ?")
+        .run("legacy task", session.id);
+    legacy.db.prepare("UPDATE schema_version SET version = 4 WHERE id = 1").run();
+    legacy.close();
+
+    const upgraded = openWorkspace(dbPath);
+    const version = upgraded.db
+        .prepare("SELECT version FROM schema_version WHERE id = 1")
+        .get() as { version: number };
+    assert.equal(version.version, WORKSPACE_SCHEMA_VERSION);
+    const expected = { ...session, taskDescription: "legacy task", pinned: false };
+    assert.deepEqual(upgraded.getGroup(group.id), group);
+    assert.deepEqual(upgraded.getSession(session.id), expected);
+    const raw = upgraded.db
+        .prepare("SELECT pinned FROM dev_sessions WHERE id = ?")
+        .get(session.id) as { pinned: number };
+    assert.equal(raw.pinned, 0);
+    upgraded.close();
+    await cleanup(dbPath);
+});
+
 
 // --- tmux targets: one minting site, safe by construction, unique (v3) ------
 
@@ -1855,6 +1892,7 @@ test("migrate refuses a database written by a newer build instead of using it", 
 // client's compatibility gate.
 const EXPECTED_INDEXES = [
     "idx_dev_sessions_group_id",
+    "idx_dev_sessions_group_pinned",
     "idx_groups_server_id",
     "idx_terminal_panes_dev_session_id",
     "idx_viewer_panes_dev_session_id",
@@ -1912,11 +1950,11 @@ test("the session lookup index is actually chosen by the query planner", async (
     const dbPath = await tmpDbPath();
     const ws = openWorkspace(dbPath);
     const plan = ws.db
-        .prepare("EXPLAIN QUERY PLAN SELECT * FROM dev_sessions WHERE group_id = ?")
+        .prepare("EXPLAIN QUERY PLAN SELECT * FROM dev_sessions WHERE group_id = ? AND pinned <> 0")
         .all("g1") as { detail: string }[];
     assert.match(
         plan.map((r) => r.detail).join("\n"),
-        /USING INDEX idx_dev_sessions_group_id/,
+        /USING INDEX idx_dev_sessions_group_pinned/,
     );
     ws.close();
     await cleanup(dbPath);

@@ -179,6 +179,18 @@ Viewer panes may contain:
 
 Viewer panes are individually splittable within the fixed viewer region.
 
+Because a viewer pane is a browser, it carries the four controls a browser has: **Back**, **Forward**,
+**Reload** and **Home**, beside the address field. Each pane keeps its OWN history of what it has shown;
+splitting produces a pane with an empty one. Navigating somewhere new truncates whatever was ahead, exactly as
+a browser does, and Back/Forward are disabled at the ends of the history rather than silently doing nothing.
+Reload re-fetches the resource currently shown for EVERY handler kind, not only for web pages: a handler with
+no reload primitive of its own (an image, a directory listing, a binary preview) is recreated, so stale content
+cannot survive a reload. Home goes to the active Dev Session's repository root and is disabled when there is no
+active session. There is no separate "open this address" button — the address field navigates on Enter.
+
+History is per pane and in memory. It is deliberately NOT persisted to the workspace: where a pane has BEEN is
+not workspace state, and a second client has no use for it.
+
 ### 3.4 Terminal Pane
 
 A **Terminal Pane** is an xterm.js-based terminal connected over SSH to a remote PTY attached to a tmux session.
@@ -195,13 +207,26 @@ Each terminal pane has:
 - connection state;
 - attention state.
 
+The display name is the user's to change: a pane can be renamed from its header, and the name is stored with the
+split layout, so it survives a restart and is seen by a second client. It is a LABEL and nothing more. A terminal's
+identity is its server-minted `terminal_panes` row (§5.2), never its name and never its slot label, so renaming a
+pane cannot re-point it at another shell. An empty or whitespace-only name means "no custom name" and the pane
+falls back to its generated slot label; names are trimmed and length-capped on the way in.
+
 ### 3.5 Remote Server
 
-Version 1 assumes one configured SSH server.
+The client stores as many server profiles as the user wants and connects to ONE at a time. The connect surface
+lists the saved servers, marks the one in use, and switching to another tears the current session down before
+dialling the new one.
 
-The server may host many repositories, Dev Sessions, tmux sessions, terminal processes, the CodeHarbor workspace database, the remote helper service, and agent-status adapters.
+The server may host many repositories, Dev Sessions, tmux sessions, terminal processes, the CodeHarbor workspace
+database, the remote helper service, and agent-status adapters.
 
-The internal data model should still include a `server_id` so multi-server support can be added later.
+Every domain row carries a `server_id`, and the client keys its whole workspace by the id the SERVER mints for
+itself (§11.1). That is what makes switching safe: rows, layouts, terminal identities and the remembered "last
+open Dev Session" all belong to one server, and a reply that arrives after a switch is discarded rather than
+painted over the new server's sidebar. Mixing two servers' rows would be a data-integrity fault, not a cosmetic
+one.
 
 ---
 
@@ -233,12 +258,12 @@ Each Dev Session row should display:
   not as a separate badge).
 
 > **Implementation status.** The shipped row renders the session name, the optional
-> subtitle, and ONE aggregate status dot. The sidebar data model
-> (`SessionsModel::Roles` in `src/models/SessionsModel.h`) exposes only `NameRole`,
-> `SubtitleRole`, `RowStateRole`, `IsGroupRole`, `CollapsedRole`, `IdRole` and
-> `GroupIdRole`; there is no role for either terminal counter and none for unsaved
-> files, so the QML delegate could not draw them even if it tried. Tracked in
-> `docs/PLAN.md`.
+> subtitle, ONE aggregate status dot, and a pin toggle. The sidebar data model
+> (`SessionsModel::Roles` in `src/models/SessionsModel.h`) exposes `NameRole`,
+> `SubtitleRole`, `RowStateRole`, `IsGroupRole`, `CollapsedRole`, `IdRole`,
+> `GroupIdRole` and `PinnedRole`; there is no role for either terminal counter and
+> none for unsaved files, so the QML delegate could not draw them even if it tried.
+> Tracked in `docs/PLAN.md`.
 
 Suggested state precedence:
 
@@ -248,6 +273,16 @@ Suggested state precedence:
 4. Finished with unseen output
 5. Idle
 6. Disconnected
+
+`Disconnected` means a session that HAD a live terminal and lost it. A session whose panes have never been
+opened, and a session with no panes at all, are `Idle`: absence of information is not a disconnection, and
+reporting it as one made every row in a fresh workspace read as broken.
+
+**Pinning.** Each row carries a pin toggle, and the sidebar toolbar carries a pin filter beside "add group".
+With the filter on, the sidebar shows only pinned sessions and only the groups that contain one; with nothing
+pinned it says so explicitly rather than showing the same blank panel a failed load would. Which sessions are
+pinned is workspace state, stored on the server so a second client sees the same pins. Whether the FILTER is on
+is client-local presentation state (§11.2) — one machine hiding rows must not hide them everywhere.
 
 Sidebar operations:
 
@@ -282,6 +317,18 @@ Supported operations:
 - zoom;
 - open developer tools where applicable.
 
+**Open as.** A file or directory in a directory listing can be opened with a specific handler instead of the
+default one, from a context menu or a small affordance on the row (both reachable from the keyboard). The menu
+offers ONLY the handlers that claim that target (§7.5), marks which one is the default, and offers the same
+choices "in a new pane", which splits the region through the ordinary split path rather than a second one. A
+plain click is unchanged and still opens the default handler in place.
+
+**Open with `<appName>://`.** The same menu can hand the target to a local desktop application by scheme, for
+plugins this client knows nothing about. The scheme is validated against the URL grammar (a letter followed by
+letters, digits, `+`, `-` or `.`) and refused with a visible message otherwise; the path is escaped before it is
+handed over. This is the one path that gives a remote-derived path to the LOCAL desktop, so it never guesses and
+never runs anything itself.
+
 ### 4.4 Terminal Region
 
 The terminal region contains one or more terminal panes arranged using a recursive split tree.
@@ -309,6 +356,52 @@ VerticalSplit
 
 A new pane should default to splitting the currently focused pane vertically. Split ratios must be persisted per Dev Session.
 
+A layout load is a server round trip, so the user can act on a region before its tree arrives, and can switch
+Dev Session while one is in flight. Every layout read and every layout write therefore carries the Dev Session
+it belongs to plus a monotonic load generation. A write stamped for a session that is no longer current is
+discarded silently — replaying it would corrupt the tree the user is now looking at, and it is not an error the
+user did anything about. A write stamped for the CURRENT session that arrives before its tree does is queued and
+applied when the tree lands. A region whose layout genuinely cannot be loaded still reports that, as before.
+
+### 4.6 Settings
+
+Preferences live in one surface with a group list on the left and the selected group's controls on the right,
+reachable from the command palette. Groups: **Appearance**, **Server**, **Tmux**.
+
+Appearance owns:
+
+- **Theme** — Dark or Light. The theme is a named palette, not a boolean, so further themes need no new plumbing:
+  every colour in the application resolves through one role vocabulary (`Theme.qml`), and switching repaints
+  everything, including the two web surfaces, which are handed the same role map (§5.1, §8.1).
+- **Group colour palette** and its size. A group's name is hashed to a stable index into the active palette and
+  that colour tints the group's presentation, so groups stay distinguishable without the user choosing colours.
+  The hash is stable across runs and machines. `plain` is the default and applies no tint at all — the historical
+  look. `tokyonight` is generated from five seed colours: to produce n colours, the generator repeatedly finds
+  the largest gap between neighbouring colours in OKLCH space and inserts their midpoint, so it only ever ADDS to
+  its seed and n must exceed the seed count.
+- **Toolbar button order.** Each toolbar button declares a stable id; the stored order is reconciled against the
+  buttons a given build actually has (unknown ids ignored, missing ones appended), so the setting survives a
+  build that adds or removes one. Reconciliation is a view, never a write: only the user reordering persists.
+- **Terminal text size** and **rendering resolution** (§5.1).
+
+Server exposes the stored connection profiles and the actions that already exist for them (connect, disconnect,
+update the remote service). Tmux exposes the options that genuinely reach the remote side. No control in this
+window may be decorative: every one changes something observable.
+
+All of it is client-local (§11.2). A preference is a property of this desktop, not of the workspace.
+
+### 4.7 Log View
+
+A log surface, reachable from the command palette, shows what the client has recorded: its own diagnostics plus
+what it collects from the remote side (SSH diagnostics and the daemon's channel output), each labelled by origin,
+because a remote-first application is not debuggable from the client's half alone.
+
+It reads a bounded in-memory ring buffer — capped in entries AND in bytes, so a chatty session cannot grow
+without limit — that is filled whether or not the view is open, so a message is not lost by having been emitted
+too early. Messages continue to reach the terminal as before: the buffer chains to whatever handler was already
+installed rather than replacing it. The view offers severity and text filters, follow-tail that stops when the
+user scrolls up, copy, and clear. Credentials never enter the buffer.
+
 ---
 
 ## 5. Terminal Architecture
@@ -332,6 +425,19 @@ Responsibilities:
 - **TerminalController:** input, output, state, buffering, reconnect logic;
 - **libssh:** SSH connection, authentication, channel, and PTY transport;
 - **tmux:** remote process persistence.
+
+**Rendering.** The terminal draws through xterm.js's WebGL renderer where the platform provides it and falls
+back to the DOM renderer where it does not, and the canvas is sized at the DEVICE pixel ratio of the window it
+is in. Getting that ratio wrong is what makes a terminal look soft: the grid is then drawn at fewer physical
+pixels than the screen has and scaled up. Text size and rendering resolution are both user preferences (§4.6):
+the size changes how big the cells are, the resolution changes how many physical pixels each cell is drawn with,
+and a resolution of "follow the screen" is the default. Changing either re-fits the grid and tells the remote
+PTY its new dimensions, so the shell re-wraps rather than drawing into a size it does not know about.
+
+**Clipboard.** Selecting text and copying it (the platform's terminal shortcut) puts it on the system clipboard;
+pasting sends the clipboard to the shell, guarded by bracketed paste where the application asked for it. A paste
+is chunked through the same flow control as ordinary output and, like it, is never split inside an escape
+sequence (§5.5). Scrolling and scrollback behaviour are unchanged by any of this.
 
 ### 5.2 Terminal Creation
 
@@ -991,13 +1097,21 @@ server_settings
 app_settings
 ```
 
+The `dev_sessions` table carries a `pinned` flag (§4.2). It arrived with schema version 5; a version 4 database
+gains the column with a default of "not pinned", so nothing already stored is lost and every existing session
+simply starts unpinned. The version is mirrored in the client by `WorkspaceDb::kSchemaVersion`, and the two must
+be bumped together — a one-sided bump makes client and server refuse each other.
+
 ### 11.2 Local State
 
 The client may store only:
 
-- SSH server connection profile;
-- window geometry;
-- client display preferences;
+- SSH server connection profiles;
+- window geometry and region widths;
+- client display preferences (theme, group-colour palette, toolbar order, terminal text size and rendering
+  resolution) — see §4.6;
+- which Dev Session was last open, per server, and which pane was last selected;
+- whether the sidebar's pin filter is on;
 - SSH-agent or credential-store references;
 - browser cookies and cache;
 - temporary reconnect state.
@@ -1213,6 +1327,14 @@ reaches the focused item, and every terminal pane hosts a real shell.
 **Refresh Workspace** is `Ctrl+Shift+R` and **Close Window** is `Ctrl+Shift+W`.
 `Close Window` exists as a binding at all because the window is frameless and
 therefore has no window-manager close button of its own.
+
+Being frameless also means the window must ask the SYSTEM to move and resize it rather than repositioning
+itself, or it loses every gesture the window manager attaches to those operations — on Windows, dragging to the
+top to maximise, to a side to half-tile, and the snap-layouts flyout on the maximise button. Qt's
+`startSystemMove()`/`startSystemResize()` provide the portable half. On Windows a frameless window is also
+created without the native style bits the shell requires before it will snap a window at all, so the client
+restores those (keeping the caption itself absent) and answers the hit test for its own maximise button, which
+is what the snap-layouts flyout is attached to. Nothing about this changes behaviour on Linux or macOS.
 
 Every remaining command — splitting a viewer or terminal pane, closing a focused
 pane, killing a terminal's remote tmux session, disconnecting from the server,

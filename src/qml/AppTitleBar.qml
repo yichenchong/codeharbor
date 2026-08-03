@@ -33,6 +33,19 @@ Rectangle {
     // plain text below and never as markup (SPEC 12).
     property string sessionLabel: ""
     property var win: Window.window
+    // Windows' custom non-client path is injected by Main.qml only on the
+    // platform that needs it. A null helper keeps standalone QML surfaces and
+    // non-Windows builds on Qt's ordinary input path.
+    property var nativeHelper: null
+
+    function registerNativeChrome() {
+        if (bar.nativeHelper && bar.win && maximiseButton)
+            bar.nativeHelper.registerMaximizeButton(bar.win, maximiseButton);
+    }
+
+    onNativeHelperChanged: bar.registerNativeChrome()
+    onWinChanged: bar.registerNativeChrome()
+    Component.onCompleted: bar.registerNativeChrome()
 
     implicitHeight: Theme.headerHeight
     color: Theme.surfaceDeep
@@ -100,6 +113,11 @@ Rectangle {
         id: button
 
         property string glyph: ""
+        // Native Windows hit-testing takes the pointer outside QML's ordinary
+        // hover/press events. These two mirrors let the helper keep this
+        // button's existing visuals and action semantics in that path.
+        property bool nativeHovered: false
+        property bool nativeDown: false
         // Close is the destructive one and says so on hover; the other two only
         // lift off the surface.
         property color hoverFill: Theme.surfaceHover
@@ -113,7 +131,8 @@ Rectangle {
         Accessible.onPressAction: button.clicked()
 
         background: Rectangle {
-            color: button.hovered || button.down ? button.hoverFill : "transparent"
+            color: button.hovered || button.nativeHovered || button.down || button.nativeDown
+                   ? button.hoverFill : "transparent"
             border.width: button.visualFocus ? 1 : 0
             border.color: Theme.accent
 
@@ -121,13 +140,13 @@ Rectangle {
                 ColorAnimation { duration: 120; easing.type: Easing.OutQuart }
             }
         }
-
         contentItem: Label {
             text: button.glyph
             // A glyph, not remote content, but the whole application renders
             // every label as plain text so no string can ever be markup.
             textFormat: Text.PlainText
-            color: button.hovered || button.down ? button.hoverText : Theme.textDim
+            color: button.hovered || button.nativeHovered || button.down || button.nativeDown
+                   ? button.hoverText : Theme.textDim
             font.pixelSize: Theme.fontSizeLabel
             horizontalAlignment: Text.AlignHCenter
             verticalAlignment: Text.AlignVCenter
@@ -147,6 +166,7 @@ Rectangle {
         }
 
         ChromeButton {
+            id: maximiseButton
             objectName: "maximiseButton"
             // The glyph is the STATE, not the action: a maximised window offers
             // "shrink back", a windowed one "fill the screen".

@@ -98,12 +98,15 @@ QString toString(FileState);
 // Reduce a set of terminal/agent conditions to the highest-priority row state.
 // The SPEC 4.2 precedence is Error > WaitingForInput > Running > FinishedUnseen
 // > Idle > Disconnected, i.e. the SessionRowState declaration order: the first
-// flag that is set wins, and all-false (no terminal in any notable state, which
-// includes a session with no terminals at all) yields Disconnected.
+// flag that is set wins. "Disconnected" is reserved for a terminal that was
+// previously live and then explicitly reported a lost connection; an empty
+// session, an unopened pane and a pane still opening have no loss to report and
+// therefore fall back to Idle instead of claiming a disconnect.
 SessionRowState aggregateRowState(bool anyError,
                                   bool anyWaitingInput,
                                   bool anyRunning,
                                   bool anyFinishedUnseen,
-                                  bool anyConnected);
+                                  bool anyConnected,
+                                  bool anyDisconnected = false);
 
 } // namespace ch

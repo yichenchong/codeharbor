@@ -174,7 +174,9 @@ private slots:
     void closeLastPaneYieldsEmptyLeaf();
     void ratiosPersistedAtNestedPath();
     void paneUrlPersistsWithoutRebuildingPanes();
+    void paneTitlePersistsAndKeepsTerminalIdentity();
     void staleLoadReplyIsDropped();
+    void rapidSwitchQueuesCurrentWritesAndDropsStaleWrites();
     void editDuringAnInFlightLoadIsNotReverted();
     void aSeedingLoadReplyNeverOverwritesASavedTree();
     void rpcErrorSurfacesWithoutCorruptingTree();
@@ -822,6 +824,82 @@ void TstSessionLayouts::paneUrlPersistsWithoutRebuildingPanes()
     QCOMPARE(errorSpy.count(), 1);
 }
 
+void TstSessionLayouts::paneTitlePersistsAndKeepsTerminalIdentity()
+{
+    makePair();
+    SessionLayouts layouts(m_db, m_uiState);
+    layouts.setServerId(QStringLiteral("srv-1"));
+
+    QJsonObject stored = terminalLeaf(QStringLiteral("terminal-1"),
+                                      QStringLiteral("row-terminal-1"));
+    stored[QStringLiteral("customTitle")] = QStringLiteral("Old title");
+    completeLoad(layouts, QStringLiteral("s1"), layoutRow(leaf(QStringLiteral("viewer-1"))),
+                 layoutRow(stored));
+
+    QSignalSpy terminalSpy(&layouts, &SessionLayouts::terminalTreeChanged);
+    QSignalSpy errorSpy(&layouts, &SessionLayouts::error);
+    const QString paneId = QStringLiteral("terminal-1");
+    const QString rowId = QStringLiteral("row-terminal-1");
+
+    QCOMPARE(layouts.setPaneTitle(QStringLiteral("terminal"), paneId,
+                                  QStringLiteral("  Build shell  ")),
+             QStringLiteral("Build shell"));
+    QCOMPARE(errorSpy.count(), 0);
+    QCOMPARE(terminalSpy.count(), 0); // the live pane must not be rebuilt
+    QJsonObject request = nextRequest();
+    QJsonObject sent = request.value(QStringLiteral("params")).toObject()
+                             .value(QStringLiteral("tree")).toObject();
+    QCOMPARE(sent.value(QStringLiteral("customTitle")).toString(),
+             QStringLiteral("Build shell"));
+    QCOMPARE(sent.value(QStringLiteral("paneId")).toString(), paneId);
+    QCOMPARE(sent.value(QStringLiteral("terminalPaneId")).toString(), rowId);
+    respondResult(request.value(QStringLiteral("id")).toInt(), layoutRow(sent));
+
+    // Whitespace-only input clears the optional field and still leaves the
+    // generated slot label and server row id exactly where they were.
+    QCOMPARE(layouts.setPaneTitle(QStringLiteral("terminal"), paneId,
+                                  QStringLiteral(" \t\n ")),
+             QString());
+    request = nextRequest();
+    sent = request.value(QStringLiteral("params")).toObject()
+                 .value(QStringLiteral("tree")).toObject();
+    QVERIFY(!sent.contains(QStringLiteral("customTitle")));
+    QCOMPARE(sent.value(QStringLiteral("paneId")).toString(), paneId);
+    QCOMPARE(sent.value(QStringLiteral("terminalPaneId")).toString(), rowId);
+    respondResult(request.value(QStringLiteral("id")).toInt(), layoutRow(sent));
+
+    // The bound is applied before the write, so a hostile or accidental
+    // paste cannot make the compact header or shared layout grow forever.
+    const QString overlong(SplitNode::kMaxCustomTitleLength + 20, QLatin1Char('x'));
+    const QString bounded =
+        overlong.left(SplitNode::kMaxCustomTitleLength);
+    QCOMPARE(layouts.setPaneTitle(QStringLiteral("terminal"), paneId, overlong),
+             bounded);
+    request = nextRequest();
+    sent = request.value(QStringLiteral("params")).toObject()
+                 .value(QStringLiteral("tree")).toObject();
+    QCOMPARE(sent.value(QStringLiteral("customTitle")).toString(), bounded);
+    QCOMPARE(sent.value(QStringLiteral("paneId")).toString(), paneId);
+    QCOMPARE(sent.value(QStringLiteral("terminalPaneId")).toString(), rowId);
+    respondResult(request.value(QStringLiteral("id")).toInt(), layoutRow(sent));
+
+    // A fresh load reads the same layout tree back, proving the title is
+    // persisted through the existing workspace.setLayout/getLayout path.
+    QSignalSpy loadedSpy(&layouts, &SessionLayouts::loaded);
+    layouts.load(QStringLiteral("s1"));
+    const QJsonObject viewerGet = nextRequest();
+    const QJsonObject terminalGet = nextRequest();
+    respondResult(viewerGet.value(QStringLiteral("id")).toInt(),
+                  layoutRow(leaf(QStringLiteral("viewer-1"))));
+    respondResult(terminalGet.value(QStringLiteral("id")).toInt(),
+                  layoutRow(sent));
+    QTRY_COMPARE(loadedSpy.count(), 1);
+    const QJsonObject roundTrip = asObject(layouts.terminalTree());
+    QCOMPARE(roundTrip.value(QStringLiteral("customTitle")).toString(), bounded);
+    QCOMPARE(roundTrip.value(QStringLiteral("paneId")).toString(), paneId);
+    QCOMPARE(roundTrip.value(QStringLiteral("terminalPaneId")).toString(), rowId);
+}
+
 void TstSessionLayouts::staleLoadReplyIsDropped()
 {
     makePair();
@@ -870,6 +948,133 @@ void TstSessionLayouts::staleLoadReplyIsDropped()
     QCOMPARE(compact(asObject(layouts.terminalTree())),
              compact(legacyLeaf(QStringLiteral("fresh-2"))));
 }
+void TstSessionLayouts::rapidSwitchQueuesCurrentWritesAndDropsStaleWrites()
+{
+    makePair();
+    SessionLayouts layouts(m_db, m_uiState);
+    layouts.setServerId(QStringLiteral("srv-1"));
+    QSignalSpy errorSpy(&layouts, &SessionLayouts::error);
+    QSignalSpy loadedSpy(&layouts, &SessionLayouts::loaded);
+
+    layouts.load(QStringLiteral("s1"));
+    const QJsonObject staleViewer = nextRequest();
+    const QJsonObject staleTerminal = nextRequest();
+    const quint64 staleGeneration = layouts.generation();
+
+    // The second selection invalidates both the old replies and old user
+    // gestures. Its writes must not be allowed to inspect a same-named pane in
+    // s2, while gestures carrying s2's stamp are retained until its tree lands.
+    layouts.load(QStringLiteral("s2"));
+    const QJsonObject freshViewer = nextRequest();
+    const QJsonObject freshTerminal = nextRequest();
+    const quint64 freshGeneration = layouts.generation();
+
+    layouts.setPaneUrlForSession(QStringLiteral("s1"), staleGeneration,
+                                 QStringLiteral("viewer"),
+                                 QStringLiteral("viewer-1"),
+                                 QStringLiteral("stale-url"));
+    layouts.setPaneUrlForSession(QStringLiteral("s2"), freshGeneration,
+                                 QStringLiteral("viewer"),
+                                 QStringLiteral("viewer-1"),
+                                 QStringLiteral("queued-url"));
+    QCOMPARE(layouts.splitPaneForSession(QStringLiteral("s2"), freshGeneration,
+                                         QStringLiteral("viewer"),
+                                         QStringLiteral("viewer-1"),
+                                         QStringLiteral("horizontal")),
+             QString());
+    layouts.closePaneForSession(QStringLiteral("s2"), freshGeneration,
+                                QStringLiteral("viewer"),
+                                QStringLiteral("viewer-1"));
+    layouts.setRatiosForSession(QStringLiteral("s2"), freshGeneration,
+                                QStringLiteral("terminal"), {}, {2.0, 3.0});
+    QCOMPARE(errorSpy.count(), 0);
+
+    // Old answers must not clear the new region's loading flag. If they did,
+    // the next current write would take the null tree as a real loaded state
+    // and report "layout not loaded" instead of remaining queued.
+    respondResult(staleViewer.value(QStringLiteral("id")).toInt(),
+                  layoutRow(leaf(QStringLiteral("wrong-viewer"))));
+    respondResult(staleTerminal.value(QStringLiteral("id")).toInt(),
+                  layoutRow(leaf(QStringLiteral("wrong-terminal"))));
+    QTest::qWait(50);
+    layouts.setPaneUrlForSession(QStringLiteral("s2"), freshGeneration,
+                                 QStringLiteral("viewer"),
+                                 QStringLiteral("viewer-1"),
+                                 QStringLiteral("queued-url-final"));
+    QCOMPARE(errorSpy.count(), 0);
+    QVERIFY(layouts.viewerTree().isNull());
+    QVERIFY(layouts.terminalTree().isNull());
+
+    const QJsonObject freshViewerTree = leaf(QStringLiteral("viewer-1"));
+    const QJsonObject freshTerminalTree =
+        split(QStringLiteral("vertical"),
+              {leaf(QStringLiteral("terminal-1")),
+               leaf(QStringLiteral("terminal-2"))},
+              {1, 1});
+    respondResult(freshViewer.value(QStringLiteral("id")).toInt(),
+                  layoutRow(freshViewerTree));
+    // URL, split, and close are replayed in order against s2, not against the
+    // stale leaf returned above. Read and acknowledge each persistence write.
+    const QJsonObject urlWrite = nextRequest();
+    QCOMPARE(urlWrite.value(QStringLiteral("method")).toString(),
+             QStringLiteral("workspace.setLayout"));
+    const QJsonObject urlTree = urlWrite.value(QStringLiteral("params"))
+                                    .toObject().value(QStringLiteral("tree"))
+                                    .toObject();
+    QCOMPARE(urlTree.value(QStringLiteral("url")).toString(),
+             QStringLiteral("queued-url-final"));
+    respondResult(urlWrite.value(QStringLiteral("id")).toInt(), layoutRow(urlTree));
+
+    const QJsonObject splitWrite = nextRequest();
+    const QJsonObject splitTree = splitWrite.value(QStringLiteral("params"))
+                                      .toObject().value(QStringLiteral("tree"))
+                                      .toObject();
+    QCOMPARE(splitTree.value(QStringLiteral("children")).toArray().size(), 2);
+    QCOMPARE(splitTree.value(QStringLiteral("children")).toArray().at(0)
+                 .toObject().value(QStringLiteral("paneId")).toString(),
+             QStringLiteral("viewer-1"));
+    respondResult(splitWrite.value(QStringLiteral("id")).toInt(),
+                  layoutRow(splitTree));
+
+    const QJsonObject closeWrite = nextRequest();
+    const QJsonObject closeTree = closeWrite.value(QStringLiteral("params"))
+                                      .toObject().value(QStringLiteral("tree"))
+                                      .toObject();
+    QCOMPARE(closeTree.value(QStringLiteral("paneId")).toString(),
+             QStringLiteral("viewer-2"));
+    respondResult(closeWrite.value(QStringLiteral("id")).toInt(),
+                  layoutRow(closeTree));
+
+    respondResult(freshTerminal.value(QStringLiteral("id")).toInt(),
+                  layoutRow(freshTerminalTree));
+    const QJsonObject ratiosWrite = nextRequest();
+    QCOMPARE(ratiosWrite.value(QStringLiteral("method")).toString(),
+             QStringLiteral("workspace.setLayout"));
+    const QJsonObject ratiosTree = ratiosWrite.value(QStringLiteral("params"))
+                                       .toObject().value(QStringLiteral("tree"))
+                                       .toObject();
+    const QJsonArray expectedRatios{2.0, 3.0};
+    QCOMPARE(ratiosTree.value(QStringLiteral("ratios")).toArray(),
+             expectedRatios);
+    respondResult(ratiosWrite.value(QStringLiteral("id")).toInt(),
+                  layoutRow(ratiosTree));
+
+    QTRY_COMPARE(loadedSpy.count(), 1);
+    QCOMPARE(compact(asObject(layouts.viewerTree())),
+             compact(leaf(QStringLiteral("viewer-2"))));
+    // As PUBLISHED: leaves loaded without a row id wear the pre-migration
+    // marker, which is added on the way out and never persisted.
+    QJsonObject expectedTerminal =
+        split(QStringLiteral("vertical"),
+              {legacyLeaf(QStringLiteral("terminal-1")),
+               legacyLeaf(QStringLiteral("terminal-2"))},
+              {2.0, 3.0});
+    QCOMPARE(compact(asObject(layouts.terminalTree())),
+             compact(expectedTerminal));
+    QCOMPARE(errorSpy.count(), 0);
+    QVERIFY(noMoreRequests());
+}
+
 
 // The reverse of staleLoadReplyIsDropped(): here the LOAD is the stale one. A
 // getLayout answer that crossed a layout edit on the wire describes the tree as

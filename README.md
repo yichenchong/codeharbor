@@ -159,10 +159,30 @@ shortcuts SPEC 15 originally suggested, in [`docs/SPEC.md`](docs/SPEC.md) — is
 | `Ctrl+Shift+R` | Refresh Workspace |
 | `Ctrl+Shift+W` | Close Window (the window is frameless, so it has no close button) |
 | `Ctrl+S` | Save the file in the focused editor |
+| `Ctrl+,` | Settings |
 
 Splitting and closing panes, killing a terminal's remote tmux session, disconnecting,
-and marking agent output seen are palette commands with no key sequence. There is no
-Dev Session switcher shortcut and no "focus next pane" shortcut.
+marking agent output seen, renaming a terminal pane, pinning a Dev Session, and
+showing the log are palette commands or in-place controls with no key sequence.
+There is no Dev Session switcher shortcut and no "focus next pane" shortcut.
+
+A few things worth knowing about the shipped client:
+
+- **Settings** (`Ctrl+,`) has Appearance, Server and Tmux groups. Appearance carries
+  the Dark/Light theme, the palette that tints Dev Session group names, the order of
+  the viewer's toolbar buttons, and the terminal's text size and rendering
+  resolution.
+- **Viewer panes navigate like a browser**: Back, Forward, Reload and Home beside the
+  address field, with a history per pane. The address field opens on Enter.
+- **The explorer can open a file with a specific viewer** ("Open as"), in place or in
+  a new pane, and can hand it to a local application by `<appName>://` scheme.
+- **Terminal panes can be renamed** from their header, and the name travels with the
+  layout, so it is there after a restart and on another machine.
+- **Dev Sessions can be pinned**, and the sidebar can be filtered to show only pinned
+  ones. Pins live on the server; the filter is local to the machine.
+- **Copy and paste work in terminals** with the usual terminal shortcuts.
+- **Several servers can be saved** and switched between; closing the app leaves the
+  remote tmux sessions running, so a reconnect finds the shells where they were.
 
 ## Build
 

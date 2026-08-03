@@ -1,6 +1,7 @@
 #include "AppController.h"
 
 #include "EditorFactory.h"
+#include "TerminalFactory.h"
 #include "UiStateStore.h"
 
 #include <QCryptographicHash>
@@ -59,6 +60,7 @@ AppController::AppController(CodeharbordClient* client, QObject* parent)
     , m_sessionsModel(new SessionsModel(this))
     , m_uiState(new UiStateStore(QString(), this))
     , m_settings(new AppSettings(QString(), this))
+    , m_logBuffer(new LogBuffer(this))
 {
     // Once the sidebar has authoritative rows, reopen whatever Dev Session the
     // user was last in (no-op if one is already active or none was remembered).
@@ -73,6 +75,14 @@ void AppController::setServerId(const QString& serverId)
     if (m_serverId.value == serverId)
         return;
     m_serverId.value = serverId;
+    // Every workspace.list response belongs to the server id that was current
+    // when it was issued. Invalidate all earlier generations BEFORE clearing
+    // the visible cache, so a reply already in the client's router cannot
+    // repopulate this sidebar after the switch.
+    ++m_refreshGeneration;
+    m_lastNodes.clear();
+    m_terminalStates.clear();
+    rebuildRows();
     // The layouts repository is keyed by the same id. Keeping it in lockstep
     // HERE, rather than at each call site, is what stops a setLayout write
     // landing under the previous server's key after a switch.
@@ -170,6 +180,33 @@ void AppController::setAgentMonitor(AgentStatusMonitor* monitor)
     // state it already accumulated, and a clear drops back to bare rows.
     rebuildRows();
 }
+void AppController::setTerminalFactory(TerminalFactory* factory)
+{
+    if (m_terminalFactory == factory)
+        return;
+    if (m_terminalFactory)
+        disconnect(m_terminalFactory, nullptr, this, nullptr);
+    m_terminalFactory = factory;
+    if (m_terminalFactory) {
+        // TerminalFactory is the only owner of pane/controller identity. The
+        // controller merely stamps each event with the server id it arrived
+        // from and ignores anything from a profile that is no longer current.
+        connect(m_terminalFactory, &TerminalFactory::terminalStateChanged, this,
+                [this](const QString& serverId, const QString& devSessionId,
+                       const QString& terminalId, TerminalState state) {
+                    if (serverId != m_serverId.value || devSessionId.isEmpty()
+                        || terminalId.isEmpty()) {
+                        return;
+                    }
+                    m_terminalStates[devSessionId].insert(terminalId, state);
+                    applyAgentStateUpdate();
+                });
+    }
+    // A factory may already have resolved panes before injection (a test or a
+    // reconfigured QML graph), so the current tree must be re-merged now even
+    // though no state signal is guaranteed to follow this setter.
+    rebuildRows();
+}
 
 void AppController::setEditorFactory(EditorFactory* factory)
 {
@@ -199,6 +236,7 @@ void AppController::setConnection(SshConnectionPool* pool,
     m_bootstrap = bootstrap;
     m_profiles = profiles;
     m_layouts = layouts;
+    m_lastSshDiagnostics.clear();
 
     // setConnection may land after a serverId is already known (test order, or
     // a re-injection); seed the layouts key so it is never one server behind.
@@ -207,7 +245,14 @@ void AppController::setConnection(SshConnectionPool* pool,
 
     if (m_pool) {
         connect(m_pool, &SshConnectionPool::diagnosticLogChanged, this,
-                &AppController::connectionDiagnosticsChanged);
+                [this] {
+                    syncSshDiagnostics();
+                    emit connectionDiagnosticsChanged();
+                });
+        // A pool can already hold a transcript when it is injected by a test
+        // or by a reconnecting startup. Copy it before the first QML binding
+        // reads the property, so no remote explanation is lost.
+        syncSshDiagnostics();
     }
     if (m_profiles) {
         // A profile save that could not take its interprocess lock still saves,
@@ -231,43 +276,74 @@ void AppController::setConnection(SshConnectionPool* pool,
                 });
     }
     if (m_bootstrap) {
+        connect(m_bootstrap, &SessionBootstrap::channelDiagnostic, this,
+                [this](const QString& role, const QString& text) {
+                    // SessionBootstrap's channel stream is remote stderr and
+                    // libssh channel faults. It never carries the credential
+                    // callback arguments, so forwarding it is safe and gives
+                    // the log pane a clear daemon origin.
+                    m_logBuffer->appendRemote(
+                        QStringLiteral("daemon"), QStringLiteral("ssh.channel"),
+                        role, text, QtInfoMsg);
+                });
+        connect(m_bootstrap, &SessionBootstrap::provisioning, this,
+                [this](const QString& message) {
+                    m_logBuffer->appendRemote(
+                        QStringLiteral("daemon"), QStringLiteral("provisioning"),
+                        QStringLiteral("SessionBootstrap"), message, QtInfoMsg);
+                });
         // The bootstrap reconnects on its own (backoff per SPEC 5.6); mirror its
         // state so the UI can show "reconnecting" instead of going quietly dead,
         // and re-adopt the server identity on every successful (re)wire.
+        const auto mirrorState = [this](SessionBootstrap::State state) {
+            switch (state) {
+            case SessionBootstrap::State::Connecting:
+                setConnectionState(QStringLiteral("connecting"));
+                break;
+            case SessionBootstrap::State::Wired:
+                setConnectionState(QStringLiteral("connected"));
+                break;
+            case SessionBootstrap::State::Reconnecting:
+                setConnectionState(QStringLiteral("reconnecting"));
+                break;
+            case SessionBootstrap::State::Failed:
+                setConnectionState(QStringLiteral("failed"), m_connectionError);
+                break;
+            case SessionBootstrap::State::Provisioning:
+                // First connect to a server with no usable remote
+                // service: SessionBootstrap is installing it. Its own
+                // state rather than "connecting", because installing
+                // downloads and unpacks a release tarball and can take
+                // far longer than a handshake — a footer that says
+                // "connecting" for thirty seconds is indistinguishable
+                // from a hung connect. Every surface that renders a
+                // connection state has a case for this string
+                // (ConnectSheet.qml, SessionsSidebar.qml) and
+                // tst_uxshell enumerates them.
+                setConnectionState(QStringLiteral("provisioning"));
+                break;
+            case SessionBootstrap::State::Disconnected:
+                setConnectionState(QStringLiteral("disconnected"));
+                break;
+            }
+        };
+        // Keep the QML property correct even when this controller is injected
+        // after a bootstrap that is already running. The normal main() order
+        // wires us before the first connect, but a late injection is a valid
+        // test and reconfiguration path; without this read-back the signal
+        // that published the current state has already been missed.
         connect(m_bootstrap, &SessionBootstrap::stateChanged, this,
-                [this](SessionBootstrap::State state) {
-                    switch (state) {
-                    case SessionBootstrap::State::Connecting:
-                        setConnectionState(QStringLiteral("connecting"));
-                        break;
-                    case SessionBootstrap::State::Wired:
-                        setConnectionState(QStringLiteral("connected"));
-                        break;
-                    case SessionBootstrap::State::Reconnecting:
-                        setConnectionState(QStringLiteral("reconnecting"));
-                        break;
-                    case SessionBootstrap::State::Failed:
-                        setConnectionState(QStringLiteral("failed"),
-                                           m_connectionError);
-                        break;
-                    case SessionBootstrap::State::Provisioning:
-                        // First connect to a server with no usable remote
-                        // service: SessionBootstrap is installing it. Its own
-                        // state rather than "connecting", because installing
-                        // downloads and unpacks a release tarball and can take
-                        // far longer than a handshake — a footer that says
-                        // "connecting" for thirty seconds is indistinguishable
-                        // from a hung connect. Every surface that renders a
-                        // connection state has a case for this string
-                        // (ConnectSheet.qml, SessionsSidebar.qml) and
-                        // tst_uxshell enumerates them.
-                        setConnectionState(QStringLiteral("provisioning"));
-                        break;
-                    case SessionBootstrap::State::Disconnected:
-                        setConnectionState(QStringLiteral("disconnected"));
-                        break;
-                    }
+                [mirrorState](SessionBootstrap::State state) {
+                    mirrorState(state);
                 });
+        mirrorState(m_bootstrap->state());
+        // A bootstrap can already be Wired when it is injected (for example,
+        // an environment-driven session created by an orchestrator). Its
+        // `wired` signal is past, so repeat the identity handshake here rather
+        // than leaving the sidebar keyed to the empty server id.
+        if (m_bootstrap->state() == SessionBootstrap::State::Wired
+            && m_client && m_client->transport())
+            adoptServerIdentity();
         connect(m_bootstrap, &SessionBootstrap::wired, this,
                 [this] { adoptServerIdentity(); });
         connect(m_bootstrap, &SessionBootstrap::error, this,
@@ -311,6 +387,32 @@ void AppController::setConnection(SshConnectionPool* pool,
 QString AppController::sshDiagnostics() const
 {
     return m_pool ? m_pool->diagnosticLog() : QString();
+}
+
+void AppController::syncSshDiagnostics()
+{
+    if (!m_logBuffer)
+        return;
+    const QString current = m_pool ? m_pool->diagnosticLog() : QString();
+    if (current == m_lastSshDiagnostics)
+        return;
+
+    QString newText;
+    if (m_lastSshDiagnostics.isEmpty()) {
+        newText = current;
+    } else if (current.startsWith(m_lastSshDiagnostics)) {
+        newText = current.mid(m_lastSshDiagnostics.size());
+    } else if (!current.isEmpty()) {
+        // The pool may have dropped the front of its own transcript at its
+        // character cap. There is no stable line id in that API, so copying the
+        // new snapshot is safer than silently losing the diagnostic that caused
+        // the rollover. The shared log buffer has its own independent cap.
+        newText = current;
+    }
+    m_lastSshDiagnostics = current;
+    m_logBuffer->appendRemote(QStringLiteral("ssh"), QStringLiteral("libssh"),
+                               QStringLiteral("SshConnectionPool"), newText,
+                               QtInfoMsg);
 }
 
 void AppController::setConnectionState(const QString& state, const QString& err)
@@ -956,25 +1058,32 @@ QString AppController::activeSessionRepoRoot() const
 
 QVector<GroupRow> AppController::computeRows()
 {
-    // Start from the pure persisted mapping (terminals empty), then overlay the
-    // live agent state from the monitor (the source of truth). Deriving the
-    // terminals fresh from m_lastNodes on every call is what makes a workspace
-    // refresh and an agent event mutually non-destructive.
+    // Start from the persisted tree and overlay both live sources: TerminalFactory
+    // owns per-pane connection state, while AgentStatusMonitor owns agent state.
+    // Rebuilding the vectors from m_lastNodes on every call keeps a refresh or
+    // either live event from wiping the other source.
     QVector<GroupRow> rows = toGroupRows(m_lastNodes);
-    if (m_agentMonitor) {
-        // toGroupRows preserves the node order 1:1, so the row tree lines up
-        // index-for-index with m_lastNodes; walk them in lockstep.
-        for (qsizetype gi = 0; gi < m_lastNodes.size(); ++gi) {
-            const GroupNode& groupNode = m_lastNodes.at(gi);
-            GroupRow& groupRow = rows[gi];
-            for (qsizetype si = 0; si < groupNode.sessions.size(); ++si) {
-                const SessionNode& sessionNode = groupNode.sessions.at(si);
-                SessionRow& sessionRow = groupRow.sessions[si];
-                const QString& devSessionId = sessionNode.session.id.value;
-                sessionRow.terminals.reserve(sessionNode.terminalPanes.size());
-                for (const TerminalPane& pane : sessionNode.terminalPanes) {
-                    TerminalStatus status;
-                    status.id = pane.id;
+    // toGroupRows preserves the node order 1:1, so the row tree lines up
+    // index-for-index with m_lastNodes; walk them in lockstep.
+    for (qsizetype gi = 0; gi < m_lastNodes.size(); ++gi) {
+        const GroupNode& groupNode = m_lastNodes.at(gi);
+        GroupRow& groupRow = rows[gi];
+        for (qsizetype si = 0; si < groupNode.sessions.size(); ++si) {
+            const SessionNode& sessionNode = groupNode.sessions.at(si);
+            SessionRow& sessionRow = groupRow.sessions[si];
+            const QString& devSessionId = sessionNode.session.id.value;
+            const auto terminalStates = m_terminalStates.constFind(devSessionId);
+            sessionRow.terminals.reserve(sessionNode.terminalPanes.size());
+            for (const TerminalPane& pane : sessionNode.terminalPanes) {
+                TerminalStatus status;
+                status.id = pane.id;
+                if (terminalStates != m_terminalStates.constEnd()) {
+                    const auto state = terminalStates->constFind(pane.id.value);
+                    if (state != terminalStates->constEnd())
+                        status.connection = state.value();
+                }
+                status.agent = AgentState::Unknown;
+                if (m_agentMonitor) {
                     AgentState agent = static_cast<AgentState>(
                         m_agentMonitor->stateFor(devSessionId, pane.id.value));
                     // The monitor keeps a terminal at IdleUnseen even after the
@@ -985,11 +1094,12 @@ QVector<GroupRow> AppController::computeRows()
                     // the badge would never clear. Downgrade IdleUnseen -> Idle
                     // for the row once the session is no longer flagged unseen.
                     if (agent == AgentState::IdleUnseen
-                        && !m_agentMonitor->hasUnseen(devSessionId))
+                        && !m_agentMonitor->hasUnseen(devSessionId)) {
                         agent = AgentState::Idle;
+                    }
                     status.agent = agent;
-                    sessionRow.terminals.push_back(status);
                 }
+                sessionRow.terminals.push_back(status);
             }
         }
     }
@@ -1089,7 +1199,7 @@ void AppController::refresh()
         if (droppedActive || self->activeSessionRepoRoot() != repoRootBefore)
             emit self->activeSessionChanged();
         emit self->refreshed();
-    });
+    }, m_sessionsModel->pinnedOnly());
 }
 
 void AppController::createGroup(QString name)
@@ -1140,6 +1250,13 @@ void AppController::renameSession(QString id, QString name)
     UpdateSessionParams params;
     params.id = DevSessionId{std::move(id)};
     params.name = std::move(name);
+    m_db->updateSession(params, refreshOnSuccess<std::optional<DevSession>>());
+}
+void AppController::setSessionPinned(QString id, bool pinned)
+{
+    UpdateSessionParams params;
+    params.id = DevSessionId{std::move(id)};
+    params.pinned = pinned;
     m_db->updateSession(params, refreshOnSuccess<std::optional<DevSession>>());
 }
 
