@@ -390,13 +390,29 @@ D=tests/live/.fixture && mkdir -p $D          # gitignored: it holds real privat
 ssh-keygen -q -t ed25519 -f $D/hostkey -N ''
 ssh-keygen -q -t ed25519 -f $D/id -N ''
 cat $D/id.pub > $D/authorized_keys && chmod 600 $D/authorized_keys $D/id
-printf 'Port 2222\nListenAddress 127.0.0.1\nHostKey %s/hostkey\nAuthorizedKeysFile %s/authorized_keys\nPidFile %s/sshd.pid\nUsePAM no\nStrictModes no\nPasswordAuthentication no\nAllowUsers %s\nSubsystem sftp internal-sftp\n' \
-  "$PWD/$D" "$PWD/$D" "$PWD/$D" "$(whoami)" > $D/sshd_config
+printf 'Port 2222\nListenAddress 127.0.0.1\nHostKey %s/hostkey\nAuthorizedKeysFile %s/authorized_keys\nPidFile %s/sshd.pid\nUsePAM no\nStrictModes no\nPasswordAuthentication no\nAllowUsers %s\nSubsystem sftp internal-sftp\nSetEnv CODEHARBOR_DB=%s/workspace.sqlite\n' \
+  "$PWD/$D" "$PWD/$D" "$PWD/$D" "$(whoami)" "$PWD/$D" > $D/sshd_config
 
 /usr/sbin/sshd -D -e -f $PWD/$D/sshd_config &   # unprivileged; logs to stderr
 ssh-agent -a $PWD/$D/agent.sock &
 SSH_AUTH_SOCK=$PWD/$D/agent.sock ssh-add $D/id
 ```
+
+**That `SetEnv CODEHARBOR_DB` line is not optional.** The live gates run a REAL
+`codeharbord` as you, and its workspace database defaults to
+`~/.local/share/codeharbor/codeharbor.sqlite` — the same file the server INSTALLED
+on this machine uses. Without the override, a live run migrates that database to
+whatever schema version the working tree carries, and the installed server then
+refuses to start (`workspace schema is newer than the build supports`) until it is
+upgraded to match. `CODEHARBOR_DB` is the documented override (see `workspace()` in
+`remote/src/workspace.ts`) and the fixture points it at a throwaway file inside
+itself. `tst_livereconnect`'s first case asks the server what it actually sees and
+fails with these instructions if the override is missing or points at the real
+database, so a mis-built fixture cannot eat your workspace quietly.
+
+If it has already happened, the workspace itself is fine — the migration only adds
+columns. Upgrade the installed server (`Update server` in the client, or unpack a
+newer `codeharbor-remote.tar.gz` over it) and it opens again.
 
 Then run them. Every variable below is REQUIRED and none of them has a default:
 omit `CH_LIVE_SSH` and every gate QSKIPs, which reports as a green run that

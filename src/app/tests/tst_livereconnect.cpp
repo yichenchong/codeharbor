@@ -129,6 +129,7 @@ private slots:
     void initTestCase();
     void cleanupTestCase();
 
+    void theFixtureIsolatesTheWorkspaceDatabase();
     void survivesADroppedConnection();
     void provisionsAnEmptyLocationThenWires();
 
@@ -230,6 +231,62 @@ void TstLiveReconnect::dropTheConnection()
     QVERIFY2(!killerStderr.contains(QStringLiteral("refusing to kill")),
              qPrintable(QStringLiteral("kill helper refused: %1")
                             .arg(killerStderr)));
+}
+
+// The live gates run a REAL codeharbord as this user, and its workspace database
+// defaults to the ONE the installed server uses. A fixture that does not override
+// that path therefore migrates the developer's own workspace to whatever schema
+// version the tree under test carries, and the installed server then refuses to
+// start at all ("workspace schema is newer than the build supports") until it is
+// upgraded too. That happened; this is the guard so it cannot happen quietly.
+//
+// Checked by asking the SERVER what it sees, over the same SSH session the daemon
+// is launched on, because that is the environment that actually decides - not the
+// environment this test process happens to have.
+void TstLiveReconnect::theFixtureIsolatesTheWorkspaceDatabase()
+{
+    if (!m_live)
+        QSKIP("live gate not armed");
+
+    const QString host = env("CH_LIVE_HOST");
+    const quint16 port = static_cast<quint16>(env("CH_LIVE_PORT").toUInt());
+    const QString user = env("CH_LIVE_USER");
+    const QString identity = env("CH_LIVE_IDENTITY");
+
+    // Its OWN pool, with its own host-key answer. The shared m_pool is the one
+    // the later cases drive through SessionBootstrap, which installs the
+    // host-key callback itself; borrowing it here would either be refused (the
+    // pool declines an unknown key when no callback is set) or would leave it
+    // connected and pre-answered for a case that means to start cold.
+    SshConnectionPool probe;
+    probe.setHostKeyCallback([](const QString&, const QString&,
+                                const QByteArray&, ch::KnownHosts::Verdict) {
+        // A throwaway fixture on loopback, and this probe reads one environment
+        // variable: accepting is the whole point, and nothing here is persisted.
+        return SshConnectionPool::HostKeyDecision::Accept;
+    });
+    QVERIFY2(probe.connectToHost(host, port, user, identity),
+             qPrintable(probe.diagnosticLog()));
+
+    bool ok = false;
+    const QString reported =
+        runExec(probe,
+                QStringLiteral("printf 'DB=%s\\n' \"${CODEHARBOR_DB-}\""), &ok);
+    QVERIFY2(ok, "could not ask the fixture what CODEHARBOR_DB it sets");
+
+    const QString value =
+        reported.section(QStringLiteral("DB="), 1).trimmed();
+    QVERIFY2(!value.isEmpty(),
+             "the live fixture does not set CODEHARBOR_DB, so codeharbord would "
+             "open the workspace database of the server installed on this "
+             "machine and migrate it. Add a SetEnv line to the fixture's "
+             "sshd_config (see docs/DEVELOPMENT.md, Live gates).");
+    QVERIFY2(!value.contains(QStringLiteral("/.local/share/codeharbor/")),
+             qPrintable(QStringLiteral(
+                            "the live fixture points CODEHARBOR_DB at the real "
+                            "workspace database (%1); it must be a throwaway file")
+                            .arg(value)));
+    probe.disconnectFromHost();
 }
 
 void TstLiveReconnect::survivesADroppedConnection()
