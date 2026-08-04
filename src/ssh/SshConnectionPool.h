@@ -123,12 +123,10 @@ public:
             std::atomic<bool> active{true};
         };
         // A native thread identifier can be recycled as soon as a thread exits.
-        // Keep a shared, per-thread token instead: it remains alive through a
-        // Route that outlives its owning thread and cannot compare equal to a
-        // later thread that happens to receive the same native identifier.
-        struct ThreadIdentity {};
+        // Store a process-unique token instead: a Route that outlives its
+        // owning thread cannot compare equal to a later thread.
         std::shared_ptr<Entry> m_entry;
-        std::shared_ptr<ThreadIdentity> m_threadIdentity;
+        quint64 m_threadIdentity = 0;
     };
 
     // Test seams. activeRouteCount() is process-wide; ownsThreadLoggingState()
@@ -156,12 +154,12 @@ private:
     // pointer into freed memory. Only the owning thread appends to or removes
     // from its own list; another thread can at most clear an entry's atomic
     // `active` flag.
-    static thread_local QList<std::shared_ptr<Route::Entry>> s_threadRoutes;
-    // Stable identity for the calling thread, unlike a recycled native thread
-    // identifier. A route keeps its token alive if it outlives that thread.
-    static thread_local std::shared_ptr<Route::ThreadIdentity>
-        s_threadIdentity;
-
+    // The pointer itself is trivially destructible, so process shutdown cannot
+    // run QList/shared-pointer destructors before a late Route or libssh log
+    // callback touches this state. The heap object is reclaimed on an ordinary
+    // last release when no dispatch is active; an owner-thread contract
+    // violation may intentionally leave it until process reclamation.
+    static thread_local QList<std::shared_ptr<Route::Entry>>* s_threadRoutes;
     // Drop entries that no longer route anywhere, including any deactivated by
     // a wrong-thread release. Only ever called on the owning thread, which is
     // the only one allowed to touch the list itself.

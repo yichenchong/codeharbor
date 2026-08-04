@@ -253,14 +253,18 @@ jobs:
       # A test that CRASHES prints nothing useful through ctest: its standard
       # output is still sitting in the process's own buffer when it dies, so
       # output-on-failure has nothing to show and the run reports only which
-      # target failed. That happened here with a Windows-only crash, and there
-      # was no way to see the failing case without another push. Re-running just
-      # the failed targets with per-test verbosity, and letting each one write
-      # straight to the console instead of through ctest's capture, shows how far
-      # the test got and which case it died in.
+      # target failed.
+      #
+      # Re-running once is not enough either, because the failure this was
+      # written for is intermittent: the first attempt to diagnose it re-ran the
+      # test, it passed, and the run finished with no more information than
+      # before. So repeat the failed targets until one of them fails again, up
+      # to twenty times. That both reproduces an intermittent failure and, by
+      # reporting how many attempts it survived, measures how often it happens —
+      # which is the difference between a real defect and a one-off.
       - name: Diagnose failed tests
         if: failure()
-        run: ctest --preset release-tests --rerun-failed --output-on-failure --verbose
+        run: ctest --preset release-tests --rerun-failed --repeat until-fail:20 --output-on-failure --verbose
         shell: bash
         continue-on-error: true
 

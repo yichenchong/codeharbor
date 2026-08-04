@@ -93,6 +93,7 @@ private slots:
     void libsshActivityAfterAHandshakeNeverReachesThePoolsTranscript();
     void aPoolLeavesNoRouteBehindAfterAFailedHandshake();
     void aThreadWithNoPreviousHookIsLeftWithAnInertOne();
+    void staticRouteAtProcessExitDoesNotUseDestroyedTls();
 #endif
 };
 
@@ -723,6 +724,18 @@ void TstSshLogRouter::
     QCOMPARE(pool.diagnosticLog(), transcriptAfterHandshake);
 
     resetLibsshLoggingBaseline();
+}
+// Keep one route alive until process shutdown. The route release then runs
+// during static destruction, after Qt and test objects have gone away; its
+// heap-backed route list must still be valid and dispatch must tolerate the
+// callback remaining installed afterward.
+void TstSshLogRouter::staticRouteAtProcessExitDoesNotUseDestroyedTls()
+{
+    static const auto route =
+        std::make_unique<SshLogRouter::Route>(
+            [](int, const char*, const char*) {});
+    QVERIFY(route != nullptr);
+    QVERIFY(SshLogRouter::activeRouteCount() > 0);
 }
 
 #endif // CH_HAVE_LIBSSH

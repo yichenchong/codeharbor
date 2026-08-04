@@ -46,6 +46,14 @@ thread_local bool t_ownsThreadState = false;
 
 // Process-wide, for the test seam only: nothing about routing consults it.
 std::atomic<int> g_activeRoutes{0};
+// Process-wide monotonic route-owner identity. Unlike a native thread handle,
+// a value is never reused while the process is alive.
+std::atomic<quint64> g_nextThreadIdentity{1};
+
+// These are deliberately trivial TLS values. Non-trivial route state lives
+// behind SshLogRouter::s_threadRoutes, whose pointer itself has no destructor.
+thread_local quint64 t_threadIdentity = 0;
+thread_local int t_dispatchDepth = 0;
 
 #if CH_HAVE_LIBSSH
 thread_local ssh_logging_callback t_previousLogCallback = nullptr;
@@ -76,18 +84,19 @@ void SshLogRouter::Route::release()
     SshLogRouter::release(this);
 }
 
-thread_local QList<std::shared_ptr<SshLogRouter::Route::Entry>>
-    SshLogRouter::s_threadRoutes;
-thread_local std::shared_ptr<SshLogRouter::Route::ThreadIdentity>
-    SshLogRouter::s_threadIdentity;
+thread_local QList<std::shared_ptr<SshLogRouter::Route::Entry>>*
+    SshLogRouter::s_threadRoutes = nullptr;
 
 void SshLogRouter::pruneInactiveThreadRoutes()
 {
-    s_threadRoutes.removeIf(
+    if (!s_threadRoutes)
+        return;
+    s_threadRoutes->removeIf(
         [](const std::shared_ptr<Route::Entry>& entry) {
             return !entry->active.load(std::memory_order_acquire);
         });
 }
+
 void SshLogRouter::restoreThreadLoggingState()
 {
 #if CH_HAVE_LIBSSH
@@ -109,20 +118,21 @@ void SshLogRouter::restoreThreadLoggingState()
 #endif
     t_ownsThreadState = false;
 }
-
-
 void SshLogRouter::acquire(Route* route)
 {
     Q_ASSERT(route);
-    if (!s_threadIdentity)
-        s_threadIdentity =
-            std::make_shared<SshLogRouter::Route::ThreadIdentity>();
-    route->m_threadIdentity = s_threadIdentity;
+    if (t_threadIdentity == 0)
+        t_threadIdentity =
+            g_nextThreadIdentity.fetch_add(1, std::memory_order_relaxed);
+    route->m_threadIdentity = t_threadIdentity;
+    if (!s_threadRoutes)
+        s_threadRoutes =
+            new QList<std::shared_ptr<SshLogRouter::Route::Entry>>();
     pruneInactiveThreadRoutes();
-    if (s_threadRoutes.isEmpty() && t_ownsThreadState)
+    if (s_threadRoutes->isEmpty() && t_ownsThreadState)
         restoreThreadLoggingState();
-    const bool firstOnThisThread = s_threadRoutes.isEmpty();
-    s_threadRoutes.append(route->m_entry);
+    const bool firstOnThisThread = s_threadRoutes->isEmpty();
+    s_threadRoutes->append(route->m_entry);
     g_activeRoutes.fetch_add(1, std::memory_order_relaxed);
     if (!firstOnThisThread)
         return;
@@ -154,9 +164,9 @@ void SshLogRouter::release(Route* route)
     entry->active.store(false, std::memory_order_release);
     g_activeRoutes.fetch_sub(1, std::memory_order_relaxed);
 
-    const bool sameThread = s_threadIdentity
-        && s_threadIdentity == route->m_threadIdentity;
-    route->m_threadIdentity.reset();
+    const bool sameThread = t_threadIdentity != 0
+        && t_threadIdentity == route->m_threadIdentity;
+    route->m_threadIdentity = 0;
     if (!sameThread) {
         // A REAL runtime guard, not an assertion that vanishes in a release
         // build. The owning thread's route stack and its saved libssh state are
@@ -172,9 +182,13 @@ void SshLogRouter::release(Route* route)
     }
 
     pruneInactiveThreadRoutes();
-    if (!s_threadRoutes.isEmpty() || !t_ownsThreadState)
+    if (!s_threadRoutes || !s_threadRoutes->isEmpty() || !t_ownsThreadState)
         return;
     restoreThreadLoggingState();
+    if (t_dispatchDepth == 0) {
+        delete s_threadRoutes;
+        s_threadRoutes = nullptr;
+    }
 }
 
 void SshLogRouter::dispatch(int priority, const char* function,
@@ -184,11 +198,29 @@ void SshLogRouter::dispatch(int priority, const char* function,
     // cannot identify the session that emitted this line. See the class comment
     // — attribution is by thread.
     Q_UNUSED(userdata);
+    if (!s_threadRoutes)
+        return;
+    pruneInactiveThreadRoutes();
+    if (s_threadRoutes->isEmpty()) {
+        delete s_threadRoutes;
+        s_threadRoutes = nullptr;
+        return;
+    }
+    ++t_dispatchDepth;
+    const auto finishDispatch = qScopeGuard([] {
+        --t_dispatchDepth;
+        if (t_dispatchDepth == 0 && s_threadRoutes
+            && s_threadRoutes->isEmpty()) {
+            delete s_threadRoutes;
+            s_threadRoutes = nullptr;
+        }
+    });
     // Innermost ACTIVE route wins. An entry can be inert when its Route was
     // released from another thread, which cannot remove it from this thread's
     // stack; skipping it here is what stops a line reaching a sink whose owner
     // has gone.
-    for (auto it = s_threadRoutes.crbegin(); it != s_threadRoutes.crend(); ++it) {
+    for (auto it = s_threadRoutes->crbegin();
+         it != s_threadRoutes->crend(); ++it) {
         const Route::Entry& entry = **it;
         if (!entry.active.load(std::memory_order_acquire))
             continue;
