@@ -201,8 +201,8 @@ test("sessionExists is false when the server has no sessions at all", async () =
 
 test("killSession targets the exact name through argv, never a shell string", async () => {
     const tmux = stubRunner(OK(""));
-    assert.deepEqual(await killSession({ name: "my session: staging" }, tmux.run), {});
-    assert.deepEqual(tmux.calls, [["kill-session", "-t", "=my session: staging"]]);
+    assert.deepEqual(await killSession({ name: "my session staging" }, tmux.run), {});
+    assert.deepEqual(tmux.calls, [["kill-session", "-t", "=my session staging"]]);
 });
 
 test("killSession passes hostile names verbatim as one argv element", async () => {
@@ -237,6 +237,25 @@ test("an option-shaped or glob name cannot be read as a flag or match another se
 test("killing an absent session is a successful no-op", async () => {
     const tmux = stubRunner({ code: 1, stdout: "", stderr: "can't find session: ghost" });
     assert.deepEqual(await killSession({ name: "ghost" }, tmux.run), {});
+});
+test("killSession rejects tmux target separators instead of killing another session", async () => {
+    const tmux = stubRunner(OK(""));
+    for (const name of ["other:0", "other.0", "   "]) {
+        await assert.rejects(
+            () => killSession({ name }, tmux.run),
+            /tmux-safe session name|non-empty string name/,
+            name,
+        );
+    }
+    assert.deepEqual(tmux.calls, [], "unsafe targets must not reach tmux");
+});
+
+test("unexpected tmux failures are surfaced", async () => {
+    const failed = stubRunner({ code: 1, stdout: "", stderr: "permission denied" });
+    await assert.rejects(() => listSessions(failed.run), /tmux list-sessions failed/);
+
+    const killFailed = stubRunner({ code: 1, stdout: "", stderr: "permission denied" });
+    await assert.rejects(() => killSession({ name: "codeharbor" }, killFailed.run), /tmux kill-session failed/);
 });
 
 test("a malformed name IS an error, unlike a missing tmux", async () => {

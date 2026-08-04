@@ -41,6 +41,8 @@ InternalUrlMap::InternalUrlMap(int maxEntries)
 
 QString InternalUrlMap::internalUrlFor(const QUrl &fileUrl)
 {
+    if (!fileUrl.isValid())
+        return {};
     const QString key = fileUrl.toString();
     QMutexLocker lock(&m_mutex);
     const auto it = m_fileToId.constFind(key);
@@ -77,8 +79,11 @@ QString InternalUrlMap::idOf(const QString &internalUrl)
     // entry point here has to agree with it: an accepting lookup next to a
     // refusing handler is precisely the sort of split that lets a URL be
     // "valid" on one side of the subsystem and rejected on the other.
-    if (u.host().compare(QLatin1String("file"), Qt::CaseInsensitive) != 0)
+    if (u.host().compare(QLatin1String("file"), Qt::CaseInsensitive) != 0
+        || u.port() != -1 || !u.userInfo().isEmpty())
         return QString();
+    // Ports and user-info are part of the URL authority too, so accepting
+    // them would create alternate origins for the same opaque resource.
     QString id = u.path();
     if (id.startsWith(QLatin1Char('/')))
         id = id.mid(1);
@@ -321,8 +326,13 @@ void InternalUrlSchemeHandler::requestStarted(QWebEngineUrlRequestJob *job)
     const auto refuse = [this, job, requestUrl](
                             Failure reason, QWebEngineUrlRequestJob::Error error,
                             const QString &detail = QString()) {
+        // A requestFailed() slot can synchronously tear down the view (and
+        // therefore the request job). Re-check through QPointer before calling
+        // fail(), instead of dereferencing a job that the signal just deleted.
+        QPointer<QWebEngineUrlRequestJob> guard(job);
         emit requestFailed(requestUrl, reason, failureMessage(reason, detail));
-        job->fail(error);
+        if (guard)
+            guard->fail(error);
     };
 
     // The privileged origin is strictly read-only. A rendered document could
@@ -334,12 +344,13 @@ void InternalUrlSchemeHandler::requestStarted(QWebEngineUrlRequestJob *job)
         return;
     }
 
-    // The one documented shape is codeharbor-internal://file/<id> (SPEC 7.4).
-    // Reject any other authority instead of accepting it as an alias for
-    // "file": a differing host is a different web origin, and serving the same
-    // bytes under several origins would hand a rendered page extra origins to
-    // play same-origin games with.
-    if (requestUrl.host().compare(QLatin1String("file"), Qt::CaseInsensitive) != 0) {
+    if (requestUrl.scheme().compare(InternalUrlMap::scheme(),
+                                    Qt::CaseInsensitive)
+            != 0
+        || requestUrl.host().compare(QLatin1String("file"),
+                                     Qt::CaseInsensitive)
+               != 0
+        || requestUrl.port() != -1 || !requestUrl.userInfo().isEmpty()) {
         refuse(Failure::UnknownHost, QWebEngineUrlRequestJob::UrlNotFound);
         return;
     }
@@ -392,19 +403,17 @@ void InternalUrlSchemeHandler::requestStarted(QWebEngineUrlRequestJob *job)
         QString::fromLatin1(rpc::kMethodReadFile), params,
         [guard, self, requestUrl,
          path](QJsonValue result, std::optional<RpcError> error) {
-            // The browser cancelled (or the view was destroyed) while the read
-            // was in flight. There is no wire operation to cancel the remote
-            // read, so the payload has already crossed the SSH channel; drop it
-            // here, before anything decodes or copies it.
-            if (!guard)
-                return;
             const auto refuseLate = [&guard, &self, &requestUrl](
                                         Failure reason,
                                         const QString &detail = QString()) {
                 if (self)
                     emit self->requestFailed(requestUrl, reason,
                                              failureMessage(reason, detail));
-                guard->fail(QWebEngineUrlRequestJob::RequestFailed);
+                // The signal may synchronously destroy the WebEngine view.
+                // QPointer turns that cancellation into a no-op instead of a
+                // use-after-free (or a null dereference).
+                if (guard)
+                    guard->fail(QWebEngineUrlRequestJob::RequestFailed);
             };
             if (error) {
                 refuseLate(Failure::ReadFailed, error->message);

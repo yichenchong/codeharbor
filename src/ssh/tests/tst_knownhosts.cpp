@@ -74,6 +74,8 @@ private slots:
     void wildcardCoversAHostSpelledWithAnAsterisk();
     void commentsAndMarkersSurviveARoundTrip();
     void addIgnoresATripleThatCannotBeStored();
+    void addRejectsNonPlainHostTokens();
+
     void lookupHostCanonicalizesTheEndpoint();
     void trustedHostRefusesUnknownKeyType();
     void markerOnlyHostStaysUnknownForOtherTypes();
@@ -560,6 +562,24 @@ void TstKnownHosts::addIgnoresATripleThatCannotBeStored()
     QCOMPARE(reparsed.verify(QStringLiteral("good.host"),
                              QStringLiteral("ssh-ed25519"), kEd25519Alpha),
              KnownHosts::Verdict::Match);
+}
+
+void TstKnownHosts::addRejectsNonPlainHostTokens()
+{
+    // add() writes one host field, so known_hosts pattern/list syntax and
+    // whitespace must not be accepted as though they were literal host names.
+    KnownHosts store;
+    for (const QString& host : {QStringLiteral("*.example.com"),
+                                QStringLiteral("!excluded.example.com"),
+                                QStringLiteral("|1|salt|hash"),
+                                QStringLiteral("one.example,two.example"),
+                                QStringLiteral("line\ninjection")}) {
+        store.add(host, QStringLiteral("ssh-ed25519"), kEd25519Alpha);
+    }
+    store.add(QStringLiteral("host.example"), QStringLiteral("ssh ed25519"),
+              kEd25519Alpha);
+    QCOMPARE(store.entries().size(), 0);
+    QCOMPARE(store.serialize(), QByteArray());
 }
 
 void TstKnownHosts::lookupHostCanonicalizesTheEndpoint()

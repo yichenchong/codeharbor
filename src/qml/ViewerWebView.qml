@@ -65,6 +65,21 @@ Item {
         settings.javascriptEnabled: !root.remoteFile
         settings.localContentCanAccessFileUrls: !root.remoteFile
         settings.localContentCanAccessRemoteUrls: !root.remoteFile
+        // Popups are not part of a pane's browser contract. Keeping them off
+        // also prevents an external page from escaping the pane's navigation
+        // and opening an uncontrolled top-level view.
+        settings.javascriptCanOpenWindows: false
+        onNavigationRequested: function(request) {
+            // Never let a link from an external page hand Chromium a
+            // client-machine file URL. Reject it before the load starts and
+            // route it back through ViewerPane, which maps remote files to a
+            // locked-down internal handler.
+            if (!root.remoteFile
+                    && request.url.toString().startsWith("file:")) {
+                request.action = WebEngineNavigationRequest.IgnoreRequest
+                root.navigated(request.url)
+            }
+        }
         url: root.remoteFile ? root.internalUrl : root.url
         // Internal remote-file loads are implementation addresses, not pane
         // history entries. External page links, however, become real viewer
@@ -72,6 +87,10 @@ Item {
         onUrlChanged: {
             if (!root.remoteFile && root.url.toString() !== webView.url.toString())
                 root.navigated(webView.url)
+        }
+        onNewWindowRequested: function(request) {
+            console.warn("ViewerWebView: refused a new window for",
+                         request.requestedUrl)
         }
         // Deliberately no webChannel: external pages get no privileged bridge.
     }

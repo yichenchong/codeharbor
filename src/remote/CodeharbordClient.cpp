@@ -109,6 +109,7 @@ CodeharbordClient::~CodeharbordClient()
     RpcError error;
     error.code = kInternalError;
     error.message = QStringLiteral("client destroyed with request pending");
+    error.data = QJsonValue(QJsonValue::Null);
     failAllPending(error);
 }
 
@@ -195,6 +196,7 @@ void CodeharbordClient::setTransport(QIODevice* transport)
         RpcError error;
         error.code = kInternalError;
         error.message = QStringLiteral("transport replaced with request pending");
+        error.data = QJsonValue(QJsonValue::Null);
         failAllPending(error);
         if (!self)
             return;
@@ -229,15 +231,16 @@ void CodeharbordClient::setTransport(QIODevice* transport)
 }
 
 qint64 CodeharbordClient::call(const QString& method, const QJsonValue& params,
-                            ResponseCallback cb)
+                               ResponseCallback cb)
 {
-    // Assign a monotonically increasing id, wrapping to 1 before the increment
-    // would overflow the maximum signed 64-bit value (signed overflow is
-    // undefined behaviour). At 64 bits a wrap can only collide with a
-    // still-pending id after ~2^63 requests, which no connection reaches; the
-    // pending map would exhaust memory long first.
-    const qint64 id = m_nextId;
-    m_nextId = (m_nextId == std::numeric_limits<qint64>::max()) ? 1 : m_nextId + 1;
+    // Keep every id unique while it is in flight, including after the positive
+    // qint64 sequence wraps and against heartbeat probes, which use the same
+    // pending map. A wrap is practically unreachable, but skipping an occupied
+    // slot makes the routing invariant true rather than probabilistic.
+    qint64 id = m_nextId;
+    while (m_pending.contains(id))
+        id = (id == std::numeric_limits<qint64>::max()) ? 1 : id + 1;
+    m_nextId = (id == std::numeric_limits<qint64>::max()) ? 1 : id + 1;
 
     QJsonObject request;
     request.insert(QStringLiteral("jsonrpc"), QStringLiteral("2.0"));
@@ -268,8 +271,6 @@ qint64 CodeharbordClient::call(const QString& method, const QJsonValue& params,
         failReason = QStringLiteral("outgoing jsonrpc is not \"2.0\"");
     else if (!request.value(QStringLiteral("id")).isDouble())
         failReason = QStringLiteral("outgoing id is not an integer");
-    else if (method.isEmpty())
-        failReason = QStringLiteral("outgoing method is empty");
     else if (request.contains(QStringLiteral("params")) &&
              !request.value(QStringLiteral("params")).isObject() &&
              !request.value(QStringLiteral("params")).isArray())
@@ -284,51 +285,69 @@ qint64 CodeharbordClient::call(const QString& method, const QJsonValue& params,
     else if (!m_transport->isOpen() || !m_transport->isWritable())
         failReason = QStringLiteral("transport not writable");
 
-    // Set when a SHORT — but non-empty — write already put a TRUNCATED frame on
-    // the wire. QIODevice::write() is allowed to report fewer bytes than asked
-    // for, and SshChannelDevice::writeData() really does return a short count
-    // when ssh_channel_write() stops making progress. The peer would then glue
-    // our next request onto that fragment, so the byte stream is desynchronised
-    // beyond repair and the transport has to go rather than keep emitting
-    // garbage frames that the server answers with parse errors.
-    bool framingLost = false;
-
-    if (failReason.isEmpty()) {
-        QByteArray line = QJsonDocument(request).toJson(QJsonDocument::Compact);
-        line.append('\n');
-        const qint64 written = m_transport->write(line);
-        if (written != line.size()) {
-            failReason = QStringLiteral("transport write failed");
-            framingLost = written > 0;
-        }
-    }
-
     if (!failReason.isEmpty()) {
-        // A protocolWarning slot is free to delete this client, so everything
-        // that still touches a member has to survive that. Guard the emit the
-        // way onReadyRead() does and bail out to the callback — which is a local
-        // copy, like `error` and `id` — the moment the object is gone.
-        QPointer<CodeharbordClient> self(this);
+        // A protocolWarning slot is free to delete this client, so do not touch
+        // any member after the signal. The callback, error and id are locals and
+        // remain valid for the required synchronous failure delivery.
         emit protocolWarning(
             QStringLiteral("call(%1): %2").arg(method, failReason));
         RpcError error;
         error.code = kInternalError;
         error.message = QStringLiteral("call failed: %1").arg(failReason);
-        // A half-written frame kills the stream for everyone, so latch the
-        // transport closed first: that fails every OTHER pending caller exactly
-        // once. Nothing after this point touches a member, so a callback that
-        // deletes this client from inside the teardown is safe.
-        if (framingLost && self)
-            onTransportClosed();
-        // Deliver the failure exactly once and register nothing. The callback
-        // may delete this client, so touch no members after invoking it; `id`
-        // is a local copy and is safe to return.
+        error.data = QJsonValue(QJsonValue::Null);
         if (cb)
             cb(QJsonValue(), error);
         return id;
     }
 
+    QByteArray line = QJsonDocument(request).toJson(QJsonDocument::Compact);
+    line.append('\n');
+
+    // Register BEFORE writing. QIODevice subclasses are allowed to emit
+    // readyRead/disconnected synchronously from writeData(); registering after
+    // write would let such a response or close race past the map and orphan
+    // this callback. The entry is removed again below if the write fails.
+    const QPointer<QIODevice> writeTransport = m_transport;
     m_pending.insert(id, std::move(cb));
+    QPointer<CodeharbordClient> self(this);
+    const qint64 written = writeTransport->write(line);
+    if (!self)
+        return id;
+
+    // A synchronous response or close may already have erased the entry. In
+    // that case its callback has fired exactly once and there is nothing left
+    // for this call to do. A short write still needs the close path even if a
+    // deliberately re-entrant test device answered before returning.
+    if (written == line.size())
+        return id;
+
+    const bool framingLost = written > 0;
+    const QString writeFailure = QStringLiteral("transport write failed");
+    emit protocolWarning(
+        QStringLiteral("call(%1): %2").arg(method, writeFailure));
+    if (!self)
+        return id;
+
+    // A partial frame permanently desynchronises the JSONL stream. Close only
+    // the transport that was written to: a warning handler may have rebound a
+    // new one while the signal was being delivered.
+    if (framingLost && m_transport == writeTransport && !m_closed)
+        onTransportClosed();
+    if (!self)
+        return id;
+
+    auto it = m_pending.find(id);
+    if (it == m_pending.end())
+        return id; // close/rebind already failed it
+    ResponseCallback failedCallback = std::move(it.value());
+    m_pending.erase(it);
+    if (failedCallback) {
+        RpcError error;
+        error.code = kInternalError;
+        error.message = QStringLiteral("call failed: %1").arg(writeFailure);
+        error.data = QJsonValue(QJsonValue::Null);
+        failedCallback(QJsonValue(), error);
+    }
     return id;
 }
 
@@ -337,8 +356,9 @@ void CodeharbordClient::onReadyRead()
     if (!m_transport || m_closed)
         return;
 
+    const QPointer<QIODevice> sourceTransport = m_transport;
     const qsizetype bufferedBefore = m_readBuffer.size();
-    m_readBuffer.append(m_transport->readAll());
+    m_readBuffer.append(m_transport->read(kMaxLineBytes + 1));
     // ANY bytes from the peer are proof of life, not just a ping reply. This is
     // one serialized JSONL stream, so while the peer is midway through writing a
     // multi-megabyte file.readFile frame its reply to our probe physically
@@ -372,13 +392,27 @@ void CodeharbordClient::onReadyRead()
     // already logically consumed.
     //
     // qsizetype, not int: QByteArray indexes are 64-bit and m_readBuffer holds
-    // whatever one readAll() handed us, which is only bounded by the cap check
-    // BELOW — narrowing the index here would corrupt the split of a buffer that
-    // grew past 2 GiB before that check ever ran.
+    // whatever the bounded read above handed us, which is only bounded by the
+    // cap check BELOW — narrowing the index here would corrupt the split of a
+    // buffer that grew past 2 GiB before that check ever ran.
     for (;;) {
         const qsizetype newline = m_readBuffer.indexOf('\n', m_scanOffset);
         if (newline == -1)
             break;
+        if (newline - m_readPos > kMaxLineBytes) {
+            m_readBuffer.clear();
+            m_readPos = 0;
+            m_scanOffset = 0;
+            emit protocolWarning(
+                QStringLiteral("RPC line exceeded %1 bytes; resetting "
+                               "transport")
+                    .arg(kMaxLineBytes));
+            if (!self)
+                return;
+            if (m_transport == sourceTransport && !m_closed)
+                onTransportClosed();
+            return;
+        }
         // A DEEP copy, not sliced()/left(): those share m_readBuffer's
         // allocation, so a nested reader's append would have to detach the
         // whole buffer — copying every byte still in it, per frame — and the
@@ -411,6 +445,8 @@ void CodeharbordClient::onReadyRead()
             m_scanOffset = 0;
             return;
         }
+        if (m_transport != sourceTransport)
+            return;
     }
     // No '\n' past m_scanOffset: the whole buffer has now been searched, so the
     // next readyRead resumes from its end instead of from the cursor.
@@ -434,11 +470,22 @@ void CodeharbordClient::onReadyRead()
         m_readPos = 0;
         m_scanOffset = 0;
         emit protocolWarning(
-            QStringLiteral("RPC line exceeded %1 bytes without a newline; "
-                           "resetting transport").arg(kMaxLineBytes));
+            QStringLiteral("RPC line exceeded %1 bytes; resetting transport")
+                .arg(kMaxLineBytes));
         if (!self)
             return;
-        onTransportClosed();
+        if (m_transport == sourceTransport && !m_closed)
+            onTransportClosed();
+    }
+    // QIODevice::read() intentionally takes only one bounded chunk. A socket
+    // may already have more bytes queued, but it will not necessarily emit a
+    // second readyRead() just because this call left some unread. Continue in
+    // the event queue so a large burst is drained without ever allocating an
+    // unbounded readAll() result.
+    if (m_transport == sourceTransport && !m_closed &&
+        m_transport->bytesAvailable() > 0) {
+        QMetaObject::invokeMethod(this, &CodeharbordClient::onReadyRead,
+                                  Qt::QueuedConnection);
     }
 }
 
@@ -471,6 +518,11 @@ void CodeharbordClient::processLine(const QByteArray& line)
 
     const QJsonObject obj = doc.object();
     const QJsonValue idValue = obj.value(QStringLiteral("id"));
+    const QJsonValue methodValue = obj.value(QStringLiteral("method"));
+    const QJsonValue versionValue = obj.value(QStringLiteral("jsonrpc"));
+    const bool validVersion =
+        versionValue.isString() && versionValue.toString() == QLatin1String("2.0");
+    const bool noId = idValue.isUndefined() || idValue.isNull();
 
     // Server -> client notification: carries a method and NO id (JSON-RPC 2.0
     // section 4.1), e.g. file.watchEvent (SPEC 8.7). Checking the id is what
@@ -479,8 +531,18 @@ void CodeharbordClient::processLine(const QByteArray& line)
     // RESPONSE that echoed `method` back would, without the id check, be
     // swallowed as a notification and leave its caller hanging forever instead
     // of being failed below.
-    const QJsonValue methodValue = obj.value(QStringLiteral("method"));
-    if (methodValue.isString() && (idValue.isUndefined() || idValue.isNull())) {
+    if (methodValue.isString() && noId) {
+        if (!validVersion) {
+            emit protocolWarning(
+                QStringLiteral("RPC notification has invalid jsonrpc member"));
+            return;
+        }
+        if (obj.contains(QStringLiteral("result")) ||
+            obj.contains(QStringLiteral("error"))) {
+            emit protocolWarning(
+                QStringLiteral("RPC notification carries result or error"));
+            return;
+        }
         emit notificationReceived(methodValue.toString(),
                                   obj.value(QStringLiteral("params")));
         return;
@@ -523,13 +585,25 @@ void CodeharbordClient::processLine(const QByteArray& line)
     const ResponseCallback cb = it.value();
     m_pending.erase(it);
 
+    if (!validVersion) {
+        emit protocolWarning(
+            QStringLiteral("response %1 has invalid jsonrpc member").arg(id));
+        RpcError error;
+        error.code = kInternalError;
+        error.message = QStringLiteral("malformed response: invalid jsonrpc");
+        error.data = QJsonValue(QJsonValue::Null);
+        if (cb)
+            cb(QJsonValue(), error);
+        return;
+    }
+
     // JSON-RPC 2.0 section 5: a response object carries jsonrpc/id and exactly
     // one of result/error — never `method`. Reaching here with one means the
     // message is either a REQUEST aimed at us (which this client does not
-    // implement) or a corrupted response, so it is not an answer to anything and
-    // its `result` must not be handed to the caller as one. Fail the caller
-    // instead: that is what keeps the exactly-once contract honest for a message
-    // the notification branch above deliberately refused.
+    // implement) or a corrupted response, so it is not an answer to anything
+    // and its `result` must not be handed to the caller as one. Fail the caller
+    // instead: that is what keeps the exactly-once contract honest for a
+    // message the notification branch above deliberately refused.
     if (!methodValue.isUndefined()) {
         emit protocolWarning(
             QStringLiteral("response %1 carries a method member; treating as "
@@ -538,6 +612,7 @@ void CodeharbordClient::processLine(const QByteArray& line)
         error.code = kInternalError;
         error.message =
             QStringLiteral("malformed response: carries a method member");
+        error.data = QJsonValue(QJsonValue::Null);
         if (cb)
             cb(QJsonValue(), error);
         return;
@@ -587,6 +662,7 @@ void CodeharbordClient::processLine(const QByteArray& line)
                 QStringLiteral("response %1 error is not an object").arg(id));
             error.code = kInternalError;
             error.message = QStringLiteral("malformed error: not an object");
+            error.data = QJsonValue(QJsonValue::Null);
         }
         if (cb)
             cb(QJsonValue(), error);
@@ -602,6 +678,7 @@ void CodeharbordClient::processLine(const QByteArray& line)
         error.code = kInternalError;
         error.message =
             QStringLiteral("malformed response: neither result nor error");
+        error.data = QJsonValue(QJsonValue::Null);
         if (cb)
             cb(QJsonValue(), error);
         return;
@@ -622,7 +699,13 @@ void CodeharbordClient::onTransportClosed()
     // unconsumed. Routing them here means a response that physically arrived is
     // DELIVERED rather than reported as "transport closed with request pending".
     QPointer<CodeharbordClient> self(this);
-    if (m_transport && m_transport->bytesAvailable() > 0) {
+    const QPointer<QIODevice> closingTransport = m_transport;
+    // read() is deliberately bounded, so a close event may find more than one
+    // chunk waiting. Drain every chunk that makes progress before failing
+    // pending requests; otherwise a valid response just beyond the first
+    // chunk would be discarded by the close path.
+    while (m_transport && m_transport->bytesAvailable() > 0) {
+        const qint64 availableBefore = m_transport->bytesAvailable();
         onReadyRead();
         if (!self)
             return; // a callback deleted us mid-drain
@@ -631,6 +714,10 @@ void CodeharbordClient::onTransportClosed()
         // Without this second check the announcement would go out twice.
         if (m_closed)
             return;
+        if (m_transport != closingTransport)
+            return;
+        if (m_transport->bytesAvailable() >= availableBefore)
+            break; // protect against a broken device that reports no progress
     }
     m_closed = true;
     // Whatever is left is a half-received frame from a peer that will never
@@ -649,11 +736,13 @@ void CodeharbordClient::onTransportClosed()
     RpcError error;
     error.code = kInternalError;
     error.message = QStringLiteral("transport closed with request pending");
+    error.data = QJsonValue(QJsonValue::Null);
     // A failed callback may delete this client during failAllPending(); guard
-    // the trailing emit so it never touches a destroyed object. m_closed was
-    // latched above, so any reentrant onTransportClosed() already returned.
+    // the trailing emit so it never touches a destroyed object. A callback may
+    // also rebind or detach the transport, in which case this close belongs to
+    // the old device and must not be announced against the new one.
     failAllPending(error);
-    if (!self)
+    if (!self || m_transport != closingTransport || !m_closed)
         return;
 
     emit transportClosed();
@@ -837,18 +926,20 @@ void CodeharbordClient::sendHeartbeatPing()
     QPointer<CodeharbordClient> self(this);
     const qint64 id =
         call(QString::fromLatin1(ch::rpc::kMethodPing), QJsonValue(),
-             [this, generation](QJsonValue, std::optional<RpcError>) {
-                 m_heartbeatProbeIds.remove(generation);
+             [self, generation](QJsonValue, std::optional<RpcError>) {
+                 if (!self)
+                     return;
+                 self->m_heartbeatProbeIds.remove(generation);
                  // A retired probe's answer says nothing about the transport we
                  // hold now — it may not even have come from the same peer — so
                  // it neither clears the live probe nor resets the miss counter.
-                 if (generation != m_heartbeatGeneration)
+                 if (generation != self->m_heartbeatGeneration)
                      return;
                  // Any answer at all — including a "method not found" from a
                  // daemon too old to know the probe — proves the peer is reading
                  // and writing.
-                 m_heartbeatProbeOutstanding = false;
-                 m_heartbeatMisses = 0;
+                 self->m_heartbeatProbeOutstanding = false;
+                 self->m_heartbeatMisses = 0;
              });
     if (!self)
         return;

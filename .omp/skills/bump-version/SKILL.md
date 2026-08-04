@@ -24,22 +24,20 @@ What it does (commit mode, the default):
    `project(CodeHarbor VERSION …)` in `CMakeLists.txt`, else `0.0.0`).
 2. Computes the next version (`major` → `X+1.0.0`, `minor` → `X.Y+1.0`,
    `patch` → `X.Y.Z+1`) or uses `--set`.
-3. Rewrites the version in all seven files that carry it: `CMakeLists.txt`;
-   `remote/src/codeharbord.ts` (the `RPC_SERVER_VERSION` constant); the four
+3. Rewrites the version in all eight files that carry it: `CMakeLists.txt`;
+   `remote/src/codeharbord.ts` (the `RPC_SERVER_VERSION` constant); the five
    workspace manifests `package.json`, `remote/package.json`,
-   `src/web/terminal/package.json` and `src/web/editor/package.json`; and
-   `package-lock.json` (its top-level `version`, `packages[""]` and one entry per
-   workspace path). So the built binary (`CODEHARBOR_VERSION`), the daemon's own
-   `server.info` reply, the remote artifact and both web bundles all report the
-   tagged version. The last two are in the list because they are the two that have
-   actually drifted: nothing else updates the lock and `npm ci` installs whatever
-   version it records, and `RPC_SERVER_VERSION` sat at 0.1.0 while the tag said
-   v0.1.8, so every server announced a version three releases stale. A missing file
-   aborts the run, before anything is rewritten, rather than being skipped.
+   `src/web/terminal/package.json`, `src/web/editor/package.json` and
+   `src/web/markdown/package.json`; and `package-lock.json` (its top-level
+   `version`, `packages[""]` and one entry per workspace path). So the built
+   binary (`CODEHARBOR_VERSION`), the daemon's own `server.info` reply, the
+   remote artifact and all three web bundles report the tagged version. A
+   missing file aborts the run, before anything is rewritten, rather than being
+   skipped.
 
-   `.github/scripts/check-versions.mjs` checks the same seven files and runs in CI.
-   **A file that carries the release version must be added to both**, or it will
-   drift with nothing to notice.
+   `.github/scripts/check-versions.mjs` checks the same eight files and runs in
+   CI. **A file that carries the release version must be added to both**, or it
+   will drift with nothing to notice.
 4. Commits **only those files** as `Release vX.Y.Z`.
 5. Verifies that the commit about to be tagged really carries `X.Y.Z` — see
    Safety — and creates the annotated tag `vX.Y.Z`.
@@ -63,8 +61,8 @@ actually starts the release workflow.
 - Aborts if any of those files — including `package-lock.json` — have
   uncommitted changes (unless `--allow-dirty`), so in-progress version edits are
   never clobbered.
-- Only the version files are staged — unrelated working-tree changes are left
-  untouched.
+- The helper stages only the version files and commits only those paths;
+  unrelated working-tree or already-staged changes are left untouched.
 - **Aborts before tagging if the commit being tagged does not carry the tagged
   version.** A tag is permanent, and one whose tree says 0.1.8 under a release
   page called v0.2.0 publishes a binary, a daemon `server.info` reply and a
@@ -74,7 +72,7 @@ actually starts the release workflow.
   rules CI does. In commit mode this can only fail if a rewrite did not take; the
   flag it really constrains is `--no-commit`, which tags HEAD as-is and
   previously could not tell a release commit from any other. `tests/bump_version_tag.sh`
-  (ctest target `tst_bump_version_tag`) covers all four paths.
+  (ctest target `tst_bump_version_tag`) covers all six release and safety cases.
 
 ## Examples
 

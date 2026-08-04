@@ -311,22 +311,32 @@ export function mountEditor(
     // The revision the current buffer was loaded (or last saved) at; every save
     // is guarded by it (SPEC 8.4/8.6). Empty until the first contentLoaded.
     let loadedRevision = "";
+    // The exact bytes represented by loadedRevision. Dirty state is based on
+    // content divergence, not on whether an edit was later undone.
+    let baselineContent = "";
     // Set while we push host-driven content into the model so the resulting
     // model-change event does NOT count as a user edit (no dirty, no report).
     let applyingHostEdit = false;
-    // Whether the buffer diverges from loadedRevision (unsaved user edits).
+    // Whether the buffer diverges from baselineContent (unsaved user edits).
     let dirty = false;
     // Monotonic count of USER edits to the model. Its only job is to answer
-    // "did the buffer change since the bytes of the in-flight save were taken?",
-    // which decides whether a reported success leaves the buffer clean.
+    // whether the host may have seen an edit while the save was in flight.
     let editSerial = 0;
     // Value of editSerial when the bytes currently believed to be on the server
     // were taken: set by every save this page issues and by every host-driven
-    // load, both of which re-baseline the buffer against the file.
+    // load.
     let baselineEditSerial = 0;
+    // Bytes handed to the host by the current save. A successful reply may
+    // arrive after more edits, so it must re-baseline against these bytes rather
+    // than whatever the model contains at reply time.
+    let pendingSaveContent: string | undefined;
     // Mirror of the host readOnly toggle (SPEC 8.2). A read-only buffer must
     // never issue a save, even via the Ctrl/Cmd+S command binding.
     let readOnly = false;
+    // The host state also gates saves during a load. Until contentLoaded lands,
+    // Monaco still contains the previous file's bytes; sending them with the
+    // new path/revision would either be refused or race the load.
+    let currentFileState = "";
 
     function clearNotice(): void {
         notice.style.display = "none";
@@ -354,12 +364,16 @@ export function mountEditor(
      * Persist the buffer guarded by `revision` (SPEC 8.4/8.6). reporter.save()
      * cancels the pending snapshot before sending, so a timer allowed to fire
      * AFTER the save succeeded cannot resurrect a stale "unsaved changes" copy
-     * of an already-saved file. A save that FAILS re-arms it (the conflict/error
-     * handlers call reporter.schedule): those edits really are still unsaved.
+     * of an already-saved file. A save that FAILS re-arms it via schedule():
+     * those edits really are still unsaved.
      */
     function requestSave(revision: string): void {
-        // The bytes handed over are the buffer as it is NOW; edits after this
-        // point are not in them (see the saved handler).
+        if (readOnly || currentFileState === "loading") {
+            return;
+        }
+        // Capture the exact bytes being handed to C++ so a successful reply can
+        // re-baseline even if the model changes before the round trip returns.
+        pendingSaveContent = bufferText(editor);
         baselineEditSerial = editSerial;
         reporter.save(revision);
     }
@@ -381,6 +395,8 @@ export function mountEditor(
 
     bind(bridge.contentLoaded, (content: string, revision: string) => {
         loadedRevision = revision;
+        baselineContent = content;
+        pendingSaveContent = undefined;
         // The buffer now IS the file, so a save reported later must not be
         // second-guessed by edits this load already superseded.
         baselineEditSerial = editSerial;
@@ -407,6 +423,13 @@ export function mountEditor(
     });
 
     bind(bridge.fileStateChanged, (state: string) => {
+        currentFileState = state;
+        // An open/reload can finish before the old page's debounce callback is
+        // delivered to C++. Cancel it at the transition, not only when
+        // contentLoaded arrives, so old-file bytes cannot dirty the new file.
+        if (state === "loading") {
+            reporter.cancel();
+        }
         stateLabel.dataset.state = state;
         renderState();
     });
@@ -418,27 +441,25 @@ export function mountEditor(
 
     bind(bridge.saved, (revision: string) => {
         loadedRevision = revision;
-        // Anything typed while the write was in flight is NOT in the bytes that
-        // just landed, so the buffer still diverges from the file and MUST stay
-        // marked as having unsaved changes.
-        //
-        // ch::EditorController::save() applies exactly this rule to its own
-        // dirty flag and FileState (src/editor/EditorController.cpp), but it can
-        // only notice edits it was TOLD about: its edit counter advances on the
-        // reportContent() slot, which this page debounces by 500 ms. So if a
-        // snapshot is still pending here, the host saw no edit, cleared its
-        // dirty flag and published the "clean" file state. Flushing the pending
-        // snapshot now corrects the host in the same turn, and it is also the
-        // only way those edits reach the crash-recovery snapshot at all
-        // (SPEC 11.3): a successful save discards the previous one. When the
-        // debounced report already went out during the write, nothing is pending
-        // and the host is dirty already, so reporter.flush() is a no-op.
-        const editedDuringSave = editSerial !== baselineEditSerial;
+        const savedContent = pendingSaveContent ?? bufferText(editor);
+        pendingSaveContent = undefined;
+        baselineContent = savedContent;
+        // Compare bytes, not edit count: an edit that is undone before this
+        // reply arrives leaves no unsaved divergence.
+        const editedDuringSave = bufferText(editor) !== savedContent;
         dirty = editedDuringSave;
         clearNotice();
         renderState();
         if (editedDuringSave) {
+            // The current bytes are not the bytes that just landed. Flush a
+            // pending snapshot so the host keeps the edits that remain local.
             reporter.flush();
+        } else {
+            // If a report for edits that were later undone already reached the
+            // host, tell it that the recovery bytes now match the saved file.
+            reporter.cancel();
+            if (editSerial !== baselineEditSerial)
+                bridge.reportContent(savedContent);
         }
     });
 
@@ -513,10 +534,8 @@ export function mountEditor(
             return;
         }
         ++editSerial;
-        if (!dirty) {
-            dirty = true;
-            renderState();
-        }
+        dirty = bufferText(editor) !== baselineContent;
+        renderState();
         reporter.schedule(dirty);
     });
 
@@ -540,6 +559,7 @@ export function mountEditor(
     // opens as an editable surface, and the user only discovers the truth when
     // a save is refused.
     if (typeof bridge.fileState === "string") {
+        currentFileState = bridge.fileState;
         stateLabel.dataset.state = bridge.fileState;
         renderState();
     }

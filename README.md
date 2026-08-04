@@ -261,9 +261,10 @@ a hard refusal into a friendly "trust this new host?" prompt.
 
 The corrections note in [`docs/PLAN.md`](docs/PLAN.md) records each one, and the gap
 list beside it is deliberately honest about what is still missing: no UI for renaming
-or deleting a group (creating one is wired); crash-recovery snapshots that are taken
-but never offered back; a reconnect that cannot prompt for a newly-unknown host key;
-and a connect that briefly blocks the GUI thread.
+a group (group deletion is wired and confirmed, including its session-count warning);
+reconnect cannot prompt for a newly-unknown host key; and a connect briefly blocks
+the GUI thread. Crash-recovery snapshots now offer an explicit Restore or Discard
+choice when the file is reopened.
 
 **Building requires Node** — the Monaco and xterm.js bundles are build artifacts
 embedded as Qt resources, and CMake builds them at configure time (it refuses to

@@ -517,20 +517,49 @@ void EditorController::setRecoveryDir(const QString& dir)
     // The server-reported recovery base (server.info.recoveryDir), pushed in by
     // EditorFactory once server.info answers. It can arrive AFTER this pane and
     // its controller already exist, so it is a mutable setter rather than a
-    // constructor argument: recoveryPath() reads whatever is current at the time
-    // a snapshot is written or probed.
+    // constructor argument.
+    if (m_recoveryDir == dir)
+        return;
     m_recoveryDir = dir;
+
+    // A recovery key change retires every in-flight operation for the old slot.
+    // The old write may still land on its old path, but its reply must not adopt
+    // that slot's revision into the new one.
+    m_recoveryRevision.clear();
+    m_recoveryHasContent = false;
+    m_recoveryWritesInFlight = 0;
+    m_recoveryClearInFlight = false;
+    m_recoveryCheckInFlight = false;
+    m_recoveryClearPending = false;
+    ++m_recoveryGeneration;
+
+    // server.info may answer after the file was already opened. Probe the newly
+    // available slot now rather than making the user close and reopen the pane.
+    if (!m_path.isEmpty() && !m_dirty && m_fileState == FileState::Clean
+        && !m_readOnly)
+        checkRecovery(m_loadedContent, m_loadGeneration);
 }
 
 void EditorController::setRecoveryId(const QString& id)
 {
-    // The pane's stable layout id, pushed in by EditorPaneView. It can settle
-    // after this controller exists (the region assigns a pane's paneId as part
-    // of building/rebuilding the layout), so this is a setter rather than a
-    // fixed constructor value; recoveryPath() reads whatever is current when a
-    // snapshot is written or probed. Keyed per pane so two panes on one file
-    // never share a snapshot (SPEC 11.3).
+    // The pane's stable layout id can settle after this controller exists. A
+    // changed id is a new recovery slot, not merely a different spelling of
+    // the old path, so old replies must be retired just like on open().
+    if (m_recoveryId == id)
+        return;
     m_recoveryId = id;
+
+    m_recoveryRevision.clear();
+    m_recoveryHasContent = false;
+    m_recoveryWritesInFlight = 0;
+    m_recoveryClearInFlight = false;
+    m_recoveryCheckInFlight = false;
+    m_recoveryClearPending = false;
+    ++m_recoveryGeneration;
+
+    if (!m_path.isEmpty() && !m_dirty && m_fileState == FileState::Clean
+        && !m_readOnly)
+        checkRecovery(m_loadedContent, m_loadGeneration);
 }
 
 void EditorController::open(QString path)
@@ -547,12 +576,15 @@ void EditorController::open(QString path)
     ++m_watchGeneration;
     m_watchPending = false;
     m_path = path;
+    m_loadedContent.clear();
     m_dirty = false;
     m_recoveryRevision.clear();
     m_recoveryHasContent = false;
     // A clear intended for the file being left behind is not owed to the new one,
     // and no reply from that file may touch this bookkeeping again.
     m_recoveryWritesInFlight = 0;
+    m_recoveryClearInFlight = false;
+    m_recoveryCheckInFlight = false;
     m_recoveryClearPending = false;
     ++m_recoveryGeneration;
     // The save chain belongs to the file being left behind: a write still on the
@@ -619,7 +651,14 @@ void EditorController::open(QString path)
                        const QString content = *decoded;
                        const QString revision =
                            obj.value(QStringLiteral("revision")).toString();
+                       if (revision.isEmpty()) {
+                           // A readable buffer without the server's revision
+                           // token cannot be safely saved later.
+                           self->setFileState(FileState::Error);
+                           return;
+                       }
                        self->m_revision = revision;
+                       self->m_loadedContent = content;
                        // The buffer is not the file's bytes when the read came
                        // back base64 (binary: save() sends utf-8, so writing it
                        // back would destroy the file) or truncated (a PREFIX:
@@ -670,39 +709,61 @@ void EditorController::checkRecovery(const QString& loadedContent, quint64 gener
     const QString recoveryPath = this->recoveryPath();
     if (recoveryPath.isEmpty())
         return;  // no stable pane id / data location: recovery disabled
+    // A permission-refresh callback can arrive after setRecoveryDir() already
+    // started this same probe. Keep the stat/read pair as one logical operation
+    // so that callback cannot issue a duplicate stat.
+    if (m_recoveryCheckInFlight)
+        return;
+    const quint64 recoveryGeneration = m_recoveryGeneration;
+    m_recoveryCheckInFlight = true;
 
     QPointer<EditorController> self(this);
     // Stat first: absence (error) simply means there is nothing to recover.
     m_client->call(
         QString::fromLatin1(rpc::kMethodStat), readParams(recoveryPath),
-        [self, recoveryPath, loadedContent, generation](
+        [self, recoveryPath, loadedContent, generation, recoveryGeneration](
             QJsonValue statRes, std::optional<RpcError> statErr) {
-            if (!self || !self->m_client || statErr.has_value())
-                return; // gone, clientless, or no snapshot present
-            // Superseded: this check belongs to a load that is no longer the
-            // one on screen.
-            if (generation != self->m_loadGeneration)
+            if (!self)
                 return;
+            // A key change reset the guard for the new slot; this old reply
+            // must not clear that new probe's guard.
+            if (recoveryGeneration != self->m_recoveryGeneration)
+                return;
+            if (!self->m_client || statErr.has_value()) {
+                self->m_recoveryCheckInFlight = false;
+                return;  // clientless or no snapshot present
+            }
+            // Superseded: this check belongs to a load that is no longer on
+            // screen.
+            if (generation != self->m_loadGeneration) {
+                self->m_recoveryCheckInFlight = false;
+                return;
+            }
             const QString snapshotRevision =
                 statRes.toObject().value(QStringLiteral("revision")).toString();
             self->m_client->call(
                 QString::fromLatin1(rpc::kMethodReadFile),
                 readFileParams(recoveryPath),
-                [self, snapshotRevision, loadedContent, generation](
+                [self, snapshotRevision, loadedContent, generation,
+                 recoveryGeneration](
                     QJsonValue readRes, std::optional<RpcError> readErr) {
-                    if (!self || readErr.has_value())
+                    if (!self)
                         return;
-                    if (generation != self->m_loadGeneration)
+                    if (recoveryGeneration != self->m_recoveryGeneration)
+                        return;
+                    self->m_recoveryCheckInFlight = false;
+                    if (readErr.has_value()
+                        || generation != self->m_loadGeneration)
                         return;
                     const QJsonObject snapshot = readRes.toObject();
-                    // Adopt the snapshot's revision unconditionally so the next
-                    // write to this pane's slot is a guarded overwrite, even
-                    // when nothing below is offered.
+                    // Adopt the snapshot's revision unconditionally so the
+                    // next write to this pane's slot is a guarded overwrite,
+                    // even when nothing below is offered.
                     self->m_recoveryRevision = snapshotRevision;
                     // A snapshot over kMaxEditableReadBytes came back a prefix,
                     // so its envelope will not parse; a tombstone (empty) does
-                    // not parse either. parseRecovery() folds both into "nothing
-                    // to offer".
+                    // not parse either. parseRecovery() folds both into
+                    // "nothing to offer".
                     QString snapshotPath;
                     QString recovered;
                     const bool parsed =
@@ -710,10 +771,10 @@ void EditorController::checkRecovery(const QString& loadedContent, quint64 gener
                         && parseRecovery(
                                snapshot.value(QStringLiteral("content")).toString(),
                                snapshotPath, recovered);
-                    // This pane's single slot is REUSED as it switches files, so
-                    // a snapshot the envelope records against a different path is
-                    // this pane's snapshot of a PREVIOUS file and must never be
-                    // handed back as the current file's unsaved work (SPEC 11.3).
+                    // This pane's single slot is REUSED as it switches files,
+                    // so a snapshot the envelope records against a different
+                    // path is this pane's snapshot of a PREVIOUS file and must
+                    // never be handed back as the current file's unsaved work.
                     const bool belongsHere =
                         parsed && snapshotPath == self->m_path
                         && !recovered.isEmpty();
@@ -728,6 +789,16 @@ void EditorController::save(QString content, QString expectedRevision)
 {
     if (!m_client || m_path.isEmpty())
         return;
+
+    // The page may still be showing the previous file while this path is
+    // Loading. A save at that point would pair old bytes with the new path (or
+    // race a read of the same path), so refuse it before dirtying the buffer or
+    // starting a write chain.
+    if (m_fileState == FileState::Loading) {
+        emit saveError(QStringLiteral(
+            "File is still loading; the buffer was not written."));
+        return;
+    }
 
     // The buffer is not writable (SPEC 8.2), so this write can only end as an
     // EACCES from the server or as a UTF-8 overwrite of a binary file. Refuse it
@@ -792,7 +863,7 @@ void EditorController::issueSave(QString content, QString expectedRevision)
     m_client->call(
         QString::fromLatin1(rpc::kMethodWriteFile),
         writeParams(path, content, expectedRevision),
-        [self, path, editSerial, loadGeneration, saveGeneration](
+        [self, path, content, editSerial, loadGeneration, saveGeneration](
             QJsonValue result, std::optional<RpcError> error) {
             if (!self)
                 return;
@@ -845,7 +916,14 @@ void EditorController::issueSave(QString content, QString expectedRevision)
             if (!error.has_value()) {
                 const QString newRevision =
                     result.toObject().value(QStringLiteral("revision")).toString();
+                if (newRevision.isEmpty()) {
+                    emit self->saveError(
+                        QStringLiteral("The server returned no revision token."));
+                    self->setFileState(FileState::Error);
+                    return;
+                }
                 self->m_revision = newRevision;
+                self->m_loadedContent = content;
                 if (queued.has_value()) {
                     // A second save arrived during this write carrying DIFFERENT
                     // bytes, so the file is not the buffer yet. Nothing may be
@@ -912,14 +990,14 @@ void EditorController::issueSave(QString content, QString expectedRevision)
                 }
                 self->m_client->call(
                     QString::fromLatin1(rpc::kMethodStat), readParams(path),
-                    [self, path, loadGeneration](QJsonValue statRes,
-                                                 std::optional<RpcError> statErr) {
-                        // Same two checks as the write reply: this second hop
+                    [self, path, loadGeneration, saveGeneration](
+                        QJsonValue statRes, std::optional<RpcError> statErr) {
                         // gives a load one more window in which to take the
                         // buffer over, and a conflict over bytes the pane no
                         // longer holds is not this pane's conflict.
                         if (!self || self->m_path != path
-                            || self->m_loadGeneration != loadGeneration)
+                            || self->m_loadGeneration != loadGeneration
+                            || self->m_saveGeneration != saveGeneration)
                             return;
                         const QString rev =
                             statErr.has_value()
@@ -964,6 +1042,17 @@ void EditorController::reportContent(QString content)
     if (m_fileState == FileState::Loading)
         return;
 
+    // Reports can arrive after an edit was undone, or after a save reply that
+    // deliberately kept the edit counter dirty because it saw an intermediate
+    // buffer. If the bytes are the loaded bytes again, there is no recovery
+    // work to preserve.
+    if (content == m_loadedContent) {
+        m_dirty = false;
+        if (m_fileState == FileState::Modified)
+            setFileState(FileState::Clean);
+        clearRecovery();
+        return;
+    }
     ++m_editSerial;
     m_dirty = true;
     if (m_fileState == FileState::Clean)
@@ -1066,9 +1155,12 @@ void EditorController::writeRecovery(const QString& content, bool retryOnMismatc
 void EditorController::honourDeferredRecoveryClear()
 {
     // Only the LAST outstanding snapshot write may act: an earlier reply that
-    // truncated on its own revision would be overwritten by the write still on the
-    // wire, putting the snapshot back after the save that asked for it to go.
-    if (!m_recoveryClearPending || m_recoveryWritesInFlight > 0)
+    // truncated on its own revision would be overwritten by the write still on
+    // the wire, putting the snapshot back after the save that asked for it to go.
+    // If a previous truncate is still on the wire, leave the intent armed; its
+    // reply will call us again after the latest snapshot write has settled.
+    if (!m_recoveryClearPending || m_recoveryWritesInFlight > 0
+        || m_recoveryClearInFlight)
         return;
     m_recoveryClearPending = false;
     clearRecovery();
@@ -1082,6 +1174,13 @@ void EditorController::clearRecovery()
     // cannot guard a truncate against it. Record the intent; that write's reply
     // performs it. See m_recoveryWritesInFlight.
     if (m_recoveryWritesInFlight > 0) {
+        m_recoveryClearPending = true;
+        return;
+    }
+    // A clear is also asynchronous. Do not issue a second truncate while the
+    // first is still outstanding: both would carry the same revision and the
+    // duplicate can wake watchers and race a fresh recovery write.
+    if (m_recoveryClearInFlight) {
         m_recoveryClearPending = true;
         return;
     }
@@ -1104,6 +1203,7 @@ void EditorController::clearRecovery()
         return;  // pane id / recovery dir withdrawn since: nothing to clear
     const quint64 recoveryGeneration = m_recoveryGeneration;
     const QString guard = m_recoveryRevision;
+    m_recoveryClearInFlight = true;
 
     QPointer<EditorController> self(this);
     m_client->call(
@@ -1111,14 +1211,20 @@ void EditorController::clearRecovery()
         writeParams(recoveryPath, QString(), guard, kRecoveryFileMode),
         [self, recoveryGeneration](QJsonValue result,
                                    std::optional<RpcError> error) {
-            if (!self || error.has_value())
-                return; // best-effort: a stale snapshot is a prompt, not data loss
+            if (!self)
+                return;
             // The pane switched files; this bookkeeping is not ours to write.
             if (recoveryGeneration != self->m_recoveryGeneration)
                 return;
+            self->m_recoveryClearInFlight = false;
+            if (error.has_value()) {
+                self->honourDeferredRecoveryClear();
+                return; // best-effort: a stale snapshot is a prompt, not data loss
+            }
             self->m_recoveryRevision =
                 result.toObject().value(QStringLiteral("revision")).toString();
             self->m_recoveryHasContent = false;
+            self->honourDeferredRecoveryClear();
         });
 }
 
@@ -1194,7 +1300,14 @@ void EditorController::reload(FileState transitional, bool discardLocalEdits)
             }
             const QString content = *decoded;
             const QString revision = obj.value(QStringLiteral("revision")).toString();
+            if (revision.isEmpty()) {
+                // A readable buffer without the server's revision token cannot
+                // be safely saved later.
+                self->setFileState(FileState::Error);
+                return;
+            }
             self->m_revision = revision;
+            self->m_loadedContent = content;
             self->m_dirty = false;
             // The buffer just became the file's bytes again, so a recovery
             // snapshot of the edits this reload replaced is obsolete: drop it,

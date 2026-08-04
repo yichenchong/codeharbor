@@ -28,6 +28,8 @@ struct LinearRgb {
 
 double clamp01(double value)
 {
+    if (!std::isfinite(value))
+        return 0.0;
     return std::clamp(value, 0.0, 1.0);
 }
 
@@ -110,6 +112,21 @@ Oklch halfway(const Oklch &first, const Oklch &second)
             normalizeHue(firstHue + delta * 0.5)};
 }
 
+Oklch diversified(const Oklch &base)
+{
+    const double lightness = clamp01(base.lightness);
+    const double chroma = std::isfinite(base.chroma)
+            ? std::clamp(base.chroma, 0.0, 1.0)
+            : 0.0;
+    const double hue = std::isfinite(base.hue) ? normalizeHue(base.hue) : 0.0;
+    const double shiftedLightness = lightness <= 0.5
+            ? std::min(1.0, lightness + 0.25)
+            : std::max(0.0, lightness - 0.25);
+    return {shiftedLightness,
+            chroma <= kHueEpsilon ? 0.08 : chroma,
+            normalizeHue(hue + kPi)};
+}
+
 SrgbColor fromHex(unsigned int red, unsigned int green, unsigned int blue)
 {
     return {red / 255.0, green / 255.0, blue / 255.0};
@@ -139,13 +156,17 @@ Oklch GroupPalette::srgbToOklch(const SrgbColor &color)
 
 SrgbColor GroupPalette::oklchToSrgb(const Oklch &color)
 {
+    const double lightness = clamp01(color.lightness);
+    const double chroma = std::isfinite(color.chroma)
+            ? std::clamp(color.chroma, 0.0, 1.0)
+            : 0.0;
     const double hue = std::isfinite(color.hue) ? normalizeHue(color.hue) : 0.0;
-    const double a = color.chroma * std::cos(hue);
-    const double b = color.chroma * std::sin(hue);
+    const double a = chroma * std::cos(hue);
+    const double b = chroma * std::sin(hue);
 
-    const double l = color.lightness + 0.3963377774 * a + 0.2158037573 * b;
-    const double m = color.lightness - 0.1055613458 * a - 0.0638541728 * b;
-    const double s = color.lightness - 0.0894841775 * a - 1.2914855480 * b;
+    const double l = lightness + 0.3963377774 * a + 0.2158037573 * b;
+    const double m = lightness - 0.1055613458 * a - 0.0638541728 * b;
+    const double s = lightness - 0.0894841775 * a - 1.2914855480 * b;
 
     const double l3 = l * l * l;
     const double m3 = m * m * m;
@@ -184,6 +205,10 @@ QVector<SrgbColor> GroupPalette::generatePalette(const QVector<SrgbColor> &seed,
         // the complete (n-1)-colour result and appends exactly one midpoint.
         // Ties retain the first pair in palette order, making output stable
         // even when two gaps have the same floating-point distance.
+        if (converted.size() < 2) {
+            palette.append(oklchToSrgb(diversified(converted.first())));
+            continue;
+        }
         for (int i = 0; i < converted.size(); ++i) {
             for (int j = i + 1; j < converted.size(); ++j) {
                 const double gap = labDistance(converted.at(i), converted.at(j));
@@ -194,7 +219,10 @@ QVector<SrgbColor> GroupPalette::generatePalette(const QVector<SrgbColor> &seed,
                 }
             }
         }
-        palette.append(oklchToSrgb(halfway(converted.at(first), converted.at(second))));
+        if (largestGap <= kHueEpsilon)
+            palette.append(oklchToSrgb(diversified(converted.first())));
+        else
+            palette.append(oklchToSrgb(halfway(converted.at(first), converted.at(second))));
     }
     return palette;
 }
@@ -211,7 +239,6 @@ QVector<SrgbColor> GroupPalette::tokyoNightSeed()
 
 int GroupPalette::stableIndexForName(const QString &name, int paletteSize)
 {
-    Q_ASSERT(paletteSize > 0);
     if (paletteSize <= 0)
         return 0;
 

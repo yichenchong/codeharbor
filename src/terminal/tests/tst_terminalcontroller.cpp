@@ -1113,6 +1113,22 @@ void TstTerminalController::flushBoundariesNeverSplitAnAnsiEscape()
     QVERIFY(spy.wait(1000));
     QCOMPARE(spy.count(), 2);
     QVERIFY(spy.at(1).at(0).toByteArray().contains(QByteArrayLiteral("\x1b[31m")));
+
+    // ESC Fe controls can have intermediate bytes before their final byte.
+    // ESC ( 0 is the common character-set designation shape; the flush at the
+    // threshold must retain both ESC and the intermediate '(' together.
+    TerminalController feController;
+    QSignalSpy feSpy(&feController, &TerminalController::flushReady);
+    QByteArray fePrefix(TerminalController::kFlushSizeBytes - 2, 'y');
+    fePrefix += QByteArrayLiteral("\x1b(");
+    feController.ingestOutput(fePrefix);
+    QCOMPARE(feSpy.count(), 1);
+    QVERIFY(!feSpy.at(0).at(0).toByteArray().contains('\x1b'));
+
+    feController.ingestOutput(QByteArrayLiteral("0"));
+    QVERIFY(feSpy.wait(1000));
+    QCOMPARE(feSpy.count(), 2);
+    QVERIFY(feSpy.at(1).at(0).toByteArray().contains(QByteArrayLiteral("\x1b(0")));
 }
 
 
@@ -1213,10 +1229,10 @@ void TstTerminalController::releasingRetainedOutputStaysInsideTheCreditWindow()
         QCOMPARE(delivered, fill);
     }
 
-    // (2) The cut goes through the same resync rule the eviction uses, so it
-    // prefers a line feed just past the window. That is the only way a release
-    // may exceed the window, and it is bounded by the resync window — a couple
-    // of terminal lines, not a couple of megabytes.
+    // (2) A line feed just past the nominal window must not make the replay
+    // exceed the credit that remains. Unlike eviction, credit-window replay
+    // cannot move its cut forward: doing so would make the advertised bound
+    // false.
     {
         TerminalController controller;
         controller.setViewVisible(false);
@@ -1231,10 +1247,30 @@ void TstTerminalController::releasingRetainedOutputStaysInsideTheCreditWindow()
 
         QCOMPARE(spy.count(), 1);
         const QByteArray first = spy.at(0).at(0).toByteArray();
-        // Up to and including the line feed, and no further.
-        QCOMPARE(first.size(), newline + 1);
-        QVERIFY(first.size()
-                <= kWindow + TerminalController::kHiddenResyncWindowBytes);
+        QCOMPARE(first.size(), kWindow);
+        QVERIFY(!first.contains('\n'));
+        QCOMPARE(controller.unacknowledgedBytes(), static_cast<qint64>(kWindow));
+    }
+    // (3) The strict cut still cannot split a complete ANSI sequence that
+    // straddles the nominal boundary: it stops before ESC and leaves the
+    // entire control in the retained suffix.
+    {
+        TerminalController controller;
+        controller.setViewVisible(false);
+
+        QByteArray fill(kCap, 'A');
+        const qsizetype escapeStart = kWindow - 2;
+        fill.replace(escapeStart, 5, QByteArrayLiteral("\x1b[31m"));
+        controller.ingestOutput(fill);
+
+        QSignalSpy spy(&controller, &TerminalController::flushReady);
+        controller.setViewVisible(true);
+
+        QCOMPARE(spy.count(), 1);
+        const QByteArray first = spy.at(0).at(0).toByteArray();
+        QCOMPARE(first.size(), escapeStart);
+        QCOMPARE(controller.unacknowledgedBytes(), static_cast<qint64>(escapeStart));
+        QVERIFY(controller.hiddenBuffer().startsWith(QByteArrayLiteral("\x1b[31m")));
     }
 }
 

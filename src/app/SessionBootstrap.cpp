@@ -520,13 +520,18 @@ void SessionBootstrap::setReconnectEnabled(bool enabled)
     // connectAndWire() then declines to relabel it Failed (a cancel means the
     // canceller owns the end state, which is true of disconnectSession() and of
     // nothing else), and the state sits on Connecting for ever with no retry
-    // armed and no way back. A user turning auto-reconnect off has not asked to
-    // abandon the connect they are in the middle of making.
+    // armed and no way back. A user turning auto-reconnect off has not asked
+    // to abandon the connect they are in the middle of making.
     if (m_attempting && m_attemptIsRetry) {
         abortAttempt();
         // The rung is gone and nothing will re-arm it, so this attempt's end
         // state is ours to set: it unwinds through scheduleReconnect(), which
         // returns at once for a cancelled attempt.
+        const bool wasTearingDown = m_tearingDown;
+        m_tearingDown = true;
+        if (m_pool)
+            m_pool->disconnectFromHost();
+        m_tearingDown = wasTearingDown;
         setState(State::Disconnected);
     } else if (m_state == State::Reconnecting) {
         setState(State::Disconnected);
@@ -552,6 +557,9 @@ void SessionBootstrap::setConnectTimeoutMs(int ms)
 void SessionBootstrap::setTrustUnknownHostKeys(bool enabled)
 {
     m_trustUnknownHostKeys = enabled;
+    // An explicit setter call is an attended caller taking ownership of the
+    // policy. Do not restore an older environment-only value over it later.
+    m_environmentTrustActive = false;
 }
 
 void SessionBootstrap::cancelReconnect()
@@ -605,6 +613,14 @@ void SessionBootstrap::handleConnectionLost(const QString& reason)
         return;
 
     unwire();
+    // A channel can die while the SSH session itself still looks connected.
+    // Drop that session before arming a retry; otherwise disabling reconnect
+    // leaves a pool that reports Connected while this object reports down.
+    const bool wasTearingDown = m_tearingDown;
+    m_tearingDown = true;
+    if (m_pool)
+        m_pool->disconnectFromHost();
+    m_tearingDown = wasTearingDown;
     emit error(reason);
 
     if (!m_reconnectEnabled) {
@@ -634,6 +650,10 @@ void SessionBootstrap::disconnectSession()
     if (m_pool)
         m_pool->disconnectFromHost();
     m_tearingDown = false;
+    if (m_environmentTrustActive) {
+        m_trustUnknownHostKeys = m_environmentTrustPrevious;
+        m_environmentTrustActive = false;
+    }
     // An upgrade nobody is connecting for any more is not owed to the next
     // connect. A request survives a FAILED attempt on purpose — the retry (the
     // same attempt resumed after a host-key or credential prompt, or a rung of
@@ -647,8 +667,16 @@ void SessionBootstrap::disconnectSession()
 void SessionBootstrap::fail(const QString& message)
 {
     unwire();
+    // Authentication may have succeeded before a later provisioning or exec
+    // step failed. Do not leave that SSH session alive behind State::Failed.
+    const bool wasTearingDown = m_tearingDown;
+    m_tearingDown = true;
+    if (m_pool)
+        m_pool->disconnectFromHost();
+    m_tearingDown = wasTearingDown;
     emit error(message);
 }
+
 
 void SessionBootstrap::unwire()
 {
@@ -1288,6 +1316,7 @@ bool SessionBootstrap::attemptWire()
     // both come back round while we are still in here.
     m_attempting = true;
     m_cancelRequested = false;
+    m_lastDiagnostic.clear();
     QElapsedTimer clock;
     clock.start();
     const auto clearAttempting = qScopeGuard([this, &clock] {
@@ -1465,6 +1494,12 @@ bool SessionBootstrap::connectAndWire(const QString& host, quint16 port,
         emit error(QStringLiteral("a connection attempt is already in progress"));
         return false;
     }
+    if (m_environmentTrustActive && !m_environmentConnectInProgress) {
+        // The environment entry point's unattended trust is scoped to its
+        // session. A later attended connect must start from the previous policy.
+        m_trustUnknownHostKeys = m_environmentTrustPrevious;
+        m_environmentTrustActive = false;
+    }
 
     // Remember the target: every automatic retry replays exactly this call.
     m_host = host;
@@ -1488,7 +1523,6 @@ bool SessionBootstrap::connectAndWire(const QString& host, quint16 port,
     // an action the user took deliberately.
     if (m_cancelRequested)
         return false;
-
     // A user-initiated connect that never came up is reported to its caller
     // (which returns false all the way to the UI) rather than retried behind
     // its back: there is no established session to survive yet. Only a loss
@@ -1524,13 +1558,23 @@ bool SessionBootstrap::connectAndWireFromEnvironment()
 
     // This entry point IS the unattended one: it only runs when CH_LIVE_SSH is
     // set, which no ordinary desktop launch does, and it has no user interface to
-    // raise a host-key prompt in. Opt in explicitly so attemptWire() accepts an
-    // unknown key here and ONLY here — every attended connect goes through
-    // AppController, which installs a prompting callback and leaves this off.
-    setTrustUnknownHostKeys(true);
-
-    return connectAndWire(host, static_cast<quint16>(port), user, nodePath,
-                          repoRoot, identityFile);
+    // raise a host-key prompt in. Keep the opt-in for automatic retries of this
+    // session, but restore the attended policy when the session is torn down.
+    const bool tookTrustScope = !m_environmentTrustActive;
+    if (tookTrustScope)
+        m_environmentTrustPrevious = m_trustUnknownHostKeys;
+    m_environmentTrustActive = true;
+    m_trustUnknownHostKeys = true;
+    m_environmentConnectInProgress = true;
+    const bool connected =
+        connectAndWire(host, static_cast<quint16>(port), user, nodePath, repoRoot,
+                       identityFile);
+    m_environmentConnectInProgress = false;
+    if (!connected && tookTrustScope && m_environmentTrustActive) {
+        m_trustUnknownHostKeys = m_environmentTrustPrevious;
+        m_environmentTrustActive = false;
+    }
+    return connected;
 }
 
 } // namespace ch

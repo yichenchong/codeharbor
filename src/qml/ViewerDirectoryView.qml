@@ -152,6 +152,9 @@ Rectangle {
         const url = RemotePath.pathToFileUrl(root.pathFor(row));
         if (root.viewerModel
                 && typeof root.viewerModel.applicableViewKinds === "function") {
+            // Keep an already-open listing in step with capability changes;
+            // invokable calls alone do not create a QML binding dependency.
+            root.viewerModel.viewKindsRevision;
             const kinds = root.viewerModel.applicableViewKinds(url);
             if (kinds && kinds.length > 0)
                 return kinds;

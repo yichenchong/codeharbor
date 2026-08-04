@@ -149,7 +149,7 @@ function(codeharbor_embed_web_bundle)
         set(_chb_stale TRUE)
     else()
         foreach(_chb_in IN LISTS _chb_inputs)
-            if(${_chb_in} IS_NEWER_THAN ${_chb_dist}/index.html)
+            if("${_chb_in}" IS_NEWER_THAN "${_chb_dist}/index.html")
                 set(_chb_stale TRUE)
             endif()
         endforeach()
@@ -222,17 +222,22 @@ function(codeharbor_embed_web_bundle)
                             OUTPUT_VARIABLE _chb_bundle_out
                             ERROR_VARIABLE _chb_bundle_out)
             if(NOT _chb_bundle_rc EQUAL 0)
-                # WARNING, not STATUS. When dist/ is absent the FATAL_ERROR below
-                # reports the problem anyway, but when a STALE dist/ is present
-                # configure carries on and embeds it - so the ONLY notice that the
-                # binary now contains an out-of-date bundle is this line, and a
-                # STATUS line is indistinguishable from the dozens of ordinary
-                # ones CMake prints.
-                message(WARNING
-                    "CodeHarbor: the ${CHB_LABEL} bundle failed to build (${_chb_bundle_rc}). "
-                    "If a previously built ${_chb_dist} is present it will be embedded AS IS, "
-                    "which means the ${CHB_PANE} pane runs stale code.\n${_chb_bundle_out}")
+                message(FATAL_ERROR
+                    "CodeHarbor: the ${CHB_LABEL} bundle failed to build "
+                    "(${_chb_bundle_rc}).\n${_chb_bundle_out}\n"
+                    "Fix the web dependency/build, then re-run CMake:\n"
+                    "    npm install\n"
+                    "    npm run ${_chb_npm_script} --workspace src/web/${CHB_DIR}\n"
+                    "Or configure with -DCODEHARBOR_SKIP_WEB_BUNDLE=ON to build a "
+                    "client whose ${CHB_PANE} pane is intentionally inert.")
             endif()
+        else()
+            message(FATAL_ERROR
+                "CodeHarbor: npm (npm.cmd or npm) is required to build the "
+                "${CHB_LABEL} bundle because its inputs are missing or stale.\n"
+                "Install npm and re-run CMake, or configure with "
+                "-DCODEHARBOR_SKIP_WEB_BUNDLE=ON to build a client whose "
+                "${CHB_PANE} pane is intentionally inert.")
         endif()
     endif()
 
@@ -273,8 +278,24 @@ function(codeharbor_embed_web_bundle)
         # Editing any bundle input re-runs configure (which rebuilds it above),
         # so the embedded copy cannot silently lag its sources. Inside a function
         # DIRECTORY still means the calling directory, i.e. src/qml.
+        #
+        # The EMBEDDED FILES are listed too, and that is not redundant. dist/ is
+        # ONE directory shared by every build tree, while the exact file list
+        # baked into the Qt resource is decided HERE, at configure time, and
+        # differs between configurations: a Debug configure asks for source maps,
+        # a Release configure asks for none. So configuring or building the other
+        # preset rewrites dist/ underneath this build tree and removes files this
+        # tree's build graph still names. With only the inputs listed, nothing
+        # asks CMake to look again, and the next build of this tree dies in the
+        # generator with "editor.js.map ... missing and no known rule to make it"
+        # — a dead end, because the only rule that produces it runs during
+        # configure. Listing the outputs makes that same event re-run configure,
+        # where the staleness comparison above rebuilds the bundle the way THIS
+        # configuration wants it. It cannot loop: the bundle is rebuilt during
+        # configure, so its files are always older than the stamp configure
+        # writes when it finishes.
         set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
-                     ${_chb_inputs})
+                     ${_chb_inputs} ${_chb_files})
     elseif(CODEHARBOR_SKIP_WEB_BUNDLE)
         message(WARNING
             "CODEHARBOR_SKIP_WEB_BUNDLE=ON: no ${CHB_LABEL} bundle is embedded, so "

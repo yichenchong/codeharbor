@@ -29,12 +29,14 @@
 #include "AgentStatusMonitor.h"
 #include "AppController.h"
 #include "CodeharbordClient.h"
+#include "GroupPaletteService.h"
 #include "EditorFactory.h"
 #include "SessionBootstrap.h"
 #include "SessionsModel.h"
 #include "SshChannelDevice.h"
 #include "SshConnectionPool.h"
 #include "UiStateStore.h"
+#include "WindowChromeNative.h"
 #include "ViewerModel.h"
 #include "ViewerProfiles.h"
 
@@ -1017,6 +1019,8 @@ void TstLiveShell::qmlRestoresAndPersistsRegionWidths()
     ch::ViewerModel viewers(&client);
     viewers.setProfiles(&profiles);
     ch::EditorFactory editorFactory(&client);
+    ch::WindowChromeNative windowChrome;
+    ch::GroupPaletteService groupPalette;
 
     QStringList qmlWarnings;
     QQmlApplicationEngine engine;
@@ -1025,6 +1029,10 @@ void TstLiveShell::qmlRestoresAndPersistsRegionWidths()
                 for (const QQmlError& error : warnings)
                     qmlWarnings.append(error.toString());
             });
+    engine.rootContext()->setContextProperty(QStringLiteral("groupPalette"),
+                                             &groupPalette);
+    engine.rootContext()->setContextProperty(QStringLiteral("windowChrome"),
+                                             &windowChrome);
     engine.rootContext()->setContextProperty(QStringLiteral("app"), &controller);
     engine.rootContext()->setContextProperty(QStringLiteral("viewers"), &viewers);
     engine.rootContext()->setContextProperty(QStringLiteral("agentMonitor"), &monitor);

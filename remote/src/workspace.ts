@@ -717,11 +717,11 @@ function terminalPaneUniqueIndexOver(db: DatabaseSync, columns: string[]): strin
 //     so every keystroke typed in one appears in the other and the two fight
 //     over the terminal size.
 //
-//   * (dev_session_id, name). `name` holds the layout pane id, and it is how a
-//     client resolves a layout slot to its row. Two rows for one slot means two
-//     minted targets, hence two tmux sessions where the user has one pane —
-//     which the tmux_target rule cannot catch, because those two targets are
-//     not equal.
+//   * (dev_session_id, name). In v3, `name` was treated as the layout pane id,
+//     and the client resolved a layout slot to its row through this pair. Two
+//     rows for one slot meant two minted targets, hence two tmux sessions where
+//     the user had one pane — which the tmux_target rule could not catch because
+//     those two targets were not equal.
 //
 // Nothing stopped either before. Fresh databases get both from schema.sql's
 // CREATE TABLE; this step is what an EXISTING v1/v2 database goes through, and
@@ -1127,11 +1127,14 @@ export class Workspace {
         return this.transaction(() => {
             const current = this.getGroup(params.id);
             const name = params.name ?? current.name;
-            const position = params.position ?? current.position;
             const collapsed = params.collapsed ?? current.collapsed;
+            const ts = Date.now();
             this.db
-                .prepare("UPDATE groups SET name = ?, position = ?, collapsed = ?, updated_at = ? WHERE id = ?")
-                .run(name, position, collapsed ? 1 : 0, Date.now(), params.id);
+                .prepare("UPDATE groups SET name = ?, collapsed = ?, updated_at = ? WHERE id = ?")
+                .run(name, collapsed ? 1 : 0, ts, params.id);
+            if (params.position !== undefined) {
+                this.placeAt("groups", "server_id", current.serverId, params.id, params.position, ts);
+            }
             return this.getGroup(params.id);
         });
     }
@@ -1213,24 +1216,26 @@ export class Workspace {
                     : current.defaultWorkingDirectory;
             const taskDescription =
                 params.taskDescription !== undefined ? params.taskDescription : current.taskDescription;
-            const position = params.position ?? current.position;
             const archived = params.archived ?? current.archived;
             const pinned = params.pinned ?? current.pinned;
+            const ts = Date.now();
             this.db
                 .prepare(
-                    "UPDATE dev_sessions SET name = ?, repository_root = ?, default_working_directory = ?, task_description = ?, position = ?, archived = ?, pinned = ?, updated_at = ? WHERE id = ?",
+                    "UPDATE dev_sessions SET name = ?, repository_root = ?, default_working_directory = ?, task_description = ?, archived = ?, pinned = ?, updated_at = ? WHERE id = ?",
                 )
                 .run(
                     name,
                     repositoryRoot,
                     defaultWorkingDirectory,
                     taskDescription,
-                    position,
                     archived ? 1 : 0,
                     pinned ? 1 : 0,
-                    Date.now(),
+                    ts,
                     params.id,
                 );
+            if (params.position !== undefined) {
+                this.placeAt("dev_sessions", "group_id", current.groupId, params.id, params.position, ts);
+            }
             return this.getSession(params.id);
         });
     }
@@ -1323,7 +1328,11 @@ export class Workspace {
                 .prepare("SELECT * FROM dev_sessions WHERE id = ?")
                 .get(params.id) as SessionRow | undefined;
             if (!source) throw new Error(`session not found: ${params.id}`);
-
+            // The parent group is authoritative for the new row's server. A
+            // legacy database may contain a session whose server_id drifted from
+            // its group; copying that drift would make the duplicate invisible
+            // to the group's server-scoped listing.
+            const targetServerId = this.parentServerId("groups", source.group_id);
             const newSessionId = randomUUID();
             const ts = Date.now();
             const position = this.nextPosition("dev_sessions", "group_id", source.group_id);
@@ -1333,7 +1342,7 @@ export class Workspace {
                 )
                 .run(
                     newSessionId,
-                    source.server_id,
+                    targetServerId,
                     source.group_id,
                     source.name,
                     source.repository_root,
@@ -1350,7 +1359,7 @@ export class Workspace {
             // fresh prepare() inside the loop compiled the identical SQL again
             // for each pane and left a statement handle per iteration for the
             // garbage collector to finalize. The copies take the NEW session's
-            // server_id (which is the source session's) rather than each child
+            // server_id (derived from its parent group) rather than each child
             // row's own, so a duplicate always satisfies SPEC 3.5's "a row
             // shares its ancestors' server" invariant even if the source data
             // predates that rule.
@@ -1370,7 +1379,7 @@ export class Workspace {
                 viewerIdMap.set(v.id, newId);
                 insertViewer.run(
                     newId,
-                    source.server_id,
+                    targetServerId,
                     newSessionId,
                     v.url,
                     v.handler,
@@ -1393,7 +1402,7 @@ export class Workspace {
                 const tmuxTarget = mintTmuxTarget(newSessionId, newId);
                 insertTerminal.run(
                     newId,
-                    source.server_id,
+                    targetServerId,
                     newSessionId,
                     t.name,
                     t.working_directory,
@@ -1431,7 +1440,7 @@ export class Workspace {
                     continue;
                 }
                 const tree = JSON.stringify(remapPaneIds(parsed, idMap));
-                insertLayout.run(randomUUID(), source.server_id, newSessionId, l.region, tree, ts, ts);
+                insertLayout.run(randomUUID(), targetServerId, newSessionId, l.region, tree, ts, ts);
             }
 
             return this.sessionNode(newSessionId);
@@ -1497,27 +1506,35 @@ export class Workspace {
             const url = params.url ?? current.url;
             const handler = params.handler !== undefined ? params.handler : current.handler;
             const title = params.title !== undefined ? params.title : current.title;
-            const position = params.position ?? current.position;
+            const ts = Date.now();
             this.db
-                .prepare("UPDATE viewer_panes SET url = ?, handler = ?, title = ?, position = ?, updated_at = ? WHERE id = ?")
-                .run(url, handler, title, position, Date.now(), params.id);
+                .prepare("UPDATE viewer_panes SET url = ?, handler = ?, title = ?, updated_at = ? WHERE id = ?")
+                .run(url, handler, title, ts, params.id);
+            if (params.position !== undefined) {
+                this.placeAt(
+                    "viewer_panes",
+                    "dev_session_id",
+                    current.devSessionId,
+                    params.id,
+                    params.position,
+                    ts,
+                );
+            }
             return this.getViewerPane(params.id);
         });
     }
 
-    // Delete a viewer pane, then repair the region's stored split layout so no
-    // leaf still references it. The server is AUTHORITATIVE for this integrity
-    // invariant — a stored layout never references a deleted pane. The client
-    // still authors trees (it rewrites and saves a layout when it closes a
-    // pane), but the server enforces delete-consistency for any client or path
-    // that deletes a pane without a following layout save (RW13).
+    // Delete a viewer pane, then repair every stored split layout for its
+    // session so no leaf still references it. Layout trees are client-authored,
+    // so a malformed client can put a viewer id in the terminal region; the
+    // server's integrity guarantee must cover both regions.
     deleteViewerPane(params: { id: string }): { ok: true } {
         return this.transaction(() => {
             const row = this.db
                 .prepare("SELECT dev_session_id FROM viewer_panes WHERE id = ?")
                 .get(params.id) as { dev_session_id: string } | undefined;
             this.db.prepare("DELETE FROM viewer_panes WHERE id = ?").run(params.id);
-            if (row) this.repairLayout(row.dev_session_id, "viewer", params.id);
+            if (row) this.repairLayoutsForPane(row.dev_session_id, params.id);
             return { ok: true };
         });
     }
@@ -1686,29 +1703,37 @@ export class Workspace {
             const startupCommand =
                 params.startupCommand !== undefined ? params.startupCommand : current.startupCommand;
             const harness = params.harness !== undefined ? params.harness : current.harness;
-            const position = params.position ?? current.position;
+            const ts = Date.now();
             this.db
                 .prepare(
-                    "UPDATE terminal_panes SET name = ?, working_directory = ?, tmux_target = ?, startup_command = ?, harness = ?, position = ?, updated_at = ? WHERE id = ?",
+                    "UPDATE terminal_panes SET name = ?, working_directory = ?, tmux_target = ?, startup_command = ?, harness = ?, updated_at = ? WHERE id = ?",
                 )
-                .run(name, workingDirectory, tmuxTarget, startupCommand, harness, position, Date.now(), params.id);
+                .run(name, workingDirectory, tmuxTarget, startupCommand, harness, ts, params.id);
+            if (params.position !== undefined) {
+                this.placeAt(
+                    "terminal_panes",
+                    "dev_session_id",
+                    current.devSessionId,
+                    params.id,
+                    params.position,
+                    ts,
+                );
+            }
             return this.getTerminalPane(params.id);
         });
     }
 
-    // Delete a terminal pane, then repair the region's stored split layout so no
-    // leaf still references it. The server is AUTHORITATIVE for this integrity
-    // invariant — a stored layout never references a deleted pane. The client
-    // still authors trees (it rewrites and saves a layout when it closes a
-    // pane), but the server enforces delete-consistency for any client or path
-    // that deletes a pane without a following layout save (RW13).
+    // Delete a terminal pane, then repair every stored split layout for its
+    // session so no leaf still references it. Layout trees are client-authored,
+    // so a malformed client can put a terminal id in the viewer region; the
+    // server's integrity guarantee must cover both regions.
     deleteTerminalPane(params: { id: string }): { ok: true } {
         return this.transaction(() => {
             const row = this.db
                 .prepare("SELECT dev_session_id FROM terminal_panes WHERE id = ?")
                 .get(params.id) as { dev_session_id: string } | undefined;
             this.db.prepare("DELETE FROM terminal_panes WHERE id = ?").run(params.id);
-            if (row) this.repairLayout(row.dev_session_id, "terminal", params.id);
+            if (row) this.repairLayoutsForPane(row.dev_session_id, params.id);
             return { ok: true };
         });
     }
@@ -1814,9 +1839,16 @@ export class Workspace {
         }
         const repaired = removePaneFromTree(tree, paneId);
         const finalTree = repaired === null ? { type: "leaf", paneId: "" } : repaired;
+        const serialized = JSON.stringify(finalTree);
+        if (serialized === row.tree) return;
         this.db
             .prepare("UPDATE session_layouts SET tree = ?, updated_at = ? WHERE id = ?")
-            .run(JSON.stringify(finalTree), Date.now(), row.id);
+            .run(serialized, Date.now(), row.id);
+    }
+    private repairLayoutsForPane(devSessionId: string, paneId: string): void {
+        for (const region of REGIONS) {
+            this.repairLayout(devSessionId, region, paneId);
+        }
     }
 
     // --- Nested read --------------------------------------------------------
@@ -1827,14 +1859,32 @@ export class Workspace {
     //
     // The nested listing's result may be narrowed to pinned sessions for a
     // client-local sidebar filter. The predicate is read-only; `pinned` itself
-    // remains in the server-owned session row.
+    // remains in the server-owned session row. A deferred read transaction keeps
+    // the multiple group/session/pane queries on one SQLite snapshot, so another
+    // daemon cannot make the returned tree describe a mixture of states.
     list(serverId: string, pinnedOnly = false): GroupNode[] {
-        const listing = this.listing();
-        const rows = (pinnedOnly ? listing.groupsPinned : listing.groups).all(serverId) as unknown as GroupRow[];
-        return rows.map((g) => ({
-            ...toGroup(g),
-            sessions: this.listSessions(g.id, pinnedOnly),
-        }));
+        const read = (): GroupNode[] => {
+            const listing = this.listing();
+            const rows = (pinnedOnly ? listing.groupsPinned : listing.groups).all(serverId) as unknown as GroupRow[];
+            return rows.map((g) => ({
+                ...toGroup(g),
+                sessions: this.listSessions(g.id, pinnedOnly, serverId),
+            }));
+        };
+        if (this.inTransaction) return read();
+        this.db.exec("BEGIN");
+        try {
+            const result = read();
+            this.db.exec("COMMIT");
+            return result;
+        } catch (err) {
+            try {
+                this.db.exec("ROLLBACK");
+            } catch {
+                // Preserve the original read or commit failure.
+            }
+            throw err;
+        }
     }
 
     // Compile the listing's statements on first use and keep them; see
@@ -1845,55 +1895,55 @@ export class Workspace {
                 "SELECT * FROM groups WHERE server_id = ? ORDER BY position, id",
             ),
             groupsPinned: this.db.prepare(
-                "SELECT * FROM groups WHERE server_id = ? AND EXISTS (SELECT 1 FROM dev_sessions WHERE dev_sessions.group_id = groups.id AND dev_sessions.pinned <> 0) ORDER BY position, id",
+                "SELECT * FROM groups WHERE server_id = ? AND EXISTS (SELECT 1 FROM dev_sessions WHERE dev_sessions.group_id = groups.id AND dev_sessions.server_id = groups.server_id AND dev_sessions.pinned <> 0) ORDER BY position, id",
             ),
             sessions: this.db.prepare(
-                "SELECT * FROM dev_sessions WHERE group_id = ? ORDER BY position, id",
+                "SELECT * FROM dev_sessions WHERE group_id = ? AND server_id = ? ORDER BY position, id",
             ),
             sessionsPinned: this.db.prepare(
-                "SELECT * FROM dev_sessions WHERE group_id = ? AND pinned <> 0 ORDER BY position, id",
+                "SELECT * FROM dev_sessions WHERE group_id = ? AND server_id = ? AND pinned <> 0 ORDER BY position, id",
             ),
             viewerPanes: this.db.prepare(
-                "SELECT * FROM viewer_panes WHERE dev_session_id = ? ORDER BY position, id",
+                "SELECT * FROM viewer_panes WHERE dev_session_id = ? AND server_id = ? ORDER BY position, id",
             ),
             terminalPanes: this.db.prepare(
-                "SELECT * FROM terminal_panes WHERE dev_session_id = ? ORDER BY position, id",
+                "SELECT * FROM terminal_panes WHERE dev_session_id = ? AND server_id = ? ORDER BY position, id",
             ),
             layouts: this.db.prepare(
-                "SELECT region, tree FROM session_layouts WHERE dev_session_id = ?",
+                "SELECT region, tree FROM session_layouts WHERE dev_session_id = ? AND server_id = ?",
             ),
         });
     }
 
-    private listSessions(groupId: string, pinnedOnly: boolean): SessionNode[] {
+    private listSessions(groupId: string, pinnedOnly: boolean, serverId: string): SessionNode[] {
         const statement = pinnedOnly ? this.listing().sessionsPinned : this.listing().sessions;
-        const rows = statement.all(groupId) as unknown as SessionRow[];
-        return rows.map((s) => this.sessionNode(s.id, s));
+        const rows = statement.all(groupId, serverId) as unknown as SessionRow[];
+        return rows.map((s) => this.sessionNode(s.id, s, serverId));
     }
-    private sessionNode(sessionId: string, row?: SessionRow): SessionNode {
+    private sessionNode(sessionId: string, row?: SessionRow, serverId?: string): SessionNode {
         const session = row
             ? toSession(row)
             : this.getSession(sessionId);
+        const scopeServerId = serverId ?? session.serverId;
         return {
             ...session,
-            viewerPanes: this.listViewerPanes(sessionId),
-            terminalPanes: this.listTerminalPanes(sessionId),
-            layouts: this.getLayouts(sessionId),
+            viewerPanes: this.listViewerPanes(sessionId, scopeServerId),
+            terminalPanes: this.listTerminalPanes(sessionId, scopeServerId),
+            layouts: this.getLayouts(sessionId, scopeServerId),
         };
     }
-
-    private listViewerPanes(sessionId: string): ViewerPane[] {
-        const rows = this.listing().viewerPanes.all(sessionId) as unknown as ViewerPaneRow[];
+    private listViewerPanes(sessionId: string, serverId: string): ViewerPane[] {
+        const rows = this.listing().viewerPanes.all(sessionId, serverId) as unknown as ViewerPaneRow[];
         return rows.map(toViewerPane);
     }
 
-    private listTerminalPanes(sessionId: string): TerminalPane[] {
-        const rows = this.listing().terminalPanes.all(sessionId) as unknown as TerminalPaneRow[];
+    private listTerminalPanes(sessionId: string, serverId: string): TerminalPane[] {
+        const rows = this.listing().terminalPanes.all(sessionId, serverId) as unknown as TerminalPaneRow[];
         return rows.map(toTerminalPane);
     }
 
-    private getLayouts(sessionId: string): SessionLayouts {
-        const rows = this.listing().layouts.all(sessionId) as unknown as Array<{
+    private getLayouts(sessionId: string, serverId: string): SessionLayouts {
+        const rows = this.listing().layouts.all(sessionId, serverId) as unknown as Array<{
             region: Region;
             tree: string;
         }>;
@@ -1911,6 +1961,7 @@ export class Workspace {
         }
         return layouts;
     }
+
 
     // --- Internal helpers ---------------------------------------------------
 
@@ -2087,12 +2138,11 @@ export function serverIdentity(): string {
 // change is a one-place edit here and in its C++ mirror — never a retyped
 // literal that can drift apart silently.
 export const WORKSPACE_METHODS: Record<RpcWorkspaceMethodName, (params: unknown) => unknown> = {
-    // `position` is guarded with optionalIndex, not optionalNumber: it is
-    // written STRAIGHT into an ordering column that every other path keeps at
-    // contiguous integers 0..n-1 (packOrder). optionalNumber accepts -5 and
-    // 2.5, and SQLite stores both verbatim in an INTEGER-affinity column, so a
-    // single such create left the scope ordered around a fractional or negative
-    // slot for ever after — and nextPosition then handed the NEXT row 3.5.
+    // `position` is guarded with optionalIndex, not optionalNumber: it is an
+    // insertion index for create/update operations and a stored integer for
+    // every scope that packOrder maintains. optionalNumber accepts -5 and 2.5,
+    // while an invalid position would otherwise leave a scope ordered around a
+    // negative or fractional slot.
     //
     // The non-nullable text fields (a group's name, a session's repositoryRoot,
     // a viewer pane's url) are guarded with optionalPlainString rather than

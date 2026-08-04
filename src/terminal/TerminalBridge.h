@@ -57,8 +57,8 @@ class TerminalController;
 // cannot see. What is left is the renderer's own view state (input bytes into
 // THIS pane's PTY, its geometry, its visibility, its mount handshake, and how
 // much output it has consumed), so the worst a compromised page can do is
-// drive the terminal its user is already looking at. The one value that leaves
-// the process is the geometry, and it is bounded below.
+// drive the terminal its user is already looking at. The one value that
+// leaves the process is the geometry, and it is bounded above.
 
 class TerminalBridge : public QObject {
     Q_OBJECT
@@ -78,6 +78,7 @@ public:
     static constexpr int kMaxDimension = 2048;
 
     explicit TerminalBridge(TerminalController* controller, QObject* parent = nullptr);
+    ~TerminalBridge() override;
 
     TerminalController* controller() const;
     QString connectionState() const;
@@ -164,6 +165,11 @@ private:
     // truncated glyph at a time.
     int m_undeliveredBytes = 0;
     bool m_rendererReady = false;
+    // QML and the page can report visibility before the renderer handshake.
+    // Remember whether that happened so ready() preserves a real hidden
+    // report, while still defaulting a unit/older host with no report to
+    // visible on its first mount.
+    bool m_visibilityReported = false;
     // Last visibility reported by the page or the QML pane. True by default:
     // a pane is shown unless something says otherwise, and QML only reports on
     // a CHANGE, so the initial "visible" report never arrives.

@@ -35,8 +35,16 @@ namespace {
 // the shared model. If a future feature must distinguish cleared-vs-empty, widen
 // the model types first, then decode via QJsonValue::isNull() here.
 
-Group parseGroup(const QJsonObject& obj)
+bool hasNonEmptyString(const QJsonObject &obj, const QString &key)
 {
+    const QJsonValue value = obj.value(key);
+    return value.isString() && !value.toString().isEmpty();
+}
+
+std::optional<Group> parseGroup(const QJsonObject& obj)
+{
+    if (!hasNonEmptyString(obj, QStringLiteral("id")))
+        return std::nullopt;
     Group group;
     group.id = GroupId{obj.value(QStringLiteral("id")).toString()};
     group.serverId = ServerId{obj.value(QStringLiteral("serverId")).toString()};
@@ -46,8 +54,10 @@ Group parseGroup(const QJsonObject& obj)
     return group;
 }
 
-DevSession parseSession(const QJsonObject& obj)
+std::optional<DevSession> parseSession(const QJsonObject& obj)
 {
+    if (!hasNonEmptyString(obj, QStringLiteral("id")))
+        return std::nullopt;
     DevSession session;
     session.id = DevSessionId{obj.value(QStringLiteral("id")).toString()};
     session.serverId = ServerId{obj.value(QStringLiteral("serverId")).toString()};
@@ -65,8 +75,10 @@ DevSession parseSession(const QJsonObject& obj)
     return session;
 }
 
-ViewerPane parseViewerPane(const QJsonObject& obj)
+std::optional<ViewerPane> parseViewerPane(const QJsonObject& obj)
 {
+    if (!hasNonEmptyString(obj, QStringLiteral("id")))
+        return std::nullopt;
     ViewerPane pane;
     pane.id = ViewerPaneId{obj.value(QStringLiteral("id")).toString()};
     pane.serverId = ServerId{obj.value(QStringLiteral("serverId")).toString()};
@@ -79,8 +91,10 @@ ViewerPane parseViewerPane(const QJsonObject& obj)
     return pane;
 }
 
-TerminalPane parseTerminalPane(const QJsonObject& obj)
+std::optional<TerminalPane> parseTerminalPane(const QJsonObject& obj)
 {
+    if (!hasNonEmptyString(obj, QStringLiteral("id")))
+        return std::nullopt;
     TerminalPane pane;
     pane.id = TerminalId{obj.value(QStringLiteral("id")).toString()};
     pane.serverId = ServerId{obj.value(QStringLiteral("serverId")).toString()};
@@ -115,48 +129,88 @@ std::optional<SplitNode> parseLayoutTree(const QJsonValue& value)
     return SplitNode::tryFromJson(value.toObject());
 }
 
-// Nested list elements are skipped unless they are JSON objects. QJsonValue::
-// toObject() turns a non-object into an EMPTY object, which every parse helper
-// above happily maps to a fully-default record: an entry with an empty id that
-// looks real to the rest of the client and can collide with other id-keyed
-// state. A malformed element is dropped instead, so a broken element costs its
-// own entry and nothing more.
-SessionNode parseSessionNode(const QJsonObject& obj)
+bool readOptionalArray(const QJsonObject &obj, const QString &key, QJsonArray &out)
 {
-    SessionNode node;
-    node.session = parseSession(obj);
+    if (!obj.contains(key))
+        return true;
+    const QJsonValue value = obj.value(key);
+    if (!value.isArray())
+        return false;
+    out = value.toArray();
+    return true;
+}
 
-    const QJsonArray viewers = obj.value(QStringLiteral("viewerPanes")).toArray();
+// Nested list elements are skipped unless they are valid JSON objects with a
+// non-empty identity. QJsonValue::toObject() turns a non-object into an EMPTY
+// object, and an object missing its id would likewise map to a fully-default
+// record that looks real to the rest of the client. A malformed element is
+// dropped instead, so a broken element costs its own entry and nothing more.
+std::optional<SessionNode> parseSessionNode(const QJsonObject& obj)
+{
+    const std::optional<DevSession> session = parseSession(obj);
+    if (!session)
+        return std::nullopt;
+
+    SessionNode node;
+    node.session = *session;
+
+    QJsonArray viewers;
+    if (!readOptionalArray(obj, QStringLiteral("viewerPanes"), viewers))
+        return std::nullopt;
     node.viewerPanes.reserve(viewers.size());
     for (const QJsonValue& viewer : viewers) {
-        if (viewer.isObject())
-            node.viewerPanes.append(parseViewerPane(viewer.toObject()));
+        if (!viewer.isObject())
+            continue;
+        const std::optional<ViewerPane> pane = parseViewerPane(viewer.toObject());
+        if (pane)
+            node.viewerPanes.append(*pane);
     }
 
-    const QJsonArray terminals =
-        obj.value(QStringLiteral("terminalPanes")).toArray();
+    QJsonArray terminals;
+    if (!readOptionalArray(obj, QStringLiteral("terminalPanes"), terminals))
+        return std::nullopt;
     node.terminalPanes.reserve(terminals.size());
     for (const QJsonValue& terminal : terminals) {
-        if (terminal.isObject())
-            node.terminalPanes.append(parseTerminalPane(terminal.toObject()));
+        if (!terminal.isObject())
+            continue;
+        const std::optional<TerminalPane> pane =
+            parseTerminalPane(terminal.toObject());
+        if (pane)
+            node.terminalPanes.append(*pane);
     }
 
-    const QJsonObject layouts = obj.value(QStringLiteral("layouts")).toObject();
+    QJsonObject layouts;
+    if (obj.contains(QStringLiteral("layouts"))) {
+        const QJsonValue value = obj.value(QStringLiteral("layouts"));
+        if (!value.isObject())
+            return std::nullopt;
+        layouts = value.toObject();
+    }
     node.viewerLayout = parseLayoutTree(layouts.value(QStringLiteral("viewer")));
     node.terminalLayout =
         parseLayoutTree(layouts.value(QStringLiteral("terminal")));
     return node;
 }
 
-GroupNode parseGroupNode(const QJsonObject& obj)
+std::optional<GroupNode> parseGroupNode(const QJsonObject& obj)
 {
+    const std::optional<Group> group = parseGroup(obj);
+    if (!group)
+        return std::nullopt;
+
     GroupNode node;
-    node.group = parseGroup(obj);
-    const QJsonArray sessions = obj.value(QStringLiteral("sessions")).toArray();
+    node.group = *group;
+    QJsonArray sessions;
+    if (!readOptionalArray(obj, QStringLiteral("sessions"), sessions))
+        return std::nullopt;
     node.sessions.reserve(sessions.size());
     for (const QJsonValue& session : sessions) {
-        if (session.isObject())
-            node.sessions.append(parseSessionNode(session.toObject()));
+        if (!session.isObject())
+            continue;
+        const std::optional<SessionNode> parsed =
+            parseSessionNode(session.toObject());
+        if (parsed)
+            node.sessions.append(*parsed);
     }
     return node;
 }
@@ -170,8 +224,11 @@ QVector<GroupNode> parseGroupList(const QJsonArray& array)
     QVector<GroupNode> groups;
     groups.reserve(array.size());
     for (const QJsonValue& group : array) {
-        if (group.isObject())
-            groups.append(parseGroupNode(group.toObject()));
+        if (!group.isObject())
+            continue;
+        const std::optional<GroupNode> parsed = parseGroupNode(group.toObject());
+        if (parsed)
+            groups.append(*parsed);
     }
     return groups;
 }
@@ -418,9 +475,10 @@ void failAsync(QObject* context, Callback cb, RpcError error)
 }
 
 // Response handler for every workspace.* method whose result is a single record
-// object: forwards a server error verbatim, rejects a non-object result, and
-// otherwise hands the decoded record to `cb`. `decode` maps the result object to
-// the callback's payload type.
+// object: forwards a server error verbatim, rejects a non-object result and an
+// object without the record's required non-empty id, and otherwise hands the
+// decoded record to `cb`. `decode` maps the result object to an optional typed
+// payload so malformed objects cannot become blank records.
 template <typename Callback, typename Decode>
 auto recordHandler(const char* method, Callback cb, Decode decode)
 {
@@ -434,7 +492,13 @@ auto recordHandler(const char* method, Callback cb, Decode decode)
             cb(std::nullopt, malformedResult(method, "a JSON object"));
             return;
         }
-        cb(decode(result.toObject()), std::nullopt);
+        auto decoded = decode(result.toObject());
+        if (!decoded) {
+            cb(std::nullopt,
+               malformedResult(method, "a JSON object with a non-empty id"));
+            return;
+        }
+        cb(std::move(decoded), std::nullopt);
     };
 }
 

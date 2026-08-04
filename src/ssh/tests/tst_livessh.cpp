@@ -69,6 +69,7 @@ private slots:
 
     void connectsToFixture();
     void connectionLogRecordsLibsshTrace();
+    void execChannelReportsBufferedLines();
     void execChannelDeliversStdout();
     void manyShortLivedChannelsReuseTheirSlots();
     void ptyChannelRunsWithTheRequestedTerminalType();
@@ -79,9 +80,9 @@ private slots:
     void multiStepServerAcceptsKeyThenPassword();
     void keyboardInteractiveOnlyServerAuthenticatesWithPassword();
     void windowsNamedPipeAgentFallsBackToIdentityFile();
-    void unavailableTrustedAlgorithmStillReachesHostVerification();
+    void trustedHostMismatchIsCheckedAfterKex();
+    void poolDestructorEmitsOnlySessionClosing();
     void deviceOutlivingItsSessionStopsCleanly();
-
 private:
     void ensureConnected();
 
@@ -155,10 +156,12 @@ void TstLiveSsh::ensureConnected()
                                 .arg(m_port)
                                 .arg(failure)));
 
-    QDir().mkpath(QFileInfo(m_knownHostsPath).absolutePath());
+    QVERIFY(QDir().mkpath(QFileInfo(m_knownHostsPath).absolutePath()));
     QFile out(m_knownHostsPath);
-    if (out.open(QIODevice::WriteOnly | QIODevice::Truncate))
-        out.write(m_pool.knownHosts().serialize());
+    QVERIFY2(out.open(QIODevice::WriteOnly | QIODevice::Truncate),
+             qPrintable(out.errorString()));
+    const QByteArray serialized = m_pool.knownHosts().serialize();
+    QCOMPARE(out.write(serialized), qint64(serialized.size()));
 }
 
 // (a) A real authenticated session against the fixture sshd.
@@ -185,6 +188,28 @@ void TstLiveSsh::execChannelDeliversStdout()
 
     QTRY_VERIFY_WITH_TIMEOUT(sink.finished, kExecTimeoutMs);
     QCOMPARE(sink.out, QByteArray("LIVE_EXEC_OK\n"));
+    device.closeChannel();
+}
+
+void TstLiveSsh::execChannelReportsBufferedLines()
+{
+    ensureConnected();
+    QCOMPARE(m_pool.state(), SshConnectionPool::State::Connected);
+
+    SshChannelDevice device(&m_pool);
+    QByteArray line;
+    bool finished = false;
+    QObject::connect(&device, &SshChannelDevice::readyRead, &device,
+                     [&device, &line] {
+                         if (device.canReadLine())
+                             line = device.readLine();
+                     });
+    QObject::connect(&device, &SshChannelDevice::readChannelFinished, &device,
+                     [&finished] { finished = true; });
+
+    QVERIFY(device.startExec(QStringLiteral("printf 'LIVE_LINE_OK\\n'")));
+    QTRY_VERIFY_WITH_TIMEOUT(finished, kExecTimeoutMs);
+    QCOMPARE(line, QByteArray("LIVE_LINE_OK\n"));
     device.closeChannel();
 }
 
@@ -251,6 +276,9 @@ void TstLiveSsh::ptyChannelRunsWithTheRequestedTerminalType()
              qPrintable(QStringLiteral("remote TERM was not the requested one; "
                                        "channel produced: %1")
                             .arg(QString::fromUtf8(sink.out))));
+    // EOF latches the read side closed even while the device remains open for
+    // buffered reads; a completed PTY is no longer live to resize.
+    QVERIFY(!device.resizePty(100, 30));
     device.closeChannel();
 }
 
@@ -698,10 +726,10 @@ void TstLiveSsh::keyboardInteractiveOnlyServerAuthenticatesWithPassword()
     pool.disconnectFromHost();
 }
 
-// A stored key type may be disabled in the libssh build used by the desktop
-// client. It must not be passed back as SSH_OPTIONS_HOSTKEYS: connecting then
-// dies during KEXINIT, before verification can reject the mismatched key.
-void TstLiveSsh::unavailableTrustedAlgorithmStillReachesHostVerification()
+// A trusted host must still reach host-key verification when the presented
+// key differs; the client deliberately does not pre-filter KEX by the types
+// found in known_hosts.
+void TstLiveSsh::trustedHostMismatchIsCheckedAfterKex()
 {
     SshConnectionPool pool;
     KnownHosts hosts;
@@ -729,6 +757,48 @@ void TstLiveSsh::unavailableTrustedAlgorithmStillReachesHostVerification()
 // is told first, its poll timer keeps calling libssh on a freed ssh_channel.
 // sessionClosing() is that notification; this proves the device drops the
 // handle, reports end of stream exactly once, and stays inert afterwards.
+// A live-session destructor may notify channel owners, but must not emit QML
+// property notifications while its QObject state is being dismantled.
+void TstLiveSsh::poolDestructorEmitsOnlySessionClosing()
+{
+    ensureConnected();
+
+    int stateNotifications = 0;
+    int logNotifications = 0;
+    int closingNotifications = 0;
+    {
+        SshConnectionPool pool;
+        pool.setKnownHosts(m_pool.knownHosts());
+        pool.setHostKeyCallback([](const QString&, const QString&,
+                                   const QByteArray&, KnownHosts::Verdict) {
+            return SshConnectionPool::HostKeyDecision::Accept;
+        });
+        QObject::connect(&pool, &SshConnectionPool::stateChanged, &pool,
+                         [&stateNotifications](SshConnectionPool::State) {
+                             ++stateNotifications;
+                         });
+        QObject::connect(&pool, &SshConnectionPool::diagnosticLogChanged,
+                         &pool, [&logNotifications] { ++logNotifications; });
+        QObject::connect(&pool, &SshConnectionPool::sessionClosing, &pool,
+                         [&closingNotifications] {
+                             ++closingNotifications;
+                         });
+
+        QVERIFY2(pool.connectToHost(m_host, m_port, m_user),
+                 "secondary live pool did not connect");
+        QCOMPARE(pool.state(), SshConnectionPool::State::Connected);
+        // Ignore normal handshake notifications; only destructor emissions are
+        // under test.
+        stateNotifications = 0;
+        logNotifications = 0;
+        closingNotifications = 0;
+    }
+
+    QCOMPARE(closingNotifications, 1);
+    QCOMPARE(stateNotifications, 0);
+    QCOMPARE(logNotifications, 0);
+}
+
 // Declared last on purpose: it deliberately takes the shared session down.
 void TstLiveSsh::deviceOutlivingItsSessionStopsCleanly()
 {

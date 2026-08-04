@@ -42,9 +42,9 @@ namespace ch {
 // Validation happens at the write boundary, never on read: a profile that could
 // not possibly connect is refused rather than stored. addProfile() returns an
 // empty id and updateProfile() is a no-op when, after normalization, the host or
-// the user is empty or the port falls outside 1..65535. Everything else is
-// normalized: strings are trimmed, a missing/blank port becomes 22, and a blank
-// name becomes the host.
+// the user is empty, the port is not an integral number, or the port falls
+// outside 1..65535. Everything else is normalized: strings are trimmed, a
+// missing/blank port becomes 22, and a blank name becomes the host.
 //
 // NO SECRET IS EVER STORED. The seven fields above are a whitelist, applied to
 // every addProfile()/updateProfile() call: any other key in the caller's map is

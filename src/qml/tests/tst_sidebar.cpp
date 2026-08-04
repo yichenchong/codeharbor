@@ -18,6 +18,7 @@
 
 #include <QtTest>
 
+#include <algorithm>
 #include <QAbstractItemModel>
 #include <QColor>
 #include <QGuiApplication>

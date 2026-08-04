@@ -17,6 +17,11 @@ const registry: Partial<Record<Harness, HarnessAdapter>> = {
 };
 
 export function adapterFor(harness: Harness): HarnessAdapter | undefined {
+    // `Harness` is compile-time-only; a malformed bridge message can still
+    // supply a runtime string such as "constructor" or "__proto__". A plain
+    // object lookup would return Object.prototype members for those names, and
+    // the bridge would then fail trying to call `.map` on a non-adapter.
+    if (!Object.prototype.hasOwnProperty.call(registry, harness)) return undefined;
     return registry[harness];
 }
 

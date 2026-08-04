@@ -175,9 +175,29 @@ Rectangle {
     // supplies the privileged WebEngine profile the WebChannel bridge needs.
     // Guarded the same way, for the same reason.
     property var viewerModel: (typeof viewers !== "undefined") ? viewers : null
-    // User preferences are client-local and exposed by AppController as
-    // app.settings. The guarded lookup keeps this component loadable in the
-    // headless QML shell used by tests, where no application context exists.
+    // Mint the controller and bridge once, rather than binding creation to
+    // mutable properties. A factory or session binding can settle again while
+    // a pane is being rehomed; a reactive create() would orphan the live
+    // controller (and its PTY) and leave the WebChannel pointing at a
+    // different object.
+    property var controller: null
+    property var bridge: null
+    property bool started: false
+    property bool bridgeRegistered: false
+
+    function initializeController() {
+        if (!pane.controller && pane.factory)
+            pane.controller = pane.factory.create(pane)
+        if (!pane.bridge && pane.controller && pane.factory)
+            pane.bridge = pane.factory.createBridge(pane.controller, pane)
+        if (pane.bridge && !pane.bridgeRegistered) {
+            terminalChannel.registerObject("terminal", pane.bridge)
+            pane.bridgeRegistered = true
+            viewLoader.active = true
+        }
+    }
+
+    onFactoryChanged: if (pane.started) pane.initializeController()
     property var settingsObject: (typeof app !== "undefined" && app && app.settings)
                                  ? app.settings : null
 
@@ -188,9 +208,6 @@ Rectangle {
     onPaneActiveChanged: if (!pane.paneActive) pane.focusPending = false
 
 
-    // Per-pane C++ objects, owned by this pane (destroyed with it).
-    property var controller: pane.factory ? pane.factory.create(pane) : null
-    property var bridge: pane.controller ? pane.factory.createBridge(pane.controller, pane) : null
 
     // Entry page of the trusted terminal bundle; overridable by a host or test
     // that wants to serve the bundle from elsewhere.
@@ -1034,10 +1051,8 @@ Rectangle {
     // bootstrap looks up (channel.objects.terminal) BEFORE the view is created,
     // so the handshake always finds it.
     Component.onCompleted: {
-        if (pane.bridge) {
-            terminalChannel.registerObject("terminal", pane.bridge)
-            viewLoader.active = true
-        }
+        pane.initializeController()
+        pane.started = true
         pane.attachNow()
     }
 

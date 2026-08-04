@@ -203,11 +203,13 @@ private:
     // reconnecting page always sees the LATEST content exactly once.
     void deliverContent(const QString& content, const QString& revision);
     // Look for a crash-recovery snapshot for the file `generation` loaded. The
-    // generation is carried through both round trips so a snapshot belonging to
-    // a superseded load can never be offered against the file now open, and the
-    // snapshot's own recorded path is matched against the open file so this
-    // pane's snapshot of a PREVIOUS file is never offered as the current one
-    // (the recovery file is keyed per pane, not per path).
+    // generation is carried through both round trips so a snapshot belonging
+    // to a superseded load can never be offered against the file now open, and
+    // the snapshot's own recovery-key generation is carried too so a late
+    // server.info/pane-id update cannot install an old slot's revision into
+    // the new slot. The snapshot's recorded path is also matched against the
+    // open file, so a reused per-pane slot from a previous file is never
+    // offered as the current one.
     void checkRecovery(const QString& loadedContent, quint64 generation);
     void writeRecovery(const QString& content, bool retryOnMismatch);
     // Discard this pane's recovery snapshot after a successful save
@@ -257,6 +259,11 @@ private:
     QString m_recoveryDir;
 
     QString m_path;
+    // Last complete content loaded from the server. The controller normally
+    // does not own the editor buffer, but keeping this bounded-to-read-window
+    // baseline lets a recovery directory or pane id that arrives after open()
+    // still probe an existing snapshot without asking the page for a value.
+    QString m_loadedContent;
     QString m_revision;      // baseline expectedRevision for the main file
     FileState m_fileState = FileState::Disconnected;
     bool m_readOnly = false;
@@ -359,6 +366,16 @@ private:
     // snapshot this pane wrote for a different file.
     QString m_recoveryRevision;
     bool m_recoveryHasContent = false;
+    // A recovery clear is itself an asynchronous write. Keep it separate from
+    // m_recoveryWritesInFlight (which counts snapshot writes) so two successful
+    // saves cannot issue duplicate truncates while the first one is still on
+    // the wire.
+    bool m_recoveryClearInFlight = false;
+    // A stat/read probe is one logical operation. This guard prevents a
+    // recovery-key update from racing the permission-refresh callback into a
+    // duplicate stat, while its generation capture keeps an old probe from
+    // clearing the guard belonging to a newer slot.
+    bool m_recoveryCheckInFlight = false;
     // How many snapshot writes issued by writeRecovery() are on the wire. m_recoveryRevision
     // and m_recoveryHasContent are only adopted when its reply lands, so between
     // the two there is a window in which the controller does not yet know a
@@ -381,18 +398,18 @@ private:
     // truncate would then be guarded against a revision the second write is about
     // to replace, resurrecting the snapshot after the save.
     int m_recoveryWritesInFlight = 0;
-    // Which file's recovery slot the bookkeeping above describes, bumped by every
-    // open(). Every snapshot-write callback captures it and returns before touching
-    // anything if it has moved: the count and the deferred-truncate intent are
-    // shared state, so a reply belonging to the PREVIOUS file must not decrement the
-    // new file's count (which would fire its deferred truncate early, or make a
-    // later legitimate decrement clamp at zero and lose it). Same idiom as
-    // m_loadGeneration and m_watchGeneration.
+    // Which file and recovery key's slot the bookkeeping above describes,
+    // bumped by every open(), setRecoveryDir(), and setRecoveryId(). Every
+    // snapshot-write callback captures it and returns before touching anything
+    // if it has moved: a reply belonging to the previous file or key must not
+    // decrement the new file's count (which would fire its deferred truncate
+    // early, or make a later legitimate decrement clamp at zero and lose it).
+    // Same idiom as m_loadGeneration and m_watchGeneration.
     quint64 m_recoveryGeneration = 0;
     // Set by clearRecovery() when it cannot act yet; carried out by the last
-    // outstanding snapshot write's reply. CLEARED by a fresh content write, because
-    // bytes reported after the save are unsaved work the save did not cover and
-    // must not be truncated.
+    // outstanding snapshot write's reply. Cleared by a fresh content write,
+    // because bytes reported after the save are unsaved work the save did not
+    // cover and must not be truncated.
     bool m_recoveryClearPending = false;
 
     // Ready handshake (see the ready() slot). m_pendingContent holds a load that

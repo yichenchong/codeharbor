@@ -147,9 +147,13 @@ Rectangle {
                 Layout.preferredWidth: 130
                 model: [qsTr("All"), qsTr("Debug"), qsTr("Info"),
                         qsTr("Warning"), qsTr("Critical"), qsTr("Fatal")]
-                onCurrentTextChanged: {
-                    root.severityFilter = currentIndex === 0 ? ""
-                                                               : currentText.toLowerCase();
+                onCurrentIndexChanged: {
+                    // The visible labels are translated, so deriving the
+                    // filter key from currentText breaks every non-English
+                    // locale. LogBuffer stores canonical severity names.
+                    var keys = ["", "debug", "info", "warning", "critical", "fatal"];
+                    root.severityFilter = currentIndex >= 0 && currentIndex < keys.length
+                                           ? keys[currentIndex] : "";
                 }
             }
 

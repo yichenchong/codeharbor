@@ -157,7 +157,7 @@ private:
 
     QPointer<CodeharbordClient> m_client;
     InternalUrlMap *m_map;
-    ViewerProfiles *m_profiles = nullptr;
+    QPointer<ViewerProfiles> m_profiles;
     bool m_ownsProfiles = false;
     // The live InternalUrlSchemeHandler::requestFailed forwarding connection,
     // held so re-wiring can drop it without touching the old handler (which may

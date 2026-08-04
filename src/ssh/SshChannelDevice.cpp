@@ -11,6 +11,15 @@ namespace {
 // Drain granularity per libssh read. 16 KiB comfortably exceeds one SSH channel
 // data packet, so a burst is normally emptied in a couple of iterations.
 constexpr int kChunkBytes = 16 * 1024;
+// Yield after a bounded amount even when a remote producer never goes quiet.
+// Without this cap, a `yes`-style command can keep the nonblocking read loop
+// inside one timer callback forever and starve the Qt event loop.
+constexpr qsizetype kMaxPumpBytes = 256 * 1024;
+constexpr qsizetype kReadCompactionThreshold = 64 * 1024;
+// Let the SSH channel's own window apply backpressure instead of retaining an
+// unbounded remote flood in this process when a consumer stops reading.
+constexpr qsizetype kMaxReadBufferBytes = 8 * 1024 * 1024;
+
 
 } // namespace
 
@@ -56,7 +65,16 @@ SshChannelDevice::~SshChannelDevice()
 
 qint64 SshChannelDevice::bytesAvailable() const
 {
-    return QIODevice::bytesAvailable() + m_readBuffer.size();
+    return QIODevice::bytesAvailable()
+           + (m_readBuffer.size() - m_readOffset);
+}
+
+bool SshChannelDevice::canReadLine() const
+{
+    // QIODevice's own buffer stays empty because this device is Unbuffered;
+    // line framing lives in m_readBuffer instead.
+    return m_readBuffer.indexOf('\n', m_readOffset) >= 0
+           || QIODevice::canReadLine();
 }
 
 void SshChannelDevice::close()
@@ -79,7 +97,8 @@ qint64 SshChannelDevice::readData(char* data, qint64 maxSize)
 {
     if (maxSize <= 0)
         return 0;
-    const qint64 count = qMin<qint64>(maxSize, m_readBuffer.size());
+    const qsizetype available = m_readBuffer.size() - m_readOffset;
+    const qint64 count = qMin<qint64>(maxSize, available);
     if (count <= 0) {
         // QIODevice's contract distinguishes the two empty answers, and a
         // generic consumer relies on it: 0 means "nothing buffered right now,
@@ -89,8 +108,17 @@ qint64 SshChannelDevice::readData(char* data, qint64 maxSize)
         // against the plain interface wait for bytes that can never come.
         return m_remoteFinished ? -1 : 0;
     }
-    std::memcpy(data, m_readBuffer.constData(), static_cast<size_t>(count));
-    m_readBuffer.remove(0, count);
+    std::memcpy(data, m_readBuffer.constData() + m_readOffset,
+                static_cast<size_t>(count));
+    m_readOffset += count;
+    if (m_readOffset == m_readBuffer.size()) {
+        m_readBuffer.clear();
+        m_readOffset = 0;
+    } else if (m_readOffset >= kReadCompactionThreshold
+               && m_readOffset * 2 >= m_readBuffer.size()) {
+        m_readBuffer.remove(0, m_readOffset);
+        m_readOffset = 0;
+    }
     return count;
 }
 
@@ -132,6 +160,7 @@ void SshChannelDevice::abortStart(const QString& reason)
         if (m_pool)
             m_pool->releaseChannel(m_channel);
         m_channel = nullptr;
+        ++m_channelGeneration;
     }
     m_hasPty = false;
 #endif
@@ -170,6 +199,7 @@ void SshChannelDevice::closeChannel()
     m_pump->stop();
     m_hasPty = false;
     m_readBuffer.clear();
+    m_readOffset = 0;
     if (isOpen())
         QIODevice::close();
     // Same contract as the libssh build: the end of the read channel is
@@ -215,12 +245,14 @@ bool SshChannelDevice::acquireChannel()
         failWith(QStringLiteral("could not open SSH channel"));
         return false;
     }
+    ++m_channelGeneration;
     return true;
 }
 
 bool SshChannelDevice::beginStreaming()
 {
     m_readBuffer.clear();
+    m_readOffset = 0;
     m_remoteFinished = false;
     // A previous channel may have ended mid-character; the new channel's stderr
     // must not inherit that half-decoded state.
@@ -295,8 +327,9 @@ bool SshChannelDevice::startPty(const QString& term, int cols, int rows,
 
 bool SshChannelDevice::resizePty(int cols, int rows)
 {
-    if (!m_channel || !m_hasPty)
+    if (!m_channel || !m_hasPty || m_remoteFinished)
         return false;
+
     // Same floor as startPty(): never push a zero-sized window to the remote.
     return ssh_channel_change_pty_size(m_channel, qMax(1, cols), qMax(1, rows))
            == SSH_OK;
@@ -314,12 +347,14 @@ void SshChannelDevice::closeChannel()
         if (m_pool)
             m_pool->releaseChannel(m_channel);
         m_channel = nullptr;
+        ++m_channelGeneration;
     }
     m_hasPty = false;
 
     // Drop anything still buffered: bytesAvailable() must not advertise
     // readable bytes on a device that has been closed.
     m_readBuffer.clear();
+    m_readOffset = 0;
     if (isOpen())
         QIODevice::close();
 
@@ -349,9 +384,12 @@ qint64 SshChannelDevice::writeData(const char* data, qint64 maxSize)
         if (n == SSH_ERROR) {
             // -1 without an errorString() is what QIODevice consumers see as
             // "Unknown error"; failWith() records the libssh message so a
-            // generic reader/writer can report the real cause.
+            // generic reader/writer can report the real cause. Preserve a
+            // prefix that was already accepted: returning -1 after a partial
+            // write invites a caller to retry the entire frame and duplicate
+            // those bytes on the remote side.
             failWith(lastError());
-            return -1;
+            return written > 0 ? written : -1;
         }
         if (n <= 0)
             break;  // no progress possible right now; report the short write
@@ -364,10 +402,12 @@ void SshChannelDevice::pump()
 {
     if (!m_channel)
         return;
+    const ssh_channel channel = m_channel;
+    const quint64 generation = m_channelGeneration;
     // A slot reached from readyRead() may spin a nested event loop (QTRY_*,
     // QSignalSpy::wait); re-entering libssh from inside our own drain would
-    // reorder the stream. The timer is single-shot, so a swallowed tick MUST be
-    // re-armed or the read pump would be dead for good — silently, with the
+    // reorder the stream. The timer is single-shot, so a swallowed tick MUST
+    // be re-armed or the read pump would be dead for good — silently, with the
     // channel still open.
     if (m_pumping) {
         m_pump->start(kIdlePollMs);
@@ -381,17 +421,29 @@ void SshChannelDevice::pump()
     bool eof = false;
     // Append straight into the read buffer: staging payload in a second
     // QByteArray would copy every byte that crosses the channel.
-    const qsizetype bufferedBefore = m_readBuffer.size();
+    const qsizetype bufferedBefore =
+        m_readBuffer.size() - m_readOffset;
 
     // Drain stdout and stderr separately. Everything below stays inside libssh
     // until the loops finish: no signal is emitted mid-drain, so a handler can
     // never re-enter ssh_channel_read_nonblocking() on this channel.
     for (int stream = 0; stream < 2 && failure.isEmpty(); ++stream) {
         const int isStderr = stream;
-        for (;;) {
-            const int n = ssh_channel_read_nonblocking(
-                m_channel, chunk, static_cast<uint32_t>(sizeof(chunk)),
-                isStderr);
+        qsizetype streamBytes = 0;
+        while (streamBytes < kMaxPumpBytes) {
+            qsizetype remaining = kMaxPumpBytes - streamBytes;
+            if (!isStderr) {
+                remaining = qMin<qsizetype>(
+                    remaining,
+                    kMaxReadBufferBytes
+                        - (m_readBuffer.size() - m_readOffset));
+            }
+            if (remaining <= 0)
+                break;
+            const uint32_t request = static_cast<uint32_t>(
+                qMin<qsizetype>(sizeof(chunk), remaining));
+            const int n =
+                ssh_channel_read_nonblocking(channel, chunk, request, isStderr);
             if (n == SSH_ERROR) {
                 failure = lastError();
                 break;
@@ -402,6 +454,7 @@ void SshChannelDevice::pump()
             }
             if (n <= 0)
                 break;  // nothing more buffered on this stream right now
+            streamBytes += n;
             if (isStderr)
                 stderrBytes.append(chunk, n);
             else
@@ -409,16 +462,20 @@ void SshChannelDevice::pump()
         }
     }
 
-    if (!eof && failure.isEmpty() && ssh_channel_is_eof(m_channel) != 0)
+    if (!eof && failure.isEmpty() && ssh_channel_is_eof(channel) != 0)
         eof = true;
 
-    const bool gotPayload = m_readBuffer.size() > bufferedBefore;
+    const bool gotPayload =
+        m_readBuffer.size() - m_readOffset > bufferedBefore;
     m_pumping = false;
 
     // Re-arm before emitting so a handler that calls closeChannel() wins: its
-    // m_pump->stop() then cancels the timer we just started.
-    if (m_channel && !eof && failure.isEmpty())
+    // m_pump->stop() then cancels the timer we just started. The generation
+    // check also prevents an old pass from arming a newly started channel.
+    if (m_channel == channel && m_channelGeneration == generation && !eof
+        && failure.isEmpty()) {
         m_pump->start(gotPayload || !stderrBytes.isEmpty() ? 0 : kIdlePollMs);
+    }
 
     // Every emit below can reach a handler that destroys this device: the
     // documented teardown path runs from inside readChannelFinished(), and a
@@ -438,16 +495,25 @@ void SshChannelDevice::pump()
         if (!text.isEmpty())
             emit channelError(text);
     }
-    if (self && !failure.isEmpty())
+    // A channel-error handler may close this channel, destroy the device, or
+    // immediately start a replacement channel. Do not publish old bytes or
+    // finish the replacement in any of those cases.
+    if (self && m_channel == channel && m_channelGeneration == generation
+        && !failure.isEmpty()) {
         failWith(failure);
-    if (self && gotPayload)
+    }
+    if (self && m_channel == channel && m_channelGeneration == generation
+        && gotPayload) {
         emit readyRead();
+    }
 
     // Remote EOF: report the end of the read channel exactly once, after the
-    // final bytes have been surfaced. The device stays open so buffered data is
-    // still readable; the owner decides when to closeChannel().
-    if (self && (eof || !failure.isEmpty()))
+    // final bytes have been surfaced. The device stays open so buffered data
+    // is still readable; the owner decides when to closeChannel().
+    if (self && m_channel == channel && m_channelGeneration == generation
+        && (eof || !failure.isEmpty())) {
         finishReadChannel();
+    }
 }
 
 #endif // CH_HAVE_LIBSSH

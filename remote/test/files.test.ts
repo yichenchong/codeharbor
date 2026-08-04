@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { EventEmitter } from "node:events";
 import { spawn } from "node:child_process";
+import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 
 import {
@@ -20,6 +21,8 @@ import {
     fileWatchService,
     FileWatchService,
     MAX_DIRECTORY_LISTING_BYTES,
+    MAX_FILE_READ_BYTES,
+    MAX_FILE_RESPONSE_BYTES,
     MAX_WATCH_SUBSCRIPTIONS,
 } from "../src/files.ts";
 import {
@@ -260,17 +263,24 @@ test("watch emits a WatchEvent when the file changes", async () => {
     await fs.rm(dir, { recursive: true, force: true });
 });
 
-test("listDirectory (RPC) classifies entries; getMimeType maps extensions", async () => {
+test("listDirectory (RPC) sorts entries, includes hidden files, and classifies them", async () => {
     const dir = await tmpDir();
     await fs.writeFile(path.join(dir, "readme.md"), "# hi");
+    await fs.writeFile(path.join(dir, "aaa.txt"), "first");
+    await fs.writeFile(path.join(dir, ".hidden"), "secret");
     await fs.mkdir(path.join(dir, "sub"));
 
     const result = await listDirectory({ path: dir });
     assert.equal(result.path, dir);
+    assert.deepEqual(
+        result.entries.map((entry) => entry.name),
+        [".hidden", "aaa.txt", "readme.md", "sub"],
+    );
     const byName: Record<string, string> = {};
     for (const entry of result.entries) byName[entry.name] = entry.kind;
     assert.equal(byName["readme.md"], "file");
     assert.equal(byName["sub"], "directory");
+    assert.equal(byName[".hidden"], "file");
 
     assert.equal(getMimeType("a/b/readme.md"), "text/markdown");
     assert.equal(getMimeType("photo.PNG"), "image/png");
@@ -495,6 +505,33 @@ test("ranged readFile returns only the window of a huge (sparse) file", async ()
     await fs.rm(dir, { recursive: true, force: true });
 });
 
+test("readFile refuses oversized whole reads and oversized encoded responses", async () => {
+    const dir = await tmpDir();
+    const sparse = path.join(dir, "sparse.bin");
+    const handle = await fs.open(sparse, "w");
+    try {
+        await handle.truncate(MAX_FILE_READ_BYTES + 1);
+    } finally {
+        await handle.close();
+    }
+
+    const isResourceLimit = (err: unknown): boolean =>
+        err instanceof Error && "code" in err && err.code === RPC_RESOURCE_LIMIT;
+    await assert.rejects(() => readFile({ path: sparse }), isResourceLimit);
+    await assert.rejects(
+        () => readFile({ path: sparse, offset: 0, length: MAX_FILE_READ_BYTES + 1 }),
+        isResourceLimit,
+    );
+
+    // A raw read can be under the allocation cap but still expand beyond the
+    // transport cap when JSON escapes control bytes in the text payload.
+    const escaped = path.join(dir, "escaped.txt");
+    await fs.writeFile(escaped, "\u0001".repeat(Math.ceil(MAX_FILE_RESPONSE_BYTES / 6)));
+    await assert.rejects(() => readFile({ path: escaped }), isResourceLimit);
+
+    await fs.rm(dir, { recursive: true, force: true });
+});
+
 test("watch emits no WatchEvent for a subscription after unwatch", async () => {
     const dir = await tmpDir();
     const file = path.join(dir, "unwatched.txt");
@@ -599,6 +636,16 @@ test("writeFile rejects malformed base64 instead of writing corrupt bytes", asyn
         /Invalid base64 content/,
     );
     assert.equal(await fs.access(junk).then(() => true, () => false), false);
+    const rpcTarget = path.join(dir, "rpc-invalid.bin");
+    const rpcError = await callFile("file.writeFile", {
+        path: rpcTarget,
+        content: "!!! not base64 !!!",
+        encoding: "base64",
+        expectedRevision: "",
+    });
+    assert.equal(rpcError.code, RPC_INVALID_PARAMS);
+    assert.match(rpcError.message, /Invalid base64 content/);
+    assert.equal(await fs.access(rpcTarget).then(() => true, () => false), false);
 
     // A payload cut mid-group has a stripped length of 1 mod 4, which encodes no
     // byte string: Buffer would discard the partial group and write short data.
@@ -608,6 +655,17 @@ test("writeFile rejects malformed base64 instead of writing corrupt bytes", asyn
         /Invalid base64 content/,
     );
     assert.equal(await fs.access(truncated).then(() => true, () => false), false);
+    // Padding is part of the base64 grammar: a lone "=" or more than two
+    // trailing "=" characters must not be silently accepted as an empty or
+    // shortened payload.
+    for (const [index, content] of ["=", "aGk===", "ab=", "a=="].entries()) {
+        const target = path.join(dir, `bad-padding-${index}.bin`);
+        await assert.rejects(
+            () => writeFile({ path: target, content, encoding: "base64", expectedRevision: "" }),
+            /Invalid base64 content/,
+        );
+        assert.equal(await fs.access(target).then(() => true, () => false), false);
+    }
 
     await fs.rm(dir, { recursive: true, force: true });
 });
@@ -638,6 +696,14 @@ test("a revision-mismatch error carries the current revision for the conflict di
         .then(() => undefined, (err: unknown) => err);
     if (!isRevisionMismatch(exists)) throw new Error("expected a revision mismatch");
     assert.deepEqual(exists.data, { path: file, currentRevision: current.revision });
+    const rpcResponse = await dispatch({
+        jsonrpc: "2.0",
+        id: 8,
+        method: "file.writeFile",
+        params: { path: file, content: "mine", expectedRevision: "1-1-1-1" },
+    });
+    assert.ok(rpcResponse && "error" in rpcResponse);
+    assert.equal(rpcResponse.error.code, RPC_REVISION_MISMATCH);
 
     await fs.rm(dir, { recursive: true, force: true });
 });
@@ -1289,6 +1355,22 @@ test("writeFile refuses a symbolic-link cycle instead of looping forever", async
     await fs.rm(dir, { recursive: true, force: true });
 });
 
+test("writeFile follows the maximum supported symbolic-link depth", async () => {
+    const dir = await tmpDir();
+    const target = path.join(dir, "target.txt");
+    let link = target;
+    for (let index = 40; index >= 1; index -= 1) {
+        const next = path.join(dir, `link-${index}.txt`);
+        await fs.symlink(path.basename(link), next);
+        link = next;
+    }
+
+    await writeFile({ path: link, content: "deep", expectedRevision: "" });
+    assert.equal(await fs.readFile(target, "utf-8"), "deep");
+
+    await fs.rm(dir, { recursive: true, force: true });
+});
+
 // A listing longer than one transport frame did not merely fail: MAX_LINE_BYTES
 // is enforced by BOTH ends, so the client's bounded reader dropped the SSH
 // channel and took every terminal, editor and watch subscription in the session
@@ -1435,6 +1517,7 @@ test("file.watch past the cap answers with the resource-limit code, not internal
 // handler is exactly the behaviour under test.
 async function runDaemonUntilSignalled(
     signals: readonly NodeJS.Signals[],
+    keepSignallingUntilExit = false,
 ): Promise<{ code: number | null; signal: NodeJS.Signals | null }> {
     const child = spawn(process.execPath, [DAEMON_ENTRY, "rpc", "--stdio"], {
         stdio: ["pipe", "pipe", "pipe"],
@@ -1457,6 +1540,19 @@ async function runDaemonUntilSignalled(
         assert.match(await withTimeout(answered, 20000), /"id":7/);
 
         for (const signal of signals) child.kill(signal);
+        if (keepSignallingUntilExit) {
+            // Keep re-sending SIGTERM every few milliseconds right up to the
+            // moment the process is gone, so one of them is guaranteed to land
+            // in the narrow window while the process is finishing its exit. A
+            // single late signal only hits that window by luck. Real delays,
+            // deliberately: the thing under test is signal delivery to a
+            // separate operating-system process, and a fake clock in this
+            // process cannot move that process's timeline at all.
+            while (child.exitCode === null && child.signalCode === null) {
+                child.kill("SIGTERM");
+                await delay(3);
+            }
+        }
         return await withTimeout(exited, 20000);
     } finally {
         if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
@@ -1483,5 +1579,19 @@ test("SIGHUP — what an ending SSH session sends — also shuts the daemon down
 test("a second signal during shutdown does not turn a clean exit into a kill", async () => {
     const { code, signal } = await runDaemonUntilSignalled(["SIGTERM", "SIGTERM", "SIGINT"]);
     assert.equal(signal, null);
+    assert.equal(code, 0);
+});
+
+// The same second signal, but delivered while the daemon is actually leaving,
+// rather than in the same instant as the first. The tight loop above only
+// reproduces that by accident, when the machine happens to be loaded enough to
+// spread the three calls out. By the time a late signal arrives the first
+// shutdown has already finished its work and the process is on its way out, so
+// this is the case that catches Node closing its internal signal watchers
+// before the process is really gone and letting the late signal kill it after
+// all. Removing the fix in the daemon makes this test fail every time.
+test("signals that keep arriving while the daemon exits still do not kill it", async () => {
+    const { code, signal } = await runDaemonUntilSignalled(["SIGTERM"], true);
+    assert.equal(signal, null, "a late signal killed the daemon during its exit");
     assert.equal(code, 0);
 });

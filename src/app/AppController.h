@@ -264,8 +264,9 @@ private:
     // a newer one; see refresh().
     quint64 m_refreshGeneration = 0;
     // Live agent-status monitor (SPEC 6.4), not owned; set via setAgentMonitor.
-    // When non-null its per-terminal state is merged into the sidebar rows.
-    AgentStatusMonitor* m_agentMonitor = nullptr;
+    // QPointer turns null if the caller destroys its monitor before this
+    // controller, so a late rebuild cannot dereference a dead observer.
+    QPointer<AgentStatusMonitor> m_agentMonitor;
     // Per-pane terminal lifecycle reported by TerminalFactory. The outer key is
     // the server's Dev Session id and the inner key is the server's
     // terminal_panes row id; both are cleared on a server switch so an old

@@ -526,9 +526,13 @@ private:
     int m_connectTimeoutMs = kDefaultConnectTimeoutMs;
     qint64 m_lastAttemptMs = -1;
     bool m_reconnectEnabled = true;
-    // See setTrustUnknownHostKeys(). Deliberately false by default: the safe
-    // answer to an unknown host key with nobody to ask is "do not connect".
+    // connectAndWireFromEnvironment() keeps this opt-in only for the
+    // unattended session it started. A later attended connect on the same
+    // object must not inherit trust-on-first-use.
     bool m_trustUnknownHostKeys = false;
+    bool m_environmentTrustActive = false;
+    bool m_environmentTrustPrevious = false;
+    bool m_environmentConnectInProgress = false;
     // Set while we are inside our own connect/teardown, so the pool and device
     // signals those steps provoke are not mistaken for a fresh loss.
     bool m_attempting = false;

@@ -81,22 +81,32 @@ inline constexpr auto kMethodListDirectory = "file.listDirectory";
 // shared it: ch_editor deliberately does not link ch_viewers (see
 // EditorController::kMaxEditableReadBytes) and both link ch_remote.
 //
-// Returns nullopt ONLY when a base64 payload is not valid base64 — a server bug
-// or a corrupted frame. Callers report that rather than rendering an empty
-// file. Invalid UTF-8 INSIDE a correctly encoded payload is not an error here:
-// it becomes U+FFFD, which is the honest read-only view of a file the strict
-// decoder refused.
+// Returns nullopt when the wire shape is missing a string `encoding` or
+// `content`, names an unsupported encoding, or a base64 payload is not valid
+// base64 — each is a server bug or a corrupted frame. Callers report that
+// rather than rendering an empty file. Invalid UTF-8 INSIDE a correctly encoded
+// payload is not an error here: it becomes U+FFFD, which is the honest read-only
+// view of a file the strict decoder refused.
 //
 // Decoding NEVER makes a buffer writable. Writability is derived by the caller
 // from the wire `encoding` (and `truncated`), never from the payload's shape,
 // so a decoded base64 buffer is still refused by the save path.
 inline std::optional<QString> decodeFileContent(const QJsonObject& readResult)
 {
-    const QString content =
-        readResult.value(QStringLiteral("content")).toString();
-    if (readResult.value(QStringLiteral("encoding")).toString()
-        != QLatin1String("base64"))
+    const QJsonValue encodingValue =
+        readResult.value(QStringLiteral("encoding"));
+    const QJsonValue contentValue =
+        readResult.value(QStringLiteral("content"));
+    if (!encodingValue.isString() || !contentValue.isString())
+        return std::nullopt;
+
+    const QString encoding = encodingValue.toString();
+    const QString content = contentValue.toString();
+    if (encoding == QLatin1String("utf-8"))
         return content;
+    if (encoding != QLatin1String("base64"))
+        return std::nullopt;
+
     const auto decoded = QByteArray::fromBase64Encoding(
         content.toUtf8(),
         QByteArray::Base64Encoding | QByteArray::AbortOnBase64DecodingErrors);

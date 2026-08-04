@@ -37,7 +37,7 @@ private slots:
     void aDeclinedUnknownKeyIsRefusedWithAnExplanation();
     void aPortedEndpointIsLookedUpAndStoredOpenSshStyle();
 #if CH_HAVE_LIBSSH
-    void destroyingAPoolAnnouncesTheSessionButChangesNoProperty();
+    void destroyingAnUnconnectedPoolChangesNoProperty();
 #endif
 };
 
@@ -154,18 +154,13 @@ void TstSshConnectionPool::aPortedEndpointIsLookedUpAndStoredOpenSshStyle()
 
 #if CH_HAVE_LIBSSH
 
-// A destructor that emits Qt signals hands every connected slot — and every QML
-// property binding, because diagnosticLog is a Q_PROPERTY — an object that is
-// on its way out. Teardown therefore announces exactly ONE thing,
-// sessionClosing(), which is load-bearing: it is how a channel device that
-// outlives its pool is told to drop its channel handle before the handles are
-// freed. It fires only when there is a live session to close, so what is
-// checkable without a server is the other half, and it is the half that used to
-// be wrong on every teardown: stateChanged() and diagnosticLogChanged() must
-// stay quiet. (The live gate, tst_livessh, is what exercises sessionClosing()
-// against a real session.)
+// An unconnected pool has no live session, so its destructor has no teardown
+// signal to announce. It still must not emit stateChanged() or
+// diagnosticLogChanged() while transitioning its private state to
+// Disconnected; the live gate checks the corresponding sessionClosing()
+// behavior against a real session.
 void TstSshConnectionPool::
-    destroyingAPoolAnnouncesTheSessionButChangesNoProperty()
+    destroyingAnUnconnectedPoolChangesNoProperty()
 {
     // The pool parses ~/.ssh/config; point HOME at an empty directory so a
     // developer's real config cannot influence, or hang, this test.

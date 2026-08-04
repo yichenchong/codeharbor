@@ -71,11 +71,10 @@ if(NOT CMAKE_CXX_COMPILER_LAUNCHER)
 endif()
 
 # Debug information for the test executables, traded against build time. There
-# are 35 of them, one translation unit each, and together they are the single
-# largest bucket in a Debug build of this tree (767 s of 1985 s of compile work
-# measured on a 2-core box). Dropping them from `-g` to `-g1` - line tables and
-# function boundaries, no local variable or type descriptions - measured 15.2 s
-# -> 11.7 s for tst_qmlload.cpp, about 23%.
+# are dozens of them, one translation unit each, and together they are the
+# single largest bucket in a Debug build. Dropping them from `-g` to `-g1` -
+# line tables and function boundaries, no local variable or type descriptions -
+# measured 15.2 s -> 11.7 s for tst_qmlload.cpp, about 23%.
 #
 # OFF by default, deliberately. When anyone actually reaches for a debugger here
 # it is almost always a failing TEST they are stepping through, and what -g1
@@ -129,26 +128,35 @@ if(libssh_FOUND)
         set(_ch_libssh_target libssh::libssh)
     endif()
 endif()
-# The audited floor is libssh 0.11.2 (docs/DEVELOPMENT.md § Verified toolchain,
-# and the per-symbol audit comment at the top of src/ssh/SshConnectionPool.cpp).
-# This is a WARNING, not a hard requirement: several supported distributions
-# still ship 0.10.x, the client compiles and links against it, and everything
-# except the libssh-0.12.0 key-exchange workaround works there. Turning it into
-# a `find_package` version constraint would refuse to configure on those
-# machines, which is a worse outcome than an explicit warning.
+# The audited runtime floor is libssh 0.11.2 (docs/DEVELOPMENT.md § Verified
+# toolchain, and the per-symbol audit comment in src/ssh/SshConnectionPool.cpp).
+# The vcpkg registry still offers 0.12.0, whose hybrid ML-KEM exchange cannot
+# complete a handshake against a modern sshd. SshConnectionPool subtracts that
+# algorithm only when the runtime version is exactly 0.12.0 - never 0.12.1 or
+# newer. The separate Windows release overlay is pinned to 0.12.2, which contains
+# the upstream fix, and does not change the audited runtime floor for system
+# packages on Linux or macOS.
 set(CODEHARBOR_LIBSSH_FLOOR "0.11.2")
 function(_ch_warn_if_old_libssh version how)
+    if("${version}" VERSION_EQUAL "0.12.0")
+        message(WARNING
+            "libssh 0.12.0 (found via ${how}) cannot complete a handshake "
+            "against a modern sshd without the ML-KEM subtraction workaround. "
+            "SshConnectionPool applies it only to exactly 0.12.0, never to "
+            "0.12.1 or newer; upgrade when possible. The Windows release "
+            "overlay is separately pinned to libssh 0.12.2.")
+        return()
+    endif()
     if("${version}" STREQUAL ""
        OR "${version}" VERSION_GREATER_EQUAL "${CODEHARBOR_LIBSSH_FLOOR}")
         return()
     endif()
     message(WARNING
-        "libssh ${version} (found via ${how}) is older than the audited floor "
-        "${CODEHARBOR_LIBSSH_FLOOR}. It will build and connect, but it is missing "
-        "the CVE-2025-5351 fix in the public-key export path this client calls on "
-        "every connect, and the libssh-0.12.0 key-exchange workaround in "
-        "src/ssh/SshConnectionPool.cpp needs the 0.11.0 algorithm-list syntax. "
-        "See docs/DEVELOPMENT.md.")
+        "libssh ${version} (found via ${how}) is older than the audited runtime "
+        "floor ${CODEHARBOR_LIBSSH_FLOOR}. It may build, but it is missing the "
+        "CVE-2025-5351 fix in the public-key export path this client calls on "
+        "every connect. The Windows release overlay is separately pinned to "
+        "libssh 0.12.2. See docs/DEVELOPMENT.md.")
 endfunction()
 if(_ch_libssh_target)
     add_library(ch_libssh INTERFACE)

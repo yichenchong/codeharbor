@@ -25,9 +25,8 @@ CREATE INDEX IF NOT EXISTS idx_dev_sessions_group_id
     ON dev_sessions (group_id);
 -- The sidebar's optional pinned-only listing filters by both group and pinned
 -- state. Keep the group-only index above for the unfiltered listing and use
--- this composite index for the filtered path; the latter is client-local UI
--- state, but the server still avoids scanning every session when asked for the
--- current view.
+-- this composite index for the filtered path; `pinned` is server-owned state,
+-- and the server still avoids scanning every session when asked for that view.
 CREATE INDEX IF NOT EXISTS idx_dev_sessions_group_pinned
     ON dev_sessions (group_id, pinned);
 

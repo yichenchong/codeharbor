@@ -116,18 +116,20 @@ Examples:
 
 - Work
 - Personal
-- Tailbale
+- Tasks
 - Experiments
 - Archived
 
 Supported operations:
 
 - create;
-- rename;
 - delete;
 - reorder;
 - collapse or expand;
 - move sessions into or out of the group.
+
+The current client has no group-rename control; a group can be renamed only by a
+future settings or sidebar surface.
 
 ### 3.2 Dev Session
 
@@ -327,19 +329,19 @@ is a correctness fault, not a cosmetic one.
 
 The viewer region contains one or more viewer panes arranged using a recursive split tree.
 
-Supported operations:
+Supported operations currently implemented in the client:
 
 - split horizontally;
 - split vertically;
 - close pane;
-- duplicate pane;
-- move pane within the viewer region;
-- change viewer handler;
 - navigate to another URL;
 - reload;
-- open externally;
-- zoom;
-- open developer tools where applicable.
+- choose another applicable viewer handler ("Open as");
+- open externally where the resolved download/metadata view offers a desktop
+  application scheme.
+
+Pane duplication and moving within the viewer region are not implemented. Zoom
+controls and an in-app developer-tools action are not implemented either.
 
 **Open as.** A file or directory in a directory listing can be opened with a specific handler instead of the
 default one, from a context menu or a small affordance on the row (both reachable from the keyboard). The menu
@@ -406,9 +408,11 @@ merely marking a QML item focused. The remembered pane is client-local (§11.2):
 it describes what somebody was doing at this desk. A restore is stamped like any
 other layout operation and is dropped if the user has since switched away, it
 waits for the region's tree to arrive rather than firing into an empty region, and
-it never overrides a pane the user has clicked in the meantime. A remembered pane
-that no longer exists falls back to the first viewer pane silently — a closed pane
-is not an error.
+it never overrides a pane the user has clicked in the meantime. Today, pane
+selection persistence is driven by pane activation (including pointer/header
+actions); keyboard-only traversal between viewer and terminal panes is not
+implemented (see §15). A remembered pane that no longer exists falls back to
+the first viewer pane silently — a closed pane is not an error.
 
 ### 4.6 Settings
 
@@ -440,8 +444,8 @@ extension, a wrong value type — is rejected or normalised on the way in rather
 than trusted.
 
 Server exposes the stored connection profiles and the actions that already exist for them (connect, disconnect,
-update the remote service). Tmux exposes the options that genuinely reach the remote side. No control in this
-window may be decorative: every one changes something observable.
+update the remote service). Tmux currently explains the fixed per-session mouse-reporting behavior; it has no
+editable options. No control in this window may be decorative: every one changes something observable.
 
 All of it is client-local (§11.2). A preference is a property of this desktop, not of the workspace.
 
@@ -515,12 +519,17 @@ Suggested command:
 ```bash
 tmux new-session -A \
   -s 'ch_<dev-session-uuid>_<terminal-uuid>' \
-  -c '/remote/working/directory'
-```
+  -c '/remote/working/directory' \
+  \; set-option -t '=ch_<dev-session-uuid>_<terminal-uuid>:' mouse on
 
 Stable IDs should be used for tmux names rather than user-facing display names.
 
-### 5.3 Connection Pooling
+The server owns the target string. Terminal targets supplied through the
+workspace RPC are accepted only when they are 1–200 characters from
+`[A-Za-z0-9_-]`. In particular, `:` and `.` are rejected rather than rewritten,
+because tmux interprets them as session/window/pane separators. The tmux
+`killSession` operation applies the same separator and control-character
+rejection before it builds its exact-match target.
 
 Use one authenticated SSH connection to the configured server, with multiple independent SSH channels.
 
@@ -654,6 +663,11 @@ Fallback:
   }
 }
 ```
+
+The timestamp is strict: it must be a valid ISO 8601 date-time with exactly
+three fractional-second digits and either `Z` or a numeric timezone offset.
+Invalid calendar dates, missing milliseconds, and other timestamp shapes are
+dropped by the bridge.
 
 `metadata` is free-form, but the tool name is keyed **`tool`**. That is not a
 preference: all three shipped adapters in `remote/src/adapters/` emit it under
@@ -942,25 +956,31 @@ Unsaved-file state should appear both in the pane header and in the Dev Session 
 
 ### 8.3 Remote File API
 
-The server-side file service should eventually support:
+The currently implemented file RPC surface is:
 
 ```text
 stat(path)
 readFile(path, offset?, length?)
-writeFile(path, content, expectedRevision)
-createFile(path)
-createDirectory(path)
-listDirectory(path)
-rename(source, destination)
-copy(source, destination)
-delete(path)
+writeFile(path, content, expectedRevision, encoding?, mode?)
 watch(path)
-unwatch(path)
-resolvePath(path)
-getMimeType(path)
+unwatch(subscriptionId)
+resolvePath(path, base?)
+listDirectory(path)
 ```
 
-Initial editing support requires:
+`offset` and `length` are non-negative byte ranges. `encoding` is either
+`utf-8` or `base64`; base64 input is checked against the complete alphabet,
+padding grammar, and group length before it is decoded. Malformed base64 is
+reported as an **Invalid params** RPC error, not as an internal server error.
+`mode` is an optional POSIX mode used, among other things, for private recovery
+snapshots.
+
+The server refuses a full read or requested range over 16 MiB, and refuses a
+serialized `readFile` response (regardless of content encoding) over 15 MiB. A
+serialized `listDirectory` response also has a 15 MiB limit. These refusals use
+the resource-limit error described in §10.3 rather than returning partial data.
+
+The editor's initial editing support requires:
 
 ```text
 stat
@@ -969,6 +989,23 @@ writeFile
 watch
 resolvePath
 ```
+
+`listDirectory` supports the remote directory viewer, and `unwatch` releases a
+watch subscription when a pane closes.
+
+These operations remain planned rather than registered RPC methods:
+
+```text
+createFile(path)
+createDirectory(path)
+rename(source, destination)
+copy(source, destination)
+delete(path)
+getMimeType(path)
+```
+
+`getMimeType` is currently an internal server helper; the client resolves
+viewer types through its handler registry.
 
 ### 8.4 Revision Tokens
 
@@ -1019,13 +1056,20 @@ Behavior:
 
 Polling may be used as a fallback.
 
+Watch changes are sent as the id-less `file.watchEvent` notification. If the
+client stops reading, the daemon coalesces pending events by subscription and
+path in a bounded queue (at most 512 entries and 1 MiB). Events that still
+cannot fit are dropped and reported through `file.watchEventsLost`, naming the
+subscriptions whose paths must be re-read. The daemon also refuses a 513rd
+live watch with the resource-limit error.
+
 ### 8.8 File Type Behavior
 
 | Type | Default behavior |
 |---|---|
 | Source code | Monaco editor |
 | Plain text | Monaco editor |
-| Markdown | editor with preview toggle |
+| Markdown | rendered document; "Open as → Editor" opens the source |
 | JSON, YAML, TOML | Monaco editor |
 | HTML | source editor or rendered page |
 | Images | image viewer |
@@ -1088,6 +1132,10 @@ codeharbord rpc --stdio
 
 It does not need to run permanently.
 
+The stdio daemon closes its watch handles and exits cleanly when stdin reaches
+end-of-input or when it receives `SIGHUP`, `SIGINT`, or `SIGTERM`; it does not
+need to remain running between SSH sessions.
+
 ### 10.2 Responsibilities
 
 `codeharbord` should eventually handle:
@@ -1118,6 +1166,10 @@ channel's stdin/stdout. The rules below are the ones the implementation
   unsupported: it fails the request-shape check and is answered with a single
   Invalid Request (`-32600`), never with an array of responses. The only client
   writes one request per line and correlates replies by `id`.
+
+- **Frames are bounded.** An input or output JSON line over 16 MiB is not
+  accepted; the daemon drops the transport instead of buffering an unbounded
+  request or response.
 - **Blank lines are ignored.** A line containing no non-whitespace character is
   skipped silently and produces no response, so stray separators are harmless.
 - **Unparseable or structurally invalid input is answered with `id: null`.**
@@ -1129,12 +1181,23 @@ channel's stdin/stdout. The rules below are the ones the implementation
 - **`params`, when present, must be an object or an array.** A primitive or `null`
   is rejected up front with Invalid params (`-32602`) rather than failing later,
   confusingly, inside a method handler.
+
+- **Invalid parameters are client errors.** A malformed field, including
+  malformed base64 content or a wrong field type, is answered with Invalid
+  params (`-32602`), not Internal error (`-32603`).
 - **Unknown method** yields Method not found (`-32601`), and it outranks bad
   params. An exception escaping a handler yields Internal error (`-32603`).
 - **A notification never receives a response.** A request with no `id` member is
   dispatched for its side effects only and answered with nothing at all, whether it
   succeeds, hits an unknown method, or throws. Server-initiated messages use the
   same id-less form — see the `file.watchEvent` notification in section 8.7.
+
+- **Backpressure.** The daemon starts independent handlers as input lines arrive,
+  so replies may be written in completion order and are correlated by id. If
+  stdout is stalled, responses wait in a separate bounded queue of at most 512
+  responses and 16 MiB of encoded lines; crossing either bound closes the
+  transport rather than growing memory without limit.
+
 - **Application-level failures use JSON-RPC's implementation-defined
   `-32000..-32099` range.** Each code has a constant in `remote/src/rpc-types.ts`
   mirrored in C++ in `src/remote/RpcTypes.h`, and `remote/test/rpc-mirror.test.ts`
@@ -1146,10 +1209,11 @@ channel's stdin/stdout. The rules below are the ones the implementation
     for a workspace write that could not take the server database's write lock
     before the busy timeout ran out (section 11.1).
   - **`-32003`, resource limit** (`RPC_RESOURCE_LIMIT` / `kResourceLimit`),
-    returned when the parameters are valid and nothing was applied, but the server
-    refuses to answer at that size: a `file.listDirectory` whose serialized listing
-    would exceed 15 MiB, or a `file.watch` past 512 live subscriptions
-    (sections 8.3 and 8.7).
+    returned when the parameters are valid and nothing was applied, but the
+    server refuses to answer at that size: a `file.readFile` full read or
+    requested range over 16 MiB, a serialized read response over 15 MiB, a
+    `file.listDirectory` whose serialized listing would exceed 15 MiB, or a
+    `file.watch` past 512 live subscriptions (sections 8.3 and 8.7).
 
 ---
 
@@ -1165,7 +1229,14 @@ Suggested location:
 ~/.local/share/codeharbor/codeharbor.sqlite
 ```
 
-Suggested tables:
+The schema's metadata tables are:
+
+```text
+schema_version
+server_identity
+```
+
+The domain tables are:
 
 ```text
 groups
@@ -1177,6 +1248,12 @@ server_profiles
 server_settings
 app_settings
 ```
+
+`server_identity` is the stable server-owned id returned by `server.info`; it
+is not a client profile id. `schema_version` records the migration level.
+Lookup indexes are kept separately in `remote/sql/indexes.sql` and are applied
+on every database open, including databases already at the current schema
+version.
 
 The `dev_sessions` table carries `pinned` (§4.2) and `archived` (§4.2). `pinned` arrived with schema version 5; a
 version 4 database gains the column with a default of "not pinned", so nothing already stored is lost and every
@@ -1201,6 +1278,10 @@ The client may store only:
 - temporary reconnect state.
 
 The client must not store project repositories or project files.
+The current profile store records connection metadata (including host, port, user,
+remote Node path, repository root, and an optional local identity-file path) but
+never stores a password, passphrase, private-key bytes, repository, or project
+file.
 
 ### 11.3 Unsaved Recovery
 
@@ -1316,6 +1397,11 @@ Preferred behavior:
 - stream selected bytes through client memory if required;
 - do not persist the file to client disk.
 
+These are target behaviors rather than current download/upload plumbing: the
+client currently renders the external page in Qt WebEngine but does not yet
+intercept its download destination or replace its file picker with an SSH-backed
+picker.
+
 A fully server-side browser would require remote Chromium and display streaming, which is outside the initial scope.
 
 The practical invariant is:
@@ -1343,6 +1429,7 @@ src/
 ├── qml/
 └── web/
     ├── terminal/
+    ├── markdown/
     └── editor/
 ```
 
@@ -1353,9 +1440,9 @@ remote/
 ├── src/
 │   ├── codeharbord.ts        RPC service (JSON-RPC 2.0 over newline-delimited JSON)
 │   ├── rpc-types.ts          request/result shapes shared by the RPC modules
-│   ├── files.ts              file.* methods: stat/read/write/watch/listDirectory
+│   ├── files.ts              file.* methods: stat/readFile/writeFile/resolvePath/watch/unwatch/listDirectory
 │   ├── workspace.ts          workspace.* methods over the SQLite database
-│   ├── tmux.ts               tmux.* discovery methods
+│   ├── tmux.ts               tmux.* session discovery/kill methods
 │   ├── validate.ts           request-parameter validation helpers
 │   ├── events.ts             agent event schema + socket-path resolution
 │   ├── bridge.ts             agent event relay
@@ -1372,7 +1459,9 @@ Technologies actually used:
 - C++20;
 - Qt WebEngine;
 - Qt WebChannel;
-- libssh (floor 0.11.2, never 0.12.0);
+- libssh (runtime floor 0.11.2; exactly 0.12.0 is warned about and gets the
+  ML-KEM subtraction workaround; the Windows vcpkg overlay is separately pinned
+  to 0.12.2);
 - xterm.js;
 - Monaco Editor;
 - SQLite, on the server only — the workspace database is opened by

@@ -1,14 +1,14 @@
-#!/bin/sh
+#!/usr/bin/env bash
 # Fails if review/debug scaffolding was left in the tree.
 #
 # This exists because it actually happened, twice, in one review round: an agent
 # left a deliberate mutation marker in ViewerProfiles.cpp while proving a gate
 # could fail, and it survived into the shared working tree and red-lit two
 # unrelated agents. Policing that by convention did not work; a gate does. Runs
-# in the default suite, costs milliseconds.
+# in the default suite, costs a few seconds while scanning every source file.
 #
 # Usage: no_scaffolding.sh <repo-root>
-set -eu
+set -euo pipefail
 
 root="${1:-.}"
 cd "$root"
@@ -39,7 +39,7 @@ pattern='MUTATION''-TEST|FIXME''\(remove\)|DEBUG ''ONLY'
 #   * build, build-*, out, CMakeFiles, _deps, artifact, installer - build and
 #     packaging output.
 #   * .fixture                        - generated live-gate SSH keys/state.
-#   * docs/bug-hunt-*.md              - the round reports NAME these markers in
+#   * docs/bug-hunt-*.md          - the round reports name these markers in
 #     prose when they record why this gate exists. They are historical records,
 #     never code, and they are the one place the marker text is legitimate.
 #
@@ -47,29 +47,43 @@ pattern='MUTATION''-TEST|FIXME''\(remove\)|DEBUG ''ONLY'
 # over rather than matched byte-wise.
 #
 # grep exits 0 when it matched, 1 when it did not, and >1 on a REAL failure
-# (unreadable tree, bad pattern, missing directory). The three must not be
+# (unreadable file, bad pattern, missing directory). The three must not be
 # collapsed: a `|| true` here made a broken search print "no scaffolding markers
 # found" and pass the gate, which is the exact failure mode this gate exists to
 # prevent. Errors are left on stderr rather than discarded.
-set +e
-hits=$(grep -rEnI "$pattern" \
-        --exclude-dir=.git --exclude-dir=.venv \
-        --exclude-dir=node_modules --exclude-dir=dist \
-        --exclude-dir=.npm --exclude-dir=.cache \
-        --exclude-dir=build --exclude-dir='build-*' --exclude-dir=out \
-        --exclude-dir=CMakeFiles --exclude-dir=_deps \
-        --exclude-dir=artifact --exclude-dir=installer \
-        --exclude-dir=.fixture \
-        --exclude='bug-hunt-*.md' \
-        .)
-status=$?
-set -e
-
-if [ "$status" -gt 1 ]; then
-    echo "no_scaffolding.sh: grep failed with exit status $status;" \
-         "the scaffolding gate did not run." >&2
+#
+# Do not use grep's GNU-only --exclude-dir/--exclude options here: this test runs
+# on the macOS CI runner, whose system grep does not implement them. Build a
+# portable NUL-delimited file list with find, then scan each file explicitly.
+file_list="$(mktemp)"
+trap 'rm -f "$file_list"' EXIT
+if ! find . \
+    \( -type d \( -name .git -o -name .venv -o -name node_modules \
+        -o -name dist -o -name .npm -o -name .cache \
+        -o -name build -o -name 'build-*' -o -name out \
+        -o -name CMakeFiles -o -name _deps -o -name artifact \
+        -o -name installer -o -name .fixture \) -prune \) -o \
+    \( -type f ! -path './docs/bug-hunt-*.md' -print0 \) >"$file_list"; then
+    echo "no_scaffolding.sh: find failed; the scaffolding gate did not run." >&2
     exit 1
 fi
+
+hits=""
+while IFS= read -r -d '' file; do
+    if output="$(grep -nEI "$pattern" "$file")"; then
+        if [ -n "$hits" ]; then
+            hits+=$'\n'
+        fi
+        hits+="$output"
+    else
+        status=$?
+        if [ "$status" -gt 1 ]; then
+            echo "no_scaffolding.sh: grep failed with exit status $status for $file;" \
+                 "the scaffolding gate did not run." >&2
+            exit 1
+        fi
+    fi
+done <"$file_list"
 
 if [ -n "$hits" ]; then
     echo "Review scaffolding left in the tree:"

@@ -42,6 +42,7 @@ import {
     RPC_PING_METHOD,
     RPC_RESOURCE_LIMIT,
     RPC_REVISION_MISMATCH,
+    RPC_SERVER_INFO_METHOD,
     RPC_WATCH_EVENT_NOTIFICATION,
     RPC_WATCH_EVENTS_LOST_NOTIFICATION,
 } from "./rpc-types.ts";
@@ -138,7 +139,7 @@ const methods: Record<string, MethodHandler> = {
     // 0o700 on the first snapshot. Additive and OPTIONAL: it does not raise the
     // schemaVersion floor, so an older server simply omits it and the client
     // degrades to no-recovery rather than failing the compatibility gate.
-    "server.info": () => ({
+    [RPC_SERVER_INFO_METHOD]: () => ({
         name: RPC_SERVER_NAME,
         version: RPC_SERVER_VERSION,
         schemaVersion: RPC_SCHEMA_VERSION,
@@ -349,11 +350,21 @@ export function createLineFramer(
             if (discarding) {
                 // The end of the over-cap frame: drop it and resume framing.
                 discarding = false;
-            } else if (heldBytes === 0) {
-                onLine(segment.toString("utf8"));
             } else {
-                held.push(segment);
-                onLine(Buffer.concat(held, heldBytes + segment.length).toString("utf8"));
+                const lineBytes = heldBytes + segment.length;
+                if (lineBytes > MAX_LINE_BYTES) {
+                    // The newline is in this chunk, so the offending frame is
+                    // complete already: report it and discard the whole line,
+                    // but resume framing immediately after this newline.
+                    held = [];
+                    heldBytes = 0;
+                    onOverflow();
+                } else if (heldBytes === 0) {
+                    onLine(segment.toString("utf8"));
+                } else {
+                    held.push(segment);
+                    onLine(Buffer.concat(held, lineBytes).toString("utf8"));
+                }
             }
             held = [];
             heldBytes = 0;
@@ -450,6 +461,8 @@ export interface WatchNotificationRelay {
 export function createWatchNotificationRelay(
     out: NodeJS.WritableStream,
     hasSubscription: (subscriptionId: string) => boolean,
+    onStall: () => void = () => {},
+    onDrain: () => void = () => {},
 ): WatchNotificationRelay {
     // The queued entry holds the SERIALIZED line, not the event: it is built
     // once (its byte length is what the byte bound measures) and written
@@ -475,7 +488,10 @@ export function createWatchNotificationRelay(
     const writeLine = (line: string): void => {
         // A false return means Node is now buffering internally; everything
         // after it must queue instead of adding to that buffer.
-        if (!out.write(line)) stalled = true;
+        if (!out.write(line)) {
+            stalled = true;
+            onStall();
+        }
     };
     const flushLost = (): void => {
         if (stalled || lost.size === 0) return;
@@ -494,6 +510,7 @@ export function createWatchNotificationRelay(
     };
 
     out.on("drain", () => {
+        onDrain();
         stalled = false;
         for (const [key, entry] of pending) {
             // Delete before writing: a write that re-stalls must leave the
@@ -522,10 +539,20 @@ export function createWatchNotificationRelay(
             const entry: Pending = { subscriptionId: event.subscriptionId, line, bytes };
             const existing = pending.get(key);
             if (existing) {
+                // Coalescing still has to honor the byte cap: replacing a
+                // small entry with a larger one can otherwise push the queue
+                // beyond MAX_PENDING_WATCH_BYTES without increasing its count.
+                const nextBytes = pendingBytes + bytes - existing.bytes;
+                if (nextBytes > MAX_PENDING_WATCH_BYTES) {
+                    pending.delete(key);
+                    pendingBytes -= existing.bytes;
+                    lost.add(event.subscriptionId);
+                    return;
+                }
                 // Coalesce: the newest event for this key supersedes the one
                 // held. Map preserves the original insertion position, which
                 // keeps the flush order stable.
-                pendingBytes += bytes - existing.bytes;
+                pendingBytes = nextBytes;
                 pending.set(key, entry);
                 return;
             }
@@ -549,6 +576,7 @@ export function createWatchNotificationRelay(
         },
         stall() {
             stalled = true;
+            onStall();
         },
         pendingCount: () => pending.size,
     };
@@ -559,12 +587,18 @@ export function createWatchNotificationRelay(
 // this daemon's most common way to be told to stop; SIGINT covers a hand-started
 // daemon under Ctrl-C; SIGTERM covers `kill` and every supervisor.
 export const SHUTDOWN_SIGNALS = ["SIGTERM", "SIGINT", "SIGHUP"] as const;
+// Responses cannot be dropped like watch notifications: the client would
+// wait forever for the matching request id. Queue them while stdout is stalled,
+// but close the transport once the queue itself reaches a bounded size rather
+// than letting Node's internal writable buffer grow without limit.
+export const MAX_PENDING_RPC_RESPONSES = 512;
+export const MAX_PENDING_RPC_RESPONSE_BYTES = MAX_LINE_BYTES;
+
 
 // How long the shutdown backstop waits for in-flight work before forcing the
 // exit. Two seconds is beyond any handler that is making progress and well
 // inside the patience of a supervisor's own SIGTERM-then-SIGKILL window.
 export const SHUTDOWN_GRACE_MS = 2000;
-
 export interface StdioHandle {
     /**
      * Run the orderly shutdown now, exactly as an incoming SIGTERM would.
@@ -583,13 +617,24 @@ export function runStdio(): StdioHandle {
     // not surface as an unhandled 'error'.
     process.stdout.on("error", () => {});
     process.stdin.on("error", () => {});
-    // Relay watch notifications to the client as id-less JSON-RPC messages,
-    // through the bounded relay: the filesystem cannot be paused, so a stalled
-    // client must cost a bounded queue plus an explicit loss report rather than
-    // an unbounded stdout buffer that eventually kills the daemon — and killing
-    // the daemon takes the whole workspace connection with it.
-    const watchRelay = createWatchNotificationRelay(process.stdout, (id) =>
-        fileWatchService.hasSubscription(id),
+    // Relay watch notifications to the client as id-less JSON-RPC messages.
+    // The relay's queue is bounded because filesystem producers cannot pause.
+    // Responses use a separate bounded queue below because they cannot be
+    // dropped: the client would otherwise wait forever for their ids.
+    let outputStalled = false;
+    let outputFailed = false;
+    const pendingResponses: string[] = [];
+    let pendingResponseBytes = 0;
+    let pendingResponseIndex = 0;
+    const watchRelay = createWatchNotificationRelay(
+        process.stdout,
+        (id) => fileWatchService.hasSubscription(id),
+        () => {
+            outputStalled = true;
+        },
+        () => {
+            outputStalled = false;
+        },
     );
     fileWatchService.onWatchEvent((event) => watchRelay.deliver(event));
     // No queue outlives its subscriber: unwatch, and closeAll on stdin close,
@@ -601,33 +646,75 @@ export function runStdio(): StdioHandle {
     // previous one. Responses are therefore written in COMPLETION order, not in
     // arrival order: a slow file.readFile of a large file can be answered after
     // a later, faster file.stat. JSON-RPC 2.0 explicitly allows this, and the
-    // client MUST match a response to its call by the `id` field alone — never
-    // by position in the stream (ch::CodeharbordClient in
-    // src/remote/CodeharbordClient.cpp does exactly that: it keys its pending
-    // callbacks in a QHash<qint64, ResponseCallback> by request id — those ids
-    // are 64-bit on the C++ side, not int). The only ordered part of the stream
-    // is the framing: one JSON object per line, so a reader never has to
-    // interleave two.
-    //
-    // The in-flight count is deliberately NOT bounded. A bound would need real
-    // backpressure (pausing stdin, or queueing lines), and getting that wrong is
-    // far more damaging than the unbounded case: pausing the single SSH channel
-    // also stops the watch-notification stream and any request that would let a
-    // stalled client make progress, and a queue that silently drops a line
-    // leaves the client waiting on a reply that will never come. The exposure is
-    // small by construction: the only producer is our own client, whose pending
-    // calls are bounded by user actions; handlers never wait on another request,
-    // so nothing can deadlock; the per-request memory is bounded by the client's
-    // own read cap (InternalUrlSchemeHandler::kMaxInlineReadBytes); and the one
-    // ordering hazard that would be a real bug — two concurrent writes to the
-    // SAME path racing their revision check against their rename — is already
-    // serialized per path by the write locks in files.ts.
-    // Every response goes through here so the watch relay learns when the
-    // SHARED stdout stalls. The relay only sees the return value of its own
-    // writes; a large response that filled the buffer would otherwise leave it
-    // writing notifications straight into an unbounded internal buffer.
+    // client matches replies by id rather than stream position. The input
+    // producer is trusted to keep the number of active calls reasonable; the
+    // output queue itself is bounded so a stalled peer cannot grow Node's
+    // writable buffer without limit.
+    const failOutput = (): void => {
+        if (outputFailed) return;
+        outputFailed = true;
+        outputStalled = true;
+        pendingResponses.length = 0;
+        pendingResponseBytes = 0;
+        pendingResponseIndex = 0;
+        fileWatchService.closeAll();
+        process.exitCode = 1;
+        if (!process.stdin.destroyed) process.stdin.destroy();
+    };
+    const flushResponses = (): void => {
+        if (outputFailed) return;
+        while (pendingResponseIndex < pendingResponses.length) {
+            const line = pendingResponses[pendingResponseIndex++];
+            pendingResponseBytes -= Buffer.byteLength(line);
+            try {
+                if (!process.stdout.write(line)) {
+                    outputStalled = true;
+                    watchRelay.stall();
+                    break;
+                }
+            } catch {
+                failOutput();
+                return;
+            }
+        }
+        if (pendingResponseIndex === pendingResponses.length) {
+            pendingResponses.length = 0;
+            pendingResponseIndex = 0;
+            pendingResponseBytes = 0;
+        }
+    };
+    process.stdout.on("drain", flushResponses);
+    process.stdout.on("error", failOutput);
     const writeOut = (line: string): void => {
-        if (!process.stdout.write(line)) watchRelay.stall();
+        if (outputFailed) return;
+        const bytes = Buffer.byteLength(line);
+        // Sending a response larger than the framing cap would make the peer
+        // drop the entire transport, so fail before writing a doomed frame.
+        if (bytes > MAX_LINE_BYTES) {
+            failOutput();
+            return;
+        }
+        if (outputStalled) {
+            const queuedCount = pendingResponses.length - pendingResponseIndex;
+            if (
+                queuedCount >= MAX_PENDING_RPC_RESPONSES ||
+                pendingResponseBytes + bytes > MAX_PENDING_RPC_RESPONSE_BYTES
+            ) {
+                failOutput();
+                return;
+            }
+            pendingResponses.push(line);
+            pendingResponseBytes += bytes;
+            return;
+        }
+        try {
+            if (!process.stdout.write(line)) {
+                outputStalled = true;
+                watchRelay.stall();
+            }
+        } catch {
+            failOutput();
+        }
     };
     const dispatchLine = (line: string): void => {
         // Skip separator lines without copying the line: trim() on a multi-MiB
@@ -683,13 +770,6 @@ export function runStdio(): StdioHandle {
         process.stdin.destroy();
     });
     process.stdin.on("data", feed);
-    process.stdin.on("close", () => {
-        // End of stdin means the SSH channel is gone. Watch subscriptions hold
-        // live fs.watch handles that keep the event loop — and therefore this
-        // process — alive indefinitely, so release them and let the process
-        // exit on its own once in-flight work settles.
-        fileWatchService.closeAll();
-    });
     // SIGNALS. Until this existed, the ONLY orderly shutdown was stdin closing:
     // a plain `kill` (or the SIGHUP an ending SSH session delivers, or Ctrl-C on
     // a hand-started daemon) hit Node's default disposition and killed the
@@ -719,20 +799,31 @@ export function runStdio(): StdioHandle {
         // start work whose reply cannot be guaranteed to reach the wire.
         process.stdin.removeListener("data", feed);
         if (!process.stdin.destroyed) process.stdin.destroy();
-        // Exit 0 rather than re-raising the signal: a signal-terminated exit is
-        // how a crash reports itself, and this is not one.
-        process.exitCode = 0;
+        // Exit 0 rather than re-raising a clean signal. Preserve a non-zero
+        // status when the output transport itself failed.
+        process.exitCode = outputFailed ? 1 : 0;
+        // Leave the process through an explicit process.exit() rather than by
+        // letting the event loop run dry. Keeping the signal listeners
+        // registered (above) is not enough on its own: when Node exits because
+        // the loop emptied, it first CLOSES its internal signal watchers and
+        // only then finishes tearing the process down, and a signal delivered
+        // inside that gap finds the default disposition again and kills the
+        // process. A supervisor that sends a second, impatient SIGTERM a few
+        // tens of milliseconds after the first lands squarely in that gap, so
+        // the clean stop is reported as a signal death after all. 'beforeExit'
+        // fires at the moment the loop would have drained — every in-flight
+        // handler has finished and every stdout write has flushed, because
+        // either would still be holding the loop open — and process.exit()
+        // from there terminates immediately without the graceful handle
+        // teardown, so the watchers stay armed until the process is gone.
+        process.once("beforeExit", () => process.exit(process.exitCode ?? 0));
         // Installing a handler at all removes the default "die now", so this
-        // function is now solely responsible for the process ending. With the
-        // watch handles gone the event loop normally empties by itself and Node
-        // exits — but an in-flight handler (a large file.readFile) or a stdout
-        // the peer stopped draining can hold it open indefinitely, and a daemon
-        // that ignores SIGTERM is worse than one that dies rudely. The timer is
-        // UNREF'd on purpose, so it is exactly a backstop: it can only fire while
-        // something else is still keeping the loop alive, which is the only case
-        // where a forced exit is needed.
-        setTimeout(() => process.exit(0), SHUTDOWN_GRACE_MS).unref();
+        // timer is the backstop for a stuck handler or stdout.
+        setTimeout(() => process.exit(process.exitCode ?? 0), SHUTDOWN_GRACE_MS).unref();
     };
+    // End of stdin is the normal SSH-channel shutdown path. Use the same
+    // idempotent cleanup and grace timer as an explicit signal.
+    process.stdin.on("close", shutdown);
     for (const signal of SHUTDOWN_SIGNALS) process.on(signal, shutdown);
     return { shutdown };
 }

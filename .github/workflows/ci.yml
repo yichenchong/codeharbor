@@ -120,10 +120,13 @@ jobs:
       # vcpkg builds libssh FROM SOURCE (~10 min), so it is cached. The key
       # carries the runner IMAGE version - MSVC and the bundled vcpkg ship with
       # the image, so a static key would restore a tree built by an older
-      # toolchain - and the PINNED libssh version, because vcpkg's registry port
-      # is 0.12.0, whose hybrid ML-KEM key exchange cannot pack its own client
-      # KEX init, and the build therefore takes libssh from the in-tree overlay
-      # port instead.
+      # toolchain - the PINNED libssh version - and a hash of every overlay-port
+      # file. The hash is required because changing a patch without bumping the
+      # upstream version must still force a rebuild; otherwise vcpkg treats the
+      # restored install as a no-op and silently ships the old patched tree.
+      # The registry port is 0.12.0, whose hybrid ML-KEM key exchange cannot
+      # pack its own client KEX init, so the build takes libssh from the
+      # in-tree 0.12.2 overlay port instead.
       #
       # This leg is also what SEEDS that cache for release tags: a run can only
       # restore a cache written by its own ref or by the DEFAULT BRANCH, so a tag
@@ -152,7 +155,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: ${{ steps.imgver.outputs.vcpkg }}\installed
-          key: vcpkg-libssh-${{ steps.imgver.outputs.libssh }}-x64-windows-${{ steps.imgver.outputs.v }}
+          key: vcpkg-libssh-${{ steps.imgver.outputs.libssh }}-x64-windows-${{ steps.imgver.outputs.v }}-${{ hashFiles('packaging/vcpkg-ports/libssh/**') }}
 
       - name: Install libssh via vcpkg (Windows)
         if: matrix.name == 'windows'
@@ -191,42 +194,45 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: ${{ steps.imgver.outputs.vcpkg }}\installed
-          key: vcpkg-libssh-${{ steps.imgver.outputs.libssh }}-x64-windows-${{ steps.imgver.outputs.v }}
+          key: vcpkg-libssh-${{ steps.imgver.outputs.libssh }}-x64-windows-${{ steps.imgver.outputs.v }}-${{ hashFiles('packaging/vcpkg-ports/libssh/**') }}
 
       # --- MSVC environment for the Ninja generator (Windows) ------------------
       - name: Set up MSVC (Windows)
         if: matrix.name == 'windows'
         uses: ilammy/msvc-dev-cmd@v1
 
-      # The Monaco and xterm.js bundles are gitignored build artifacts that
-      # src/qml/CMakeLists.txt embeds as Qt resources AT CONFIGURE TIME. CMake
-      # refuses to configure without them (FATAL_ERROR, unless
-      # -DCODEHARBOR_SKIP_WEB_BUNDLE=ON), so building them here is what keeps the
-      # configure step below from failing outright.
+      # The Monaco, xterm.js and Markdown bundles are gitignored build artifacts
+      # that src/qml/CMakeLists.txt embeds as Qt resources AT CONFIGURE TIME.
+      # CMake refuses to configure without them (FATAL_ERROR, unless
+      # -DCODEHARBOR_SKIP_WEB_BUNDLE=ON), so building all three here keeps the
+      # configure step from failing outright and leaves no pane without a page.
       - uses: actions/setup-node@v4
         with:
           node-version: "24"
           cache: npm
-      # BOTH bundles, via the root workspaces script. Naming only the editor left
-      # the terminal bundle to CMake's npm fallback, which is a convenience for
-      # local dev and is not portable - it failed outright on the Windows runner.
+      # All three bundles, via the root workspaces script. Naming only the
+      # editor left the terminal and Markdown bundles to CMake's npm fallback,
+      # which is a convenience for local dev and is not portable - it failed
+      # outright on the Windows runner.
       - name: Build web bundles (must precede CMake configure)
         # npm ci requires an up-to-date package-lock.json (installs from it strictly).
         run: npm ci && npm run build
         shell: bash
-      # BD24: type-check both web bundles. esbuild strips types without checking
-      # them, so a TS error anywhere in src/web/* would otherwise reach a shipped
-      # bundle unreported. The root workspaces script runs tsc --noEmit across the
-      # editor and terminal packages; a type error here fails CI before configure.
+      # BD24: type-check every web workspace. esbuild strips types without
+      # checking them, so a TS error anywhere in src/web/* would otherwise reach
+      # a shipped bundle unreported. The root workspaces script runs tsc
+      # --noEmit across editor, terminal and markdown; a type error here fails
+      # CI before configure.
       - name: Typecheck web bundles
         run: npm run typecheck
         shell: bash
       # The web bundles ship real logic (Monaco language selection, unsaved-work
-      # snapshots, terminal visibility) with node --test suites next to them.
-      # Nothing ran them before: the `remote` job only tests remote/, and this
-      # job only type-checked. A regression in either bundle reached a release.
+      # snapshots, terminal visibility and Markdown sanitisation) with node
+      # --test suites next to them. Nothing ran them before: the `remote` job
+      # only tests remote/, and this job only type-checked. A regression in any
+      # web workspace must fail before a release.
       - name: Test web bundles
-        run: npm test --workspace src/web/terminal --workspace src/web/editor
+        run: npm test --workspace src/web/terminal --workspace src/web/editor --workspace src/web/markdown
         shell: bash
 
       # CMake 3.21+ reads CMAKE_TOOLCHAIN_FILE from the environment (set by the

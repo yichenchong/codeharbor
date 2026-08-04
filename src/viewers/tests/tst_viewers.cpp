@@ -185,6 +185,7 @@ private slots:
     void responseHeadersLetSvgStyleItself();
     void refusalMessagesExplainThemselves();
     void internalRequestFailuresReachQml();
+    void viewerModelRecoversAfterInjectedProfilesDestroyed();
 };
 
 void TstViewers::resolveByExtensionTable()
@@ -449,6 +450,8 @@ void TstViewers::applicationSchemeValidationAndEscaping()
 void TstViewers::urlMappingRoundTrip()
 {
     InternalUrlMap map;
+    QVERIFY(map.internalUrlFor(QUrl()).isEmpty());
+    QCOMPARE(map.size(), 0);
     const QList<QUrl> files = {
         QUrl(QStringLiteral("file:///home/yc/project/README.md")),
         QUrl(QStringLiteral("file:///home/yc/project/src/main.cpp")),
@@ -746,6 +749,11 @@ void TstViewers::urlMappingBareId()
                  .isValid());
     QVERIFY(!map.fileUrlFor(QStringLiteral("codeharbor-internal://files/") + id)
                  .isValid());
+    QVERIFY(!map.fileUrlFor(QStringLiteral("codeharbor-internal://file:443/") + id)
+                 .isValid());
+    QVERIFY(!map.fileUrlFor(QStringLiteral("codeharbor-internal://user@file/")
+                            + id)
+                 .isValid());
     // Host matching stays case-insensitive, which is how URLs work.
     QCOMPARE(map.fileUrlFor(QStringLiteral("codeharbor-internal://FILE/") + id),
              file);
@@ -958,6 +966,12 @@ void TstViewers::directoryListingIsSortedDirectoriesFirst()
     QCOMPARE(listings.at(1).at(0).toString(), QStringLiteral("/p/empty"));
     QVERIFY(listings.at(1).at(1).toList().isEmpty());
     QCOMPARE(failures.size(), 0);
+    // A malformed success payload is an error, not an empty directory. Treating
+    // a missing array as empty would hide a protocol mismatch from the user.
+    viewers.listDirectory(QStringLiteral("/p/malformed"));
+    pair.respondResult(pair.nextRequest(), QJsonObject{});
+    QTRY_COMPARE(failures.size(), 1);
+    QCOMPARE(failures.at(0).at(0).toString(), QStringLiteral("/p/malformed"));
 }
 
 void TstViewers::resolvePathCarriesTheRepositoryRootFlag()
@@ -1060,6 +1074,12 @@ void TstViewers::resolvePathFailuresLeaveTheFlagUndetermined()
     QVERIFY(!baseless.value(QStringLiteral("params"))
                  .toObject()
                  .contains(QStringLiteral("base")));
+    pair.respondResult(
+        baseless,
+        QJsonObject{{QStringLiteral("insideRepositoryRoot"), true}});
+    QTRY_COMPARE(failures.size(), 3);
+    QCOMPARE(failures.at(2).at(0).toString(), QStringLiteral("/p/c.txt"));
+    QCOMPARE(resolved.size(), 0);
 }
 
 void TstViewers::pinnedInternalUrlSurvivesEviction()
@@ -1273,6 +1293,20 @@ void TstViewers::internalRequestFailuresReachQml()
         address, InternalUrlSchemeHandler::Failure::NoClient,
         QStringLiteral("no remote client is connected"));
     QCOMPARE(failures.size(), 2);
+}
+void TstViewers::viewerModelRecoversAfterInjectedProfilesDestroyed()
+{
+    ViewerModel viewers;
+    auto *profiles = new ViewerProfiles(nullptr, &viewers);
+    viewers.setProfiles(profiles);
+    QVERIFY(profiles->internalSchemeHandler() != nullptr);
+
+    // The injected object is not owned by ViewerModel. If it disappears while
+    // the model remains alive, the model must lazily replace it instead of
+    // calling through a dangling pointer.
+    delete profiles;
+    QVERIFY(viewers.externalProfile() != nullptr);
+    QVERIFY(viewers.internalProfile() != nullptr);
 }
 
 int main(int argc, char *argv[])

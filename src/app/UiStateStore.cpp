@@ -1,6 +1,7 @@
 #include "UiStateStore.h"
 
 #include <QSettings>
+#include <algorithm>
 
 namespace ch {
 
@@ -71,6 +72,14 @@ QString activeSessionKey(const QString& serverId)
 {
     return QStringLiteral("session/") + serverId + QStringLiteral("/active");
 }
+
+bool isAddressableRegion(const QString& region)
+{
+    // Region names become one path component in QSettings. Reject an empty
+    // component and separators so malformed QML input cannot create a key
+    // outside the documented per-region counter shape.
+    return !region.isEmpty() && !region.contains(QLatin1Char('/'));
+}
 } // namespace
 
 UiStateStore::UiStateStore(QString iniPath, QObject* parent)
@@ -94,9 +103,16 @@ void UiStateStore::setRegionWidths(int sidebar, int viewer, int terminal)
     // flushes periodically and from its own destructor, which runs when the
     // m_settings unique_ptr is released with this object, so a fresh instance
     // still reads back the last written values.
-    m_settings->setValue(kSidebarKey, sidebar);
-    m_settings->setValue(kViewerKey, viewer);
-    m_settings->setValue(kTerminalKey, terminal);
+    // Keep the write side aligned with the read-side minima: a transient
+    // negative or zero sidebar/terminal width must not be persisted as a value
+    // that the next launch rejects and silently replaces with a different
+    // default.
+    const int storedSidebar = std::max(1, sidebar);
+    const int storedViewer = std::max(0, viewer);
+    const int storedTerminal = std::max(1, terminal);
+    m_settings->setValue(kSidebarKey, storedSidebar);
+    m_settings->setValue(kViewerKey, storedViewer);
+    m_settings->setValue(kTerminalKey, storedTerminal);
 }
 
 int UiStateStore::sidebarWidth() const
@@ -178,7 +194,7 @@ void UiStateStore::setNextPaneSuffix(QString devSessionId, QString region,
     // whose id has not arrived yet, so one session's numbering would leak into
     // the next one's - and a pane id collision is exactly what this counter
     // exists to prevent.
-    if (devSessionId.isEmpty())
+    if (devSessionId.isEmpty() || !isAddressableRegion(region))
         return;
     // The same floor nextPaneSuffix() enforces on the way out. Without it the
     // two halves disagree: a caller could store 0 or a negative, the read side
@@ -198,7 +214,7 @@ void UiStateStore::setNextPaneSuffix(QString devSessionId, QString region,
 
 int UiStateStore::nextPaneSuffix(QString devSessionId, QString region) const
 {
-    if (devSessionId.isEmpty())
+    if (devSessionId.isEmpty() || !isAddressableRegion(region))
         return kFirstPaneSuffix;
     return storedInt(*m_settings, paneSuffixKey(devSessionId, region),
                      kFirstPaneSuffix, kFirstPaneSuffix);

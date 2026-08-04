@@ -52,6 +52,7 @@
 #include "CodeharbordClient.h"
 #include "EditorController.h"
 #include "EditorFactory.h"
+#include "GroupPaletteService.h"
 #include "Notifier.h"
 #include "ServerProfiles.h"
 #include "SessionBootstrap.h"
@@ -63,6 +64,7 @@
 #include "TerminalController.h"
 #include "TerminalFactory.h"
 #include "UiStateStore.h"
+#include "WindowChromeNative.h"
 #include "ViewerModel.h"
 #include "ViewerProfiles.h"
 
@@ -321,6 +323,8 @@ struct AppGraph {
     ch::EditorFactory editorFactory;
     ch::TerminalFactory terminalFactory;
     ch::Notifier notifier;
+    ch::WindowChromeNative windowChrome;
+    ch::GroupPaletteService groupPalette;
     QQmlApplicationEngine engine;
 
     QStringList qmlWarnings;
@@ -345,26 +349,37 @@ struct AppGraph {
         QObject::connect(&app, &ch::AppController::error, &app,
                          [this](const QString& text) { appErrors << stamped(text); });
 
-        // Before the auto-connect, exactly as in main.cpp: a terminal pane's
-        // identity is a row in the SERVER's terminal_panes table, so the
-        // factory needs the workspace repository and the adopted server id
-        // before the first pane tries to attach.
+        // The same connection and pane wiring as main.cpp, before any
+        // environment auto-connect can synchronously emit `wired`.
+        app.setAgentMonitor(&monitor);
+        viewers.setProfiles(&viewerProfiles);
+        viewers.setDefaultKinds(app.settings()->viewerDefaultKinds());
+        QObject::connect(app.settings(), &ch::AppSettings::viewerDefaultsChanged,
+                         &viewers, [this]() {
+                             viewers.setDefaultKinds(
+                                 app.settings()->viewerDefaultKinds());
+                         });
+        app.setConnection(&pool, &bootstrap, &serverProfiles, &layouts);
+
+        // A terminal pane's identity is a row in the SERVER's terminal_panes
+        // table, so the factory needs the workspace repository and adopted
+        // server id before the first pane can attach.
         terminalFactory.setWorkspace(app.workspaceDb());
         QObject::connect(&app, &ch::AppController::serverIdChanged, &terminalFactory,
                          [this]() { terminalFactory.setServerId(app.serverId()); });
-        // SPEC 6.6, also as in main.cpp: the factory reports terminal-output
-        // activity to the monitor so a "generic" harness pane, which no adapter
-        // ever produces an event for, still gets an agent state.
+        // SPEC 6.6: generic harness panes report output activity through this
+        // factory because they have no adapter lifecycle events.
         terminalFactory.setAgentMonitor(&monitor);
+        QObject::connect(&terminalFactory, &ch::TerminalFactory::paneRowResolved,
+                         &layouts, &ch::SessionLayouts::bindTerminalPaneRow);
+
+        app.setEditorFactory(&editorFactory);
+        app.setTerminalFactory(&terminalFactory);
+        QObject::connect(&monitor, &ch::AgentStatusMonitor::notify, &notifier,
+                         &ch::Notifier::notify);
 
         // --- main.cpp, line for line ------------------------------------
         wiredFromEnvironment = bootstrap.connectAndWireFromEnvironment();
-
-        app.setAgentMonitor(&monitor);
-        viewers.setProfiles(&viewerProfiles);
-        app.setConnection(&pool, &bootstrap, &serverProfiles, &layouts);
-        QObject::connect(&monitor, &ch::AgentStatusMonitor::notify, &notifier,
-                         &ch::Notifier::notify);
 
         // Engine-level QML warnings only: binding loops, type errors, undefined
         // property reads — everything Main.qml and its children can raise while
@@ -387,6 +402,10 @@ struct AppGraph {
         // Exactly what main.cpp publishes, no more: QML reaches the layouts
         // through `app.layouts`, and the Notifier is a C++-only sink.
         engine.rootContext()->setContextProperty(QStringLiteral("app"), &app);
+        engine.rootContext()->setContextProperty(QStringLiteral("groupPalette"),
+                                                 &groupPalette);
+        engine.rootContext()->setContextProperty(QStringLiteral("windowChrome"),
+                                                 &windowChrome);
         engine.rootContext()->setContextProperty(QStringLiteral("viewers"), &viewers);
         engine.rootContext()->setContextProperty(QStringLiteral("agentMonitor"), &monitor);
         engine.rootContext()->setContextProperty(QStringLiteral("editorFactory"),

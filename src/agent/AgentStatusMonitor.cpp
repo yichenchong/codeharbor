@@ -295,20 +295,56 @@ void AgentStatusMonitor::setTerminalHarness(const QString& devSessionId,
                                             const QString& harness)
 {
     if (harness != QLatin1String("generic")) {
-        // Not generic: only clear a previous registration. Never create a row —
-        // an adapter-driven pane's state comes from the wire, and inventing an
-        // Unknown entry for one that has never been heard from would make
-        // retainDevSessions() and the tick walk rows that carry no information.
+        // Not generic: never create a row for an adapter-driven pane that has
+        // not spoken on the wire. If this pane was previously generic, clear
+        // the output-derived state as the source of truth changes; otherwise
+        // a pane that was running in generic mode would remain falsely busy
+        // until an adapter event happened to arrive.
         if (TerminalStatus* st = findStatus(devSessionId, terminalId)) {
+            const bool wasGeneric = st->generic;
+            const bool preserveCompletion =
+                st->state == AgentState::IdleUnseen
+                && m_unseen.contains(devSessionId);
+            const bool clearStale =
+                wasGeneric && !preserveCompletion
+                && st->state != AgentState::Unknown;
             st->generic = false;
+            if (clearStale)
+                st->state = AgentState::Unknown;
             rearmAgeTimer();
+            if (clearStale)
+                emit agentStateChanged(devSessionId, terminalId,
+                                       static_cast<int>(AgentState::Unknown));
         }
         return;
     }
-    // Generic: start tracking at Unknown. Emitting Starting here would be a
-    // claim about a pane that may never be opened — SPEC 6.6's "starting" means
-    // "attached and silent", which is noteTerminalAttached()'s job.
-    m_states[devSessionId][terminalId].generic = true;
+    // Generic: a new registration starts at Unknown. Re-registering an
+    // already-generic pane must preserve its derived state because this method
+    // is called again whenever the workspace tree is rebuilt. If the harness
+    // changes while a channel is attached, begin a fresh silent observation;
+    // output from the old harness must not be mistaken for generic activity.
+    TerminalStatus& st = m_states[devSessionId][terminalId];
+    if (!st.generic) {
+        const AgentState previous = st.state;
+        st.generic = true;
+        st.lastOutputMs = -1;
+        const bool preserveCompletion =
+            previous == AgentState::IdleUnseen
+            && m_unseen.contains(devSessionId);
+        const AgentState next =
+            preserveCompletion
+                ? previous
+                : st.attached ? AgentState::Starting : AgentState::Unknown;
+        const bool changed = next != previous;
+        st.state = next;
+        if (st.attached)
+            st.lastEventMs = m_clock.elapsed();
+        rearmAgeTimer();
+        if (changed)
+            emit agentStateChanged(devSessionId, terminalId,
+                                   static_cast<int>(next));
+        return;
+    }
     rearmAgeTimer();
 }
 
@@ -373,9 +409,10 @@ bool agesWithTime(const AgentState state, bool generic, bool attached,
         (state == AgentState::Starting || state == AgentState::Running);
     // A generic pane at Running is waiting to fall to Idle. At Starting it is
     // waiting for OUTPUT, and at Idle it has settled: neither moves on its own,
-    // so the timer must not keep the process awake for them.
-    if (generic && attached && state == AgentState::Running)
-        return true;
+    // so the timer must not keep the process awake for them. Generic panes do
+    // not use the generic stale-timeout rule below.
+    if (generic)
+        return attached && state == AgentState::Running;
     return staleTimeoutMs > 0 && claimsWork;
 }
 
@@ -425,8 +462,15 @@ void AgentStatusMonitor::onAgeTick()
         }
     }
 
-    for (const Pending& p : pending)
+    for (const Pending& p : pending) {
+        // A signal handler may evict or replace this pane while an earlier
+        // pending transition is being emitted. Do not report a transition for
+        // a pane that no longer exists, or for a state superseded re-entrantly.
+        TerminalStatus* st = findStatus(p.dev, p.term);
+        if (!st || st->state != p.state)
+            continue;
         emit agentStateChanged(p.dev, p.term, static_cast<int>(p.state));
+    }
 
     rearmAgeTimer();
 }

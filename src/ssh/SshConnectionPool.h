@@ -22,8 +22,10 @@ namespace ch {
 // Process-wide router for libssh's diagnostic logging, so that every component
 // that wants a transcript gets its OWN lines and only its own.
 //
-// WHAT LIBSSH ACTUALLY DOES — measured against the installed 0.11.3 library,
-// because all three of these contradict what the headers suggest:
+// WHAT LIBSSH ACTUALLY DOES — behavior confirmed against the 0.12.x line the
+// Windows overlay port pins (0.12.2), and unchanged on the 0.11.2 runtime floor
+// the project still supports, because all three of these contradict what the
+// headers suggest:
 //   1. There is exactly ONE logging hook (ssh_set_log_callback), ONE user-data
 //      pointer (ssh_set_log_userdata) and ONE verbosity level
 //      (ssh_set_log_level) — not one per session. Whoever installs last wins,
@@ -157,6 +159,10 @@ private:
     // a wrong-thread release. Only ever called on the owning thread, which is
     // the only one allowed to touch the list itself.
     static void pruneInactiveThreadRoutes();
+    // Restore the logging state captured by the first route on this thread.
+    // Used both by the normal last release and to repair a route that was
+    // released from the wrong thread before another route is acquired.
+    static void restoreThreadLoggingState();
 };
 
 // One authenticated SSH connection per configured server, multiplexing many
@@ -261,8 +267,8 @@ public:
 
     // Which rungs this handshake has already spent. A rung is climbed at most
     // once, and that is what bounds the multi-step loop: a server that keeps
-    // answering SSH_AUTH_PARTIAL without ever granting access runs out of rungs
-    // after four steps instead of looping forever.
+    // answering SSH_AUTH_PARTIAL without ever granting access runs out of the
+    // five distinct rungs after five steps instead of looping forever.
     struct AuthRungsTried {
         bool agent = false;
         bool keyFile = false;
@@ -470,6 +476,9 @@ private:
     // from sessionClosing() cannot connect, disconnect or open a channel on a
     // pool that is being destroyed.
     bool m_destroying = false;
+    // Prevent a sessionClosing() slot from starting a replacement handshake
+    // while closeSession() is still freeing the old session.
+    bool m_closingSession = false;
     KnownHosts m_knownHosts;
     HostKeyCallback m_hostKeyCallback;
     CredentialCallback m_credentialCallback;

@@ -6,6 +6,7 @@ import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { requireStringArray } from "../src/validate.ts";
 
 import {
     applyConnectionPragmas,
@@ -598,6 +599,30 @@ test("duplicateSession of an empty session yields fresh id, no panes, null layou
     await cleanup(dbPath);
 });
 
+test("duplicateSession rehomes legacy rows to the parent group's server", async () => {
+    const dbPath = await tmpDbPath();
+    const ws = openWorkspace(dbPath);
+    const group = ws.createGroup({ serverId: SERVER, name: "G" });
+    const session = ws.createSession({ serverId: SERVER, groupId: group.id, name: "S", repositoryRoot: "/r" });
+    const viewer = ws.createViewerPane({ serverId: SERVER, devSessionId: session.id, url: "http://x" });
+
+    // Preserve a malformed legacy relationship: the source session and child
+    // disagree with the parent group about their server.
+    ws.db.prepare("UPDATE dev_sessions SET server_id = 'srv-other' WHERE id = ?").run(session.id);
+    ws.db.prepare("UPDATE viewer_panes SET server_id = 'srv-other' WHERE id = ?").run(viewer.id);
+
+    const duplicate = ws.duplicateSession({ id: session.id });
+    assert.equal(duplicate.serverId, SERVER);
+    assert.equal(duplicate.viewerPanes[0]?.serverId, SERVER);
+    assert.equal(
+        ws.list(SERVER)[0].sessions.some((listed) => listed.id === duplicate.id),
+        true,
+    );
+
+    ws.close();
+    await cleanup(dbPath);
+});
+
 test("a naive group delete is rejected by the foreign key (manual cascade is load-bearing)", async () => {
     const dbPath = await tmpDbPath();
     const ws = openWorkspace(dbPath);
@@ -685,6 +710,42 @@ test("child rows inherit the parent's server_id, overriding a mismatched param (
     assert.equal(listed[0].sessions[0].serverId, SERVER);
     assert.equal(listed[0].sessions[0].viewerPanes[0].serverId, SERVER);
     assert.equal(listed[0].sessions[0].terminalPanes[0].serverId, SERVER);
+
+    ws.close();
+    await cleanup(dbPath);
+});
+
+test("list keeps mismatched child rows out of a server's workspace view", async () => {
+    const dbPath = await tmpDbPath();
+    const ws = openWorkspace(dbPath);
+    const group = ws.createGroup({ serverId: SERVER, name: "Work" });
+    const session = ws.createSession({ serverId: SERVER, groupId: group.id, name: "S", repositoryRoot: "/r" });
+    const viewer = ws.createViewerPane({ serverId: SERVER, devSessionId: session.id, url: "http://x" });
+    ws.createTerminalPane({ serverId: SERVER, devSessionId: session.id, name: "shell" });
+    ws.setLayout({
+        serverId: SERVER,
+        devSessionId: session.id,
+        region: "viewer",
+        tree: { type: "leaf", paneId: viewer.id },
+    });
+
+    // A legacy/manual write can leave a child row carrying a different server
+    // id even though its parent still belongs to this server. Listing must not
+    // leak that row through the parent-id joins.
+    ws.db.prepare("UPDATE viewer_panes SET server_id = 'srv-other' WHERE id = ?").run(viewer.id);
+    ws.db
+        .prepare("UPDATE session_layouts SET server_id = 'srv-other' WHERE dev_session_id = ?")
+        .run(session.id);
+    const listed = ws.list(SERVER)[0].sessions[0];
+    assert.equal(listed.viewerPanes.length, 0);
+    assert.equal(listed.terminalPanes.length, 1);
+    assert.equal(listed.layouts.viewer, null);
+
+    // The same guard applies one level higher to a mismatched session, including
+    // the pinned-only group predicate.
+    ws.db.prepare("UPDATE dev_sessions SET server_id = 'srv-other', pinned = 1 WHERE id = ?").run(session.id);
+    assert.equal(ws.list(SERVER)[0].sessions.length, 0);
+    assert.deepEqual(ws.list(SERVER, true), []);
 
     ws.close();
     await cleanup(dbPath);
@@ -1757,6 +1818,75 @@ test("creating a row at an explicit position re-packs its scope instead of tying
     await cleanup(dbPath);
 });
 
+test("updating an explicit position re-packs the affected scope", async () => {
+    const dbPath = await tmpDbPath();
+    const ws = openWorkspace(dbPath);
+    const groupA = ws.createGroup({ serverId: SERVER, name: "A" });
+    ws.createGroup({ serverId: SERVER, name: "B" });
+    const groupC = ws.createGroup({ serverId: SERVER, name: "C" });
+    ws.updateGroup({ id: groupC.id, position: 0 });
+    assert.deepEqual(
+        ws.list(SERVER).map((group) => ({ name: group.name, position: group.position })),
+        [
+            { name: "C", position: 0 },
+            { name: "A", position: 1 },
+            { name: "B", position: 2 },
+        ],
+    );
+
+    const sessionA = mkSession(ws, groupA.id, "S1");
+    mkSession(ws, groupA.id, "S2");
+    const sessionC = mkSession(ws, groupA.id, "S3");
+    ws.updateSession({ id: sessionC.id, position: 0 });
+    assert.deepEqual(
+        ws.list(SERVER).find((group) => group.id === groupA.id)?.sessions.map((session) => ({
+            name: session.name,
+            position: session.position,
+        })),
+        [
+            { name: "S3", position: 0 },
+            { name: "S1", position: 1 },
+            { name: "S2", position: 2 },
+        ],
+    );
+
+    const viewerA = ws.createViewerPane({ serverId: SERVER, devSessionId: sessionA.id, url: "v1" });
+    const viewerB = ws.createViewerPane({ serverId: SERVER, devSessionId: sessionA.id, url: "v2" });
+    const viewerC = ws.createViewerPane({ serverId: SERVER, devSessionId: sessionA.id, url: "v3" });
+    ws.updateViewerPane({ id: viewerC.id, position: 0 });
+    assert.deepEqual(
+        ws.list(SERVER).find((group) => group.id === groupA.id)?.sessions.find((session) => session.id === sessionA.id)?.viewerPanes.map((pane) => ({
+            id: pane.id,
+            position: pane.position,
+        })),
+        [
+            { id: viewerC.id, position: 0 },
+            { id: viewerA.id, position: 1 },
+            { id: viewerB.id, position: 2 },
+        ],
+    );
+
+    const terminalA = ws.createTerminalPane({ serverId: SERVER, devSessionId: sessionA.id, name: "t1" });
+    const terminalB = ws.createTerminalPane({ serverId: SERVER, devSessionId: sessionA.id, name: "t2" });
+    const terminalC = ws.createTerminalPane({ serverId: SERVER, devSessionId: sessionA.id, name: "t3" });
+    ws.updateTerminalPane({ id: terminalC.id, position: 0 });
+    assert.deepEqual(
+        ws.list(SERVER).find((group) => group.id === groupA.id)?.sessions.find((session) => session.id === sessionA.id)?.terminalPanes.map((pane) => ({
+            id: pane.id,
+            position: pane.position,
+        })),
+        [
+            { id: terminalC.id, position: 0 },
+            { id: terminalA.id, position: 1 },
+            { id: terminalB.id, position: 2 },
+        ],
+    );
+
+    ws.close();
+    await cleanup(dbPath);
+});
+
+
 test("reorderGroups/reorderSessions keep the scope packed when the given order is partial", async () => {
     const dbPath = await tmpDbPath();
     const ws = openWorkspace(dbPath);
@@ -2057,6 +2187,36 @@ test("RW13: deleting a pane with no stored layout row is a no-op", async () => {
     await cleanup(dbPath);
 });
 
+test("RW13: deleting a pane repairs references in either layout region", async () => {
+    const dbPath = await tmpDbPath();
+    const ws = openWorkspace(dbPath);
+    const group = ws.createGroup({ serverId: SERVER, name: "Work" });
+    const session = ws.createSession({
+        serverId: SERVER,
+        groupId: group.id,
+        name: "s",
+        repositoryRoot: "/r",
+    });
+    const viewer = ws.createViewerPane({ serverId: SERVER, devSessionId: session.id, url: "https://a" });
+    ws.setLayout({
+        serverId: SERVER,
+        devSessionId: session.id,
+        region: "terminal",
+        // Layout payloads are client-authored; the server must not leave this
+        // cross-region reference behind when the viewer row is deleted.
+        tree: { type: "leaf", paneId: viewer.id },
+    });
+
+    ws.deleteViewerPane({ id: viewer.id });
+
+    assert.deepEqual(
+        ws.getLayout({ devSessionId: session.id, region: "terminal" })?.tree,
+        { type: "leaf", paneId: "" },
+    );
+    ws.close();
+    await cleanup(dbPath);
+});
+
 // --- RW14: a corrupt tree must not fail the whole listing -------------------
 
 test("RW14: a corrupt stored layout tree is self-healed to null, not thrown", async () => {
@@ -2107,6 +2267,14 @@ test("RW15: a handler rejects a non-object params value", () => {
     );
 });
 
+
+test("RW15: sparse ordered-id arrays reject missing elements", () => {
+    const orderedIds = new Array<string>(1);
+    assert.throws(
+        () => requireStringArray({ orderedIds }, "orderedIds", "workspace.reorderGroups"),
+        /workspace\.reorderGroups: missing or invalid field 'orderedIds'/,
+    );
+});
 // The region names a column with a CHECK constraint. An unlisted value used to
 // travel all the way to SQLite and come back as a raw constraint-violation
 // message that named neither the field nor the two values it accepts.

@@ -98,9 +98,12 @@ public:
     // column. Only the literal "generic" opts a pane into activity detection:
     // a pane with no harness configured is a plain shell, and inferring "an
     // agent is running" from a shell's output would light up every terminal in
-    // the sidebar. Registering a generic pane starts tracking it at
-    // AgentState::Unknown and emits nothing; registering any other harness only
-    // clears a previous generic registration, and never creates a row.
+    // the sidebar. Registering a new generic pane starts tracking it at
+    // AgentState::Unknown and emits nothing; repeated registration preserves
+    // its derived state. Switching away from generic clears a previous
+    // generic-derived or stale lifecycle state to Unknown and emits that
+    // transition, without creating a row for an adapter-driven pane that has
+    // never spoken.
     Q_INVOKABLE void setTerminalHarness(const QString& devSessionId,
                                         const QString& terminalId,
                                         const QString& harness);

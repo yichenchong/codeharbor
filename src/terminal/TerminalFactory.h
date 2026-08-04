@@ -96,8 +96,8 @@ public:
     //     the shell alive on purpose). paneRowResolved() reports the row this
     //     found so the leaf can be backfilled and never ask by label again.
     //
-    // Returns false when no resolution was started — no controller, no pane
-    // name, or no server to ask — having reported the reason through error().
+    // Returns false when no resolution was started — no controller, no Dev
+    // Session, no pane name for a legacy label lookup, or no server to ask —
     // A lookup and a create both need the server, so this refuses in exactly
     // the cases attach() does rather than inventing a target locally.
     //
@@ -171,9 +171,12 @@ public:
     // only a controller that has never been sized falls back to 80x24. A
     // reconnect therefore never shrinks a pane that is already laid out.
     //
-    // CALLER CONTRACT — `tmuxTarget` must be the one resolveTarget() answered
-    // with for this pane, i.e. a `terminal_panes.tmuxTarget` value. The attach
-    // command is `tmux new-session -A`, "attach if it already exists, create
+    // CALLER CONTRACT — in production `tmuxTarget` must be the one
+    // resolveTarget() answered with for this pane, i.e. a
+    // `terminal_panes.tmuxTarget` value. attach() enforces that provenance
+    // whenever a workspace is configured; a factory without one is only the
+    // lower-level PTY test seam used by the live attach gate.
+    // The attach command is `tmux new-session -A`, "attach if it already exists, create
     // otherwise", which is exactly what makes a terminal survive a disconnect,
     // an app restart and a session switch — and it is also why a target used by
     // a second pane silently adopts the first pane's shell, scrollback and
@@ -202,8 +205,10 @@ public:
     Q_INVOKABLE void kill(ch::TerminalController* controller);
 
     // tmux target for `controller`: the one its LAST attach() aimed at, whether
-    // or not that attach succeeded, and empty before the first one (or after a
-    // kill that ran). Survives detach() so kill() still knows what to destroy.
+    // or not that attach succeeded, and empty before the first one (or after
+    // a kill that ran). A target is only returned while the factory is still
+    // looking at the server that supplied it; it cannot be used to kill a
+    // same-named session on a different server after a profile switch.
     Q_INVOKABLE QString targetFor(ch::TerminalController* controller) const;
 
     // The command kill() runs on its own Exec channel:
@@ -248,6 +253,13 @@ private:
         // out from under us takes it along.
         QPointer<SshChannelDevice> device;
         QString target;
+        // The server whose tmux namespace contains `target`; a profile switch
+        // must not let kill() send the old name to the new server.
+        QString targetServerId;
+        // The latest tmux target returned by resolveTarget() for this pane.
+        // Production attach() accepts only this server-supplied value; the
+        // target remains authorised across detach/reconnect.
+        QString resolvedTarget;
         // The pane's agent-status identity: the Dev Session it belongs to and
         // its `terminal_panes` row id, i.e. exactly the pair every AgentEvent
         // is keyed by. BOTH are read off the server's answer and never off the

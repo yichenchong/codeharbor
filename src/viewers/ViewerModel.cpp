@@ -254,15 +254,28 @@ void ViewerModel::listDirectory(const QString &path)
                 emit guard->directoryError(path, error->message);
                 return;
             }
-            const QJsonArray array =
-                result.toObject().value(QStringLiteral("entries")).toArray();
+            const QJsonValue entriesValue =
+                result.toObject().value(QStringLiteral("entries"));
+            if (!entriesValue.isArray()) {
+                emit guard->directoryError(
+                    path,
+                    QStringLiteral("reply carried no directory entries"));
+                return;
+            }
+            const QJsonArray array = entriesValue.toArray();
             QList<DirectoryEntry> parsed;
             parsed.reserve(array.size());
             for (const QJsonValue &value : array) {
                 const QJsonObject entry = value.toObject();
-                parsed.append(
-                    DirectoryEntry{entry.value(QStringLiteral("name")).toString(),
-                                   entry.value(QStringLiteral("kind")).toString()});
+                const QJsonValue name = entry.value(QStringLiteral("name"));
+                const QJsonValue kind = entry.value(QStringLiteral("kind"));
+                if (!value.isObject() || !name.isString() || !kind.isString()) {
+                    emit guard->directoryError(
+                        path,
+                        QStringLiteral("reply carried a malformed directory entry"));
+                    return;
+                }
+                parsed.append(DirectoryEntry{name.toString(), kind.toString()});
             }
             // Server order is unspecified.
             std::sort(parsed.begin(), parsed.end(), directoryEntryLess);
@@ -313,9 +326,16 @@ void ViewerModel::resolvePath(const QString &path, const QString &base)
                     QStringLiteral("reply carried no insideRepositoryRoot flag"));
                 return;
             }
-            emit guard->pathResolved(
-                path, obj.value(QStringLiteral("path")).toString(),
-                inside.toBool());
+            const QJsonValue resolvedPath =
+                obj.value(QStringLiteral("path"));
+            if (!resolvedPath.isString()) {
+                emit guard->pathResolveError(
+                    path,
+                    QStringLiteral("reply carried no resolved path"));
+                return;
+            }
+            emit guard->pathResolved(path, resolvedPath.toString(),
+                                     inside.toBool());
         });
 }
 

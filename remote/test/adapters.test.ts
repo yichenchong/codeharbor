@@ -49,6 +49,11 @@ test("registry resolves known harnesses and skips generic", () => {
     assert.ok(adapterFor("pi"));
     assert.ok(adapterFor("claude-code"));
     assert.equal(adapterFor("generic"), undefined);
+
+    // The type is not present at runtime: malformed bridge input can still
+    // contain a property name inherited from Object.prototype.
+    const inheritedName = "toString" as Parameters<typeof adapterFor>[0];
+    assert.equal(adapterFor(inheritedName), undefined);
 });
 
 test("processBridgeLine builds a validated event from a native message", () => {
@@ -182,15 +187,67 @@ test("codeharbord handleLine reports parse errors", async () => {
 test("claude-code adapter maps its lifecycle hook names", () => {
     assert.equal(claudeCodeAdapter.map({ hook: "SessionStart" }), "starting");
     assert.equal(claudeCodeAdapter.map({ hook: "UserPromptSubmit" }), "running");
+    assert.equal(claudeCodeAdapter.map({ hook: "UserPromptExpansion" }), "running");
     assert.equal(claudeCodeAdapter.map({ hook: "PreToolUse" }), "running");
     assert.equal(claudeCodeAdapter.map({ hook: "PostToolUse" }), "running");
+    assert.equal(claudeCodeAdapter.map({ hook: "PostToolUseFailure" }), "running");
+    assert.equal(claudeCodeAdapter.map({ hook: "PostToolBatch" }), "running");
+    assert.equal(claudeCodeAdapter.map({ hook: "PreCompact" }), "running");
+    assert.equal(claudeCodeAdapter.map({ hook: "PostCompact" }), "running");
+    assert.equal(claudeCodeAdapter.map({ hook: "SubagentStart" }), "running");
+    assert.equal(claudeCodeAdapter.map({ hook: "SubagentStop" }), "running");
+    assert.equal(claudeCodeAdapter.map({ hook: "TeammateIdle" }), "running");
+    assert.equal(claudeCodeAdapter.map({ hook: "TaskCreated" }), "running");
+    assert.equal(claudeCodeAdapter.map({ hook: "TaskCompleted" }), "running");
+    assert.equal(claudeCodeAdapter.map({ hook: "MessageDisplay" }), "running");
+    assert.equal(claudeCodeAdapter.map({ hook: "ElicitationResult" }), "running");
+    assert.equal(claudeCodeAdapter.map({ hook: "PermissionRequest" }), "waiting_input");
+    assert.equal(claudeCodeAdapter.map({ hook: "Elicitation" }), "waiting_input");
+    assert.equal(claudeCodeAdapter.map({ hook: "PermissionDenied" }), "error");
+    assert.equal(claudeCodeAdapter.map({ hook: "StopFailure" }), "error");
     assert.equal(claudeCodeAdapter.map({ hook: "Notification" }), "waiting_input");
+    assert.equal(
+        claudeCodeAdapter.map({ hook: "Notification", notification_type: "permission_prompt" }),
+        "waiting_input",
+    );
+    assert.equal(
+        claudeCodeAdapter.map({ hook: "Notification", notification_type: "idle_prompt" }),
+        "waiting_input",
+    );
+    assert.equal(
+        claudeCodeAdapter.map({ hook: "Notification", notification_type: "elicitation_dialog" }),
+        "waiting_input",
+    );
+    assert.equal(
+        claudeCodeAdapter.map({ hook: "Notification", notification_type: "agent_needs_input" }),
+        "waiting_input",
+    );
+    assert.equal(
+        claudeCodeAdapter.map({
+            hook: "Notification",
+            notification_type: "elicitation_complete",
+        }),
+        "running",
+    );
+    assert.equal(
+        claudeCodeAdapter.map({
+            hook: "Notification",
+            notification_type: "elicitation_response",
+        }),
+        "running",
+    );
+    assert.equal(
+        claudeCodeAdapter.map({ hook: "Notification", notification_type: "auth_success" }),
+        null,
+    );
+    assert.equal(
+        claudeCodeAdapter.map({ hook: "Notification", notification_type: 7 }),
+        null,
+    );
     assert.equal(claudeCodeAdapter.map({ hook: "Stop" }), "idle_unseen");
     // SubagentStop fires when a Task-tool subagent finishes while the MAIN agent
-    // is still working. Mapping it to a completion would arm the Dev Session's
-    // unseen-completion badge and raise an "Agent finished" desktop notification
-    // mid-turn, once per subagent; the agent is running, so that is the state.
-    assert.equal(claudeCodeAdapter.map({ hook: "SubagentStop" }), "running");
+    // is still working. It is covered above and must map to running rather than
+    // a completion, which would arm the unseen-completion badge mid-turn.
     assert.equal(claudeCodeAdapter.map({ hook: "SessionEnd" }), "stopped");
     assert.equal(claudeCodeAdapter.map({ hook: "Anything", error: true }), "error");
     assert.equal(claudeCodeAdapter.map({ hook: "Unrecognized" }), null);

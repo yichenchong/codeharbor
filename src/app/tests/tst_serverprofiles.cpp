@@ -256,6 +256,7 @@ private slots:
     void insertionOrderSurvivesReload();
     void handEditedStoreIsRepairedOnLoad();
     void outOfRangeStoredPortsAreRepairedNotTruncated();
+    void fractionalAndBooleanPortsAreRejected();
     void secretsInTheCallersMapNeverReachTheStore();
     void aSecondWritersProfileSurvivesEveryMutation();
     void aDeletionIsNeverResurrectedByTheMerge();
@@ -817,6 +818,55 @@ void TstServerProfiles::outOfRangeStoredPortsAreRepairedNotTruncated()
     store.updateProfile(QStringLiteral("eee-top"),
                         QVariantMap{{QStringLiteral("port"), 70000}});
     QCOMPARE(portOf("eee-top"), 65535);
+}
+
+void TstServerProfiles::fractionalAndBooleanPortsAreRejected()
+{
+    const QString path = iniPath(QStringLiteral("port-types.ini"));
+    {
+        QSettings raw(path, QSettings::IniFormat);
+        const auto seed = [&raw](const QString& id, const QVariant& port) {
+            const QString prefix = QStringLiteral("servers/") + id + QLatin1Char('/');
+            raw.setValue(prefix + QStringLiteral("name"), id);
+            raw.setValue(prefix + QStringLiteral("host"), QStringLiteral("host"));
+            raw.setValue(prefix + QStringLiteral("user"), QStringLiteral("user"));
+            raw.setValue(prefix + QStringLiteral("port"), port);
+        };
+        seed(QStringLiteral("stored-fraction"), 22.5);
+        seed(QStringLiteral("stored-bool"), true);
+        raw.sync();
+    }
+
+    ServerProfiles store(path);
+    QCOMPARE(store.profile(QStringLiteral("stored-fraction"))
+                 .value(QStringLiteral("port")).toInt(),
+             22);
+    QCOMPARE(store.profile(QStringLiteral("stored-bool"))
+                 .value(QStringLiteral("port")).toInt(),
+             22);
+    QVERIFY(store.addProfile(profileFields(QStringLiteral("fraction"),
+                                           QStringLiteral("host"), 22.5,
+                                           QStringLiteral("user")))
+                .isEmpty());
+    QVERIFY(store.addProfile(profileFields(QStringLiteral("fraction-text"),
+                                           QStringLiteral("host"), QStringLiteral("22.5"),
+                                           QStringLiteral("user")))
+                .isEmpty());
+    QVERIFY(store.addProfile(profileFields(QStringLiteral("boolean"),
+                                           QStringLiteral("host"), true,
+                                           QStringLiteral("user")))
+                .isEmpty());
+
+    const QString id = store.addProfile(profileFields(QStringLiteral("valid"),
+                                                      QStringLiteral("host"), 22,
+                                                      QStringLiteral("user")));
+    QVERIFY(!id.isEmpty());
+    store.updateProfile(id, QVariantMap{{QStringLiteral("port"), 22.5}});
+    QCOMPARE(store.profile(id).value(QStringLiteral("port")).toInt(), 22);
+    QVERIFY(store.addProfile(profileFields(QStringLiteral("list"),
+                                           QStringLiteral("host"), QVariantList{22},
+                                           QStringLiteral("user")))
+                .isEmpty());
 }
 
 // The store is the one file on disk that says how to REACH a machine, and it

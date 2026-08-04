@@ -230,9 +230,6 @@ void TstOpenAs::menuContentsForTextFile()
     QVERIFY(submenu);
     QVERIFY(QMetaObject::invokeMethod(submenu, "open"));
     QTest::qWait(20);
-    for (QObject *o : submenu->findChildren<QObject *>())
-        qDebug() << "  item" << o->metaObject()->className() << o->property("text");
-    qDebug() << "count" << submenu->property("count");
     QVERIFY(findText(menu, QStringLiteral("Editor (default)")));
     QVERIFY(findText(menu, QStringLiteral("Text")));
     QVERIFY(!findText(menu, QStringLiteral("Image")));

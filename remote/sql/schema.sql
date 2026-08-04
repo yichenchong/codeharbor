@@ -1,17 +1,17 @@
 -- CodeHarbor workspace database schema (SPEC 11.1).
 --
 -- Authoritative SQLite DDL for the server-side workspace database. The schema
--- version defined here is mirrored by `WorkspaceDb::kSchemaVersion` in
--- `WorkspaceDb::kSchemaVersion` in the C++ client and
--- `WORKSPACE_SCHEMA_VERSION` in remote/src/workspace.ts mirror this value.
+-- version defined here is mirrored by `WorkspaceDb::kSchemaVersion` in the C++
+-- client and `WORKSPACE_SCHEMA_VERSION` in remote/src/workspace.ts; keep all
+-- three values aligned.
 -- Additive changes use an ordered migration there so existing databases keep
 -- every row.
 --
 -- Conventions:
 --   * TEXT UUID primary keys for every domain row.
 --   * INTEGER for positions, booleans (0/1), and timestamps (unix epoch ms).
---   * Every domain table carries `server_id` (SPEC 3.5) so multi-server support
---     can be added later without a schema break.
+--   * Every domain table carries `server_id` (SPEC 3.5) so rows remain scoped
+--     when multiple server workspaces share one database.
 --
 -- Indexes are NOT here: they live in indexes.sql, which openWorkspace() applies
 -- on every open. This file is applied only by the migration runner, so an index

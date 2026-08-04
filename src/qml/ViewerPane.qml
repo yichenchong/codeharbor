@@ -39,7 +39,18 @@ Item {
     // soon as the region gives focus to another pane so a late page callback
     // cannot fight a user's click.
     property bool focusPending: false
-    onPaneActiveChanged: if (!pane.paneActive) pane.focusPending = false
+    Timer {
+        id: focusRetry
+        interval: 100
+        repeat: false
+        onTriggered: pane.focusContent()
+    }
+    onPaneActiveChanged: {
+        if (!pane.paneActive) {
+            pane.focusPending = false
+            focusRetry.stop()
+        }
+    }
 
     // ---- browser navigation history ----------------------------------------
     //
@@ -228,15 +239,34 @@ Item {
                 pane.focusPending = false;
             return;
         }
-        // textarea. Other viewer pages have no such input and simply retain the
-        // WebEngineView focus above.
+        // A Loader becomes ready before its WebEngine page does. Keep the
+        // request pending until JavaScript can actually run; otherwise a
+        // session restore clears it on an empty document and the editor or
+        // terminal-like input never receives keyboard focus.
         view.runJavaScript(
             "(function () {"
+          + "try {"
           + "var e = document.querySelector('.monaco-editor textarea.inputarea,"
           + " .xterm-helper-textarea');"
           + "if (e) e.focus();"
-          + "})()");
-        pane.focusPending = false;
+          + "return document.readyState;"
+          + "} catch (e) { return 'loading'; }"
+          + "})()",
+            function(result) {
+                if (!pane.focusPending || !pane.paneActive)
+                    return;
+                const state = String(result === undefined || result === null
+                                     ? "" : result);
+                if (state.length === 0 || state === "loading") {
+                    focusRetry.restart();
+                    return;
+                }
+                pane.focusPending = false;
+            });
+        // The callback is asynchronous and a page can take several turns to
+        // start executing scripts. This also covers engines that do not invoke
+        // a callback for a request issued before navigation completes.
+        focusRetry.restart();
     }
 
     Connections {
@@ -285,7 +315,10 @@ Item {
         // that no longer follows the Dev Session.
         pane.urlOpened(pane.paneId, pane.url.toString());
     }
-
+    onDefaultUrlChanged: {
+        pane.refreshDefaultHistory()
+        pane.syncAddressField(false)
+    }
     // A navigation is the pane's OWN answer to whatever was asked of it, so the
     // field follows it even while it has the keyboard: the user pressed Enter on
     // a relative name ("README.md" typed in a listing, or a path the server had
@@ -298,10 +331,6 @@ Item {
     }
     onPaneIdChanged: pane.reportUrl()
 
-    // Session-root changes alter what an empty-url pane displays, but they are
-    // not user navigations. Keep the current concrete root entry aligned while
-    // leaving every older address in the pane's history intact.
-    onDefaultUrlChanged: pane.refreshDefaultHistory()
 
     // ---- remote paths <-> file:// URLs -------------------------------------
 

@@ -302,6 +302,13 @@ Rectangle {
             if (region.focusedPaneId === key)
                 region.focusedPaneId = "";
         }
+        // A target may be queued for a pane whose recursive Loader has not
+        // materialised yet. Drop it as soon as that leaf leaves the tree, or a
+        // recycled pane id can consume the old open request later.
+        for (const key in region.pendingOpenTargets) {
+            if (!live[key])
+                delete region.pendingOpenTargets[key];
+        }
         region.applyFocusFlags();
     }
 
@@ -479,7 +486,11 @@ Rectangle {
     function openPaneTarget(paneId, url, kind) {
         const pane = region.paneCache[paneId];
         if (!pane) {
-            region.paneOwner.pendingOpenTargets[paneId] = { url: url, kind: kind };
+            region.paneOwner.pendingOpenTargets[paneId] = {
+                url: url,
+                kind: kind,
+                expectedUrl: ""
+            };
             return true;
         }
         return pane.openUrlWithKind(url, kind);
@@ -536,13 +547,17 @@ Rectangle {
         const pane = region.paneOwner.takePane(key, paneHost, { url: url });
         if (!pane)
             return;
+        // `forcedKind` is a transient "Open as" choice. A normal tree
+        // publication must resolve the persisted URL through the registry.
+        pane.forcedKind = "";
         pane.url = url;
         region.shownPaneId = key;
         region.showingPane = true;
         const pending = region.paneOwner.pendingOpenTargets[key];
         if (pending) {
             delete region.paneOwner.pendingOpenTargets[key];
-            pane.openUrlWithKind(pending.url, pending.kind);
+            if (String(pending.expectedUrl || "") === String(url))
+                pane.openUrlWithKind(pending.url, pending.kind);
         }
     }
 
@@ -671,17 +686,23 @@ Rectangle {
     // Fraction of the split this child should occupy. Prefers the node's
     // persisted `ratios` (SPEC 4.5 - split ratios are per Dev Session state),
     // normalized so a stale or partial array cannot distort the layout; falls
-    // back to an even division.
     function ratioFor(i, count) {
         if (count <= 0)
             return 1;
         const r = region.node && region.node.ratios ? region.node.ratios : null;
         if (r && r.length === count) {
             let sum = 0;
-            for (let k = 0; k < count; ++k)
-                sum += r[k] > 0 ? r[k] : 0;
-            if (sum > 0 && r[i] > 0)
-                return r[i] / sum;
+            let valid = true;
+            for (let k = 0; k < count; ++k) {
+                const value = Number(r[k]);
+                if (!isFinite(value) || value <= 0) {
+                    valid = false;
+                    break;
+                }
+                sum += value;
+            }
+            if (valid && sum > 0)
+                return Number(r[i]) / sum;
         }
         return 1 / count;
     }
@@ -738,6 +759,13 @@ Rectangle {
             onWidthChanged: applyRatios()
             onHeightChanged: applyRatios()
             Component.onCompleted: applyRatios()
+            function updateNodePaths() {
+                for (let i = 0; i < childRepeater.count; ++i) {
+                    const child = childRepeater.itemAt(i);
+                    if (child && child.item)
+                        child.item.nodePath = region.nodePath.concat([String(i)]);
+                }
+            }
 
             // The write side of `ratios` (SPEC 4.5). SplitView.resizing is true
             // only while a handle is under the pointer, so this fires exactly
@@ -794,9 +822,12 @@ Rectangle {
                 function onNodeChanged() {
                     split.ratiosApplied = false;
                     split.applyRatios();
+                    split.updateNodePaths();
+                }
+                function onNodePathChanged() {
+                    split.updateNodePaths();
                 }
             }
-
             Repeater {
                 id: childRepeater
                 // The child COUNT, not the child ARRAY. Handing the Repeater a
@@ -819,6 +850,13 @@ Rectangle {
                     readonly property var childNode:
                         region.node && region.node.children
                         ? region.node.children[childLoader.index] : null
+                    // A divider may be dragged all the way to an edge unless
+                    // each child declares a minimum on the active axis. Keep a
+                    // live pane reachable and clickable even when the user
+                    // drags aggressively; SplitView clamps the other axis
+                    // harmlessly.
+                    SplitView.minimumWidth: 120
+                    SplitView.minimumHeight: 80
                     SplitView.fillWidth: true
                     SplitView.fillHeight: true
                     // `node` must be set at creation: a declarative `source`
@@ -835,7 +873,13 @@ Rectangle {
                                                            () => region.paneOwner.layoutGeneration),
                                                        hostStampsWrites: Qt.binding(
                                                            () => region.paneOwner.hostStampsWrites) })
-                    onChildNodeChanged: if (item) item.node = childLoader.childNode
+                    onChildNodeChanged: {
+                        if (!item)
+                            return;
+                        item.node = childLoader.childNode;
+                        item.nodePath = region.nodePath.concat(
+                            [String(childLoader.index)]);
+                    }
                 }
             }
         }

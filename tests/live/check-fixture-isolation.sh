@@ -1,11 +1,11 @@
-#!/bin/sh
+#!/usr/bin/env bash
 # Verify the environment a real sshd session gives to codeharbord.
 #
 # This is a CTest fixture setup test, not a config-file grep. OpenSSH's SetEnv
 # directive is only useful if it reaches the session that starts the daemon.
 #
 # Usage: check-fixture-isolation.sh
-set -eu
+set -euo pipefail
 
 # The portable suite does not need an SSH server. Passing without output keeps
 # this setup test harmless when the live gates are not armed.
@@ -53,8 +53,8 @@ if ! reported=$(ssh "$@" 2>&1); then
     fail "could not ask the fixture what CODEHARBOR_DB is set to: $reported"
 fi
 
-db=$(printf '%s\n' "$reported" | sed -n 's/^DB=//p' | sed -n '1p')
-home=$(printf '%s\n' "$reported" | sed -n 's/^HOME=//p' | sed -n '1p')
+db=$(printf '%s\n' "$reported" | awk 'index($0, "DB=") == 1 { print substr($0, 4); exit }')
+home=$(printf '%s\n' "$reported" | awk 'index($0, "HOME=") == 1 { print substr($0, 6); exit }')
 if [ -z "$db" ]; then
     fail "the fixture session returned an empty CODEHARBOR_DB"
 fi

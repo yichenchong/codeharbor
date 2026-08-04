@@ -44,16 +44,24 @@ bool writeNode(const SplitNode &node, QJsonObject &obj, int depth)
     }
 
     // One ratio per child, each finite and > 0 - the parser's rule, checked
-    // here so the bad shape is never emitted in the first place.
+    // here so the bad shape is never emitted in the first place. The sum must
+    // also remain finite and positive because downstream geometry divides by
+    // it; individually finite ratios can still overflow that sum.
     if (node.ratios.size() != node.children.size())
         return false;
 
     QJsonArray ratioArray;
+    double ratioSum = 0.0;
     for (double ratio : node.ratios) {
         if (!std::isfinite(ratio) || ratio <= 0.0)
             return false;
+        ratioSum += ratio;
+        if (!std::isfinite(ratioSum))
+            return false;
         ratioArray.append(ratio);
     }
+    if (ratioSum <= 0.0)
+        return false;
 
     QJsonArray childArray;
     for (const SplitNode &child : node.children) {
@@ -63,11 +71,19 @@ bool writeNode(const SplitNode &node, QJsonObject &obj, int depth)
         childArray.append(childObj);
     }
 
+    QString orientation;
+    switch (node.orientation) {
+    case SplitOrientation::Horizontal:
+        orientation = QStringLiteral("horizontal");
+        break;
+    case SplitOrientation::Vertical:
+        orientation = QStringLiteral("vertical");
+        break;
+    default:
+        return false;
+    }
     obj[QStringLiteral("type")] = QStringLiteral("split");
-    obj[QStringLiteral("orientation")] =
-            node.orientation == SplitOrientation::Vertical
-            ? QStringLiteral("vertical")
-            : QStringLiteral("horizontal");
+    obj[QStringLiteral("orientation")] = orientation;
     obj[QStringLiteral("children")] = childArray;
     obj[QStringLiteral("ratios")] = ratioArray;
     return true;
@@ -143,10 +159,13 @@ bool parseNode(const QJsonObject &obj, SplitNode &out, int depth)
         return false;
 
     SplitNode node;
-    node.orientation = obj.value(QStringLiteral("orientation")).toString()
-                == QStringLiteral("vertical")
-            ? SplitOrientation::Vertical
-            : SplitOrientation::Horizontal;
+    const QString orientation = obj.value(QStringLiteral("orientation")).toString();
+    if (orientation == QStringLiteral("horizontal"))
+        node.orientation = SplitOrientation::Horizontal;
+    else if (orientation == QStringLiteral("vertical"))
+        node.orientation = SplitOrientation::Vertical;
+    else
+        return false;
 
     node.children.reserve(childArray.size());
     for (const QJsonValue &value : childArray) {
@@ -163,6 +182,7 @@ bool parseNode(const QJsonObject &obj, SplitNode &out, int depth)
     }
 
     node.ratios.reserve(ratioArray.size());
+    double ratioSum = 0.0;
     for (const QJsonValue &value : ratioArray) {
         if (!value.isDouble())
             return false;
@@ -172,12 +192,17 @@ bool parseNode(const QJsonObject &obj, SplitNode &out, int depth)
         // yield NaN/negative pane sizes, and an all-zero array a divide-by-zero.
         // Reject such malformed input outright, consistent with the count and
         // structural rejections above, rather than silently persisting a tree
-        // that produces broken geometry downstream. Requiring every ratio to be
-        // finite and > 0 also guarantees their sum is > 0.
+        // that produces broken geometry downstream. The sum is checked too:
+        // individually finite ratios can overflow it to infinity.
         if (!std::isfinite(ratio) || ratio <= 0.0)
+            return false;
+        ratioSum += ratio;
+        if (!std::isfinite(ratioSum))
             return false;
         node.ratios.append(ratio);
     }
+    if (ratioSum <= 0.0)
+        return false;
 
     out = std::move(node);
     return true;

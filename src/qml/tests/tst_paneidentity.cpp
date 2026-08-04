@@ -534,6 +534,7 @@ private slots:
     void navigationTruncatesForwardHistoryAfterFreshAddress();
     void navigationButtonsAreDisabledAtHistoryEnds();
     void reloadRefreshesNonWebContent();
+    void reloadKeepsTheEditorHandlerAlive();
     void homeUsesTheActiveSessionRootAndDisablesWithoutOne();
 
     // OUTSIDE THE REPOSITORY ROOT (SPEC 9). A path outside the Dev Session's
@@ -554,6 +555,7 @@ private slots:
     // Dev Session was reopened. The reading has to name the branch it belongs
     // to by index path, which is the part a nested region gets wrong.
     void dragAdjustedRatiosAreReportedForTheRightBranch();
+    void reorderedNestedBranchesUpdateRatioPaths();
 
     // ADDRESS BAR, part two. A name typed without a leading "/" is resolved
     // against the directory the pane is showing, so what the pane opens is NOT
@@ -575,6 +577,10 @@ private slots:
     // buffer while the user types and finds it again on the next open, but
     // finding it is worth nothing unless the user is told and can take it back.
     void theEditorOffersToRestoreARecoveredBuffer();
+    void theEditorOffersToRestoreAnEmptyRecoveredBuffer();
+    // The other half of the same offer: answering "discard" has to close the
+    // dialog and leave the file exactly as it was read from disk, rather than
+    // quietly marking it edited.
     void discardingARecoveredBufferLeavesTheEditorShowingTheFile();
 
     // THE PATH PROBE IS BOUNDED. A path typed with no trailing slash makes the
@@ -1696,6 +1702,32 @@ void TstPaneIdentity::reloadRefreshesNonWebContent()
     QCOMPARE(refreshed->property("errorText").toString(), QString());
     QCOMPARE(pane->property("url").toUrl(), QUrl(address));
 }
+void TstPaneIdentity::reloadKeepsTheEditorHandlerAlive()
+{
+    const QString address = QStringLiteral("file:///tmp/reload.txt");
+    QVERIFY(openRegion(QStringLiteral("ViewerRegion.qml"),
+                       leafNode(QStringLiteral("viewer-1"), address),
+                       /*terminal=*/false));
+    const auto panes = [this] { return collect(m_region, isLeafPane); };
+    const auto editors = [this] { return collect(m_region, isEditorPane); };
+    QTRY_VERIFY(panes().size() == 1);
+    QTRY_VERIFY2(editors().size() == 1,
+                 "the reload test did not resolve to an editor handler");
+    QObject *const original = editors().constFirst();
+    QPointer<QObject> editorGuard(original);
+    QObject *const controller = asObject(original->property("controller"));
+    QVERIFY(controller);
+
+    QVERIFY(QMetaObject::invokeMethod(panes().constFirst(), "reloadCurrent"));
+    QTest::qWait(100);
+
+    QVERIFY2(!editorGuard.isNull(),
+             "reloading an editor destroyed the live handler and its unsaved buffer");
+    QCOMPARE(editors().size(), 1);
+    QCOMPARE(editors().constFirst(), original);
+    QCOMPARE(asObject(original->property("controller")), controller);
+}
+
 
 void TstPaneIdentity::homeUsesTheActiveSessionRootAndDisablesWithoutOne()
 {
@@ -1732,6 +1764,16 @@ void TstPaneIdentity::homeUsesTheActiveSessionRootAndDisablesWithoutOne()
     QVERIFY((home->property("focusPolicy").toInt() & Qt::TabFocus) != 0);
     QCOMPARE(pane->property("effectiveUrl").toUrl(),
              QUrl(QStringLiteral("file:///srv/repos/app/")));
+    // An untouched pane follows a newly selected session's root. Its editable
+    // address field must follow too, or it advertises the directory the pane
+    // has already left.
+    m_app.setActiveSessionRepoRoot(QStringLiteral("/srv/repos/other"));
+    QTRY_COMPARE(pane->property("effectiveUrl").toUrl(),
+                 QUrl(QStringLiteral("file:///srv/repos/other/")));
+    QObject *const address = childNamed(pane, QStringLiteral("viewerAddressField"));
+    QVERIFY(address);
+    QTRY_COMPARE(address->property("text").toString(),
+                 QStringLiteral("/srv/repos/other/"));
 
     pane->setProperty("url", QUrl(QStringLiteral("file:///tmp/away.bin")));
     QTRY_COMPARE(pane->property("url").toUrl(),
@@ -1739,7 +1781,7 @@ void TstPaneIdentity::homeUsesTheActiveSessionRootAndDisablesWithoutOne()
     QVERIFY(QMetaObject::invokeMethod(pane, "goHome"));
     QTRY_COMPARE(pane->property("url").toUrl(), QUrl());
     QCOMPARE(pane->property("effectiveUrl").toUrl(),
-             QUrl(QStringLiteral("file:///srv/repos/app/")));
+             QUrl(QStringLiteral("file:///srv/repos/other/")));
 }
 
 
@@ -2010,6 +2052,48 @@ void TstPaneIdentity::dragAdjustedRatiosAreReportedForTheRightBranch()
     expectedReported.sort();
     QCOMPARE(reportedPaths, expectedReported);
 }
+void TstPaneIdentity::reorderedNestedBranchesUpdateRatioPaths()
+{
+    const QVariantMap nested = branchNode(
+        QStringLiteral("vertical"),
+        QVariantList{leafNode(QStringLiteral("viewer-2")),
+                             leafNode(QStringLiteral("viewer-3"))});
+    const QVariantMap initial = branchNode(
+        QStringLiteral("horizontal"),
+        QVariantList{leafNode(QStringLiteral("viewer-1")), nested});
+    QVERIFY(openRegion(QStringLiteral("ViewerRegion.qml"), initial, /*terminal=*/false));
+
+    const auto panes = [this] { return collect(m_region, isLeafPane); };
+    QTRY_VERIFY(panes().size() == 3);
+    QTest::qWait(kSettleMs);
+
+    // Keep both child counts unchanged while moving the nested branch from
+    // index 1 to index 0. Repeater delegates therefore survive and must update
+    // their index paths rather than retaining the addresses they were created
+    // with.
+    const QVariantMap reordered = branchNode(
+        QStringLiteral("horizontal"),
+        QVariantList{nested, leafNode(QStringLiteral("viewer-1"))});
+    setNode(reordered);
+    QTRY_VERIFY2(collect(m_region, [](QObject *object) {
+                     return object->metaObject()->indexOfProperty("nodePath") >= 0;
+                 }).size() == 5,
+                 "the reordered tree did not retain all recursive regions");
+
+    const QList<QObject *> regions = collect(m_region, [](QObject *object) {
+        return object->metaObject()->indexOfProperty("nodePath") >= 0;
+    });
+    QStringList paths;
+    for (QObject *region : regions)
+        paths.append(pathText(asList(region->property("nodePath"))));
+    paths.sort();
+    QStringList expected{QStringLiteral("[]"), QStringLiteral("[0]"),
+                         QStringLiteral("[0,0]"), QStringLiteral("[0,1]"),
+                         QStringLiteral("[1]")};
+    expected.sort();
+    QCOMPARE(paths, expected);
+}
+
 
 // ---------------------------------------------------------------------------
 // (11) The address bar after a RELATIVE name.
@@ -2174,6 +2258,37 @@ void TstPaneIdentity::theEditorOffersToRestoreARecoveredBuffer()
     QCOMPARE(controller.reported(), QStringList{QStringLiteral("recovered line\n")});
     QTRY_VERIFY(!dialog->property("visible").toBool());
 }
+void TstPaneIdentity::theEditorOffersToRestoreAnEmptyRecoveredBuffer()
+{
+    EditorControllerStub controller;
+    QSignalSpy delivered(&controller, &EditorControllerStub::contentLoaded);
+    QVERIFY(delivered.isValid());
+
+    QObject *const pane =
+        openInShell(QStringLiteral("EditorPaneView.qml"), recoveryPaneProps(&controller));
+    QVERIFY(pane);
+    QObject *const dialog = childNamed(pane, QStringLiteral("editorRecoveryDialog"));
+    QVERIFY(dialog);
+
+    // Empty recovered content and an empty revision are both valid: the user
+    // may have deleted every character from a new file. Neither value may be
+    // used as the "nothing is pending" sentinel.
+    emit controller.recoveryAvailable(QString());
+    QTest::qWait(80);
+    QVERIFY(!dialog->property("visible").toBool());
+
+    emit controller.contentLoaded(QStringLiteral("what is on disk\n"), QString());
+    QTRY_VERIFY2(dialog->property("visible").toBool(),
+                 "an empty recovered buffer was treated as no recovery");
+    QCOMPARE(delivered.size(), 1);
+
+    QVERIFY(QMetaObject::invokeMethod(dialog, "accept"));
+    QTRY_COMPARE(delivered.size(), 2);
+    QCOMPARE(delivered.constLast().at(0).toString(), QString());
+    QCOMPARE(delivered.constLast().at(1).toString(), QString());
+    QCOMPARE(controller.reported(), QStringList{QString()});
+}
+
 
 void TstPaneIdentity::discardingARecoveredBufferLeavesTheEditorShowingTheFile()
 {

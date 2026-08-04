@@ -56,6 +56,14 @@ Item {
         }
     }
 
+    function pinnedDocument(candidate) {
+        let text = String(candidate)
+        const fragment = text.indexOf("#")
+        if (fragment >= 0)
+            text = text.substring(0, fragment)
+        return text
+    }
+
     WebEngineView {
         anchors.fill: parent
         visible: root.errorText.length === 0
@@ -67,8 +75,20 @@ Item {
         settings.javascriptEnabled: false
         settings.localContentCanAccessFileUrls: false
         settings.localContentCanAccessRemoteUrls: false
+        settings.javascriptCanOpenWindows: false
         settings.pdfViewerEnabled: true
         settings.pluginsEnabled: true
+        onNavigationRequested: function(request) {
+            if (root.pinnedDocument(request.url)
+                    === root.pinnedDocument(root.internalUrl))
+                return
+            request.action = WebEngineNavigationRequest.IgnoreRequest
+            console.warn("ViewerPdfView: refused navigation to", request.url)
+        }
+        onNewWindowRequested: function(request) {
+            console.warn("ViewerPdfView: refused a new window for",
+                         request.requestedUrl)
+        }
         url: root.internalUrl
     }
 

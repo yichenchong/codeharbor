@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/usr/bin/env bash
 # Fake Oh My Pi agent for the live agent-awareness gate (src/agent/tests/
 # tst_liveagent.cpp).
 #
@@ -24,7 +24,7 @@
 # A tool name is a positional argument rather than an env var so the caller
 # cannot leave a stale OMP_TOOL set across firings: `tool_call` with tool `ask`
 # is waiting_input, `tool_call` without a tool is running (SPEC 6.5).
-set -eu
+set -euo pipefail
 
 event=${1:?usage: fake-omp-agent.sh <native-event> [tool]}
 tool=${2:-}

@@ -38,17 +38,23 @@ const sanitizerConfig: Config = {
     ALLOW_DATA_ATTR: false,
     ADD_ATTR: ["data-language"],
     ALLOWED_URI_REGEXP: allowedUri,
-    FORBID_ATTR: ["style", "target"],
     FORBID_TAGS: [
+        "audio",
         "base",
         "embed",
         "form",
         "iframe",
         "link",
+        "math",
         "meta",
         "object",
+        "picture",
         "script",
+        "source",
         "style",
+        "svg",
+        "track",
+        "video",
     ],
     KEEP_CONTENT: true,
 };
@@ -97,15 +103,17 @@ export function renderMarkdown(
     } catch {
         // Never return dirty HTML when a host sanitizer fails. Showing escaped
         // source is safer and more useful than replacing the whole pane with a
-        // blank error page.
-        return active.sanitize(`<pre>${escapeHtml(source)}</pre>`, sanitizerConfig);
+        // blank error page. It is already escaped, so this final fallback does
+        // not need to call the broken sanitizer a second time.
+        return `<pre>${escapeHtml(source)}</pre>`;
     }
 }
 
 function isRelativeResource(value: string): boolean {
     return value.length > 0
         && !/^(?:[a-z][a-z0-9+.-]*:|\/\/)/i.test(value)
-        && !value.startsWith("#");
+        && !value.startsWith("#")
+        && !value.startsWith("?");
 }
 
 function pathDirectory(documentPath: string): string {
@@ -138,10 +146,12 @@ export function resolveRemotePath(documentPath: string, relativePath: string): s
     }
     return `/${output.join("/")}`;
 }
-
 /** Convert a server POSIX path to CodeHarbor's remote file:// spelling. */
 export function remotePathToFileUrl(path: string): string {
-    return `file://${path.split("/").map((part) => encodeURIComponent(part)).join("/")}`;
+    const absolutePath = path.startsWith("/") ? path : `/${path}`;
+    return `file://${absolutePath.split("/")
+        .map((part) => encodeURIComponent(part))
+        .join("/")}`;
 }
 
 /**
@@ -171,10 +181,12 @@ export function rewriteRelativeUrls(
     for (const link of template.content.querySelectorAll("a[href]")) {
         const href = link.getAttribute("href") ?? "";
         if (isRelativeResource(href)) {
-            link.setAttribute("href", remotePathToFileUrl(resolveRemotePath(
-                documentPath,
-                href,
-            )));
+            const separator = href.search(/[?#]/);
+            const path = separator < 0 ? href : href.slice(0, separator);
+            const suffix = separator < 0 ? "" : href.slice(separator);
+            link.setAttribute("href", remotePathToFileUrl(
+                resolveRemotePath(documentPath, path),
+            ) + suffix);
         }
         // target was forbidden by the sanitizer. Keep all navigation in the
         // current pane so QML can apply the external-profile boundary.

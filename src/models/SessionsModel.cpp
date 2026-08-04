@@ -17,10 +17,12 @@ QVector<GroupRow> filteredGroups(const QVector<GroupRow> &source,
     QVector<GroupRow> filtered;
     filtered.reserve(source.size());
     for (const GroupRow &group : source) {
-        // Preserve a genuinely empty group; this is a workspace fact, not a
-        // filter result, and existing sidebar semantics keep that group row.
+        // An empty group has no pinned session, so pinned-only mode must not
+        // expose it. Without that check the filter claims to show only pinned
+        // sessions while still displaying unrelated empty group rows.
         if (group.sessions.isEmpty()) {
-            filtered.append(group);
+            if (!pinnedOnly)
+                filtered.append(group);
             continue;
         }
         GroupRow visible = group;
@@ -202,6 +204,8 @@ SessionRowState SessionsModel::aggregateSessionState(const QVector<TerminalStatu
 
 QModelIndex SessionsModel::index(int row, int column, const QModelIndex &parent) const
 {
+    if (parent.isValid() && parent.model() != this)
+        return {};
     if (!hasIndex(row, column, parent))
         return {};
     if (!parent.isValid())
@@ -212,15 +216,25 @@ QModelIndex SessionsModel::index(int row, int column, const QModelIndex &parent)
 
 QModelIndex SessionsModel::parent(const QModelIndex &child) const
 {
-    if (!child.isValid() || child.internalId() == kTopLevel)
+    if (!child.isValid() || child.model() != this || child.column() != 0
+        || child.internalId() == kTopLevel)
         return {};
-    return createIndex(static_cast<int>(child.internalId()), 0, kTopLevel);
+    if (child.internalId() > static_cast<quintptr>(std::numeric_limits<int>::max()))
+        return {};
+    const int groupRow = static_cast<int>(child.internalId());
+    if (groupRow < 0 || groupRow >= groups_.size())
+        return {};
+    if (child.row() < 0 || child.row() >= groups_.at(groupRow).sessions.size())
+        return {};
+    return createIndex(groupRow, 0, kTopLevel);
 }
 
 int SessionsModel::rowCount(const QModelIndex &parent) const
 {
     if (!parent.isValid())
         return static_cast<int>(groups_.size());
+    if (parent.model() != this || parent.column() != 0)
+        return 0;
     if (parent.internalId() != kTopLevel)
         return 0; // sessions have no children
     if (parent.row() < 0 || parent.row() >= groups_.size())
@@ -235,7 +249,7 @@ int SessionsModel::columnCount(const QModelIndex &) const
 
 QVariant SessionsModel::data(const QModelIndex &index, int role) const
 {
-    if (!index.isValid())
+    if (!index.isValid() || index.model() != this || index.column() != 0)
         return {};
 
     if (index.internalId() == kTopLevel) {
@@ -258,6 +272,8 @@ QVariant SessionsModel::data(const QModelIndex &index, int role) const
         }
     }
 
+    if (index.internalId() > static_cast<quintptr>(std::numeric_limits<int>::max()))
+        return {};
     const int groupRow = static_cast<int>(index.internalId());
     if (groupRow < 0 || groupRow >= groups_.size())
         return {};

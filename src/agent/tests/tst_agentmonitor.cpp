@@ -139,6 +139,10 @@ private slots:
     void genericHarnessDerivesItsStateFromTerminalOutput();
     void onlyTheGenericHarnessDerivesStateFromOutput();
     void genericActivityRegistrationIsSilentUntilTheChannelAttaches();
+    // Harness registration changes must not leave output-derived state behind.
+    void harnessChangesClearDerivedState();
+    // Re-entrant eviction must not emit pending transitions for removed panes.
+    void ageingSignalsSkipEvictedPanes();
 
 private:
     void makePair();
@@ -1586,6 +1590,63 @@ void TstAgentMonitor::genericActivityRegistrationIsSilentUntilTheChannelAttaches
     QCOMPARE(m_monitor->stateFor("dQ", "tQ"), asInt(AgentState::Unknown));
     m_monitor->noteTerminalOutput(QStringLiteral("dQ"), QStringLiteral("tQ"));
     QCOMPARE(m_monitor->stateFor("dQ", "tQ"), asInt(AgentState::Unknown));
+}
+
+void TstAgentMonitor::harnessChangesClearDerivedState()
+{
+    m_monitor->setFallbackIdleThresholdMs(80);
+    QSignalSpy stateSpy(m_monitor, &AgentStatusMonitor::agentStateChanged);
+
+    m_monitor->setTerminalHarness(QStringLiteral("dH"), QStringLiteral("tH"),
+                                  QStringLiteral("generic"));
+    m_monitor->noteTerminalAttached(QStringLiteral("dH"), QStringLiteral("tH"));
+    m_monitor->noteTerminalOutput(QStringLiteral("dH"), QStringLiteral("tH"));
+    QCOMPARE(m_monitor->stateFor("dH", "tH"), asInt(AgentState::Running));
+
+    // Once the pane is no longer generic, the output-derived Running state is
+    // no longer supported and must not remain visible until a wire event.
+    m_monitor->setTerminalHarness(QStringLiteral("dH"), QStringLiteral("tH"),
+                                   QStringLiteral("oh-my-pi"));
+    QCOMPARE(m_monitor->stateFor("dH", "tH"), asInt(AgentState::Unknown));
+    QCOMPARE(stateSpy.count(), 3); // Starting, Running, Unknown
+
+    // Switching back while the channel is still attached starts a fresh
+    // observation immediately; repeated registration remains idempotent.
+    m_monitor->setTerminalHarness(QStringLiteral("dH"), QStringLiteral("tH"),
+                                  QStringLiteral("generic"));
+    QCOMPARE(m_monitor->stateFor("dH", "tH"), asInt(AgentState::Starting));
+    QCOMPARE(stateSpy.count(), 4);
+    m_monitor->setTerminalHarness(QStringLiteral("dH"), QStringLiteral("tH"),
+                                  QStringLiteral("generic"));
+    QCOMPARE(stateSpy.count(), 4);
+}
+
+void TstAgentMonitor::ageingSignalsSkipEvictedPanes()
+{
+    m_monitor->setFallbackIdleThresholdMs(40);
+    QSignalSpy stateSpy(m_monitor, &AgentStatusMonitor::agentStateChanged);
+
+    for (const QString& dev : {QStringLiteral("dE1"), QStringLiteral("dE2")}) {
+        m_monitor->setTerminalHarness(dev, QStringLiteral("tE"),
+                                      QStringLiteral("generic"));
+        m_monitor->noteTerminalAttached(dev, QStringLiteral("tE"));
+        m_monitor->noteTerminalOutput(dev, QStringLiteral("tE"));
+    }
+    stateSpy.clear();
+
+    bool evicted = false;
+    connect(m_monitor, &AgentStatusMonitor::agentStateChanged, this,
+            [this, &evicted](const QString&, const QString&, int state) {
+                if (state == asInt(AgentState::Idle) && !evicted) {
+                    evicted = true;
+                    m_monitor->retainDevSessions({});
+                }
+            });
+
+    QTRY_VERIFY_WITH_TIMEOUT(evicted, 1000);
+    QCOMPARE(stateSpy.count(), 1);
+    QCOMPARE(m_monitor->stateFor("dE1", "tE"), asInt(AgentState::Unknown));
+    QCOMPARE(m_monitor->stateFor("dE2", "tE"), asInt(AgentState::Unknown));
 }
 
 QTEST_MAIN(TstAgentMonitor)

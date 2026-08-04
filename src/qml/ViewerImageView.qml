@@ -81,6 +81,13 @@ Item {
                 root.errorText = message;
         }
     }
+    function pinnedDocument(candidate) {
+        let text = String(candidate)
+        const fragment = text.indexOf("#")
+        if (fragment >= 0)
+            text = text.substring(0, fragment)
+        return text
+    }
 
     WebEngineView {
         anchors.fill: parent
@@ -96,6 +103,18 @@ Item {
         settings.javascriptEnabled: false
         settings.localContentCanAccessFileUrls: false
         settings.localContentCanAccessRemoteUrls: false
+        settings.javascriptCanOpenWindows: false
+        onNavigationRequested: function(request) {
+            if (root.pinnedDocument(request.url)
+                    === root.pinnedDocument(root.internalUrl))
+                return
+            request.action = WebEngineNavigationRequest.IgnoreRequest
+            console.warn("ViewerImageView: refused navigation to", request.url)
+        }
+        onNewWindowRequested: function(request) {
+            console.warn("ViewerImageView: refused a new window for",
+                         request.requestedUrl)
+        }
         url: root.internalUrl
     }
 

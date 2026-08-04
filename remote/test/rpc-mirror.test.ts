@@ -15,6 +15,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
@@ -23,6 +24,7 @@ import {
     RPC_METHODS,
     RPC_REVISION_MISMATCH,
     RPC_RESOURCE_LIMIT,
+    RPC_SERVER_INFO_METHOD,
     RPC_TMUX_METHODS,
     RPC_WORKSPACE_METHODS,
     RPC_PING_METHOD,
@@ -32,6 +34,9 @@ import {
 import {
     RPC_SCHEMA_VERSION,
     MAX_LINE_BYTES,
+    MAX_PENDING_WATCH_EVENTS,
+    createLineFramer,
+    createWatchNotificationRelay,
     dispatch,
 } from "../src/codeharbord.ts";
 import { WORKSPACE_METHODS } from "../src/workspace.ts";
@@ -103,9 +108,12 @@ test("singleton wire names match between rpc-types.ts and RpcTypes.h", () => {
         CPP_CONSTANTS.get("kWatchEventsLostNotification"),
         RPC_WATCH_EVENTS_LOST_NOTIFICATION,
     );
-    // server.info has no TypeScript table (it is a built-in in codeharbord.ts's
-    // static method map), so its name is pinned directly.
-    assert.equal(CPP_CONSTANTS.get("kMethodServerInfo"), "server.info");
+    // server.info is a built-in in codeharbord.ts's static method map rather
+    // than a spread-in table, but it still has a shared TypeScript constant.
+    assert.equal(
+        CPP_CONSTANTS.get("kMethodServerInfo"),
+        RPC_SERVER_INFO_METHOD,
+    );
     // Same for the transport keepalive: `ping` is a built-in in that same map,
     // is not an application method, and belongs to no group — see the comment
     // on kMethodPing in RpcTypes.h for why it keeps its bare, ungrouped name.
@@ -121,7 +129,7 @@ test("RpcTypes.h declares no wire name outside a known group", () => {
         ...Object.values(RPC_WORKSPACE_METHODS),
         RPC_WATCH_EVENT_NOTIFICATION,
         RPC_WATCH_EVENTS_LOST_NOTIFICATION,
-        "server.info",
+        RPC_SERVER_INFO_METHOD,
         RPC_PING_METHOD,
     ]);
     const unexpected = [...CPP_CONSTANTS.entries()]
@@ -289,5 +297,60 @@ test("the remote line cap matches the C++ kMaxLineBytes", () => {
         cppValue,
         `codeharbord caps a line at ${MAX_LINE_BYTES} but the C++ client caps ` +
             `at ${cppValue}: keep both at 16 MiB`,
+    );
+});
+
+test("the line framer rejects an oversized frame whose newline is in the same chunk", () => {
+    const lines: string[] = [];
+    let overflows = 0;
+    const feed = createLineFramer(
+        (line) => lines.push(line),
+        () => {
+            overflows += 1;
+        },
+    );
+    feed(Buffer.concat([Buffer.alloc(MAX_LINE_BYTES + 1, 0x61), Buffer.from("\nok\n")]));
+    assert.equal(overflows, 1);
+    assert.deepEqual(lines, ["ok"]);
+});
+
+test("watch relay coalescing cannot exceed its byte bound", () => {
+    let blocked = true;
+    const lines: string[] = [];
+    const out = Object.assign(new EventEmitter(), {
+        write(line: string): boolean {
+            lines.push(line);
+            return !blocked;
+        },
+    }) as unknown as NodeJS.WritableStream & EventEmitter;
+    const live = new Set<string>(["sub"]);
+    const relay = createWatchNotificationRelay(out, (id) => live.has(id));
+    relay.stall();
+    relay.deliver({ subscriptionId: "sub", path: "/same", event: "modified" });
+    for (let i = 0; i < MAX_PENDING_WATCH_EVENTS; i += 1) {
+        const id = `sub-${i}`;
+        live.add(id);
+        relay.deliver({
+            subscriptionId: id,
+            path: "/" + "x".repeat(4000) + `-${i}`,
+            event: "modified",
+        });
+    }
+    // A larger replacement for an existing key must be reported as loss, not
+    // allowed to push the serialized queue past its byte cap.
+    relay.deliver({
+        subscriptionId: "sub",
+        path: "/same",
+        event: "modified",
+        revision: "r".repeat(10_000),
+    });
+    assert.ok(relay.pendingCount() <= MAX_PENDING_WATCH_EVENTS);
+    blocked = false;
+    out.emit("drain");
+    assert.ok(
+        lines.some(
+            (line) => JSON.parse(line).method === "file.watchEventsLost",
+        ),
+        "the client must be told that the oversized replacement was dropped",
     );
 });

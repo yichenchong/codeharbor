@@ -707,10 +707,17 @@ Rectangle {
         const r = region.node && region.node.ratios ? region.node.ratios : null;
         if (r && r.length === count) {
             let sum = 0;
-            for (let k = 0; k < count; ++k)
-                sum += r[k] > 0 ? r[k] : 0;
-            if (sum > 0 && r[i] > 0)
-                return r[i] / sum;
+            let valid = true;
+            for (let k = 0; k < count; ++k) {
+                const value = Number(r[k]);
+                if (!isFinite(value) || value <= 0) {
+                    valid = false;
+                    break;
+                }
+                sum += value;
+            }
+            if (valid && sum > 0)
+                return Number(r[i]) / sum;
         }
         return 1 / count;
     }
@@ -766,6 +773,13 @@ Rectangle {
             onWidthChanged: applyRatios()
             onHeightChanged: applyRatios()
             Component.onCompleted: applyRatios()
+            function updateNodePaths() {
+                for (let i = 0; i < childRepeater.count; ++i) {
+                    const child = childRepeater.itemAt(i);
+                    if (child && child.item)
+                        child.item.nodePath = region.nodePath.concat([String(i)]);
+                }
+            }
 
             // The write side of `ratios` (SPEC 4.5). SplitView.resizing is true
             // only while a handle is under the pointer, so this fires exactly
@@ -823,6 +837,10 @@ Rectangle {
                 function onNodeChanged() {
                     split.ratiosApplied = false;
                     split.applyRatios();
+                    split.updateNodePaths();
+                }
+                function onNodePathChanged() {
+                    split.updateNodePaths();
                 }
             }
 
@@ -848,6 +866,13 @@ Rectangle {
                     readonly property var childNode:
                         region.node && region.node.children
                         ? region.node.children[childLoader.index] : null
+                    // A divider may be dragged all the way to an edge unless
+                    // each child declares a minimum on the active axis. Keep a
+                    // live pane reachable and clickable even when the user
+                    // drags aggressively; SplitView clamps the other axis
+                    // harmlessly.
+                    SplitView.minimumWidth: 120
+                    SplitView.minimumHeight: 80
                     SplitView.fillWidth: true
                     SplitView.fillHeight: true
                     // `node` must be set at creation: a declarative `source`
@@ -867,7 +892,13 @@ Rectangle {
                                                            () => region.paneOwner.layoutGeneration),
                                                        hostStampsWrites: Qt.binding(
                                                            () => region.paneOwner.hostStampsWrites) })
-                    onChildNodeChanged: if (item) item.node = childLoader.childNode
+                    onChildNodeChanged: {
+                        if (!item)
+                            return;
+                        item.node = childLoader.childNode;
+                        item.nodePath = region.nodePath.concat(
+                            [String(childLoader.index)]);
+                    }
                 }
             }
         }

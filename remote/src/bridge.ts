@@ -7,7 +7,6 @@
 // unavailable (SPEC 6.4): a broken line is dropped, never thrown.
 
 import net from "node:net";
-import readline from "node:readline";
 import fs from "node:fs";
 import path from "node:path";
 // pathToFileURL, not string concatenation: a script path containing a space (or
@@ -88,33 +87,41 @@ export function processBridgeLine(line: string): AgentEvent | null {
         return null;
     }
 
-    const adapter = adapterFor(message.harness);
-    if (!adapter) return null;
+    try {
+        const adapter = adapterFor(message.harness);
+        if (!adapter) return null;
 
-    const native = message.native as Record<string, unknown>;
+        const native = message.native as Record<string, unknown>;
 
-    const state = adapter.map(native);
-    if (state === null) return null;
+        const state = adapter.map(native);
+        if (state === null) return null;
 
-    // Metadata is derived from the native event by the adapter (harness-agnostic),
-    // then merged with any explicit metadata a bridge producer put on the wire.
-    // Explicit wire fields win over derived ones.
-    const derived = adapter.metadata?.(native);
-    const explicit = isPlainObject(message.metadata) ? message.metadata : undefined;
-    const metadata = (derived || explicit)
-        ? { ...(derived ?? {}), ...(explicit ?? {}) }
-        : undefined;
+        // Metadata is derived from the native event by the adapter
+        // (harness-agnostic), then merged with any explicit metadata a bridge
+        // producer put on the wire. Explicit wire fields win over derived
+        // ones.
+        const derived = adapter.metadata?.(native);
+        const explicit = isPlainObject(message.metadata) ? message.metadata : undefined;
+        const metadata = (derived || explicit)
+            ? { ...(derived ?? {}), ...(explicit ?? {}) }
+            : undefined;
 
-    const nativeName = native.type ?? native.hook;
-    return makeEvent({
-        harness: message.harness,
-        devSessionId: message.devSessionId,
-        terminalId: message.terminalId,
-        state,
-        event: typeof nativeName === "string" ? nativeName : "unknown",
-        summary: typeof message.summary === "string" ? message.summary : undefined,
-        metadata,
-    });
+        const nativeName = native.type ?? native.hook;
+        return makeEvent({
+            harness: message.harness,
+            devSessionId: message.devSessionId,
+            terminalId: message.terminalId,
+            state,
+            event: typeof nativeName === "string" ? nativeName : "unknown",
+            summary: typeof message.summary === "string" ? message.summary : undefined,
+            metadata,
+        });
+    } catch {
+        // Adapters are extensions at this boundary. A malformed native payload
+        // must be isolated to its producer, not allowed to terminate the relay.
+        return null;
+    }
+
 }
 
 /**
@@ -123,6 +130,125 @@ export function processBridgeLine(line: string): AgentEvent | null {
  * arrived on and resumes it once the output drains (RR24).
  */
 export type EventSink = (event: AgentEvent, source: net.Socket) => void;
+interface BridgeLineFramer {
+    feed(chunk: Buffer): void;
+    // Resume parsing bytes retained from a chunk that arrived just before the
+    // source socket was paused for output back-pressure.
+    resume(): void;
+    close(): void;
+}
+
+// A paused socket can still finish delivering the chunk that triggered the
+// pause. Keep that remainder bounded too; otherwise one unusually large
+// readable chunk would bypass the socket-level back-pressure guard.
+export const MAX_BRIDGE_PENDING_BYTES = MAX_BRIDGE_LINE_BYTES + 64 * 1024;
+
+/**
+ * Frame bridge input without readline's unbounded unterminated-line buffer.
+ * The consumer returns false when it paused the source socket; the framer then
+ * retains only the unprocessed suffix and resumes it after the sink drains.
+ */
+export function createBridgeLineFramer(
+    onLine: (line: string) => boolean,
+    onOverflow: () => void,
+): BridgeLineFramer {
+    let held: Buffer[] = [];
+    let heldBytes = 0;
+    let pending: Buffer[] = [];
+    let pendingBytes = 0;
+    let blocked = false;
+    let closed = false;
+
+    const drop = (): void => {
+        if (closed) return;
+        closed = true;
+        held = [];
+        heldBytes = 0;
+        pending = [];
+        pendingBytes = 0;
+        onOverflow();
+    };
+
+    const retain = (chunk: Buffer): boolean => {
+        if (chunk.length === 0) return true;
+        if (pendingBytes + chunk.length > MAX_BRIDGE_PENDING_BYTES) {
+            drop();
+            return false;
+        }
+        pending.push(chunk);
+        pendingBytes += chunk.length;
+        return true;
+    };
+
+    const processChunk = (chunk: Buffer): void => {
+        let start = 0;
+        let nl = chunk.indexOf(0x0a);
+        while (nl !== -1 && !closed) {
+            const segment = chunk.subarray(start, nl);
+            const lineBytes = heldBytes + segment.length;
+            if (lineBytes > MAX_BRIDGE_LINE_BYTES) {
+                drop();
+                return;
+            }
+            let line: string;
+            if (heldBytes === 0) {
+                line = segment.toString("utf8");
+            } else {
+                held.push(segment);
+                line = Buffer.concat(held, lineBytes).toString("utf8");
+            }
+            held = [];
+            heldBytes = 0;
+            start = nl + 1;
+            nl = chunk.indexOf(0x0a, start);
+            if (!onLine(line)) {
+                blocked = true;
+                retain(chunk.subarray(start));
+                return;
+            }
+        }
+        if (closed || blocked) return;
+        if (start < chunk.length) {
+            const rest = chunk.subarray(start);
+            held.push(rest);
+            heldBytes += rest.length;
+            if (heldBytes > MAX_BRIDGE_LINE_BYTES) drop();
+        }
+    };
+
+    const drain = (): void => {
+        if (closed || blocked) return;
+        while (pending.length > 0 && !closed && !blocked) {
+            const chunk = pending.shift() as Buffer;
+            pendingBytes -= chunk.length;
+            processChunk(chunk);
+        }
+    };
+
+    return {
+        feed(chunk) {
+            if (closed) return;
+            if (blocked) {
+                retain(chunk);
+                return;
+            }
+            processChunk(chunk);
+        },
+        resume() {
+            if (!blocked || closed) return;
+            blocked = false;
+            drain();
+        },
+        close() {
+            closed = true;
+            held = [];
+            heldBytes = 0;
+            pending = [];
+            pendingBytes = 0;
+        },
+    };
+}
+
 
 /**
  * Default sink: relay events as JSONL on `out` (stdout in production),
@@ -143,12 +269,34 @@ export function makeStreamSink(out: NodeJS.WritableStream): EventSink {
     // is still collectable.
     const hooked = new WeakSet<net.Socket>();
     out.on("drain", () => {
-        for (const socket of paused) socket.resume();
+        const toResume = [...paused];
+        // Clear before resuming. A resumed source may synchronously deliver
+        // buffered input, and that write can fill the output again.
+        paused.clear();
+        for (const socket of toResume) {
+            if (!socket.destroyed) socket.resume();
+        }
+    });
+    out.on("error", () => {
+        // There can be no useful drain after an output failure. Destroying
+        // paused producers releases the set and prevents the bridge from
+        // retaining every socket forever.
+        for (const socket of paused) socket.destroy();
         paused.clear();
     });
     return (event, source) => {
-        const ok = out.write(`${JSON.stringify(event)}\n`);
-        if (!ok && !paused.has(source)) {
+        // The line framer normally stops before invoking us again for a paused
+        // source. Keep this guard for custom callers so a full output stream
+        // can never be fed another event synchronously.
+        if (paused.has(source)) return;
+        let ok: boolean;
+        try {
+            ok = out.write(`${JSON.stringify(event)}\n`);
+        } catch {
+            source.destroy();
+            return;
+        }
+        if (!ok) {
             source.pause();
             paused.add(source);
             // Forget a producer that disconnects while the output is still
@@ -178,47 +326,46 @@ export function makeStreamSink(out: NodeJS.WritableStream): EventSink {
  */
 export async function startBridge(
     socketPath: string = resolveSocketPath(),
-    sink: EventSink = makeStreamSink(process.stdout),
+    sink?: EventSink,
 ): Promise<net.Server> {
+    // Delay the default sink until the bridge has actually bound and accepted
+    // a producer. A failed live-socket probe must not leak a stdout drain
+    // listener on every retry.
+    let activeSink = sink;
     const server = net.createServer((socket) => {
-        const lines = readline.createInterface({ input: socket });
-        lines.on("line", (line) => {
-            const event = processBridgeLine(line);
-            if (event) sink(event, socket);
-        });
-        // readline buffers an unterminated line without any upper bound, so a
-        // producer that streams bytes and never sends a newline grows the
-        // bridge's memory until the process dies — taking every other harness's
-        // status reporting with it. Count the bytes since the last newline and
-        // drop such a producer, the same rule codeharbord's framer applies to
-        // its own transport (MAX_LINE_BYTES there).
-        let sinceNewline = 0;
-        socket.on("data", (chunk: Buffer) => {
-            const nl = chunk.lastIndexOf(0x0a);
-            sinceNewline = nl === -1 ? sinceNewline + chunk.length : chunk.length - nl - 1;
-            if (sinceNewline > MAX_BRIDGE_LINE_BYTES) {
+        const lines = createBridgeLineFramer(
+            (line) => {
+                const event = processBridgeLine(line);
+                if (event) {
+                    try {
+                        if (!activeSink) activeSink = makeStreamSink(process.stdout);
+                        activeSink(event, socket);
+                    } catch {
+                        // A sink is an extension boundary. A failed output
+                        // must disconnect only this producer, not crash the
+                        // bridge serving every other harness.
+                        socket.destroy();
+                        return false;
+                    }
+                }
+                return !socket.isPaused();
+            },
+            () => {
                 process.stderr.write(
-                    `codeharbor-bridge: dropping a producer that sent more than ${MAX_BRIDGE_LINE_BYTES} bytes without a newline\n`,
+                    `codeharbor-bridge: dropping a producer that exceeded the ${MAX_BRIDGE_LINE_BYTES}-byte frame bound\n`,
                 );
-                lines.close();
                 socket.destroy();
-            }
-        });
-        // Release readline's listeners with the connection rather than leaving
-        // one interface per socket attached for the lifetime of the process.
-        socket.on("close", () => lines.close());
+            },
+        );
+        socket.on("data", lines.feed);
+        socket.on("resume", lines.resume);
+        socket.on("close", lines.close);
         socket.on("error", () => socket.destroy());
     });
     // Ensure the socket's parent directory exists (the ~/.cache fallback may
-    // not, SPEC 6.3) and is private (0700) so an unrelated user cannot connect
-    // to the socket even before the post-listen chmod tightens it.
+    // not, SPEC 6.3). The mode applies when mkdir creates a directory; do not
+    // chmod an existing caller-owned directory such as /tmp.
     fs.mkdirSync(path.dirname(socketPath), { recursive: true, mode: 0o700 });
-    try {
-        fs.chmodSync(path.dirname(socketPath), 0o700);
-    } catch {
-        // Directory already existed with other perms we cannot change; the
-        // 0600 socket chmod below is still the primary guard.
-    }
     // Only touch an existing entry if it is actually a socket, so a mistyped
     // path pointing at a regular file is never clobbered (listen() then fails).
     let existing = false;
@@ -233,14 +380,16 @@ export async function startBridge(
         // run's leftover) means the socket is stale -> unlink and take over.
         const alive = await new Promise<boolean>((resolve) => {
             const probe = net.createConnection(socketPath);
-            probe.on("connect", () => {
+            let settled = false;
+            const finish = (isAlive: boolean): void => {
+                if (settled) return;
+                settled = true;
                 probe.destroy();
-                resolve(true);
-            });
-            probe.on("error", () => {
-                probe.destroy();
-                resolve(false);
-            });
+                resolve(isAlive);
+            };
+            probe.setTimeout(1000, () => finish(false));
+            probe.on("connect", () => finish(true));
+            probe.on("error", () => finish(false));
         });
         if (alive) {
             throw new Error(
@@ -253,22 +402,20 @@ export async function startBridge(
         const onError = (err: Error): void => reject(err);
         server.once("error", onError);
         server.listen(socketPath, () => {
-            server.removeListener("error", onError);
             // Restrict the socket to the owning user (0600); the default
             // net.Server socket honours only umask, which may leave it
-            // group/world-accessible.
+            // group/world-accessible. Refuse to run if this security boundary
+            // cannot be established on the host.
             try {
                 fs.chmodSync(socketPath, 0o600);
-            } catch {
-                // Best-effort: some platforms ignore socket permissions.
+            } catch (err) {
+                server.removeListener("error", onError);
+                server.close(() => reject(err));
+                return;
             }
+            server.removeListener("error", onError);
             resolve();
         });
-    });
-    // Report post-listen server errors without crashing: a server that errors
-    // after it is bound should not take the process down.
-    server.on("error", (err) => {
-        process.stderr.write(`codeharbor-bridge: ${err.message}\n`);
     });
     return server;
 }
@@ -278,11 +425,12 @@ if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {
     try {
         const server = await startBridge(socketPath);
         process.stderr.write(`codeharbor-bridge listening on ${socketPath}\n`);
-        // Without a handler, SIGINT/SIGTERM terminate the process outright and
-        // leave the socket file behind, so the next run has to treat a socket
-        // that may still look live as stale. Close the listener and remove the
-        // socket ourselves, then exit immediately: waiting for open connections
-        // to drain would let one stuck producer block shutdown forever.
+        // Without handlers, SIGHUP/SIGINT/SIGTERM terminate the process
+        // outright and leave the socket file behind, so the next run has to
+        // treat a socket that may still look live as stale. Close the listener
+        // and remove the socket ourselves, then exit immediately: waiting for
+        // open connections to drain would let one stuck producer block
+        // shutdown forever.
         const shutdown = (): void => {
             server.close();
             try {
@@ -292,11 +440,12 @@ if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {
             }
             process.exit(0);
         };
+        process.on("SIGHUP", shutdown);
         process.on("SIGINT", shutdown);
         process.on("SIGTERM", shutdown);
     } catch (err) {
         // A live bridge already owns the socket (RR12), or listen failed.
-        process.stderr.write(`${(err as Error).message}\n`);
+        process.stderr.write(`${err instanceof Error ? err.message : String(err)}\n`);
         process.exit(1);
     }
 }

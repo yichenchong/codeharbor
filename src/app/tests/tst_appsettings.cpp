@@ -1,6 +1,9 @@
 #include <QSignalSpy>
+#include <QSettings>
 #include <QTemporaryDir>
 #include <QtTest/QtTest>
+
+#include <limits>
 
 #include "AppSettings.h"
 
@@ -69,6 +72,18 @@ void TstAppSettings::aHandEditedFileFallsBackInsteadOfPropagating()
                      QStringLiteral("crisp"));
     }
     AppSettings s(path);
+
+    const QString nanPath = scratchIni(m_dir, QStringLiteral("nanratio"));
+    {
+        QSettings raw(nanPath, QSettings::IniFormat);
+        raw.setValue(QStringLiteral("settings/appearance/terminalPixelRatio"),
+                     std::numeric_limits<qreal>::quiet_NaN());
+        raw.sync();
+    }
+    AppSettings nan(nanPath);
+    QCOMPARE(nan.terminalPixelRatio(), 0.0);
+    nan.setTerminalPixelRatio(std::numeric_limits<qreal>::quiet_NaN());
+    QCOMPARE(nan.terminalPixelRatio(), 0.0);
     QCOMPARE(s.terminalFontSize(), AppSettings::kDefaultTerminalFontSize);
     QCOMPARE(s.groupPaletteSize(), AppSettings::kDefaultPaletteSize);
     QCOMPARE(s.terminalPixelRatio(), 0.0);
@@ -300,6 +315,7 @@ void TstAppSettings::resetRestoresDefaultsAndAnnouncesWhatMoved()
     QSignalSpy fontSpy(&s, &AppSettings::terminalFontSizeChanged);
     QSignalSpy paletteSpy(&s, &AppSettings::groupPaletteChanged);
     QSignalSpy viewerSpy(&s, &AppSettings::viewerDefaultsChanged);
+    QSignalSpy settingSpy(&s, &AppSettings::settingChanged);
     s.resetToDefaults();
 
     QCOMPARE(s.theme(), QStringLiteral("dark"));
@@ -311,6 +327,7 @@ void TstAppSettings::resetRestoresDefaultsAndAnnouncesWhatMoved()
     QCOMPARE(themeSpy.count(), 1);
     QCOMPARE(fontSpy.count(), 1);
     QCOMPARE(viewerSpy.count(), 1);
+    QCOMPARE(settingSpy.count(), 1);
     // The palette was never changed, so nothing moved and nothing is announced.
     QCOMPARE(paletteSpy.count(), 0);
     // UiStateStore shares this file. Its keys live outside `settings/` and a
@@ -320,7 +337,9 @@ void TstAppSettings::resetRestoresDefaultsAndAnnouncesWhatMoved()
         raw.setValue(QStringLiteral("layout/sidebarWidth"), 321);
     }
     AppSettings again(path);
+    QSignalSpy noGeneric(&again, &AppSettings::settingChanged);
     again.resetToDefaults();
+    QCOMPARE(noGeneric.count(), 0);
     QSettings raw(path, QSettings::IniFormat);
     QCOMPARE(raw.value(QStringLiteral("layout/sidebarWidth")).toInt(), 321);
 }

@@ -10,6 +10,7 @@
 #include <QStringList>
 #include <QUuid>
 #include <QVariant>
+#include <cmath>
 
 #include <algorithm>
 #include <limits>
@@ -58,10 +59,25 @@ QString entryKey(const QString& id, const QString& field)
 std::optional<int> parsePort(const QVariant& raw)
 {
     QVariant value = raw;
-    if (value.typeId() == QMetaType::QString)
-        value = value.toString().trimmed(); // a UI field may carry stray spaces
-    if (!value.isValid() || value.toString().isEmpty())
+    if (!value.isValid())
         return kDefaultPort;
+    if (value.typeId() == QMetaType::QString) {
+        value = value.toString().trimmed(); // a UI field may carry stray spaces
+        if (value.toString().isEmpty())
+            return kDefaultPort;
+    }
+    if (value.typeId() == QMetaType::Bool)
+        return std::nullopt;
+    if (value.typeId() == QMetaType::Double
+        || value.typeId() == QMetaType::Float) {
+        bool ok = false;
+        const double number = value.toDouble(&ok);
+        if (!ok || !std::isfinite(number) || std::trunc(number) != number)
+            return std::nullopt;
+        if (number < kMinPort || number > kMaxPort)
+            return std::nullopt;
+        return static_cast<int>(number);
+    }
 
     bool ok = false;
     const int port = value.toInt(&ok);
@@ -210,14 +226,14 @@ QVariantList ServerProfiles::readStoredProfiles(QString* activeOut) const
         const QString user = m_settings->value(prefix + kUser).toString().trimmed();
         if (host.isEmpty() || user.isEmpty())
             continue;
-        const int storedPort = m_settings->value(prefix + kPort).toInt();
-        const bool portUsable = storedPort >= kMinPort && storedPort <= kMaxPort;
+        const std::optional<int> parsedPort =
+            parsePort(m_settings->value(prefix + kPort));
 
         QVariantMap fields;
         fields.insert(kId, id);
         fields.insert(kName, m_settings->value(prefix + kName).toString());
         fields.insert(kHost, host);
-        fields.insert(kPort, portUsable ? storedPort : kDefaultPort);
+        fields.insert(kPort, parsedPort.value_or(kDefaultPort));
         fields.insert(kUser, user);
         fields.insert(kIdentityFile,
                       m_settings->value(prefix + kIdentityFile).toString());

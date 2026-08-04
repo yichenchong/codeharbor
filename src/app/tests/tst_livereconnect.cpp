@@ -104,14 +104,14 @@ QString sq(const QString& value)
 QString runExec(SshConnectionPool& pool, const QString& command, bool* ok)
 {
     SshChannelDevice device(&pool);
+    bool finished = false;
+    QObject::connect(&device, &SshChannelDevice::readChannelFinished, &device,
+                     [&finished] { finished = true; });
     if (!device.startExec(command)) {
         if (ok)
             *ok = false;
         return {};
     }
-    bool finished = false;
-    QObject::connect(&device, &SshChannelDevice::readChannelFinished, &device,
-                     [&finished] { finished = true; });
     QByteArray out;
     QDeadlineTimer deadline(kExecTimeoutMs);
     while (!finished && !deadline.hasExpired()) {

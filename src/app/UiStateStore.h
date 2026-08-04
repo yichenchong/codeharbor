@@ -95,10 +95,10 @@ public:
     // this counter - or one whose settings file was cleared - still cannot
     // label a new pane with a number a pane already on screen is wearing.
     //
-    // An empty devSessionId is not a Dev Session and is handled exactly as
-    // setSelectedPane()/setActiveSession() handle theirs: reads answer the
-    // default and writes are dropped, so nothing is ever parked under a bare
-    // "paneSuffix//<region>" key.
+    // An empty devSessionId or region, or a region containing '/', is not a
+    // valid address. Reads answer the default and writes are dropped, so
+    // nothing is ever parked under a bare "paneSuffix//<region>" key or a
+    // nested region path.
     Q_INVOKABLE void setNextPaneSuffix(QString devSessionId, QString region,
                                        int suffix);
     Q_INVOKABLE int nextPaneSuffix(QString devSessionId, QString region) const;

@@ -219,6 +219,7 @@ ItemDelegate {
             Label {
                 width: parent.width
                 text: row.name
+                textFormat: Text.PlainText
                 color: Theme.text
                 font.pixelSize: Theme.fontSizeLabel
                 elide: Text.ElideRight
@@ -226,6 +227,7 @@ ItemDelegate {
             Label {
                 width: parent.width
                 text: row.subtitle
+                textFormat: Text.PlainText
                 color: Theme.textDim
                 font.pixelSize: 11
                 elide: Text.ElideRight

@@ -363,7 +363,46 @@ QString LogBuffer::truncateUtf8(const QString& value, qsizetype byteLimit)
     const QByteArray encoded = value.toUtf8();
     if (encoded.size() <= byteLimit)
         return value;
-    return QString::fromUtf8(encoded.constData(), static_cast<int>(byteLimit));
+
+    // Do not hand QString::fromUtf8() a prefix ending halfway through a
+    // multi-byte sequence: Qt replaces that incomplete sequence with U+FFFD,
+    // whose three bytes can put the result back over the hard byte cap. Trim
+    // the incomplete lead byte and its continuation bytes instead.
+    qsizetype end = byteLimit;
+    const auto isContinuation = [](unsigned char byte) {
+        return (byte & 0xc0u) == 0x80u;
+    };
+    const auto sequenceLength = [](unsigned char lead) -> qsizetype {
+        if (lead < 0x80u)
+            return 1;
+        if ((lead & 0xe0u) == 0xc0u)
+            return 2;
+        if ((lead & 0xf0u) == 0xe0u)
+            return 3;
+        if ((lead & 0xf8u) == 0xf0u)
+            return 4;
+        return 0;
+    };
+
+    qsizetype start = end;
+    while (start > 0
+           && isContinuation(static_cast<unsigned char>(encoded.at(start - 1)))) {
+        --start;
+    }
+    if (start < end) {
+        const unsigned char lead =
+            static_cast<unsigned char>(encoded.at(start - 1));
+        const qsizetype expected = sequenceLength(lead);
+        if (expected == 0 || expected > end - (start - 1))
+            end = start - 1;
+    } else if (end > 0) {
+        const unsigned char lead =
+            static_cast<unsigned char>(encoded.at(end - 1));
+        const qsizetype expected = sequenceLength(lead);
+        if (expected > 1)
+            end = end - 1;
+    }
+    return QString::fromUtf8(encoded.constData(), static_cast<int>(end));
 }
 
 int LogBuffer::entryBytes(const Entry& entry)

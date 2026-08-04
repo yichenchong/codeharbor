@@ -33,6 +33,7 @@
 #include <QAbstractItemModel>
 #include <QByteArray>
 #include <QColor>
+#include <QCoreApplication>
 #include <QDir>
 #include <QFile>
 #include <QHash>
@@ -45,6 +46,9 @@
 #include <QQuickItem>
 #include <QQuickView>
 #include <QRegularExpression>
+#include <QSet>
+#include <QSignalSpy>
+#include <QStandardPaths>
 #include <QString>
 #include <QStringList>
 #include <QUrl>
@@ -745,6 +749,8 @@ private slots:
     // Cold start: the sheet has to say what this dialog is for, not just show
     // an empty list.
     void sheetColdStartExplainsItself();
+    void sheetRejectsPartiallyNumericPorts();
+    void sheetModelRefreshKeepsUnsavedEdits();
 
     // A pane with nothing behind it explains itself instead of showing an id.
     void inertTerminalPaneExplainsItself();
@@ -1317,6 +1323,70 @@ void TstUxShell::sheetColdStartExplainsItself()
 
     QVERIFY2(surface.warnings.isEmpty(), qPrintable(surface.warningReport()));
 }
+
+void TstUxShell::sheetRejectsPartiallyNumericPorts()
+{
+    Surface surface(moduleUrl(QStringLiteral("ConnectSheet.qml")), QSize(900, 560));
+    QVERIFY(surface.expose());
+    QQuickItem *root = surface.root();
+    QVERIFY(root);
+
+    QObject *host = surface.child(QStringLiteral("hostField"));
+    QObject *user = surface.child(QStringLiteral("userField"));
+    QObject *port = surface.child(QStringLiteral("portField"));
+    QVERIFY(host && user && port);
+    host->setProperty("text", QStringLiteral("example.test"));
+    user->setProperty("text", QStringLiteral("alice"));
+    port->setProperty("text", QStringLiteral("22abc"));
+
+    QVariant valid;
+    QVERIFY(QMetaObject::invokeMethod(root, "formValid", Q_RETURN_ARG(QVariant, valid)));
+    QVERIFY2(!valid.toBool(), "a port with a numeric prefix was accepted as valid");
+    QVERIFY(QMetaObject::invokeMethod(root, "portValue", Q_RETURN_ARG(QVariant, valid)));
+    QCOMPARE(valid.toInt(), 0);
+
+    port->setProperty("text", QStringLiteral("2200"));
+    QVERIFY(QMetaObject::invokeMethod(root, "formValid", Q_RETURN_ARG(QVariant, valid)));
+    QVERIFY(valid.toBool());
+    QVERIFY(QMetaObject::invokeMethod(root, "portValue", Q_RETURN_ARG(QVariant, valid)));
+    QCOMPARE(valid.toInt(), 2200);
+    QVERIFY2(surface.warnings.isEmpty(), qPrintable(surface.warningReport()));
+}
+
+void TstUxShell::sheetModelRefreshKeepsUnsavedEdits()
+{
+    Surface surface(moduleUrl(QStringLiteral("ConnectSheet.qml")), QSize(900, 560));
+    QVERIFY(surface.expose());
+    QQuickItem *root = surface.root();
+    QVERIFY(root);
+    root->setProperty("profiles", twoProfiles());
+    root->setProperty("activeId", QStringLiteral("id-a"));
+    settle(40);
+
+    QObject *host = surface.child(QStringLiteral("hostField"));
+    QVERIFY(host);
+    host->setProperty("text", QStringLiteral("draft.example"));
+    QCOMPARE(host->property("text").toString(), QStringLiteral("draft.example"));
+
+    QVariantList refreshed = twoProfiles();
+    refreshed.append(QVariantMap{{QStringLiteral("id"), QStringLiteral("id-c")},
+                                 {QStringLiteral("name"), QStringLiteral("New box")},
+                                 {QStringLiteral("host"), QStringLiteral("192.0.2.4")},
+                                 {QStringLiteral("port"), 22},
+                                 {QStringLiteral("user"), QStringLiteral("alice")}});
+    root->setProperty("profiles", refreshed);
+    settle(40);
+    QCOMPARE(host->property("text").toString(), QStringLiteral("draft.example"));
+
+    // activeId is a host-side background update, not a profile-row click.
+    // A real click calls selectIndex() and intentionally loads that profile;
+    // this refresh must not destroy the draft while the host catches up.
+    root->setProperty("activeId", QStringLiteral("id-b"));
+    settle(40);
+    QCOMPARE(host->property("text").toString(), QStringLiteral("draft.example"));
+    QVERIFY2(surface.warnings.isEmpty(), qPrintable(surface.warningReport()));
+}
+
 
 void TstUxShell::inertTerminalPaneExplainsItself()
 {

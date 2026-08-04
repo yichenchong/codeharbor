@@ -90,8 +90,9 @@ void TstSshAuth::partialSuccessRoutesToTheMethodTheServerStillWants()
 }
 
 // A server may keep answering "partial" forever. The ladder is bounded by the
-// number of rungs, not by the server's answers: four steps, all distinct, then
-// Exhausted. Without that bound the handshake loop would never return.
+// number of distinct rungs, not by the server's answers: every supported rung
+// is tried once, then Exhausted. Without that bound the handshake loop would
+// never return.
 void TstSshAuth::serverThatKeepsReportingPartialRunsOutOfRungs()
 {
     AuthRungsTried tried;

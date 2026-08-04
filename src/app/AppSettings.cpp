@@ -5,6 +5,7 @@
 #include <QMetaType>
 #include <QSet>
 #include <QSettings>
+#include <cmath>
 #include <algorithm>
 
 namespace ch {
@@ -239,7 +240,7 @@ qreal AppSettings::terminalPixelRatio() const
         return 0.0;
     bool ok = false;
     const qreal value = raw.toDouble(&ok);
-    if (!ok || value <= 0.0)
+    if (!ok || !std::isfinite(value) || value <= 0.0)
         return 0.0;
     return std::clamp(value, kMinTerminalPixelRatio, kMaxTerminalPixelRatio);
 }
@@ -249,7 +250,7 @@ void AppSettings::setTerminalPixelRatio(qreal ratio)
     // A non-positive ratio is how the caller says "follow the screen again",
     // and is stored as the absent value rather than as a number.
     const qreal wanted =
-        ratio <= 0.0
+        !std::isfinite(ratio) || ratio <= 0.0
             ? 0.0
             : std::clamp(ratio, kMinTerminalPixelRatio, kMaxTerminalPixelRatio);
     if (qFuzzyCompare(wanted + 1.0, terminalPixelRatio() + 1.0))
@@ -359,6 +360,19 @@ void AppSettings::resetToDefaults()
 
     // The whole subtree, so the generic groups go too. Anything outside
     // `settings/` (UiStateStore's own keys share this file) is untouched.
+    bool hadGeneric = false;
+    for (const QString& key : m_settings->allKeys()) {
+        if (!key.startsWith(kPrefix))
+            continue;
+        if (key == kThemeKey || key == kPaletteKey
+            || key == kPaletteSizeKey || key == kToolbarKey
+            || key == kFontSizeKey || key == kPixelRatioKey
+            || key.startsWith(kViewerDefaultsGroup + QLatin1Char('/'))) {
+            continue;
+        }
+        hadGeneric = true;
+        break;
+    }
     m_settings->remove(QStringLiteral("settings"));
 
     if (theme != this->theme())
@@ -375,9 +389,11 @@ void AppSettings::resetToDefaults()
         emit terminalPixelRatioChanged();
     if (!viewerDefaults.isEmpty() && this->viewerDefaults().isEmpty())
         emit viewerDefaultsChanged();
-    // Generic pairs have no per-key record of what existed, so one blanket
-    // notification with empty names says "re-read everything".
-    emit settingChanged(QString(), QString());
+    if (hadGeneric) {
+        // Generic pairs have no per-key record of what existed, so one blanket
+        // notification with empty names says "re-read everything".
+        emit settingChanged(QString(), QString());
+    }
 }
 
 } // namespace ch

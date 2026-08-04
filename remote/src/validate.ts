@@ -87,8 +87,13 @@ export function optionalPlainString(
 
 export function requireStringArray(obj: Record<string, unknown>, field: string, method: string): string[] {
     const value = obj[field];
-    if (!Array.isArray(value) || value.some((v) => typeof v !== "string")) {
+    if (!Array.isArray(value)) {
         throw new InvalidParamsError(`${method}: missing or invalid field '${field}'`);
+    }
+    for (const item of value) {
+        if (typeof item !== "string") {
+            throw new InvalidParamsError(`${method}: missing or invalid field '${field}'`);
+        }
     }
     return value as string[];
 }

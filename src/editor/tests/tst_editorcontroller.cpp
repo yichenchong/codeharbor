@@ -154,9 +154,12 @@ private slots:
     void cleanup();
 
     void openLoadsCleanAndContent();
+    void readWithoutRevisionIsRejected();
     void saveSuccessAdoptsRevisionAndCleans();
     void saveStaleRevisionConflictsNoOverwrite();
     void saveConflictFallsBackToStat();
+    void saveSuccessWithoutRevisionIsAnError();
+    void saveConflictStatIsDroppedAfterANewSave();
     void externalChangeWhileCleanReloads();
     void externalChangeWhileDirtyDoesNotReload();
 
@@ -173,6 +176,7 @@ private slots:
     void unwatchIssuedOnDestruction();
     void reopenUnwatchesPreviousSubscription();
     void contentBufferedUntilPageReportsReady();
+    void recoveryDirArrivingAfterOpenStillOffersSnapshot();
     void successfulSaveClearsRecoverySnapshot();
 
     // SPEC 8.2 read-only. Nothing in the tree used to DERIVE read-only-ness, so
@@ -201,11 +205,14 @@ private slots:
     // auto-reloaded over unsaved work (SPEC 8.7), so every path that can leave
     // bytes only in the page has to raise it.
     void failedSaveLeavesTheBufferDirty();
+    void saveWhileLoadingIsRefused();
     void editsDuringASaveSurviveTheSaveReply();
     void editsTypedDuringASystemReloadAreNotClobbered();
     void aSaveInFlightIsNotClobberedByASystemReload();
     void aSaveReplyIsDroppedAfterAnExplicitReloadTookOverTheBuffer();
     void aSaveConflictIsDroppedAfterASamePathReopenTookOverTheBuffer();
+    void aSecondSaveWhileRecoveryClearIsInFlightDoesNotDuplicateIt();
+    void recoveryClearIntentSurvivesOverlappingSnapshot();
     void aSuccessfulSaveStillClearsASnapshotThatWasStillInFlight();
     void aReportAfterASaveCancelsTheTruncateThatSaveDeferred();
     void aDeferredTruncateSurvivesTheSnapshotRetryChain();
@@ -220,6 +227,7 @@ private slots:
     void anExplicitReloadDiscardsTheRecoverySnapshotItThrewAway();
     void aPageReloadWithUnsavedWorkIsOfferedItsRecoverySnapshot();
     void reportContentDuringALoadIsIgnored();
+    void reportIdenticalContentDoesNotStayDirty();
 
     // Out-of-order / superseded replies must never land on the file now open.
     void staleLoadReplyNeverWins();
@@ -436,6 +444,25 @@ void TstEditorController::openLoadsCleanAndContent()
     QCOMPARE(stateSpy.first().at(0).toString(), QStringLiteral("loading"));
     QCOMPARE(stateSpy.last().at(0).toString(), QStringLiteral("clean"));
 }
+void TstEditorController::readWithoutRevisionIsRejected()
+{
+    makePair();
+    m_controller->ready();
+
+    QSignalSpy contentSpy(m_controller, &EditorController::contentLoaded);
+    m_controller->open(QStringLiteral("/foo/f.txt"));
+    const QJsonObject read = nextRequest();
+    respondResult(reqId(read), {{"path", "/foo/f.txt"},
+                                {"encoding", "utf-8"},
+                                {"content", "hello"},
+                                {"truncated", false}});
+
+    QTRY_COMPARE(m_controller->fileState(), QStringLiteral("error"));
+    QCOMPARE(contentSpy.count(), 0);
+    QVERIFY2(nextRequest(300).isEmpty(),
+             "a read without a revision token continued as an editable load");
+}
+
 
 void TstEditorController::saveSuccessAdoptsRevisionAndCleans()
 {
@@ -469,6 +496,25 @@ void TstEditorController::saveSuccessAdoptsRevisionAndCleans()
     QVERIFY(seen.contains(QStringLiteral("saved")));
     QVERIFY(seen.contains(QStringLiteral("clean")));
 }
+void TstEditorController::saveSuccessWithoutRevisionIsAnError()
+{
+    makePair();
+    openClean(QStringLiteral("/foo/f.txt"), QStringLiteral("hello"),
+              QStringLiteral("r1"));
+
+    QSignalSpy savedSpy(m_controller, &EditorController::saved);
+    QSignalSpy errorSpy(m_controller, &EditorController::saveError);
+
+    m_controller->save(QStringLiteral("world"), QStringLiteral("r1"));
+    const QJsonObject write = nextRequest();
+    respondResult(reqId(write), {{"path", "/foo/f.txt"}});
+
+    QTRY_COMPARE(errorSpy.count(), 1);
+    QCOMPARE(savedSpy.count(), 0);
+    QCOMPARE(m_controller->revision(), QStringLiteral("r1"));
+    QCOMPARE(m_controller->fileState(), QStringLiteral("error"));
+}
+
 
 void TstEditorController::saveStaleRevisionConflictsNoOverwrite()
 {
@@ -520,6 +566,48 @@ void TstEditorController::saveConflictFallsBackToStat()
     QTRY_COMPARE(conflictSpy.count(), 1);
     QCOMPARE(conflictSpy.at(0).at(0).toString(), QStringLiteral("r9"));
     QCOMPARE(m_controller->fileState(), QStringLiteral("conflict"));
+}
+// A conflict fallback stats the file on a second asynchronous hop. If the user
+// starts a new save before that stat answers, the old stat must not turn the new
+// save into a conflict.
+void TstEditorController::saveConflictStatIsDroppedAfterANewSave()
+{
+    makePair();
+    openClean(QStringLiteral("/foo/f.txt"), QStringLiteral("hello"),
+              QStringLiteral("r1"));
+
+    QSignalSpy conflictSpy(m_controller, &EditorController::saveConflict);
+    QSignalSpy savedSpy(m_controller, &EditorController::saved);
+
+    m_controller->save(QStringLiteral("first"), QStringLiteral("r1"));
+    const QJsonObject first = nextRequest();
+    QCOMPARE(method(first), kWriteFile);
+    respondError(reqId(first), ch::rpc::kRevisionMismatch,
+                 QStringLiteral("stale revision"));
+
+    const QJsonObject stat = nextRequest();
+    QCOMPARE(method(stat), kStat);
+    QCOMPARE(reqPath(stat), QStringLiteral("/foo/f.txt"));
+
+    // A fresh save is a new generation, even though it uses the same loaded
+    // revision. Its success must own the pane's state.
+    m_controller->save(QStringLiteral("second"), QStringLiteral("r1"));
+    const QJsonObject second = nextRequest();
+    QCOMPARE(method(second), kWriteFile);
+    QCOMPARE(reqContent(second), QStringLiteral("second"));
+    respondResult(reqId(second), {{"path", "/foo/f.txt"}, {"revision", "r2"}});
+    QTRY_COMPARE(savedSpy.count(), 1);
+    QCOMPARE(m_controller->revision(), QStringLiteral("r2"));
+    QCOMPARE(m_controller->fileState(), QStringLiteral("clean"));
+
+    // The first save's late stat describes the pre-second-save world and must
+    // be ignored.
+    respondResult(reqId(stat), {{"path", "/foo/f.txt"}, {"revision", "r9"}});
+    QTest::qWait(100);
+    QCOMPARE(conflictSpy.count(), 0);
+    QCOMPARE(savedSpy.count(), 1);
+    QCOMPARE(m_controller->revision(), QStringLiteral("r2"));
+    QCOMPARE(m_controller->fileState(), QStringLiteral("clean"));
 }
 
 void TstEditorController::externalChangeWhileCleanReloads()
@@ -824,6 +912,51 @@ void TstEditorController::recoverySnapshotWrittenAndOfferedOnReopen()
     QCOMPARE(recoverySpy.at(0).at(0).toString(), QStringLiteral("recovered edits"));
 }
 
+// The server identity can arrive after a pane has already loaded its file. Once
+// the recovery directory becomes known, an existing snapshot must be probed
+// without requiring the user to reopen the pane.
+void TstEditorController::recoveryDirArrivingAfterOpenStillOffersSnapshot()
+{
+    makePair();
+    m_controller->setRecoveryDir(QString());
+    m_controller->ready();
+    m_controller->open(QStringLiteral("/foo/f.txt"));
+
+    const QJsonObject read = nextRequest();
+    QCOMPARE(method(read), kReadFile);
+    respondResult(reqId(read), {{"path", "/foo/f.txt"},
+                                {"encoding", "utf-8"},
+                                {"content", "orig"},
+                                {"revision", "r1"},
+                                {"truncated", false}});
+    const QJsonObject watch = nextRequest();
+    QCOMPARE(method(watch), kWatch);
+    respondResult(reqId(watch), {{"subscriptionId", "sub1"}});
+    servePermissionStat();
+    QTRY_COMPARE(m_controller->fileState(), QStringLiteral("clean"));
+
+    QSignalSpy recoverySpy(m_controller, &EditorController::recoveryAvailable);
+    m_controller->setRecoveryDir(kRecoveryBase);
+
+    const QJsonObject stat = nextRequest();
+    QCOMPARE(method(stat), kStat);
+    QCOMPARE(reqPath(stat), recoveryFilePath());
+    respondResult(reqId(stat), {{"path", recoveryFilePath()}, {"revision", "rec1"}});
+
+    const QJsonObject recRead = nextRequest();
+    QCOMPARE(method(recRead), kReadFile);
+    respondResult(reqId(recRead), {{"path", recoveryFilePath()},
+                                   {"encoding", "utf-8"},
+                                   {"content", snapshotEnvelope(
+                                                    QStringLiteral("/foo/f.txt"),
+                                                    QStringLiteral("recovered"))},
+                                   {"revision", "rec1"},
+                                   {"truncated", false}});
+
+    QTRY_COMPARE(recoverySpy.count(), 1);
+    QCOMPARE(recoverySpy.at(0).at(0).toString(), QStringLiteral("recovered"));
+}
+
 void TstEditorController::unwatchIssuedOnDestruction()
 {
     makePair();
@@ -1026,6 +1159,113 @@ void TstEditorController::successfulSaveClearsRecoverySnapshot()
 }
 
 // ---------------------------------------------------------------------------
+// A recovery clear is asynchronous too. Two saves completed before the first
+// truncate answers must not issue a duplicate truncate with the same revision.
+void TstEditorController::aSecondSaveWhileRecoveryClearIsInFlightDoesNotDuplicateIt()
+{
+    makePair();
+    openClean(QStringLiteral("/foo/f.txt"), QStringLiteral("orig"),
+              QStringLiteral("r1"));
+
+    m_controller->reportContent(QStringLiteral("edited"));
+    const QJsonObject snapshot = nextRequest();
+    QCOMPARE(method(snapshot), kWriteFile);
+    respondResult(reqId(snapshot),
+                  {{"path", recoveryFilePath()}, {"revision", "rec1"}});
+
+    QSignalSpy savedSpy(m_controller, &EditorController::saved);
+    m_controller->save(QStringLiteral("edited"), QStringLiteral("r1"));
+    const QJsonObject firstSave = nextRequest();
+    QCOMPARE(reqPath(firstSave), QStringLiteral("/foo/f.txt"));
+    respondResult(reqId(firstSave), {{"path", "/foo/f.txt"}, {"revision", "r2"}});
+    QTRY_COMPARE(savedSpy.count(), 1);
+
+    const QJsonObject clear = nextRequest();
+    QCOMPARE(method(clear), kWriteFile);
+    QCOMPARE(reqPath(clear), recoveryFilePath());
+    QCOMPARE(reqContent(clear), QString());
+    QCOMPARE(reqExpectedRevision(clear), QStringLiteral("rec1"));
+
+    // The second save completes while the first truncate is still in flight.
+    m_controller->save(QStringLiteral("edited again"), QStringLiteral("r2"));
+    const QJsonObject secondSave = nextRequest();
+    QCOMPARE(reqPath(secondSave), QStringLiteral("/foo/f.txt"));
+    respondResult(reqId(secondSave),
+                  {{"path", "/foo/f.txt"}, {"revision", "r3"}});
+    QTRY_COMPARE(savedSpy.count(), 2);
+    QVERIFY2(nextRequest(300).isEmpty(),
+             "a second save duplicated the recovery truncate");
+
+    respondResult(reqId(clear),
+                  {{"path", recoveryFilePath()}, {"revision", "rec2"}});
+    QVERIFY2(nextRequest(300).isEmpty(),
+             "the recovery clear was issued more than once");
+}
+
+// A new snapshot can race a truncate that was already issued by an earlier
+// save. If that snapshot's stale guard needs a retry, the second save's clear
+// intent must remain armed until the retry has established its revision.
+void TstEditorController::recoveryClearIntentSurvivesOverlappingSnapshot()
+{
+    makePair();
+    openClean(QStringLiteral("/foo/f.txt"), QStringLiteral("orig"),
+              QStringLiteral("r1"));
+
+    m_controller->reportContent(QStringLiteral("first"));
+    const QJsonObject firstSnapshot = nextRequest();
+    respondResult(reqId(firstSnapshot),
+                  {{"path", recoveryFilePath()}, {"revision", "rec1"}});
+
+    QSignalSpy savedSpy(m_controller, &EditorController::saved);
+    m_controller->save(QStringLiteral("first"), QStringLiteral("r1"));
+    const QJsonObject firstSave = nextRequest();
+    respondResult(reqId(firstSave), {{"path", "/foo/f.txt"}, {"revision", "r2"}});
+    QTRY_COMPARE(savedSpy.count(), 1);
+
+    const QJsonObject firstClear = nextRequest();
+    QCOMPARE(reqExpectedRevision(firstClear), QStringLiteral("rec1"));
+
+    // This report is the second snapshot write, while the first clear is still
+    // in flight. The save that follows it must eventually clear this newer slot.
+    m_controller->reportContent(QStringLiteral("second"));
+    const QJsonObject secondSnapshot = nextRequest();
+    QCOMPARE(reqPath(secondSnapshot), recoveryFilePath());
+    QCOMPARE(reqExpectedRevision(secondSnapshot), QStringLiteral("rec1"));
+
+    m_controller->save(QStringLiteral("second"), QStringLiteral("r2"));
+    const QJsonObject secondSave = nextRequest();
+    QCOMPARE(reqPath(secondSave), QStringLiteral("/foo/f.txt"));
+    respondResult(reqId(secondSave), {{"path", "/foo/f.txt"}, {"revision", "r3"}});
+    QTRY_COMPARE(savedSpy.count(), 2);
+
+    // The first truncate wins before the overlapping snapshot answers.
+    respondResult(reqId(firstClear),
+                  {{"path", recoveryFilePath()}, {"revision", "rec2"}});
+    respondError(reqId(secondSnapshot), ch::rpc::kRevisionMismatch,
+                 QStringLiteral("stale snapshot guard"), QJsonObject{});
+
+    const QJsonObject stat = nextRequest();
+    QCOMPARE(method(stat), kStat);
+    QCOMPARE(reqPath(stat), recoveryFilePath());
+    respondResult(reqId(stat), {{"path", recoveryFilePath()}, {"revision", "rec2"}});
+
+    const QJsonObject retry = nextRequest();
+    QCOMPARE(reqPath(retry), recoveryFilePath());
+    QCOMPARE(reqExpectedRevision(retry), QStringLiteral("rec2"));
+    respondResult(reqId(retry),
+                  {{"path", recoveryFilePath()}, {"revision", "rec3"}});
+
+    // The deferred intent now clears the retried snapshot, rather than leaving
+    // the bytes saved by the main file write as a stale recovery offer.
+    const QJsonObject secondClear = nextRequest();
+    QCOMPARE(reqPath(secondClear), recoveryFilePath());
+    QCOMPARE(reqExpectedRevision(secondClear), QStringLiteral("rec3"));
+    respondResult(reqId(secondClear),
+                  {{"path", recoveryFilePath()}, {"revision", "rec4"}});
+    QVERIFY2(nextRequest(300).isEmpty(),
+             "the overlapping snapshot resurrected after both saves succeeded");
+}
+
 // SPEC 5.6 reconnect.
 //
 // A file.watch subscription does not live in the wire, it lives in the
@@ -1652,6 +1892,35 @@ void TstEditorController::transportDropParksTheFileStateUntilRebind()
 // never have seen a reportContent for them, because the page debounces its
 // report by 500 ms and Ctrl+S beats that. A buffer wrongly believed clean is
 // silently auto-reloaded over by the next external change (SPEC 8.7).
+// Ctrl+S can beat the first contentLoaded signal, especially while an SSH
+// round trip is slow. The previous file's model must not be written with the
+// new path or have the load's state replaced by Saving.
+void TstEditorController::saveWhileLoadingIsRefused()
+{
+    makePair();
+    m_controller->ready();
+    m_controller->open(QStringLiteral("/foo/f.txt"));
+    const QJsonObject read = nextRequest();
+    QCOMPARE(method(read), kReadFile);
+
+    QSignalSpy errorSpy(m_controller, &EditorController::saveError);
+    m_controller->save(QStringLiteral("old page bytes"), QString());
+    QTRY_COMPARE(errorSpy.count(), 1);
+    QVERIFY2(errorSpy.at(0).at(0).toString().contains(
+                 QStringLiteral("still loading"), Qt::CaseInsensitive),
+             qPrintable(errorSpy.at(0).at(0).toString()));
+    QCOMPARE(m_controller->fileState(), QStringLiteral("loading"));
+    QVERIFY2(nextRequest(300).isEmpty(), "a save escaped while the file was loading");
+
+    respondResult(reqId(read), {{"path", "/foo/f.txt"},
+                                {"encoding", "utf-8"},
+                                {"content", "loaded"},
+                                {"revision", "r1"},
+                                {"truncated", false}});
+    serveWatchThenNoRecovery();
+    QTRY_COMPARE(m_controller->fileState(), QStringLiteral("clean"));
+}
+
 void TstEditorController::failedSaveLeavesTheBufferDirty()
 {
     makePair();
@@ -1760,6 +2029,18 @@ void TstEditorController::reportContentDuringALoadIsIgnored()
     const QJsonObject reread = nextRequest();
     QCOMPARE(method(reread), kReadFile);
     QCOMPARE(reqPath(reread), QStringLiteral("/foo/f.txt"));
+}
+
+void TstEditorController::reportIdenticalContentDoesNotStayDirty()
+{
+    makePair();
+    openClean(QStringLiteral("/foo/f.txt"), QStringLiteral("hello"),
+              QStringLiteral("r1"));
+
+    m_controller->reportContent(QStringLiteral("hello"));
+    QVERIFY2(nextRequest(300).isEmpty(),
+             "content equal to the loaded bytes created a recovery snapshot");
+    QCOMPARE(m_controller->fileState(), QStringLiteral("clean"));
 }
 
 // Two loads overlap (open A, then open B before A answered). The replies are

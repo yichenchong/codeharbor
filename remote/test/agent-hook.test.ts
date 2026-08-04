@@ -312,6 +312,21 @@ test("main prints usage and touches no socket when the event name is missing", a
     assert.match(logged[0], /^usage: /);
 });
 
+test("main survives a closed stderr stream without rejecting", async () => {
+    const real = process.stderr.write;
+    process.stderr.write = (() => {
+        throw new Error("stderr is closed");
+    }) as unknown as typeof process.stderr.write;
+    try {
+        await assert.doesNotReject(
+            main(["node", "oh-my-pi-hook.ts"], {} as NodeJS.ProcessEnv),
+        );
+    } finally {
+        process.stderr.write = real;
+    }
+});
+
+
 // AG-N4. Unusable metadata never blocks the event, but a silently dropped bag
 // is invisible — and the person who wrote the JSON is standing in the shell the
 // hook was launched from, which is the only place the mistake is actionable.

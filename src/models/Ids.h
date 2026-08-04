@@ -1,5 +1,6 @@
 #pragma once
 
+#include <QHashFunctions>
 #include <QString>
 
 // Strongly-typed identifier wrappers for the core data model. Using distinct
@@ -34,5 +35,30 @@ struct ServerId {
     QString value;
     bool operator==(const ServerId &) const = default;
 };
+
+inline size_t qHash(const GroupId &id, size_t seed = 0) noexcept
+{
+    return ::qHash(id.value, seed);
+}
+
+inline size_t qHash(const DevSessionId &id, size_t seed = 0) noexcept
+{
+    return ::qHash(id.value, seed);
+}
+
+inline size_t qHash(const ViewerPaneId &id, size_t seed = 0) noexcept
+{
+    return ::qHash(id.value, seed);
+}
+
+inline size_t qHash(const TerminalId &id, size_t seed = 0) noexcept
+{
+    return ::qHash(id.value, seed);
+}
+
+inline size_t qHash(const ServerId &id, size_t seed = 0) noexcept
+{
+    return ::qHash(id.value, seed);
+}
 
 } // namespace ch

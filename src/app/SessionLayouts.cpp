@@ -291,6 +291,12 @@ int SessionLayouts::reservePaneSuffix(int index, const SplitNode& tree)
     // above, so both this addition and the `suffix + 1` splitPane() stores
     // afterwards stay far inside int.
     const int next = qMin(qMax(stored, highest + 1), kMaxPaneSuffix);
+    // There is no free label once the ceiling itself is already on screen.
+    // Returning zero is safe because valid pane suffixes start at one; the
+    // caller turns it into a user-visible refusal instead of duplicating a
+    // label forever.
+    if (next == kMaxPaneSuffix && highest >= kMaxPaneSuffix)
+        return 0;
     // Only write when the counter actually moved: this runs on every published
     // tree, including the one a splitter drag republishes, and each write syncs
     // to disk.
@@ -454,12 +460,26 @@ void SessionLayouts::applyLoadedTree(quint64 generation, int index,
 
     RegionState& state = m_regions[index];
     state.loading = false;
-    if (err)
+    if (err) {
+        const bool wasValid = state.valid;
+        state.valid = false;
+        state.cache = QVariant();
+        state.tree = SplitNode{};
         state.pendingWrites.clear();
-    // `superseded`: an edit was persisted while this getLayout was on the wire,
-    // so its answer is older than the tree QML is already showing. Applying it
-    // would revert the edit - and on the seeding branch below would replace it
-    // with the region default and write THAT to the server. See RegionState.
+        state.superseded = false;
+        if (index == kTerminal)
+            m_legacyTerminalSlots.clear();
+        if (wasValid) {
+            if (index == kTerminal)
+                emit terminalTreeChanged();
+            else
+                emit viewerTreeChanged();
+        }
+    }
+    // For a successful reply, `superseded` means an edit was persisted while
+    // its answer predates the tree QML is already showing. Applying it would
+    // revert the edit - and on the seeding branch below would replace it with
+    // the region default and write THAT to the server. See RegionState.
     if (!err && !m_regions[index].superseded) {
         // No persisted layout for this region: adopt the default AND write it
         // back, so it becomes the session's real layout instead of a shape that
@@ -550,8 +570,14 @@ SessionLayouts::WriteDecision SessionLayouts::prepareWrite(
         return WriteDecision::Drop;
     if (!canEdit())
         return WriteDecision::Reject;
-    if (!m_regions[index].valid && m_regions[index].loading)
-        return WriteDecision::Queue;
+    if (!m_regions[index].valid) {
+        if (m_regions[index].loading)
+            return WriteDecision::Queue;
+        emit error(QStringLiteral(
+            "SessionLayouts: %1 layout is not available; edit ignored")
+                       .arg(regionKey(index)));
+        return WriteDecision::Reject;
+    }
     return WriteDecision::Apply;
 }
 
@@ -660,15 +686,18 @@ void SessionLayouts::persist(int index)
     if (index == kTerminal && hasPendingTerminalLeaf())
         return;
     QPointer<SessionLayouts> self(this);
+    const QString writeDevSessionId = m_devSessionId;
+    const quint64 writeGeneration = m_generation;
     m_db->setLayout(ServerId{m_serverId}, DevSessionId{m_devSessionId},
                     regionEnum(index), m_regions[index].tree,
-                    [self](std::optional<SplitNode>,
-                           std::optional<RpcError> err) {
-                        // The server stores and echoes the tree verbatim
-                        // (remote/src/workspace.ts setLayout), so there is
-                        // nothing to adopt on success - and re-publishing an
-                        // identical tree would needlessly rebuild every pane.
-                        if (self && err)
+                    [self, writeDevSessionId, writeGeneration](
+                        std::optional<SplitNode>, std::optional<RpcError> err) {
+                        // A write can answer after the user has switched
+                        // sessions or deliberately reloaded this one. Its
+                        // failure is no longer a current-session error.
+                        if (self && err
+                            && self->m_devSessionId == writeDevSessionId
+                            && self->m_generation == writeGeneration)
                             emit self->error(err->message);
                     });
 }
@@ -708,6 +737,10 @@ void SessionLayouts::saveTreeStamped(const QString& devSessionId,
     // A full authored tree is itself authoritative user intent, even while
     // getLayout is outstanding. It replaces the null/fallback state now and
     // retires that reply rather than waiting and risking a revert.
+    // A full tree supersedes gestures queued while the old tree was null.
+    // Replaying those older writes after this replacement would apply history
+    // to the newly authored tree and undo the user's latest snapshot.
+    m_regions[index].pendingWrites.clear();
     setTreeQuietly(index, std::move(*parsed));
     persist(index);
 }
@@ -886,6 +919,13 @@ QString SessionLayouts::splitPaneStamped(const QString& devSessionId,
     // Every earlier return above left the tree untouched, so the counter is only
     // consumed once the split is certain to happen.
     const int suffix = reservePaneSuffix(index, state.tree);
+    if (suffix == 0) {
+        if (!replay)
+            emit error(QStringLiteral(
+                "SessionLayouts: no unused %1 pane label remains")
+                           .arg(region));
+        return {};
+    }
     const QString newPaneId =
         regionKey(index) + QLatin1Char('-') + QString::number(suffix);
     // Consume it: this id is now spent for this Dev Session's region for good,
@@ -938,12 +978,16 @@ QString SessionLayouts::splitPaneStamped(const QString& devSessionId,
 void SessionLayouts::abandonTerminalMint(const QString& paneId,
                                          const QString& reason)
 {
+    // Repair the tree before notifying listeners. An error handler may issue a
+    // new layout edit synchronously; it must never observe the pending leaf or
+    // remove a same-labelled leaf from a tree it just loaded.
+    const bool removed = dropLeaf(kTerminal, paneId);
+    if (removed) {
+        publishTree(kTerminal);
+        if (canEdit())
+            persist(kTerminal);
+    }
     emit error(reason);
-    if (!dropLeaf(kTerminal, paneId))
-        return;
-    publishTree(kTerminal);
-    if (canEdit())
-        persist(kTerminal);
 }
 
 void SessionLayouts::mintTerminalPaneRow(quint64 generation, const QString& paneId)
@@ -977,6 +1021,11 @@ void SessionLayouts::mintTerminalPaneRow(quint64 generation, const QString& pane
                 return;
 
             SplitNode* leaf = self->findTerminalLeaf(paneId);
+            // Closing a pane while its row is being minted cancels the UI
+            // operation. A later server error for that already-closed pane is
+            // stale and must not produce an error banner.
+            if (!leaf)
+                return;
             if (err || !pane || pane->id.value.isEmpty()) {
                 // Take the half-made pane back out rather than leave one that
                 // can never attach and can never be told apart from a
@@ -989,8 +1038,6 @@ void SessionLayouts::mintTerminalPaneRow(quint64 generation, const QString& pane
             }
             // The pane was closed while its row was being minted. The row and
             // its tmux session stay: closing a pane never destroys either.
-            if (!leaf)
-                return;
             if (!leaf->terminalPaneId.isEmpty())
                 return; // already bound; nothing to publish
             leaf->terminalPaneId = pane->id.value;
@@ -1082,11 +1129,11 @@ void SessionLayouts::bindTerminalPaneRow(const QString& devSessionId,
         return;
     if (!leaf->terminalPaneId.isEmpty())
         return; // bound to a DIFFERENT row; a stale answer must not retarget it
+    if (!canEdit())
+        return;
     leaf->terminalPaneId = terminalPaneId;
     // This leaf has spent its one legal use of the old key.
     m_legacyTerminalSlots.remove(paneName);
-    if (!canEdit())
-        return;
     // Quiet: the pane is already attached to this very row, and republishing
     // the terminal tree only to record what it just did would be churn. The
     // next load reads the id off the server.
@@ -1114,6 +1161,9 @@ void SessionLayouts::closePaneStamped(const QString& devSessionId,
 {
     const int index = regionIndex(region);
     if (index < 0)
+        return;
+    // The empty leaf is a region placeholder, not a closable pane.
+    if (paneId.isEmpty())
         return;
     const WriteDecision decision =
         prepareWrite(index, devSessionId, generation);
@@ -1171,6 +1221,8 @@ void SessionLayouts::setPaneUrlStamped(const QString& devSessionId,
     const int index = regionIndex(region);
     if (index < 0)
         return;
+    if (paneId.isEmpty())
+        return;
     const WriteDecision decision =
         prepareWrite(index, devSessionId, generation);
     if (decision == WriteDecision::Drop || decision == WriteDecision::Reject)
@@ -1224,6 +1276,19 @@ QString SessionLayouts::setPaneTitleStamped(const QString& devSessionId,
 {
     const int index = regionIndex(region);
     if (index < 0)
+        return {};
+    // Title is terminal chrome only. Check the stamp first so a stale viewer
+    // signal remains silent instead of becoming a current-session misuse.
+    if (devSessionId != m_devSessionId || generation != m_generation)
+        return {};
+    if (index != kTerminal) {
+        if (!replay)
+            emit error(QStringLiteral(
+                "SessionLayouts: pane titles are supported only in the terminal "
+                "region"));
+        return {};
+    }
+    if (paneId.isEmpty())
         return {};
     const WriteDecision decision =
         prepareWrite(index, devSessionId, generation);

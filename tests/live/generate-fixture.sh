@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/usr/bin/env bash
 # Generate the throwaway SSH fixture used by the live gates.
 #
 # The output directory is git-ignored because it contains private keys and a
@@ -7,7 +7,7 @@
 # its CODEHARBOR_DB override.
 #
 # Usage: generate-fixture.sh [fixture-directory]
-set -eu
+set -euo pipefail
 
 if [ "$#" -gt 1 ]; then
     echo "usage: generate-fixture.sh [fixture-directory]" >&2
@@ -16,6 +16,10 @@ fi
 
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 fixture=${1:-"$script_dir/.fixture"}
+if [ -L "$fixture" ]; then
+    echo "generate-fixture.sh: refusing symlink fixture directory $fixture" >&2
+    exit 1
+fi
 fixture=$(CDPATH= cd -- "$fixture" 2>/dev/null && pwd || {
     mkdir -p "$fixture"
     CDPATH= cd -- "$fixture" && pwd
@@ -28,6 +32,14 @@ fi
 
 umask 077
 chmod 700 "$fixture"
+
+tmp=""
+cleanup() {
+    if [ -n "$tmp" ]; then
+        rm -f "$tmp"
+    fi
+}
+trap cleanup EXIT
 
 # A present private key is retained so rerunning the generator does not strand
 # an ssh-agent that already holds the fixture key. Its public half is derived
@@ -44,12 +56,12 @@ for key_name in hostkey id; do
     fi
     tmp=$(mktemp "$fixture/$key_name.pub.tmp.XXXXXX")
     if ! ssh-keygen -y -f "$private" >"$tmp"; then
-        rm -f "$tmp"
         echo "generate-fixture.sh: could not read private key $private" >&2
         exit 1
     fi
     chmod 644 "$tmp"
     mv -f "$tmp" "$public"
+    tmp=""
     chmod 600 "$private"
 done
 
@@ -59,24 +71,26 @@ tmp=$(mktemp "$fixture/authorized_keys.tmp.XXXXXX")
 cat "$fixture/id.pub" >"$tmp"
 chmod 600 "$tmp"
 mv -f "$tmp" "$fixture/authorized_keys"
+tmp=""
 
 user=$(id -un)
 tmp=$(mktemp "$fixture/sshd_config.tmp.XXXXXX")
 cat >"$tmp" <<EOF
 Port 2222
 ListenAddress 127.0.0.1
-HostKey $fixture/hostkey
-AuthorizedKeysFile $fixture/authorized_keys
-PidFile $fixture/sshd.pid
+HostKey "$fixture/hostkey"
+AuthorizedKeysFile "$fixture/authorized_keys"
+PidFile "$fixture/sshd.pid"
 UsePAM no
 StrictModes no
 PasswordAuthentication no
 AllowUsers $user
 Subsystem sftp internal-sftp
-SetEnv CODEHARBOR_DB=$fixture/workspace.sqlite
+SetEnv "CODEHARBOR_DB=$fixture/workspace.sqlite"
 EOF
 chmod 600 "$tmp"
 mv -f "$tmp" "$fixture/sshd_config"
+tmp=""
 
 printf 'live SSH fixture generated in %s\n' "$fixture"
 printf '  CODEHARBOR_DB=%s/workspace.sqlite\n' "$fixture"

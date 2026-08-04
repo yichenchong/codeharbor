@@ -67,6 +67,12 @@ Rectangle {
     // selected as soon as the host hands back a longer list.
     property bool awaitingNewProfile: false
     property int knownProfileCount: 0
+    // Keep an in-progress form intact when a background profile refresh swaps
+    // the model. `profilesChanged` is not an acknowledgement that this form
+    // changed; it can be another profile being added or a reconnect update.
+    property bool loadingForm: false
+    property bool profileDirty: false
+    property bool creatingNewProfile: false
 
     // A host-key or credential prompt is up, so the connection this sheet is
     // about is parked on that one answer.
@@ -117,6 +123,7 @@ Rectangle {
     }
 
     function loadForm(entry) {
+        root.loadingForm = true;
         nameField.text = root.textOf(entry, "name");
         hostField.text = root.textOf(entry, "host");
         portField.text = root.textOf(entry, "port") === "" ? "22" : root.textOf(entry, "port");
@@ -124,20 +131,42 @@ Rectangle {
         identityFileField.text = root.textOf(entry, "identityFile");
         nodePathField.text = root.textOf(entry, "nodePath");
         repoRootField.text = root.textOf(entry, "repoRoot");
+        root.loadingForm = false;
+        root.profileDirty = false;
+    }
+    function formDiffersFrom(entry) {
+        if (!entry || !nameField || !hostField || !portField || !userField
+                || !identityFileField || !nodePathField || !repoRootField)
+            return false;
+        var storedPort = root.textOf(entry, "port");
+        if (storedPort === "")
+            storedPort = "22";
+        return root.textOf(entry, "name") !== nameField.text
+                || root.textOf(entry, "host") !== hostField.text
+                || storedPort !== portField.text
+                || root.textOf(entry, "user") !== userField.text
+                || root.textOf(entry, "identityFile") !== identityFileField.text
+                || root.textOf(entry, "nodePath") !== nodePathField.text
+                || root.textOf(entry, "repoRoot") !== repoRootField.text;
     }
 
     function selectIndex(index) {
         var list = root.profileList();
         if (index < 0 || index >= list.length)
             return;
-        profileSelector.currentIndex = index;
+        root.awaitingNewProfile = false;
+        root.creatingNewProfile = false;
         root.editingId = root.textOf(list[index], "id");
         root.loadForm(list[index]);
+        profileSelector.currentIndex = index;
     }
 
     function beginNew() {
+        root.awaitingNewProfile = false;
+        root.knownProfileCount = root.profileList().length;
         profileSelector.currentIndex = -1;
         root.editingId = "";
+        root.creatingNewProfile = true;
         root.loadForm(null);
         nameField.input.forceActiveFocus();
     }
@@ -169,8 +198,40 @@ Rectangle {
                 profileSelector.forceActiveFocus();
             return;
         }
+
         root.knownProfileCount = list.length;
         var index = root.indexOfId(root.editingId);
+        var dirty = root.profileDirty
+                     || (root.editingId !== "" && index >= 0
+                         && root.formDiffersFrom(list[index]));
+
+        // A model refresh is not permission to overwrite a form the user is
+        // still editing. Keep the ListView highlight aligned, but do not call
+        // selectIndex(), because that reloads every field from the old model.
+        if (dirty && root.editingId !== "" && index >= 0) {
+            profileSelector.currentIndex = index;
+            Qt.callLater(root.applyCurrentIndex);
+            return;
+        }
+
+        if (root.creatingNewProfile) {
+            // A pristine first-run form is only a placeholder. Once the host
+            // supplies saved profiles, select one and give the list keyboard
+            // focus. A dirty new form, however, belongs to the user and must
+            // remain untouched across the same background refresh.
+            if (!root.profileDirty && list.length > 0) {
+                if (index < 0)
+                    index = root.indexOfId(root.activeId);
+                if (index < 0)
+                    index = 0;
+                root.selectIndex(index);
+                profileSelector.forceActiveFocus();
+            } else {
+                Qt.callLater(root.applyCurrentIndex);
+            }
+            return;
+        }
+
         if (index < 0)
             index = root.indexOfId(root.activeId);
         if (index < 0 && list.length > 0)
@@ -185,8 +246,11 @@ Rectangle {
     }
 
     function portValue() {
-        var parsed = parseInt(portField.text, 10);
-        return isNaN(parsed) ? 0 : parsed;
+        const text = portField.text.trim();
+        if (!/^[0-9]+$/.test(text))
+            return 0;
+        const parsed = parseInt(text, 10);
+        return isFinite(parsed) ? parsed : 0;
     }
 
     function formValid() {
@@ -212,6 +276,7 @@ Rectangle {
             "nodePath": nodePathField.text.trim(),
             "repoRoot": repoRootField.text.trim()
         });
+        root.profileDirty = false;
     }
 
     function connectNow() {
@@ -358,12 +423,11 @@ Rectangle {
 
     onProfilesChanged: root.syncFromModel()
     onActiveIdChanged: {
-        // Follow the host's active profile, but never onto the one already being
-        // edited: selectIndex() re-loads the form from the STORED profile, so
-        // re-selecting the current row would silently throw away whatever the
-        // user has typed but not saved — and pressing Connect is exactly what
-        // makes the host publish a new activeId.
-        if (root.activeId === root.editingId)
+        // Follow the host's active profile, but never onto a form the user is
+        // editing. Selecting it would reload every field from storage and
+        // discard text that has not been saved yet.
+        if (root.profileDirty || root.creatingNewProfile
+                || root.activeId === root.editingId)
             return;
         var index = root.indexOfId(root.activeId);
         if (index >= 0)
@@ -454,6 +518,7 @@ Rectangle {
         focusPolicy: Qt.StrongFocus
 
         contentItem: Label {
+            textFormat: Text.PlainText
             text: button.text
             color: button.enabled ? Theme.text : Theme.textPlaceholder()
             font.pixelSize: Theme.fontSizeBody
@@ -802,6 +867,13 @@ Rectangle {
                     if (profileSelector.currentIndex < 0
                             || profileSelector.currentIndex >= list.length)
                         return;
+                    // A model replacement can move currentIndex while the
+                    // user is typing. Keep the draft; an explicit row click
+                    // calls selectIndex() directly and remains intentional.
+                    if (root.profileDirty) {
+                        Qt.callLater(root.applyCurrentIndex);
+                        return;
+                    }
                     if (root.textOf(list[profileSelector.currentIndex], "id") !== root.editingId)
                         root.selectIndex(profileSelector.currentIndex);
                 }
@@ -992,6 +1064,7 @@ Rectangle {
                     label: qsTr("Name")
                     placeholder: qsTr("Defaults to the host name")
                     onAccepted: root.save()
+                    onTextChanged: if (!root.loadingForm) root.profileDirty = true
                 }
 
                 Row {
@@ -1005,6 +1078,7 @@ Rectangle {
                         label: qsTr("Host")
                         placeholder: qsTr("hostname or address")
                         onAccepted: root.save()
+                        onTextChanged: if (!root.loadingForm) root.profileDirty = true
                     }
                     LabeledField {
                         id: portField
@@ -1014,6 +1088,7 @@ Rectangle {
                         text: "22"
                         validator: IntValidator { bottom: 1; top: 65535 }
                         onAccepted: root.save()
+                        onTextChanged: if (!root.loadingForm) root.profileDirty = true
                     }
                 }
 
@@ -1024,6 +1099,7 @@ Rectangle {
                     label: qsTr("User")
                     placeholder: qsTr("login name")
                     onAccepted: root.save()
+                    onTextChanged: if (!root.loadingForm) root.profileDirty = true
                 }
 
                 LabeledField {
@@ -1034,6 +1110,7 @@ Rectangle {
                     placeholder: qsTr("Optional; ~/.ssh/config is also read")
                     hint: qsTr("Local path. Its passphrase is requested separately and never stored.")
                     onAccepted: root.save()
+                    onTextChanged: if (!root.loadingForm) root.profileDirty = true
                 }
 
                 LabeledField {
@@ -1044,6 +1121,7 @@ Rectangle {
                     placeholder: qsTr("/usr/bin/node")
                     hint: qsTr("Absolute path to node on the server; it need not be on the login PATH.")
                     onAccepted: root.save()
+                    onTextChanged: if (!root.loadingForm) root.profileDirty = true
                 }
 
                 LabeledField {
@@ -1054,6 +1132,7 @@ Rectangle {
                     placeholder: qsTr("/srv/codeharbor")
                     hint: qsTr("Remote CodeHarbor install providing codeharbord: an unpacked release tarball or a git checkout.")
                     onAccepted: root.save()
+                    onTextChanged: if (!root.loadingForm) root.profileDirty = true
                 }
             }
 

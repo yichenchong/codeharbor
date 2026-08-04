@@ -22,6 +22,7 @@ QString shellSingleQuote(const QString &value)
 enum class EscapeState {
     Normal,
     Escape,
+    EscapeIntermediate,
     Csi,
     String,
     StringEscape,
@@ -49,12 +50,27 @@ struct EscapeScanner {
             } else if (byte == 0x1b) {
                 start = index;
                 state = EscapeState::Escape;
+            } else if (byte >= 0x20 && byte <= 0x2f) {
+                // ESC Fe controls may carry one or more intermediate bytes
+                // before their final byte, such as ESC ( 0.
+                state = EscapeState::EscapeIntermediate;
             } else {
                 state = EscapeState::Normal;
                 start = -1;
                 return true;
             }
             return false;
+        case EscapeState::EscapeIntermediate:
+            if (byte == 0x1b) {
+                start = index;
+                state = EscapeState::Escape;
+                return false;
+            }
+            if (byte >= 0x20 && byte <= 0x2f)
+                return false;
+            state = EscapeState::Normal;
+            start = -1;
+            return true;
         case EscapeState::Csi:
             if (byte >= 0x40 && byte <= 0x7e) {
                 state = EscapeState::Normal;
@@ -407,17 +423,26 @@ void TerminalController::releaseRetained()
     // mechanism that exists to enforce it.
     //
     // Nothing is DROPPED by cutting: the remainder stays retained, in order,
-    // and the next acknowledgement releases the next slice. So the escape
-    // boundary rule is not at stake here the way it is in appendHidden() —
-    // both halves reach xterm.js's stateful parser in sequence. The cut still
-    // goes through resyncBoundary(), which prefers a line feed, because a batch
-    // that ends on a line boundary is the tidier split of the two and it costs
-    // nothing to ask for it.
+    // and the next acknowledgement releases the next slice. The cut must stay
+    // at or before the available credit, so use safePrefixBoundary() rather
+    // than the eviction helper, whose deliberate forward resynchronisation can
+    // exceed its input offset to find a line feed.
     const qint64 allowance = kMaxUnacknowledgedBytes - m_unacknowledged; // > 0
     QByteArray replay;
-    const qsizetype cut = m_hidden.size() <= allowance
+    qsizetype cut = m_hidden.size() <= allowance
                               ? m_hidden.size()
-                              : resyncBoundary(m_hidden, static_cast<qsizetype>(allowance));
+                              : safePrefixBoundary(m_hidden, static_cast<qsizetype>(allowance));
+    if (cut <= 0) {
+        // A single complete escape sequence can itself be larger than the
+        // remaining window. It cannot be split without corrupting the
+        // renderer's parser, so release that indivisible sequence as a last
+        // resort rather than deadlocking with no acknowledgement possible.
+        const qsizetype indivisible =
+            resyncBoundary(m_hidden, static_cast<qsizetype>(allowance));
+        if (indivisible <= 0)
+            return;
+        cut = indivisible;
+    }
     if (cut <= 0)
         return;
     if (cut >= m_hidden.size()) {

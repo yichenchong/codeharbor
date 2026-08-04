@@ -65,7 +65,21 @@ void TstLogBuffer::entryAndByteCaps()
     QVERIFY(byteBound.entries().constLast().toMap().value(QStringLiteral("message"))
                 .toString()
                 .contains(QStringLiteral("newest")));
+    const QString rocket = QString::fromUtf8("\xF0\x9F\x9A\x80");
+    for (int maxBytes = 200; maxBytes < 210; ++maxBytes) {
+        LogBuffer utf8(1, maxBytes);
+        utf8.append(QtInfoMsg, QStringLiteral("test"), QStringLiteral("unit"),
+                    rocket.repeated(100));
+        QCOMPARE(utf8.count(), 1);
+        QVERIFY(utf8.totalBytes() <= maxBytes);
+        const QString message =
+            utf8.entries().constFirst().toMap().value(QStringLiteral("message"))
+                .toString();
+        QVERIFY2(!message.contains(QChar::ReplacementCharacter),
+                 "UTF-8 truncation must not create replacement characters");
+    }
 }
+
 
 void TstLogBuffer::previousHandlerStillReceivesWarnings()
 {

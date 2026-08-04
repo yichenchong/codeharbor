@@ -112,6 +112,7 @@ ItemDelegate {
         }
         Label {
             text: header.name
+            textFormat: Text.PlainText
             // The tint is derived from this group's own name. Plain/unknown
             // palettes return Theme.text, preserving the historical pixels.
             color: header.groupTint

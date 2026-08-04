@@ -17,7 +17,7 @@
 #include <QtTest/QtTest>
 #include <QScopeGuard>
 
-#include <cstring>
+#include <functional>
 #include <optional>
 #include <type_traits>
 #include <utility>
@@ -56,6 +56,10 @@ public:
         m_in += bytes;
         emit readyRead();
     }
+    void setWriteHook(std::function<void(const QByteArray&)> hook)
+    {
+        m_writeHook = std::move(hook);
+    }
     void setShortWrite(bool on) { m_shortWrite = on; }
     // Everything the client has written since the last call, as raw wire bytes.
     QByteArray takeWritten() { return std::exchange(m_out, QByteArray()); }
@@ -78,12 +82,14 @@ protected:
     {
         const qint64 n = m_shortWrite ? maxSize / 2 : maxSize;
         m_out.append(data, n);
+        if (m_writeHook)
+            m_writeHook(QByteArray(data, n));
         return n;
     }
 
-private:
     QByteArray m_in;
     QByteArray m_out;
+    std::function<void(const QByteArray&)> m_writeHook;
     bool m_shortWrite = false;
 };
 
@@ -164,6 +170,8 @@ private slots:
     void neitherResultNorErrorFailsCallback();
     void errorNullFieldTreatedAsSuccess();
     void malformedErrorObjectWarns();
+    void emptyMethodIsSentAndRouted();
+    void responseWithInvalidJsonrpcFailsPending();
     void largeLineRoutes();
     void nonRoutableIdWarns();
     void crlfAndWhitespaceFraming();
@@ -177,15 +185,18 @@ private slots:
     void reconnectFromDestructorSweepIsRefused();
     void destroyingClientFailsPendingCallbacks();
     void oversizedNewlinelessInputIsBounded();
+    void oversizedDelimitedInputIsRejected();
     void detachingTransportFailsPendingOnce();
     void retryFromRebindFailureUsesNewTransport();
     void rebindAfterCloseRevivesClient();
+    void closeCallbackRebindKeepsNewTransportAlive();
     void methodWithIdIsNotANotification();
     void responseCarryingMethodIsNeverAResult();
     void errorCodeOutOfIntRangeWarns();
     void rebindFromASweptCallbackAnnouncesBoundOnce();
     void nullCallbackIsTolerated();
     void nonObjectJsonWarns();
+    void closeDrainProcessesAllBoundedChunks();
     void responseQueuedBeforeEofIsStillDelivered();
     void closeMidChunkDropsTheRestOfTheChunk();
     void nullResultIsSuccess();
@@ -196,6 +207,7 @@ private slots:
     void transportDestroyedWhileBoundFailsPending();
     void rebindSameDeviceAfterCloseRevivesClient();
     void shortWriteFailsCallAndClosesTransport();
+    void synchronousResponseDuringWriteIsRouted();
     void transportBoundFiresOnlyForNonNullBind();
     void liveServerInfoOverProcess();
     void heartbeatAnsweredKeepsClientAliveAndOffThePendingCount();
@@ -203,6 +215,7 @@ private slots:
     void silentPeerIsNotKilledWithTheHeartbeatDisabled();
     void heartbeatSparesASlowButLivePeer();
     void heartbeatStopsWhenTransportUnbound();
+    void heartbeatWriteFailureDeletingClientIsSafe();
     void retiredProbeAnswerDoesNotClobberTheLiveProbe();
     void rebindFromInsideACallbackKeepsProbeBookkeepingStraight();
     void reentrantFeedFromACallbackDispatchesEveryFrameOnce();
@@ -211,6 +224,7 @@ private slots:
     void reEnablingTheRunningHeartbeatIsANoOp();
     void repeatedlyReEnablingCannotSuppressSilenceDetection();
     void reArmingAgainstASilentPeerCannotPileUpProbes();
+    void decodeFileContentValidatesEncoding();
 
 private:
     void makePair();
@@ -594,6 +608,73 @@ void TstRpcClient::malformedErrorObjectWarns()
     QTRY_COMPARE(warnSpy.count(), 2);
     QCOMPARE(m_client->pendingCount(), 0);
 }
+void TstRpcClient::responseWithInvalidJsonrpcFailsPending()
+{
+    makePair();
+
+    QSignalSpy warnSpy(m_client, &CodeharbordClient::protocolWarning);
+    int failures = 0;
+    std::optional<RpcError> last;
+    const qint64 wrongVersionId =
+        m_client->call(QStringLiteral("ping"), QJsonValue(),
+                       [&](QJsonValue, std::optional<RpcError> err) {
+                           ++failures;
+                           last = err;
+                       });
+    const qint64 missingVersionId =
+        m_client->call(QStringLiteral("ping"), QJsonValue(),
+                       [&](QJsonValue, std::optional<RpcError> err) {
+                           ++failures;
+                           last = err;
+                       });
+
+    m_serverSide->write(jsonLine({{"jsonrpc", "1.0"},
+                                  {"id", wrongVersionId},
+                                  {"result", QJsonObject{}}}));
+    m_serverSide->write(
+        jsonLine({{"id", missingVersionId}, {"result", QJsonObject{}}}));
+    m_serverSide->flush();
+
+    QTRY_COMPARE(failures, 2);
+    QVERIFY(last.has_value());
+    QCOMPARE(last->code, -32603);
+    QCOMPARE(warnSpy.count(), 2);
+    QCOMPARE(m_client->pendingCount(), 0);
+}
+void TstRpcClient::emptyMethodIsSentAndRouted()
+{
+    makePair();
+
+    std::optional<RpcError> got;
+    bool fired = false;
+    const qint64 id =
+        m_client->call(QString(), QJsonValue(),
+                       [&](QJsonValue, std::optional<RpcError> err) {
+                           got = err;
+                           fired = true;
+                       });
+
+    m_clientSide->flush();
+    QVERIFY(m_serverSide->waitForReadyRead(2000));
+    const QJsonObject request =
+        QJsonDocument::fromJson(m_serverSide->readAll().trimmed()).object();
+    QVERIFY(request.contains(QStringLiteral("method")));
+    QCOMPARE(request.value(QStringLiteral("method")).toString(), QString());
+    QCOMPARE(request.value(QStringLiteral("id")).toInteger(), id);
+
+    m_serverSide->write(
+        jsonLine({{"jsonrpc", "2.0"},
+                  {"id", id},
+                  {"error", QJsonObject{{"code", -32601},
+                                        {"message", "Method not found"}}}}));
+    m_serverSide->flush();
+
+    QTRY_VERIFY(fired);
+    QVERIFY(got.has_value());
+    QCOMPARE(got->code, -32601);
+}
+
+
 
 void TstRpcClient::largeLineRoutes()
 {
@@ -957,6 +1038,47 @@ void TstRpcClient::rebindAfterCloseRevivesClient()
 
     m_client->setTransport(nullptr);
 }
+void TstRpcClient::closeCallbackRebindKeepsNewTransportAlive()
+{
+    ScriptedDevice first;
+    ScriptedDevice second;
+    m_client->setTransport(&first);
+
+    QSignalSpy closedSpy(m_client, &CodeharbordClient::transportClosed);
+    QSignalSpy boundSpy(m_client, &CodeharbordClient::transportBound);
+    int failures = 0;
+    m_client->call(
+        QStringLiteral("ping"), QJsonValue(),
+        [&](QJsonValue, std::optional<RpcError> err) {
+            QVERIFY(err.has_value());
+            ++failures;
+            // Reconnect directly from the failed request's callback. The close
+            // notification still belongs to `first`, not to `second`.
+            m_client->setTransport(&second);
+        });
+
+    first.announceEof();
+
+    QCOMPARE(failures, 1);
+    QCOMPARE(closedSpy.count(), 0);
+    QCOMPARE(boundSpy.count(), 1);
+    QCOMPARE(m_client->transport(), static_cast<QIODevice*>(&second));
+
+    bool answered = false;
+    const qint64 id =
+        m_client->call(QStringLiteral("ping"), QJsonValue(),
+                       [&](QJsonValue, std::optional<RpcError> err) {
+                           QVERIFY(!err.has_value());
+                           answered = true;
+                       });
+    second.deliver(
+        jsonLine({{"jsonrpc", "2.0"}, {"id", id}, {"result", QJsonObject{}}}));
+    QVERIFY(answered);
+    QCOMPARE(m_client->pendingCount(), 0);
+
+    m_client->setTransport(nullptr);
+}
+
 
 // A message carrying BOTH a method and an id is a request aimed at the client
 // (JSON-RPC 2.0 section 4.1 defines a notification as a request WITHOUT an id),
@@ -1211,6 +1333,40 @@ void TstRpcClient::responseQueuedBeforeEofIsStillDelivered()
 
     m_client->setTransport(nullptr);
 }
+void TstRpcClient::closeDrainProcessesAllBoundedChunks()
+{
+    ScriptedDevice device;
+    m_client->setTransport(&device);
+
+    QJsonValue result;
+    bool fired = false;
+    const qint64 id =
+        m_client->call(QStringLiteral("ping"), QJsonValue(),
+                       [&](QJsonValue value, std::optional<RpcError> err) {
+                           QVERIFY(!err.has_value());
+                           result = value;
+                           fired = true;
+                       });
+    QSignalSpy closedSpy(m_client, &CodeharbordClient::transportClosed);
+
+    // Put one complete blank line exactly at the bounded read size before the
+    // response. Closing must drain both reads instead of failing the response
+    // after only the first chunk.
+    QByteArray firstChunk(16 * 1024 * 1024, ' ');
+    firstChunk.append('\n');
+    firstChunk += jsonLine(
+        {{"jsonrpc", "2.0"}, {"id", id}, {"result", QJsonObject{{"ok", true}}}});
+    device.queueSilently(firstChunk);
+    device.announceEof();
+
+    QVERIFY(fired);
+    QVERIFY(result.toObject().value(QStringLiteral("ok")).toBool());
+    QCOMPARE(closedSpy.count(), 1);
+    QCOMPARE(m_client->pendingCount(), 0);
+
+    m_client->setTransport(nullptr);
+}
+
 
 // A SHORT write leaves a truncated frame on the wire, so the peer glues the next
 // request onto the fragment and the byte stream is desynchronised beyond repair.
@@ -1261,6 +1417,37 @@ void TstRpcClient::shortWriteFailsCallAndClosesTransport()
 
     m_client->setTransport(nullptr);
 }
+void TstRpcClient::synchronousResponseDuringWriteIsRouted()
+{
+    ScriptedDevice device;
+    m_client->setTransport(&device);
+
+    QSignalSpy warnSpy(m_client, &CodeharbordClient::protocolWarning);
+    int callbacks = 0;
+    device.setWriteHook([&device](const QByteArray& bytes) {
+        const QJsonObject request =
+            QJsonDocument::fromJson(bytes.trimmed()).object();
+        const qint64 id = request.value(QStringLiteral("id")).toInteger();
+        device.deliver(
+            jsonLine({{"jsonrpc", "2.0"}, {"id", id}, {"result", 7}}));
+    });
+
+    const qint64 id =
+        m_client->call(QStringLiteral("ping"), QJsonValue(),
+                       [&](QJsonValue result, std::optional<RpcError> err) {
+                           QVERIFY(!err.has_value());
+                           QCOMPARE(result.toInt(), 7);
+                           ++callbacks;
+                       });
+
+    QVERIFY(id > 0);
+    QCOMPARE(callbacks, 1);
+    QCOMPARE(warnSpy.count(), 0);
+    QCOMPARE(m_client->pendingCount(), 0);
+
+    m_client->setTransport(nullptr);
+}
+
 
 // transportBound() announces a NEW, usable transport and nothing else: exactly
 // once per non-null bind, never for a re-bind of the same device, never for a
@@ -1307,6 +1494,7 @@ void TstRpcClient::callWithNoTransportFailsCallbackOnce()
     QCOMPARE(fired, 1);
     QVERIFY(got.has_value());
     QCOMPARE(got->code, -32603);
+    QVERIFY(got->data.isNull());
     QCOMPARE(m_client->pendingCount(), 0); // nothing registered => no leak
 }
 
@@ -1471,6 +1659,33 @@ void TstRpcClient::oversizedNewlinelessInputIsBounded()
     QCOMPARE(got->code, -32603);
     QCOMPARE(m_client->pendingCount(), 0);
 }
+void TstRpcClient::oversizedDelimitedInputIsRejected()
+{
+    ScriptedDevice device;
+    m_client->setTransport(&device);
+
+    QSignalSpy warnSpy(m_client, &CodeharbordClient::protocolWarning);
+    QSignalSpy closedSpy(m_client, &CodeharbordClient::transportClosed);
+    std::optional<RpcError> got;
+    m_client->call(QStringLiteral("ping"), QJsonValue(),
+                   [&](QJsonValue, std::optional<RpcError> err) { got = err; });
+
+    // The newline is present, but the frame itself is over the 16 MiB cap. It
+    // must be rejected before JSON parsing rather than accepted just because
+    // the peer remembered to terminate it.
+    QByteArray oversized(16 * 1024 * 1024 + 1, 'x');
+    oversized.append('\n');
+    device.deliver(oversized);
+
+    QCOMPARE(closedSpy.count(), 1);
+    QVERIFY(warnSpy.count() >= 1);
+    QVERIFY(got.has_value());
+    QCOMPARE(got->code, -32603);
+    QCOMPARE(m_client->pendingCount(), 0);
+
+    m_client->setTransport(nullptr);
+}
+
 
 // One readyRead() can hand over several frames at once, and a callback is free
 // to tear the session down: SessionBootstrap really does close the RPC channel
@@ -2030,6 +2245,27 @@ void TstRpcClient::heartbeatStopsWhenTransportUnbound()
 
     m_client->setTransport(nullptr);
 }
+void TstRpcClient::heartbeatWriteFailureDeletingClientIsSafe()
+{
+    ScriptedDevice device;
+    m_client->enableHeartbeat(10, 1000);
+    m_client->setTransport(&device);
+    device.setShortWrite(true);
+
+    bool warned = false;
+    connect(m_client, &CodeharbordClient::protocolWarning, m_client,
+            [this, &warned](const QString& message) {
+                if (!message.contains(QStringLiteral("write failed")))
+                    return;
+                warned = true;
+                delete m_client;
+                m_client = nullptr;
+            });
+
+    QTRY_VERIFY_WITH_TIMEOUT(warned, 1000);
+    QVERIFY(m_client == nullptr);
+}
+
 
 // A probe's callback can run when that probe is no longer the one being awaited,
 // and it must then do NOTHING. Two routes reach that state; this is the one that
@@ -2425,6 +2661,31 @@ void TstRpcClient::reArmingAgainstASilentPeerCannotPileUpProbes()
 
     m_client->setTransport(nullptr);
 }
+void TstRpcClient::decodeFileContentValidatesEncoding()
+{
+    const auto utf8 =
+        ch::rpc::decodeFileContent(QJsonObject{{"encoding", "utf-8"},
+                                               {"content", "hello"}});
+    QVERIFY(utf8.has_value());
+    QCOMPARE(*utf8, QStringLiteral("hello"));
+
+    const auto base64 =
+        ch::rpc::decodeFileContent(QJsonObject{{"encoding", "base64"},
+                                               {"content", "aGVsbG8="}});
+    QVERIFY(base64.has_value());
+    QCOMPARE(*base64, QStringLiteral("hello"));
+
+    QVERIFY(!ch::rpc::decodeFileContent(
+                 QJsonObject{{"encoding", "latin-1"}, {"content", "hello"}})
+                 .has_value());
+    QVERIFY(!ch::rpc::decodeFileContent(
+                 QJsonObject{{"content", "hello"}})
+                 .has_value());
+    QVERIFY(!ch::rpc::decodeFileContent(
+                 QJsonObject{{"encoding", "utf-8"}, {"content", 7}})
+                 .has_value());
+}
+
 
 QTEST_GUILESS_MAIN(TstRpcClient)
 #include "tst_rpcclient.moc"

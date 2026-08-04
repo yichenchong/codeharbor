@@ -24,6 +24,16 @@ TerminalBridge::TerminalBridge(TerminalController* controller, QObject* parent)
     applyVisibility();
 }
 
+TerminalBridge::~TerminalBridge()
+{
+    // The JavaScript page normally reports hidden during dispose(), but the
+    // bridge can also be destroyed by the QML pane while a page is wedged or
+    // navigating. Retain later output instead of leaving the controller
+    // emitting into a bridge that no longer exists.
+    if (m_controller)
+        m_controller->setViewVisible(false);
+}
+
 TerminalController* TerminalBridge::controller() const
 {
     return m_controller.data();
@@ -91,6 +101,7 @@ void TerminalBridge::resize(int cols, int rows)
 
 void TerminalBridge::notifyViewVisible(bool visible)
 {
+    m_visibilityReported = true;
     m_viewVisible = visible;
     applyVisibility();
 }
@@ -103,6 +114,7 @@ void TerminalBridge::notifyOutputConsumed(int bytes)
 
 void TerminalBridge::ready()
 {
+    const bool replacingRenderer = m_rendererReady;
     m_rendererReady = true;
     if (!m_controller)
         return;
@@ -110,14 +122,17 @@ void TerminalBridge::ready()
     // release the buffer: becoming visible replays everything retained while
     // the renderer was absent as one flushReady batch.
     emit connectionStateChanged(toString(m_controller->state()));
-    // The handshake IS a visibility report: the page says it has mounted and
-    // wired up host.write(). It has to reset m_viewVisible rather than merely
-    // re-apply it, because the PREVIOUS page reported hidden on its way out
-    // (TerminalHost.dispose() in src/web/terminal/src/index.ts), and a reload
-    // would otherwise leave the pane retaining output forever behind a page
-    // that is very much on screen. The page's own observers correct this within
-    // a frame if the pane really is hidden.
-    m_viewVisible = true;
+    // The handshake IS a visibility report for a replacement page: it has to
+    // reset m_viewVisible rather than merely re-apply it, because the PREVIOUS
+    // page reported hidden on its way out (TerminalHost.dispose() in
+    // src/web/terminal/src/index.ts), and a reload would otherwise leave the
+    // pane retaining output forever behind a page that is very much on screen.
+    // On the first mount, however, preserve a QML/page report that arrived
+    // before ready(); this covers a pane hidden while Chromium is still
+    // loading. Hosts that never report visibility retain the historical
+    // visible default.
+    if (replacingRenderer || !m_visibilityReported)
+        m_viewVisible = true;
     // A fresh renderer has consumed nothing and is owed nothing. Both sides of
     // the account are cleared explicitly rather than left to the visibility
     // change, because a page that vanished without reporting hidden (a crash, a

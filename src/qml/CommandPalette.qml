@@ -215,7 +215,7 @@ Item {
     // One real Shortcut per command that declares one. They are intentionally
     // disabled while the palette is open: the palette owns the keyboard then.
     Instantiator {
-        model: root.commands
+        model: Array.isArray(root.commands) ? root.commands : []
         delegate: Shortcut {
             required property var modelData
 
@@ -362,6 +362,7 @@ Item {
                     anchors.rightMargin: 8
                     anchors.verticalCenter: parent.verticalCenter
                     text: root._title(resultRow.modelData)
+                    textFormat: Text.PlainText
                     color: Theme.text
                     font.pixelSize: Theme.fontSizeLabel
                     elide: Text.ElideRight
@@ -375,6 +376,7 @@ Item {
                     anchors.verticalCenter: parent.verticalCenter
                     text: resultRow.modelData && resultRow.modelData.shortcut
                           ? String(resultRow.modelData.shortcut) : ""
+                    textFormat: Text.PlainText
                     color: Theme.textDim
                     font.pixelSize: 11
                     visible: text.length > 0

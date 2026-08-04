@@ -141,6 +141,15 @@ int main(int argc, char *argv[])
     appController.setEditorFactory(&editorFactory);
     appController.setTerminalFactory(&terminalFactory);
 
+    // Agent attention -> OS notification: construct and connect this sink
+    // before any environment auto-connect can deliver the first agent event.
+    // Startup events are transitions too; wiring afterwards silently loses
+    // the only chance to notify the user about one that happened during the
+    // initial handshake.
+    ch::Notifier notifier;
+    QObject::connect(&agentMonitor, &ch::AgentStatusMonitor::notify, &notifier,
+                     &ch::Notifier::notify);
+
     // A normal desktop launch stays server-less: this returns immediately unless
     // CH_LIVE_SSH is set (with CH_LIVE_HOST/PORT/USER/NODE/REPO), so the UI still
     // comes up with no session and RPC calls fail gracefully with a synthetic
@@ -153,12 +162,6 @@ int main(int argc, char *argv[])
     // an empty sidebar on top of a perfectly good SSH session.
     sessionBootstrap.connectAndWireFromEnvironment();
 
-    // Agent attention -> OS notification: a Phase 4 deliverable in SPEC 16, over
-    // the agent states SPEC 6.4 defines. A box with no notification daemon
-    // degrades to a silent no-op.
-    ch::Notifier notifier;
-    QObject::connect(&agentMonitor, &ch::AgentStatusMonitor::notify, &notifier,
-                     &ch::Notifier::notify);
 
     // GroupPaletteService is a pure deterministic colour service, but QML
     // needs one long-lived instance to cache the expanded palette and each

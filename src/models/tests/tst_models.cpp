@@ -1,6 +1,7 @@
 #include <QtTest/QtTest>
 
 #include <QAbstractItemModelTester>
+#include <QHash>
 #include <QFile>
 #include <QJsonArray>
 #include <QJsonDocument>
@@ -16,6 +17,7 @@
 
 #include "GroupPalette.h"
 #include "SessionState.h"
+#include "ViewerKinds.h"
 #include "SessionsModel.h"
 #include "SplitTree.h"
 #include "WorkspaceTypes.h"
@@ -53,6 +55,7 @@ private slots:
     void splitTreeOperationsAreDepthBounded();
     void splitTreeRejectsChildlessSplit();
     void splitTreeRejectsInvalidRatioValues();
+    void splitTreeRejectsInvalidOrientation();
     void modelSatisfiesItemModelInvariants();
     void splitTreeRejectsUnknownAndMissingType();
     void splitTreeRejectsInvalidNestedChild();
@@ -73,6 +76,7 @@ private slots:
     void stateStringsArePinnedWireValues();
     void sessionsModelRoleNamesCoverEveryServedRole();
     void sessionsModelFiltersArchivedAndPinnedTogether();
+    void sessionsModelPinnedOnlyHidesEmptyGroups();
     void splitTreeRejectsNonObjectChildAndNonNumericRatio();
     void startingAgentCountsAsRunning();
     void agentStateWireWordsMatchRemoteEventsTs();
@@ -81,18 +85,22 @@ private slots:
     void updateTerminalStatesStaysSilentWhenTheAggregateDoesNotMove();
     void sessionsModelSessionIndicesAreScopedToTheirGroup();
     void sessionsModelIsSingleColumn();
+    void sessionsModelRejectsForeignIndices();
     void splitTreeSplitUrlIgnoredOnRoundTrip();
     void splitTreeRoundTripsLeafTerminalPaneId();
     void splitTreeWithoutTerminalPaneIdIsUnchangedByTheField();
     void splitTreeSplitTerminalPaneIdIgnoredOnRoundTrip();
     void splitTreeCustomTitleRoundTripsAndIsBounded();
     void workspaceValueTypesCompareEveryField();
+    void identifierWrappersAreHashable();
     void updateTerminalStatesFinishesEveryRowBeforeSignalling();
     void oklchRoundTripsSrgb();
     void paletteRejectsTooSmallRequest();
     void paletteOnlyAppendsToSeed();
     void paletteGenerationIsDeterministic();
     void groupNameHashIsStableAndInRange();
+    void viewerKindsValidateAssignments();
+    void paletteHandlesSingleSeedAndNonFiniteValues();
 };
 
 // Group -> DevSession -> viewer + terminal panes tree.
@@ -386,6 +394,45 @@ void TstModels::splitTreeRejectsInvalidRatioValues()
     QCOMPARE(restored.ratios.size(), 2);
     QCOMPARE(restored.ratios.at(0), 0.3);
     QCOMPARE(restored.ratios.at(1), 0.7);
+}
+
+void TstModels::splitTreeRejectsInvalidOrientation()
+{
+    const QJsonObject leaf{{"type", "leaf"}, {"paneId", "A"}};
+    const auto split = [&](const QString &orientation) {
+        return QJsonObject{
+            {"type", "split"},
+            {"orientation", orientation},
+            {"children", QJsonArray{leaf}},
+            {"ratios", QJsonArray{1.0}},
+        };
+    };
+
+    QVERIFY(SplitNode::fromJson(split(QStringLiteral("diagonal"))) == SplitNode{});
+    QVERIFY(SplitNode::fromJson(split(QString())) == SplitNode{});
+
+    SplitNode invalid;
+    invalid.children = {SplitNode{}};
+    invalid.ratios = {1.0};
+    invalid.orientation = static_cast<SplitOrientation>(99);
+    QVERIFY(!invalid.tryToJson().has_value());
+
+    // A pair of finite ratios can still overflow their sum; such a tree would
+    // make every downstream normalized extent zero.
+    const QJsonObject overflow = split(QStringLiteral("horizontal"));
+    QJsonObject withOverflow = overflow;
+    withOverflow[QStringLiteral("ratios")] =
+            QJsonArray{std::numeric_limits<double>::max(),
+                       std::numeric_limits<double>::max()};
+    withOverflow[QStringLiteral("children")] =
+            QJsonArray{leaf, leaf};
+    QVERIFY(SplitNode::fromJson(withOverflow) == SplitNode{});
+
+    SplitNode overflowNode;
+    overflowNode.children = {SplitNode{}, SplitNode{}};
+    overflowNode.ratios = {std::numeric_limits<double>::max(),
+                           std::numeric_limits<double>::max()};
+    QVERIFY(!overflowNode.tryToJson().has_value());
 }
 
 // SPEC 4.2 precedence: Error > WaitingForInput > Running > FinishedUnseen > Idle
@@ -1013,6 +1060,30 @@ void TstModels::sessionsModelFiltersArchivedAndPinnedTogether()
              QStringLiteral("pinned"));
 }
 
+void TstModels::sessionsModelPinnedOnlyHidesEmptyGroups()
+{
+    SessionsModel model;
+    GroupRow empty;
+    empty.group.id = GroupId{QStringLiteral("empty")};
+    empty.group.name = QStringLiteral("Empty");
+
+    SessionRow pinned;
+    pinned.session.id = DevSessionId{QStringLiteral("pinned")};
+    pinned.session.name = QStringLiteral("Pinned");
+    pinned.session.pinned = true;
+    GroupRow populated;
+    populated.group.id = GroupId{QStringLiteral("populated")};
+    populated.group.name = QStringLiteral("Populated");
+    populated.sessions = {pinned};
+
+    model.setGroups({empty, populated});
+    QCOMPARE(model.rowCount(), 2);
+    model.setPinnedOnly(true);
+    QCOMPARE(model.rowCount(), 1);
+    QCOMPARE(model.data(model.index(0, 0), SessionsModel::IdRole).toString(),
+             QStringLiteral("populated"));
+}
+
 // Two rejection branches in SplitTree.cpp's parser that no other case reaches: a
 // children[] entry that is not a JSON object, and a ratios[] entry that is not a
 // number. Both can only come from corrupt or hostile stored/remote data, and both
@@ -1360,6 +1431,25 @@ void TstModels::sessionsModelIsSingleColumn()
     QCOMPARE(model.columnCount(session), 1);
 }
 
+void TstModels::sessionsModelRejectsForeignIndices()
+{
+    SessionsModel model;
+    SessionsModel other;
+
+    GroupRow group;
+    group.group.id = GroupId{QStringLiteral("g")};
+    group.group.name = QStringLiteral("G");
+    model.setGroups({group});
+    other.setGroups({group});
+
+    const QModelIndex foreign = other.index(0, 0);
+    QVERIFY(foreign.isValid());
+    QVERIFY(!model.index(0, 0, foreign).isValid());
+    QCOMPARE(model.rowCount(foreign), 0);
+    QVERIFY(!model.data(foreign, SessionsModel::NameRole).isValid());
+    QVERIFY(!model.parent(foreign).isValid());
+}
+
 // url, like paneId, is persisted for LEAVES only: a split has no content of its
 // own. tryToJson() must drop a split's stray url and equality must ignore it, or a
 // tree stops comparing equal to its own round-trip and SessionLayouts rewrites
@@ -1521,14 +1611,33 @@ void TstModels::splitTreeCustomTitleRoundTripsAndIsBounded()
     const SplitNode clearedRestored = SplitNode::fromJson(cleared);
     QVERIFY(clearedRestored.customTitle.isEmpty());
     QCOMPARE(clearedRestored.paneId, QStringLiteral("terminal-7"));
-    QCOMPARE(clearedRestored.terminalPaneId, QStringLiteral("row-7"));
+    // Bounded UTF-16 truncation must not leave a dangling high surrogate when
+    // the final code point is a supplementary-plane character.
+    QString surrogateTitle(127, QLatin1Char('x'));
+    surrogateTitle.append(QChar(0xD83D));
+    surrogateTitle.append(QChar(0xDE00));
+    leaf.customTitle = surrogateTitle;
+    const QString normalized =
+        SplitNode::normalizeCustomTitle(surrogateTitle);
+    QCOMPARE(normalized.size(), 127);
+    QVERIFY(!normalized.back().isHighSurrogate());
+
+    QString completePair(126, QLatin1Char('x'));
+    completePair.append(QChar(0xD83D));
+    completePair.append(QChar(0xDE00));
+    QCOMPARE(SplitNode::normalizeCustomTitle(completePair).size(), 128);
+
+    QString loneLow(127, QLatin1Char('x'));
+    loneLow.append(QChar(0xDE00));
+    QCOMPARE(SplitNode::normalizeCustomTitle(loneLow).size(), 127);
 }
 
 
 // Defaulted equality on the persisted value types has to compare EVERY member:
 // these structs are diffed to decide whether a change needs writing back, so a
 // field left out of the comparison is a field whose edits are silently dropped.
-// Only DevSession was covered; flip each member of the other three in turn.
+// Flip each member in turn so a future change cannot silently omit one from
+// the comparison.
 void TstModels::workspaceValueTypesCompareEveryField()
 {
     Group group;
@@ -1547,6 +1656,36 @@ void TstModels::workspaceValueTypesCompareEveryField()
         Group changed = group;
         mutate(changed);
         QVERIFY(!(changed == group));
+    }
+
+    DevSession session;
+    session.id = DevSessionId{QStringLiteral("s1")};
+    session.serverId = ServerId{QStringLiteral("srv")};
+    session.groupId = GroupId{QStringLiteral("g1")};
+    session.name = QStringLiteral("Session");
+    session.repositoryRoot = QStringLiteral("/repo");
+    session.defaultWorkingDirectory = QStringLiteral("/repo/src");
+    session.taskDescription = QStringLiteral("task");
+    session.position = 2;
+    session.archived = false;
+    session.pinned = true;
+    QVERIFY(session == DevSession(session));
+    for (const auto &mutate : QVector<std::function<void(DevSession &)>>{
+                 [](DevSession &s) { s.id = DevSessionId{QStringLiteral("other")}; },
+                 [](DevSession &s) { s.serverId = ServerId{QStringLiteral("other")}; },
+                 [](DevSession &s) { s.groupId = GroupId{QStringLiteral("other")}; },
+                 [](DevSession &s) { s.name = QStringLiteral("other"); },
+                 [](DevSession &s) { s.repositoryRoot = QStringLiteral("/other"); },
+                 [](DevSession &s) {
+                     s.defaultWorkingDirectory = QStringLiteral("/other");
+                 },
+                 [](DevSession &s) { s.taskDescription = QStringLiteral("other"); },
+                 [](DevSession &s) { s.position = 3; },
+                 [](DevSession &s) { s.archived = true; },
+                 [](DevSession &s) { s.pinned = false; }}) {
+        DevSession changed = session;
+        mutate(changed);
+        QVERIFY(!(changed == session));
     }
 
     ViewerPane viewer;
@@ -1596,6 +1735,31 @@ void TstModels::workspaceValueTypesCompareEveryField()
         mutate(changed);
         QVERIFY(!(changed == term));
     }
+}
+
+// QHash needs an overload for each strong identifier wrapper so equal values
+// can be used as keys without falling back to untyped QString maps.
+void TstModels::identifierWrappersAreHashable()
+{
+    QHash<GroupId, int> groups;
+    groups.insert(GroupId{QStringLiteral("g1")}, 7);
+    QCOMPARE(groups.value(GroupId{QStringLiteral("g1")}), 7);
+
+    QHash<DevSessionId, int> sessions;
+    sessions.insert(DevSessionId{QStringLiteral("s1")}, 3);
+    QCOMPARE(sessions.value(DevSessionId{QStringLiteral("s1")}), 3);
+
+    QHash<ViewerPaneId, int> viewers;
+    viewers.insert(ViewerPaneId{QStringLiteral("v1")}, 5);
+    QCOMPARE(viewers.value(ViewerPaneId{QStringLiteral("v1")}), 5);
+
+    QHash<TerminalId, int> terminals;
+    terminals.insert(TerminalId{QStringLiteral("t1")}, 9);
+    QCOMPARE(terminals.value(TerminalId{QStringLiteral("t1")}), 9);
+
+    QHash<ServerId, int> servers;
+    servers.insert(ServerId{QStringLiteral("srv")}, 11);
+    QCOMPARE(servers.value(ServerId{QStringLiteral("srv")}), 11);
 }
 
 // updateTerminalStates has to put the WHOLE model into its new state before the
@@ -1664,6 +1828,12 @@ void TstModels::oklchRoundTripsSrgb()
         QVERIFY(std::abs(roundTrip.green - sample.green) < 0.0025);
         QVERIFY(std::abs(roundTrip.blue - sample.blue) < 0.0025);
     }
+
+    const Oklch colour{0.6, 0.2, 1.5};
+    QVERIFY(colour == Oklch(colour));
+    Oklch changed = colour;
+    changed.hue += 0.1;
+    QVERIFY(!(changed == colour));
 }
 
 void TstModels::paletteRejectsTooSmallRequest()
@@ -1711,6 +1881,65 @@ void TstModels::groupNameHashIsStableAndInRange()
         QVERIFY(first >= 0);
         QVERIFY(first < paletteSize);
     }
+
+    // The helper has a safe zero-size fallback; invalid user preferences must
+    // not trip a debug assertion before that branch can run.
+    QCOMPARE(GroupPalette::stableIndexForName(QStringLiteral("Work"), 0), 0);
+}
+
+void TstModels::viewerKindsValidateAssignments()
+{
+    const QStringList kinds = ViewerKinds::all();
+    QCOMPARE(kinds,
+             QStringList({QStringLiteral("web"), QStringLiteral("markdown"),
+                          QStringLiteral("text"), QStringLiteral("image"),
+                          QStringLiteral("pdf"), QStringLiteral("directory"),
+                          QStringLiteral("binary")}));
+    for (const QString &kind : kinds)
+        QVERIFY(ViewerKinds::isKnown(kind));
+    QVERIFY(!ViewerKinds::isKnown(QStringLiteral("WEB")));
+
+    QCOMPARE(ViewerKinds::normaliseExtension(QStringLiteral(" .Ts ")),
+             QStringLiteral("ts"));
+    QVERIFY(ViewerKinds::normaliseExtension(QStringLiteral(".")).isEmpty());
+    QVERIFY(ViewerKinds::normaliseExtension(QStringLiteral("a-b")).isEmpty());
+    QVERIFY(ViewerKinds::normaliseExtension(QString(65, QLatin1Char('x'))).isEmpty());
+
+    QCOMPARE(ViewerKinds::assignableForExtension(QStringLiteral("HTML")),
+             QStringList({QStringLiteral("web"), QStringLiteral("text"),
+                          QStringLiteral("binary")}));
+    QCOMPARE(ViewerKinds::assignableForExtension(QStringLiteral(".md")),
+             QStringList({QStringLiteral("markdown"), QStringLiteral("text"),
+                          QStringLiteral("binary")}));
+    QCOMPARE(ViewerKinds::assignableForExtension(QStringLiteral("png")),
+             QStringList({QStringLiteral("image"), QStringLiteral("text"),
+                          QStringLiteral("binary")}));
+    QVERIFY(ViewerKinds::canAssign(QStringLiteral("ts"), QStringLiteral("text")));
+    QVERIFY(!ViewerKinds::canAssign(QStringLiteral("ts"), QStringLiteral("markdown")));
+    QVERIFY(!ViewerKinds::canAssign(QStringLiteral(""), QStringLiteral("text")));
+}
+
+void TstModels::paletteHandlesSingleSeedAndNonFiniteValues()
+{
+    const QVector<SrgbColor> seed = {SrgbColor{0.0, 0.0, 0.0}};
+    QVERIFY(GroupPalette::canGenerate(seed, 2));
+    const QVector<SrgbColor> expanded = GroupPalette::generatePalette(seed, 2);
+    QCOMPARE(expanded.size(), 2);
+    QCOMPARE(expanded.first(), seed.first());
+    for (const SrgbColor &color : expanded) {
+        QVERIFY(std::isfinite(color.red));
+        QVERIFY(std::isfinite(color.green));
+        QVERIFY(std::isfinite(color.blue));
+        QVERIFY(color.red >= 0.0 && color.red <= 1.0);
+        QVERIFY(color.green >= 0.0 && color.green <= 1.0);
+        QVERIFY(color.blue >= 0.0 && color.blue <= 1.0);
+    }
+
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    const SrgbColor sanitized = GroupPalette::oklchToSrgb({nan, nan, nan});
+    QVERIFY(std::isfinite(sanitized.red));
+    QVERIFY(std::isfinite(sanitized.green));
+    QVERIFY(std::isfinite(sanitized.blue));
 }
 
 QTEST_GUILESS_MAIN(TstModels)

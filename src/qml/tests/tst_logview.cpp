@@ -4,7 +4,8 @@
 #include <QQmlContext>
 #include <QQmlEngine>
 #include <QQuickItem>
-#include <QVariantList>
+#include <QUrl>
+#include <QVariant>
 
 #include <memory>
 #include "LogBuffer.h"
@@ -16,7 +17,28 @@ class TstLogView final : public QObject {
 
 private slots:
     void messageSurvivesClosedSheet();
+    void severityFilterUsesCanonicalKeys();
 };
+
+void TstLogView::severityFilterUsesCanonicalKeys()
+{
+    QQmlEngine engine;
+    QQmlComponent component(&engine,
+                           QUrl(QStringLiteral("qrc:/qt/qml/CodeHarbor/LogView.qml")));
+    QVERIFY2(component.isReady(), qPrintable(component.errorString()));
+
+    std::unique_ptr<QObject> view(component.create());
+    QVERIFY2(view != nullptr, qPrintable(component.errorString()));
+    QObject *severity = view->findChild<QObject *>(QStringLiteral("severityFilter"));
+    QVERIFY(severity);
+
+    severity->setProperty("currentIndex", 3);
+    QTRY_COMPARE(view->property("severityFilter").toString(), QStringLiteral("warning"));
+    severity->setProperty("currentIndex", 0);
+    QTRY_COMPARE(view->property("severityFilter").toString(), QString());
+    severity->setProperty("currentIndex", 5);
+    QTRY_COMPARE(view->property("severityFilter").toString(), QStringLiteral("fatal"));
+}
 
 void TstLogView::messageSurvivesClosedSheet()
 {

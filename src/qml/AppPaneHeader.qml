@@ -89,11 +89,16 @@ Rectangle {
             wanted.push(item);
             if (item.parent !== actionRow)
                 item.parent = actionRow;
+            if (typeof item.setToolbarEnabled === "function")
+                item.setToolbarEnabled(true);
         }
         const shown = actionRow.children;
         for (let k = shown.length - 1; k >= 0; --k) {
-            if (wanted.indexOf(shown[k]) < 0)
+            if (wanted.indexOf(shown[k]) < 0) {
+                if (typeof shown[k].setToolbarEnabled === "function")
+                    shown[k].setToolbarEnabled(false);
                 shown[k].parent = null;
+            }
         }
     }
 
@@ -116,14 +121,32 @@ Rectangle {
         // its glyph or position. A viewer pane can therefore register the same
         // action even when it is hosted outside this header's action list.
         property string toolbarId: ""
+        property bool toolbarEnabled: true
+        property string registeredToolbarId: ""
 
-        Component.onCompleted: {
-            if (action.toolbarId.length > 0)
-                ToolbarRegistry.registerButton(action.toolbarId);
+        function syncToolbarRegistration() {
+            const desired = action.toolbarEnabled && action.toolbarId.length > 0
+                          ? action.toolbarId : "";
+            if (desired === action.registeredToolbarId)
+                return;
+            if (action.registeredToolbarId.length > 0)
+                ToolbarRegistry.unregisterButton(action.registeredToolbarId);
+            action.registeredToolbarId = desired;
+            if (desired.length > 0)
+                ToolbarRegistry.registerButton(desired);
         }
+
+        function setToolbarEnabled(enabled) {
+            action.toolbarEnabled = enabled;
+            action.syncToolbarRegistration();
+        }
+
+        onToolbarIdChanged: action.syncToolbarRegistration()
+        onToolbarEnabledChanged: action.syncToolbarRegistration()
+        Component.onCompleted: action.syncToolbarRegistration()
         Component.onDestruction: {
-            if (action.toolbarId.length > 0)
-                ToolbarRegistry.unregisterButton(action.toolbarId);
+            if (action.registeredToolbarId.length > 0)
+                ToolbarRegistry.unregisterButton(action.registeredToolbarId);
         }
 
         // Never takes focus: these sit on top of a terminal or an editor, and a

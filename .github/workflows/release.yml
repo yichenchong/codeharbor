@@ -87,11 +87,13 @@ jobs:
       # var on the image, not part of the `env` expression context, so it has to
       # be captured in a step first.
       #
-      # It also carries the PINNED libssh version. vcpkg's registry port is
-      # 0.12.0, whose hybrid ML-KEM key exchange cannot pack its own client KEX
-      # init ("Failed to construct client init buffer"), so the build takes
-      # libssh from the in-tree overlay port instead. Without the version in the
-      # key, an entry written before the pin would restore 0.12.0 and defeat it.
+      # It also carries the PINNED libssh version and a hash of every file in the
+      # overlay port. The hash is required because changing a patch without
+      # bumping the upstream version must force a rebuild; otherwise vcpkg treats
+      # the restored install as a no-op and silently ships the old patched tree.
+      # The registry port is 0.12.0, whose hybrid ML-KEM key exchange cannot pack
+      # its own client KEX init, so the build takes libssh from the in-tree 0.12.2
+      # overlay port instead.
       - name: Resolve cache key (Windows)
         if: matrix.name == 'windows'
         id: imgver
@@ -115,7 +117,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: ${{ steps.imgver.outputs.vcpkg }}\installed
-          key: vcpkg-libssh-${{ steps.imgver.outputs.libssh }}-x64-windows-${{ steps.imgver.outputs.v }}
+          key: vcpkg-libssh-${{ steps.imgver.outputs.libssh }}-x64-windows-${{ steps.imgver.outputs.v }}-${{ hashFiles('packaging/vcpkg-ports/libssh/**') }}
 
       - name: Install libssh via vcpkg (Windows)
         if: matrix.name == 'windows'
@@ -155,43 +157,45 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: ${{ steps.imgver.outputs.vcpkg }}\installed
-          key: vcpkg-libssh-${{ steps.imgver.outputs.libssh }}-x64-windows-${{ steps.imgver.outputs.v }}
+          key: vcpkg-libssh-${{ steps.imgver.outputs.libssh }}-x64-windows-${{ steps.imgver.outputs.v }}-${{ hashFiles('packaging/vcpkg-ports/libssh/**') }}
 
       # --- MSVC environment for the Ninja generator (Windows) ------------------
       - name: Set up MSVC (Windows)
         if: matrix.name == 'windows'
         uses: ilammy/msvc-dev-cmd@v1
 
-      # The Monaco and xterm.js bundles are gitignored artifacts embedded as Qt
-      # resources at CMake CONFIGURE time. src/qml/CMakeLists.txt raises a
-      # FATAL_ERROR when they are missing and cannot be built, so this step is
-      # what lets the configure step below run at all - and what keeps a shipped
-      # binary from having editor/terminal panes with no page to load.
+      # The Monaco, xterm.js and Markdown bundles are gitignored artifacts
+      # embedded as Qt resources at CMake CONFIGURE time. src/qml/CMakeLists.txt
+      # raises a FATAL_ERROR when they are missing and cannot be built, so this
+      # step is what lets the configure step below run at all - and what keeps a
+      # shipped binary from having editor, terminal or Markdown panes with no
+      # page to load.
       - uses: actions/setup-node@v4
         with:
           node-version: "24"
-          # ~/.npm across runs; the bundle install is Monaco plus esbuild.
+          # ~/.npm across runs; the bundle install is Monaco, xterm.js and
+          # Markdown dependencies.
           cache: npm
-      # BOTH bundles, via the root workspaces script: the terminal bundle is as
-      # load-bearing as the editor one, and CMake's npm fallback that used to
-      # cover it does not work on Windows.
+      # All three bundles, via the root workspaces script: the terminal and
+      # Markdown bundles are as load-bearing as the editor one, and CMake's npm
+      # fallback that used to cover one of them does not work on Windows.
       - name: Build web bundles (must precede CMake configure)
         # npm ci requires an up-to-date package-lock.json (installs from it strictly).
         run: npm ci && npm run build
         shell: bash
 
       # BD26: the release path must not be WEAKER than the ordinary one. ci.yml
-      # type-checks and tests both bundles; esbuild strips types without checking
-      # them, so a TS error anywhere in src/web/* passes the bundle build and
-      # would otherwise reach a published binary unreported. Tags are cut from
-      # `main`, which CI has gated - but a tag can be cut from any ref via
+      # type-checks and tests all three bundles; esbuild strips types without
+      # checking them, so a TS error anywhere in src/web/* passes the bundle build
+      # and would otherwise reach a published binary unreported. Tags are cut
+      # from `main`, which CI has gated - but a tag can be cut from any ref via
       # workflow_dispatch, and "the other workflow already checked it" is not a
       # check.
       - name: Typecheck web bundles
         run: npm run typecheck
         shell: bash
       - name: Test web bundles
-        run: npm test --workspace src/web/terminal --workspace src/web/editor
+        run: npm test --workspace src/web/terminal --workspace src/web/editor --workspace src/web/markdown
         shell: bash
 
       # --- configure + build + test -------------------------------------------

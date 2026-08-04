@@ -143,6 +143,12 @@ Item {
         view.runJavaScript("if (typeof window.applyTheme === 'function')"
                            + " window.applyTheme(" + roles + ");")
     }
+    // ViewerPane keeps handler objects alive when they provide reload(). The
+    // editor is a live WebEngine document with unsaved text, so falling back to
+    // Loader churn would destroy Monaco and could discard that buffer.
+    function reload() {
+        view.reload()
+    }
 
     WebChannel {
         id: editorChannel
@@ -298,40 +304,40 @@ Item {
     // The revision the page's buffer is guarded at (SPEC 8.4/8.6), read off the
     // same `contentLoaded` the editor page takes its content from.
     //
-    // Restoring needs it: putting the recovered text into the page must not
-    // change WHICH revision the next save is guarded by. An empty guard is not
-    // a lax one — remote/src/files.ts reads it as a create-only write — so a
-    // restore that lost the revision would leave the user unable to save the
-    // very work it just handed back.
     property string loadedRevision: ""
-
-    // The recovered buffer waiting to be offered, or "" when there is none.
+    // A recovered buffer may legitimately be empty (the user deleted every
+    // character), and a new file may have an empty revision. Separate
+    // readiness/presence flags keep those valid values from being mistaken for
+    // "nothing recovered" or "the page has not loaded yet".
+    property bool contentReadyForRecovery: false
     property string recoveredContent: ""
+    property bool recoveryPending: false
 
     Connections {
         target: root.controller
-        function onContentLoaded(content, revision) { root.loadedRevision = revision }
+        function onContentLoaded(content, revision) {
+            root.loadedRevision = revision
+            root.contentReadyForRecovery = true
+            root.showRecoveryOffer()
+        }
         // Named `recovered`, not `recoveredContent`: a parameter that shadows
         // the property it is assigned to reads as a self-assignment.
         function onRecoveryAvailable(recovered) {
             root.recoveredContent = recovered
+            root.recoveryPending = true
             root.showRecoveryOffer()
         }
     }
 
     // Offer the recovered buffer, but never before the page can be GIVEN it.
     // ch::EditorController holds contentLoaded until the page reports ready(),
-    // so an empty `loadedRevision` means the page has not taken the file yet
-    // and a restore would push the text at a page with no handler attached —
-    // losing exactly the work this exists to save. The revision arriving IS the
-    // page being able to take it, so the offer waits for that instead.
+    // so the content-loaded flag means the page has taken the file even when
+    // the revision itself is empty.
     function showRecoveryOffer() {
-        if (root.recoveredContent.length > 0 && root.loadedRevision.length > 0
+        if (root.recoveryPending && root.contentReadyForRecovery
                 && !recoveryDialog.visible)
             recoveryDialog.open()
     }
-
-    onLoadedRevisionChanged: root.showRecoveryOffer()
 
     // Put the recovered text back into the pane, and keep it recoverable.
     //
@@ -344,10 +350,11 @@ Item {
     // change from silently reloading over the restored work (SPEC 8.7), and
     // what keeps the snapshot alive until the user actually saves.
     function restoreRecovered() {
+        if (!root.controller || !root.recoveryPending || !root.contentReadyForRecovery)
+            return
         const recovered = root.recoveredContent
         root.recoveredContent = ""
-        if (!root.controller || recovered.length === 0)
-            return
+        root.recoveryPending = false
         root.controller.contentLoaded(recovered, root.loadedRevision)
         root.controller.reportContent(recovered)
     }
@@ -357,6 +364,7 @@ Item {
     // is what discards the snapshot, on the next successful save.
     function discardRecovered() {
         root.recoveredContent = ""
+        root.recoveryPending = false
     }
 
     AppDialog {
@@ -442,7 +450,9 @@ Item {
         // was still standing. Offering the previous file's unsaved work against
         // the new one would restore it into the wrong buffer.
         root.loadedRevision = ""
+        root.contentReadyForRecovery = false
         root.recoveredContent = ""
+        root.recoveryPending = false
         recoveryDialog.close()
         if (root.controller && root.remotePath.length > 0)
             root.controller.open(root.remotePath)

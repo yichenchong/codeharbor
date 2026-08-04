@@ -51,6 +51,18 @@ bool hasHostPatternSyntax(const QString& hostField)
            || hostField.contains(QLatin1Char('?'))
            || hostField.contains(QLatin1Char('!'));
 }
+// A value handed to add() becomes one whitespace-delimited known_hosts field.
+// Reject whitespace and embedded NULs rather than serializing a line that
+// parse() would split differently (or that could inject a second line).
+bool hasFieldWhitespace(const QString& field)
+{
+    for (const QChar character : field) {
+        if (character.isSpace() || character.unicode() == 0)
+            return true;
+    }
+    return false;
+}
+
 
 // OpenSSH's match_pattern(): `*` matches any run of characters (including
 // none), `?` matches exactly one, every other character is literal, and the
@@ -177,7 +189,10 @@ void KnownHosts::add(const QString& host, const QString& keyType,
     // then drops as malformed — the trust would be silently gone on the next
     // launch and the user asked to approve the same key all over again. Refuse
     // to record something that cannot be stored instead.
-    if (host.isEmpty() || keyType.isEmpty() || keyBlob.isEmpty())
+    if (host.isEmpty() || keyType.isEmpty() || keyBlob.isEmpty()
+        || host.startsWith(QLatin1Char('|'))
+        || hasHostPatternSyntax(host) || host.contains(QLatin1Char(','))
+        || hasFieldWhitespace(host) || hasFieldWhitespace(keyType))
         return;
 
     for (Entry& e : m_entries) {

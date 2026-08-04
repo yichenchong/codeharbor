@@ -25,6 +25,8 @@ struct Oklch {
     double lightness = 0.0;
     double chroma = 0.0;
     double hue = 0.0;
+
+    bool operator==(const Oklch &) const = default;
 };
 
 // Deterministic group colours. The conversion and palette expansion are pure

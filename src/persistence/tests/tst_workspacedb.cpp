@@ -758,19 +758,24 @@ void TstWorkspaceDb::listSkipsNonObjectEntries()
 
     const char* kJson = R"([
       7,
+      {},
       {
         "id": "g1", "serverId": "srv-1", "name": "Alpha",
         "position": 0, "collapsed": false,
         "sessions": [
           null,
+          {},
+          {
+            "id": "s-bad", "viewerPanes": {}, "terminalPanes": []
+          },
           {
             "id": "s1", "serverId": "srv-1", "groupId": "g1", "name": "S1",
             "repositoryRoot": "/r", "position": 0, "archived": false,
-            "viewerPanes": ["nonsense",
+            "viewerPanes": ["nonsense", {},
               { "id": "v1", "serverId": "srv-1", "devSessionId": "s1",
                 "url": "http://x", "position": 0 }
             ],
-            "terminalPanes": [[],
+            "terminalPanes": [[], {},
               { "id": "t1", "serverId": "srv-1", "devSessionId": "s1",
                 "name": "term", "position": 0 }
             ],
@@ -780,7 +785,7 @@ void TstWorkspaceDb::listSkipsNonObjectEntries()
       }
     ])";
     const QJsonArray result = QJsonDocument::fromJson(kJson).array();
-    QCOMPARE(result.size(), 2); // guard against a malformed canned fixture
+    QCOMPARE(result.size(), 3); // guard against a malformed canned fixture
 
     m_serverSide->write(jsonLine(
         {{"jsonrpc", "2.0"}, {"id", id}, {"result", result}}));
@@ -889,6 +894,26 @@ void TstWorkspaceDb::malformedResultsDeliverRpcErrorInsteadOfBlankRecords()
     QTRY_VERIFY(paneFired);
     QVERIFY(!pane.has_value());
     QVERIFY(paneErr.has_value());
+
+    // An object with no identity is also malformed; accepting it would create
+    // a blank TerminalPane despite passing the JSON-kind check.
+    pane.reset();
+    paneErr.reset();
+    paneFired = false;
+    m_db->createTerminalPane(
+        ch::CreateTerminalPaneParams{.serverId = ServerId{QStringLiteral("srv-1")},
+                                     .devSessionId = ch::DevSessionId{QStringLiteral("s1")},
+                                     .name = QStringLiteral("sh")},
+        [&](std::optional<ch::TerminalPane> p, std::optional<RpcError> e) {
+            pane = p;
+            paneErr = e;
+            paneFired = true;
+        });
+    respond(QJsonObject{});
+    QTRY_VERIFY(paneFired);
+    QVERIFY(!pane.has_value());
+    QVERIFY(paneErr.has_value());
+    QCOMPARE(paneErr->code, -32603);
 
     // list() answered with an object instead of an array: an empty sidebar
     // reported as a successful load is indistinguishable from a server that

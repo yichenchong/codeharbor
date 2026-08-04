@@ -14,9 +14,9 @@ import { isRendererVisible } from "./visibility";
 import { CoalescingWriter } from "./writer";
 // Input pacing keeps large pastes bounded and preserves ANSI sequence boundaries.
 import { TerminalInputWriter } from "./input";
-// User settings are applied to the live xterm instance rather than rebuilding the page.
 import {
     applyTerminalPreferences,
+    terminalFontPointsToCssPixels,
     type TerminalPreferenceValues,
 } from "./preferences";
 import {
@@ -99,8 +99,10 @@ export function mountTerminal(element: HTMLElement, bridge: TerminalBridge): Ter
     const term = new Terminal({
         cursorBlink: true,
         fontFamily: "monospace",
-        fontSize: 13,
-        // The pane's own scrollback is NOT the history the user scrolls. Every
+        // AppSettings stores the default in points; use the same conversion as
+        // live preference updates so the first frame does not use a different
+        // cell size from the configured default.
+        fontSize: terminalFontPointsToCssPixels(13),
         // pane attaches tmux (see ch::TerminalController::tmuxNewSessionCommand),
         // tmux runs on the ALTERNATE screen, and the alternate screen has no
         // scrollback at all — the wheel is reported to tmux, which scrolls its
@@ -328,7 +330,11 @@ export function mountTerminal(element: HTMLElement, bridge: TerminalBridge): Ter
     // ch::TerminalController::setViewVisible() already ignores a value equal to
     // the one it holds, so a redundant report costs one WebChannel message and
     // changes nothing.
-    let intersecting = true;
+    // Start pessimistically until IntersectionObserver has delivered the
+    // element's first real intersection. Otherwise bridge.ready() can release
+    // the controller's retained output to a page that mounted off-screen or
+    // in a collapsed splitter before this observer's asynchronous callback.
+    let intersecting = false;
     function reportVisibility(): void {
         bridge.notifyViewVisible(
             isRendererVisible(intersecting, element.ownerDocument.visibilityState),
@@ -341,6 +347,7 @@ export function mountTerminal(element: HTMLElement, bridge: TerminalBridge): Ter
     });
     visibilityObserver.observe(element);
     element.ownerDocument.addEventListener("visibilitychange", reportVisibility);
+    reportVisibility();
 
     // Terminal output goes through the coalescing writer rather than straight
     // into term.write(): see writer.ts for why an unthrottled write() can throw
@@ -430,7 +437,9 @@ export function mountTerminal(element: HTMLElement, bridge: TerminalBridge): Ter
             }
             disposed = true;
             input.close();
-            surface.removeEventListener("contextmenu", suppressContextMenu);
+            if (pageApi.applyTheme === applyPageTheme) {
+                delete pageApi.applyTheme;
+            }
             if (pageApi.codeharborSetTerminalPreferences === applyPagePreferences) {
                 delete pageApi.codeharborSetTerminalPreferences;
             }

@@ -74,6 +74,7 @@ void AppController::setServerId(const QString& serverId)
 {
     if (m_serverId.value == serverId)
         return;
+    QPointer<AppController> self(this);
     m_serverId.value = serverId;
     // Every workspace.list response belongs to the server id that was current
     // when it was issued. Invalidate all earlier generations BEFORE clearing
@@ -83,11 +84,15 @@ void AppController::setServerId(const QString& serverId)
     m_lastNodes.clear();
     m_terminalStates.clear();
     rebuildRows();
+    if (!self)
+        return;
     // The layouts repository is keyed by the same id. Keeping it in lockstep
     // HERE, rather than at each call site, is what stops a setLayout write
     // landing under the previous server's key after a switch.
     if (m_layouts)
         m_layouts->setServerId(serverId);
+    if (!self)
+        return;
     // A Dev Session belongs to exactly one server. Carrying the previous
     // server's active session across a switch would show its panes against the
     // new server's workspace and make the next layout write pair the OLD
@@ -99,9 +104,15 @@ void AppController::setServerId(const QString& serverId)
         // to show. Whatever the PREVIOUS server remembers stays remembered, so
         // switching back reopens it.
         clearActiveSession(/*forget=*/false);
+        if (!self)
+            return;
         emit activeSessionChanged();
+        if (!self)
+            return;
     }
     emit serverIdChanged();
+    if (!self)
+        return;
     // Switching the active server must reload the sidebar from that server's
     // authoritative tree; nothing else re-drives refresh() on a server change,
     // so without this a server switch would leave the previous server's rows
@@ -166,11 +177,10 @@ void AppController::setAgentMonitor(AgentStatusMonitor* monitor)
     if (m_agentMonitor) {
         // Any agent transition or unseen-flag flip re-derives the badges from
         // the last known workspace tree and pushes them incrementally (a
-        // targeted dataChanged(), not a full reset). The QPointer-free lambda is
-        // safe: the
-        // connection is bound to `this` as the context object, so Qt severs it
-        // automatically when this controller is destroyed (no UAF), and the
-        // disconnect above severs it on re-set.
+        // targeted dataChanged(), not a full reset). The connection is bound
+        // to `this` as the context object, so Qt severs it automatically when
+        // this controller is destroyed (and QPointer protects the monitor
+        // member if the caller destroys it first).
         connect(m_agentMonitor, &AgentStatusMonitor::agentStateChanged, this,
                 [this](const QString&, const QString&, int) { applyAgentStateUpdate(); });
         connect(m_agentMonitor, &AgentStatusMonitor::unseenChanged, this,
@@ -186,6 +196,10 @@ void AppController::setTerminalFactory(TerminalFactory* factory)
         return;
     if (m_terminalFactory)
         disconnect(m_terminalFactory, nullptr, this, nullptr);
+    // State belongs to the injected factory instance. Keeping it when the
+    // factory is replaced would let a new graph inherit a stale disconnected
+    // (or ready) status for the same server and pane ids.
+    m_terminalStates.clear();
     m_terminalFactory = factory;
     if (m_terminalFactory) {
         // TerminalFactory is the only owner of pane/controller identity. The
@@ -220,6 +234,7 @@ void AppController::setConnection(SshConnectionPool* pool,
                                   ServerProfiles* profiles,
                                   SessionLayouts* layouts)
 {
+    QPointer<AppController> self(this);
     // Re-injection must not stack a second set of connections onto the same
     // signals: a doubled stateChanged/wired/error handler would issue two
     // server.info calls per wire and show every connect failure twice. Severing
@@ -242,17 +257,25 @@ void AppController::setConnection(SshConnectionPool* pool,
     // a re-injection); seed the layouts key so it is never one server behind.
     if (m_layouts)
         m_layouts->setServerId(m_serverId.value);
+    if (!self)
+        return;
 
     if (m_pool) {
         connect(m_pool, &SshConnectionPool::diagnosticLogChanged, this,
-                [this] {
+                [this, self] {
+                    if (!self)
+                        return;
                     syncSshDiagnostics();
+                    if (!self)
+                        return;
                     emit connectionDiagnosticsChanged();
                 });
         // A pool can already hold a transcript when it is injected by a test
         // or by a reconnecting startup. Copy it before the first QML binding
         // reads the property, so no remote explanation is lost.
         syncSshDiagnostics();
+        if (!self)
+            return;
     }
     if (m_profiles) {
         // A profile save that could not take its interprocess lock still saves,
@@ -295,7 +318,9 @@ void AppController::setConnection(SshConnectionPool* pool,
         // The bootstrap reconnects on its own (backoff per SPEC 5.6); mirror its
         // state so the UI can show "reconnecting" instead of going quietly dead,
         // and re-adopt the server identity on every successful (re)wire.
-        const auto mirrorState = [this](SessionBootstrap::State state) {
+        const auto mirrorState = [this, self](SessionBootstrap::State state) {
+            if (!self)
+                return;
             switch (state) {
             case SessionBootstrap::State::Connecting:
                 setConnectionState(QStringLiteral("connecting"));
@@ -337,6 +362,8 @@ void AppController::setConnection(SshConnectionPool* pool,
                     mirrorState(state);
                 });
         mirrorState(m_bootstrap->state());
+        if (!self)
+            return;
         // A bootstrap can already be Wired when it is injected (for example,
         // an environment-driven session created by an orchestrator). Its
         // `wired` signal is past, so repeat the identity handshake here rather
@@ -344,10 +371,14 @@ void AppController::setConnection(SshConnectionPool* pool,
         if (m_bootstrap->state() == SessionBootstrap::State::Wired
             && m_client && m_client->transport())
             adoptServerIdentity();
+        if (!self)
+            return;
         connect(m_bootstrap, &SessionBootstrap::wired, this,
                 [this] { adoptServerIdentity(); });
         connect(m_bootstrap, &SessionBootstrap::error, this,
-                [this](const QString& message) {
+                [this, self](const QString& message) {
+                    if (!self)
+                        return;
                     // connectionStateChanged is the NOTIFY of both
                     // connectionState and connectionError, so it must fire when
                     // one of them actually moves and not on every repeat. The
@@ -370,6 +401,8 @@ void AppController::setConnection(SshConnectionPool* pool,
                         m_heldConnectError = message;
                     else
                         emit error(message);
+                    if (!self)
+                        return;
                     if (changed)
                         emit connectionStateChanged();
                 });
@@ -381,6 +414,8 @@ void AppController::setConnection(SshConnectionPool* pool,
                 [this](const QString& message) { emit error(message); });
     }
     emit connectionChanged();
+    if (!self)
+        return;
     emit connectionDiagnosticsChanged();
 }
 
@@ -539,8 +574,11 @@ void AppController::startConnect(const QString& profileId,
         m_credentialUser.clear();
         m_credentialLabel.clear();
         m_credentialKind = CredentialKind::KeyPassphrase;
-        // The chain succeeded: its secrets have done their job and go now.
+        // The chain succeeded: its secrets and its pending profile have done
+        // their job and go now. Keeping the profile id would leave stale
+        // attempt state behind until the next disconnect or connect.
         m_credentials.clear();
+        m_pendingProfileId.clear();
         m_profiles->setActiveId(profileId);
         return;  // wired() -> adoptServerIdentity()
     }
@@ -834,10 +872,20 @@ void AppController::disconnectServer()
     // runs every pending callback inline before returning, so they all land
     // inside this scope. A client that ever deferred them would need this flag
     // cleared by the arrival of the LAST failure instead.
-    if (m_bootstrap) {
+    QPointer<AppController> self(this);
+    QPointer<SessionBootstrap> bootstrap = m_bootstrap;
+    if (bootstrap) {
         m_tearingDown = true;
-        const auto restore = qScopeGuard([this] { m_tearingDown = false; });
-        m_bootstrap->disconnectSession();
+        // disconnectSession() emits state changes synchronously. A listener is
+        // allowed to delete this controller while that signal is delivered,
+        // so the guard must not retain a raw `this` for its destructor.
+        const auto restore = qScopeGuard([self] {
+            if (self)
+                self->m_tearingDown = false;
+        });
+        bootstrap->disconnectSession();
+        if (!self)
+            return;
     }
 
     // Land on a clear empty state instead of a half-live shell. The Dev
@@ -861,7 +909,11 @@ void AppController::disconnectServer()
     // leaves the panes exactly where they were.
     if (!m_activeSessionId.isEmpty()) {
         clearActiveSession(/*forget=*/false);
+        if (!self)
+            return;
         emit activeSessionChanged();
+        if (!self)
+            return;
     }
 
     setConnectionState(QStringLiteral("disconnected"));
@@ -959,13 +1011,13 @@ void AppController::adoptServerIdentity()
 
 void AppController::refuseServer(const QString& message)
 {
+    QPointer<AppController> self(this);
     emit error(message);
     // Refuse rather than limp on. Deferred by one event-loop turn because both
     // callers run INSIDE a CodeharbordClient response callback and the teardown
     // drops that very client's transport. The QPointer keeps the deferred work
     // from touching a controller destroyed in the meantime; QTimer's context
     // overload would already cancel it, and the explicit check documents why.
-    QPointer<AppController> self(this);
     QTimer::singleShot(0, this, [self, message] {
         if (!self)
             return;
@@ -1044,8 +1096,14 @@ void AppController::restoreActiveSession()
 
 void AppController::activateSession(QString devSessionId)
 {
-    if (devSessionId.isEmpty())
+    // Activation is driven by a sidebar row, but a stale click can arrive
+    // while a refresh is replacing that row. Refuse ids the authoritative
+    // cache does not contain (and archived rows hidden by the default filter)
+    // instead of loading a phantom layout and remembering it for next launch.
+    if (devSessionId.isEmpty() || !sessionExists(devSessionId)
+        || sessionIsArchived(devSessionId)) {
         return;
+    }
     m_activeSessionId = devSessionId;
     if (m_uiState)
         m_uiState->setActiveSession(m_serverId.value, devSessionId);
@@ -1175,6 +1233,36 @@ void AppController::refresh()
         // the stale working directory forever.
         const QString repoRootBefore = self->activeSessionRepoRoot();
         self->m_lastNodes = std::move(nodes);
+        // TerminalFactory events can outlive a pane row: a pane may be closed
+        // between two workspace reads. Retain only the state represented by
+        // this authoritative tree so the cache cannot grow forever or repaint
+        // a later pane that happens to use the same local id.
+        QHash<QString, QSet<QString>> liveTerminalIds;
+        for (const GroupNode& groupNode : self->m_lastNodes) {
+            for (const SessionNode& sessionNode : groupNode.sessions) {
+                QSet<QString>& paneIds =
+                    liveTerminalIds[sessionNode.session.id.value];
+                for (const TerminalPane& pane : sessionNode.terminalPanes)
+                    paneIds.insert(pane.id.value);
+            }
+        }
+        for (auto sessionIt = self->m_terminalStates.begin();
+             sessionIt != self->m_terminalStates.end();) {
+            const auto liveSessionIt =
+                liveTerminalIds.constFind(sessionIt.key());
+            if (liveSessionIt == liveTerminalIds.constEnd()) {
+                sessionIt = self->m_terminalStates.erase(sessionIt);
+                continue;
+            }
+            QHash<QString, TerminalState>& states = sessionIt.value();
+            for (auto stateIt = states.begin(); stateIt != states.end();) {
+                if (!liveSessionIt->contains(stateIt.key()))
+                    stateIt = states.erase(stateIt);
+                else
+                    ++stateIt;
+            }
+            ++sessionIt;
+        }
         // Only HERE: past the error return (an RpcError means "we do not know",
         // not "it is gone") and past the generation guard, so a stale list()
         // can never retire a session the newest tree still has.
@@ -1204,19 +1292,30 @@ void AppController::refresh()
                 for (const SessionNode& sessionNode : groupNode.sessions)
                     liveDevSessions.insert(sessionNode.session.id.value);
             self->m_agentMonitor->retainDevSessions(liveDevSessions);
+            if (!self)
+                return;
             for (const GroupNode& groupNode : self->m_lastNodes) {
                 for (const SessionNode& sessionNode : groupNode.sessions) {
                     for (const TerminalPane& pane : sessionNode.terminalPanes) {
                         self->m_agentMonitor->setTerminalHarness(
                             sessionNode.session.id.value, pane.id.value, pane.harness);
+                        if (!self)
+                            return;
                     }
                 }
             }
         }
+        if (!self)
+            return;
         const bool droppedActive = self->dropActiveSessionIfGone();
         self->rebuildRows();
-        if (droppedActive || self->activeSessionRepoRoot() != repoRootBefore)
+        if (!self)
+            return;
+        if (droppedActive || self->activeSessionRepoRoot() != repoRootBefore) {
             emit self->activeSessionChanged();
+            if (!self)
+                return;
+        }
         emit self->refreshed();
     });
 }
@@ -1312,7 +1411,11 @@ void AppController::updateSessionArchived(QString id, bool archived)
             // the authoritative refresh confirms the row is gone.
             if (archived && self->m_activeSessionId == sessionId) {
                 self->clearActiveSession(/*forget=*/true);
+                if (!self)
+                    return;
                 emit self->activeSessionChanged();
+                if (!self)
+                    return;
             }
             self->refresh();
         });

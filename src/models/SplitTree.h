@@ -69,6 +69,12 @@ struct SplitNode {
         title = title.trimmed();
         if (title.size() > kMaxCustomTitleLength)
             title.truncate(kMaxCustomTitleLength);
+        const int last = title.size() - 1;
+        if (last >= 0
+            && (title.at(last).isHighSurrogate()
+                || (title.at(last).isLowSurrogate()
+                    && (last == 0 || !title.at(last - 1).isHighSurrogate()))))
+            title.chop(1);
         return title;
     }
     

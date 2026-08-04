@@ -26,15 +26,49 @@ export const claudeCodeAdapter: HarnessAdapter = {
             case "SessionStart":
                 return "starting";
             case "UserPromptSubmit":
+            case "UserPromptExpansion":
             case "PreToolUse":
             case "PostToolUse":
+            case "PostToolUseFailure":
+            case "PostToolBatch":
+            case "PreCompact":
+            case "PostCompact":
+            case "SubagentStart":
+            case "SubagentStop":
+            case "TaskCreated":
+            case "TaskCompleted":
+            case "TeammateIdle":
+            case "MessageDisplay":
+            case "ElicitationResult":
                 return "running";
-            case "Notification":
+            case "PermissionRequest":
+            case "Elicitation":
                 return "waiting_input";
+            case "PermissionDenied":
+            case "StopFailure":
+                return "error";
+            case "Notification": {
+                // Claude Code also emits informational notifications (for
+                // example auth_success). Only notifications that indicate a
+                // prompt should move the terminal to waiting_input; otherwise
+                // an unrelated desktop message can leave a false completion
+                // signal in the sidebar. A malformed notification type is
+                // ignored rather than treated as a prompt.
+                const rawNotificationType = native.notification_type;
+                if (rawNotificationType === undefined) return "waiting_input";
+                if (typeof rawNotificationType !== "string") return null;
+                if (rawNotificationType === "elicitation_complete"
+                    || rawNotificationType === "elicitation_response")
+                    return "running";
+                return rawNotificationType === "permission_prompt"
+                    || rawNotificationType === "idle_prompt"
+                    || rawNotificationType === "elicitation_dialog"
+                    || rawNotificationType === "agent_needs_input"
+                    ? "waiting_input"
+                    : null;
+            }
             case "Stop":
                 return "idle_unseen";
-            case "SubagentStop":
-                return "running";
             default:
                 return null;
         }

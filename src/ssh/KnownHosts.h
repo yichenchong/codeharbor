@@ -57,6 +57,9 @@ public:
 
     // Record (or replace) a host key. A subsequent verify() with the same triple
     // returns Match. Distinct key types for one host are kept independently.
+    // An empty field, a hashed/pattern/comma-separated host token, or a field
+    // containing whitespace/NUL is ignored: add() only records one plain host
+    // that can round-trip as a single known_hosts line.
     // An empty host, key type or blob is ignored: such a triple cannot be
     // written as a known_hosts line that parses back, so recording it would
     // silently lose the trust on the next launch.

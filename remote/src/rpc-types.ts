@@ -136,6 +136,11 @@ export const RPC_METHODS = {
 export type RpcMethodKey = keyof typeof RPC_METHODS;
 export type RpcMethodName = (typeof RPC_METHODS)[RpcMethodKey];
 
+// Server introspection request. The handler lives in codeharbord.ts rather
+// than a spread-in method group, but its name is still part of the shared
+// wire contract and is mirrored by kMethodServerInfo in RpcTypes.h.
+export const RPC_SERVER_INFO_METHOD = "server.info";
+
 // Server -> client notification method name for an active watch subscription
 // (SPEC 8.7). This is a NOTIFICATION name (no id, no response), deliberately
 // absent from RPC_METHODS, which enumerates only request methods. It
@@ -198,7 +203,7 @@ export const RPC_DATABASE_BUSY = -32002;
 
 // Implementation-defined server error code for a request that is perfectly
 // well-formed but whose ANSWER would exceed a server resource bound, so it was
-// refused outright and nothing was changed. Two conditions raise it today, both
+// refused outright and nothing was changed. Four conditions raise it today, all
 // in files.ts:
 //
 //   * file.listDirectory on a directory whose listing would not fit in one
@@ -209,6 +214,12 @@ export const RPC_DATABASE_BUSY = -32002;
 //     message naming the directory.
 //   * file.watch past MAX_WATCH_SUBSCRIPTIONS live subscriptions, each of which
 //     holds an OS watch handle and a poll timer.
+//   * file.readFile on a file whose raw size is past MAX_FILE_READ_BYTES, or a
+//     ranged read whose window is that large. Reading it in would have meant a
+//     single allocation of the whole file.
+//   * file.readFile whose ENCODED answer is past MAX_FILE_RESPONSE_BYTES, which
+//     is the same wire problem as the directory case above: base64 expansion and
+//     JSON escaping can make a within-limit file into an over-cap frame.
 //
 // Deliberately NOT -32603: nothing malfunctioned and nothing is half-applied.
 // Not -32602 either: the params are valid, the server simply will not answer at

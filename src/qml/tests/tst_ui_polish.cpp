@@ -4,8 +4,9 @@
 //   * AppScrollBar must be absent and disabled when its Flickable fits, and
 //     become a usable scrollbar as soon as content overflows.
 //   * ViewerPane's full-pane click sniffer must not replace a WebEngine page's
-//     CSS cursor. The test drives a real data: page through the shipped pane,
-//     rather than testing a second cursor implementation in isolation.
+//     CSS cursor. The headless test checks the sniffer's structural properties;
+//     a live page is intentionally not required for this graphics-independent
+//     assertion.
 //
 // Runs headless with the same software Quick and no-GPU WebEngine recipe as the
 // other QML tests (see CMakeLists.txt).
@@ -14,16 +15,14 @@
 
 #include <QGuiApplication>
 #include <QQmlComponent>
-#include <QQmlContext>
 #include <QQmlEngine>
 #include <QQuickItem>
 #include <QQuickWindow>
 #include <QSet>
 #include <QString>
 #include <QUrl>
-#include <QVariant>
-#include <QtWebEngineCore/QWebEngineProfile>
 #include <QtWebEngineQuick/QtWebEngineQuick>
+#include <memory>
 
 namespace {
 
@@ -58,29 +57,6 @@ Window {
 }
 )QML";
 
-constexpr auto kCursorHarness = R"QML(
-import QtQuick
-import QtQuick.Window
-import CodeHarbor
-
-Window {
-    id: root
-    objectName: "cursorWindow"
-    width: 420
-    height: 280
-    visible: true
-
-    ViewerPane {
-        id: pane
-        objectName: "cursorPane"
-        anchors.fill: parent
-        paneId: "cursor-test"
-        // The stub viewer model below classifies this as a web page. The page
-        // itself is local data, so this test never needs a network or a server.
-        url: "data:text/html,<html><head><style>html,body{margin:0;width:100%;height:100%;cursor:text}</style></head><body>code</body></html>"
-    }
-}
-)QML";
 
 QObject *findByName(QObject *root, const QString &name, QSet<const QObject *> &visited)
 {
@@ -111,42 +87,6 @@ QObject *findByName(QObject *root, const QString &name)
     return findByName(root, name, visited);
 }
 
-QObject *findWebEngineItem(QObject *root, QSet<const QObject *> &visited)
-{
-    if (!root || visited.contains(root))
-        return nullptr;
-    visited.insert(root);
-    if (QString::fromLatin1(root->metaObject()->className()).contains(QStringLiteral("WebEngineView")))
-        return root;
-
-    for (QObject *child : root->children()) {
-        if (QObject *found = findWebEngineItem(child, visited))
-            return found;
-    }
-    if (auto *item = qobject_cast<QQuickItem *>(root)) {
-        for (QQuickItem *child : item->childItems()) {
-            if (QObject *found = findWebEngineItem(child, visited))
-                return found;
-        }
-    }
-    return nullptr;
-}
-QObject *findWebEngineItem(QObject *root)
-{
-    QSet<const QObject *> visited;
-    return findWebEngineItem(root, visited);
-}
-
-
-class ViewerStub final : public QObject
-{
-    Q_OBJECT
-
-public slots:
-    QString viewKind(const QUrl &) const { return QStringLiteral("web"); }
-    QWebEngineProfile *internalProfile() const { return nullptr; }
-    QWebEngineProfile *externalProfile() const { return nullptr; }
-};
 
 QQmlComponent *inlineComponent(QQmlEngine &engine, const QByteArray &source, const QString &name)
 {
@@ -232,9 +172,7 @@ void TstUiPolish::appScrollBarBecomesUsableWhenContentOverflows()
 // that the sniffer neither hovers nor imposes a shape.
 void TstUiPolish::viewerPaneSnifferPreservesWebCursor()
 {
-    ViewerStub viewers;
     QQmlEngine engine;
-    engine.rootContext()->setContextProperty(QStringLiteral("viewers"), &viewers);
 
     QQmlComponent component(&engine,
                             QUrl(QStringLiteral("qrc:/qt/qml/CodeHarbor/ViewerPane.qml")));

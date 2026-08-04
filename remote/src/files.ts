@@ -34,6 +34,7 @@ import type {
     RpcMethodName,
 } from "./rpc-types.ts";
 import {
+    InvalidParamsError,
     optionalIndex,
     optionalIntegerInRange,
     optionalOneOf,
@@ -128,6 +129,23 @@ function decodeUtf8(buf: Buffer): string | undefined {
         return undefined;
     }
 }
+// Full-file and ranged reads share a raw-byte ceiling so a request cannot
+// allocate an unbounded Buffer. The serialized result has its own lower
+// ceiling, leaving room for the JSON-RPC envelope under the transport's
+// 16 MiB line limit.
+export const MAX_FILE_READ_BYTES = 16 * 1024 * 1024;
+export const MAX_FILE_RESPONSE_BYTES = 15 * 1024 * 1024;
+
+function assertReadFits(result: ReadFileResult): void {
+    const bytes = Buffer.byteLength(JSON.stringify(result));
+    if (bytes > MAX_FILE_RESPONSE_BYTES) {
+        throw new ResourceLimitError(
+            `Cannot read ${result.path}: the encoded response is ${bytes} bytes, ` +
+                `above this server's ${MAX_FILE_RESPONSE_BYTES}-byte reply limit. ` +
+                `Read the file in smaller ranges.`,
+        );
+    }
+}
 
 export async function stat(params: StatParams): Promise<StatResult> {
     // lstat so symlinks report kind "symlink" rather than their target.
@@ -191,6 +209,16 @@ export async function readFile(params: ReadFileParams): Promise<ReadFileResult> 
         }
         const revision = revisionFrom(stats);
         const size = stats.size;
+        if (
+            params.offset === undefined &&
+            params.length === undefined &&
+            size > MAX_FILE_READ_BYTES
+        ) {
+            throw new ResourceLimitError(
+                `Cannot read ${params.path}: the file is ${size} bytes, above this server's ` +
+                    `${MAX_FILE_READ_BYTES}-byte full-read limit. Read it in smaller ranges.`,
+            );
+        }
 
         // offset/length are BYTE ranges. Normalize to non-negative integers: a
         // negative offset would otherwise index from the end of the file and
@@ -207,13 +235,26 @@ export async function readFile(params: ReadFileParams): Promise<ReadFileResult> 
                 slice = Buffer.alloc(0);
             } else {
                 const want = wanted === undefined ? size - offset : Math.min(wanted, size - offset);
+                if (want > MAX_FILE_READ_BYTES) {
+                    throw new ResourceLimitError(
+                        `Cannot read ${params.path}: the requested range is ${want} bytes, ` +
+                            `above this server's ${MAX_FILE_READ_BYTES}-byte range limit. ` +
+                            `Read it in smaller ranges.`,
+                    );
+                }
                 const dest = Buffer.alloc(want);
                 const { bytesRead } = await handle.read(dest, 0, want, offset);
                 slice = bytesRead === want ? dest : dest.subarray(0, bytesRead);
             }
         } else {
-            slice = await handle.readFile();
+            // Read exactly the size observed by fstat rather than delegating to
+            // readFile(), whose internal growth handling could allocate again if
+            // another process appends to the file while this request is running.
+            const dest = Buffer.alloc(size);
+            const { bytesRead } = await handle.read(dest, 0, size, 0);
+            slice = bytesRead === size ? dest : dest.subarray(0, bytesRead);
         }
+        const fileChangedDuringRead = revisionFrom(await handle.stat()) !== revision;
 
         // `truncated` answers exactly ONE question: is `content` the WHOLE file?
         // It is true whenever any byte of the file is absent from the returned
@@ -228,27 +269,26 @@ export async function readFile(params: ReadFileParams): Promise<ReadFileResult> 
         // (src/editor/EditorController.cpp).
         //
         // Derived ONCE from the CLAMPED window [start, end) against the file
-        // size, so every return path above obeys the same definition — the flag
-        // used to be assigned only inside the ranged branch, which reported
-        // "whole file" for an offset-only tail read and for a read past the end.
-        // Computed from the requested window rather than from bytesRead: a short
-        // read caused by the file shrinking mid-read is a separate concern, and
-        // an empty file always reports false because "" IS its whole content.
+        // size, so every return path above obeys the same definition. A change
+        // observed on the open descriptor also makes the result partial/stale,
+        // so the editor cannot save it over a version it did not receive.
         const start = Math.min(offset, size);
         const end = wanted === undefined ? size : Math.min(start + wanted, size);
-        const truncated = start > 0 || end < size;
+        const truncated = fileChangedDuringRead || start > 0 || end < size;
 
         // A byte range that cuts a multibyte codepoint is not valid UTF-8, so
         // the decode fails and the encoding flips to base64 — the exact bytes
         // round-trip losslessly rather than being mangled by a lossy decode.
         const text = decodeUtf8(slice);
-        return {
+        const result: ReadFileResult = {
             path: params.path,
             encoding: text === undefined ? "base64" : "utf-8",
             content: text ?? slice.toString("base64"),
             revision,
             truncated,
         };
+        assertReadFits(result);
+        return result;
     } finally {
         await handle.close();
     }
@@ -325,7 +365,7 @@ const MAX_SYMLINK_DEPTH = 40;
 
 async function resolveLinkChain(p: string): Promise<string> {
     let current = p;
-    for (let depth = 0; depth < MAX_SYMLINK_DEPTH; depth += 1) {
+    for (let depth = 0; depth <= MAX_SYMLINK_DEPTH; depth += 1) {
         let link: string;
         try {
             link = await fsp.readlink(current);
@@ -406,15 +446,24 @@ async function writeFileLocked(params: WriteFileParams): Promise<WriteFileResult
     // Buffer.from(s, "base64") is LENIENT: it silently drops every character
     // outside the alphabet and discards a trailing partial group. A payload
     // mangled in transit would therefore be written as short, corrupt bytes and
-    // reported back as a successful save. Reject it instead. Node accepts the
-    // standard (+/) and URL-safe (-_) alphabets and ignores whitespace, so the
-    // check mirrors that; a stripped length of 1 mod 4 encodes no byte string.
+    // reported back as a successful save. Node accepts the standard (+/) and
+    // URL-safe (-_) alphabets and ignores whitespace, so validate the alphabet,
+    // group length, and padding grammar before decoding.
     if (encoding === "base64") {
-        const compact = params.content.replace(/\s/g, "").replace(/=+$/, "");
-        if (!/^[A-Za-z0-9+\/\-_]*$/.test(compact) || compact.length % 4 === 1) {
-            throw Object.assign(new Error(`Invalid base64 content for ${params.path}`), {
-                code: "ERR_INVALID_ARG_VALUE",
-            });
+        const compact = params.content.replace(/\s/g, "");
+        const match = /^([A-Za-z0-9+\/\-_]*)(=*)$/.exec(compact);
+        const data = match?.[1] ?? "";
+        const padding = match?.[2] ?? "";
+        const remainder = data.length % 4;
+        const validPadding =
+            match !== null &&
+            padding.length <= 2 &&
+            remainder !== 1 &&
+            (padding.length === 0 ||
+                (padding.length === 1 && remainder === 3) ||
+                (padding.length === 2 && remainder === 2));
+        if (!validPadding) {
+            throw new InvalidParamsError(`Invalid base64 content for ${params.path}`);
         }
     }
     const existing = await statOrUndefined(params.path);
@@ -817,6 +866,9 @@ export async function listDirectory(
     params: ListDirectoryParams,
 ): Promise<ListDirectoryResult> {
     const dirents = await fsp.readdir(params.path, { withFileTypes: true });
+    // Filesystem enumeration order is platform-dependent; sort by the raw
+    // filename so the same directory has one stable wire representation.
+    dirents.sort((left, right) => (left.name < right.name ? -1 : left.name > right.name ? 1 : 0));
     assertListingFits(params.path, dirents);
     return {
         path: params.path,

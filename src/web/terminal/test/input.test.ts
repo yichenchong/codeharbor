@@ -35,6 +35,25 @@ test("large multi-byte paste is chunked without splitting UTF-8 or ANSI sequence
     assertEscapeSequencesStayInOneChunk(chunks);
 });
 
+test("an ESC followed by a Unicode scalar keeps the scalar intact", () => {
+    const payload = "\x1b😀";
+    const chunks = chunkTerminalInput(payload, 2);
+    assert.deepEqual(chunks, [payload]);
+    assert.equal(new TextDecoder("utf-8", { fatal: true }).decode(
+        new TextEncoder().encode(chunks[0]),
+    ), payload);
+});
+
+test("ESC sequences with intermediate bytes stay in one chunk", () => {
+    const payload = "\x1b(0";
+    assert.deepEqual(chunkTerminalInput(payload, 2), [payload]);
+});
+
+test("fractional chunk bounds are rejected", () => {
+    assert.throws(() => chunkTerminalInput("data", 1.5), RangeError);
+    assert.throws(() => new TerminalInputWriter({ sendInput() {} }, 1.5), RangeError);
+});
+
 test("a paste larger than one flow-control window drains in order", async () => {
     const sent: string[] = [];
     const writer = new TerminalInputWriter({

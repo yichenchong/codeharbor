@@ -60,6 +60,10 @@ while [ $# -gt 0 ]; do
     shift
 done
 
+if [ -n "$LEVEL" ] && [ -n "$SET_VERSION" ]; then
+    die "choose either major|minor|patch or --set X.Y.Z, not both"
+fi
+
 command -v git >/dev/null || die "git not found"
 command -v node >/dev/null || die "node not found (needed for package.json edits)"
 git rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "not inside a git repository"
@@ -111,9 +115,9 @@ if [ "$DRY_RUN" -eq 1 ]; then
 fi
 
 # The npm manifests, rewritten as JSON. Split out from VERSION_FILES below only
-# because they share one edit shape; the two web-bundle manifests are in here
-# because they are real workspaces, and leaving them behind is how
-# src/web/*/package.json drifted to 0.1.0 while the tag said 0.1.7.
+# because they share one edit shape; the web-bundle manifests are in here
+# because they are real workspaces, and leaving one behind is how a workspace
+# package can drift while the tag says a newer version.
 MANIFEST_FILES=(package.json
                 remote/package.json
                 src/web/terminal/package.json
@@ -126,8 +130,8 @@ MANIFEST_FILES=(package.json
 #
 # remote/src/codeharbord.ts hand-carries RPC_SERVER_VERSION, which the daemon
 # reports to the client in its `server.info` reply and which the client shows to
-# the user verbatim. It was NOT in this list, so it sat at 0.1.0 while the tag
-# said v0.1.8 and every server announced a version three releases stale.
+# the user verbatim. Keeping it in VERSION_FILES prevents that reported version
+# from drifting away from the release tag.
 VERSION_FILES=(CMakeLists.txt
                remote/src/codeharbord.ts
                "${MANIFEST_FILES[@]}"
@@ -152,11 +156,24 @@ if [ "$DO_COMMIT" -eq 1 ]; then
     for f in "${VERSION_FILES[@]}"; do
         [ -f "$f" ] || die "expected version file is missing: $f"
     done
+    [ -f .github/scripts/check-versions.mjs ] \
+        || die "expected version checker is missing: .github/scripts/check-versions.mjs"
 
     # Version files kept in sync with the tag. The two source files are rewritten
     # with a targeted regex; package.json edits go through node so JSON formatting
     # stays intact.
-    node -e 'const fs=require("fs");let s=fs.readFileSync("CMakeLists.txt","utf8");s=s.replace(/(project\(CodeHarbor[\s\S]*?VERSION\s+)\d+\.\d+\.\d+/,`$1'"$new"'`);fs.writeFileSync("CMakeLists.txt",s)'
+    node -e '
+const fs=require("fs");
+const f="CMakeLists.txt";
+const v=process.argv[1];
+const s=fs.readFileSync(f,"utf8");
+const re=/(project\(CodeHarbor[\s\S]*?VERSION\s+)\d+\.\d+\.\d+/;
+if(!re.test(s)){
+  console.error(`bump.sh: could not find the project(CodeHarbor VERSION declaration in ${f}`);
+  process.exit(1);
+}
+fs.writeFileSync(f,s.replace(re,`$1${v}`));
+' "$new"
     changed=(CMakeLists.txt)
 
     # RPC_SERVER_VERSION in the daemon. The substitution is anchored on the whole
@@ -184,26 +201,38 @@ fs.writeFileSync(f,s.replace(re,`$1${v}$2`));
     # package-lock.json mirrors every manifest version it locks (the root one
     # and one entry per workspace path). npm does NOT rewrite those on its own
     # unless someone runs an install, so leaving the lock out of this list is
-    # how it drifted to 0.1.7 while every manifest said 0.1.8 - and a stale lock
+    # how it drifted while every manifest said a newer version - and a stale lock
     # is what `npm ci` in CI actually installs.
     node -e '
 const fs=require("fs");
 const v=process.argv[1];
 const l=JSON.parse(fs.readFileSync("package-lock.json","utf8"));
+const workspaces=JSON.parse(fs.readFileSync("package.json","utf8")).workspaces||[];
+if(!l.packages || !l.packages[""]){
+  throw new Error("package-lock.json has no root packages[\"\"] entry");
+}
 l.version=v;
-const pkgs=l.packages||{};
-if(pkgs[""])pkgs[""].version=v;
-for(const w of JSON.parse(fs.readFileSync("package.json","utf8")).workspaces||[]){
-  if(pkgs[w])pkgs[w].version=v;
+l.packages[""].version=v;
+for(const w of workspaces){
+  if(!l.packages[w]){
+    throw new Error(`package-lock.json has no packages["${w}"] entry`);
+  }
+  l.packages[w].version=v;
 }
 fs.writeFileSync("package-lock.json",JSON.stringify(l,null,2)+"\n");
 ' "$new"
     changed+=(package-lock.json)
+    # Validate the complete set before committing it. This keeps a malformed
+    # workspace manifest or lock entry from creating a release commit that can
+    # never receive its tag.
+    node .github/scripts/check-versions.mjs
     git add "${changed[@]}"
-    if git diff --cached --quiet; then
+    if git diff --cached --quiet -- "${changed[@]}"; then
         echo "Version files already at $new; tagging current HEAD without a commit"
     else
-        git commit -q -m "Release $tag"
+        # --only is essential: unrelated staged work must remain in the index
+        # and must never be swept into the release commit.
+        git commit -q --only "${changed[@]}" -m "Release $tag"
         echo "Committed version bump: ${changed[*]}"
     fi
 fi

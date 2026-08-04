@@ -61,12 +61,25 @@ function ansiTokenEnd(text: string, start: number): number {
         return text.length;
     }
 
-    // Two-byte ESC Fe sequences (including the common ESC c / ESC 7 / ESC 8
-    // controls). The trailing byte is ASCII by definition, so this also keeps
-    // a Unicode code point following ESC from being separated accidentally.
-    return Math.min(text.length, start + 2);
+    // ESC Fe sequences may have intermediate bytes (for example ESC ( 0), so
+    // do not assume every non-CSI escape ends after two code units. A final
+    // byte is 0x30..0x7e; keep intermediates 0x20..0x2f in the same token.
+    for (let index = start + 1; index < text.length; ++index) {
+        const byte = text.charCodeAt(index);
+        if (byte >= 0x30 && byte <= 0x7e) {
+            return index + 1;
+        }
+        if (byte >= 0x20 && byte <= 0x2f) {
+            continue;
+        }
+        if (byte === 0x1b) {
+            return index;
+        }
+        const codePoint = text.codePointAt(index) ?? 0xfffd;
+        return index + codePointLength(codePoint);
+    }
+    return text.length;
 }
-
 /**
  * Split terminal input into bounded chunks without cutting a control sequence
  * or a Unicode scalar value. A single control sequence longer than the bound is
@@ -79,8 +92,8 @@ export function chunkTerminalInput(
     if (text.length === 0) {
         return [];
     }
-    if (!Number.isFinite(maxBytes) || maxBytes < 1) {
-        throw new RangeError("maxBytes must be a positive finite number");
+    if (!Number.isFinite(maxBytes) || !Number.isInteger(maxBytes) || maxBytes < 1) {
+        throw new RangeError("maxBytes must be a positive integer");
     }
 
     const encoder = new TextEncoder();
@@ -135,10 +148,9 @@ export class TerminalInputWriter {
     private readonly backlog: string[] = [];
     private inFlight = false;
     private closed = false;
-
     constructor(sink: TerminalInputSink, maxBytes = kTerminalInputChunkBytes) {
-        if (!Number.isFinite(maxBytes) || maxBytes < 1) {
-            throw new RangeError("maxBytes must be a positive finite number");
+        if (!Number.isFinite(maxBytes) || !Number.isInteger(maxBytes) || maxBytes < 1) {
+            throw new RangeError("maxBytes must be a positive integer");
         }
         this.sink = sink;
         this.maxBytes = maxBytes;

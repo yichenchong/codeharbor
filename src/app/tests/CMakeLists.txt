@@ -202,8 +202,6 @@ set_tests_properties(tst_liveshell PROPERTIES
     ENVIRONMENT "QT_QPA_PLATFORM=offscreen;QT_QUICK_BACKEND=software;QTWEBENGINE_CHROMIUM_FLAGS=--disable-gpu --no-sandbox --disable-dev-shm-usage"
     TIMEOUT 300
 )
-set_tests_properties(tst_liveshell PROPERTIES
-    FIXTURES_REQUIRED codeharbor_live_fixture)
 
 # THE COLD-START ACCEPTANCE GATE (tst_coldstart.cpp): a fresh config dir, the
 # real qrc Main.qml on top of main.cpp's exact object graph, and the whole

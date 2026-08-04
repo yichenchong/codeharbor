@@ -69,6 +69,7 @@ let mountedBridge: MarkdownBridge | null = null;
 let mountedPath = "";
 let currentSource = "";
 let renderSerial = 0;
+let mountedToken = 0;
 
 function isThemeColor(value: unknown): value is string {
     return typeof value === "string" && /^#[0-9a-fA-F]{6}$/.test(value);
@@ -124,6 +125,7 @@ function clearError(): void {
 
 
 async function renderCurrent(): Promise<void> {
+    const token = mountedToken;
     const root = mountedRoot;
     const bridge = mountedBridge;
     if (!root || !bridge || currentSource.length === 0) {
@@ -136,17 +138,21 @@ async function renderCurrent(): Promise<void> {
     clearError();
     const sanitized = renderMarkdown(currentSource);
     const html = rewriteRelativeUrls(sanitized, mountedPath);
+    if (token !== mountedToken || mountedRoot !== root || mountedBridge !== bridge) {
+        return;
+    }
     root.innerHTML = html;
 
     const images = Array.from(root.querySelectorAll("img[data-ch-image-path]"));
     await Promise.all(images.map(async (image) => {
         const relativePath = image.getAttribute("data-ch-image-path") ?? "";
         const internalUrl = await requestImageUrl(bridge, relativePath);
-        if (serial !== renderSerial) {
+        if (serial !== renderSerial || token !== mountedToken
+            || mountedRoot !== root || mountedBridge !== bridge) {
             return;
         }
         image.removeAttribute("data-ch-image-path");
-        if (internalUrl.startsWith("codeharbor-internal://")) {
+        if (internalUrl.startsWith("codeharbor-internal://file/")) {
             image.setAttribute("src", internalUrl);
         }
     }));
@@ -186,9 +192,48 @@ async function fetchMarkdown(sourceUrl: string): Promise<string> {
     if (!response.ok) {
         throw new Error(`the remote file request failed (${response.status})`);
     }
-    const bytes = await response.arrayBuffer();
-    if (bytes.byteLength > MAX_MARKDOWN_BYTES) {
-        throw new Error("the Markdown file is too large to display");
+    const contentLength = response.headers.get("content-length");
+    if (contentLength !== null) {
+        const declaredLength = Number(contentLength);
+        if (Number.isFinite(declaredLength)
+            && declaredLength > MAX_MARKDOWN_BYTES) {
+            throw new Error("the Markdown file is too large to display");
+        }
+    }
+
+    let bytes: Uint8Array;
+    if (!response.body) {
+        const array = await response.arrayBuffer();
+        if (array.byteLength > MAX_MARKDOWN_BYTES) {
+            throw new Error("the Markdown file is too large to display");
+        }
+        bytes = new Uint8Array(array);
+    } else {
+        const reader = response.body.getReader();
+        const chunks: Uint8Array[] = [];
+        let total = 0;
+        try {
+            while (true) {
+                const part = await reader.read();
+                if (part.done) {
+                    break;
+                }
+                total += part.value.byteLength;
+                if (total > MAX_MARKDOWN_BYTES) {
+                    await reader.cancel();
+                    throw new Error("the Markdown file is too large to display");
+                }
+                chunks.push(part.value);
+            }
+        } finally {
+            reader.releaseLock();
+        }
+        bytes = new Uint8Array(total);
+        let offset = 0;
+        for (const chunk of chunks) {
+            bytes.set(chunk, offset);
+            offset += chunk.byteLength;
+        }
     }
     try {
         return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
@@ -202,6 +247,7 @@ export async function mountMarkdown(
     bridge: MarkdownBridge,
     options: MarkdownMountOptions,
 ): Promise<MarkdownHost> {
+    const token = ++mountedToken;
     mountedRoot = element;
     mountedBridge = bridge;
     mountedPath = options.documentPath;
@@ -211,12 +257,22 @@ export async function mountMarkdown(
     element.replaceChildren();
 
     try {
-        currentSource = await fetchMarkdown(options.sourceUrl);
-        await renderCurrent();
+        const source = await fetchMarkdown(options.sourceUrl);
+        // A second mount can begin before this fetch finishes. Only the
+        // current mount may publish its source or trigger a render; an older
+        // response must not overwrite the newer document.
+        if (token === mountedToken && mountedRoot === element
+            && mountedBridge === bridge) {
+            currentSource = source;
+            await renderCurrent();
+        }
     } catch (error) {
-        currentSource = "";
-        element.replaceChildren();
-        showError(`Unable to render Markdown: ${error instanceof Error ? error.message : "remote read failed"}`);
+        if (token === mountedToken && mountedRoot === element
+            && mountedBridge === bridge) {
+            currentSource = "";
+            element.replaceChildren();
+            showError(`Unable to render Markdown: ${error instanceof Error ? error.message : "remote read failed"}`);
+        }
     }
 
     let disposed = false;
@@ -226,13 +282,16 @@ export async function mountMarkdown(
                 return;
             }
             disposed = true;
-            renderSerial += 1;
-            if (mountedRoot === element) {
-                mountedRoot = null;
-                mountedBridge = null;
-                mountedPath = "";
-                currentSource = "";
+            if (token !== mountedToken || mountedRoot !== element
+                || mountedBridge !== bridge) {
+                return;
             }
+            renderSerial += 1;
+            ++mountedToken;
+            mountedRoot = null;
+            mountedBridge = null;
+            mountedPath = "";
+            currentSource = "";
             element.replaceChildren();
         },
     };

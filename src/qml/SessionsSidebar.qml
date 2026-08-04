@@ -38,10 +38,12 @@ Rectangle {
     // from the server, but whether to hide those rows belongs to this sidebar
     // and is persisted by UiStateStore.
     property bool pinnedOnly:
-        (app && app.uiState && typeof app.uiState.pinnedOnly === "function")
+        (typeof app !== "undefined" && app && app.uiState
+         && typeof app.uiState.pinnedOnly === "function")
             ? app.uiState.pinnedOnly() : false
     property bool showArchived:
-        (app && app.uiState && typeof app.uiState.showArchived === "function")
+        (typeof app !== "undefined" && app && app.uiState
+         && typeof app.uiState.showArchived === "function")
             ? app.uiState.showArchived() : false
     property bool pinFilterReady: false
     property bool archiveFilterReady: false
@@ -57,10 +59,12 @@ Rectangle {
     // small QML harnesses; its absence follows the same plain-palette rule as
     // an unknown palette name.
     readonly property string groupPaletteName:
-        (app && app.settings && app.settings.groupPalette !== undefined)
+        (typeof app !== "undefined" && app && app.settings
+         && app.settings.groupPalette !== undefined)
             ? String(app.settings.groupPalette) : "plain"
     readonly property int groupPaletteSize:
-        (app && app.settings && app.settings.groupPaletteSize !== undefined)
+        (typeof app !== "undefined" && app && app.settings
+         && app.settings.groupPaletteSize !== undefined)
             ? Number(app.settings.groupPaletteSize) : 5
 
     function groupColorFor(name, paletteName, paletteSize) {
@@ -82,15 +86,17 @@ Rectangle {
     // harness) must keep working — it then simply has nothing to report and
     // the footer takes no space.
     // ---------------------------------------------------------------------
-    readonly property string linkState: (app && app.connectionState !== undefined)
-                                        ? String(app.connectionState) : ""
+    readonly property string linkState:
+        (typeof app !== "undefined" && app && app.connectionState !== undefined)
+            ? String(app.connectionState) : ""
     // Rows on screen are known to predate the current reality.
     readonly property bool stale: linkState === "reconnecting" || linkState === "failed"
                                   || linkState === "disconnected"
     // The session the host considers loaded, which is not the same thing as the
     // keyboard cursor or the last row clicked.
-    readonly property string hostActiveSessionId: (app && app.activeSessionId !== undefined)
-                                                  ? String(app.activeSessionId) : ""
+    readonly property string hostActiveSessionId:
+        (typeof app !== "undefined" && app && app.activeSessionId !== undefined)
+            ? String(app.activeSessionId) : ""
 
     // Same three-way encoding as ConnectSheet's chip: colour, glyph and word.
     // Every word ch::AppController::setConnectionState() publishes needs a case
@@ -141,11 +147,11 @@ Rectangle {
     }
 
     function applySessionFilters() {
-        if (app && app.sessionsModel) {
+        if (typeof app !== "undefined" && app && app.sessionsModel) {
             app.sessionsModel.pinnedOnly = sidebar.pinnedOnly
             app.sessionsModel.showArchived = sidebar.showArchived
         }
-        if (app && app.uiState) {
+        if (typeof app !== "undefined" && app && app.uiState) {
             if (typeof app.uiState.setPinnedOnly === "function")
                 app.uiState.setPinnedOnly(sidebar.pinnedOnly)
             if (typeof app.uiState.setShowArchived === "function")
@@ -157,33 +163,34 @@ Rectangle {
         applySessionFilters()
         pinFilterReady = true
         archiveFilterReady = true
-        app.refresh()
+        if (typeof app !== "undefined" && app
+                && typeof app.refresh === "function")
+            app.refresh()
     }
 
     onPinnedOnlyChanged: {
         if (!pinFilterReady)
             return
         applySessionFilters()
-        app.refresh()
+        if (typeof app !== "undefined" && app
+                && typeof app.refresh === "function")
+            app.refresh()
     }
 
     onShowArchivedChanged: {
         if (!archiveFilterReady)
             return
         applySessionFilters()
-        app.refresh()
+        if (typeof app !== "undefined" && app
+                && typeof app.refresh === "function")
+            app.refresh()
     }
 
 
-    // ---------------------------------------------------------------------
-    // Delegate registry
-    //
-    // Hit-testing and ordering need the live delegates, and a nested
-    // DelegateModel gives no flat index to work from. Delegates register
-    // themselves on creation and drop out on destruction; every consumer reads
-    // itemId/groupId/index/collapsed off the live item, so a model refresh
-    // needs no invalidation step.
-    // ---------------------------------------------------------------------
+
+    // DelegateModel.items is the authoritative ordered set: it contains every
+    // model row even when ListView has not instantiated that row's delegate.
+    // The live registry remains useful only for geometry and per-row actions.
     property var rowItems: []
     property var headerItems: []
 
@@ -210,26 +217,40 @@ Rectangle {
             cancelDrag();
     }
 
-    // Groups in model order, each with its sessions in model order. Sessions of
-    // a collapsed group are included: they still exist as (invisible) items and
-    // their ids are needed to build a complete ordering for reorderSessions.
-    function orderedGroups() {
-        var headers = [];
-        for (var h = 0; h < headerItems.length; ++h) {
-            if (headerItems[h])
-                headers.push(headerItems[h]);
+    function liveHeader(id) {
+        for (var i = 0; i < headerItems.length; ++i) {
+            if (headerItems[i] && headerItems[i].itemId === id)
+                return headerItems[i];
         }
-        headers.sort(function (a, b) { return a.index - b.index; });
+        return null;
+    }
 
+    function modelId(modelData) {
+        if (!modelData)
+            return "";
+        var value = modelData.itemId !== undefined ? modelData.itemId : modelData.id;
+        return value === undefined || value === null ? "" : String(value);
+    }
+
+    // Groups in model order. The DelegateModel item contains the model roles
+    // even when its visual delegate is outside the ListView viewport.
+    function orderedGroups() {
         var out = [];
-        for (var g = 0; g < headers.length; ++g) {
+        for (var g = 0; g < groupsDelegateModel.items.count; ++g) {
+            var item = groupsDelegateModel.items.get(g);
+            var modelData = item ? item.model : null;
+            var id = sidebar.modelId(modelData);
+            if (id === "")
+                continue;
+            var header = sidebar.liveHeader(id);
             var rows = [];
             for (var r = 0; r < rowItems.length; ++r) {
-                if (rowItems[r] && rowItems[r].groupId === headers[g].itemId)
+                if (rowItems[r] && rowItems[r].groupId === id)
                     rows.push(rowItems[r]);
             }
             rows.sort(function (a, b) { return a.index - b.index; });
-            out.push({ header: headers[g], rows: rows });
+            out.push({ header: header, rows: rows, itemId: id,
+                       index: g, model: modelData });
         }
         return out;
     }
@@ -237,7 +258,7 @@ Rectangle {
     function groupEntry(groupId) {
         var gs = orderedGroups();
         for (var i = 0; i < gs.length; ++i) {
-            if (gs[i].header.itemId === groupId)
+            if (gs[i].itemId === groupId)
                 return gs[i];
         }
         return null;
@@ -275,6 +296,16 @@ Rectangle {
         return { top: top, bottom: bottom };
     }
 
+    function visibleGroupEntries() {
+        var all = orderedGroups();
+        var out = [];
+        for (var i = 0; i < all.length; ++i) {
+            if (all[i].header)
+                out.push(all[i]);
+        }
+        return out;
+    }
+
     // ---------------------------------------------------------------------
     // Drop resolution
     // ---------------------------------------------------------------------
@@ -283,7 +314,7 @@ Rectangle {
     // the index within it. Dropping onto a collapsed group appends to it,
     // because its rows offer no insertion points to aim at.
     function resolveSessionDrop(y) {
-        var gs = orderedGroups();
+        var gs = sidebar.visibleGroupEntries();
         if (gs.length === 0)
             return null;
 
@@ -296,7 +327,7 @@ Rectangle {
         }
 
         if (chosen.header.collapsed)
-            return { groupId: chosen.header.itemId, index: chosen.rows.length, append: true };
+            return { groupId: chosen.itemId, index: chosen.rows.length, append: true };
 
         var rows = visibleRows(chosen);
         var index = rows.length;
@@ -306,22 +337,23 @@ Rectangle {
                 break;
             }
         }
-        return { groupId: chosen.header.itemId, index: index };
+        return { groupId: chosen.itemId, index: index };
     }
 
-    // Insertion point for a dragged group: index in the top-level ordering.
+    // Insertion point for a dragged group: the model index in the top-level
+    // ordering, not the position among whichever headers ListView realised.
     function resolveGroupDrop(y) {
-        var gs = orderedGroups();
+        var gs = sidebar.visibleGroupEntries();
         if (gs.length === 0)
             return null;
         for (var i = 0; i < gs.length; ++i) {
             var span = groupSpan(gs[i]);
             if (y < (span.top + span.bottom) / 2)
-                return { index: i };
+                return { index: gs[i].index };
             if (y < span.bottom)
-                return { index: i + 1 };
+                return { index: gs[i].index + 1 };
         }
-        return { index: gs.length };
+        return { index: gs[gs.length - 1].index + 1 };
     }
 
     // ---------------------------------------------------------------------
@@ -402,7 +434,7 @@ Rectangle {
         var gs = orderedGroups();
         var ids = [];
         for (var i = 0; i < gs.length; ++i)
-            ids.push(gs[i].header.itemId);
+            ids.push(gs[i].itemId);
 
         var from = ids.indexOf(header.itemId);
         if (from < 0)
@@ -458,7 +490,7 @@ Rectangle {
         var entry = groupEntry(groupId);
         if (!entry || !app || !app.sessionsModel)
             return 0;
-        var parentIndex = app.sessionsModel.index(entry.header.index, 0);
+        var parentIndex = app.sessionsModel.index(entry.index, 0);
         return app.sessionsModel.rowCount(parentIndex);
     }
     function deleteGroup(groupId) {
@@ -489,21 +521,28 @@ Rectangle {
         }
 
         if (dragKind === "group") {
-            var gs = orderedGroups();
+            var gs = sidebar.visibleGroupEntries();
             if (gs.length === 0) {
                 dropLineVisible = false;
                 dropHighlightVisible = false;
                 return;
             }
-            dropLineY = target.index < gs.length ? groupSpan(gs[target.index]).top
-                                                 : groupSpan(gs[gs.length - 1]).bottom;
+            var next = null;
+            for (var n = 0; n < gs.length; ++n) {
+                if (gs[n].index >= target.index) {
+                    next = gs[n];
+                    break;
+                }
+            }
+            dropLineY = next ? groupSpan(next).top
+                             : groupSpan(gs[gs.length - 1]).bottom;
             dropLineVisible = true;
             dropHighlightVisible = false;
             return;
         }
 
         var entry = groupEntry(target.groupId);
-        if (!entry) {
+        if (!entry || !entry.header) {
             dropLineVisible = false;
             dropHighlightVisible = false;
             return;
@@ -530,21 +569,20 @@ Rectangle {
         dropHighlightVisible = false;
     }
 
-    // ---------------------------------------------------------------------
-    // Selection and keyboard navigation
-    // ---------------------------------------------------------------------
-
-    // Flat, visually ordered cursor list: every group header, plus the sessions
-    // of expanded groups.
+    // Flat, visually ordered cursor list: every model group header, plus the
+    // sessions of expanded groups whose delegate is currently realised.
     function navItems() {
         var gs = orderedGroups();
         var out = [];
         for (var i = 0; i < gs.length; ++i) {
-            out.push({ id: gs[i].header.itemId, isGroup: true, item: gs[i].header });
-            if (gs[i].header.collapsed)
+            out.push({ id: gs[i].itemId, isGroup: true, item: gs[i].header,
+                       modelIndex: gs[i].index, model: gs[i].model });
+            if (!gs[i].header || gs[i].header.collapsed)
                 continue;
             for (var j = 0; j < gs[i].rows.length; ++j)
-                out.push({ id: gs[i].rows[j].itemId, isGroup: false, item: gs[i].rows[j] });
+                out.push({ id: gs[i].rows[j].itemId, isGroup: false,
+                           item: gs[i].rows[j], modelIndex: -1,
+                           model: null });
         }
         return out;
     }
@@ -581,12 +619,15 @@ Rectangle {
         var next = current < 0 ? (delta > 0 ? 0 : items.length - 1)
                                : Math.max(0, Math.min(items.length - 1, current + delta));
         setCurrent(items[next].id, items[next].isGroup);
-        ensureVisible(items[next].item);
+        ensureVisible(items[next].item, items[next].modelIndex);
     }
 
-    function ensureVisible(item) {
-        if (!item)
+    function ensureVisible(item, modelIndex) {
+        if (!item) {
+            if (modelIndex >= 0)
+                sessionsList.positionViewAtIndex(modelIndex, ListView.Contain);
             return;
+        }
         var top = item.mapToItem(sessionsList.contentItem, 0, 0).y;
         var bottom = top + item.height;
         if (top < sessionsList.contentY)
@@ -611,8 +652,10 @@ Rectangle {
         if (!currentIsGroup || currentId === "")
             return;
         var entry = groupEntry(currentId);
-        if (entry)
-            app.setGroupCollapsed(currentId, !entry.header.collapsed);
+        if (!entry)
+            return;
+        var collapsed = entry.header ? entry.header.collapsed : entry.model.collapsed;
+        app.setGroupCollapsed(currentId, !collapsed);
     }
 
     Keys.onPressed: (event) => {
@@ -1058,6 +1101,7 @@ Rectangle {
             font.pixelSize: Theme.fontSizeBody
             elide: Text.ElideRight
             text: sidebar.dragItem ? sidebar.dragItem.name : ""
+            textFormat: Text.PlainText
         }
     }
 

@@ -183,6 +183,7 @@ private slots:
     void createOwnerlessControllerIsAdoptedByTheFactory();
     void createBridgeWrapsTheControllerAndDiesWithThePane();
     void attachWithoutAConnectionFailsAndReportsWhy();
+    void attachRejectsTargetNotResolvedByServer();
     void attachWithoutATargetIsRefused();
     void resolveTargetWithoutAServerRefuses();
     void paneKeysAddressOneSlotOfOneDevSession();
@@ -195,8 +196,10 @@ private slots:
     void bridgeForwardsInputResizeAndVisibility();
     void bridgeHoldsOutputUntilTheRendererIsReady();
     void bridgeIgnoresAVisibleReportFromAPaneWithNoRenderer();
+    void bridgePreservesHiddenReportBeforeReady();
     void bridgeRetainsOutputForAHiddenPaneAndAcrossAPageReload();
     void bridgeIsInertOnceItsControllerIsDestroyed();
+    void bridgeDestructorHidesItsController();
     void bridgeDecodesUtf8SplitAcrossFlushes();
     void bridgeCarriesByteWeightAndFeedsAcknowledgementsBack();
     void bridgeReportsStateTransitionsAsStrings();
@@ -207,6 +210,7 @@ private slots:
     void aPaneReportsItsOutputUnderTheRowIdTheServerAnswered();
     void aPaneRetargetedMidLookupNeverReportsUnderTheSupersededPanesIdentity();
     void aFailedResolutionLeavesThePaneWithNoIdentity();
+    void targetCannotCrossAWorkspaceServerSwitch();
     void changingTheWorkspaceServerForgetsRememberedRowIdentities();
 };
 
@@ -316,6 +320,32 @@ void TstTerminalFactory::attachWithoutAConnectionFailsAndReportsWhy()
     QCOMPARE(poollessErrors.count(), 1);
 }
 
+// A target supplied by a QML caller is not trusted merely because it is
+// non-empty. Once the workspace repository is configured, attach() accepts only
+// the target returned by resolveTarget(), so a stale or compromised caller
+// cannot attach this pane to another session.
+void TstTerminalFactory::attachRejectsTargetNotResolvedByServer()
+{
+    RpcPair rpc;
+    QVERIFY(rpc.start());
+
+    OfflineFactory factory(nullptr);
+    factory.setWorkspace(rpc.db());
+    factory.setServerId(QStringLiteral("srv-1"));
+
+    QObject pane;
+    TerminalController* controller = factory.create(&pane);
+    QSignalSpy errors(&factory, &TerminalFactory::error);
+
+    QVERIFY(!factory.attach(controller, QStringLiteral("client-made-target"),
+                            QStringLiteral("/repo"), 80, 24));
+    QCOMPARE(errors.count(), 1);
+    QCOMPARE(errors.at(0).at(0).value<TerminalController*>(), controller);
+    QVERIFY(errors.at(0).at(1).toString().contains(QStringLiteral("server")));
+    QVERIFY(factory.targetFor(controller).isEmpty());
+    QVERIFY(controller->state() == TerminalState::Unloaded);
+}
+
 // A pane that has not been resolved against the server yet has no target, and
 // there is no longer anything the factory could put in its place: the identity
 // is a server row. Refusing is the whole point — every locally plausible
@@ -421,6 +451,12 @@ void TstTerminalFactory::resolveAddressesAPaneByItsRowIdAndNeverByItsLabel()
     // not look like part of the question.
     QVERIFY(byRow.name.isEmpty());
     QVERIFY(!byRow.workingDirectory.has_value());
+
+    const ResolveTerminalPaneParams byRowWithoutLabel = TerminalFactory::resolveParamsFor(
+        server, session, QString(), row, QStringLiteral("/home/u"));
+    QCOMPARE(byRowWithoutLabel.id.value, row);
+    QVERIFY(byRowWithoutLabel.name.isEmpty());
+    QVERIFY(!byRowWithoutLabel.workingDirectory.has_value());
 
     const ResolveTerminalPaneParams byLabel = TerminalFactory::resolveParamsFor(
         server, session, QStringLiteral("terminal-2"), QString(), QStringLiteral("/home/u"));
@@ -781,6 +817,26 @@ void TstTerminalFactory::bridgeIgnoresAVisibleReportFromAPaneWithNoRenderer()
     QCOMPARE(writes.at(0).at(0).toString(), QStringLiteral("first screenful"));
 }
 
+void TstTerminalFactory::bridgePreservesHiddenReportBeforeReady()
+{
+    QObject pane;
+    TerminalFactory factory(nullptr);
+    TerminalController* controller = factory.create(&pane);
+    TerminalBridge* bridge = factory.createBridge(controller, &pane);
+    QSignalSpy writes(bridge, &TerminalBridge::write);
+
+    bridge->notifyViewVisible(false);
+    controller->ingestOutput(QByteArrayLiteral("hidden while loading"));
+    QTRY_COMPARE(controller->hiddenBuffer(), QByteArrayLiteral("hidden while loading"));
+    bridge->ready();
+
+    QVERIFY(!controller->viewVisible());
+    QCOMPARE(writes.count(), 0);
+    bridge->notifyViewVisible(true);
+    QCOMPARE(writes.count(), 1);
+    QCOMPARE(writes.at(0).at(0).toString(), QStringLiteral("hidden while loading"));
+}
+
 // The other side of the same rule, in the two shapes production produces:
 // a pane the user hid, and a page that reloaded under a pane that never moved.
 void TstTerminalFactory::bridgeRetainsOutputForAHiddenPaneAndAcrossAPageReload()
@@ -858,6 +914,20 @@ void TstTerminalFactory::bridgeIsInertOnceItsControllerIsDestroyed()
     QCOMPARE(geometry.count(), 0);
     // requestClear() is a pure view operation and needs no controller at all.
     QCOMPARE(cleared.count(), 1);
+}
+
+void TstTerminalFactory::bridgeDestructorHidesItsController()
+{
+    TerminalFactory factory(nullptr);
+    QObject pane;
+    TerminalController* controller = factory.create(&pane);
+    QPointer<TerminalBridge> bridge = factory.createBridge(controller, &pane);
+
+    bridge->ready();
+    QVERIFY(controller->viewVisible());
+    delete bridge;
+    QVERIFY(bridge.isNull());
+    QVERIFY(!controller->viewVisible());
 }
 
 // Two halves of one contract.
@@ -1087,6 +1157,11 @@ void TstTerminalFactory::aPaneReportsItsOutputUnderTheRowIdTheServerAnswered()
     QVERIFY(factory.resolveTarget(controller, QStringLiteral("s1"),
                                   QStringLiteral("terminal-1"), QString(),
                                   QStringLiteral("/repo")));
+    // Repeating the same request before its answer joins the existing flight;
+    // it must not produce a duplicate targetResolved() signal.
+    QVERIFY(factory.resolveTarget(controller, QStringLiteral("s1"),
+                                  QStringLiteral("terminal-1"), QString(),
+                                  QStringLiteral("/repo")));
     const QJsonObject request = rpc.takeRequest();
     QCOMPARE(request.value(QStringLiteral("method")).toString(),
              QString::fromLatin1(rpc::kMethodWorkspaceResolveTerminalPane));
@@ -1259,6 +1334,29 @@ void TstTerminalFactory::aFailedResolutionLeavesThePaneWithNoIdentity()
     QCOMPARE(monitor.stateFor(QStringLiteral("s1"), QStringLiteral("row-A")),
              asInt(AgentState::Idle));
     QCOMPARE(transitions.count(), 0);
+}
+
+// A target recorded while looking at one workspace server must not be reused
+// to kill a same-named session after the factory switches profiles.
+void TstTerminalFactory::targetCannotCrossAWorkspaceServerSwitch()
+{
+    OfflineFactory factory(nullptr);
+    factory.setServerId(QStringLiteral("srv-1"));
+
+    QObject pane;
+    TerminalController* controller = factory.create(&pane);
+    QSignalSpy errors(&factory, &TerminalFactory::error);
+
+    // The offline subclass opens the lower-level attach seam, which records a
+    // target before the expected no-pool failure. That lets this test exercise
+    // the target's server binding without a live SSH session.
+    QVERIFY(!factory.attach(controller, QStringLiteral("srv-1-target"),
+                            QStringLiteral("/repo"), 80, 24));
+    QCOMPARE(factory.targetFor(controller), QStringLiteral("srv-1-target"));
+
+    factory.setServerId(QStringLiteral("srv-2"));
+    QVERIFY(factory.targetFor(controller).isEmpty());
+    QVERIFY(errors.count() >= 1);
 }
 
 // A remembered answer names rows on ONE server. Both halves of it — the tmux

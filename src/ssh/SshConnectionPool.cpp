@@ -21,8 +21,12 @@
 //     ProxyCommand built from config, fixed in 0.10.6 — connectToHost() parses
 //     the user's ~/.ssh/config) and CVE-2025-5351 (double free in the public-key
 //     export path used by ssh_pki_export_pubkey_base64(); affects 0.10.0 and
-//     newer built against OpenSSL 3, fixed in 0.11.2). 0.12.0 is excluded
-//     outright — see hasBrokenHybridKex().
+//     newer built against OpenSSL 3, fixed in 0.11.2). 0.11.2 is therefore the
+//     audited RUNTIME floor, which is what CMake checks; the in-tree Windows
+//     vcpkg overlay port is separately pinned to 0.12.2 because vcpkg's own
+//     registry port is the unusable 0.12.0. A runtime reporting exactly 0.12.0
+//     receives the narrowly scoped hybrid-KEX subtraction in
+//     hasBrokenHybridKex(); 0.12.1 and newer never do.
 #if CH_HAVE_LIBSSH
 #include <libssh/callbacks.h>
 #endif
@@ -83,12 +87,36 @@ void SshLogRouter::pruneInactiveThreadRoutes()
             return !entry->active.load(std::memory_order_acquire);
         });
 }
+void SshLogRouter::restoreThreadLoggingState()
+{
+#if CH_HAVE_LIBSSH
+    // Same order the per-handshake scope guard used: level, then user data,
+    // then callback, so the previous callback is never briefly paired with
+    // this router's verbosity.
+    ssh_set_log_level(t_previousLogLevel);
+    ssh_set_log_userdata(t_previousLogUserdata);
+    // libssh REFUSES a null callback (ssh_set_log_callback returns SSH_ERROR
+    // and keeps the current one), so a thread that had no hook cannot be given
+    // its emptiness back. Leaving dispatch() installed is harmless: with no
+    // route on this thread it forwards nothing, and the restored verbosity
+    // means libssh does not even format a line.
+    if (t_previousLogCallback)
+        ssh_set_log_callback(t_previousLogCallback);
+    t_previousLogCallback = nullptr;
+    t_previousLogUserdata = nullptr;
+    t_previousLogLevel = SSH_LOG_NOLOG;
+#endif
+    t_ownsThreadState = false;
+}
+
 
 void SshLogRouter::acquire(Route* route)
 {
     Q_ASSERT(route);
     route->m_thread = QThread::currentThreadId();
     pruneInactiveThreadRoutes();
+    if (s_threadRoutes.isEmpty() && t_ownsThreadState)
+        restoreThreadLoggingState();
     const bool firstOnThisThread = s_threadRoutes.isEmpty();
     s_threadRoutes.append(route->m_entry);
     g_activeRoutes.fetch_add(1, std::memory_order_relaxed);
@@ -125,12 +153,10 @@ void SshLogRouter::release(Route* route)
     if (QThread::currentThreadId() != route->m_thread) {
         // A REAL runtime guard, not an assertion that vanishes in a release
         // build. The owning thread's route stack and its saved libssh state are
-        // thread-local and unreachable from here, so neither is touched: the
-        // entry above is already inert, the owning thread sweeps it out of its
-        // own stack on its next acquire/release, and that thread's libssh
-        // verbosity goes back when it drops its own last route. Warn, because a
-        // caller doing this is violating the documented threading contract and
-        // is silently keeping libssh noisy on another thread.
+        // thread-local and unreachable from here, so neither is touched. The
+        // owning thread's verbosity cannot be repaired from this call; it is
+        // restored when that thread next acquires a route (or releases another
+        // route of its own). This violation must still be visible to the caller.
         qWarning("SshLogRouter: a route taken on another thread was released "
                  "here; the owning thread's libssh logging state cannot be "
                  "restored from this one (see SshConnectionPool.h, THREADING "
@@ -141,24 +167,7 @@ void SshLogRouter::release(Route* route)
     pruneInactiveThreadRoutes();
     if (!s_threadRoutes.isEmpty() || !t_ownsThreadState)
         return;
-#if CH_HAVE_LIBSSH
-    // Same order the per-handshake scope guard used: level, then user data,
-    // then callback, so the previous callback is never briefly paired with this
-    // router's verbosity.
-    ssh_set_log_level(t_previousLogLevel);
-    ssh_set_log_userdata(t_previousLogUserdata);
-    // libssh REFUSES a null callback (ssh_set_log_callback returns SSH_ERROR
-    // and keeps the current one), so a thread that had no hook cannot be given
-    // its emptiness back. Leaving dispatch() installed is harmless and is the
-    // only option: with no route on this thread it forwards nothing, and the
-    // restored verbosity means libssh does not even format a line.
-    if (t_previousLogCallback)
-        ssh_set_log_callback(t_previousLogCallback);
-    t_previousLogCallback = nullptr;
-    t_previousLogUserdata = nullptr;
-    t_previousLogLevel = SSH_LOG_NOLOG;
-#endif
-    t_ownsThreadState = false;
+    restoreThreadLoggingState();
 }
 
 void SshLogRouter::dispatch(int priority, const char* function,
@@ -255,6 +264,11 @@ SshConnectionPool::~SshConnectionPool()
     // that is being destroyed.
     m_destroying = true;
 #if CH_HAVE_LIBSSH
+    // No diagnostic property notification is allowed from a destructor.
+    // Drop the route before libssh teardown can emit a final packet/error line;
+    // the route's sink would otherwise call appendDiagnostic() on an object
+    // whose destruction is already in progress.
+    m_logRoute.reset();
     closeSession();
 #endif
     // Deliberately NOT disconnectFromHost(): its setState(Disconnected) emits
@@ -497,13 +511,15 @@ QStringList identityFileCandidates(ssh_session session,
     // single unopenable key and no way to reach the user's actual keys. Anything
     // still carrying a libssh '%' escape is therefore dropped.
     char* configuredIdentity = nullptr;
-    if (ssh_options_get(session, SSH_OPTIONS_IDENTITY, &configuredIdentity)
-        == SSH_OK) {
+    const int identityResult =
+        ssh_options_get(session, SSH_OPTIONS_IDENTITY, &configuredIdentity);
+    if (identityResult == SSH_OK && configuredIdentity) {
         const QString identity = QFile::decodeName(configuredIdentity);
         if (!identity.contains(QLatin1Char('%')))
             add(identity);
-        ssh_string_free_char(configuredIdentity);
     }
+    if (configuredIdentity)
+        ssh_string_free_char(configuredIdentity);
 
     // With a profile or config identity, stop there: each rejected key spends
     // one server authentication attempt. Scan defaults only when neither
@@ -640,8 +656,10 @@ bool SshConnectionPool::connectToHost(const QString& host, quint16 port,
 {
     // A slot reached from ~SshConnectionPool()'s sessionClosing() must not be
     // able to start a fresh handshake: the session it allocated would never be
-    // freed, and the state it set would be overwritten moments later.
-    if (m_destroying)
+    // freed, and the state it set would be overwritten moments later. The same
+    // guard applies during ordinary teardown, where a replacement handshake
+    // would otherwise race the old session's channel sweep.
+    if (m_destroying || m_closingSession)
         return false;
 
     clearDiagnostics();
@@ -683,16 +701,18 @@ bool SshConnectionPool::connectToHost(const QString& host, quint16 port,
         });
     const auto dropLogRoute = qScopeGuard([this] { m_logRoute.reset(); });
 
-    // Option failures are invisible in libssh's later return values: a private
-    // key that never reached the session looks exactly like a key the server
-    // rejected. Record them instead of dropping them on the floor.
+    // Option failures can otherwise be mistaken for server-side
+    // authentication failures, so report and abort before connecting.
     const auto setOption = [this](ssh_options_e option, const void* value,
                                   const QString& what) {
         if (ssh_options_set(m_session, option, value) == SSH_OK)
-            return;
-        appendDiagnostic(
+            return true;
+        const QString failure =
             QStringLiteral("Could not apply %1: %2")
-                .arg(what, QString::fromUtf8(ssh_get_error(m_session))));
+                .arg(what, QString::fromUtf8(ssh_get_error(m_session)));
+        appendDiagnostic(failure);
+        emit errorOccurred(failure);
+        return false;
     };
 
     const QString runtimeVersion = QString::fromUtf8(ssh_version(0));
@@ -701,8 +721,12 @@ bool SshConnectionPool::connectToHost(const QString& host, quint16 port,
     const QByteArray hostUtf8 = host.toUtf8();
     const QByteArray userUtf8 = user.toUtf8();
     unsigned int portValue = port;
-    setOption(SSH_OPTIONS_HOST, hostUtf8.constData(),
-              QStringLiteral("SSH host"));
+    if (!setOption(SSH_OPTIONS_HOST, hostUtf8.constData(),
+                   QStringLiteral("SSH host"))) {
+        closeSession();
+        setState(State::Error);
+        return false;
+    }
 
     // SH15: cap the worst-case handshake freeze (see kHandshakeTimeoutSeconds).
     // Applied BEFORE the user's OpenSSH config is parsed, not after: libssh's
@@ -713,9 +737,13 @@ bool SshConnectionPool::connectToHost(const QString& host, quint16 port,
     // and skipping it whenever a config exists at all — which is nearly every
     // developer machine — silently removed the bound this constant exists for.
     const long handshakeTimeout = kHandshakeTimeoutSeconds;
-    setOption(SSH_OPTIONS_TIMEOUT, &handshakeTimeout,
-              QStringLiteral("handshake timeout (%1s)")
-                  .arg(kHandshakeTimeoutSeconds));
+    if (!setOption(SSH_OPTIONS_TIMEOUT, &handshakeTimeout,
+                   QStringLiteral("handshake timeout (%1s)")
+                       .arg(kHandshakeTimeoutSeconds))) {
+        closeSession();
+        setState(State::Error);
+        return false;
+    }
 
     // libssh only learns IdentityFile, ProxyJump and the rest of the user's
     // OpenSSH configuration when asked to parse it. Set Host first so its
@@ -742,13 +770,22 @@ bool SshConnectionPool::connectToHost(const QString& host, quint16 port,
         }
     }
 
-    setOption(SSH_OPTIONS_PORT, &portValue, QStringLiteral("SSH port"));
-    setOption(SSH_OPTIONS_USER, userUtf8.constData(),
-              QStringLiteral("SSH user"));
+    if (!setOption(SSH_OPTIONS_PORT, &portValue, QStringLiteral("SSH port"))
+        || !setOption(SSH_OPTIONS_USER, userUtf8.constData(),
+                      QStringLiteral("SSH user"))) {
+        closeSession();
+        setState(State::Error);
+        return false;
+    }
     if (!m_identityFile.isEmpty()) {
         const QByteArray identityUtf8 = QFile::encodeName(m_identityFile);
-        setOption(SSH_OPTIONS_IDENTITY, identityUtf8.constData(),
-                  QStringLiteral("private key file %1").arg(m_identityFile));
+        if (!setOption(SSH_OPTIONS_IDENTITY, identityUtf8.constData(),
+                       QStringLiteral("private key file %1")
+                           .arg(m_identityFile))) {
+            closeSession();
+            setState(State::Error);
+            return false;
+        }
     }
 
     // libssh 0.12.0's mlkem768x25519-sha256 branch hands ssh_buffer_pack() an
@@ -846,8 +883,11 @@ void SshConnectionPool::disconnectFromHost()
 
 void SshConnectionPool::closeSession()
 {
-    if (!m_session)
+    if (!m_session || m_closingSession)
         return;
+    m_closingSession = true;
+    const auto clearClosing =
+        qScopeGuard([this] { m_closingSession = false; });
     // Detach the session from the member BEFORE announcing the teardown: a slot
     // reached from sessionClosing() that asks for another disconnect must not
     // start a second teardown of the same session, and nothing may open a fresh
@@ -880,7 +920,11 @@ void SshConnectionPool::closeSession()
 bool SshConnectionPool::verifyHostKey(const QString& host)
 {
     ssh_key serverKey = nullptr;
-    if (ssh_get_server_publickey(m_session, &serverKey) != SSH_OK || !serverKey) {
+
+    const int keyResult = ssh_get_server_publickey(m_session, &serverKey);
+    if (keyResult != SSH_OK || !serverKey) {
+        if (serverKey)
+            ssh_key_free(serverKey);
         emit errorOccurred(QStringLiteral("Could not read server host key"));
         return false;
     }
@@ -894,7 +938,11 @@ bool SshConnectionPool::verifyHostKey(const QString& host)
     // decoding on purpose: a lenient decode silently skips invalid characters
     // and would hand KnownHosts a blob that is not what the server presented.
     char* b64Key = nullptr;
-    if (ssh_pki_export_pubkey_base64(serverKey, &b64Key) != SSH_OK || !b64Key) {
+    const int exportResult =
+        ssh_pki_export_pubkey_base64(serverKey, &b64Key);
+    if (exportResult != SSH_OK || !b64Key) {
+        if (b64Key)
+            ssh_string_free_char(b64Key);
         ssh_key_free(serverKey);
         emit errorOccurred(QStringLiteral("Could not export server host key"));
         return false;
@@ -980,7 +1028,7 @@ bool SshConnectionPool::authenticate(const QString& user)
     // SSH_AUTH_PARTIAL and then advertises only the method it still wants, so
     // the ladder is re-derived from the server's current offer after every step
     // rather than walked blindly. It terminates because nextAuthRung() never
-    // returns a rung already in `tried`: at most four steps, however many
+    // returns a rung already in `tried`: at most five steps, however many
     // partial successes the server reports.
     AuthMethods offered = methodsFromMask(ssh_userauth_list(m_session, nullptr));
     m_publicKeyOffered = offered.publicKey;

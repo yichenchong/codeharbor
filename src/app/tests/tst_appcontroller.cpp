@@ -23,6 +23,7 @@
 #include <cstring>
 #include <functional>
 
+#include "GroupPaletteService.h"
 #include "AppController.h"
 #include "SessionLayouts.h"
 #include "UiStateStore.h"
@@ -341,6 +342,7 @@ private slots:
     void initTestCase();
     void toGroupRowsMapsNestedNodes();
     void toGroupRowsEmptyIsEmpty();
+    void paletteIndexRejectsNonPositiveSize();
     void uiStateStorePersistsAcrossInstances();
     void uiStateStoreDocumentedDefaults();
     void toGroupRowsSubtitleHandlesTrailingSlashAndEmpty();
@@ -362,6 +364,7 @@ private slots:
     void terminalConnectionStateMergesIntoSidebar();
     void refreshDoesNotWipeAgentDerivedState();
     void markSeenClearsFinishedUnseenBadge();
+    void activationRejectsUnknownOrArchivedSessions();
     void vanishedActiveSessionIsRetiredEverywhere();
     void staleOrFailedRefreshNeverRetiresActiveSession();
     // The sidebar's filters hide rows; they must never narrow what the
@@ -463,6 +466,15 @@ void TstAppController::toGroupRowsMapsNestedNodes()
 void TstAppController::toGroupRowsEmptyIsEmpty()
 {
     QVERIFY(AppController::toGroupRows({}).isEmpty());
+}
+
+void TstAppController::paletteIndexRejectsNonPositiveSize()
+{
+    GroupPaletteService service;
+    QCOMPARE(service.indexForName(QStringLiteral("build"), 0), 0);
+    QCOMPARE(service.indexForName(QStringLiteral("build"), -2), 0);
+    QVERIFY(service.indexForName(QStringLiteral("build"), 7) >= 0);
+    QVERIFY(service.indexForName(QStringLiteral("build"), 7) < 7);
 }
 
 // A fresh store over the same .ini file reads back exactly what a previous
@@ -1090,6 +1102,31 @@ void TstAppController::markSeenClearsFinishedUnseenBadge()
     // monitor.
     QCOMPARE(monitor.stateFor(QStringLiteral("sess-1"), QStringLiteral("term-1")),
              static_cast<int>(AgentState::IdleUnseen));
+}
+
+// Activation is a user-facing boundary, so a stale delegate must not load a
+// layout for an id missing from the last authoritative tree or for an archived
+// row hidden by the sidebar.
+void TstAppController::activationRejectsUnknownOrArchivedSessions()
+{
+    FakeTransport transport;
+    CodeharbordClient client;
+    AppController controller(&client);
+    client.setTransport(&transport);
+
+    controller.refresh();
+    const QJsonObject request = takeRequest(transport);
+    transport.deliver(listWithSessionFrame(
+        request.value(QStringLiteral("id")).toInt(), QStringLiteral("g"),
+        QStringLiteral("archived"), true));
+
+    QSignalSpy activeSpy(&controller, &AppController::activeSessionChanged);
+    controller.activateSession(QStringLiteral("missing"));
+    controller.activateSession(QStringLiteral("archived"));
+
+    QCOMPARE(controller.activeSessionId(), QString());
+    QCOMPARE(activeSpy.count(), 0);
+    QVERIFY(transport.takeSent().isEmpty());
 }
 
 // AppController's own UiStateStore is the REAL per-user QSettings (it is
@@ -2177,6 +2214,18 @@ void TstAppController::uiStateStoreIgnoresCorruptWidths()
     UiStateStore narrow(iniPath);
     QCOMPARE(narrow.sidebarWidth(), 1);
     QCOMPARE(narrow.terminalWidth(), 3);
+
+    // Writes are normalised too: a transient layout value below the documented
+    // minima must not be persisted only to be replaced by a different value on
+    // the next launch.
+    {
+        UiStateStore writer(iniPath);
+        writer.setRegionWidths(0, -4, 0);
+    }
+    UiStateStore normalised(iniPath);
+    QCOMPARE(normalised.sidebarWidth(), 1);
+    QCOMPARE(normalised.viewerWidth(), 0);
+    QCOMPARE(normalised.terminalWidth(), 1);
 }
 
 // The empty devSessionId is not a Dev Session, and is treated exactly as
@@ -2198,6 +2247,19 @@ void TstAppController::uiStateStoreRejectsAnEmptyDevSessionId()
         store.setSelectedPane(QStringLiteral("s1"), QStringLiteral("viewer-2"));
         QCOMPARE(store.selectedPane(QStringLiteral("s1")),
                  QStringLiteral("viewer-2"));
+        // Empty and path-like regions are not addressable settings keys.
+        store.setNextPaneSuffix(QStringLiteral("s1"), QString(), 9);
+        store.setNextPaneSuffix(QStringLiteral("s1"),
+                                QStringLiteral("viewer/evil"), 9);
+        QCOMPARE(store.nextPaneSuffix(QStringLiteral("s1"), QString()), 1);
+        QCOMPARE(store.nextPaneSuffix(QStringLiteral("s1"),
+                                      QStringLiteral("viewer/evil")),
+                 1);
+        store.setNextPaneSuffix(QStringLiteral("s1"),
+                                QStringLiteral("viewer"), 3);
+        QCOMPARE(store.nextPaneSuffix(QStringLiteral("s1"),
+                                      QStringLiteral("viewer")),
+                 3);
     }
 
     UiStateStore reopened(iniPath);

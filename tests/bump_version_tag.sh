@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/usr/bin/env bash
 # Guards the one thing .omp/skills/bump-version/bump.sh must never do: create a
 # release tag whose COMMIT carries a different version.
 #
@@ -15,7 +15,7 @@
 # touched and no tag is ever created in it.
 #
 # Usage: bump_version_tag.sh <repo-root>
-set -eu
+set -euo pipefail
 
 root="${1:-.}"
 root="$(cd "$root" && pwd)"
@@ -86,6 +86,15 @@ EOF
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
+# --- 0. conflicting version selectors must fail clearly ---------------------
+make_repo 0.1.8
+if bash "$bump" patch --set 0.2.0 >"$work/out0" 2>&1; then
+    cat "$work/out0" >&2
+    fail "bump.sh accepted both a component selector and --set"
+fi
+grep -q "either major|minor|patch or --set" "$work/out0" \
+    || { cat "$work/out0" >&2; fail "no explanation of conflicting version selectors"; }
+
 # --- 1. --no-commit must refuse to tag a version the commit does not carry ----
 make_repo 0.1.8
 if bash "$bump" --set 0.2.0 --no-commit >"$work/out1" 2>&1; then
@@ -145,4 +154,22 @@ git rev-parse -q --verify refs/tags/v0.3.0 >/dev/null \
 [ "$(git rev-parse 'v0.3.0^{commit}')" = "$(git rev-parse HEAD)" ] \
     || fail "--no-commit moved HEAD instead of tagging it"
 
-echo "bump.sh refuses to tag a mislabelled tree; ordinary and --no-commit paths intact"
+# --- 5. unrelated staged work must not enter the release commit --------------
+# The release helper stages version files before committing. A caller may
+# already have unrelated work staged; `git commit` without `--only` would sweep
+# that work into the release commit and tag it unexpectedly.
+make_repo 0.4.0
+printf 'keep this staged for its own commit\n' >notes.txt
+git add notes.txt
+bash "$bump" --set 0.5.0 >"$work/out6" 2>&1 \
+    || { cat "$work/out6" >&2; fail "the bump with unrelated staged work was refused"; }
+git rev-parse -q --verify refs/tags/v0.5.0 >/dev/null \
+    || fail "the bump with unrelated staged work created no tag"
+if git cat-file -e "v0.5.0:notes.txt" 2>/dev/null; then
+    fail "the release commit swept unrelated staged notes.txt into the tag"
+fi
+[ "$(git diff --cached --name-only)" = "notes.txt" ] \
+    || fail "unrelated staged notes.txt was removed from the index"
+
+echo "bump.sh refuses mislabelled trees, preserves staged work, and keeps release paths intact"
+

@@ -51,7 +51,9 @@ test("sanitises executable and embedding markup without losing surrounding text"
         + "<a href=\"javascript:alert(3)\" target=\"_blank\">link</a> "
         + "<iframe src=\"https://evil.example\"></iframe> "
         + "<object data=\"https://evil.example/a\"></object> "
-        + "<embed src=\"https://evil.example/a\">",
+        + "<embed src=\"https://evil.example/a\"> "
+        + "<video src=\"https://evil.example/v.mp4\"><source src=\"https://evil.example/s.mp4\">"
+        + "</video><svg><image href=\"https://evil.example/i.png\"></image></svg>",
         sanitizerFor(window),
     );
 
@@ -63,6 +65,7 @@ test("sanitises executable and embedding markup without losing surrounding text"
     assert.doesNotMatch(html, /<iframe/i);
     assert.doesNotMatch(html, /<object/i);
     assert.doesNotMatch(html, /<embed/i);
+    assert.doesNotMatch(html, /<(?:audio|video|source|svg|image)\b/i);
     assert.doesNotMatch(html, /target=/i);
 });
 
@@ -71,13 +74,13 @@ test("relative images and links resolve against the document directory", () => {
     const { window } = dom;
     const { document } = window;
     const html = renderMarkdown(
-        "![diagram](../assets/diagram.png)\n\n[details](./details.md)",
+        "![diagram](../assets/diagram.png)\n\n[details](./details.md?raw=1#intro)",
         sanitizerFor(window),
     );
     const rewritten = rewriteRelativeUrls(html, "/docs/guide/README.md", document);
 
     assert.match(rewritten, /data-ch-image-path="\.\.\/assets\/diagram\.png"/);
-    assert.match(rewritten, /href="file:\/\/\/docs\/guide\/details\.md"/);
+    assert.match(rewritten, /href="file:\/\/\/docs\/guide\/details\.md\?raw=1#intro"/);
     assert.equal(
         resolveRemotePath("/docs/guide/README.md", "../assets/diagram.png"),
         "/docs/assets/diagram.png",
@@ -86,12 +89,36 @@ test("relative images and links resolve against the document directory", () => {
         remotePathToFileUrl("/docs/assets/diagram #1.png"),
         "file:///docs/assets/diagram%20%231.png",
     );
+    assert.equal(
+        remotePathToFileUrl("docs/readme.md"),
+        "file:///docs/readme.md",
+    );
 });
 
 test("a sanitizer that strips raw tags leaves the Markdown document readable", () => {
     const sanitizer = { sanitize: (dirty: string): string => dirty.replaceAll(/<span[^>]*>|<\/span>/gi, "") };
     const html = renderMarkdown("Keep <span>this sentence</span> visible.", sanitizer);
     assert.equal(html, "<p>Keep this sentence visible.</p>\n");
+});
+test("a failing sanitizer falls back to escaped source instead of throwing", () => {
+    const sanitizer = {
+        sanitize(): string {
+            throw new Error("sanitizer unavailable");
+        },
+    };
+    assert.equal(
+        renderMarkdown("<script>alert(1)</script>", sanitizer),
+        "<pre>&lt;script&gt;alert(1)&lt;/script&gt;</pre>",
+    );
+});
+test("the image bridge also settles direct host return values", async () => {
+    const bridge: MarkdownBridge = {
+        resolveImage: () => "codeharbor-internal://file/direct-id",
+    };
+    assert.equal(
+        await requestImageUrl(bridge, "diagram.png"),
+        "codeharbor-internal://file/direct-id",
+    );
 });
 
 test("the image bridge uses WebChannel return-value callbacks, not QML callbacks", async () => {

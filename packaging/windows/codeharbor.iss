@@ -149,10 +149,10 @@ Source: "{#IconFile}"; DestDir: "{app}"; DestName: "codeharbor.ico"; Flags: igno
 ; releases, so an upgraded install would accumulate orphaned DLLs and, worse,
 ; could load a stale Qt plugin left behind from the previous version.
 ;
-; Clearing {app} is only safe if {app} really is a previous CodeHarbor install,
-; which is exactly what the Check below establishes. On a fresh install, or if
-; the user points the installer at some directory of their own, nothing is
-; deleted.
+; Clearing {app} is only safe if {app} is the previous install directory. The
+; Check below requires both the executable and the stable AppId uninstall record
+; to point at this exact path. On a fresh install, or if the user points the
+; installer at some directory of their own, nothing is deleted.
 Type: filesandordirs; Name: "{app}\*"; Check: PreviousInstallPresent
 
 [Icons]
@@ -169,13 +169,34 @@ Filename: "{app}\{#AppExeName}"; Description: "{cm:LaunchProgram,{#AppName}}"; F
 Type: dirifempty; Name: "{app}"
 
 [Code]
-// True when the target directory already contains a CodeHarbor installation.
-// Gates the [InstallDelete] sweep above so it can never wipe an unrelated
-// directory. (Pascal comments here use // deliberately: a { } comment would end
-// at the first closing brace of an Inno constant such as {app}.)
+// True when the target directory is the existing CodeHarbor install directory.
+// The executable check alone was unsafe: a user could select a directory that
+// happened to contain an unrelated codeharbor.exe and the [InstallDelete] sweep
+// would erase every file in it. The AppId-specific registry path is written by
+// Inno Setup for every install and is stable across upgrades.
 function PreviousInstallPresent: Boolean;
+const
+  UninstallKey = 'Software\Microsoft\Windows\CurrentVersion\Uninstall\{6B1C2A74-3E4D-4F58-9A0B-7C5D8E2F1A93}_is1';
+var
+  PreviousPath: String;
+  AppPath: String;
 begin
-  Result := FileExists(ExpandConstant('{app}\{#AppExeName}'));
+  Result := False;
+  AppPath := AddBackslash(ExpandConstant('{app}'));
+  if not FileExists(AppPath + '{#AppExeName}') then
+    Exit;
+
+  if RegQueryStringValue(HKEY_CURRENT_USER, UninstallKey,
+                         'Inno Setup: App Path', PreviousPath) and
+     (CompareText(AddBackslash(PreviousPath), AppPath) = 0) then
+    begin
+      Result := True;
+      Exit;
+    end;
+  if RegQueryStringValue(HKEY_LOCAL_MACHINE, UninstallKey,
+                         'Inno Setup: App Path', PreviousPath) and
+     (CompareText(AddBackslash(PreviousPath), AppPath) = 0) then
+    Result := True;
 end;
 
 // Per-user settings live in the registry, NOT in the install directory: the

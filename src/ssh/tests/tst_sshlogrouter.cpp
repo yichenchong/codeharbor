@@ -87,6 +87,7 @@ private slots:
     void nestedRoutesRestoreTheOuterRouteWhenTheInnerGoes();
     void concurrentRoutesOnTwoThreadsNeverSeeEachOthersLines();
     void releasingARouteFromTheWrongThreadStopsItRoutingAnyway();
+    void wrongThreadReleaseIsRepairedBeforeNextRoute();
     void twoPoolsHandshakingConcurrentlyKeepSeparateTranscripts();
     void libsshActivityAfterAHandshakeNeverReachesThePoolsTranscript();
     void aPoolLeavesNoRouteBehindAfterAFailedHandshake();
@@ -599,6 +600,52 @@ void TstSshLogRouter::releasingARouteFromTheWrongThreadStopsItRoutingAnyway()
 
     // No double decrement from the owning thread's later release(), and that
     // thread's libssh state went back with its own last route.
+    QCOMPARE(SshLogRouter::activeRouteCount(), 0);
+}
+
+void TstSshLogRouter::wrongThreadReleaseIsRepairedBeforeNextRoute()
+{
+    QSemaphore routeTaken;
+    QSemaphore released;
+    SshLogRouter::Route* route = nullptr;
+    bool stateRestored = false;
+    bool inertHookRemains = false;
+    int levelAfter = -1;
+
+    QThread* const worker = QThread::create([&] {
+        auto doomed =
+            std::make_unique<SshLogRouter::Route>([](int, const char*,
+                                                      const char*) {});
+        route = doomed.get();
+        routeTaken.release();
+        released.acquire();
+
+        // The wrong-thread release leaves an inactive entry on this thread's
+        // stack. Acquiring a new route must prune it and restore the original
+        // state before installing the replacement route.
+        {
+            SshLogRouter::Route replacement(
+                [](int, const char*, const char*) {});
+            stateRestored = SshLogRouter::ownsThreadLoggingState();
+        }
+        levelAfter = ssh_get_log_level();
+        inertHookRemains = ssh_get_log_callback() != nullptr;
+    });
+    worker->start();
+    routeTaken.acquire();
+
+    QTest::ignoreMessage(
+        QtWarningMsg,
+        QRegularExpression(QStringLiteral(
+            "route taken on another thread was released")));
+    route->release();
+    released.release();
+    QVERIFY(worker->wait(60000));
+    delete worker;
+
+    QVERIFY(stateRestored);
+    QVERIFY(inertHookRemains);
+    QCOMPARE(levelAfter, int(SSH_LOG_NOLOG));
     QCOMPARE(SshLogRouter::activeRouteCount(), 0);
 }
 

@@ -58,6 +58,15 @@ test("validateEvent accepts a well-formed event and rejects bad ones", () => {
     // says "object" for both.
     assert.equal(validateEvent({ ...good, metadata: [] }), false);
     assert.equal(validateEvent({ ...good, metadata: { toolName: "ask" } }), true);
+    assert.equal(validateEvent({ ...good, timestamp: "" }), false);
+    assert.equal(validateEvent({ ...good, timestamp: "2026-08-03T12:00:00Z" }), false);
+    assert.equal(validateEvent({ ...good, timestamp: "2026-13-03T12:00:00.000Z" }), false);
+    assert.equal(validateEvent({ ...good, timestamp: "2026-02-29T12:00:00.000Z" }), false);
+    assert.equal(
+        validateEvent({ ...good, timestamp: "2026-08-03T12:00:00.000+00:00" }),
+        true,
+    );
+    assert.equal(validateEvent({ ...good, metadata: new Date() }), false);
     assert.equal(validateEvent(null), false);
     assert.equal(validateEvent("string"), false);
 });
@@ -70,6 +79,8 @@ test("parseEventLine round-trips valid JSONL and rejects junk", () => {
         state: "starting",
         event: "session_start",
     });
+    assert.equal(parseEventLine(null), null);
+    assert.equal(parseEventLine(42), null);
     const line = JSON.stringify(e);
     assert.deepEqual(parseEventLine(line), e);
 

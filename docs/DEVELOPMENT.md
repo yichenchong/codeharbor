@@ -18,8 +18,12 @@ This stack has been confirmed to configure, build, and link the full tree
 | CMake | 4.2.3 | 3.25 (CMakePresets schema v6) |
 | Ninja | 1.13.2 | any |
 | Qt 6 | 6.10.2 | 6.9 |
-| libssh | 0.11.3 | 0.11.2+, **except 0.12.0** |
+| libssh | 0.11.3 (verified runtime) | audited runtime floor 0.11.2; exactly 0.12.0 is warned about and worked around |
 | Node.js | 24.16 | 23.6 (native TS type-stripping) |
+
+The Windows release uses the separate in-tree vcpkg overlay, pinned to libssh
+0.12.2. That overlay pin does not change the runtime floor for ordinary Linux
+and macOS builds, which use libssh 0.11.2 or newer.
 
 The CMake floor is Qt **6.9**; newer (6.10 here) works unchanged. 6.9 is not a
 guess: it is the first release with `QQuickWebEngineProfile(storageName, parent)`,
@@ -43,6 +47,9 @@ any host key is seen. Upstream fixed the cast in 0.12.1. Two consequences:
 The libssh floor is **0.11.2**, audited symbol by symbol against what
 `src/ssh/SshConnectionPool.cpp` and `src/ssh/SshChannelDevice.cpp` actually call
 (the audit is recorded as a comment at the top of `SshConnectionPool.cpp`).
+CMake records that audited runtime floor as `CODEHARBOR_LIBSSH_FLOOR=0.11.2`
+and emits warnings rather than making it a hard configure-time version
+constraint. It warns separately when the runtime is exactly 0.12.0.
 Three separate bounds stack up to that number:
 
 - **0.8.0** is the hard compile/link floor: every libssh symbol these two files
@@ -179,11 +186,57 @@ off there; pass `-DCODEHARBOR_WEB_SOURCEMAP=ON`/`=OFF` to decide explicitly, whi
 persists in the cache until it is set back to `AUTO`.
 
 Both build directories share the one `src/web/*/dist`, and the option changes what
-has to be in it, so switching between a Debug and a Release configure rebuilds both
-bundles. In a clone that has both `build/dev/` and `build/release/`, re-run
+has to be in it, so switching between a Debug and a Release configure rebuilds all
+three bundles. In a clone that has both `build/dev/` and `build/release/`, re-run
 `cmake --preset dev` — not just `cmake --build --preset dev` — after configuring
 `release`, or the dev build will look for map files the release configure just
 removed.
+
+By hand the same build is `npm run build:sourcemap --workspace src/web/editor`
+(equivalently, from that workspace directory, `node build.mjs --sourcemap` or
+`CODEHARBOR_WEB_SOURCEMAP=1 node build.mjs`) and plain `npm run build` for the
+mapless variant. Either script writes into a fresh `src/web/<name>/dist.tmp/` and
+swaps it into place only after every step has succeeded: a build that fails
+midway leaves the previous `dist/` exactly as it was rather than leaving CMake
+with no bundle to embed, and a build that succeeds leaves no renamed or deleted
+output behind. Both builds are reproducible — rebuilding an unchanged tree, with
+or without maps, produces byte-identical files.
+
+Presets are defined in [`CMakePresets.json`](../CMakePresets.json): `dev`
+(Debug + tests, `build/dev/`), `release` (Release, tests off, `build/release/`)
+and `release-tests` (Release **with** tests, also `build/release/` — it is what
+CI and the release workflow configure, build, and `ctest` against, so the tree
+that is packaged is the tree that was tested). `release` and `release-tests`
+deliberately share one binary directory; switching between them reconfigures it.
+
+> Running the GUI needs a display. On a headless box use an X/Wayland session or
+> `xvfb-run ./build/dev/src/app/codeharbor`. WebEngine may need
+> `--no-sandbox` in constrained containers.
+
+### Build speed
+
+**Historical build-speed snapshot.** A clean Debug build with tests took about
+**13½ minutes** on the reference box (2 cores, 7 GB RAM, `ninja -j2`, GCC 15.2,
+Qt 6.9). The edge totals below were measured from clean scratch trees before the
+current test expansion, so they are not a current timing claim.
+
+`ctest --preset dev -N` is the authoritative way to count configured tests; it
+currently lists **45 CTest entries**, including the three script/fixture tests.
+Use the command rather than copying a pinned count when the suite changes.
+
+**Install a compiler cache — it is the one large lever.** CMake looks for
+`ccache` and then `sccache` at configure time and wires whichever it finds into
+`CMAKE_C_COMPILER_LAUNCHER` / `CMAKE_CXX_COMPILER_LAUNCHER` automatically. There
+is nothing to pass and nothing to remember; the configure output says which way
+it went:
+
+```
+-- compiler cache: /usr/bin/ccache
+-- compiler cache: not found (looked for ccache, sccache); builds are uncached. …
+```
+`sudo apt install ccache` (or `brew install ccache`) and re-run `cmake --preset dev`
+is the whole procedure. An explicit `-DCMAKE_CXX_COMPILER_LAUNCHER=…` still wins,
+so this never fights a deliberate choice.
 
 By hand the same builds are `npm run build:sourcemap --workspace src/web/editor`
 (equivalently `node build.mjs --sourcemap`, or `CODEHARBOR_WEB_SOURCEMAP=1
@@ -206,40 +259,18 @@ deliberately share one binary directory; switching between them reconfigures it.
 > `xvfb-run ./build/dev/src/app/codeharbor`. WebEngine may need
 > `--no-sandbox` in constrained containers.
 
-### Build speed
-
-A full clean Debug build with tests takes about **13½ minutes** on the reference
-box (2 cores, 7 GB RAM, `ninja -j2`, GCC 15.2, Qt 6.9). Every number below was
-measured there, from clean scratch trees; on a machine with more cores the
-absolute figures shrink but the proportions hold.
-
-**Install a compiler cache — it is the one large lever.** CMake looks for
-`ccache` and then `sccache` at configure time and wires whichever it finds into
-`CMAKE_C_COMPILER_LAUNCHER` / `CMAKE_CXX_COMPILER_LAUNCHER` automatically. There
-is nothing to pass and nothing to remember; the configure output says which way
-it went:
-
-```
--- compiler cache: /usr/bin/ccache
--- compiler cache: not found (looked for ccache, sccache); builds are uncached. …
-```
-
-`sudo apt install ccache` (or `brew install ccache`) and re-run `cmake --preset dev`
-is the whole procedure. An explicit `-DCMAKE_CXX_COMPILER_LAUNCHER=…` still wins,
-so this never fights a deliberate choice.
-
-**Where the time actually goes.** Summing every compile/link edge of a clean
-`dev` build (1985 seconds of work, which `-j2` turns into ~13½ minutes of wall
-clock):
+**Where the time actually went in that snapshot.** Summing every compile/link edge
+of a clean `dev` build (1985 seconds of work, which `-j2` turned into ~13½ minutes
+of wall clock):
 
 | Bucket | Edge-seconds | Share |
 | --- | --- | --- |
-| 35 test executables, one translation unit each | 767 | 39% |
+| 35 test executables (snapshot), one translation unit each | 767 | 39% |
 | `qmlcachegen` units for the QML module | 321 | 16% |
 | AUTOMOC/AUTOGEN steps | ~200 | 10% |
 | module library objects (all of `src/*/*.cpp`) | 282 | 14% |
 | `mocs_compilation.cpp` for every target | 80 | 4% |
-| **all linking, including the 36 executables** | **~40** | **2%** |
+| **all linking, including the 36 executables (snapshot)** | **~40** | **2%** |
 
 The two things people reach for first are therefore the wrong two things here.
 The linker is not the problem — 40 seconds of 1985. And the C++ *the project
@@ -333,7 +364,7 @@ schema is older than it needs, which is the "Server too old" path.
 ## Test suites
 
 ```bash
-ctest --preset dev                 # default: unit + integration, no external deps
+ctest --preset dev                 # default unit + integration; desktop proof skips without a session bus
 ctest --preset dev -L live         # live gates (need a real SSH server, see below)
 ctest --preset dev -L desktop      # desktop-only proofs (need a session bus)
 ```
@@ -401,7 +432,7 @@ Environment contract:
 | `CH_LIVE_NODE` | **Absolute** path to `node` on the remote side (a non-interactive SSH session usually has no version-manager `PATH`) |
 | `CH_LIVE_REPO` | Absolute path to this repo on the remote side |
 | `CH_LIVE_IDENTITY` | Optional private key used by `tst_livessh` to encrypt a temporary copy and prove the passphrase callback; never committed |
-| `CH_LIVE_KNOWN_HOSTS` | Scratch known-hosts file; the first-use host key is persisted here |
+| `CH_LIVE_KNOWN_HOSTS` | Optional scratch known-hosts file; when unset, each gate uses a temporary path |
 | `SSH_AUTH_SOCK` | Agent socket holding the key — the pool authenticates via ssh-agent first |
 
 Standing up a throwaway `sshd` fixture (no root, no changes to your `~/.ssh`):
@@ -455,11 +486,13 @@ If the schema migration has already happened, the workspace itself is fine — t
 migration only adds columns. Upgrade the installed server (`Update server` in the
 client, or unpack a newer `codeharbor-remote.tar.gz` over it) and it opens again.
 
-Then run them. Every variable below is REQUIRED and none of them has a default:
-omit `CH_LIVE_SSH` and every gate QSKIPs, which reports as a green run that
-proved nothing — the exact outcome this whole section exists to avoid. Omit any
-of `CH_LIVE_HOST` / `CH_LIVE_PORT` / `CH_LIVE_USER` / `CH_LIVE_NODE` /
-`CH_LIVE_REPO` and the gates fail their own precondition check instead.
+Then run them. `CH_LIVE_SSH` and `CH_LIVE_HOST` / `CH_LIVE_PORT` / `CH_LIVE_USER` /
+`CH_LIVE_NODE` / `CH_LIVE_REPO` are required for the SSH-backed gates. Omit
+`CH_LIVE_SSH` and every gate QSKIPs, which reports as a green run that proved
+nothing — the exact outcome this whole section exists to avoid. Omit any of the
+other required variables and the gates fail their own precondition check instead.
+`CH_LIVE_IDENTITY` and `CH_LIVE_KNOWN_HOSTS` are optional; the gates use their
+documented fallback paths when they are unset.
 
 ```bash
 export CH_LIVE_SSH=1

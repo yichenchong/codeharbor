@@ -264,6 +264,8 @@ struct Harness {
                                    QStringLiteral("/srv/codeharbor"));
     }
 
+    bool wireFromEnvironment() { return boot.connectAndWireFromEnvironment(); }
+
     // Point the harness at a local socket and let the production pre-flight run
     // against it.
     void useRealProbeAgainst(quint16 localPort)
@@ -337,6 +339,7 @@ private slots:
     void initialConnectFailureDoesNotRetry();
     void unknownHostKeyIsNeverTrustedWithoutADecisionPolicy();
     void unattendedTrustDoesNotOutliveTheAttempt();
+    void environmentTrustDoesNotLeakIntoAttendedConnect();
     void channelLossReconnectsAndRewires();
     void agentChannelLossAlsoReconnects();
     void pendingCallsFailWhenTheSessionDies();
@@ -511,8 +514,58 @@ void TstSessionBootstrap::unattendedTrustDoesNotOutliveTheAttempt()
         return SshConnectionPool::HostKeyDecision::Reject;
     });
     QVERIFY(h.wire());
+
     QVERIFY2(static_cast<bool>(h.pool.hostKeyCallback()),
              "the attempt removed a host-key policy it did not install");
+}
+
+void TstSessionBootstrap::environmentTrustDoesNotLeakIntoAttendedConnect()
+{
+    const bool hadSsh = qEnvironmentVariableIsSet("CH_LIVE_SSH");
+    const QByteArray oldSsh = qgetenv("CH_LIVE_SSH");
+    const bool hadHost = qEnvironmentVariableIsSet("CH_LIVE_HOST");
+    const QByteArray oldHost = qgetenv("CH_LIVE_HOST");
+    const bool hadPort = qEnvironmentVariableIsSet("CH_LIVE_PORT");
+    const QByteArray oldPort = qgetenv("CH_LIVE_PORT");
+    const bool hadUser = qEnvironmentVariableIsSet("CH_LIVE_USER");
+    const QByteArray oldUser = qgetenv("CH_LIVE_USER");
+    const bool hadNode = qEnvironmentVariableIsSet("CH_LIVE_NODE");
+    const QByteArray oldNode = qgetenv("CH_LIVE_NODE");
+    const bool hadRepo = qEnvironmentVariableIsSet("CH_LIVE_REPO");
+    const QByteArray oldRepo = qgetenv("CH_LIVE_REPO");
+    const auto restore = qScopeGuard([&] {
+        const auto putBack = [](const char* name, bool wasSet,
+                                const QByteArray& value) {
+            if (wasSet)
+                qputenv(name, value);
+            else
+                qunsetenv(name);
+        };
+        putBack("CH_LIVE_SSH", hadSsh, oldSsh);
+        putBack("CH_LIVE_HOST", hadHost, oldHost);
+        putBack("CH_LIVE_PORT", hadPort, oldPort);
+        putBack("CH_LIVE_USER", hadUser, oldUser);
+        putBack("CH_LIVE_NODE", hadNode, oldNode);
+        putBack("CH_LIVE_REPO", hadRepo, oldRepo);
+    });
+    qputenv("CH_LIVE_SSH", "1");
+    qputenv("CH_LIVE_HOST", "example.invalid");
+    qputenv("CH_LIVE_PORT", "2222");
+    qputenv("CH_LIVE_USER", "user");
+    qputenv("CH_LIVE_NODE", "/usr/bin/node");
+    qputenv("CH_LIVE_REPO", "/srv/codeharbor");
+
+    Harness h;
+    h.boot.setTrustUnknownHostKeys(false);
+    QVERIFY(h.wireFromEnvironment());
+    QVERIFY(h.boot.trustUnknownHostKeys());
+    h.boot.disconnectSession();
+    QVERIFY(!h.boot.trustUnknownHostKeys());
+
+    // An attended connect has no automatic trust decision and must refuse
+    // before it reaches the test seam (or a real SSH handshake).
+    QVERIFY(!h.wire());
+    QCOMPARE(h.boot.connectCalls, 1);
 }
 
 // The load-bearing case: the RPC channel dies, both devices are dropped, a

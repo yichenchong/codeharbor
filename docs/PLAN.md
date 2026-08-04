@@ -31,14 +31,16 @@ contract so downstream work can build against it before it is fully implemented.
 - Model enums with real logic: `SessionState.{h,cpp}` (terminal/agent/row/file
   state + `aggregateRowState`), typed `Ids.h`.
 - **Remote workspace fully implemented + tested (Node, zero deps):**
-  - `events.ts` — internal event schema, validation, socket-path resolution.
+  - `events.ts` — internal event schema, strict timestamp and identifier
+    validation, socket-path resolution.
   - `adapters/` — `oh-my-pi` (SPEC 6.5 mapping), `pi`, `claude-code`, registry.
-  - `bridge.ts` — Unix-socket → JSONL relay (dir-create + stale-socket guard).
-  - `codeharbord.ts` — JSON-RPC 2.0 `--stdio` dispatch (`ping`, `server.info`).
-  - **Verified at bootstrap:** `npm test` → 11/11 pass (a bootstrap-era number,
-    kept only as a record of that moment; the suite is far larger now and no
-    document pins a current count on purpose, because every pinned count in this
-    repo has gone stale). RPC stdio + bridge socket smoke-tested.
+  - `bridge.ts` — Unix-socket → JSONL relay (dir-create, stale-socket guard,
+    bounded input and output back-pressure).
+  - `codeharbord.ts` — JSON-RPC 2.0 `--stdio` dispatch (`ping`, `server.info`,
+    file/workspace/tmux methods).
+  - The bootstrap smoke suite passed; its early test count is intentionally not
+    recorded because the workspace suite has grown. RPC stdio + bridge socket
+    smoke-tested.
 - CI: a `remote` job (install/typecheck/test), a `client` job (web bundles +
   Qt/CMake configure/build/test), and a Windows job that only warms the shared
   vcpkg libssh cache on `main`.
@@ -53,19 +55,21 @@ These are the cross-workstream interfaces. Land them first; changing them later
 is a coordinated break.
 
 - [x] **C1 — RPC method catalog.** Extend `codeharbord.ts` with typed
-  request/result shapes for the SPEC 10.2 methods (start with the file set:
-  `stat`, `readFile`, `writeFile`, `watch`, `resolvePath`). Publish as
-  `remote/src/rpc-types.ts`; mirror in C++ `src/remote/`. Owner: R.
+  request/result shapes for the SPEC 10.2 file methods
+  (`stat`, `readFile`, `writeFile`, `resolvePath`, `watch`, `unwatch`,
+  `listDirectory`). Publish as `remote/src/rpc-types.ts`; mirror in C++ `src/remote/`.
+  Owner: R.
 - [x] **C2 — Workspace DB schema.** Author `remote/sql/schema.sql` for the SPEC
-  11.1 tables (`groups`, `dev_sessions`, `viewer_panes`, `terminal_panes`,
-  `session_layouts`, `server_profiles`, `server_settings`, `app_settings`) with
-  `server_id` columns (SPEC 3.5). Bump `WorkspaceDb::kSchemaVersion`. Owner: P.
+  11.1 tables (`schema_version`, `server_identity`, `groups`, `dev_sessions`,
+  `viewer_panes`, `terminal_panes`, `session_layouts`, `server_profiles`,
+  `server_settings`, `app_settings`) with `server_id` columns on domain rows
+  (SPEC 3.5). Bump `WorkspaceDb::kSchemaVersion`. Owner: P.
 - [x] **C3 — WebChannel bridge interfaces.** Freeze the JS↔C++ object shapes:
   `TerminalBridge`/`TerminalHost` (`src/web/terminal`) and
   `RemoteEditorBridge`/`EditorHost` (`src/web/editor`). Owners: T, E.
 
 **Status: LANDED** — delegated to three parallel subagents,
-adversarially reviewed, and verified (remote typecheck + 15/15 tests; cmake
+adversarially reviewed, and verified (remote typecheck and tests; cmake
 configure+build+link). Wave 1 (S / M / R-server) is now unblocked.
 
 ## Dependency graph
@@ -141,7 +145,9 @@ graph TD
   - **TODO:** [x] file methods (`stat/readFile/writeFile/resolvePath`) with
     revision tokens (SPEC 8.4) + atomic save (SPEC 8.5); [x] `watch`/`unwatch`
     (fs.watch + poll fallback); [x] `listDirectory` (RPC, schema v2, for viewers)
-    + `getMimeType` (internal helper); [x] `workspace.*` (with P). tmux: not yet.
+    + `getMimeType` (internal helper); [x] `workspace.*` (with P); [x] `tmux.*`
+    discovery (`listSessions`/`sessionExists`/`killSession`), with absent tmux
+    treated as an empty/false result.
   - **Stop gate:** [x] MET — `node --test` covers revision-mismatch rejection,
     atomic-save replace, watch-event emission.
 - **R-client (C++ `ch_remote`)**
@@ -248,10 +254,11 @@ graph TD
 ### U — UI shell & persistence — ✅ LANDED (Wave 3); live gate MET (Wave 5)
 - **Start gate:** [x] M models · [x] P (for layout persistence).
 - **TODO:**
-  - [x] Sidebar: groups (collapse), session rows with aggregate status, ops
-    create/rename/duplicate/move/delete (SPEC 4.2), and drag-and-drop reorder /
+  - [x] Sidebar: groups (collapse), session rows with aggregate status, session-row
+    ops create/rename/duplicate/move/delete (SPEC 4.2), and drag-and-drop reorder /
     cross-group move / group reorder with keyboard selection (Wave 6, covered by
-    `tst_sidebar` driving real QTest drags).
+    `tst_sidebar` driving real QTest drags). Ordering and navigation are derived
+    from the model's complete group/session order, not only visible delegates.
   - [x] Persist region widths + selected pane per client (QSettings, SPEC 4.1); split ratios persist server-side via P layouts.
   - [x] Command palette + keyboard shortcuts (SPEC 15) — `CommandPalette.qml`,
     hosted in Main.qml, with per-command global `Shortcut`s (Wave 6).
@@ -264,8 +271,8 @@ graph TD
   Wave 5 fixed a defect this gate exposed: persistence fired on every width change,
   so a restored width that did not fit was clamped and the clamped value overwrote
   the user's preference permanently. Writes now happen only on drag end.
-  Pane FOCUS is not tracked, so palette split commands act on a region's first
-  pane rather than the focused one (see the Wave 7 gap list).
+  Pane focus is tracked per region and persisted per client; keyboard-only focus traversal
+  still does not report a new pane (see the Wave 7 gap list).
 - **Parallel with:** V/T rendering (consumes their pane views).
 
 ## Milestones (integration barriers → SPEC §16)
@@ -320,7 +327,7 @@ Contract: the oh-my-pi hook emits BridgeMessage (the bridge stays the single map
 >    `SessionBootstrap`.
 > 2. **The app could not start** (Wave 5). `ViewerRegion.qml`/`TerminalRegion.qml`
 >    instantiated their own type recursively, which QML rejects, so `Main.qml`
->    failed to load. No test instantiated the real QML tree, so a green 9/9 suite
+>    failed to load. No test instantiated the real QML tree, so a green suite
 >    coexisted with an app that could not launch. Fixed by url-sourced `Loader`
 >    recursion plus a permanent `tst_qmlload` gate.
 > 3. **Unknown SSH host keys were trusted silently** (Wave 7, SECURITY).
@@ -380,10 +387,10 @@ mid-flight**. Their code changes were already on disk, so the round was salvaged
 re-dispatching finishers scoped to the failing tests each had left behind, and by the
 orchestrator finishing the rest. What that means:
 
-- **Swept and completed:** the cold-start acceptance gate (`tst_coldstart`, 9/9 —
+- **Swept and completed:** the cold-start acceptance gate (`tst_coldstart` —
   first run → add server → key prompt/accept/persist → session → live tmux pane →
-  edit+save a remote file → relaunch restores), pane identity across splits, the UI/UX
-  pass, and a verification pass over the interrupted fixes.
+  edit+save a remote file → relaunch restores), pane identity across splits, the
+  UI/UX pass, and a verification pass over the interrupted fixes.
 - **Salvaged, NOT completed:** the security and integration reviews. Their FIXES
   landed and are tested, but each reviewer died before writing its findings list, so
   any defect it had noticed and not yet written down was lost with it. The host-key
@@ -399,44 +406,42 @@ reload silently died for every open editor; deliberate teardown and the delibera
 host-key refusal were painted as red error toasts; three "fixed" items were green only
 because no test exercised the path at all.
 
-**Wave 8 — ✅ DONE (the review that was owed) + ⚠️ one slice cut short.** The Wave-7
+**Wave 8 — ✅ DONE (the review that was owed, plus follow-up slices).** The Wave-7
 security and integration reviewers died before filing findings, so that review was
 re-run with agents streaming findings over IRC as they worked — which is the only
 reason the analysis survived two further terminations. It found and fixed a HIGH
 host-key TYPE downgrade (correction 3's neighbour: a MITM presenting a different
-ALGORITHM turned the hard refusal into a friendly first-use prompt, and the defect was
-CODIFIED as expected behaviour by an existing test), an unpinned privileged editor
-WebEngineView, a never-retired active Dev Session, unreachable password/passphrase
-auth, a client that could only launch a dev checkout (the released tarball was
-unlaunchable), a missing schema-compatibility gate, unwritable pane focus, dead
-read-only derivation, and the workspace.* contract drift hole. A final slice
-(group operations UI, crash-recovery prompt) was killed at ~4 minutes with its
-features written but essentially untested; the untested destructive half
-(`deleteGroup` cascades through every session in the group) was REVERTED rather than
-shipped, and the contained half (pane URL persistence) was completed and tested here.
+ALGORITHM turned the hard refusal into a friendly first-use prompt, and the defect
+was CODIFIED as expected behaviour by an existing test), an unpinned privileged
+editor WebEngineView, a never-retired active Dev Session, unreachable
+password/passphrase auth, a client that could only launch a dev checkout (the
+released tarball was unlaunchable), a missing schema-compatibility gate,
+unwritable pane focus, dead read-only derivation, and the workspace.* contract
+drift hole. The final slice was initially killed at ~4 minutes, but follow-up
+work completed and tested its two features: group deletion now has a reachable
+confirmation that states the authoritative session count, and crash recovery now
+offers Restore or Discard when a recovered file is reopened. Pane URL persistence
+was also completed and tested.
 
 One more finding closed at the end, and it is the sharpest example of the pattern
 this document keeps recording: **`createSession` had no production caller at all**, so
 a user could add a server, accept its host key and create a group — and then hit a
 dead end, unable to create a Dev Session and therefore unable to reach a terminal, an
 editor, or anything else the product is for. The sidebar's own empty state told them
-to "add a Dev Session to it", which the UI could not do. `tst_coldstart` passed 9/9
-throughout, because it creates its session over RawRpc: a gate doing what the USER
-cannot. Now wired (group header "+ Session" → dialog → `app.createSession`), with the
-drag-reorder regression it briefly introduced caught by `tst_sidebar` and fixed.
+to "add a Dev Session to it", which the UI could not do. `tst_coldstart`
+passed throughout, because it creates its session over RawRpc: a gate doing what
+the USER cannot. Now wired (group header "+ Session" → dialog → `app.createSession`),
+with the drag-reorder regression it briefly introduced caught by `tst_sidebar` and
+fixed.
 
 > **Remaining known gaps — honest list.**
-> - **No rename or delete for groups.** `renameGroup` and `deleteGroup` have no
->   reachable affordance, so a group created by mistake is permanent. Creating groups
->   and Dev Sessions IS wired ("+ New group", "+ Session"); delete was implemented once
->   and reverted for lack of tests, and it cascades to every session in the group, so
->   it needs a confirmation that states the real cost.
-> - **Crash-recovery is written but never offered.** `EditorController::recoveryAvailable`
->   has no consumer, so SPEC 11.3 snapshots are taken, found on reopen, and ignored:
->   `checkRecovery()` reads the server-side snapshot, sees it differs from the file on
->   disk, emits the signal — and because no QML connects to it the recovered text is
->   dropped on the floor. The user is never asked, and the unsaved work the snapshot
->   exists to protect is silently lost. The fix belongs in `EditorPaneView.qml`.
+> - **Groups cannot be renamed in the UI.** `renameGroup` has no reachable
+>   affordance. Creating groups and Dev Sessions IS wired ("+ New group", "+ Session");
+>   group deletion is wired with a confirmation that states how many sessions will
+>   be destroyed.
+> - **Crash recovery is implemented and tested.** `EditorController::recoveryAvailable`
+>   is consumed by `EditorPaneView.qml`, which offers Restore or Discard when a
+>   recovered file is reopened. This is no longer a remaining gap.
 > - **The sidebar row shows a status dot, not the counters SPEC 4.2 asks for.** SPEC 4.2
 >   wants the number of active terminals, the number of terminals requiring attention,
 >   an unsaved-file indicator and an error indicator on each Dev Session row. Only the

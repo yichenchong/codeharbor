@@ -24,6 +24,7 @@ Rectangle {
     property string profileNodePath: ""
     property string profileRepoRoot: ""
     property bool loadingProfile: false
+    property bool profileDirty: false
     signal dismissed()
 
     visible: shown
@@ -67,6 +68,7 @@ Rectangle {
             leftPadding: 9
             rightPadding: 9
             text: choice.displayText
+            textFormat: Text.PlainText
             color: Theme.text
             font.pixelSize: Theme.fontSizeBody
             verticalAlignment: Text.AlignVCenter
@@ -231,7 +233,6 @@ Rectangle {
         }
         return null;
     }
-
     function loadSelectedProfile() {
         var entry = root.profileAt(root.selectedProfileId);
         root.loadingProfile = true;
@@ -243,6 +244,7 @@ Rectangle {
         root.profileNodePath = root.profileText(entry, "nodePath");
         root.profileRepoRoot = root.profileText(entry, "repoRoot");
         root.loadingProfile = false;
+        root.profileDirty = false;
     }
 
     function syncProfiles() {
@@ -251,9 +253,13 @@ Rectangle {
             profiles = app.serverProfiles.profiles || [];
         root.profileEntries = profiles;
         if (root.profileAt(root.selectedProfileId)) {
-            root.loadSelectedProfile();
+            // A settings refresh can arrive while a field is being edited.
+            // Re-reading the stored profile here would erase that draft.
+            if (!root.profileDirty)
+                root.loadSelectedProfile();
             return;
         }
+        root.profileDirty = false;
         var preferred = (typeof app !== "undefined" && app && app.serverProfiles
                          && app.serverProfiles.activeId)
                         ? app.serverProfiles.activeId : "";
@@ -277,6 +283,7 @@ Rectangle {
             nodePath: root.profileNodePath,
             repoRoot: root.profileRepoRoot
         });
+        root.profileDirty = false;
     }
 
     function closeSheet() {
@@ -396,6 +403,7 @@ Rectangle {
                         contentItem: Label {
                             leftPadding: 10
                             text: groupButton.text
+                            textFormat: Text.PlainText
                             color: groupButton.checked ? Theme.text : Theme.textDim
                             font.pixelSize: Theme.fontSizeBody
                             verticalAlignment: Text.AlignVCenter
@@ -575,6 +583,7 @@ Rectangle {
                                 anchors.right: moveButtons.left
                                 anchors.verticalCenter: parent.verticalCenter
                                 text: root.toolbarLabel(modelData)
+                                textFormat: Text.PlainText
                                 color: Theme.text
                                 font.pixelSize: Theme.fontSizeBody
                             }
@@ -811,6 +820,7 @@ Rectangle {
                                 anchors.verticalCenter: parent.verticalCenter
                                 text: "." + modelData.extension + "  \u2014  "
                                       + root.viewerKindLabel(modelData.kind)
+                                textFormat: Text.PlainText
                                 color: Theme.text
                                 font.pixelSize: Theme.fontSizeBody
                                 elide: Text.ElideRight
@@ -903,49 +913,84 @@ Rectangle {
                         width: 300
                         label: qsTr("Name")
                         text: root.profileName
-                        onTextChanged: if (!root.loadingProfile) root.profileName = text
+                        onTextChanged: {
+                            if (!root.loadingProfile) {
+                                root.profileName = text;
+                                root.profileDirty = true;
+                            }
+                        }
                         onEditingFinished: root.saveProfile()
                     }
                     Field {
                         width: 300
                         label: qsTr("Host")
                         text: root.profileHost
-                        onTextChanged: if (!root.loadingProfile) root.profileHost = text
+                        onTextChanged: {
+                            if (!root.loadingProfile) {
+                                root.profileHost = text;
+                                root.profileDirty = true;
+                            }
+                        }
                         onEditingFinished: root.saveProfile()
                     }
                     Field {
                         width: 300
                         label: qsTr("Port")
                         text: root.profilePort
-                        onTextChanged: if (!root.loadingProfile) root.profilePort = text
+                        onTextChanged: {
+                            if (!root.loadingProfile) {
+                                root.profilePort = text;
+                                root.profileDirty = true;
+                            }
+                        }
                         onEditingFinished: root.saveProfile()
                     }
                     Field {
                         width: 300
                         label: qsTr("User")
                         text: root.profileUser
-                        onTextChanged: if (!root.loadingProfile) root.profileUser = text
+                        onTextChanged: {
+                            if (!root.loadingProfile) {
+                                root.profileUser = text;
+                                root.profileDirty = true;
+                            }
+                        }
                         onEditingFinished: root.saveProfile()
                     }
                     Field {
                         width: 300
                         label: qsTr("Identity file")
                         text: root.profileIdentityFile
-                        onTextChanged: if (!root.loadingProfile) root.profileIdentityFile = text
+                        onTextChanged: {
+                            if (!root.loadingProfile) {
+                                root.profileIdentityFile = text;
+                                root.profileDirty = true;
+                            }
+                        }
                         onEditingFinished: root.saveProfile()
                     }
                     Field {
                         width: 300
                         label: qsTr("Remote Node path")
                         text: root.profileNodePath
-                        onTextChanged: if (!root.loadingProfile) root.profileNodePath = text
+                        onTextChanged: {
+                            if (!root.loadingProfile) {
+                                root.profileNodePath = text;
+                                root.profileDirty = true;
+                            }
+                        }
                         onEditingFinished: root.saveProfile()
                     }
                     Field {
                         width: 614
                         label: qsTr("Remote CodeHarbor directory")
                         text: root.profileRepoRoot
-                        onTextChanged: if (!root.loadingProfile) root.profileRepoRoot = text
+                        onTextChanged: {
+                            if (!root.loadingProfile) {
+                                root.profileRepoRoot = text;
+                                root.profileDirty = true;
+                            }
+                        }
                         onEditingFinished: root.saveProfile()
                     }
                 }

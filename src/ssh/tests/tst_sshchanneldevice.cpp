@@ -146,6 +146,7 @@ void TstSshChannelDevice::aFinishedStreamReadsAsMinusOneNotZero()
 
     char byte = 0;
     // Live but quiet: nothing buffered, more may still arrive.
+    QVERIFY(!device.canReadLine());
     QCOMPARE(device.read(&byte, 1), qint64(0));
 
     QSignalSpy finished(&device, &SshChannelDevice::readChannelFinished);
@@ -156,6 +157,7 @@ void TstSshChannelDevice::aFinishedStreamReadsAsMinusOneNotZero()
     QVERIFY(device.isOpen());
 
     QCOMPARE(device.read(&byte, 1), qint64(-1));
+    QVERIFY(!device.canReadLine());
     QVERIFY(device.readAll().isEmpty());
     QVERIFY(device.atEnd());
 

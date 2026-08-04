@@ -222,6 +222,27 @@ export function missingCoordinates(input: HookInput): string[] {
 }
 
 /**
+ * Write diagnostics without allowing a closed stderr pipe to reject the hook.
+ * Hook failures must be best-effort: an agent can close or redirect stderr
+ * independently of the bridge, and reporting that failure must not turn a
+ * successful hook invocation into a non-zero process exit.
+ */
+function writeStderr(message: string): void {
+    let onError: (() => void) | undefined;
+    try {
+        onError = (): void => {};
+        process.stderr.once("error", onError);
+        process.stderr.write(message, () => {
+            if (onError !== undefined) process.stderr.off("error", onError);
+        });
+    } catch {
+        // Remove only this write's guard if write() failed synchronously.
+        if (onError !== undefined) process.stderr.off("error", onError);
+        // The diagnostics channel is optional; never break the harness for it.
+    }
+}
+
+/**
  * CLI entry point. Never throws: on any failure it warns to stderr and returns
  * so the calling agent is never disrupted (SPEC 6.4). A misconfigured
  * environment is reported the same way — loudly on stderr, but with a success
@@ -233,12 +254,12 @@ export async function main(
 ): Promise<void> {
     const input = readHookInput(argv, env);
     if (!input.event) {
-        process.stderr.write(USAGE);
+        writeStderr(USAGE);
         return;
     }
     const missing = missingCoordinates(input);
     if (missing.length > 0) {
-        process.stderr.write(
+        writeStderr(
             `oh-my-pi-hook: not emitting ${input.event}: ${missing.join(" and ")} ` +
                 `unset or blank, so the event could not be attributed to a terminal\n${USAGE}`,
         );
@@ -248,7 +269,7 @@ export async function main(
     // also invisible once dropped, and the harness author who wrote the JSON is
     // standing right here. Say so, and still emit.
     if ((env.OMP_METADATA ?? "").trim() !== "" && input.metadata === undefined) {
-        process.stderr.write(
+        writeStderr(
             "oh-my-pi-hook: ignoring OMP_METADATA: not a JSON object, so the " +
                 "event is emitted without it\n",
         );
@@ -257,7 +278,7 @@ export async function main(
         await emitHookEvent(input, resolveSocketPath(env));
     } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
-        process.stderr.write(`oh-my-pi-hook: ${message}\n`);
+        writeStderr(`oh-my-pi-hook: ${message}\n`);
     }
 }
 

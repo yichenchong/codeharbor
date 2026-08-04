@@ -98,16 +98,51 @@ export function isEventIdentifier(value: unknown): value is string {
  * validation footgun.
  */
 export function isPlainObject(value: unknown): value is Record<string, unknown> {
-    return typeof value === "object" && value !== null && !Array.isArray(value);
+    if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+    const prototype = Object.getPrototypeOf(value);
+    return prototype === Object.prototype || prototype === null;
+}
+
+const ISO_TIMESTAMP =
+    /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})\.\d{3}(?:Z|[+-]\d{2}:\d{2})$/;
+const DAYS_IN_MONTH = [31, 0, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31] as const;
+
+function isTimestamp(value: unknown): value is string {
+    if (typeof value !== "string") return false;
+    const match = ISO_TIMESTAMP.exec(value);
+    if (!match) return false;
+    const year = Number(match[1]);
+    const month = Number(match[2]);
+    const day = Number(match[3]);
+    const hour = Number(match[4]);
+    const minute = Number(match[5]);
+    const second = Number(match[6]);
+    const leapYear = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+    const daysInMonth =
+        month === 2
+            ? leapYear
+                ? 29
+                : 28
+            : DAYS_IN_MONTH[month - 1] ?? 0;
+    return (
+        month >= 1 &&
+        month <= 12 &&
+        day >= 1 &&
+        day <= daysInMonth &&
+        hour <= 23 &&
+        minute <= 59 &&
+        second <= 59 &&
+        Number.isFinite(Date.parse(value))
+    );
 }
 
 /** Structural validation of a decoded object against the event contract. */
 export function validateEvent(value: unknown): value is AgentEvent {
-    if (typeof value !== "object" || value === null) return false;
-    const e = value as Record<string, unknown>;
+    if (!isPlainObject(value)) return false;
+    const e = value;
     return (
         e.version === CH_EVENT_VERSION &&
-        typeof e.timestamp === "string" &&
+        isTimestamp(e.timestamp) &&
         isHarness(e.harness) &&
         // Non-blank, not merely a string: see isEventIdentifier for why an empty
         // identifier is an unroutable event rather than a harmless one.
@@ -128,9 +163,9 @@ export function validateEvent(value: unknown): value is AgentEvent {
  * blank, malformed, or fails validation. Never throws: a broken producer must
  * not take down the relay (SPEC 6.4).
  */
-export function parseEventLine(line: string): AgentEvent | null {
+export function parseEventLine(line: unknown): AgentEvent | null {
+    if (typeof line !== "string") return null;
     const trimmed = line.trim();
-    if (trimmed.length === 0) return null;
     let decoded: unknown;
     try {
         decoded = JSON.parse(trimmed);

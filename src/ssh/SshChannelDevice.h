@@ -75,6 +75,8 @@ public:
     // QIODevice
     bool isSequential() const override { return true; }
     qint64 bytesAvailable() const override;
+    bool canReadLine() const override;
+
     void close() override;
     // Always false. A channel is what makes this device readable, so the only
     // way in is startExec()/startPty(); QIODevice::open() would otherwise hand
@@ -118,10 +120,18 @@ private:
     QPointer<SshConnectionPool> m_pool;
     QTimer* m_pump = nullptr;
     QByteArray m_readBuffer;
+    // Keep consumed bytes out of the front of the array. Consumers normally
+    // call readAll(), but a line reader may take small chunks repeatedly; an
+    // eager remove(0, count) would copy the entire unread tail each time.
+    qsizetype m_readOffset = 0;
     bool m_remoteFinished = false;
     // A window-change request is only meaningful on a channel that really has a
     // PTY, so resizePty() can honour its documented "false if no PTY" contract.
     bool m_hasPty = false;
+    // Incremented whenever a channel is acquired or released. A pump pass
+    // captures it before reading and checks it after emitting a signal, so a
+    // re-entrant close/start cannot finish or publish bytes for a new channel.
+    quint64 m_channelGeneration = 0;
     bool m_pumping = false;
     // Remote stderr arrives in 16 KiB reads spread over as many pump passes as
     // the writer needs, so a multi-byte UTF-8 character can straddle two of

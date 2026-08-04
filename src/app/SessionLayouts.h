@@ -112,7 +112,7 @@ public:
     //
     // Concurrent/repeated calls are safe: each load is stamped with a monotonic
     // generation and only the newest one may touch the trees, so a late reply
-    // for an abandoned Dev Session is dropped (errors are still surfaced
+    // for an abandoned Dev Session is dropped (errors are still surfaced).
     Q_INVOKABLE void load(QString devSessionId);
 
     // Production QML MUST use the stamped entry points below. The session id

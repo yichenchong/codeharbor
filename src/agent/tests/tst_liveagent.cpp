@@ -561,12 +561,13 @@ void TstLiveAgent::errorAndShutdownReachTheRowState()
     QCOMPARE(m_unseenSpy->count(), unseenBefore);
 
     // SPEC 6.5 precedence, the arm that matters most in practice: a producer
-    // that exported OMP_ERROR=1 once and never unset it. Every later firing
-    // carries the stale flag, INCLUDING the shutdown — and if the flag won
-    // there, the row would stay red for a session that is gone, because nothing
-    // after a shutdown can ever arrive to replace the state. Drive the terminal
-    // back into Error first so the shutdown is a real transition and not a
-    // repeat of the state it is already in.
+    // may leave OMP_ERROR=1 set for a later firing, INCLUDING the shutdown.
+    // This helper starts each hook in a fresh remote process, so the final
+    // call passes error=true explicitly to model that stale flag. If the flag
+    // won there, the row would stay red for a session that is gone, because
+    // nothing after a shutdown can ever arrive to replace the state. Drive the
+    // terminal back into Error first so the shutdown is a real transition and
+    // not a repeat of the state it is already in.
     QVERIFY(fireHook(QStringLiteral("agent_end"), QString(),
                      QStringLiteral("live gate: agent blew up again"), true));
     QTRY_COMPARE_WITH_TIMEOUT(m_monitor.stateFor(m_dev, m_term),

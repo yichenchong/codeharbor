@@ -153,8 +153,28 @@ async function run(runner: CommandRunner, argv: string[]): Promise<CommandResult
     try {
         return await runner(argv);
     } catch (err) {
-        return { code: SPAWN_FAILED, stdout: "", stderr: err instanceof Error ? err.message : String(err) };
+        return {
+            code: SPAWN_FAILED,
+            stdout: "",
+            stderr: err instanceof Error ? err.message : String(err),
+        };
     }
+}
+
+function isMissingTmux(result: CommandResult): boolean {
+    return (
+        result.code === SPAWN_FAILED &&
+        /(?:\bENOENT\b|\btmux\b.*\b(?:not found|cannot find)\b)/i.test(result.stderr)
+    );
+}
+
+function isNoServer(result: CommandResult): boolean {
+    return /no (?:tmux )?server running\b/i.test(result.stderr);
+}
+
+function commandFailure(operation: string, result: CommandResult): Error {
+    const detail = result.stderr.trim() || `exit code ${result.code}`;
+    return new Error(`tmux ${operation} failed: ${detail}`);
 }
 
 // SECURITY: a session name is REMOTE-CONTROLLED data that is echoed back inside
@@ -203,12 +223,12 @@ export function parseSessions(stdout: string, marker = ""): TmuxSession[] {
         if (fields.length < 4) continue;
         // STRICT field validation, not Number.parseInt's prefix scan. parseInt
         // stops at the first character it cannot use, so "3abc" parsed as 3,
-        // "1753372800\u0000junk" as a valid timestamp, and " 7" as 7 — a record
-        // whose numeric fields are not numbers was accepted as if they were,
-        // with the garbage silently discarded. The whole point of parsing
-        // positionally is that fields 0-2 have exactly one shape each; a field
-        // that does not have it means the line is not a record this format
-        // produced, so drop the line rather than invent a value for it.
+        // "1753372800\u0000junk" as a valid timestamp, and " 7" as 7 — a
+        // record whose numeric fields are not numbers was accepted as if they
+        // were, with the garbage silently discarded. The whole point of
+        // parsing positionally is that fields 0-2 have exactly one shape each;
+        // a field that does not have it means the line is not a record this
+        // format produced, so drop the line rather than invent a value for it.
         //
         // Number.isSafeInteger is the second half: `session_created` is seconds
         // since the epoch and a 20-digit field passes /^\d+$/ but lands beyond
@@ -221,10 +241,15 @@ export function parseSessions(stdout: string, marker = ""): TmuxSession[] {
         if (fields[2] !== "0" && fields[2] !== "1") continue;
         const windows = Number.parseInt(fields[0], 10);
         const created = Number.parseInt(fields[1], 10);
-        if (!Number.isSafeInteger(windows) || !Number.isSafeInteger(created)) continue;
+        const name = fields.slice(3).join("\t");
+        if (
+            !Number.isSafeInteger(windows) ||
+            !Number.isSafeInteger(created) ||
+            name === ""
+        ) continue;
         sessions.push({
             // Everything past the third tab is the name — see LIST_SESSIONS_FORMAT.
-            name: fields.slice(3).join("\t"),
+            name,
             windows,
             created,
             attached: fields[2] === "1",
@@ -241,8 +266,9 @@ export function parseSessions(stdout: string, marker = ""): TmuxSession[] {
 export async function listSessions(runner: CommandRunner = execFileRunner): Promise<ListSessionsResult> {
     const marker = randomBytes(12).toString("base64url");
     const result = await run(runner, ["list-sessions", "-F", marker + "\t" + LIST_SESSIONS_FORMAT]);
-    if (result.code !== 0) return [];
-    return parseSessions(result.stdout, marker);
+    if (result.code === 0) return parseSessions(result.stdout, marker);
+    if (isMissingTmux(result) || isNoServer(result)) return [];
+    throw commandFailure("list-sessions", result);
 }
 
 // Validates the one parameter shared by sessionExists and killSession. A blank
@@ -253,9 +279,22 @@ export async function listSessions(runner: CommandRunner = execFileRunner): Prom
 function requireName(params: unknown, method: string): string {
     if (typeof params === "object" && params !== null && "name" in params) {
         const { name } = params;
-        if (typeof name === "string" && name !== "") return name;
+        if (typeof name === "string" && name.trim() !== "") return name;
     }
     throw new InvalidParamsError(`${method} requires a non-empty string name`);
+}
+// `=` makes tmux use an exact target, but it does not make `:` or `.` literal:
+// tmux still interprets those as window/pane separators. Reject them (and
+// control characters) before building a kill target so a malformed name such
+// as `other:0` can never kill another session.
+function requireKillName(params: unknown): string {
+    const name = requireName(params, RPC_TMUX_METHODS.killSession);
+    if (/[:.\u0000-\u001f\u007f]/.test(name)) {
+        throw new InvalidParamsError(
+            `${RPC_TMUX_METHODS.killSession} requires a tmux-safe session name`,
+        );
+    }
+    return name;
 }
 
 /**
@@ -277,21 +316,27 @@ export async function sessionExists(
  * Kill one session by exact name. Idempotent: killing an absent session, or
  * calling this where tmux is not installed, is a successful no-op.
  *
- * Unlike sessionExists this does go through tmux's `-t` target grammar, because
- * there is no listing-only way to destroy a session. `=` pins the lookup to an
- * exact name, so neither an option-shaped nor a glob name can reach another
- * session. The one construct `=` does not neutralize is a `:` inside the name,
- * which the grammar may read as a session/window separator — tmux rewrites `:`
- * out of a session name when the session is created, so such a name should not
- * exist on the host, but this is the reason sessionExists prefers the listing.
+ * `=` pins the lookup to an exact name, so neither an option-shaped nor a glob
+ * name can reach another session. The target grammar still treats `:` and `.`
+ * as session/window/pane structure; requireKillName rejects those before the
+ * argument is built. Other command failures are surfaced instead of reported
+ * as a successful kill.
  */
 export async function killSession(
     params: KillSessionParams,
     runner: CommandRunner = execFileRunner,
 ): Promise<KillSessionResult> {
-    const name = requireName(params, RPC_TMUX_METHODS.killSession);
-    await run(runner, ["kill-session", "-t", `=${name}`]);
-    return {};
+    const name = requireKillName(params);
+    const result = await run(runner, ["kill-session", "-t", `=${name}`]);
+    if (
+        result.code === 0 ||
+        isMissingTmux(result) ||
+        isNoServer(result) ||
+        /(?:can't find session|no such session|session not found)\b/i.test(result.stderr)
+    ) {
+        return {};
+    }
+    throw commandFailure("kill-session", result);
 }
 
 // RPC handler table for the `tmux.*` group, keyed by the frozen wire names.
