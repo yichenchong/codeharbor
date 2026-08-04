@@ -88,6 +88,7 @@ private slots:
     void concurrentRoutesOnTwoThreadsNeverSeeEachOthersLines();
     void releasingARouteFromTheWrongThreadStopsItRoutingAnyway();
     void wrongThreadReleaseIsRepairedBeforeNextRoute();
+    void routeOutlivingOwnerThreadIsStillWrongThread();
     void twoPoolsHandshakingConcurrentlyKeepSeparateTranscripts();
     void libsshActivityAfterAHandshakeNeverReachesThePoolsTranscript();
     void aPoolLeavesNoRouteBehindAfterAFailedHandshake();
@@ -647,6 +648,37 @@ void TstSshLogRouter::wrongThreadReleaseIsRepairedBeforeNextRoute()
     QVERIFY(inertHookRemains);
     QCOMPARE(levelAfter, int(SSH_LOG_NOLOG));
     QCOMPARE(SshLogRouter::activeRouteCount(), 0);
+}
+// Native thread identifiers may be recycled immediately after a worker exits.
+// Keep the Route alive across that exit and release it from the main thread:
+// the release must remain a wrong-thread release even if Windows gives the
+// next thread the worker's former identifier.
+void TstSshLogRouter::routeOutlivingOwnerThreadIsStillWrongThread()
+{
+    QSemaphore routeTaken;
+    std::unique_ptr<SshLogRouter::Route> route;
+
+    // Construct the route on the worker, then publish it only after its
+    // constructor has recorded the worker's per-thread identity.
+    QThread* const owner = QThread::create([&route, &routeTaken] {
+        route = std::make_unique<SshLogRouter::Route>(
+            [](int, const char*, const char*) {});
+        routeTaken.release();
+    });
+    owner->start();
+    routeTaken.acquire();
+    QVERIFY(owner->wait(60000));
+    delete owner;
+
+    QVERIFY(route != nullptr);
+    QTest::ignoreMessage(
+        QtWarningMsg,
+        QRegularExpression(QStringLiteral(
+            "route taken on another thread was released")));
+    route->release();
+    route.reset();
+    QCOMPARE(SshLogRouter::activeRouteCount(), 0);
+    resetLibsshLoggingBaseline();
 }
 
 // The concrete regression the router removes. The old code installed

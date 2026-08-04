@@ -5,7 +5,6 @@
 #include <QFileInfo>
 #include <QScopeGuard>
 #include <QStringList>
-#include <QThread>
 // libssh version floor for this file and SshChannelDevice.cpp, audited symbol
 // by symbol against the upstream release headers:
 //   * Compile/link floor is 0.8.0, set by ONE symbol: ssh_get_server_publickey()
@@ -79,6 +78,8 @@ void SshLogRouter::Route::release()
 
 thread_local QList<std::shared_ptr<SshLogRouter::Route::Entry>>
     SshLogRouter::s_threadRoutes;
+thread_local std::shared_ptr<SshLogRouter::Route::ThreadIdentity>
+    SshLogRouter::s_threadIdentity;
 
 void SshLogRouter::pruneInactiveThreadRoutes()
 {
@@ -113,7 +114,10 @@ void SshLogRouter::restoreThreadLoggingState()
 void SshLogRouter::acquire(Route* route)
 {
     Q_ASSERT(route);
-    route->m_thread = QThread::currentThreadId();
+    if (!s_threadIdentity)
+        s_threadIdentity =
+            std::make_shared<SshLogRouter::Route::ThreadIdentity>();
+    route->m_threadIdentity = s_threadIdentity;
     pruneInactiveThreadRoutes();
     if (s_threadRoutes.isEmpty() && t_ownsThreadState)
         restoreThreadLoggingState();
@@ -150,7 +154,10 @@ void SshLogRouter::release(Route* route)
     entry->active.store(false, std::memory_order_release);
     g_activeRoutes.fetch_sub(1, std::memory_order_relaxed);
 
-    if (QThread::currentThreadId() != route->m_thread) {
+    const bool sameThread = s_threadIdentity
+        && s_threadIdentity == route->m_threadIdentity;
+    route->m_threadIdentity.reset();
+    if (!sameThread) {
         // A REAL runtime guard, not an assertion that vanishes in a release
         // build. The owning thread's route stack and its saved libssh state are
         // thread-local and unreachable from here, so neither is touched. The

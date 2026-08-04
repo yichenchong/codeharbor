@@ -122,10 +122,13 @@ public:
             // also the only thread that removes the entry from its stack.
             std::atomic<bool> active{true};
         };
+        // A native thread identifier can be recycled as soon as a thread exits.
+        // Keep a shared, per-thread token instead: it remains alive through a
+        // Route that outlives its owning thread and cannot compare equal to a
+        // later thread that happens to receive the same native identifier.
+        struct ThreadIdentity {};
         std::shared_ptr<Entry> m_entry;
-        // The thread that took this route: the only one whose libssh state it
-        // saved, and so the only one that may put that state back.
-        Qt::HANDLE m_thread = nullptr;
+        std::shared_ptr<ThreadIdentity> m_threadIdentity;
     };
 
     // Test seams. activeRouteCount() is process-wide; ownsThreadLoggingState()
@@ -154,6 +157,10 @@ private:
     // from its own list; another thread can at most clear an entry's atomic
     // `active` flag.
     static thread_local QList<std::shared_ptr<Route::Entry>> s_threadRoutes;
+    // Stable identity for the calling thread, unlike a recycled native thread
+    // identifier. A route keeps its token alive if it outlives that thread.
+    static thread_local std::shared_ptr<Route::ThreadIdentity>
+        s_threadIdentity;
 
     // Drop entries that no longer route anywhere, including any deactivated by
     // a wrong-thread release. Only ever called on the owning thread, which is
