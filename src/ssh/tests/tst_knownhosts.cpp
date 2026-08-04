@@ -67,6 +67,7 @@ private slots:
     void certAuthorityIsOpaque();
     void revocationWinsBeforeTrustedEntry();
     void malformedBase64LineSkipped();
+    void emptyBase64LineSkipped();
     void crlfAndTabWhitespaceParsed();
     void hostnamesMatchCaseInsensitively();
     void wildcardHostIsATrustedHost();
@@ -362,6 +363,19 @@ void TstKnownHosts::malformedBase64LineSkipped()
              KnownHosts::Verdict::Match);
     // The dropped line must NOT turn an unknown host into a hard Mismatch.
     QCOMPARE(store.verify(QStringLiteral("bad.host"),
+                          QStringLiteral("ssh-ed25519"), kEd25519Alpha),
+             KnownHosts::Verdict::Unknown);
+}
+
+void TstKnownHosts::emptyBase64LineSkipped()
+{
+    // Qt's strict decoder considers an empty string valid base64, but an empty
+    // key blob is not a usable known_hosts key and must not establish trust.
+    const KnownHosts store = KnownHosts::parse(QStringLiteral(
+        "good.host ssh-ed25519 ZWQyNTUxOS1rZXktYWxwaGEtMDAwMQ==\n"
+        "empty.host ssh-ed25519\n"));
+    QCOMPARE(store.entries().size(), 1);
+    QCOMPARE(store.verify(QStringLiteral("empty.host"),
                           QStringLiteral("ssh-ed25519"), kEd25519Alpha),
              KnownHosts::Verdict::Unknown);
 }

@@ -261,8 +261,8 @@ KnownHosts KnownHosts::parse(const QString& text)
             fields.at(idx + 2).toUtf8(),
             QByteArray::Base64Encoding
                 | QByteArray::AbortOnBase64DecodingErrors);
-        if (!decoded)
-            continue;  // malformed base64: drop the line, don't store a bogus key
+        if (!decoded || decoded.decoded.isEmpty())
+            continue;  // an empty key blob is not a known_hosts key
         const QByteArray key = decoded.decoded;
         QString comment;
         for (int i = idx + 3; i < fields.size(); ++i) {

@@ -481,9 +481,13 @@ private:
     // from sessionClosing() cannot connect, disconnect or open a channel on a
     // pool that is being destroyed.
     bool m_destroying = false;
-    // Prevent a sessionClosing() slot from starting a replacement handshake
-    // while closeSession() is still freeing the old session.
     bool m_closingSession = false;
+    // Synchronous handshakes emit Qt signals and invoke user callbacks while
+    // libssh is on the stack. A re-entrant disconnect therefore cannot free
+    // the session immediately; it sets a request that connectToHost() handles
+    // between libssh calls.
+    bool m_handshakeInProgress = false;
+    bool m_disconnectRequested = false;
     KnownHosts m_knownHosts;
     HostKeyCallback m_hostKeyCallback;
     CredentialCallback m_credentialCallback;

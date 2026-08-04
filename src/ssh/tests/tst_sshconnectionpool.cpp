@@ -37,6 +37,7 @@ private slots:
     void aDeclinedUnknownKeyIsRefusedWithAnExplanation();
     void aPortedEndpointIsLookedUpAndStoredOpenSshStyle();
 #if CH_HAVE_LIBSSH
+    void aDisconnectDuringHandshakeIsDeferredUntilTheCallReturns();
     void destroyingAnUnconnectedPoolChangesNoProperty();
 #endif
 };
@@ -153,6 +154,24 @@ void TstSshConnectionPool::aPortedEndpointIsLookedUpAndStoredOpenSshStyle()
 }
 
 #if CH_HAVE_LIBSSH
+void TstSshConnectionPool::
+    aDisconnectDuringHandshakeIsDeferredUntilTheCallReturns()
+{
+    SshConnectionPool pool;
+    bool sawConnecting = false;
+    connect(&pool, &SshConnectionPool::stateChanged, &pool,
+            [&pool, &sawConnecting](SshConnectionPool::State state) {
+                if (state == SshConnectionPool::State::Connecting) {
+                    sawConnecting = true;
+                    pool.disconnectFromHost();
+                }
+            });
+
+    QVERIFY(!pool.connectToHost(QStringLiteral("127.0.0.1"), 1,
+                                QStringLiteral("nobody")));
+    QVERIFY(sawConnecting);
+    QCOMPARE(pool.state(), SshConnectionPool::State::Disconnected);
+}
 
 // An unconnected pool has no live session, so its destructor has no teardown
 // signal to announce. It still must not emit stateChanged() or

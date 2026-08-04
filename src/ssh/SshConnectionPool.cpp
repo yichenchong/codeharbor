@@ -426,9 +426,13 @@ bool SshConnectionPool::applyHostKeyPolicy(const QString& host, quint16 port,
                     .arg(host, keyType));
             return false;
         }
-        if (m_hostKeyCallback(host, keyType, keyBlob,
-                              KnownHosts::Verdict::Unknown)
-            == HostKeyDecision::Accept) {
+        const HostKeyDecision decision =
+            m_hostKeyCallback(host, keyType, keyBlob,
+                              KnownHosts::Verdict::Unknown);
+        if (m_handshakeInProgress
+            && (m_disconnectRequested || !m_session))
+            return false;
+        if (decision == HostKeyDecision::Accept) {
             m_knownHosts.add(lookupHost, keyType, keyBlob);
             return true;
         }
@@ -697,27 +701,54 @@ bool SshConnectionPool::connectToHost(const QString& host, quint16 port,
     // able to start a fresh handshake: the session it allocated would never be
     // freed, and the state it set would be overwritten moments later. The same
     // guard applies during ordinary teardown, where a replacement handshake
-    // would otherwise race the old session's channel sweep.
-    if (m_destroying || m_closingSession)
+    // would otherwise race the old session's channel sweep. A signal or
+    // credential callback also cannot start a nested synchronous handshake.
+    if (m_destroying || m_closingSession || m_handshakeInProgress)
         return false;
+
+    disconnectFromHost();
+    m_handshakeInProgress = true;
+    m_disconnectRequested = false;
+    const auto finishHandshake =
+        qScopeGuard([this] {
+            m_handshakeInProgress = false;
+            m_disconnectRequested = false;
+        });
+    const auto failHandshake = [this] {
+        const bool cancelledBeforeClose = m_disconnectRequested;
+        closeSession();
+        const bool cancelled = cancelledBeforeClose || m_disconnectRequested;
+        if (m_state != State::NotAvailable)
+            setState(cancelled ? State::Disconnected : State::Error);
+    };
+    const auto abortRequested = [this] {
+        if (!m_disconnectRequested)
+            return false;
+        closeSession();
+        if (m_state != State::NotAvailable)
+            setState(State::Disconnected);
+        return true;
+    };
 
     clearDiagnostics();
     appendDiagnostic(QStringLiteral("Starting SSH connection to %1:%2.")
                          .arg(host)
                          .arg(port));
-
-    disconnectFromHost();
+    if (abortRequested())
+        return false;
     m_host = host;
     m_port = port;
     m_user = user;
     m_identityFile = resolveIdentityFilePath(identityFile);
 
     setState(State::Connecting);
+    if (abortRequested())
+        return false;
     m_session = ssh_new();
     if (!m_session) {
         appendDiagnostic(QStringLiteral("libssh could not allocate a session."));
         emit errorOccurred(QStringLiteral("ssh_new() failed"));
-        setState(State::Error);
+        failHandshake();
         return false;
     }
 
@@ -744,6 +775,8 @@ bool SshConnectionPool::connectToHost(const QString& host, quint16 port,
     // authentication failures, so report and abort before connecting.
     const auto setOption = [this](ssh_options_e option, const void* value,
                                   const QString& what) {
+        if (!m_session || m_disconnectRequested)
+            return false;
         if (ssh_options_set(m_session, option, value) == SSH_OK)
             return true;
         const QString failure =
@@ -759,11 +792,12 @@ bool SshConnectionPool::connectToHost(const QString& host, quint16 port,
         QStringLiteral("libssh runtime: %1").arg(runtimeVersion));
     const QByteArray hostUtf8 = host.toUtf8();
     const QByteArray userUtf8 = user.toUtf8();
+    if (abortRequested())
+        return false;
     unsigned int portValue = port;
     if (!setOption(SSH_OPTIONS_HOST, hostUtf8.constData(),
                    QStringLiteral("SSH host"))) {
-        closeSession();
-        setState(State::Error);
+        failHandshake();
         return false;
     }
 
@@ -779,8 +813,7 @@ bool SshConnectionPool::connectToHost(const QString& host, quint16 port,
     if (!setOption(SSH_OPTIONS_TIMEOUT, &handshakeTimeout,
                    QStringLiteral("handshake timeout (%1s)")
                        .arg(kHandshakeTimeoutSeconds))) {
-        closeSession();
-        setState(State::Error);
+        failHandshake();
         return false;
     }
 
@@ -793,6 +826,8 @@ bool SshConnectionPool::connectToHost(const QString& host, quint16 port,
     if (QFileInfo(configPath).isFile()) {
         appendDiagnostic(
             QStringLiteral("Parsing SSH configuration: %1").arg(configPath));
+        if (abortRequested())
+            return false;
         const QByteArray configUtf8 = QFile::encodeName(configPath);
         if (ssh_options_parse_config(m_session, configUtf8.constData())
             != SSH_OK) {
@@ -803,8 +838,7 @@ bool SshConnectionPool::connectToHost(const QString& host, quint16 port,
             emit errorOccurred(
                 QStringLiteral("Could not parse SSH config %1: %2")
                     .arg(configPath, error));
-            closeSession();
-            setState(State::Error);
+            failHandshake();
             return false;
         }
     }
@@ -812,8 +846,7 @@ bool SshConnectionPool::connectToHost(const QString& host, quint16 port,
     if (!setOption(SSH_OPTIONS_PORT, &portValue, QStringLiteral("SSH port"))
         || !setOption(SSH_OPTIONS_USER, userUtf8.constData(),
                       QStringLiteral("SSH user"))) {
-        closeSession();
-        setState(State::Error);
+        failHandshake();
         return false;
     }
     if (!m_identityFile.isEmpty()) {
@@ -821,8 +854,7 @@ bool SshConnectionPool::connectToHost(const QString& host, quint16 port,
         if (!setOption(SSH_OPTIONS_IDENTITY, identityUtf8.constData(),
                        QStringLiteral("private key file %1")
                            .arg(m_identityFile))) {
-            closeSession();
-            setState(State::Error);
+            failHandshake();
             return false;
         }
     }
@@ -838,6 +870,8 @@ bool SshConnectionPool::connectToHost(const QString& host, quint16 port,
     // (not filter) any KexAlgorithms parsed from ~/.ssh/config above - an
     // acceptable trade against a handshake that cannot complete at all.
     if (hasBrokenHybridKex(runtimeVersion)) {
+        if (abortRequested())
+            return false;
         const bool applied = ssh_options_set(m_session,
                                              SSH_OPTIONS_KEY_EXCHANGE,
                                              "-mlkem768x25519-sha256")
@@ -851,9 +885,13 @@ bool SshConnectionPool::connectToHost(const QString& host, quint16 port,
                                  "libssh %1: %2")
                       .arg(runtimeVersion,
                            QString::fromUtf8(ssh_get_error(m_session))));
+        if (abortRequested())
+            return false;
     }
 
     appendDiagnostic(QStringLiteral("Beginning SSH handshake."));
+    if (abortRequested())
+        return false;
     if (ssh_connect(m_session) != SSH_OK) {
         const QString error = QString::fromUtf8(ssh_get_error(m_session));
         appendDiagnostic(QStringLiteral("SSH handshake failed: %1").arg(error));
@@ -868,17 +906,25 @@ bool SshConnectionPool::connectToHost(const QString& host, quint16 port,
                     .arg(runtimeVersion));
         }
         emit errorOccurred(error);
-        closeSession();
-        setState(State::Error);
+        failHandshake();
         return false;
     }
+    if (abortRequested())
+        return false;
 
     appendDiagnostic(
         QStringLiteral("SSH handshake completed; verifying host key."));
+    if (abortRequested())
+        return false;
     setState(State::HostKeyCheck);
+    if (abortRequested())
+        return false;
     if (!verifyHostKey(host)) {
+        if (abortRequested())
+            return false;
         const QString libsshError =
-            QString::fromUtf8(ssh_get_error(m_session)).trimmed();
+            m_session ? QString::fromUtf8(ssh_get_error(m_session)).trimmed()
+                      : QString();
         // The refusal is CodeHarbor's own policy decision, so libssh normally
         // has nothing to add here; appending an empty or stale message would
         // only make the transcript read as though libssh had failed.
@@ -886,25 +932,33 @@ bool SshConnectionPool::connectToHost(const QString& host, quint16 port,
                              ? QStringLiteral("Host-key verification failed.")
                              : QStringLiteral("Host-key verification failed: %1")
                                    .arg(libsshError));
-        closeSession();
-        setState(State::Error);
+        failHandshake();
         return false;
     }
 
     appendDiagnostic(QStringLiteral("Host key accepted; authenticating."));
+    if (abortRequested())
+        return false;
     setState(State::Authenticating);
+    if (abortRequested())
+        return false;
     if (!authenticate(user)) {
+        if (abortRequested())
+            return false;
         const QString error = authenticationFailure();
         appendDiagnostic(QStringLiteral("SSH authentication failed: %1")
                              .arg(error));
         emit errorOccurred(error);
-        closeSession();
-        setState(State::Error);
+        failHandshake();
         return false;
     }
 
     appendDiagnostic(QStringLiteral("SSH authentication succeeded."));
+    if (abortRequested())
+        return false;
     setState(State::Connected);
+    if (abortRequested())
+        return false;
     return true;
 }
 
@@ -915,6 +969,14 @@ void SshConnectionPool::disconnectFromHost()
     // must not put the stateChanged() emission back.
     if (m_destroying)
         return;
+    // A synchronous handshake may be inside a libssh call when a diagnostic
+    // signal or credential callback asks to disconnect. Freeing the session
+    // from that re-entrant stack would be a use-after-free inside libssh; let
+    // connectToHost() close it between calls instead.
+    if (m_handshakeInProgress) {
+        m_disconnectRequested = true;
+        return;
+    }
     closeSession();
     if (m_state != State::NotAvailable)
         setState(State::Disconnected);
@@ -958,6 +1020,8 @@ void SshConnectionPool::closeSession()
 
 bool SshConnectionPool::verifyHostKey(const QString& host)
 {
+    if (!m_session || m_disconnectRequested)
+        return false;
     ssh_key serverKey = nullptr;
 
     const int keyResult = ssh_get_server_publickey(m_session, &serverKey);
@@ -1015,9 +1079,13 @@ bool SshConnectionPool::verifyHostKey(const QString& host)
 
 bool SshConnectionPool::authenticate(const QString& user)
 {
+    const auto cancelled = [this] {
+        return m_disconnectRequested || !m_session;
+    };
+    if (cancelled())
+        return false;
     m_partialMethods.clear();
     m_publicKeyOffered = false;
-
     // ssh_userauth_list() is only defined after a "none" request. It is not
     // enough to query it after an auto-key failure: some libssh builds then
     // report no methods at all, silently skipping the passphrase callback.
@@ -1047,9 +1115,13 @@ bool SshConnectionPool::authenticate(const QString& user)
         // lecturing the user about ssh-agent and identity files — advice that
         // describes nothing that happened.
         m_partialMethods << QStringLiteral("none");
+        if (cancelled())
+            return false;
         appendDiagnostic(
             QStringLiteral("The server accepted the 'none' authentication "
                            "method and requires a further one."));
+        if (cancelled())
+            return false;
         break;
     case AuthOutcome::Refused:
         break;
@@ -1061,6 +1133,8 @@ bool SshConnectionPool::authenticate(const QString& user)
     const bool unsupportedWindowsAgent = usesUnsupportedWindowsAgent();
     const QStringList identityFiles =
         identityFileCandidates(m_session, m_identityFile);
+    if (cancelled())
+        return false;
 
     // Authentication is a CONVERSATION, not a list of fallbacks. A server with
     // `AuthenticationMethods publickey,password` answers an accepted key with
@@ -1070,6 +1144,8 @@ bool SshConnectionPool::authenticate(const QString& user)
     // returns a rung already in `tried`: at most five steps, however many
     // partial successes the server reports.
     AuthMethods offered = methodsFromMask(ssh_userauth_list(m_session, nullptr));
+    if (cancelled())
+        return false;
     m_publicKeyOffered = offered.publicKey;
     AuthRungsTried tried;
     const bool canPrompt = static_cast<bool>(m_credentialCallback);
@@ -1077,6 +1153,8 @@ bool SshConnectionPool::authenticate(const QString& user)
     for (AuthRung rung = nextAuthRung(tried, offered, canPrompt);
          rung != AuthRung::Exhausted;
          rung = nextAuthRung(tried, offered, canPrompt)) {
+        if (cancelled())
+            return false;
         // Marked spent BEFORE the attempt, so no path out of the switch below
         // can leave the same rung eligible again.
         tried.add(rung);
@@ -1110,6 +1188,8 @@ bool SshConnectionPool::authenticate(const QString& user)
             // indistinguishable. The password rung below asks separately.
             CredentialReply passphrase =
                 m_credentialCallback(user, CredentialKind::KeyPassphrase);
+            if (cancelled())
+                return false;
             if (passphrase.promptRequested) {
                 // The pool never blocks on the user: the attempt is abandoned
                 // here, the controller raises the prompt, and the whole connect
@@ -1140,6 +1220,8 @@ bool SshConnectionPool::authenticate(const QString& user)
             // request above returns from the whole handshake.
             CredentialReply password =
                 m_credentialCallback(user, CredentialKind::Password);
+            if (cancelled())
+                return false;
             if (password.promptRequested) {
                 appendDiagnostic(QStringLiteral(
                     "A password is required; abandoning this attempt so it can "
@@ -1167,6 +1249,8 @@ bool SshConnectionPool::authenticate(const QString& user)
             // secret for each — the documented limitation of mapping a
             // multi-prompt method onto one secret without changing the callback.
             int result = ssh_userauth_kbdint(m_session, nullptr, nullptr);
+            if (cancelled())
+                return false;
             bool parked = false;
             // SSH_AUTH_INFO means "here is a batch of prompts; answer them and
             // call kbdint again". Re-entered until the server stops asking, but
@@ -1177,6 +1261,8 @@ bool SshConnectionPool::authenticate(const QString& user)
             for (int round = 0; result == SSH_AUTH_INFO && round < kMaxKbdIntRounds;
                  ++round) {
                 const int prompts = ssh_userauth_kbdint_getnprompts(m_session);
+                if (cancelled())
+                    return false;
                 for (int prompt = 0; prompt < prompts; ++prompt) {
                     char echo = 0;
                     const char* promptText = ssh_userauth_kbdint_getprompt(
@@ -1184,12 +1270,18 @@ bool SshConnectionPool::authenticate(const QString& user)
                     const QString promptLabel =
                         promptText ? QString::fromUtf8(promptText).trimmed()
                                    : QString();
+                    if (cancelled())
+                        return false;
                     if (!promptLabel.isEmpty())
                         appendDiagnostic(
                             QStringLiteral("Keyboard-interactive prompt: %1")
                                 .arg(promptLabel));
+                    if (cancelled())
+                        return false;
                     CredentialReply answer =
                         m_credentialCallback(user, CredentialKind::Password);
+                    if (cancelled())
+                        return false;
                     if (answer.promptRequested) {
                         // Same non-blocking contract as the other prompts: give
                         // up now so the controller can gather the secret and
@@ -1214,6 +1306,8 @@ bool SshConnectionPool::authenticate(const QString& user)
                         m_session, static_cast<unsigned int>(prompt),
                         answerUtf8.constData());
                     wipeSecret(answerUtf8);
+                    if (cancelled())
+                        return false;
                     if (setResult < 0) {
                         // libssh rejected the answer; nothing more can be sent
                         // on this rung.
@@ -1224,6 +1318,8 @@ bool SshConnectionPool::authenticate(const QString& user)
                 if (parked)
                     break;
                 result = ssh_userauth_kbdint(m_session, nullptr, nullptr);
+                if (cancelled())
+                    return false;
             }
             outcome = classifyAuthResult(result);
             break;
@@ -1232,6 +1328,8 @@ bool SshConnectionPool::authenticate(const QString& user)
         case AuthRung::Exhausted:
             break;  // unreachable: the loop condition excludes it
         }
+        if (cancelled())
+            return false;
 
         if (outcome == AuthOutcome::Granted)
             return true;
@@ -1242,6 +1340,8 @@ bool SshConnectionPool::authenticate(const QString& user)
                                "authentication method.")
                     .arg(authRungName(rung)));
         }
+        if (cancelled())
+            return false;
         // A rung can fail because the server dropped the connection rather than
         // because it refused the credential, and libssh reports both as a plain
         // non-success. On a dead transport ssh_userauth_list() then answers 0,
@@ -1260,7 +1360,11 @@ bool SshConnectionPool::authenticate(const QString& user)
         // as the exchange proceeds — after a partial success it typically drops
         // the method just satisfied — so a stale copy would keep offering a
         // method the server has stopped asking for.
+        if (cancelled())
+            return false;
         offered = methodsFromMask(ssh_userauth_list(m_session, nullptr));
+        if (cancelled())
+            return false;
     }
     return false;
 }
