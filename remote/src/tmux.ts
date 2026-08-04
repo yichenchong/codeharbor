@@ -168,8 +168,17 @@ function isMissingTmux(result: CommandResult): boolean {
     );
 }
 
+// "No tmux server" has TWO spellings, and only one of them says "server".
+// Newer tmux prints "no server running on /tmp/tmux-1000/default", but when the
+// socket file does not exist at all it instead reports the failed connect:
+// "error connecting to /tmp/tmux-1000/default (No such file or directory)".
+// That second form is the ordinary state of a machine where tmux has simply
+// never been started — which is exactly what a continuous-integration runner
+// looks like — so treating it as a real failure turns "no sessions yet" into an
+// internal error and breaks the very first listing on a fresh host.
 function isNoServer(result: CommandResult): boolean {
-    return /no (?:tmux )?server running\b/i.test(result.stderr);
+    if (/no (?:tmux )?server running\b/i.test(result.stderr)) return true;
+    return /error connecting to .*\(No such file or directory\)/i.test(result.stderr);
 }
 
 function commandFailure(operation: string, result: CommandResult): Error {
@@ -260,8 +269,11 @@ export function parseSessions(stdout: string, marker = ""): TmuxSession[] {
 
 /**
  * List every tmux session on the host. Empty when tmux is missing or no server
- * is running (tmux exits non-zero with "no server running on ..." — expected on
- * a fresh box, not an error).
+ * is running — expected on a fresh box, not an error. tmux exits non-zero and
+ * says either "no server running on ..." or, when the socket file was never
+ * created at all, "error connecting to ... (No such file or directory)"; both
+ * mean the same thing here. Any other non-zero exit is a real failure and is
+ * raised, so a permission problem cannot masquerade as an empty host.
  */
 export async function listSessions(runner: CommandRunner = execFileRunner): Promise<ListSessionsResult> {
     const marker = randomBytes(12).toString("base64url");

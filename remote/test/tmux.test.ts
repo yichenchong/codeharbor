@@ -151,6 +151,18 @@ test("no tmux server running yields an empty result, not an error", async () => 
     assert.deepEqual(await listSessions(tmux.run), []);
 });
 
+// The other thing tmux says when there is no server. When the socket file has
+// never been created, tmux does not mention a server at all: it reports the
+// failed connect. That is the ordinary state of a machine where tmux has never
+// been started, so it must read as "no sessions", not as a server failure.
+test("a missing tmux socket also yields an empty result, not an error", async () => {
+    const stderr = "error connecting to /tmp/tmux-1001/default (No such file or directory)";
+    const tmux = stubRunner({ code: 1, stdout: "", stderr });
+    assert.deepEqual(await listSessions(tmux.run), []);
+    const killTmux = stubRunner({ code: 1, stdout: "", stderr });
+    assert.deepEqual(await killSession({ name: "codeharbor" }, killTmux.run), {});
+});
+
 test("tmux missing from PATH yields an empty result, not an error", async () => {
     const tmux = stubRunner({ code: SPAWN_FAILED, stdout: "", stderr: "spawn tmux ENOENT" });
     assert.deepEqual(await listSessions(tmux.run), []);
