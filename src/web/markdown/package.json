@@ -1,6 +1,6 @@
 {
   "name": "@codeharbor/web-markdown",
-  "version": "0.1.15",
+  "version": "0.1.16",
   "private": true,
   "description": "Sanitized rendered Markdown bundle for the remote viewer",
   "type": "module",
