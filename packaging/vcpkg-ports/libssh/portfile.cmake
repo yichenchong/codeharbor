@@ -9,6 +9,17 @@
 #
 # Everything except VERSION/SHA512 mirrors the registry port, so the built tree
 # keeps the layout, features and CMake config the client already expects.
+#
+# DO NOT "correct" the patches. They are unified diffs, so every line that does
+# not start with `+` or `-` is CONTEXT that must reproduce the upstream file
+# byte for byte. 0001-export-pkgconfig-file.patch quotes a line that upstream
+# libssh really does misspell — `set(LIBSSSH_PC_REQUIRES_PRIVATE "")`, with
+# three S — while the rest of upstream reads the two-S name. Upstream's
+# initialiser is therefore dead, which is harmless: `string(APPEND ...)` creates
+# the two-S variable on first use. Rewriting the context line to the two-S
+# spelling makes the patch stop matching, and dropping its leading space makes
+# git reject the whole hunk as a corrupt patch. Either way the Windows build
+# fails at extraction, before anything is compiled.
 vcpkg_download_distfile(distfile
     URLS https://www.libssh.org/files/0.12/libssh-${VERSION}.tar.xz
     FILENAME libssh-${VERSION}.tar.xz

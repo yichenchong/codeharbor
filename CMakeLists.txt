@@ -203,6 +203,14 @@ if(CODEHARBOR_BUILD_TESTS)
                  COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/bump_version_tag.sh
                          ${CMAKE_CURRENT_SOURCE_DIR})
         set_tests_properties(tst_bump_version_tag PROPERTIES SKIP_RETURN_CODE 77)
+        # Checks that the in-tree vcpkg overlay patches are still well-formed
+        # unified diffs. Nothing an ordinary Linux or macOS build does reads
+        # them: they are applied on a Windows release runner, against a tarball
+        # downloaded there, so a malformed one is invisible until a release is
+        # already tagged and its Windows job dies during extraction.
+        add_test(NAME tst_vcpkg_patches
+                 COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/vcpkg_patches.sh
+                         ${CMAKE_CURRENT_SOURCE_DIR})
     endif()
 endif()
 
