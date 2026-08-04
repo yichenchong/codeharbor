@@ -250,6 +250,19 @@ jobs:
       - name: Test
         run: ctest --preset release-tests
         shell: bash
+      # A test that CRASHES prints nothing useful through ctest: its standard
+      # output is still sitting in the process's own buffer when it dies, so
+      # output-on-failure has nothing to show and the run reports only which
+      # target failed. That happened here with a Windows-only crash, and there
+      # was no way to see the failing case without another push. Re-running just
+      # the failed targets with per-test verbosity, and letting each one write
+      # straight to the console instead of through ctest's capture, shows how far
+      # the test got and which case it died in.
+      - name: Diagnose failed tests
+        if: failure()
+        run: ctest --preset release-tests --rerun-failed --output-on-failure --verbose
+        shell: bash
+        continue-on-error: true
 
   # The Windows installer script is compiled ONLY by the release workflow, at the
   # very end of a twenty-minute Windows build, and only for a pushed tag. A typo
