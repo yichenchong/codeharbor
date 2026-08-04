@@ -851,7 +851,11 @@ Rectangle {
         anchors.bottom: statusFooter.top
         clip: true
         model: groupsDelegateModel
-
+        // Keep nearby group/session blocks realised while scrolling so drag
+        // geometry and keyboard navigation do not lose their delegates at the
+        // viewport edge. The model remains authoritative; this only controls
+        // the visual cache.
+        cacheBuffer: 256
         ScrollBar.vertical: AppScrollBar {}
     }
 
@@ -889,7 +893,7 @@ Rectangle {
                        ? qsTr("All your sessions are archived")
                        : qsTr("No sessions yet"))
                   : qsTr("No server")
-            font.pixelSize: Theme.fontSizeLabel
+            color: Theme.text
         }
         Label {
             objectName: "sidebarEmptyHint"
@@ -903,7 +907,7 @@ Rectangle {
                        ? qsTr("Pin a session to see it here.")
                        : qsTr("Press the \u201c+\u201d at the top of this panel to add a group, then add a Dev Session to it."))
                   : qsTr("Connect to the machine that holds your checkout, and its groups and Dev Sessions appear here.")
-            font.pixelSize: 11
+            color: Theme.textDim
         }
     }
 
@@ -935,7 +939,6 @@ Rectangle {
             anchors.rightMargin: 6
             anchors.verticalCenter: parent.verticalCenter
             text: qsTr("Server…")
-            font.pixelSize: 11
             leftPadding: 6
             rightPadding: 6
 
@@ -978,7 +981,6 @@ Rectangle {
                     anchors.centerIn: parent
                     text: sidebar.linkGlyph(sidebar.linkState)
                     color: Theme.textOnAccent
-                    font.pixelSize: 9
                     font.bold: true
                 }
             }

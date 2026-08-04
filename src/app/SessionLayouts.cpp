@@ -21,12 +21,67 @@ namespace {
 // its own right (it is what a region with no panes left persists), not a
 // "nothing here" marker. SplitNode::tryFromJson draws that distinction from the
 // parser itself; see its comment for why fromJson() cannot.
+bool hasDuplicatePaneIds(const SplitNode& node, QSet<QString>& seen);
+
 std::optional<SplitNode> parseVariantTree(const QVariant& value)
 {
     const QJsonValue json = QJsonValue::fromVariant(value);
     if (!json.isObject())
         return std::nullopt;
-    return SplitNode::tryFromJson(json.toObject());
+    std::optional<SplitNode> parsed = SplitNode::tryFromJson(json.toObject());
+    if (!parsed)
+        return std::nullopt;
+    QSet<QString> seen;
+    if (hasDuplicatePaneIds(*parsed, seen))
+        return std::nullopt;
+    return parsed;
+}
+bool hasDuplicatePaneIds(const SplitNode& node, QSet<QString>& seen)
+{
+    if (node.isLeaf()) {
+        if (node.paneId.isEmpty())
+            return false;
+        if (seen.contains(node.paneId))
+            return true;
+        seen.insert(node.paneId);
+        return false;
+    }
+    for (const SplitNode& child : node.children) {
+        if (hasDuplicatePaneIds(child, seen))
+            return true;
+    }
+    return false;
+}
+
+
+// One place for the rule a QML-supplied ratio list has to satisfy, because it
+// is the SAME rule SplitNode's parser and writer apply: every value finite and
+// strictly positive, and their SUM still finite. That last clause is not
+// pedantry - two individually finite values like 1e308 add to infinity, and
+// SplitNode::tryToJson() refuses to emit a node whose ratios do not add up to a
+// finite positive number. Accepting such a pair here would write it into the
+// loaded tree and only then discover the tree can be neither published nor
+// persisted, leaving the region blank with the layout it was showing already
+// overwritten. Returns the parsed values, or std::nullopt with `rejected` set
+// to the offending value's text for the error message.
+std::optional<QVector<double>> parseRatios(const QVariantList& ratios,
+                                           QString& rejected)
+{
+    QVector<double> parsed;
+    parsed.reserve(ratios.size());
+    double sum = 0.0;
+    for (const QVariant& value : ratios) {
+        bool ok = false;
+        const double ratio = value.toDouble(&ok);
+        if (!ok || !std::isfinite(ratio) || ratio <= 0.0
+            || !std::isfinite(sum + ratio)) {
+            rejected = value.toString();
+            return std::nullopt;
+        }
+        sum += ratio;
+        parsed.append(ratio);
+    }
+    return parsed;
 }
 
 // DEPTH: none of the recursive walks below carries a bound of its own, and none
@@ -89,9 +144,11 @@ DropOutcome dropLeafFrom(SplitNode& node, const QString& paneId)
             continue;
         if (outcome == DropOutcome::Emptied) {
             node.children.removeAt(i);
-            // A tree off the wire is not required to carry one ratio per child
-            // (SplitNode fills the missing ones in), so this is guarded rather
-            // than assumed to be in step.
+            // SplitNode's parser refuses a split whose ratio count does not
+            // match its child count, and every tree built in this file keeps
+            // the two in step, so this cannot fire for a tree off the wire.
+            // It is a guard against a hand-assembled node: SplitNode is a
+            // plain aggregate, so nothing stops one being made out of step.
             if (i < node.ratios.size())
                 node.ratios.removeAt(i);
         }
@@ -410,6 +467,10 @@ void SessionLayouts::load(QString devSessionId)
     emit generationChanged();
     m_devSessionId = std::move(devSessionId);
     m_pendingLoads = 0;
+    // Every `terminal_panes` mint still on the wire was stamped with the
+    // generation just superseded, so its answer will be dropped on arrival:
+    // as far as this object is concerned none of them is in flight any more.
+    m_pendingTerminalMints.clear();
     if (sessionChanged) {
         emit devSessionIdChanged();
         // The previous session's panes must not linger while the new layout is
@@ -476,7 +537,35 @@ void SessionLayouts::applyLoadedTree(quint64 generation, int index,
                 emit viewerTreeChanged();
         }
     }
-    // For a successful reply, `superseded` means an edit was persisted while
+    // Reject duplicate pane labels before publishing a tree. Labels are the
+    // client-side handles used by every structural edit; accepting a duplicate
+    // would make one close or URL update an arbitrary matching leaf.
+    if (!err && tree) {
+        QSet<QString> seen;
+        if (hasDuplicatePaneIds(*tree, seen)) {
+            emit error(QStringLiteral(
+                "SessionLayouts: %1 layout contains duplicate pane ids; not shown")
+                           .arg(regionKey(index)));
+            RegionState& invalid = m_regions[index];
+            const bool wasValid = invalid.valid;
+            invalid.valid = false;
+            invalid.cache = QVariant();
+            invalid.tree = SplitNode{};
+            invalid.pendingWrites.clear();
+            invalid.superseded = false;
+            if (index == kTerminal)
+                m_legacyTerminalSlots.clear();
+            if (wasValid) {
+                if (index == kTerminal)
+                    emit terminalTreeChanged();
+                else
+                    emit viewerTreeChanged();
+            }
+            if (m_pendingLoads > 0 && --m_pendingLoads == 0)
+                emit loaded(m_devSessionId);
+            return;
+        }
+    }
     // its answer predates the tree QML is already showing. Applying it would
     // revert the edit - and on the seeding branch below would replace it with
     // the region default and write THAT to the server. See RegionState.
@@ -742,6 +831,12 @@ void SessionLayouts::saveTreeStamped(const QString& devSessionId,
     // to the newly authored tree and undo the user's latest snapshot.
     m_regions[index].pendingWrites.clear();
     setTreeQuietly(index, std::move(*parsed));
+    // An authored tree is not derived from the server, so the terminal region's
+    // per-leaf bookkeeping has to be brought back in step with it before the
+    // write goes out - notably, any brand new terminal leaf in it needs a row
+    // minted or the region would never be writable again.
+    if (index == kTerminal)
+        adoptAuthoredTerminalTree(generation);
     persist(index);
 }
 
@@ -752,6 +847,7 @@ void SessionLayouts::setRatiosForSession(QString devSessionId,
 {
     setRatiosStamped(devSessionId, generation, region, pathIndexes, ratios, false);
 }
+
 QString SessionLayouts::setPaneTitleForSession(QString devSessionId,
                                                quint64 generation,
                                                QString region, QString paneId,
@@ -760,7 +856,6 @@ QString SessionLayouts::setPaneTitleForSession(QString devSessionId,
     return setPaneTitleStamped(devSessionId, generation, region, paneId, title,
                                false);
 }
-
 
 void SessionLayouts::setRatios(QString region, QStringList pathIndexes,
                                QVariantList ratios)
@@ -786,15 +881,11 @@ void SessionLayouts::setRatiosStamped(const QString& devSessionId,
     if (decision == WriteDecision::Queue) {
         // The branch count is unknown until the server tree arrives, but the
         // values themselves are still user input and must be checked now.
-        for (const QVariant& value : ratios) {
-            bool ok = false;
-            const double ratio = value.toDouble(&ok);
-            if (!ok || !std::isfinite(ratio) || ratio <= 0.0) {
-                emit error(QStringLiteral(
-                    "SessionLayouts: invalid %1 ratio \"%2\"")
-                               .arg(region, value.toString()));
-                return;
-            }
+        QString rejected;
+        if (!parseRatios(ratios, rejected)) {
+            emit error(QStringLiteral("SessionLayouts: invalid %1 ratio \"%2\"")
+                           .arg(region, rejected));
+            return;
         }
         PendingWrite write;
         write.kind = PendingWriteKind::Ratios;
@@ -835,24 +926,19 @@ void SessionLayouts::setRatiosStamped(const QString& devSessionId,
         return;
     }
 
-    QVector<double> parsed;
-    parsed.reserve(ratios.size());
-    for (const QVariant& value : ratios) {
-        bool ok = false;
-        const double ratio = value.toDouble(&ok);
-        // Same rule SplitNode::fromJson enforces: a non-finite or non-positive
-        // ratio yields broken geometry and would not survive a round-trip.
-        if (!ok || !std::isfinite(ratio) || ratio <= 0.0) {
-            if (!replay)
-                emit error(QStringLiteral(
-                    "SessionLayouts: invalid %1 ratio \"%2\"")
-                               .arg(region, value.toString()));
-            return;
-        }
-        parsed.append(ratio);
+    QString rejected;
+    // Same rule SplitNode's parser and writer enforce: a non-finite or
+    // non-positive ratio - or a set of them whose sum is not finite - yields
+    // broken geometry and would not survive a round-trip.
+    const std::optional<QVector<double>> parsed = parseRatios(ratios, rejected);
+    if (!parsed) {
+        if (!replay)
+            emit error(QStringLiteral("SessionLayouts: invalid %1 ratio \"%2\"")
+                           .arg(region, rejected));
+        return;
     }
 
-    node->ratios = std::move(parsed);
+    node->ratios = std::move(*parsed);
     // Quiet: the drag already resized the panes; re-publishing the tree would
     // destroy and rebuild them.
     publishTreeQuietly(index);
@@ -1007,6 +1093,9 @@ void SessionLayouts::mintTerminalPaneRow(quint64 generation, const QString& pane
     // than a QTimer this object owns so a mint for a Dev Session that is long
     // gone cannot be resurrected by a stray stop().
     auto settled = std::make_shared<bool>(false);
+    // This label has a row coming from now until the answer or the deadline
+    // below settles it, whichever gets there first.
+    m_pendingTerminalMints.insert(paneId);
     m_db->createTerminalPane(
         params, [self, generation, paneId, devSessionId, settled](
                     std::optional<TerminalPane> pane, std::optional<RpcError> err) {
@@ -1019,6 +1108,11 @@ void SessionLayouts::mintTerminalPaneRow(quint64 generation, const QString& pane
             // than being deleted from under a shell that may already be running.
             if (self->m_generation != generation || self->m_devSessionId != devSessionId)
                 return;
+
+            // Settled: this label has no mint in flight any more. Only reached
+            // for the CURRENT stamp, and an answer carrying an older one finds
+            // a set load() has already emptied.
+            self->m_pendingTerminalMints.remove(paneId);
 
             SplitNode* leaf = self->findTerminalLeaf(paneId);
             // Closing a pane while its row is being minted cancels the UI
@@ -1036,8 +1130,8 @@ void SessionLayouts::mintTerminalPaneRow(quint64 generation, const QString& pane
                         : QStringLiteral("the server created this terminal without an id"));
                 return;
             }
-            // The pane was closed while its row was being minted. The row and
-            // its tmux session stay: closing a pane never destroys either.
+            // Already bound, which is what makes a mint's answer idempotent:
+            // nothing to write and nothing to publish.
             if (!leaf->terminalPaneId.isEmpty())
                 return; // already bound; nothing to publish
             leaf->terminalPaneId = pane->id.value;
@@ -1068,6 +1162,15 @@ void SessionLayouts::mintTerminalPaneRow(quint64 generation, const QString& pane
                            if (self->m_generation != generation
                                || self->m_devSessionId != devSessionId)
                                return;
+                           self->m_pendingTerminalMints.remove(paneId);
+                           // The pane was closed while its row was still being
+                           // minted. That close is the authoritative
+                           // correction: there is no leaf left to take back
+                           // out, and a deadline for a pane the user has
+                           // already closed is not news. Same verdict the
+                           // FAILED answer above reaches for the same case.
+                           if (!self->findTerminalLeaf(paneId))
+                               return;
                            self->abandonTerminalMint(
                                paneId,
                                QStringLiteral(
@@ -1077,6 +1180,31 @@ void SessionLayouts::mintTerminalPaneRow(quint64 generation, const QString& pane
                                    .arg(paneId)
                                    .arg(self->m_mintTimeoutMs / 1000));
                        });
+}
+
+void SessionLayouts::adoptAuthoredTerminalTree(quint64 generation)
+{
+    QStringList labels;
+    collectLeafPaneIds(m_regions[kTerminal].tree, labels);
+    QSet<QString> present;
+    for (const QString& label : labels)
+        present.insert(label);
+    // A slot the authored tree dropped takes its one legal resolve-by-label
+    // use with it, exactly as closing that leaf would have done.
+    m_legacyTerminalSlots.intersect(present);
+    for (const QString& label : labels) {
+        const SplitNode* leaf = findTerminalLeaf(label);
+        if (!leaf || !leaf->terminalPaneId.isEmpty())
+            continue;
+        // A pre-migration leaf resolves by its label and needs no row minted;
+        // a leaf whose mint is already on the wire must not get a second one,
+        // because only one of the two rows would ever be bound and the other
+        // would be left running on the server with nothing pointing at it.
+        if (m_legacyTerminalSlots.contains(label)
+            || m_pendingTerminalMints.contains(label))
+            continue;
+        mintTerminalPaneRow(generation, label);
+    }
 }
 
 SplitNode* SessionLayouts::findTerminalLeaf(const QString& paneId)
@@ -1176,13 +1304,6 @@ void SessionLayouts::closePaneStamped(const QString& devSessionId,
         queueWrite(index, std::move(write));
         return;
     }
-    RegionState& state = m_regions[index];
-    if (!state.valid) {
-        if (!replay)
-            emit error(QStringLiteral(
-                "SessionLayouts: %1 layout not loaded; close ignored").arg(region));
-        return;
-    }
 
     // Deliberately layout-only. The pane's `terminal_panes` row and its remote
     // tmux session are LEFT ALONE: a closed pane's shell keeps running so the
@@ -1236,13 +1357,6 @@ void SessionLayouts::setPaneUrlStamped(const QString& devSessionId,
         return;
     }
     RegionState& state = m_regions[index];
-    if (!state.valid) {
-        if (!replay)
-            emit error(QStringLiteral(
-                "SessionLayouts: %1 layout not loaded; pane url ignored").arg(region));
-        return;
-    }
-
     SplitNode* leaf = nullptr;
     SplitNode* parent = nullptr;
     int childIndex = -1;
@@ -1305,14 +1419,6 @@ QString SessionLayouts::setPaneTitleStamped(const QString& devSessionId,
     }
 
     RegionState& state = m_regions[index];
-    if (!state.valid) {
-        if (!replay)
-            emit error(QStringLiteral(
-                "SessionLayouts: %1 layout not loaded; pane title ignored")
-                           .arg(region));
-        return {};
-    }
-
     SplitNode* leaf = nullptr;
     SplitNode* parent = nullptr;
     int childIndex = -1;

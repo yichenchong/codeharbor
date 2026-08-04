@@ -58,6 +58,12 @@ home=$(printf '%s\n' "$reported" | awk 'index($0, "HOME=") == 1 { print substr($
 if [ -z "$db" ]; then
     fail "the fixture session returned an empty CODEHARBOR_DB"
 fi
+case "$db" in
+    /*) ;;
+    *)
+        fail "the fixture session returned a relative CODEHARBOR_DB path ($db); a relative path can resolve to the real workspace database"
+        ;;
+esac
 
 # Reject the exact default and the equivalent path under any remote HOME. The
 # latter catches a remote shell that reports a different HOME than this client.

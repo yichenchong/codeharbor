@@ -202,6 +202,12 @@ set_tests_properties(tst_liveshell PROPERTIES
     ENVIRONMENT "QT_QPA_PLATFORM=offscreen;QT_QUICK_BACKEND=software;QTWEBENGINE_CHROMIUM_FLAGS=--disable-gpu --no-sandbox --disable-dev-shm-usage"
     TIMEOUT 300
 )
+# Every other `live` target requires the fixture-isolation setup test, and this
+# one drives codeharbord over the fixture too: without the dependency ctest may
+# start it before (or entirely without) the check that the fixture session does
+# not point CODEHARBOR_DB at the developer's real workspace database.
+set_tests_properties(tst_liveshell PROPERTIES
+    FIXTURES_REQUIRED codeharbor_live_fixture)
 
 # THE COLD-START ACCEPTANCE GATE (tst_coldstart.cpp): a fresh config dir, the
 # real qrc Main.qml on top of main.cpp's exact object graph, and the whole

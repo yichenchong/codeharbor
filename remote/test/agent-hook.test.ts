@@ -659,3 +659,96 @@ test("startBridge drops a producer that never sends a newline", async () => {
         fs.rmSync(dir, { recursive: true, force: true });
     }
 });
+
+// RA4. The event name is trimmed before use, and so must the other environment
+// inputs be: hook configurations are shell, and `OMP_TOOL="$(current_tool)"`
+// or a config file saved with CRLF line endings leaves a trailing newline on
+// the value. A tool of "ask\n" is not the tool named "ask" as far as the
+// adapter's exact match is concerned, so the one state that means "the user
+// must answer something" would never be reported.
+test("readHookInput trims the environment values it forwards (RA4)", () => {
+    const input = readHookInput(["node", "hook.ts", " tool_call\n"], {
+        OMP_DEV_SESSION_ID: "sess-t",
+        OMP_TERMINAL_ID: "term-t",
+        OMP_TOOL: "ask\r\n",
+        OMP_ERROR: " true\n",
+        OMP_SUMMARY: "  waiting on you  ",
+    } as NodeJS.ProcessEnv);
+    assert.equal(input.event, "tool_call");
+    assert.equal(input.tool, "ask");
+    assert.equal(input.error, true);
+    assert.equal(input.summary, "waiting on you");
+
+    // Whitespace-only is no value at all: the field must be absent rather than
+    // present and blank, so the wire message does not carry an empty tool name.
+    const blank = readHookInput(["node", "hook.ts", "agent_start"], {
+        OMP_DEV_SESSION_ID: "sess-t",
+        OMP_TERMINAL_ID: "term-t",
+        OMP_TOOL: "   ",
+        OMP_SUMMARY: "\n",
+    } as NodeJS.ProcessEnv);
+    assert.equal(blank.tool, undefined);
+    assert.equal(blank.summary, undefined);
+    assert.deepEqual(toBridgeMessage(blank).native, { type: "agent_start" });
+});
+
+// RA1. The hook blocks the agent for exactly as long as it runs (SPEC 6.4), and
+// the only bound on that is the inactivity watchdog — which is DISARMED the
+// moment the write succeeds. If the hook then merely half-closes its socket,
+// the connection (and this process, and the agent waiting on it) stays alive
+// until the PEER closes. A peer created with allowHalfOpen never does. The hook
+// must close its own socket outright: it never reads a reply, so there is
+// nothing to wait for.
+test("emitHookEvent closes its socket against a peer that never closes (RA1)", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ch-hook-halfopen-"));
+    const socketPath = path.join(dir, "events.sock");
+
+    const received = Promise.withResolvers<string>();
+    let serverSocket: net.Socket | undefined;
+    const server = net.createServer({ allowHalfOpen: true }, (socket) => {
+        serverSocket = socket;
+        const chunks: Buffer[] = [];
+        socket.on("data", (chunk) => chunks.push(chunk));
+        socket.on("end", () => received.resolve(Buffer.concat(chunks).toString("utf8")));
+    });
+    const listening = Promise.withResolvers<void>();
+    server.listen(socketPath, () => listening.resolve());
+    await listening.promise;
+
+    try {
+        await emitHookEvent(
+            { event: "agent_start", devSessionId: "sess-h", terminalId: "term-h" },
+            socketPath,
+        );
+        // The line still arrived in full despite the immediate close: a Unix
+        // stream socket delivers buffered bytes to the peer after the sender
+        // has gone.
+        const raw = await received.promise;
+        assert.deepEqual(JSON.parse(raw.trim()).native, { type: "agent_start" });
+    } finally {
+        // The server intentionally keeps its writable half open to model a
+        // peer that never closes. Destroy that test-side half after the
+        // client's behavior has been observed, otherwise server.close() quite
+        // correctly waits forever for this deliberately retained socket.
+        serverSocket?.destroy();
+        const closed = Promise.withResolvers<void>();
+        server.close(() => closed.resolve());
+        await closed.promise;
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+// RA2. emitHookEvent documents that it REPORTS failures by rejecting. An
+// argument net.createConnection refuses outright (an empty path) is validated
+// synchronously, so without a guard the throw escapes past the returned
+// promise: a caller that wrote `emitHookEvent(...).catch(...)` would never see
+// it, and the exception would land in the agent's hook invocation instead.
+test("emitHookEvent rejects instead of throwing on an unusable socket path (RA2)", async () => {
+    // A synchronous throw fails the test right here, on this line, before the
+    // rejection assertion is ever reached.
+    const pending = emitHookEvent(
+        { event: "agent_start", devSessionId: "s", terminalId: "t" },
+        "",
+    );
+    await assert.rejects(pending);
+});

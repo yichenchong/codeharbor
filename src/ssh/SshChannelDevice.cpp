@@ -449,7 +449,18 @@ void SshChannelDevice::pump()
                 break;
             }
             if (n == SSH_EOF) {
-                eof = true;
+                // NOT the end of the device: libssh answers SSH_EOF for THIS
+                // stream as soon as the peer sent EOF and this stream's own
+                // buffer is empty, regardless of what the OTHER stream still
+                // holds. stderr therefore reports SSH_EOF while megabytes of
+                // stdout are still queued inside libssh, and latching the end
+                // here threw those bytes away: the read pump stopped and
+                // readChannelFinished() fired on a truncated stream. The same
+                // happened whenever a pass stopped on one of the two byte caps
+                // below. ssh_channel_is_eof() is the question that has the
+                // right answer — it reports 0 while EITHER buffer still has
+                // data — so stop draining this stream and let the check after
+                // the loops decide.
                 break;
             }
             if (n <= 0)
@@ -462,7 +473,10 @@ void SshChannelDevice::pump()
         }
     }
 
-    if (!eof && failure.isEmpty() && ssh_channel_is_eof(channel) != 0)
+    // Authoritative end-of-stream: false while libssh still holds undelivered
+    // stdout or stderr, so a pass that stopped early re-arms and comes back for
+    // the rest instead of finishing on a partial stream.
+    if (failure.isEmpty() && ssh_channel_is_eof(channel) != 0)
         eof = true;
 
     const bool gotPayload =

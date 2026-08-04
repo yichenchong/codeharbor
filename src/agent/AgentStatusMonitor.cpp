@@ -437,6 +437,16 @@ void AgentStatusMonitor::onAgeTick()
             TerminalStatus& st = tit.value();
             std::optional<AgentState> next;
             if (st.generic && st.attached) {
+                // A completion remains an explicit user-facing state until
+                // the user has seen it. The generic activity clock must not
+                // resurrect that pane as Starting/Running merely because
+                // another pane caused this shared timer to tick. Explicit
+                // observations (a fresh attach or output) may still replace
+                // IdleUnseen; time alone never may.
+                if (st.state == AgentState::IdleUnseen
+                    && m_unseen.contains(sit.key())) {
+                    continue;
+                }
                 // SPEC 6.6, mirroring the three arms the fallback detector
                 // defines: no output yet, output within the quiet window, or
                 // quiet for longer than it.

@@ -46,7 +46,7 @@ import {
     RPC_WATCH_EVENT_NOTIFICATION,
     RPC_WATCH_EVENTS_LOST_NOTIFICATION,
 } from "./rpc-types.ts";
-import type { WatchEvent } from "./rpc-types.ts";
+import type { PingResult, ServerInfoResult, WatchEvent } from "./rpc-types.ts";
 export { RPC_METHODS } from "./rpc-types.ts";
 // JSON-RPC 2.0 reserved error codes are DEFINED in rpc-types.ts (see the note
 // there on the import cycle) and re-exported here, which is where every
@@ -124,7 +124,7 @@ const methods: Record<string, MethodHandler> = {
     // consecutive probes go unanswered, so this must never touch the filesystem
     // or the database — an answer is meant to prove only that this process is
     // still reading its input and writing its output.
-    [RPC_PING_METHOD]: () => ({ pong: true }),
+    [RPC_PING_METHOD]: (): PingResult => ({ pong: true }),
     // `name`, `version` and `schemaVersion` are frozen; `serverId` (SPEC 3.5)
     // is the stable identity of the workspace database on THIS host, minted on
     // first read and unchanged thereafter. Clients key their view of the remote
@@ -139,7 +139,7 @@ const methods: Record<string, MethodHandler> = {
     // 0o700 on the first snapshot. Additive and OPTIONAL: it does not raise the
     // schemaVersion floor, so an older server simply omits it and the client
     // degrades to no-recovery rather than failing the compatibility gate.
-    [RPC_SERVER_INFO_METHOD]: () => ({
+    [RPC_SERVER_INFO_METHOD]: (): ServerInfoResult => ({
         name: RPC_SERVER_NAME,
         version: RPC_SERVER_VERSION,
         schemaVersion: RPC_SCHEMA_VERSION,
@@ -185,7 +185,18 @@ export async function dispatch(value: unknown): Promise<RpcResponse | null> {
             error: { code: RPC_INVALID_REQUEST, message: "Invalid Request" },
         };
     }
-    const handler = methods[value.method];
+    // Object.hasOwn, not a bare index: `methods` is an object LITERAL, so it
+    // inherits Object.prototype and a request naming an inherited member finds
+    // a "handler" that was never registered. `method: "constructor"` is the
+    // worst of them — Object(params) returns the params, so the request is
+    // answered with a bogus SUCCESS echoing its own arguments instead of
+    // "Method not found"; `method: "toString"` answers "[object Undefined]".
+    // The rest ("valueOf", "hasOwnProperty", ...) throw a TypeError from the
+    // call below and are reported as -32603, blaming the server for a method
+    // the client made up. All of them must be -32601.
+    const handler = Object.hasOwn(methods, value.method)
+        ? methods[value.method]
+        : undefined;
     // JSON-RPC 2.0: `params`, when present, MUST be a structured value — an
     // object or an array. Every handler immediately treats it as a record, so a
     // primitive (or null) is rejected here as Invalid params instead of
@@ -486,9 +497,25 @@ export function createWatchNotificationRelay(
             params: event,
         })}\n`;
     const writeLine = (line: string): void => {
+        // The write is GUARDED, exactly like runStdio's writeOut: a stream whose
+        // far end has gone (a destroyed or already-ended stdout) can raise
+        // synchronously, and this function is reached from the filesystem watch
+        // callback in files.ts. An escaping exception there is not caught by
+        // anything — it is an uncaught exception that kills the whole daemon,
+        // taking every terminal and editor of the session with it, over a
+        // notification that was already undeliverable. Treat a throwing output
+        // as stalled so subsequent notifications queue (and are reported lost
+        // past the bound) instead of throwing again per event; stdout's 'error'
+        // event is what drives the actual transport teardown.
+        let accepted: boolean;
+        try {
+            accepted = out.write(line);
+        } catch {
+            accepted = false;
+        }
         // A false return means Node is now buffering internally; everything
         // after it must queue instead of adding to that buffer.
-        if (!out.write(line)) {
+        if (!accepted) {
             stalled = true;
             onStall();
         }
@@ -662,7 +689,12 @@ export function runStdio(): StdioHandle {
         if (!process.stdin.destroyed) process.stdin.destroy();
     };
     const flushResponses = (): void => {
-        if (outputFailed) return;
+        // outputStalled is cleared by the watch relay's own 'drain' listener,
+        // which runs FIRST (it was registered first) and may re-stall the stream
+        // flushing its queued notifications. Without this guard the flush below
+        // would write into a stream that is buffering internally again, past
+        // the bound this queue exists to enforce. The next 'drain' gets it.
+        if (outputFailed || outputStalled) return;
         while (pendingResponseIndex < pendingResponses.length) {
             const line = pendingResponses[pendingResponseIndex++];
             pendingResponseBytes -= Buffer.byteLength(line);
@@ -681,6 +713,15 @@ export function runStdio(): StdioHandle {
             pendingResponses.length = 0;
             pendingResponseIndex = 0;
             pendingResponseBytes = 0;
+        } else {
+            // Drop the already-written prefix. The index alone keeps the queue
+            // O(1) to advance, but the array goes on REFERENCING every response
+            // it has handed to stdout, so a stream that stalls, drains a little
+            // and stalls again holds megabytes of delivered lines that no longer
+            // count against pendingResponseBytes — the bound stops describing
+            // the memory actually held.
+            pendingResponses.splice(0, pendingResponseIndex);
+            pendingResponseIndex = 0;
         }
     };
     process.stdout.on("drain", flushResponses);
@@ -829,10 +870,21 @@ export function runStdio(): StdioHandle {
 }
 
 if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {
-    const mode = process.argv[2];
-    if (mode === "rpc") {
+    const [mode, ...flags] = process.argv.slice(2);
+    // The documented invocation is `codeharbord rpc --stdio` (SPEC 10.1), and
+    // stdio is the only transport there has ever been, so the flag stays
+    // OPTIONAL for compatibility with any launcher that omits it. What is not
+    // acceptable is accepting an argument that asks for something else:
+    // `codeharbord rpc --http` used to start the stdio server anyway and then
+    // sit there reading a stdin nobody was writing to, which looks exactly like
+    // a hung daemon. Anything that is not the stdio flag is a usage error.
+    const unknown = flags.find((flag) => flag !== "--stdio");
+    if (mode === "rpc" && unknown === undefined) {
         runStdio();
     } else {
+        if (mode === "rpc") {
+            process.stderr.write(`codeharbord: unknown option '${unknown}'\n`);
+        }
         process.stderr.write("usage: codeharbord rpc --stdio\n");
         process.exit(2);
     }

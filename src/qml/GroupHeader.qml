@@ -174,6 +174,7 @@ ItemDelegate {
         focusPolicy: Qt.StrongFocus
         anchors.right: deleteGroupButton.left
         anchors.rightMargin: 4
+        anchors.verticalCenter: parent.verticalCenter
 
         // The label is a bare "+", so this sentence is the button's only real
         // name — and it has to name the GROUP, because there is one of these per

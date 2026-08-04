@@ -37,6 +37,14 @@ struct GroupRow {
 
 class SessionsModel : public QAbstractItemModel {
     Q_OBJECT
+    // Both sidebar filters are set from QML (SessionsSidebar.qml assigns
+    // `app.sessionsModel.pinnedOnly` / `.showArchived`), so BOTH must be
+    // Q_PROPERTYs. A plain C++ setter is not reachable from a QML property
+    // assignment: the write does not land, and depending on the object's QML
+    // context it either throws and aborts the rest of the handler or is
+    // silently dropped. pinnedOnly used to have only the setter, which left
+    // the pin filter dead in the shipping sidebar.
+    Q_PROPERTY(bool pinnedOnly READ pinnedOnly WRITE setPinnedOnly NOTIFY pinnedOnlyChanged)
     Q_PROPERTY(bool showArchived READ showArchived WRITE setShowArchived NOTIFY showArchivedChanged)
     Q_PROPERTY(bool hasSessions READ hasSessions NOTIFY sessionPresenceChanged)
     Q_PROPERTY(bool hasUnarchivedSessions READ hasUnarchivedSessions NOTIFY sessionPresenceChanged)
@@ -89,7 +97,10 @@ public:
 
     // Highest-priority sidebar state for a set of terminals (SPEC 4.2 precedence:
     // Error > WaitingForInput > Running > FinishedUnseen > Idle > Disconnected).
-    // An empty set (session with no terminals) yields Disconnected.
+    // An empty set (a session with no terminals) yields Idle, NOT Disconnected:
+    // ch::aggregateRowState reserves Disconnected for a pane that was live and
+    // then reported the connection lost, and a session with nothing open has no
+    // such loss to report (see SessionState.h).
     static SessionRowState aggregateSessionState(const QVector<TerminalStatus> &terminals);
 
     QModelIndex index(int row, int column,

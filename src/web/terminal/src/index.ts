@@ -200,12 +200,20 @@ export function mountTerminal(element: HTMLElement, bridge: TerminalBridge): Ter
         const textarea = surface.querySelector(".xterm-helper-textarea");
         let copied = false;
         if (textarea instanceof HTMLTextAreaElement) {
+            const previousValue = textarea.value;
+            const previousStart = textarea.selectionStart;
+            const previousEnd = textarea.selectionEnd;
             textarea.value = text;
             textarea.select();
             try {
                 copied = element.ownerDocument.execCommand("copy");
             } catch {
                 copied = false;
+            } finally {
+                textarea.value = previousValue;
+                if (previousStart !== null && previousEnd !== null) {
+                    textarea.setSelectionRange(previousStart, previousEnd);
+                }
             }
         }
         if (!copied && pageWindow.navigator.clipboard) {
@@ -219,7 +227,7 @@ export function mountTerminal(element: HTMLElement, bridge: TerminalBridge): Ter
         if (event.type !== "keydown") {
             return true;
         }
-        const key = event.key.toLowerCase();
+        const key = event.key?.toLowerCase() ?? "";
         const copyShortcut = isMac
             ? event.metaKey && !event.ctrlKey && !event.altKey && key === "c"
             : event.ctrlKey && event.shiftKey && !event.altKey && key === "c";
@@ -454,17 +462,14 @@ export function mountTerminal(element: HTMLElement, bridge: TerminalBridge): Ter
             resizeObserver.disconnect();
             visibilityObserver.disconnect();
             element.ownerDocument.removeEventListener("visibilitychange", reportVisibility);
+            surface.removeEventListener("contextmenu", suppressContextMenu);
             // The renderer is going away (pane closed, or the page is about to
             // be replaced by a reload). The controller must hear about it
-            // BEFORE the teardown: otherwise it still believes a renderer is
-            // listening and keeps emitting write() at a page that no longer
-            // has a handler attached, and that output is LOST instead of being
-            // retained and replayed to the next page (SPEC 5.4). Sent
-            // unconditionally for the reason given above: what this page last
-            // reported is not proof of what the controller currently holds.
+            // BEFORE the teardown so output is retained for the next renderer.
             bridge.notifyViewVisible(false);
-            // Disposing the terminal also disposes loaded addons (FitAddon).
             term.dispose();
+            status.remove();
+            surface.remove();
         },
     };
 }

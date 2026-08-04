@@ -224,6 +224,7 @@ private slots:
     void reEnablingTheRunningHeartbeatIsANoOp();
     void repeatedlyReEnablingCannotSuppressSilenceDetection();
     void reArmingAgainstASilentPeerCannotPileUpProbes();
+    void outgoingOversizedFrameIsRejectedWithoutClosingTransport();
     void decodeFileContentValidatesEncoding();
 
 private:
@@ -2661,6 +2662,55 @@ void TstRpcClient::reArmingAgainstASilentPeerCannotPileUpProbes()
 
     m_client->setTransport(nullptr);
 }
+void TstRpcClient::outgoingOversizedFrameIsRejectedWithoutClosingTransport()
+{
+    ScriptedDevice device;
+    m_client->setTransport(&device);
+    QSignalSpy warningSpy(m_client, &CodeharbordClient::protocolWarning);
+    QSignalSpy closedSpy(m_client, &CodeharbordClient::transportClosed);
+
+    // JSON escapes each U+0001 as six ASCII bytes. The resulting request is
+    // over the shared 16 MiB frame cap even though the input is valid UTF-8.
+    const QString controlText(3 * 1024 * 1024, QChar(0x0001));
+    bool called = false;
+    std::optional<RpcError> observedError;
+    m_client->call(QStringLiteral("file.writeFile"),
+                   QJsonObject{{"path", "/large"},
+                               {"content", controlText},
+                               {"expectedRevision", "r"}},
+                   [&](QJsonValue, std::optional<RpcError> error) {
+                       called = true;
+                       observedError = std::move(error);
+                   });
+
+    QVERIFY(called);
+    QVERIFY(observedError.has_value());
+    QCOMPARE(observedError->code, -32603);
+    QCOMPARE(m_client->pendingCount(), 0);
+    QVERIFY(!device.takeWritten().contains('\n'));
+    QCOMPARE(warningSpy.count(), 1);
+    QCOMPARE(closedSpy.count(), 0);
+
+    // The transport remains usable after rejecting the oversized request.
+    bool smallCalled = false;
+    const qint64 id = m_client->call(
+        QStringLiteral("ping"), QJsonObject{},
+        [&](QJsonValue, std::optional<RpcError> error) {
+            smallCalled = true;
+            QVERIFY(!error.has_value());
+        });
+    QVERIFY(id > 0);
+    QCOMPARE(m_client->pendingCount(), 1);
+    const QJsonObject request =
+        QJsonDocument::fromJson(device.takeWritten()).object();
+    QCOMPARE(request.value(QStringLiteral("method")).toString(),
+             QStringLiteral("ping"));
+    device.deliver(jsonLine({{"jsonrpc", "2.0"},
+                              {"id", id},
+                              {"result", QJsonObject{}}}));
+    QVERIFY(smallCalled);
+}
+
 void TstRpcClient::decodeFileContentValidatesEncoding()
 {
     const auto utf8 =

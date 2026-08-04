@@ -12,6 +12,7 @@ const languages: readonly LanguageInfo[] = [
     { id: "javascript", extensions: [".js", ".JS"] },
     { id: "shell", filenames: [".bashrc"] },
     { id: "dockerfile", extensions: [".dockerfile"], filenames: ["Dockerfile"] },
+    { id: "gzip", extensions: [".gz"] },
     { id: "no-patterns" },
 ];
 
@@ -84,4 +85,26 @@ test("a dotfile with a suffix still resolves on the suffix", () => {
 
 test("a name that is nothing but a dot has no extension", () => {
     assert.equal(selectLanguage("/home/u/.", languages), "plaintext");
+});
+test("only the LAST extension of a multi-dot name is used", () => {
+    assert.equal(selectLanguage("/srv/archive.tar.gz", languages), "gzip");
+    assert.equal(selectLanguage("/srv/app.min.js", languages), "javascript");
+});
+
+test("a directory named like a registered filename does not decide the language", () => {
+    assert.equal(selectLanguage("/srv/Dockerfile/notes.txt", languages), "plaintext-lang");
+    assert.equal(selectLanguage("/srv/CMakeLists.txt/README", languages), "plaintext");
+});
+
+test("an UPPERCASE extension matches a lowercase registration", () => {
+    assert.equal(selectLanguage("/srv/READ.TXT", languages), "plaintext-lang");
+});
+
+test("the filename pass and extension pass both handle their registrations", () => {
+    assert.equal(selectLanguage("/srv/Dockerfile", languages), "dockerfile");
+    assert.equal(selectLanguage("/srv/web.dockerfile", languages), "dockerfile");
+});
+
+test("an empty registration list still yields a rendered editor", () => {
+    assert.equal(selectLanguage("/srv/app.js", []), "plaintext");
 });

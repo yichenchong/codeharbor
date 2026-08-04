@@ -25,6 +25,7 @@ namespace ch {
 //   sidebar/showArchived
 //   selectedPane/<devSessionId>
 //   paneSuffix/<devSessionId>/<region>
+//   session/<serverId>/active
 class UiStateStore : public QObject {
     Q_OBJECT
 
@@ -56,8 +57,9 @@ public:
     // setActiveSession() handles an empty serverId: reads return empty and
     // writes are dropped, so no value is ever parked under a bare
     // "selectedPane/" key that the next empty-id read would pick up.
-    Q_INVOKABLE void setSelectedPane(QString devSessionId, QString paneId);
-    Q_INVOKABLE QString selectedPane(QString devSessionId) const;
+    Q_INVOKABLE void setSelectedPane(const QString& devSessionId,
+                                     const QString& paneId);
+    Q_INVOKABLE QString selectedPane(const QString& devSessionId) const;
 
     // The next "<region>-<n>" suffix to mint for one (Dev Session, region)
     // pair. Persisted so a pane id is not handed out twice within a Dev
@@ -99,9 +101,10 @@ public:
     // valid address. Reads answer the default and writes are dropped, so
     // nothing is ever parked under a bare "paneSuffix//<region>" key or a
     // nested region path.
-    Q_INVOKABLE void setNextPaneSuffix(QString devSessionId, QString region,
-                                       int suffix);
-    Q_INVOKABLE int nextPaneSuffix(QString devSessionId, QString region) const;
+    Q_INVOKABLE void setNextPaneSuffix(const QString& devSessionId,
+                                       const QString& region, int suffix);
+    Q_INVOKABLE int nextPaneSuffix(const QString& devSessionId,
+                                   const QString& region) const;
 
     // The sessions-sidebar pin filter is presentation state, not a workspace
     // mutation: a second client may see the same pinned sessions but chooses
@@ -134,8 +137,9 @@ public:
     // An empty serverId is not a server: reads return empty and writes are
     // dropped, so nothing is ever stored under a placeholder key during the
     // window before server.info has answered.
-    Q_INVOKABLE void setActiveSession(QString serverId, QString devSessionId);
-    Q_INVOKABLE QString activeSession(QString serverId) const;
+    Q_INVOKABLE void setActiveSession(const QString& serverId,
+                                      const QString& devSessionId);
+    Q_INVOKABLE QString activeSession(const QString& serverId) const;
 
 private:
     std::unique_ptr<QSettings> m_settings;

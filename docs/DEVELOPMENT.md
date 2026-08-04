@@ -90,7 +90,7 @@ in the top-level `CMakeLists.txt`):
 |---|---|
 | Compiler + make | `build-essential` |
 | CMake + Ninja generator | `cmake`, `ninja-build` |
-| `pkg_check_modules(libssh)` (`ch_ssh`) | `pkg-config`, `libssh-dev` |
+| `pkg_check_modules(libssh)` (`ch_libssh`) | `pkg-config`, `libssh-dev` |
 | Qt6 Core / Gui / Network | `qt6-base-dev` |
 | Qt6 Qml / Quick / **QuickControls2** | `qt6-declarative-dev` |
 | Qt6 **WebEngineQuick** | `qt6-webengine-dev` |
@@ -220,9 +220,9 @@ deliberately share one binary directory; switching between them reconfigures it.
 Qt 6.9). The edge totals below were measured from clean scratch trees before the
 current test expansion, so they are not a current timing claim.
 
-`ctest --preset dev -N` is the authoritative way to count configured tests; it
-currently lists **45 CTest entries**, including the three script/fixture tests.
-Use the command rather than copying a pinned count when the suite changes.
+`ctest --preset dev -N` is the authoritative way to count configured tests.
+Use the command rather than copying a pinned count when the suite changes; it
+includes script and fixture tests as well as executable targets.
 
 **Install a compiler cache — it is the one large lever.** CMake looks for
 `ccache` and then `sccache` at configure time and wires whichever it finds into
@@ -230,7 +230,7 @@ Use the command rather than copying a pinned count when the suite changes.
 is nothing to pass and nothing to remember; the configure output says which way
 it went:
 
-```
+```text
 -- compiler cache: /usr/bin/ccache
 -- compiler cache: not found (looked for ccache, sccache); builds are uncached. …
 ```
@@ -238,26 +238,7 @@ it went:
 is the whole procedure. An explicit `-DCMAKE_CXX_COMPILER_LAUNCHER=…` still wins,
 so this never fights a deliberate choice.
 
-By hand the same builds are `npm run build:sourcemap --workspace src/web/editor`
-(equivalently `node build.mjs --sourcemap`, or `CODEHARBOR_WEB_SOURCEMAP=1
-node build.mjs`) and plain `npm run build` for the mapless variant. Either script
-writes into a fresh `src/web/<name>/dist.tmp/` and swaps it into place only after
-every step has succeeded: a build that fails midway leaves the previous `dist/`
-exactly as it was rather than leaving CMake with no bundle to embed, and a build
-that succeeds leaves no renamed or deleted output behind. Both builds are
-reproducible — rebuilding an unchanged tree, with or without maps, produces
-byte-identical files.
 
-Presets are defined in [`CMakePresets.json`](../CMakePresets.json): `dev`
-(Debug + tests, `build/dev/`), `release` (Release, tests off, `build/release/`)
-and `release-tests` (Release **with** tests, also `build/release/` — it is what
-CI and the release workflow configure, build, and `ctest` against, so the tree
-that is packaged is the tree that was tested). `release` and `release-tests`
-deliberately share one binary directory; switching between them reconfigures it.
-
-> Running the GUI needs a display. On a headless box use an X/Wayland session or
-> `xvfb-run ./build/dev/src/app/codeharbor`. WebEngine may need
-> `--no-sandbox` in constrained containers.
 
 **Where the time actually went in that snapshot.** Summing every compile/link edge
 of a clean `dev` build (1985 seconds of work, which `-j2` turned into ~13½ minutes
@@ -433,7 +414,8 @@ Environment contract:
 | `CH_LIVE_REPO` | Absolute path to this repo on the remote side |
 | `CH_LIVE_IDENTITY` | Optional private key used by `tst_livessh` to encrypt a temporary copy and prove the passphrase callback; never committed |
 | `CH_LIVE_KNOWN_HOSTS` | Optional scratch known-hosts file; when unset, each gate uses a temporary path |
-| `SSH_AUTH_SOCK` | Agent socket holding the key — the pool authenticates via ssh-agent first |
+| `CH_LIVE_PASSWORD` | Optional password for the multi-step SSH authentication live gate |
+| `CH_LIVE_KBDINT_PASSWORD` | Optional password for the keyboard-interactive SSH live gate |
 
 Standing up a throwaway `sshd` fixture (no root, no changes to your `~/.ssh`):
 

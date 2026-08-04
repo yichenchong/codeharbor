@@ -252,7 +252,10 @@ test("killing an absent session is a successful no-op", async () => {
 });
 test("killSession rejects tmux target separators instead of killing another session", async () => {
     const tmux = stubRunner(OK(""));
-    for (const name of ["other:0", "other.0", "   "]) {
+    // A raw control character is refused for the same reason: tmux vis-escapes
+    // it in its own output, so the stored name never matches the session tmux
+    // actually made, and an unanchored match can land on a different one.
+    for (const name of ["other:0", "other.0", "   ", "bell\u0007", "\u007f", "nl\nx"]) {
         await assert.rejects(
             () => killSession({ name }, tmux.run),
             /tmux-safe session name|non-empty string name/,
@@ -348,6 +351,8 @@ test("a partly-numeric field is skipped, not read as its numeric prefix", () => 
         "3.7\t1753372800\t1\tsneaky", // a fraction truncated to 3
         "0x10\t1753372800\t1\tsneaky", // parseInt(_, 10) reads this as 0
         "\t1753372800\t1\tsneaky", // an empty numeric field
+        "-1\t1753372800\t1\tsneaky", // a negative window count parseInt accepts
+        "3\t-1753372800\t1\tsneaky", // a negative timestamp parseInt accepts
     ]) {
         assert.deepEqual(parseSessions(line), [], line);
     }
@@ -402,6 +407,7 @@ test("isSafeTmuxTarget refuses anything tmux reads as structure", () => {
     // A bound, so a target cannot be stored here and truncated into a different
     // session's name somewhere downstream.
     assert.equal(isSafeTmuxTarget("x".repeat(TMUX_TARGET_MAX_LENGTH + 1)), false);
+    assert.equal(isSafeTmuxTarget("-d"), false);
 });
 
 // This mirrors tmux's session_check_name(), verified against tmux 3.6:

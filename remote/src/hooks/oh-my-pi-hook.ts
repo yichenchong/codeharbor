@@ -127,9 +127,19 @@ export function readHookInput(
         devSessionId: env.OMP_DEV_SESSION_ID ?? "",
         terminalId: env.OMP_TERMINAL_ID ?? "",
     };
-    if (env.OMP_TOOL) input.tool = env.OMP_TOOL;
-    if (env.OMP_ERROR === "1" || env.OMP_ERROR === "true") input.error = true;
-    if (env.OMP_SUMMARY) input.summary = env.OMP_SUMMARY;
+    // Trimmed for the same reason as the event name above: these come from a
+    // shell hook configuration, and a command substitution or a CRLF-authored
+    // config routinely leaves a trailing newline on the value. An OMP_TOOL of
+    // "ask\n" is not the tool named "ask" as far as the adapter's exact match
+    // is concerned, so the prompt the user must answer would be relayed as an
+    // ordinary running event and never raise waiting_input. A value that is
+    // only whitespace is no value at all and is dropped.
+    const tool = (env.OMP_TOOL ?? "").trim();
+    if (tool) input.tool = tool;
+    const errorFlag = (env.OMP_ERROR ?? "").trim();
+    if (errorFlag === "1" || errorFlag === "true") input.error = true;
+    const summary = (env.OMP_SUMMARY ?? "").trim();
+    if (summary) input.summary = summary;
     const metadata = parseHookMetadata(env.OMP_METADATA);
     if (metadata !== undefined) input.metadata = metadata;
     return input;
@@ -174,7 +184,18 @@ export function emitHookEvent(
 ): Promise<BridgeMessage> {
     const message = toBridgeMessage(input);
     const { promise, resolve, reject } = Promise.withResolvers<BridgeMessage>();
-    const socket = net.createConnection(socketPath);
+    let socket: net.Socket;
+    try {
+        // createConnection validates its argument synchronously (an empty or
+        // non-string path throws right here). This function promises to REPORT
+        // failures by rejecting; letting one escape synchronously would bypass
+        // a caller's .catch() and surface as an unhandled throw inside the
+        // agent's hook invocation (SPEC 6.4).
+        socket = net.createConnection(socketPath);
+    } catch (err) {
+        reject(err instanceof Error ? err : new Error(String(err)));
+        return promise;
+    }
     // A bridge that accepted the connection but stopped reading, or a socket
     // file whose listener is wedged, produces neither 'connect' nor 'error':
     // without this bound the hook — and the agent waiting on it — would hang.
@@ -186,12 +207,18 @@ export function emitHookEvent(
     socket.on("connect", () => {
         socket.end(`${JSON.stringify(message)}\n`, () => {
             // Disarm the watchdog: the write succeeded, and a promise that has
-            // resolved must never reject afterwards. Node closes the socket
-            // itself once the writable side finishes with the readable side
-            // never consumed, so the hook process is free to exit even against
-            // a peer that keeps its own half open.
+            // resolved must never reject afterwards.
             socket.setTimeout(0);
             resolve(message);
+            // Then close outright. The line is already handed to the kernel —
+            // a Unix stream socket delivers buffered bytes to the peer even
+            // after the sender closes — and we never read a reply, so nothing
+            // is lost. Merely half-closing leaves the socket (and therefore
+            // this process, and therefore the blocked agent) alive until the
+            // PEER decides to close: with the watchdog disarmed, a peer that
+            // keeps its half open holds the hook open forever, which is the
+            // exact outcome SPEC 6.4 forbids.
+            socket.destroy();
         });
     });
     return promise;
@@ -228,16 +255,15 @@ export function missingCoordinates(input: HookInput): string[] {
  * successful hook invocation into a non-zero process exit.
  */
 function writeStderr(message: string): void {
-    let onError: (() => void) | undefined;
+    const onError = (): void => {};
     try {
-        onError = (): void => {};
         process.stderr.once("error", onError);
         process.stderr.write(message, () => {
-            if (onError !== undefined) process.stderr.off("error", onError);
+            process.stderr.off("error", onError);
         });
     } catch {
         // Remove only this write's guard if write() failed synchronously.
-        if (onError !== undefined) process.stderr.off("error", onError);
+        process.stderr.off("error", onError);
         // The diagnostics channel is optional; never break the harness for it.
     }
 }

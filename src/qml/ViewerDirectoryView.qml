@@ -17,6 +17,7 @@ import "RemotePath.js" as RemotePath
 // activating a file opens the matching viewer, both in the same pane.
 Rectangle {
     id: root
+    color: Theme.surface
     property url url
 
     // The pane should open `path` (absolute, on the remote server; a directory
@@ -205,13 +206,7 @@ Rectangle {
                                        + "letters, digits, '+', '-' or '.'."));
             return false;
         }
-        if (!root.viewerModel
-                || typeof root.viewerModel.openWithApplication !== "function"
-                || !root.viewerModel.openWithApplication(scheme, root.pathFor(row))) {
-            root.messageRequested(qsTr("No desktop application accepted %1://.")
-                                  .arg(scheme));
-            return false;
-        }
+        root.openWithRequested(root.pathFor(row), scheme);
         root.customSchemeRow = null;
         return true;
     }
@@ -232,7 +227,10 @@ Rectangle {
         root.viewerModel.listDirectory(root.requestedPath);
     }
 
-    onUrlChanged: reload()
+    onUrlChanged: {
+        list.currentIndex = -1;
+        reload();
+    }
     Component.onCompleted: reload()
 
     // This reply belongs to the listing THIS view issued. Settling clears the
@@ -266,16 +264,23 @@ Rectangle {
         objectName: "directoryList"
         anchors.fill: parent
         clip: true
+        cacheBuffer: 320
+        focus: true
+        activeFocusOnTab: true
         model: root.rows
         visible: root.errorText.length === 0
         boundsBehavior: Flickable.StopAtBounds
-
-        ScrollBar.vertical: AppScrollBar {}
-
-        // The Basic style draws an ItemDelegate's label in the SYSTEM palette's
-        // text colour — near-black on this pane's own surface, i.e. an unreadable
-        // listing. Every other row in this application states its colours, and
-        // so does this one.
+        Keys.onPressed: function(event) {
+            if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
+                if (list.currentIndex >= 0 && list.currentIndex < root.rows.length)
+                    root.activate(root.rows[list.currentIndex]);
+                event.accepted = true;
+            } else if (event.key === Qt.Key_Backspace
+                       && root.parentPath.length > 0) {
+                root.activate({ kind: "parent", name: ".." });
+                event.accepted = true;
+            }
+        }
         delegate: ItemDelegate {
             id: entry
             required property var modelData
@@ -452,10 +457,7 @@ Rectangle {
             }
         }
 
-        onOpened: {
-            customSchemeField.text = "";
-            customSchemeField.forceActiveFocus();
-        }
+        onOpened: customSchemeField.forceActiveFocus()
         onAccepted: if (!root.submitCustomScheme()) customSchemeDialog.open()
         onRejected: root.customSchemeRow = null
     }

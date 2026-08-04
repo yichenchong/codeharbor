@@ -1,5 +1,5 @@
 import type { AgentState } from "../events.ts";
-import type { HarnessAdapter, NativeEvent } from "./types.ts";
+import { nativeString, type HarnessAdapter, type NativeEvent } from "./types.ts";
 
 // Claude Code exposes lifecycle hooks rather than a native event stream
 // (SPEC 6.3). Hook names map onto CodeHarbor states; the Notification hook that
@@ -11,10 +11,10 @@ import type { HarnessAdapter, NativeEvent } from "./types.ts";
 // "Agent finished" desktop notification for a turn that has not finished —
 // once per subagent, on a turn that may spawn a dozen. The main agent is
 // running at that moment, and that is what the state says.
-export const claudeCodeAdapter: HarnessAdapter = {
+export const claudeCodeAdapter = {
     harness: "claude-code",
     map(native: NativeEvent): AgentState | null {
-        const hook = typeof native.hook === "string" ? native.hook : "";
+        const hook = nativeString(native.hook);
         // PRECEDENCE — `SessionEnd` outranks the error flag; see the same rule
         // and the same reasoning in adapters/pi-family.ts. The session is over
         // and observed to be over, so "stopped" is the terminal's last word and
@@ -57,13 +57,14 @@ export const claudeCodeAdapter: HarnessAdapter = {
                 const rawNotificationType = native.notification_type;
                 if (rawNotificationType === undefined) return "waiting_input";
                 if (typeof rawNotificationType !== "string") return null;
-                if (rawNotificationType === "elicitation_complete"
-                    || rawNotificationType === "elicitation_response")
+                const notificationType = rawNotificationType.trim();
+                if (notificationType === "elicitation_complete"
+                    || notificationType === "elicitation_response")
                     return "running";
-                return rawNotificationType === "permission_prompt"
-                    || rawNotificationType === "idle_prompt"
-                    || rawNotificationType === "elicitation_dialog"
-                    || rawNotificationType === "agent_needs_input"
+                return notificationType === "permission_prompt"
+                    || notificationType === "idle_prompt"
+                    || notificationType === "elicitation_dialog"
+                    || notificationType === "agent_needs_input"
                     ? "waiting_input"
                     : null;
             }
@@ -74,6 +75,12 @@ export const claudeCodeAdapter: HarnessAdapter = {
         }
     },
     metadata(native: NativeEvent): Record<string, unknown> | undefined {
-        return typeof native.tool_name === "string" ? { tool: native.tool_name } : undefined;
+        const tool = nativeString(native.tool_name);
+        return tool === "" ? undefined : { tool };
     },
-};
+    // `satisfies`, not a type annotation: it checks the shape against
+    // HarnessAdapter while keeping `harness` a literal type, which is what lets
+    // adapters/index.ts require each registry key to equal the harness the
+    // adapter claims (a mis-registration is then a compile error, not a stream
+    // of events silently attributed to the wrong harness).
+} satisfies HarnessAdapter;

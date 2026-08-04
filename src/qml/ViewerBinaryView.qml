@@ -111,7 +111,7 @@ Rectangle {
             textFormat: Text.PlainText
             text: root.baseName(root.url)
             color: Theme.text
-            font.pixelSize: 15
+            font.pixelSize: Theme.fontSizeTitle
             font.bold: true
             elide: Text.ElideMiddle
             Layout.fillWidth: true
@@ -127,11 +127,8 @@ Rectangle {
             // Same rule: the remote path is data.
             textFormat: Text.PlainText
             text: root.url
-            // #585b70 is a step between Theme.textDim and Theme.textFaint and
-            // has no Theme role; kept so the path stays quieter than the caption
-            // above it.
             color: Theme.textPlaceholder()
-            font.pixelSize: 11
+            font.pixelSize: Theme.fontSizeSmall
             elide: Text.ElideMiddle
             Layout.fillWidth: true
             horizontalAlignment: Text.AlignHCenter

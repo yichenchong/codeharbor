@@ -191,6 +191,8 @@ void KnownHosts::add(const QString& host, const QString& keyType,
     // to record something that cannot be stored instead.
     if (host.isEmpty() || keyType.isEmpty() || keyBlob.isEmpty()
         || host.startsWith(QLatin1Char('|'))
+        || host.startsWith(QLatin1Char('@'))
+        || host.startsWith(QLatin1Char('#'))
         || hasHostPatternSyntax(host) || host.contains(QLatin1Char(','))
         || hasFieldWhitespace(host) || hasFieldWhitespace(keyType))
         return;

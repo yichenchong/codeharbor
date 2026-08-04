@@ -181,7 +181,11 @@ void SshLogRouter::release(Route* route)
         return;
     }
 
-    pruneInactiveThreadRoutes();
+    // A sink may release its route while dispatch() is walking this list.
+    // Removing an element here would invalidate that walk's iterator; leave
+    // inactive entries in place until the outermost dispatch has returned.
+    if (t_dispatchDepth == 0)
+        pruneInactiveThreadRoutes();
     if (!s_threadRoutes || !s_threadRoutes->isEmpty() || !t_ownsThreadState)
         return;
     restoreThreadLoggingState();
@@ -200,19 +204,30 @@ void SshLogRouter::dispatch(int priority, const char* function,
     Q_UNUSED(userdata);
     if (!s_threadRoutes)
         return;
-    pruneInactiveThreadRoutes();
-    if (s_threadRoutes->isEmpty()) {
-        delete s_threadRoutes;
-        s_threadRoutes = nullptr;
-        return;
+    // Housekeeping only when no OUTER dispatch frame is walking this list. A
+    // sink can re-enter libssh (its own diagnostics, a nested handshake), and
+    // both removeIf() and the delete below would then mutate or free the
+    // container the outer frame is iterating. Skipping it changes no routing
+    // decision: the walk below already ignores inactive entries.
+    if (t_dispatchDepth == 0) {
+        pruneInactiveThreadRoutes();
+        if (s_threadRoutes->isEmpty()) {
+            delete s_threadRoutes;
+            s_threadRoutes = nullptr;
+            return;
+        }
     }
     ++t_dispatchDepth;
     const auto finishDispatch = qScopeGuard([] {
         --t_dispatchDepth;
-        if (t_dispatchDepth == 0 && s_threadRoutes
-            && s_threadRoutes->isEmpty()) {
-            delete s_threadRoutes;
-            s_threadRoutes = nullptr;
+        if (t_dispatchDepth == 0 && s_threadRoutes) {
+            pruneInactiveThreadRoutes();
+            if (s_threadRoutes->isEmpty()) {
+                if (t_ownsThreadState)
+                    restoreThreadLoggingState();
+                delete s_threadRoutes;
+                s_threadRoutes = nullptr;
+            }
         }
     });
     // Innermost ACTIVE route wins. An entry can be inert when its Route was
@@ -430,7 +445,7 @@ bool SshConnectionPool::applyHostKeyPolicy(const QString& host, quint16 port,
             m_hostKeyCallback(host, keyType, keyBlob,
                               KnownHosts::Verdict::Unknown);
         if (m_handshakeInProgress
-            && (m_disconnectRequested || !m_session))
+            && (m_disconnectRequested || sessionGone()))
             return false;
         if (decision == HostKeyDecision::Accept) {
             m_knownHosts.add(lookupHost, keyType, keyBlob);

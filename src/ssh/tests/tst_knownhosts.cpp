@@ -587,6 +587,8 @@ void TstKnownHosts::addRejectsNonPlainHostTokens()
                                 QStringLiteral("!excluded.example.com"),
                                 QStringLiteral("|1|salt|hash"),
                                 QStringLiteral("one.example,two.example"),
+                                QStringLiteral("@marker-looking"),
+                                QStringLiteral("#comment-looking"),
                                 QStringLiteral("line\ninjection")}) {
         store.add(host, QStringLiteral("ssh-ed25519"), kEd25519Alpha);
     }

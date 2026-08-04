@@ -72,7 +72,16 @@ const common = {
     loader: { ".ttf": "dataurl" },
 };
 
+// Every file CMake's resource step lists in dist/, and therefore every file
+// this build must have produced before it is allowed to replace the previous
+// bundle. See the verification inside the try below.
+const names = ["index.html", "editor.js", "editor.css", "editor.worker.js"];
+if (sourcemap) {
+    names.push("editor.js.map", "editor.css.map", "editor.worker.js.map");
+}
+
 let results;
+let sizes;
 try {
     // allSettled, not all: `all` rejects the instant one build fails, while the
     // other is still writing into dist.tmp/ — the cleanup below would then race
@@ -106,6 +115,22 @@ try {
     results = settled.map((r) => r.value);
 
     await copyFile(join(root, "index.html"), join(staging, "index.html"));
+
+    // Verify the bundle is COMPLETE and non-empty before it replaces the good
+    // one, not after. esbuild writes editor.css only when the JS graph actually
+    // yields CSS and the .map files only with --sourcemap, so a change that
+    // silently stops producing one of them would otherwise install a dist/
+    // whose index.html links a stylesheet that is not there — a page that loads
+    // and renders unstyled — and only then fail, with the previous good bundle
+    // already deleted. Checking here means the failure takes dist.tmp/ with it
+    // and leaves dist/ exactly as it was.
+    sizes = await Promise.all(names.map(async (name) => {
+        const { size } = await stat(join(staging, name));
+        if (size === 0) {
+            throw new Error(`build produced an empty ${name}`);
+        }
+        return { name, size };
+    }));
 } catch (error) {
     await rm(staging, { recursive: true, force: true });
     throw error;
@@ -133,12 +158,7 @@ try {
 }
 await rm(previous, { recursive: true, force: true });
 
-const names = ["index.html", "editor.js", "editor.css", "editor.worker.js"];
-if (sourcemap) {
-    names.push("editor.js.map", "editor.css.map", "editor.worker.js.map");
-}
-for (const name of names) {
-    const { size } = await stat(join(dist, name));
+for (const { name, size } of sizes) {
     console.log(`dist/${name}\t${(size / 1024).toFixed(1)} KiB`);
 }
 const warnings = results.flatMap((r) => r.warnings);

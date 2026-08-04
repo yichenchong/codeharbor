@@ -230,15 +230,20 @@ QVariantList ServerProfiles::readStoredProfiles(QString* activeOut) const
             parsePort(m_settings->value(prefix + kPort));
 
         QVariantMap fields;
+        QString name = m_settings->value(prefix + kName).toString().trimmed();
+        if (name.isEmpty())
+            name = host;
         fields.insert(kId, id);
-        fields.insert(kName, m_settings->value(prefix + kName).toString());
+        fields.insert(kName, name);
         fields.insert(kHost, host);
         fields.insert(kPort, parsedPort.value_or(kDefaultPort));
         fields.insert(kUser, user);
         fields.insert(kIdentityFile,
-                      m_settings->value(prefix + kIdentityFile).toString());
-        fields.insert(kNodePath, m_settings->value(prefix + kNodePath).toString());
-        fields.insert(kRepoRoot, m_settings->value(prefix + kRepoRoot).toString());
+                      m_settings->value(prefix + kIdentityFile).toString().trimmed());
+        fields.insert(kNodePath,
+                      m_settings->value(prefix + kNodePath).toString().trimmed());
+        fields.insert(kRepoRoot,
+                      m_settings->value(prefix + kRepoRoot).toString().trimmed());
 
         // A store written by an older/other writer may carry no ordinal; those
         // entries sort last, in id order, rather than jumping to the front.

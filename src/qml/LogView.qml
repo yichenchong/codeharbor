@@ -229,18 +229,7 @@ Rectangle {
                     placeholderText: qsTr("No diagnostics yet.")
                 }
 
-                ScrollBar.vertical: ScrollBar {
-                    id: logScrollBar
-                    policy: ScrollBar.AsNeeded
-                    position: logFlick.visibleArea.yPosition
-                    size: logFlick.visibleArea.heightRatio
-                    onPositionChanged: {
-                        if (!pressed)
-                            return;
-                        logFlick.contentY = position * Math.max(
-                            0, logFlick.contentHeight - logFlick.height);
-                    }
-                }
+                ScrollBar.vertical: AppScrollBar {}
             }
         }
     }

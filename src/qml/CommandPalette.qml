@@ -5,6 +5,7 @@ pragma ComponentBehavior: Bound
 import QtQml
 import QtQuick
 import QtQuick.Controls.Basic
+import CodeHarbor
 
 // Command palette + global keyboard shortcuts (SPEC 15).
 //
@@ -263,9 +264,8 @@ Item {
             height: 40
 
             objectName: "filterField"
+            Accessible.name: qsTr("Command filter")
             placeholderText: qsTr("Type a command\u2026")
-            // #585b70 is a step between Theme.textDim and Theme.textFaint and
-            // has no Theme role.
             placeholderTextColor: Theme.textPlaceholder()
             color: Theme.text
             selectByMouse: true

@@ -167,7 +167,8 @@ bool UiStateStore::showArchived() const
     return storedBool(*m_settings, kShowArchivedKey, false);
 }
 
-void UiStateStore::setSelectedPane(QString devSessionId, QString paneId)
+void UiStateStore::setSelectedPane(const QString& devSessionId,
+                                   const QString& paneId)
 {
     // Same rule as setActiveSession(): with no Dev Session there is nothing for
     // a selected pane to belong to, and writing it would park the value under
@@ -175,19 +176,26 @@ void UiStateStore::setSelectedPane(QString devSessionId, QString paneId)
     // pick up.
     if (devSessionId.isEmpty())
         return;
+    // Same no-op rule as setPinnedOnly()/setShowArchived(). This one is called
+    // every time focus moves between panes, and Main.qml re-persists the very
+    // value it just restored on every Dev Session open, so without this guard
+    // an unchanged selection meant a settings write AND a synchronous flush to
+    // disk per focus change.
+    if (paneId == selectedPane(devSessionId))
+        return;
     m_settings->setValue(selectedPaneKey(devSessionId), paneId);
     m_settings->sync();
 }
 
-QString UiStateStore::selectedPane(QString devSessionId) const
+QString UiStateStore::selectedPane(const QString& devSessionId) const
 {
     if (devSessionId.isEmpty())
         return {};
     return m_settings->value(selectedPaneKey(devSessionId)).toString();
 }
 
-void UiStateStore::setNextPaneSuffix(QString devSessionId, QString region,
-                                     int suffix)
+void UiStateStore::setNextPaneSuffix(const QString& devSessionId,
+                                     const QString& region, int suffix)
 {
     // Same empty-id rule as the two accessors above. A counter parked under
     // "paneSuffix//<region>" would be read back by every OTHER Dev Session
@@ -212,7 +220,8 @@ void UiStateStore::setNextPaneSuffix(QString devSessionId, QString region,
     m_settings->sync();
 }
 
-int UiStateStore::nextPaneSuffix(QString devSessionId, QString region) const
+int UiStateStore::nextPaneSuffix(const QString& devSessionId,
+                                 const QString& region) const
 {
     if (devSessionId.isEmpty() || !isAddressableRegion(region))
         return kFirstPaneSuffix;
@@ -220,17 +229,24 @@ int UiStateStore::nextPaneSuffix(QString devSessionId, QString region) const
                      kFirstPaneSuffix, kFirstPaneSuffix);
 }
 
-void UiStateStore::setActiveSession(QString serverId, QString devSessionId)
+void UiStateStore::setActiveSession(const QString& serverId,
+                                    const QString& devSessionId)
 {
     // No server, no meaningful "active session": refuse to park a value under a
     // placeholder key that the next connected server would then read back.
     if (serverId.isEmpty())
         return;
+    // AppController::activateSession() deliberately does NOT short-circuit on
+    // an unchanged id (re-picking the current session is the user's retry after
+    // a failed layout load), so this setter takes the same id repeatedly. Skip
+    // the write and its flush when nothing moved.
+    if (devSessionId == activeSession(serverId))
+        return;
     m_settings->setValue(activeSessionKey(serverId), devSessionId);
     m_settings->sync();
 }
 
-QString UiStateStore::activeSession(QString serverId) const
+QString UiStateStore::activeSession(const QString& serverId) const
 {
     if (serverId.isEmpty())
         return {};

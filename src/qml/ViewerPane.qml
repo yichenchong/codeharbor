@@ -576,8 +576,11 @@ Item {
         pane.viewerModel.resolvePath(pane.repoCheckPath, pane.repoCheckBase);
     }
 
-    onRepoCheckTargetChanged: pane.checkRepoRoot()
-    onSessionRootChanged: pane.checkRepoRoot()
+    onRepoCheckTargetChanged: Qt.callLater(pane.checkRepoRoot)
+    // The session-root binding is refreshed after its change notification.
+    // Defer until that pass completes so checkRepoRoot compares the new base
+    // with the new derived target, not a stale target from the old session.
+    onSessionRootChanged: Qt.callLater(pane.checkRepoRoot)
 
     // ---- address entry -----------------------------------------------------
 

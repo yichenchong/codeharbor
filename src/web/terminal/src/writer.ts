@@ -116,7 +116,12 @@ export class CoalescingWriter {
         this.backlog = "";
         this.backlogBytes = 0;
         this.inFlight = true;
-        this.sink.write(chunk, () => {
+        let completed = false;
+        const done = (): void => {
+            if (completed) {
+                return;
+            }
+            completed = true;
             this.inFlight = false;
             // Acknowledge BEFORE pumping: the C++ side may answer the
             // acknowledgement by releasing what it retained, and that arrives
@@ -127,6 +132,18 @@ export class CoalescingWriter {
                 this.onConsumed(bytes);
             }
             this.pump();
-        });
+        };
+        try {
+            this.sink.write(chunk, done);
+        } catch {
+            // A disposed xterm instance can reject a late write. Keep the
+            // chunk (and its byte credit) for a later live sink instead of
+            // wedging the writer with inFlight=true or silently losing output.
+            if (!completed && !this.closed) {
+                this.inFlight = false;
+                this.backlog = chunk + this.backlog;
+                this.backlogBytes = bytes + this.backlogBytes;
+            }
+        }
     }
 }

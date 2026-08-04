@@ -175,7 +175,7 @@ public:
     // Count the sessions in the last authoritative tree, including rows hidden
     // by client-local pin/archive filters. The group confirmation uses this
     // before issuing the destructive RPC.
-    Q_INVOKABLE int sessionCountForGroup(QString id) const;
+    Q_INVOKABLE int sessionCountForGroup(const QString& id) const;
     Q_INVOKABLE void reorderGroups(QStringList orderedIds);
     // Session mutations.
     Q_INVOKABLE void createSession(QString groupId, QString name, QString repoRoot);

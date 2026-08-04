@@ -783,12 +783,11 @@ Rectangle {
 
             // The write side of `ratios` (SPEC 4.5). SplitView.resizing is true
             // only while a handle is under the pointer, so this fires exactly
-            // once, when a drag FINISHES — the same discipline Main.qml uses for
-            // Zero-argument on purpose: the stamp a drag reports under is the
+            // once, when a drag FINISHES. The stamp a drag reports under is the
             // one captured when the drag STARTED (see onResizingChanged), not
-            // whatever is current when it ends, and keeping it on the split
-            // rather than in the signature means no caller can report a drag
-            // under the wrong session by passing the wrong pair.
+            // whatever is current when it ends; keeping it on the split means
+            // no caller can report a drag under the wrong session by passing the
+            // wrong pair.
             function publishRatios() {
                 const sessionId = split.resizeSessionId;
                 const generation = split.resizeGeneration;
@@ -859,7 +858,11 @@ Rectangle {
                 // added after first layout would get no preferred size and render
                 // zero-extent - the defect this sizing exists to prevent.
                 onItemAdded: split.applyRatios()
-                onCountChanged: { split.ratiosApplied = false; split.applyRatios(); }
+                onCountChanged: {
+                    split.ratiosApplied = false;
+                    split.applyRatios();
+                    split.updateNodePaths();
+                }
                 delegate: Loader {
                     id: childLoader
                     required property int index
@@ -898,6 +901,10 @@ Rectangle {
                         item.node = childLoader.childNode;
                         item.nodePath = region.nodePath.concat(
                             [String(childLoader.index)]);
+                    }
+                    onLoaded: {
+                        split.applyRatios();
+                        split.updateNodePaths();
                     }
                 }
             }

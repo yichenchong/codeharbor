@@ -93,11 +93,13 @@ export interface UnwatchResult {
 
 // Server -> client notification emitted for an active watch subscription. Sent
 // as a JSON-RPC notification (no id); `revision` is present when a new revision
-// is known for the affected path (created/modified).
+// is known for the affected path (created/modified). A watch is attached to one
+// path and the daemon has no rename event source; `renamed` here used to promise
+// a notification the server can never emit.
 export interface WatchEvent {
     subscriptionId: string;
     path: string;
-    event: "created" | "modified" | "deleted" | "renamed";
+    event: "created" | "modified" | "deleted";
     revision?: string;
 }
 
@@ -141,6 +143,31 @@ export type RpcMethodName = (typeof RPC_METHODS)[RpcMethodKey];
 // wire contract and is mirrored by kMethodServerInfo in RpcTypes.h.
 export const RPC_SERVER_INFO_METHOD = "server.info";
 
+// The server.info payload. Every other method in the catalog has its result
+// shape declared here, and these two did not: nothing tied the two
+// introspection handlers in codeharbord.ts to the contract the C++ client reads
+// (AppController::onServerInfo), so a field could be renamed or dropped on the
+// server without a single compile error on either side — it would surface as
+// the client silently degrading (a missing `serverId` orphans the whole
+// workspace view) rather than as a build failure.
+export interface ServerInfoResult {
+    // Always "codeharbord". Lets the client tell this daemon from anything else
+    // an SSH command might have started on the far end.
+    name: string;
+    // Release version, shown to the USER verbatim in the client's
+    // "Server too old" message.
+    version: string;
+    // Wire-contract revision the client gates compatibility on.
+    schemaVersion: number;
+    // Stable, persisted identity of the workspace database on this host
+    // (SPEC 3.5). Clients key their stored view of the remote workspace by it.
+    serverId: string;
+    // The REMOTE user's data directory for crash-recovery snapshots (SPEC
+    // 11.3). Additive and OPTIONAL: an older server omits it and the client
+    // degrades to no-recovery rather than failing the compatibility gate.
+    recoveryDir?: string;
+}
+
 // Server -> client notification method name for an active watch subscription
 // (SPEC 8.7). This is a NOTIFICATION name (no id, no response), deliberately
 // absent from RPC_METHODS, which enumerates only request methods. It
@@ -158,6 +185,13 @@ export const RPC_WATCH_EVENT_NOTIFICATION = "file.watchEvent";
 // already-deployed daemon answers, and the keepalive is precisely the call that
 // must work before the client knows anything about the peer.
 export const RPC_PING_METHOD = "ping";
+
+// The keepalive payload. Its only job is to be a well-formed, cheap success:
+// the client (CodeharbordClient::enableHeartbeat) counts unanswered probes and
+// never inspects the body.
+export interface PingResult {
+    pong: true;
+}
 
 // Server -> client notification: watch notifications for these subscriptions
 // were DROPPED and will never be delivered. The daemon writes notifications to

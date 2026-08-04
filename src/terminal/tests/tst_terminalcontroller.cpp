@@ -118,6 +118,7 @@ private slots:
     void flushBoundariesNeverSplitAMultiByteCharacter();
     void flushBoundariesNeverSplitAnAnsiEscape();
     void anEvictionCannotOrphanHalfOfACharacterInTheDecoder();
+    void unterminatedEscapeIsBoundedAndStringTerminatorsAreCorrect();
     void releasingRetainedOutputStaysInsideTheCreditWindow();
 };
 
@@ -1131,6 +1132,27 @@ void TstTerminalController::flushBoundariesNeverSplitAnAnsiEscape()
     QVERIFY(feSpy.at(1).at(0).toByteArray().contains(QByteArrayLiteral("\x1b(0")));
 }
 
+
+// Unterminated strings are hostile input, not a reason to retain bytes
+// indefinitely. BEL is an OSC terminator only; DCS remains open until ST.
+void TstTerminalController::unterminatedEscapeIsBoundedAndStringTerminatorsAreCorrect()
+{
+    TerminalController controller;
+    QSignalSpy spy(&controller, &TerminalController::flushReady);
+    QByteArray malformed = QByteArrayLiteral("\x1b]0;");
+    malformed += QByteArray(TerminalController::kMaxPendingEscapeBytes, 'x');
+    controller.ingestOutput(malformed);
+    QVERIFY(!spy.isEmpty());
+
+    TerminalController dcs;
+    QSignalSpy dcsSpy(&dcs, &TerminalController::flushReady);
+    QByteArray dcsPayload = QByteArrayLiteral("\x1bPabc\x07");
+    dcsPayload += QByteArray(TerminalController::kFlushSizeBytes, 'q');
+    dcs.ingestOutput(dcsPayload);
+    QCOMPARE(dcsSpy.count(), 0);
+    dcs.ingestOutput(QByteArrayLiteral("\x1b\\"));
+    QVERIFY(!dcsSpy.isEmpty());
+}
 
 // WHY (1) above matters, end to end. ch::TerminalBridge decodes statefully, so
 // a character split across two batches is normally harmless: the decoder holds

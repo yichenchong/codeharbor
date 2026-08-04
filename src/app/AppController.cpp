@@ -426,8 +426,6 @@ QString AppController::sshDiagnostics() const
 
 void AppController::syncSshDiagnostics()
 {
-    if (!m_logBuffer)
-        return;
     const QString current = m_pool ? m_pool->diagnosticLog() : QString();
     if (current == m_lastSshDiagnostics)
         return;
@@ -500,6 +498,12 @@ void AppController::upgradeRemoteService(QString profileId)
     // the session goes first. This also clears the chain, which is why the arm
     // below comes after it.
     disconnectServer();
+    // disconnectServer() drives the bootstrap's teardown and emits both
+    // activeSessionChanged and connectionStateChanged, and a listener is
+    // allowed to tear the connection spine down while those are delivered. The
+    // QPointer reads back null in that case; dereferencing it would not.
+    if (!m_bootstrap)
+        return;
     m_bootstrap->requestRemoteUpgrade();
     startConnect(profileId, QString());
 }
@@ -1013,6 +1017,12 @@ void AppController::refuseServer(const QString& message)
 {
     QPointer<AppController> self(this);
     emit error(message);
+    // `error` is delivered synchronously to every connected slot, and one of
+    // them is allowed to destroy this controller. Everything below touches
+    // `this` (QTimer::singleShot takes it as the context object), so the
+    // guard has to be checked here and not only inside the deferred lambda.
+    if (!self)
+        return;
     // Refuse rather than limp on. Deferred by one event-loop turn because both
     // callers run INSIDE a CodeharbordClient response callback and the teardown
     // drops that very client's transport. The QPointer keeps the deferred work
@@ -1348,7 +1358,7 @@ void AppController::deleteGroup(QString id)
     m_db->deleteGroup(GroupId{std::move(id)}, refreshOnSuccess<>());
 }
 
-int AppController::sessionCountForGroup(QString id) const
+int AppController::sessionCountForGroup(const QString& id) const
 {
     for (const GroupNode& group : m_lastNodes) {
         if (group.group.id.value == id)

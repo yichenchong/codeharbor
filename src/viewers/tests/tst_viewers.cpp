@@ -174,6 +174,7 @@ private slots:
     // The order and the shape of the entries the directory pane renders.
     void directoryListingIsSortedDirectoriesFirst();
     void openAsKindsFollowRegistryClaims();
+    void wellKnownTextStemDoesNotClaimBinarySuffixes();
     void applicationSchemeValidationAndEscaping();
     // SPEC 9: an out-of-project path stays openable, but the pane has to be
     // TOLD it is out of project. These pin the flag's trip from the reply to
@@ -399,11 +400,10 @@ void TstViewers::openAsKindsFollowRegistryClaims()
 {
     QCOMPARE(ViewerHandlerRegistry::applicableViewKinds(
                  QUrl(QStringLiteral("file:///repo/main.cpp"))),
-             QStringList({QStringLiteral("editor"), QStringLiteral("text")}));
+             QStringList({QStringLiteral("text")}));
     QCOMPARE(ViewerHandlerRegistry::applicableViewKinds(
                  QUrl(QStringLiteral("file:///repo/index.html"))),
-             QStringList({QStringLiteral("editor"), QStringLiteral("text"),
-                          QStringLiteral("web")}));
+             QStringList({QStringLiteral("text"), QStringLiteral("web")}));
     QCOMPARE(ViewerHandlerRegistry::applicableViewKinds(
                  QUrl(QStringLiteral("file:///repo/logo.png"))),
              QStringList({QStringLiteral("image")}));
@@ -417,6 +417,22 @@ void TstViewers::openAsKindsFollowRegistryClaims()
                  QUrl(QStringLiteral("https://example.test/"))),
              QStringList({QStringLiteral("web")}));
 }
+void TstViewers::wellKnownTextStemDoesNotClaimBinarySuffixes()
+{
+    for (const QString &name :
+         {QStringLiteral("readme.zip"), QStringLiteral("news.tar.gz"),
+          QStringLiteral("version.o"), QStringLiteral("Dockerfile.exe"),
+          QStringLiteral(".env.local")}) {
+        const ViewerResolution resolution =
+            ViewerHandlerRegistry::resolve(QUrl(QStringLiteral("file:///repo/"))
+                                            .resolved(QUrl(name)));
+        if (name == QLatin1String(".env.local"))
+            QCOMPARE(resolution, ViewerResolution::TextEditor);
+        else
+            QCOMPARE(resolution, ViewerResolution::Download);
+    }
+}
+
 
 void TstViewers::applicationSchemeValidationAndEscaping()
 {

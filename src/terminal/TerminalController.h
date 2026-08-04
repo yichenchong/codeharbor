@@ -26,6 +26,11 @@ public:
     // on whichever comes first — a size cap or a short time window.
     static constexpr int kFlushSizeBytes = 8 * 1024;             // 8 KiB
     static constexpr int kFlushIntervalMs = 10;                  // 10 ms
+    // Never hold an unterminated ANSI string indefinitely: malformed remote
+    // output must not make the pending buffer grow without bound. A complete
+    // OSC 52 payload is normally only a few KiB; 64 KiB leaves generous room
+    // while making the failure mode for a malicious stream bounded.
+    static constexpr int kMaxPendingEscapeBytes = 64 * 1024;
     // Rolling buffer retained while the view is hidden (SPEC 5.4/5.5); oldest
     // bytes are evicted past this cap and tmux history covers anything older.
     static constexpr int kHiddenBufferMaxBytes = 2 * 1024 * 1024; // 2 MiB

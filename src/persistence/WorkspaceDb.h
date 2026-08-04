@@ -237,10 +237,18 @@ public:
     // unconditionally.
     WorkspaceDb(std::nullptr_t) = delete;
 
-    // Nested read. `pinnedOnly` is a read predicate for the client-local
-    // sidebar filter; the session's pinned bit remains server-owned state.
-    void list(const ServerId& serverId, ListCallback cb,
-              bool pinnedOnly = false);
+    // Nested read: every group on `serverId` with its sessions, panes and
+    // layouts.
+    //
+    // Deliberately WITHOUT the server's `pinnedOnly` request filter, even
+    // though workspace.list accepts one. Pinning is server-owned state, but
+    // which pinned/archived rows the sidebar SHOWS is a client-local
+    // presentation choice held by ch::SessionsModel: it filters the tree it
+    // already has, so toggling the star costs no round trip and turning it off
+    // brings the rows straight back. Asking the server to pre-filter would
+    // return a tree missing rows the client still needs; the app-level tests
+    // assert that this request never carries `pinnedOnly`.
+    void list(const ServerId& serverId, ListCallback cb);
     // Groups.
     void createGroup(const CreateGroupParams& params, GroupCallback cb);
     void updateGroup(const UpdateGroupParams& params, GroupCallback cb);

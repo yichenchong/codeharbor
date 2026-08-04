@@ -6,7 +6,7 @@ import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { requireStringArray } from "../src/validate.ts";
+import { isInvalidParams, requireStringArray } from "../src/validate.ts";
 
 import {
     applyConnectionPragmas,
@@ -438,6 +438,11 @@ test("updateSession keeps unset fields but clears explicit nulls (undefined vs n
     s = ws.updateSession({ id: session.id, archived: true });
     assert.equal(s.archived, true);
     s = ws.updateSession({ id: session.id, archived: false });
+    assert.equal(s.archived, false);
+    // ...and the cleared flag is what a fresh read reports, not just what the
+    // update returned.
+    assert.equal(ws.getSession(session.id).archived, false);
+
     // The workspace-owned pin survives both the update round-trip and a
     // second connection's filtered read.
     s = ws.updateSession({ id: session.id, pinned: true });
@@ -1654,12 +1659,16 @@ test("the v4 migration drops an address index whose name contains a double quote
 // two are genuinely in flight together; transaction()'s BEGIN IMMEDIATE takes
 // the write lock before the SELECT, so the loser reads after the winner's
 // commit and finds the row instead of inserting a second one.
-test("two concurrent daemons resolving one slot converge on one row", async () => {
+// Bounded: a daemon that starts but never answers would hang the suite for
+// ever, because the only thing awaited is its reply.
+test("two concurrent daemons resolving one slot converge on one row", { timeout: 120_000 }, async () => {
     const dbPath = await tmpDbPath();
-    const seed = openWorkspace(dbPath);
-    const g = seed.createGroup({ serverId: SERVER, name: "G" });
-    const s = seed.createSession({ serverId: SERVER, groupId: g.id, name: "S", repositoryRoot: "/r" });
-    seed.close();
+    // Not named `seed`: that is the module-level helper this file uses
+    // everywhere else, and shadowing it here would hide it from this test.
+    const setup = openWorkspace(dbPath);
+    const g = setup.createGroup({ serverId: SERVER, name: "G" });
+    const s = setup.createSession({ serverId: SERVER, groupId: g.id, name: "S", repositoryRoot: "/r" });
+    setup.close();
 
     const daemon = fileURLToPath(new URL("../src/codeharbord.ts", import.meta.url));
     const spawnDaemon = () =>
@@ -1678,26 +1687,32 @@ test("two concurrent daemons resolving one slot converge on one row", async () =
         }) + "\n";
 
     const daemons = [spawnDaemon(), spawnDaemon()];
-    const replies = daemons.map(
-        (proc) =>
-            new Promise<Record<string, unknown>>((resolve, reject) => {
-                let buffered = "";
-                proc.stdout.setEncoding("utf8");
-                proc.stdout.on("data", (chunk: string) => {
-                    buffered += chunk;
-                    const end = buffered.indexOf("\n");
-                    if (end >= 0) resolve(JSON.parse(buffered.slice(0, end)));
-                });
-                proc.on("error", reject);
-                proc.on("exit", () => reject(new Error("daemon exited before answering")));
-            }),
-    );
-    for (const proc of daemons) proc.stdin.write(request);
-
-    const answers = await Promise.all(replies);
-    for (const proc of daemons) {
-        proc.stdin.end();
-        proc.kill();
+    const answers: Record<string, unknown>[] = [];
+    // The kill is in a `finally` because a daemon that never answers rejects the
+    // await below: without it, two real processes would be left running, holding
+    // this database file open, for the rest of the run.
+    try {
+        const replies = daemons.map(
+            (proc) =>
+                new Promise<Record<string, unknown>>((resolve, reject) => {
+                    let buffered = "";
+                    proc.stdout.setEncoding("utf8");
+                    proc.stdout.on("data", (chunk: string) => {
+                        buffered += chunk;
+                        const end = buffered.indexOf("\n");
+                        if (end >= 0) resolve(JSON.parse(buffered.slice(0, end)));
+                    });
+                    proc.on("error", reject);
+                    proc.on("exit", () => reject(new Error("daemon exited before answering")));
+                }),
+        );
+        for (const proc of daemons) proc.stdin.write(request);
+        answers.push(...(await Promise.all(replies)));
+    } finally {
+        for (const proc of daemons) {
+            proc.stdin.end();
+            proc.kill();
+        }
     }
 
     // Neither client was told to retry, and neither got an error.
@@ -2337,7 +2352,7 @@ test("RW15: a null is rejected for the fields that cannot be cleared", () => {
 // SQLite stores -5 and 2.5 verbatim in an INTEGER-affinity column, so one such
 // call left the scope ordered around a negative or fractional slot for ever
 // after, and nextPosition then handed the following row 3.5.
-test("RW15: a fractional or negative position is rejected by every create/update", () => {
+test("RW15: a fractional, negative or non-finite position is rejected by every create/update", () => {
     const cases: Array<[keyof typeof WORKSPACE_METHODS, Record<string, unknown>]> = [
         ["workspace.createGroup", { serverId: SERVER, name: "G" }],
         ["workspace.updateGroup", { id: "g" }],
@@ -2349,7 +2364,10 @@ test("RW15: a fractional or negative position is rejected by every create/update
         ["workspace.updateTerminalPane", { id: "t" }],
     ];
     for (const [method, base] of cases) {
-        for (const position of [2.5, -1, Number.NaN]) {
+        // Infinity is neither fractional nor negative, but it is just as
+        // unusable as an ordering slot: nextPosition would hand the next row
+        // Infinity too, and every later comparison ties.
+        for (const position of [2.5, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
             assert.throws(
                 () => WORKSPACE_METHODS[method]({ ...base, position }),
                 /field 'position' must be a non-negative integer/,
@@ -2448,7 +2466,10 @@ test("openWorkspace closes the connection when it refuses a newer database", asy
 // Each daemon is handed a whole batch of createGroup requests before either
 // daemon's first reply is read, so the two are writing simultaneously for the
 // whole run rather than trading one request each.
-test("two daemons writing at once all succeed, and positions stay packed", async () => {
+// A timeout, because `until()` waits for a reply COUNT and nothing else: a
+// daemon that starts and then never answers would otherwise hang the whole
+// suite for ever instead of failing this one test.
+test("two daemons writing at once all succeed, and positions stay packed", { timeout: 120_000 }, async () => {
     const dbPath = await tmpDbPath();
     openWorkspace(dbPath).close();
 
@@ -2496,35 +2517,41 @@ test("two daemons writing at once all succeed, and positions stay packed", async
         return { proc, replies, until, tag: `d${n}` };
     });
 
-    // The barrier: `ping` needs no database, so answering it proves only that
-    // the process is running and reading its stdin — exactly what we need
-    // before releasing the writes.
-    for (const d of daemons) {
-        d.proc.stdin.write(JSON.stringify({ jsonrpc: "2.0", id: 0, method: "ping" }) + "\n");
-    }
-    await Promise.all(daemons.map((d) => d.until(1)));
-
-    // Both bursts released without awaiting anything in between, so each
-    // daemon's whole batch is queued while the other is still writing.
-    for (const d of daemons) {
-        let batch = "";
-        for (let i = 1; i <= PER_DAEMON; i++) {
-            batch +=
-                JSON.stringify({
-                    jsonrpc: "2.0",
-                    id: i,
-                    method: "workspace.createGroup",
-                    params: { serverId: SERVER, name: `${d.tag}-${i}` },
-                }) + "\n";
+    const answers: Record<string, unknown>[] = [];
+    // Everything that can reject sits inside the `try`, so the two daemons are
+    // killed even when one of them dies or stops answering. A leaked daemon
+    // keeps this database file open and outlives the test run.
+    try {
+        // The barrier: `ping` needs no database, so answering it proves only
+        // that the process is running and reading its stdin — exactly what we
+        // need before releasing the writes.
+        for (const d of daemons) {
+            d.proc.stdin.write(JSON.stringify({ jsonrpc: "2.0", id: 0, method: "ping" }) + "\n");
         }
-        d.proc.stdin.write(batch);
-    }
-    await Promise.all(daemons.map((d) => d.until(PER_DAEMON + 1)));
+        await Promise.all(daemons.map((d) => d.until(1)));
 
-    const answers = daemons.flatMap((d) => d.replies.slice(1));
-    for (const d of daemons) {
-        d.proc.stdin.end();
-        d.proc.kill();
+        // Both bursts released without awaiting anything in between, so each
+        // daemon's whole batch is queued while the other is still writing.
+        for (const d of daemons) {
+            let batch = "";
+            for (let i = 1; i <= PER_DAEMON; i++) {
+                batch +=
+                    JSON.stringify({
+                        jsonrpc: "2.0",
+                        id: i,
+                        method: "workspace.createGroup",
+                        params: { serverId: SERVER, name: `${d.tag}-${i}` },
+                    }) + "\n";
+            }
+            d.proc.stdin.write(batch);
+        }
+        await Promise.all(daemons.map((d) => d.until(PER_DAEMON + 1)));
+        answers.push(...daemons.flatMap((d) => d.replies.slice(1)));
+    } finally {
+        for (const d of daemons) {
+            d.proc.stdin.end();
+            d.proc.kill();
+        }
     }
 
     // Not one of the fifty writes was refused. A "database is locked" here is
@@ -2707,6 +2734,241 @@ test("openWorkspace reports why an unreadable database failed, not a downstream 
     broken.close();
 
     assert.throws(() => openWorkspace(dbPath), /no such column: version/);
+
+    await cleanup(dbPath);
+});
+
+// An in-process `position` is an insertion INDEX, and Array.splice reads a
+// negative index as an offset from the END — so `position: -1` used to insert
+// the new row second-to-LAST, the exact opposite of the "before everything" a
+// negative index reads as, and a fractional index named no slot at all. The RPC
+// guards reject both before they get here (optionalIndex); this pins the same
+// promise for the in-process API, which is the one the daemon's own code uses.
+test("an out-of-range in-process position is clamped, not read as an offset from the end", async () => {
+    const dbPath = await tmpDbPath();
+    const ws = openWorkspace(dbPath);
+    ws.createGroup({ serverId: SERVER, name: "A" });
+    ws.createGroup({ serverId: SERVER, name: "B" });
+    ws.createGroup({ serverId: SERVER, name: "C" });
+
+    // Below the start: first, not second-to-last.
+    ws.createGroup({ serverId: SERVER, name: "First", position: -1 });
+    assert.deepEqual(
+        ws.list(SERVER).map((g) => g.name),
+        ["First", "A", "B", "C"],
+    );
+    // Fractional: truncated to the slot it names, never left as 1.9.
+    ws.createGroup({ serverId: SERVER, name: "Second", position: 1.9 });
+    assert.deepEqual(
+        ws.list(SERVER).map((g) => g.name),
+        ["First", "Second", "A", "B", "C"],
+    );
+    // And the scope is still packed 0..n-1, so no two rows can tie.
+    assert.deepEqual(
+        ws.list(SERVER).map((g) => g.position),
+        [0, 1, 2, 3, 4],
+    );
+
+    ws.close();
+    await cleanup(dbPath);
+});
+
+// `tree` is free-form client JSON, and not every JavaScript value has a JSON
+// form: JSON.stringify answers `undefined` for undefined/a function/a symbol and
+// THROWS for a circular structure. Both used to reach the SQLite driver — the
+// first as a bind value it rejects with an opaque type error naming no field,
+// the second as an exception out of an already-open transaction — and both came
+// back to the client as a server malfunction rather than "your payload is
+// wrong".
+test("setLayout rejects a tree that has no JSON form and leaves the stored one alone", async () => {
+    const dbPath = await tmpDbPath();
+    const ws = openWorkspace(dbPath);
+    const { session } = seed(ws);
+    const before = ws.getLayout({ devSessionId: session.id, region: "viewer" });
+    assert.notEqual(before, null);
+
+    const circular: Record<string, unknown> = { type: "leaf", paneId: "x" };
+    circular.self = circular;
+    for (const tree of [circular, undefined, () => "nope"]) {
+        let thrown: unknown;
+        try {
+            ws.setLayout({ serverId: SERVER, devSessionId: session.id, region: "viewer", tree });
+        } catch (err) {
+            thrown = err;
+        }
+        // Tagged invalid-params, so the dispatcher answers -32602 rather than a
+        // generic internal error.
+        assert.equal(isInvalidParams(thrown), true);
+        assert.match(
+            (thrown as Error).message,
+            /workspace\.setLayout: 'tree' must be a JSON-serializable split tree/,
+        );
+    }
+
+    // The region still holds exactly what it held before the rejected writes,
+    // and the connection is still usable.
+    assert.deepEqual(ws.getLayout({ devSessionId: session.id, region: "viewer" }), before);
+    ws.setLayout({
+        serverId: SERVER,
+        devSessionId: session.id,
+        region: "viewer",
+        tree: { type: "leaf", paneId: "later" },
+    });
+
+    ws.close();
+    await cleanup(dbPath);
+});
+
+// Deleting a pane repairs BOTH regions' layouts, because a client-authored tree
+// can file a leaf under either. Repairing must still be a no-op for a region
+// that never mentioned the pane: removePaneFromTree rebuilds every split it
+// walks (it renormalizes ratios), so its output almost never compares equal to
+// the stored text even when it dropped nothing, and the untouched region's tree
+// was rewritten and its updated_at bumped on every unrelated delete.
+test("deleting a pane leaves a region that never referenced it byte-identical", async () => {
+    const dbPath = await tmpDbPath();
+    const ws = openWorkspace(dbPath);
+    const group = ws.createGroup({ serverId: SERVER, name: "Work" });
+    const session = ws.createSession({
+        serverId: SERVER,
+        groupId: group.id,
+        name: "S",
+        repositoryRoot: "/r",
+    });
+    const viewer = ws.createViewerPane({ serverId: SERVER, devSessionId: session.id, url: "u" });
+    const left = ws.createTerminalPane({ serverId: SERVER, devSessionId: session.id, name: "l" });
+    const right = ws.createTerminalPane({ serverId: SERVER, devSessionId: session.id, name: "r" });
+    ws.setLayout({
+        serverId: SERVER,
+        devSessionId: session.id,
+        region: "viewer",
+        tree: { type: "leaf", paneId: viewer.id },
+    });
+    // Deliberately UNNORMALIZED ratios: they are what a rewrite would visibly
+    // change, so an accidental rewrite cannot pass this test unnoticed.
+    ws.setLayout({
+        serverId: SERVER,
+        devSessionId: session.id,
+        region: "terminal",
+        tree: {
+            type: "split",
+            orientation: "horizontal",
+            ratios: [1, 3],
+            children: [
+                { type: "leaf", paneId: "terminal-1", terminalPaneId: left.id },
+                { type: "leaf", paneId: "terminal-2", terminalPaneId: right.id },
+            ],
+        },
+    });
+
+    const storedTerminal = ws.db.prepare(
+        "SELECT tree, updated_at FROM session_layouts WHERE dev_session_id = ? AND region = 'terminal'",
+    );
+    const untouchedBefore = storedTerminal.get(session.id) as { tree: string; updated_at: number };
+
+    ws.deleteViewerPane({ id: viewer.id });
+
+    // The terminal region is byte-for-byte what it was, timestamp included.
+    assert.deepEqual(storedTerminal.get(session.id), untouchedBefore);
+    // Not a vacuous test: the region that DID reference the pane was repaired.
+    assert.deepEqual(ws.getLayout({ devSessionId: session.id, region: "viewer" })?.tree, {
+        type: "leaf",
+        paneId: "",
+    });
+
+    ws.close();
+    await cleanup(dbPath);
+});
+
+// Layout trees are client-authored, so a malformed client can file a viewer leaf
+// under the terminal region and vice versa. duplicateSession used to pick its
+// old->new id map BY REGION, so a leaf stored in the "wrong" region was not
+// found in that region's map and was left alone — and the DUPLICATE's tree went
+// on naming the ORIGINAL session's pane row, which is the one cross-session
+// reference this whole method exists to prevent (two Dev Sessions sharing one
+// remote shell). One map over both pane tables fixes it; the keys are
+// server-minted UUIDs, so viewer and terminal ids can never collide.
+test("duplicateSession remaps a leaf filed under the wrong region", async () => {
+    const dbPath = await tmpDbPath();
+    const ws = openWorkspace(dbPath);
+    const g = ws.createGroup({ serverId: SERVER, name: "G" });
+    const s = ws.createSession({ serverId: SERVER, groupId: g.id, name: "S", repositoryRoot: "/r" });
+    const viewer = ws.createViewerPane({ serverId: SERVER, devSessionId: s.id, url: "u" });
+    const term = ws.createTerminalPane({ serverId: SERVER, devSessionId: s.id, name: "t" });
+    // A VIEWER pane referenced from the TERMINAL region...
+    ws.setLayout({
+        serverId: SERVER,
+        devSessionId: s.id,
+        region: "terminal",
+        tree: { type: "leaf", paneId: viewer.id },
+    });
+    // ...and a TERMINAL row referenced from the VIEWER region.
+    ws.setLayout({
+        serverId: SERVER,
+        devSessionId: s.id,
+        region: "viewer",
+        tree: { type: "leaf", paneId: "slot", terminalPaneId: term.id },
+    });
+
+    const copy = ws.duplicateSession({ id: s.id });
+    const copiedViewer = copy.viewerPanes[0].id;
+    const copiedTerminal = copy.terminalPanes[0].id;
+    assert.notEqual(copiedViewer, viewer.id);
+    assert.notEqual(copiedTerminal, term.id);
+
+    assert.deepEqual(copy.layouts.terminal, { type: "leaf", paneId: copiedViewer });
+    assert.deepEqual(copy.layouts.viewer, {
+        type: "leaf",
+        paneId: "slot",
+        terminalPaneId: copiedTerminal,
+    });
+
+    ws.close();
+    await cleanup(dbPath);
+});
+
+// The v3 upgrade re-mints a duplicated tmux target onto the row's own canonical
+// `ch_<dev_session_id>_<id>`. Nothing ever constrained those two legacy columns
+// to UUIDs, so that string can itself be unusable as a tmux session name — and
+// refusing to mint it threw out of the migration, rolled the whole upgrade back
+// and left the database PERMANENTLY unopenable by this build. The row falls back
+// to no target instead: it mints a fresh one on its next attach.
+test("the v3 migration opens a legacy database whose canonical mint is unusable", async () => {
+    const dbPath = await tmpDbPath();
+    const legacy = openWorkspace(dbPath);
+    const g = legacy.createGroup({ serverId: SERVER, name: "G" });
+    // A Dev Session id from before ids were minted UUIDs. ':' is a tmux
+    // session/window/pane separator, so no target containing it can name a
+    // session.
+    const badSessionId = "legacy session:1";
+    legacy.db
+        .prepare(
+            "INSERT INTO dev_sessions (id, server_id, group_id, name, repository_root, position, archived, pinned, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .run(badSessionId, SERVER, g.id, "S", "/r", 0, 0, 0, 1, 1);
+    // v2 first: only then is the table free of UNIQUE (tmux_target) and able to
+    // hold the two rows on one target that v3 has to reconcile.
+    downgradeToV2(legacy);
+    const insert = legacy.db.prepare(
+        "INSERT INTO terminal_panes (id, server_id, dev_session_id, name, tmux_target, position, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+    );
+    insert.run("pane-a", SERVER, badSessionId, "a", "ch_shared", 0, 1, 1);
+    insert.run("pane-b", SERVER, badSessionId, "b", "ch_shared", 1, 1, 1);
+    legacy.close();
+
+    const upgraded = openWorkspace(dbPath);
+    assert.equal(
+        (upgraded.db.prepare("SELECT version FROM schema_version WHERE id = 1").get() as {
+            version: number;
+        }).version,
+        WORKSPACE_SCHEMA_VERSION,
+    );
+    // The oldest row keeps the contested target; the loser keeps its ROW and its
+    // slot label, and simply has no session bound to it any more.
+    assert.equal(upgraded.getTerminalPane("pane-a").tmuxTarget, "ch_shared");
+    assert.equal(upgraded.getTerminalPane("pane-b").tmuxTarget, null);
+    assert.equal(upgraded.getTerminalPane("pane-b").name, "b");
+    upgraded.close();
 
     await cleanup(dbPath);
 });

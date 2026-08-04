@@ -11,6 +11,7 @@ import {
     piAdapter,
     type NativeEvent,
 } from "../src/adapters/index.ts";
+import { HARNESSES } from "../src/events.ts";
 import { processBridgeLine } from "../src/bridge.ts";
 import {
     createLineFramer,
@@ -450,4 +451,80 @@ test("createLineFramer discards the rest of an over-cap frame instead of framing
     feed(Buffer.from('trailing garbage\n{"a":1}\n'));
     assert.deepEqual(lines, ['{"a":1}']);
     assert.equal(overflows, 1);
+});
+
+// RA5. The registry maps a harness NAME onto an adapter, and the bridge labels
+// every relayed event with the name that arrived on the wire — never with the
+// adapter's own `harness` field. So filing an adapter under the wrong key is
+// invisible at runtime: events would simply be attributed to a harness that did
+// not produce them. The registry's value type now forbids it at compile time
+// (see adapters/index.ts); this is the runtime half of the same contract.
+test("every registered adapter is filed under the harness it claims (RA5)", () => {
+    for (const harness of HARNESSES) {
+        const adapter = adapterFor(harness);
+        if (harness === "generic") {
+            assert.equal(adapter, undefined, "generic has no adapter (SPEC 6.6)");
+            continue;
+        }
+        assert.ok(adapter, `no adapter registered for ${harness}`);
+        assert.equal(adapter.harness, harness);
+    }
+
+    // Names inherited from Object.prototype are not registrations. A malformed
+    // bridge message can contain any string, and a plain lookup would hand back
+    // a Function for these.
+    for (const inherited of ["toString", "constructor", "valueOf", "__proto__"]) {
+        assert.equal(
+            adapterFor(inherited as Parameters<typeof adapterFor>[0]),
+            undefined,
+            `${inherited} must not resolve to an adapter`,
+        );
+    }
+});
+
+// RA3. Producers are shell hook configurations that interpolate variables, so a
+// native field routinely arrives with a trailing newline or CR ("ask\n" from a
+// command substitution, "agent_start\r\n" from a CRLF-authored config). Every
+// adapter decides state by comparing these fields against exact names, so an
+// untrimmed value matches nothing: the agent's state would silently freeze at
+// whatever it was, and a `tool_call: ask` — the one event meaning "the user
+// must answer something" — would be downgraded to an ordinary running event.
+test("adapters tolerate surrounding whitespace in native fields (RA3)", () => {
+    assert.equal(ohMyPiAdapter.map({ type: "agent_start\r\n" }), "running");
+    assert.equal(ohMyPiAdapter.map({ type: " session_shutdown " }), "stopped");
+    assert.equal(piAdapter.map({ type: "tool_call\n", tool: " ask\n" }), "waiting_input");
+    assert.equal(claudeCodeAdapter.map({ hook: " SessionEnd\n" }), "stopped");
+    assert.equal(claudeCodeAdapter.map({ hook: "Stop\r\n" }), "idle_unseen");
+    assert.equal(
+        claudeCodeAdapter.map({ hook: "Notification", notification_type: " idle_prompt\n" }),
+        "waiting_input",
+    );
+
+    // The normalization reaches the metadata too, so the client never displays
+    // a tool name with a newline glued to it.
+    assert.deepEqual(piAdapter.metadata?.({ type: "tool_call", tool: " ask\n" }), { tool: "ask" });
+    assert.deepEqual(
+        claudeCodeAdapter.metadata?.({ hook: "PreToolUse", tool_name: "Bash\n" }),
+        { tool: "Bash" },
+    );
+
+    // A blank tool name is no tool name: the bag must be absent rather than
+    // carry an empty string the client would render as a nameless tool.
+    assert.equal(piAdapter.metadata?.({ type: "tool_call", tool: "   " }), undefined);
+    assert.equal(claudeCodeAdapter.metadata?.({ hook: "PreToolUse", tool_name: "" }), undefined);
+    assert.equal(claudeCodeAdapter.metadata?.({ hook: "PreToolUse", tool_name: 7 }), undefined);
+});
+
+// The SPEC 6.5 table maps `tool_result: ask` to running and says nothing about
+// any other tool result, which is deliberate: the agent was already running
+// before a non-ask tool returned, so the result of one carries no transition
+// and must be a no-op rather than a state write. Only the shared-mapping test
+// covered this case, and it only asserted that the two pi adapters AGREE — they
+// would still agree if both regressed.
+test("a non-ask tool_result carries no state transition", () => {
+    assert.equal(ohMyPiAdapter.map({ type: "tool_result", tool: "read" }), null);
+    assert.equal(ohMyPiAdapter.map({ type: "tool_result" }), null);
+    assert.equal(piAdapter.map({ type: "tool_result", tool: "read" }), null);
+    // The error flag still outranks it: a tool result that blew up is an error.
+    assert.equal(ohMyPiAdapter.map({ type: "tool_result", tool: "read", error: true }), "error");
 });

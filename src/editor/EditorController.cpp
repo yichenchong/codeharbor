@@ -236,6 +236,7 @@ void EditorController::onTransportClosed()
     m_watchSubscriptionId.clear();
 
     // Nothing is open, or the drop has already been reported.
+
     if (m_path.isEmpty() || m_fileState == FileState::Disconnected)
         return;
 
@@ -268,13 +269,13 @@ void EditorController::onTransportBound()
     if (m_path.isEmpty())
         return;  // nothing open in this pane
 
-    // Leave the Disconnected state the drop parked us in BEFORE issuing
-    // anything: the reconciliation below may move the state again (to
-    // ExternallyModified, or through a reload), and it has to move it from a
-    // truthful starting point.
-    if (m_fileState == FileState::Disconnected)
+    // Leave a transient Disconnected or transport Error state behind BEFORE
+    // issuing anything: reconciliation may move the state again (to
+    // ExternallyModified, or through a reload), and it has to start truthful.
+    if (m_fileState == FileState::Disconnected
+        || m_fileState == FileState::Error)
         setFileState(m_resumeState.value_or(m_dirty ? FileState::Modified
-                                                    : FileState::Clean));
+                                                     : FileState::Clean));
     m_resumeState.reset();
 
     // Order matters: subscribe FIRST so a change landing during the
@@ -576,6 +577,8 @@ void EditorController::open(QString path)
     ++m_watchGeneration;
     m_watchPending = false;
     m_path = path;
+    m_revision.clear();
+
     m_loadedContent.clear();
     m_dirty = false;
     m_recoveryRevision.clear();
@@ -789,6 +792,16 @@ void EditorController::save(QString content, QString expectedRevision)
 {
     if (!m_client || m_path.isEmpty())
         return;
+
+    // A disconnected pane cannot issue a meaningful save. CodeharbordClient
+    // reports an unbound call synchronously; allowing that callback to run
+    // would replace truthful Disconnected with a generic Error and prevent
+    // reconnect recovery.
+    if (m_fileState == FileState::Disconnected) {
+        emit saveError(QStringLiteral(
+            "Disconnected from the server; the buffer was not written."));
+        return;
+    }
 
     // The page may still be showing the previous file while this path is
     // Loading. A save at that point would pair old bytes with the new path (or
@@ -1042,18 +1055,19 @@ void EditorController::reportContent(QString content)
     if (m_fileState == FileState::Loading)
         return;
 
-    // Reports can arrive after an edit was undone, or after a save reply that
-    // deliberately kept the edit counter dirty because it saw an intermediate
-    // buffer. If the bytes are the loaded bytes again, there is no recovery
-    // work to preserve.
-    if (content == m_loadedContent) {
+    // Every report is a new observation of the page buffer. This matters while
+    // a save is in flight: content equal to the old baseline is a deliberate
+    // revert, but the server is about to contain the bytes from that save.
+    ++m_editSerial;
+
+    // Do not use the old baseline as a clean shortcut while a write is pending.
+    if (!m_saveInFlight && content == m_loadedContent) {
         m_dirty = false;
         if (m_fileState == FileState::Modified)
             setFileState(FileState::Clean);
         clearRecovery();
         return;
     }
-    ++m_editSerial;
     m_dirty = true;
     if (m_fileState == FileState::Clean)
         setFileState(FileState::Modified);
@@ -1369,6 +1383,9 @@ bool EditorController::watchLossNamesThisPane(const QJsonValue& params) const
 // each has decided the news is about THIS pane.
 void EditorController::applyExternalChange()
 {
+    if (m_saveInFlight)
+        return;
+
     if (m_dirty) {
         // Unsaved local edits: do NOT clobber them. Flag the divergence and let
         // the UI resolve it (SPEC 8.7). An existing Conflict is NOT downgraded:

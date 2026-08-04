@@ -28,15 +28,38 @@ enum class EscapeState {
     StringEscape,
 };
 
+// CAN (cancel) and SUB (substitute) abandon whatever control sequence is in
+// progress and put the parser back on ordinary text. This scanner has to agree
+// with the renderer that consumes the bytes: @xterm/xterm's parser routes both
+// bytes to GROUND from every escape, CSI and string state, so a scanner that
+// kept "waiting for the end of the sequence" past one of them would hold back
+// bytes the renderer would already be printing.
+constexpr unsigned char kCancelByte = 0x18;
+constexpr unsigned char kSubstituteByte = 0x1a;
+constexpr unsigned char kBellByte = 0x07;
+constexpr unsigned char kEscapeByte = 0x1b;
+
 struct EscapeScanner {
     EscapeState state = EscapeState::Normal;
     qsizetype start = -1;
+    // BEL terminates an OSC string (ESC ]) and nothing else. DCS (ESC P), SOS
+    // (ESC X), PM (ESC ^) and APC (ESC _) end only at ST (ESC \), and a
+    // sixel/DECRQSS payload may legitimately carry a 0x07 byte — treating that
+    // as the end would declare a batch boundary in the middle of a sequence,
+    // which is exactly what this scanner exists to prevent.
+    bool bellTerminates = false;
 
     bool consume(unsigned char byte, qsizetype index)
     {
+        if (state != EscapeState::Normal
+            && (byte == kCancelByte || byte == kSubstituteByte)) {
+            state = EscapeState::Normal;
+            start = -1;
+            return true;
+        }
         switch (state) {
         case EscapeState::Normal:
-            if (byte == 0x1b) {
+            if (byte == kEscapeByte) {
                 state = EscapeState::Escape;
                 start = index;
             }
@@ -46,8 +69,9 @@ struct EscapeScanner {
                 state = EscapeState::Csi;
             } else if (byte == ']' || byte == 'P' || byte == 'X' || byte == '^'
                        || byte == '_') {
+                bellTerminates = byte == ']';
                 state = EscapeState::String;
-            } else if (byte == 0x1b) {
+            } else if (byte == kEscapeByte) {
                 start = index;
                 state = EscapeState::Escape;
             } else if (byte >= 0x20 && byte <= 0x2f) {
@@ -61,7 +85,7 @@ struct EscapeScanner {
             }
             return false;
         case EscapeState::EscapeIntermediate:
-            if (byte == 0x1b) {
+            if (byte == kEscapeByte) {
                 start = index;
                 state = EscapeState::Escape;
                 return false;
@@ -77,18 +101,18 @@ struct EscapeScanner {
                 start = -1;
                 return true;
             }
-            if (byte == 0x1b) {
+            if (byte == kEscapeByte) {
                 state = EscapeState::Escape;
                 start = index;
             }
             return false;
         case EscapeState::String:
-            if (byte == 0x07) {
+            if (bellTerminates && byte == kBellByte) {
                 state = EscapeState::Normal;
                 start = -1;
                 return true;
             }
-            if (byte == 0x1b)
+            if (byte == kEscapeByte)
                 state = EscapeState::StringEscape;
             return false;
         case EscapeState::StringEscape:
@@ -97,7 +121,7 @@ struct EscapeScanner {
                 start = -1;
                 return true;
             }
-            state = byte == 0x1b ? EscapeState::StringEscape : EscapeState::String;
+            state = byte == kEscapeByte ? EscapeState::StringEscape : EscapeState::String;
             return false;
         }
         return false;
@@ -384,9 +408,16 @@ void TerminalController::flush()
     // incomplete suffix here makes every emitted batch independently safe.
     const qsizetype utf8Partial = incompleteTrailingUtf8(m_pending);
     const qsizetype escapePartial = incompleteTrailingEscape(m_pending);
-    const qsizetype partial = qMax(utf8Partial, escapePartial);
+    // An unterminated control string is malformed input, not a reason to let
+    // m_pending grow forever. Once its suffix exceeds the cap, release the
+    // string bytes and retain only a possible UTF-8 lead; xterm.js is a
+    // streaming parser and will recover at the next escape/printable byte.
+    const qsizetype partial =
+        escapePartial > kMaxPendingEscapeBytes
+            ? utf8Partial
+            : qMax(utf8Partial, escapePartial);
     if (partial == m_pending.size())
-        return; // nothing but the head of a character: wait for the rest
+        return; // nothing but an incomplete character/escape: wait for the rest
 
     QByteArray batch = std::move(m_pending);
     m_pending = batch.right(partial); // empty when partial == 0
@@ -443,8 +474,6 @@ void TerminalController::releaseRetained()
             return;
         cut = indivisible;
     }
-    if (cut <= 0)
-        return;
     if (cut >= m_hidden.size()) {
         replay = std::move(m_hidden);
         m_hidden.clear();
@@ -491,9 +520,10 @@ qsizetype TerminalController::resyncBoundary(const QByteArray &buffer, qsizetype
             continue;
         }
 
-        if (candidate < from || candidate > limit)
+        if (candidate < from)
             continue;
-        if (scanner.state == EscapeState::Normal
+        if (candidate <= limit
+            && scanner.state == EscapeState::Normal
             && (candidate == buffer.size()
                 || !isUtf8Continuation(
                     static_cast<unsigned char>(buffer.at(candidate))))) {
@@ -502,6 +532,13 @@ qsizetype TerminalController::resyncBoundary(const QByteArray &buffer, qsizetype
             if (byte == '\n')
                 lineFeed = candidate;
         }
+        // Once the bounded look-ahead is exhausted in ordinary text there is
+        // no sequence left to finish; do not scan the remaining megabytes of
+        // retained scrollback on every eviction. A sequence that started
+        // before the cut is intentionally allowed to run past the window and
+        // is handled by the completed branch above.
+        if (candidate > limit && scanner.state == EscapeState::Normal)
+            break;
     }
 
     if (lineFeed >= from)

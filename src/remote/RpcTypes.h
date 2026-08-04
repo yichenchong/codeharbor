@@ -38,9 +38,17 @@ inline constexpr int kDatabaseBusy = -32002;
 // Application-level JSON-RPC error code for a request that is well-formed but
 // whose ANSWER would exceed a server resource bound, so the server refused it
 // outright and changed nothing. Mirrors RPC_RESOURCE_LIMIT in
-// remote/src/rpc-types.ts, which raises it for a file.listDirectory whose
-// listing would not fit in one transport frame and for a file.watch past the
-// live-subscription cap.
+// remote/src/rpc-types.ts, which raises it for FOUR conditions, all in
+// remote/src/files.ts:
+//   * file.listDirectory whose serialized listing would not fit in one
+//     transport frame (MAX_DIRECTORY_LISTING_BYTES);
+//   * file.watch past the live-subscription cap (MAX_WATCH_SUBSCRIPTIONS);
+//   * file.readFile on a file whose raw size — or whose requested range — is
+//     past MAX_FILE_READ_BYTES, which would have meant one allocation of the
+//     whole file on the server;
+//   * file.readFile whose ENCODED reply is past MAX_FILE_RESPONSE_BYTES, since
+//     base64 expansion and JSON escaping can turn a within-limit file into an
+//     over-cap frame.
 //
 // No client code special-cases it and none should: the server's message names
 // the limit that bit and is written for a person, so the generic error path
@@ -49,6 +57,19 @@ inline constexpr int kDatabaseBusy = -32002;
 // CodeharbordClient's 16 MiB cap, and going over that cap does not fail one
 // reply, it drops the whole transport.
 inline constexpr int kResourceLimit = -32003;
+
+// JSON-RPC 2.0's RESERVED code for an internal error (section 5.1). Mirrors
+// RPC_INTERNAL_ERROR in remote/src/rpc-types.ts, and it is the code
+// CodeharbordClient stamps on every failure it synthesizes itself — a dead,
+// replaced or unwritable transport, a malformed response, a request it refuses
+// to put on the wire — so a caller needs no separate code path for "the server
+// said no" and "we never reached the server".
+//
+// It lives in this mirror header, beside the application codes above, because
+// more than one place on the C++ side mints it and they must not drift: the
+// value used to be spelled as a private constant per translation unit, with
+// only a comment claiming the two agreed.
+inline constexpr int kInternalError = -32603;
 
 // Stable wire method names for the initial file set (SPEC 8.3). These mirror the
 // values in RPC_METHODS in remote/src/rpc-types.ts.

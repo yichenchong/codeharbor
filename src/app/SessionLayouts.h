@@ -425,6 +425,17 @@ private:
     // `reason`, and republish/persist. Shared by the error answer and the
     // deadline so the two cannot drift apart.
     void abandonTerminalMint(const QString& paneId, const QString& reason);
+    // Bring the terminal region's per-leaf bookkeeping back in step with a tree
+    // this client did NOT derive from the server (see saveTree): drop the
+    // resolve-by-label permission of every slot the authored tree no longer
+    // holds - the permission belonged to that leaf, and a later leaf wearing
+    // the same label is a different pane - and mint a `terminal_panes` row for
+    // every leaf that has none, is not a pre-migration leaf, and has no mint in
+    // flight already. Without that last step an authored tree's brand new
+    // terminal leaves would be PENDING with nothing on the wire to resolve
+    // them, and persist() refuses for the rest of the session to write a region
+    // that holds one (see hasPendingTerminalLeaf()).
+    void adoptAuthoredTerminalTree(quint64 generation);
     // Find the terminal leaf labelled `paneId` in the loaded terminal tree, or
     // nullptr. Terminal region only: a viewer leaf has no row to bind.
     SplitNode* findTerminalLeaf(const QString& paneId);
@@ -466,6 +477,15 @@ private:
     // `terminalLegacy` on the leaf; never persisted, because it is a statement
     // about what THIS client has learned, not about the layout.
     QSet<QString> m_legacyTerminalSlots;
+    // Terminal slot labels whose `terminal_panes` mint has been sent and not
+    // yet settled, i.e. exactly the leaves that already have a row coming.
+    // Kept so a tree written twice cannot start a SECOND mint for the same leaf
+    // - the loser's row and its tmux session would be orphaned on the server -
+    // and so adoptAuthoredTerminalTree() can tell "its row is on the way" from
+    // "nothing has ever been asked for it". A label leaves the set the moment
+    // its mint settles either way, and load() empties it because a new
+    // generation drops every outstanding answer anyway.
+    QSet<QString> m_pendingTerminalMints;
 };
 
 } // namespace ch

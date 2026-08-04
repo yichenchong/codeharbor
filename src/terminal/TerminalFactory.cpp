@@ -536,8 +536,13 @@ void TerminalFactory::finishResolution(const QString& key, const QString& target
                                   answer.harness);
             }
         }
-        if (target.isEmpty() && !message.isEmpty())
+        if (target.isEmpty() && !message.isEmpty()) {
             emit error(waiter, message);
+            if (!waiter)
+                continue;
+        }
+        if (!waiter)
+            continue;
         emit targetResolved(waiter, target);
     }
 }
@@ -705,7 +710,8 @@ void TerminalFactory::detach(TerminalController* controller)
     // it did, the controller is already bound to a brand new channel and the
     // steps below must not unbind or report that fresh pane as dropped.
     const bool stillOurs = pane && device && pane->transport() == device;
-    device->deleteLater();
+    if (device)
+        device->deleteLater();
     if (!stillOurs || !pane)
         return;
 

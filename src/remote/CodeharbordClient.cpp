@@ -15,15 +15,21 @@ namespace ch {
 
 namespace {
 
-// JSON-RPC 2.0 reserved code for an internal/transport error. Reused for the
-// synthetic failure delivered to pending callbacks when the transport dies.
-constexpr int kInternalError = -32603;
+// JSON-RPC 2.0 reserved code for an internal/transport error, sourced from the
+// shared mirror header so this client's synthetic failures and ch::rpc's
+// contract constants cannot drift apart.
+constexpr int kInternalError = rpc::kInternalError;
 
-// Hard cap on a single unframed line. A well-behaved server delimits every
-// message with '\n'; a peer that streams megabytes without one is malformed and
-// must not grow m_readBuffer without bound. Set above the largest legitimate
-// frame: the internal scheme handler bounds inline file reads to 8 MiB raw
-// (~11 MiB base64), so 16 MiB leaves headroom for that plus JSON overhead.
+// Hard cap on ONE framed line, in BOTH directions. Inbound: a well-behaved
+// server delimits every message with '\n'; a peer that streams megabytes
+// without one is malformed and must not grow m_readBuffer without bound.
+// Outbound: call() refuses to write a frame past this, because the daemon drops
+// the whole transport on an over-cap line rather than failing one request.
+//
+// Set above the largest legitimate frame: the internal scheme handler bounds
+// inline file reads to 8 MiB raw (~11 MiB base64), so 16 MiB leaves headroom
+// for that plus JSON overhead. MAX_LINE_BYTES in remote/src/codeharbord.ts is
+// the same number, and remote/test/rpc-mirror.test.ts pins the two together.
 constexpr int kMaxLineBytes = 16 * 1024 * 1024;
 
 // Hard cap on how many heartbeat probes may be unanswered at once: the live one
@@ -40,7 +46,7 @@ constexpr qsizetype kMaxOutstandingProbes = 4;
 // copy the WHOLE line — megabytes for an inline file read — just to answer "is
 // this blank?". '\n' cannot appear (the caller split on it) and a trailing '\r'
 // has already been chopped, but both are listed for completeness.
-bool isBlankLine(const QByteArray& line)
+bool isBlankLine(const QByteArray& line) noexcept
 {
     for (const char c : line) {
         if (c != ' ' && c != '\t' && c != '\v' && c != '\f' && c != '\r' &&
@@ -249,6 +255,11 @@ qint64 CodeharbordClient::call(const QString& method, const QJsonValue& params,
     if (!params.isUndefined() && !params.isNull())
         request.insert(QStringLiteral("params"), params);
 
+    // Serialize BEFORE the transmit decision below: the frame's SIZE is one of
+    // the things that decides it, so the bytes have to exist first.
+    QByteArray line = QJsonDocument(request).toJson(QJsonDocument::Compact);
+    line.append('\n');
+
     // Decide whether we can actually transmit BEFORE registering the pending
     // callback. If we cannot, the callback would otherwise be orphaned forever
     // (leak + caller hangs, never learning it failed). Instead we fail it once
@@ -276,6 +287,24 @@ qint64 CodeharbordClient::call(const QString& method, const QJsonValue& params,
              !request.value(QStringLiteral("params")).isArray())
         failReason =
             QStringLiteral("outgoing params is neither object nor array");
+    // Both ends of this wire agree that a frame past kMaxLineBytes is a FAULT,
+    // not something to buffer: the daemon's framer destroys its stdin on one
+    // (createLineFramer in remote/src/codeharbord.ts), which drops the whole SSH
+    // RPC channel and with it every editor and terminal in the session. The
+    // daemon already refuses to WRITE an over-cap response for exactly that
+    // reason; this is the missing mirror of that check on the request side.
+    //
+    // It is reachable, not theoretical: file.writeFile carries the buffer's full
+    // text, and JSON escaping is not size preserving — 8 MiB of C0 control bytes
+    // (valid UTF-8, so the daemon returns them as `utf-8` text a pane may edit)
+    // becomes 48 MiB of \uXXXX escapes. Refusing the one request keeps the
+    // session alive and tells the caller which write was too big, instead of
+    // silently taking the connection down.
+    else if (line.size() - 1 > kMaxLineBytes)
+        failReason = QStringLiteral("outgoing frame is %1 bytes, past the "
+                                    "%2-byte line cap")
+                         .arg(qint64(line.size() - 1))
+                         .arg(kMaxLineBytes);
     else if (m_destroying)
         failReason = QStringLiteral("client is being destroyed");
     else if (m_closed)
@@ -299,9 +328,6 @@ qint64 CodeharbordClient::call(const QString& method, const QJsonValue& params,
             cb(QJsonValue(), error);
         return id;
     }
-
-    QByteArray line = QJsonDocument(request).toJson(QJsonDocument::Compact);
-    line.append('\n');
 
     // Register BEFORE writing. QIODevice subclasses are allowed to emit
     // readyRead/disconnected synchronously from writeData(); registering after
@@ -582,7 +608,7 @@ void CodeharbordClient::processLine(const QByteArray& line)
     // `cb` may be EMPTY: call() accepts a null callback for a fire-and-forget
     // request, so every invocation below is guarded. Invoking an empty
     // std::function would throw std::bad_function_call out of a Qt slot.
-    const ResponseCallback cb = it.value();
+    ResponseCallback cb = std::move(it.value());
     m_pending.erase(it);
 
     if (!validVersion) {

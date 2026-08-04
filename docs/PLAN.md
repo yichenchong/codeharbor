@@ -41,9 +41,9 @@ contract so downstream work can build against it before it is fully implemented.
   - The bootstrap smoke suite passed; its early test count is intentionally not
     recorded because the workspace suite has grown. RPC stdio + bridge socket
     smoke-tested.
-- CI: a `remote` job (install/typecheck/test), a `client` job (web bundles +
-  Qt/CMake configure/build/test), and a Windows job that only warms the shared
-  vcpkg libssh cache on `main`.
+- CI: a `remote` job (install/typecheck/test), a `client` matrix job that builds
+  and tests on Linux, Windows and macOS, and an `installer-script` job that
+  compiles the Windows installer script.
 
 > The bootstrap seams described above are all filled in by later waves; see
 > "Delivery progress" for what actually landed and the corrections found when the
@@ -462,9 +462,12 @@ fixed.
 >   (`src/editor/EditorController.h`) has no diff-view and no write-to-another-path
 >   method. The safety requirement of that section is met — no silent overwrite — so
 >   this is a missing affordance, not a correctness hole. SPEC 8.6 now records it.
-> - **`viewer_panes`/`terminal_panes` CRUD is unused.** Pane URLs ride in the layout
->   tree instead (atomic with the structure, no extra RPC); those six methods and the
->   two tables stay dead until per-pane metadata needs a home.
+> - **`viewer_panes` CRUD is unused, but `terminal_panes` is authoritative.** Pane
+>   URLs ride in the layout tree instead of `viewer_panes`; terminal panes are
+>   resolved and persisted through `workspace.resolveTerminalPane` and used by
+>   `TerminalFactory` to obtain server-minted identities and tmux targets. The
+>   remaining viewer-pane CRUD methods stay dormant until per-pane metadata needs
+>   a home.
 > - **A reconnect that meets a NEW unknown host key cannot prompt** — `hostKeyPrompt`
 >   is only raised from an interactive connect, so the ladder dead-ends on an opaque
 >   failure. Needs a design call about prompting outside a user-initiated attempt.

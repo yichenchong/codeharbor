@@ -252,23 +252,27 @@ Item {
                                     && root.fileState === "disconnected"
     readonly property bool conflicted: root.fileState === "conflict"
 
+    // Binding notifications run before dependent bindings are refreshed. Event
+    // handlers therefore use this direct conversion when they need the current
+    // file path, rather than reading the potentially stale `remotePath` binding.
+    function currentRemotePath() {
+        const value = root.fileUrl.toString();
+        return value.length > 0 ? RemotePath.fileUrlToPath(value) : "";
+    }
+
     // Same treatment TerminalPaneView gives a dropped channel: a thin banner
     // across the top of the pane, so the warning is unmissable without hiding
     // the text the user is still working on.
     Rectangle {
         objectName: "editorStateBanner"
-        anchors.left: parent.left
-        anchors.right: parent.right
-        anchors.top: parent.top
-        height: 22
+        // These are dim fills behind danger/warning text and have no direct
+        // Theme role; the palette's errorSurface() and warningSurface()
+        // helpers keep both shades aligned across dark and light themes.
+        color: root.conflicted ? Theme.errorSurface() : Theme.warningSurface()
         visible: root.dropped || root.conflicted
         // Red for the state that puts the user's edits at risk, amber for the
         // one that merely suspends them — the same split, and the same two
         // colours, TerminalPaneView uses for "error" versus a plain drop.
-        // #45222c / #3a2f1e are dim FILLS behind danger/warning text and have no
-        // Theme role (Theme.danger and Theme.warning are the text colours, far
-        // too bright to fill with). Same pair TerminalPaneView's banner uses.
-        color: root.conflicted ? Theme.errorSurface() : Theme.warningSurface()
 
         Label {
             objectName: "editorStateBannerLabel"
@@ -439,8 +443,9 @@ Item {
             view.url = ""
             return
         }
-        view.url = root.remotePath.length > 0
-            ? base + "?path=" + encodeURIComponent(root.remotePath)
+        const path = root.currentRemotePath()
+        view.url = path.length > 0
+            ? base + "?path=" + encodeURIComponent(path)
             : base
     }
 
@@ -454,8 +459,9 @@ Item {
         root.recoveredContent = ""
         root.recoveryPending = false
         recoveryDialog.close()
-        if (root.controller && root.remotePath.length > 0)
-            root.controller.open(root.remotePath)
+        const path = root.currentRemotePath()
+        if (root.controller && path.length > 0)
+            root.controller.open(path)
         root.navigate()
     }
 

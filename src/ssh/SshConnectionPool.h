@@ -475,6 +475,17 @@ private:
     QString authenticationFailure() const;
     void closeSession();
 #endif
+    // Whether the libssh session an in-flight handshake was using has already
+    // been freed — asked by applyHostKeyPolicy(), which is compiled in BOTH
+    // builds and so cannot name m_session directly: that member only exists
+    // when libssh is present, and referring to it unguarded broke the
+    // CH_HAVE_LIBSSH=0 build outright.
+#if CH_HAVE_LIBSSH
+    bool sessionGone() const { return m_session == nullptr; }
+#else
+    // No session is ever allocated and no handshake ever runs in this build.
+    bool sessionGone() const { return true; }
+#endif
 
     State m_state = State::Disconnected;
     // Set by the destructor before it tears the session down, so a slot reached

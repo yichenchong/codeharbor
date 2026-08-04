@@ -512,12 +512,9 @@ WorkspaceDb::WorkspaceDb(CodeharbordClient* client) : m_client(client)
     Q_ASSERT(m_client);
 }
 
-void WorkspaceDb::list(const ServerId& serverId, ListCallback cb,
-                       bool pinnedOnly)
+void WorkspaceDb::list(const ServerId& serverId, ListCallback cb)
 {
-    QJsonObject params{{QStringLiteral("serverId"), serverId.value}};
-    if (pinnedOnly)
-        params[QStringLiteral("pinnedOnly")] = true;
+    const QJsonObject params{{QStringLiteral("serverId"), serverId.value}};
     m_client->call(
         QString::fromLatin1(rpc::kMethodWorkspaceList), params,
         [cb = std::move(cb)](QJsonValue result, std::optional<RpcError> error) {

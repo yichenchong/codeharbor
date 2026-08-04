@@ -645,17 +645,15 @@ ApplicationWindow {
         id: logView
         anchors.fill: parent
         z: 900
-        visible: shown
-        property bool shown: false
+        visible: logView.shown
         logBuffer: app.logBuffer
-        onDismissed: shown = false
+        onDismissed: logView.shown = false
     }
     SettingsWindow {
         id: settingsWindow
         anchors.fill: parent
         z: 910
         visible: shown
-        property bool shown: false
         onDismissed: shown = false
     }
 
@@ -673,6 +671,7 @@ ApplicationWindow {
             connectSheet.pendingCredential = {
                 user: user, host: host, prompt: prompt, kind: kind
             };
+            connectSheet.shown = true;
         }
         // A successful connect is the sheet's exit condition. It fills the
         // window at z 900, so leaving it up after the workspace is reachable
@@ -750,18 +749,6 @@ ApplicationWindow {
         return window.firstPaneId(tree, region === "viewer" ? "viewer-1" : "terminal-1");
     }
 
-    // Leaf count of a split tree: how many panes a region command could have
-    // meant.
-    function paneCount(tree) {
-        if (!tree)
-            return 0;
-        if (!tree.children || tree.children.length === 0)
-            return 1;
-        var n = 0;
-        for (var i = 0; i < tree.children.length; ++i)
-            n += window.paneCount(tree.children[i]);
-        return n;
-    }
 
     // Open a directory target in a NEW viewer pane. SessionLayouts remains the
     // sole creator of split leaves; ViewerRegion only applies the target to the

@@ -102,3 +102,38 @@ test("a reload replaces both the mark and the line endings", () => {
     model.setValue(`${BOM}back\r\nagain\r\n`);
     assert.equal(bufferText(model), `${BOM}back\r\nagain\r\n`);
 });
+
+test("a MIXED-ending file is normalised to the majority ending, and that is expected", () => {
+    // The documented limitation in buffer.ts, pinned so it is a KNOWN loss
+    // rather than a surprise: Monaco decides one line ending for the whole
+    // buffer when the content is set, before any accessor is reachable, so a
+    // file that mixes the two comes back out in whichever kind was in the
+    // majority. Nothing bufferText() can do changes this; the test exists so a
+    // future change of the rule does not silently claim to have fixed it.
+    assert.equal(bufferText(new MonacoModel("a\r\nb\nc\r\n")), "a\r\nb\r\nc\r\n");
+    assert.equal(bufferText(new MonacoModel("a\nb\r\nc\n")), "a\nb\nc\n");
+});
+
+test("the accessor asks for the file's own ending, never a concrete one", () => {
+    // The exact shape of the options object is the contract: Monaco overrides
+    // the line ending only for "\n" or "\r\n", so passing either would rewrite
+    // every line of a file of the other kind on the first save. "" is how the
+    // caller asks for "whatever the file uses" while still keeping the mark.
+    let seen: unknown;
+    const spy: BufferSource = {
+        getValue(options) {
+            seen = options;
+            return "";
+        },
+    };
+    bufferText(spy);
+    assert.deepEqual(seen, { preserveBOM: true, lineEnding: "" });
+});
+
+test("a concrete lineEnding really would rewrite the file, which is why it is not passed", () => {
+    // The failure the rule above avoids, demonstrated on the real buffer: ask
+    // for LF and a CRLF file loses every one of its carriage returns.
+    const model = new MonacoModel("alpha\r\nbeta\r\n");
+    assert.equal(model.getValue({ preserveBOM: true, lineEnding: "\n" }), "alpha\nbeta\n");
+    assert.equal(bufferText(model), "alpha\r\nbeta\r\n");
+});

@@ -743,7 +743,7 @@ Rectangle {
         pane.focusPending = false;
     }
 
-    // ---- keyboard focus handoff --------------------------------------------
+    // ---- renderer preferences and theme ------------------------------------
 
     // Push the two client-local terminal preferences into the trusted page.
     // WebEngineView is a separate JavaScript world from QML, so a direct
@@ -869,7 +869,9 @@ Rectangle {
                 }
 
                 onLoadingChanged: function(request) {
-                    if (request.status === WebEngineView.LoadSucceededStatus) {
+                    if (request.status === WebEngineView.LoadStartedStatus) {
+                        pane.pageLoaded = false
+                    } else if (request.status === WebEngineView.LoadSucceededStatus) {
                         pane.pageLoaded = true
                         Qt.callLater(pane.applyTerminalTheme)
                         Qt.callLater(pane.applyTerminalSettings)

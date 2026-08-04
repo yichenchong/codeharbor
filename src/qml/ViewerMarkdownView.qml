@@ -187,10 +187,15 @@ Item {
         }
     }
 
+    function ownsFailure(candidate) {
+        return root.internalUrl.toString().length > 0
+               && String(candidate) === root.internalUrl.toString()
+    }
+
     Connections {
         target: root.viewerModel
         function onInternalResourceError(internalUrl, message) {
-            if (String(internalUrl) === root.internalUrl.toString())
+            if (root.ownsFailure(internalUrl))
                 root.errorText = message
         }
     }

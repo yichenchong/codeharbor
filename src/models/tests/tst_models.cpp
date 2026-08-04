@@ -1,6 +1,7 @@
 #include <QtTest/QtTest>
 
 #include <QAbstractItemModelTester>
+#include <QMetaProperty>
 #include <QHash>
 #include <QFile>
 #include <QJsonArray>
@@ -75,6 +76,7 @@ private slots:
     void aggregateRowStateCoversEveryInputCombination();
     void stateStringsArePinnedWireValues();
     void sessionsModelRoleNamesCoverEveryServedRole();
+    void sessionsModelExposesPinnedOnlyAsQmlProperty();
     void sessionsModelFiltersArchivedAndPinnedTogether();
     void sessionsModelPinnedOnlyHidesEmptyGroups();
     void splitTreeRejectsNonObjectChildAndNonNumericRatio();
@@ -1002,6 +1004,24 @@ void TstModels::sessionsModelRoleNamesCoverEveryServedRole()
     // Qt::DisplayRole is an alias for the row's name on both row kinds.
     QCOMPARE(model.data(group, Qt::DisplayRole).toString(), QStringLiteral("G"));
     QCOMPARE(model.data(session, Qt::DisplayRole).toString(), QStringLiteral("S"));
+}
+// SessionsSidebar.qml writes both local filters through QObject property syntax.
+// A C++ getter/setter pair without Q_PROPERTY is not visible to that syntax, so
+// verify the pin filter is exposed and writable alongside showArchived.
+void TstModels::sessionsModelExposesPinnedOnlyAsQmlProperty()
+{
+    SessionsModel model;
+    const QMetaObject *meta = model.metaObject();
+    const int propertyIndex = meta->indexOfProperty("pinnedOnly");
+    QVERIFY(propertyIndex >= 0);
+    const QMetaProperty property = meta->property(propertyIndex);
+    QVERIFY(property.isReadable());
+    QVERIFY(property.isWritable());
+    QCOMPARE(property.notifySignal().name(), QByteArrayLiteral("pinnedOnlyChanged"));
+    QVERIFY(property.write(&model, true));
+    QVERIFY(model.pinnedOnly());
+    QVERIFY(property.write(&model, false));
+    QVERIFY(!model.pinnedOnly());
 }
 // Archived visibility and pin visibility are independent filters. Showing
 // archived rows never bypasses "only pinned", and clearing that filter still

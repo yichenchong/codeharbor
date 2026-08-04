@@ -69,6 +69,19 @@ test("sanitises executable and embedding markup without losing surrounding text"
     assert.doesNotMatch(html, /target=/i);
 });
 
+test("responsive image sources and inline styles never survive the rewrite", () => {
+    const dom = new JSDOM("");
+    const { window } = dom;
+    const html = renderMarkdown(
+        '<img src="ok.png" srcset="https://evil.example/x.png 1x" sizes="100vw" '
+        + 'style="position:fixed;top:0">',
+        sanitizerFor(window),
+    );
+    const rewritten = rewriteRelativeUrls(html, "/docs/readme.md", window.document);
+    assert.doesNotMatch(rewritten, /srcset=|sizes=|style=/i);
+    assert.match(rewritten, /data-ch-image-path="ok\.png"/);
+});
+
 test("relative images and links resolve against the document directory", () => {
     const dom = new JSDOM("");
     const { window } = dom;

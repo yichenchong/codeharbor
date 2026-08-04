@@ -22,7 +22,6 @@ QT_END_NAMESPACE
 namespace ch {
 
 class SshChannelDevice;
-class SshConnectionPool;
 
 // Brings a remote workspace session up and hands its byte streams to the
 // consumers that already speak QIODevice (SPEC 5.3, 6.4, 10.1).
@@ -145,8 +144,9 @@ public:
     bool reconnectPending() const;
 
     // Automatic reconnect is on by default. Turning it off cancels a pending
-    // retry AND aborts a retry that is already inside its connect pre-flight,
-    // so a user who asked to stay disconnected is not dragged back.
+    // retry AND aborts a retry that is already inside its connect pre-flight or
+    // remote provisioning step, so a user who asked to stay disconnected is
+    // not dragged back.
     //
     // A connect the USER asked for is not the ladder's to abandon: switching
     // this off while connectAndWire() is in flight leaves that attempt alone.
@@ -169,9 +169,9 @@ public:
     double reconnectTimeScale() const { return m_timeScale; }
 
     // User-initiated teardown: cancels any pending retry, aborts an in-flight
-    // connect attempt (probeEndpoint()'s nested event loop returns at once),
-    // unwires both consumers, drops the SSH session and ends in
-    // State::Disconnected WITHOUT scheduling a reconnect.
+    // connect attempt (including probeEndpoint() or remote provisioning's
+    // nested event loop), unwires both consumers, drops the SSH session and
+    // ends in State::Disconnected WITHOUT scheduling a reconnect.
     void disconnectSession();
 
     // Retry delay in seconds for the Nth (0-based) automatic reconnect attempt:
@@ -415,10 +415,11 @@ protected:
     // So the endpoint is asked to prove itself first, over a throwaway
     // QTcpSocket driven by the event loop rather than by blocking waits: DNS,
     // TCP connect and the server's first byte must all land inside
-    // connectTimeoutMs(). Failing that we never call libssh at all, and the
-    // attempt ends in a clean State::Failed. Because the probe spins a nested
-    // QEventLoop with ExcludeUserInputEvents, the shell keeps repainting while
-    // it runs and cannot be re-entered by a second click.
+    // connectTimeoutMs(). Failing that we never call libssh. A user-initiated
+    // attempt ends in State::Failed; a reconnect rung returns to its retry
+    // ladder unless cancellation or a fatal prerequisite ends it. Because the
+    // probe spins a nested QEventLoop with ExcludeUserInputEvents, the shell
+    // keeps repainting while it runs and cannot be re-entered by a second click.
     //
     // Cost: one extra TCP connection per attempt, which an OpenSSH server logs
     // as "Did not receive identification string". That is the price of not
@@ -462,6 +463,9 @@ private:
     void cancelReconnect();
     void unwire();
     void fail(const QString& message);
+    // Same teardown as fail(), but marks a server/configuration prerequisite
+    // failure as non-retryable. The reconnect ladder stops after this attempt.
+    void failFatal(const QString& message);
     // `message` with the most recent channelDiagnostic() of the exec attempt
     // appended, so a setup failure carries the remote side's own explanation.
     QString withLastDiagnostic(const QString& message) const;
@@ -549,7 +553,14 @@ private:
     QEventLoop* m_nestedLoop = nullptr;
     // The in-flight attempt was cancelled from inside its own nested loop; it
     // must unwind without wiring anything, failing, or arming a retry.
+    // Set by failFatal() for a retry attempt whose cause cannot be repaired by
+    // reconnecting (missing/incompatible Node, invalid install target, or a bad
+    // artifact). The timer path turns that attempt directly into Failed.
     bool m_cancelRequested = false;
+    bool m_attemptFatal = false;
+    // Covers the stateChanged() delivery in connectAndWire() before
+    // attemptWire() can raise m_attempting.
+    bool m_connectRequested = false;
 };
 
 } // namespace ch

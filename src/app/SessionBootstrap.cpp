@@ -12,6 +12,7 @@
 #include <QFile>
 #include <QFileInfo>
 #include <QLatin1String>
+#include <QSaveFile>
 #include <QScopeGuard>
 #include <QStandardPaths>
 #include <QTcpSocket>
@@ -109,15 +110,35 @@ SessionBootstrap::SessionBootstrap(SshConnectionPool* pool,
         // nothing left to re-arm it, State::Reconnecting for ever — so the rung
         // is deferred instead.
         if (m_attempting) {
-            scheduleReconnect();
+            // Re-arm THIS rung rather than announcing a new one.
+            // scheduleReconnect() would emit reconnectScheduled() a second time
+            // for a rung the user has already been told about — and on a session
+            // the in-flight attempt may yet bring up, so the shell would flash
+            // "reconnecting in N s" over a link that is coming back. Whichever
+            // way that attempt ends it owns the outcome: on failure it calls
+            // scheduleReconnect() itself and overwrites this tick, and on
+            // success the tick lands in State::Wired and is dropped above.
+            m_reconnectTimer->start();
             return;
         }
         ++m_attempt;
         // This attempt belongs to the ladder, so setReconnectEnabled(false) may
         // abandon it mid-flight; a connectAndWire() may not. See there.
         m_attemptIsRetry = true;
-        if (!attemptWire())
+        if (!attemptWire()) {
+            // A prerequisite on the SERVER that the user has to change — no
+            // Node.js on the far side, a Node too old to run the service, a
+            // repository root nothing may be installed into, an artifact that
+            // is not a codeharbor-remote release. Waiting does not make any of
+            // those true, so the ladder stops here instead of spending nine
+            // more rungs re-asking the same question and painting nine more
+            // identical toasts. failFatal() has already reported it.
+            if (m_attemptFatal) {
+                setState(State::Failed);
+                return;
+            }
             scheduleReconnect();
+        }
     });
 
     if (m_pool) {
@@ -298,9 +319,10 @@ bool SessionBootstrap::nodeVersionIsSupported(const QString& version)
     QString text = version.trimmed();
     if (text.startsWith(QLatin1Char('v')))
         text.remove(0, 1);
+    // QString::split() always yields at least one element, so parts.at(0) below
+    // is safe: an empty version string arrives as a single empty element, whose
+    // toInt() then fails.
     const QStringList parts = text.split(QLatin1Char('.'));
-    if (parts.isEmpty())
-        return false;
     bool ok = false;
     const int major = parts.at(0).toInt(&ok);
     if (!ok)
@@ -583,10 +605,16 @@ void SessionBootstrap::scheduleReconnect()
     if (m_cancelRequested)
         return;
     if (!m_reconnectEnabled) {
+        // The ladder is over, so nothing of it may still be ticking:
+        // reconnectPending() is public, and a rung left armed behind
+        // State::Disconnected makes it report a retry that will be dropped the
+        // moment it fires.
+        cancelReconnect();
         setState(State::Disconnected);
         return;
     }
     if (m_maxAttempts > 0 && m_attempt >= m_maxAttempts) {
+        cancelReconnect();
         emit error(QStringLiteral("giving up on the session after %1 reconnect "
                                   "attempts")
                        .arg(m_attempt));
@@ -611,6 +639,12 @@ void SessionBootstrap::handleConnectionLost(const QString& reason)
     // session to lose.
     if (m_attempting || m_tearingDown || m_state != State::Wired)
         return;
+
+    // A rung can be armed even here: a tick that fired while the previous
+    // attempt was still in flight re-arms itself, and that attempt then wired
+    // the session. This loss supersedes it, and scheduleReconnect() below arms
+    // the rung that actually belongs to it.
+    cancelReconnect();
 
     unwire();
     // A channel can die while the SSH session itself still looks connected.
@@ -644,12 +678,17 @@ void SessionBootstrap::disconnectSession()
     // connect budget — and so the unwinding attempt does not go on to wire the
     // very session that is being torn down here.
     abortAttempt();
+    const bool wasTearingDown = m_tearingDown;
     m_tearingDown = true;
     cancelReconnect();
     unwire();
     if (m_pool)
         m_pool->disconnectFromHost();
-    m_tearingDown = false;
+    // Restored rather than forced false: this can run from inside a teardown
+    // that is already in progress (a handler of the error() fail() emits, say),
+    // and clearing the flag under that caller would let the pool and device
+    // signals its remaining steps provoke be mistaken for a fresh loss.
+    m_tearingDown = wasTearingDown;
     if (m_environmentTrustActive) {
         m_trustUnknownHostKeys = m_environmentTrustPrevious;
         m_environmentTrustActive = false;
@@ -675,6 +714,16 @@ void SessionBootstrap::fail(const QString& message)
         m_pool->disconnectFromHost();
     m_tearingDown = wasTearingDown;
     emit error(message);
+}
+
+void SessionBootstrap::failFatal(const QString& message)
+{
+    // Same teardown and the same report as fail(); the difference is that the
+    // reconnect ladder must not spend nine more rungs on a condition only a
+    // change on the server can clear. Set BEFORE fail(), because fail() emits
+    // error() and a handler of that may look at the object.
+    m_attemptFatal = true;
+    fail(message);
 }
 
 
@@ -946,7 +995,16 @@ bool SessionBootstrap::runRemoteScript(const QString& script, int timeoutMs,
     // ExcludeUserInputEvents, exactly as probeEndpoint() does it: the shell
     // keeps repainting (which is the whole point of reporting progress) but a
     // second click cannot re-enter the connect path.
-    loop.exec(QEventLoop::ExcludeUserInputEvents);
+    //
+    // Not entered at all when the verdict is already in. startExec() publishes
+    // the remote's first stderr line synchronously, and a handler of the
+    // channelDiagnostic() that carries it may call disconnectSession() — which
+    // finds no nested loop of ours to quit and only raises the cancel flag.
+    // QEventLoop::quit() before exec() is forgotten, so entering anyway would
+    // spend the whole budget (three minutes for an install) frozen on the GUI
+    // thread, for a session nobody wants any more.
+    if (!m_cancelRequested && !finished && !timedOut)
+        loop.exec(QEventLoop::ExcludeUserInputEvents);
     poll.stop();
     // Whatever landed together with the EOF that ended the loop, and then
     // whatever the first drain's own read left behind. Twice rather than a bare
@@ -1048,7 +1106,7 @@ bool SessionBootstrap::ensureRemoteService()
         // Not a soft warning even when something is installed: without node
         // nothing under repoRoot can start, and "sh: node: not found" on a dead
         // channel is precisely the unactionable failure this replaces.
-        fail(tr("\"%1\" is not a runnable Node.js on %2. The CodeHarbor remote "
+        failFatal(tr("\"%1\" is not a runnable Node.js on %2. The CodeHarbor remote "
                 "service needs Node %3.%4 or newer there. Install it (nodesource "
                 "or nvm) and set the profile's node path to its ABSOLUTE "
                 "location — a non-interactive SSH session has none of a version "
@@ -1111,7 +1169,7 @@ bool SessionBootstrap::ensureRemoteService()
     const QString releaseEntry =
         entryCandidates(m_repoRoot, QStringLiteral("codeharbord")).at(0);
     if (forced && !info.entry.isEmpty() && info.entry != releaseEntry) {
-        fail(tr("\"%1\" on %2 is a source checkout, not an installed release: it "
+        failFatal(tr("\"%1\" on %2 is a source checkout, not an installed release: it "
                 "runs %3. Update it there (git pull, then build), or point this "
                 "profile's repository root at a directory of its own to install "
                 "releases into. Nothing was changed.")
@@ -1122,7 +1180,7 @@ bool SessionBootstrap::ensureRemoteService()
     // ---- everything below writes to somebody else's machine ---------------
 
     if (!nodeOk) {
-        fail(tr("Node %1 on %2 is too old to run the CodeHarbor remote service, "
+        failFatal(tr("Node %1 on %2 is too old to run the CodeHarbor remote service, "
                 "which needs %3.%4 or newer. Install a current Node.js there and "
                 "point the profile's node path at it. Nothing was written to "
                 "\"%5\".")
@@ -1139,7 +1197,7 @@ bool SessionBootstrap::ensureRemoteService()
         // tilde would create a directory literally named "~" and install into
         // it. Reading such a path merely fails; WRITING to it makes a mess in
         // the user's home.
-        fail(tr("Cannot install the CodeHarbor remote service into \"%1\". Give "
+        failFatal(tr("Cannot install the CodeHarbor remote service into \"%1\". Give "
                 "the profile an absolute directory of its own on %2, for example "
                 "/home/<user>/codeharbor; \"~\" is not expanded because every "
                 "path sent to the server is quoted.")
@@ -1157,7 +1215,7 @@ bool SessionBootstrap::ensureRemoteService()
                  "updated")
                   .arg(m_host, m_repoRoot);
     if (url.isEmpty()) {
-        fail(tr("%1, and this build cannot tell which release matches it (it "
+        failFatal(tr("%1, and this build cannot tell which release matches it (it "
                 "reports no version). Unpack codeharbor-remote.tar.gz there "
                 "yourself, or set CH_REMOTE_ARTIFACT_URL to the tarball to "
                 "install.")
@@ -1166,7 +1224,7 @@ bool SessionBootstrap::ensureRemoteService()
     }
     const QString staged = stagedArtifactPath(url);
     if (staged.isEmpty() && info.fetcher == QLatin1String("none")) {
-        fail(tr("%1, and neither curl nor wget is installed there to download "
+        failFatal(tr("%1, and neither curl nor wget is installed there to download "
                 "%2. Install one of them, or unpack codeharbor-remote.tar.gz "
                 "into \"%3\" by hand, or stage the tarball on the server and set "
                 "CH_REMOTE_ARTIFACT_URL to its path.")
@@ -1174,7 +1232,7 @@ bool SessionBootstrap::ensureRemoteService()
         return false;
     }
     if (!info.tar) {
-        fail(tr("%1: there is no `tar` there to unpack one. Install tar, or "
+        failFatal(tr("%1: there is no `tar` there to unpack one. Install tar, or "
                 "unpack codeharbor-remote.tar.gz into \"%2\" by hand.")
                 .arg(lacks, m_repoRoot));
         return false;
@@ -1228,7 +1286,7 @@ bool SessionBootstrap::ensureRemoteService()
     }
     const RemoteInspection after = parseInspection(verifyReport);
     if (after.entry.isEmpty()) {
-        fail(tr("Unpacked %1 into \"%2\" on %3, but there is no codeharbord entry "
+        failFatal(tr("Unpacked %1 into \"%2\" on %3, but there is no codeharbord entry "
                 "point there afterwards, so the archive is not a "
                 "codeharbor-remote release.")
                 .arg(url, m_repoRoot, m_host));
@@ -1316,6 +1374,7 @@ bool SessionBootstrap::attemptWire()
     // both come back round while we are still in here.
     m_attempting = true;
     m_cancelRequested = false;
+    m_attemptFatal = false;
     m_lastDiagnostic.clear();
     QElapsedTimer clock;
     clock.start();
@@ -1408,10 +1467,17 @@ bool SessionBootstrap::attemptWire()
         // already up, so this is the one error() that does not abort anything.
         const QFileInfo info(m_knownHostsPath);
         QDir().mkpath(info.absolutePath());
-        QFile out(m_knownHostsPath);
+        // QSaveFile rather than a truncating QFile: this store holds the user's
+        // whole set of trust decisions. Opening it with Truncate and then
+        // failing halfway through the write — a full disk, a network home
+        // directory that went away — left it truncated, so every host the user
+        // had ever approved was gone and the next connect re-prompted for all
+        // of them. QSaveFile writes a temporary beside it and renames only on
+        // commit(), so a failed write leaves the previous store byte for byte.
+        QSaveFile out(m_knownHostsPath);
         const QByteArray serialized = m_pool->knownHosts().serialize();
-        if (!out.open(QIODevice::WriteOnly | QIODevice::Truncate)
-            || out.write(serialized) != serialized.size() || !out.flush()) {
+        if (!out.open(QIODevice::WriteOnly)
+            || out.write(serialized) != serialized.size() || !out.commit()) {
             emit error(QStringLiteral(
                            "connected, but could not record the host key of "
                            "%1:%2 in %3 (%4); you will be asked to approve it "
@@ -1477,7 +1543,12 @@ bool SessionBootstrap::attemptWire()
     m_attempt = 0;
     setState(State::Wired);
     emit wired();
-    return true;
+    // A stateChanged()/wired() handler is allowed to tear this session down
+    // again — AppController runs its identity handshake from wired() and a
+    // Disconnect can land while these signals are being delivered. Reporting
+    // success afterwards would have connectAndWire()'s caller tell the UI the
+    // session is up while this object already says Disconnected.
+    return m_state == State::Wired;
 }
 
 bool SessionBootstrap::connectAndWire(const QString& host, quint16 port,
@@ -1490,10 +1561,17 @@ bool SessionBootstrap::connectAndWire(const QString& host, quint16 port,
     // probeEndpoint()'s nested event loop. Overwriting the target underneath it
     // would wire a session to one host and report it as another, so a second
     // request is refused rather than interleaved.
-    if (m_attempting) {
+    if (m_attempting || m_connectRequested) {
         emit error(QStringLiteral("a connection attempt is already in progress"));
         return false;
     }
+    // m_attempting alone does not cover this whole function: setState() below
+    // delivers stateChanged() to consumers BEFORE attemptWire() raises that
+    // flag, and a handler that called back in here would overwrite the target
+    // the outer call is one line away from connecting to.
+    m_connectRequested = true;
+    const auto clearRequest =
+        qScopeGuard([this] { m_connectRequested = false; });
     if (m_environmentTrustActive && !m_environmentConnectInProgress) {
         // The environment entry point's unattended trust is scoped to its
         // session. A later attended connect must start from the previous policy.

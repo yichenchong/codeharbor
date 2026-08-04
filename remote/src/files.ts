@@ -102,11 +102,23 @@ function nodeKind(node: Pick<Stats, "isFile" | "isDirectory" | "isSymbolicLink">
     return "other";
 }
 
+// "Nothing at this path" has TWO errnos, not one. ENOENT is the obvious one;
+// ENOTDIR means a component of the path is not a directory (a file was created
+// where a parent directory used to be), which likewise means the path names no
+// node. Treating only ENOENT as absent made the watch service SWALLOW that
+// second case — statOrUndefined threw, diffAndEmit's catch discarded it, and no
+// "deleted" event was ever sent, so an editor kept presenting a file that no
+// longer exists as live content.
 async function statOrUndefined(target: string): Promise<Stats | undefined> {
     try {
         return await fsp.stat(target);
     } catch (err) {
-        if (err && typeof err === "object" && "code" in err && err.code === "ENOENT") {
+        if (
+            err &&
+            typeof err === "object" &&
+            "code" in err &&
+            (err.code === "ENOENT" || err.code === "ENOTDIR")
+        ) {
             return undefined;
         }
         throw err;
@@ -198,13 +210,37 @@ export async function readFile(params: ReadFileParams): Promise<ReadFileResult> 
     // pinned across a concurrent rename, so fstat + read cannot straddle two
     // versions of the file the way two independent fsp.stat / fsp.readFile calls
     // could (TOCTOU: revision minted from one version, bytes from another).
-    const handle = await fsp.open(params.path, "r");
+    //
+    // O_NONBLOCK is a correctness requirement, not a tuning knob: open(2) on a
+    // FIFO opened for reading BLOCKS until some other process opens the same
+    // FIFO for writing, and fs.promises.open runs that blocking call on libuv's
+    // threadpool, which has FOUR threads by default. So four readFile requests
+    // naming named pipes — a `.fifo` a build system left in the tree is enough —
+    // wedged EVERY filesystem operation in the daemon: no listing, no save, no
+    // watch check, for the life of the process, with no error anywhere. Opening
+    // non-blocking returns immediately for every file type and is ignored for
+    // regular files. Windows has no O_NONBLOCK, hence the fallback to 0.
+    const handle = await fsp.open(
+        params.path,
+        fsConstants.O_RDONLY | (fsConstants.O_NONBLOCK ?? 0),
+    );
     try {
         const stats = await handle.stat();
         if (stats.isDirectory()) {
             throw Object.assign(
                 new Error(`EISDIR: illegal operation on a directory, read '${params.path}'`),
                 { code: "EISDIR" },
+            );
+        }
+        // Anything that is neither a regular file nor a directory — a FIFO, a
+        // socket, a character or block device — has no meaningful "contents" to
+        // return. fstat reports size 0 for all of them, so the read used to
+        // answer with empty content and `truncated: false`, i.e. "this file is
+        // empty" for a device holding a whole disk. Say what it is instead.
+        if (!stats.isFile()) {
+            throw Object.assign(
+                new Error(`EINVAL: not a regular file, read '${params.path}'`),
+                { code: "EINVAL" },
             );
         }
         const revision = revisionFrom(stats);
@@ -438,8 +474,23 @@ function tempName(basename: string): string {
     const room = NAME_MAX_BYTES - suffix.length - 1;
     let stem = basename;
     while (stem.length > 0 && Buffer.byteLength(stem) > room) stem = stem.slice(0, -1);
+    // The loop above trims one UTF-16 CODE UNIT at a time, and a character
+    // outside the Basic Multilingual Plane (an emoji, say) is stored as TWO of
+    // them. Dropping only the second half leaves a lone leading half, which
+    // encodes as the three bytes of U+FFFD — so the trim could stop with a
+    // question-mark diamond glued to the end of the temp name. Drop the orphan.
+    const last = stem.length > 0 ? stem.charCodeAt(stem.length - 1) : 0;
+    if (last >= 0xd800 && last <= 0xdbff) stem = stem.slice(0, -1);
     return `.${stem}${suffix}`;
 }
+
+// A JSON string can carry an UNPAIRED UTF-16 surrogate ("\ud800"), which is not
+// a character and has no UTF-8 encoding. Buffer.from(s, "utf-8") does not
+// refuse it: it substitutes U+FFFD, so a mangled payload would be written as
+// different bytes than the client sent and reported back as a successful save —
+// exactly the silent corruption the base64 grammar check below exists to stop,
+// so the utf-8 path gets the same treatment.
+const UNPAIRED_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
 
 async function writeFileLocked(params: WriteFileParams): Promise<WriteFileResult> {
     const encoding = params.encoding ?? "utf-8";
@@ -465,6 +516,11 @@ async function writeFileLocked(params: WriteFileParams): Promise<WriteFileResult
         if (!validPadding) {
             throw new InvalidParamsError(`Invalid base64 content for ${params.path}`);
         }
+    }
+    if (encoding !== "base64" && UNPAIRED_SURROGATE.test(params.content)) {
+        throw new InvalidParamsError(
+            `Invalid utf-8 content for ${params.path}: unpaired surrogate code unit`,
+        );
     }
     const existing = await statOrUndefined(params.path);
 
@@ -585,6 +641,10 @@ interface Subscription {
     id: string;
     path: string;
     watcher?: FSWatcher;
+    // The inode number fs.watch was armed on, or undefined when no watcher is
+    // installed. An OS watch handle names an INODE, not a path, so it goes deaf
+    // the moment the path is repointed at a different inode — see armWatcher.
+    watchedIno?: number;
     poll?: NodeJS.Timeout;
     lastRevision?: string;
     // Coalescing scheme (RF14) that bounds the check chain at ONE waiter: the
@@ -691,17 +751,7 @@ export class FileWatchService {
         if (sub.closed || !this.subscriptions.has(id)) return { subscriptionId: id };
         sub.lastRevision = existing ? revisionFrom(existing) : undefined;
 
-        try {
-            sub.watcher = fsWatch(params.path, () => {
-                void this.reconcile(sub);
-            });
-            sub.watcher.on("error", () => {
-                sub.watcher?.close();
-                sub.watcher = undefined;
-            });
-        } catch {
-            // fs.watch unavailable for this path; polling covers it.
-        }
+        this.armWatcher(sub, existing?.ino);
 
         sub.poll = setInterval(() => {
             void this.reconcile(sub);
@@ -729,6 +779,47 @@ export class FileWatchService {
     closeAll(): void {
         for (const id of [...this.subscriptions.keys()]) {
             this.unwatch({ subscriptionId: id });
+        }
+    }
+
+    // Install (or re-install) the fs.watch handle for `sub`.
+    //
+    // An OS watch handle is bound to the INODE the path named when it was
+    // created, not to the path. Every atomic save (SPEC 8.5, and this module's
+    // own writeFile) replaces the file by renaming a NEW inode over the old
+    // name, so the handle is left watching an unlinked inode and never fires
+    // again — verified on Linux: after a rename-over, an in-place append to the
+    // same path produced no fs.watch callback at all. The subscription then
+    // silently degraded to the once-per-second polling fallback FOREVER, for
+    // every file any client had ever saved, which is the exact opposite of the
+    // intended "fs.watch is the primary signal" design. Re-arming on the new
+    // inode restores it.
+    //
+    // `ino` is the inode the handle ends up watching; undefined means the path
+    // has nothing at it, in which case fs.watch throws (ENOENT) and polling is
+    // the only signal until the path appears and a check re-arms.
+    private armWatcher(sub: Subscription, ino: number | undefined): void {
+        sub.watcher?.close();
+        sub.watcher = undefined;
+        sub.watchedIno = undefined;
+        if (sub.closed) return;
+        try {
+            const watcher = fsWatch(sub.path, () => {
+                void this.reconcile(sub);
+            });
+            watcher.on("error", () => {
+                // A dead handle must not stay in the table pretending to watch:
+                // clearing it lets the next observed change re-arm.
+                watcher.close();
+                if (sub.watcher === watcher) {
+                    sub.watcher = undefined;
+                    sub.watchedIno = undefined;
+                }
+            });
+            sub.watcher = watcher;
+            sub.watchedIno = ino;
+        } catch {
+            // fs.watch unavailable for this path; polling covers it.
         }
     }
 
@@ -775,6 +866,9 @@ export class FileWatchService {
         // emitting now would deliver an event for a released subscription.
         if (sub.closed || !this.subscriptions.has(sub.id)) return;
         if (!stats) {
+            // Nothing at the path: drop the handle so a later re-create arms a
+            // fresh one on the new inode instead of trusting a dead handle.
+            if (sub.watcher) this.armWatcher(sub, undefined);
             if (sub.lastRevision !== undefined) {
                 sub.lastRevision = undefined;
                 this.emitter.emit("event", {
@@ -784,6 +878,13 @@ export class FileWatchService {
                 } satisfies WatchEvent);
             }
             return;
+        }
+        // Re-arm whenever the path now names a DIFFERENT inode than the handle
+        // was bound to (an atomic save, a delete-and-recreate, a re-pointed
+        // symlink), or whenever there is no handle at all because arming failed
+        // or the handle errored. Same inode plus a live handle costs nothing.
+        if (sub.watcher === undefined || sub.watchedIno !== stats.ino) {
+            this.armWatcher(sub, stats.ino);
         }
         const revision = revisionFrom(stats);
         if (revision === sub.lastRevision) return;

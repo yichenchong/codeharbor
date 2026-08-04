@@ -139,6 +139,7 @@ private slots:
     void genericHarnessDerivesItsStateFromTerminalOutput();
     void onlyTheGenericHarnessDerivesStateFromOutput();
     void genericActivityRegistrationIsSilentUntilTheChannelAttaches();
+    void genericIdleUnseenSurvivesAnotherPaneAgeTick();
     // Harness registration changes must not leave output-derived state behind.
     void harnessChangesClearDerivedState();
     // Re-entrant eviction must not emit pending transitions for removed panes.
@@ -1521,6 +1522,33 @@ void TstAgentMonitor::genericHarnessDerivesItsStateFromTerminalOutput()
     m_monitor->noteTerminalAttached(QStringLiteral("dG"), QStringLiteral("tG"));
     QCOMPARE(m_monitor->stateFor("dG", "tG"), asInt(AgentState::Starting));
 }
+void TstAgentMonitor::genericIdleUnseenSurvivesAnotherPaneAgeTick()
+{
+    makePair();
+    m_monitor->setFallbackIdleThresholdMs(30);
+    m_monitor->setTerminalHarness(QStringLiteral("done"),
+                                  QStringLiteral("t1"), QStringLiteral("generic"));
+    m_monitor->noteTerminalAttached(QStringLiteral("done"),
+                                    QStringLiteral("t1"));
+    feed(eventLine(QStringLiteral("idle_unseen"), QStringLiteral("done"),
+                   QStringLiteral("t1")));
+    QTRY_COMPARE(m_monitor->stateFor("done", "t1"),
+                 asInt(AgentState::IdleUnseen));
+    QVERIFY(m_monitor->hasUnseen(QStringLiteral("done")));
+
+    // Keep a second generic pane's timer active. Before the fix its tick
+    // resurrected the completed first pane as Starting.
+    m_monitor->setTerminalHarness(QStringLiteral("live"),
+                                  QStringLiteral("t2"), QStringLiteral("generic"));
+    m_monitor->noteTerminalAttached(QStringLiteral("live"),
+                                    QStringLiteral("t2"));
+    m_monitor->noteTerminalOutput(QStringLiteral("live"),
+                                  QStringLiteral("t2"));
+    QTest::qWait(60);
+    QCOMPARE(m_monitor->stateFor("done", "t1"),
+             asInt(AgentState::IdleUnseen));
+}
+
 
 // AG-N1. Only a pane the user configured as the "generic" harness takes its
 // state from output. A pane with no harness is a plain shell, and inferring "an

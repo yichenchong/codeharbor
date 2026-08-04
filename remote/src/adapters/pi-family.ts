@@ -1,5 +1,5 @@
 import type { AgentState } from "../events.ts";
-import type { NativeEvent } from "./types.ts";
+import { nativeString, type NativeEvent } from "./types.ts";
 
 // The event vocabulary shared by the Oh My Pi and Pi harnesses (SPEC 6.2), and
 // the SPEC 6.5 mapping from it onto CodeHarbor agent states:
@@ -22,7 +22,7 @@ import type { NativeEvent } from "./types.ts";
 // which is a smaller and far more visible change than keeping two files in
 // lockstep by hand.
 export function mapPiFamilyEvent(native: NativeEvent): AgentState | null {
-    const type = typeof native.type === "string" ? native.type : "";
+    const type = nativeString(native.type);
     // PRECEDENCE — a shutdown outranks the error flag, and everything else is
     // outranked by it.
     //
@@ -37,7 +37,7 @@ export function mapPiFamilyEvent(native: NativeEvent): AgentState | null {
     // is the one state that must not be maskable.
     if (type === "session_shutdown") return "stopped";
     if (native.error === true) return "error";
-    const tool = typeof native.tool === "string" ? native.tool : undefined;
+    const tool = nativeString(native.tool);
     switch (type) {
         case "session_start":
             return "starting";
@@ -59,5 +59,6 @@ export function mapPiFamilyEvent(native: NativeEvent): AgentState | null {
 
 /** Auxiliary metadata both harnesses carry: the tool name, when there is one. */
 export function piFamilyMetadata(native: NativeEvent): Record<string, unknown> | undefined {
-    return typeof native.tool === "string" ? { tool: native.tool } : undefined;
+    const tool = nativeString(native.tool);
+    return tool === "" ? undefined : { tool };
 }

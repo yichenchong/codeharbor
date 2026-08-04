@@ -42,7 +42,7 @@ src/            C++/QML client
   editor/       EditorController: remote file state machine, guarded saves
   agent/        AgentStatusMonitor: coding-agent status over the bridge
   qml/          shared QML components
-  web/          bundled web assets (terminal, editor)
+  web/          bundled web assets (terminal, editor, markdown)
 remote/         server-side service, agent bridge, harness adapters
 docs/           SPEC.md, PLAN.md, DEVELOPMENT.md
 ```
@@ -168,10 +168,10 @@ There is no Dev Session switcher shortcut and no "focus next pane" shortcut.
 
 A few things worth knowing about the shipped client:
 
-- **Settings** (`Ctrl+,`) has Appearance, File Types, Server and Tmux groups.
+- **Settings** (`Ctrl+,`) has Appearance, File viewers, Server and Tmux groups.
   Appearance carries the Dark/Light theme, the palette that tints Dev Session group
   names, the order of the viewer's toolbar buttons, and the terminal's text size and
-  rendering resolution. File Types is where you choose which viewer opens which kind
+  rendering resolution. File viewers is where you choose which viewer opens which kind
   of file — for example open `.md` in the editor instead of the renderer.
 - **Markdown files render**, with headings, tables, code blocks and task lists,
   themed to match the app. "Open as → Editor" gives you the source to edit.

@@ -22,19 +22,15 @@ export const defaultThemeRoles: ThemeRoles = {
     warning: "#f9e2af",
     danger: "#f38ba8",
     busy: "#cba6f7",
-    textPlaceholder: "#585b70",
-    controlHoverSurface: "#3a3a52",
-    errorSurface: "#45222c",
+    errorSurface: "#3a1d28",
     warningSurface: "#3a2f1e",
-    modalOverlaySurface: "#e61e1e",
-    statusReconnecting: "#fab387",
     statusText: "#a6adc8",
-    inactiveRail: "#585b70",
-    dropHighlightSurface: "#302a4a",
 };
-
 function isColor(value: unknown): value is string {
-    return typeof value === "string" && /^#[0-9a-fA-F]{6}(?:[0-9a-fA-F]{2})?$/.test(value);
+    // QML's Theme.roles deliberately exports opaque #rrggbb values. Do not
+    // accept eight-digit values: Qt's #aarrggbb spelling would be interpreted
+    // as CSS #rrggbbaa and silently change the intended colour.
+    return typeof value === "string" && /^#[0-9a-fA-F]{6}$/.test(value);
 }
 
 function cssVariableName(role: string): string {
@@ -73,6 +69,5 @@ export function xtermTheme(roles: ThemeRoles): Record<string, string> {
         cursor: roles.accent,
         cursorAccent: roles.surfaceSunken,
         selectionBackground: roles.surfaceSelected,
-        selectionForeground: roles.textOnAccent,
     };
 }

@@ -45,10 +45,15 @@ Item {
     Component.onCompleted: root.retarget()
     Component.onDestruction: root.releaseInternalUrl()
 
+    function ownsFailure(candidate) {
+        return root.remoteFile && root.internalUrl.toString().length > 0
+               && String(candidate) === root.internalUrl.toString();
+    }
+
     Connections {
         target: root.viewerModel
         function onInternalResourceError(internalUrl, message) {
-            if (root.remoteFile && String(internalUrl) === root.internalUrl.toString())
+            if (root.ownsFailure(internalUrl))
                 root.errorText = message;
         }
     }
@@ -64,20 +69,21 @@ Item {
         // execute script or use either local files or network requests.
         settings.javascriptEnabled: !root.remoteFile
         settings.localContentCanAccessFileUrls: !root.remoteFile
-        settings.localContentCanAccessRemoteUrls: !root.remoteFile
-        // Popups are not part of a pane's browser contract. Keeping them off
-        // also prevents an external page from escaping the pane's navigation
-        // and opening an uncontrolled top-level view.
-        settings.javascriptCanOpenWindows: false
         onNavigationRequested: function(request) {
+            if (root.remoteFile) {
+                if (request.url.toString() === root.internalUrl.toString())
+                    return;
+                request.action = WebEngineNavigationRequest.IgnoreRequest;
+                root.navigated(request.url);
+                return;
+            }
             // Never let a link from an external page hand Chromium a
             // client-machine file URL. Reject it before the load starts and
             // route it back through ViewerPane, which maps remote files to a
             // locked-down internal handler.
-            if (!root.remoteFile
-                    && request.url.toString().startsWith("file:")) {
-                request.action = WebEngineNavigationRequest.IgnoreRequest
-                root.navigated(request.url)
+            if (request.url.toString().startsWith("file:")) {
+                request.action = WebEngineNavigationRequest.IgnoreRequest;
+                root.navigated(request.url);
             }
         }
         url: root.remoteFile ? root.internalUrl : root.url
@@ -103,6 +109,7 @@ Item {
     }
 
     Label {
+        objectName: "webStatus"
         anchors.centerIn: parent
         width: parent.width - 48
         wrapMode: Text.WordWrap

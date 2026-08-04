@@ -169,13 +169,19 @@ export function createBridgeLineFramer(
         onOverflow();
     };
 
-    const retain = (chunk: Buffer): boolean => {
+    // `front` puts the chunk back at the HEAD of the queue. That is the only
+    // correct place for the unprocessed tail of a chunk being drained: the rest
+    // of the queue arrived AFTER those bytes, so appending the tail instead
+    // reorders the stream — and because a tail can end mid-line, the bytes of
+    // one event get glued to the bytes of a later one and both lines are lost.
+    const retain = (chunk: Buffer, front = false): boolean => {
         if (chunk.length === 0) return true;
         if (pendingBytes + chunk.length > MAX_BRIDGE_PENDING_BYTES) {
             drop();
             return false;
         }
-        pending.push(chunk);
+        if (front) pending.unshift(chunk);
+        else pending.push(chunk);
         pendingBytes += chunk.length;
         return true;
     };
@@ -203,7 +209,7 @@ export function createBridgeLineFramer(
             nl = chunk.indexOf(0x0a, start);
             if (!onLine(line)) {
                 blocked = true;
-                retain(chunk.subarray(start));
+                retain(chunk.subarray(start), true);
                 return;
             }
         }
@@ -414,6 +420,15 @@ export async function startBridge(
                 return;
             }
             server.removeListener("error", onError);
+            // Past listen(), the ONLY listener for 'error' is gone — and an
+            // EventEmitter 'error' with no listener THROWS. A listening server
+            // can still emit one (an accept() failure such as EMFILE), which
+            // would take down a bridge that had been serving fine for hours,
+            // and with it every harness's status reporting. Report and keep
+            // running: the failed accept cost one producer, not the service.
+            server.on("error", (err: Error) => {
+                process.stderr.write(`codeharbor-bridge: ${err.message}\n`);
+            });
             resolve();
         });
     });

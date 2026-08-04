@@ -16,6 +16,19 @@ on:
 permissions:
   contents: read
 
+# A tag's run must never race a second run of itself. That happens for real: a
+# re-run requested from the Actions UI while the first attempt is still going,
+# or a tag that is deleted and re-pushed. Two live runs would both reach
+# `publish`, and `gh release upload --clobber` from two directions can leave the
+# release page holding one job's Windows zip beside the other's installer.
+#
+# cancel-in-progress is deliberately FALSE: a half-finished publish that is
+# killed mid-upload is worse than a queued duplicate that finds the assets
+# already correct. The later run simply waits and then re-uploads.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
 env:
   # Must be >= the CMake floor (6.9). 6.8.1 predates
   # QQuickWebEngineProfile(storageName, parent) and does not compile.
@@ -37,8 +50,12 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.ref }}
 
+      # Pinned to an exact release for the same reason as get-cmake below: `@v4`
+      # is a tag this third-party action's author moves, so the Qt installer that
+      # produces published binaries could change with no commit here. v4.3.1 is
+      # what `@v4` resolves to today; bump it deliberately.
       - name: Install Qt ${{ env.QT_VERSION }}
-        uses: jurplel/install-qt-action@v4
+        uses: jurplel/install-qt-action@v4.3.1
         with:
           version: ${{ env.QT_VERSION }}
           # qtpositioning is a hard dependency of Qt6WebEngineCore; omitting it
@@ -160,9 +177,11 @@ jobs:
           key: vcpkg-libssh-${{ steps.imgver.outputs.libssh }}-x64-windows-${{ steps.imgver.outputs.v }}-${{ hashFiles('packaging/vcpkg-ports/libssh/**') }}
 
       # --- MSVC environment for the Ninja generator (Windows) ------------------
+      # Pinned to an exact release: `@v1` is a moving tag on a third-party action
+      # that decides which MSVC toolchain compiles the published Windows binary.
       - name: Set up MSVC (Windows)
         if: matrix.name == 'windows'
-        uses: ilammy/msvc-dev-cmd@v1
+        uses: ilammy/msvc-dev-cmd@v1.13.0
 
       # The Monaco, xterm.js and Markdown bundles are gitignored artifacts
       # embedded as Qt resources at CMake CONFIGURE time. src/qml/CMakeLists.txt
@@ -217,7 +236,13 @@ jobs:
       - name: Test (release preset)
         # Keep the preset's output-on-failure setting explicit: child-process
         # tests must show their diagnostic output on native runners.
-        run: ctest --preset release-tests --output-on-failure --repeat until-pass:2
+        #
+        # NO `--repeat until-pass`. It used to be `until-pass:2`, which reports a
+        # test that fails once and passes on the retry as a pass. ci.yml runs the
+        # same suite with no retry, so the release path was the WEAKER of the two
+        # - the exact thing the typecheck/test steps above exist to prevent - and
+        # an intermittent failure could be silently carried into a permanent tag.
+        run: ctest --preset release-tests --output-on-failure
         shell: bash
 
       # --- package a runnable artifact per OS ----------------------------------
@@ -420,12 +445,19 @@ jobs:
 
   # The build/remote jobs only upload workflow ARTIFACTS, which expire and are
   # invisible to logged-out users. This job is what actually puts binaries on the
-  # Releases page, and it runs for tag builds only - a manual workflow_dispatch
+  # Releases page, and it runs for PUSHED TAGS only - a manual workflow_dispatch
   # stays a dry run that exercises the cross-OS builds without publishing.
+  #
+  # The `github.event_name == 'push'` half is load-bearing and not belt-and-
+  # braces. workflow_dispatch can be started from a TAG in the Actions UI, and
+  # then `github.ref` is that tag: the ref test alone would let a dry run publish
+  # a real release. Worse, the builders check out `inputs.ref || github.ref`, so
+  # a dispatch on tag v1.2.3 with `ref` set to some branch would attach that
+  # branch's binaries to the v1.2.3 release page.
   publish:
     name: publish release
     needs: [build, remote]
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
       contents: write

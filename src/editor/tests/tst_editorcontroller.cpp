@@ -207,6 +207,7 @@ private slots:
     void failedSaveLeavesTheBufferDirty();
     void saveWhileLoadingIsRefused();
     void editsDuringASaveSurviveTheSaveReply();
+    void revertingDuringASaveStaysDirty();
     void editsTypedDuringASystemReloadAreNotClobbered();
     void aSaveInFlightIsNotClobberedByASystemReload();
     void aSaveReplyIsDroppedAfterAnExplicitReloadTookOverTheBuffer();
@@ -1993,6 +1994,33 @@ void TstEditorController::editsDuringASaveSurviveTheSaveReply()
     QVERIFY2(nextRequest(300).isEmpty(),
              "keystrokes made during a save were re-read over");
     QCOMPARE(m_controller->revision(), QStringLiteral("r2"));
+}
+
+void TstEditorController::revertingDuringASaveStaysDirty()
+{
+    makePair();
+    openClean(QStringLiteral("/foo/f.txt"), QStringLiteral("orig"),
+              QStringLiteral("r1"));
+
+    m_controller->save(QStringLiteral("new"), QStringLiteral("r1"));
+    const QJsonObject write = nextRequest();
+    QCOMPARE(method(write), kWriteFile);
+
+    // The page reports a revert before the write answers. The old baseline is
+    // not the post-save server content, so this must remain unsaved work.
+    m_controller->reportContent(QStringLiteral("orig"));
+    const QJsonObject snapshot = nextRequest();
+    QCOMPARE(method(snapshot), kWriteFile);
+    QCOMPARE(reqPath(snapshot), recoveryFilePath());
+    respondResult(reqId(snapshot),
+                  {{"path", reqPath(snapshot)}, {"revision", "rec1"}});
+
+    respondResult(reqId(write),
+                  {{"path", "/foo/f.txt"}, {"revision", "r2"}});
+    QTRY_COMPARE(m_controller->fileState(), QStringLiteral("modified"));
+    QCOMPARE(m_controller->revision(), QStringLiteral("r2"));
+    QVERIFY2(nextRequest(300).isEmpty(),
+             "a revert reported during save was treated as clean");
 }
 
 // The page debounces reportContent by 500 ms, which outlives an open(). A report

@@ -10,7 +10,13 @@ import { claudeCodeAdapter } from "./claude-code.ts";
 // CLIENT in ch::AgentStatusMonitor (SPEC 6.6) — the daemon has no per-pane
 // source of terminal output. So the table is partial over Harness, and
 // adapterFor() answering undefined is the whole of this side's handling.
-const registry: Partial<Record<Harness, HarnessAdapter>> = {
+//
+// The value type is keyed on the mapped key, so an adapter may only be filed
+// under the harness name it declares. Registering piAdapter under "oh-my-pi"
+// used to compile, and the mistake is invisible at runtime: the bridge labels
+// the event with the WIRE harness, so every Pi event would be relayed as if a
+// different harness produced it, with no error anywhere.
+const registry: { [H in Harness]?: HarnessAdapter & { harness: H } } = {
     "oh-my-pi": ohMyPiAdapter,
     pi: piAdapter,
     "claude-code": claudeCodeAdapter,

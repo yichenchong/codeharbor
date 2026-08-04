@@ -211,3 +211,26 @@ test("save sends the buffer as of the save, guarded by the given revision", () =
         { content: "two", revision: "rev-2" },
     ]);
 });
+
+
+test("report sends immediately even when no debounce timer is armed", () => {
+    const clock = new FakeClock();
+    const { bridge, reports } = fakeBridge();
+    const reporter = new RecoveryReporter(bridge, () => "undone-during-save", clock.timers);
+
+    reporter.report();
+    assert.deepEqual(reports, ["undone-during-save"]);
+    assert.equal(reporter.pending, false);
+});
+
+test("report replaces a pending timer instead of sending twice", () => {
+    const clock = new FakeClock();
+    const { bridge, reports } = fakeBridge();
+    const reporter = new RecoveryReporter(bridge, () => "latest", clock.timers);
+
+    reporter.schedule(true);
+    reporter.report();
+    clock.fire();
+    assert.deepEqual(reports, ["latest"]);
+    assert.equal(clock.armed, 0);
+});

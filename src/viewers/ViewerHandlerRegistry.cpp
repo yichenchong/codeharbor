@@ -72,9 +72,54 @@ bool isWellKnownTextName(const QString &name)
         return true;
     // A well-known name with a suffix bolted on is still that file:
     // "Dockerfile.dev", "Makefile.am", "README.old", ".env.local". The search
-    // starts at index 1 so a dotfile's leading dot stays part of the stem. Only
-    // reached once the suffix itself has already been found meaningless, so
-    // "archive.zip" and "photo.jpg" never get here.
+    // starts at index 1 so a dotfile's leading dot stays part of the stem.
+    //
+    // The suffix must be MEANINGLESS for the stem to speak, and reaching this
+    // function is not enough to establish that. resolveByExtension() answers
+    // Download for two different reasons — "we do not recognise this
+    // extension" and "we recognise it and it is binary" — and only the first
+    // lets the stem decide. Without this veto "readme.zip", "news.tar.gz" and
+    // "version.o" are poured into the text editor as if they were prose,
+    // because their stems are in the table above. The set below exists ONLY to
+    // silence the stem rule; it does not change any resolution on its own,
+    // since resolveByExtension() already sends every one of these to Download.
+    static const QSet<QString> kBinarySuffixes = {
+        QStringLiteral("zip"),    QStringLiteral("gz"),
+        QStringLiteral("bz2"),    QStringLiteral("xz"),
+        QStringLiteral("zst"),    QStringLiteral("tar"),
+        QStringLiteral("tgz"),    QStringLiteral("7z"),
+        QStringLiteral("rar"),    QStringLiteral("jar"),
+        QStringLiteral("war"),    QStringLiteral("whl"),
+        QStringLiteral("deb"),    QStringLiteral("rpm"),
+        QStringLiteral("dmg"),    QStringLiteral("iso"),
+        QStringLiteral("img"),    QStringLiteral("exe"),
+        QStringLiteral("dll"),    QStringLiteral("so"),
+        QStringLiteral("dylib"),  QStringLiteral("a"),
+        QStringLiteral("o"),      QStringLiteral("obj"),
+        QStringLiteral("lib"),    QStringLiteral("bin"),
+        QStringLiteral("class"),  QStringLiteral("pyc"),
+        QStringLiteral("pyo"),    QStringLiteral("wasm"),
+        QStringLiteral("node"),   QStringLiteral("db"),
+        QStringLiteral("sqlite"), QStringLiteral("sqlite3"),
+        QStringLiteral("doc"),    QStringLiteral("docx"),
+        QStringLiteral("xls"),    QStringLiteral("xlsx"),
+        QStringLiteral("ppt"),    QStringLiteral("pptx"),
+        QStringLiteral("odt"),    QStringLiteral("ods"),
+        QStringLiteral("rtf"),    QStringLiteral("epub"),
+        QStringLiteral("mobi"),   QStringLiteral("mp3"),
+        QStringLiteral("mp4"),    QStringLiteral("mkv"),
+        QStringLiteral("mov"),    QStringLiteral("avi"),
+        QStringLiteral("wav"),    QStringLiteral("flac"),
+        QStringLiteral("ogg"),    QStringLiteral("webm"),
+        QStringLiteral("tiff"),   QStringLiteral("tif"),
+        QStringLiteral("heic"),   QStringLiteral("psd"),
+        QStringLiteral("eps"),    QStringLiteral("ttf"),
+        QStringLiteral("otf"),    QStringLiteral("woff"),
+        QStringLiteral("woff2"),  QStringLiteral("p12"),
+        QStringLiteral("pfx"),
+    };
+    if (kBinarySuffixes.contains(extensionOf(lower)))
+        return false;
     const qsizetype dot = lower.indexOf(QLatin1Char('.'), 1);
     return dot > 0 && kTextNames.contains(lower.left(dot));
 }
@@ -239,10 +284,21 @@ QStringList ViewerHandlerRegistry::applicableViewKinds(const QUrl &url)
         // rendered document (the default) and the source in the editor. Listing
         // the renderer first is what makes it the default, because the menu
         // marks the first entry - see `defaultKind` in ViewerDirectoryView.qml.
+        //
+        // The source handler is spelled "text", the ONE canonical word for it.
+        // "editor" used to be listed beside it as a separate choice, from a
+        // time when a second, read-only text pane existed; that pane was
+        // removed (see the note on ch::ViewerModel) and the two words have
+        // meant the same handler ever since — ViewerPane.qml maps both onto the
+        // same component. Offering both put two menu entries in front of the
+        // user, "Editor" and "Text", that did exactly the same thing, and
+        // "editor" is not even in ch::ViewerKinds::all(), which is documented
+        // as the only viewer-kind words that cross the C++/QML boundary and is
+        // what a persisted per-extension default is validated against. So a
+        // user could be shown a default ("Editor") they could never save.
         if (ext == QLatin1String("md") || ext == QLatin1String("markdown"))
-            return {QStringLiteral("markdown"), QStringLiteral("editor"),
-                    QStringLiteral("text")};
-        QStringList kinds = {QStringLiteral("editor"), QStringLiteral("text")};
+            return {QStringLiteral("markdown"), QStringLiteral("text")};
+        QStringList kinds = {QStringLiteral("text")};
         // HTML is positively claimed by the editor, but it can also be shown
         // as a rendered document through the privileged internal profile.
         if (ext == QLatin1String("html") || ext == QLatin1String("htm"))

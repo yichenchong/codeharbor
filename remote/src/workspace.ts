@@ -466,6 +466,22 @@ function removePaneFromTree(node: unknown, paneId: string): unknown | null {
     return node;
 }
 
+// Does any leaf of this split tree reference `paneId`, by either of the two
+// fields removePaneFromTree matches on? Asked BEFORE repairing a region, so a
+// tree that has nothing to do with the deleted pane is left byte-for-byte as it
+// was: removePaneFromTree rebuilds every split it walks (it renormalizes
+// ratios), so its output is almost never equal to the stored text even when it
+// dropped nothing at all.
+function treeReferencesPane(node: unknown, paneId: string): boolean {
+    if (node === null || typeof node !== "object") return false;
+    const n = node as Record<string, unknown>;
+    if (n.type === "leaf") return n.paneId === paneId || n.terminalPaneId === paneId;
+    if (n.type === "split" && Array.isArray(n.children)) {
+        return n.children.some((child) => treeReferencesPane(child, paneId));
+    }
+    return false;
+}
+
 // --- tmux targets (SPEC 5.2) ------------------------------------------------
 //
 // THE one place a terminal pane's tmux target is minted. It used to be two:
@@ -786,8 +802,17 @@ function migrateTerminalPaneIdentity(db: DatabaseSync): void {
         const repaired = tmuxSafeName(row.tmux_target);
         let next: string | null = repaired;
         if (takenTargets.has(repaired)) {
-            const minted = mintTmuxTarget(row.dev_session_id, row.id);
-            next = takenTargets.has(minted) ? null : minted;
+            // The canonical mint, but WITHOUT mintTmuxTarget's throw. Nothing
+            // ever constrained a legacy `terminal_panes.id` or `dev_session_id`
+            // to a UUID, so `ch_<dev_session_id>_<id>` can itself be unusable as
+            // a tmux session name — and throwing here would roll the whole
+            // upgrade back and leave that database permanently unopenable by
+            // this build, the exact outcome the foreign-key handling in
+            // migrate() goes out of its way to avoid. Falling back to NULL costs
+            // the pane only its stored session name; it mints a fresh one on its
+            // next attach.
+            const minted = `ch_${row.dev_session_id}_${row.id}`;
+            next = isSafeTmuxTarget(minted) && !takenTargets.has(minted) ? minted : null;
         }
         if (next !== null) takenTargets.add(next);
         if (next !== row.tmux_target) assignTarget.run(next, row.rowid);
@@ -888,21 +913,27 @@ function migrateDropTerminalPaneAddressUnique(db: DatabaseSync): void {
     `);
 }
 
-function migrate(db: DatabaseSync): void {
-    const from = schemaVersion(db);
-    if (from >= WORKSPACE_SCHEMA_VERSION) {
-        // A database written by a NEWER build than this one. Refuse it instead
-        // of using it: the missing migrations may have renamed or dropped
-        // columns this build still selects, and the failures would surface much
-        // later as confusing per-statement SQL errors on a live workspace.
-        // Equality is the normal case and passes through silently.
-        if (from > WORKSPACE_SCHEMA_VERSION) {
-            throw new Error(
-                `workspace database schema version ${from} is newer than this build supports (${WORKSPACE_SCHEMA_VERSION})`,
-            );
-        }
-        return;
+// Is `version` already at or past what this build targets — i.e. is there no
+// upgrade work to do? A version ABOVE the target is a database written by a
+// NEWER build than this one, and that is refused rather than used: the
+// migrations this build is missing may have renamed or dropped columns it still
+// selects, and the failures would surface much later as confusing per-statement
+// SQL errors on a live workspace. Equality is the normal case and passes
+// through silently.
+function isSchemaUpToDate(version: number): boolean {
+    if (version > WORKSPACE_SCHEMA_VERSION) {
+        throw new Error(
+            `workspace database schema version ${version} is newer than this build supports (${WORKSPACE_SCHEMA_VERSION})`,
+        );
     }
+    return version === WORKSPACE_SCHEMA_VERSION;
+}
+
+function migrate(db: DatabaseSync): void {
+    // Cheap pre-check with no lock held: an already-current database is by far
+    // the common case, and taking the write lock on every open would serialise
+    // every daemon start against every other one.
+    if (isSchemaUpToDate(schemaVersion(db))) return;
     // Foreign-key enforcement is turned OFF for the duration of the upgrade,
     // and only for the upgrade.
     //
@@ -937,20 +968,28 @@ function migrate(db: DatabaseSync): void {
         // behind the line above either.)
         db.exec("BEGIN IMMEDIATE");
         try {
-            for (const step of MIGRATIONS) {
-                if (step.version > from && step.version <= WORKSPACE_SCHEMA_VERSION) {
-                    step.apply(db);
+            // Re-read the stored version UNDER the write lock. The pre-check
+            // above ran with no lock at all, so a second daemon may have
+            // completed the entire upgrade in between; re-applying every step on
+            // top of that only happens to be harmless because each step is
+            // idempotent today, and the next one added need not be.
+            const from = schemaVersion(db);
+            if (!isSchemaUpToDate(from)) {
+                for (const step of MIGRATIONS) {
+                    if (step.version > from && step.version <= WORKSPACE_SCHEMA_VERSION) {
+                        step.apply(db);
+                    }
                 }
+                // schema.sql seeds the version row with INSERT OR IGNORE, which
+                // cannot advance an already-present row. Record the target
+                // version explicitly so a WORKSPACE_SCHEMA_VERSION bump is
+                // persisted (and migrate stops re-running steps on every open)
+                // rather than the stored version silently drifting from the
+                // DDL's hard-coded literal.
+                db.prepare("UPDATE schema_version SET version = ? WHERE id = 1").run(
+                    WORKSPACE_SCHEMA_VERSION,
+                );
             }
-            // schema.sql seeds the version row with INSERT OR IGNORE, which
-            // cannot advance an already-present row. Record the target version
-            // explicitly so a WORKSPACE_SCHEMA_VERSION bump is persisted (and
-            // migrate stops re-running steps on every open) rather than the
-            // stored version silently drifting from the DDL's hard-coded
-            // literal.
-            db.prepare("UPDATE schema_version SET version = ? WHERE id = 1").run(
-                WORKSPACE_SCHEMA_VERSION,
-            );
             db.exec("COMMIT");
         } catch (err) {
             try {
@@ -996,12 +1035,24 @@ interface ListStatements {
     layouts: StatementSync;
 }
 
-// A table whose rows carry a `position` within a scope, and the column naming
-// that scope. Literal unions rather than plain strings because both are
-// interpolated into SQL — an identifier cannot be a bound parameter, so the
-// type is what keeps a caller-supplied name from ever reaching the query text.
-type OrderedTable = "groups" | "dev_sessions" | "viewer_panes" | "terminal_panes";
-type ScopeColumn = "server_id" | "group_id" | "dev_session_id";
+// Every table whose rows carry a `position` within a scope, mapped to the
+// column naming that scope. Literal types rather than plain strings because
+// both halves are interpolated into SQL — an identifier cannot be a bound
+// parameter, so the type is what keeps a caller-supplied name from ever
+// reaching the query text.
+//
+// A MAP from table to column, not two independent unions: with independent
+// unions `packOrder("groups", "dev_session_id", …)` type-checked happily and
+// then failed at runtime with SQLite's "no such column: dev_session_id",
+// mid-transaction, on a scope that has no such column at all. Now only the one
+// column each table actually has is accepted.
+interface OrderedScope {
+    groups: "server_id";
+    dev_sessions: "group_id";
+    viewer_panes: "dev_session_id";
+    terminal_panes: "dev_session_id";
+}
+type OrderedTable = keyof OrderedScope;
 
 // A single workspace database connection with all CRUD operations (SPEC 4.2,
 // 11.1). Booleans are stored as 0/1 integers; deletes cascade manually because
@@ -1363,12 +1414,22 @@ export class Workspace {
             // row's own, so a duplicate always satisfies SPEC 3.5's "a row
             // shares its ancestors' server" invariant even if the source data
             // predates that rule.
+            // ONE map for both pane tables, not one per region. Every key is a
+            // server-minted UUID, so viewer and terminal ids can never collide,
+            // and a leaf is then remapped by what it actually REFERENCES rather
+            // than by which region it happens to be stored in. Layout trees are
+            // client-authored: a malformed client can file a viewer leaf under
+            // the terminal region, and with a per-region map that leaf's paneId
+            // was not found, was left alone, and the DUPLICATE's tree went on
+            // pointing at the ORIGINAL session's pane row — a cross-session
+            // reference this whole method exists to avoid.
+            //
             // A Map, not a plain object: the keys are pane ids read out of a
             // CLIENT-authored split tree, and on an object literal a leaf whose
             // paneId is "constructor" or "toString" would look up a function
             // inherited from Object.prototype, which JSON.stringify then drops
             // — silently deleting the field from the copied leaf.
-            const viewerIdMap = new Map<string, string>();
+            const idMap = new Map<string, string>();
             const viewerRows = this.db
                 .prepare("SELECT * FROM viewer_panes WHERE dev_session_id = ? ORDER BY position, id").all(params.id) as unknown as ViewerPaneRow[];
             const insertViewer = this.db.prepare(
@@ -1376,7 +1437,7 @@ export class Workspace {
             );
             for (const v of viewerRows) {
                 const newId = randomUUID();
-                viewerIdMap.set(v.id, newId);
+                idMap.set(v.id, newId);
                 insertViewer.run(
                     newId,
                     targetServerId,
@@ -1390,7 +1451,6 @@ export class Workspace {
                 );
             }
 
-            const terminalIdMap = new Map<string, string>();
             const terminalRows = this.db
                 .prepare("SELECT * FROM terminal_panes WHERE dev_session_id = ? ORDER BY position, id").all(params.id) as unknown as TerminalPaneRow[];
             const insertTerminal = this.db.prepare(
@@ -1398,7 +1458,7 @@ export class Workspace {
             );
             for (const t of terminalRows) {
                 const newId = randomUUID();
-                terminalIdMap.set(t.id, newId);
+                idMap.set(t.id, newId);
                 const tmuxTarget = mintTmuxTarget(newSessionId, newId);
                 insertTerminal.run(
                     newId,
@@ -1421,7 +1481,6 @@ export class Workspace {
                 "INSERT INTO session_layouts (id, server_id, dev_session_id, region, tree, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
             );
             for (const l of layoutRows) {
-                const idMap = l.region === "viewer" ? viewerIdMap : terminalIdMap;
                 // A stored tree that no longer parses must not abort the whole
                 // duplicate. Everywhere else a corrupt blob self-heals to "this
                 // region has no layout" (getLayout / getLayouts, RW14); here it
@@ -1786,6 +1845,26 @@ export class Workspace {
         // read-back: without it a second connection writing the same region in
         // between makes this call RETURN that other tree as if it were the one
         // it just stored, and the client then renders a layout it never saved.
+        // Serialized BEFORE the transaction opens, and checked: `tree` is
+        // free-form client JSON, and JSON.stringify answers `undefined` for a
+        // value that has no JSON form at all (undefined itself, a function, a
+        // symbol) and THROWS for a circular structure or a BigInt. Both used to
+        // reach node:sqlite, the first as a bind value the driver rejects with
+        // an opaque type error naming no field, the second as an exception
+        // rolling back a transaction that had already been opened. `tree` is
+        // NOT NULL in the schema, so there is no column value to fall back to.
+        let serializedTree: string;
+        try {
+            const json = JSON.stringify(params.tree);
+            if (json === undefined) throw new Error("value has no JSON representation");
+            serializedTree = json;
+        } catch (err) {
+            throw new InvalidParamsError(
+                `workspace.setLayout: 'tree' must be a JSON-serializable split tree (${
+                    err instanceof Error ? err.message : String(err)
+                })`,
+            );
+        }
         return this.transaction(() => {
             const serverId = this.parentServerId("dev_sessions", params.devSessionId);
             const ts = Date.now();
@@ -1799,7 +1878,7 @@ export class Workspace {
                     serverId,
                     params.devSessionId,
                     params.region,
-                    JSON.stringify(params.tree),
+                    serializedTree,
                     ts,
                     ts,
                 );
@@ -1837,6 +1916,14 @@ export class Workspace {
             // getLayouts) reports it as null. Nothing to repair here.
             return;
         }
+        // Nothing in this region names the deleted pane: leave the row exactly
+        // as it is. removePaneFromTree rebuilds every split it walks (it
+        // renormalizes ratios), so its output almost never compares equal to
+        // the stored text even when no leaf was dropped — without this check,
+        // deleting a pane in ONE region rewrote the OTHER region's tree and
+        // bumped its updated_at for no reason, which the equality check below
+        // was written to prevent and cannot.
+        if (!treeReferencesPane(tree, paneId)) return;
         const repaired = removePaneFromTree(tree, paneId);
         const finalTree = repaired === null ? { type: "leaf", paneId: "" } : repaired;
         const serialized = JSON.stringify(finalTree);
@@ -1873,11 +1960,18 @@ export class Workspace {
         };
         if (this.inTransaction) return read();
         this.db.exec("BEGIN");
+        // Kept in step with the actual state of the connection: the flag means
+        // "this connection is inside a BEGIN", so anything the read path may
+        // ever call that wants atomicity of its own joins this transaction
+        // instead of issuing a nested BEGIN, which SQLite rejects outright.
+        this.inTransaction = true;
         try {
             const result = read();
+            this.inTransaction = false;
             this.db.exec("COMMIT");
             return result;
         } catch (err) {
+            this.inTransaction = false;
             try {
                 this.db.exec("ROLLBACK");
             } catch {
@@ -1974,11 +2068,11 @@ export class Workspace {
         this.db.prepare("DELETE FROM dev_sessions WHERE id = ?").run(id);
     }
 
-    // Ids of one ordered scope, in listing order. See OrderedTable on why the
-    // identifiers are literal unions.
-    private orderedIds(
-        table: OrderedTable,
-        scopeColumn: ScopeColumn,
+    // Ids of one ordered scope, in listing order. See OrderedScope on why the
+    // identifiers are typed the way they are.
+    private orderedIds<T extends OrderedTable>(
+        table: T,
+        scopeColumn: OrderedScope[T],
         scopeValue: string,
     ): string[] {
         const rows = this.db
@@ -1998,16 +2092,26 @@ export class Workspace {
     // this; creation has the same hole. An index past the end simply appends,
     // which is the only sensible reading of "create at position 9" in a scope
     // of three.
-    private placeAt(
-        table: OrderedTable,
-        scopeColumn: ScopeColumn,
+    //
+    // The index is truncated and clamped at BOTH ends before use. Array.splice
+    // reads a NEGATIVE index as an offset from the END, so `position: -1` used
+    // to insert the new row second-to-LAST — the opposite of the "before
+    // everything" a negative index reads as — and a fractional index is not a
+    // slot at all. The RPC guards already reject both (optionalIndex), so this
+    // is the in-process API keeping the same promise on its own.
+    private placeAt<T extends OrderedTable>(
+        table: T,
+        scopeColumn: OrderedScope[T],
         scopeValue: string,
         id: string,
         index: number,
         ts: number,
     ): void {
         const others = this.orderedIds(table, scopeColumn, scopeValue).filter((x) => x !== id);
-        others.splice(Math.min(index, others.length), 0, id);
+        const at = Number.isFinite(index)
+            ? Math.min(Math.max(Math.trunc(index), 0), others.length)
+            : others.length;
+        others.splice(at, 0, id);
         this.packOrder(table, scopeColumn, scopeValue, others, ts);
     }
 
@@ -2023,9 +2127,9 @@ export class Workspace {
     // since every listing query orders by `position, id`, the tie would be broken
     // by UUID, i.e. at random. A client that sends a filtered or stale list gets
     // its requested prefix and a still-packed scope instead of a shuffle.
-    private packOrder(
-        table: OrderedTable,
-        scopeColumn: ScopeColumn,
+    private packOrder<T extends OrderedTable>(
+        table: T,
+        scopeColumn: OrderedScope[T],
         scopeValue: string,
         orderedIds: readonly string[],
         ts: number,
@@ -2046,11 +2150,11 @@ export class Workspace {
     }
 
     // Next free position in a scope: one past the current maximum, so the first
-    // row of an empty scope lands on 0. See OrderedTable on why the identifiers
-    // are literal unions.
-    private nextPosition(
-        table: OrderedTable,
-        scopeColumn: ScopeColumn,
+    // row of an empty scope lands on 0. See OrderedScope on why the identifiers
+    // are typed the way they are.
+    private nextPosition<T extends OrderedTable>(
+        table: T,
+        scopeColumn: OrderedScope[T],
         scopeValue: string,
     ): number {
         const row = this.db
@@ -2152,8 +2256,11 @@ export const WORKSPACE_METHODS: Record<RpcWorkspaceMethodName, (params: unknown)
     [M.list]: (p) => {
         const o = requireObject(p, M.list);
         const serverId = requireString(o, "serverId", M.list);
-        optionalBoolean(o, "pinnedOnly", M.list);
-        return workspace().list(serverId, (o.pinnedOnly as boolean | undefined) ?? false);
+        // The guard's RETURN value, not a second unchecked cast of the same
+        // field: reading `o.pinnedOnly` again meant the validated value was
+        // thrown away and the cast could drift from what was actually checked.
+        const pinnedOnly = optionalBoolean(o, "pinnedOnly", M.list) ?? false;
+        return workspace().list(serverId, pinnedOnly);
     },
     [M.createGroup]: (p) => {
         const o = requireObject(p, M.createGroup);

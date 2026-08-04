@@ -53,8 +53,8 @@ async function tmpDir(): Promise<string> {
 // duration. `withTimeout` uses a wall-clock guard because real filesystem
 // events (fs.watch / polling against the OS clock) cannot be driven by fake
 // timers; the guard converts a regression into a failure instead of a hang.
-// The executor form (not Promise.withResolvers) is required: tsconfig targets
-// ES2022, whose lib predates the withResolvers typing.
+// The executor form is used because `resolve` IS the callback the service
+// wants, so there is nothing for Promise.withResolvers to add here.
 function firstWatchEvent(service: FileWatchService): Promise<WatchEvent> {
     return new Promise<WatchEvent>((resolve) => {
         service.onWatchEvent(resolve);
@@ -218,7 +218,7 @@ test("writeFile create-only fails when the file already exists", async () => {
     await fs.rm(dir, { recursive: true, force: true });
 });
 
-test("resolvePath flags inside vs outside the repository root", async () => {
+test("resolvePath flags inside vs outside the repository root", () => {
     const base = path.resolve("/repo/project");
 
     const inside = resolvePath({ path: "src/index.ts", base });
@@ -234,8 +234,6 @@ test("resolvePath flags inside vs outside the repository root", async () => {
     const absoluteOutside = resolvePath({ path: "/etc/hosts", base });
     assert.equal(absoluteOutside.insideRepositoryRoot, false);
     assert.equal(absoluteOutside.path, path.resolve("/etc/hosts"));
-
-    await Promise.resolve();
 });
 
 test("watch emits a WatchEvent when the file changes", async () => {
@@ -262,6 +260,53 @@ test("watch emits a WatchEvent when the file changes", async () => {
 
     await fs.rm(dir, { recursive: true, force: true });
 });
+test("watch re-arms after atomic replacement and sees later edits", async () => {
+    const dir = await tmpDir();
+    const file = path.join(dir, "replaced.txt");
+    await fs.writeFile(file, "one");
+
+    const service = new FileWatchService();
+    service.pollIntervalMs = 25;
+    const { subscriptionId } = await service.watch({ path: file });
+
+    // Atomic replacement is exactly how writeFile saves. It leaves the
+    // original fs.watch handle attached to an unlinked inode on Linux.
+    const replacement = path.join(dir, ".replacement");
+    await fs.writeFile(replacement, "two");
+    await fs.rename(replacement, file);
+    await delay(100);
+
+    const eventPromise = firstWatchEvent(service);
+    await fs.writeFile(file, "three — after replacement");
+    const event = await withTimeout(eventPromise, 5000);
+
+    service.unwatch({ subscriptionId });
+    service.closeAll();
+    assert.equal(event.event, "modified");
+    await fs.rm(dir, { recursive: true, force: true });
+});
+
+test("watch reports deletion when a parent is replaced by a file", async () => {
+    const dir = await tmpDir();
+    const parent = path.join(dir, "parent");
+    const file = path.join(parent, "nested.txt");
+    await fs.mkdir(parent);
+    await fs.writeFile(file, "here");
+
+    const service = new FileWatchService();
+    service.pollIntervalMs = 25;
+    const { subscriptionId } = await service.watch({ path: file });
+    const eventPromise = firstWatchEvent(service);
+    await fs.rm(parent, { recursive: true });
+    await fs.writeFile(parent, "not a directory");
+    const event = await withTimeout(eventPromise, 5000);
+
+    service.unwatch({ subscriptionId });
+    service.closeAll();
+    assert.equal(event.event, "deleted");
+    await fs.rm(dir, { recursive: true, force: true });
+});
+
 
 test("listDirectory (RPC) sorts entries, includes hidden files, and classifies them", async () => {
     const dir = await tmpDir();
@@ -342,6 +387,7 @@ test("readFile clamps a negative offset to the start of the file", async () => {
     const file = path.join(dir, "neg.txt");
     await fs.writeFile(file, "0123456789");
 
+
     // A negative offset must NOT index from the end of the buffer
     // (Buffer.subarray semantics); it is clamped to 0 so the whole file reads.
     const r = await readFile({ path: file, offset: -3 });
@@ -377,6 +423,21 @@ test("readFile handles an empty file", async () => {
 
     await fs.rm(dir, { recursive: true, force: true });
 });
+test("readFile rejects a FIFO without blocking the daemon", async () => {
+    const dir = await tmpDir();
+    const fifo = path.join(dir, "pipe");
+    await new Promise<void>((resolve, reject) => {
+        const child = spawn("mkfifo", [fifo]);
+        child.once("error", reject);
+        child.once("exit", (code) => (code === 0 ? resolve() : reject(new Error(`mkfifo exited ${code}`))));
+    });
+
+    await assert.rejects(
+        () => readFile({ path: fifo }),
+        (err: unknown) => err instanceof Error && "code" in err && err.code === "EINVAL",
+    );
+    await fs.rm(dir, { recursive: true, force: true });
+});
 
 test("readFile rejects a directory with EISDIR", async () => {
     const dir = await tmpDir();
@@ -408,6 +469,18 @@ test("writeFile decodes base64 content and reads it back byte-exact", async () =
 
     await fs.rm(dir, { recursive: true, force: true });
 });
+test("writeFile rejects unpaired UTF-16 surrogates instead of replacing them", async () => {
+    const dir = await tmpDir();
+    const file = path.join(dir, "invalid.txt");
+
+    await assert.rejects(
+        () => writeFile({ path: file, content: "\ud800", expectedRevision: "" }),
+        /unpaired surrogate/,
+    );
+    assert.equal(await fs.access(file).then(() => true, () => false), false);
+    await fs.rm(dir, { recursive: true, force: true });
+});
+
 
 test("concurrent writeFile with the same revision: exactly one wins", async () => {
     const dir = await tmpDir();
@@ -562,7 +635,7 @@ test("watch emits no WatchEvent for a subscription after unwatch", async () => {
     await fs.rm(dir, { recursive: true, force: true });
 });
 
-test("resolvePath treats an in-repo name starting with '..' as inside", async () => {
+test("resolvePath treats an in-repo name starting with '..' as inside", () => {
     const base = path.resolve("/repo/project");
 
     // "..config" is a real in-repo filename, NOT a parent-directory escape.
@@ -573,8 +646,6 @@ test("resolvePath treats an in-repo name starting with '..' as inside", async ()
     // A genuine parent escape ("..") is still flagged outside.
     assert.equal(resolvePath({ path: "..", base }).insideRepositoryRoot, false);
     assert.equal(resolvePath({ path: "../x", base }).insideRepositoryRoot, false);
-
-    await Promise.resolve();
 });
 
 test("readFile keeps a UTF-8 byte-order mark, and writeFile puts it back byte-exact", async () => {
@@ -1017,6 +1088,10 @@ test("file.readFile rejects a non-integer or negative offset/length", async () =
         { path: file, offset: 1.5 },
         { path: file, length: Number.NaN },
         { path: file, length: -4 },
+        // Beyond Number.MAX_SAFE_INTEGER an integer no longer round-trips as
+        // itself, so it is not a byte count anything downstream can honour.
+        { path: file, offset: Number.MAX_SAFE_INTEGER + 1 },
+        { path: file, length: Number.POSITIVE_INFINITY },
     ]) {
         const error = await callFile("file.readFile", params);
         assert.equal(error.code, RPC_INVALID_PARAMS, JSON.stringify(params));
@@ -1519,8 +1594,13 @@ async function runDaemonUntilSignalled(
     signals: readonly NodeJS.Signals[],
     keepSignallingUntilExit = false,
 ): Promise<{ code: number | null; signal: NodeJS.Signals | null }> {
+    // A throwaway workspace database. The daemon opens one lazily, so `ping`
+    // alone never creates it — but nothing in this suite may be one code change
+    // away from writing into the developer's real ~/.local/share workspace.
+    const dbDir = await tmpDir();
     const child = spawn(process.execPath, [DAEMON_ENTRY, "rpc", "--stdio"], {
         stdio: ["pipe", "pipe", "pipe"],
+        env: { ...process.env, CODEHARBOR_DB: path.join(dbDir, "codeharbor.sqlite") },
     });
     const exited = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) => {
         child.on("exit", (code, signal) => resolve({ code, signal }));
@@ -1556,6 +1636,7 @@ async function runDaemonUntilSignalled(
         return await withTimeout(exited, 20000);
     } finally {
         if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+        await fs.rm(dbDir, { recursive: true, force: true });
     }
 }
 

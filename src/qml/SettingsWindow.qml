@@ -27,11 +27,11 @@ Rectangle {
     property bool profileDirty: false
     signal dismissed()
 
-    visible: shown
+    // The host owns visibility; this component only manages its sheet content.
     color: Theme.surface
     border.width: 1
     border.color: Theme.borderSubtle
-    focus: shown
+    focus: visible
 
     component SheetButton: Button {
         id: button
@@ -89,7 +89,7 @@ Rectangle {
         focusPolicy: Qt.StrongFocus
         editable: true
         contentItem: TextInput {
-            text: numberBox.textFromValue(numberBox.value, numberBox.locale)
+            text: numberBox.displayText
             color: Theme.text
             font.pixelSize: Theme.fontSizeBody
             horizontalAlignment: Text.AlignHCenter
@@ -287,12 +287,11 @@ Rectangle {
     }
 
     function closeSheet() {
-        root.shown = false;
         root.dismissed();
     }
 
-    onShownChanged: {
-        if (root.shown) {
+    onVisibleChanged: {
+        if (root.visible) {
             root.reconcileToolbar();
             root.syncViewerDefaults();
             root.syncProfiles();

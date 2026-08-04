@@ -389,20 +389,31 @@ QString LogBuffer::truncateUtf8(const QString& value, qsizetype byteLimit)
            && isContinuation(static_cast<unsigned char>(encoded.at(start - 1)))) {
         --start;
     }
+    if (start == 0) {
+        // The kept prefix begins with a continuation byte, so it carries no
+        // lead byte and nothing in it can be decoded. Valid UTF-8 never looks
+        // like this, but the arithmetic below would then read encoded.at(-1)
+        // and set `end` to -1 - and QString::fromUtf8() reads a negative size
+        // as "scan to the terminating null", returning the WHOLE string and
+        // blowing straight past the byte cap this function exists to enforce.
+        return QString();
+    }
     if (start < end) {
         const unsigned char lead =
             static_cast<unsigned char>(encoded.at(start - 1));
         const qsizetype expected = sequenceLength(lead);
         if (expected == 0 || expected > end - (start - 1))
             end = start - 1;
-    } else if (end > 0) {
+    } else {
         const unsigned char lead =
             static_cast<unsigned char>(encoded.at(end - 1));
         const qsizetype expected = sequenceLength(lead);
         if (expected > 1)
             end = end - 1;
     }
-    return QString::fromUtf8(encoded.constData(), static_cast<int>(end));
+    // qsizetype, not int: QString::fromUtf8() takes a qsizetype length, and
+    // narrowing it here would corrupt the cut for a value above INT_MAX.
+    return QString::fromUtf8(encoded.constData(), end);
 }
 
 int LogBuffer::entryBytes(const Entry& entry)

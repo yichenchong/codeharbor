@@ -435,9 +435,9 @@ Rectangle {
     }
     onPendingHostKeyChanged: {
         if (root.pendingHostKey)
-            hostKeyReject.forceActiveFocus();
+            Qt.callLater(() => hostKeyReject.forceActiveFocus());
         else if (root.visible)
-            profileSelector.forceActiveFocus();
+            Qt.callLater(() => profileSelector.forceActiveFocus());
     }
     onPendingCredentialChanged: {
         // Cleared on BOTH edges: on open so a previous attempt's keystrokes can
@@ -445,9 +445,23 @@ Rectangle {
         // in a live QML item (and its undo stack) after it has been spent.
         secretField.clear();
         if (root.pendingCredential)
-            secretField.forceActiveFocus();
+            Qt.callLater(() => secretField.forceActiveFocus());
         else if (root.visible)
-            profileSelector.forceActiveFocus();
+            Qt.callLater(() => profileSelector.forceActiveFocus());
+    }
+    onVisibleChanged: {
+        if (!root.visible)
+            return;
+        Qt.callLater(() => {
+            if (root.pendingCredential)
+                secretField.forceActiveFocus();
+            else if (root.pendingHostKey)
+                hostKeyReject.forceActiveFocus();
+            else if (root.profileList().length > 0)
+                profileSelector.forceActiveFocus();
+            else
+                nameField.input.forceActiveFocus();
+        });
     }
     Component.onCompleted: root.syncFromModel()
 

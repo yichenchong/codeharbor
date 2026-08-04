@@ -11,15 +11,23 @@ namespace ch {
 namespace {
 // Both filters are independent predicates: showArchived broadens the set of
 // sessions eligible for display, while pinnedOnly narrows it to pinned rows.
+//
+// Group visibility follows from that, and the two cases are NOT the same:
+//   * a group that has no sessions at all is a container the user just made
+//     and is about to fill, so it stays visible - except in pinned-only mode,
+//     where it has nothing pinned under it and showing it would contradict the
+//     filter's own promise;
+//   * a group whose every session is hidden by a filter drops out entirely.
+//     That is what lets the sidebar answer an all-archived workspace with one
+//     clear "All your sessions are archived" panel (it keys off rowCount() == 0
+//     plus hasSessions(); see SessionsSidebar.qml) instead of a list of group
+//     headers with nothing under them.
 QVector<GroupRow> filteredGroups(const QVector<GroupRow> &source,
                                  bool pinnedOnly, bool showArchived)
 {
     QVector<GroupRow> filtered;
     filtered.reserve(source.size());
     for (const GroupRow &group : source) {
-        // An empty group has no pinned session, so pinned-only mode must not
-        // expose it. Without that check the filter claims to show only pinned
-        // sessions while still displaying unrelated empty group rows.
         if (group.sessions.isEmpty()) {
             if (!pinnedOnly)
                 filtered.append(group);

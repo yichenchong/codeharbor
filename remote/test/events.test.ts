@@ -62,11 +62,26 @@ test("validateEvent accepts a well-formed event and rejects bad ones", () => {
     assert.equal(validateEvent({ ...good, timestamp: "2026-08-03T12:00:00Z" }), false);
     assert.equal(validateEvent({ ...good, timestamp: "2026-13-03T12:00:00.000Z" }), false);
     assert.equal(validateEvent({ ...good, timestamp: "2026-02-29T12:00:00.000Z" }), false);
+    // A day count is checked against the month, and February against the leap
+    // rule in both directions: 2024 has a 29th, 2026 does not (above), and no
+    // April has a 31st.
+    assert.equal(validateEvent({ ...good, timestamp: "2024-02-29T12:00:00.000Z" }), true);
+    assert.equal(validateEvent({ ...good, timestamp: "2026-04-31T12:00:00.000Z" }), false);
+    // The time-of-day fields are range-checked too: 24:00 is not an hour.
+    assert.equal(validateEvent({ ...good, timestamp: "2026-08-03T24:00:00.000Z" }), false);
     assert.equal(
         validateEvent({ ...good, timestamp: "2026-08-03T12:00:00.000+00:00" }),
         true,
     );
     assert.equal(validateEvent({ ...good, metadata: new Date() }), false);
+    // `event` is the harness's own event name and is required to be a string:
+    // the client renders it, and a number or an absent value would reach the
+    // sidebar as "undefined".
+    assert.equal(validateEvent({ ...good, event: 42 }), false);
+    assert.equal(validateEvent({ ...good, event: undefined }), false);
+    // `summary` is optional but, when present, is also text the client shows.
+    assert.equal(validateEvent({ ...good, summary: 7 }), false);
+    assert.equal(validateEvent({ ...good, summary: "all done" }), true);
     assert.equal(validateEvent(null), false);
     assert.equal(validateEvent("string"), false);
 });

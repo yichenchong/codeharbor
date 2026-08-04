@@ -76,14 +76,24 @@ export class RecoveryReporter {
         }, REPORT_DELAY_MS);
     }
 
+    /** Send the buffer to the host NOW, whether or not a timer is armed, and
+     *  disarm the one that is. Used when the buffer is KNOWN to diverge from
+     *  the file even though nothing is scheduled: an edit that is later undone
+     *  during a save leaves the buffer clean against the OLD baseline, so the
+     *  edit handler scheduled nothing, yet after the save lands those bytes are
+     *  no longer the file's bytes and the host must hold a snapshot of them. */
+    report(): void {
+        this.cancel();
+        this.bridge.reportContent(this.getValue());
+    }
+
     /** Send a still-pending snapshot immediately (teardown / retarget). No-op
      *  when nothing is pending. */
     flush(): void {
         if (this.timer === undefined) {
             return;
         }
-        this.cancel();
-        this.bridge.reportContent(this.getValue());
+        this.report();
     }
 
     /** Persist the buffer guarded by `expectedRevision`, cancelling any pending

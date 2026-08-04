@@ -263,7 +263,7 @@ Each Dev Session row should display:
 > subtitle, ONE aggregate status dot, and a pin toggle. The sidebar data model
 > (`SessionsModel::Roles` in `src/models/SessionsModel.h`) exposes `NameRole`,
 > `SubtitleRole`, `RowStateRole`, `IsGroupRole`, `CollapsedRole`, `IdRole`,
-> `GroupIdRole` and `PinnedRole`; there is no role for either terminal counter and
+> `GroupIdRole`, `PinnedRole` and `ArchivedRole`; there is no role for either terminal counter and
 > none for unsaved files, so the QML delegate could not draw them even if it tried.
 > Tracked in `docs/PLAN.md`.
 
@@ -417,7 +417,7 @@ the first viewer pane silently — a closed pane is not an error.
 ### 4.6 Settings
 
 Preferences live in one surface with a group list on the left and the selected group's controls on the right,
-reachable from the command palette. Groups: **Appearance**, **File Types**, **Server**, **Tmux**.
+reachable from the command palette. Groups: **Appearance**, **File viewers**, **Server**, **Tmux**.
 
 Appearance owns:
 
@@ -435,7 +435,7 @@ Appearance owns:
   build that adds or removes one. Reconciliation is a view, never a write: only the user reordering persists.
 - **Terminal text size** and **rendering resolution** (§5.1).
 
-File Types owns which handler opens which file extension (§7.5). An empty mapping
+File viewers owns which handler opens which file extension (§7.5). An empty mapping
 means "use the built-in defaults", which is the shipped behaviour; the page lists
 what the user has customised and lets them add and remove a mapping, offering only
 the handlers that can actually display the type in question. The store is a plain
@@ -521,6 +521,7 @@ tmux new-session -A \
   -s 'ch_<dev-session-uuid>_<terminal-uuid>' \
   -c '/remote/working/directory' \
   \; set-option -t '=ch_<dev-session-uuid>_<terminal-uuid>:' mouse on
+```
 
 Stable IDs should be used for tmux names rather than user-facing display names.
 
@@ -530,6 +531,8 @@ workspace RPC are accepted only when they are 1–200 characters from
 because tmux interprets them as session/window/pane separators. The tmux
 `killSession` operation applies the same separator and control-character
 rejection before it builds its exact-match target.
+
+### 5.3 Connection Model
 
 Use one authenticated SSH connection to the configured server, with multiple independent SSH channels.
 
@@ -671,10 +674,10 @@ dropped by the bridge.
 
 `metadata` is free-form, but the tool name is keyed **`tool`**. That is not a
 preference: all three shipped adapters in `remote/src/adapters/` emit it under
-that exact key — `oh-my-pi.ts` and `pi.ts` pass their harness's own `tool` field
-through, and `claude-code.ts` renames the harness's `tool_name` to it. An adapter
-that picks a different key compiles, validates and relays fine, and the client
-simply never sees a tool name.
+that exact key — the shared `pi-family.ts` mapping handles the Pi and Oh My Pi
+adapters' `tool` field, and `claude-code.ts` renames the harness's `tool_name`
+to it. An adapter that picks a different key compiles, validates and relays
+fine, and the client simply never sees a tool name.
 
 Supported states:
 
@@ -949,8 +952,8 @@ Disconnected
 Unsaved-file state should appear both in the pane header and in the Dev Session row.
 
 > **Implementation status.** Only the pane header shows it. The row aggregation,
-> `aggregateRowState()` in `src/models/SessionState.cpp`, takes five booleans — error,
-> waiting-for-input, running, finished-with-unseen-output, connected — all derived from
+> `aggregateRowState()` in `src/models/SessionState.cpp`, takes six booleans — error,
+> waiting-for-input, running, finished-with-unseen-output, connected, disconnected — all derived from
 > terminal and coding-agent conditions. No file state is passed in, so an unsaved
 > buffer never reaches the sidebar row. Tracked in `docs/PLAN.md`.
 
@@ -1138,7 +1141,7 @@ need to remain running between SSH sessions.
 
 ### 10.2 Responsibilities
 
-`codeharbord` should eventually handle:
+`codeharbord` handles:
 
 - workspace database;
 - groups and sessions;
@@ -1150,8 +1153,10 @@ need to remain running between SSH sessions.
 - MIME detection;
 - tmux discovery;
 - agent-status events;
-- Git metadata;
 - session recovery.
+
+Git metadata integration remains planned and is not currently exposed by the
+remote service.
 
 ### 10.3 RPC
 
@@ -1446,8 +1451,8 @@ remote/
 │   ├── validate.ts           request-parameter validation helpers
 │   ├── events.ts             agent event schema + socket-path resolution
 │   ├── bridge.ts             agent event relay
-│   ├── adapters/             oh-my-pi.ts, pi.ts (both over pi-family.ts),
-│   │                         claude-code.ts, types.ts, index.ts (the registry)
+│   ├── adapters/             pi-family.ts (shared Pi mapping), oh-my-pi.ts,
+│   │                         pi.ts, claude-code.ts, types.ts, index.ts (registry)
 │   └── hooks/                oh-my-pi-hook.ts (the native harness hook)
 └── sql/                      schema.sql, indexes.sql
 ```
@@ -1481,12 +1486,13 @@ Ctrl+Shift+P    Command palette
 Ctrl+Shift+O    Connect to Server…
 Ctrl+Shift+R    Refresh Workspace
 Ctrl+Shift+W    Close Window
+Ctrl+,          Settings
 Ctrl+S          Save active remote file (inside the focused editor)
 ```
 
 `Ctrl+Shift+P` opens the palette (`activationSequence` in
 `src/qml/CommandPalette.qml`; Qt maps `Ctrl` in a key sequence to Command on macOS,
-so it is `⌘⇧P` there). `Ctrl+Shift+O`, `Ctrl+Shift+R` and `Ctrl+Shift+W` are
+so it is `⌘⇧P` there). `Ctrl+Shift+O`, `Ctrl+Shift+R`, `Ctrl+Shift+W` and `Ctrl+,` are
 `shortcut` entries on the command list in `src/qml/Main.qml`, which the palette
 turns into real window-wide `Shortcut` objects, so they fire whether or not the
 palette is open. `Ctrl+S` is registered on the Monaco instance itself in

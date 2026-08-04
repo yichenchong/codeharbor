@@ -862,6 +862,13 @@ Rectangle {
                     // `node` must be set at creation: a declarative `source`
                     // would instantiate the child with the default single-pane
                     // node first, transiently building a stray leaf pane.
+                    function updateChildRegion() {
+                        if (!item)
+                            return;
+                        item.node = childLoader.childNode;
+                        item.nodePath = region.nodePath.concat(
+                            [String(childLoader.index)]);
+                    }
                     Component.onCompleted: setSource("ViewerRegion.qml",
                                                      { node: childLoader.childNode,
                                                        rootRegion: region.paneOwner,
@@ -873,13 +880,8 @@ Rectangle {
                                                            () => region.paneOwner.layoutGeneration),
                                                        hostStampsWrites: Qt.binding(
                                                            () => region.paneOwner.hostStampsWrites) })
-                    onChildNodeChanged: {
-                        if (!item)
-                            return;
-                        item.node = childLoader.childNode;
-                        item.nodePath = region.nodePath.concat(
-                            [String(childLoader.index)]);
-                    }
+                    onLoaded: updateChildRegion()
+                    onChildNodeChanged: updateChildRegion()
                 }
             }
         }

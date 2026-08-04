@@ -55,8 +55,13 @@ const TMUX_BINARY = process.env.CODEHARBOR_TMUX ?? "tmux";
 // the dispatcher awaits the handler, so a tmux that never answers (an
 // unresponsive server socket, a stuck NFS-mounted socket directory) would hang
 // the RPC method — and the client's session list — forever. Ten seconds is far
-// beyond any healthy `list-sessions`, and hitting it lands on rule 1's empty
-// result rather than an error.
+// beyond any healthy `list-sessions`.
+//
+// Hitting it is a REAL failure and is surfaced as one, unlike rule 1's two
+// absences: a hung tmux is not a host without sessions, and answering "no
+// sessions" would invite the client to create a second session alongside the
+// live one it could not see. execFileRunner names the timeout in `stderr` so
+// the surfaced message says so instead of "exit code -1".
 const TMUX_TIMEOUT_MS = 10_000;
 
 // --- tmux target names (SPEC 5.2) -------------------------------------------
@@ -80,7 +85,15 @@ const TMUX_TIMEOUT_MS = 10_000;
 // option, and control characters come back vis-escaped in tmux's output (see
 // the listing parser below). Everything CodeHarbor mints is `ch_` plus two
 // UUIDs, which fits this set with room to spare.
-const TMUX_TARGET_SAFE = /^[A-Za-z0-9_-]+$/;
+// The FIRST character is restricted further: `^[A-Za-z0-9_]` excludes a leading
+// `-`, which the prose above claims to exclude but a plain `[A-Za-z0-9_-]+`
+// happily accepted. A stored target such as `-d` survives every `-t '=<target>'`
+// call site (the `=` shields it), but it is handed to tmux UNSHIELDED wherever a
+// name is created rather than targeted — `tmux new-session -A -s <target>`
+// (TerminalController::tmuxNewSessionCommand) — and one getopt away from being
+// read as a flag. Nothing CodeHarbor mints starts with `-`, so this costs
+// nothing and closes the gap between the rule and the regex.
+const TMUX_TARGET_SAFE = /^[A-Za-z0-9_][A-Za-z0-9_-]*$/;
 
 // Longest target accepted. Nothing in tmux's grammar hangs on it; it is a bound
 // so an absurd name cannot be stored, shipped through a command line and then
@@ -138,10 +151,21 @@ export const execFileRunner: CommandRunner = (argv) =>
                 }
                 // execFile reports a non-zero exit as a numeric `code` and a
                 // spawn failure (ENOENT for a missing tmux) as a string errno.
+                //
+                // A TIMEOUT is neither: execFile kills the child with a signal,
+                // so there is no exit code at all and `stderr` is usually empty.
+                // That collapsed onto the same shape as "could not spawn" and
+                // produced the useless message `tmux list-sessions failed: exit
+                // code -1`. Name it, so the error the user is shown says what
+                // actually happened, and so isMissingTmux can never read a hung
+                // server as an absent binary.
+                const timedOut = err.killed === true && typeof err.code !== "number";
                 resolve({
                     code: typeof err.code === "number" ? err.code : SPAWN_FAILED,
                     stdout: stdout ?? "",
-                    stderr: stderr ?? err.message,
+                    stderr: timedOut
+                        ? `tmux did not respond within ${TMUX_TIMEOUT_MS}ms`
+                        : (stderr ?? err.message),
                 });
             },
         );

@@ -236,3 +236,28 @@ test("a sink that acknowledges synchronously still drains in order", () => {
     assert.deepEqual(acked, [3, 3]);
     assert.equal(writer.backlogSize, 0);
 });
+
+test("a sink throw keeps the chunk available for a later retry", () => {
+    const chunks: string[] = [];
+    let shouldThrow = true;
+    const acked: number[] = [];
+    const writer = new CoalescingWriter(
+        {
+            write(data, done) {
+                chunks.push(data);
+                if (shouldThrow) {
+                    shouldThrow = false;
+                    throw new Error("disposed sink");
+                }
+                done();
+            },
+        },
+        (bytes) => acked.push(bytes),
+    );
+
+    writer.write("first", 5);
+    assert.equal(writer.backlogSize, 5);
+    writer.write("second", 6);
+    assert.deepEqual(chunks, ["first", "firstsecond"]);
+    assert.deepEqual(acked, [11]);
+});

@@ -361,6 +361,28 @@ export function mountEditor(
     const reporter = new RecoveryReporter(bridge, () => bufferText(editor));
 
     /**
+     * Show the "save failed" notice with a Retry affordance. Shared by the
+     * host's saveError signal and by the refusals requestSave() makes locally,
+     * so a Ctrl+S that cannot be honoured is never silent. Re-arms the recovery
+     * snapshot because the buffer is, by definition, still unsaved.
+     */
+    function showSaveError(message: string): void {
+        clearNotice();
+        reporter.schedule(dirty);
+        const msg = doc.createElement("span");
+        msg.textContent = `Save failed: ${message}`;
+        const retry = doc.createElement("button");
+        retry.type = "button";
+        retry.textContent = "Retry";
+        retry.addEventListener("click", () => {
+            clearNotice();
+            requestSave(loadedRevision);
+        });
+        notice.replaceChildren(msg, retry);
+        notice.style.display = "flex";
+    }
+
+    /**
      * Persist the buffer guarded by `revision` (SPEC 8.4/8.6). reporter.save()
      * cancels the pending snapshot before sending, so a timer allowed to fire
      * AFTER the save succeeded cannot resurrect a stale "unsaved changes" copy
@@ -369,6 +391,16 @@ export function mountEditor(
      */
     function requestSave(revision: string): void {
         if (readOnly || currentFileState === "loading") {
+            return;
+        }
+        // With no transport bound the host's save slot returns immediately and
+        // emits NOTHING (EditorController::save bails on a null client), so a
+        // silent return here would leave the user believing the file was
+        // written. Refuse locally and say so instead — and refuse BEFORE
+        // reporter.save(), which would otherwise cancel the pending recovery
+        // snapshot for a save that never happens.
+        if (currentFileState === "disconnected") {
+            showSaveError("no connection to the server.");
             return;
         }
         // Capture the exact bytes being handed to C++ so a successful reply can
@@ -451,15 +483,26 @@ export function mountEditor(
         clearNotice();
         renderState();
         if (editedDuringSave) {
-            // The current bytes are not the bytes that just landed. Flush a
-            // pending snapshot so the host keeps the edits that remain local.
-            reporter.flush();
+            // The current bytes are not the bytes that just landed, so the host
+            // must hold a snapshot of the edits that remain local. report(),
+            // not flush(): a timer is not necessarily armed. An edit made and
+            // then UNDONE during the round trip leaves the buffer equal to the
+            // OLD baseline, so the edit handler saw dirty=false and scheduled
+            // nothing — yet against the bytes the save just wrote, that undo is
+            // itself an unsaved change. flush() would drop it on the floor and
+            // leave the host believing the file is clean, which lets the next
+            // external change auto-reload over it (SPEC 8.7).
+            reporter.report();
         } else {
             // If a report for edits that were later undone already reached the
             // host, tell it that the recovery bytes now match the saved file.
             reporter.cancel();
             if (editSerial !== baselineEditSerial)
                 bridge.reportContent(savedContent);
+            // The server's bytes ARE the current buffer, so this is the edit
+            // count they were taken at; without this a later reply would
+            // re-send an already-reconciled snapshot.
+            baselineEditSerial = editSerial;
         }
     });
 
@@ -468,6 +511,9 @@ export function mountEditor(
         // user a choice: reload (discard local edits) or overwrite (force save
         // against the server's current revision).
         clearNotice();
+        // As in saveError: this save did not land, so the bytes it carried must
+        // never be adopted as the server's by a later reply.
+        pendingSaveContent = undefined;
         // The buffer is still unsaved, so keep the recovery snapshot current
         // while the notice waits for the user (requestSave cancelled it).
         reporter.schedule(dirty);
@@ -503,19 +549,10 @@ export function mountEditor(
     });
 
     bind(bridge.saveError, (message: string) => {
-        clearNotice();
-        reporter.schedule(dirty); // as above: the buffer is still unsaved
-        const msg = doc.createElement("span");
-        msg.textContent = `Save failed: ${message}`;
-        const retry = doc.createElement("button");
-        retry.type = "button";
-        retry.textContent = "Retry";
-        retry.addEventListener("click", () => {
-            clearNotice();
-            requestSave(loadedRevision);
-        });
-        notice.replaceChildren(msg, retry);
-        notice.style.display = "flex";
+        // The bytes handed to the host did NOT land, so they are not a
+        // baseline candidate any more; a later `saved` must not adopt them.
+        pendingSaveContent = undefined;
+        showSaveError(message);
     });
 
     // ---- slots: JS -> C++ ----
@@ -598,6 +635,13 @@ export function mountEditor(
             // Disposing a standalone editor also disposes the model it created
             // from `value`, so nothing is left behind.
             editor.dispose();
+            // Take the two elements this mount ADDED back out. `element` is the
+            // host's, not ours: leaving them means a second mountEditor() on the
+            // same element (a host that retargets without reloading the page)
+            // stacks a second status bar over a dead surface, and showFatal()
+            // is the only other thing that ever clears it.
+            statusEl.remove();
+            editorEl.remove();
         },
     };
 }
@@ -644,6 +688,36 @@ function showFatal(element: HTMLElement, message: string): void {
 }
 
 /**
+ * Name the first member of the frozen C3 contract that the host's proxy does
+ * NOT provide, or null when the proxy is complete.
+ *
+ * WebChannel builds the proxy from whatever the C++ object actually declares,
+ * so a renamed signal or a half-registered controller yields an object that
+ * looks fine and is missing exactly one member. mountEditor() connects all of
+ * them unconditionally, and `undefined.connect(...)` throws INSIDE the channel
+ * callback — after Monaco is already on screen, wired to nothing, with the
+ * exception going nowhere a user can see. Checking first turns that into the
+ * one explanatory line showFatal() exists for.
+ */
+function missingBridgeMember(bridge: EditorBridge): string | null {
+    const proxy = bridge as unknown as Record<string, unknown>;
+    for (const name of ["contentLoaded", "fileStateChanged", "readOnlyChanged",
+        "saved", "saveConflict", "saveError"]) {
+        const signal = proxy[name] as { connect?: unknown; disconnect?: unknown } | undefined;
+        if (!signal || typeof signal.connect !== "function"
+            || typeof signal.disconnect !== "function") {
+            return name;
+        }
+    }
+    for (const name of ["save", "reportContent", "requestReload"]) {
+        if (typeof proxy[name] !== "function") {
+            return name;
+        }
+    }
+    return null;
+}
+
+/**
  * Page entry point: open the WebChannel injected by the QML host and mount the
  * editor against the "editor" object (the C++ EditorController proxy).
  */
@@ -657,6 +731,11 @@ export function connectEditor(element: HTMLElement, options: MountOptions = {}):
         const bridge = channel.objects.editor as EditorBridge | undefined;
         if (!bridge) {
             showFatal(element, "The editor bridge is missing from this window.");
+            return;
+        }
+        const missing = missingBridgeMember(bridge);
+        if (missing) {
+            showFatal(element, `The editor bridge is incomplete: "${missing}" is missing.`);
             return;
         }
         const host = mountEditor(element, bridge, options);

@@ -212,9 +212,9 @@ ItemDelegate {
             // from the Row's implicit width, which is derived from these very
             // children and would be a cycle.
             width: Math.max(0, parent.width - parent.leftPadding - dot.width
-                            - archivedMarker.width - parent.spacing
+                            - (archivedMarker.visible ? archivedMarker.width : 0)
                             - pinButton.width - archiveButton.width - deleteButton.width
-                            - parent.spacing * 4 - 8)
+                            - parent.spacing * (archivedMarker.visible ? 4 : 3) - 8)
 
             Label {
                 width: parent.width

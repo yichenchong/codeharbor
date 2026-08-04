@@ -448,6 +448,16 @@ void InternalUrlSchemeHandler::requestStarted(QWebEngineUrlRequestJob *job)
                 bytes = content.toUtf8();
             }
 
+            // The request may have been cancelled while the read was in
+            // flight — a pane navigating away, a split closing, a reload —
+            // in which case Chromium has already destroyed the job and the
+            // QPointer is null. There is nothing left to reply to and nobody
+            // to report a failure to, so stop here: parenting a QBuffer to a
+            // null owner would leak it, and every call below would dereference
+            // a null job. The refusal paths above are guarded the same way.
+            if (!guard)
+                return;
+
             auto *buffer = new QBuffer(guard);
             buffer->setData(bytes);
             buffer->open(QIODevice::ReadOnly);

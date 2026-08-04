@@ -38,6 +38,7 @@ const sanitizerConfig: Config = {
     ALLOW_DATA_ATTR: false,
     ADD_ATTR: ["data-language"],
     ALLOWED_URI_REGEXP: allowedUri,
+    FORBID_ATTR: ["sizes", "srcset", "style"],
     FORBID_TAGS: [
         "audio",
         "base",
@@ -53,6 +54,7 @@ const sanitizerConfig: Config = {
         "source",
         "style",
         "svg",
+        "template",
         "track",
         "video",
     ],
@@ -169,13 +171,16 @@ export function rewriteRelativeUrls(
     const template = document.createElement("template");
     template.innerHTML = sanitizedHtml;
 
-    for (const image of template.content.querySelectorAll("img[src]")) {
+    for (const image of template.content.querySelectorAll("img")) {
         const source = image.getAttribute("src") ?? "";
-        if (isRelativeResource(source)) {
+        if (source.length > 0 && isRelativeResource(source)) {
             image.setAttribute("data-ch-image-path", source);
         }
-        // No source is left until the bridge gives us codeharbor-internal://.
+        // No source or responsive source is left until the bridge gives us
+        // one opaque codeharbor-internal:// URL.
         image.removeAttribute("src");
+        image.removeAttribute("srcset");
+        image.removeAttribute("sizes");
     }
 
     for (const link of template.content.querySelectorAll("a[href]")) {

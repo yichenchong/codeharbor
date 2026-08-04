@@ -23,6 +23,14 @@
 # here will at least parse there. This deliberately does NOT try to apply the
 # patches: that needs the upstream tarball and a network fetch, which is not
 # something a unit test should do.
+#
+# A hunk ends when the DECLARED line counts are satisfied, not when a line that
+# looks like a file header turns up. That distinction is the whole reason the
+# reader is count-driven: inside a hunk, deleting a line whose own text begins
+# `-- ` produces the body line `--- foo`, and adding a line beginning `++ `
+# produces `+++ foo`. Treating either as the start of a new file's diff would
+# end the hunk early and report a perfectly valid patch as malformed. git's own
+# parser reads exactly the declared number of body lines for the same reason.
 set -euo pipefail
 
 root=${1:-.}
@@ -50,6 +58,7 @@ while IFS= read -r -d '' patch; do
                 bad = 1
             }
             inhunk = 0
+            completed = 1
         }
         /^@@ / {
             flush()
@@ -65,24 +74,48 @@ while IFS= read -r -d '' patch; do
             old = 0; new = 0; inhunk = 1; hunkline = NR
             next
         }
-        /^(diff --git |--- |\+\+\+ |index |new file |deleted file |old mode |new mode |similarity |rename )/ {
-            # A file header ends the previous hunk. Note this must come AFTER
-            # the @@ rule but BEFORE the body rule, because "--- " and "+++ "
-            # would otherwise be read as ordinary removed and added lines.
-            if (!inhunk) next
-            flush()
+        !inhunk && /^(diff --git |--- |\+\+\+ |index |new file |deleted file |old mode |new mode |similarity |rename )/ {
+            # These are file-level metadata, including the ambiguous-looking
+            # ---/+++ headers. They are valid immediately after a completed
+            # hunk and must not be counted as removed/added body lines.
+            completed = 0
             next
         }
-        inhunk {
+        inhunk && (old < oldwant || new < newwant) {
             if ($0 ~ /^\\/) next          # "\ No newline at end of file"
             c = substr($0, 1, 1)
-            if (c == " " || $0 == "") { old++; new++; next }
-            if (c == "-") { old++; next }
-            if (c == "+") { new++; next }
+            if (c == " " || $0 == "") {
+                old++; new++
+                if (old >= oldwant && new >= newwant) { inhunk = 0; completed = 1 }
+                next
+            }
+            if (c == "-") {
+                old++
+                if (old >= oldwant && new >= newwant) { inhunk = 0; completed = 1 }
+                next
+            }
+            if (c == "+") {
+                new++
+                if (old >= oldwant && new >= newwant) { inhunk = 0; completed = 1 }
+                next
+            }
             printf "%s:%d: body line starts with %s, not a space, + or -\n",
                 file, NR, (c == "" ? "nothing" : "\"" c "\"")
             bad = 1
+            next
         }
+        completed && ($0 == "" || $0 ~ /^[ +-]/) {
+            printf "%s:%d: body line appears after hunk counts are complete\n",
+                file, NR
+            bad = 1
+            completed = 0
+            next
+        }
+        # The declared counts are met (or we were never in a hunk), so this line
+        # belongs to the surrounding file-level diff. Close the hunk and ignore
+        # it: everything outside a hunk body is metadata this check does not
+        # police.
+        { flush() }
         END { flush(); exit bad ? 1 : 0 }
     ' "$patch"; then
         status=1

@@ -148,8 +148,17 @@ bool isAddressable(const QString& group, const QString& key)
 
 AppSettings::AppSettings(QString iniPath, QObject* parent)
     : QObject(parent)
+    // The organisation/application pair is spelt out rather than left to
+    // QSettings' default constructor, which reads QCoreApplication's names.
+    // Those are only set by main.cpp, so the default constructor made "the
+    // same file UiStateStore uses" (which names them explicitly) true by
+    // coincidence: anything constructing an AppSettings before - or without -
+    // that setup silently landed on a different store, and with no names set
+    // at all QSettings produces an unusable one and warns.
     , m_settings(iniPath.isEmpty()
-                     ? std::make_unique<QSettings>()
+                     ? std::make_unique<QSettings>(
+                           QStringLiteral("CodeHarbor"),
+                           QStringLiteral("CodeHarbor"))
                      : std::make_unique<QSettings>(iniPath,
                                                    QSettings::IniFormat))
 {
@@ -297,8 +306,10 @@ bool AppSettings::setViewerDefault(const QString& extension,
         return false;
 
     QVariantMap next = viewerDefaults();
-    if (next.value(canonical).toString() == kind
-        && next.contains(canonical))
+    // Presence FIRST: value() answers a default-constructed QVariant for a key
+    // that is not there, so comparing the value alone would report "already
+    // stored" for an absent extension whenever `kind` happened to be empty.
+    if (next.contains(canonical) && next.value(canonical).toString() == kind)
         return true;
     next.insert(canonical, kind);
     setViewerDefaults(next);
@@ -387,7 +398,7 @@ void AppSettings::resetToDefaults()
         emit terminalFontSizeChanged();
     if (!qFuzzyCompare(pixelRatio + 1.0, terminalPixelRatio() + 1.0))
         emit terminalPixelRatioChanged();
-    if (!viewerDefaults.isEmpty() && this->viewerDefaults().isEmpty())
+    if (viewerDefaults != this->viewerDefaults())
         emit viewerDefaultsChanged();
     if (hadGeneric) {
         // Generic pairs have no per-key record of what existed, so one blanket
