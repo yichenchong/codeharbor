@@ -250,3 +250,69 @@ jobs:
       - name: Test
         run: ctest --preset release-tests
         shell: bash
+
+  # The Windows installer script is compiled ONLY by the release workflow, at the
+  # very end of a twenty-minute Windows build, and only for a pushed tag. A typo
+  # in it therefore could not be discovered until after a release tag existed —
+  # and a tag is permanent. That is not hypothetical: an edit to its Pascal
+  # `[Code]` section put a `const` block where Inno Setup allows only `var` or
+  # `begin`, and the first thing that noticed was a failed release build.
+  #
+  # Inno Setup has no syntax-only mode, so this compiles the script for real
+  # against a directory of placeholder files standing in for the deployed
+  # application. That exercises the preprocessor, every section and the whole
+  # `[Code]` section, and it takes about a minute because nothing is built.
+  # The installer it produces is thrown away; only the exit status matters.
+  installer-script:
+    name: installer script (windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile packaging/windows/codeharbor.iss
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          # Same resolution order as the release workflow: prefer the real
+          # compiler over a Chocolatey shim of the same name on PATH.
+          function Resolve-Iscc {
+            foreach ($p in @("${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
+                             "$env:ProgramFiles\Inno Setup 6\ISCC.exe")) {
+              if (Test-Path $p) { return $p }
+            }
+            $cmd = Get-Command ISCC.exe -ErrorAction SilentlyContinue
+            if ($cmd) { return $cmd.Source }
+            return $null
+          }
+          $iscc = Resolve-Iscc
+          if (-not $iscc) {
+            Write-Host "Inno Setup not present on this image; installing it."
+            choco install innosetup --no-progress -y
+            if ($LASTEXITCODE -ne 0) { throw "choco install innosetup failed with exit code $LASTEXITCODE" }
+            $iscc = Resolve-Iscc
+          }
+          if (-not $iscc) { throw "ISCC.exe not found after installing Inno Setup" }
+          Write-Host "Using ISCC $iscc"
+
+          # [Files] takes SourceDir\* recursively, so one placeholder file is
+          # enough to satisfy it. The name matches the real executable so the
+          # entries that reference it by name stay meaningful.
+          $src = Join-Path $env:RUNNER_TEMP "iss-src"
+          $out = Join-Path $env:RUNNER_TEMP "iss-out"
+          New-Item -ItemType Directory -Force -Path $src, $out | Out-Null
+          Set-Content -Path (Join-Path $src "codeharbor.exe") -Value "placeholder"
+
+          # The version is a placeholder too: the release workflow reads the real
+          # one out of CMakeLists.txt, and what is under test here is the script,
+          # not the version.
+          & $iscc "/DAppVersion=0.0.0" "/DSourceDir=$src" "/DOutputDir=$out" `
+                  "packaging/windows/codeharbor.iss"
+          # $ErrorActionPreference does not cover a native process's exit code.
+          if ($LASTEXITCODE -ne 0) {
+            throw "ISCC could not compile packaging/windows/codeharbor.iss (exit code $LASTEXITCODE)."
+          }
+          $setup = @(Get-ChildItem $out -Filter "*.exe")
+          if ($setup.Count -ne 1) {
+            throw "expected exactly one installer, found $($setup.Count); the script compiled but produced nothing."
+          }
+          Write-Host "codeharbor.iss compiles."

@@ -169,16 +169,35 @@ Filename: "{app}\{#AppExeName}"; Description: "{cm:LaunchProgram,{#AppName}}"; F
 Type: dirifempty; Name: "{app}"
 
 [Code]
-// True when the target directory is the existing CodeHarbor install directory.
-// The executable check alone was unsafe: a user could select a directory that
-// happened to contain an unrelated codeharbor.exe and the [InstallDelete] sweep
-// would erase every file in it. The AppId-specific registry path is written by
-// Inno Setup for every install and is stable across upgrades.
-function PreviousInstallPresent: Boolean;
-const
-  UninstallKey = 'Software\Microsoft\Windows\CurrentVersion\Uninstall\{6B1C2A74-3E4D-4F58-9A0B-7C5D8E2F1A93}_is1';
+// Guards the [InstallDelete] sweep above. The executable check alone was
+// unsafe: a user could point the installer at a directory that happened to
+// contain an unrelated codeharbor.exe, and the sweep would then erase every
+// file in it. So the directory must ALSO be the one this application's own
+// uninstall record names. Inno Setup writes that record for every install
+// under a key derived from AppId, which is stable across upgrades.
+
+// Reads this installer's own uninstall record from one registry root and
+// reports whether it names exactly the directory being installed into.
+function UninstallRecordPointsAt(RootKey: Integer; AppPath: String): Boolean;
 var
+  UninstallKey: String;
   PreviousPath: String;
+begin
+  // A local `const` block is NOT valid in Inno Setup's Pascal Script: after a
+  // routine header it accepts only `var` (or `label`) before `begin`, and
+  // anything else fails the whole compile with "'BEGIN' expected". The key is
+  // therefore an ordinary local string. It is the AppId declared in [Setup]
+  // above plus the "_is1" suffix Inno Setup appends, so the two must be changed
+  // together.
+  UninstallKey := 'Software\Microsoft\Windows\CurrentVersion\Uninstall\' +
+                  '{6B1C2A74-3E4D-4F58-9A0B-7C5D8E2F1A93}_is1';
+  Result := RegQueryStringValue(RootKey, UninstallKey,
+                                'Inno Setup: App Path', PreviousPath) and
+            (CompareText(AddBackslash(PreviousPath), AppPath) = 0);
+end;
+
+function PreviousInstallPresent: Boolean;
+var
   AppPath: String;
 begin
   Result := False;
@@ -186,17 +205,19 @@ begin
   if not FileExists(AppPath + '{#AppExeName}') then
     Exit;
 
-  if RegQueryStringValue(HKEY_CURRENT_USER, UninstallKey,
-                         'Inno Setup: App Path', PreviousPath) and
-     (CompareText(AddBackslash(PreviousPath), AppPath) = 0) then
-    begin
-      Result := True;
-      Exit;
-    end;
-  if RegQueryStringValue(HKEY_LOCAL_MACHINE, UninstallKey,
-                         'Inno Setup: App Path', PreviousPath) and
-     (CompareText(AddBackslash(PreviousPath), AppPath) = 0) then
-    Result := True;
+  // Per-user first: PrivilegesRequired=lowest makes that the normal place for
+  // this installer's record, and the per-user hive is not split into 32-bit and
+  // 64-bit views, so one lookup covers it.
+  //
+  // The machine-wide hive IS split, and this script sets
+  // ArchitecturesInstallIn64BitMode, so which view a lookup lands in depends on
+  // the mode the installer happens to be running in. Both views are therefore
+  // named explicitly; otherwise an elevated install recorded in the other view
+  // would go unnoticed, the upgrade sweep would not run, and stale Qt libraries
+  // from the previous version would be left behind for the new one to load.
+  Result := UninstallRecordPointsAt(HKEY_CURRENT_USER, AppPath)
+            or UninstallRecordPointsAt(HKEY_LOCAL_MACHINE_32, AppPath)
+            or UninstallRecordPointsAt(HKEY_LOCAL_MACHINE_64, AppPath);
 end;
 
 // Per-user settings live in the registry, NOT in the install directory: the
