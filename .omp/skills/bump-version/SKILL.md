@@ -39,19 +39,23 @@ What it does (commit mode, the default):
    CI. **A file that carries the release version must be added to both**, or it
    will drift with nothing to notice.
 4. Commits **only those files** as `Release vX.Y.Z`.
-5. Verifies that the commit about to be tagged really carries `X.Y.Z` — see
+5. In `--push` mode, runs the local release preflight (`cmake --preset dev`,
+   Debug build, Debug ctest, all workspace npm tests and all workspace
+   typechecks). If any gate fails, the script stops before creating or pushing
+   the tag, so the failed attempt does not consume a public version number.
+6. Verifies that the commit about to be tagged really carries `X.Y.Z` — see
    Safety — and creates the annotated tag `vX.Y.Z`.
+7. With `--push`, pushes the release commit and tag to `origin`.
 
 It **does not push by default** — it prints the push command. Pushing is what
-actually starts the release workflow.
+actually starts the release workflow; `--push` runs the local preflight first.
 
 ### Options
 
 | Flag | Effect |
 |---|---|
 | `--set X.Y.Z` | Use an explicit version instead of bumping a component. |
-| `--push` | Push the release commit + tag to `origin` (triggers CI). |
-| `--no-commit` | Tag current HEAD without editing/committing version files. HEAD must already carry the target version. |
+| `--push` | Run the local release preflight, then push the release commit + tag to `origin` (triggers CI). |
 | `--dry-run` | Print the planned actions; change nothing. |
 | `--allow-dirty` | Proceed even if the version files have uncommitted edits. |
 

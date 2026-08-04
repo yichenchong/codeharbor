@@ -561,10 +561,14 @@ other version lands, because vcpkg's registry port is the unusable 0.12.0.
 1. **Dispatch `release.yml` on `main`** ("Run workflow"). The `publish` job is
    gated on `refs/tags/v*`, so this is a genuine dry run: it exercises all three
    OS builders and publishes nothing.
-2. **Then push the tag.** `bash .omp/skills/bump-version/bump.sh --set X.Y.Z`
-   syncs the version files, commits, and creates the annotated tag; it does
-   **not** push. Add `--push`, or run the `git push origin HEAD vX.Y.Z` it
-   prints. Only the push starts the release build.
+2. **Cut and push the tag only after the dry run.**
+   `bash .omp/skills/bump-version/bump.sh --set X.Y.Z --push` syncs the version
+   files, commits them, runs the local Debug build, ctest, all workspace npm
+   tests and all workspace typechecks, then creates and pushes the annotated
+   tag. If any local gate fails, no tag is created.
+3. To create a tag without pushing, omit `--push`; the script prints the
+   explicit push command. That mode is for inspection only and does not run the
+   release preflight.
 
 This ordering is not ceremony, for two reasons.
 

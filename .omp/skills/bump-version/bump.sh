@@ -13,10 +13,8 @@ Computes the next version from the latest v* git tag (or the CMake project
 version if there are no tags), updates the version in CMakeLists.txt and every
 package.json in the workspace, commits those files, and creates an annotated tag
 vX.Y.Z.
-
-Options:
-  --set X.Y.Z    Use an explicit version instead of bumping a component.
-  --push         Push the commit and tag to origin after creating them.
+  --push         Run the local release preflight, then push the commit and tag
+                 to origin after creating them.
   --no-commit    Tag the current HEAD without a release commit or file edits.
                  HEAD must already carry X.Y.Z; the tag is refused otherwise.
   --dry-run      Print the planned actions without changing anything.
@@ -271,6 +269,25 @@ fi
 
 (cd "$verify_tree" && node .github/scripts/check-versions.mjs) \
     || die "refusing to create $tag: the commit being tagged disagrees with itself about the version (see above)."
+
+# A pushed release tag starts the cross-platform release workflow immediately.
+# Run the repository's local gates before creating that tag, so a failed build
+# cannot consume another public version number. The preflight is intentionally
+# only required for --push: local dry runs and the test fixture can still check
+# version/tag safety without requiring a configured Qt toolchain.
+if [ "$DO_PUSH" -eq 1 ]; then
+    command -v cmake >/dev/null || die "cmake not found (required for release preflight)"
+    command -v ctest >/dev/null || die "ctest not found (required for release preflight)"
+    command -v npm >/dev/null || die "npm not found (required for release preflight)"
+    echo "Running release preflight before creating $tag..."
+    cmake --preset dev
+    cmake --build --preset dev
+    ctest --preset dev
+    npm test
+    npm run typecheck
+    echo "Release preflight passed"
+fi
+
 
 git tag -a "$tag" -m "$tag"
 echo "Created annotated tag $tag"
