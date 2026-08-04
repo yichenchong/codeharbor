@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Guards the one thing .omp/skills/bump-version/bump.sh must never do: create a
-# release tag whose COMMIT carries a different version.
+# Guards the release helper `.omp/skills/bump-version/bump.sh`, and above all the
+# one thing it must never do: create a release tag whose COMMIT carries a
+# different version.
 #
 # A tag is permanent. If v0.2.0 points at a tree that still says 0.1.8, the
 # release workflow publishes, under a page called v0.2.0, a binary and a daemon
@@ -9,6 +10,12 @@
 # `--no-commit` is the flag that could do it: it tags HEAD without editing
 # anything, which is correct when HEAD is already the release commit and wrong
 # otherwise.
+#
+# The second thing it must never do is leave the tree half-bumped: some version
+# files rewritten, others not. That state produces a release commit that can
+# never receive its tag, and it is easy to reach if one of the files is
+# malformed. Several cases below break a file on purpose and then assert that
+# every version file is byte-for-byte what it was.
 #
 # Everything happens in a throwaway git repository under $TMPDIR built from the
 # same file set the real one carries, so the checkout this runs in is never
@@ -24,9 +31,13 @@ command -v git >/dev/null || { echo "git not found; skipping" >&2; exit 77; }
 command -v node >/dev/null || { echo "node not found; skipping" >&2; exit 77; }
 
 bump="$root/.omp/skills/bump-version/bump.sh"
-checker="$root/.github/scripts/check-versions.mjs"
+bumpctl="$root/.omp/skills/bump-version/bumpctl.mjs"
+config="$root/.bumpversion.json"
+ci_checker="$root/.github/scripts/check-versions.mjs"
 [ -f "$bump" ] || { echo "missing $bump" >&2; exit 1; }
-[ -f "$checker" ] || { echo "missing $checker" >&2; exit 1; }
+[ -f "$bumpctl" ] || { echo "missing $bumpctl" >&2; exit 1; }
+[ -f "$config" ] || { echo "missing $config" >&2; exit 1; }
+[ -f "$ci_checker" ] || { echo "missing $ci_checker" >&2; exit 1; }
 
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
@@ -36,13 +47,26 @@ trap 'rm -rf "$work"' EXIT
 export GIT_AUTHOR_NAME="bump test" GIT_AUTHOR_EMAIL="bump@test.invalid"
 export GIT_COMMITTER_NAME="bump test" GIT_COMMITTER_EMAIL="bump@test.invalid"
 
+fail() { echo "FAIL: $*" >&2; exit 1; }
+
+# The files the fixture carries a version in. Kept in step with the real
+# .bumpversion.json, which the fixture copies verbatim so these tests exercise
+# the configuration the project actually releases with.
+version_files=(CMakeLists.txt
+               remote/src/codeharbord.ts
+               package.json
+               remote/package.json
+               src/web/terminal/package.json
+               src/web/editor/package.json
+               src/web/markdown/package.json
+               package-lock.json)
+
 # A repository carrying every file the bump rewrites, all at $1.
 make_repo() {
     version="$1"
     rm -rf "$work/repo"
     mkdir -p "$work/repo/remote/src" "$work/repo/src/web/terminal" \
-             "$work/repo/src/web/editor" "$work/repo/src/web/markdown" \
-             "$work/repo/.github/scripts"
+             "$work/repo/src/web/editor" "$work/repo/src/web/markdown"
     cd "$work/repo"
     cat >CMakeLists.txt <<EOF
 cmake_minimum_required(VERSION 3.25)
@@ -78,13 +102,21 @@ EOF
     done
     printf 'export const RPC_SERVER_VERSION = "%s";\n' "$version" \
         >remote/src/codeharbord.ts
-    cp "$checker" .github/scripts/check-versions.mjs
+    cp "$config" .bumpversion.json
     git init -q .
     git add -A
     git commit -q -m "fixture at $version"
 }
 
-fail() { echo "FAIL: $*" >&2; exit 1; }
+# A single value that changes if ANY version file changes, used to prove that a
+# refused run left the tree exactly as it found it.
+snapshot() {
+    local file
+    for file in "${version_files[@]}"; do
+        printf '%s ' "$file"
+        cksum <"$file"
+    done
+}
 
 # --- 0. conflicting version selectors must fail clearly ---------------------
 make_repo 0.1.8
@@ -99,7 +131,7 @@ grep -q "either major|minor|patch or --set" "$work/out0" \
 make_repo 0.1.8
 if bash "$bump" --set 0.2.0 --no-commit >"$work/out1" 2>&1; then
     cat "$work/out1" >&2
-    fail "bump.sh --no-commit created v0.2.0 on a tree that carries 0.1.8"
+    fail "--no-commit tagged v0.2.0 on a tree that carries 0.1.8"
 fi
 if git rev-parse -q --verify refs/tags/v0.2.0 >/dev/null; then
     fail "the refused run left tag v0.2.0 behind"
@@ -116,7 +148,7 @@ rm -f CMakeLists.txt.bak
 git commit -q -am "half a bump"
 if bash "$bump" --set 0.2.0 --no-commit >"$work/out2" 2>&1; then
     cat "$work/out2" >&2
-    fail "bump.sh --no-commit tagged a commit whose version files disagree"
+    fail "--no-commit tagged a commit that disagrees with itself"
 fi
 if git rev-parse -q --verify refs/tags/v0.2.0 >/dev/null; then
     fail "the refused run left tag v0.2.0 behind"
@@ -130,6 +162,8 @@ git rev-parse -q --verify refs/tags/v0.2.0 >/dev/null \
     || fail "the ordinary bump created no tag"
 git show "v0.2.0:remote/src/codeharbord.ts" | grep -q '"0.2.0"' \
     || fail "the tagged tree does not carry the bumped RPC_SERVER_VERSION"
+git show "v0.2.0:package-lock.json" | grep -q '"version": "0.2.0"' \
+    || fail "the tagged tree does not carry the bumped lock version"
 
 # --- 4. and --no-commit still works for what it is FOR ------------------------
 # Tagging a HEAD that is already the release commit - the legitimate use - must
@@ -171,5 +205,89 @@ fi
 [ "$(git diff --cached --name-only)" = "notes.txt" ] \
     || fail "unrelated staged notes.txt was removed from the index"
 
-echo "bump.sh refuses mislabelled trees, preserves staged work, and keeps release paths intact"
+# --- 6. a repository with no configuration must be refused, not guessed at ----
+make_repo 0.1.8
+git rm -q .bumpversion.json
+git commit -q -m "no release configuration"
+if bash "$bump" --set 0.2.0 >"$work/out7" 2>&1; then
+    cat "$work/out7" >&2
+    fail "the bump ran in a repository with no .bumpversion.json"
+fi
+grep -q "no .bumpversion.json" "$work/out7" \
+    || { cat "$work/out7" >&2; fail "no explanation that the configuration is missing"; }
 
+# --- 7. a malformed configuration must stop the run before anything changes ---
+make_repo 0.1.8
+before="$(snapshot)"
+printf '{ this is not json\n' >.bumpversion.json
+if bash "$bump" --set 0.2.0 --allow-dirty >"$work/out8" 2>&1; then
+    cat "$work/out8" >&2
+    fail "the bump ran with a malformed .bumpversion.json"
+fi
+[ "$(snapshot)" = "$before" ] \
+    || fail "a malformed configuration still changed version files"
+if git rev-parse -q --verify refs/tags/v0.2.0 >/dev/null; then
+    fail "a malformed configuration still produced a tag"
+fi
+
+# --- 8. a malformed lock file must leave every version file untouched ---------
+# This is the all-or-nothing guarantee. The lock is the last file rewritten, so
+# a tool that wrote as it went would already have bumped seven files by the time
+# it discovered the lock was unreadable.
+make_repo 0.1.8
+printf '{ "name": "broken", \n' >package-lock.json
+git commit -q -am "lock file damaged by a bad merge"
+before="$(snapshot)"
+if bash "$bump" --set 0.2.0 >"$work/out9" 2>&1; then
+    cat "$work/out9" >&2
+    fail "the bump ran with a malformed package-lock.json"
+fi
+[ "$(snapshot)" = "$before" ] \
+    || { cat "$work/out9" >&2; fail "a malformed lock file left the tree half-bumped"; }
+if git rev-parse -q --verify refs/tags/v0.2.0 >/dev/null; then
+    fail "a malformed lock file still produced a tag"
+fi
+
+# --- 9. a pattern that no longer matches must stop the run, not skip the file -
+# Renaming the constant is how a version silently stopped being updated before.
+# The run must fail loudly instead of quietly bumping everything else.
+make_repo 0.1.8
+printf 'export const SERVER_VERSION_RENAMED = "0.1.8";\n' >remote/src/codeharbord.ts
+git commit -q -am "constant renamed"
+before="$(snapshot)"
+if bash "$bump" --set 0.2.0 >"$work/out10" 2>&1; then
+    cat "$work/out10" >&2
+    fail "the bump ran with a pattern that matches nothing"
+fi
+grep -q "matches nothing" "$work/out10" \
+    || { cat "$work/out10" >&2; fail "no explanation that a configured pattern stopped matching"; }
+[ "$(snapshot)" = "$before" ] \
+    || fail "a non-matching pattern still left other files bumped"
+
+# --- 10. --dry-run must change nothing and create no tag ----------------------
+make_repo 0.1.8
+before="$(snapshot)"
+bash "$bump" --set 0.2.0 --dry-run >"$work/out11" 2>&1 \
+    || { cat "$work/out11" >&2; fail "--dry-run failed"; }
+[ "$(snapshot)" = "$before" ] || fail "--dry-run changed version files"
+if git rev-parse -q --verify refs/tags/v0.2.0 >/dev/null; then
+    fail "--dry-run created a tag"
+fi
+
+# --- 11. the standalone check reports drift and names the file ----------------
+make_repo 0.1.8
+sed -i.bak 's/"version": "0\.1\.8"/"version": "0.1.7"/' remote/package.json
+rm -f remote/package.json.bak
+if node "$bumpctl" check --root "$work/repo" >"$work/out12" 2>&1; then
+    cat "$work/out12" >&2
+    fail "the version check passed while remote/package.json disagreed"
+fi
+grep -q "remote/package.json" "$work/out12" \
+    || { cat "$work/out12" >&2; fail "the drift report does not name the offending file"; }
+
+# --- 12. ... and passes on a consistent tree ----------------------------------
+make_repo 0.1.8
+node "$bumpctl" check --root "$work/repo" >"$work/out13" 2>&1 \
+    || { cat "$work/out13" >&2; fail "the version check failed on a consistent tree"; }
+
+echo "bump.sh refuses mislabelled trees, never half-bumps, preserves staged work, and keeps release paths intact"

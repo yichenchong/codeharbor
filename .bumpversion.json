@@ -1,0 +1,42 @@
+{
+  "$comment": [
+    "Release-version map for this repository, read by the generic bump-version",
+    "skill (.omp/skills/bump-version). The skill itself knows nothing about this",
+    "project; every path, pattern and command it uses comes from this file.",
+    "",
+    "A file that carries the release version and is NOT listed here is a file that",
+    "will silently drift away from the tag. Both the release helper and the CI",
+    "version check read this one list, so adding a source here is enough."
+  ],
+  "primary": "CMakeLists.txt",
+  "tagPrefix": "v",
+  "remote": "origin",
+  "commitMessage": "Release {tag}",
+  "sources": [
+    {
+      "path": "CMakeLists.txt",
+      "kind": "regex",
+      "pattern": "project\\(CodeHarbor[\\s\\S]*?VERSION\\s+(\\d+\\.\\d+\\.\\d+)",
+      "label": "CMakeLists.txt project() VERSION"
+    },
+    {
+      "path": "remote/src/codeharbord.ts",
+      "kind": "regex",
+      "pattern": "export const RPC_SERVER_VERSION\\s*=\\s*\"(\\d+\\.\\d+\\.\\d+)\"",
+      "label": "remote/src/codeharbord.ts RPC_SERVER_VERSION"
+    },
+    { "path": "package.json", "kind": "json" },
+    { "path": "remote/package.json", "kind": "json" },
+    { "path": "src/web/terminal/package.json", "kind": "json" },
+    { "path": "src/web/editor/package.json", "kind": "json" },
+    { "path": "src/web/markdown/package.json", "kind": "json" },
+    { "path": "package-lock.json", "kind": "npm-lock", "manifest": "package.json" }
+  ],
+  "preflight": [
+    "cmake --preset dev",
+    "cmake --build --preset dev",
+    "ctest --preset dev",
+    "npm test",
+    "npm run typecheck"
+  ]
+}
