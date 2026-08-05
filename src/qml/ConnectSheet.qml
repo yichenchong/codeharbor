@@ -6,6 +6,7 @@ pragma ComponentBehavior: Bound
 import QtQuick
 import QtQuick.Controls.Basic
 import CodeHarbor
+import "EndpointField.js" as EndpointField
 
 // Server connection sheet (SPEC 4.1, 12.1): the one piece of UI that lets a
 // user with a fresh config reach a server at all — list saved connection
@@ -96,6 +97,21 @@ Rectangle {
     border.width: 1
     border.color: Theme.borderSubtle
     focus: true
+
+    // This sheet fills the whole window on top of the three regions, but a
+    // Rectangle accepts no input of its own: Qt Quick hands an unaccepted press
+    // to the next item DOWN, so a click that missed one of the controls below
+    // went straight through to the terminal or editor behind the sheet. On the
+    // cold-start path that is a click on a workspace the user has not connected
+    // to yet. Declared FIRST so every real control still hit-tests above it;
+    // `wheel` too, because a stray scroll is as wrong as a stray click.
+    MouseArea {
+        objectName: "sheetInputShield"
+        anchors.fill: parent
+        acceptedButtons: Qt.AllButtons
+        hoverEnabled: true
+        onWheel: (wheel) => wheel.accepted = true
+    }
 
     // ---- helpers ----------------------------------------------------------
     // Never let a missing key reach a string property: assigning `undefined`
@@ -253,10 +269,30 @@ Rectangle {
         return isFinite(parsed) ? parsed : 0;
     }
 
+    // The Save gate. It has to be the STORE's rule, not a looser one: whatever
+    // ServerProfiles::sanitize() refuses is dropped on the floor without a
+    // word, so a Save button that is enabled for a value the store will reject
+    // reports success and produces nothing — no new row in the list, no error.
+    // Pasting a whole command line ("box.local -p 2222") into the host field is
+    // exactly how a user gets there.
     function formValid() {
-        return hostField.text.trim().length > 0
-            && userField.text.trim().length > 0
+        return EndpointField.isUsable(hostField.text)
+            && EndpointField.isUsable(userField.text)
             && root.portValue() >= 1 && root.portValue() <= 65535;
+    }
+
+    // Why the form cannot be saved, in the user's own terms; empty when it can.
+    // "Fill these in" and "what you pasted cannot be a host" are different
+    // problems and a single sentence covering both tells the second user
+    // nothing about what to change.
+    function validationMessage() {
+        if (EndpointField.hasRejectedCharacters(hostField.text))
+            return qsTr("The host cannot contain spaces or line breaks.");
+        if (EndpointField.hasRejectedCharacters(userField.text))
+            return qsTr("The user name cannot contain spaces or line breaks.");
+        if (root.formValid())
+            return "";
+        return qsTr("Host, user and a port in 1-65535 are required.");
     }
 
     function save() {
@@ -269,9 +305,11 @@ Rectangle {
         root.profileSaved({
             "id": root.editingId,
             "name": nameField.text.trim(),
-            "host": hostField.text.trim(),
+            // Trimmed with the STORE's character set (EndpointField.trim), so
+            // the value that was validated above is the value that is sent.
+            "host": EndpointField.trim(hostField.text),
             "port": root.portValue(),
-            "user": userField.text.trim(),
+            "user": EndpointField.trim(userField.text),
             "identityFile": identityFileField.text.trim(),
             "nodePath": nodePathField.text.trim(),
             "repoRoot": repoRootField.text.trim()
@@ -1162,8 +1200,12 @@ Rectangle {
                     anchors.verticalCenter: parent.verticalCenter
                     color: Theme.warning
                     font.pixelSize: 11
-                    visible: !root.formValid()
-                    text: qsTr("Host, user and a port in 1-65535 are required.")
+                    // Naming the actual reason: the old sentence said only
+                    // "these are required", which is no help at all to
+                    // somebody who HAS filled the host in and whose value is
+                    // refused for a different reason.
+                    text: root.validationMessage()
+                    visible: text.length > 0
                 }
                 SheetButton {
                     objectName: "cancelButton"

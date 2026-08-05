@@ -268,6 +268,7 @@ private slots:
     void aStaleLockFromADeadHolderDoesNotWedgeTheStore();
     void aFirstRunWithNoConfigDirectoryLocksSilently();
     void blankHostOrUserRowsAreNotProfilesAndAreDroppedOnLoad();
+    void hostAndUserWithEmbeddedWhitespaceAreNotProfiles();
     void aSaveDegradedHandlerMayMutateTheStore();
 
     // ---- ConnectSheet.qml ----
@@ -1487,6 +1488,88 @@ void TstServerProfiles::blankHostOrUserRowsAreNotProfilesAndAreDroppedOnLoad()
     ServerProfiles reopened(path);
     QCOMPARE(namesOf(reopened.profiles()), QStringList({QStringLiteral("Good")}));
     QCOMPARE(reopened.activeId(), QStringLiteral("aaa"));
+}
+
+// The other half of "this row is not a profile". A blank host is caught above;
+// a host that is not blank but still cannot be one is the case a real user
+// produces, because the connect sheet is a plain text field: "box.local -p
+// 2222" pasted whole out of an ssh command line, a tab dragged in with a copy
+// out of a table, a login name carrying the newline the document it came from
+// ended with.
+//
+// None of those can ever resolve - no hostname, address literal or POSIX login
+// name may contain whitespace - and the store used to keep them, so the profile
+// listed, looked right, and failed with an opaque name-resolution error every
+// single time it was selected. The newline case is the worst of the three: the
+// ini writer escapes it as "\n" and reads it back, so it survives a full round
+// trip and reaches the resolver intact.
+void TstServerProfiles::hostAndUserWithEmbeddedWhitespaceAreNotProfiles()
+{
+    const QString path = iniPath(QStringLiteral("whitespacefields.ini"));
+    ServerProfiles store(path);
+    QSignalSpy profilesSpy(&store, &ServerProfiles::profilesChanged);
+
+    const QList<QVariantMap> broken = {
+        profileFields(QStringLiteral("n"), QStringLiteral("box.local -p 2222"), 22,
+                      QStringLiteral("u")),
+        profileFields(QStringLiteral("n"), QStringLiteral("a\tb"), 22,
+                      QStringLiteral("u")),
+        profileFields(QStringLiteral("n"), QStringLiteral("box\nlocal"), 22,
+                      QStringLiteral("u")),
+        // Same rule for the login name.
+        profileFields(QStringLiteral("n"), QStringLiteral("box.local"), 22,
+                      QStringLiteral("my user")),
+        profileFields(QStringLiteral("n"), QStringLiteral("box.local"), 22,
+                      QStringLiteral("u\nroot")),
+    };
+    for (const QVariantMap& fields : broken) {
+        QVERIFY2(store.addProfile(fields).isEmpty(),
+                 qPrintable(QDebug::toString(fields)));
+    }
+    QVERIFY(store.profiles().isEmpty());
+    QCOMPARE(profilesSpy.count(), 0);
+
+    // ...and the rule is NOT a hostname grammar. ':', '%' and '@' are all legal
+    // in values people really store - an IPv6 literal with a zone id here - and
+    // a store that second-guesses libssh's own parsing refuses connections that
+    // work perfectly.
+    const QString v6 = store.addProfile(profileFields(
+        QStringLiteral("v6"), QStringLiteral("fe80::1%eth0"), 22,
+        QStringLiteral("u")));
+    QVERIFY(!v6.isEmpty());
+    QCOMPARE(store.profile(v6).value(QStringLiteral("host")).toString(),
+             QStringLiteral("fe80::1%eth0"));
+
+    // An edit cannot smuggle one into a working profile either: the stored
+    // profile survives the bad edit intact.
+    store.updateProfile(v6, QVariantMap{{QStringLiteral("host"),
+                                         QStringLiteral("box.local -p 22")}});
+    QCOMPARE(store.profile(v6).value(QStringLiteral("host")).toString(),
+             QStringLiteral("fe80::1%eth0"));
+
+    // READ side, exactly as for a blank host: a hand edit that puts one in the
+    // file is dropped rather than listed, and the drop is written back by the
+    // next save so no unusable row is left for an older build to pick up.
+    {
+        QSettings raw(path, QSettings::IniFormat);
+        raw.setValue(QStringLiteral("servers/zzz/name"), QStringLiteral("Pasted"));
+        raw.setValue(QStringLiteral("servers/zzz/host"),
+                     QStringLiteral("box.local -p 2222"));
+        raw.setValue(QStringLiteral("servers/zzz/user"), QStringLiteral("u"));
+        raw.setValue(QStringLiteral("servers/zzz/port"), 22);
+        raw.sync();
+    }
+    ServerProfiles reopened(path);
+    QCOMPARE(idsOf(reopened.profiles()), QStringList({v6}));
+    QVERIFY(reopened.profile(QStringLiteral("zzz")).isEmpty());
+
+    reopened.updateProfile(v6, QVariantMap{{QStringLiteral("name"),
+                                            QStringLiteral("v6 renamed")}});
+    QSettings raw(path, QSettings::IniFormat);
+    raw.sync();
+    raw.beginGroup(QStringLiteral("servers"));
+    QCOMPARE(raw.childGroups(), QStringList({v6}));
+    raw.endGroup();
 }
 
 // persist() carries no re-entrancy guard, and this is the path that would need

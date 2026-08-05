@@ -217,7 +217,7 @@ private:
     // m_lastNodes, merging live per-terminal agent state from m_agentMonitor
     // (the source of truth), so neither a workspace refresh nor an agent
     // transition ever wipes the other's contribution to the badges.
-    QVector<GroupRow> computeRows();
+    QVector<GroupRow> computeRows() const;
 
     // Structural refresh: rebuild computeRows() into a full model reset. Called
     // on every successful workspace refresh.

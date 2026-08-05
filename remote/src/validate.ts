@@ -117,11 +117,18 @@ export function optionalBoolean(obj: Record<string, unknown>, field: string, met
 }
 
 /**
- * A byte offset or length: a non-negative integer no larger than
- * Number.MAX_SAFE_INTEGER. Anything else — a float, a negative, NaN, a numeric
- * string — is rejected HERE rather than being silently clamped or truncated
- * deeper in a handler, where it surfaces as a confusing internal error (a
- * non-numeric offset used to reach Buffer.alloc(NaN)).
+ * A whole-number index into something: a non-negative integer no larger than
+ * Number.MAX_SAFE_INTEGER. Two kinds of caller use it — a byte offset or length
+ * in the `file.*` group, and a `position` (a row's slot in an ordered scope) in
+ * the `workspace.*` group.
+ *
+ * Anything else — a float, a negative, NaN, Infinity, a numeric string — is
+ * rejected HERE rather than being silently clamped or truncated deeper in a
+ * handler. Both callers had a concrete failure from that: a non-numeric offset
+ * reached Buffer.alloc(NaN), and a fractional or negative position was stored
+ * verbatim in an ordering column every other write keeps at contiguous
+ * integers, leaving the scope permanently ordered around a slot that is not
+ * one.
  */
 export function optionalIndex(
     obj: Record<string, unknown>,

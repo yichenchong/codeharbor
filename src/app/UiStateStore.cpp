@@ -20,14 +20,8 @@ const QString kShowArchivedKey = QStringLiteral("sidebar/showArchived");
 // A stored value, or `fallback` when the key is absent, holds something that is
 // not a whole number, or is smaller than `minimum`.
 //
-// value(key, default).toInt() alone is not enough: QVariant::toInt() answers 0
-// for any text it cannot parse, so ONE hand-edited or half-written line
-// ("sidebarWidth=" after a crash mid-write, "sidebarWidth=wide") silently
-// collapses the region to zero instead of falling back to the documented
-// default. `minimum` is 1 for the two regions whose width is their whole
-// presence on screen and 0 for the viewer, where 0 legitimately means "fill
-// whatever the other two leave"; for a pane suffix it is 1, because
-// "<region>-0" is not a pane id this application has ever minted.
+// Convert via text so a wrong-typed native QVariant (for example, a fractional
+// double) cannot be silently truncated by QVariant::toInt().
 int storedInt(const QSettings& settings, const QString& key, int fallback,
               int minimum)
 {
@@ -35,7 +29,7 @@ int storedInt(const QSettings& settings, const QString& key, int fallback,
     if (!raw.isValid())
         return fallback;
     bool ok = false;
-    const int value = raw.toInt(&ok);
+    const int value = raw.toString().trimmed().toInt(&ok);
     if (!ok || value < minimum)
         return fallback;
     return value;
@@ -82,7 +76,7 @@ bool isAddressableRegion(const QString& region)
 }
 } // namespace
 
-UiStateStore::UiStateStore(QString iniPath, QObject* parent)
+UiStateStore::UiStateStore(const QString& iniPath, QObject* parent)
     : QObject(parent)
 {
     if (iniPath.isEmpty()) {

@@ -184,6 +184,7 @@ private slots:
     void staleLayoutWriteErrorsAreDropped();
     void sameSessionReloadFailureClearsTheStaleRegion();
     void invalidSavedTreeIsRejected();
+    void aLayoutBindingTwoPanesToOneTerminalIsRejected();
     void publishedTreeIsConsumableFromQml();
     void splitAfterCloseNeverReusesThePaneId();
     void refillingAnEmptiedRegionNeverReusesThePaneId();
@@ -1431,6 +1432,70 @@ void TstSessionLayouts::invalidSavedTreeIsRejected()
                          .value(QStringLiteral("tree")).toObject()),
              compact(good));
     QCOMPARE(compact(asObject(layouts.viewerTree())), compact(good));
+}
+
+// A terminal leaf's `terminalPaneId` is the server's row for that pane, and
+// that row IS the identity of a remote shell: the tmux target is minted from
+// it. Two leaves carrying one row id are therefore two panes attached to the
+// SAME shell - they echo each other's keystrokes and share one scrollback,
+// which is the exact defect the row id was introduced to remove.
+//
+// Nothing in this client can produce such a tree (each new leaf mints its own
+// row), so it can only arrive from the server or from QML - and both are
+// exactly the inputs this class does not own. It is refused on both paths, the
+// same verdict a duplicate pane LABEL already gets and for the same reason:
+// showing it invites the user to work in it.
+void TstSessionLayouts::aLayoutBindingTwoPanesToOneTerminalIsRejected()
+{
+    makePair();
+    SessionLayouts layouts(m_db, m_uiState);
+    layouts.setServerId(QStringLiteral("srv-1"));
+
+    QSignalSpy errorSpy(&layouts, &SessionLayouts::error);
+    QSignalSpy loadedSpy(&layouts, &SessionLayouts::loaded);
+
+    const QJsonObject shared = split(
+        QStringLiteral("vertical"),
+        {terminalLeaf(QStringLiteral("terminal-1"), QStringLiteral("row-one")),
+         terminalLeaf(QStringLiteral("terminal-2"), QStringLiteral("row-one"))},
+        {1, 1});
+
+    layouts.load(QStringLiteral("s1"));
+    const QJsonObject viewerGet = nextRequest();
+    const QJsonObject terminalGet = nextRequest();
+    respondResult(viewerGet.value(QStringLiteral("id")).toInt(),
+                  layoutRow(leaf(QStringLiteral("viewer-1"))));
+    respondResult(terminalGet.value(QStringLiteral("id")).toInt(),
+                  layoutRow(shared));
+    QTRY_COMPARE(loadedSpy.count(), 1);
+
+    QCOMPARE(errorSpy.count(), 1);
+    QVERIFY2(errorSpy.at(0).at(0).toString().contains(
+                 QStringLiteral("same terminal")),
+             qPrintable(errorSpy.at(0).at(0).toString()));
+    // The region reads as null rather than showing an unusable layout, and the
+    // load still completes so nothing waiting on it can hang. The viewer region
+    // beside it is untouched: the verdict is per region.
+    QVERIFY(layouts.terminalTree().isNull());
+    QCOMPARE(compact(asObject(layouts.viewerTree())),
+             compact(leaf(QStringLiteral("viewer-1"))));
+    // Nothing was written back over the layout that was refused.
+    QVERIFY(noMoreRequests());
+
+    // Same rule for a tree QML authors, and the tree already on screen survives
+    // the refusal intact.
+    const QJsonObject sound =
+        terminalLeaf(QStringLiteral("terminal-1"), QStringLiteral("row-one"));
+    completeLoad(layouts, QStringLiteral("s2"),
+                 layoutRow(leaf(QStringLiteral("viewer-1"))), layoutRow(sound));
+    errorSpy.clear();
+
+    layouts.saveTree(QStringLiteral("terminal"), shared.toVariantMap());
+    QCOMPARE(errorSpy.count(), 1);
+    QVERIFY2(errorSpy.at(0).at(0).toString().contains(QStringLiteral("not saved")),
+             qPrintable(errorSpy.at(0).at(0).toString()));
+    QCOMPARE(compact(asObject(layouts.terminalTree())), compact(sound));
+    QVERIFY(noMoreRequests());
 }
 
 // The published tree is only useful if QML can read it with the very

@@ -553,10 +553,11 @@ private:
     QEventLoop* m_nestedLoop = nullptr;
     // The in-flight attempt was cancelled from inside its own nested loop; it
     // must unwind without wiring anything, failing, or arming a retry.
-    // Set by failFatal() for a retry attempt whose cause cannot be repaired by
-    // reconnecting (missing/incompatible Node, invalid install target, or a bad
-    // artifact). The timer path turns that attempt directly into Failed.
     bool m_cancelRequested = false;
+    // Set by failFatal() for an attempt whose cause cannot be repaired by
+    // reconnecting (missing/incompatible Node, invalid install target, or a bad
+    // artifact). The timer path turns that attempt directly into Failed instead
+    // of spending the rest of the ladder re-asking the same question.
     bool m_attemptFatal = false;
     // Covers the stateChanged() delivery in connectAndWire() before
     // attemptWire() can raise m_attempting.

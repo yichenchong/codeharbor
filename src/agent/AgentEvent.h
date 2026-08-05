@@ -23,10 +23,14 @@ constexpr int kAgentEventVersion = 1;
 // parsed enum; `summary`/`metadata` are optional (empty when the producer
 // omitted them).
 //
-// `timestamp` is deliberately kept as the producer's opaque string. events.ts
-// documents it as ISO-8601-with-milliseconds but validates only that it IS a
-// string, and the client matches that exactly: it is display/diagnostic data,
-// never a sequencing key. Ordering comes from the single ordered byte stream —
+// `timestamp` is deliberately kept as the producer's opaque string, and the
+// client deliberately validates LESS of it than the daemon does: validateEvent()
+// in remote/src/events.ts insists on ISO-8601-with-milliseconds and a real
+// calendar date, while this parser requires only that the field IS a string.
+// The asymmetry is on purpose. The timestamp is display/diagnostic data,
+// never a sequencing key, so dropping a whole event over a formatting nit
+// would throw away a live state change to enforce something nothing reads.
+// Ordering comes from the single ordered byte stream —
 // one producer, one socket, one channel — so events are applied strictly in
 // arrival order (last one wins for a given terminal). Do NOT start comparing
 // timestamps to reorder or drop events: they are remote wall-clock readings

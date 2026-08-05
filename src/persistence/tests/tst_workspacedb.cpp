@@ -94,6 +94,7 @@ private slots:
     void setLayoutRefusesATreeItCouldNotReadBack();
     void workspaceDbCannotBeBuiltWithoutAClient();
     void updateOptionalsOmitUnsetAndSendEmptyStringsVerbatim();
+    void pinnedStateCrossesTheWireInBothDirections();
     void liveCreateAndListOverProcess();
 
 private:
@@ -154,6 +155,12 @@ void TstWorkspaceDb::makePair()
 // Read exactly one JSONL request frame that the repository just wrote through
 // the client transport. Flushes the client side first because CodeharbordClient
 // buffers its write and this test drives no event loop between call and read.
+//
+// Cannot use QVERIFY: that macro returns from its enclosing function, which
+// here would mean handing the caller an empty object anyway. So a timeout is
+// reported as a warning instead of vanishing - without it, a repository that
+// never sends its request fails later and elsewhere, as a callback that simply
+// never fires.
 QJsonObject TstWorkspaceDb::readRequest()
 {
     m_clientSide->flush();
@@ -164,8 +171,12 @@ QJsonObject TstWorkspaceDb::readRequest()
             buffer += m_serverSide->readAll();
     }
     const qsizetype newline = buffer.indexOf('\n');
-    const QByteArray line = newline >= 0 ? buffer.left(newline) : buffer;
-    return QJsonDocument::fromJson(line).object();
+    if (newline < 0) {
+        qWarning("readRequest: no complete request frame arrived within 2s (%lld bytes read)",
+                 static_cast<long long>(buffer.size()));
+        return {};
+    }
+    return QJsonDocument::fromJson(buffer.left(newline)).object();
 }
 
 void TstWorkspaceDb::listParsesNestedTree()
@@ -1205,16 +1216,30 @@ void TstWorkspaceDb::resolveTerminalPaneSendsTheSlotAddressAndParsesTheRow()
 
     // The working directory is omitted when the caller has none, so the server
     // applies its own default instead of being told to store an explicit null.
+    //
+    // This request is ANSWERED rather than left hanging: a pending callback is
+    // dispatched with a synthetic error when the client is destroyed in
+    // cleanup(), which is after this function has returned, so a callback
+    // capturing a local by reference would write into a dead stack frame.
     bool secondFired = false;
     m_db->resolveTerminalPane(
         ch::ResolveTerminalPaneParams{.serverId = ch::ServerId{QStringLiteral("srv-1")},
                                       .devSessionId = ch::DevSessionId{QStringLiteral("s1")},
                                       .name = QStringLiteral("terminal-3")},
         [&](std::optional<ch::TerminalPane>, std::optional<RpcError>) { secondFired = true; });
-    const QJsonObject bare =
-        readRequest().value(QStringLiteral("params")).toObject();
+    const QJsonObject secondReq = readRequest();
+    const QJsonObject bare = secondReq.value(QStringLiteral("params")).toObject();
     QVERIFY(!bare.contains(QStringLiteral("workingDirectory")));
-    Q_UNUSED(secondFired);
+
+    m_serverSide->write(jsonLine(
+        {{"jsonrpc", "2.0"},
+         {"id", secondReq.value(QStringLiteral("id")).toInt()},
+         {"result", QJsonObject{{"id", "row-3"}, {"serverId", "srv-1"},
+                                {"devSessionId", "s1"}, {"name", "terminal-3"},
+                                {"tmuxTarget", "ch_s1_row-3"}, {"position", 2}}}}));
+    m_serverSide->flush();
+    QTRY_VERIFY(secondFired);
+    QCOMPARE(m_client->pendingCount(), 0);
 }
 
 // The NORMAL half: a leaf that carries its `terminal_panes` row id is addressed
@@ -1473,6 +1498,128 @@ void TstWorkspaceDb::updateOptionalsOmitUnsetAndSendEmptyStringsVerbatim()
                                 {"harness", ""}, {"position", 0}}}}));
     m_serverSide->flush();
     QTRY_VERIFY(fired);
+}
+
+// The Dev Session pin bit is server-owned state (schema version 5) and it drives
+// the sidebar's star filter, so it has to survive both directions of the wire.
+// Nothing covered it: the pin could have been dropped on decode, or an explicit
+// "unpin" could have been swallowed as if it were an unset field, and every
+// existing test would still have passed.
+void TstWorkspaceDb::pinnedStateCrossesTheWireInBothDirections()
+{
+    makePair();
+
+    QVector<GroupNode> got;
+    std::optional<RpcError> err;
+    bool fired = false;
+    m_db->list(ServerId{QStringLiteral("srv-1")},
+               [&](QVector<GroupNode> groups, std::optional<RpcError> e) {
+                   got = groups;
+                   err = e;
+                   fired = true;
+               });
+
+    const QJsonObject listReq = readRequest();
+    // The pin FILTER is a client-local presentation choice held by
+    // ch::SessionsModel, never a server-side narrowing: asking the server to
+    // pre-filter would return a tree missing rows the client still needs the
+    // moment the user turns the filter off.
+    QVERIFY(!listReq.value(QStringLiteral("params")).toObject()
+                 .contains(QStringLiteral("pinnedOnly")));
+
+    const char* kJson = R"([
+      {
+        "id": "g1", "serverId": "srv-1", "name": "Alpha",
+        "position": 0, "collapsed": false,
+        "sessions": [
+          { "id": "s1", "serverId": "srv-1", "groupId": "g1", "name": "Pinned",
+            "repositoryRoot": "/r", "position": 0, "archived": false,
+            "pinned": true,
+            "viewerPanes": [], "terminalPanes": [],
+            "layouts": { "viewer": null, "terminal": null } },
+          { "id": "s2", "serverId": "srv-1", "groupId": "g1", "name": "Plain",
+            "repositoryRoot": "/r", "position": 1, "archived": true,
+            "pinned": false,
+            "viewerPanes": [], "terminalPanes": [],
+            "layouts": { "viewer": null, "terminal": null } },
+          { "id": "s3", "serverId": "srv-1", "groupId": "g1", "name": "Legacy",
+            "repositoryRoot": "/r", "position": 2, "archived": false,
+            "viewerPanes": [], "terminalPanes": [],
+            "layouts": { "viewer": null, "terminal": null } }
+        ]
+      }
+    ])";
+    const QJsonArray result = QJsonDocument::fromJson(kJson).array();
+    QCOMPARE(result.size(), 1); // guard against a malformed canned fixture
+
+    m_serverSide->write(jsonLine({{"jsonrpc", "2.0"},
+                                  {"id", listReq.value(QStringLiteral("id")).toInt()},
+                                  {"result", result}}));
+    m_serverSide->flush();
+
+    QTRY_VERIFY(fired);
+    QVERIFY(!err.has_value());
+    QCOMPARE(got.size(), 1);
+    QCOMPARE(got[0].sessions.size(), 3);
+    QCOMPARE(got[0].sessions[0].session.pinned, true);
+    QCOMPARE(got[0].sessions[1].session.pinned, false);
+    QCOMPARE(got[0].sessions[1].session.archived, true);
+    // A row from a database that predates the column arrives without the key at
+    // all and must read as unpinned rather than as anything else.
+    QCOMPARE(got[0].sessions[2].session.pinned, false);
+
+    // Unpinning is an explicit `pinned: false` on the wire. Dropping it because
+    // the value is false would leave the row pinned on the server while the
+    // sidebar showed it unpinned.
+    bool updateFired = false;
+    m_db->updateSession(
+        ch::UpdateSessionParams{.id = ch::DevSessionId{QStringLiteral("s1")},
+                                .pinned = false},
+        [&](std::optional<ch::DevSession>, std::optional<RpcError>) {
+            updateFired = true;
+        });
+    const QJsonObject updateReq = readRequest();
+    const QJsonObject updateParams =
+        updateReq.value(QStringLiteral("params")).toObject();
+    QVERIFY(updateParams.contains(QStringLiteral("pinned")));
+    QCOMPARE(updateParams.value(QStringLiteral("pinned")).toBool(), false);
+    QVERIFY(!updateParams.contains(QStringLiteral("archived")));
+
+    m_serverSide->write(jsonLine(
+        {{"jsonrpc", "2.0"},
+         {"id", updateReq.value(QStringLiteral("id")).toInt()},
+         {"result", QJsonObject{{"id", "s1"}, {"serverId", "srv-1"},
+                                {"groupId", "g1"}, {"name", "Pinned"},
+                                {"repositoryRoot", "/r"}, {"position", 0},
+                                {"archived", false}, {"pinned", false}}}}));
+    m_serverSide->flush();
+    QTRY_VERIFY(updateFired);
+
+    // On create, an unset pin is ABSENT so the server applies its own default.
+    bool createFired = false;
+    m_db->createSession(
+        ch::CreateSessionParams{.serverId = ServerId{QStringLiteral("srv-1")},
+                                .groupId = ch::GroupId{QStringLiteral("g1")},
+                                .name = QStringLiteral("Fresh"),
+                                .repositoryRoot = QStringLiteral("/r")},
+        [&](std::optional<ch::DevSession>, std::optional<RpcError>) {
+            createFired = true;
+        });
+    const QJsonObject createReq = readRequest();
+    const QJsonObject createParams =
+        createReq.value(QStringLiteral("params")).toObject();
+    QVERIFY(!createParams.contains(QStringLiteral("pinned")));
+    QVERIFY(!createParams.contains(QStringLiteral("archived")));
+
+    m_serverSide->write(jsonLine(
+        {{"jsonrpc", "2.0"},
+         {"id", createReq.value(QStringLiteral("id")).toInt()},
+         {"result", QJsonObject{{"id", "s4"}, {"serverId", "srv-1"},
+                                {"groupId", "g1"}, {"name", "Fresh"},
+                                {"repositoryRoot", "/r"}, {"position", 3},
+                                {"archived", false}, {"pinned", false}}}}));
+    m_serverSide->flush();
+    QTRY_VERIFY(createFired);
 }
 
 QTEST_GUILESS_MAIN(TstWorkspaceDb)

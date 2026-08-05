@@ -144,6 +144,10 @@ private slots:
     void harnessChangesClearDerivedState();
     // Re-entrant eviction must not emit pending transitions for removed panes.
     void ageingSignalsSkipEvictedPanes();
+    // AG5: the ageing timer must be armed for exactly the panes the tick moves.
+    void aSeenGenericCompletionResumesActivityDerivation();
+    // AG6: both windows are policy, and 0 has a defined meaning for each.
+    void windowSettersClampNegativeValues();
 
 private:
     void makePair();
@@ -1675,6 +1679,88 @@ void TstAgentMonitor::ageingSignalsSkipEvictedPanes()
     QCOMPARE(stateSpy.count(), 1);
     QCOMPARE(m_monitor->stateFor("dE1", "tE"), asInt(AgentState::Unknown));
     QCOMPARE(m_monitor->stateFor("dE2", "tE"), asInt(AgentState::Unknown));
+}
+
+// AG5. Two pieces of code decide when a pane's state may change with time
+// alone: onAgeTick(), which computes the new state, and rearmAgeTimer(), which
+// decides whether the timer that calls onAgeTick() should run at all. They must
+// agree exactly, and for a generic pane holding an unseen completion they used
+// not to.
+//
+// onAgeTick() deliberately refuses to let time overwrite a completion the user
+// has not seen. The timer predicate, however, only ever armed a generic pane
+// that was Running, so a pane parked at IdleUnseen was excluded from the timer
+// permanently — including AFTER the user viewed the completion and the
+// protection no longer applied. The pane was then frozen at IdleUnseen for the
+// life of the application unless some unrelated pane happened to keep the
+// shared timer alive, and markSeen() itself never re-evaluated the timer at
+// all. The sidebar kept showing a finished agent for a pane the user had
+// already acknowledged.
+void TstAgentMonitor::aSeenGenericCompletionResumesActivityDerivation()
+{
+    makePair();
+    m_monitor->setFallbackIdleThresholdMs(40);
+
+    m_monitor->setTerminalHarness(QStringLiteral("dP"), QStringLiteral("tP"),
+                                  QStringLiteral("generic"));
+    m_monitor->noteTerminalAttached(QStringLiteral("dP"), QStringLiteral("tP"));
+    QCOMPARE(m_monitor->stateFor("dP", "tP"), asInt(AgentState::Starting));
+
+    // A completion lands on the pane from the wire.
+    feed(eventLine("idle_unseen", QStringLiteral("dP"), QStringLiteral("tP")));
+    QTRY_COMPARE(m_monitor->stateFor("dP", "tP"), asInt(AgentState::IdleUnseen));
+    QVERIFY(m_monitor->hasUnseen(QStringLiteral("dP")));
+
+    // While it is unseen, time may not touch it, and this pane is the only one
+    // that exists — so nothing else can keep a timer alive on its behalf.
+    QTest::qWait(200);
+    QCOMPARE(m_monitor->stateFor("dP", "tP"), asInt(AgentState::IdleUnseen));
+
+    // The user views it. The pane is back under SPEC 6.6 activity derivation,
+    // and no output has been seen on this channel, so it reads Starting again.
+    m_monitor->markSeen(QStringLiteral("dP"));
+    QTRY_COMPARE(m_monitor->stateFor("dP", "tP"), asInt(AgentState::Starting));
+
+    // ...and it is genuinely live again: output moves it on immediately.
+    m_monitor->noteTerminalOutput(QStringLiteral("dP"), QStringLiteral("tP"));
+    QCOMPARE(m_monitor->stateFor("dP", "tP"), asInt(AgentState::Running));
+    QTRY_COMPARE(m_monitor->stateFor("dP", "tP"), asInt(AgentState::Idle));
+}
+
+// AG6. Both windows are policy rather than physics, and the header defines what
+// a non-positive value means for each: the silence window turns the demotion
+// off entirely, and the idle threshold makes a generic pane quiet immediately.
+// Nothing pinned either the clamp or those two meanings, so a setter that
+// stored a negative value straight through — which would make `now - last <
+// threshold` and `now - last >= timeout` behave backwards — would have gone
+// unnoticed.
+void TstAgentMonitor::windowSettersClampNegativeValues()
+{
+    m_monitor->setStaleTimeoutMs(-5);
+    QCOMPARE(m_monitor->staleTimeoutMs(), 0);
+    m_monitor->setFallbackIdleThresholdMs(-1);
+    QCOMPARE(m_monitor->fallbackIdleThresholdMs(), 0);
+
+    makePair();
+
+    // Silence window 0: a pane that claims to be working is never demoted,
+    // however long it says nothing.
+    feed(eventLine("running", QStringLiteral("dC"), QStringLiteral("tC")));
+    QTRY_COMPARE(m_monitor->stateFor("dC", "tC"), asInt(AgentState::Running));
+    QTest::qWait(150);
+    QCOMPARE(m_monitor->stateFor("dC", "tC"), asInt(AgentState::Running));
+
+    // Idle threshold 0: a generic pane is Running the instant it prints and
+    // quiet again on the very next tick, with no window to wait out.
+    m_monitor->setTerminalHarness(QStringLiteral("dC"), QStringLiteral("tG"),
+                                  QStringLiteral("generic"));
+    m_monitor->noteTerminalAttached(QStringLiteral("dC"), QStringLiteral("tG"));
+    m_monitor->noteTerminalOutput(QStringLiteral("dC"), QStringLiteral("tG"));
+    QCOMPARE(m_monitor->stateFor("dC", "tG"), asInt(AgentState::Running));
+    QTRY_COMPARE(m_monitor->stateFor("dC", "tG"), asInt(AgentState::Idle));
+
+    // The non-generic pane still has not aged: the two windows are independent.
+    QCOMPARE(m_monitor->stateFor("dC", "tC"), asInt(AgentState::Running));
 }
 
 QTEST_MAIN(TstAgentMonitor)

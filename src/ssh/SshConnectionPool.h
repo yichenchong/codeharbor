@@ -502,9 +502,12 @@ private:
     KnownHosts m_knownHosts;
     HostKeyCallback m_hostKeyCallback;
     CredentialCallback m_credentialCallback;
-    QString m_host;
+    // The port of the handshake in progress or most recently attempted;
+    // verifyHostKey() canonicalizes the known-hosts lookup with it.
     quint16 m_port = 22;
-    QString m_user;
+    // The `~`-expanded private key path of that same attempt, reported by
+    // authenticationFailure(). Host and user are not retained: nothing outside
+    // connectToHost() reads them.
     QString m_identityFile;
     QString m_diagnosticLog;
 #if CH_HAVE_LIBSSH

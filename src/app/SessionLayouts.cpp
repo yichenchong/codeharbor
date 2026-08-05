@@ -15,14 +15,57 @@ namespace ch {
 
 namespace {
 
+// What makes a tree unusable even though SplitNode's parser accepted it: two
+// leaves wearing the same key. There are two such keys and they fail
+// differently.
+//
+//   paneId          the client-side handle every structural edit addresses a
+//                   leaf by. With a duplicate, one close, url or title update
+//                   lands on an arbitrary matching leaf.
+//   terminalPaneId  the SERVER's `terminal_panes` row, which IS the identity of
+//                   a remote shell. Two leaves carrying one row id are two
+//                   panes attached to the same tmux session, echoing each
+//                   other's keystrokes.
+//
+// An EMPTY value is not a key: the empty paneId is the placeholder an emptied
+// region keeps, and an empty terminalPaneId means "written before layouts
+// carried row ids, or a row is still being minted for it".
+enum class DuplicateKey {
+    None,
+    PaneId,
+    TerminalRow,
+};
+
+DuplicateKey findDuplicateLeafKey(const SplitNode& node, QSet<QString>& panes,
+                                  QSet<QString>& rows)
+{
+    if (node.isLeaf()) {
+        if (!node.paneId.isEmpty()) {
+            if (panes.contains(node.paneId))
+                return DuplicateKey::PaneId;
+            panes.insert(node.paneId);
+        }
+        if (!node.terminalPaneId.isEmpty()) {
+            if (rows.contains(node.terminalPaneId))
+                return DuplicateKey::TerminalRow;
+            rows.insert(node.terminalPaneId);
+        }
+        return DuplicateKey::None;
+    }
+    for (const SplitNode& child : node.children) {
+        const DuplicateKey found = findDuplicateLeafKey(child, panes, rows);
+        if (found != DuplicateKey::None)
+            return found;
+    }
+    return DuplicateKey::None;
+}
+
 // Decode a QML-authored (or otherwise foreign) tree. Returns std::nullopt when
 // the value is not a valid split tree, so an invalid layout is rejected instead
 // of being silently replaced by an empty leaf - which is a legitimate tree in
 // its own right (it is what a region with no panes left persists), not a
 // "nothing here" marker. SplitNode::tryFromJson draws that distinction from the
 // parser itself; see its comment for why fromJson() cannot.
-bool hasDuplicatePaneIds(const SplitNode& node, QSet<QString>& seen);
-
 std::optional<SplitNode> parseVariantTree(const QVariant& value)
 {
     const QJsonValue json = QJsonValue::fromVariant(value);
@@ -31,26 +74,11 @@ std::optional<SplitNode> parseVariantTree(const QVariant& value)
     std::optional<SplitNode> parsed = SplitNode::tryFromJson(json.toObject());
     if (!parsed)
         return std::nullopt;
-    QSet<QString> seen;
-    if (hasDuplicatePaneIds(*parsed, seen))
+    QSet<QString> panes;
+    QSet<QString> rows;
+    if (findDuplicateLeafKey(*parsed, panes, rows) != DuplicateKey::None)
         return std::nullopt;
     return parsed;
-}
-bool hasDuplicatePaneIds(const SplitNode& node, QSet<QString>& seen)
-{
-    if (node.isLeaf()) {
-        if (node.paneId.isEmpty())
-            return false;
-        if (seen.contains(node.paneId))
-            return true;
-        seen.insert(node.paneId);
-        return false;
-    }
-    for (const SplitNode& child : node.children) {
-        if (hasDuplicatePaneIds(child, seen))
-            return true;
-    }
-    return false;
 }
 
 
@@ -505,6 +533,30 @@ void SessionLayouts::load(QString devSessionId)
     }
 }
 
+// Put one region back into the "nothing to show" state a failed or unusable
+// load leaves behind: no tree, a null QVariant for QML, no queued edits, and no
+// resolve-by-label permission carried over from the layout that is being
+// dropped. The changed signal fires only if something WAS on screen, so a
+// region that was already null costs no delegate churn.
+void SessionLayouts::invalidateRegion(int index)
+{
+    RegionState& state = m_regions[index];
+    const bool wasValid = state.valid;
+    state.valid = false;
+    state.cache = QVariant();
+    state.tree = SplitNode{};
+    state.pendingWrites.clear();
+    state.superseded = false;
+    if (index == kTerminal)
+        m_legacyTerminalSlots.clear();
+    if (!wasValid)
+        return;
+    if (index == kTerminal)
+        emit terminalTreeChanged();
+    else
+        emit viewerTreeChanged();
+}
+
 void SessionLayouts::applyLoadedTree(quint64 generation, int index,
                                      std::optional<SplitNode> tree,
                                      std::optional<RpcError> err)
@@ -522,53 +574,34 @@ void SessionLayouts::applyLoadedTree(quint64 generation, int index,
     RegionState& state = m_regions[index];
     state.loading = false;
     if (err) {
-        const bool wasValid = state.valid;
-        state.valid = false;
-        state.cache = QVariant();
-        state.tree = SplitNode{};
-        state.pendingWrites.clear();
-        state.superseded = false;
-        if (index == kTerminal)
-            m_legacyTerminalSlots.clear();
-        if (wasValid) {
-            if (index == kTerminal)
-                emit terminalTreeChanged();
-            else
-                emit viewerTreeChanged();
-        }
-    }
-    // Reject duplicate pane labels before publishing a tree. Labels are the
-    // client-side handles used by every structural edit; accepting a duplicate
-    // would make one close or URL update an arbitrary matching leaf.
-    if (!err && tree) {
-        QSet<QString> seen;
-        if (hasDuplicatePaneIds(*tree, seen)) {
-            emit error(QStringLiteral(
-                "SessionLayouts: %1 layout contains duplicate pane ids; not shown")
-                           .arg(regionKey(index)));
-            RegionState& invalid = m_regions[index];
-            const bool wasValid = invalid.valid;
-            invalid.valid = false;
-            invalid.cache = QVariant();
-            invalid.tree = SplitNode{};
-            invalid.pendingWrites.clear();
-            invalid.superseded = false;
-            if (index == kTerminal)
-                m_legacyTerminalSlots.clear();
-            if (wasValid) {
-                if (index == kTerminal)
-                    emit terminalTreeChanged();
-                else
-                    emit viewerTreeChanged();
-            }
+        invalidateRegion(index);
+    } else if (tree) {
+        // Reject a tree whose leaves share a key before publishing it. Two
+        // leaves with one paneId make every structural edit hit an arbitrary
+        // one of them; two with one terminalPaneId are two panes attached to a
+        // single remote shell.
+        QSet<QString> panes;
+        QSet<QString> rows;
+        const DuplicateKey duplicate = findDuplicateLeafKey(*tree, panes, rows);
+        if (duplicate != DuplicateKey::None) {
+            emit error(
+                duplicate == DuplicateKey::PaneId
+                    ? QStringLiteral("SessionLayouts: %1 layout contains "
+                                     "duplicate pane ids; not shown")
+                          .arg(regionKey(index))
+                    : QStringLiteral("SessionLayouts: %1 layout binds two panes "
+                                     "to the same terminal; not shown")
+                          .arg(regionKey(index)));
+            invalidateRegion(index);
             if (m_pendingLoads > 0 && --m_pendingLoads == 0)
                 emit loaded(m_devSessionId);
             return;
         }
     }
-    // its answer predates the tree QML is already showing. Applying it would
-    // revert the edit - and on the seeding branch below would replace it with
-    // the region default and write THAT to the server. See RegionState.
+    // A local edit has already replaced this region's tree since this load was
+    // issued, so its answer predates the tree QML is already showing. Applying
+    // it would revert the edit - and on the seeding branch below would replace
+    // it with the region default and write THAT to the server. See RegionState.
     if (!err && !m_regions[index].superseded) {
         // No persisted layout for this region: adopt the default AND write it
         // back, so it becomes the session's real layout instead of a shape that
@@ -1050,7 +1083,10 @@ QString SessionLayouts::splitPaneStamped(const QString& devSessionId,
         // Nothing about this pane resolves in the meantime - notably it does
         // NOT fall back to its slot label, which is how a recycled label used
         // to hand a new pane a closed pane's still-running shell.
-        mintTerminalPaneRow(m_generation, newPaneId);
+        // `generation` rather than m_generation: prepareWrite() has already
+        // proved the two are equal, and the parameter is the stamp this whole
+        // call is scoped to.
+        mintTerminalPaneRow(generation, newPaneId);
     }
     persist(index);
     return newPaneId;

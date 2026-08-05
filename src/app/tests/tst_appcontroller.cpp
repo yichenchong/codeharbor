@@ -415,6 +415,9 @@ private slots:
     void anUpgradeWithNoServerChosenSaysSoInsteadOfDialling();
     void anUpgradeThatDidNotHappenIsReportedEvenWhenTheConnectSucceeds();
     void anAbandonedUpgradeDoesNotAmbushTheNextOrdinaryConnect();
+    // Drag-reordering is the one pair of mutations that sends a whole ordered
+    // list rather than a single field, and order is the entire payload.
+    void reorderingSendsTheOrderedIdsInOrderAndRefreshes();
 };
 
 // Two GroupNodes with sessions map to GroupRows preserving order, with the
@@ -2184,6 +2187,7 @@ void TstAppController::uiStateStoreIgnoresCorruptWidths()
         raw.setValue(QStringLiteral("layout/viewerWidth"), QStringLiteral("-40"));
         // A line the writer never finished.
         raw.setValue(QStringLiteral("layout/terminalWidth"), QString());
+        raw.setValue(QStringLiteral("layout/sidebarWidth"), 12.5);
         raw.sync();
     }
 
@@ -2536,6 +2540,121 @@ void TstAppController::anAbandonedUpgradeDoesNotAmbushTheNextOrdinaryConnect()
         QVERIFY2(!f.boot.remoteUpgradeRequested(),
                  "Disconnect left the upgrade armed");
     }
+
+    // (e) The profile the chain was dialling is deleted from the connect sheet
+    // while its host-key prompt is parked, and the user then accepts the key.
+    // startConnect() finds nothing to dial and the chain ends right there -
+    // which is still an abandonment, and used to be the one that kept the
+    // upgrade armed, so the user's next ordinary Connect reinstalled the remote
+    // service on a server they never asked to update.
+    {
+        ConnectFixture f;
+        f.boot.duringConnect = [&f] { offerUnknownHostKey(f.pool); };
+        f.controller.upgradeRemoteService(f.profileId);
+        QCOMPARE(f.controller.connectionState(), QStringLiteral("hostkey"));
+        QVERIFY(f.boot.remoteUpgradeRequested());
+
+        f.profiles.removeProfile(f.profileId);
+        f.controller.resolveHostKey(true);
+
+        QCOMPARE(f.controller.connectionState(), QStringLiteral("failed"));
+        QVERIFY2(!f.boot.remoteUpgradeRequested(),
+                 "a chain whose profile vanished left the upgrade armed");
+
+        // ...and the proof of what that costs: an ordinary connect to a
+        // DIFFERENT server must reach the bootstrap with nothing armed.
+        const QString other = f.profiles.addProfile(
+            {{QStringLiteral("name"), QStringLiteral("other box")},
+             {QStringLiteral("host"), QStringLiteral("10.0.0.4")},
+             {QStringLiteral("port"), 22},
+             {QStringLiteral("user"), QStringLiteral("yichen")},
+             {QStringLiteral("nodePath"), QStringLiteral("/usr/bin/node")},
+             {QStringLiteral("repoRoot"), QStringLiteral("/srv/codeharbor")}});
+        QVERIFY(!other.isEmpty());
+        bool armedAtDialTime = true;
+        f.boot.connectOk = true;
+        f.boot.duringConnect = [&f, &armedAtDialTime] {
+            armedAtDialTime = f.boot.remoteUpgradeRequested();
+        };
+        f.controller.connectToProfile(other);
+        QCOMPARE(f.boot.connectCalls, 2);
+        QVERIFY2(!armedAtDialTime,
+                 "the next ordinary connect dialled with an upgrade armed");
+    }
+}
+
+// Both reorder mutations carry the user's drag result as a whole list. Nothing
+// else in the payload says what moved, so an order the client rewrites - or a
+// list it sends against the wrong key - silently rearranges the sidebar into
+// something the user did not ask for the moment the authoritative tree comes
+// back.
+void TstAppController::reorderingSendsTheOrderedIdsInOrderAndRefreshes()
+{
+    FakeTransport transport;
+    CodeharbordClient client;
+    AppController controller(&client);
+    client.setTransport(&transport);
+    controller.setServerId(QStringLiteral("srv-1"));
+    // setServerId() drives its own workspace.list; drain it so the assertions
+    // below read the reorder request and nothing else.
+    QCOMPARE(takeRequestIds(transport).size(), 1);
+
+    controller.reorderGroups(
+        QStringList{QStringLiteral("g2"), QStringLiteral("g1")});
+    const QJsonObject groupReq = takeRequest(transport);
+    QCOMPARE(groupReq.value(QStringLiteral("method")).toString(),
+             QStringLiteral("workspace.reorderGroups"));
+    const QJsonObject groupParams =
+        groupReq.value(QStringLiteral("params")).toObject();
+    // Keyed by the CURRENT server: a reorder that went out under a stale id
+    // would be applied to another server's groups, or to none at all.
+    QCOMPARE(groupParams.value(QStringLiteral("serverId")).toString(),
+             QStringLiteral("srv-1"));
+    const QJsonArray groupIds =
+        groupParams.value(QStringLiteral("orderedIds")).toArray();
+    QCOMPARE(groupIds.size(), 2);
+    QCOMPARE(groupIds.at(0).toString(), QStringLiteral("g2"));
+    QCOMPARE(groupIds.at(1).toString(), QStringLiteral("g1"));
+
+    // Acknowledged, and the sidebar is re-read from authoritative state rather
+    // than reordered locally.
+    const QJsonObject groupAck{
+        {"jsonrpc", "2.0"},
+        {"id", groupReq.value(QStringLiteral("id")).toInt()},
+        {"result", true}};
+    transport.deliver(QJsonDocument(groupAck).toJson(QJsonDocument::Compact) + '\n');
+    QCOMPARE(takeRequest(transport).value(QStringLiteral("method")).toString(),
+             QStringLiteral("workspace.list"));
+
+    controller.reorderSessions(
+        QStringLiteral("g1"),
+        QStringList{QStringLiteral("s3"), QStringLiteral("s1"),
+                    QStringLiteral("s2")});
+    const QJsonObject sessionReq = takeRequest(transport);
+    QCOMPARE(sessionReq.value(QStringLiteral("method")).toString(),
+             QStringLiteral("workspace.reorderSessions"));
+    const QJsonObject sessionParams =
+        sessionReq.value(QStringLiteral("params")).toObject();
+    // Sessions are ordered within their GROUP, so this one carries a groupId
+    // and no serverId.
+    QCOMPARE(sessionParams.value(QStringLiteral("groupId")).toString(),
+             QStringLiteral("g1"));
+    const QJsonArray sessionIds =
+        sessionParams.value(QStringLiteral("orderedIds")).toArray();
+    QCOMPARE(sessionIds.size(), 3);
+    QCOMPARE(sessionIds.at(0).toString(), QStringLiteral("s3"));
+    QCOMPARE(sessionIds.at(1).toString(), QStringLiteral("s1"));
+    QCOMPARE(sessionIds.at(2).toString(), QStringLiteral("s2"));
+
+    // An empty list is still a well-formed request: it is what a group whose
+    // last session was dragged out looks like, and it must not be turned into a
+    // missing field the server would reject.
+    controller.reorderSessions(QStringLiteral("g1"), QStringList{});
+    const QJsonObject emptyParams = takeRequest(transport)
+                                        .value(QStringLiteral("params"))
+                                        .toObject();
+    QVERIFY(emptyParams.contains(QStringLiteral("orderedIds")));
+    QVERIFY(emptyParams.value(QStringLiteral("orderedIds")).toArray().isEmpty());
 }
 
 QTEST_GUILESS_MAIN(TstAppController)

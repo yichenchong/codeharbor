@@ -86,6 +86,35 @@ std::optional<int> parsePort(const QVariant& raw)
     return port;
 }
 
+// Is this ALREADY-TRIMMED string usable as the host (or the login name) of an
+// SSH connection? Non-empty, and free of the two character classes that can
+// only ever be a typo or an accident:
+//
+//   * whitespace anywhere inside it. No hostname, IPv4 literal, IPv6 literal or
+//     POSIX user name may contain a space or a tab. What DOES produce one is a
+//     user pasting "box.local -p 2222" or "my server" into the field, and the
+//     store used to keep it: the profile then listed and looked fine and failed
+//     with an opaque name-resolution error every single time it was selected.
+//   * control characters, including newline. QSettings' ini writer escapes a
+//     newline as "\n" and reads it back, so such a value survives a round trip
+//     and reaches getaddrinfo() intact - and a host field holding two lines is
+//     also how a hand edit of this file smuggles something past a reader that
+//     assumes one key per line.
+//
+// Deliberately NOT a hostname grammar. '@', ':' and '%' are all legal in the
+// values people really store (IPv6 literals, zone ids), and a store that
+// second-guesses libssh's own parsing refuses connections that work.
+bool isUsableEndpointField(const QString& trimmed)
+{
+    if (trimmed.isEmpty())
+        return false;
+    for (const QChar c : trimmed) {
+        if (c.isSpace() || c.category() == QChar::Other_Control)
+            return false;
+    }
+    return true;
+}
+
 // Trim, default, and validate one field set. Returns nullopt for a profile that
 // could never connect: SshConnectionPool::connectToHost(host, port, user) needs
 // all three, so storing a record missing any of them is storing garbage.
@@ -95,11 +124,11 @@ std::optional<int> parsePort(const QVariant& raw)
 std::optional<QVariantMap> sanitize(const QVariantMap& in)
 {
     const QString host = in.value(kHost).toString().trimmed();
-    if (host.isEmpty())
+    if (!isUsableEndpointField(host))
         return std::nullopt;
 
     const QString user = in.value(kUser).toString().trimmed();
-    if (user.isEmpty())
+    if (!isUsableEndpointField(user))
         return std::nullopt;
 
     const std::optional<int> port = parsePort(in.value(kPort));
@@ -214,17 +243,18 @@ QVariantList ServerProfiles::readStoredProfiles(QString* activeOut) const
         //
         // Host and user have no such repair, and no default to fall back on.
         // SshConnectionPool::connectToHost(host, port, user) needs all three,
-        // and the save path already refuses to store a profile missing any of
-        // them (see sanitize()), so a row with either blank cannot have come
-        // from this client and is not a profile at all - it is a row that can
-        // only ever offer the user a server entry which fails the moment it is
-        // selected. It is skipped, which is the same verdict sanitize() reaches
-        // on the way in; the rule lives in this class and is applied on both
-        // sides of it rather than being duplicated somewhere else. Like the
-        // port repair, the skip is written back by the next save.
+        // and the save path already refuses to store a profile whose host or
+        // user is blank or is not a usable endpoint field (see sanitize() and
+        // isUsableEndpointField()), so such a row cannot have come from this
+        // client and is not a profile at all - it is a row that can only ever
+        // offer the user a server entry which fails the moment it is selected.
+        // It is skipped, which is the same verdict sanitize() reaches on the
+        // way in; the rule lives in this class and is applied on both sides of
+        // it rather than being duplicated somewhere else. Like the port repair,
+        // the skip is written back by the next save.
         const QString host = m_settings->value(prefix + kHost).toString().trimmed();
         const QString user = m_settings->value(prefix + kUser).toString().trimmed();
-        if (host.isEmpty() || user.isEmpty())
+        if (!isUsableEndpointField(host) || !isUsableEndpointField(user))
             continue;
         const std::optional<int> parsedPort =
             parsePort(m_settings->value(prefix + kPort));

@@ -130,12 +130,6 @@ QtObject {
         return result;
     }
 
-    function index(id) {
-        var clean = registry._cleanId(id);
-        var orderedIds = registry.ordered(registry.knownIds());
-        return orderedIds.indexOf(clean);
-    }
-
     // QtObject has no default property, so this cannot be an anonymous child:
     // it has to be held by a named property to be part of the singleton at all.
     property Connections settingsLink: Connections {

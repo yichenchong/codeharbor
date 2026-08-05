@@ -1,5 +1,7 @@
 #include "SshChannelDevice.h"
 
+#include <QDeadlineTimer>
+#include <QThread>
 #include <QTimer>
 
 #include <cstring>
@@ -91,6 +93,46 @@ bool SshChannelDevice::open(OpenMode mode)
         QStringLiteral("an SSH channel device is opened by startExec() or "
                        "startPty(), not by open()"));
     return false;
+}
+
+bool SshChannelDevice::waitForReadyRead(int msecs)
+{
+    if (bytesAvailable() > 0)
+        return true;
+#if CH_HAVE_LIBSSH
+    // None of these can ever produce a byte, and spinning on them would only
+    // burn the deadline: no channel at all, a read stream that has already
+    // ended, or a re-entrant call made from inside the read pass itself (a
+    // readyRead() handler that blocks for more).
+    if (!m_channel || m_remoteFinished || m_pumping)
+        return false;
+
+    const QDeadlineTimer deadline = msecs < 0
+                                        ? QDeadlineTimer(QDeadlineTimer::Forever)
+                                        : QDeadlineTimer(msecs);
+    for (;;) {
+        // pump() reaches handlers that may destroy this device.
+        const QPointer<SshChannelDevice> self(this);
+        const quint64 passesBefore = m_payloadPasses;
+        pump();
+        if (!self)
+            return false;
+        // True either way round: the bytes are still buffered, or a readyRead()
+        // handler consumed them during the pass. Both mean the wait was
+        // satisfied, and only the counter can tell the second case from "the
+        // channel is simply quiet".
+        if (m_payloadPasses != passesBefore || bytesAvailable() > 0)
+            return true;
+        if (!m_channel || m_remoteFinished || deadline.hasExpired())
+            return false;
+        // The channel is quiet. Sleep rather than spin: this is a blocking call
+        // on the caller's thread and libssh has nothing buffered right now.
+        QThread::msleep(1);
+    }
+#else
+    Q_UNUSED(msecs);
+    return false;
+#endif
 }
 
 qint64 SshChannelDevice::readData(char* data, qint64 maxSize)
@@ -404,11 +446,14 @@ void SshChannelDevice::pump()
         return;
     const ssh_channel channel = m_channel;
     const quint64 generation = m_channelGeneration;
-    // A slot reached from readyRead() may spin a nested event loop (QTRY_*,
-    // QSignalSpy::wait); re-entering libssh from inside our own drain would
-    // reorder the stream. The timer is single-shot, so a swallowed tick MUST
-    // be re-armed or the read pump would be dead for good — silently, with the
-    // channel still open.
+    // A slot reached from readyRead()/channelError()/readChannelFinished() may
+    // spin a nested event loop (QTRY_*, QSignalSpy::wait, a modal dialog),
+    // which lets this timer fire again while the previous pass is still
+    // unwinding. Re-entering libssh from inside that pass would read the same
+    // channel twice over and publish a nested readyRead() underneath the
+    // handler that is still running, so the pass is skipped instead. The timer
+    // is single-shot, so a swallowed tick MUST be re-armed or the read pump
+    // would be dead for good — silently, with the channel still open.
     if (m_pumping) {
         m_pump->start(kIdlePollMs);
         return;
@@ -481,7 +526,8 @@ void SshChannelDevice::pump()
 
     const bool gotPayload =
         m_readBuffer.size() - m_readOffset > bufferedBefore;
-    m_pumping = false;
+    if (gotPayload)
+        ++m_payloadPasses;
 
     // Re-arm before emitting so a handler that calls closeChannel() wins: its
     // m_pump->stop() then cancels the timer we just started. The generation
@@ -528,6 +574,16 @@ void SshChannelDevice::pump()
         && (eof || !failure.isEmpty())) {
         finishReadChannel();
     }
+
+    // Last, and only if this device still exists: the re-entrancy guard stays
+    // raised for the WHOLE pass, emissions included. Clearing it before the
+    // emits (as this used to) left the guard unable to do the job its comment
+    // claims — a readyRead() handler that spins a nested event loop would
+    // re-enter pump(), read the same channel from inside our own pass and emit
+    // a nested readyRead() while the outer handler was still on the stack, so a
+    // line-framing consumer could see its chunks interleaved.
+    if (self)
+        m_pumping = false;
 }
 
 #endif // CH_HAVE_LIBSSH

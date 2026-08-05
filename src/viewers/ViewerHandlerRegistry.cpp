@@ -337,11 +337,32 @@ bool ViewerHandlerRegistry::isValidApplicationScheme(const QString &scheme)
             return false;
     }
 
-    const QString lower = scheme.toLower();
-    return lower != QLatin1String("codeharbor-internal")
-           && lower != QLatin1String("http")
-           && lower != QLatin1String("https")
-           && lower != QLatin1String("file");
+    // Reserved spellings, all refused. Two groups, for two different reasons.
+    //
+    // The first is CodeHarbor's own scheme plus the browser/file schemes the
+    // viewer handles itself: handing one of these to the desktop would route a
+    // resource the application owns back out to whatever else claims it.
+    //
+    // The second is the pseudo-schemes whose "path" IS a program or a document
+    // body rather than a locator. applicationUrl() percent-escapes the remote
+    // path so it stays one URL path, but escaping does not disarm anything
+    // here: the receiving browser un-escapes it again and then EXECUTES it. A
+    // desktop handler is launched with the user's full privileges, so a scheme
+    // that turns a server-supplied string into code is never handed over.
+    static const QSet<QString> kReserved = {
+        QStringLiteral("codeharbor-internal"),
+        QStringLiteral("http"),
+        QStringLiteral("https"),
+        QStringLiteral("file"),
+        QStringLiteral("javascript"),
+        QStringLiteral("vbscript"),
+        QStringLiteral("data"),
+        QStringLiteral("blob"),
+        QStringLiteral("about"),
+        QStringLiteral("view-source"),
+        QStringLiteral("filesystem"),
+    };
+    return !kReserved.contains(scheme.toLower());
 }
 
 QUrl ViewerHandlerRegistry::applicationUrl(const QString &scheme,

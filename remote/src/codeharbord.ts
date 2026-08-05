@@ -24,7 +24,14 @@ import { fileMethods, fileWatchService, isResourceLimit, isRevisionMismatch } fr
 // isDatabaseBusy recognizes SQLite's lock-contention failures, which are a
 // transient race between codeharbord processes sharing one database file, not
 // a server malfunction — see the dispatch() branch below.
-import { isDatabaseBusy, serverIdentity, WORKSPACE_METHODS } from "./workspace.ts";
+// closeDefaultWorkspace() releases that shared connection on an orderly stop;
+// see the 'beforeExit' handler in runStdio for why it is called only there.
+import {
+    closeDefaultWorkspace,
+    isDatabaseBusy,
+    serverIdentity,
+    WORKSPACE_METHODS,
+} from "./workspace.ts";
 // tmux session discovery (SPEC 10.2). Its own `tmux.*` method group, likewise
 // outside the frozen C1 file catalog.
 import { TMUX_METHODS } from "./tmux.ts";
@@ -46,7 +53,12 @@ import {
     RPC_WATCH_EVENT_NOTIFICATION,
     RPC_WATCH_EVENTS_LOST_NOTIFICATION,
 } from "./rpc-types.ts";
-import type { PingResult, ServerInfoResult, WatchEvent } from "./rpc-types.ts";
+import type {
+    PingResult,
+    ServerInfoResult,
+    WatchEvent,
+    WatchEventsLost,
+} from "./rpc-types.ts";
 export { RPC_METHODS } from "./rpc-types.ts";
 // JSON-RPC 2.0 reserved error codes are DEFINED in rpc-types.ts (see the note
 // there on the import cycle) and re-exported here, which is where every
@@ -323,6 +335,50 @@ export async function handleLine(line: string): Promise<RpcResponse | null> {
 }
 
 /**
+ * Serialize one response into the single wire line that carries it.
+ *
+ * Two things can go wrong between a handler's return value and the wire, and
+ * both must still produce SOME response: the client correlates replies by
+ * request id, so a request answered with nothing leaves a pending call hanging
+ * until the heartbeat gives up on the whole transport.
+ *
+ *   * The payload is not JSON-serializable (a reference cycle, or a BigInt).
+ *     Answer with an internal error naming that.
+ *   * The serialized line is past MAX_LINE_BYTES. BOTH ends of this protocol
+ *     drop the transport on an over-cap frame, so writing it anyway costs the
+ *     user the entire workspace connection — every terminal and every editor on
+ *     it — over one oversized reply, with nothing on screen saying why. Answer
+ *     with RPC_RESOURCE_LIMIT instead, exactly as the handlers that DO know
+ *     their own size (file.readFile, file.listDirectory) already do: the one
+ *     request is refused, the message names the limit, and the session lives.
+ */
+export function responseLine(response: RpcResponse): string {
+    let refusal: { code: number; message: string };
+    try {
+        const line = `${JSON.stringify(response)}\n`;
+        if (Buffer.byteLength(line) <= MAX_LINE_BYTES) return line;
+        refusal = {
+            code: RPC_RESOURCE_LIMIT,
+            message:
+                `The answer to this request is larger than the ${MAX_LINE_BYTES}-byte ` +
+                "transport frame limit, so it was refused. Nothing was changed.",
+        };
+    } catch {
+        refusal = { code: RPC_INTERNAL_ERROR, message: "Response could not be serialized" };
+    }
+    const refusalId =
+        typeof response.id === "string" &&
+        Buffer.byteLength(response.id) > 1024
+            ? null
+            : response.id;
+    return `${JSON.stringify({
+        jsonrpc: "2.0",
+        id: refusalId,
+        error: refusal,
+    })}\n`;
+}
+
+/**
  * Hand-written line framer mirroring the C++ client's bounded reader
  * (kMaxLineBytes in src/remote/CodeharbordClient.cpp, C3). Emits each
  * newline-delimited line via `onLine`, and calls `onOverflow` once the bytes
@@ -527,11 +583,12 @@ export function createWatchNotificationRelay(
         const subscriptionIds = [...lost].filter(hasSubscription);
         lost.clear();
         if (subscriptionIds.length === 0) return;
+        const params: WatchEventsLost = { subscriptionIds };
         writeLine(
             `${JSON.stringify({
                 jsonrpc: "2.0",
                 method: RPC_WATCH_EVENTS_LOST_NOTIFICATION,
-                params: { subscriptionIds },
+                params,
             })}\n`,
         );
     };
@@ -650,7 +707,10 @@ export function runStdio(): StdioHandle {
     // dropped: the client would otherwise wait forever for their ids.
     let outputStalled = false;
     let outputFailed = false;
-    const pendingResponses: string[] = [];
+    // Each queued entry carries its own byte length. Recomputing it on flush
+    // rescans a response line that may be megabytes long, for a number that was
+    // already measured when the line was queued.
+    const pendingResponses: { line: string; bytes: number }[] = [];
     let pendingResponseBytes = 0;
     let pendingResponseIndex = 0;
     const watchRelay = createWatchNotificationRelay(
@@ -696,10 +756,10 @@ export function runStdio(): StdioHandle {
         // the bound this queue exists to enforce. The next 'drain' gets it.
         if (outputFailed || outputStalled) return;
         while (pendingResponseIndex < pendingResponses.length) {
-            const line = pendingResponses[pendingResponseIndex++];
-            pendingResponseBytes -= Buffer.byteLength(line);
+            const entry = pendingResponses[pendingResponseIndex++];
+            pendingResponseBytes -= entry.bytes;
             try {
-                if (!process.stdout.write(line)) {
+                if (!process.stdout.write(entry.line)) {
                     outputStalled = true;
                     watchRelay.stall();
                     break;
@@ -729,8 +789,10 @@ export function runStdio(): StdioHandle {
     const writeOut = (line: string): void => {
         if (outputFailed) return;
         const bytes = Buffer.byteLength(line);
-        // Sending a response larger than the framing cap would make the peer
-        // drop the entire transport, so fail before writing a doomed frame.
+        // Backstop only: responseLine() has already replaced an over-cap answer
+        // with a small refusal, so nothing should reach here. A frame past the
+        // cap makes the peer drop the whole transport, so fail rather than write
+        // a line that is known to be doomed.
         if (bytes > MAX_LINE_BYTES) {
             failOutput();
             return;
@@ -744,7 +806,7 @@ export function runStdio(): StdioHandle {
                 failOutput();
                 return;
             }
-            pendingResponses.push(line);
+            pendingResponses.push({ line, bytes });
             pendingResponseBytes += bytes;
             return;
         }
@@ -764,26 +826,7 @@ export function runStdio(): StdioHandle {
         if (!/\S/.test(line)) return;
         void handleLine(line)
             .then((response) => {
-                if (!response) return;
-                try {
-                    writeOut(`${JSON.stringify(response)}\n`);
-                } catch {
-                    // Only a non-serializable handler payload (a reference
-                    // cycle, or a BigInt) reaches here. Answer the request with
-                    // an internal error so the client's pending call completes
-                    // instead of waiting forever for a line that cannot be
-                    // produced.
-                    writeOut(
-                        `${JSON.stringify({
-                            jsonrpc: "2.0",
-                            id: response.id,
-                            error: {
-                                code: RPC_INTERNAL_ERROR,
-                                message: "Response could not be serialized",
-                            },
-                        })}\n`,
-                    );
-                }
+                if (response) writeOut(responseLine(response));
             })
             .catch(() => {
                 // handleLine is total today. This guard exists because an
@@ -840,6 +883,26 @@ export function runStdio(): StdioHandle {
         // start work whose reply cannot be guaranteed to reach the wire.
         process.stdin.removeListener("data", feed);
         if (!process.stdin.destroyed) process.stdin.destroy();
+        // Hand every queued response to stdout unconditionally. They are queued
+        // only because the PEER stalled, and Node keeps the process alive until
+        // its writable buffer flushes, so this is the last chance for a reply
+        // the client is still waiting on — dropping them left those calls
+        // hanging until the client's heartbeat tore the transport down. The
+        // queue is bounded by MAX_PENDING_RPC_RESPONSE_BYTES so this cannot
+        // buffer without limit, and the grace timer below is the backstop for a
+        // peer that never reads again.
+        if (!outputFailed) {
+            for (let i = pendingResponseIndex; i < pendingResponses.length; i += 1) {
+                try {
+                    process.stdout.write(pendingResponses[i].line);
+                } catch {
+                    break;
+                }
+            }
+        }
+        pendingResponses.length = 0;
+        pendingResponseIndex = 0;
+        pendingResponseBytes = 0;
         // Exit 0 rather than re-raising a clean signal. Preserve a non-zero
         // status when the output transport itself failed.
         process.exitCode = outputFailed ? 1 : 0;
@@ -857,7 +920,24 @@ export function runStdio(): StdioHandle {
         // either would still be holding the loop open — and process.exit()
         // from there terminates immediately without the graceful handle
         // teardown, so the watchers stay armed until the process is gone.
-        process.once("beforeExit", () => process.exit(process.exitCode ?? 0));
+        process.once("beforeExit", () => {
+            // The ONLY safe point to close the workspace database. The loop has
+            // drained here, so no workspace.* handler can still be holding a
+            // statement open — closing while one is mid-query would turn a
+            // reply that was about to succeed into "database is not open".
+            //
+            // Skipping the close is not a durability problem: SQLite's
+            // write-ahead log is crash-safe by construction, which it has to be
+            // because a daemon can be SIGKILLed or lose its machine at any
+            // moment. What the close buys is an orderly stop that CHECKPOINTS
+            // the log and removes the -wal/-shm files, instead of leaving a
+            // write-ahead log behind for the next process to recover on open.
+            // That is also why the grace timer below deliberately does NOT call
+            // it: that path exists for a handler that is stuck, i.e. exactly the
+            // case where a statement may still be running.
+            closeDefaultWorkspace();
+            process.exit(process.exitCode ?? 0);
+        });
         // Installing a handler at all removes the default "die now", so this
         // timer is the backstop for a stuck handler or stdout.
         setTimeout(() => process.exit(process.exitCode ?? 0), SHUTDOWN_GRACE_MS).unref();

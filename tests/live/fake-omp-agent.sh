@@ -10,16 +10,21 @@
 #
 #   usage: fake-omp-agent.sh <native-event> [tool]
 #
+# Run it directly (it is mode 0755) so the shebang above picks the shell: the
+# `set -o pipefail` below is a Bash option, and `sh fake-omp-agent.sh ...` on a
+# host whose /bin/sh is dash or BusyBox ash aborts on it before firing anything.
+#
 #   env (required):
 #     CH_HOOK_NODE        node binary (>= 23.6; runs the TypeScript directly)
 #     CH_HOOK_REPO        CodeHarbor checkout root holding remote/src
 #     OMP_DEV_SESSION_ID  Dev Session the event belongs to
 #     OMP_TERMINAL_ID     terminal pane the agent runs in
-#   env (optional):
+#   env (optional, passed through to the hook untouched):
 #     XDG_RUNTIME_DIR     selects the bridge socket, <dir>/codeharbor.sock
 #                         (SPEC 6.3; defaults to ~/.cache/codeharbor)
 #     OMP_SUMMARY         human-readable summary carried to the notification
 #     OMP_ERROR=1         mark the firing as an agent/hook error
+#     OMP_METADATA        JSON object of free-form fields carried to the client
 #
 # A tool name is a positional argument rather than an env var so the caller
 # cannot leave a stale OMP_TOOL set across firings: `tool_call` with tool `ask`

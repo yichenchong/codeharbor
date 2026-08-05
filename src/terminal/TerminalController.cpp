@@ -509,11 +509,13 @@ qsizetype TerminalController::resyncBoundary(const QByteArray &buffer, qsizetype
             // A sequence that crosses the nominal resync window is still
             // emitted as a whole. The window bounds ordinary scrolling data;
             // it must not turn a long OSC title into literal terminal text.
+            //
+            // No line-feed check here: `completed` is only ever true on the
+            // final byte of a control sequence, and no control sequence ends
+            // on a line feed.
             if (candidate <= limit || sequenceStart < from) {
                 if (safe < 0)
                     safe = candidate;
-                if (byte == '\n' && before == EscapeState::Normal)
-                    lineFeed = candidate;
                 if (candidate > limit)
                     break;
             }
@@ -529,8 +531,14 @@ qsizetype TerminalController::resyncBoundary(const QByteArray &buffer, qsizetype
                     static_cast<unsigned char>(buffer.at(candidate))))) {
             if (safe < 0)
                 safe = candidate;
-            if (byte == '\n')
+            // The FIRST line feed at or after the cut, not the last one in the
+            // window: both are equally safe resume points, and taking the last
+            // one throws away up to a whole window of scrollback the eviction
+            // never asked for.
+            if (byte == '\n') {
                 lineFeed = candidate;
+                break;
+            }
         }
         // Once the bounded look-ahead is exhausted in ordinary text there is
         // no sequence left to finish; do not scan the remaining megabytes of

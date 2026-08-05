@@ -131,7 +131,63 @@ if [ "$status" -ne 0 ]; then
     echo "vcpkg_patches.sh: $found patch(es) checked, at least one is malformed" >&2
     echo "A context line must reproduce the upstream file EXACTLY, including any" >&2
     echo "upstream typo, and must keep its leading space." >&2
+fi
+
+# Second contract: the portfile's PATCHES list and the patch files on disk must
+# name exactly the same set.
+#
+# The loop above proves each patch PARSES; it says nothing about whether vcpkg
+# will ever look at it. A patch that is renamed, or added to the directory and
+# never listed, is invisible here: `vcpkg_extract_source_archive` applies only
+# what PATCHES names, and it aborts the whole port when a named file is absent.
+# Either way the first thing to notice is a Windows release job dying during
+# extraction, ten minutes into a build for a tag that is already permanent.
+work="$(mktemp -d)"
+trap 'rm -rf "$work"' EXIT
+
+ports=0
+while IFS= read -r -d '' portfile; do
+    ports=$((ports + 1))
+    portdir="$(dirname "$portfile")"
+
+    # The names between `PATCHES` and the closing `)` of the
+    # vcpkg_extract_source_archive() call. Comments and blank lines are ignored;
+    # anything else in that block is a filename relative to the port directory.
+    awk '
+        !inlist && $1 == "PATCHES" {
+            inlist = 1
+            for (i = 2; i <= NF; i++) print $i
+            next
+        }
+        inlist && /^[[:space:]]*\)/ { inlist = 0; next }
+        inlist {
+            sub(/#.*/, "")
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "")
+            if ($0 != "") print
+        }
+    ' "$portfile" | sort >"$work/listed"
+
+    find "$portdir" -maxdepth 1 -type f \( -name '*.patch' -o -name '*.diff' \) \
+        -exec basename {} \; | sort >"$work/present"
+
+    if ! diff -u "$work/listed" "$work/present" >"$work/diff"; then
+        echo "vcpkg_patches.sh: $portfile's PATCHES list does not match $portdir" >&2
+        echo "  (-) listed in the portfile but not on disk: vcpkg aborts the port." >&2
+        echo "  (+) on disk but not listed: the patch is never applied." >&2
+        sed -n '3,$p' "$work/diff" >&2
+        status=1
+    fi
+done < <(find "$dir" -type f -name portfile.cmake -print0)
+
+if [ "$ports" -eq 0 ]; then
+    echo "vcpkg_patches.sh: found no portfile.cmake under $dir; the patches above" >&2
+    echo "are applied by nothing, so the check would pass vacuously" >&2
     exit 1
 fi
 
-echo "vcpkg_patches.sh: $found patch(es) are well formed"
+if [ "$status" -ne 0 ]; then
+    exit 1
+fi
+
+echo "vcpkg_patches.sh: $found patch(es) are well formed and are exactly what" \
+     "$ports portfile(s) apply"

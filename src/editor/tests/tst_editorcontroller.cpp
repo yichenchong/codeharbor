@@ -229,6 +229,12 @@ private slots:
     void aPageReloadWithUnsavedWorkIsOfferedItsRecoverySnapshot();
     void reportContentDuringALoadIsIgnored();
     void reportIdenticalContentDoesNotStayDirty();
+    void aSaveIssuedAfterAnExplicitReloadIsNotSwallowedByTheOldWrite();
+    void aPageReloadDuringAnOutageIsServedWhenTheTransportReturns();
+    void aSaveWithNothingToWriteToIsRefusedWithAReason();
+    void recoveryIdArrivingAfterOpenStillOffersSnapshot();
+    void aSnapshotFromAPreviousFileIsNotOfferedAsThisOnes();
+    void aBase64SnapshotIsDecodedBeforeItIsOffered();
 
     // Out-of-order / superseded replies must never land on the file now open.
     void staleLoadReplyNeverWins();
@@ -3371,6 +3377,389 @@ void TstEditorController::anUndecodableBase64ReadIsAReadFailure()
     QVERIFY2(nextRequest(300).isEmpty(),
              "an undecodable read still re-derived permissions or truncated the "
              "recovery snapshot");
+}
+
+// A reload the USER asked for is allowed to replace the buffer with a write
+// still on the wire (aSaveReplyIsDroppedAfterAnExplicitReloadTookOverTheBuffer
+// pins that). What must ALSO happen is that the reload retires that write's
+// save chain. Otherwise the next Ctrl+S sees "a save is already in flight",
+// parks the user's bytes in the queue, and the old write's reply — which the
+// load-generation guard drops — throws them away without emitting saved,
+// saveConflict or saveError. The page would then be left believing the file was
+// written, the pane would call the buffer clean, and the next external change
+// would auto-reload straight over work that exists nowhere else.
+void TstEditorController::aSaveIssuedAfterAnExplicitReloadIsNotSwallowedByTheOldWrite()
+{
+    makePair();
+    openClean(QStringLiteral("/foo/f.txt"), QStringLiteral("hello"),
+              QStringLiteral("r1"));
+
+    QSignalSpy savedSpy(m_controller, &EditorController::saved);
+    QSignalSpy conflictSpy(m_controller, &EditorController::saveConflict);
+    QSignalSpy errorSpy(m_controller, &EditorController::saveError);
+
+    m_controller->save(QStringLiteral("the user's edits"), QStringLiteral("r1"));
+    const QJsonObject abandoned = nextRequest();
+    QCOMPARE(method(abandoned), kWriteFile);
+    // Deliberately left unanswered: this write stays on the wire throughout.
+
+    // The user presses Reload while it is still out there.
+    m_controller->requestReload();
+    const QJsonObject read = nextRequest();
+    QCOMPARE(method(read), kReadFile);
+    respondResult(reqId(read), {{"path", "/foo/f.txt"},
+                                {"encoding", "utf-8"},
+                                {"content", "the server's bytes"},
+                                {"revision", "r9"},
+                                {"truncated", false}});
+    const QJsonObject stat = nextRequest();
+    QCOMPARE(method(stat), kStat);
+    respondResult(reqId(stat), {{"path", "/foo/f.txt"},
+                                {"revision", "r9"},
+                                {"writable", true}});
+    QTRY_COMPARE(m_controller->fileState(), QStringLiteral("clean"));
+
+    // The user edits the reloaded buffer and saves it. This save belongs to the
+    // buffer on screen and must go out NOW, guarded by the revision the reload
+    // adopted — not queue behind a write for bytes the pane has discarded.
+    m_controller->save(QStringLiteral("typed after the reload"),
+                       QStringLiteral("r9"));
+    const QJsonObject write = nextRequest();
+    QVERIFY2(method(write) == kWriteFile,
+             "the save queued behind the write the reload superseded, where its "
+             "reply would silently throw the user's bytes away");
+    QCOMPARE(reqPath(write), QStringLiteral("/foo/f.txt"));
+    QCOMPARE(reqContent(write), QStringLiteral("typed after the reload"));
+    QCOMPARE(reqExpectedRevision(write), QStringLiteral("r9"));
+    QCOMPARE(m_controller->fileState(), QStringLiteral("saving"));
+
+    // The abandoned write finally answers. It decides nothing: not the pane's
+    // state, not the revision, and emphatically not this chain's flag.
+    respondResult(reqId(abandoned), {{"path", "/foo/f.txt"}, {"revision", "r2"}});
+    QTest::qWait(100);
+    QCOMPARE(savedSpy.count(), 0);
+    QCOMPARE(m_controller->fileState(), QStringLiteral("saving"));
+    QCOMPARE(m_controller->revision(), QStringLiteral("r9"));
+
+    // The live write is the one outcome the page sees.
+    respondResult(reqId(write), {{"path", "/foo/f.txt"}, {"revision", "r10"}});
+    QTRY_COMPARE(savedSpy.count(), 1);
+    QCOMPARE(savedSpy.at(0).at(0).toString(), QStringLiteral("r10"));
+    QCOMPARE(m_controller->revision(), QStringLiteral("r10"));
+    QTRY_COMPARE(m_controller->fileState(), QStringLiteral("clean"));
+    QCOMPARE(conflictSpy.count(), 0);
+    QCOMPARE(errorSpy.count(), 0);
+}
+
+// The Monaco page can reload at any moment (a renderer crash, a retargeted
+// bundle) — including while the SSH session is down. Its buffer is gone, so it
+// needs the file back, but nothing can be fetched over a dead transport: the
+// request fails synchronously AFTER open() has already cleared the dirty flag,
+// the revision baseline and the whole recovery slot. The pane would end up
+// blank, claiming "clean", with the only copy of the user's unsaved work sitting
+// in a snapshot nothing would ever probe again. The fetch is therefore deferred
+// to the next transport bind, which performs it in full.
+void TstEditorController::aPageReloadDuringAnOutageIsServedWhenTheTransportReturns()
+{
+    makePair();
+    openClean(QStringLiteral("/foo/f.txt"), QStringLiteral("orig"),
+              QStringLiteral("r1"));
+
+    m_controller->reportContent(QStringLiteral("work only the page holds"));
+    const QJsonObject snapshot = nextRequest();
+    QCOMPARE(method(snapshot), kWriteFile);
+    QCOMPARE(reqPath(snapshot), recoveryFilePath());
+    respondResult(reqId(snapshot),
+                  {{"path", recoveryFilePath()}, {"revision", "rec1"}});
+    QCOMPARE(m_controller->fileState(), QStringLiteral("modified"));
+
+    QSignalSpy contentSpy(m_controller, &EditorController::contentLoaded);
+    QSignalSpy recoverySpy(m_controller, &EditorController::recoveryAvailable);
+
+    // The session dies. Not reconnectTransport(): the page has to reload in the
+    // middle of the outage, so the drop and the rebind are separate steps here.
+    QSignalSpy closedSpy(m_client, &CodeharbordClient::transportClosed);
+    m_clientSide->disconnectFromServer();
+    QTRY_COMPARE(closedSpy.count(), 1);
+    m_client->setTransport(nullptr);
+    delete m_serverSide;
+    m_serverSide = nullptr;
+    delete m_clientSide;
+    m_clientSide = nullptr;
+    delete m_server;
+    m_server = nullptr;
+    m_serverBuf.clear();
+    QCOMPARE(m_controller->fileState(), QStringLiteral("disconnected"));
+
+    // The page reloads while there is nothing to fetch over: a second ready()
+    // with no held buffer to replay. Nothing may be mutated or attempted.
+    m_controller->ready();
+    QTest::qWait(100);
+    QCOMPARE(m_controller->fileState(), QStringLiteral("disconnected"));
+    QCOMPARE(contentSpy.count(), 0);
+
+    // The replacement server arrives, and the debt is paid. The buffer was
+    // dirty, so this is a full re-open — which is what puts the crash-recovery
+    // snapshot back in front of the user (SPEC 11.3). No file.unwatch: the id
+    // died with the process that minted it.
+    makePair();
+
+    const QJsonObject read = nextRequest();
+    QVERIFY2(method(read) == kReadFile,
+             "the reloaded page was never served: the pane re-subscribed and "
+             "reconciled as if its buffer were still on screen");
+    QCOMPARE(reqPath(read), QStringLiteral("/foo/f.txt"));
+    respondResult(reqId(read), {{"path", "/foo/f.txt"},
+                                {"encoding", "utf-8"},
+                                {"content", "orig"},
+                                {"revision", "r1"},
+                                {"truncated", false}});
+
+    const QJsonObject watch = nextRequest();
+    QCOMPARE(method(watch), kWatch);
+    QCOMPARE(reqPath(watch), QStringLiteral("/foo/f.txt"));
+    respondResult(reqId(watch), {{"subscriptionId", "sub2"}});
+
+    servePermissionStat();
+
+    const QJsonObject recStat = nextRequest();
+    QCOMPARE(method(recStat), kStat);
+    QCOMPARE(reqPath(recStat), recoveryFilePath());
+    respondResult(reqId(recStat),
+                  {{"path", recoveryFilePath()}, {"revision", "rec1"}});
+
+    const QJsonObject recRead = nextRequest();
+    QCOMPARE(method(recRead), kReadFile);
+    QCOMPARE(reqPath(recRead), recoveryFilePath());
+    respondResult(
+        reqId(recRead),
+        {{"path", recoveryFilePath()},
+         {"encoding", "utf-8"},
+         {"content", snapshotEnvelope(QStringLiteral("/foo/f.txt"),
+                                      QStringLiteral("work only the page holds"))},
+         {"revision", "rec1"},
+         {"truncated", false}});
+
+    QTRY_COMPARE(contentSpy.count(), 1);
+    QTRY_COMPARE(recoverySpy.count(), 1);
+    QCOMPARE(recoverySpy.at(0).at(0).toString(),
+             QStringLiteral("work only the page holds"));
+    QCOMPARE(m_controller->fileState(), QStringLiteral("clean"));
+
+    // The debt is settled, not standing: a later rebind reconciles normally
+    // instead of re-opening the file underneath the page.
+    reconnectTransport();
+    const QJsonObject rewatch = nextRequest();
+    QCOMPARE(method(rewatch), kWatch);
+    respondResult(reqId(rewatch), {{"subscriptionId", "sub3"}});
+    const QJsonObject reconcile = nextRequest();
+    QCOMPARE(method(reconcile), kStat);
+    QCOMPARE(reqPath(reconcile), QStringLiteral("/foo/f.txt"));
+}
+
+// Every refusal save() makes has to be audible. The page hands its buffer over
+// fire-and-forget, cancels the crash-recovery timer it had armed, and then waits
+// for saved / saveConflict / saveError; a silent return leaves the user believing
+// the file was written when nothing was even sent.
+void TstEditorController::aSaveWithNothingToWriteToIsRefusedWithAReason()
+{
+    makePair();
+
+    // Nothing has been opened in this pane, so there is no path to write to.
+    QSignalSpy errorSpy(m_controller, &EditorController::saveError);
+    m_controller->save(QStringLiteral("bytes with nowhere to go"), QString());
+    QCOMPARE(errorSpy.count(), 1);
+    QVERIFY2(errorSpy.at(0).at(0).toString().contains(
+                 QStringLiteral("no file is open"), Qt::CaseInsensitive),
+             qPrintable(errorSpy.at(0).at(0).toString()));
+    QVERIFY2(nextRequest(300).isEmpty(),
+             "a save with no file open reached the server");
+
+    // ...and a controller whose borrowed RPC client has been destroyed (the
+    // session is being torn down) says so rather than swallowing the save.
+    EditorController clientless(nullptr, kPaneId);
+    QSignalSpy clientlessErrors(&clientless, &EditorController::saveError);
+    clientless.save(QStringLiteral("bytes with nobody to send them to"),
+                    QStringLiteral("r1"));
+    QCOMPARE(clientlessErrors.count(), 1);
+    QVERIFY2(clientlessErrors.at(0).at(0).toString().contains(
+                 QStringLiteral("disconnected"), Qt::CaseInsensitive),
+             qPrintable(clientlessErrors.at(0).at(0).toString()));
+}
+
+// The twin of recoveryDirArrivingAfterOpenStillOffersSnapshot, for the OTHER
+// half of the recovery key. The pane's layout id is assigned by the region's
+// layout logic and can settle after the controller exists — EditorPaneView
+// pushes it in through setRecoveryId() — so the slot it names has never been
+// probed. Until it arrives recovery is DISABLED rather than sharing one unkeyed
+// snapshot file between panes.
+void TstEditorController::recoveryIdArrivingAfterOpenStillOffersSnapshot()
+{
+    makePair();
+    m_controller->setRecoveryId(QString());
+    m_controller->ready();
+    m_controller->open(QStringLiteral("/foo/f.txt"));
+
+    const QJsonObject read = nextRequest();
+    QCOMPARE(method(read), kReadFile);
+    respondResult(reqId(read), {{"path", "/foo/f.txt"},
+                                {"encoding", "utf-8"},
+                                {"content", "orig"},
+                                {"revision", "r1"},
+                                {"truncated", false}});
+    const QJsonObject watch = nextRequest();
+    QCOMPARE(method(watch), kWatch);
+    respondResult(reqId(watch), {{"subscriptionId", "sub1"}});
+    servePermissionStat();
+    QTRY_COMPARE(m_controller->fileState(), QStringLiteral("clean"));
+    QVERIFY2(nextRequest(300).isEmpty(),
+             "a pane with no stable id probed a recovery slot it cannot own");
+
+    QSignalSpy recoverySpy(m_controller, &EditorController::recoveryAvailable);
+    m_controller->setRecoveryId(kPaneId);
+    QCOMPARE(m_controller->recoveryId(), kPaneId);
+
+    const QJsonObject stat = nextRequest();
+    QCOMPARE(method(stat), kStat);
+    QCOMPARE(reqPath(stat), recoveryFilePath());
+    respondResult(reqId(stat),
+                  {{"path", recoveryFilePath()}, {"revision", "rec1"}});
+
+    const QJsonObject recRead = nextRequest();
+    QCOMPARE(method(recRead), kReadFile);
+    QCOMPARE(reqPath(recRead), recoveryFilePath());
+    respondResult(reqId(recRead),
+                  {{"path", recoveryFilePath()},
+                   {"encoding", "utf-8"},
+                   {"content", snapshotEnvelope(QStringLiteral("/foo/f.txt"),
+                                                QStringLiteral("recovered"))},
+                   {"revision", "rec1"},
+                   {"truncated", false}});
+
+    QTRY_COMPARE(recoverySpy.count(), 1);
+    QCOMPARE(recoverySpy.at(0).at(0).toString(), QStringLiteral("recovered"));
+}
+
+// There is ONE snapshot file per pane and the pane REUSES it as it switches
+// files, which is why the snapshot is a JSON envelope recording the path it
+// belongs to. A snapshot this pane wrote for a file it has since left must never
+// be handed back as the current file's unsaved work: accepting it would paste
+// one file's text into another.
+void TstEditorController::aSnapshotFromAPreviousFileIsNotOfferedAsThisOnes()
+{
+    makePair();
+    openClean(QStringLiteral("/foo/a.txt"), QStringLiteral("A"),
+              QStringLiteral("ra1"));
+
+    m_controller->reportContent(QStringLiteral("edits in a.txt"));
+    const QJsonObject snapshot = nextRequest();
+    QCOMPARE(method(snapshot), kWriteFile);
+    QCOMPARE(reqPath(snapshot), recoveryFilePath());
+    QCOMPARE(snapshotPathOf(snapshot), QStringLiteral("/foo/a.txt"));
+    respondResult(reqId(snapshot),
+                  {{"path", recoveryFilePath()}, {"revision", "rec1"}});
+
+    // Switch to another file. Its recovery slot is the very same file.
+    QSignalSpy recoverySpy(m_controller, &EditorController::recoveryAvailable);
+    m_controller->open(QStringLiteral("/foo/b.txt"));
+    const QJsonObject unwatch = nextRequest();
+    QCOMPARE(method(unwatch), kUnwatch);
+    respondResult(reqId(unwatch), {});
+    const QJsonObject read = nextRequest();
+    QCOMPARE(method(read), kReadFile);
+    QCOMPARE(reqPath(read), QStringLiteral("/foo/b.txt"));
+    respondResult(reqId(read), {{"path", "/foo/b.txt"},
+                                {"encoding", "utf-8"},
+                                {"content", "B"},
+                                {"revision", "rb1"},
+                                {"truncated", false}});
+    const QJsonObject watch = nextRequest();
+    QCOMPARE(method(watch), kWatch);
+    respondResult(reqId(watch), {{"subscriptionId", "sub2"}});
+    servePermissionStat();
+
+    const QJsonObject recStat = nextRequest();
+    QCOMPARE(method(recStat), kStat);
+    QCOMPARE(reqPath(recStat), recoveryFilePath());
+    respondResult(reqId(recStat),
+                  {{"path", recoveryFilePath()}, {"revision", "rec1"}});
+
+    const QJsonObject recRead = nextRequest();
+    QCOMPARE(method(recRead), kReadFile);
+    respondResult(reqId(recRead),
+                  {{"path", recoveryFilePath()},
+                   {"encoding", "utf-8"},
+                   {"content", snapshotEnvelope(QStringLiteral("/foo/a.txt"),
+                                                QStringLiteral("edits in a.txt"))},
+                   {"revision", "rec1"},
+                   {"truncated", false}});
+
+    QTest::qWait(100);
+    QVERIFY2(recoverySpy.isEmpty(),
+             "a snapshot belonging to the PREVIOUS file was offered as this "
+             "file's unsaved work");
+    QCOMPARE(m_controller->fileState(), QStringLiteral("clean"));
+
+    // The slot's revision was still adopted, so b.txt's own snapshot is a
+    // guarded overwrite rather than a create the server would refuse.
+    m_controller->reportContent(QStringLiteral("edits in b.txt"));
+    const QJsonObject next = nextRequest();
+    QCOMPARE(method(next), kWriteFile);
+    QCOMPARE(reqPath(next), recoveryFilePath());
+    QCOMPARE(reqExpectedRevision(next), QStringLiteral("rec1"));
+    QCOMPARE(snapshotPathOf(next), QStringLiteral("/foo/b.txt"));
+}
+
+// The snapshot is read back through the ordinary file.readFile wire shape, so it
+// arrives base64 whenever the daemon's strict UTF-8 decoder refuses its bytes.
+// Reading that payload as if it were the text hands the envelope parser a wall
+// of base64, which does not parse — and the user's unsaved work is silently
+// dropped from the offer. It must be decoded first, exactly as open() and
+// reload() decode the file itself.
+void TstEditorController::aBase64SnapshotIsDecodedBeforeItIsOffered()
+{
+    makePair();
+    openClean(QStringLiteral("/foo/f.txt"), QStringLiteral("orig"),
+              QStringLiteral("r1"));
+
+    QSignalSpy recoverySpy(m_controller, &EditorController::recoveryAvailable);
+
+    m_controller->open(QStringLiteral("/foo/f.txt"));
+    const QJsonObject unwatch = nextRequest();
+    QCOMPARE(method(unwatch), kUnwatch);
+    respondResult(reqId(unwatch), {});
+    const QJsonObject read = nextRequest();
+    QCOMPARE(method(read), kReadFile);
+    respondResult(reqId(read), {{"path", "/foo/f.txt"},
+                                {"encoding", "utf-8"},
+                                {"content", "orig"},
+                                {"revision", "r1"},
+                                {"truncated", false}});
+    const QJsonObject watch = nextRequest();
+    QCOMPARE(method(watch), kWatch);
+    respondResult(reqId(watch), {{"subscriptionId", "sub2"}});
+    servePermissionStat();
+
+    const QJsonObject recStat = nextRequest();
+    QCOMPARE(method(recStat), kStat);
+    QCOMPARE(reqPath(recStat), recoveryFilePath());
+    respondResult(reqId(recStat),
+                  {{"path", recoveryFilePath()}, {"revision", "rec1"}});
+
+    const QString envelope = snapshotEnvelope(QStringLiteral("/foo/f.txt"),
+                                              QStringLiteral("recovered edits"));
+    const QJsonObject recRead = nextRequest();
+    QCOMPARE(method(recRead), kReadFile);
+    respondResult(
+        reqId(recRead),
+        {{"path", recoveryFilePath()},
+         {"encoding", "base64"},
+         {"content", QString::fromLatin1(envelope.toUtf8().toBase64())},
+         {"revision", "rec1"},
+         {"truncated", false}});
+
+    QTRY_COMPARE(recoverySpy.count(), 1);
+    QCOMPARE(recoverySpy.at(0).at(0).toString(), QStringLiteral("recovered edits"));
 }
 
 QTEST_GUILESS_MAIN(TstEditorController)

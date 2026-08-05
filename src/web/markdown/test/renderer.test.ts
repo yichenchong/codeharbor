@@ -108,6 +108,127 @@ test("relative images and links resolve against the document directory", () => {
     );
 });
 
+test("no image can carry a source the host did not mint", () => {
+    const dom = new JSDOM("");
+    const { window } = dom;
+    // DOMPurify exempts data: URIs on <img src> from its URL policy and gives
+    // no way to switch that exemption off, so the sanitizer alone lets this
+    // through. The rewrite is what has to remove it, and this pins that.
+    const inlinePayload = renderMarkdown(
+        '<img src="data:image/svg+xml;base64,PHN2Zy8+">',
+        sanitizerFor(window),
+    );
+    assert.match(inlinePayload, /data:image\/svg/);
+    const rewritten = rewriteRelativeUrls(inlinePayload, "/docs/readme.md", window.document);
+    assert.doesNotMatch(rewritten, /src=/i);
+    assert.doesNotMatch(rewritten, /data:/i);
+
+    // An absolute http(s) source is not a relative resource, so no path is
+    // recorded for the bridge and nothing is left for the browser to fetch.
+    const remote = rewriteRelativeUrls(
+        renderMarkdown('<img src="https://evil.example/beacon.png">', sanitizerFor(window)),
+        "/docs/readme.md",
+        window.document,
+    );
+    assert.doesNotMatch(remote, /src=|data-ch-image-path=/i);
+});
+
+test("an <input type=image> cannot fetch a URL from the privileged page", () => {
+    const dom = new JSDOM("");
+    const { window } = dom;
+    // <input> survives sanitisation because the task-list checkbox renderer
+    // emits one, and an https: src passes the URL policy. It is an image
+    // request all the same, and it is not an <img>, so the img rewrite misses
+    // it. Left alone the privileged page would call out to an external host.
+    const rewritten = rewriteRelativeUrls(
+        renderMarkdown(
+            '<input type="image" src="https://evil.example/beacon.png">'
+            + '<input type="image" src="local.png">',
+            sanitizerFor(window),
+        ),
+        "/docs/readme.md",
+        window.document,
+    );
+    assert.doesNotMatch(rewritten, /src=/i);
+    assert.doesNotMatch(rewritten, /evil\.example/i);
+    // The task-list checkbox the renderer itself emits is untouched.
+    const checklist = renderMarkdown("- [x] done", sanitizerFor(window));
+    assert.match(checklist, /<input type="checkbox" checked="" disabled="">/);
+});
+
+test("attributes that fetch or redirect on the document's behalf are removed", () => {
+    const dom = new JSDOM("");
+    const { window } = dom;
+    const html = renderMarkdown(
+        '<table><tr><td background="https://evil.example/b.png">cell</td></tr></table>'
+        + '<a href="notes.md" download="notes.md" referrerpolicy="unsafe-url">link</a>'
+        + '<img src="logo.png" crossorigin="use-credentials">',
+        sanitizerFor(window),
+    );
+    // `background` is a legacy attribute Chromium still honours: it loads an
+    // image from an arbitrary URL without ever being an <img>. `download` turns
+    // a click into a profile download instead of the in-pane navigation QML
+    // arbitrates. The other two let the document dictate how the privileged
+    // page requests its own subresources.
+    assert.doesNotMatch(html, /background=|download=|referrerpolicy=|crossorigin=/i);
+    // ...and the content around them still renders.
+    assert.match(html, /cell/);
+    assert.match(html, /link/);
+});
+
+test("link rewriting keeps every address inside the remote file namespace", () => {
+    const dom = new JSDOM("");
+    const { window } = dom;
+    const rewritten = rewriteRelativeUrls(
+        renderMarkdown(
+            "[up](../../../../etc/passwd) [abs](/srv/other.md) "
+            + "[remote](https://example.test/x) [anchor](#section)",
+            sanitizerFor(window),
+        ),
+        "/docs/guide/README.md",
+        window.document,
+    );
+    // ".." can never walk above the server's root, and an absolute path is
+    // taken as given: SPEC 9 allows a document to link outside the project, and
+    // the pane marks that rather than refusing it.
+    assert.match(rewritten, /href="file:\/\/\/etc\/passwd"/);
+    assert.match(rewritten, /href="file:\/\/\/srv\/other\.md"/);
+    // Absolute and in-page addresses are left exactly as the author wrote them.
+    assert.match(rewritten, /href="https:\/\/example\.test\/x"/);
+    assert.match(rewritten, /href="#section"/);
+
+    // A protocol-relative URL never becomes a network address: the URL policy
+    // rejects it, so the sanitizer drops the attribute entirely.
+    const protocolRelative = rewriteRelativeUrls(
+        renderMarkdown('<a href="//evil.example/x">l</a>', sanitizerFor(window)),
+        "/docs/readme.md",
+        window.document,
+    );
+    assert.doesNotMatch(protocolRelative, /evil\.example/);
+});
+
+test("relative paths resolve the same wherever the document sits", () => {
+    // The document's own address decides the base directory. These are the
+    // spellings a real remote path arrives in.
+    assert.equal(resolveRemotePath("/README.md", "docs/a.png"), "/docs/a.png");
+    assert.equal(resolveRemotePath("/docs/", "a.png"), "/docs/a.png");
+    assert.equal(resolveRemotePath("/docs/readme.md", "./a.png"), "/docs/a.png");
+    assert.equal(resolveRemotePath("/docs/readme.md", "b/../a.png"), "/docs/a.png");
+    assert.equal(resolveRemotePath("/docs/readme.md", "/abs.png"), "/abs.png");
+    // A query or fragment belongs to neither path.
+    assert.equal(resolveRemotePath("/docs/readme.md?v=2", "a.png"), "/docs/a.png");
+    assert.equal(resolveRemotePath("/docs/readme.md", "a.png#top"), "/docs/a.png");
+    // No document path at all still yields an absolute server path.
+    assert.equal(resolveRemotePath("", "a.png"), "/a.png");
+});
+
+test("an empty sanitizer result is returned as-is, never as the dirty HTML", () => {
+    // The fallback in renderMarkdown() exists for a sanitizer that THROWS. A
+    // sanitizer that legitimately removes everything must not be second-guessed
+    // into republishing the unsanitised input.
+    assert.equal(renderMarkdown("<script>alert(1)</script>", { sanitize: () => "" }), "");
+});
+
 test("a sanitizer that strips raw tags leaves the Markdown document readable", () => {
     const sanitizer = { sanitize: (dirty: string): string => dirty.replaceAll(/<span[^>]*>|<\/span>/gi, "") };
     const html = renderMarkdown("Keep <span>this sentence</span> visible.", sanitizer);
@@ -159,4 +280,44 @@ test("the image bridge uses WebChannel return-value callbacks, not QML callbacks
         "codeharbor-internal://file/image-id",
     );
     assert.deepEqual(calls, ["../assets/diagram.png"]);
+});
+
+test("the image bridge answers every caller exactly once, even when it fails", async () => {
+    // A bridge that is gone, or that refuses the path, must not leave the
+    // renderer awaiting a promise that never settles: the whole render awaits
+    // these, so one hung image would freeze the pane on a half-drawn document.
+    const throwing: MarkdownBridge = {
+        resolveImage: () => {
+            throw new Error("bridge detached");
+        },
+    };
+    assert.equal(await requestImageUrl(throwing, "diagram.png"), "");
+
+    // QML answers "" for a path it will not resolve.
+    assert.equal(await requestImageUrl({ resolveImage: () => "" }, "../../etc/passwd"), "");
+
+    // A bridge that neither calls back nor returns a string — a WebChannel
+    // transport torn down mid-render — must not hang the caller forever. The
+    // renderer awaits one of these per image, so a single silent answer used to
+    // leave that render pending for the life of the page.
+    const started = Date.now();
+    assert.equal(await requestImageUrl({ resolveImage: () => undefined }, "x.png", 20), "");
+    assert.ok(Date.now() - started < 5_000, "the timeout did not bound the wait");
+
+    // The FIRST answer wins and later ones are ignored, so a host that both
+    // calls back and returns cannot resolve one image twice.
+    const values: unknown[] = [];
+    const chatty: MarkdownBridge = {
+        resolveImage(relativePath: string, callback?: (value: string) => void): string {
+            values.push(relativePath);
+            callback?.("codeharbor-internal://file/first");
+            callback?.("codeharbor-internal://file/second");
+            return "codeharbor-internal://file/third";
+        },
+    };
+    assert.equal(
+        await requestImageUrl(chatty, "a.png"),
+        "codeharbor-internal://file/first",
+    );
+    assert.deepEqual(values, ["a.png"]);
 });

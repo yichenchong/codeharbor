@@ -63,7 +63,6 @@ const defaultThemeRoles: Record<ThemeRoleName, string> = {
 };
 
 const themeRoleNames = Object.keys(defaultThemeRoles) as ThemeRoleName[];
-let activeThemeRoles: Record<ThemeRoleName, string> = { ...defaultThemeRoles };
 let mountedRoot: HTMLElement | null = null;
 let mountedBridge: MarkdownBridge | null = null;
 let mountedPath = "";
@@ -164,8 +163,7 @@ async function renderCurrent(): Promise<void> {
  * update must never create a second unsanitised insertion path.
  */
 export function applyTheme(roles: unknown): void {
-    activeThemeRoles = normaliseThemeRoles(roles);
-    applyThemeToDocument(activeThemeRoles);
+    applyThemeToDocument(normaliseThemeRoles(roles));
     void renderCurrent();
 }
 
@@ -311,23 +309,19 @@ type QWebChannelCtor = new (
 declare const QWebChannel: QWebChannelCtor | undefined;
 declare const qt: { webChannelTransport: unknown } | undefined;
 
-function showFatal(message: string): void {
-    showError(message);
-}
-
 export function connectMarkdown(
     element: HTMLElement,
     options: MarkdownMountOptions,
 ): void {
     if (typeof QWebChannel === "undefined" || typeof qt === "undefined"
         || !qt.webChannelTransport) {
-        showFatal("This page requires the CodeHarbor host: no WebChannel transport.");
+        showError("This page requires the CodeHarbor host: no WebChannel transport.");
         return;
     }
     new QWebChannel(qt.webChannelTransport, (channel: QWebChannelInstance) => {
         const bridge = channel.objects.markdown as MarkdownBridge | undefined;
         if (!bridge || typeof bridge.resolveImage !== "function") {
-            showFatal("The Markdown bridge is missing from this window.");
+            showError("The Markdown bridge is missing from this window.");
             return;
         }
         void mountMarkdown(element, bridge, options);
@@ -343,7 +337,7 @@ function bootstrap(): void {
     const sourceUrl = query.get("source") ?? "";
     const documentPath = query.get("path") ?? "";
     if (sourceUrl.length === 0 || documentPath.length === 0) {
-        showFatal("The Markdown document address is missing.");
+        showError("The Markdown document address is missing.");
         return;
     }
     connectMarkdown(root, { sourceUrl, documentPath });

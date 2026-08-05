@@ -21,7 +21,17 @@ Item {
         (typeof viewers !== "undefined") ? viewers : null
     property url internalUrl: ""
     property bool retained: false
-    property var retainedSubresources: []
+    // Internal address -> true, for every subresource address this view has
+    // pinned for the document it is currently showing.
+    //
+    // A MAP, not a list. applyTheme() re-renders the document (deliberately —
+    // see index.ts — so a live theme change never creates a second unsanitised
+    // insertion path), the re-render re-requests EVERY image, and a list
+    // appended to with concat grew by the whole image count on every theme
+    // change: one more entry held, and one more pin taken on each address, for
+    // as long as the document stayed open. Keyed by address, one retain is
+    // taken per distinct address per document and exactly one release is owed.
+    property var retainedSubresources: ({})
     property string errorText: ""
     property bool pageReady: false
 
@@ -32,37 +42,110 @@ Item {
         return RemotePath.pathToFileUrl(path)
     }
 
-    function resolveImagePath(relativePath) {
-        const value = String(relativePath || "")
-        if (value.length === 0 || /^(?:[a-z][a-z0-9+.-]*:|\/\/)/i.test(value))
+    // ---- resolving a document-relative image reference ---------------------
+    //
+    // DUPLICATED, DELIBERATELY, and kept in step by hand. The same two rules —
+    // "is this reference relative" and "resolve it against the document's
+    // directory with POSIX `..` semantics" — are implemented in TypeScript in
+    // src/web/markdown/src/renderer.ts (isRelativeResource / pathDirectory /
+    // resolveRemotePath), which is the authority for the rendered page's own
+    // link rewriting.
+    //
+    // QML cannot call into that module: it is bundled JavaScript running in a
+    // separate Chromium world, and the only channel between them is the
+    // WebChannel bridge, whose frozen contract passes the RAW document-relative
+    // string. So this side has to resolve it too, and it resolves it against
+    // ITS OWN `remotePath` rather than trusting anything the page computed.
+    //
+    // The pair must agree. tst_paneidentity's
+    // theMarkdownImagePathResolverAgreesWithTheRendererBundle pins the shared
+    // table; test/renderer.test.ts pins the same cases on the other side.
+    //
+    // TWO deliberate divergences, both marked below and both in the same
+    // direction — this side refuses where the other side answers, because its
+    // answer is fed to a remote file READ and the other side's is used as a
+    // link target:
+    //
+    //   * a reference that climbs to the filesystem root. resolveRemotePath()
+    //     answers "/"; this answers "".
+    //   * no document to resolve against. resolveRemotePath() treats an empty
+    //     document path as "/" and answers "/a.png"; this answers "". The page
+    //     cannot reach that state at all — its document path is the `?path=`
+    //     query this very file wrote — and this view can, because `remotePath`
+    //     is empty until a url arrives.
+
+    // renderer.ts: isRelativeResource(). A "#" or "?" prefix is a same-document
+    // reference, not a resource — and it is not merely uninteresting here, it
+    // is harmful: everything before the first "?" or "#" is stripped below, so
+    // "#anchor" would otherwise resolve to the document's own DIRECTORY and
+    // this view would mint a file read for it.
+    function isRelativeResource(value) {
+        return value.length > 0
+            && !/^(?:[a-z][a-z0-9+.-]*:|\/\/)/i.test(value)
+            && value.charAt(0) !== "#"
+            && value.charAt(0) !== "?"
+    }
+
+    // renderer.ts: pathDirectory(), except for DIVERGENCE 2. "" — and only "" —
+    // means there is no document to resolve against; pathDirectory() would
+    // answer "/" and resolve against the filesystem root. This view can reach
+    // that state and the page cannot: `remotePath` is empty until a url
+    // arrives, while the page's document path is the `?path=` query navigate()
+    // wrote below.
+    function documentDirectory() {
+        const path = String(root.remotePath).split(/[?#]/, 1)[0]
+        if (path.length === 0)
             return ""
-        const withoutFragment = value.split(/[?#]/, 1)[0]
-        const base = root.remotePath.endsWith("/")
-            ? root.remotePath.substring(0, root.remotePath.length - 1)
-            : root.remotePath.substring(0, root.remotePath.lastIndexOf("/"))
-        const combined = withoutFragment.charAt(0) === "/"
-            ? withoutFragment : base + "/" + withoutFragment
+        if (path.charAt(path.length - 1) === "/")
+            return path.substring(0, path.length - 1) || "/"
+        const separator = path.lastIndexOf("/")
+        if (separator < 0)
+            return "/"
+        return path.substring(0, separator) || "/"
+    }
+
+    // renderer.ts: resolveRemotePath(), plus the two refusals above.
+    function resolveImagePath(relativePath) {
+        const value = String(relativePath === undefined || relativePath === null
+                             ? "" : relativePath)
+        if (!root.isRelativeResource(value))
+            return ""
+        const directory = root.documentDirectory()
+        if (directory.length === 0)
+            return ""
+        const candidate = value.split(/[?#]/, 1)[0]
+        if (candidate.length === 0)
+            return ""
+        const combined = candidate.charAt(0) === "/"
+            ? candidate : directory + "/" + candidate
         const parts = []
         for (const part of combined.split("/")) {
             if (part.length === 0 || part === ".")
                 continue
             if (part === "..") {
+                // Clamped at the server root, exactly as resolveRemotePath()
+                // clamps it: ".." can never climb above "/".
                 if (parts.length > 0)
                     parts.pop()
                 continue
             }
             parts.push(part)
         }
+        // DIVERGENCE 1. resolveRemotePath() answers "/" here, which is a
+        // perfectly good LINK target. It is not a file, and this function's
+        // answer is fed straight to a remote read, so refusing is the honest
+        // reply; "" is the page's documented "no image" value.
+        if (parts.length === 0)
+            return ""
         return "/" + parts.join("/")
     }
 
     function releaseInternalUrl() {
         if (root.viewerModel) {
-            for (const subresource of root.retainedSubresources) {
-                root.viewerModel.releaseInternalUrl(String(subresource))
-            }
+            for (const subresource in root.retainedSubresources)
+                root.viewerModel.releaseInternalUrl(subresource)
         }
-        root.retainedSubresources = []
+        root.retainedSubresources = ({})
         if (root.retained && root.viewerModel)
             root.viewerModel.releaseInternalUrl(root.internalUrl.toString())
         root.retained = false
@@ -115,19 +198,38 @@ Item {
     // supplies a relative path from the current document; QML resolves it on
     // the remote server, mints an opaque internal URL, and pins that URL until
     // the page is retargeted or destroyed. There is no general read method.
+    //
+    // "" is the refusal, and the page understands it: requestImageUrl() in
+    // src/web/markdown/src/bridge.ts settles on "" for a bridge that refuses,
+    // throws or never answers, and renderCurrent() only sets an `src` for an
+    // address that starts with "codeharbor-internal://file/". So every failure
+    // here can be — and is — reported as "" rather than as a plausible-looking
+    // address the page would try to load.
     QtObject {
         id: markdownBridge
+        objectName: "markdownImageBridge"
         function resolveImage(relativePath) {
             const path = root.resolveImagePath(relativePath)
             if (path.length === 0 || !root.viewerModel)
                 return ""
-            const mapped = root.viewerModel.internalUrlFor(root.fileUrlFor(path))
-            if (root.viewerModel.retainInternalUrl(mapped.toString())) {
-                root.retainedSubresources = root.retainedSubresources.concat([
-                    mapped.toString()
-                ])
+            const mapped = String(root.viewerModel.internalUrlFor(root.fileUrlFor(path)))
+            if (mapped.length === 0)
+                return ""
+            // Already pinned for this document: hand back the same address
+            // without taking a second pin. The page asks again for every image
+            // on every theme-driven re-render, and each extra retain is one
+            // more release this view would owe and never make.
+            if (root.retainedSubresources[mapped] === true)
+                return mapped
+            if (!root.viewerModel.retainInternalUrl(mapped)) {
+                // Unknown or malformed (ViewerModel.h): nothing was pinned, so
+                // the address can be evicted while the page is still fetching
+                // it. Handing it over anyway would produce an image that loads
+                // sometimes; "" produces one that visibly does not.
+                return ""
             }
-            return mapped.toString()
+            root.retainedSubresources[mapped] = true
+            return mapped
         }
     }
 
@@ -163,6 +265,13 @@ Item {
                        || request.status === WebEngineView.LoadFailedStatus
                        || request.status === WebEngineView.LoadStoppedStatus) {
                 root.pageReady = false
+                // The renderer page itself failing to load leaves nothing on
+                // screen at all. internalResourceError only covers refusals of
+                // the DOCUMENT this page then fetches, so its wording wins when
+                // it has already arrived.
+                if (request.status === WebEngineView.LoadFailedStatus
+                        && root.errorText.length === 0)
+                    root.errorText = request.errorString
             }
         }
 

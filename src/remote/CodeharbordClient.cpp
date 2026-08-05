@@ -41,6 +41,14 @@ constexpr int kMaxLineBytes = 16 * 1024 * 1024;
 // already proven, so the tick counts a miss instead of adding a fifth id.
 constexpr qsizetype kMaxOutstandingProbes = 4;
 
+// Read-buffer capacity kept across frames. compactReadBuffer() drops the
+// consumed prefix but QByteArray::remove() keeps the allocation, so one
+// legitimately large frame — an inline file read is megabytes — would pin its
+// whole buffer for the rest of the client's life. Anything above this is handed
+// back once the buffer has drained; below it, holding on avoids a malloc per
+// frame on ordinary traffic.
+constexpr qsizetype kIdleReadCapacityBytes = 64 * 1024;
+
 // True when `line` holds nothing but ASCII whitespace, i.e. it is a separator
 // rather than a frame. Deliberately allocation free: QByteArray::trimmed() would
 // copy the WHOLE line — megabytes for an inline file read — just to answer "is
@@ -384,7 +392,20 @@ void CodeharbordClient::onReadyRead()
 
     const QPointer<QIODevice> sourceTransport = m_transport;
     const qsizetype bufferedBefore = m_readBuffer.size();
-    m_readBuffer.append(m_transport->read(kMaxLineBytes + 1));
+    // ONE bounded read per call, sized to what is actually waiting.
+    // QIODevice::read(n) resizes its result to n BEFORE reading, so asking for
+    // the cap unconditionally requested a 32 MiB allocation (16 MiB rounded up
+    // by QByteArray's growth policy) on EVERY readyRead, however few bytes had
+    // arrived: a 60-byte ping reply cost a 32 MiB malloc and free.
+    // bytesAvailable() is only a lower bound on some devices, so one that
+    // reports nothing still gets the full cap, and whatever this read leaves
+    // behind is picked up by the queued re-invoke at the bottom of this
+    // function.
+    const qint64 available = m_transport->bytesAvailable();
+    const qint64 chunkSize =
+        available > 0 ? qMin<qint64>(available, qint64(kMaxLineBytes) + 1)
+                      : qint64(kMaxLineBytes) + 1;
+    m_readBuffer.append(m_transport->read(chunkSize));
     // ANY bytes from the peer are proof of life, not just a ping reply. This is
     // one serialized JSONL stream, so while the peer is midway through writing a
     // multi-megabyte file.readFile frame its reply to our probe physically
@@ -517,12 +538,19 @@ void CodeharbordClient::onReadyRead()
 
 void CodeharbordClient::compactReadBuffer()
 {
-    if (m_readPos == 0)
-        return;
-    m_readBuffer.remove(0, m_readPos);
-    // m_scanOffset is never behind the cursor, so this stays non-negative.
-    m_scanOffset -= m_readPos;
-    m_readPos = 0;
+    if (m_readPos > 0) {
+        m_readBuffer.remove(0, m_readPos);
+        // m_scanOffset is never behind the cursor, so this stays non-negative.
+        m_scanOffset -= m_readPos;
+        m_readPos = 0;
+    }
+    // remove() keeps the allocation. Give a big one back once the buffer has
+    // drained, so a single multi-megabyte frame does not pin its buffer for the
+    // client's whole remaining life.
+    if (m_readBuffer.isEmpty() &&
+        m_readBuffer.capacity() > kIdleReadCapacityBytes) {
+        m_readBuffer.squeeze();
+    }
 }
 
 void CodeharbordClient::processLine(const QByteArray& line)
@@ -668,18 +696,26 @@ void CodeharbordClient::processLine(const QByteArray& line)
             // (JSON-RPC 2.0 section 5.1). Surface the violation but still fail
             // the callback with best-effort fields so the caller cannot hang.
             //
-            // `code` is probed with two distinct sentinels for the same reason
-            // the id is: toInt() silently yields its defaultValue for a
-            // fractional or out-of-int-range number, so `{"code": 1e12}` would
-            // otherwise reach the caller as a perfectly plausible-looking 0 with
-            // no hint that anything was lost.
-            if (!codeValue.isDouble() || codeValue.toInt(0) != codeValue.toInt(1) ||
+            // `code` is probed with two distinct sentinels because toInt()
+            // silently yields its defaultValue for a fractional or
+            // out-of-int-range number, so `{"code": 1e12}` would otherwise
+            // reach the caller as a perfectly plausible-looking 0 with no hint
+            // that anything was lost.
+            const bool usableCode =
+                codeValue.isDouble() && codeValue.toInt(0) == codeValue.toInt(1);
+            if (!usableCode ||
                 !errObj.value(QStringLiteral("message")).isString()) {
                 emit protocolWarning(
                     QStringLiteral("response %1 error object missing code/message")
                         .arg(id));
             }
-            error.code = codeValue.toInt();
+            // An unusable code becomes the synthetic internal-error code, NOT
+            // 0: 0 is a value a server could legitimately have sent, so a
+            // caller comparing against a known application code would silently
+            // take the wrong branch. The sibling case just below — an `error`
+            // that is not an object at all — already reports this same code for
+            // the same class of malformation.
+            error.code = usableCode ? codeValue.toInt() : kInternalError;
             error.message = errObj.value(QStringLiteral("message")).toString();
             error.data = errObj.value(QStringLiteral("data"));
         } else {
@@ -878,6 +914,8 @@ void CodeharbordClient::onHeartbeatTick()
         return;
     }
 
+    QPointer<CodeharbordClient> self(this);
+
     // "A probe is already on the wire" is the live one, OR enough retired ones
     // that issuing another would just grow m_pending/m_heartbeatProbeIds again.
     // A retired probe is abandoned but still physically in flight and still
@@ -887,53 +925,65 @@ void CodeharbordClient::onHeartbeatTick()
     // kMaxOutstandingProbes unanswered probes are already conclusive evidence
     // of silence, and the interval still counts as a miss below, so detection
     // gets faster rather than slower.
-    if (m_heartbeatProbeOutstanding ||
-        m_heartbeatProbeIds.size() >= kMaxOutstandingProbes) {
-        // The previous probe is still unanswered AND not one byte has arrived
-        // from the peer since (onReadyRead() would have zeroed this counter).
-        // Only ONE probe is ever in flight: piling on a fresh id every interval
-        // would measure the same silence and merely leave more entries to
-        // abandon. Consecutive silent intervals are the measurement.
-        ++m_heartbeatMisses;
-        if (m_heartbeatMisses < m_heartbeatMissTolerance)
+    //
+    // Only ONE probe is ever issued at a time: piling on a fresh id every
+    // interval would measure the same silence and merely leave more entries to
+    // abandon. Consecutive silent intervals are the measurement.
+    const bool probeAlreadyInFlight =
+        m_heartbeatProbeOutstanding ||
+        m_heartbeatProbeIds.size() >= kMaxOutstandingProbes;
+    if (!probeAlreadyInFlight) {
+        // Nothing outstanding, so probe. A probe that cannot even be WRITTEN is
+        // not proof of life either: on a transport that is bound and open but
+        // unwritable, call() fails the probe synchronously, and treating that
+        // as a completed interval meant the miss counter never moved. The peer
+        // was probed forever, never declared dead, and SessionBootstrap's
+        // reconnect ladder never ran. Count the interval as the silence it is.
+        const bool sent = sendHeartbeatPing();
+        if (!self || m_closed || m_destroying)
+            return; // the failed write already tore the transport down
+        if (sent)
             return;
-
-        // Last-gasp drain, for the same reason onTransportClosed() has one: the
-        // peer's answer may already be sitting on the transport with its
-        // readyRead() still queued behind this timeout. Killing a session over
-        // bytes we simply had not picked up yet would be the worst possible
-        // false positive. onReadyRead() zeroes the miss counter for any non-empty
-        // read, so that is the signal to check.
-        QPointer<CodeharbordClient> self(this);
-        if (m_transport->bytesAvailable() > 0) {
-            onReadyRead();
-            if (!self || m_closed)
-                return;
-            if (m_heartbeatMisses == 0)
-                return;
-        }
-        // The peer is dead or wedged. Take the ordinary transport-loss path
-        // rather than inventing a second kind of failure: every pending
-        // callback is failed exactly once with the standard synthetic transport
-        // error and transportClosed() is emitted, which is byte for byte what a
-        // real disconnect does and what SessionBootstrap's reconnect ladder
-        // already handles. onTransportClosed() stops this timer on the way
-        // through, via restartHeartbeat().
-        emit protocolWarning(
-            QStringLiteral("heartbeat: no response from peer for %1 consecutive "
-                           "intervals of %2 ms; treating transport as dead")
-                .arg(m_heartbeatMissTolerance)
-                .arg(m_heartbeatIntervalMs));
-        if (!self)
-            return; // the warning slot deleted us; there is nothing left to tear down
-        onTransportClosed();
-        return;
     }
 
-    sendHeartbeatPing();
+    // The previous probe is still unanswered (or could not be sent) AND not one
+    // byte has arrived from the peer since — onReadyRead() would have zeroed
+    // this counter.
+    ++m_heartbeatMisses;
+    if (m_heartbeatMisses < m_heartbeatMissTolerance)
+        return;
+
+    // Last-gasp drain, for the same reason onTransportClosed() has one: the
+    // peer's answer may already be sitting on the transport with its
+    // readyRead() still queued behind this timeout. Killing a session over
+    // bytes we simply had not picked up yet would be the worst possible false
+    // positive. onReadyRead() zeroes the miss counter for any non-empty read,
+    // so that is the signal to check.
+    if (m_transport && m_transport->bytesAvailable() > 0) {
+        onReadyRead();
+        if (!self || m_closed)
+            return;
+        if (m_heartbeatMisses == 0)
+            return;
+    }
+    // The peer is dead or wedged. Take the ordinary transport-loss path rather
+    // than inventing a second kind of failure: every pending callback is failed
+    // exactly once with the standard synthetic transport error and
+    // transportClosed() is emitted, which is byte for byte what a real
+    // disconnect does and what SessionBootstrap's reconnect ladder already
+    // handles. onTransportClosed() stops this timer on the way through, via
+    // restartHeartbeat().
+    emit protocolWarning(
+        QStringLiteral("heartbeat: no response from peer for %1 consecutive "
+                       "intervals of %2 ms; treating transport as dead")
+            .arg(m_heartbeatMissTolerance)
+            .arg(m_heartbeatIntervalMs));
+    if (!self)
+        return; // the warning slot deleted us; there is nothing left to tear down
+    onTransportClosed();
 }
 
-void CodeharbordClient::sendHeartbeatPing()
+bool CodeharbordClient::sendHeartbeatPing()
 {
     // Stamp this probe before issuing it. The callback captures the stamp BY
     // VALUE and refuses to touch the live state unless it still matches, which
@@ -958,24 +1008,29 @@ void CodeharbordClient::sendHeartbeatPing()
                  self->m_heartbeatProbeIds.remove(generation);
                  // A retired probe's answer says nothing about the transport we
                  // hold now — it may not even have come from the same peer — so
-                 // it neither clears the live probe nor resets the miss counter.
+                 // it does not clear the live probe.
                  if (generation != self->m_heartbeatGeneration)
                      return;
-                 // Any answer at all — including a "method not found" from a
-                 // daemon too old to know the probe — proves the peer is reading
-                 // and writing.
+                 // Release the slot so the next tick may probe again. The miss
+                 // counter is deliberately NOT touched here: this callback also
+                 // runs for a probe this client failed itself (an unwritable
+                 // transport, a rebind sweep), which is not evidence of a live
+                 // peer. Real proof of life is inbound BYTES, and
+                 // onReadyRead() has already zeroed the counter for those —
+                 // including for this very reply, which had to be read before
+                 // it could be dispatched here.
                  self->m_heartbeatProbeOutstanding = false;
-                 self->m_heartbeatMisses = 0;
              });
     if (!self)
-        return;
+        return false;
     if (!m_pending.contains(id))
-        return; // call() already failed it synchronously; nothing is in flight
+        return false; // call() already failed it synchronously; nothing in flight
     // Tracked for pendingCount() unconditionally, but treated as the LIVE probe
     // only if nothing retired us while call() was running.
     m_heartbeatProbeIds.insert(generation, id);
     if (generation == m_heartbeatGeneration)
         m_heartbeatProbeOutstanding = true;
+    return true;
 }
 
 } // namespace ch

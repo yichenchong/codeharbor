@@ -997,7 +997,8 @@ void TstTerminalController::hiddenEvictionResumesOnACleanBoundary()
         controller.ingestOutput(tail);
 
         const QByteArray &hidden = controller.hiddenBuffer();
-        // The LATER line feed was used, so the buffer is back under its cap.
+        // The line feed PAST the cut was used, not the decoy before it, so the
+        // buffer is back under its cap.
         QVERIFY(hidden.size() <= kCap);
         QCOMPARE(hidden.size(), kCap - 11);
         QVERIFY(!hidden.contains('\n')); // both decoy and resume point are gone
@@ -1024,6 +1025,63 @@ void TstTerminalController::hiddenEvictionResumesOnACleanBoundary()
         const QByteArray &hidden = controller.hiddenBuffer();
         // The overflow plus exactly one window, and not a byte more.
         QCOMPARE(hidden.size(), kCap - TerminalController::kHiddenResyncWindowBytes);
+        QCOMPARE(hidden.right(tail.size()), tail);
+    }
+
+    // (5) When the window offers SEVERAL resume points, the FIRST one wins.
+    // Every line feed at or after the cut is equally safe, so taking a later
+    // one throws away scrollback the overflow never asked for — up to a whole
+    // resync window of it on ordinary line-oriented output, which is exactly
+    // the output a terminal produces.
+    {
+        TerminalController controller;
+        controller.setViewVisible(false);
+
+        QByteArray fill(kCap, 'A');
+        const QByteArray tail(TerminalController::kFlushSizeBytes, 'B');
+        // Two line feeds past the raw cut, one near it and one near the far
+        // end of the resync window.
+        fill[tail.size() + 10] = '\n';
+        fill[tail.size() + TerminalController::kHiddenResyncWindowBytes - 10] = '\n';
+
+        controller.ingestOutput(fill);
+        controller.ingestOutput(tail);
+
+        const QByteArray &hidden = controller.hiddenBuffer();
+        // The NEAR line feed was the resume point: eleven bytes past the raw
+        // overflow, not most of a window past it.
+        QCOMPARE(hidden.size(), kCap - 11);
+        // The far one is still in the retained buffer, untouched.
+        QCOMPARE(hidden.count('\n'), static_cast<qsizetype>(1));
+        QCOMPARE(hidden.right(tail.size()), tail);
+    }
+
+    // (6) The other sequence an eviction must never cut into. An escape
+    // sequence straddling the raw overflow offset loses its ESC, and its
+    // remaining bytes ("[31m") are printed as literal text at the top of the
+    // replay instead of setting a colour. The cut moves past the whole
+    // sequence.
+    {
+        TerminalController controller;
+        controller.setViewVisible(false);
+
+        QByteArray fill(kCap, 'A');
+        const QByteArray tail(TerminalController::kFlushSizeBytes, 'B');
+        // ESC [ 3 1 m, positioned so the raw cut at index tail.size() lands on
+        // the '3' — two bytes into the sequence.
+        fill.replace(tail.size() - 2, 5, QByteArrayLiteral("\x1b[31m"));
+
+        controller.ingestOutput(fill);
+        controller.ingestOutput(tail);
+
+        const QByteArray &hidden = controller.hiddenBuffer();
+        // Three bytes past the raw overflow: the rest of the sequence went too.
+        QCOMPARE(hidden.size(), kCap - 3);
+        QCOMPARE(hidden.at(0), 'A');
+        // No orphaned tail of the control sequence survived at the front.
+        QVERIFY(!hidden.contains('\x1b'));
+        QVERIFY(!hidden.startsWith(QByteArrayLiteral("[31m")));
+        QVERIFY(!hidden.contains(QByteArrayLiteral("31m")));
         QCOMPARE(hidden.right(tail.size()), tail);
     }
 }

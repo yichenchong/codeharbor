@@ -423,14 +423,21 @@ test("readFile handles an empty file", async () => {
 
     await fs.rm(dir, { recursive: true, force: true });
 });
-test("readFile rejects a FIFO without blocking the daemon", async () => {
-    const dir = await tmpDir();
-    const fifo = path.join(dir, "pipe");
+
+// Create a named pipe. `mkfifo` is a real process because Node has no mknod
+// binding; every caller needs the same four lines, so they live here once.
+async function makeFifo(fifoPath: string): Promise<void> {
     await new Promise<void>((resolve, reject) => {
-        const child = spawn("mkfifo", [fifo]);
+        const child = spawn("mkfifo", [fifoPath]);
         child.once("error", reject);
         child.once("exit", (code) => (code === 0 ? resolve() : reject(new Error(`mkfifo exited ${code}`))));
     });
+}
+
+test("readFile rejects a FIFO without blocking the daemon", async () => {
+    const dir = await tmpDir();
+    const fifo = path.join(dir, "pipe");
+    await makeFifo(fifo);
 
     await assert.rejects(
         () => readFile({ path: fifo }),
@@ -1488,6 +1495,20 @@ test("a listing too big for one transport frame is refused, not put on the wire"
     );
 });
 
+// The two watch bounds are documented as EQUAL, and files.ts says a parity test
+// pins that — it did not, so nothing stopped one of them drifting.
+//
+// Why they must match: the relay coalesces its queue per (subscription, path)
+// and a subscription watches exactly one path, so the queue can never hold more
+// entries than there are live subscriptions. Equal bounds make the relay's
+// COUNT limit provably unreachable, leaving its byte limit as the one that can
+// actually fire. Raising the subscription cap alone would start the relay
+// dropping watch events — and reporting them as lost — for no reason a user
+// could act on.
+test("the watch-subscription cap and the relay's queue bound stay equal", () => {
+    assert.equal(MAX_WATCH_SUBSCRIPTIONS, MAX_PENDING_WATCH_EVENTS);
+});
+
 // Each subscription holds an OS watch handle plus a poll timer, and the table
 // holding them was unbounded: a client that leaks unwatch calls walks it up
 // until every watch on the host starts failing.
@@ -1675,4 +1696,248 @@ test("signals that keep arriving while the daemon exits still do not kill it", a
     const { code, signal } = await runDaemonUntilSignalled(["SIGTERM"], true);
     assert.equal(signal, null, "a late signal killed the daemon during its exit");
     assert.equal(code, 0);
+});
+
+// A kernel-generated file reports size 0 in stat while holding real content.
+// Sizing the buffer from stat therefore returned an empty string with
+// `truncated: false` — the viewer presented /proc/version as a document that
+// genuinely has nothing in it, which is indistinguishable from a real empty
+// file and gives the user no hint that anything went wrong.
+test(
+    "readFile returns the contents of a file whose reported size is 0",
+    { skip: process.platform === "linux" ? false : "needs a /proc filesystem" },
+    async () => {
+        assert.equal((await fs.stat("/proc/version")).size, 0, "precondition: stat reports 0");
+
+        const r = await readFile({ path: "/proc/version" });
+        assert.equal(r.encoding, "utf-8");
+        assert.match(r.content, /Linux version/);
+        // The read went to end of file, so it IS the whole file. Reporting it as
+        // partial would make the viewer refuse to render it.
+        assert.equal(r.truncated, false);
+
+        // A window still applies, and now against the bytes that are really
+        // there rather than against the size of zero.
+        const head = await readFile({ path: "/proc/version", offset: 0, length: 5 });
+        assert.equal(head.content, r.content.slice(0, 5));
+        assert.equal(head.truncated, true);
+    },
+);
+
+// An atomic save replaces a file by renaming over its name, which needs write
+// permission on the DIRECTORY and none at all on the file. So a file the user
+// deliberately marked read-only — one stat() had just reported as
+// writable:false — was overwritten anyway, where a plain open for writing, and
+// every ordinary editor, refuses with EACCES.
+test(
+    "writeFile refuses a read-only file instead of renaming over it",
+    { skip: process.getuid?.() === 0 ? "root ignores file permissions" : false },
+    async () => {
+        const dir = await tmpDir();
+        const file = path.join(dir, "readonly.txt");
+        await fs.writeFile(file, "protected");
+        await fs.chmod(file, 0o444);
+
+        const current = await stat({ path: file });
+        assert.equal(current.writable, false);
+
+        await assert.rejects(
+            () => writeFile({ path: file, content: "clobber", expectedRevision: current.revision }),
+            (err: NodeJS.ErrnoException) => err.code === "EACCES",
+        );
+        assert.equal(await fs.readFile(file, "utf-8"), "protected");
+        // The refusal happens before any temp file is created, so nothing is
+        // left behind for the user to clean up.
+        assert.deepEqual(await fs.readdir(dir), ["readonly.txt"]);
+
+        await fs.chmod(file, 0o644);
+        await fs.rm(dir, { recursive: true, force: true });
+    },
+);
+
+// Resolve once an event satisfying `predicate` has been delivered, checking the
+// events already collected first so one that arrived before this call is not
+// missed.
+//
+// Waits for a CONDITION, never for a duration or for an event COUNT. One
+// `writeFile` is a truncate followed by a write, and Linux is free to report
+// that as two changes or, if the two land inside one check, as one — so any
+// assertion on "how many events arrived" is a coin flip. What is stable is the
+// state the file ends in.
+function untilWatched(
+    service: FileWatchService,
+    collected: readonly WatchEvent[],
+    predicate: (event: WatchEvent) => boolean,
+): Promise<void> {
+    return new Promise<void>((resolve) => {
+        if (collected.some(predicate)) return resolve();
+        const off = service.onWatchEvent((event) => {
+            if (predicate(event)) {
+                off();
+                resolve();
+            }
+        });
+    });
+}
+
+// Events are handed out through an EventEmitter, which runs its listeners in
+// order and lets an exception escape: one broken subscriber silenced every
+// later one, turned a perfectly good unwatch into a failed RPC call, and — the
+// worst of the three — aborted closeAll() halfway through, leaving the rest of
+// a dead session's watch handles installed on the operating system.
+test("a throwing watch subscriber cannot silence the others or break teardown", async () => {
+    const dir = await tmpDir();
+    const file = path.join(dir, "throwing.txt");
+    await fs.writeFile(file, "one");
+
+    const service = new FileWatchService();
+    service.pollIntervalMs = 25;
+    const seen: WatchEvent[] = [];
+    const closed: string[] = [];
+    // Counted rather than asserted-on directly: the contract is that the good
+    // subscriber is invoked for EVERY delivery the broken one was, whatever
+    // number the kernel happens to produce. If isolation regressed, the broken
+    // subscriber's throw would stop the emit and `seen` would fall behind.
+    let thrown = 0;
+    service.onWatchEvent(() => {
+        thrown += 1;
+        throw new Error("this subscriber is broken");
+    });
+    service.onWatchEvent((event) => seen.push(event));
+    service.onWatchClosed(() => {
+        throw new Error("this closed-subscriber is broken");
+    });
+    service.onWatchClosed((id) => closed.push(id));
+
+    // Every path out of this block releases the subscriptions. A failed
+    // assertion used to skip the teardown below, and an unreleased fs.watch
+    // handle keeps Node's event loop alive: the runner reported the failure and
+    // then hung until something killed it, which buries the failure it just
+    // found under a timeout.
+    try {
+        const first = await service.watch({ path: file });
+        await fs.writeFile(file, "two — a clearly different length");
+        const finalRevision = revisionFrom(await fs.stat(file));
+        await withTimeout(
+            untilWatched(service, seen, (event) => event.revision === finalRevision),
+            5000,
+        );
+        assert.ok(thrown >= 1, "the broken subscriber was never invoked");
+        assert.equal(seen.length, thrown, "a throw skipped the subscriber behind it");
+        assert.equal(seen.at(-1)?.event, "modified");
+
+        // unwatch emits "closed" synchronously, straight out of the RPC handler.
+        service.unwatch({ subscriptionId: first.subscriptionId });
+        assert.deepEqual(closed, [first.subscriptionId]);
+
+        // closeAll is the channel-drop path and must release EVERY handle even
+        // though the first listener throws on each one.
+        const second = await service.watch({ path: file });
+        const third = await service.watch({ path: file });
+        service.closeAll();
+        assert.deepEqual(closed, [
+            first.subscriptionId,
+            second.subscriptionId,
+            third.subscriptionId,
+        ]);
+        assert.equal(service.hasSubscription(second.subscriptionId), false);
+        assert.equal(service.hasSubscription(third.subscriptionId), false);
+    } finally {
+        service.closeAll();
+        await fs.rm(dir, { recursive: true, force: true });
+    }
+});
+
+// Subscribers are wrapped before registration (so one that throws cannot take
+// the others down), which is exactly the kind of change that quietly breaks
+// removal: `off(callback)` does not match a wrapper. A subscriber that cannot
+// be removed keeps its whole closure alive for the life of the process.
+test("the disposer returned by onWatchEvent really removes the subscriber", async () => {
+    const dir = await tmpDir();
+    const file = path.join(dir, "detached.txt");
+    await fs.writeFile(file, "one");
+
+    const service = new FileWatchService();
+    service.pollIntervalMs = 25;
+    const afterOff: WatchEvent[] = [];
+    const off = service.onWatchEvent((event) => afterOff.push(event));
+    off();
+
+    const seen: WatchEvent[] = [];
+    service.onWatchEvent((event) => seen.push(event));
+
+    // Same rule as the test above: an unreleased fs.watch handle keeps Node's
+    // event loop alive, so a failed assertion here would hang the whole runner
+    // instead of just failing.
+    try {
+        const { subscriptionId } = await service.watch({ path: file });
+        await fs.writeFile(file, "two — a clearly different length");
+        const finalRevision = revisionFrom(await fs.stat(file));
+        await withTimeout(
+            untilWatched(service, seen, (event) => event.revision === finalRevision),
+            5000,
+        );
+        service.unwatch({ subscriptionId });
+        // The removed subscriber saw nothing, while the one still registered did.
+        assert.ok(seen.length >= 1);
+        assert.deepEqual(afterOff, []);
+    } finally {
+        service.closeAll();
+        await fs.rm(dir, { recursive: true, force: true });
+    }
+});
+
+// A directory holds more than files and folders. None of these may make the
+// listing fail as a whole: a user who cannot list a directory because ONE entry
+// in it is unusual has lost access to everything else in it.
+test("listDirectory classifies special files and a dangling symlink", async () => {
+    const dir = await tmpDir();
+    await fs.writeFile(path.join(dir, "plain.txt"), "x");
+    // A link to a name that does not exist. Its target cannot be stat'd, so any
+    // classification that resolves the link would fail on it.
+    await fs.symlink(path.join(dir, "nowhere.txt"), path.join(dir, "broken.lnk"));
+    await makeFifo(path.join(dir, "pipe"));
+
+    const listing = await listDirectory({ path: dir });
+    assert.deepEqual(
+        listing.entries.map((entry) => entry.name),
+        ["broken.lnk", "pipe", "plain.txt"],
+    );
+    const kinds: Record<string, string> = {};
+    for (const entry of listing.entries) kinds[entry.name] = entry.kind;
+    assert.equal(kinds["broken.lnk"], "symlink");
+    assert.equal(kinds["pipe"], "other");
+    assert.equal(kinds["plain.txt"], "file");
+
+    await fs.rm(dir, { recursive: true, force: true });
+});
+
+// A filesystem path is a NUL-terminated byte string, so no name can hold a NUL.
+// Node enforces that deep inside fs with a TypeError, which the dispatcher can
+// only report as -32603 "internal error" — telling the user the SERVER broke
+// when the REQUEST was malformed. resolvePath never touches the filesystem at
+// all, so it answered with an ordinary-looking result that failed later.
+test("file methods reject a path containing a NUL character", async () => {
+    const bad = "/tmp/a\u0000b";
+    for (const method of [
+        "file.stat",
+        "file.readFile",
+        "file.writeFile",
+        "file.resolvePath",
+        "file.watch",
+        "file.listDirectory",
+    ]) {
+        const params =
+            method === "file.writeFile"
+                ? { path: bad, content: "x", expectedRevision: "" }
+                : { path: bad };
+        const error = await callFile(method, params);
+        assert.equal(error.code, RPC_INVALID_PARAMS, method);
+        assert.match(error.message, /field 'path' must not contain a NUL character/);
+    }
+
+    // The repository root a path is resolved against is a path too.
+    const base = await callFile("file.resolvePath", { path: "x", base: "/repo\u0000" });
+    assert.equal(base.code, RPC_INVALID_PARAMS);
+    assert.match(base.message, /field 'base' must not contain a NUL character/);
 });

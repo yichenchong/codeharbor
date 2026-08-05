@@ -19,6 +19,26 @@
 #include <QtWebEngineQuick/QtWebEngineQuick>
 #include <QtQuickControls2/QQuickStyle>
 
+// Process entry point.
+//
+// Command line: CodeHarbor parses no options of its own. argc/argv are handed
+// straight to QGuiApplication, so only Qt's own switches (-platform, -style,
+// -qwindowgeometry, the QPA arguments) are recognised; anything else is
+// accepted and ignored. There is deliberately no --help or --version, because
+// there is nothing this binary can be asked to do other than open its window.
+//
+// Exit codes:
+//   0    the window was closed normally (QGuiApplication::exec() returned 0).
+//   255  the QML graph failed to instantiate. objectCreationFailed below calls
+//        QCoreApplication::exit(-1), and a negative status is truncated to a
+//        byte by the operating system, so the shell reports 255.
+//   Any other value is one a QML `Qt.exit(n)` chose.
+//
+// Environment: nothing is read here. The remote session spine reads CH_LIVE_SSH
+// and its CH_LIVE_HOST/PORT/USER/NODE/REPO companions inside
+// SessionBootstrap::connectAndWireFromEnvironment(), called below. Note that
+// QQuickStyle::setStyle() overrides QT_QUICK_CONTROLS_STYLE: the shell is drawn
+// against the Basic style and nothing else.
 int main(int argc, char *argv[])
 {
     // Custom URL schemes must be registered before WebEngine and the GUI

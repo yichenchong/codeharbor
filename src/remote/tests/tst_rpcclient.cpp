@@ -3,6 +3,7 @@
 
 #include <QCoreApplication>
 #include <QIODevice>
+#include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QJsonValue>
@@ -45,7 +46,10 @@ QByteArray jsonLine(const QJsonObject& obj)
 // No Q_OBJECT: only inherited QIODevice signals are emitted, so no moc is needed.
 class ScriptedDevice : public QIODevice {
 public:
-    ScriptedDevice() { open(QIODevice::ReadWrite); }
+    explicit ScriptedDevice(QIODevice::OpenMode mode = QIODevice::ReadWrite)
+    {
+        open(mode);
+    }
 
     // Make bytes readable WITHOUT emitting readyRead().
     void queueSilently(const QByteArray& bytes) { m_in += bytes; }
@@ -226,6 +230,13 @@ private slots:
     void reArmingAgainstASilentPeerCannotPileUpProbes();
     void outgoingOversizedFrameIsRejectedWithoutClosingTransport();
     void decodeFileContentValidatesEncoding();
+    void notificationWithBadEnvelopeIsRefused();
+    void scalarParamsAreRefusedWithoutWriting();
+    void enableHeartbeatRefusesNonPositiveConfiguration();
+    void unwritableTransportIsDeclaredDeadByTheHeartbeat();
+    void invalidUtf8FrameWarnsAndTheStreamResynchronises();
+    void escapedNewlineInsideAStringDoesNotSplitTheFrame();
+    void decodeFileContentRejectsInvalidBase64();
 
 private:
     void makePair();
@@ -307,14 +318,14 @@ void TstRpcClient::matchesResponsesById()
     bool f1 = false;
     bool f2 = false;
 
-    const int id1 = m_client->call(
+    const qint64 id1 = m_client->call(
         QStringLiteral("file.stat"), QJsonObject{{"path", "/a"}},
         [&](QJsonValue res, std::optional<RpcError> err) {
             QVERIFY(!err.has_value());
             r1 = res;
             f1 = true;
         });
-    const int id2 = m_client->call(
+    const qint64 id2 = m_client->call(
         QStringLiteral("file.readFile"), QJsonObject{{"path", "/b"}},
         [&](QJsonValue res, std::optional<RpcError> err) {
             QVERIFY(!err.has_value());
@@ -346,7 +357,7 @@ void TstRpcClient::errorResponseDeliversRpcError()
 
     std::optional<RpcError> got;
     bool fired = false;
-    const int id = m_client->call(
+    const qint64 id = m_client->call(
         QStringLiteral("file.writeFile"), QJsonObject{{"path", "/x"}},
         [&](QJsonValue, std::optional<RpcError> err) {
             got = err;
@@ -376,7 +387,7 @@ void TstRpcClient::partialLineThenCompleted()
 
     QJsonValue res;
     bool fired = false;
-    const int id = m_client->call(
+    const qint64 id = m_client->call(
         QStringLiteral("ping"), QJsonValue(),
         [&](QJsonValue r, std::optional<RpcError> err) {
             QVERIFY(!err.has_value());
@@ -386,7 +397,7 @@ void TstRpcClient::partialLineThenCompleted()
 
     const QByteArray full = jsonLine(
         {{"jsonrpc", "2.0"}, {"id", id}, {"result", QJsonObject{{"pong", true}}}});
-    const int half = full.size() / 2; // split mid-JSON, before the trailing '\n'
+    const qsizetype half = full.size() / 2; // split mid-JSON, before the '\n'
 
     m_serverSide->write(full.left(half));
     m_serverSide->flush();
@@ -434,7 +445,7 @@ void TstRpcClient::unknownAndDuplicateIdWarn()
 
     // Duplicate id: a second response after the callback already fired.
     bool fired = false;
-    const int id = m_client->call(
+    const qint64 id = m_client->call(
         QStringLiteral("ping"), QJsonValue(),
         [&](QJsonValue, std::optional<RpcError>) { fired = true; });
     m_serverSide->write(
@@ -442,7 +453,7 @@ void TstRpcClient::unknownAndDuplicateIdWarn()
     m_serverSide->flush();
     QTRY_VERIFY(fired);
 
-    const int before = spy.count();
+    const qsizetype before = spy.count();
     m_serverSide->write(
         jsonLine({{"jsonrpc", "2.0"}, {"id", id}, {"result", QJsonObject{}}}));
     m_serverSide->flush();
@@ -483,7 +494,7 @@ void TstRpcClient::bothResultAndErrorTreatedAsError()
     QSignalSpy warnSpy(m_client, &CodeharbordClient::protocolWarning);
     std::optional<RpcError> got;
     bool fired = false;
-    const int id = m_client->call(
+    const qint64 id = m_client->call(
         QStringLiteral("file.stat"), QJsonObject{{"path", "/a"}},
         [&](QJsonValue, std::optional<RpcError> err) {
             got = err;
@@ -513,7 +524,7 @@ void TstRpcClient::neitherResultNorErrorFailsCallback()
     QSignalSpy warnSpy(m_client, &CodeharbordClient::protocolWarning);
     std::optional<RpcError> got;
     bool fired = false;
-    const int id = m_client->call(
+    const qint64 id = m_client->call(
         QStringLiteral("ping"), QJsonValue(),
         [&](QJsonValue, std::optional<RpcError> err) {
             got = err;
@@ -540,7 +551,7 @@ void TstRpcClient::errorNullFieldTreatedAsSuccess()
     std::optional<RpcError> got;
     QJsonValue res;
     bool fired = false;
-    const int id = m_client->call(
+    const qint64 id = m_client->call(
         QStringLiteral("file.stat"), QJsonObject{{"path", "/a"}},
         [&](QJsonValue r, std::optional<RpcError> err) {
             res = r;
@@ -570,7 +581,7 @@ void TstRpcClient::malformedErrorObjectWarns()
     QSignalSpy warnSpy(m_client, &CodeharbordClient::protocolWarning);
     std::optional<RpcError> got;
     bool fired = false;
-    const int id = m_client->call(
+    const qint64 id = m_client->call(
         QStringLiteral("file.stat"), QJsonObject{{"path", "/a"}},
         [&](QJsonValue, std::optional<RpcError> err) {
             got = err;
@@ -578,7 +589,9 @@ void TstRpcClient::malformedErrorObjectWarns()
         });
 
     // Error object without the required code/message: warn, but still fail the
-    // callback (best effort, code defaults to 0) so the caller cannot hang.
+    // callback so the caller cannot hang. An unusable code is reported as the
+    // synthetic internal-error code, never as 0 — 0 is a value a server could
+    // legitimately have sent.
     m_serverSide->write(jsonLine({{"jsonrpc", "2.0"},
                                   {"id", id},
                                   {"error", QJsonObject{{"reason", "nope"}}}}));
@@ -586,14 +599,14 @@ void TstRpcClient::malformedErrorObjectWarns()
 
     QTRY_VERIFY(fired);
     QVERIFY(got.has_value());
-    QCOMPARE(got->code, 0);
+    QCOMPARE(got->code, -32603);
     QTRY_COMPARE(warnSpy.count(), 1);
 
     // A second response whose `error` is not even an object: warn and fail with
     // the synthetic internal-error code.
     std::optional<RpcError> got2;
     bool fired2 = false;
-    const int id2 = m_client->call(
+    const qint64 id2 = m_client->call(
         QStringLiteral("ping"), QJsonValue(),
         [&](QJsonValue, std::optional<RpcError> err) {
             got2 = err;
@@ -683,7 +696,7 @@ void TstRpcClient::largeLineRoutes()
 
     QJsonValue res;
     bool fired = false;
-    const int id = m_client->call(
+    const qint64 id = m_client->call(
         QStringLiteral("file.readFile"), QJsonObject{{"path", "/big"}},
         [&](QJsonValue r, std::optional<RpcError> err) {
             QVERIFY(!err.has_value());
@@ -710,7 +723,7 @@ void TstRpcClient::nonRoutableIdWarns()
 
     QSignalSpy warnSpy(m_client, &CodeharbordClient::protocolWarning);
     bool fired = false;
-    const int id = m_client->call(
+    const qint64 id = m_client->call(
         QStringLiteral("ping"), QJsonValue(),
         [&](QJsonValue, std::optional<RpcError>) { fired = true; });
 
@@ -742,7 +755,7 @@ void TstRpcClient::crlfAndWhitespaceFraming()
 
     bool fired = false;
     QJsonValue res;
-    const int id = m_client->call(
+    const qint64 id = m_client->call(
         QStringLiteral("ping"), QJsonValue(),
         [&](QJsonValue r, std::optional<RpcError> err) {
             QVERIFY(!err.has_value());
@@ -771,7 +784,7 @@ void TstRpcClient::utf8SplitAcrossChunkBoundary()
 
     bool fired = false;
     QString content;
-    const int id = m_client->call(
+    const qint64 id = m_client->call(
         QStringLiteral("file.readFile"), QJsonObject{{"path", "/u"}},
         [&](QJsonValue r, std::optional<RpcError> err) {
             QVERIFY(!err.has_value());
@@ -804,8 +817,8 @@ void TstRpcClient::reentrantCallFromCallback()
 
     bool first = false;
     bool second = false;
-    int secondId = -1;
-    const int firstId = m_client->call(
+    qint64 secondId = -1;
+    const qint64 firstId = m_client->call(
         QStringLiteral("a"), QJsonValue(),
         [&](QJsonValue, std::optional<RpcError>) {
             first = true;
@@ -868,7 +881,7 @@ void TstRpcClient::setTransportTwiceDetachesOld()
     // would hang its caller forever.
     int fired = 0;
     std::optional<RpcError> got;
-    const int id = m_client->call(
+    const qint64 id = m_client->call(
         QStringLiteral("ping"), QJsonValue(),
         [&](QJsonValue, std::optional<RpcError> err) {
             ++fired;
@@ -902,7 +915,7 @@ void TstRpcClient::setTransportTwiceDetachesOld()
 
     // The NEW transport carries fresh work normally.
     bool second = false;
-    const int id2 = m_client->call(
+    const qint64 id2 = m_client->call(
         QStringLiteral("ping"), QJsonValue(),
         [&](QJsonValue, std::optional<RpcError> err) {
             QVERIFY(!err.has_value());
@@ -955,7 +968,7 @@ void TstRpcClient::retryFromRebindFailureUsesNewTransport()
 
     bool retried = false;
     bool retryAnswered = false;
-    int retryId = -1;
+    qint64 retryId = -1;
     m_client->call(QStringLiteral("first"), QJsonValue(),
                    [&](QJsonValue, std::optional<RpcError> err) {
                        QVERIFY(err.has_value());
@@ -986,7 +999,7 @@ void TstRpcClient::retryFromRebindFailureUsesNewTransport()
         QJsonDocument::fromJson(newServer->readAll().trimmed()).object();
     QCOMPARE(sent.value(QStringLiteral("method")).toString(),
              QStringLiteral("retry"));
-    QCOMPARE(sent.value(QStringLiteral("id")).toInt(), retryId);
+    QCOMPARE(sent.value(QStringLiteral("id")).toInteger(), retryId);
 
     newServer->write(jsonLine(
         {{"jsonrpc", "2.0"}, {"id", retryId}, {"result", QJsonObject{}}}));
@@ -1025,7 +1038,7 @@ void TstRpcClient::rebindAfterCloseRevivesClient()
     QCOMPARE(boundSpy.count(), 1);
 
     bool answered = false;
-    const int id = m_client->call(
+    const qint64 id = m_client->call(
         QStringLiteral("ping"), QJsonValue(),
         [&](QJsonValue, std::optional<RpcError> err) {
             QVERIFY(!err.has_value());
@@ -1094,7 +1107,7 @@ void TstRpcClient::methodWithIdIsNotANotification()
 
     std::optional<RpcError> got;
     bool fired = false;
-    const int id = m_client->call(
+    const qint64 id = m_client->call(
         QStringLiteral("ping"), QJsonValue(),
         [&](QJsonValue, std::optional<RpcError> err) {
             got = err;
@@ -1165,9 +1178,10 @@ void TstRpcClient::responseCarryingMethodIsNeverAResult()
 }
 
 // An error `code` that is a JSON number but not a whole value an int can hold
-// is best-effort'd to 0 — which is indistinguishable from a server that sent
-// {"code": 0}. The loss must be REPORTED, not silent, exactly like the
-// missing-code case beside it.
+// cannot be surfaced verbatim. It must be REPORTED and replaced with the
+// synthetic internal-error code — not best-effort'd to 0, which is
+// indistinguishable from a server that really sent {"code": 0} and would send a
+// caller comparing against a known application code down the wrong branch.
 void TstRpcClient::errorCodeOutOfIntRangeWarns()
 {
     makePair();
@@ -1191,7 +1205,7 @@ void TstRpcClient::errorCodeOutOfIntRangeWarns()
     QTRY_VERIFY(fired);
     QVERIFY(got.has_value());
     QCOMPARE(got->message, QStringLiteral("huge"));
-    QCOMPARE(got->code, 0); // best effort, and flagged rather than swallowed
+    QCOMPARE(got->code, -32603); // flagged and marked internal, not silently 0
     QTRY_COMPARE(warnSpy.count(), 1);
     QCOMPARE(m_client->pendingCount(), 0);
 }
@@ -1250,7 +1264,7 @@ void TstRpcClient::nullCallbackIsTolerated()
 {
     makePair();
 
-    const int id = m_client->call(QStringLiteral("ping"), QJsonValue(), nullptr);
+    const qint64 id = m_client->call(QStringLiteral("ping"), QJsonValue(), nullptr);
     QCOMPARE(m_client->pendingCount(), 1);
     m_serverSide->write(
         jsonLine({{"jsonrpc", "2.0"}, {"id", id}, {"result", QJsonObject{}}}));
@@ -1275,7 +1289,7 @@ void TstRpcClient::nonObjectJsonWarns()
 
     QSignalSpy warnSpy(m_client, &CodeharbordClient::protocolWarning);
     bool fired = false;
-    const int id = m_client->call(
+    const qint64 id = m_client->call(
         QStringLiteral("ping"), QJsonValue(),
         [&](QJsonValue, std::optional<RpcError>) { fired = true; });
 
@@ -1312,7 +1326,7 @@ void TstRpcClient::responseQueuedBeforeEofIsStillDelivered()
     QJsonValue res;
     std::optional<RpcError> err;
     bool fired = false;
-    const int id = m_client->call(
+    const qint64 id = m_client->call(
         QStringLiteral("ping"), QJsonValue(),
         [&](QJsonValue r, std::optional<RpcError> e) {
             res = r;
@@ -1463,7 +1477,7 @@ void TstRpcClient::transportBoundFiresOnlyForNonNullBind()
     m_client->setTransport(m_clientSide); // same device: a no-op, not an event
     QCOMPARE(boundSpy.count(), 1);
 
-    int handlerId = 0;
+    qint64 handlerId = 0;
     connect(m_client, &CodeharbordClient::transportBound, m_client, [&] {
         handlerId = m_client->call(QStringLiteral("ping"), QJsonValue(), nullptr);
     });
@@ -1532,7 +1546,7 @@ void TstRpcClient::callbackDeletingClientMidDispatchIsSafe()
     // A callback that deletes the client from inside the dispatch loop must not
     // trigger a use-after-free when onReadyRead() resumes.
     bool fired = false;
-    const int id = m_client->call(
+    const qint64 id = m_client->call(
         QStringLiteral("ping"), QJsonValue(),
         [&](QJsonValue, std::optional<RpcError>) {
             fired = true;
@@ -1559,7 +1573,7 @@ void TstRpcClient::destroyingClientFailsPendingCallbacks()
     int firedFirst = 0;
     int firedRetry = 0;
     std::optional<RpcError> got;
-    int retryId = -1;
+    qint64 retryId = -1;
 
     m_client->call(QStringLiteral("first"), QJsonValue(),
                    [&](QJsonValue, std::optional<RpcError> err) {
@@ -2734,6 +2748,247 @@ void TstRpcClient::decodeFileContentValidatesEncoding()
     QVERIFY(!ch::rpc::decodeFileContent(
                  QJsonObject{{"encoding", "utf-8"}, {"content", 7}})
                  .has_value());
+}
+
+// A notification is a method with no id, jsonrpc "2.0", and no result/error.
+// Both other shapes must be refused rather than dispatched: a bad `jsonrpc`
+// means the sender is not speaking the protocol we assume, and a "notification"
+// carrying result/error is a mangled response whose payload must never reach a
+// notification consumer as if it were an event.
+void TstRpcClient::notificationWithBadEnvelopeIsRefused()
+{
+    makePair();
+
+    QSignalSpy notifySpy(m_client, &CodeharbordClient::notificationReceived);
+    QSignalSpy warnSpy(m_client, &CodeharbordClient::protocolWarning);
+
+    // Wrong protocol version.
+    m_serverSide->write(jsonLine({{"jsonrpc", "1.0"},
+                                  {"method", ch::rpc::kWatchEventNotification},
+                                  {"params", QJsonObject{{"path", "/w"}}}}));
+    // No jsonrpc member at all.
+    m_serverSide->write(jsonLine({{"method", ch::rpc::kWatchEventNotification},
+                                  {"params", QJsonObject{{"path", "/w"}}}}));
+    // Well-versioned, but carrying a response payload.
+    m_serverSide->write(jsonLine({{"jsonrpc", "2.0"},
+                                  {"method", ch::rpc::kWatchEventNotification},
+                                  {"result", QJsonObject{{"path", "/w"}}}}));
+    m_serverSide->flush();
+
+    QTRY_COMPARE(warnSpy.count(), 3);
+    QCOMPARE(notifySpy.count(), 0);
+
+    // The stream is not poisoned: a well-formed notification still arrives.
+    m_serverSide->write(jsonLine({{"jsonrpc", "2.0"},
+                                  {"method", ch::rpc::kWatchEventNotification},
+                                  {"params", QJsonObject{{"path", "/w"}}}}));
+    m_serverSide->flush();
+    QTRY_COMPARE(notifySpy.count(), 1);
+    QCOMPARE(warnSpy.count(), 3);
+}
+
+// JSON-RPC 2.0 section 4: `params`, when present, is an object or an array.
+// A caller that hands over a scalar would make the client emit a request the
+// server answers with a null-id error it cannot route back, so the request must
+// be refused before a byte reaches the wire and its callback failed once.
+void TstRpcClient::scalarParamsAreRefusedWithoutWriting()
+{
+    ScriptedDevice device;
+    m_client->setTransport(&device);
+    QSignalSpy warnSpy(m_client, &CodeharbordClient::protocolWarning);
+
+    int fired = 0;
+    std::optional<RpcError> got;
+    m_client->call(QStringLiteral("file.stat"), QJsonValue(42),
+                   [&](QJsonValue, std::optional<RpcError> err) {
+                       ++fired;
+                       got = err;
+                   });
+    QCOMPARE(fired, 1);
+    QVERIFY(got.has_value());
+    QCOMPARE(got->code, -32603);
+    QCOMPARE(m_client->pendingCount(), 0);
+    QVERIFY(device.takeWritten().isEmpty());
+    QCOMPARE(warnSpy.count(), 1);
+
+    // A string params is refused the same way; an ARRAY is perfectly legal and
+    // goes out untouched.
+    m_client->call(QStringLiteral("file.stat"), QJsonValue(QStringLiteral("x")),
+                   [&](QJsonValue, std::optional<RpcError> err) {
+                       ++fired;
+                       got = err;
+                   });
+    QCOMPARE(fired, 2);
+    QVERIFY(device.takeWritten().isEmpty());
+
+    const qint64 id = m_client->call(QStringLiteral("file.stat"),
+                                     QJsonArray{QStringLiteral("/a")}, nullptr);
+    QCOMPARE(m_client->pendingCount(), 1);
+    const QJsonObject sent =
+        QJsonDocument::fromJson(device.takeWritten().trimmed()).object();
+    QCOMPARE(sent.value(QStringLiteral("id")).toInteger(), id);
+    QVERIFY(sent.value(QStringLiteral("params")).isArray());
+
+    m_client->setTransport(nullptr);
+}
+
+// A zero or negative interval would spin the event loop or silently mean "off",
+// and a tolerance below one would declare the very first interval fatal. Both
+// are refused outright — the heartbeat stays off and says so — rather than
+// clamped into something the caller did not ask for.
+void TstRpcClient::enableHeartbeatRefusesNonPositiveConfiguration()
+{
+    ScriptedDevice device;
+    QSignalSpy warnSpy(m_client, &CodeharbordClient::protocolWarning);
+    QSignalSpy closedSpy(m_client, &CodeharbordClient::transportClosed);
+
+    m_client->enableHeartbeat(0, 4);
+    m_client->enableHeartbeat(-1, 4);
+    m_client->enableHeartbeat(20, 0);
+    QCOMPARE(warnSpy.count(), 3);
+
+    m_client->setTransport(&device);
+    QTest::qWait(150);
+    QCOMPARE(countPings(device), 0); // never armed
+    QCOMPARE(closedSpy.count(), 0);
+
+    // And a valid configuration afterwards still works.
+    m_client->enableHeartbeat(20, 1000);
+    QVERIFY2(awaitPing(device) != 0, "a valid configuration did not arm");
+
+    m_client->setTransport(nullptr);
+}
+
+// A transport that is bound and open but NOT writable is the one silent failure
+// the heartbeat used to miss entirely: every probe was refused by call() before
+// it reached the wire, that synthetic failure was mistaken for an answer, and
+// the miss counter never moved — so the peer was never declared dead and
+// SessionBootstrap's reconnect ladder never ran. A probe that cannot be written
+// is not proof of life; the interval counts as silence like any other.
+void TstRpcClient::unwritableTransportIsDeclaredDeadByTheHeartbeat()
+{
+    ScriptedDevice device(QIODevice::ReadOnly);
+    QVERIFY(device.isOpen());
+    QVERIFY(!device.isWritable());
+
+    m_client->enableHeartbeat(20, 3);
+    m_client->setTransport(&device);
+
+    QSignalSpy closedSpy(m_client, &CodeharbordClient::transportClosed);
+    QTRY_VERIFY_WITH_TIMEOUT(closedSpy.count() == 1, 5000);
+    QVERIFY(device.takeWritten().isEmpty()); // nothing ever reached the wire
+
+    // Latched dead: it does not keep closing every interval.
+    QTest::qWait(150);
+    QCOMPARE(closedSpy.count(), 1);
+
+    m_client->setTransport(nullptr);
+}
+
+// A frame whose bytes are not valid UTF-8 cannot be parsed as JSON. It must be
+// reported and SKIPPED — the newline framing is still trustworthy, so the very
+// next frame has to route normally instead of the connection being lost or the
+// reader being left mid-buffer.
+void TstRpcClient::invalidUtf8FrameWarnsAndTheStreamResynchronises()
+{
+    ScriptedDevice device;
+    m_client->setTransport(&device);
+
+    QSignalSpy warnSpy(m_client, &CodeharbordClient::protocolWarning);
+    QSignalSpy closedSpy(m_client, &CodeharbordClient::transportClosed);
+
+    bool fired = false;
+    const qint64 id = m_client->call(
+        QStringLiteral("file.readFile"), QJsonObject{{"path", "/u"}},
+        [&](QJsonValue, std::optional<RpcError> err) {
+            QVERIFY(!err.has_value());
+            fired = true;
+        });
+
+    // A lone 0xFF byte inside a JSON string: well-framed, not decodable.
+    QByteArray bad("{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":\"\xFF\"}\n");
+    device.deliver(bad);
+    QCOMPARE(warnSpy.count(), 1);
+    QVERIFY(!fired);
+    QCOMPARE(closedSpy.count(), 0);
+    QCOMPARE(m_client->pendingCount(), 1);
+
+    device.deliver(
+        jsonLine({{"jsonrpc", "2.0"}, {"id", id}, {"result", QJsonObject{}}}));
+    QVERIFY(fired);
+    QCOMPARE(warnSpy.count(), 1);
+    QCOMPARE(m_client->pendingCount(), 0);
+
+    m_client->setTransport(nullptr);
+}
+
+// The framing is newline-delimited and the payload is JSON, so a newline INSIDE
+// a string is escaped as the two characters \ and n and cannot split the frame.
+// A file whose contents contain newlines — i.e. nearly every file the editor
+// ever loads — depends on that holding in both directions.
+void TstRpcClient::escapedNewlineInsideAStringDoesNotSplitTheFrame()
+{
+    ScriptedDevice device;
+    m_client->setTransport(&device);
+
+    const QString text = QStringLiteral("line one\nline two\r\nline three\n");
+    QSignalSpy warnSpy(m_client, &CodeharbordClient::protocolWarning);
+
+    QString roundTripped;
+    bool fired = false;
+    const qint64 id = m_client->call(
+        QStringLiteral("file.writeFile"),
+        QJsonObject{{"path", "/f"}, {"content", text}},
+        [&](QJsonValue r, std::optional<RpcError> err) {
+            QVERIFY(!err.has_value());
+            roundTripped = r.toObject().value(QStringLiteral("content")).toString();
+            fired = true;
+        });
+
+    // The request is exactly ONE line: the only raw newline is the terminator.
+    const QByteArray written = device.takeWritten();
+    QCOMPARE(written.count('\n'), qsizetype(1));
+    QVERIFY(written.endsWith('\n'));
+    const QJsonObject sent = QJsonDocument::fromJson(written).object();
+    QCOMPARE(sent.value(QStringLiteral("params"))
+                 .toObject()
+                 .value(QStringLiteral("content"))
+                 .toString(),
+             text);
+
+    // And the same holds for the reply.
+    device.deliver(jsonLine({{"jsonrpc", "2.0"},
+                             {"id", id},
+                             {"result", QJsonObject{{"content", text}}}}));
+    QVERIFY(fired);
+    QCOMPARE(roundTripped, text);
+    QCOMPARE(warnSpy.count(), 0);
+
+    m_client->setTransport(nullptr);
+}
+
+// A base64 payload that is not valid base64 is a server bug or a corrupted
+// frame, and decoding must refuse it rather than hand back a truncated file.
+// Invalid UTF-8 INSIDE a well-formed base64 payload is a different thing
+// entirely: those are the file's real bytes, which is exactly why the daemon
+// sent base64, so they become U+FFFD and the read succeeds.
+void TstRpcClient::decodeFileContentRejectsInvalidBase64()
+{
+    QVERIFY(!ch::rpc::decodeFileContent(
+                 QJsonObject{{"encoding", "base64"}, {"content", "not*base64"}})
+                 .has_value());
+
+    // "/w==" is one byte, 0xFF, which is not valid UTF-8 on its own.
+    const auto lossy = ch::rpc::decodeFileContent(
+        QJsonObject{{"encoding", "base64"}, {"content", "/w=="}});
+    QVERIFY(lossy.has_value());
+    QCOMPARE(*lossy, QString(QChar(QChar::ReplacementCharacter)));
+
+    // An empty payload is a legitimately empty file, not a failure.
+    const auto empty = ch::rpc::decodeFileContent(
+        QJsonObject{{"encoding", "base64"}, {"content", ""}});
+    QVERIFY(empty.has_value());
+    QVERIFY(empty->isEmpty());
 }
 
 

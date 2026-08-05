@@ -43,17 +43,16 @@ bool isKnownPalette(const QString& value)
            || value == QLatin1String("tokyonight");
 }
 
-// A whole number from the store, clamped into [minimum, maximum]. As in
-// UiStateStore, QVariant::toInt() answering 0 for unparseable text is the thing
-// being guarded: one half-written line must not become a zero-point font.
+// A whole number from the store, clamped into [minimum, maximum]. Convert via
+// text so a wrong-typed native QVariant (for example, a fractional double)
+// cannot be silently truncated by QVariant::toInt().
 int storedInt(const QSettings& settings, const QString& key, int fallback,
               int minimum, int maximum)
 {
     const QVariant raw = settings.value(key);
-    if (!raw.isValid())
-        return fallback;
+    const QString text = raw.toString().trimmed();
     bool ok = false;
-    const int value = raw.toInt(&ok);
+    const int value = text.toInt(&ok);
     if (!ok)
         return fallback;
     return std::clamp(value, minimum, maximum);

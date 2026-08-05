@@ -6,5 +6,6 @@ Comment=Manage persistent remote development workspaces
 Exec=codeharbor
 Icon=codeharbor
 Categories=Development;IDE;
+Keywords=remote;ssh;development;workspace;terminal;editor;
 Terminal=false
 StartupWMClass=codeharbor

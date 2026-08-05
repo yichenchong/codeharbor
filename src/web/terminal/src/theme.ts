@@ -51,8 +51,15 @@ export function normalizeThemeRoles(input: unknown): ThemeRoles {
     return roles;
 }
 
+/** Everything applyThemeToDocument() touches. A real Document satisfies it;
+ *  Pick<Document, "documentElement"> did not, because that still drags in the
+ *  full HTMLElement and left this function unreachable from a unit test. */
+export interface ThemeStyleTarget {
+    documentElement: { style: Pick<CSSStyleDeclaration, "setProperty"> };
+}
+
 export function applyThemeToDocument(
-    document: Pick<Document, "documentElement">,
+    document: ThemeStyleTarget,
     input: unknown,
 ): ThemeRoles {
     const roles = normalizeThemeRoles(input);

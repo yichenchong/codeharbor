@@ -10,6 +10,7 @@ import { isInvalidParams, requireStringArray } from "../src/validate.ts";
 
 import {
     applyConnectionPragmas,
+    closeDefaultWorkspace,
     isDatabaseBusy,
     openWorkspace,
     WORKSPACE_SCHEMA_VERSION,
@@ -2027,16 +2028,19 @@ test("migrate refuses a database written by a newer build instead of using it", 
     await cleanup(dbPath);
 });
 
-// The four lookup columns that every listing joins or filters on. They are
-// indexed by remote/sql/indexes.sql, which openWorkspace applies on EVERY open
-// rather than through the migration runner: migrate() skips its DDL entirely
-// once the stored schema_version has reached the current one, so an index
-// delivered only by schema.sql would never appear on an existing database — and
-// bumping the version to force it is not available, because that number is
-// mirrored in C++ (WorkspaceDb::kSchemaVersion) and a one-sided bump breaks the
-// client's compatibility gate.
+// The lookup columns that every listing joins or filters on. They are indexed
+// by remote/sql/indexes.sql, which openWorkspace applies on EVERY open rather
+// than through the migration runner: migrate() skips its DDL entirely once the
+// stored schema_version has reached the current one, so an index delivered only
+// by schema.sql would never appear on an existing database — and bumping the
+// version to force it is not available, because that number is mirrored in C++
+// (WorkspaceDb::kSchemaVersion) and a one-sided bump breaks the client's
+// compatibility gate.
+//
+// `idx_dev_sessions_group_id` is deliberately NOT here: its single column is a
+// strict prefix of idx_dev_sessions_group_pinned, so the planner never chose
+// it. See "a retired index is dropped from an existing database" below.
 const EXPECTED_INDEXES = [
-    "idx_dev_sessions_group_id",
     "idx_dev_sessions_group_pinned",
     "idx_groups_server_id",
     "idx_terminal_panes_dev_session_id",
@@ -2088,20 +2092,60 @@ test("opening an existing database without the lookup indexes creates them", asy
 });
 
 // An index nobody can use is worse than none: it costs every write and buys
-// nothing. Ask SQLite's planner directly whether the session listing uses the
-// group_id index, so a typo in a column name fails here rather than passing as
-// "the index exists".
+// nothing. Ask SQLite's planner directly which index each dev_sessions query
+// actually gets, so a typo in a column name fails here rather than passing as
+// "the index exists" — and so a re-added group-only index would be caught as
+// the dead weight it is.
 test("the session lookup index is actually chosen by the query planner", async () => {
     const dbPath = await tmpDbPath();
     const ws = openWorkspace(dbPath);
-    const plan = ws.db
-        .prepare("EXPLAIN QUERY PLAN SELECT * FROM dev_sessions WHERE group_id = ? AND pinned <> 0")
-        .all("g1") as { detail: string }[];
+    const planFor = (sql: string): string => {
+        const rows = ws.db.prepare(`EXPLAIN QUERY PLAN ${sql}`).all("g1", "s1") as {
+            detail: string;
+        }[];
+        return rows.map((r) => r.detail).join("\n");
+    };
+    // The filtered sidebar view...
     assert.match(
-        plan.map((r) => r.detail).join("\n"),
+        planFor("SELECT * FROM dev_sessions WHERE group_id = ? AND server_id = ? AND pinned <> 0"),
+        /USING INDEX idx_dev_sessions_group_pinned/,
+    );
+    // ...and the unfiltered one, which the same index serves because group_id
+    // is its leftmost column. This is why the group-only index was retired.
+    assert.match(
+        planFor("SELECT * FROM dev_sessions WHERE group_id = ? AND server_id = ?"),
         /USING INDEX idx_dev_sessions_group_pinned/,
     );
     ws.close();
+    await cleanup(dbPath);
+});
+
+// indexes.sql runs on every open, so it can retire an index as well as add one.
+// `idx_dev_sessions_group_id` indexed a strict prefix of the composite index
+// above, so the planner never chose it and every session write paid for a
+// second b-tree for nothing. A database written by an older build still carries
+// it; opening it must take it away, and must not break the foreign key that
+// leaned on it (deleting a group has to find the sessions that reference it).
+test("a retired index is dropped from an existing database", async () => {
+    const dbPath = await tmpDbPath();
+    const legacy = openWorkspace(dbPath);
+    const { group, session } = seed(legacy);
+    legacy.db.exec("CREATE INDEX idx_dev_sessions_group_id ON dev_sessions (group_id)");
+    assert.equal(indexNames(legacy).includes("idx_dev_sessions_group_id"), true);
+    legacy.close();
+
+    const upgraded = openWorkspace(dbPath);
+    assert.deepEqual(indexNames(upgraded), EXPECTED_INDEXES);
+    // Nothing else moved: the rows and the schema version are as they were.
+    assert.deepEqual(upgraded.getSession(session.id).groupId, group.id);
+    // The foreign key still rejects a naive group delete, i.e. SQLite can still
+    // find the referencing sessions through the surviving composite index.
+    assert.throws(() => upgraded.db.prepare("DELETE FROM groups WHERE id = ?").run(group.id));
+    // And the real cascade still works.
+    assert.deepEqual(upgraded.deleteGroup({ id: group.id }), { ok: true });
+    assert.deepEqual(upgraded.list(SERVER), []);
+    upgraded.close();
+
     await cleanup(dbPath);
 });
 
@@ -2969,6 +3013,296 @@ test("the v3 migration opens a legacy database whose canonical mint is unusable"
     assert.equal(upgraded.getTerminalPane("pane-b").tmuxTarget, null);
     assert.equal(upgraded.getTerminalPane("pane-b").name, "b");
     upgraded.close();
+
+    await cleanup(dbPath);
+});
+
+// The same legacy shape from the OTHER side: not migrating a database that
+// already holds panes, but creating a BRAND NEW terminal pane inside a Dev
+// Session whose id predates UUIDs. `ch_<devSessionId>_<paneId>` is unusable as
+// a tmux session name when the Dev Session id carries a ':' — and minting used
+// to THROW there, so every terminal in such a session came back as a bare
+// internal error and the user could not open a shell at all. The identity
+// degrades to something still unique instead.
+test("a terminal pane in a Dev Session with a legacy id still gets a usable tmux target", async () => {
+    const dbPath = await tmpDbPath();
+    const ws = openWorkspace(dbPath);
+    const g = ws.createGroup({ serverId: SERVER, name: "G" });
+    const legacyId = "legacy session:1";
+    ws.db
+        .prepare(
+            "INSERT INTO dev_sessions (id, server_id, group_id, name, repository_root, position, archived, pinned, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .run(legacyId, SERVER, g.id, "S", "/r", 0, 0, 0, 1, 1);
+
+    const created = ws.createTerminalPane({ serverId: SERVER, devSessionId: legacyId, name: "t1" });
+    // Falls back to the pane row id, which IS a UUID and therefore safe.
+    assert.equal(created.tmuxTarget, `ch_${created.id}`);
+    // A second pane gets its own target, so the two never share a shell.
+    const other = ws.createTerminalPane({ serverId: SERVER, devSessionId: legacyId, name: "t2" });
+    assert.notEqual(other.tmuxTarget, created.tmuxTarget);
+
+    // The heal path (a row found with no target) works in the same session.
+    ws.updateTerminalPane({ id: created.id, tmuxTarget: null });
+    const healed = ws.resolveTerminalPane({ serverId: SERVER, devSessionId: legacyId, id: created.id });
+    assert.equal(healed.tmuxTarget, `ch_${created.id}`);
+
+    // And a row whose OWN id is legacy too still gets something usable: no
+    // component of the canonical name is safe, so a fresh one is minted.
+    ws.db
+        .prepare(
+            "INSERT INTO terminal_panes (id, server_id, dev_session_id, name, position, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .run("legacy pane:2", SERVER, legacyId, "t3", 2, 1, 1);
+    const rescued = ws.resolveTerminalPane({
+        serverId: SERVER,
+        devSessionId: legacyId,
+        id: "legacy pane:2",
+    });
+    assert.match(rescued.tmuxTarget ?? "", /^ch_[0-9a-f-]{36}$/);
+
+    ws.close();
+    await cleanup(dbPath);
+});
+
+// The sidebar's pinned-only view. A group is listed only when it actually holds
+// a pinned session, and within a listed group only the pinned sessions come
+// back — otherwise the filter would either hide a session the user pinned or
+// show a group that is empty under the filter.
+test("the pinned-only listing keeps pinned sessions and drops groups with none", async () => {
+    const dbPath = await tmpDbPath();
+    const ws = openWorkspace(dbPath);
+    const mixed = ws.createGroup({ serverId: SERVER, name: "Mixed" });
+    const none = ws.createGroup({ serverId: SERVER, name: "None" });
+    const plain = mkSession(ws, mixed.id, "plain");
+    const pinned = mkSession(ws, mixed.id, "pinned");
+    mkSession(ws, none.id, "also-plain");
+    ws.updateSession({ id: pinned.id, pinned: true });
+
+    // Unfiltered: both groups, all three sessions.
+    assert.deepEqual(
+        ws.list(SERVER).map((g) => g.sessions.length),
+        [2, 1],
+    );
+
+    const filtered = ws.list(SERVER, true);
+    assert.deepEqual(filtered.map((g) => g.name), ["Mixed"]);
+    assert.deepEqual(filtered[0].sessions.map((s) => s.name), ["pinned"]);
+    // The pinned session keeps its panes and layouts under the filter; the
+    // predicate narrows which sessions are listed, never what a session holds.
+    const v = ws.createViewerPane({ serverId: SERVER, devSessionId: pinned.id, url: "http://x" });
+    assert.deepEqual(
+        ws.list(SERVER, true)[0].sessions[0].viewerPanes.map((p) => p.id),
+        [v.id],
+    );
+
+    // Unpinning the last pinned session empties the filtered view entirely.
+    ws.updateSession({ id: pinned.id, pinned: false });
+    assert.deepEqual(ws.list(SERVER, true), []);
+    // Archiving is NOT a server-side filter: an archived session still lists.
+    ws.updateSession({ id: plain.id, archived: true });
+    assert.equal(ws.list(SERVER)[0].sessions.length, 2);
+
+    ws.close();
+    await cleanup(dbPath);
+});
+
+// Deleting is idempotent on purpose: a client that retries after a dropped
+// connection must not be told its second attempt failed. Pinned here because
+// the alternative (throwing "not found", the way every update does) is a change
+// a reader could easily make by accident while making the two consistent.
+test("deleting a row that is already gone succeeds instead of throwing", async () => {
+    const dbPath = await tmpDbPath();
+    const ws = openWorkspace(dbPath);
+    const { group, session, viewer, terminal } = seed(ws);
+
+    assert.deepEqual(ws.deleteViewerPane({ id: viewer.id }), { ok: true });
+    assert.deepEqual(ws.deleteViewerPane({ id: viewer.id }), { ok: true });
+    assert.deepEqual(ws.deleteTerminalPane({ id: terminal.id }), { ok: true });
+    assert.deepEqual(ws.deleteTerminalPane({ id: terminal.id }), { ok: true });
+    assert.deepEqual(ws.deleteSession({ id: session.id }), { ok: true });
+    assert.deepEqual(ws.deleteSession({ id: session.id }), { ok: true });
+    assert.deepEqual(ws.deleteGroup({ id: group.id }), { ok: true });
+    assert.deepEqual(ws.deleteGroup({ id: group.id }), { ok: true });
+    assert.deepEqual(ws.deleteGroup({ id: "never-existed" }), { ok: true });
+
+    // Reading a row that is gone is still an error — a delete answering "ok" is
+    // about repeating a request, not about pretending the row is there.
+    assert.throws(() => ws.getGroup(group.id), /group not found/);
+    assert.deepEqual(ws.list(SERVER), []);
+
+    ws.close();
+    await cleanup(dbPath);
+});
+
+// deleteGroup is the one cascade that spans every table, and it is set-based
+// rather than a loop over the group's sessions. Exercise it with more than one
+// session, each with panes and both layout regions, and with a sibling group
+// that must come through untouched — a subquery scoped to the wrong column
+// would take the sibling's rows with it and nothing smaller would notice.
+test("deleteGroup removes every descendant of that group and nothing else", async () => {
+    const dbPath = await tmpDbPath();
+    const ws = openWorkspace(dbPath);
+    const doomed = ws.createGroup({ serverId: SERVER, name: "Doomed" });
+    const keeper = ws.createGroup({ serverId: SERVER, name: "Keeper" });
+
+    const furnish = (groupId: string, name: string) => {
+        const s = ws.createSession({ serverId: SERVER, groupId, name, repositoryRoot: "/r" });
+        const v = ws.createViewerPane({ serverId: SERVER, devSessionId: s.id, url: `http://${name}` });
+        const t = ws.createTerminalPane({ serverId: SERVER, devSessionId: s.id, name: `${name}-sh` });
+        ws.setLayout({ serverId: SERVER, devSessionId: s.id, region: "viewer", tree: { type: "leaf", paneId: v.id } });
+        ws.setLayout({ serverId: SERVER, devSessionId: s.id, region: "terminal", tree: { type: "leaf", paneId: t.id } });
+        return s;
+    };
+    const a = furnish(doomed.id, "a");
+    const b = furnish(doomed.id, "b");
+    const survivor = furnish(keeper.id, "survivor");
+
+    ws.deleteGroup({ id: doomed.id });
+
+    const count = (table: string, column: string, value: string): number => {
+        // A COUNT(*) aliased to `n` always comes back as one row with that one
+        // column, which is why the shape is asserted rather than parsed.
+        const row = ws.db
+            .prepare(`SELECT COUNT(*) AS n FROM ${table} WHERE ${column} = ?`)
+            .get(value) as { n: number };
+        return row.n;
+    };
+    for (const gone of [a.id, b.id]) {
+        assert.equal(count("dev_sessions", "id", gone), 0);
+        assert.equal(count("viewer_panes", "dev_session_id", gone), 0);
+        assert.equal(count("terminal_panes", "dev_session_id", gone), 0);
+        assert.equal(count("session_layouts", "dev_session_id", gone), 0);
+    }
+    // The sibling group is complete, down to both layout regions.
+    const [remaining] = ws.list(SERVER);
+    assert.equal(remaining.id, keeper.id);
+    assert.equal(remaining.sessions.length, 1);
+    assert.equal(remaining.sessions[0].id, survivor.id);
+    assert.equal(remaining.sessions[0].viewerPanes.length, 1);
+    assert.equal(remaining.sessions[0].terminalPanes.length, 1);
+    assert.notEqual(remaining.sessions[0].layouts.viewer, null);
+    assert.notEqual(remaining.sessions[0].layouts.terminal, null);
+
+    ws.close();
+    await cleanup(dbPath);
+});
+
+// Both layout regions are repaired against ONE timestamp, so a delete that
+// touches both cannot leave them claiming to have happened at different
+// moments — repairLayout used to call Date.now() per region.
+test("deleting a pane referenced by both regions stamps both with one time", async () => {
+    const dbPath = await tmpDbPath();
+    const ws = openWorkspace(dbPath);
+    const g = ws.createGroup({ serverId: SERVER, name: "G" });
+    const s = ws.createSession({ serverId: SERVER, groupId: g.id, name: "S", repositoryRoot: "/r" });
+    const shared = ws.createViewerPane({ serverId: SERVER, devSessionId: s.id, url: "http://x" });
+    // Client-authored trees can name the same pane from both regions.
+    for (const region of ["viewer", "terminal"] as const) {
+        ws.setLayout({ serverId: SERVER, devSessionId: s.id, region, tree: { type: "leaf", paneId: shared.id } });
+    }
+
+    ws.deleteViewerPane({ id: shared.id });
+
+    const rows = ws.db
+        .prepare("SELECT region, tree, updated_at FROM session_layouts WHERE dev_session_id = ? ORDER BY region")
+        .all(s.id) as unknown as Array<{ region: string; tree: string; updated_at: number }>;
+    assert.deepEqual(rows.map((r) => r.region), ["terminal", "viewer"]);
+    for (const row of rows) assert.equal(row.tree, JSON.stringify({ type: "leaf", paneId: "" }));
+    assert.equal(rows[0].updated_at, rows[1].updated_at);
+
+    ws.close();
+    await cleanup(dbPath);
+});
+
+// A split tree is client-authored, so a leaf can carry a paneId that is not a
+// string at all. Copying used to rewrite such a leaf's paneId to "", i.e. to
+// the value the client uses for "this region is empty" — turning malformed
+// input into a silently different layout. The copy differs from the original
+// only in which panes it names.
+test("duplicateSession copies a leaf with a non-string paneId unchanged", async () => {
+    const dbPath = await tmpDbPath();
+    const ws = openWorkspace(dbPath);
+    const g = ws.createGroup({ serverId: SERVER, name: "G" });
+    const s = ws.createSession({ serverId: SERVER, groupId: g.id, name: "S", repositoryRoot: "/r" });
+    const real = ws.createViewerPane({ serverId: SERVER, devSessionId: s.id, url: "u" });
+    ws.setLayout({
+        serverId: SERVER,
+        devSessionId: s.id,
+        region: "viewer",
+        tree: {
+            type: "split",
+            orientation: "horizontal",
+            ratios: [0.5, 0.5],
+            children: [
+                { type: "leaf", paneId: 7 },
+                { type: "leaf", paneId: real.id },
+            ],
+        },
+    });
+
+    const copy = ws.duplicateSession({ id: s.id });
+    const tree = copy.layouts.viewer as { children: Array<Record<string, unknown>> };
+    assert.equal(tree.children[0].paneId, 7);
+    assert.equal(tree.children[1].paneId, copy.viewerPanes[0].id);
+
+    ws.close();
+    await cleanup(dbPath);
+});
+
+// The daemon's shutdown path calls this unconditionally, so it has to survive
+// being called when nothing was ever opened and being called twice, and it must
+// never throw — a shutdown that fails because of a tidy-up step is worse than
+// no tidy-up at all. Closing is what checkpoints the write-ahead log and
+// removes the -wal/-shm files; without it they are left for the next process.
+test("closeDefaultWorkspace is a no-op when unused, and idempotent when used", async () => {
+    // Never opened: nothing to close, and no throw.
+    assert.equal(closeDefaultWorkspace(), undefined);
+    assert.equal(closeDefaultWorkspace(), undefined);
+
+    const dbPath = await tmpDbPath();
+    const previous = process.env.CODEHARBOR_DB;
+    process.env.CODEHARBOR_DB = dbPath;
+    try {
+        // Any handler call opens the singleton against CODEHARBOR_DB.
+        const created = WORKSPACE_METHODS["workspace.createGroup"]({
+            serverId: SERVER,
+            name: "G",
+        }) as { id: string };
+        const wal = `${dbPath}-wal`;
+        assert.equal(
+            await fs
+                .stat(wal)
+                .then(() => true)
+                .catch(() => false),
+            true,
+            "a file-backed workspace runs in WAL, so the log must exist while open",
+        );
+
+        closeDefaultWorkspace();
+        // The clean close checkpointed and removed the log.
+        assert.equal(
+            await fs
+                .stat(wal)
+                .then(() => true)
+                .catch(() => false),
+            false,
+            "closing must checkpoint the WAL and remove it",
+        );
+        // Twice is fine: the singleton is cleared, not left half-closed.
+        closeDefaultWorkspace();
+
+        // The row is on disk, and the next handler call reopens rather than
+        // reusing the closed handle.
+        const listed = WORKSPACE_METHODS["workspace.list"]({ serverId: SERVER }) as Array<{
+            id: string;
+        }>;
+        assert.deepEqual(listed.map((g) => g.id), [created.id]);
+    } finally {
+        closeDefaultWorkspace();
+        if (previous === undefined) delete process.env.CODEHARBOR_DB;
+        else process.env.CODEHARBOR_DB = previous;
+    }
 
     await cleanup(dbPath);
 });

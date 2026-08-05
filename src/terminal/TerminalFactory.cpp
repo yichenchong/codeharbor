@@ -36,7 +36,7 @@ constexpr int kDefaultRows = 24;
 // Upper bound on how long the fire-and-forget kill channel may stay alive.
 // The channel self-deletes on its own end-of-stream; if the SSH session dies
 // mid-kill that signal may never arrive, so this bounds the wait before the
-// one-shot object is reclaimed regardless (TM13).
+// one-shot object is reclaimed regardless.
 constexpr int kKillWatchdogMs = 30000;
 
 } // namespace
@@ -536,11 +536,11 @@ void TerminalFactory::finishResolution(const QString& key, const QString& target
                                   answer.harness);
             }
         }
-        if (target.isEmpty() && !message.isEmpty()) {
+        if (target.isEmpty() && !message.isEmpty())
             emit error(waiter, message);
-            if (!waiter)
-                continue;
-        }
+        // Re-checked once, after everything above that can reach QML:
+        // bindAgentIdentity() and error() both emit, and a pane is free to
+        // close itself in response.
         if (!waiter)
             continue;
         emit targetResolved(waiter, target);

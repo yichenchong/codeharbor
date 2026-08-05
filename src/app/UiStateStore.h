@@ -33,7 +33,8 @@ public:
     // Empty iniPath -> native per-user store (org "CodeHarbor", app
     // "CodeHarbor"). Non-empty iniPath -> an explicit .ini file in IniFormat,
     // used by tests for a deterministic, isolated store.
-    explicit UiStateStore(QString iniPath = QString(), QObject* parent = nullptr);
+    explicit UiStateStore(const QString& iniPath = QString(),
+                          QObject* parent = nullptr);
     ~UiStateStore() override;
 
     // Persist all three region widths at once (a handle move adjusts two

@@ -295,8 +295,14 @@ bool TstLiveAgent::fireHook(const QString& nativeEvent, const QString& tool,
     // for a shutdown, which outranks the flag (SPEC 6.5 precedence).
     if (error)
         argv << q(QStringLiteral("OMP_ERROR=1"));
-    argv << QStringLiteral("sh")
-         << q(m_repo + QStringLiteral("/tests/live/fake-omp-agent.sh"))
+    // Executed directly rather than as `sh <script>`, so its `#!/usr/bin/env
+    // bash` shebang is honoured. The script enables `set -o pipefail`, which
+    // is a Bash option: handing it to a POSIX /bin/sh (dash on Debian, ash on
+    // Alpine/BusyBox) makes the shell abort with "Illegal option -o pipefail"
+    // before a single hook is fired, and the gate then reports a relay timeout
+    // for a hook that never ran. `env` execs it, so the file's 0755 mode and
+    // its interpreter line are what select the shell.
+    argv << q(m_repo + QStringLiteral("/tests/live/fake-omp-agent.sh"))
          << q(nativeEvent);
     if (!tool.isEmpty())
         argv << q(tool);

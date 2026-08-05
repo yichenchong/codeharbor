@@ -124,7 +124,10 @@ public slots:
     //
     // A second ready() means the page RELOADED and lost its buffer: there is
     // nothing held to replay, so the file is re-fetched instead of re-emitting
-    // a stale copy.
+    // a stale copy. With no transport bound the re-fetch is DEFERRED to the
+    // next bind rather than attempted and lost: it would fail synchronously
+    // after having already cleared the dirty flag and the recovery slot, which
+    // would leave the pane blank and its unsaved work unreachable.
     Q_INVOKABLE void ready();
 
 signals:
@@ -202,6 +205,12 @@ private:
     // ready() slot). The held buffer is overwritten by a newer load, so a
     // reconnecting page always sees the LATEST content exactly once.
     void deliverContent(const QString& content, const QString& revision);
+    // Fetch the file again for a page that reloaded and lost its buffer: an
+    // open() when the buffer was dirty (so this pane's crash-recovery snapshot
+    // is probed and offered back), a plain discarding reload otherwise. Called
+    // from ready(), or from onTransportBound() when the page reloaded during an
+    // outage and the fetch had to wait for a transport.
+    void refetchForReloadedPage();
     // Look for a crash-recovery snapshot for the file `generation` loaded. The
     // generation is carried through both round trips so a snapshot belonging
     // to a superseded load can never be offered against the file now open, and
@@ -211,6 +220,15 @@ private:
     // open file, so a reused per-pane slot from a previous file is never
     // offered as the current one.
     void checkRecovery(const QString& loadedContent, quint64 generation);
+    // Forget everything known about this pane's recovery slot and retire every
+    // reply still in flight for it (by bumping m_recoveryGeneration). Shared by
+    // open() and by both recovery-key setters, which face the same problem: the
+    // slot they described is not the slot the next write will touch.
+    void resetRecoverySlot();
+    // Probe the recovery slot for the file already open, used by the two
+    // recovery-key setters. A no-op unless a clean, writable, fully loaded
+    // buffer is on screen — the same conditions open() checks before it probes.
+    void probeRecoveryForOpenFile();
     void writeRecovery(const QString& content, bool retryOnMismatch);
     // Discard this pane's recovery snapshot after a successful save
     // (SPEC 11.3): the saved file IS the buffer now, so a later reopen must not
@@ -323,8 +341,11 @@ private:
     // the page has no such guarantee.
     bool m_saveInFlight = false;
     // Bumped by every write issued. A reply carrying a superseded generation
-    // (open() bumps it too) must not clear the flag or consume the queue: they
-    // belong to a later chain, possibly for another file.
+    // must not clear the flag or consume the queue: they belong to a later
+    // chain, possibly for another file. Also bumped by every load that COMMITS
+    // to the buffer over a running chain — open(), and the explicit reload that
+    // is allowed to replace a buffer mid-save — because the bytes that chain is
+    // carrying are then no longer the ones on screen.
     quint64 m_saveGeneration = 0;
     // The bytes of the write on the wire, so a second save of an UNCHANGED
     // buffer is recognised as the same save and costs no second write (which
@@ -417,6 +438,10 @@ private:
     bool m_ready = false;
     std::optional<QString> m_pendingContent;
     QString m_pendingRevision;
+    // A page reloaded (a second ready()) while there was no transport to fetch
+    // its buffer over, so the fetch is owed and onTransportBound() performs it.
+    // Cleared by open(): a host-driven load serves the page on its own.
+    bool m_pageNeedsContent = false;
 };
 
 } // namespace ch

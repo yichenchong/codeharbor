@@ -1,6 +1,7 @@
 import QtQuick
 import QtQuick.Controls.Basic
 import QtQuick.Window
+import CodeHarbor
 
 // The fixed three-region outer layout (SPEC 2.3, 4.1). Region widths are
 // adjustable via the SplitView handles and are persisted per client via
@@ -85,20 +86,6 @@ ApplicationWindow {
     property int focusRestoreTerminalSerial: 0
     property int focusRestoreAttempts: 0
     property bool focusRestoreArmed: false
-
-    // Point the terminal region at the active Dev Session, WORKING DIRECTORY
-    // FIRST.
-    //
-    // AppController notifies activeSessionId and activeSessionRepoRoot with the
-    // same activeSessionChanged signal, and TerminalPaneView attaches its PTY on
-    // devSessionId (onDevSessionIdChanged -> retarget) while only adopting a
-    // working directory it is not yet attached with (onWorkingDirChanged -> attach
-    // if !attached). Two independent bindings therefore raced: whenever the id
-    // landed first the pane attached with an empty working directory — a shell in
-    // $HOME instead of the repo — and the later directory update was ignored.
-    // Writing both here, in order, makes the pane see the directory before the id
-    // it attaches on. (The pane-side fix, adopting a late working directory, is
-    // TerminalPaneView's; this removes the race from the host regardless.)
 
     function focusRestoreStampCurrent() {
         return window.focusRestoreArmed
@@ -204,6 +191,20 @@ ApplicationWindow {
             return;
         window.scheduleFocusRestore();
     }
+
+    // Point the terminal region at the active Dev Session, WORKING DIRECTORY
+    // FIRST.
+    //
+    // AppController notifies activeSessionId and activeSessionRepoRoot with the
+    // same activeSessionChanged signal, and TerminalPaneView attaches its PTY on
+    // devSessionId (onDevSessionIdChanged -> retarget) while only adopting a
+    // working directory it is not yet attached with (onWorkingDirChanged -> attach
+    // if !attached). Two independent bindings therefore raced: whenever the id
+    // landed first the pane attached with an empty working directory — a shell in
+    // $HOME instead of the repo — and the later directory update was ignored.
+    // Writing both here, in order, makes the pane see the directory before the id
+    // it attaches on. (The pane-side fix, adopting a late working directory, is
+    // TerminalPaneView's; this removes the race from the host regardless.)
     function retargetTerminals() {
         terminalRegion.workingDir = app.activeSessionRepoRoot;
         terminalRegion.devSessionId = app.activeSessionId;
@@ -563,11 +564,10 @@ ApplicationWindow {
 
     Connections {
         target: app
-        function onError(message) {
-            errorLabel.text = message;
-            errorBanner.opacity = 0.97;
-            errorHideTimer.restart();
-        }
+        // The same toast the palette commands use (window.notifyUser), said
+        // once: two copies of "set the text, raise the opacity, restart the
+        // timer" are two places for the timing or the opacity to drift.
+        function onError(message) { window.notifyUser(message); }
     }
 
     // Layout failures reach the user too. Without this every SessionLayouts
@@ -688,8 +688,10 @@ ApplicationWindow {
 
     // --- Command palette (SPEC 15) ------------------------------------------
 
-    // Surface a message in the existing toast. QML cannot emit app.error (a C++
-    // signal), so a command that cannot run says so here rather than no-oping.
+    // The ONE way anything in this window raises the transient error toast:
+    // app.error, SessionLayouts.error and any palette command that cannot run
+    // all come through here. QML cannot emit app.error (a C++ signal), so a
+    // command that cannot run says so here rather than no-oping.
     function notifyUser(message) {
         errorLabel.text = message;
         errorBanner.opacity = 0.97;
@@ -966,9 +968,16 @@ ApplicationWindow {
         // until now nothing in the UI could reach TerminalPaneView.killSession().
         { id: "terminal.kill", title: qsTr("Kill Focused Terminal's Remote Session"),
           invoke: () => window.killActiveTerminal() },
+        // `agentMonitor` is a context property main.cpp injects, so it follows
+        // the same rule as `windowChrome` above: checked with typeof, because a
+        // headless QML fixture that mirrors an older context set would
+        // otherwise turn this command into a ReferenceError instead of a
+        // no-op with a reason on screen.
         { id: "agent.markSeen", title: qsTr("Mark Agent Output Seen"),
           invoke: () => {
-              if (app.activeSessionId.length === 0)
+              if (typeof agentMonitor === "undefined" || !agentMonitor)
+                  window.notifyUser(qsTr("Agent status is not available."));
+              else if (app.activeSessionId.length === 0)
                   window.notifyUser(qsTr("No active Dev Session."));
               else
                   agentMonitor.markSeen(app.activeSessionId);

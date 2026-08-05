@@ -84,6 +84,17 @@ public:
     // returns nothing and every write fails.
     bool open(OpenMode mode) override;
 
+    // Block until at least one byte is readable, the read channel finishes, or
+    // `msecs` elapses (negative waits without a deadline). QIODevice's default
+    // implementation answers false unconditionally, which on a device whose
+    // whole purpose is to be consumed through the plain QIODevice interface is
+    // a trap: a caller that blocks for bytes instead of connecting to
+    // readyRead() gets an immediate "no data, ever" and concludes the stream is
+    // dead while the channel is perfectly alive. Drives the same read pass the
+    // poll timer does, so readyRead() is emitted for the bytes it collects just
+    // as it would have been asynchronously.
+    bool waitForReadyRead(int msecs) override;
+
 signals:
     // Channel-level diagnostics: the remote side's stderr plus libssh failures.
     // Kept OUT of the read stream on purpose — folding stderr into readData()
@@ -133,6 +144,11 @@ private:
     // re-entrant close/start cannot finish or publish bytes for a new channel.
     quint64 m_channelGeneration = 0;
     bool m_pumping = false;
+    // Counts the pump passes that collected at least one payload byte. Only
+    // waitForReadyRead() reads it, and only to tell "the channel produced
+    // something a readyRead() handler has already taken" apart from "the
+    // channel is quiet", which the buffer size alone cannot distinguish.
+    quint64 m_payloadPasses = 0;
     // Remote stderr arrives in 16 KiB reads spread over as many pump passes as
     // the writer needs, so a multi-byte UTF-8 character can straddle two of
     // them. A stateful decoder holds the incomplete sequence over until the

@@ -73,6 +73,9 @@ public:
     // Parse known_hosts-format text. Blank lines and #-comments are ignored;
     // a leading @marker (@cert-authority, @revoked) is captured: a @revoked key
     // is refused (Mismatch) if presented and @cert-authority entries are opaque.
+    // Those two are the ONLY markers accepted; a line beginning with any other
+    // @token is dropped, exactly as OpenSSH drops it, so a misspelt or
+    // mis-cased marker can never quietly demote a revocation into plain trust.
     // A plain comma-separated host list expands to one entry per name, while a
     // list containing wildcards or a `!` negation is kept verbatim in one entry
     // so its negation keeps working.

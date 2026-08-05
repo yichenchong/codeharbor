@@ -224,10 +224,14 @@ bool InternalUrlSchemeHandler::isActiveContentMime(const QByteArray &mime)
     // Any XML-family document renders as an active document and can carry inline
     // script, an xml-stylesheet PI pulling an XSLT transform, or foreign HTML.
     // Catches application/xml, text/xml, and every "*+xml" (SVG, XHTML, XSLT,
-    // RSS, Atom, ...).
+    // RSS, Atom, ...). "+xml-compressed" is shared-mime-info's spelling for a
+    // gzipped member of the same family (image/svg+xml-compressed, i.e. .svgz);
+    // it does not end in "+xml" and so has to be named separately, or the one
+    // SVG spelling that is compressed would slip past the gate.
     if (m == QByteArrayLiteral("application/xml")
         || m == QByteArrayLiteral("text/xml")
-        || m.endsWith(QByteArrayLiteral("+xml")))
+        || m.endsWith(QByteArrayLiteral("+xml"))
+        || m.endsWith(QByteArrayLiteral("+xml-compressed")))
         return true;
 
     return m == QByteArrayLiteral("text/html")
@@ -237,6 +241,35 @@ bool InternalUrlSchemeHandler::isActiveContentMime(const QByteArray &mime)
         || m == QByteArrayLiteral("multipart/related")
         || m == QByteArrayLiteral("message/rfc822")
         || m == QByteArrayLiteral("application/x-mimearchive");
+}
+
+bool InternalUrlSchemeHandler::isTextualMime(const QByteArray &mime)
+{
+    QByteArray m = mime.toLower();
+    const qsizetype semi = m.indexOf(';');
+    if (semi >= 0)
+        m = m.left(semi).trimmed();
+
+    if (m.startsWith(QByteArrayLiteral("text/")))
+        return true;
+    // The two structured suffixes RFC 6839 registers. Everything spelled
+    // "*+xml" or "*+json" is a text document by construction.
+    if (m.endsWith(QByteArrayLiteral("+xml")) || m.endsWith(QByteArrayLiteral("+json")))
+        return true;
+    // application/* types that are plainly text but carry no structured suffix.
+    // Missing one costs a mojibake rendering of a non-ASCII file, so the list
+    // covers the spellings shared-mime-info actually produces for source and
+    // configuration files (.json, .yaml, .toml, .js).
+    return m == QByteArrayLiteral("application/xml")
+        || m == QByteArrayLiteral("application/json")
+        || m == QByteArrayLiteral("application/yaml")
+        || m == QByteArrayLiteral("application/x-yaml")
+        || m == QByteArrayLiteral("application/toml")
+        || m == QByteArrayLiteral("application/javascript")
+        || m == QByteArrayLiteral("application/ecmascript")
+        || m == QByteArrayLiteral("application/sql")
+        || m == QByteArrayLiteral("application/x-sh")
+        || m == QByteArrayLiteral("application/x-shellscript");
 }
 
 QString InternalUrlSchemeHandler::failureMessage(Failure reason,
@@ -270,6 +303,12 @@ QString InternalUrlSchemeHandler::failureMessage(Failure reason,
         return QStringLiteral("file is too large to display inline");
     case Failure::UndecodableContent:
         return QStringLiteral("file contents could not be decoded");
+    case Failure::MalformedReply:
+        // Distinct from UndecodableContent: there the payload was the right
+        // SHAPE and only the base64 was corrupt; here the server answered with
+        // fields this build cannot trust at all, so nothing was even attempted.
+        return QStringLiteral(
+            "the server sent a reply this viewer cannot interpret");
     }
     return QStringLiteral("the file could not be displayed");
 }
@@ -291,6 +330,15 @@ InternalUrlSchemeHandler::responseHeadersFor(const QByteArray &mime)
     // fragment labelled as the complete resource. Say so instead of staying
     // silent, which invites a range-capable consumer to assume seekability.
     headers.insert(QByteArrayLiteral("Accept-Ranges"), QByteArrayLiteral("none"));
+    // An internal URL is STABLE for as long as its file is retained: the same
+    // id is handed back for the same remote path every time. The file behind it
+    // is not stable — it is a live file on a server the user is also editing on
+    // — so a cached response would show the picture as it was when the pane
+    // first loaded it and go on showing that through every reload. Nothing here
+    // can revalidate (there is no ETag and no conditional-request path in the
+    // job interface), so the only honest answer is to keep no copy at all.
+    headers.insert(QByteArrayLiteral("Cache-Control"),
+                   QByteArrayLiteral("no-store"));
     if (isActiveContentMime(mime)) {
         // Defense-in-depth alongside the internal profile's JS-disabled
         // WebEngineViews: sandbox the document and forbid every
@@ -312,6 +360,61 @@ InternalUrlSchemeHandler::responseHeadersFor(const QByteArray &mime)
                               "sandbox"));
     }
     return headers;
+}
+
+std::optional<InternalUrlSchemeHandler::Failure>
+InternalUrlSchemeHandler::decodeReadReply(const QJsonObject &reply,
+                                          QByteArray *bytes)
+{
+    // `truncated` is the server's answer to "is this the WHOLE file?" and this
+    // handler has no way to serve a prefix honestly — every reply goes out as a
+    // complete resource under an implicit 200. QJsonValue::toBool() on a value
+    // that is absent, null, or a string reads as FALSE, so coercing it would
+    // turn "the server did not say" into "the file is complete" and hand
+    // Chromium the first 8 MB of a video as if that were the whole document.
+    const QJsonValue truncated = reply.value(QStringLiteral("truncated"));
+    if (!truncated.isBool())
+        return Failure::MalformedReply;
+    if (truncated.toBool()) {
+        // File exceeds the inline render cap; fail cleanly rather than serve
+        // partial bytes as a complete document.
+        return Failure::TooLarge;
+    }
+
+    const QJsonValue content = reply.value(QStringLiteral("content"));
+    if (!content.isString())
+        return Failure::MalformedReply;
+
+    // The encoding decides how the string is turned back into bytes, so an
+    // unrecognised spelling cannot be defaulted: treating a base64 payload as
+    // UTF-8 text serves the base64 alphabet itself where the image should be,
+    // and reports it as a successful read. The write side refuses an unlisted
+    // encoding for the same reason (writeFileLocked, remote/src/files.ts).
+    const QJsonValue encoding = reply.value(QStringLiteral("encoding"));
+    if (!encoding.isString())
+        return Failure::MalformedReply;
+    const QString encodingName = encoding.toString();
+
+    if (encodingName == QLatin1String("base64")) {
+        // Strict decode. QByteArray::fromBase64() silently yields an
+        // empty/garbled result for a malformed payload, which would be served
+        // to Chromium as a successful but empty document; abort instead so the
+        // viewer reports a failure.
+        QByteArray encoded = content.toString().toUtf8();
+        const auto decoded = QByteArray::fromBase64Encoding(
+            std::move(encoded),
+            QByteArray::Base64Encoding
+                | QByteArray::AbortOnBase64DecodingErrors);
+        if (!decoded)
+            return Failure::UndecodableContent;
+        *bytes = *decoded;
+        return std::nullopt;
+    }
+    if (encodingName == QLatin1String("utf-8")) {
+        *bytes = content.toString().toUtf8();
+        return std::nullopt;
+    }
+    return Failure::MalformedReply;
 }
 
 void InternalUrlSchemeHandler::requestStarted(QWebEngineUrlRequestJob *job)
@@ -419,33 +522,11 @@ void InternalUrlSchemeHandler::requestStarted(QWebEngineUrlRequestJob *job)
                 refuseLate(Failure::ReadFailed, error->message);
                 return;
             }
-            const QJsonObject obj = result.toObject();
-            if (obj.value(QStringLiteral("truncated")).toBool()) {
-                // File exceeds the inline render cap; fail cleanly rather than
-                // serve partial bytes as a complete document.
-                refuseLate(Failure::TooLarge);
-                return;
-            }
-            const QString encoding = obj.value(QStringLiteral("encoding")).toString();
-            const QString content = obj.value(QStringLiteral("content")).toString();
             QByteArray bytes;
-            if (encoding == QLatin1String("base64")) {
-                // Strict decode. QByteArray::fromBase64() silently yields an
-                // empty/garbled result for a malformed payload, which would be
-                // served to Chromium as a successful but empty document; abort
-                // instead so the viewer reports a failure.
-                QByteArray encoded = content.toUtf8();
-                const auto decoded = QByteArray::fromBase64Encoding(
-                    std::move(encoded),
-                    QByteArray::Base64Encoding
-                        | QByteArray::AbortOnBase64DecodingErrors);
-                if (!decoded) {
-                    refuseLate(Failure::UndecodableContent);
-                    return;
-                }
-                bytes = *decoded;
-            } else {
-                bytes = content.toUtf8();
+            if (const std::optional<Failure> refusal =
+                    decodeReadReply(result.toObject(), &bytes)) {
+                refuseLate(*refusal);
+                return;
             }
 
             // The request may have been cancelled while the read was in
@@ -469,12 +550,9 @@ void InternalUrlSchemeHandler::requestStarted(QWebEngineUrlRequestJob *job)
             // a UTF-8 file with non-ASCII characters renders as mojibake. The
             // CSP gate in responseHeadersFor() deliberately keys off the bare
             // type, and isActiveContentMime() strips any parameter anyway.
-            const bool textual = mime.startsWith(QByteArrayLiteral("text/"))
-                || mime.endsWith(QByteArrayLiteral("+xml"))
-                || mime == QByteArrayLiteral("application/xml")
-                || mime == QByteArrayLiteral("application/json");
             const QByteArray contentType =
-                textual ? mime + QByteArrayLiteral("; charset=utf-8") : mime;
+                isTextualMime(mime) ? mime + QByteArrayLiteral("; charset=utf-8")
+                                    : mime;
             guard->setAdditionalResponseHeaders(
                 InternalUrlSchemeHandler::responseHeadersFor(mime));
             guard->reply(contentType, buffer);

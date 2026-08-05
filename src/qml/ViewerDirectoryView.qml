@@ -233,6 +233,38 @@ Rectangle {
     }
     Component.onCompleted: reload()
 
+    // The wait is BOUNDED. `requestedPath` is cleared by exactly two replies,
+    // and neither arrives if the SSH session drops between the request and its
+    // answer: the view then said "Listing…" for ever and drew the pane's header
+    // busy with it, with no way to ask again. Same shape and the same budget as
+    // ViewerPane's path probe — generous next to one round trip, short enough
+    // that the view stops lying while the user is still looking at it. Giving
+    // up reports it as the failure it is, which the Reload button can retry.
+    Timer {
+        id: listingWatchdog
+        // Named so a test can shorten the wait instead of sitting out twenty
+        // real seconds.
+        objectName: "directoryListingWatchdog"
+        interval: 20000
+        repeat: false
+        onTriggered: {
+            if (root.requestedPath.length === 0)
+                return;
+            root.requestedPath = "";
+            root.loading = false;
+            root.errorText = qsTr("The server did not answer with this directory's contents.");
+        }
+    }
+
+    // One place that arms and disarms it, so no settle path can forget: every
+    // route out of a listing clears `requestedPath`.
+    onRequestedPathChanged: {
+        if (root.requestedPath.length > 0)
+            listingWatchdog.restart();
+        else
+            listingWatchdog.stop();
+    }
+
     // This reply belongs to the listing THIS view issued. Settling clears the
     // key, so a later answer about the same directory — another pane's request,
     // or this pane's own probe in ViewerPane — cannot disturb what is already
@@ -243,10 +275,13 @@ Rectangle {
 
     Connections {
         target: root.viewerModel
-        function onDirectoryListed(path, list) {
+        // The listing is named `listing`, not `list`: `list` is the id of the
+        // ListView below, and a parameter of that name shadows it for the whole
+        // body — a trap for the next edit that needs to touch the view here.
+        function onDirectoryListed(path, listing) {
             if (root.ownsReply(path)) {
                 root.requestedPath = "";
-                root.entries = list;
+                root.entries = listing;
                 root.loading = false;
             }
         }
@@ -352,8 +387,15 @@ Rectangle {
                 onTapped: if (!entry.isParent) contextMenu.popup()
             }
 
+            // The keyboard row has to be VISIBLE. Arrow keys move
+            // ListView.currentIndex and Enter opens whatever it names, so
+            // without a mark a keyboard user is opening a row they cannot see
+            // they are on. Selection reads stronger than hover, which is a
+            // transient pointer state.
             background: Rectangle {
-                color: entry.hovered ? Theme.surfaceHover : "transparent"
+                color: entry.ListView.isCurrentItem && list.activeFocus
+                       ? Theme.surfaceSelected
+                       : entry.hovered ? Theme.surfaceHover : "transparent"
             }
 
             Menu {

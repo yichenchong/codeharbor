@@ -105,7 +105,9 @@ What it does, in order:
    every file and prepares all of the replacement text before writing anything,
    and if a write still fails part-way it puts back what it had already
    replaced. A malformed lock file therefore leaves the tree at the version it
-   started from, never half-bumped.
+   started from, never half-bumped. Each file is replaced by renaming a fresh
+   copy over it, and the original's file mode is carried across, so a version
+   file that is also an executable script keeps its executable bit.
 6. Re-checks that every file now agrees, then commits **only** those files.
 7. Verifies that the commit about to be tagged really carries the new version —
    see Safety — and creates the annotated tag.
@@ -142,9 +144,12 @@ usually what actually starts a release build.
   integration runs. In the ordinary path this can only fail if a rewrite did not
   take; the flag it really constrains is `--no-commit`, which tags HEAD as-is
   and otherwise could not tell a release commit from any other.
-* `tests/bump_version_tag.sh` exercises the release and safety paths, including
-  a malformed lock file proving that a failed update leaves every version file
-  byte-identical.
+* `tests/bump_version_tag.sh` exercises the release and safety paths: a
+  malformed lock file proving that a failed update leaves every version file
+  byte-identical, an uncommitted edit and an already-existing tag both being
+  refused before anything is rewritten, a configured path that points outside
+  the repository being rejected, a wildcard workspace pattern being refused
+  rather than guessed at, and a rewritten file keeping its mode.
 
 ## The tool underneath
 

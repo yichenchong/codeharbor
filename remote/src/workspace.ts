@@ -57,11 +57,11 @@ const schemaSql = readFileSync(
 );
 
 // Lookup indexes, applied on EVERY open rather than by the migration runner.
-// They carry no data and every statement is `CREATE INDEX IF NOT EXISTS`, so
-// re-running them is a no-op; that is precisely what lets an existing database
-// at the current schema version gain a newly added index without a version bump
-// (which would have to be mirrored in C++ — see indexes.sql for the full
-// reasoning).
+// They carry no data and every statement is idempotent (`CREATE INDEX IF NOT
+// EXISTS` / `DROP INDEX IF EXISTS`), so re-running them is a no-op; that is
+// precisely what lets an existing database at the current schema version gain a
+// newly added index — or shed a retired one — without a version bump (which
+// would have to be mirrored in C++ — see indexes.sql for the full reasoning).
 const indexesSql = readFileSync(
     fileURLToPath(new URL("../sql/indexes.sql", import.meta.url)),
     "utf8",
@@ -137,10 +137,14 @@ export interface SessionLayout {
     updatedAt: number;
 }
 
-// Per-session split trees, one slot per region. A missing region is null.
+// Per-session split trees, one slot per region. `null` means the region has no
+// stored layout (or its stored tree no longer parses — see getLayouts); any
+// other value is the client-authored tree exactly as it was stored. The fields
+// are `unknown` rather than `unknown | null`: TypeScript collapses that union
+// back to `unknown`, so writing it only suggests a narrowing that is not there.
 export interface SessionLayouts {
-    viewer: unknown | null;
-    terminal: unknown | null;
+    viewer: unknown;
+    terminal: unknown;
 }
 
 export interface SessionNode extends Session {
@@ -411,8 +415,12 @@ function remapPaneIds(node: unknown, idMap: ReadonlyMap<string, string>): unknow
     if (node === null || typeof node !== "object") return node;
     const n = node as Record<string, unknown>;
     if (n.type === "leaf") {
-        const paneId = typeof n.paneId === "string" ? n.paneId : "";
-        const leaf: Record<string, unknown> = { ...n, paneId: idMap.get(paneId) ?? paneId };
+        // Only a STRING paneId is a pane reference. A leaf carrying anything
+        // else is malformed client data, and it is copied through untouched
+        // rather than rewritten to "" — the copy is supposed to differ from the
+        // original only in which panes it names.
+        const leaf: Record<string, unknown> = { ...n };
+        if (typeof n.paneId === "string") leaf.paneId = idMap.get(n.paneId) ?? n.paneId;
         if (typeof n.terminalPaneId === "string" && n.terminalPaneId !== "") {
             // An unmapped row id would name a row in ANOTHER Dev Session, which
             // resolveTerminalPane refuses. Dropping the field instead lets the
@@ -496,17 +504,26 @@ function treeReferencesPane(node: unknown, paneId: string): boolean {
 // value verbatim, so an identity is minted exactly once, from a row id that is
 // never reused, and holds across machines.
 //
-// Both inputs are server-minted UUIDs, so the result is inside the safe set by
-// construction; the check is a guard against a future caller feeding this
-// something else, not a validation of user input. It throws rather than
-// rewriting because a rewritten target would be minted here and stored, while
-// the caller went on believing in the value it asked for.
+// Normally both inputs are server-minted UUIDs, so `ch_<devSessionId>_<paneId>`
+// is inside the safe set by construction. A database upgraded from an old build
+// need not oblige: nothing ever constrained `dev_sessions.id` or
+// `terminal_panes.id` to a UUID, and a legacy id may contain a character tmux
+// reads as a session/window/pane separator. Throwing there made every terminal
+// pane in such a Dev Session impossible to create OR to heal — the client got a
+// bare internal error and no shell at all — which is exactly the outcome the v3
+// migration's own fallback goes out of its way to avoid.
+//
+// So the identity degrades instead of failing: the pane row id alone, and
+// failing that a fresh UUID. Both are unique and neither is ever reused, which
+// is all a target has to be; the value is stored on the row, so it does not
+// have to be recomputable from the ids. Only the human-readable link back to
+// the Dev Session is lost, and only for a database that predates UUID ids.
 function mintTmuxTarget(devSessionId: string, paneId: string): string {
     const target = `ch_${devSessionId}_${paneId}`;
-    if (!isSafeTmuxTarget(target)) {
-        throw new Error(`refusing to mint an unusable tmux target: ${target}`);
-    }
-    return target;
+    if (isSafeTmuxTarget(target)) return target;
+    const fromPane = `ch_${paneId}`;
+    if (isSafeTmuxTarget(fromPane)) return fromPane;
+    return `ch_${randomUUID()}`;
 }
 
 // Gate for a tmux target supplied by a CLIENT (createTerminalPane /
@@ -802,15 +819,14 @@ function migrateTerminalPaneIdentity(db: DatabaseSync): void {
         const repaired = tmuxSafeName(row.tmux_target);
         let next: string | null = repaired;
         if (takenTargets.has(repaired)) {
-            // The canonical mint, but WITHOUT mintTmuxTarget's throw. Nothing
-            // ever constrained a legacy `terminal_panes.id` or `dev_session_id`
-            // to a UUID, so `ch_<dev_session_id>_<id>` can itself be unusable as
-            // a tmux session name — and throwing here would roll the whole
-            // upgrade back and leave that database permanently unopenable by
-            // this build, the exact outcome the foreign-key handling in
-            // migrate() goes out of its way to avoid. Falling back to NULL costs
-            // the pane only its stored session name; it mints a fresh one on its
-            // next attach.
+            // The canonical mint, spelled out here rather than delegated to
+            // mintTmuxTarget, because this loop needs the one thing that
+            // function cannot know: whether the name is already claimed by an
+            // earlier row in this same upgrade. Nothing ever constrained a
+            // legacy `terminal_panes.id` or `dev_session_id` to a UUID, so
+            // `ch_<dev_session_id>_<id>` can itself be unusable as a tmux
+            // session name. Falling back to NULL costs the pane only its stored
+            // session name; it mints a fresh one on its next attach.
             const minted = `ch_${row.dev_session_id}_${row.id}`;
             next = isSafeTmuxTarget(minted) && !takenTargets.has(minted) ? minted : null;
         }
@@ -1062,11 +1078,20 @@ export class Workspace {
     readonly db: DatabaseSync;
     // Memoized server_identity row (see serverId()); the row never changes.
     private cachedServerId: string | undefined;
-    // Whether transaction() already has this connection inside a BEGIN; see
-    // transaction(). A flag rather than a counter: a nested call never opens a
-    // transaction of its own, so the value only ever toggles between the two
-    // states and a counter invited a reader to expect otherwise.
+    // Whether this connection is already inside a BEGIN; see transaction(). A
+    // flag rather than a counter: a nested call never opens a transaction of
+    // its own, so the value only ever toggles between the two states and a
+    // counter invited a reader to expect otherwise.
     private inTransaction = false;
+    // ...and whether that BEGIN is list()'s DEFERRED read rather than a
+    // BEGIN IMMEDIATE. The distinction matters because a deferred transaction
+    // holds no write lock: under WAL, a write issued inside one has to upgrade,
+    // and if another connection committed in the meantime SQLite answers
+    // SQLITE_BUSY_SNAPSHOT, which the busy timeout cannot wait out and only a
+    // full restart of the transaction can resolve. Nothing writes from the read
+    // path today; transaction() checks this so that a future caller that does
+    // fails immediately and legibly instead of intermittently in production.
+    private inReadTransaction = false;
     // The nested listing's seven statements (all/pinned groups and sessions,
     // plus three pane/layout lookups), compiled once per connection.
     //
@@ -1190,11 +1215,28 @@ export class Workspace {
         });
     }
 
+    // Delete a group and everything under it. Children go first, and deepest
+    // first, because the schema's foreign keys REJECT (NO ACTION) rather than
+    // cascade — a group with sessions still attached cannot be deleted.
+    //
+    // Set-based, not a loop over the group's sessions: the per-session version
+    // compiled four fresh statements for EVERY session in the group, which is
+    // the same cost duplicateSession and packOrder already hoist out of their
+    // loops. Five statements now, whatever the group holds.
+    //
+    // Deleting a group that does not exist is a successful no-op, deliberately:
+    // a client that retries a delete after a dropped connection must not be
+    // told the second attempt failed.
     deleteGroup(params: { id: string }): { ok: true } {
         return this.transaction(() => {
-            const sessions = this.db
-                .prepare("SELECT id FROM dev_sessions WHERE group_id = ?").all(params.id) as unknown as Array<{ id: string }>;
-            for (const s of sessions) this.deleteSessionRows(s.id);
+            for (const table of ["viewer_panes", "terminal_panes", "session_layouts"] as const) {
+                this.db
+                    .prepare(
+                        `DELETE FROM ${table} WHERE dev_session_id IN (SELECT id FROM dev_sessions WHERE group_id = ?)`,
+                    )
+                    .run(params.id);
+            }
+            this.db.prepare("DELETE FROM dev_sessions WHERE group_id = ?").run(params.id);
             this.db.prepare("DELETE FROM groups WHERE id = ?").run(params.id);
             return { ok: true } as const;
         });
@@ -1476,7 +1518,7 @@ export class Workspace {
             }
 
             const layoutRows = this.db
-                .prepare("SELECT * FROM session_layouts WHERE dev_session_id = ?").all(params.id) as unknown as SessionLayoutRow[];
+                .prepare("SELECT * FROM session_layouts WHERE dev_session_id = ? ORDER BY region").all(params.id) as unknown as SessionLayoutRow[];
             const insertLayout = this.db.prepare(
                 "INSERT INTO session_layouts (id, server_id, dev_session_id, region, tree, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
             );
@@ -1587,14 +1629,20 @@ export class Workspace {
     // session so no leaf still references it. Layout trees are client-authored,
     // so a malformed client can put a viewer id in the terminal region; the
     // server's integrity guarantee must cover both regions.
+    //
+    // Deleting a pane that is not there is a successful no-op (nothing to
+    // delete, and no session to repair layouts for), on purpose: a client
+    // retrying after a dropped connection must not be told its second attempt
+    // failed. Both regions are repaired against ONE timestamp, so a delete that
+    // touches both leaves them agreeing on when it happened.
     deleteViewerPane(params: { id: string }): { ok: true } {
         return this.transaction(() => {
             const row = this.db
                 .prepare("SELECT dev_session_id FROM viewer_panes WHERE id = ?")
                 .get(params.id) as { dev_session_id: string } | undefined;
             this.db.prepare("DELETE FROM viewer_panes WHERE id = ?").run(params.id);
-            if (row) this.repairLayoutsForPane(row.dev_session_id, params.id);
-            return { ok: true };
+            if (row) this.repairLayoutsForPane(row.dev_session_id, params.id, Date.now());
+            return { ok: true } as const;
         });
     }
 
@@ -1785,15 +1833,17 @@ export class Workspace {
     // Delete a terminal pane, then repair every stored split layout for its
     // session so no leaf still references it. Layout trees are client-authored,
     // so a malformed client can put a terminal id in the viewer region; the
-    // server's integrity guarantee must cover both regions.
+    // server's integrity guarantee must cover both regions. Deleting a pane
+    // that is not there is a successful no-op, and both regions are repaired
+    // against one timestamp — see deleteViewerPane for both.
     deleteTerminalPane(params: { id: string }): { ok: true } {
         return this.transaction(() => {
             const row = this.db
                 .prepare("SELECT dev_session_id FROM terminal_panes WHERE id = ?")
                 .get(params.id) as { dev_session_id: string } | undefined;
             this.db.prepare("DELETE FROM terminal_panes WHERE id = ?").run(params.id);
-            if (row) this.repairLayoutsForPane(row.dev_session_id, params.id);
-            return { ok: true };
+            if (row) this.repairLayoutsForPane(row.dev_session_id, params.id, Date.now());
+            return { ok: true } as const;
         });
     }
 
@@ -1903,7 +1953,7 @@ export class Workspace {
     // the tree and updated_at change; the row's id, created_at, and server_id are
     // left untouched, matching setLayout's identity-preserving semantics. Callers
     // must already be inside a transaction (both delete methods are).
-    private repairLayout(devSessionId: string, region: Region, paneId: string): void {
+    private repairLayout(devSessionId: string, region: Region, paneId: string, ts: number): void {
         const row = this.db
             .prepare("SELECT * FROM session_layouts WHERE dev_session_id = ? AND region = ?")
             .get(devSessionId, region) as SessionLayoutRow | undefined;
@@ -1930,11 +1980,12 @@ export class Workspace {
         if (serialized === row.tree) return;
         this.db
             .prepare("UPDATE session_layouts SET tree = ?, updated_at = ? WHERE id = ?")
-            .run(serialized, Date.now(), row.id);
+            .run(serialized, ts, row.id);
     }
-    private repairLayoutsForPane(devSessionId: string, paneId: string): void {
+
+    private repairLayoutsForPane(devSessionId: string, paneId: string, ts: number): void {
         for (const region of REGIONS) {
-            this.repairLayout(devSessionId, region, paneId);
+            this.repairLayout(devSessionId, region, paneId, ts);
         }
     }
 
@@ -1965,13 +2016,16 @@ export class Workspace {
         // ever call that wants atomicity of its own joins this transaction
         // instead of issuing a nested BEGIN, which SQLite rejects outright.
         this.inTransaction = true;
+        this.inReadTransaction = true;
         try {
             const result = read();
             this.inTransaction = false;
+            this.inReadTransaction = false;
             this.db.exec("COMMIT");
             return result;
         } catch (err) {
             this.inTransaction = false;
+            this.inReadTransaction = false;
             try {
                 this.db.exec("ROLLBACK");
             } catch {
@@ -2188,7 +2242,19 @@ export class Workspace {
     // be called both directly and from inside a larger operation. A nested
     // failure still aborts the whole outermost transaction, which is the
     // semantics every caller here wants.
+    //
+    // The one nesting it refuses is a write inside list()'s DEFERRED read
+    // transaction, which holds no write lock — see inReadTransaction. No such
+    // caller exists; the check is here so that adding one is a loud programming
+    // error rather than an occasional SQLITE_BUSY_SNAPSHOT under real
+    // concurrency, which is unreproducible and which no retry inside the
+    // transaction can clear.
     private transaction<T>(fn: () => T): T {
+        if (this.inReadTransaction) {
+            throw new Error(
+                "workspace: refusing to write inside the read-only listing transaction",
+            );
+        }
         if (this.inTransaction) return fn();
         this.db.exec("BEGIN IMMEDIATE");
         this.inTransaction = true;
@@ -2225,6 +2291,39 @@ function workspace(): Workspace {
         defaultWorkspace = openWorkspace(dbPath);
     }
     return defaultWorkspace;
+}
+
+/**
+ * Release the default connection on an orderly daemon shutdown.
+ *
+ * Only closing checkpoints the write-ahead log and removes the `-wal`/`-shm`
+ * files beside the database, so a daemon that exits without this leaves them
+ * behind for the next process to recover. Nothing is LOST either way — WAL is
+ * crash-safe, which it has to be for SIGKILL — so this is tidiness on the paths
+ * that can afford it, never a correctness requirement.
+ *
+ * Safe to call unconditionally, and that is the point: it is a no-op when no
+ * connection was ever opened (a daemon can answer a whole session without
+ * touching the database), it is idempotent, and it never throws. A shutdown
+ * path must not have to reason about any of that.
+ *
+ * Call it only where the event loop has drained and no `workspace.*` handler
+ * can still be running — closing a connection out from under a statement in
+ * flight would turn a clean exit into an error. A forced/timed-out shutdown
+ * should skip it and let SQLite recover, exactly as it does after a crash.
+ */
+export function closeDefaultWorkspace(): void {
+    if (defaultWorkspace === undefined) return;
+    const open = defaultWorkspace;
+    // Cleared BEFORE the close, so a close that throws cannot leave the
+    // singleton pointing at a half-closed handle that the next workspace()
+    // would hand straight back out.
+    defaultWorkspace = undefined;
+    try {
+        open.close();
+    } catch {
+        // Nothing useful to do on the way out, and nothing at risk: see above.
+    }
 }
 
 // This server's stable identity, from the same default database the

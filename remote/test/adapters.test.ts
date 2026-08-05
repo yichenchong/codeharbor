@@ -528,3 +528,76 @@ test("a non-ask tool_result carries no state transition", () => {
     // The error flag still outranks it: a tool result that blew up is an error.
     assert.equal(ohMyPiAdapter.map({ type: "tool_result", tool: "read", error: true }), "error");
 });
+
+// AG3. The error marker is the JSON boolean `true` and nothing else. It arrives
+// on a wire built by shell hook configurations, where every value starts life
+// as a string: the hook script is the piece that turns OMP_ERROR=1 or "true"
+// into a real boolean (readHookInput), and a hand-written producer that puts
+// the STRING "false" or the number 0 there is writing the shape a truthiness
+// test gets wrong in both directions. `=== true` is the only reading that
+// cannot turn an ordinary event into a red sidebar row, or drop a real error.
+test("the error marker must be the boolean true, never merely truthy (AG3)", () => {
+    for (const marker of ["true", "1", 1, "yes", {}, [], "false", 0, "", null]) {
+        const label = JSON.stringify(marker) ?? String(marker);
+        assert.equal(
+            ohMyPiAdapter.map({ type: "agent_start", error: marker }),
+            "running",
+            `oh-my-pi treated error=${label} as an error`,
+        );
+        assert.equal(
+            piAdapter.map({ type: "agent_start", error: marker }),
+            "running",
+            `pi treated error=${label} as an error`,
+        );
+        assert.equal(
+            claudeCodeAdapter.map({ hook: "UserPromptSubmit", error: marker }),
+            "running",
+            `claude-code treated error=${label} as an error`,
+        );
+        // ...and it does not resurrect an event that maps to nothing either.
+        assert.equal(ohMyPiAdapter.map({ type: "unrecognized", error: marker }), null, label);
+        assert.equal(claudeCodeAdapter.map({ hook: "Unrecognized", error: marker }), null, label);
+    }
+    // The one value that IS the marker.
+    assert.equal(ohMyPiAdapter.map({ type: "agent_start", error: true }), "error");
+    assert.equal(claudeCodeAdapter.map({ hook: "UserPromptSubmit", error: true }), "error");
+});
+
+// AG3. Every field of a native event is typed `unknown` because it comes
+// straight out of JSON.parse on a producer's line. A number, null or an object
+// where the event NAME belongs must map to nothing rather than be coerced into
+// a name: nativeString() answers "" for a non-string, and "" matches no arm in
+// any adapter. The same goes for the tool name, where a non-string must mean
+// "no tool" — so a tool_call is the plain running arm, not the prompt arm, and
+// the metadata bag stays absent rather than carrying a stringified number.
+test("a non-string native event name maps to nothing (AG3)", () => {
+    for (const name of [7, null, true, {}, ["session_start"], undefined]) {
+        const label = JSON.stringify(name) ?? String(name);
+        assert.equal(ohMyPiAdapter.map({ type: name }), null, `oh-my-pi type=${label}`);
+        assert.equal(piAdapter.map({ type: name }), null, `pi type=${label}`);
+        assert.equal(claudeCodeAdapter.map({ hook: name }), null, `claude-code hook=${label}`);
+    }
+    assert.equal(ohMyPiAdapter.map({ type: "tool_call", tool: 7 }), "running");
+    assert.equal(ohMyPiAdapter.metadata?.({ type: "tool_call", tool: 7 }), undefined);
+    assert.equal(claudeCodeAdapter.map({ hook: "Notification", notification_type: null }), null);
+});
+
+// AG3. The two vocabularies must not cross. Oh My Pi and Pi name their event
+// under `type`, Claude Code under `hook`, and NativeEvent declares both keys —
+// so a message carrying both (a producer relaying for two harnesses, or a
+// copy-paste in a hook config) is structurally legal. Each adapter must read
+// only its own key: reading the other one attributes a state to a harness that
+// never reported it, and the bridge labels the relayed event with the WIRE
+// harness, so nothing downstream could notice.
+test("each adapter reads only its own event-name key (AG3)", () => {
+    const both = { type: "session_shutdown", hook: "SessionStart" };
+    assert.equal(ohMyPiAdapter.map(both), "stopped");
+    assert.equal(piAdapter.map(both), "stopped");
+    assert.equal(claudeCodeAdapter.map(both), "starting");
+
+    // And the metadata keys are per-harness too: `tool` for the pi family,
+    // `tool_name` for Claude Code. Neither may pick up the other's.
+    const bothTools = { type: "tool_call", tool: "ask", tool_name: "Bash" };
+    assert.deepEqual(ohMyPiAdapter.metadata?.(bothTools), { tool: "ask" });
+    assert.deepEqual(claudeCodeAdapter.metadata?.(bothTools), { tool: "Bash" });
+});

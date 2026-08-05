@@ -32,6 +32,7 @@
     {
       "name": "release-tests",
       "displayName": "Release (with tests)",
+      "description": "Release build with the C++ tests enabled. Shares build/release with the 'release' preset ON PURPOSE: the release workflow packages out of build/release, so both presets must produce the executable at the same path. Re-running one preset over the other's tree only flips CODEHARBOR_BUILD_TESTS and reconfigures; it never leaves a stale binary behind.",
       "inherits": "release",
       "binaryDir": "${sourceDir}/build/release",
       "cacheVariables": {
@@ -48,12 +49,14 @@
     {
       "name": "dev",
       "configurePreset": "dev",
-      "output": { "outputOnFailure": true }
+      "output": { "outputOnFailure": true },
+      "execution": { "noTestsAction": "error" }
     },
     {
       "name": "release-tests",
       "configurePreset": "release-tests",
-      "output": { "outputOnFailure": true }
+      "output": { "outputOnFailure": true },
+      "execution": { "noTestsAction": "error" }
     }
   ]
 }

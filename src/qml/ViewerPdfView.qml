@@ -89,6 +89,15 @@ Item {
             console.warn("ViewerPdfView: refused a new window for",
                          request.requestedUrl)
         }
+        // Same rule as ViewerImageView: a load Chromium itself refused would
+        // otherwise be a blank pane, because internalResourceError only covers
+        // the refusals the scheme handler knows about. The handler's own
+        // explanation is better wording, so it is never overwritten.
+        onLoadingChanged: function(request) {
+            if (request.status === WebEngineView.LoadFailedStatus
+                    && root.errorText.length === 0)
+                root.errorText = request.errorString
+        }
         url: root.internalUrl
     }
 

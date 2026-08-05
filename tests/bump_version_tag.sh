@@ -290,4 +290,109 @@ make_repo 0.1.8
 node "$bumpctl" check --root "$work/repo" >"$work/out13" 2>&1 \
     || { cat "$work/out13" >&2; fail "the version check failed on a consistent tree"; }
 
-echo "bump.sh refuses mislabelled trees, never half-bumps, preserves staged work, and keeps release paths intact"
+# --- 13. uncommitted edits to a version file are refused ----------------------
+# Documented safety rule: without --allow-dirty the run must not clobber work in
+# progress in the very files it is about to rewrite. Nothing exercised it, so
+# the guard could have been deleted and every case above would still pass.
+make_repo 0.1.8
+printf '{\n  "name": "codeharbor-workspace",\n  "version": "0.1.8",\n  "private": true,\n  "workspaces": ["remote", "src/web/terminal", "src/web/editor", "src/web/markdown"],\n  "description": "edited but not committed"\n}\n' >package.json
+before="$(snapshot)"
+if bash "$bump" --set 0.2.0 >"$work/out14" 2>&1; then
+    cat "$work/out14" >&2
+    fail "the bump overwrote an uncommitted edit to a version file"
+fi
+grep -q "uncommitted changes" "$work/out14" \
+    || { cat "$work/out14" >&2; fail "no explanation that a version file is dirty"; }
+[ "$(snapshot)" = "$before" ] || fail "the refused dirty run still rewrote version files"
+if git rev-parse -q --verify refs/tags/v0.2.0 >/dev/null; then
+    fail "the refused dirty run still produced a tag"
+fi
+
+# --- 14. an existing tag is refused before anything is rewritten --------------
+# Re-running a release that already happened must not rewrite the tree and then
+# die at `git tag`, leaving a second, untagged release commit behind.
+make_repo 0.1.8
+git tag -a v0.2.0 -m "already released"
+before="$(snapshot)"
+if bash "$bump" --set 0.2.0 >"$work/out15" 2>&1; then
+    cat "$work/out15" >&2
+    fail "the bump created a release for a tag that already exists"
+fi
+grep -q "already exists" "$work/out15" \
+    || { cat "$work/out15" >&2; fail "no explanation that the tag already exists"; }
+[ "$(snapshot)" = "$before" ] || fail "the refused run still rewrote version files"
+[ "$(git rev-list --count HEAD)" = "1" ] || fail "the refused run still created a release commit"
+
+# --- 15. a wildcard workspace list is refused, not guessed at -----------------
+# `"workspaces": ["src/web/*"]` would make the tool guess which lock entries to
+# keep in step, and a guess that misses one ships a package whose version
+# disagrees with the release.
+make_repo 0.1.8
+printf '{\n  "name": "codeharbor-workspace",\n  "version": "0.1.8",\n  "private": true,\n  "workspaces": ["remote", "src/web/*"]\n}\n' >package.json
+git commit -q -am "workspaces collapsed to a glob"
+if node "$bumpctl" check --root "$work/repo" >"$work/out16" 2>&1; then
+    cat "$work/out16" >&2
+    fail "a wildcard workspace pattern was accepted"
+fi
+grep -q "wildcard" "$work/out16" \
+    || { cat "$work/out16" >&2; fail "no explanation that a workspace pattern is a wildcard"; }
+
+# --- 16. a configured path outside the repository is refused ------------------
+# .bumpversion.json is data. A tool that rewrites whatever path it is handed
+# turns a bad merge into a file clobbered outside the checkout.
+make_repo 0.1.8
+node -e '
+  const fs = require("node:fs");
+  const config = JSON.parse(fs.readFileSync(".bumpversion.json", "utf8"));
+  config.sources.push({ path: "../escapee.json", kind: "json" });
+  fs.writeFileSync(".bumpversion.json", JSON.stringify(config, null, 2) + "\n");
+'
+printf '{ "version": "0.1.8" }\n' >"$work/escapee.json"
+before="$(snapshot)"
+if node "$bumpctl" check --root "$work/repo" >"$work/out17" 2>&1; then
+    cat "$work/out17" >&2
+    fail "a source path outside the repository root was accepted"
+fi
+grep -q "\.\." "$work/out17" \
+    || { cat "$work/out17" >&2; fail "no explanation that the path escapes the repository"; }
+[ "$(snapshot)" = "$before" ] || fail "the refused escaping path still rewrote version files"
+
+# --- 17. rewriting a version file keeps its mode ------------------------------
+# Each file is rewritten by renaming a fresh temporary over it, which takes the
+# umask's mode unless the original's is carried across. A version-carrying
+# script would silently stop being executable.
+make_repo 0.1.8
+chmod +x CMakeLists.txt
+node "$bumpctl" apply 0.2.0 --root "$work/repo" >"$work/out18" 2>&1 \
+    || { cat "$work/out18" >&2; fail "apply failed on a tree with an executable version file"; }
+grep -q '0\.2\.0' CMakeLists.txt || fail "apply did not rewrite the executable version file"
+[ -x CMakeLists.txt ] || fail "apply dropped the executable bit from a version file"
+
+# --- 18. a capture group that matches nothing is reported, not crashed on -----
+# A pattern can match a file while its single capturing group takes part in no
+# alternative. Reading the capture's offsets first turned that into a raw
+# JavaScript stack trace that named no file.
+make_repo 0.1.8
+node -e '
+  const fs = require("node:fs");
+  const config = JSON.parse(fs.readFileSync(".bumpversion.json", "utf8"));
+  for (const source of config.sources) {
+    if (source.path === "remote/src/codeharbord.ts") {
+      source.pattern = "LEGACY_VERSION|RPC_SERVER_VERSION\\s*=\\s*\"(\\d+\\.\\d+\\.\\d+)\"";
+    }
+  }
+  fs.writeFileSync(".bumpversion.json", JSON.stringify(config, null, 2) + "\n");
+'
+printf 'export const LEGACY_VERSION = "0.1.8";\n' >remote/src/codeharbord.ts
+if node "$bumpctl" check --root "$work/repo" >"$work/out19" 2>&1; then
+    cat "$work/out19" >&2
+    fail "a pattern whose capture group took part in nothing was accepted"
+fi
+grep -q "remote/src/codeharbord.ts" "$work/out19" \
+    || { cat "$work/out19" >&2; fail "the failure does not name the offending source file"; }
+if grep -qE "TypeError|Cannot destructure" "$work/out19"; then
+    cat "$work/out19" >&2
+    fail "an unhandled JavaScript error escaped instead of a readable message"
+fi
+
+echo "bump.sh refuses mislabelled trees, never half-bumps, preserves staged work, keeps file modes, and keeps release paths intact"

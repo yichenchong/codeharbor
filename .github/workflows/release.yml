@@ -38,6 +38,10 @@ jobs:
   build:
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
+    # GitHub's default job timeout is SIX HOURS. A Qt WebEngine build that wedges
+    # - a vcpkg source build stuck on a prompt, a hung ctest - would otherwise
+    # hold a runner for that long before the release is even reported as failed.
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
@@ -49,6 +53,34 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref || github.ref }}
+
+      # The release version, resolved ONCE for every platform out of the single
+      # source of truth that .omp/skills/bump-version/bump.sh rewrites. Each
+      # deploy step below stamps it into the artifact's filename, and the
+      # `publish` job then requires every one of those names to match the tag —
+      # which is what catches a tag pushed at a tree whose CMakeLists.txt was
+      # never bumped. Previously only the Windows installer carried a version,
+      # so the AppImage and the disk image could not be checked at all.
+      - name: Resolve the release version
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Anchored on the project() call, exactly like the check in
+          # .bumpversion.json, so an unrelated `VERSION` elsewhere in the file
+          # can never be picked up. No pipe: `set -o pipefail` plus a `head`
+          # that closes early is a SIGPIPE waiting to happen.
+          version=$(sed -n '/^project(CodeHarbor/,/)/ s/^[[:space:]]*VERSION[[:space:]]\{1,\}\([0-9][0-9.]*\).*$/\1/p' CMakeLists.txt)
+          version=${version%%$'\n'*}
+          case "$version" in
+            [0-9]*.[0-9]*.[0-9]*) ;;
+            *)
+              echo "could not parse the project() VERSION out of CMakeLists.txt (got '$version');" >&2
+              echo "the release refuses to name its artifacts after a guess." >&2
+              exit 1
+              ;;
+          esac
+          echo "Release version (from CMakeLists.txt): $version"
+          echo "CH_VERSION=$version" >> "$GITHUB_ENV"
 
       # Pinned to an exact release for the same reason as get-cmake below: `@v4`
       # is a tag this third-party action's author moves, so the Qt installer that
@@ -254,6 +286,7 @@ jobs:
           # Avoid depending on FUSE on the runner (ubuntu package naming varies).
           APPIMAGE_EXTRACT_AND_RUN: "1"
         run: |
+          set -euo pipefail
           curl -fsSLO https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage
           curl -fsSLO https://github.com/linuxdeploy/linuxdeploy-plugin-qt/releases/download/continuous/linuxdeploy-plugin-qt-x86_64.AppImage
           # BD25: linuxdeploy ships only a rolling `continuous` release (no
@@ -273,7 +306,18 @@ jobs:
             --output appimage \
             --desktop-file packaging/codeharbor.desktop \
             --icon-file packaging/codeharbor.svg
-          mkdir -p artifact && mv CodeHarbor*.AppImage artifact/
+          # One deterministic name, carrying the version, so `publish` can
+          # require it to equal the tag. linuxdeploy's own output name depends
+          # on environment it reads for itself, so do not rely on it: match
+          # exactly one file and rename it.
+          mkdir -p artifact
+          shopt -s nullglob
+          built=(CodeHarbor*.AppImage)
+          if [ "${#built[@]}" -ne 1 ]; then
+            echo "expected exactly one AppImage from linuxdeploy, found ${#built[@]}: ${built[*]-}" >&2
+            exit 1
+          fi
+          mv "${built[0]}" "artifact/CodeHarbor-$CH_VERSION-x86_64.AppImage"
 
       - name: Deploy (Windows, windeployqt)
         if: matrix.name == 'windows'
@@ -303,23 +347,26 @@ jobs:
       # "extract a zip somewhere and delete the old folder by hand".
       #
       # Why the script carries no version: packaging/windows/codeharbor.iss reads
-      # it from /DAppVersion, and the value is parsed here out of the top-level
+      # it from /DAppVersion, and the value comes from the "Resolve the release
+      # version" step at the top of this job, which parses the top-level
       # CMakeLists.txt - the single source of truth that
       # .omp/skills/bump-version/bump.sh rewrites. Nothing about the installer has
       # to be bumped separately, which is deliberate: a version the bump script
       # misses has already bitten this project once.
+      #
+      # It used to re-parse CMakeLists.txt here with a second, PowerShell copy of
+      # the same regular expression. One parser, used by every platform, is one
+      # fewer thing that can drift.
       - name: Build installer (Windows, Inno Setup)
         if: matrix.name == 'windows'
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
 
-          $cmake = Get-Content CMakeLists.txt -Raw
-          $m = [regex]::Match($cmake, 'project\(CodeHarbor[\s\S]*?VERSION\s+(\d+\.\d+\.\d+)')
-          if (-not $m.Success) {
-            throw "could not parse the project() VERSION out of CMakeLists.txt; the installer refuses to guess a version."
+          $version = $env:CH_VERSION
+          if (-not $version) {
+            throw "CH_VERSION is not set; the 'Resolve the release version' step did not run."
           }
-          $version = $m.Groups[1].Value
           Write-Host "Installer version (from CMakeLists.txt): $version"
 
           # ISCC is the Inno Setup command-line compiler. The runner image ships
@@ -384,12 +431,20 @@ jobs:
           path: installer/
           if-no-files-found: error
 
+      # The disk image is renamed to carry the version and the CPU architecture.
+      # macdeployqt names it after the bundle alone (`codeharbor.dmg`), which
+      # said nothing about what was inside it: `macos-latest` is Apple silicon,
+      # so a generically named image was silently arm64-only, and the version
+      # could not be checked against the tag the way the Windows installer's can.
       - name: Deploy (macOS, macdeployqt)
         if: matrix.name == 'macos'
         run: |
+          set -euo pipefail
           APP=build/release/src/app/codeharbor.app
           macdeployqt "$APP" -qmldir=src/qml -dmg
-          mkdir -p artifact && mv build/release/src/app/codeharbor.dmg artifact/
+          mkdir -p artifact
+          mv build/release/src/app/codeharbor.dmg \
+             "artifact/CodeHarbor-$CH_VERSION-macos-$(uname -m).dmg"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -403,6 +458,7 @@ jobs:
   remote:
     name: remote
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
         with:
@@ -459,6 +515,7 @@ jobs:
     needs: [build, remote]
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     permissions:
       contents: write
     steps:
@@ -472,6 +529,7 @@ jobs:
       # The Windows installer is already a single .exe and passes through as-is.
       - name: Normalise assets
         run: |
+          set -euo pipefail
           cd dist
           for d in */; do
             [ -d "$d" ] || continue
@@ -480,30 +538,65 @@ jobs:
           done
           ls -la
 
-      # A release missing the Windows installer is a release most Windows users
-      # cannot install, and a silently absent asset is worse than a red run: the
-      # tag is permanent. Assert both Windows assets before anything is published.
+      # A silently absent asset is worse than a red run, because the tag is
+      # permanent: a release missing the Windows installer is a release most
+      # Windows users cannot install, and one missing the remote tarball is a
+      # client with no server to talk to. Every expected asset is asserted, not
+      # only the two Windows ones - the other three were unchecked, and the
+      # matrix's `fail-fast: false` means a job can go red without stopping the
+      # others, so "the build job succeeded" is not the same statement.
       #
-      # The installer's filename carries the version the Windows job parsed out
-      # of CMakeLists.txt, so requiring it to equal the TAG also catches the one
+      # Three of the names carry the version each build job read out of
+      # CMakeLists.txt, so requiring them to equal the TAG also catches the one
       # mistake nothing else here would: tagging v0.2.0 on a tree whose
       # CMakeLists.txt still says 0.1.8. That would publish, under the v0.2.0
       # release, an installer that names and registers itself as 0.1.8 in
       # "Installed apps" - a wrong version is worse than a missing one, because
-      # it looks fine. The wildcard this replaces waved that straight through.
-      - name: Verify Windows assets are present and versioned like the tag
+      # it looks fine.
+      #
+      # The macOS image is matched by a pattern only because its architecture is
+      # whatever the `macos-latest` runner is; its version is still pinned.
+      - name: Verify every asset is present and versioned like the tag
         run: |
-          set -eu
+          set -euo pipefail
+          # No pathname expansion: the list below deliberately contains a glob
+          # that `find` must receive verbatim, not one the shell resolves first.
+          set -f
           version="${GITHUB_REF_NAME#v}"
-          for name in "codeharbor-windows.zip" "CodeHarbor-$version-windows-x64-setup.exe"; do
+          expected="
+          codeharbor-windows.zip
+          CodeHarbor-$version-windows-x64-setup.exe
+          CodeHarbor-$version-x86_64.AppImage
+          CodeHarbor-$version-macos-*.dmg
+          codeharbor-remote.tar.gz
+          "
+          missing=0
+          for name in $expected; do
             matches=$(find dist -maxdepth 1 -name "$name" | wc -l)
-            [ "$matches" -eq 1 ] || {
+            if [ "$matches" -ne 1 ]; then
               echo "expected exactly one dist/$name, found $matches" >&2
-              echo "assets present:" >&2
-              ls -1 dist >&2
-              exit 1
-            }
+              missing=1
+            fi
           done
+          if [ "$missing" -ne 0 ]; then
+            echo "assets present:" >&2
+            ls -1 dist >&2
+            exit 1
+          fi
+
+      # Checksums, so a download can be verified against something the release
+      # itself publishes. Generated here rather than per build job because this
+      # is the only place that sees every artifact at once, and it runs AFTER
+      # the verification above so the file can never list a partial release.
+      # `cd dist` keeps the names in the file bare, which is what
+      # `sha256sum -c SHA256SUMS.txt` expects next to the downloads.
+      - name: Generate checksums
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum -- * >../SHA256SUMS.txt
+          mv ../SHA256SUMS.txt .
+          cat SHA256SUMS.txt
 
       - name: Publish GitHub Release assets
         env:

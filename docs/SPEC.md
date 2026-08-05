@@ -1079,7 +1079,7 @@ live watch with the resource-limit error.
 | PDF | PDF viewer |
 | Directory | remote directory browser |
 | Binary | metadata and download/open options |
-| Very large text file | streaming read-only viewer |
+| Very large text file | no streaming viewer yet; oversized inline reads are refused with “file is too large to display inline” |
 | Anything not matched above | metadata and download view. The editor is reached on a positive match only, never as a fallback (§7.5). |
 
 ---

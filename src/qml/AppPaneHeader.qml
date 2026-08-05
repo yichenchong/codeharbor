@@ -1,5 +1,6 @@
 import QtQuick
 import QtQuick.Controls.Basic
+import CodeHarbor
 
 // The per-pane header bar (SPEC 4.3/4.4/4.5), used by BOTH regions — a terminal
 // pane header and a viewer pane header are the SAME component, so the two

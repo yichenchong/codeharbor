@@ -103,15 +103,16 @@ export function mountTerminal(element: HTMLElement, bridge: TerminalBridge): Ter
         // live preference updates so the first frame does not use a different
         // cell size from the configured default.
         fontSize: terminalFontPointsToCssPixels(13),
-        // pane attaches tmux (see ch::TerminalController::tmuxNewSessionCommand),
-        // tmux runs on the ALTERNATE screen, and the alternate screen has no
-        // scrollback at all — the wheel is reported to tmux, which scrolls its
-        // own history. What is left for this buffer is the NORMAL screen: the
-        // few lines printed before tmux takes over, and whatever a user sees if
-        // tmux exits. A few hundred lines cover both, so this is deliberately
-        // small rather than the 5000 it held while xterm.js was believed to own
-        // the history: every line costs memory per pane, and there can be many
-        // panes.
+        // SCROLLBACK: the pane attaches tmux (see
+        // ch::TerminalController::tmuxNewSessionCommand), tmux runs on the
+        // ALTERNATE screen, and the alternate screen has no scrollback at all —
+        // the wheel is reported to tmux, which scrolls its own history. What is
+        // left for this buffer is the NORMAL screen: the few lines printed
+        // before tmux takes over, and whatever a user sees if tmux exits. A few
+        // hundred lines cover both, so this is deliberately small rather than
+        // the 5000 it held while xterm.js was believed to own the history:
+        // every line costs memory per pane, and there can be many panes.
+        scrollback: 500,
         // The host may replace this immediately after page load through
         // window.applyTheme(); these dark roles are the standalone fallback.
         theme: xtermTheme(activeTheme),
@@ -393,8 +394,19 @@ export function mountTerminal(element: HTMLElement, bridge: TerminalBridge): Ter
     const terminalDiagnostics = (): Record<string, unknown> => {
         const canvas = surface.querySelector("canvas");
         const canvasRect = canvas?.getBoundingClientRect();
+        // What the user is looking at, read out of xterm's OWN buffer rather
+        // than out of the DOM. The .xterm-rows element only carries glyphs
+        // while the DOM renderer is active; loading the WebGL addon disposes
+        // that renderer and takes the element with it, so a DOM scrape reports
+        // an empty screen on exactly the hosts where rendering works best.
+        const buffer = term.buffer.active;
+        const viewport: string[] = [];
+        for (let row = 0; row < term.rows; ++row) {
+            viewport.push(buffer.getLine(buffer.viewportY + row)?.translateToString(true) ?? "");
+        }
         return {
             renderer,
+            screenText: viewport.join("\n"),
             windowDevicePixelRatio: pageWindow.devicePixelRatio,
             actualDevicePixelRatio: pixelRatio.state.actual,
             effectiveDevicePixelRatio: pixelRatio.state.effective,
@@ -457,12 +469,17 @@ export function mountTerminal(element: HTMLElement, bridge: TerminalBridge): Ter
             if (pageApi.codeharborTerminalDiagnostics === terminalDiagnostics) {
                 delete pageApi.codeharborTerminalDiagnostics;
             }
-            pixelRatio.restore();
-            writer.close();
+            // Observers FIRST. pixelRatio.restore() dispatches a synthetic
+            // "resize" at the window to make xterm remeasure, and a live
+            // ResizeObserver would answer that by re-fitting a terminal that is
+            // already being torn down — which forwards a geometry change to the
+            // remote PTY on the way out of a pane the user just closed.
             resizeObserver.disconnect();
             visibilityObserver.disconnect();
             element.ownerDocument.removeEventListener("visibilitychange", reportVisibility);
             surface.removeEventListener("contextmenu", suppressContextMenu);
+            pixelRatio.restore();
+            writer.close();
             // The renderer is going away (pane closed, or the page is about to
             // be replaced by a reload). The controller must hear about it
             // BEFORE the teardown so output is retained for the next renderer.
@@ -558,7 +575,17 @@ export function connectTerminal(element: HTMLElement): void {
             showFatal(element, "The terminal bridge is missing from this window.");
             return;
         }
-        const host = mountTerminal(element, bridge);
+        // mountTerminal() can throw before a terminal exists — a document with
+        // no window, or an xterm.js constructor that refuses the environment.
+        // Left uncaught it escapes into qwebchannel.js' connection callback and
+        // the pane is a blank black rectangle with nothing anywhere saying why.
+        let host: TerminalHost;
+        try {
+            host = mountTerminal(element, bridge);
+        } catch (error) {
+            showFatal(element, `The terminal could not start: ${String(error)}`);
+            return;
+        }
         // Named, so the same references can be handed back to disconnect()
         // during teardown. An anonymous arrow could never be unsubscribed, and
         // qwebchannel.js keeps every connected handler alive on the proxy for
@@ -580,7 +607,10 @@ export function connectTerminal(element: HTMLElement): void {
         // renderer hidden on its way out). The signal handlers go first so that
         // output still in flight from C++ stops reaching this page at all,
         // rather than relying on the host's post-dispose guards.
-        window.addEventListener("pagehide", () => {
+        // The element's OWN window, not the ambient global: a page that mounts
+        // the terminal inside a frame must tear it down when THAT document
+        // goes away.
+        (element.ownerDocument.defaultView ?? window).addEventListener("pagehide", () => {
             bridge.write.disconnect(onWrite);
             bridge.connectionStateChanged.disconnect(onConnectionStateChanged);
             bridge.clearRequested.disconnect(onClearRequested);

@@ -235,8 +235,16 @@ void AgentStatusMonitor::applyEvent(const AgentEvent& ev)
 
 void AgentStatusMonitor::markSeen(const QString& devSessionId)
 {
-    if (m_unseen.remove(devSessionId))
-        emit unseenChanged(devSessionId, false);
+    if (!m_unseen.remove(devSessionId))
+        return;
+    // Clearing the flag can put a pane back under time-driven derivation:
+    // onAgeTick() refuses to let time overwrite an UNSEEN completion, so a
+    // generic pane parked at IdleUnseen starts ageing again the moment the
+    // user views it. Without this the tick timer stays stopped and the pane
+    // only moves if some OTHER pane happens to keep it running. Rearmed before
+    // the emit so a slot that re-enters finds the timer already consistent.
+    rearmAgeTimer();
+    emit unseenChanged(devSessionId, false);
 }
 
 void AgentStatusMonitor::retainDevSessions(const QSet<QString>& liveDevSessionIds)
@@ -397,26 +405,32 @@ void AgentStatusMonitor::setStaleTimeoutMs(int ms)
     rearmAgeTimer();
 }
 
-namespace {
-
 // Whether a pane's state can still change with the passage of time alone.
-// Exactly the predicate rearmAgeTimer() runs the timer for and onAgeTick()
-// would find work in, so the two can never disagree about when to stop.
-bool agesWithTime(const AgentState state, bool generic, bool attached,
-                  int staleTimeoutMs)
+// This must be EXACTLY the set of panes onAgeTick() would find work in, or the
+// two disagree: rearmAgeTimer() stops the timer while a pane still has a
+// pending transition, and that pane then only moves if some OTHER pane happens
+// to keep the timer alive. It is therefore written as the same arms onAgeTick()
+// evaluates, in the same order, reading the same fields.
+bool AgentStatusMonitor::agesWithTime(const TerminalStatus& st,
+                                      bool devSessionUnseen) const
 {
-    const bool claimsWork =
-        (state == AgentState::Starting || state == AgentState::Running);
-    // A generic pane at Running is waiting to fall to Idle. At Starting it is
-    // waiting for OUTPUT, and at Idle it has settled: neither moves on its own,
-    // so the timer must not keep the process awake for them. Generic panes do
-    // not use the generic stale-timeout rule below.
-    if (generic)
-        return attached && state == AgentState::Running;
-    return staleTimeoutMs > 0 && claimsWork;
+    if (st.generic && st.attached) {
+        // A completion the user has not seen is never overwritten by time.
+        if (st.state == AgentState::IdleUnseen && devSessionUnseen)
+            return false;
+        // SPEC 6.6's arms. With no output yet the pane settles at Starting and
+        // stays there; once output has been seen it is Running until the quiet
+        // window elapses and Idle after that. So the pane has time-driven work
+        // left exactly while it has not reached the state its own arm ends in.
+        return st.lastOutputMs < 0 ? st.state != AgentState::Starting
+                                   : st.state != AgentState::Idle;
+    }
+    // Silence demotion: only a pane that claims a live agent ages, and only
+    // once it has produced at least one sign of life to measure silence from.
+    return m_staleTimeoutMs > 0
+        && (st.state == AgentState::Starting || st.state == AgentState::Running)
+        && qMax(st.lastEventMs, st.lastOutputMs) >= 0;
 }
-
-} // namespace
 
 void AgentStatusMonitor::onAgeTick()
 {
@@ -490,10 +504,10 @@ void AgentStatusMonitor::rearmAgeTimer()
     bool needed = false;
     for (auto sit = m_states.constBegin(); sit != m_states.constEnd() && !needed;
          ++sit) {
+        const bool unseen = m_unseen.contains(sit.key());
         for (auto tit = sit.value().constBegin(); tit != sit.value().constEnd();
              ++tit) {
-            const TerminalStatus& st = tit.value();
-            if (agesWithTime(st.state, st.generic, st.attached, m_staleTimeoutMs)) {
+            if (agesWithTime(tit.value(), unseen)) {
                 needed = true;
                 break;
             }

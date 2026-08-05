@@ -29,16 +29,39 @@ renderer.checkbox = ({ checked }: Tokens.Checkbox): string => {
     return `<input type="checkbox"${state} disabled>`;
 };
 
-// DOMPurify's built-in URL checks reject javascript:, vbscript: and data: by
-// default. This narrower expression also rejects protocol-relative URLs, which
-// could otherwise reach an external host from a link in the privileged page.
+// The URL policy for every attribute DOMPurify treats as a URI. It REPLACES
+// DOMPurify's default expression, and is narrower than it: besides the
+// javascript:/vbscript:/data: spellings the default already refuses, this one
+// also rejects protocol-relative URLs ("//host/x"), which could otherwise reach
+// an external host from a link in the privileged page.
+//
+// It is not the whole story for images. DOMPurify exempts `src` on <img> (and
+// its DATA_URI_TAGS siblings) from this expression whenever the value starts
+// with "data:", and that exemption is not configurable away. Nothing here can
+// stop a data: image source, so rewriteRelativeUrls() is what removes it: that
+// function drops `src` from EVERY image unconditionally and puts back only an
+// opaque codeharbor-internal:// URL minted by the host.
 const allowedUri = /^(?:(?:https?|mailto|file|codeharbor-internal):|#|\/(?!\/)|\.{0,2}\/(?!\/)|[^:\/?#]+(?:[\/?#]|$))/i;
 
 const sanitizerConfig: Config = {
     ALLOW_DATA_ATTR: false,
     ADD_ATTR: ["data-language"],
     ALLOWED_URI_REGEXP: allowedUri,
-    FORBID_ATTR: ["sizes", "srcset", "style"],
+    // `background` is a legacy attribute Chromium still honours on <body>,
+    // <table> and <td>: it fetches an image from an arbitrary URL, so it is an
+    // <img> the img rewrite below would never see. `download` turns a link
+    // click into a profile download instead of the in-pane navigation QML
+    // arbitrates. `crossorigin` and `referrerpolicy` let a document dictate how
+    // the privileged page requests its own subresources.
+    FORBID_ATTR: [
+        "background",
+        "crossorigin",
+        "download",
+        "referrerpolicy",
+        "sizes",
+        "srcset",
+        "style",
+    ],
     FORBID_TAGS: [
         "audio",
         "base",
@@ -111,6 +134,26 @@ export function renderMarkdown(
     }
 }
 
+// MIRRORED IN QML. src/qml/ViewerMarkdownView.qml reimplements the next three
+// functions (isRelativeResource, pathDirectory, resolveRemotePath) because the
+// WebChannel image bridge passes the RAW document-relative string and the host
+// has to resolve it against its own copy of the document path — it cannot call
+// into this bundle, which runs in a separate Chromium world. The two must stay
+// in step: any change here needs the same change there, and both sides pin the
+// shared table (relative, "..", ".." above the root, absolute, protocol-
+// relative "//host/x", backslashes, "#"/"?" prefixes) — here in
+// test/renderer.test.ts and there in
+// src/qml/tests/tst_paneidentity.cpp's
+// theMarkdownImagePathResolverAgreesWithTheRendererBundle.
+//
+// The QML side has exactly TWO deliberate divergences, documented at both ends.
+// Both go the same way — it refuses where this side answers, because its answer
+// is fed to a remote file READ rather than used as a link target:
+//   * where resolveRemotePath() answers "/" (a reference that climbs to the
+//     filesystem root), it answers "".
+//   * where this side treats an empty documentPath as "/", it answers "". The
+//     page cannot reach that state: its document path is the ?path= query the
+//     QML side wrote. That view can, before a url arrives.
 function isRelativeResource(value: string): boolean {
     return value.length > 0
         && !/^(?:[a-z][a-z0-9+.-]*:|\/\/)/i.test(value)
@@ -162,6 +205,11 @@ export function remotePathToFileUrl(path: string): string {
  * generated data attributes until the narrow WebChannel bridge mints an opaque
  * internal URL; every non-relative image is removed so it cannot load a network
  * or client-file resource.
+ *
+ * This is also the only place a `data:` image source dies. DOMPurify exempts
+ * data: URIs on <img src> from its URL policy and offers no way to switch that
+ * exemption off, so the unconditional `src` removal below is what stops a
+ * document from smuggling its own inline payload into the privileged page.
  */
 export function rewriteRelativeUrls(
     sanitizedHtml: string,
@@ -181,6 +229,16 @@ export function rewriteRelativeUrls(
         image.removeAttribute("src");
         image.removeAttribute("srcset");
         image.removeAttribute("sizes");
+    }
+
+    // <input type="image"> issues an image request exactly like <img> does, and
+    // it is NOT an <img>, so the loop above never sees it. The sanitizer keeps
+    // <input> because the task-list checkbox renderer emits one, and it keeps an
+    // https: src because the URL policy allows https — which left a Markdown
+    // document able to fetch an arbitrary external URL from the privileged page.
+    // A Markdown document has no legitimate <input src>.
+    for (const input of template.content.querySelectorAll("input[src]")) {
+        input.removeAttribute("src");
     }
 
     for (const link of template.content.querySelectorAll("a[href]")) {

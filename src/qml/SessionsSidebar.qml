@@ -2,6 +2,7 @@ import QtQuick
 import QtQuick.Controls.Basic
 import QtQml.Models
 import QtQuick.Layouts
+import CodeHarbor
 
 // Sessions sidebar region (SPEC 4.2): collapsible groups, Dev Session rows with
 // aggregate status, drag-and-drop reordering and keyboard navigation. Bound to
@@ -413,6 +414,13 @@ Rectangle {
         var entry = groupEntry(target.groupId);
         if (!entry)
             return;
+        // `target.index` was resolved against visibleRows(entry), while this
+        // list is entry.rows. The two agree because a session row is only ever
+        // hidden by its whole group collapsing, and a collapsed group offers
+        // nothing to drag FROM — so an expanded group's realised rows are
+        // exactly its visible ones. If a per-row `visible` is ever introduced,
+        // this loop has to use visibleRows() too, or the reorder will move the
+        // wrong session.
         var ids = [];
         for (var i = 0; i < entry.rows.length; ++i)
             ids.push(entry.rows[i].itemId);

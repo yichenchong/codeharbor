@@ -51,6 +51,16 @@ QString displayFingerprint(const QString& fingerprint)
     return QStringLiteral("SHA256:") + fingerprint;
 }
 
+// One (Dev Session, terminal pane) harness registration. refresh() gathers the
+// whole set from the authoritative tree BEFORE pushing any of it to the agent
+// monitor, so the push loop never walks a member container across a call that
+// can re-enter this controller.
+struct HarnessRegistration {
+    QString devSessionId;
+    QString terminalPaneId;
+    QString harness;
+};
+
 } // namespace
 
 AppController::AppController(CodeharbordClient* client, QObject* parent)
@@ -511,8 +521,15 @@ void AppController::upgradeRemoteService(QString profileId)
 void AppController::startConnect(const QString& profileId,
                                  QString acceptedFingerprint)
 {
-    if (!m_bootstrap || !m_profiles || !m_pool)
+    if (!m_bootstrap || !m_profiles || !m_pool) {
+        // There is no spine to dial with, so the chain is over before it began
+        // and nothing it armed may survive it. An upgrade request left standing
+        // here would turn whatever the user connects to next into an
+        // unasked-for reinstall of the remote service.
+        if (m_bootstrap)
+            m_bootstrap->cancelRemoteUpgrade();
         return;
+    }
     // One handshake at a time: a second invocation while a connect is running -
     // or while the user still owes us a host-key answer - would race two
     // sessions onto one pool and could re-enter the host-key callback. The flag
@@ -522,7 +539,17 @@ void AppController::startConnect(const QString& profileId,
 
     const QVariantMap profile = m_profiles->profile(profileId);
     if (profile.isEmpty()) {
+        // Reachable with a chain already in flight: the user asks to update a
+        // server, parks on its host-key prompt, deletes the profile from the
+        // connect sheet behind it and then accepts. The chain ends HERE, so it
+        // gets the same full teardown the ordinary failure tail below performs
+        // - including the armed upgrade, which would otherwise ambush the next
+        // ordinary connect, and the profile id and held error, which the next
+        // chain's failure path would report as though they had just happened.
         m_credentials.clear();
+        m_pendingProfileId.clear();
+        m_heldConnectError.clear();
+        m_bootstrap->cancelRemoteUpgrade();
         setConnectionState(QStringLiteral("failed"),
                            tr("No such server profile."));
         return;
@@ -765,6 +792,12 @@ void AppController::resolveHostKey(bool accept)
         m_credentials.clear();
         m_pendingProfileId.clear();
         m_heldConnectError.clear();
+        // The credential half of the attempt state goes with the host-key half:
+        // a request flag left standing describes a prompt nobody can answer any
+        // more, and submitCredential() reads it.
+        m_credentialRequested = false;
+        m_credentialUser.clear();
+        m_credentialLabel.clear();
         // Including an armed upgrade: this chain is over without reaching the
         // install, and a request left behind would make the user's NEXT
         // ordinary connect reinstall the remote service unasked.
@@ -1133,7 +1166,7 @@ QString AppController::activeSessionRepoRoot() const
     return {};
 }
 
-QVector<GroupRow> AppController::computeRows()
+QVector<GroupRow> AppController::computeRows() const
 {
     // Start from the persisted tree and overlay both live sources: TerminalFactory
     // owns per-pane connection state, while AgentStatusMonitor owns agent state.
@@ -1176,7 +1209,7 @@ QVector<GroupRow> AppController::computeRows()
                     }
                     status.agent = agent;
                 }
-                sessionRow.terminals.push_back(status);
+                sessionRow.terminals.push_back(std::move(status));
             }
         }
     }
@@ -1297,22 +1330,37 @@ void AppController::refresh()
         // resolved since the last refresh gets. setTerminalHarness is
         // idempotent, so both running costs nothing.
         if (self->m_agentMonitor) {
+            // The retain set and the harness registrations come out of ONE walk
+            // of the authoritative tree, up front, so the push loop below walks
+            // a LOCAL list instead of m_lastNodes. retainDevSessions() and
+            // setTerminalHarness() reach the monitor, whose signals come back
+            // through applyAgentStateUpdate() into the sidebar model and from
+            // there into QML - and a handler there is allowed to re-enter this
+            // controller and replace m_lastNodes. A range-for over the member
+            // across those calls would be walking a vector something else had
+            // reallocated underneath it.
             QSet<QString> liveDevSessions;
-            for (const GroupNode& groupNode : self->m_lastNodes)
-                for (const SessionNode& sessionNode : groupNode.sessions)
-                    liveDevSessions.insert(sessionNode.session.id.value);
-            self->m_agentMonitor->retainDevSessions(liveDevSessions);
-            if (!self)
-                return;
+            QVector<HarnessRegistration> registrations;
             for (const GroupNode& groupNode : self->m_lastNodes) {
                 for (const SessionNode& sessionNode : groupNode.sessions) {
+                    const QString& devSessionId = sessionNode.session.id.value;
+                    liveDevSessions.insert(devSessionId);
                     for (const TerminalPane& pane : sessionNode.terminalPanes) {
-                        self->m_agentMonitor->setTerminalHarness(
-                            sessionNode.session.id.value, pane.id.value, pane.harness);
-                        if (!self)
-                            return;
+                        registrations.push_back(
+                            {devSessionId, pane.id.value, pane.harness});
                     }
                 }
+            }
+            self->m_agentMonitor->retainDevSessions(liveDevSessions);
+            // Guarded BEFORE each dereference, not after it: a check that runs
+            // once the call it is meant to guard has already returned has
+            // nothing left to protect.
+            for (const HarnessRegistration& registration : registrations) {
+                if (!self || !self->m_agentMonitor)
+                    return;
+                self->m_agentMonitor->setTerminalHarness(
+                    registration.devSessionId, registration.terminalPaneId,
+                    registration.harness);
             }
         }
         if (!self)

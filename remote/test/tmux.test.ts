@@ -1,8 +1,12 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import os from "node:os";
+import path from "node:path";
 
 import {
     LIST_SESSIONS_FORMAT,
+    execFileRunner,
     SPAWN_FAILED,
     TMUX_TARGET_MAX_LENGTH,
     isSafeTmuxTarget,
@@ -422,4 +426,45 @@ test("tmuxSafeName rewrites exactly the two characters tmux rewrites", () => {
     // still not a target this server will accept, it is simply not this
     // function's business.
     assert.equal(tmuxSafeName("ch a.b"), "ch a_b");
+});
+
+// execFile reports two very different outcomes with neither an exit code nor
+// an errno: a timeout, and output past its maxBuffer. They used to collapse
+// onto one message, so a listing that was merely enormous was reported as
+// "tmux did not respond within 10000ms" — which sends whoever has to debug it
+// hunting an unresponsive tmux server that is not there. Driven through a real
+// child process because that classification only exists in execFileRunner.
+test("output past the execFile buffer is reported as output, not as a timeout", async () => {
+    const dir = mkdtempSync(path.join(os.tmpdir(), "ch-tmux-runner-"));
+    const fake = path.join(dir, "tmux");
+    // Nine megabytes: comfortably past the eight-megabyte execFile buffer, and
+    // small enough that the child finishes far inside the ten-second timeout,
+    // so the test cannot pass for the wrong reason.
+    writeFileSync(
+        fake,
+        `#!/bin/sh\nexec ${process.execPath} -e "process.stdout.write('a'.repeat(9*1024*1024))"\n`,
+        { mode: 0o755 },
+    );
+    const previous = process.env.CODEHARBOR_TMUX;
+    process.env.CODEHARBOR_TMUX = fake;
+    try {
+        // Reading the override per invocation is itself the contract here: a
+        // binary captured at import time would ignore this assignment and the
+        // test would silently run the host's real tmux.
+        const result = await execFileRunner(["list-sessions"]);
+        assert.equal(result.code, SPAWN_FAILED);
+        assert.match(result.stderr, /produced more than \d+ bytes of output/);
+        assert.doesNotMatch(result.stderr, /did not respond/);
+        // And it stays a REAL failure: neither "no tmux installed" nor "no
+        // server running", both of which would answer with an empty listing and
+        // invite the client to start a second session beside the live one.
+        await assert.rejects(
+            () => listSessions(execFileRunner),
+            /tmux list-sessions failed: tmux produced more than/,
+        );
+    } finally {
+        if (previous === undefined) delete process.env.CODEHARBOR_TMUX;
+        else process.env.CODEHARBOR_TMUX = previous;
+        rmSync(dir, { recursive: true, force: true });
+    }
 });

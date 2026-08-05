@@ -21,6 +21,7 @@ import { fileURLToPath } from "node:url";
 
 import {
     RPC_DATABASE_BUSY,
+    RPC_INTERNAL_ERROR,
     RPC_METHODS,
     RPC_REVISION_MISMATCH,
     RPC_RESOURCE_LIMIT,
@@ -33,6 +34,8 @@ import {
 } from "../src/rpc-types.ts";
 import {
     RPC_SCHEMA_VERSION,
+    RPC_SERVER_VERSION,
+    responseLine,
     MAX_LINE_BYTES,
     MAX_PENDING_WATCH_EVENTS,
     createLineFramer,
@@ -353,4 +356,77 @@ test("watch relay coalescing cannot exceed its byte bound", () => {
         ),
         "the client must be told that the oversized replacement was dropped",
     );
+});
+
+// The version server.info reports is written out twice: as RPC_SERVER_VERSION
+// in remote/src/codeharbord.ts and as the "version" field of
+// remote/package.json. Only the package.json copy is rewritten by the release
+// script, which is how the constant once sat at 0.1.0 while the tag said 0.1.8
+// and every deployed server reported a version three releases stale. That
+// number is not cosmetic: the client shows it to the USER verbatim in its
+// "Server too old: codeharbord <version> speaks ..." message, so a stale one
+// names the wrong release to upgrade.
+test("the reported server version matches remote/package.json", () => {
+    const packagePath = fileURLToPath(new URL("../package.json", import.meta.url));
+    const declared = JSON.parse(readFileSync(packagePath, "utf8")) as { version?: string };
+    assert.equal(
+        RPC_SERVER_VERSION,
+        declared.version,
+        "codeharbord.ts's RPC_SERVER_VERSION and remote/package.json's version must be bumped together",
+    );
+});
+
+test("a response is serialized as one newline-terminated JSON line", () => {
+    assert.equal(
+        responseLine({ jsonrpc: "2.0", id: 1, result: { pong: true } }),
+        '{"jsonrpc":"2.0","id":1,"result":{"pong":true}}\n',
+    );
+});
+
+// An answer bigger than one transport frame used to be written out anyway, and
+// BOTH ends of this protocol drop the connection on an over-cap frame: a single
+// oversized reply cost the user every terminal and every editor on that
+// connection, with nothing on screen saying why. It must instead become a small
+// refusal that keeps the request id — so the client's pending call completes,
+// the message names the limit, and the session survives.
+test("an over-cap response is refused instead of written as a doomed frame", () => {
+    const line = responseLine({
+        jsonrpc: "2.0",
+        id: 7,
+        result: { blob: "x".repeat(MAX_LINE_BYTES + 1) },
+    });
+    assert.ok(
+        Buffer.byteLength(line) <= MAX_LINE_BYTES,
+        "the refusal itself must fit in a frame",
+    );
+    const decoded = JSON.parse(line);
+    assert.equal(decoded.id, 7);
+    assert.equal(decoded.error.code, RPC_RESOURCE_LIMIT);
+    assert.match(decoded.error.message, /transport frame limit/);
+});
+test("an oversized response id is replaced with null in the bounded refusal", () => {
+    const line = responseLine({
+        jsonrpc: "2.0",
+        id: "x".repeat(MAX_LINE_BYTES),
+        result: { method: "unknown" },
+    });
+    assert.ok(Buffer.byteLength(line) <= MAX_LINE_BYTES);
+    const decoded = JSON.parse(line);
+    assert.equal(decoded.id, null);
+    assert.equal(decoded.error.code, RPC_RESOURCE_LIMIT);
+});
+
+// A payload JSON.stringify cannot render (a reference cycle, a BigInt) still
+// has to produce a line. The client correlates replies by request id, so a
+// request answered with nothing holds that call open until the heartbeat tears
+// the whole transport down over one unserializable result.
+test("an unserializable response still answers the request", () => {
+    const cyclic: Record<string, unknown> = {};
+    cyclic.self = cyclic;
+    const decoded = JSON.parse(
+        responseLine({ jsonrpc: "2.0", id: "abc", result: cyclic }),
+    );
+    assert.equal(decoded.id, "abc");
+    assert.equal(decoded.error.code, RPC_INTERNAL_ERROR);
+    assert.match(decoded.error.message, /could not be serialized/);
 });

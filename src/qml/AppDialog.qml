@@ -1,4 +1,5 @@
 import QtQuick.Controls.Basic
+import CodeHarbor
 
 // A modal dialog wearing the application's own colour scheme (SPEC 4.1).
 //

@@ -1,6 +1,7 @@
 import QtQuick
 import QtQuick.Controls.Basic
 import QtQuick.Window
+import CodeHarbor
 
 // The application's own title bar (SPEC 4.1), drawn inside the window because
 // the window itself is frameless on the platforms where that is safe (see

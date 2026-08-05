@@ -7,3 +7,13 @@
 *.gif binary
 *.pdf binary
 *.ico binary
+
+# Unified diffs are applied byte-for-byte against an upstream tarball on the
+# Windows release runner (packaging/vcpkg-ports/). `text=auto eol=lf` above
+# already checks them out with LF, but `-text` takes them out of line-ending
+# conversion entirely, so no future .gitattributes change or per-clone
+# core.autocrlf setting can rewrite a context line and make `git apply` reject
+# the hunk mid-release. tests/vcpkg_patches.sh guards the same property from
+# the other side.
+*.patch -text
+*.diff -text

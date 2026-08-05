@@ -1,5 +1,6 @@
 import QtQuick
 import QtQuick.Controls.Basic
+import CodeHarbor
 
 // The one scrollbar used by every scrollable view in the application (SPEC 4.1).
 // Drop it into any of the three standard slots:

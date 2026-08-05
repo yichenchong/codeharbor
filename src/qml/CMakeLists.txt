@@ -20,6 +20,7 @@ qt_add_qml_module(codeharbor_qml
         Theme.qml
         ToolbarRegistry.qml
         RemotePath.js
+        EndpointField.js
         Main.qml
         AppTitleBar.qml
         AppSplitHandle.qml

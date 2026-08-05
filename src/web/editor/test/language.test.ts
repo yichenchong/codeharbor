@@ -108,3 +108,39 @@ test("the filename pass and extension pass both handle their registrations", () 
 test("an empty registration list still yields a rendered editor", () => {
     assert.equal(selectLanguage("/srv/app.js", []), "plaintext");
 });
+
+// Monaco's registration list really does contain competing claims — two
+// contributions can both list ".md", and a host extension can register a
+// filename another language already owns. The resolver has to be DETERMINISTIC
+// about it, or the same path picks a different language depending on the order
+// contributions happened to load in.
+const conflicting: readonly LanguageInfo[] = [
+    { id: "first-ext", extensions: [".conf"] },
+    { id: "second-ext", extensions: [".CONF"] },
+    { id: "first-name", filenames: ["Makefile"] },
+    { id: "second-name", filenames: ["makefile"] },
+    // Claims the extension of a file whose exact NAME a later entry owns, to
+    // prove the two-pass rule is not just "whichever entry comes first".
+    { id: "greedy-ext", extensions: [".mk"] },
+    { id: "exact-name", filenames: ["build.mk"] },
+];
+
+test("when two languages claim one extension, the first registration wins", () => {
+    assert.equal(selectLanguage("/etc/app.conf", conflicting), "first-ext");
+    // ...including when the SECOND registration is the exact-case spelling: the
+    // comparison is case-insensitive, so it does not get to jump the queue.
+    assert.equal(selectLanguage("/etc/app.CONF", conflicting), "first-ext");
+});
+
+test("when two languages claim one filename, the first registration wins", () => {
+    assert.equal(selectLanguage("/srv/Makefile", conflicting), "first-name");
+    assert.equal(selectLanguage("/srv/makefile", conflicting), "first-name");
+});
+
+test("a later filename registration still beats an earlier extension one", () => {
+    // The filename pass runs to completion before the extension pass starts, so
+    // registration order never lets an extension claim a file whose exact name
+    // some other language owns.
+    assert.equal(selectLanguage("/srv/build.mk", conflicting), "exact-name");
+    assert.equal(selectLanguage("/srv/other.mk", conflicting), "greedy-ext");
+});

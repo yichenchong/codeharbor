@@ -39,13 +39,29 @@ public:
     static Oklch srgbToOklch(const SrgbColor &color);
     static SrgbColor oklchToSrgb(const Oklch &color);
 
-    // A generator request must add at least one colour beyond the seed. The
-    // QML adapter handles an exact seed-sized preference by returning the seed
-    // unchanged, while this assertion catches a too-small programmer request.
-    // Callers that receive user preferences should check this predicate first
-    // so a hand-edited settings file cannot abort the application in a release
-    // build.
+    // Largest palette this generator will produce. Expansion compares every
+    // pair of colours already chosen for each new one, so the work grows with
+    // the CUBE of the requested count: asking for a few thousand colours would
+    // freeze the user interface for minutes while it computed a palette nobody
+    // could tell apart. Group tints need dozens, not thousands, so an
+    // out-of-range request is refused outright instead.
+    //
+    // This must stay at or above ch::AppSettings::kMaxPaletteSize (64), the
+    // upper end of the user-facing preference; if that preference is ever
+    // widened past this number, raise this one with it or the affected sizes
+    // silently produce no palette at all.
+    static constexpr int kMaxPaletteSize = 256;
+
+    // A generator request must add at least one colour beyond the seed, and
+    // must not ask for more than kMaxPaletteSize in total. The QML adapter
+    // handles an exact seed-sized preference by returning the seed unchanged,
+    // while this predicate catches a too-small or absurdly large request.
+    // Callers that receive user preferences should check it first so a
+    // hand-edited settings file can neither abort the application in a release
+    // build nor hang it in any build.
     static bool canGenerate(const QVector<SrgbColor> &seed, int requestedCount);
+    // Precondition: canGenerate(seed, requestedCount). Returns an empty vector
+    // when that does not hold.
     static QVector<SrgbColor> generatePalette(const QVector<SrgbColor> &seed,
                                               int requestedCount);
     static QVector<SrgbColor> tokyoNightSeed();

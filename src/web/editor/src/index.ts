@@ -390,15 +390,26 @@ export function mountEditor(
      * those edits really are still unsaved.
      */
     function requestSave(revision: string): void {
-        if (readOnly || currentFileState === "loading") {
+        // A read-only buffer has no save to refuse: Monaco renders it as
+        // non-editable and the user is not waiting for a write. Every OTHER
+        // refusal below says so out loud, because the caller has just asked for
+        // a save and nothing else will ever answer.
+        if (readOnly) {
             return;
         }
-        // With no transport bound the host's save slot returns immediately and
-        // emits NOTHING (EditorController::save bails on a null client), so a
-        // silent return here would leave the user believing the file was
-        // written. Refuse locally and say so instead — and refuse BEFORE
-        // reporter.save(), which would otherwise cancel the pending recovery
-        // snapshot for a save that never happens.
+        // The host refuses a save issued during a load with exactly this reason
+        // (EditorController::save): the page is still showing the PREVIOUS
+        // file's bytes, so sending them would pair them with the new path.
+        // Refusing here as well keeps the pending recovery snapshot armed, which
+        // reporter.save() would otherwise cancel for a save that never happens.
+        if (currentFileState === "loading") {
+            showSaveError("the file is still loading.");
+            return;
+        }
+        // With no transport bound the host's save slot cannot write anything, so
+        // a silent return here would leave the user believing the file was
+        // written. Refuse locally and say so instead — again BEFORE
+        // reporter.save() cancels the pending recovery snapshot.
         if (currentFileState === "disconnected") {
             showSaveError("no connection to the server.");
             return;
@@ -436,8 +447,7 @@ export function mountEditor(
         // A snapshot armed by edits this load supersedes must not be sent: it
         // would re-flag the freshly loaded buffer as dirty.
         reporter.cancel();
-        const model = editor.getModel();
-        if (model && bufferText(editor) === content) {
+        if (bufferText(editor) === content) {
             // Identical buffer (e.g. reload of unchanged file): just re-baseline.
             dirty = false;
             renderState();
@@ -577,7 +587,7 @@ export function mountEditor(
     });
 
     // Cancel only; the pending snapshot is NOT flushed here. It is flushed in
-    // EditorHost.dispose() (flushReport() runs before editor.dispose()). By the
+    // EditorHost.dispose() (reporter.flush() runs before editor.dispose()). By the
     // time Monaco fires onDidDispose the editor is already being torn down, so
     // a flush here would call getValue() on a dead model. This handler exists so
     // that a host disposing the editor directly (not through the returned host)

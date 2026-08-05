@@ -370,6 +370,10 @@ private:
     void applyLoadedTree(quint64 generation, int index,
                          std::optional<SplitNode> tree,
                          std::optional<RpcError> err);
+    // Drop everything this region was showing and publish a null tree to QML.
+    // Used by every "this layout cannot be used" verdict a load can reach: a
+    // getLayout that failed, and one that came back with duplicate leaf keys.
+    void invalidateRegion(int index);
     // Store `tree` in the slot, reserve the pane suffixes it carries, refresh
     // the variant cache, and emit the region's changed signal.
     void setTree(int index, SplitNode tree);

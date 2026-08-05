@@ -120,9 +120,16 @@ done <<<"$settings"
 [ -n "$GIT_REMOTE" ] || die "could not read the configuration (is .bumpversion.json valid?)"
 [ -n "$COMMIT_TEMPLATE" ] || die "could not read the release commit message from .bumpversion.json"
 
+# `mapfile < <(...)` reports the status of `mapfile`, never of the command
+# inside the process substitution, and `set -o pipefail` does not reach in
+# there either. So check both arrays: a tool that died would otherwise leave an
+# empty file list, and the run would go on to "commit" nothing and tag it.
 mapfile -t VERSION_FILES < <(ctl paths)
 mapfile -t INPUT_FILES < <(ctl inputs)
-[ "${#VERSION_FILES[@]}" -gt 0 ] || die "the configuration lists no version files"
+[ "${#VERSION_FILES[@]}" -gt 0 ] \
+    || die "could not list the version files from .bumpversion.json (see above)"
+[ "${#INPUT_FILES[@]}" -ge "${#VERSION_FILES[@]}" ] \
+    || die "could not list the files a bump reads from .bumpversion.json (see above)"
 
 # Resolve the current version: newest release tag, else the authoritative file.
 # awk, not `head -n1`: `set -o pipefail` is on, and `head` exits after the first
@@ -257,6 +264,12 @@ echo "Created annotated tag $tag"
 
 if [ "$DO_PUSH" -eq 1 ]; then
     branch="$(git rev-parse --abbrev-ref HEAD)"
+    # On a detached HEAD `--abbrev-ref HEAD` is the literal string "HEAD", and
+    # `git push <remote> HEAD` then tries to create a branch called HEAD on the
+    # remote. Refuse instead: the tag exists locally at this point, so say so
+    # and let the caller push it from a real branch.
+    [ "$branch" != "HEAD" ] \
+        || die "HEAD is detached, so there is no branch to push. $tag was created locally; check out the release branch and run: git push $GIT_REMOTE HEAD $tag"
     git push "$GIT_REMOTE" "$branch" "$tag"
     echo "Pushed $branch and $tag to $GIT_REMOTE"
 else

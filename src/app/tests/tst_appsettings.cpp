@@ -70,6 +70,8 @@ void TstAppSettings::aHandEditedFileFallsBackInsteadOfPropagating()
                      QStringLiteral(""));
         raw.setValue(QStringLiteral("settings/appearance/terminalPixelRatio"),
                      QStringLiteral("crisp"));
+        raw.setValue(QStringLiteral("settings/appearance/terminalFontSize"),
+                     12.5);
     }
     AppSettings s(path);
 

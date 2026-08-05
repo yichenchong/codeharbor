@@ -4,6 +4,8 @@
 #include <QQmlContext>
 #include <QQmlEngine>
 #include <QQuickItem>
+#include <QQuickView>
+#include <QSet>
 #include <QUrl>
 #include <QVariant>
 
@@ -12,12 +14,48 @@
 
 using namespace ch;
 
+namespace {
+
+// An attached `ScrollBar.vertical: ...` object is parented into the VISUAL
+// tree, not the QObject tree, so QObject::findChild() never reaches it. Walk
+// both, the way the other QML tests in this directory do.
+QObject *findByName(QObject *root, const QString &name, QSet<const QObject *> &seen)
+{
+    if (!root || seen.contains(root))
+        return nullptr;
+    seen.insert(root);
+    if (root->objectName() == name)
+        return root;
+    const auto objectChildren = root->children();
+    for (QObject *child : objectChildren) {
+        if (QObject *found = findByName(child, name, seen))
+            return found;
+    }
+    if (auto *item = qobject_cast<QQuickItem *>(root)) {
+        const auto itemChildren = item->childItems();
+        for (QQuickItem *child : itemChildren) {
+            if (QObject *found = findByName(child, name, seen))
+                return found;
+        }
+    }
+    return nullptr;
+}
+
+QObject *findByName(QObject *root, const QString &name)
+{
+    QSet<const QObject *> seen;
+    return findByName(root, name, seen);
+}
+
+} // namespace
+
 class TstLogView final : public QObject {
     Q_OBJECT
 
 private slots:
     void messageSurvivesClosedSheet();
     void severityFilterUsesCanonicalKeys();
+    void longLinesStayReachable();
 };
 
 void TstLogView::severityFilterUsesCanonicalKeys()
@@ -67,6 +105,48 @@ void TstLogView::messageSurvivesClosedSheet()
     QTRY_VERIFY_WITH_TIMEOUT(
         item->property("visibleText").toString().contains(QStringLiteral("message while closed")),
         1000);
+}
+
+// Entries are shown unwrapped, one message per line, so a remote stack trace or
+// a long RPC payload is routinely wider than the sheet. Without a horizontal
+// axis the overflow is clipped and there is no gesture that can bring it back:
+// the text is in the buffer and the user cannot read it.
+void TstLogView::longLinesStayReachable()
+{
+    LogBuffer buffer;
+    // A real (offscreen) window: the sheet's content sits in a ColumnLayout,
+    // and a layout only runs its polish pass once the item is in a window, so
+    // a windowless component reports no geometry to assert on.
+    QQuickView view;
+    view.setResizeMode(QQuickView::SizeRootObjectToView);
+    view.resize(400, 300);
+    view.setSource(QUrl(QStringLiteral("qrc:/qt/qml/CodeHarbor/LogView.qml")));
+    QQuickItem *const item = view.rootObject();
+    QVERIFY(item != nullptr);
+    item->setProperty("logBuffer", QVariant::fromValue(&buffer));
+    item->setProperty("shown", true);
+    view.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&view));
+
+    auto *const flick =
+        qobject_cast<QQuickItem *>(findByName(item, QStringLiteral("logScroll")));
+    QVERIFY(flick != nullptr);
+
+    buffer.appendRemote(QStringLiteral("daemon"), QStringLiteral("rpc"),
+                        QStringLiteral("bridge"), QString(600, QLatin1Char('x')));
+    QTRY_VERIFY_WITH_TIMEOUT(
+        item->property("visibleText").toString().length() > 500, 1000);
+
+    QTRY_VERIFY_WITH_TIMEOUT(
+        flick->property("contentWidth").toReal()
+            > flick->property("width").toReal() + 1.0,
+        1000);
+    // AppScrollBar disables and hides itself whenever the viewport already
+    // holds the whole content, so a horizontal bar that is live is the
+    // observable proof that the overflow can be reached.
+    QObject *const bar = findByName(item, QStringLiteral("logHorizontalScroll"));
+    QVERIFY2(bar != nullptr, "the log well has no horizontal scrollbar");
+    QTRY_VERIFY_WITH_TIMEOUT(bar->property("enabled").toBool(), 1000);
 }
 
 QTEST_MAIN(TstLogView)

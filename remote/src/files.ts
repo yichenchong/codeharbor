@@ -148,7 +148,21 @@ function decodeUtf8(buf: Buffer): string | undefined {
 export const MAX_FILE_READ_BYTES = 16 * 1024 * 1024;
 export const MAX_FILE_RESPONSE_BYTES = 15 * 1024 * 1024;
 
+// Upper bound on the bytes ONE UTF-16 code unit can occupy inside a JSON
+// string: a control character becomes the six characters `\u00XX`, and neither
+// any other escape nor the UTF-8 encoding of a single unit is longer.
+const JSON_MAX_BYTES_PER_UNIT = 6;
+
 function assertReadFits(result: ReadFileResult): void {
+    // Serializing a 15 MiB payload purely to measure it doubles the peak memory
+    // of every large read, so try a cheap sufficient bound first: if even the
+    // worst-case escaping of this content fits, no measurement is needed. Only
+    // a payload that could plausibly be over the cap pays for the exact count.
+    const overhead =
+        JSON_MAX_BYTES_PER_UNIT * (result.path.length + result.revision.length) + 128;
+    if (result.content.length * JSON_MAX_BYTES_PER_UNIT + overhead <= MAX_FILE_RESPONSE_BYTES) {
+        return;
+    }
     const bytes = Buffer.byteLength(JSON.stringify(result));
     if (bytes > MAX_FILE_RESPONSE_BYTES) {
         throw new ResourceLimitError(
@@ -157,6 +171,60 @@ function assertReadFits(result: ReadFileResult): void {
                 `Read the file in smaller ranges.`,
         );
     }
+}
+
+// Read `length` bytes at `position` into `dest`, looping until the window is
+// full or the file ends, and return how many bytes landed.
+//
+// read(2) is permitted to return FEWER bytes than asked for even for a regular
+// file; a single call is not a guarantee. A one-shot read could therefore hand
+// back a prefix of the requested window while the result reported it as the
+// whole of it — a silently short file in the editor, which would then save that
+// prefix over the complete file.
+async function readFully(
+    handle: FileHandle,
+    dest: Buffer,
+    length: number,
+    position: number,
+): Promise<number> {
+    let filled = 0;
+    while (filled < length) {
+        const { bytesRead } = await handle.read(dest, filled, length - filled, position + filled);
+        if (bytesRead === 0) break; // end of file
+        filled += bytesRead;
+    }
+    return filled;
+}
+
+// Chunk size for reading a file whose reported size is a lie (see readToEnd).
+// 64 KiB swallows every /proc and /sys file in a single round trip.
+const EOF_READ_CHUNK_BYTES = 64 * 1024;
+
+// Read from byte 0 to end of file WITHOUT trusting the size fstat reported.
+//
+// Kernel-generated files (/proc, /sys) report size 0 while holding real
+// content, so sizing the buffer from stat returned an empty string and
+// `truncated: false` — the viewer presented /proc/version as a document that
+// genuinely has nothing in it. The full-read ceiling still applies, so this
+// cannot allocate without bound.
+async function readToEnd(handle: FileHandle, filePath: string): Promise<Buffer> {
+    const chunks: Buffer[] = [];
+    let total = 0;
+    for (;;) {
+        const chunk = Buffer.alloc(EOF_READ_CHUNK_BYTES);
+        const filled = await readFully(handle, chunk, EOF_READ_CHUNK_BYTES, total);
+        if (filled === 0) break;
+        total += filled;
+        if (total > MAX_FILE_READ_BYTES) {
+            throw new ResourceLimitError(
+                `Cannot read ${filePath}: the file is larger than this server's ` +
+                    `${MAX_FILE_READ_BYTES}-byte full-read limit. Read it in smaller ranges.`,
+            );
+        }
+        chunks.push(filled === chunk.length ? chunk : chunk.subarray(0, filled));
+    }
+    if (chunks.length === 1) return chunks[0]!;
+    return Buffer.concat(chunks, total);
 }
 
 export async function stat(params: StatParams): Promise<StatResult> {
@@ -263,7 +331,23 @@ export async function readFile(params: ReadFileParams): Promise<ReadFileResult> 
         const wanted =
             params.length === undefined ? undefined : Math.max(0, Math.trunc(params.length));
         let slice: Buffer;
-        if (params.offset !== undefined || wanted !== undefined) {
+        // The size fstat reported, corrected below when the file turns out to
+        // hold more than stat admitted. `truncated` is derived from THIS rather
+        // than from the raw stat size, so a kernel-generated file is never
+        // reported as a complete read of nothing.
+        let fileSize = size;
+        // A file that fstat calls empty may not be: /proc and /sys report size 0
+        // for files with real content. The only way to know is to read to the
+        // end, which for a genuinely empty file costs one read returning
+        // nothing. The window, if any, is then applied to what was actually
+        // there rather than to a size that was never true.
+        if (size === 0) {
+            const whole = await readToEnd(handle, params.path);
+            fileSize = whole.length;
+            const from = Math.min(offset, fileSize);
+            const to = wanted === undefined ? fileSize : Math.min(from + wanted, fileSize);
+            slice = whole.subarray(from, to);
+        } else if (params.offset !== undefined || wanted !== undefined) {
             // Ranged read: pull ONLY the requested window into memory via a
             // positioned read, so a multi-GiB file never loads whole (which
             // would also exceed Buffer's max length).
@@ -279,7 +363,7 @@ export async function readFile(params: ReadFileParams): Promise<ReadFileResult> 
                     );
                 }
                 const dest = Buffer.alloc(want);
-                const { bytesRead } = await handle.read(dest, 0, want, offset);
+                const bytesRead = await readFully(handle, dest, want, offset);
                 slice = bytesRead === want ? dest : dest.subarray(0, bytesRead);
             }
         } else {
@@ -287,10 +371,16 @@ export async function readFile(params: ReadFileParams): Promise<ReadFileResult> 
             // readFile(), whose internal growth handling could allocate again if
             // another process appends to the file while this request is running.
             const dest = Buffer.alloc(size);
-            const { bytesRead } = await handle.read(dest, 0, size, 0);
+            const bytesRead = await readFully(handle, dest, size, 0);
             slice = bytesRead === size ? dest : dest.subarray(0, bytesRead);
         }
-        const fileChangedDuringRead = revisionFrom(await handle.stat()) !== revision;
+        // Skipped for a stat-size-0 file: its revision token is minted from a
+        // size and an mtime that describe nothing (procfs restamps mtime on
+        // every stat, so the comparison would ALWAYS report a change), and the
+        // read above went to end of file, so the content is whole by
+        // construction.
+        const fileChangedDuringRead =
+            size > 0 && revisionFrom(await handle.stat()) !== revision;
 
         // `truncated` answers exactly ONE question: is `content` the WHOLE file?
         // It is true whenever any byte of the file is absent from the returned
@@ -308,9 +398,9 @@ export async function readFile(params: ReadFileParams): Promise<ReadFileResult> 
         // size, so every return path above obeys the same definition. A change
         // observed on the open descriptor also makes the result partial/stale,
         // so the editor cannot save it over a version it did not receive.
-        const start = Math.min(offset, size);
-        const end = wanted === undefined ? size : Math.min(start + wanted, size);
-        const truncated = fileChangedDuringRead || start > 0 || end < size;
+        const start = Math.min(offset, fileSize);
+        const end = wanted === undefined ? fileSize : Math.min(start + wanted, fileSize);
+        const truncated = fileChangedDuringRead || start > 0 || end < fileSize;
 
         // A byte range that cuts a multibyte codepoint is not valid UTF-8, so
         // the decode fails and the encoding flips to base64 — the exact bytes
@@ -326,7 +416,11 @@ export async function readFile(params: ReadFileParams): Promise<ReadFileResult> 
         assertReadFits(result);
         return result;
     } finally {
-        await handle.close();
+        // A throwing close() inside `finally` REPLACES whatever the body threw,
+        // so a resource-limit or EISDIR failure would reach the client as an
+        // unrelated close error. Nothing is read after this point, so a failure
+        // here costs no data; the original diagnosis is worth more.
+        await handle.close().catch(() => {});
     }
 }
 
@@ -543,9 +637,31 @@ async function writeFileLocked(params: WriteFileParams): Promise<WriteFileResult
     // user's link and creates its target, exactly as a plain create through the
     // link would; renaming over params.path would have replaced the link itself
     // with a regular file and lost it with no error and no way back.
+    //
+    // A rename-over also BREAKS a hard link: the other names for the old inode
+    // keep the old bytes. That is inherent to an atomic save — there is no way
+    // to replace a file's contents in one step while keeping its inode — and
+    // rewriting in place instead would trade a rare surprise for the routine
+    // risk of a half-written file, so the atomicity wins.
     const target = existing ? await fsp.realpath(params.path) : await resolveLinkChain(params.path);
     const dir = path.dirname(target);
     const tmp = path.join(dir, tempName(path.basename(target)));
+    // An atomic save replaces the file by RENAMING over its name, which needs
+    // write permission on the containing DIRECTORY and none whatsoever on the
+    // file itself. So a file the user deliberately marked read-only — one that
+    // stat() truthfully reported as writable:false a moment earlier — was
+    // cheerfully overwritten, where a plain open(O_WRONLY) and every ordinary
+    // editor refuse with EACCES. Ask the kernel the same question open() asks.
+    if (existing) {
+        try {
+            await fsp.access(target, fsConstants.W_OK);
+        } catch {
+            throw Object.assign(
+                new Error(`EACCES: permission denied, write '${params.path}'`),
+                { code: "EACCES" },
+            );
+        }
+    }
     // Creating a file whose parent directory does not exist yet must WORK, not
     // fail with ENOENT: the frozen C1 method catalog has no createDirectory, so
     // writeFile is the only way a client can bring a new path into being. The
@@ -577,6 +693,24 @@ async function writeFileLocked(params: WriteFileParams): Promise<WriteFileResult
         await handle.sync();
         await handle.close();
         handle = undefined;
+        // Preserve ownership. The temp file belongs to the daemon's own user, so
+        // renaming it over a file owned by somebody else — the daemon running as
+        // root over a user's file, or over a file in a shared group — silently
+        // rewrote that file's owner and group, a permission change nobody asked
+        // for and that the user only discovers when their own tooling can no
+        // longer write it. Best effort: an unprivileged process may not give a
+        // file away, and the save is still the right thing to do. Done BEFORE
+        // the chmod, because chown clears the setuid and setgid bits.
+        const uid = process.getuid?.();
+        const gid = process.getgid?.();
+        if (
+            existing !== undefined &&
+            uid !== undefined &&
+            gid !== undefined &&
+            (existing.uid !== uid || existing.gid !== gid)
+        ) {
+            await fsp.chown(tmp, existing.uid, existing.gid).catch(() => {});
+        }
         // open()'s mode is masked by umask; chmod pins the exact mode.
         if (pinMode) await fsp.chmod(tmp, finalMode);
         // Re-verify as late as possible — right before the atomic replace — so a
@@ -636,6 +770,21 @@ export function resolvePath(params: ResolvePathParams): ResolvePathResult {
 
 type WatchCallback = (event: WatchEvent) => void;
 type WatchClosedCallback = (subscriptionId: string) => void;
+
+// Wrap a subscriber so a throw inside it stays inside it. The failure is
+// reported on stderr — the daemon's diagnostic channel — rather than swallowed
+// in silence, because a subscriber that has started throwing is a bug somebody
+// needs to see even though the watch service must survive it.
+function isolate<A>(callback: (arg: A) => void): (arg: A) => void {
+    return (arg: A) => {
+        try {
+            callback(arg);
+        } catch (err) {
+            const message = err instanceof Error ? err.message : String(err);
+            process.stderr.write(`file-watch: subscriber threw: ${message}\n`);
+        }
+    };
+}
 
 interface Subscription {
     id: string;
@@ -699,9 +848,19 @@ export class FileWatchService {
     // Polling-fallback cadence, in milliseconds. Adjustable for tests.
     pollIntervalMs = 1000;
 
+    // Subscribe to change notifications. Returns a disposer.
+    //
+    // The callback is wrapped so a THROWING subscriber cannot take anything
+    // else down with it. EventEmitter.emit runs its listeners in order and lets
+    // an exception escape, which skipped every later subscriber and — for the
+    // "closed" signal below, emitted straight from unwatch() — turned a
+    // successful unwatch into a failed RPC call, and aborted closeAll() halfway
+    // through, leaving the rest of the session's watch handles installed on a
+    // connection that had already gone away.
     onWatchEvent(callback: WatchCallback): () => void {
-        this.emitter.on("event", callback);
-        return () => this.emitter.off("event", callback);
+        const guarded = isolate(callback);
+        this.emitter.on("event", guarded);
+        return () => this.emitter.off("event", guarded);
     }
 
     // Announce that a subscription is gone (unwatch, or closeAll when the SSH
@@ -709,8 +868,9 @@ export class FileWatchService {
     // events for it while the client's end of the channel is stalled; without
     // this signal that queue would outlive its only possible consumer.
     onWatchClosed(callback: WatchClosedCallback): () => void {
-        this.emitter.on("closed", callback);
-        return () => this.emitter.off("closed", callback);
+        const guarded = isolate(callback);
+        this.emitter.on("closed", guarded);
+        return () => this.emitter.off("closed", guarded);
     }
 
     // Whether `id` is still an active subscription. The relay consults this
@@ -963,6 +1123,34 @@ export function assertListingFits(
     }
 }
 
+// How many unknown entries are re-checked at once (see listDirectory). Enough
+// to keep libuv's four-thread pool busy without queueing a whole directory's
+// worth of stat calls at once.
+const LISTING_STAT_BATCH = 64;
+
+/**
+ * True when readdir could not say what this entry is.
+ *
+ * The kind normally comes from the directory entry itself (`d_type`), which
+ * several filesystems decline to fill in — XFS in some configurations, plenty
+ * of network mounts, overlay filesystems — reporting "unknown" instead. Node
+ * turns that into a Dirent whose predicates ALL answer false, and `nodeKind`
+ * then reports "other" for every single name: the file tree shows no folders
+ * at all and the viewer offers nothing to open. Such an entry has to be
+ * lstat'd to be classified.
+ */
+function direntKindUnknown(entry: Dirent): boolean {
+    return (
+        !entry.isFile() &&
+        !entry.isDirectory() &&
+        !entry.isSymbolicLink() &&
+        !entry.isFIFO() &&
+        !entry.isSocket() &&
+        !entry.isBlockDevice() &&
+        !entry.isCharacterDevice()
+    );
+}
+
 export async function listDirectory(
     params: ListDirectoryParams,
 ): Promise<ListDirectoryResult> {
@@ -971,10 +1159,27 @@ export async function listDirectory(
     // filename so the same directory has one stable wire representation.
     dirents.sort((left, right) => (left.name < right.name ? -1 : left.name > right.name ? 1 : 0));
     assertListingFits(params.path, dirents);
-    return {
-        path: params.path,
-        entries: dirents.map((entry) => ({ name: entry.name, kind: nodeKind(entry) })),
-    };
+    const entries: ListDirectoryResult["entries"] = dirents.map((entry) => ({
+        name: entry.name,
+        kind: nodeKind(entry),
+    }));
+    // Re-classify only the entries readdir could not type. On the common
+    // filesystems this list is empty and costs one predicate call per name.
+    const unknown = dirents.flatMap((entry, index) => (direntKindUnknown(entry) ? [index] : []));
+    for (let from = 0; from < unknown.length; from += LISTING_STAT_BATCH) {
+        await Promise.all(
+            unknown.slice(from, from + LISTING_STAT_BATCH).map(async (index) => {
+                const name = entries[index]!.name;
+                // A failing lstat — the entry was deleted between the readdir
+                // and now, or its parent is not searchable — must NOT abort the
+                // listing: one unreadable name is no reason to refuse to show
+                // the other thousand, so it keeps the "other" kind it has.
+                const stats = await fsp.lstat(path.join(params.path, name)).catch(() => undefined);
+                if (stats) entries[index]!.kind = nodeKind(stats);
+            }),
+        );
+    }
+    return { path: params.path, entries };
 }
 
 const MIME_TYPES: Record<string, string> = {
@@ -1032,14 +1237,34 @@ const FILE_ENCODINGS = ["utf-8", "base64"] as const;
 // writeFile keeps (`mode & 0o7777`).
 const MAX_FILE_MODE = 0o7777;
 
+// A path field, rejected for an embedded NUL.
+//
+// A filesystem path is a NUL-terminated byte string, so no name can contain
+// one. Node enforces that deep inside fs with a TypeError
+// (ERR_INVALID_ARG_VALUE), which the dispatcher can only report as -32603
+// "internal error" — telling the user the SERVER broke when in fact the
+// REQUEST was malformed. Worse, `resolvePath` never touches the filesystem, so
+// it answered a NUL-bearing path with a perfectly ordinary-looking result that
+// then failed at every later use. Catch it here, where the answer is -32602
+// and names the field.
+function requirePath(obj: Record<string, unknown>, field: string, method: string): string {
+    const value = requireString(obj, field, method);
+    if (value.includes("\0")) {
+        throw new InvalidParamsError(
+            `${method}: field '${field}' must not contain a NUL character`,
+        );
+    }
+    return value;
+}
+
 function pathParams<T extends { path: string }>(params: unknown, method: string): T {
     const obj = requireObject(params, method);
-    return { path: requireString(obj, "path", method) } as T;
+    return { path: requirePath(obj, "path", method) } as T;
 }
 
 function readFileParams(params: unknown, method: string): ReadFileParams {
     const obj = requireObject(params, method);
-    const result: ReadFileParams = { path: requireString(obj, "path", method) };
+    const result: ReadFileParams = { path: requirePath(obj, "path", method) };
     const offset = optionalIndex(obj, "offset", method);
     if (offset !== undefined) result.offset = offset;
     const length = optionalIndex(obj, "length", method);
@@ -1050,7 +1275,7 @@ function readFileParams(params: unknown, method: string): ReadFileParams {
 function writeFileParams(params: unknown, method: string): WriteFileParams {
     const obj = requireObject(params, method);
     const result: WriteFileParams = {
-        path: requireString(obj, "path", method),
+        path: requirePath(obj, "path", method),
         content: requireString(obj, "content", method),
         expectedRevision: requireString(obj, "expectedRevision", method),
     };
@@ -1066,9 +1291,16 @@ function writeFileParams(params: unknown, method: string): WriteFileParams {
 
 function resolvePathParams(params: unknown, method: string): ResolvePathParams {
     const obj = requireObject(params, method);
-    const result: ResolvePathParams = { path: requireString(obj, "path", method) };
+    const result: ResolvePathParams = { path: requirePath(obj, "path", method) };
     const base = optionalString(obj, "base", method);
-    if (typeof base === "string") result.base = base;
+    if (typeof base === "string") {
+        if (base.includes("\0")) {
+            throw new InvalidParamsError(
+                `${method}: field 'base' must not contain a NUL character`,
+            );
+        }
+        result.base = base;
+    }
     return result;
 }
 

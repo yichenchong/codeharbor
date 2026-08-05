@@ -278,6 +278,18 @@ void EditorController::onTransportBound()
                                                      : FileState::Clean));
     m_resumeState.reset();
 
+    // A page that reloaded while the transport was down is still empty and is
+    // owed its buffer (see ready()). Serving it IS the reconciliation — it
+    // fetches the file's current bytes — so it replaces the stat below rather
+    // than running next to it. Only the reload branch needs a watch of its own:
+    // open() subscribes on its way through.
+    if (m_pageNeedsContent) {
+        if (!m_dirty)
+            subscribeWatch();
+        refetchForReloadedPage();
+        return;
+    }
+
     // Order matters: subscribe FIRST so a change landing during the
     // reconciliation round trip is still announced, then close the window the
     // outage opened.
@@ -482,6 +494,26 @@ void EditorController::ready()
     // an option and the file must be fetched again.
     if (!reconnected || m_path.isEmpty())
         return;
+    // ...but not over a dead transport. Every fetch below mutates pane state
+    // before it can know the request will fail — open() in particular clears
+    // the dirty flag, the revision baseline and the whole recovery slot — and
+    // with nothing bound the call fails synchronously, so the pane would end up
+    // blank, claiming "clean" over work that exists only in this pane's
+    // crash-recovery snapshot, and nothing would ever probe that snapshot
+    // again. Record the debt instead and pay it from onTransportBound().
+    if (!m_client || m_fileState == FileState::Disconnected) {
+        m_pageNeedsContent = true;
+        return;
+    }
+    refetchForReloadedPage();
+}
+
+// Serve a page that reloaded and lost its buffer. Split out of ready() because
+// a reload arriving during an outage has to wait for a transport and then run
+// exactly this (see the m_pageNeedsContent note in ready()).
+void EditorController::refetchForReloadedPage()
+{
+    m_pageNeedsContent = false;
     if (m_dirty) {
         // The buffer the page just lost held unsaved work. A plain reload would
         // silently replace it with the server's bytes and the only surviving
@@ -489,7 +521,7 @@ void EditorController::ready()
         // be mentioned again, because only open() probes for it. Re-open the
         // file instead: the fresh page is treated exactly like a first open, so
         // the snapshot is offered back through recoveryAvailable and the user
-        // decides.
+        // decides. open() also re-subscribes the watch on its own.
         open(m_path);
         return;
     }
@@ -513,6 +545,36 @@ QString EditorController::recoveryPath() const
     return m_recoveryDir + QLatin1Char('/') + m_recoveryId;
 }
 
+// A recovery key or file change retires every in-flight operation for the old
+// slot. The old write may still land on its old path, but its reply must not
+// adopt that slot's revision into the new one, decrement the new slot's
+// in-flight count, or carry out a truncate the new slot never asked for — the
+// generation bump is what makes every outstanding reply recognise itself as
+// stale.
+void EditorController::resetRecoverySlot()
+{
+    m_recoveryRevision.clear();
+    m_recoveryHasContent = false;
+    m_recoveryWritesInFlight = 0;
+    m_recoveryClearInFlight = false;
+    m_recoveryCheckInFlight = false;
+    m_recoveryClearPending = false;
+    ++m_recoveryGeneration;
+}
+
+// A recovery key can settle AFTER the file is already on screen, so the slot it
+// names has never been probed. Probe it now rather than making the user close
+// and reopen the pane — but only under the conditions open() itself requires
+// before it offers a snapshot: a file is open, its load finished (Clean), the
+// buffer is the file's bytes, and the file is one the user could save a
+// restored snapshot back to (SPEC 11.3).
+void EditorController::probeRecoveryForOpenFile()
+{
+    if (!m_path.isEmpty() && !m_dirty && m_fileState == FileState::Clean
+        && !m_readOnly)
+        checkRecovery(m_loadedContent, m_loadGeneration);
+}
+
 void EditorController::setRecoveryDir(const QString& dir)
 {
     // The server-reported recovery base (server.info.recoveryDir), pushed in by
@@ -522,23 +584,8 @@ void EditorController::setRecoveryDir(const QString& dir)
     if (m_recoveryDir == dir)
         return;
     m_recoveryDir = dir;
-
-    // A recovery key change retires every in-flight operation for the old slot.
-    // The old write may still land on its old path, but its reply must not adopt
-    // that slot's revision into the new one.
-    m_recoveryRevision.clear();
-    m_recoveryHasContent = false;
-    m_recoveryWritesInFlight = 0;
-    m_recoveryClearInFlight = false;
-    m_recoveryCheckInFlight = false;
-    m_recoveryClearPending = false;
-    ++m_recoveryGeneration;
-
-    // server.info may answer after the file was already opened. Probe the newly
-    // available slot now rather than making the user close and reopen the pane.
-    if (!m_path.isEmpty() && !m_dirty && m_fileState == FileState::Clean
-        && !m_readOnly)
-        checkRecovery(m_loadedContent, m_loadGeneration);
+    resetRecoverySlot();
+    probeRecoveryForOpenFile();
 }
 
 void EditorController::setRecoveryId(const QString& id)
@@ -549,18 +596,8 @@ void EditorController::setRecoveryId(const QString& id)
     if (m_recoveryId == id)
         return;
     m_recoveryId = id;
-
-    m_recoveryRevision.clear();
-    m_recoveryHasContent = false;
-    m_recoveryWritesInFlight = 0;
-    m_recoveryClearInFlight = false;
-    m_recoveryCheckInFlight = false;
-    m_recoveryClearPending = false;
-    ++m_recoveryGeneration;
-
-    if (!m_path.isEmpty() && !m_dirty && m_fileState == FileState::Clean
-        && !m_readOnly)
-        checkRecovery(m_loadedContent, m_loadGeneration);
+    resetRecoverySlot();
+    probeRecoveryForOpenFile();
 }
 
 void EditorController::open(QString path)
@@ -581,15 +618,9 @@ void EditorController::open(QString path)
 
     m_loadedContent.clear();
     m_dirty = false;
-    m_recoveryRevision.clear();
-    m_recoveryHasContent = false;
     // A clear intended for the file being left behind is not owed to the new one,
     // and no reply from that file may touch this bookkeeping again.
-    m_recoveryWritesInFlight = 0;
-    m_recoveryClearInFlight = false;
-    m_recoveryCheckInFlight = false;
-    m_recoveryClearPending = false;
-    ++m_recoveryGeneration;
+    resetRecoverySlot();
     // The save chain belongs to the file being left behind: a write still on the
     // wire for it must not make a save on the NEW file queue behind it, and the
     // bytes queued for it are not owed to the new one. Bumping the generation is
@@ -609,6 +640,10 @@ void EditorController::open(QString path)
     // a switch; the new load supersedes it.
     m_pendingContent.reset();
     m_pendingRevision.clear();
+    // This load serves the page itself, so a refetch owed to a page that
+    // reloaded during an outage is settled here rather than fired again on the
+    // next rebind (which would re-open the file underneath this one).
+    m_pageNeedsContent = false;
     // Where an outage that is still unresolved wanted to come back to. It
     // described the file being left behind (a conflict over ITS bytes, a
     // truncated read of IT), so a rebind must not restore it over the file
@@ -763,17 +798,25 @@ void EditorController::checkRecovery(const QString& loadedContent, quint64 gener
                     // next write to this pane's slot is a guarded overwrite,
                     // even when nothing below is offered.
                     self->m_recoveryRevision = snapshotRevision;
+                    // The snapshot is read through the same wire shape as any
+                    // other file, so it is decoded the same way (open() and
+                    // reload() both do): the daemon sends base64 for bytes its
+                    // strict UTF-8 decoder refused, and reading that payload as
+                    // if it were the text would hand parseRecovery() a wall of
+                    // base64 and silently discard the user's unsaved work.
+                    //
                     // A snapshot over kMaxEditableReadBytes came back a prefix,
                     // so its envelope will not parse; a tombstone (empty) does
-                    // not parse either. parseRecovery() folds both into
-                    // "nothing to offer".
+                    // not parse either, and neither does an undecodable
+                    // payload. All three fold into "nothing to offer".
+                    const std::optional<QString> payload =
+                        rpc::decodeFileContent(snapshot);
                     QString snapshotPath;
                     QString recovered;
                     const bool parsed =
-                        !snapshot.value(QStringLiteral("truncated")).toBool()
-                        && parseRecovery(
-                               snapshot.value(QStringLiteral("content")).toString(),
-                               snapshotPath, recovered);
+                        payload.has_value()
+                        && !snapshot.value(QStringLiteral("truncated")).toBool()
+                        && parseRecovery(*payload, snapshotPath, recovered);
                     // This pane's single slot is REUSED as it switches files,
                     // so a snapshot the envelope records against a different
                     // path is this pane's snapshot of a PREVIOUS file and must
@@ -790,8 +833,25 @@ void EditorController::checkRecovery(const QString& loadedContent, quint64 gener
 
 void EditorController::save(QString content, QString expectedRevision)
 {
-    if (!m_client || m_path.isEmpty())
+    // Every refusal below SAYS SO. The page's save path is fire-and-forget: it
+    // hands the buffer over, cancels the crash-recovery snapshot timer it had
+    // armed, and waits for one of saved/saveConflict/saveError. A silent return
+    // leaves the user believing the file was written when nothing was even sent.
+    if (!m_client) {
+        // The borrowed RPC client has been destroyed (the session is being torn
+        // down). Nothing can be written and nothing ever will be on this client.
+        emit saveError(QStringLiteral(
+            "Disconnected from the server; the buffer was not written."));
         return;
+    }
+    if (m_path.isEmpty()) {
+        // No file has been opened in this pane, so there is nothing to write
+        // the buffer to. Reachable from a host or a page driving a bare
+        // controller; the file's own open() is what makes a save meaningful.
+        emit saveError(
+            QStringLiteral("No file is open; the buffer was not written."));
+        return;
+    }
 
     // A disconnected pane cannot issue a meaningful save. CodeharbordClient
     // reports an unbound call synchronously; allowing that callback to run
@@ -1082,11 +1142,12 @@ void EditorController::writeRecovery(const QString& content, bool retryOnMismatc
     if (recoveryPath.isEmpty())
         return;  // no stable pane id / data location: recovery disabled
     // The path is recorded INSIDE the snapshot (envelope) so a later open can
-    // tell whose file it holds; the pane's current path is captured separately
-    // to detect a file switch landing during this round trip.
-    const QString path = m_path;
+    // tell whose file it holds. A file switch landing during this round trip is
+    // detected by the recovery GENERATION below, not by re-comparing the path:
+    // open() bumps that generation, and it also covers the two changes a path
+    // comparison cannot see — a new recovery directory and a new pane id.
     const quint64 recoveryGeneration = m_recoveryGeneration;
-    const QString payload = serializeRecovery(path, content);
+    const QString payload = serializeRecovery(m_path, content);
 
     // See m_recoveryWritesInFlight: until this answers, clearRecovery() cannot know
     // a snapshot exists, so it must defer to this reply rather than no-op.
@@ -1101,7 +1162,7 @@ void EditorController::writeRecovery(const QString& content, bool retryOnMismatc
     m_client->call(
         QString::fromLatin1(rpc::kMethodWriteFile),
         writeParams(recoveryPath, payload, m_recoveryRevision, kRecoveryFileMode),
-        [self, content, path, recoveryPath, retryOnMismatch, recoveryGeneration](
+        [self, content, recoveryPath, retryOnMismatch, recoveryGeneration](
             QJsonValue result, std::optional<RpcError> error) {
             // The pane switched files while this was in flight: open() has already
             // reset the recovery bookkeeping for the new file, so neither this
@@ -1141,7 +1202,7 @@ void EditorController::writeRecovery(const QString& content, bool retryOnMismatc
             ++self->m_recoveryWritesInFlight;
             self->m_client->call(
                 QString::fromLatin1(rpc::kMethodStat), readParams(recoveryPath),
-                [self, content, path, recoveryGeneration](
+                [self, content, recoveryGeneration](
                     QJsonValue statRes, std::optional<RpcError> statErr) {
                     // File switched: open() reset the recovery bookkeeping including
                     // any deferred truncate, so nothing is owed to the file being
@@ -1323,6 +1384,24 @@ void EditorController::reload(FileState transitional, bool discardLocalEdits)
             self->m_revision = revision;
             self->m_loadedContent = content;
             self->m_dirty = false;
+            // This load has taken the buffer over, so the save chain it found
+            // running belongs to bytes the pane no longer holds. Retire it the
+            // way open() does. Only an EXPLICIT reload can get here with a write
+            // still on the wire (the guard above sends every system-initiated
+            // one home), and leaving the chain standing would strand the next
+            // save: save() would see m_saveInFlight, park the user's bytes in
+            // m_queuedSaveContent, and the old write's reply — dropped by the
+            // load-generation check below — would throw them away without a
+            // saved, a saveConflict or a saveError. The buffer would then be
+            // believed clean while the page still holds unsaved work, and the
+            // next external change would auto-reload straight over it.
+            //
+            // The generation bump is what keeps that old reply from clearing a
+            // flag or consuming a queue that now belongs to a later chain.
+            ++self->m_saveGeneration;
+            self->m_saveInFlight = false;
+            self->m_inFlightSaveContent.clear();
+            self->m_queuedSaveContent.reset();
             // The buffer just became the file's bytes again, so a recovery
             // snapshot of the edits this reload replaced is obsolete: drop it,
             // or reopening the pane offers unsaved changes the user already

@@ -86,10 +86,7 @@ release that matches it. Two things keep them in step:
   `curl … | tar -xz` above), which the automatic path deliberately never
   overwrites, or after a client update if you want to force the issue.
 
-Both need `tar` plus either `curl` or `wget` on the server. Without outbound
-network access, stage `codeharbor-remote.tar.gz` on the server and set
-`CH_REMOTE_ARTIFACT_URL` to its path — it is copied instead of downloaded. Set
-the same variable to an internal mirror URL to install from there.
+URL-based automatic or on-demand updates need `tar` and either `curl` or `wget` on the server. For an air-gapped install, stage `codeharbor-remote.tar.gz` on the server and set `CH_REMOTE_ARTIFACT_URL` to its local path; that mode copies the tarball and needs `tar` but no downloader. Set the same variable to an internal mirror URL when downloading from a mirror.
 
 A **git checkout** is never overwritten by either path. **Update server** on one
 says so and changes nothing: update it with `git pull` and a build instead.

@@ -56,8 +56,10 @@ QString extensionForFileUrl(const QUrl& url)
     const QString path = url.path();
     if (path.endsWith(QLatin1Char('/')))
         return {};
-    const int slash = path.lastIndexOf(QLatin1Char('/'));
-    const int dot = path.lastIndexOf(QLatin1Char('.'));
+    // qsizetype, not int: QString indices are qsizetype and `path.size() - 1`
+    // below is compared against them.
+    const qsizetype slash = path.lastIndexOf(QLatin1Char('/'));
+    const qsizetype dot = path.lastIndexOf(QLatin1Char('.'));
     if (dot <= slash + 1 || dot == path.size() - 1)
         return {};
     return ViewerKinds::normaliseExtension(path.mid(dot + 1));

@@ -70,7 +70,11 @@ fi
 
 hits=""
 while IFS= read -r -d '' file; do
-    if output="$(grep -nEI "$pattern" "$file")"; then
+    # -H is required. grep prints the file name only when it was given more than
+    # one file, and this loop hands it exactly one, so without -H the report was
+    # a list of bare `<line>:<text>` entries that named no file at all - the one
+    # thing someone reading a failed gate needs to know.
+    if output="$(grep -nHEI "$pattern" "$file")"; then
         if [ -n "$hits" ]; then
             hits+=$'\n'
         fi

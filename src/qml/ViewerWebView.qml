@@ -94,6 +94,17 @@ Item {
             if (!root.remoteFile && root.url.toString() !== webView.url.toString())
                 root.navigated(webView.url)
         }
+        // A remote HTML file is served through the internal scheme, and a job
+        // Chromium aborted there paints nothing at all. An EXTERNAL page is
+        // deliberately left alone: Chromium's own error page already explains
+        // an http(s) failure, and replacing it would also throw away the
+        // address the user could retry from.
+        onLoadingChanged: function(request) {
+            if (root.remoteFile
+                    && request.status === WebEngineView.LoadFailedStatus
+                    && root.errorText.length === 0)
+                root.errorText = request.errorString
+        }
         onNewWindowRequested: function(request) {
             console.warn("ViewerWebView: refused a new window for",
                          request.requestedUrl)

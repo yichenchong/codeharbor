@@ -1,6 +1,8 @@
 #pragma once
 
+#include <QByteArray>
 #include <QHash>
+#include <QJsonObject>
 #include <QList>
 #include <QMultiMap>
 #include <QMutex>
@@ -9,6 +11,8 @@
 #include <QString>
 #include <QUrl>
 #include <QWebEngineUrlSchemeHandler>
+
+#include <optional>
 
 // Full definition (not a forward declaration): m_client is a QPointer, whose
 // QObject static_cast needs the complete CodeharbordClient (a QObject) type.
@@ -155,11 +159,21 @@ public:
 
     // Whether a served MIME type is "active content": a type Chromium renders
     // as a top-level document that can execute script or pull subresources —
-    // text/html, any XML document (application/xml, text/xml, and every "*+xml"
-    // such as SVG, XHTML, XSLT, RSS, Atom), standalone XSLT, and MHTML archives.
-    // Replies for such types are locked down with a restrictive CSP. Exposed so
-    // the security gate is unit-testable without a live WebEngine job.
+    // text/html, any XML document (application/xml, text/xml, every "*+xml"
+    // such as SVG, XHTML, XSLT, RSS, Atom, and the gzipped "*+xml-compressed"
+    // spelling shared-mime-info uses for .svgz), standalone XSLT, and MHTML
+    // archives. Replies for such types are locked down with a restrictive CSP.
+    // Exposed so the security gate is unit-testable without a live WebEngine
+    // job.
     static bool isActiveContentMime(const QByteArray &mime);
+
+    // Whether a served MIME type carries text, and therefore needs an explicit
+    // "; charset=utf-8" on its Content-Type. Without one Chromium falls back to
+    // a locale-derived guess and a UTF-8 file with any non-ASCII byte renders
+    // as mojibake. Covers text/*, the "+xml" and "+json" structured suffixes,
+    // and the handful of application/* types that are plainly text. Exposed
+    // static for the same reason as isActiveContentMime().
+    static bool isTextualMime(const QByteArray &mime);
 
     // Why a request was refused. QWebEngineUrlRequestJob::fail() takes only
     // Chromium's coarse Error enum and carries NO text, so an oversized image
@@ -177,6 +191,7 @@ public:
         ReadFailed,          // file.readFile returned an error
         TooLarge,            // file exceeds kMaxInlineReadBytes
         UndecodableContent,  // base64 payload the server sent is malformed
+        MalformedReply,      // file.readFile answered with fields we cannot trust
     };
     Q_ENUM(Failure)
 
@@ -195,6 +210,24 @@ public:
     // the security headers are checkable.
     static QMultiMap<QByteArray, QByteArray>
     responseHeadersFor(const QByteArray &mime);
+
+    // Turn a successful file.readFile result into the bytes to serve.
+    //
+    // Returns std::nullopt on success, having written the file's bytes to
+    // `bytes`; otherwise the reason the reply cannot be served, and `bytes` is
+    // left untouched. Every field is CHECKED rather than coerced: an absent
+    // `truncated` reads as false through QJsonValue::toBool() and would let a
+    // prefix of a huge file be served as though it were the whole document, and
+    // an encoding this build does not know would be decoded as UTF-8 text —
+    // which for a base64 payload means serving the base64 alphabet itself as if
+    // it were the image. The write side already refuses an unlisted encoding
+    // for exactly this reason (see writeFileLocked in remote/src/files.ts).
+    //
+    // Exposed static because QWebEngineUrlRequestJob cannot be constructed
+    // outside Chromium, so this is the only seam at which the reply contract is
+    // unit-testable.
+    static std::optional<Failure> decodeReadReply(const QJsonObject &reply,
+                                                  QByteArray *bytes);
 
 signals:
     // A request for `internalUrl` was refused, with the reason the job

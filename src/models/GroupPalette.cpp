@@ -1,6 +1,6 @@
 #include "GroupPalette.h"
-#include <QByteArray>
 
+#include <QByteArray>
 #include <QtGlobal>
 
 #include <algorithm>
@@ -180,49 +180,58 @@ SrgbColor GroupPalette::oklchToSrgb(const Oklch &color)
 
 bool GroupPalette::canGenerate(const QVector<SrgbColor> &seed, int requestedCount)
 {
-    return !seed.isEmpty() && requestedCount > seed.size();
+    // The upper bound is not cosmetic: expansion is cubic in the requested
+    // count (see kMaxPaletteSize), so an out-of-range preference would hang the
+    // application rather than merely look wrong.
+    return !seed.isEmpty() && requestedCount > seed.size()
+            && requestedCount <= kMaxPaletteSize;
 }
 
 QVector<SrgbColor> GroupPalette::generatePalette(const QVector<SrgbColor> &seed,
                                                   int requestedCount)
 {
     Q_ASSERT_X(canGenerate(seed, requestedCount), "GroupPalette::generatePalette",
-               "requestedCount must be greater than the number of seed colours");
+               "requestedCount must exceed the number of seed colours and must "
+               "not exceed kMaxPaletteSize");
     if (!canGenerate(seed, requestedCount))
         return {};
 
     QVector<SrgbColor> palette = seed;
+    // The OKLCH view of `palette`, kept in step with it rather than rebuilt
+    // from scratch on every pass: each pass adds exactly one colour, so one
+    // conversion per pass is all that changes. Rebuilding converted the whole
+    // palette again for every colour added, which is pure repeated work.
+    QVector<Oklch> converted;
+    converted.reserve(requestedCount);
+    for (const SrgbColor &colour : palette)
+        converted.append(srgbToOklch(colour));
+
+    // This is recursive expansion in iterative form: each pass starts with the
+    // complete (n-1)-colour result and appends exactly one midpoint. Ties
+    // retain the first pair in palette order, making output stable even when
+    // two gaps have the same floating-point distance.
     while (palette.size() < requestedCount) {
         int first = 0;
         int second = 1;
         double largestGap = -1.0;
-        QVector<Oklch> converted;
-        converted.reserve(palette.size());
-        for (const SrgbColor &colour : palette)
-            converted.append(srgbToOklch(colour));
-
-        // This is recursive expansion in iterative form: each loop starts with
-        // the complete (n-1)-colour result and appends exactly one midpoint.
-        // Ties retain the first pair in palette order, making output stable
-        // even when two gaps have the same floating-point distance.
-        if (converted.size() < 2) {
-            palette.append(oklchToSrgb(diversified(converted.first())));
-            continue;
-        }
-        for (int i = 0; i < converted.size(); ++i) {
-            for (int j = i + 1; j < converted.size(); ++j) {
+        for (qsizetype i = 0; i < converted.size(); ++i) {
+            for (qsizetype j = i + 1; j < converted.size(); ++j) {
                 const double gap = labDistance(converted.at(i), converted.at(j));
                 if (gap > largestGap) {
                     largestGap = gap;
-                    first = i;
-                    second = j;
+                    first = static_cast<int>(i);
+                    second = static_cast<int>(j);
                 }
             }
         }
-        if (largestGap <= kHueEpsilon)
-            palette.append(oklchToSrgb(diversified(converted.first())));
-        else
-            palette.append(oklchToSrgb(halfway(converted.at(first), converted.at(second))));
+        // Fewer than two colours, or every colour identical: there is no gap to
+        // halve, so shift the first colour instead of duplicating it.
+        const Oklch next = largestGap <= kHueEpsilon
+                ? diversified(converted.first())
+                : halfway(converted.at(first), converted.at(second));
+        const SrgbColor appended = oklchToSrgb(next);
+        palette.append(appended);
+        converted.append(srgbToOklch(appended));
     }
     return palette;
 }

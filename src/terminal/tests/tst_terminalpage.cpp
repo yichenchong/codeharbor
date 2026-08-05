@@ -167,11 +167,23 @@ constexpr auto kJsStatus = R"JS(
 })()
 )JS";
 
-// xterm's rendered screen. The DOM renderer is the default in xterm 5, so the
-// glyphs are real elements rather than canvas pixels.
+// xterm's rendered screen.
+//
+// Read out of the PAGE's own diagnostics hook, which reports xterm's buffer,
+// not out of the DOM. The .xterm-rows element only carries glyphs while the DOM
+// renderer is active, and the page loads the WebGL addon whenever the host can
+// run it (src/web/terminal/src/index.ts) — which disposes the DOM renderer and
+// removes that element. Scraping the DOM therefore reported an empty screen on
+// exactly the hosts where rendering works best. The DOM scrape stays as the
+// fallback for a page too old to expose the hook.
 constexpr auto kJsScreenText = R"JS(
 (function () {
     try {
+        if (typeof window.codeharborTerminalDiagnostics === "function") {
+            var text = window.codeharborTerminalDiagnostics().screenText;
+            if (typeof text === "string" && text.length > 0)
+                return text;
+        }
         var rows = document.querySelector(".xterm-rows");
         if (!rows) return "NO_ROWS";
         return rows.textContent.replace(/\u00a0/g, " ");

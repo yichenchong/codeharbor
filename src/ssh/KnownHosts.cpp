@@ -248,10 +248,21 @@ KnownHosts KnownHosts::parse(const QString& text)
         const QStringList fields =
             line.split(fieldSeparator, Qt::SkipEmptyParts);
         int idx = 0;
-        // Capture an optional leading marker (@cert-authority, @revoked).
+        // Capture an optional leading marker. OpenSSH recognises EXACTLY two
+        // (@cert-authority, @revoked) and treats any other @token as a
+        // malformed line that it skips entirely. Accepting an unrecognised one
+        // was a silent trust upgrade: verify() only refuses to grant trust for
+        // the two markers it knows, so a line whose marker was misspelt or
+        // merely mis-cased — "@Revoked" — stopped being a revocation and became
+        // an ordinary trusted host key for exactly the key the administrator
+        // had revoked. Any future OpenSSH marker would have been read the same
+        // way. Skip the line instead, as OpenSSH does.
         QString marker;
         if (idx < fields.size() && fields.at(idx).startsWith(QLatin1Char('@'))) {
             marker = fields.at(idx);
+            if (marker != QLatin1String("@cert-authority")
+                && marker != QLatin1String("@revoked"))
+                continue;
             ++idx;
         }
         if (fields.size() - idx < 3)

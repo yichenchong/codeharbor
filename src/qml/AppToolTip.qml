@@ -1,5 +1,6 @@
 import QtQuick
 import QtQuick.Controls.Basic
+import CodeHarbor
 
 // The one tooltip used by every hint in the application (SPEC 4.1).
 //

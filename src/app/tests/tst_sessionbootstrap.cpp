@@ -348,6 +348,7 @@ private slots:
     void retryDelaySequenceAndCap();
     void reconnectDisabledNeverSchedules();
     void disablingMidLadderStopsIt();
+    void disablingTheLadderClearsItsAttemptCounter();
     void userDisconnectDoesNotReconnect();
     void uncappedLadderKeepsRetryingAtSixty();
 
@@ -391,6 +392,7 @@ private slots:
     void aRequestedUpgradeRefusesASourceCheckout();
     void aRequestedUpgradeAppliesToOneAttemptOnly();
     void aRequestedUpgradeThatCannotInspectSaysSo();
+    void anArmedUpgradeIsSpentOrWithdrawnNeverForgotten();
 };
 
 // A cold wire walks Disconnected -> Connecting -> Wired exactly once and hands
@@ -778,6 +780,40 @@ void TstSessionBootstrap::disablingMidLadderStopsIt()
     QTest::qWait(50);
     QCOMPARE(h.boot.connectCalls, 1);
     QCOMPARE(h.boot.state(), State::Disconnected);
+}
+
+// Switching the ladder off is a way OUT of the ladder, exactly like
+// disconnectSession(), and it has to leave the same bookkeeping behind.
+// reconnectAttempt() is public and is what a shell renders as "attempt N of M";
+// leaving the rung the ladder stopped on behind State::Disconnected reports a
+// retry sequence that is not running any more, and nothing ever clears it
+// except a later connect or a later loss.
+void TstSessionBootstrap::disablingTheLadderClearsItsAttemptCounter()
+{
+    Harness h;
+    // Uncapped, so the ladder cannot reach State::Failed underneath the wait
+    // below and turn this into a race with the attempt cap.
+    h.boot.setMaxReconnectAttempts(0);
+    QVERIFY(h.wire());
+
+    h.boot.connectOk = false;
+    h.boot.rpcChannel()->dropRemote();
+    // Let several rungs burn so the counter is genuinely non-zero.
+    QTRY_VERIFY(h.boot.reconnectAttempt() >= 3);
+    QCOMPARE(h.boot.state(), State::Reconnecting);
+
+    h.boot.setReconnectEnabled(false);
+
+    QCOMPARE(h.boot.state(), State::Disconnected);
+    QVERIFY(!h.boot.reconnectPending());
+    QCOMPARE(h.boot.reconnectAttempt(), 0);
+    QCOMPARE(h.boot.nextReconnectDelaySeconds(), 0);
+
+    // ...and it really is over: nothing fires afterwards.
+    const int calls = h.boot.connectCalls;
+    QTest::qWait(100);
+    QCOMPARE(h.boot.state(), State::Disconnected);
+    QCOMPARE(h.boot.connectCalls, calls);
 }
 
 // The user closed the session. It must stay closed.
@@ -2083,6 +2119,57 @@ void TstSessionBootstrap::aRequestedUpgradeThatCannotInspectSaysSo()
              qPrintable(message));
     QVERIFY(!h.boot.remoteUpgradeRequested());
     QCOMPARE(h.boot.scriptsRun.size(), 1);
+}
+
+// requestRemoteUpgrade() arms exactly ONE attempt, and the attempt that spends
+// it is pinned by aRequestedUpgradeAppliesToOneAttemptOnly(). This is the other
+// half: the two ways the request can be taken back before it is ever spent.
+//
+// Both matter because an upgrade DOWNLOADS AND UNPACKS over somebody's server.
+// A flag that outlived the intent behind it would do that on a connect the user
+// never asked it for - and, on the reconnect ladder, on every rung.
+void TstSessionBootstrap::anArmedUpgradeIsSpentOrWithdrawnNeverForgotten()
+{
+    { // cancelRemoteUpgrade(): the user changed their mind before connecting.
+        Harness h;
+        h.boot.setRemoteArtifactUrl(artifactUrl());
+        h.boot.requestRemoteUpgrade();
+        QVERIFY(h.boot.remoteUpgradeRequested());
+        h.boot.cancelRemoteUpgrade();
+        QVERIFY(!h.boot.remoteUpgradeRequested());
+
+        // So the connect that follows is an ORDINARY one: an installation with
+        // no release marker belongs to a person and is left alone, and the only
+        // remote command is the prerequisite report.
+        h.boot.fakeScript(true, inspectionReport(QStringLiteral("v24.16.0"),
+                                                 installedEntry()));
+        QSignalSpy errorSpy(&h.boot, &SessionBootstrap::error);
+        QSignalSpy progressSpy(&h.boot, &SessionBootstrap::provisioning);
+        QVERIFY(h.wire());
+        QCOMPARE(h.boot.scriptsRun.size(), 1);
+        QVERIFY(progressSpy.isEmpty());
+        QVERIFY(errorSpy.isEmpty());
+    }
+    { // disconnectSession(): the user gave up on the connect it was made for.
+      // A request survives a FAILED attempt on purpose (the retry is still
+      // their upgrade), but an explicit teardown is not a retry.
+        Harness h;
+        h.boot.setRemoteArtifactUrl(artifactUrl());
+        h.boot.requestRemoteUpgrade();
+        h.boot.disconnectSession();
+        QVERIFY(!h.boot.remoteUpgradeRequested());
+
+        h.boot.fakeScript(true, inspectionReport(QStringLiteral("v24.16.0"),
+                                                 installedEntry()));
+        QSignalSpy progressSpy(&h.boot, &SessionBootstrap::provisioning);
+        QVERIFY(h.wire());
+        QCOMPARE(h.boot.state(), State::Wired);
+        QVERIFY2(progressSpy.isEmpty(),
+                 qPrintable(QStringLiteral("a withdrawn upgrade still wrote to "
+                                           "the server: %1")
+                                .arg(progressSpy.value(0).value(0).toString())));
+        QCOMPARE(h.boot.scriptsRun.size(), 1);
+    }
 }
 
 // Guiless: nothing here needs a display, and QTEST_MAIN would pull in

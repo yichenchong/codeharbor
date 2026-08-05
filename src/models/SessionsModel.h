@@ -110,6 +110,7 @@ public:
     int columnCount(const QModelIndex &parent = QModelIndex()) const override;
     QVariant data(const QModelIndex &index, int role = Qt::DisplayRole) const override;
     QHash<int, QByteArray> roleNames() const override;
+
 signals:
     void pinnedOnlyChanged();
     void showArchivedChanged();
@@ -123,6 +124,6 @@ private:
     QVector<GroupRow> groups_;
     bool pinnedOnly_ = false;
     bool showArchived_ = false;
-
 };
+
 } // namespace ch

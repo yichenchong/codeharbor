@@ -164,6 +164,12 @@ public:
     // pendingCount(), and it can never be reported as an orphaned or unknown
     // response.
     //
+    // An interval whose probe could not even be WRITTEN — a transport that is
+    // bound and open but not writable, so call() refuses it before a byte
+    // reaches the wire — counts as a silent interval too. A failed write is not
+    // evidence of a live peer, and treating it as one meant such a transport
+    // was probed forever and never declared dead.
+    //
     // WHAT THIS DOES NOT GUARANTEE. It bounds "the peer is dead or wedged". It
     // does NOT bound one lost reply: if the daemon drops or forgets a single
     // response while its event loop keeps answering pings, that one caller still
@@ -244,7 +250,11 @@ private slots:
 private:
     void processLine(const QByteArray& line);
     void failAllPending(const RpcError& error);
-    void sendHeartbeatPing();
+    // Issue the next probe. Returns true when a probe is genuinely in flight
+    // afterwards, false when call() failed it synchronously (an unwritable
+    // transport) so nothing reached the wire — which onHeartbeatTick() counts
+    // as a silent interval rather than as a completed probe.
+    bool sendHeartbeatPing();
     // Start the heartbeat timer if it is configured and a live transport is
     // bound, stop it otherwise, and RETIRE whatever probe was outstanding —
     // retire, not forget: the probe may still be sitting in m_pending, and its
@@ -266,6 +276,10 @@ private:
     // one read measure the same either way. What this shape buys is that the
     // consumption point is a member, so a callback that re-enters the reader
     // advances the same cursor instead of re-dispatching consumed frames.
+    //
+    // remove() keeps the allocation, so this also hands a LARGE buffer back
+    // once it has drained: without that, one legitimately multi-megabyte frame
+    // pinned its whole buffer for the client's remaining life.
     void compactReadBuffer();
 
     // QPointer, not a raw pointer: the transport is owned by the CALLER and can
@@ -313,9 +327,11 @@ private:
     QTimer* m_heartbeatTimer = nullptr;
     int m_heartbeatIntervalMs = 0;
     int m_heartbeatMissTolerance = kDefaultHeartbeatMisses;
-    // Consecutive intervals in which NOTHING was read from the peer. Reset by
+    // Consecutive intervals in which no proof of life was seen. Reset by
     // onReadyRead() on any non-empty chunk, not merely by a ping reply, so a
-    // slow large transfer counts as the proof of life it is.
+    // slow large transfer counts as the proof of life it is. An interval in
+    // which the probe could not even be written counts as a miss, because a
+    // failed write is not evidence of a live peer either.
     int m_heartbeatMisses = 0;
     // Monotonic stamp identifying the probe currently being awaited. Bumped for
     // every probe sent AND by restartHeartbeat(). This is what makes an OLD
@@ -334,10 +350,9 @@ private:
     // pendingCount(), and leave the miss counter measuring the wrong thing.
     quint64 m_heartbeatGeneration = 0;
     // True while the CURRENT-generation probe is unanswered. A retired probe's
-    // answer never clears this, and never resets m_heartbeatMisses either: it
-    // is evidence about a transport we have already let go. Liveness on the
-    // transport we actually hold is covered by onReadyRead()'s reset for any
-    // inbound bytes.
+    // answer never clears this: it is evidence about a transport we have
+    // already let go. Liveness on the transport we actually hold is covered by
+    // onReadyRead()'s miss-counter reset for any inbound bytes.
     bool m_heartbeatProbeOutstanding = false;
     // Generation -> request id, for every probe still sitting in m_pending: the
     // live one plus any retired by a restart that has not been answered or

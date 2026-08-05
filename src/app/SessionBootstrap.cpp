@@ -554,8 +554,15 @@ void SessionBootstrap::setReconnectEnabled(bool enabled)
         if (m_pool)
             m_pool->disconnectFromHost();
         m_tearingDown = wasTearingDown;
+        // The ladder is over, so its counter is history. reconnectAttempt() is
+        // public and is what the shell shows as "attempt N of M"; leaving the
+        // last rung's number behind State::Disconnected reports a ladder that
+        // is not running. disconnectSession(), the other way out of the ladder,
+        // has always cleared it.
+        m_attempt = 0;
         setState(State::Disconnected);
     } else if (m_state == State::Reconnecting) {
+        m_attempt = 0;
         setState(State::Disconnected);
     }
 }

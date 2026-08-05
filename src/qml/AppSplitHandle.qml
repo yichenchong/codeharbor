@@ -1,5 +1,6 @@
 import QtQuick
 import QtQuick.Controls.Basic
+import CodeHarbor
 
 // The one draggable divider used by every SplitView in the application
 // (SPEC 4.1). Set it as the view's `handle`:

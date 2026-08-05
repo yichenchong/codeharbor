@@ -53,8 +53,13 @@ if ! reported=$(ssh "$@" 2>&1); then
     fail "could not ask the fixture what CODEHARBOR_DB is set to: $reported"
 fi
 
-db=$(printf '%s\n' "$reported" | awk 'index($0, "DB=") == 1 { print substr($0, 4); exit }')
-home=$(printf '%s\n' "$reported" | awk 'index($0, "HOME=") == 1 { print substr($0, 6); exit }')
+# A here-string, not `printf ... | awk`. `set -o pipefail` is on and the awk
+# programs stop at the first match, so on a long enough reply printf would be
+# killed by SIGPIPE, the assignment would inherit 141, and `set -e` would abort
+# this gate with no message at all - a live-fixture check that silently stops
+# checking is worse than one that fails.
+db=$(awk 'index($0, "DB=") == 1 { print substr($0, 4); exit }' <<<"$reported")
+home=$(awk 'index($0, "HOME=") == 1 { print substr($0, 6); exit }' <<<"$reported")
 if [ -z "$db" ]; then
     fail "the fixture session returned an empty CODEHARBOR_DB"
 fi

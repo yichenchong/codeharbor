@@ -138,6 +138,68 @@ test("resolveSocketPath prefers XDG_RUNTIME_DIR, else falls back to cache", () =
     );
     const fallback = resolveSocketPath({});
     assert.match(fallback, /\.cache\/codeharbor\/events\.sock$/);
+    // An empty variable is the same as an unset one.
+    assert.equal(resolveSocketPath({ XDG_RUNTIME_DIR: "" }), fallback);
+    // A RELATIVE runtime directory is ignored. Honouring it would make the
+    // socket path depend on each process's working directory, so the bridge
+    // would bind one path and a hook started elsewhere would look for another —
+    // every status event lost, with nothing logged anywhere.
+    assert.equal(resolveSocketPath({ XDG_RUNTIME_DIR: "run/user" }), fallback);
+    assert.equal(resolveSocketPath({ XDG_RUNTIME_DIR: "." }), fallback);
+});
+
+// The bridge reads JSONL off a socket, and a producer that ends its lines with
+// CRLF is not a malformed producer — the trailing carriage return is framing,
+// not payload. Dropping those events would make CodeHarbor silently useless for
+// that harness.
+test("parseEventLine tolerates surrounding whitespace and a trailing CR", () => {
+    const event = makeEvent({
+        harness: "generic",
+        devSessionId: "s",
+        terminalId: "t",
+        state: "running",
+        event: "tick",
+    });
+    assert.deepEqual(parseEventLine(`${JSON.stringify(event)}\r`), event);
+    assert.deepEqual(parseEventLine(`  ${JSON.stringify(event)}  `), event);
+});
+
+// Valid JSON that is not an event object at all. Each of these decodes without
+// throwing, so only the structural check stands between them and the client.
+test("parseEventLine rejects valid JSON that is not an event object", () => {
+    for (const line of ["[]", "42", '"a string"', "null", "true", '[{"version":1}]']) {
+        assert.equal(parseEventLine(line), null, line);
+    }
+});
+
+// The timestamp grammar accepts a numeric timezone offset, so the offset's own
+// fields have to be real ones: "+00:60" and "+99:99" match the shape and name
+// no instant. Date.parse is what rules them out, and this pins that it does.
+test("validateEvent rejects an impossible timezone offset", () => {
+    const good = makeEvent({
+        harness: "pi",
+        devSessionId: "s",
+        terminalId: "t",
+        state: "idle",
+        event: "done",
+        timestamp: "2026-08-03T12:00:00.000Z",
+    });
+    assert.equal(validateEvent(good), true);
+    for (const offset of ["+00:60", "+24:00", "+99:99", "-13:70"]) {
+        assert.equal(
+            validateEvent({ ...good, timestamp: `2026-08-03T12:00:00.000${offset}` }),
+            false,
+            offset,
+        );
+    }
+    // A real offset still passes, in both directions.
+    for (const offset of ["+05:30", "-08:00"]) {
+        assert.equal(
+            validateEvent({ ...good, timestamp: `2026-08-03T12:00:00.000${offset}` }),
+            true,
+            offset,
+        );
+    }
 });
 
 // Cross-language drift gate, the same shape as rpc-mirror.test.ts: the agent

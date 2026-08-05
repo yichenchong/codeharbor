@@ -39,12 +39,20 @@ namespace ch {
 // `<id>` is QUuid::createUuid().toString(QUuid::WithoutBraces) — plain hex and
 // dashes, safe as an INI key fragment.
 //
-// Validation happens at the write boundary, never on read: a profile that could
-// not possibly connect is refused rather than stored. addProfile() returns an
-// empty id and updateProfile() is a no-op when, after normalization, the host or
-// the user is empty, the port is not an integral number, or the port falls
+// Validation happens at the write boundary: a profile that could not possibly
+// connect is refused rather than stored. addProfile() returns an empty id and
+// updateProfile() is a no-op when, after normalization, the host or the user is
+// empty or still holds whitespace or a control character (no hostname, address
+// literal or POSIX login name may, and what really produces one is a pasted
+// "box.local -p 2222"), the port is not an integral number, or the port falls
 // outside 1..65535. Everything else is normalized: strings are trimmed, a
 // missing/blank port becomes 22, and a blank name becomes the host.
+//
+// The READ side applies exactly one repair - an unusable port becomes 22,
+// because that is already what an absent port means - and otherwise only
+// enforces the same host/user rule, by skipping a row that breaks it. Such a
+// row cannot have been written by this class, and listing it would only offer
+// the user a server entry that fails the moment it is selected.
 //
 // NO SECRET IS EVER STORED. The seven fields above are a whitelist, applied to
 // every addProfile()/updateProfile() call: any other key in the caller's map is
@@ -195,11 +203,11 @@ private:
     // Read the whole `servers` group into m_profiles/m_activeId.
     void load();
     // The `servers` group as it currently stands on disk, in the same order and
-    // shape load() produces (ordinal, then id; ports repaired; rows with a
-    // blank host or user skipped, because they are not connectable profiles and
-    // the save path would not have written them; exactly the whitelisted fields
-    // plus id). Non-null `activeOut` receives the raw stored `servers/active`,
-    // which may name nothing that exists.
+    // shape load() produces (ordinal, then id; ports repaired; rows whose host
+    // or user is not a usable endpoint field skipped, because they are not
+    // connectable profiles and the save path would not have written them;
+    // exactly the whitelisted fields plus id). Non-null `activeOut` receives
+    // the raw stored `servers/active`, which may name nothing that exists.
     QVariantList readStoredProfiles(QString* activeOut) const;
     // Write one profile's keys at the given list position.
     void writeEntry(const QVariantMap& fields, int ordinal);

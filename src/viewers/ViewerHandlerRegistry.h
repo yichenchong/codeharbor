@@ -56,8 +56,10 @@ public:
     static QStringList applicableViewKinds(const QUrl &url);
 
     // Application schemes are user/plugin input, so they are stricter than
-    // QUrl's permissive parsing. The built-in CodeHarbor scheme and ordinary
-    // browser/file schemes are reserved and never handed to the desktop.
+    // QUrl's permissive parsing. Reserved and never handed to the desktop: the
+    // built-in CodeHarbor scheme, the browser/file schemes the viewer handles
+    // itself, and the pseudo-schemes whose "path" is a program or a document
+    // body rather than a locator (javascript:, data:, vbscript:, ...).
     static bool isValidApplicationScheme(const QString &scheme);
 
     // Build the URL handed to a desktop application handler. `remotePath` is

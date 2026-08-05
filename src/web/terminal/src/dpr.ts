@@ -5,6 +5,15 @@
 // keeps the screen value for diagnostics, and temporarily exposes the user's
 // explicit ratio to xterm when requested.
 
+// The SAME bounds normalizeTerminalPreferences() clamps the stored setting to.
+// Imported rather than restated: two copies of "1 to 4" drift, and a
+// preference the settings layer accepted but this one clamped differently
+// would render at a ratio the diagnostics then report as the user's choice.
+import {
+    kMaxTerminalPixelRatio,
+    kMinTerminalPixelRatio,
+} from "./preferences.ts";
+
 export interface DevicePixelRatioWindow {
     devicePixelRatio: number;
     dispatchEvent?: (event: Event) => boolean;
@@ -55,7 +64,8 @@ export function createDevicePixelRatioController(
         set(preference: number): DevicePixelRatioState {
             const finite = Number.isFinite(preference) ? preference : 0;
             const requested = finite > 0
-                ? Math.min(4, Math.max(1, finite))
+                ? Math.min(kMaxTerminalPixelRatio,
+                           Math.max(kMinTerminalPixelRatio, finite))
                 : 0;
             if (requested === 0 || descriptor?.configurable === false) {
                 if (overridden) {

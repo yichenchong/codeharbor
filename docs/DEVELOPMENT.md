@@ -391,13 +391,7 @@ It is deliberately NOT in `-L live`, whose prerequisite is the SSH fixture inste
 
 ### Live gates
 
-The `live`-labelled targets exercise the real thing: a real `sshd`, a real
-`codeharbord` over an SSH channel, real `tmux`, the real Monaco and xterm.js pages,
-and the real agent hook. They **QSKIP** unless `CH_LIVE_SSH` is set, so the default
-suite stays portable. List them with `ctest --preset dev -L live -N`; the headline
-one is **`tst_coldstart`**, the whole first-run walkthrough (add a server, accept its
-host key, create and open a session, get a live shell, edit and save a remote file,
-relaunch and find it restored).
+The `live` label covers both SSH-backed integration gates and a small number of local WebEngine probes. SSH-backed targets exercise a real `sshd`, a real `codeharbord` over an SSH channel, real `tmux`, the packaged Monaco/xterm pages, or the real agent hook; those targets QSKIP unless `CH_LIVE_SSH` is set. `tst_webengine_headless` and the non-SSH renderer cases in `tst_terminalpage` do not require `CH_LIVE_SSH` and instead QSKIP only when WebEngine cannot run. List them with `ctest --preset dev -L live -N`; the headline SSH-backed gate is `tst_coldstart`, the whole first-run walkthrough (add a server, accept its host key, create and open a session, get a live shell, edit and save a remote file, relaunch and find it restored).
 
 Requirements on the remote side: `tmux`, Node 23.6+, and this repository checked out
 at the path given by `CH_LIVE_REPO`. Pointing the fixture at `127.0.0.1` (your own

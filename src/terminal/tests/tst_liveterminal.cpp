@@ -156,8 +156,22 @@ void TstLiveTerminal::initTestCase()
         TerminalController::tmuxNewSessionCommand(m_sessionName, m_repo);
     m_marker = QByteArrayLiteral("CH_LIVE_MARKER_") + terminalRowId.toLatin1();
 
+    // Collect what the renderer would see, and acknowledge it as the renderer
+    // does. The acknowledgement is not decoration: the controller stops
+    // emitting once kMaxUnacknowledgedBytes of output is outstanding (SPEC
+    // 5.4), so a gate that never answered would silently stop seeing remote
+    // bytes half a megabyte into a run and time out on a marker that had
+    // already been printed. Posted rather than called inline, exactly as the
+    // page's own acknowledgement is: releasing retained output re-enters
+    // flushReady, and doing that from inside the emission would recurse.
     connect(&m_controller, &TerminalController::flushReady, this,
-            [this](const QByteArray& batch) { m_out += batch; });
+            [this](const QByteArray& batch) {
+                m_out += batch;
+                const qint64 bytes = batch.size();
+                QMetaObject::invokeMethod(
+                    &m_controller, [this, bytes]() { m_controller.acknowledgeOutput(bytes); },
+                    Qt::QueuedConnection);
+            });
 
     // This gate drives the SPEC 5.6 states BY HAND and deliberately parks the
     // pane in AttachingTmux while it types into it and waits for remote answers

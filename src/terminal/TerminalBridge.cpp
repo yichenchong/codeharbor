@@ -139,6 +139,14 @@ void TerminalBridge::ready()
     // navigation the pagehide handler did not survive) leaves the controller
     // already visible — so its replacement's handshake is not a CHANGE, and the
     // new renderer would inherit a debt it can never pay off.
+    //
+    // The DECODER is part of that account. It can be holding the lead bytes of
+    // a character whose tail went to the page that is being replaced; those
+    // bytes were emitted, so they are not in the controller's retained buffer
+    // and will never arrive. Left in place, that half-character would be
+    // completed from the first bytes of the replay and paint one wrong glyph
+    // at the top of the new renderer's screen.
+    m_decoder.resetState();
     m_undeliveredBytes = 0;
     m_controller->resetOutputAcknowledgements();
     applyVisibility();

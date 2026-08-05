@@ -187,14 +187,24 @@ endif()
 if(CODEHARBOR_BUILD_TESTS)
     enable_testing()
 
-    # Fails if review/debug scaffolding (e.g. a deliberate mutation marker left
-    # behind while proving a gate can fail) reaches the tree. Cheap, and it
-    # closes a hole that convention alone did not.
+    # Repository-wide gates. They are shell scripts, so they run on UNIX only;
+    # `tests/` (the live-fixture CTest fixture) guards itself the same way and
+    # is added unconditionally below.
+    #
+    # Every one of them carries an explicit TIMEOUT, as every other test in this
+    # tree does. CTest's default is 1500 s, and all three of these can hang
+    # rather than fail: the scaffolding scan walks the whole worktree, and the
+    # bump-version test runs git and node inside a throwaway repository, where a
+    # git subprocess waiting on a credential or editor prompt would otherwise
+    # stall the suite for twenty-five minutes before reporting anything.
     if(UNIX)
+        # Fails if review/debug scaffolding (e.g. a deliberate mutation marker
+        # left behind while proving a gate can fail) reaches the tree. Cheap,
+        # and it closes a hole that convention alone did not.
         add_test(NAME tst_no_scaffolding
                  COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/no_scaffolding.sh
                          ${CMAKE_CURRENT_SOURCE_DIR})
-        add_subdirectory(tests)
+        set_tests_properties(tst_no_scaffolding PROPERTIES TIMEOUT 120)
         # Refuses a release tag whose commit carries a different version. Runs
         # entirely inside a throwaway git repository under TMPDIR, so it neither
         # touches this checkout nor creates a tag in it. Skips (77) when git or
@@ -202,16 +212,23 @@ if(CODEHARBOR_BUILD_TESTS)
         add_test(NAME tst_bump_version_tag
                  COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/bump_version_tag.sh
                          ${CMAKE_CURRENT_SOURCE_DIR})
-        set_tests_properties(tst_bump_version_tag PROPERTIES SKIP_RETURN_CODE 77)
+        set_tests_properties(tst_bump_version_tag PROPERTIES
+            SKIP_RETURN_CODE 77
+            TIMEOUT 300)
         # Checks that the in-tree vcpkg overlay patches are still well-formed
-        # unified diffs. Nothing an ordinary Linux or macOS build does reads
-        # them: they are applied on a Windows release runner, against a tarball
-        # downloaded there, so a malformed one is invisible until a release is
-        # already tagged and its Windows job dies during extraction.
+        # unified diffs, and that the portfile's PATCHES list and the patch
+        # files on disk name exactly the same set. Nothing an ordinary Linux or
+        # macOS build does reads them: they are applied on a Windows release
+        # runner, against a tarball downloaded there, so a malformed or
+        # misnamed one is invisible until a release is already tagged and its
+        # Windows job dies during extraction.
         add_test(NAME tst_vcpkg_patches
                  COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/vcpkg_patches.sh
                          ${CMAKE_CURRENT_SOURCE_DIR})
+        set_tests_properties(tst_vcpkg_patches PROPERTIES TIMEOUT 60)
     endif()
+
+    add_subdirectory(tests)
 endif()
 
 add_subdirectory(src)

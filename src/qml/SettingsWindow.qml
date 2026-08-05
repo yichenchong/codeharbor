@@ -3,6 +3,7 @@ pragma ComponentBehavior: Bound
 import QtQuick
 import QtQuick.Controls.Basic
 import CodeHarbor
+import "EndpointField.js" as EndpointField
 
 // Full-surface settings sheet. Main owns the `shown` flag; this component owns
 // focus, Escape and the preference controls so each value is written directly
@@ -32,6 +33,21 @@ Rectangle {
     border.width: 1
     border.color: Theme.borderSubtle
     focus: visible
+
+    // This sheet fills the whole window on top of the three regions, but a
+    // Rectangle accepts no input of its own: Qt Quick hands an unaccepted press
+    // to the next item DOWN, so a click that missed one of the controls below
+    // went straight through to the terminal or editor behind the sheet —
+    // focusing a pane, or scrolling a shell the user could not even see.
+    // Declared FIRST so every real control still hit-tests above it; `wheel`
+    // too, because a stray scroll is as wrong as a stray click.
+    MouseArea {
+        objectName: "sheetInputShield"
+        anchors.fill: parent
+        acceptedButtons: Qt.AllButtons
+        hoverEnabled: true
+        onWheel: (wheel) => wheel.accepted = true
+    }
 
     component SheetButton: Button {
         id: button
@@ -269,8 +285,35 @@ Rectangle {
         root.loadSelectedProfile();
     }
 
+    // The same requirements ServerProfiles::sanitize() enforces, checked here
+    // so the draft can SAY it will not be stored instead of the write being
+    // dropped in silence. Host and user go through the module's one copy of
+    // the store's rule (EndpointField.js), which the Connect sheet uses too:
+    // this pane edits exactly the same records, so a value it accepts and the
+    // sheet refuses would be the same silent-drop bug wearing a different hat.
+    // Port follows the store's rule as well: blank means "use the default",
+    // anything else has to be a number in range.
+    function profileValid() {
+        var port = String(root.profilePort).trim();
+        if (port.length > 0) {
+            if (!/^[0-9]+$/.test(port))
+                return false;
+            var parsed = parseInt(port, 10);
+            if (parsed < 1 || parsed > 65535)
+                return false;
+        }
+        return EndpointField.isUsable(root.profileHost)
+            && EndpointField.isUsable(root.profileUser);
+    }
+
     function saveProfile() {
         if (root.loadingProfile || root.selectedProfileId.length === 0)
+            return;
+        // An unsaveable draft stays DIRTY: clearing the flag would tell the
+        // rest of this file the fields match the stored profile when the store
+        // just refused them, and the next background refresh would then wipe
+        // the user's half-finished edit.
+        if (!root.profileValid())
             return;
         if (typeof app === "undefined" || !app || !app.serverProfiles)
             return;
@@ -754,7 +797,17 @@ Rectangle {
                                 });
                             return choices;
                         }
-                        currentIndex: model.length > 0 ? 0 : -1
+                        // Reset on every model change rather than as a
+                        // `currentIndex:` binding. Picking an entry writes
+                        // currentIndex imperatively, which DESTROYS such a
+                        // binding — after one pick, typing a different
+                        // extension left the box pointing at whatever slot the
+                        // old list had, so "Add or update" either stored the
+                        // wrong viewer or silently did nothing.
+                        onModelChanged: viewerKindChoice.currentIndex =
+                            viewerKindChoice.model.length > 0 ? 0 : -1
+                        Component.onCompleted: viewerKindChoice.currentIndex =
+                            viewerKindChoice.model.length > 0 ? 0 : -1
                     }
                     SheetButton {
                         objectName: "viewerDefaultAddButton"
@@ -873,6 +926,7 @@ Rectangle {
                 }
 
                 ListView {
+                    id: serverProfileListView
                     objectName: "serverProfileList"
                     width: Math.min(parent.width, 620)
                     height: Math.max(36, Math.min(4 * 36, root.profileEntries.length * 36))
@@ -881,7 +935,11 @@ Rectangle {
                     delegate: SheetButton {
                         required property var modelData
                         objectName: "serverProfile:" + root.profileText(modelData, "id")
-                        width: parent ? parent.width : 500
+                        // The view, NOT `parent`: a delegate's parent is the
+                        // view's contentItem, whose width is not the viewport
+                        // width, so the rows came out an arbitrary size. Same
+                        // rule the two lists in the Appearance pane follow.
+                        width: serverProfileListView.width
                         text: root.profileText(modelData, "name")
                               || root.profileText(modelData, "host")
                               || qsTr("Unnamed profile")
@@ -909,6 +967,7 @@ Rectangle {
                     width: Math.min(parent.width, 640)
 
                     Field {
+                        objectName: "serverField:name"
                         width: 300
                         label: qsTr("Name")
                         text: root.profileName
@@ -921,6 +980,7 @@ Rectangle {
                         onEditingFinished: root.saveProfile()
                     }
                     Field {
+                        objectName: "serverField:host"
                         width: 300
                         label: qsTr("Host")
                         text: root.profileHost
@@ -933,6 +993,7 @@ Rectangle {
                         onEditingFinished: root.saveProfile()
                     }
                     Field {
+                        objectName: "serverField:port"
                         width: 300
                         label: qsTr("Port")
                         text: root.profilePort
@@ -945,6 +1006,7 @@ Rectangle {
                         onEditingFinished: root.saveProfile()
                     }
                     Field {
+                        objectName: "serverField:user"
                         width: 300
                         label: qsTr("User")
                         text: root.profileUser
@@ -957,6 +1019,7 @@ Rectangle {
                         onEditingFinished: root.saveProfile()
                     }
                     Field {
+                        objectName: "serverField:identityFile"
                         width: 300
                         label: qsTr("Identity file")
                         text: root.profileIdentityFile
@@ -969,6 +1032,7 @@ Rectangle {
                         onEditingFinished: root.saveProfile()
                     }
                     Field {
+                        objectName: "serverField:nodePath"
                         width: 300
                         label: qsTr("Remote Node path")
                         text: root.profileNodePath
@@ -980,18 +1044,44 @@ Rectangle {
                         }
                         onEditingFinished: root.saveProfile()
                     }
-                    Field {
-                        width: 614
-                        label: qsTr("Remote CodeHarbor directory")
-                        text: root.profileRepoRoot
-                        onTextChanged: {
-                            if (!root.loadingProfile) {
-                                root.profileRepoRoot = text;
-                                root.profileDirty = true;
-                            }
+                }
+
+                // Deliberately NOT a Grid cell. A Grid sizes each column to its
+                // widest child, so a 614-wide field in column 0 pushed column 1
+                // — Host, User, Node path — out past the pane's right edge and
+                // off screen. It is a full-width field, so it lives on its own
+                // below the grid.
+                Field {
+                    objectName: "serverField:repoRoot"
+                    width: Math.min(parent.width, 614)
+                    label: qsTr("Remote CodeHarbor directory")
+                    text: root.profileRepoRoot
+                    onTextChanged: {
+                        if (!root.loadingProfile) {
+                            root.profileRepoRoot = text;
+                            root.profileDirty = true;
                         }
-                        onEditingFinished: root.saveProfile()
                     }
+                    onEditingFinished: root.saveProfile()
+                }
+
+                // ServerProfiles.updateProfile() silently REFUSES an edit that
+                // would leave a profile unable to connect (it will not let a
+                // bad edit corrupt a working profile), so without this the
+                // fields simply stopped saving and nothing on screen said why.
+                // Same sentence the Connect sheet shows for the same rule.
+                Label {
+                    objectName: "serverValidationHint"
+                    width: parent.width
+                    wrapMode: Text.WordWrap
+                    visible: root.selectedProfileId.length > 0 && !root.profileValid()
+                    text: EndpointField.hasRejectedCharacters(root.profileHost)
+                          ? qsTr("The host cannot contain spaces or line breaks; this edit will not be saved.")
+                          : EndpointField.hasRejectedCharacters(root.profileUser)
+                            ? qsTr("The user name cannot contain spaces or line breaks; this edit will not be saved.")
+                            : qsTr("Host, user and a port in 1-65535 are required; edits are not saved until all three are filled in.")
+                    color: Theme.warning
+                    font.pixelSize: Theme.fontSizeSmall
                 }
 
                 Row {

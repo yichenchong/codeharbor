@@ -1,6 +1,7 @@
 #include "SshChannelDevice.h"
 #include "SshConnectionPool.h"
 
+#include <QElapsedTimer>
 #include <QSignalSpy>
 #include <QString>
 #include <QStringList>
@@ -45,6 +46,7 @@ private slots:
     void closeChannelIsIdempotentAndReportsTheEndExactlyOnce();
     void resizeIsRefusedWhenThereIsNoPty();
     void aFinishedStreamReadsAsMinusOneNotZero();
+    void waitingForBytesFailsFastWhenNoneCanArrive();
 };
 
 // QIODevice::open() is the obvious thing for a caller to reach for, and on this
@@ -166,6 +168,39 @@ void TstSshChannelDevice::aFinishedStreamReadsAsMinusOneNotZero()
     device.finishReadChannel();
     QCOMPARE(finished.size(), 1);
     QCOMPARE(device.read(&byte, 1), qint64(-1));
+}
+
+// QIODevice's default waitForReadyRead() answers false without waiting, which
+// on a device built to be consumed through the plain QIODevice interface reads
+// as "this stream is dead" on a channel that is merely quiet. The override has
+// to answer honestly, and — this is what this case pins — it must answer
+// IMMEDIATELY in the three situations where no byte can ever arrive, instead of
+// sitting on the caller's thread for the whole timeout: no channel, a read
+// stream that has already ended, and a device that was never started.
+void TstSshChannelDevice::waitingForBytesFailsFastWhenNoneCanArrive()
+{
+    QElapsedTimer elapsed;
+    elapsed.start();
+
+    SshChannelDevice unopened(nullptr);
+    QVERIFY(!unopened.waitForReadyRead(5000));
+
+    OpenedChannelDevice device;
+    QVERIFY(device.isOpen());
+    // Open, but with no channel behind it: nothing will ever be pumped in.
+    QVERIFY(!device.waitForReadyRead(5000));
+
+    device.finishReadChannel();
+    QVERIFY(!device.waitForReadyRead(5000));
+    // A negative timeout means "no deadline"; on a stream that has finished it
+    // must still return rather than block the caller for good.
+    QVERIFY(!device.waitForReadyRead(-1));
+
+    // Four calls that each asked for five seconds. Anything near even one of
+    // those budgets means the fast paths are not being taken.
+    QVERIFY2(elapsed.elapsed() < 2000,
+             qPrintable(QStringLiteral("waitForReadyRead() blocked for %1 ms")
+                            .arg(elapsed.elapsed())));
 }
 
 QTEST_GUILESS_MAIN(TstSshChannelDevice)

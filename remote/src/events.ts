@@ -105,6 +105,9 @@ export function isPlainObject(value: unknown): value is Record<string, unknown> 
 
 const ISO_TIMESTAMP =
     /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})\.\d{3}(?:Z|[+-]\d{2}:\d{2})$/;
+// February is a deliberate 0: its real length depends on the leap rule, which
+// isTimestamp applies below. Reading this entry for month 2 would reject every
+// February date, so the branch there must stay.
 const DAYS_IN_MONTH = [31, 0, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31] as const;
 
 function isTimestamp(value: unknown): value is string {
@@ -176,12 +179,23 @@ export function parseEventLine(line: unknown): AgentEvent | null {
 }
 
 /**
- * Resolve the bridge socket path (SPEC 6.3): prefer $XDG_RUNTIME_DIR, else fall
- * back to ~/.cache/codeharbor/events.sock.
+ * Resolve the bridge socket path (SPEC 6.3): `$XDG_RUNTIME_DIR/codeharbor.sock`
+ * when the runtime directory is set, otherwise `~/.cache/codeharbor/events.sock`.
+ * The two file names differ; that is what SPEC 6.3 specifies, and both the
+ * bridge and every hook resolve the path through this one function so the two
+ * ends cannot disagree.
+ *
+ * A RELATIVE $XDG_RUNTIME_DIR is ignored rather than honoured. The variable is
+ * defined to be an absolute path, and joining a relative one produces a socket
+ * path that depends on the process's working directory: the bridge would bind
+ * it under its own directory and a hook — a separate process, started wherever
+ * the coding agent happens to be running — would look for it under a different
+ * one, so every status event would silently vanish. Falling back gives both
+ * ends the same answer.
  */
 export function resolveSocketPath(env: NodeJS.ProcessEnv = process.env): string {
     const runtimeDir = env.XDG_RUNTIME_DIR;
-    if (runtimeDir && runtimeDir.length > 0) {
+    if (runtimeDir && path.isAbsolute(runtimeDir)) {
         return path.join(runtimeDir, "codeharbor.sock");
     }
     return path.join(os.homedir(), ".cache", "codeharbor", "events.sock");

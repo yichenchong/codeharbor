@@ -115,6 +115,16 @@ Item {
             console.warn("ViewerImageView: refused a new window for",
                          request.requestedUrl)
         }
+        // A load that Chromium itself refuses (the scheme handler aborted the
+        // job, the resource decoded to nothing) is otherwise a blank rectangle:
+        // internalResourceError only fires for the refusals the HANDLER knows
+        // about, and this view's whole job is to show one image. The handler's
+        // own explanation is better wording, so it is never overwritten.
+        onLoadingChanged: function(request) {
+            if (request.status === WebEngineView.LoadFailedStatus
+                    && root.errorText.length === 0)
+                root.errorText = request.errorString
+        }
         url: root.internalUrl
     }
 

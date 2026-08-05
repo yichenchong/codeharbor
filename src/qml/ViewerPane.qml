@@ -39,11 +39,31 @@ Item {
     // soon as the region gives focus to another pane so a late page callback
     // cannot fight a user's click.
     property bool focusPending: false
+    // The retry is BOUNDED. focusContent() re-arms the timer every time the
+    // page is not scriptable yet, and a page that never becomes scriptable —
+    // a handler whose load failed, a document Chromium never finished — would
+    // otherwise run a JavaScript request against it ten times a second for as
+    // long as the pane exists. Twenty seconds is the same budget the path
+    // probe and the terminal identity watchdog use; after it, giving up costs
+    // only the keyboard focus this restore was trying to place.
+    readonly property int focusRetryLimit: 200
+    property int focusRetriesLeft: 0
     Timer {
         id: focusRetry
+        objectName: "viewerFocusRetry"
         interval: 100
         repeat: false
         onTriggered: pane.focusContent()
+    }
+    // One place that arms it, so no caller can re-arm past the budget.
+    function armFocusRetry() {
+        if (pane.focusRetriesLeft <= 0) {
+            pane.focusPending = false
+            focusRetry.stop()
+            return
+        }
+        pane.focusRetriesLeft -= 1
+        focusRetry.restart()
     }
     onPaneActiveChanged: {
         if (!pane.paneActive) {
@@ -223,6 +243,8 @@ Item {
     // click while Main.qml is guarding against late restores.
     function acceptFocus() {
         pane.focusPending = true;
+        // A fresh restore gets the whole budget back; the previous one is over.
+        pane.focusRetriesLeft = pane.focusRetryLimit;
         pane.forceActiveFocus();
         pane.focusContent();
     }
@@ -258,7 +280,7 @@ Item {
                 const state = String(result === undefined || result === null
                                      ? "" : result);
                 if (state.length === 0 || state === "loading") {
-                    focusRetry.restart();
+                    pane.armFocusRetry();
                     return;
                 }
                 pane.focusPending = false;
@@ -266,7 +288,7 @@ Item {
         // The callback is asynchronous and a page can take several turns to
         // start executing scripts. This also covers engines that do not invoke
         // a callback for a request issued before navigation completes.
-        focusRetry.restart();
+        pane.armFocusRetry();
     }
 
     Connections {

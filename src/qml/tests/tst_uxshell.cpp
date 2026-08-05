@@ -39,6 +39,9 @@
 #include <QHash>
 #include <QGuiApplication>
 #include <QImage>
+#include <QList>
+#include <QPoint>
+#include <QPointF>
 #include <QQmlComponent>
 #include <QQmlContext>
 #include <QQmlEngine>
@@ -557,6 +560,43 @@ Item {
 )QML";
 }
 
+// One of the three full-window overlay sheets, laid over a background that
+// counts the clicks it receives. `extra` carries whatever the sheet needs to be
+// live (LogView and SettingsWindow gate themselves on `shown`).
+QByteArray overlayHarness(const QByteArray &component, const QByteArray &extra)
+{
+    QByteArray qml = R"QML(
+import QtQuick
+import CodeHarbor
+
+Item {
+    id: harness
+    width: 900
+    height: 560
+    property int behindClicks: 0
+    property alias sheetVisible: sheet.visible
+
+    // Stands in for the three regions the sheet covers in Main.qml.
+    MouseArea {
+        anchors.fill: parent
+        onClicked: harness.behindClicks++
+    }
+
+    @SHEET@ {
+        id: sheet
+        objectName: "sheet"
+        anchors.fill: parent
+        z: 10
+        visible: false
+        @EXTRA@
+    }
+}
+)QML";
+    qml.replace("@SHEET@", component);
+    qml.replace("@EXTRA@", extra);
+    return qml;
+}
+
 // Accessible.name of an item in the document above.
 QString accessibleName(QObject *harness, QObject *item)
 {
@@ -767,6 +807,20 @@ private slots:
     // The one control in the sheet that WRITES to the server: it has to be
     // wired to a profile and, like Connect, unreachable behind a prompt.
     void sheetUpdateServerButtonNamesItsProfile();
+
+    // The three full-window sheets sit ON TOP of the workspace. A Rectangle
+    // accepts no input of its own, so without a shield every click that missed
+    // one of their controls fell straight through to the pane behind them.
+    void overlaySheetsSwallowClicksToTheWorkspace_data();
+    void overlaySheetsSwallowClicksToTheWorkspace();
+
+    // The Settings server pane lays its fields out in a two-column grid; one
+    // over-wide entry pushes the whole second column off the pane.
+    void settingsServerFieldsStayInsideThePane();
+
+    // The sheet's Save gate has to be the STORE's rule. Anything looser reports
+    // a save that ServerProfiles silently drops on the floor.
+    void sheetRejectsAHostOrUserThatIsNotASingleWord();
 };
 
 // The states ch::AppController publishes, read out of the SOURCE rather than
@@ -1353,6 +1407,88 @@ void TstUxShell::sheetRejectsPartiallyNumericPorts()
     QVERIFY2(surface.warnings.isEmpty(), qPrintable(surface.warningReport()));
 }
 
+// ServerProfiles refuses a profile whose host or login name carries whitespace
+// or a control character: no hostname, IP literal or POSIX user name can
+// contain one, so such a profile could only ever fail at connect time with an
+// opaque resolver error. The refusal is silent by design (an invalid edit must
+// not corrupt a working profile), which is exactly why the SHEET has to apply
+// the same rule: a Save button that is live for a value the store will drop
+// tells the user the server was saved and then produces no row at all.
+//
+// The rule is whitespace and control characters ONLY, never hostname grammar:
+// ':' and '%' have to stay legal or an IPv6 literal with a zone identifier
+// becomes unsavable.
+void TstUxShell::sheetRejectsAHostOrUserThatIsNotASingleWord()
+{
+    Surface surface(moduleUrl(QStringLiteral("ConnectSheet.qml")), QSize(900, 560));
+    QVERIFY(surface.expose());
+    QQuickItem *root = surface.root();
+    QVERIFY(root);
+
+    QObject *host = surface.child(QStringLiteral("hostField"));
+    QObject *user = surface.child(QStringLiteral("userField"));
+    QObject *port = surface.child(QStringLiteral("portField"));
+    auto *hint = qobject_cast<QQuickItem *>(surface.child(QStringLiteral("validationHint")));
+    auto *save = qobject_cast<QQuickItem *>(surface.child(QStringLiteral("saveButton")));
+    QVERIFY(host && user && port && hint && save);
+
+    QVariant valid;
+
+    // The way a real user gets here: pasting a whole ssh command line into the
+    // host field.
+    host->setProperty("text", QStringLiteral("box.local -p 2222"));
+    user->setProperty("text", QStringLiteral("alice"));
+    port->setProperty("text", QStringLiteral("22"));
+    settle(40);
+
+    QVERIFY(QMetaObject::invokeMethod(root, "formValid", Q_RETURN_ARG(QVariant, valid)));
+    QVERIFY2(!valid.toBool(), "a host containing a space was accepted as valid");
+    QVERIFY2(!save->isEnabled(),
+             "Save is live for a host the store will silently drop");
+    QVERIFY2(hint->isVisible(), "nothing on screen says why the host is refused");
+    QVERIFY2(textOf(hint).contains(QStringLiteral("host"), Qt::CaseInsensitive),
+             qPrintable(QStringLiteral("the hint does not name the host: \"%1\"")
+                                .arg(textOf(hint))));
+
+    // Same rule for the login name, and it has to say so.
+    host->setProperty("text", QStringLiteral("box.local"));
+    user->setProperty("text", QStringLiteral("al ice"));
+    settle(40);
+    QVERIFY(QMetaObject::invokeMethod(root, "formValid", Q_RETURN_ARG(QVariant, valid)));
+    QVERIFY2(!valid.toBool(), "a user name containing a space was accepted as valid");
+    QVERIFY2(textOf(hint).contains(QStringLiteral("user"), Qt::CaseInsensitive),
+             qPrintable(QStringLiteral("the hint does not name the user: \"%1\"")
+                                .arg(textOf(hint))));
+
+    // A tab is whitespace too, and it is invisible in the field.
+    host->setProperty("text", QStringLiteral("box\tlocal"));
+    user->setProperty("text", QStringLiteral("alice"));
+    settle(40);
+    QVERIFY(QMetaObject::invokeMethod(root, "formValid", Q_RETURN_ARG(QVariant, valid)));
+    QVERIFY2(!valid.toBool(), "a host containing a tab was accepted as valid");
+
+    // ...and the gate must not have become hostname grammar. Surrounding
+    // whitespace is trimmed, exactly as the store trims it, so it is not a
+    // reason to refuse anything either.
+    QSignalSpy saved(root, SIGNAL(profileSaved(QVariant)));
+    QVERIFY(saved.isValid());
+    host->setProperty("text", QStringLiteral("  fe80::1%eth0  "));
+    settle(40);
+    QVERIFY(QMetaObject::invokeMethod(root, "formValid", Q_RETURN_ARG(QVariant, valid)));
+    QVERIFY2(valid.toBool(),
+             "an IPv6 address with a zone identifier was refused; the gate has "
+             "turned into hostname grammar");
+    QVERIFY(save->isEnabled());
+    QVERIFY2(!hint->isVisible(), "a saveable form still shows a validation hint");
+
+    // The accepted path is not merely un-blocked, it actually saves.
+    QMetaObject::invokeMethod(root, "save");
+    settle(40);
+    QCOMPARE(saved.size(), 1);
+
+    QVERIFY2(surface.warnings.isEmpty(), qPrintable(surface.warningReport()));
+}
+
 void TstUxShell::sheetModelRefreshKeepsUnsavedEdits()
 {
     Surface surface(moduleUrl(QStringLiteral("ConnectSheet.qml")), QSize(900, 560));
@@ -1565,6 +1701,107 @@ void TstUxShell::titleBarButtonsAreNamedAndCloseIsWired()
     QCOMPARE(textOf(surface.child(QStringLiteral("sessionLabel"))), QStringLiteral("codeharbor"));
 
     QVERIFY2(surface.warnings.isEmpty(), qPrintable(surface.warningReport()));
+}
+
+void TstUxShell::overlaySheetsSwallowClicksToTheWorkspace_data()
+{
+    QTest::addColumn<QByteArray>("component");
+    QTest::addColumn<QByteArray>("extra");
+    QTest::addColumn<QPoint>("blankSpot");
+
+    // A point on each sheet that carries no control of its own: the strip of
+    // header between the title and the buttons, and (for the log) the sheet's
+    // own outer margin.
+    QTest::newRow("ConnectSheet") << QByteArray("ConnectSheet") << QByteArray()
+                                  << QPoint(450, 22);
+    QTest::newRow("SettingsWindow") << QByteArray("SettingsWindow")
+                                    << QByteArray("shown: true") << QPoint(450, 23);
+    QTest::newRow("LogView") << QByteArray("LogView") << QByteArray("shown: true")
+                             << QPoint(450, 6);
+}
+
+// Each of these sheets fills the window at a high z on top of the sidebar, the
+// viewer and the terminal. They are Rectangles, and a Rectangle accepts no
+// mouse input, so Qt Quick hands any press that missed one of their controls to
+// the next item DOWN — the user clicks the settings background and focuses, or
+// types into, a terminal they cannot see.
+void TstUxShell::overlaySheetsSwallowClicksToTheWorkspace()
+{
+    QFETCH(QByteArray, component);
+    QFETCH(QByteArray, extra);
+    QFETCH(QPoint, blankSpot);
+
+    Surface surface(overlayHarness(component, extra), QSize(900, 560),
+                    QStringLiteral("unusedContext"), nullptr);
+    QVERIFY2(surface.root(), qPrintable(surface.componentError()));
+    QVERIFY(surface.expose());
+    settle(60);
+
+    // Control case: with the sheet hidden the very same press DOES reach the
+    // workspace, so a pass below cannot come from aiming at nothing.
+    QTest::mouseClick(&surface.view, Qt::LeftButton, Qt::NoModifier, blankSpot);
+    settle(60);
+    QCOMPARE(surface.root()->property("behindClicks").toInt(), 1);
+
+    surface.root()->setProperty("sheetVisible", true);
+    settle(60);
+    QTest::mouseClick(&surface.view, Qt::LeftButton, Qt::NoModifier, blankSpot);
+    settle(60);
+    QVERIFY2(surface.root()->property("behindClicks").toInt() == 1,
+             "a click on the sheet reached the workspace behind it");
+}
+
+// The pane is a fixed 190-pixel sidebar plus the rest of the window, and the
+// server fields are laid out two to a row. A Grid sizes each column to its
+// widest child, so one full-width field in the left column pushes every field
+// in the right column past the pane's edge and off screen.
+void TstUxShell::settingsServerFieldsStayInsideThePane()
+{
+    Surface surface(moduleUrl(QStringLiteral("SettingsWindow.qml")), QSize(900, 560));
+    QVERIFY(surface.expose());
+    QQuickItem *root = surface.root();
+    QVERIFY(root);
+    root->setProperty("shown", true);
+    root->setProperty("selectedGroup", QStringLiteral("server"));
+    settle(120);
+
+    auto *pane = qobject_cast<QQuickItem *>(surface.child(QStringLiteral("serverPane")));
+    QVERIFY2(pane, "the Settings sheet has no server pane");
+    // The positioners inside the pane lay out on a polish pass, so the
+    // geometry below is only meaningful once the pane itself has a size.
+    QTRY_VERIFY_WITH_TIMEOUT(pane->width() > 0 && pane->height() > 0, 2000);
+
+    // Every field the pane is required to show, named at the source rather
+    // than sniffed out by C++ class name: a Qt Quick Controls TextField is
+    // instantiated from the style's own QML document, so its runtime
+    // metaobject is a generated subclass whose name is not "QQuickTextField"
+    // and a class-name scan finds nothing at all.
+    const QStringList fieldNames{QStringLiteral("serverField:name"),
+                                 QStringLiteral("serverField:host"),
+                                 QStringLiteral("serverField:port"),
+                                 QStringLiteral("serverField:user"),
+                                 QStringLiteral("serverField:identityFile"),
+                                 QStringLiteral("serverField:nodePath"),
+                                 QStringLiteral("serverField:repoRoot")};
+
+    const qreal paneRight = pane->width();
+    for (const QString &name : fieldNames) {
+        auto *field = qobject_cast<QQuickItem *>(surface.child(name));
+        QVERIFY2(field, qPrintable(QStringLiteral("the server pane has no %1").arg(name)));
+        QVERIFY2(field->isVisible(), qPrintable(QStringLiteral("%1 is not shown").arg(name)));
+        // Guard against a vacuous pass: a field collapsed to nothing would
+        // "fit" inside any pane.
+        QVERIFY2(field->width() >= 200,
+                 qPrintable(QStringLiteral("%1 is only %2 wide")
+                                    .arg(name)
+                                    .arg(field->width())));
+        const qreal right = field->mapToItem(pane, QPointF(field->width(), 0)).x();
+        QVERIFY2(right <= paneRight + 0.5,
+                 qPrintable(QStringLiteral("%1 reaches x=%2, past the %3-pixel pane")
+                                    .arg(name)
+                                    .arg(right)
+                                    .arg(paneRight)));
+    }
 }
 
 // QTEST_MAIN cannot be used: QtWebEngineQuick::initialize() must run before the

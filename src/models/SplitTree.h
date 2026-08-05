@@ -63,21 +63,43 @@ struct SplitNode {
     QString customTitle;
     // Keep persisted titles bounded: a pane header is compact, and allowing an
     // unbounded value here would make a user-controlled layout grow forever.
+    // The bound counts UTF-16 code units, which is what QString::size() reports.
     static constexpr int kMaxCustomTitleLength = 128;
+    // IDEMPOTENT BY CONSTRUCTION: normalizeCustomTitle(normalizeCustomTitle(t))
+    // == normalizeCustomTitle(t) for every t. That matters because the value is
+    // normalized more than once on the same round trip - the parser normalizes
+    // what it reads and the writer normalizes again on the way out - so a
+    // function that kept changing its own output would make a stored layout
+    // differ from the one just written and provoke an endless "the tree
+    // changed, save it again" cycle. Two clean-ups can each expose work for the
+    // other (truncating at the limit can leave a trailing space that had
+    // nothing to trim before, and dropping a half-character left by that
+    // truncation can expose a space in turn), so they run until the value stops
+    // shrinking rather than once each.
     static QString normalizeCustomTitle(QString title)
     {
         title = title.trimmed();
         if (title.size() > kMaxCustomTitleLength)
             title.truncate(kMaxCustomTitleLength);
-        const int last = title.size() - 1;
-        if (last >= 0
-            && (title.at(last).isHighSurrogate()
-                || (title.at(last).isLowSurrogate()
-                    && (last == 0 || !title.at(last - 1).isHighSurrogate()))))
-            title.chop(1);
-        return title;
+        for (;;) {
+            // Truncation can split a surrogate pair - the two-unit encoding of
+            // one non-BMP character such as an emoji - leaving half a character
+            // that is not valid text on its own. Drop an unpaired half.
+            const qsizetype last = title.size() - 1;
+            if (last >= 0
+                && (title.at(last).isHighSurrogate()
+                    || (title.at(last).isLowSurrogate()
+                        && (last == 0 || !title.at(last - 1).isHighSurrogate())))) {
+                title.chop(1);
+                continue;
+            }
+            const QString trimmed = title.trimmed();
+            if (trimmed.size() == title.size())
+                return title;
+            title = trimmed;
+        }
     }
-    
+
     SplitOrientation orientation = SplitOrientation::Horizontal;
     QVector<SplitNode> children;
     QVector<double> ratios;

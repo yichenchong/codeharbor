@@ -4,6 +4,8 @@ import net from "node:net";
 import os from "node:os";
 import fs from "node:fs";
 import path from "node:path";
+import { spawn } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import {
     emitHookEvent,
     main,
@@ -452,6 +454,35 @@ test("startBridge rejects when a live bridge already owns the socket (RR12)", as
         fs.rmSync(dir, { recursive: true, force: true });
     }
 });
+test("concurrent bridge starts cannot orphan the winner", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ch-bridge-race-"));
+    const socketPath = path.join(dir, "bridge.sock");
+    let winner: net.Server | undefined;
+    try {
+        const attempts = await Promise.allSettled([
+            startBridge(socketPath, () => {}),
+            startBridge(socketPath, () => {}),
+        ]);
+        const fulfilled = attempts.filter(
+            (attempt): attempt is PromiseFulfilledResult<net.Server> =>
+                attempt.status === "fulfilled",
+        );
+        assert.equal(fulfilled.length, 1);
+        winner = fulfilled[0].value;
+        assert.equal(
+            fs.lstatSync(socketPath).isSocket(),
+            true,
+            "the winning bridge must still own the socket path",
+        );
+    } finally {
+        if (winner) {
+            const closed = Promise.withResolvers<void>();
+            winner.close(() => closed.resolve());
+            await closed.promise;
+        }
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
+});
 
 test("startBridge unlinks a stale socket left by a dead bridge (RR12)", async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ch-bridge-stale-"));
@@ -490,6 +521,7 @@ test("startBridge unlinks a stale socket left by a dead bridge (RR12)", async ()
 // disconnects mid-stall can be forgotten.
 function fakeSource(): {
     socket: net.Socket;
+    destroyed: boolean;
     paused: boolean;
     pauses: number;
     resumes: number;
@@ -497,6 +529,7 @@ function fakeSource(): {
     close: () => void;
 } {
     const state = {
+        destroyed: false,
         paused: false,
         pauses: 0,
         resumes: 0,
@@ -505,6 +538,11 @@ function fakeSource(): {
         socket: undefined as unknown as net.Socket,
     };
     state.socket = {
+        destroyed: false,
+        destroy() {
+            state.destroyed = true;
+            state.close();
+        },
         pause() {
             state.paused = true;
             state.pauses += 1;
@@ -521,6 +559,60 @@ function fakeSource(): {
     } as unknown as net.Socket;
     return state;
 }
+test("makeStreamSink refuses an event whose envelope exceeds the desktop frame", () => {
+    const out = new PassThrough();
+    const sink = makeStreamSink(out);
+    const source = fakeSource();
+    const oversized = {
+        ...RELAY_EVENT,
+        summary: "x".repeat(MAX_BRIDGE_LINE_BYTES),
+    } as AgentEvent;
+    sink(oversized, source.socket);
+    assert.equal(source.destroyed, true);
+    assert.equal(out.read(), null);
+});
+// A sink can tear a producer down mid-chunk: makeStreamSink destroys the source
+// when a mapped event would exceed the desktop's frame limit. Everything after
+// that point in the SAME write must be abandoned, otherwise a producer that has
+// already been disconnected still gets its later lines relayed.
+test("a producer destroyed by the sink has the rest of its chunk abandoned", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ch-bridge-destroy-"));
+    const socketPath = path.join(dir, "bridge.sock");
+    const relayed: AgentEvent[] = [];
+    const server = await startBridge(socketPath, (event, source) => {
+        relayed.push(event);
+        // Stand in for the oversized-event refusal, which destroys the source.
+        source.destroy();
+    });
+    try {
+        const producer = net.createConnection(socketPath);
+        const connected = Promise.withResolvers<void>();
+        const closed = Promise.withResolvers<void>();
+        producer.on("error", () => {});
+        producer.once("connect", () => connected.resolve());
+        producer.once("close", () => closed.resolve());
+        await connected.promise;
+
+        const message = (terminalId: string): string =>
+            `${JSON.stringify({
+                harness: "oh-my-pi",
+                devSessionId: "s1",
+                terminalId,
+                native: { type: "agent_start" },
+            })}\n`;
+        // Both lines in ONE write, so the framer holds them in a single chunk.
+        producer.write(`${message("first")}${message("second")}`);
+        await closed.promise;
+
+        assert.equal(relayed.length, 1, "only the line before teardown may be relayed");
+        assert.equal(relayed[0].terminalId, "first");
+    } finally {
+        const stopped = Promise.withResolvers<void>();
+        server.close(() => stopped.resolve());
+        await stopped.promise;
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
+});
 
 const RELAY_EVENT = {
     harness: "oh-my-pi",
@@ -751,4 +843,116 @@ test("emitHookEvent rejects instead of throwing on an unusable socket path (RA2)
         "",
     );
     await assert.rejects(pending);
+});
+
+
+// AG2. Everything above drives the hook's exported functions in-process. What
+// a harness actually runs is the SCRIPT, and that path has its own contract
+// that nothing covered:
+//
+//   * The CLI entry point has to recognise itself. It compares import.meta.url
+//     against pathToFileURL(process.argv[1]); if that comparison ever stops
+//     matching, the installed hook becomes a silent no-op — it loads, defines
+//     everything, emits nothing, and exits 0, so the harness sees a perfectly
+//     healthy hook and the sidebar simply never updates.
+//   * The hook runs INSIDE someone else's process tree, and its stdout may be
+//     a pipe the harness parses. A single stray byte there corrupts the host.
+//     Its payload goes to the socket; stdout must stay empty, always.
+//   * An unavailable bridge must still exit 0 (SPEC 6.4), with the complaint
+//     on stderr and nothing on stdout.
+function runHookScript(
+    args: readonly string[],
+    env: NodeJS.ProcessEnv,
+): Promise<{ code: number | null; stdout: string; stderr: string }> {
+    const hookPath = fileURLToPath(new URL("../src/hooks/oh-my-pi-hook.ts", import.meta.url));
+    const { promise, resolve } = Promise.withResolvers<{
+        code: number | null;
+        stdout: string;
+        stderr: string;
+    }>();
+    const child = spawn(process.execPath, [hookPath, ...args], {
+        // A deliberately minimal environment: inheriting this process's would
+        // let a stray OMP_* or XDG_RUNTIME_DIR on the developer's machine
+        // change what the hook does.
+        env: { PATH: process.env.PATH ?? "", ...env },
+        stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk: string) => (stdout += chunk));
+    child.stderr.on("data", (chunk: string) => (stderr += chunk));
+    child.on("close", (code) => resolve({ code, stdout, stderr }));
+    return promise;
+}
+
+test("the installed hook script emits to the socket, never to stdout (AG2)", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ch-hook-cli-"));
+    const socketPath = resolveSocketPath({ XDG_RUNTIME_DIR: dir } as NodeJS.ProcessEnv);
+    const received = Promise.withResolvers<string>();
+    const server = net.createServer((socket) => {
+        const chunks: Buffer[] = [];
+        socket.on("data", (chunk) => chunks.push(chunk));
+        socket.on("end", () => received.resolve(Buffer.concat(chunks).toString("utf8")));
+    });
+    const listening = Promise.withResolvers<void>();
+    server.listen(socketPath, () => listening.resolve());
+    await listening.promise;
+
+    try {
+        const ok = await runHookScript(["tool_call"], {
+            XDG_RUNTIME_DIR: dir,
+            OMP_DEV_SESSION_ID: "sess-cli",
+            OMP_TERMINAL_ID: "term-cli",
+            OMP_TOOL: "ask",
+            OMP_SUMMARY: "approve this?",
+        } as NodeJS.ProcessEnv);
+        assert.equal(ok.code, 0);
+        assert.equal(ok.stdout, "", "the hook must never write to the host's stdout");
+        assert.equal(ok.stderr, "", "a successful firing is silent");
+
+        // The entry point really ran: a line reached the socket, and the bridge
+        // maps it to the state the SPEC 6.5 table names for tool_call: ask.
+        const raw = await received.promise;
+        assert.ok(raw.endsWith("\n"), "line must be newline-terminated JSONL");
+        const event = processBridgeLine(raw);
+        assert.ok(event, "the emitted line must map to an AgentEvent");
+        assert.equal(event.state, "waiting_input");
+        assert.equal(event.devSessionId, "sess-cli");
+        assert.equal(event.terminalId, "term-cli");
+        assert.equal(event.summary, "approve this?");
+    } finally {
+        const closed = Promise.withResolvers<void>();
+        server.close(() => closed.resolve());
+        await closed.promise;
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+test("the installed hook script exits 0 with no bridge listening (AG2)", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ch-hook-cli-dead-"));
+    try {
+        const dead = await runHookScript(["agent_start"], {
+            XDG_RUNTIME_DIR: dir,
+            OMP_DEV_SESSION_ID: "sess-cli",
+            OMP_TERMINAL_ID: "term-cli",
+        } as NodeJS.ProcessEnv);
+        // Exit 0 is the whole point: a harness may read a non-zero hook as a
+        // failed step and surface it to the user (SPEC 6.4).
+        assert.equal(dead.code, 0);
+        assert.equal(dead.stdout, "");
+        assert.match(dead.stderr, /^oh-my-pi-hook: /);
+
+        // A misconfigured firing behaves the same way: loud on stderr, silent
+        // on stdout, successful exit.
+        const blank = await runHookScript(["agent_start"], {
+            XDG_RUNTIME_DIR: dir,
+        } as NodeJS.ProcessEnv);
+        assert.equal(blank.code, 0);
+        assert.equal(blank.stdout, "");
+        assert.match(blank.stderr, /OMP_DEV_SESSION_ID and OMP_TERMINAL_ID/);
+    } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
 });

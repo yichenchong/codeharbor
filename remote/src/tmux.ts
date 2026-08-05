@@ -47,10 +47,6 @@ export type CommandRunner = (argv: string[]) => Promise<CommandResult>;
 /** Exit code used when tmux is not on PATH (or otherwise unspawnable). */
 export const SPAWN_FAILED = -1;
 
-// The binary is overridable so the live suite can point at a wrapper or a
-// non-PATH tmux; unset it and this is plain `tmux` resolved through PATH.
-const TMUX_BINARY = process.env.CODEHARBOR_TMUX ?? "tmux";
-
 // Wall-clock ceiling for one tmux invocation. Every caller awaits its runner and
 // the dispatcher awaits the handler, so a tmux that never answers (an
 // unresponsive server socket, a stuck NFS-mounted socket directory) would hang
@@ -63,6 +59,11 @@ const TMUX_BINARY = process.env.CODEHARBOR_TMUX ?? "tmux";
 // live one it could not see. execFileRunner names the timeout in `stderr` so
 // the surfaced message says so instead of "exit code -1".
 const TMUX_TIMEOUT_MS = 10_000;
+
+// Ceiling on the bytes one tmux invocation may print. A listing of every
+// session on a busy host is kilobytes; eight megabytes is a producer that has
+// gone wrong, and execFile needs a bound or it buffers without one.
+const TMUX_MAX_OUTPUT_BYTES = 8 * 1024 * 1024;
 
 // --- tmux target names (SPEC 5.2) -------------------------------------------
 //
@@ -141,9 +142,18 @@ export const LIST_SESSIONS_FORMAT =
 export const execFileRunner: CommandRunner = (argv) =>
     new Promise<CommandResult>((resolve) => {
         execFile(
-            TMUX_BINARY,
+            // The binary is overridable so the live suite can point at a
+            // wrapper or a non-PATH tmux; unset it and this is plain `tmux`
+            // resolved through PATH. Read per invocation rather than captured
+            // at import time, so a value exported after this module was loaded
+            // is honoured instead of silently ignored.
+            process.env.CODEHARBOR_TMUX ?? "tmux",
             argv,
-            { encoding: "utf8", maxBuffer: 8 * 1024 * 1024, timeout: TMUX_TIMEOUT_MS },
+            {
+                encoding: "utf8",
+                maxBuffer: TMUX_MAX_OUTPUT_BYTES,
+                timeout: TMUX_TIMEOUT_MS,
+            },
             (err, stdout, stderr) => {
                 if (err === null) {
                     resolve({ code: 0, stdout, stderr });
@@ -152,27 +162,43 @@ export const execFileRunner: CommandRunner = (argv) =>
                 // execFile reports a non-zero exit as a numeric `code` and a
                 // spawn failure (ENOENT for a missing tmux) as a string errno.
                 //
-                // A TIMEOUT is neither: execFile kills the child with a signal,
-                // so there is no exit code at all and `stderr` is usually empty.
-                // That collapsed onto the same shape as "could not spawn" and
-                // produced the useless message `tmux list-sessions failed: exit
-                // code -1`. Name it, so the error the user is shown says what
-                // actually happened, and so isMissingTmux can never read a hung
-                // server as an absent binary.
-                const timedOut = err.killed === true && typeof err.code !== "number";
+                // Two more outcomes are neither, and both used to collapse onto
+                // the same shape as "could not spawn" and produce the useless
+                // message `tmux list-sessions failed: exit code -1`:
+                //
+                //   * a TIMEOUT: execFile kills the child, so there is no exit
+                //     code at all and `stderr` is usually empty;
+                //   * OUTPUT PAST maxBuffer: execFile also kills the child, and
+                //     tags the error ERR_CHILD_PROCESS_STDIO_MAXBUFFER. Reported
+                //     as a timeout it sent whoever had to debug it hunting an
+                //     unresponsive tmux over a listing that was merely enormous.
+                //
+                // Naming both also stops isMissingTmux from ever reading a hung
+                // or over-talkative tmux as an absent binary.
+                const overflowed = err.code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER";
+                const timedOut =
+                    !overflowed && err.killed === true && typeof err.code !== "number";
+                let detail: string;
+                if (overflowed) {
+                    detail = `tmux produced more than ${TMUX_MAX_OUTPUT_BYTES} bytes of output`;
+                } else if (timedOut) {
+                    detail = `tmux did not respond within ${TMUX_TIMEOUT_MS}ms`;
+                } else {
+                    detail = stderr ?? err.message;
+                }
                 resolve({
                     code: typeof err.code === "number" ? err.code : SPAWN_FAILED,
                     stdout: stdout ?? "",
-                    stderr: timedOut
-                        ? `tmux did not respond within ${TMUX_TIMEOUT_MS}ms`
-                        : (stderr ?? err.message),
+                    stderr: detail,
                 });
             },
         );
     });
 
-// A stub runner may throw where the real one resolves; absorbing that here
-// keeps rule 1 (absence is not failure) true for every caller.
+// A stub runner may throw where the real one resolves. Absorbing that here
+// gives every caller ONE shape to branch on (a CommandResult, never an
+// exception); whether the failure is then an absence or a real error is
+// isMissingTmux/isNoServer's decision, exactly as for a runner that resolved.
 async function run(runner: CommandRunner, argv: string[]): Promise<CommandResult> {
     try {
         return await runner(argv);

@@ -111,17 +111,11 @@ Rectangle {
     // forgotten the moment the Dev Session is reopened.
     //
     // Emitted by the ROOT region only, like the three requests above: nested
-    // regions hand their reading up through reportRatios() on the owner, so the
-    // host has exactly one signal to listen to per region.
+    // regions hand their reading up through reportRatiosForSession() on the
+    // owner, so the host has exactly one signal to listen to per region.
     signal splitRatiosAdjusted(var pathIndexes, var ratios)
     signal splitRatiosAdjustedForSession(string sessionId, double generation,
                                          var pathIndexes, var ratios)
-
-    function reportRatios(pathIndexes, ratios) {
-        const owner = region.paneOwner;
-        reportRatiosForSession(owner.devSessionId, owner.layoutGeneration,
-                               pathIndexes, ratios);
-    }
 
     function reportRatiosForSession(sessionId, generation, pathIndexes, ratios) {
         const owner = region.paneOwner;
@@ -151,6 +145,11 @@ Rectangle {
 
     // paneId -> pane Item. Mutated in place; nothing binds to it.
     property var paneCache: ({})
+    // Bumped by the OWNER every time the whole cache is thrown away
+    // (resetPanesForNewTree). Unlike the cache itself this IS a bindable
+    // property, and it is the one thing a nested region can watch to learn
+    // that the pane it believes it is showing no longer exists.
+    property int paneEpoch: 0
     // paneId -> { sessionId, generation }: which session's tree the pane is
     // currently part of. Beside the cache and for the same reason - one Item is
     // reused across sessions, so where its reports belong is not a property of
@@ -416,12 +415,10 @@ Rectangle {
 
     // A pane asking to be split from its own header. Relayed rather than acted
     // on: changing a split tree is a layout operation only the host can publish.
-    function notePaneSplit(paneId, orientation) {
-        if (region.hostStampsWrites)
-            return; // production uses the immutable callback stamp below
-        region.splitRequested(paneId, orientation);
-    }
-
+    // Every pane report travels stamped with the session and layout generation
+    // the pane was taken into (see reportForPane); a standalone region with no
+    // session falls through to the plain signal below, which is what the
+    // component tests listen to.
     function notePaneSplitForSession(sessionId, generation, paneId, orientation) {
         if (region.hostStampsWrites) {
             if (String(sessionId).length === 0)
@@ -437,12 +434,6 @@ Rectangle {
     // A pane asking to be closed from its own header. Relayed rather than acted
     // on: closing a pane is a layout change only the host can publish, and it
     // deliberately leaves the remote tmux session running.
-    function notePaneClose(paneId) {
-        if (region.hostStampsWrites)
-            return; // production uses the callback stamp below
-        region.closePaneRequested(paneId);
-    }
-
     function notePaneCloseForSession(sessionId, generation, paneId) {
         if (region.hostStampsWrites) {
             if (String(sessionId).length === 0)
@@ -454,12 +445,6 @@ Rectangle {
         region.closePaneRequested(paneId);
     }
 
-    function notePaneKill(paneId) {
-        if (region.hostStampsWrites)
-            return; // production uses the immutable callback stamp below
-        region.killTerminalRequested(paneId);
-    }
-
     function notePaneKillForSession(sessionId, generation, paneId) {
         if (region.hostStampsWrites) {
             if (String(sessionId).length === 0)
@@ -469,12 +454,6 @@ Rectangle {
             return;
         }
         region.killTerminalRequested(paneId);
-    }
-
-    function notePaneTitle(paneId, title) {
-        if (region.hostStampsWrites)
-            return; // production uses the callback stamp below
-        region.paneTitleReported(paneId, title);
     }
 
     function notePaneTitleForSession(sessionId, generation, paneId, title) {
@@ -607,6 +586,9 @@ Rectangle {
         region.focusResetting = true;
         region.focusedPaneId = "";
         region.focusResetting = false;
+        // Announced LAST, so every region rebuilds against a cache that is
+        // already empty and a focus that is already cleared.
+        region.paneEpoch += 1;
     }
 
     onDevSessionIdChanged: {
@@ -620,6 +602,22 @@ Rectangle {
     // longer belong to.
     onLayoutGenerationChanged: region.resetPanesForNewTree()
     onWorkingDirChanged: region.applyPaneContext()
+
+    // Rebuild the leaf this region was showing after the owner threw the cache
+    // away. Every region in the tree listens, the owner included: a region's
+    // record of "I am showing pane X" outlives X itself, so without this it
+    // goes on believing a destroyed pane is on screen and stays BLANK until
+    // its `node` happens to change shape. `node` need not change at all — the
+    // host binds `node` and `layoutGeneration` to the same object, and a reload
+    // that republishes an identical tree only moves the generation.
+    Connections {
+        target: region.paneOwner
+        function onPaneEpochChanged() {
+            region.showingPane = false;
+            region.shownPaneId = "";
+            region.syncPane();
+        }
+    }
 
     Component.onCompleted: {
         region.paneHostReady = true;
@@ -749,6 +747,13 @@ Rectangle {
             // before release, the write still names the tree that was resized.
             property string resizeSessionId: ""
             property double resizeGeneration: 0
+            // ...and WHERE in that tree this branch sat. A republish during the
+            // drag (another client splitting a pane, say) can move this branch
+            // to a different index, and a reading filed under the new path
+            // would resize a branch the user never touched. `null` means "no
+            // drag captured one", which is the case when publishRatios() is
+            // called directly; it then uses the path the branch has now.
+            property var resizePath: null
 
             function applyRatios() {
                 if (ratiosApplied || width <= 0 || height <= 0
@@ -783,14 +788,16 @@ Rectangle {
 
             // The write side of `ratios` (SPEC 4.5). SplitView.resizing is true
             // only while a handle is under the pointer, so this fires exactly
-            // once, when a drag FINISHES. The stamp a drag reports under is the
-            // one captured when the drag STARTED (see onResizingChanged), not
-            // whatever is current when it ends; keeping it on the split means
-            // no caller can report a drag under the wrong session by passing the
-            // wrong pair.
+            // once, when a drag FINISHES. The stamp and index path a drag
+            // reports under are the ones captured when the drag STARTED (see
+            // onResizingChanged), not whatever is current when it ends; keeping
+            // them on the split means no caller can report a drag under the
+            // wrong session or against the wrong branch.
             function publishRatios() {
                 const sessionId = split.resizeSessionId;
                 const generation = split.resizeGeneration;
+                const path = split.resizePath !== null ? split.resizePath
+                                                       : region.nodePath;
                 const count = childRepeater.count;
                 if (count < 2)
                     return;
@@ -815,15 +822,17 @@ Rectangle {
                 for (let k = 0; k < sizes.length; ++k)
                     ratios.push(sizes[k] / total);
                 region.paneOwner.reportRatiosForSession(
-                    sessionId, generation, region.nodePath, ratios);
+                    sessionId, generation, path, ratios);
             }
 
             onResizingChanged: {
                 if (resizing) {
                     split.resizeSessionId = region.paneOwner.devSessionId;
                     split.resizeGeneration = region.paneOwner.layoutGeneration;
+                    split.resizePath = region.nodePath;
                 } else {
                     split.publishRatios();
+                    split.resizePath = null;
                 }
             }
 

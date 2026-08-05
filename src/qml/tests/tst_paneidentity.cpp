@@ -449,6 +449,17 @@ class EditorControllerStub : public QObject
 public:
     QString fileState() const { return m_fileState; }
 
+    // ch::EditorController leaves the file in "disconnected" when the SSH
+    // transport drops and in "conflict" when a save was refused; both are
+    // states the pane has to announce rather than leave in a status line.
+    void setFileState(const QString &state)
+    {
+        if (m_fileState == state)
+            return;
+        m_fileState = state;
+        emit fileStateChanged(m_fileState);
+    }
+
     Q_INVOKABLE void open(const QString &path) { m_opened.append(path); }
     Q_INVOKABLE void save(const QString &, const QString &) { }
     Q_INVOKABLE void reportContent(const QString &content) { m_reported.append(content); }
@@ -608,6 +619,44 @@ private slots:
     // refused internal resource — an image over the inline cap, say — reached
     // the pane as a blank failed page with nothing at all to explain it.
     void aRefusedInternalResourceSaysWhyInsteadOfShowingABlankPage();
+
+    // A LAYOUT RELOAD throws the whole pane cache away, because a reloaded
+    // tree can name exactly the same panes and nothing else would notice they
+    // now belong to a different load. Every region in the tree then has to
+    // rebuild the leaf it was showing: its own record of "I am showing pane X"
+    // outlives X, and a region that keeps believing it goes BLANK — with the
+    // right pane ids still in the layout and nothing at all on screen.
+    void aLayoutReloadRebuildsEveryPaneInTheTree();
+
+    // The editor's drop/conflict banner. It is the only thing that tells a user
+    // typing into a buffer that the buffer cannot be saved, and a banner with
+    // no geometry is built, flips `visible` correctly, and draws nothing.
+    void theEditorSaysWhenItsFileCannotBeSaved();
+
+    // THE DIRECTORY LISTING IS BOUNDED, for the same reason the path probe is:
+    // the view says "Listing…" and draws the pane's header busy until a reply
+    // settles it, and a session that drops between the request and its answer
+    // sends neither.
+    void theDirectoryListingStopsWaitingForAnAnswerThatNeverArrives();
+
+    // ...and so is a download. The Download button is disabled while a request
+    // this pane started is pending, so a request that never reaches the handler
+    // left the pane's one affordance dead for good.
+    void theBinaryViewStopsWaitingForADownloadThatNeverStarts();
+
+    // THE MARKDOWN IMAGE PATH IS RESOLVED TWICE, in two languages. The rendered
+    // page resolves its own links in TypeScript; the WebChannel image bridge
+    // hands QML the raw document-relative string, so QML resolves that one
+    // itself. Neither can call the other, so the only thing keeping them in
+    // step is a shared table asserted on both sides.
+    void theMarkdownImagePathResolverAgreesWithTheRendererBundle_data();
+    void theMarkdownImagePathResolverAgreesWithTheRendererBundle();
+
+    // ...and the pins those resolved addresses take. A theme change re-renders
+    // the document, which re-requests every image; a view that pinned each
+    // answer again grew its held set on every theme change while one document
+    // stayed open.
+    void theMarkdownViewPinsEachImageAddressExactlyOnce();
 
 private:
     // Load one qrc component into the harness window with `props` as its
@@ -2536,6 +2585,446 @@ void TstPaneIdentity::aRefusedInternalResourceSaysWhyInsteadOfShowingABlankPage(
                  "the refusal never reached the screen");
     QVERIFY2(status->property("text").toString().contains(why),
              qPrintable(status->property("text").toString()));
+}
+
+// ---------------------------------------------------------------------------
+// A layout RELOAD (SPEC 4.5). ch::SessionLayouts republishes a tree and bumps
+// its load generation; the region drops every cached pane, because a reloaded
+// tree can name the very same pane ids and a stale pane would otherwise be
+// handed to a load it does not belong to.
+//
+// Dropping them is only half of it. Each region in the recursive tree keeps its
+// own note of which pane it is showing, and that note survives the pane. The
+// host binds `node` and `layoutGeneration` to the same object, so a reload that
+// republishes an IDENTICAL tree moves only the generation — no `node` change
+// re-runs the leaves — and every region went on believing a destroyed pane was
+// on screen. The layout looked right in every property and the column was
+// empty.
+void TstPaneIdentity::aLayoutReloadRebuildsEveryPaneInTheTree()
+{
+    QVERIFY(openRegion(
+        QStringLiteral("ViewerRegion.qml"),
+        branchNode(QStringLiteral("horizontal"),
+                   QVariantList{leafNode(QStringLiteral("viewer-1")),
+                                branchNode(QStringLiteral("vertical"),
+                                           QVariantList{leafNode(QStringLiteral("viewer-2")),
+                                                        leafNode(QStringLiteral("viewer-3"))})}),
+        /*terminal=*/false));
+
+    const auto panes = [this] { return collect(m_region, isLeafPane); };
+    QTRY_VERIFY(panes().size() == 3);
+    QTest::qWait(kSettleMs);
+
+    const QList<QObject *> live = panes();
+    QList<QPointer<QObject>> before;
+    before.reserve(live.size());
+    for (QObject *pane : live)
+        before.append(QPointer<QObject>(pane));
+
+    // Exactly what a reload of the same layout does: the generation moves and
+    // the tree does not.
+    m_region->setProperty("layoutGeneration", 1.0);
+    QTest::qWait(kSettleMs);
+
+    const QList<QObject *> after = panes();
+    QVERIFY2(after.size() == 3,
+             qPrintable(QStringLiteral("the reload left %1 pane(s) in a 3-leaf tree; the region "
+                                       "is showing nothing where a pane should be: %2")
+                            .arg(after.size())
+                            .arg(describePanes(after))));
+
+    // Every one of them is a NEW object: the old ones belonged to the previous
+    // load and were destroyed with the cache.
+    for (const QPointer<QObject> &old : before) {
+        QVERIFY2(old.isNull(),
+                 "a pane from the previous layout load survived into the reloaded tree");
+    }
+
+    QStringList ids;
+    for (QObject *pane : after)
+        ids.append(pane->property("paneId").toString());
+    ids.sort();
+    QCOMPARE(ids, (QStringList{QStringLiteral("viewer-1"), QStringLiteral("viewer-2"),
+                               QStringLiteral("viewer-3")}));
+
+    // And they are real panes, not zero-extent placeholders left behind by a
+    // sizing pass that never re-ran. QTRY on the first one: the rebuilt panes
+    // are re-parented before the region's next layout pass gives them their
+    // share, so a bare read here measures the gap rather than the result.
+    auto *const firstItem = qobject_cast<QQuickItem *>(after.constFirst());
+    QVERIFY(firstItem);
+    QTRY_VERIFY2(firstItem->width() > 4 && firstItem->height() > 4,
+                 qPrintable(QStringLiteral("pane \"%1\" came back %2x%3 after the reload")
+                                .arg(after.constFirst()->property("paneId").toString())
+                                .arg(firstItem->width())
+                                .arg(firstItem->height())));
+    for (QObject *pane : after) {
+        auto *item = qobject_cast<QQuickItem *>(pane);
+        QVERIFY(item);
+        QVERIFY2(item->width() > 4 && item->height() > 4,
+                 qPrintable(QStringLiteral("pane \"%1\" came back %2x%3 after the reload")
+                                .arg(pane->property("paneId").toString())
+                                .arg(item->width())
+                                .arg(item->height())));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The editor's state banner (SPEC 8.4/8.6). "conflict" and "disconnected" are
+// the two states in which the text on screen cannot be saved, and the editor
+// page prints only a state word in its status line — far too quiet for either.
+//
+// The banner has to be DRAWN, not merely built: a Rectangle with no anchors and
+// no height is 0x0 in the pane's top-left corner, and every property assertion
+// about it passes while the user is shown nothing at all.
+void TstPaneIdentity::theEditorSaysWhenItsFileCannotBeSaved()
+{
+    EditorControllerStub controller;
+    QObject *const pane =
+        openInShell(QStringLiteral("EditorPaneView.qml"), recoveryPaneProps(&controller));
+    QVERIFY(pane);
+
+    // openInShell() returns the instant the Loader has an item, which is BEFORE
+    // the harness Window's first layout pass: at that moment the Loader has not
+    // been given the window's size, so the pane root is 0x0 and every child
+    // anchored to it is zero-width. Measuring there says nothing about this
+    // pane — so wait for the pane itself to have area first, and say so
+    // separately, or a harness that never lays out reads as a broken banner.
+    auto *const paneItem = qobject_cast<QQuickItem *>(pane);
+    QVERIFY(paneItem);
+    QTest::qWait(kSettleMs);
+    QTRY_VERIFY2(paneItem->width() > 100 && paneItem->height() > 100,
+                 qPrintable(QStringLiteral("the harness never laid the pane out: %1x%2")
+                                .arg(paneItem->width())
+                                .arg(paneItem->height())));
+
+    QObject *const banner = childNamed(pane, QStringLiteral("editorStateBanner"));
+    QVERIFY2(banner, "the editor pane has nowhere to say that its file cannot be saved");
+    auto *const bannerItem = qobject_cast<QQuickItem *>(banner);
+    QVERIFY(bannerItem);
+
+    // A file that is loading normally says nothing.
+    QVERIFY(!banner->property("visible").toBool());
+
+    controller.setFileState(QStringLiteral("disconnected"));
+    QTRY_VERIFY2(banner->property("visible").toBool(),
+                 "the connection dropped and the editor never said so");
+    // Full width of the pane, not merely "some" width: the banner is anchored
+    // left and right, so anything less means it is not anchored to the pane at
+    // all. QTRY because a geometry change can be one event-loop turn behind the
+    // property change that revealed it; the assertion itself is not weakened.
+    QTRY_VERIFY2(qFuzzyCompare(bannerItem->width(), paneItem->width())
+                     && bannerItem->height() > 8,
+                 qPrintable(QStringLiteral("the banner is %1x%2 inside a %3-wide pane, so "
+                                           "nothing is drawn however correctly `visible` behaves")
+                                .arg(bannerItem->width())
+                                .arg(bannerItem->height())
+                                .arg(paneItem->width())));
+
+    QObject *const label = childNamed(pane, QStringLiteral("editorStateBannerLabel"));
+    QVERIFY(label);
+    QVERIFY2(label->property("text").toString().contains(QStringLiteral("connection")),
+             qPrintable(label->property("text").toString()));
+
+    // A refused save is the other one, and it is the more dangerous of the two:
+    // the user's edits are at risk rather than merely suspended.
+    controller.setFileState(QStringLiteral("conflict"));
+    QTRY_VERIFY(pane->property("conflicted").toBool());
+    QVERIFY(banner->property("visible").toBool());
+    QVERIFY2(label->property("text").toString().contains(QStringLiteral("changed on the server")),
+             qPrintable(label->property("text").toString()));
+
+    controller.setFileState(QStringLiteral("clean"));
+    QTRY_VERIFY(!banner->property("visible").toBool());
+}
+
+// ---------------------------------------------------------------------------
+// The directory listing is bounded, exactly like the viewer pane's path probe.
+void TstPaneIdentity::theDirectoryListingStopsWaitingForAnAnswerThatNeverArrives()
+{
+    QVERIFY(openRegion(QStringLiteral("ViewerRegion.qml"), leafNode(QStringLiteral("viewer-1")),
+                       /*terminal=*/false));
+    const auto panes = [this] { return collect(m_region, isLeafPane); };
+    QTRY_VERIFY(panes().size() == 1);
+    QObject *const pane = panes().constFirst();
+
+    pane->setProperty("url", QUrl(QStringLiteral("file:///srv/repos/app/")));
+    QTRY_COMPARE(pane->property("kind").toString(), QStringLiteral("directory"));
+
+    QList<QObject *> views;
+    QTRY_VERIFY((views = collect(pane, isDirectoryView)).size() == 1);
+    QObject *const view = views.constFirst();
+
+    QObject *const watchdog = childNamed(view, QStringLiteral("directoryListingWatchdog"));
+    QVERIFY2(watchdog,
+             "nothing bounds the directory listing: a reply that never arrives leaves the view "
+             "saying \"Listing…\" and the pane's header busy for ever");
+
+    // This fixture's client has no transport, so the view's own listDirectory
+    // already failed. That leaves a SETTLED view with nothing outstanding.
+    QTRY_VERIFY(!view->property("errorText").toString().isEmpty());
+    QVERIFY2(!watchdog->property("running").toBool(),
+             "the listing watchdog is armed with no listing outstanding");
+
+    // Twenty seconds is the shipped budget; what is under test is what happens
+    // when it runs out, not how long it is.
+    watchdog->setProperty("interval", 60);
+
+    const QList<QObject *> headers = collect(pane, isPaneHeader);
+    QCOMPARE(headers.size(), 1);
+    QObject *const header = headers.constFirst();
+
+    // A listing the server never answers. Written straight into the view's own
+    // published record of what is outstanding, for the reason the probe test
+    // gives: this fixture cannot leave a real request in flight.
+    view->setProperty("errorText", QString());
+    view->setProperty("loading", true);
+    view->setProperty("requestedPath", QStringLiteral("/srv/repos/app/"));
+    QVERIFY2(watchdog->property("running").toBool(),
+             "an outstanding listing does not arm the watchdog");
+    QVERIFY2(header->property("busy").toBool(),
+             "the pane does not show the listing as in flight");
+
+    QTRY_VERIFY2(view->property("requestedPath").toString().isEmpty(),
+                 "the view sat out its own watchdog and stayed loading");
+    QVERIFY2(!view->property("loading").toBool(), "the view is still loading after giving up");
+    QVERIFY2(!view->property("errorText").toString().isEmpty(),
+             "the view gave up silently, so an empty listing and a lost reply look identical");
+    QVERIFY2(!header->property("busy").toBool(), "the pane is still drawn busy after giving up");
+    QVERIFY2(!watchdog->property("running").toBool(), "the watchdog re-armed itself after firing");
+
+    // A listing that settles normally disarms the watchdog instead of firing
+    // later over whatever the view has moved on to.
+    view->setProperty("requestedPath", QStringLiteral("/srv/repos/app/sub/"));
+    QVERIFY(watchdog->property("running").toBool());
+    view->setProperty("requestedPath", QString());
+    QVERIFY2(!watchdog->property("running").toBool(),
+             "a settled listing leaves its watchdog armed");
+}
+
+// ---------------------------------------------------------------------------
+// A download is bounded for the same reason. The Download button is the binary
+// view's only affordance and it is disabled while a request is pending, so a
+// request the handler never answers took the pane out of service permanently.
+void TstPaneIdentity::theBinaryViewStopsWaitingForADownloadThatNeverStarts()
+{
+    QVERIFY(openRegion(QStringLiteral("ViewerRegion.qml"), leafNode(QStringLiteral("viewer-1")),
+                       /*terminal=*/false));
+    const auto panes = [this] { return collect(m_region, isLeafPane); };
+    QTRY_VERIFY(panes().size() == 1);
+    QObject *const pane = panes().constFirst();
+
+    pane->setProperty("url", QUrl(QStringLiteral("file:///srv/repos/app/archive.tar.gz")));
+    QTRY_COMPARE(pane->property("kind").toString(), QStringLiteral("binary"));
+
+    QList<QObject *> views;
+    QTRY_VERIFY((views = collect(pane, isBinaryView)).size() == 1);
+    QObject *const view = views.constFirst();
+
+    QObject *const watchdog = childNamed(view, QStringLiteral("binaryDownloadWatchdog"));
+    QVERIFY2(watchdog,
+             "nothing bounds a pending download: a request the handler never answers leaves the "
+             "Download button disabled for the life of the pane");
+    QVERIFY(!watchdog->property("running").toBool());
+    watchdog->setProperty("interval", 60);
+
+    QList<QObject *> buttons;
+    QTRY_VERIFY((buttons = collect(pane, isDownloadButton)).size() == 1);
+    QObject *const button = buttons.constFirst();
+    QVERIFY(button->property("enabled").toBool());
+
+    // A request nothing ever answers. Driven through the view's own published
+    // record rather than the button, so the outcome is the watchdog's and not a
+    // refusal this transport-less fixture would produce on its own.
+    view->setProperty("downloadRequested", true);
+    QVERIFY2(watchdog->property("running").toBool(),
+             "a pending download does not arm the watchdog");
+    QVERIFY2(!button->property("enabled").toBool(),
+             "the Download button is still live while a request is pending");
+
+    QTRY_VERIFY2(!view->property("downloadRequested").toBool(),
+                 "the view sat out its own watchdog and stayed pending");
+    QVERIFY2(!view->property("retained").toBool(), "giving up left the internal address pinned");
+    QVERIFY2(!view->property("errorText").toString().isEmpty(),
+             "the view gave up silently, so the user is shown a button that simply works again");
+    QVERIFY2(button->property("enabled").toBool(),
+             "the Download button never came back, so the pane cannot be retried");
+    QVERIFY2(!watchdog->property("running").toBool(), "the watchdog re-armed itself after firing");
+}
+
+// ---------------------------------------------------------------------------
+// The Markdown image path is resolved in TWO places, in two languages.
+//
+// The rendered page (src/web/markdown/src/renderer.ts) resolves its own link
+// targets with isRelativeResource() / pathDirectory() / resolveRemotePath().
+// The image bridge deliberately does not use the answer: it hands QML the RAW
+// document-relative string, and ViewerMarkdownView resolves it against its own
+// copy of the document path, because the address it produces is fed to a remote
+// file read. QML cannot call into the bundle — it is JavaScript in a separate
+// Chromium world reachable only through the frozen WebChannel contract.
+//
+// So the two implementations must agree, and nothing but a shared table can
+// make them. This is that table on the QML side; renderer.test.ts pins the same
+// cases on the other side, and a comment at each end points at the other.
+void TstPaneIdentity::theMarkdownImagePathResolverAgreesWithTheRendererBundle_data()
+{
+    QTest::addColumn<QString>("documentPath");
+    QTest::addColumn<QString>("reference");
+    QTest::addColumn<QString>("expected");
+
+    const QString doc = QStringLiteral("/srv/repos/app/docs/guide.md");
+
+    // The ordinary cases: a sibling, an explicit "./", and a climb.
+    QTest::newRow("sibling") << doc << QStringLiteral("diagram.png")
+                             << QStringLiteral("/srv/repos/app/docs/diagram.png");
+    QTest::newRow("dot-sibling") << doc << QStringLiteral("./diagram.png")
+                                 << QStringLiteral("/srv/repos/app/docs/diagram.png");
+    QTest::newRow("parent") << doc << QStringLiteral("../img/logo.png")
+                            << QStringLiteral("/srv/repos/app/img/logo.png");
+    QTest::newRow("bare-parent") << doc << QStringLiteral("..")
+                                 << QStringLiteral("/srv/repos/app");
+    QTest::newRow("interior-dots") << doc << QStringLiteral("a/../b/./c.png")
+                                   << QStringLiteral("/srv/repos/app/docs/b/c.png");
+
+    // ".." is CLAMPED at the server root on both sides. It does not escape and
+    // it does not produce a relative fragment; it simply stops climbing.
+    QTest::newRow("clamped-at-root")
+        << doc << QStringLiteral("../../../../../../../etc/passwd")
+        << QStringLiteral("/etc/passwd");
+
+    // An absolute server path is taken as it stands.
+    QTest::newRow("absolute") << doc << QStringLiteral("/srv/other/a.png")
+                              << QStringLiteral("/srv/other/a.png");
+
+    // Query and fragment are cut before resolving, on both sides.
+    QTest::newRow("query") << doc << QStringLiteral("img.png?v=2")
+                           << QStringLiteral("/srv/repos/app/docs/img.png");
+    QTest::newRow("fragment") << doc << QStringLiteral("img.png#frag")
+                              << QStringLiteral("/srv/repos/app/docs/img.png");
+
+    // A backslash is an ORDINARY CHARACTER in a POSIX remote path — not a
+    // separator — on both sides, so a name containing one stays one segment.
+    QTest::newRow("backslash") << doc << QStringLiteral("sub\\odd name.png")
+                               << QStringLiteral("/srv/repos/app/docs/sub\\odd name.png");
+
+    // Everything that is NOT a document-relative reference is refused. A
+    // protocol-relative "//host/x" is the dangerous one: it reaches an external
+    // host, and the page's own URL policy refuses it for exactly that reason.
+    QTest::newRow("protocol-relative") << doc << QStringLiteral("//host/x.png") << QString();
+    QTest::newRow("https") << doc << QStringLiteral("https://host/x.png") << QString();
+    QTest::newRow("data") << doc << QStringLiteral("data:image/png;base64,AAAA") << QString();
+    QTest::newRow("empty") << doc << QString() << QString();
+
+    // A "#" or "?" prefix is a same-document reference, not a resource. Refused
+    // by isRelativeResource() on the page — and it MUST be refused here too,
+    // because everything from the first "?" or "#" is cut before resolving, so
+    // "#anchor" would otherwise resolve to the document's own DIRECTORY and
+    // this view would mint a file read for it.
+    QTest::newRow("hash-only") << doc << QStringLiteral("#anchor") << QString();
+    QTest::newRow("query-only") << doc << QStringLiteral("?v=2") << QString();
+
+    // The two DELIBERATE DIVERGENCES from resolveRemotePath(), documented at
+    // both ends. Both go the same way: this side refuses where the page's side
+    // answers, because this answer is fed to a remote file READ while the
+    // page's is used as a link target.
+    //
+    // 1. No document to resolve against. resolveRemotePath("", "a.png") answers
+    //    "/a.png" (renderer.test.ts pins that); this answers "". The view can
+    //    reach the state — its url is empty until one arrives — and the page
+    //    cannot, because its document path is the ?path= query the view wrote.
+    QTest::newRow("no-document") << QString() << QStringLiteral("a.png") << QString();
+
+    // 2. A reference that climbs to the filesystem root. resolveRemotePath()
+    //    answers "/", which is a fine LINK target; "/" is not a file.
+    QTest::newRow("resolves-to-root")
+        << QStringLiteral("/a.md") << QStringLiteral("../..") << QString();
+}
+
+void TstPaneIdentity::theMarkdownImagePathResolverAgreesWithTheRendererBundle()
+{
+    QFETCH(QString, documentPath);
+    QFETCH(QString, reference);
+    QFETCH(QString, expected);
+
+    // An empty bundle url keeps the view's own WebEngineView inert: navigate()
+    // reads it as "go nowhere", so this stays a test of the resolver.
+    QObject *const view = openInShell(
+        QStringLiteral("ViewerMarkdownView.qml"),
+        {{QStringLiteral("markdownBundleUrl"), QString()},
+         {QStringLiteral("url"),
+          documentPath.isEmpty() ? QString()
+                                 : QStringLiteral("file://") + documentPath}});
+    QVERIFY(view);
+
+    QVariant resolved;
+    QVERIFY2(QMetaObject::invokeMethod(view, "resolveImagePath",
+                                       Q_RETURN_ARG(QVariant, resolved),
+                                       Q_ARG(QVariant, reference)),
+             "ViewerMarkdownView has no resolveImagePath()");
+    QCOMPARE(resolved.toString(), expected);
+}
+
+// ---------------------------------------------------------------------------
+// One pin per image address per document.
+//
+// applyTheme() re-renders the whole document on purpose, so a live theme change
+// never opens a second unsanitised insertion path — and the re-render asks the
+// bridge for EVERY image again. A view that pinned each answer took one more
+// pin, and held one more entry, per image per theme change, for as long as the
+// document stayed open. The reference counts balanced, so nothing leaked at
+// teardown and nothing ever showed it.
+void TstPaneIdentity::theMarkdownViewPinsEachImageAddressExactlyOnce()
+{
+    ch::InternalUrlMap &map = ch::InternalUrlMap::shared();
+    const int pinnedBefore = map.retainedCount();
+
+    QObject *const view = openInShell(
+        QStringLiteral("ViewerMarkdownView.qml"),
+        {{QStringLiteral("markdownBundleUrl"), QString()},
+         {QStringLiteral("url"), QStringLiteral("file:///srv/repos/app/docs/guide.md")}});
+    QVERIFY(view);
+
+    // The document itself is pinned by retarget().
+    QTRY_COMPARE(map.retainedCount(), pinnedBefore + 1);
+
+    QObject *const bridge = childNamed(view, QStringLiteral("markdownImageBridge"));
+    QVERIFY2(bridge, "the markdown view exposes no image bridge to its page");
+
+    const auto resolve = [bridge](const QString &reference) {
+        QVariant answer;
+        QMetaObject::invokeMethod(bridge, "resolveImage", Q_RETURN_ARG(QVariant, answer),
+                                  Q_ARG(QVariant, reference));
+        return answer.toString();
+    };
+
+    const QString first = resolve(QStringLiteral("a.png"));
+    QVERIFY2(first.startsWith(QStringLiteral("codeharbor-internal://file/")),
+             qPrintable(first));
+    const QString second = resolve(QStringLiteral("b.png"));
+    QVERIFY(second.startsWith(QStringLiteral("codeharbor-internal://file/")));
+    QVERIFY(second != first);
+    QCOMPARE(map.retainedCount(), pinnedBefore + 3);
+
+    // Exactly what a theme change does: the page re-renders and asks again for
+    // every image it holds.
+    for (int pass = 0; pass < 5; ++pass) {
+        QCOMPARE(resolve(QStringLiteral("a.png")), first);
+        QCOMPARE(resolve(QStringLiteral("b.png")), second);
+    }
+    QVERIFY2(map.retainedCount() == pinnedBefore + 3,
+             qPrintable(QStringLiteral("re-rendering took %1 extra pin(s); the view's held set "
+                                       "grows with every theme change")
+                            .arg(map.retainedCount() - pinnedBefore - 3)));
+
+    // A refused reference is reported as "" — the page's documented "no image"
+    // value — and pins nothing.
+    QCOMPARE(resolve(QStringLiteral("https://host/x.png")), QString());
+    QCOMPARE(resolve(QStringLiteral("#anchor")), QString());
+    QCOMPARE(map.retainedCount(), pinnedBefore + 3);
+
+    // Every pin is given back when the view goes away.
+    m_shell.reset();
+    QTRY_COMPARE(map.retainedCount(), pinnedBefore);
 }
 
 // QTEST_MAIN cannot be used: registerUrlScheme() and QtWebEngineQuick::initialize()

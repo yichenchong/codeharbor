@@ -103,6 +103,10 @@ private slots:
     void groupNameHashIsStableAndInRange();
     void viewerKindsValidateAssignments();
     void paletteHandlesSingleSeedAndNonFiniteValues();
+    void splitTreeCustomTitleNormalisationIsIdempotent();
+    void paletteRefusesAnAbsurdlyLargeRequest();
+    void sessionsModelFilterSettersIgnoreUnchangedValues();
+    void sessionsModelPresenceTracksTheUnfilteredTree();
 };
 
 // Group -> DevSession -> viewer + terminal panes tree.
@@ -1937,6 +1941,38 @@ void TstModels::viewerKindsValidateAssignments()
     QVERIFY(ViewerKinds::canAssign(QStringLiteral("ts"), QStringLiteral("text")));
     QVERIFY(!ViewerKinds::canAssign(QStringLiteral("ts"), QStringLiteral("markdown")));
     QVERIFY(!ViewerKinds::canAssign(QStringLiteral(""), QStringLiteral("text")));
+    QVERIFY(!ViewerKinds::isKnown(QString()));
+
+    // 64 characters is the accepted boundary; the test above pins 65 as too
+    // long, so an off-by-one in either direction now fails something.
+    QCOMPARE(ViewerKinds::normaliseExtension(QString(64, QLatin1Char('x'))),
+             QString(64, QLatin1Char('x')));
+    // Exactly ONE leading dot is stripped: "..md" is not an extension.
+    QVERIFY(ViewerKinds::normaliseExtension(QStringLiteral("..md")).isEmpty());
+    // Non-ASCII is refused outright rather than lower-cased into a key no
+    // handler table contains.
+    QVERIFY(ViewerKinds::normaliseExtension(QStringLiteral("t\u00e4r")).isEmpty());
+
+    // "directory" is a real viewer kind but never a FILE handler, so it is
+    // known yet assignable to no extension at all.
+    QVERIFY(ViewerKinds::isKnown(QStringLiteral("directory")));
+    QVERIFY(!ViewerKinds::canAssign(QStringLiteral("txt"), QStringLiteral("directory")));
+
+    // Every specialised extension still offers the honest text/binary
+    // fallbacks, and offers them LAST so the specialised handler is the
+    // default the user is shown.
+    for (const QString &extension : {QStringLiteral("svg"), QStringLiteral("pdf"),
+                                     QStringLiteral("htm"), QStringLiteral("markdown")}) {
+        const QStringList assignable = ViewerKinds::assignableForExtension(extension);
+        QCOMPARE(assignable.size(), 3);
+        QVERIFY2(ViewerKinds::isKnown(assignable.at(0)), qPrintable(extension));
+        QCOMPARE(assignable.at(1), QStringLiteral("text"));
+        QCOMPARE(assignable.at(2), QStringLiteral("binary"));
+    }
+
+    // An extension with no specialised handler gets exactly those two.
+    QCOMPARE(ViewerKinds::assignableForExtension(QStringLiteral("zig")),
+             QStringList({QStringLiteral("text"), QStringLiteral("binary")}));
 }
 
 void TstModels::paletteHandlesSingleSeedAndNonFiniteValues()
@@ -1960,6 +1996,176 @@ void TstModels::paletteHandlesSingleSeedAndNonFiniteValues()
     QVERIFY(std::isfinite(sanitized.red));
     QVERIFY(std::isfinite(sanitized.green));
     QVERIFY(std::isfinite(sanitized.blue));
+}
+
+// normalizeCustomTitle runs more than once on the same value in a single round
+// trip: the parser normalizes what it reads and the writer normalizes again on
+// the way out. If the second run could still change the value, a stored layout
+// would never compare equal to the one just written and SessionLayouts would
+// keep re-saving it. Two clean-ups can each expose work for the other, which is
+// where that used to go wrong.
+void TstModels::splitTreeCustomTitleNormalisationIsIdempotent()
+{
+    const int limit = SplitNode::kMaxCustomTitleLength;
+
+    // Cutting at the limit lands right after a space that trimming had nothing
+    // to remove from before. The trailing space must not survive.
+    QString spaceAtTheCut(limit - 1, QLatin1Char('x'));
+    spaceAtTheCut.append(QLatin1String(" tail"));
+    const QString cut = SplitNode::normalizeCustomTitle(spaceAtTheCut);
+    QCOMPARE(cut, QString(limit - 1, QLatin1Char('x')));
+
+    // Cutting at the limit splits an emoji in half, and dropping the orphaned
+    // half then exposes the space in front of it. Both must go.
+    QString spaceThenEmoji(limit - 2, QLatin1Char('x'));
+    spaceThenEmoji.append(QLatin1Char(' '));
+    spaceThenEmoji.append(QChar(0xD83D)); // first half of U+1F600
+    spaceThenEmoji.append(QChar(0xDE00)); // second half
+    spaceThenEmoji.append(QLatin1Char('z'));
+    QCOMPARE(SplitNode::normalizeCustomTitle(spaceThenEmoji),
+             QString(limit - 2, QLatin1Char('x')));
+
+    // Whatever the input, normalizing the result again changes nothing.
+    QString emojiRun;
+    for (int i = 0; i < 90; ++i) {
+        emojiRun.append(QChar(0xD83D));
+        emojiRun.append(QChar(0xDE00));
+    }
+    const QStringList inputs{QString(),
+                             QStringLiteral("   "),
+                             QStringLiteral("  Build shell  "),
+                             spaceAtTheCut,
+                             spaceThenEmoji,
+                             emojiRun,
+                             QString(limit + 40, QLatin1Char('y')),
+                             QString(limit, QLatin1Char('y'))};
+    for (const QString &input : inputs) {
+        const QString once = SplitNode::normalizeCustomTitle(input);
+        QCOMPARE(SplitNode::normalizeCustomTitle(once), once);
+        QVERIFY2(once.size() <= limit, qPrintable(QString::number(once.size())));
+    }
+
+    // A leaf carrying such a title still round-trips: the tree it writes is the
+    // tree it reads back, which is the property the writer's own normalization
+    // exists to keep.
+    SplitNode leaf;
+    leaf.paneId = QStringLiteral("terminal-1");
+    leaf.customTitle = spaceThenEmoji;
+    const SplitNode restored = SplitNode::fromJson(wire(leaf));
+    QCOMPARE(restored.customTitle, SplitNode::normalizeCustomTitle(spaceThenEmoji));
+    QVERIFY(restored == leaf);
+}
+
+// Palette expansion compares every pair of colours chosen so far for each new
+// one, so its cost grows with the cube of the requested count. Without an upper
+// bound a hand-edited preference asking for a few thousand colours would freeze
+// the application instead of merely looking wrong, so canGenerate refuses it -
+// the same preflight that already refuses a too-small request.
+void TstModels::paletteRefusesAnAbsurdlyLargeRequest()
+{
+    const QVector<SrgbColor> seed = GroupPalette::tokyoNightSeed();
+
+    QVERIFY(GroupPalette::canGenerate(seed, GroupPalette::kMaxPaletteSize));
+    QVERIFY(!GroupPalette::canGenerate(seed, GroupPalette::kMaxPaletteSize + 1));
+    QVERIFY(!GroupPalette::canGenerate(seed, std::numeric_limits<int>::max()));
+
+    // The cap has to stay above the user-facing preference's own upper bound
+    // (ch::AppSettings::kMaxPaletteSize is 64), or a perfectly legal setting
+    // would produce no palette at all.
+    QVERIFY(GroupPalette::kMaxPaletteSize >= 64);
+    QCOMPARE(GroupPalette::generatePalette(seed, 64).size(), 64);
+}
+
+// Both sidebar filters are written from QML on every binding pass, usually with
+// the value they already hold. Each write that got through would reset the
+// model, throwing away delegate state and the selection, so an unchanged value
+// must do nothing at all - not even emit its own change signal.
+void TstModels::sessionsModelFilterSettersIgnoreUnchangedValues()
+{
+    SessionsModel model;
+    SessionRow s;
+    s.session.id = DevSessionId{QStringLiteral("s1")};
+    GroupRow g;
+    g.group.id = GroupId{QStringLiteral("g1")};
+    g.sessions = {s};
+    model.setGroups({g});
+
+    QSignalSpy reset(&model, &QAbstractItemModel::modelReset);
+    QSignalSpy pinnedChanged(&model, &SessionsModel::pinnedOnlyChanged);
+    QSignalSpy archivedChanged(&model, &SessionsModel::showArchivedChanged);
+
+    model.setPinnedOnly(false);   // already false
+    model.setShowArchived(false); // already false
+    QCOMPARE(reset.count(), 0);
+    QCOMPARE(pinnedChanged.count(), 0);
+    QCOMPARE(archivedChanged.count(), 0);
+
+    // A real change still resets once and announces itself once.
+    model.setPinnedOnly(true);
+    QCOMPARE(reset.count(), 1);
+    QCOMPARE(pinnedChanged.count(), 1);
+    model.setPinnedOnly(true);
+    QCOMPARE(reset.count(), 1);
+    QCOMPARE(pinnedChanged.count(), 1);
+
+    model.setShowArchived(true);
+    QCOMPARE(reset.count(), 2);
+    QCOMPARE(archivedChanged.count(), 1);
+    model.setShowArchived(true);
+    QCOMPARE(reset.count(), 2);
+    QCOMPARE(archivedChanged.count(), 1);
+}
+
+// hasSessions/hasUnarchivedSessions describe the AUTHORITATIVE tree, not the
+// filtered view: they are what lets the sidebar say "all your sessions are
+// archived" instead of presenting a filtered-empty workspace as a brand new
+// one. So they must ignore the client-local filters entirely, and their change
+// signal must fire when the source tree gains or loses sessions - and only then.
+void TstModels::sessionsModelPresenceTracksTheUnfilteredTree()
+{
+    SessionsModel model;
+    QVERIFY(!model.hasSessions());
+    QVERIFY(!model.hasUnarchivedSessions());
+
+    QSignalSpy presence(&model, &SessionsModel::sessionPresenceChanged);
+
+    // A group with no sessions changes nothing about session presence.
+    GroupRow group;
+    group.group.id = GroupId{QStringLiteral("g1")};
+    model.setGroups({group});
+    QVERIFY(!model.hasSessions());
+    QCOMPARE(presence.count(), 0);
+
+    // One archived session: present, but nothing unarchived, and hidden by the
+    // default filter - which is exactly the state the empty-state panel needs
+    // to tell apart from a new workspace.
+    SessionRow archived;
+    archived.session.id = DevSessionId{QStringLiteral("s1")};
+    archived.session.archived = true;
+    GroupRow withArchived = group;
+    withArchived.sessions = {archived};
+    model.setGroups({withArchived});
+    QVERIFY(model.hasSessions());
+    QVERIFY(!model.hasUnarchivedSessions());
+    QCOMPARE(model.rowCount(), 0);
+    QCOMPARE(presence.count(), 1);
+
+    // Filters move what is VISIBLE and never touch presence.
+    model.setShowArchived(true);
+    QCOMPARE(model.rowCount(), 1);
+    QVERIFY(model.hasSessions());
+    QVERIFY(!model.hasUnarchivedSessions());
+    QCOMPARE(presence.count(), 1);
+
+    // Unarchiving the row is a source change, so presence moves again.
+    withArchived.sessions[0].session.archived = false;
+    model.setGroups({withArchived});
+    QVERIFY(model.hasUnarchivedSessions());
+    QCOMPARE(presence.count(), 2);
+
+    // Re-setting identical contents announces nothing.
+    model.setGroups({withArchived});
+    QCOMPARE(presence.count(), 2);
 }
 
 QTEST_GUILESS_MAIN(TstModels)

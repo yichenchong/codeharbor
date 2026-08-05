@@ -1012,7 +1012,7 @@ Rectangle {
                       ? pane.statusText
                       : qsTr("terminal %1").arg(pane.connectionState)
                 color: Theme.warning
-                font.pixelSize: 11
+                font.pixelSize: Theme.fontSizeSmall
             }
             // Sized and coloured to sit INSIDE a 22-pixel banner. The Basic
             // style's default is a light plate at its own metrics, which both
@@ -1055,6 +1055,13 @@ Rectangle {
     Component.onCompleted: {
         pane.initializeController()
         pane.started = true
+        // The renderer is told the pane's CURRENT visibility once, at birth.
+        // onVisibleChanged below only fires on a CHANGE, so a pane created
+        // already hidden (minted into the region's parking lot, or built while
+        // its window is not on screen) would otherwise leave the bridge on its
+        // default assumption and have output flushed at a view nobody sees.
+        if (pane.bridge)
+            pane.bridge.notifyViewVisible(pane.visible)
         pane.attachNow()
     }
 

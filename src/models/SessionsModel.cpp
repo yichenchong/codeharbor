@@ -47,11 +47,14 @@ QVector<GroupRow> filteredGroups(const QVector<GroupRow> &source,
     }
     return filtered;
 }
+
+// Sentinel internalId marking a TOP-LEVEL (group) index. Session indices carry
+// their parent group's row number instead, which is how parent() finds its way
+// back up; no real group row can collide with this value.
+constexpr quintptr kTopLevel = std::numeric_limits<quintptr>::max();
+
 } // namespace
 
-namespace {
-constexpr quintptr kTopLevel = std::numeric_limits<quintptr>::max();
-} // namespace
 SessionsModel::SessionsModel(QObject *parent)
     : QAbstractItemModel(parent)
 {

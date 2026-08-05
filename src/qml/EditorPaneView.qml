@@ -263,8 +263,23 @@ Item {
     // Same treatment TerminalPaneView gives a dropped channel: a thin banner
     // across the top of the pane, so the warning is unmissable without hiding
     // the text the user is still working on.
+    //
+    // The geometry is explicit and load-bearing. A Rectangle with neither
+    // anchors nor a size is 0x0 at the pane's top-left corner, which is what
+    // this was: the banner was built, its `visible` binding flipped correctly,
+    // and nothing was ever drawn. Anchored across the top with the same height
+    // TerminalPaneView's banner uses, the two columns line up.
     Rectangle {
         objectName: "editorStateBanner"
+        anchors.left: parent.left
+        anchors.right: parent.right
+        anchors.top: parent.top
+        height: 22
+        // Drawn over the editor page rather than beside it: this item is
+        // declared after the WebEngineView, and delivery order is declaration
+        // order, so the banner is on top of Monaco's first line instead of
+        // being hidden behind it.
+        z: 1
         // These are dim fills behind danger/warning text and have no direct
         // Theme role; the palette's errorSurface() and warningSurface()
         // helpers keep both shades aligned across dark and light themes.
@@ -288,7 +303,7 @@ Item {
                   ? qsTr("This file changed on the server since it was opened, so the last save was refused. Reload to take the server's copy, or save again to overwrite it.")
                   : qsTr("The connection to the server is down. This file cannot be saved or reloaded until it comes back.")
             color: Theme.warning
-            font.pixelSize: 11
+            font.pixelSize: Theme.fontSizeSmall
         }
     }
 

@@ -145,8 +145,20 @@ void TstLiveTerminalFactory::initTestCase()
     m_bridge = m_factory->createBridge(m_controller, m_pane);
     QVERIFY(m_controller && m_bridge);
 
+    // Collect what the renderer would see, and hand the byte weight back as the
+    // page does. Without the acknowledgement the controller stops emitting once
+    // kMaxUnacknowledgedBytes is outstanding (SPEC 5.4) and this gate would
+    // stop seeing remote output half a megabyte into a run. Posted rather than
+    // called inline, exactly as the page's own acknowledgement is: releasing
+    // retained output re-enters write(), and answering from inside the emission
+    // would recurse.
     connect(m_bridge, &TerminalBridge::write, this,
-            [this](const QString& text) { m_rendered += text; });
+            [this](const QString& text, int bytes) {
+                m_rendered += text;
+                QMetaObject::invokeMethod(
+                    m_bridge, [this, bytes]() { m_bridge->notifyOutputConsumed(bytes); },
+                    Qt::QueuedConnection);
+            });
     connect(m_factory, &TerminalFactory::error, this,
             [this](TerminalController*, const QString& text) { m_factoryErrors += text; });
 

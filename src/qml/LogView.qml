@@ -99,6 +99,22 @@ Rectangle {
         function onEntriesChanged() { root.rebuild(); }
     }
 
+    // This sheet fills the whole window on top of the three regions, but a
+    // Rectangle accepts no input of its own: Qt Quick hands an unaccepted press
+    // to the next item DOWN, so every click that did not happen to land on one
+    // of the controls below went straight through to the terminal or editor
+    // behind the sheet — focusing a pane, or scrolling a shell the user could
+    // not even see. Declared FIRST so every real control still hit-tests above
+    // it; `wheel` is handled too, because a scroll is just as much a stray
+    // input as a click.
+    MouseArea {
+        objectName: "sheetInputShield"
+        anchors.fill: parent
+        acceptedButtons: Qt.AllButtons
+        hoverEnabled: true
+        onWheel: (wheel) => wheel.accepted = true
+    }
+
     ColumnLayout {
         anchors.fill: parent
         anchors.margins: 16
@@ -197,7 +213,12 @@ Rectangle {
                 contentWidth: logText.width
                 contentHeight: logText.height
                 boundsBehavior: Flickable.StopAtBounds
-                flickableDirection: Flickable.VerticalFlick
+                // Entries are NOT wrapped (a log line is easier to scan when
+                // one entry is one line), so the widest line routinely runs
+                // past the sheet. Without a horizontal axis the overflow was
+                // simply clipped and unreachable — a remote stack trace could
+                // be in the buffer and still be unreadable.
+                flickableDirection: Flickable.HorizontalAndVerticalFlick
 
                 onContentYChanged: {
                     if (root._movingTail)
@@ -212,7 +233,11 @@ Rectangle {
                 TextArea {
                     id: logText
                     objectName: "logText"
-                    width: logFlick.width
+                    // Never narrower than the viewport, so a short log still
+                    // fills the well and the click target for `selectAll` is
+                    // the whole area; wider when a line demands it, which is
+                    // what gives the Flickable something to scroll.
+                    width: Math.max(implicitWidth, logFlick.width)
                     height: Math.max(implicitHeight, logFlick.height)
                     text: root.visibleText
                     readOnly: true
@@ -229,7 +254,8 @@ Rectangle {
                     placeholderText: qsTr("No diagnostics yet.")
                 }
 
-                ScrollBar.vertical: AppScrollBar {}
+                ScrollBar.vertical: AppScrollBar { objectName: "logVerticalScroll" }
+                ScrollBar.horizontal: AppScrollBar { objectName: "logHorizontalScroll" }
             }
         }
     }

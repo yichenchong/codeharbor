@@ -180,3 +180,74 @@ test("session_layouts pins one row per region and rejects an unknown region", ()
     assert.deepEqual(rows.map((r) => r.region), ["terminal", "viewer"]);
     db.close();
 });
+
+// The terminal-pane identity rules, spelled out in schema.sql's long comment
+// and relied on by the store: a tmux target names ONE row (two panes on one
+// target drive the same remote shell), an unbound pane is legal and there may
+// be many of them, and a slot LABEL is not an identity, so one Dev Session may
+// hold several rows wearing the same one.
+test("terminal_panes constrains tmux_target only, and allows repeated labels", () => {
+    const db = loadSchema();
+    db.exec(
+        "INSERT INTO groups (id, server_id, name, position, collapsed, created_at, updated_at) VALUES ('g', 's', 'G', 0, 0, 1, 1)",
+    );
+    db.exec(
+        "INSERT INTO dev_sessions (id, server_id, group_id, name, repository_root, position, archived, created_at, updated_at) VALUES ('d', 's', 'g', 'S', '/r', 0, 0, 1, 1)",
+    );
+    const insert = db.prepare(
+        "INSERT INTO terminal_panes (id, server_id, dev_session_id, name, tmux_target, position, created_at, updated_at) VALUES (?, 's', 'd', ?, ?, 0, 1, 1)",
+    );
+    insert.run("t1", "terminal-1", "ch_one");
+    // A second row on the same target is refused...
+    assert.throws(() => insert.run("t2", "terminal-2", "ch_one"));
+    // ...but the same LABEL on a second row is fine, because a label is a
+    // layout slot and not the pane's identity (schema v4 removed that rule).
+    insert.run("t2", "terminal-1", "ch_two");
+    // And any number of panes may have no remote session bound to them: SQLite
+    // treats each NULL as distinct under UNIQUE.
+    insert.run("t3", "terminal-1", null);
+    insert.run("t4", "terminal-1", null);
+    const rows = db
+        .prepare("SELECT id FROM terminal_panes ORDER BY id")
+        .all() as Array<{ id: string }>;
+    assert.deepEqual(rows.map((r) => r.id), ["t1", "t2", "t3", "t4"]);
+    db.close();
+});
+
+// The foreign keys are declared without ON DELETE, i.e. NO ACTION: they REJECT
+// a delete that would orphan a child rather than cascading. That is exactly why
+// Workspace.deleteGroup/deleteSession delete children first, by hand — if these
+// ever became ON DELETE CASCADE the manual cascade would still be correct, but
+// if they became unenforced, a delete would silently strand rows.
+test("the child foreign keys reject an orphaning delete rather than cascading", () => {
+    const db = loadSchema();
+    db.exec(
+        "INSERT INTO groups (id, server_id, name, position, collapsed, created_at, updated_at) VALUES ('g', 's', 'G', 0, 0, 1, 1)",
+    );
+    db.exec(
+        "INSERT INTO dev_sessions (id, server_id, group_id, name, repository_root, position, archived, created_at, updated_at) VALUES ('d', 's', 'g', 'S', '/r', 0, 0, 1, 1)",
+    );
+    db.exec(
+        "INSERT INTO viewer_panes (id, server_id, dev_session_id, url, position, created_at, updated_at) VALUES ('v', 's', 'd', 'http://x', 0, 1, 1)",
+    );
+
+    // A parent that still has children cannot be deleted, at either level.
+    assert.throws(() => db.exec("DELETE FROM dev_sessions WHERE id = 'd'"), /FOREIGN KEY/);
+    assert.throws(() => db.exec("DELETE FROM groups WHERE id = 'g'"), /FOREIGN KEY/);
+    // Nor can a child be inserted under a parent that does not exist.
+    assert.throws(
+        () =>
+            db.exec(
+                "INSERT INTO dev_sessions (id, server_id, group_id, name, repository_root, position, archived, created_at, updated_at) VALUES ('d2', 's', 'nope', 'S', '/r', 0, 0, 1, 1)",
+            ),
+        /FOREIGN KEY/,
+    );
+
+    // Deepest-first is the order that works, which is the order the store uses.
+    db.exec("DELETE FROM viewer_panes WHERE dev_session_id = 'd'");
+    db.exec("DELETE FROM dev_sessions WHERE group_id = 'g'");
+    db.exec("DELETE FROM groups WHERE id = 'g'");
+    const left = db.prepare("SELECT COUNT(*) AS n FROM groups").get() as { n: number };
+    assert.equal(left.n, 0);
+    db.close();
+});

@@ -7,6 +7,7 @@
 
 #include <QtWebEngineQuick/QQuickWebEngineProfile>
 
+#include <QByteArray>
 #include <QCoreApplication>
 #include <QDeadlineTimer>
 #include <QGuiApplication>
@@ -24,6 +25,8 @@
 #include <QWebEngineUrlScheme>
 #include <QtTest/QtTest>
 #include <QtWebEngineQuick/QtWebEngineQuick>
+
+#include <optional>
 
 using ch::CodeharbordClient;
 using ch::InternalUrlMap;
@@ -163,6 +166,8 @@ private slots:
     void profileIsolation();
     void schemeFlags();
     void activeContentMimeGate();
+    void textualMimesDeclareTheirCharset();
+    void readReplyFieldsAreCheckedNotCoerced();
     void activeContentMimeFromExtension();
     void urlMappingRemintAfterEviction();
     void urlMappingBareId();
@@ -171,6 +176,8 @@ private slots:
     void viewerDefaultKindsNotifyAlreadyOpenPanes();
     void validViewKindsMatchHandlerCapabilities();
     void viewerModelWithoutClientReportsErrors();
+    void viewerModelSharesOneInternalUrlTable();
+    void openWithApplicationRefusesBeforeReachingTheDesktop();
     // The order and the shape of the entries the directory pane renders.
     void directoryListingIsSortedDirectoriesFirst();
     void openAsKindsFollowRegistryClaims();
@@ -449,6 +456,25 @@ void TstViewers::applicationSchemeValidationAndEscaping()
         QVERIFY2(!ViewerHandlerRegistry::isValidApplicationScheme(scheme),
                  qPrintable(scheme));
 
+    // Pseudo-schemes whose "path" is a program or a document body, not a
+    // locator. Each spells a valid URI scheme, so the grammar check above lets
+    // them through; each also turns a server-supplied string into something the
+    // receiving browser EXECUTES, and applicationUrl()'s percent-escaping does
+    // not disarm that — the browser un-escapes it again on the way in. A
+    // desktop handler runs with the user's full privileges, so these never
+    // leave the application.
+    for (const QString &scheme :
+         {QStringLiteral("javascript"), QStringLiteral("JavaScript"),
+          QStringLiteral("vbscript"), QStringLiteral("data"),
+          QStringLiteral("blob"), QStringLiteral("about"),
+          QStringLiteral("view-source"), QStringLiteral("filesystem")}) {
+        QVERIFY2(!ViewerHandlerRegistry::isValidApplicationScheme(scheme),
+                 qPrintable(scheme));
+        QVERIFY2(!ViewerHandlerRegistry::applicationUrl(
+                      scheme, QStringLiteral("alert(1)")).isValid(),
+                 qPrintable(scheme));
+    }
+
     const QUrl escaped = ViewerHandlerRegistry::applicationUrl(
         QStringLiteral("my-app"),
         QStringLiteral("/srv/repo/notes #1?draft=1%done"));
@@ -657,6 +683,10 @@ void TstViewers::activeContentMimeGate()
         QByteArrayLiteral("multipart/related"),
         QByteArrayLiteral("message/rfc822"),
         QByteArrayLiteral("application/x-mimearchive"),
+        // shared-mime-info's name for a gzipped SVG (.svgz). It is the same
+        // scriptable document, and it does NOT end in "+xml", so the suffix
+        // rule alone would have let the one compressed SVG spelling through.
+        QByteArrayLiteral("image/svg+xml-compressed"),
     };
     for (const QByteArray &m : active)
         QVERIFY2(InternalUrlSchemeHandler::isActiveContentMime(m), m.constData());
@@ -681,6 +711,154 @@ void TstViewers::activeContentMimeGate()
     };
     for (const QByteArray &m : passive)
         QVERIFY2(!InternalUrlSchemeHandler::isActiveContentMime(m), m.constData());
+}
+
+void TstViewers::textualMimesDeclareTheirCharset()
+{
+    // The bytes are the raw remote file bytes, served as UTF-8 by the file
+    // service. Without an explicit charset Chromium guesses from the locale and
+    // a UTF-8 file with any non-ASCII character renders as mojibake — invisible
+    // in ASCII-only content, which is why it is asserted directly.
+    for (const QByteArray &m : {
+             QByteArrayLiteral("text/plain"),
+             QByteArrayLiteral("text/markdown"),
+             QByteArrayLiteral("text/html"),
+             QByteArrayLiteral("text/javascript"),
+             QByteArrayLiteral("text/csv"),
+             QByteArrayLiteral("application/xml"),
+             QByteArrayLiteral("application/json"),
+             QByteArrayLiteral("application/xhtml+xml"),
+             QByteArrayLiteral("image/svg+xml"),
+             // The structured "+json" suffix, e.g. .ipynb.
+             QByteArrayLiteral("application/x-ipynb+json"),
+             // application/* spellings shared-mime-info produces for ordinary
+             // configuration files.
+             QByteArrayLiteral("application/yaml"),
+             QByteArrayLiteral("application/toml"),
+             QByteArrayLiteral("application/javascript"),
+         })
+        QVERIFY2(InternalUrlSchemeHandler::isTextualMime(m), m.constData());
+
+    // Binary payloads must NOT gain a charset: an image or a PDF labelled
+    // "; charset=utf-8" is a lie about bytes that are not text at all.
+    for (const QByteArray &m : {
+             QByteArrayLiteral("image/png"),
+             QByteArrayLiteral("image/jpeg"),
+             QByteArrayLiteral("application/pdf"),
+             QByteArrayLiteral("application/octet-stream"),
+             QByteArrayLiteral("application/zip"),
+             QByteArrayLiteral("image/svg+xml-compressed"),
+         })
+        QVERIFY2(!InternalUrlSchemeHandler::isTextualMime(m), m.constData());
+
+    // Same tolerances as the active-content gate: case, and a parameter that a
+    // future MIME source might attach.
+    QVERIFY(InternalUrlSchemeHandler::isTextualMime(QByteArrayLiteral("TEXT/PLAIN")));
+    QVERIFY(InternalUrlSchemeHandler::isTextualMime(
+        QByteArrayLiteral("text/plain; charset=utf-8")));
+
+    // The whole point of the seam: the extensions the internal scheme actually
+    // serves get the right answer through mimeForPath().
+    QVERIFY(InternalUrlSchemeHandler::isTextualMime(
+        InternalUrlSchemeHandler::mimeForPath(QStringLiteral("/a/README.md"))));
+    QVERIFY(!InternalUrlSchemeHandler::isTextualMime(
+        InternalUrlSchemeHandler::mimeForPath(QStringLiteral("/a/logo.png"))));
+}
+
+void TstViewers::readReplyFieldsAreCheckedNotCoerced()
+{
+    using Failure = InternalUrlSchemeHandler::Failure;
+    const auto decode = [](const QJsonObject &reply, QByteArray *bytes) {
+        return InternalUrlSchemeHandler::decodeReadReply(reply, bytes);
+    };
+    const auto reply = [](const QString &encoding, const QString &content,
+                          const QJsonValue &truncated) {
+        return QJsonObject{{QStringLiteral("encoding"), encoding},
+                           {QStringLiteral("content"), content},
+                           {QStringLiteral("truncated"), truncated}};
+    };
+
+    // The happy paths: text verbatim as UTF-8, binary through a strict base64
+    // decode.
+    QByteArray bytes;
+    QVERIFY(!decode(reply(QStringLiteral("utf-8"), QStringLiteral("héllo"), false),
+                    &bytes));
+    QCOMPARE(bytes, QStringLiteral("héllo").toUtf8());
+
+    bytes.clear();
+    QVERIFY(!decode(reply(QStringLiteral("base64"), QStringLiteral("AAECA/8="), false),
+                    &bytes));
+    QCOMPARE(bytes, QByteArray::fromHex("000102 03ff"));
+
+    // An empty file is a successful read of nothing, not a failure.
+    bytes = QByteArrayLiteral("stale");
+    QVERIFY(!decode(reply(QStringLiteral("utf-8"), QString(), false), &bytes));
+    QVERIFY(bytes.isEmpty());
+
+    // `truncated` is the server's answer to "is this the WHOLE file?", and this
+    // handler can only serve a complete resource. A prefix is refused with the
+    // sentence the pane shows.
+    bytes.clear();
+    QCOMPARE(decode(reply(QStringLiteral("utf-8"), QStringLiteral("prefix"), true),
+                    &bytes),
+             std::optional<Failure>(Failure::TooLarge));
+    QVERIFY(bytes.isEmpty());
+
+    // ...and a reply that does not answer the question is a failure, never a
+    // default. QJsonValue::toBool() reads absent, null and string values as
+    // false, so coercion here would serve the first 8 MB of a video as though
+    // that were the whole document.
+    for (const QJsonValue &notABool :
+         {QJsonValue(), QJsonValue(QJsonValue::Null), QJsonValue(QStringLiteral("no")),
+          QJsonValue(1)}) {
+        bytes.clear();
+        QCOMPARE(decode(reply(QStringLiteral("utf-8"), QStringLiteral("x"), notABool),
+                        &bytes),
+                 std::optional<Failure>(Failure::MalformedReply));
+        QVERIFY(bytes.isEmpty());
+    }
+
+    // An unlisted encoding cannot be defaulted to utf-8: for a base64 payload
+    // that would serve the base64 alphabet itself where the image belongs, and
+    // call it a successful read.
+    for (const QString &encoding :
+         {QStringLiteral("binary"), QStringLiteral("BASE64"), QStringLiteral("utf8"),
+          QStringLiteral("")}) {
+        bytes.clear();
+        QCOMPARE(decode(reply(encoding, QStringLiteral("AAEC"), false), &bytes),
+                 std::optional<Failure>(Failure::MalformedReply));
+        QVERIFY(bytes.isEmpty());
+    }
+    bytes.clear();
+    QCOMPARE(decode(QJsonObject{{QStringLiteral("content"), QStringLiteral("x")},
+                                {QStringLiteral("truncated"), false}},
+                    &bytes),
+             std::optional<Failure>(Failure::MalformedReply));
+
+    // A missing or non-string `content` is not an empty document.
+    for (const QJsonValue &notAString :
+         {QJsonValue(), QJsonValue(QJsonValue::Null), QJsonValue(42),
+          QJsonValue(QJsonArray{})}) {
+        bytes.clear();
+        QCOMPARE(decode(QJsonObject{{QStringLiteral("encoding"), QStringLiteral("utf-8")},
+                                    {QStringLiteral("content"), notAString},
+                                    {QStringLiteral("truncated"), false}},
+                        &bytes),
+                 std::optional<Failure>(Failure::MalformedReply));
+        QVERIFY(bytes.isEmpty());
+    }
+
+    // A corrupt base64 payload is reported, not served as an empty but
+    // "successful" document — QByteArray::fromBase64() would silently return
+    // garbage for each of these.
+    for (const QString &corrupt :
+         {QStringLiteral("AAE!"), QStringLiteral("===="),
+          QStringLiteral("AAECA/8==")}) {
+        bytes.clear();
+        QCOMPARE(decode(reply(QStringLiteral("base64"), corrupt, false), &bytes),
+                 std::optional<Failure>(Failure::UndecodableContent));
+        QVERIFY(bytes.isEmpty());
+    }
 }
 
 void TstViewers::activeContentMimeFromExtension()
@@ -919,6 +1097,62 @@ void TstViewers::viewerModelWithoutClientReportsErrors()
              QStringLiteral("/p/README.md"));
 }
 
+void TstViewers::viewerModelSharesOneInternalUrlTable()
+{
+    // QML never touches InternalUrlMap directly: it mints, resolves and pins
+    // through the model, which must forward to the SAME table the scheme
+    // handler resolves against. A model that made its own would hand panes
+    // addresses the browser could never resolve.
+    InternalUrlMap map(2);
+    ViewerModel viewers(nullptr, &map);
+    const QUrl file(QStringLiteral("file:///p/logo.png"));
+
+    const QString internal = viewers.internalUrlFor(file);
+    QVERIFY(internal.startsWith(InternalUrlMap::prefix()));
+    QCOMPARE(map.fileUrlFor(internal), file);
+    QCOMPARE(viewers.fileUrlFor(internal), file);
+    // Minting twice is stable, which is what stops a reload from creating a
+    // second identity for a file already on screen.
+    QCOMPARE(viewers.internalUrlFor(file), internal);
+
+    // The pin/release pair a displaying pane owns.
+    QVERIFY(viewers.retainInternalUrl(internal));
+    QCOMPARE(map.retainedCount(), 1);
+    for (int i = 0; i < 6; ++i)
+        viewers.internalUrlFor(QUrl(QStringLiteral("file:///p/o%1.txt").arg(i)));
+    QCOMPARE(viewers.fileUrlFor(internal), file); // survived the churn
+    viewers.releaseInternalUrl(internal);
+    QCOMPARE(map.retainedCount(), 0);
+
+    // An address the table never issued pins nothing and says so, so a pane
+    // knows not to issue the matching release.
+    QVERIFY(!viewers.retainInternalUrl(
+        QStringLiteral("codeharbor-internal://file/deadbeef")));
+    QVERIFY(!viewers.fileUrlFor(QStringLiteral("codeharbor-internal://file/deadbeef"))
+                 .isValid());
+}
+
+void TstViewers::openWithApplicationRefusesBeforeReachingTheDesktop()
+{
+    // The one client path that hands a remote-derived string to the local
+    // desktop. Every rejection happens in ViewerHandlerRegistry::applicationUrl,
+    // BEFORE QDesktopServices is consulted, so these cases launch nothing at
+    // all — which is also why they are safe to assert in a unit test.
+    ViewerModel viewers;
+    for (const QString &scheme :
+         {QStringLiteral("javascript"), QStringLiteral("data"),
+          QStringLiteral("file"), QStringLiteral("codeharbor-internal"),
+          QStringLiteral("app_name"), QString()}) {
+        QVERIFY2(!viewers.isValidApplicationScheme(scheme), qPrintable(scheme));
+        QVERIFY2(!viewers.openWithApplication(scheme, QStringLiteral("/srv/x")),
+                 qPrintable(scheme));
+    }
+    // A legal scheme with nothing to open is refused too: an empty path would
+    // become the bare "zed:" URL, which names no file.
+    QVERIFY(viewers.isValidApplicationScheme(QStringLiteral("zed")));
+    QVERIFY(!viewers.openWithApplication(QStringLiteral("zed"), QString()));
+}
+
 void TstViewers::directoryListingIsSortedDirectoriesFirst()
 {
     // The server states no order, so the model imposes one: directories first,
@@ -988,6 +1222,34 @@ void TstViewers::directoryListingIsSortedDirectoriesFirst()
     pair.respondResult(pair.nextRequest(), QJsonObject{});
     QTRY_COMPARE(failures.size(), 1);
     QCOMPARE(failures.at(0).at(0).toString(), QStringLiteral("/p/malformed"));
+
+    // A single unusable ENTRY fails the whole listing too. A pane that silently
+    // dropped it would show a directory that is missing a file, and the user
+    // would conclude the file is not there.
+    const QJsonArray malformedEntries[] = {
+        // Not an object at all.
+        QJsonArray{QJsonValue(QStringLiteral("plain.txt"))},
+        // No name.
+        QJsonArray{QJsonObject{{QStringLiteral("kind"), QStringLiteral("file")}}},
+        // No kind, so the pane could not tell a folder from a file.
+        QJsonArray{QJsonObject{{QStringLiteral("name"), QStringLiteral("a.txt")}}},
+        // A name of the wrong type.
+        QJsonArray{QJsonObject{{QStringLiteral("name"), 7},
+                               {QStringLiteral("kind"), QStringLiteral("file")}}},
+    };
+    int expected = failures.size();
+    for (const QJsonArray &entries : malformedEntries) {
+        const QString path =
+            QStringLiteral("/p/bad%1").arg(expected);
+        viewers.listDirectory(path);
+        pair.respondResult(pair.nextRequest(),
+                           QJsonObject{{QStringLiteral("entries"), entries}});
+        ++expected;
+        QTRY_COMPARE(failures.size(), expected);
+        QCOMPARE(failures.last().at(0).toString(), path);
+    }
+    // ...and no partial listing was published alongside the failure.
+    QCOMPARE(listings.size(), 2);
 }
 
 void TstViewers::resolvePathCarriesTheRepositoryRootFlag()
@@ -1228,6 +1490,14 @@ void TstViewers::responseHeadersLetSvgStyleItself()
         // resource. Saying "none" is the honest answer.
         QCOMPARE(headers.value(QByteArrayLiteral("Accept-Ranges")),
                  QByteArrayLiteral("none"));
+        // ...and neither may be cached. An internal URL is stable for as long
+        // as its file is retained, but the FILE is a live file on a server the
+        // user is also editing on. A cached response would keep showing the
+        // picture as it was when the pane first loaded it, through every
+        // reload, and there is no ETag or conditional-request path here to
+        // revalidate with.
+        QCOMPARE(headers.value(QByteArrayLiteral("Cache-Control")),
+                 QByteArrayLiteral("no-store"));
     }
 }
 
@@ -1242,7 +1512,7 @@ void TstViewers::refusalMessagesExplainThemselves()
         Failure::UnknownResource,  Failure::NotARemoteFile,
         Failure::EmptyPath,        Failure::NoClient,
         Failure::ReadFailed,       Failure::TooLarge,
-        Failure::UndecodableContent,
+        Failure::UndecodableContent, Failure::MalformedReply,
     };
     QSet<QString> seen;
     for (Failure f : all) {

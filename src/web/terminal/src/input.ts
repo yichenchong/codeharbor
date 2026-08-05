@@ -14,9 +14,42 @@ function codePointLength(codePoint: number): number {
     return codePoint > 0xffff ? 2 : 1;
 }
 
-function isCsiFinal(byte: number): boolean {
-    return byte >= 0x40 && byte <= 0x7e;
+/**
+ * UTF-8 byte length of `text`, computed arithmetically.
+ *
+ * TextEncoder would allocate a fresh Uint8Array for every token measured — one
+ * per character on ordinary text — which is a lot of garbage for a paste the
+ * size of a log file. A lone surrogate counts as three bytes because that is
+ * what TextEncoder emits for it (U+FFFD).
+ */
+function utf8Length(text: string): number {
+    let bytes = 0;
+    for (let index = 0; index < text.length; ++index) {
+        const unit = text.charCodeAt(index);
+        if (unit < 0x80) {
+            bytes += 1;
+        } else if (unit < 0x800) {
+            bytes += 2;
+        } else if (unit >= 0xd800 && unit <= 0xdbff && index + 1 < text.length
+            && text.charCodeAt(index + 1) >= 0xdc00
+            && text.charCodeAt(index + 1) <= 0xdfff) {
+            bytes += 4; // a surrogate PAIR is one four-byte character
+            ++index;
+        } else {
+            bytes += 3;
+        }
+    }
+    return bytes;
 }
+
+// CAN and SUB abandon whatever control sequence is in progress and put the
+// parser back on ordinary text. This scanner has to agree with the parsers on
+// either side of it — @xterm/xterm routes both bytes to GROUND from every
+// escape, CSI and string state, and so does the C++ scanner in
+// src/terminal/TerminalController.cpp. Without them an unterminated control
+// string in a paste swallows the whole remainder of the paste into one token.
+const kCancelByte = 0x18;
+const kSubstituteByte = 0x1a;
 
 function ansiTokenEnd(text: string, start: number): number {
     if (text.charCodeAt(start) !== 0x1b) {
@@ -33,7 +66,10 @@ function ansiTokenEnd(text: string, start: number): number {
     if (introducer === 0x5b) {
         for (let index = start + 2; index < text.length; ++index) {
             const byte = text.charCodeAt(index);
-            if (isCsiFinal(byte)) {
+            if (byte >= 0x40 && byte <= 0x7e) {
+                return index + 1; // CSI final byte
+            }
+            if (byte === kCancelByte || byte === kSubstituteByte) {
                 return index + 1;
             }
             // A new ESC starts a new sequence. Keeping it outside an unfinished
@@ -45,13 +81,21 @@ function ansiTokenEnd(text: string, start: number): number {
         return text.length;
     }
 
-    // OSC, DCS, SOS, PM and APC are string controls. They end at BEL or ST
-    // (ESC backslash), not at the first printable byte.
+    // OSC, DCS, SOS, PM and APC are string controls. They end at ST (ESC
+    // backslash), not at the first printable byte. BEL terminates an OSC and
+    // NOTHING else: a DCS payload (a sixel image, a DECRQSS reply) may
+    // legitimately carry a 0x07 byte, and cutting there would split the
+    // sequence this function exists to keep whole. Same rule as the C++ scanner
+    // in src/terminal/TerminalController.cpp.
     if (introducer === 0x5d || introducer === 0x50 || introducer === 0x58
         || introducer === 0x5e || introducer === 0x5f) {
+        const bellTerminates = introducer === 0x5d;
         for (let index = start + 2; index < text.length; ++index) {
             const byte = text.charCodeAt(index);
-            if (byte === 0x07) {
+            if (bellTerminates && byte === 0x07) {
+                return index + 1;
+            }
+            if (byte === kCancelByte || byte === kSubstituteByte) {
                 return index + 1;
             }
             if (byte === 0x1b && text.charCodeAt(index + 1) === 0x5c) {
@@ -96,7 +140,6 @@ export function chunkTerminalInput(
         throw new RangeError("maxBytes must be a positive integer");
     }
 
-    const encoder = new TextEncoder();
     const chunks: string[] = [];
     let chunk = "";
     let chunkBytes = 0;
@@ -105,7 +148,7 @@ export function chunkTerminalInput(
     while (index < text.length) {
         const end = ansiTokenEnd(text, index);
         const token = text.slice(index, end);
-        const tokenBytes = encoder.encode(token).byteLength;
+        const tokenBytes = utf8Length(token);
 
         if (chunk.length > 0 && chunkBytes + tokenBytes > maxBytes) {
             chunks.push(chunk);
@@ -164,7 +207,13 @@ export class TerminalInputWriter {
         if (this.closed || data.length === 0) {
             return;
         }
-        this.backlog.push(...chunkTerminalInput(data, this.maxBytes));
+        // Appended one at a time rather than spread into push(): a paste split
+        // into more chunks than the engine's argument limit (hundreds of
+        // thousands, which a small maxBytes reaches easily) makes the spread
+        // form throw RangeError and lose the whole paste.
+        for (const chunk of chunkTerminalInput(data, this.maxBytes)) {
+            this.backlog.push(chunk);
+        }
         this.pump();
     }
 
@@ -186,9 +235,12 @@ export class TerminalInputWriter {
             this.sink.sendInput(chunk);
         } finally {
             this.inFlight = false;
-        }
-        if (this.backlog.length > 0 && !this.closed) {
-            queueMicrotask(() => this.pump());
+            // Scheduled from the finally block so a sink that throws (a bridge
+            // torn down mid-paste) costs one chunk rather than stranding every
+            // chunk behind it with nothing left to restart the drain.
+            if (this.backlog.length > 0 && !this.closed) {
+                queueMicrotask(() => this.pump());
+            }
         }
     }
 }

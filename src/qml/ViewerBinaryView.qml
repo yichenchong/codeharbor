@@ -70,6 +70,38 @@ Rectangle {
     }
     Component.onDestruction: root.clearPendingDownload()
 
+    // The wait is BOUNDED. `downloadRequested` is cleared by exactly two
+    // things — the profile accepting the download, or the handler reporting a
+    // refusal — and neither happens if the request never reaches the handler
+    // at all (an SSH session that dropped between the click and the fetch).
+    // The Download button is disabled while a request is pending, so without
+    // this the pane's one affordance stayed dead for the rest of its life.
+    // Same budget as ViewerPane's path probe and the terminal's identity
+    // watchdog; giving up says so and re-enables the button.
+    Timer {
+        id: downloadWatchdog
+        // Named so a test can shorten the wait instead of sitting out twenty
+        // real seconds.
+        objectName: "binaryDownloadWatchdog"
+        interval: 20000
+        repeat: false
+        onTriggered: {
+            if (!root.downloadRequested)
+                return;
+            root.clearPendingDownload();
+            root.errorText = qsTr("The server never started this download.");
+        }
+    }
+
+    // One place that arms and disarms it, so no settle path can forget: every
+    // route out of a download clears `downloadRequested`.
+    onDownloadRequestedChanged: {
+        if (root.downloadRequested)
+            downloadWatchdog.restart();
+        else
+            downloadWatchdog.stop();
+    }
+
     // A failure is this view's own only if it names the address this view
     // asked for: ONE ViewerModel is shared by every pane and they all listen
     // here. Same rule ViewerPane applies to its probe replies.
@@ -171,11 +203,14 @@ Rectangle {
                 // the click and the profile's callback.
                 root.retained = root.viewerModel.retainInternalUrl(root.pendingDownloadUrl);
                 root.downloadRequested = true;
+                // The renderer is minted on the first click and kept from then
+                // on; `active` is already true on a retry.
+                downloadLoader.active = true;
                 // Cleared first: a retry after a refusal would otherwise assign
                 // the very same address the hidden view already holds, which is
                 // a no-op and starts no request at all.
-                downloader.url = "";
-                downloader.url = root.pendingDownloadUrl;
+                downloadLoader.item.url = "";
+                downloadLoader.item.url = root.pendingDownloadUrl;
             }
         }
 
@@ -196,16 +231,30 @@ Rectangle {
     }
 
     // Hidden view that drives the download through the internal scheme handler.
-    WebEngineView {
-        id: downloader
+    //
+    // Behind a Loader, because it is a WHOLE CHROMIUM RENDERER and most binary
+    // panes are never downloaded from: a directory of archives used to cost one
+    // renderer process per pane just to show a file name and a button. Loaders
+    // are synchronous, so `downloadLoader.item` is usable in the same statement
+    // that activates it.
+    //
+    // Once activated it STAYS activated for the life of the view. Tearing the
+    // view down after a download was accepted would be the one thing that could
+    // interrupt a transfer in progress, for the sake of a renderer the user has
+    // already shown they want.
+    Loader {
+        id: downloadLoader
+        active: false
         visible: false
         width: 0
         height: 0
-        profile: root.viewerModel ? root.viewerModel.internalProfile() : null
-        // Untrusted bytes: never let this hidden view execute scripts.
-        settings.javascriptEnabled: false
-        settings.localContentCanAccessFileUrls: false
-        settings.localContentCanAccessRemoteUrls: false
+        sourceComponent: WebEngineView {
+            profile: root.viewerModel ? root.viewerModel.internalProfile() : null
+            // Untrusted bytes: never let this hidden view execute scripts.
+            settings.javascriptEnabled: false
+            settings.localContentCanAccessFileUrls: false
+            settings.localContentCanAccessRemoteUrls: false
+        }
     }
 
     Connections {

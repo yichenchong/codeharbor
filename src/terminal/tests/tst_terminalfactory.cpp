@@ -201,6 +201,7 @@ private slots:
     void bridgeIsInertOnceItsControllerIsDestroyed();
     void bridgeDestructorHidesItsController();
     void bridgeDecodesUtf8SplitAcrossFlushes();
+    void bridgeStartsAFreshDecodeForAReplacementRenderer();
     void bridgeCarriesByteWeightAndFeedsAcknowledgementsBack();
     void bridgeReportsStateTransitionsAsStrings();
     void bridgeClearIsAViewOnlyRequest();
@@ -978,6 +979,40 @@ void TstTerminalFactory::bridgeDecodesUtf8SplitAcrossFlushes()
     QCOMPARE(writes.count(), 2);
     QCOMPARE(writes.at(1).at(0).toString(), QString::fromUtf8("\xE2\x9C\x94"));
     QCOMPARE(writes.at(1).at(1).toInt(), 3);
+}
+
+// A page reload leaves the bridge's stateful UTF-8 decoder holding the lead
+// bytes of a character whose tail was handed to the page that is going away.
+// Those bytes were EMITTED, so the controller is not retaining them and they
+// are never coming back. Left in the decoder they would be completed from the
+// first bytes the replacement renderer is sent, painting one wrong glyph at the
+// top of a screen the user is looking at. The mount handshake starts the decode
+// over, exactly as it starts the flow-control account over.
+void TstTerminalFactory::bridgeStartsAFreshDecodeForAReplacementRenderer()
+{
+    QObject pane;
+    TerminalFactory factory(nullptr);
+    TerminalController* controller = factory.create(&pane);
+    TerminalBridge* bridge = factory.createBridge(controller, &pane);
+    bridge->ready();
+    QSignalSpy writes(bridge, &TerminalBridge::write);
+
+    // Two thirds of "✔" (E2 9C 94) reach the page's decoder and stay there.
+    emit controller->flushReady(QByteArrayLiteral("\xE2\x9C"));
+    QCOMPARE(writes.count(), 0);
+
+    // The page reloads and announces itself. Its first batch is plain ASCII.
+    bridge->ready();
+    emit controller->flushReady(QByteArrayLiteral("fresh"));
+
+    QCOMPARE(writes.count(), 1);
+    // Exactly the new batch: no replacement character in front of it from the
+    // half-character the previous renderer took with it.
+    QCOMPARE(writes.at(0).at(0).toString(), QStringLiteral("fresh"));
+    QVERIFY(!writes.at(0).at(0).toString().contains(QChar(0xFFFD)));
+    // And only the new batch's bytes are charged, so the page can hand back
+    // exactly what it was told.
+    QCOMPARE(writes.at(0).at(1).toInt(), 5);
 }
 
 // The flow-control loop across the bridge: what write() advertises as the byte

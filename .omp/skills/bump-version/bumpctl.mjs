@@ -21,7 +21,7 @@
 // builds the complete new text of every file in memory before it writes a
 // single byte. A malformed lock file or a pattern that no longer matches
 // therefore leaves the whole tree untouched, instead of half-bumped.
-import { readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { isAbsolute, join, relative, resolve } from "node:path";
 
 const CONFIG_NAME = ".bumpversion.json";
@@ -235,8 +235,17 @@ function loadRegexSource(root, source) {
         `the release version`,
     );
   }
+  // Validate the captured text BEFORE reading its offsets. A pattern whose one
+  // capturing group sits inside an alternative that did not participate (say
+  // `LEGACY_VERSION|VERSION (\d+\.\d+\.\d+)`) matches the file, but the group
+  // captured nothing: `indices[1]` is then undefined, and destructuring it
+  // first crashed with a bare "Cannot destructure property" stack instead of
+  // saying which configured source is at fault.
+  const version = checkSemver(
+    matches[0][1],
+    `${source.path}: the text captured by the configured pattern`,
+  );
   const [start, end] = matches[0].indices[1];
-  const version = checkSemver(matches[0][1], `${source.path}: the captured text`);
   return {
     path: source.path,
     absolute,
@@ -414,6 +423,11 @@ function commandApply(config, version) {
     path: source.path,
     absolute: source.absolute,
     original: readFileSync(source.absolute),
+    // The replacement is written to a fresh file and renamed over the target,
+    // which would otherwise give it whatever the umask says rather than the
+    // mode the original had. Carry the original mode across, so a version file
+    // that is also an executable script does not silently lose its +x bit.
+    mode: statSync(source.absolute).mode,
     content: source.render(version),
   }));
 
@@ -425,6 +439,7 @@ function commandApply(config, version) {
     for (const file of pending) {
       const temporary = `${file.absolute}.bumpctl-${process.pid}`;
       writeFileSync(temporary, file.content);
+      chmodSync(temporary, file.mode);
       staged.push({ ...file, temporary });
     }
   } catch (error) {

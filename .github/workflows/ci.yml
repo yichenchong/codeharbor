@@ -29,6 +29,7 @@ jobs:
   remote:
     name: remote (node)
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -78,6 +79,9 @@ jobs:
   client:
     name: client (${{ matrix.name }})
     runs-on: ${{ matrix.os }}
+    # GitHub's default job timeout is SIX HOURS; a wedged Qt WebEngine build or
+    # a hung test would otherwise sit on a runner for that long.
+    timeout-minutes: 120
     strategy:
       # One platform's failure must not hide the other two: the whole point is
       # to learn about every platform per commit, not the first one to break.
@@ -225,10 +229,14 @@ jobs:
         shell: bash
       # BD24: type-check every web workspace. esbuild strips types without
       # checking them, so a TS error anywhere in src/web/* would otherwise reach
-      # a shipped bundle unreported. The root workspaces script runs tsc
-      # --noEmit across editor, terminal and markdown; a type error here fails
-      # CI before configure.
-      - name: Typecheck web bundles
+      # a shipped bundle unreported; a type error here fails CI before configure.
+      #
+      # The root script runs `tsc --noEmit` across EVERY workspace, which
+      # includes remote/ as well as the three web ones. That overlaps with the
+      # `remote` job on purpose and is not worth narrowing: it is seconds of
+      # work, and it means this job's Windows and macOS legs type-check the
+      # remote sources too, which the Linux-only `remote` job never does.
+      - name: Typecheck every workspace
         run: npm run typecheck
         shell: bash
       # The web bundles ship real logic (Monaco language selection, unsaved-work
@@ -294,6 +302,7 @@ jobs:
   installer-script:
     name: installer script (windows)
     runs-on: windows-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - name: Compile packaging/windows/codeharbor.iss

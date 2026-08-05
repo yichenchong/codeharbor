@@ -30,6 +30,98 @@ import {
 // smaller than codeharbord's 16 MiB transport cap: that one has to carry whole
 // file contents, this one never does.
 export const MAX_BRIDGE_LINE_BYTES = 1024 * 1024;
+const BRIDGE_LOCK_SUFFIX = ".lock";
+
+function bridgeLockPath(socketPath: string): string {
+    return `${socketPath}${BRIDGE_LOCK_SUFFIX}`;
+}
+
+function acquireBridgeLock(socketPath: string): string {
+    const lockPath = bridgeLockPath(socketPath);
+    for (;;) {
+        const tempPath = `${lockPath}.${process.pid}.${Date.now()}.${Math.random()}`;
+        try {
+            fs.writeFileSync(tempPath, `${process.pid}\n`, {
+                encoding: "utf8",
+                flag: "wx",
+                mode: 0o600,
+            });
+            try {
+                // Publishing the fully written PID with linkSync is atomic:
+                // no contender can observe an empty ownership record.
+                fs.linkSync(tempPath, lockPath);
+                fs.unlinkSync(tempPath);
+                return lockPath;
+            } catch (err) {
+                try {
+                    fs.unlinkSync(tempPath);
+                } catch {
+                    // The temporary file may already have been removed.
+                }
+                if (
+                    !(err instanceof Error) ||
+                    !("code" in err) ||
+                    err.code !== "EEXIST"
+                ) {
+                    throw err;
+                }
+            }
+        } catch (err) {
+            if (!(err instanceof Error) || !("code" in err) || err.code !== "EEXIST") {
+                throw err;
+            }
+        }
+        let ownerPid: number;
+        try {
+            const ownerText = fs.readFileSync(lockPath, "utf8").trim();
+            ownerPid = Number.parseInt(ownerText, 10);
+        } catch {
+            throw new Error(
+                `codeharbor-bridge: address already in use: ${socketPath}`,
+            );
+        }
+        if (!Number.isInteger(ownerPid) || ownerPid <= 0) {
+            throw new Error(
+                `codeharbor-bridge: address already in use: ${socketPath}`,
+            );
+        }
+        let ownerAlive = false;
+        try {
+            process.kill(ownerPid, 0);
+            ownerAlive = true;
+        } catch (probeError) {
+            ownerAlive =
+                probeError instanceof Error &&
+                "code" in probeError &&
+                probeError.code === "EPERM";
+        }
+        if (ownerAlive) {
+            throw new Error(`codeharbor-bridge: address already in use: ${socketPath}`);
+        }
+        try {
+            fs.unlinkSync(lockPath);
+        } catch (unlinkError) {
+            if (
+                !(unlinkError instanceof Error) ||
+                !("code" in unlinkError) ||
+                unlinkError.code !== "ENOENT"
+            ) {
+                throw unlinkError;
+            }
+        }
+    }
+}
+
+// How long a freshly accepted producer may stay completely silent. Every real
+// producer is a harness hook that connects, writes its one line and ends
+// (remote/src/hooks/oh-my-pi-hook.ts), so a connection that has delivered no
+// bytes AT ALL within this window is abandoned or hung. Without the bound each
+// such connection pins a file descriptor for the lifetime of the bridge, and
+// enough of them make accept() fail with EMFILE — at which point no producer
+// can connect again and the only symptom is that agent status quietly stops
+// updating. The timer is disarmed by the FIRST byte, so a live producer that is
+// later paused for output back-pressure is never mistaken for an idle one.
+export const BRIDGE_HANDSHAKE_TIMEOUT_MS = 30_000;
 
 // Wire format for a single line arriving on the bridge socket. Every field is
 // optional and `unknown`: this describes what a producer is SUPPOSED to send,
@@ -121,7 +213,6 @@ export function processBridgeLine(line: string): AgentEvent | null {
         // must be isolated to its producer, not allowed to terminate the relay.
         return null;
     }
-
 }
 
 /**
@@ -295,9 +386,23 @@ export function makeStreamSink(out: NodeJS.WritableStream): EventSink {
         // source. Keep this guard for custom callers so a full output stream
         // can never be fed another event synchronously.
         if (paused.has(source)) return;
+        let line: string;
+        try {
+            line = `${JSON.stringify(event)}\n`;
+        } catch {
+            source.destroy();
+            return;
+        }
+        if (Buffer.byteLength(line) > MAX_BRIDGE_LINE_BYTES) {
+            process.stderr.write(
+                `codeharbor-bridge: dropping an event that exceeds the ${MAX_BRIDGE_LINE_BYTES}-byte frame bound\n`,
+            );
+            source.destroy();
+            return;
+        }
         let ok: boolean;
         try {
-            ok = out.write(`${JSON.stringify(event)}\n`);
+            ok = out.write(line);
         } catch {
             source.destroy();
             return;
@@ -305,12 +410,6 @@ export function makeStreamSink(out: NodeJS.WritableStream): EventSink {
         if (!ok) {
             source.pause();
             paused.add(source);
-            // Forget a producer that disconnects while the output is still
-            // stalled. Without this the set holds a reference to every socket
-            // paused since the last 'drain', and if the consumer at the far end
-            // of the SSH channel never drains again — the exact situation that
-            // caused the pause — that set (and the sockets in it) is never
-            // released for as long as the bridge runs.
             if (!hooked.has(source)) {
                 hooked.add(source);
                 source.once("close", () => paused.delete(source));
@@ -334,9 +433,6 @@ export async function startBridge(
     socketPath: string = resolveSocketPath(),
     sink?: EventSink,
 ): Promise<net.Server> {
-    // Delay the default sink until the bridge has actually bound and accepted
-    // a producer. A failed live-socket probe must not leak a stdout drain
-    // listener on every retry.
     let activeSink = sink;
     const server = net.createServer((socket) => {
         const lines = createBridgeLineFramer(
@@ -347,14 +443,15 @@ export async function startBridge(
                         if (!activeSink) activeSink = makeStreamSink(process.stdout);
                         activeSink(event, socket);
                     } catch {
-                        // A sink is an extension boundary. A failed output
-                        // must disconnect only this producer, not crash the
-                        // bridge serving every other harness.
                         socket.destroy();
                         return false;
                     }
                 }
-                return !socket.isPaused();
+                // A sink may destroy the producer (an oversized mapped event,
+                // or a failed write). Stop parsing immediately: the rest of
+                // this same chunk must not be relayed for a socket that has
+                // already been torn down.
+                return !socket.destroyed && !socket.isPaused();
             },
             () => {
                 process.stderr.write(
@@ -363,69 +460,78 @@ export async function startBridge(
                 socket.destroy();
             },
         );
+        const handshake = setTimeout(() => socket.destroy(), BRIDGE_HANDSHAKE_TIMEOUT_MS);
+        handshake.unref();
+        socket.once("data", () => clearTimeout(handshake));
         socket.on("data", lines.feed);
         socket.on("resume", lines.resume);
-        socket.on("close", lines.close);
+        socket.on("close", () => {
+            clearTimeout(handshake);
+            lines.close();
+        });
         socket.on("error", () => socket.destroy());
     });
-    // Ensure the socket's parent directory exists (the ~/.cache fallback may
-    // not, SPEC 6.3). The mode applies when mkdir creates a directory; do not
-    // chmod an existing caller-owned directory such as /tmp.
     fs.mkdirSync(path.dirname(socketPath), { recursive: true, mode: 0o700 });
-    // Only touch an existing entry if it is actually a socket, so a mistyped
-    // path pointing at a regular file is never clobbered (listen() then fails).
-    let existing = false;
-    try {
-        existing = fs.lstatSync(socketPath).isSocket();
-    } catch {
-        // Nothing at socketPath (ENOENT); nothing to probe or clear.
-    }
-    if (existing) {
-        // Probe liveness: a bridge still listening answers the connect, so
-        // refuse rather than orphan it. A refused/absent connection (a dead
-        // run's leftover) means the socket is stale -> unlink and take over.
-        const alive = await new Promise<boolean>((resolve) => {
-            const probe = net.createConnection(socketPath);
-            let settled = false;
-            const finish = (isAlive: boolean): void => {
-                if (settled) return;
-                settled = true;
-                probe.destroy();
-                resolve(isAlive);
-            };
-            probe.setTimeout(1000, () => finish(false));
-            probe.on("connect", () => finish(true));
-            probe.on("error", () => finish(false));
-        });
-        if (alive) {
-            throw new Error(
-                `codeharbor-bridge: address already in use: a live bridge is listening on ${socketPath}`,
-            );
+    const lockPath = acquireBridgeLock(socketPath);
+    let lockReleased = false;
+    const releaseLock = (): void => {
+        if (lockReleased) return;
+        lockReleased = true;
+        try {
+            fs.unlinkSync(lockPath);
+        } catch {
+            // Another cleanup path may already have removed the lock.
         }
-        fs.unlinkSync(socketPath);
+    };
+    server.once("close", releaseLock);
+    try {
+        let existing = false;
+        try {
+            existing = fs.lstatSync(socketPath).isSocket();
+        } catch {
+            // No existing socket.
+        }
+        if (existing) {
+            const alive = await new Promise<boolean>((resolve) => {
+                const probe = net.createConnection(socketPath);
+                let settled = false;
+                const finish = (isAlive: boolean): void => {
+                    if (settled) return;
+                    settled = true;
+                    probe.destroy();
+                    resolve(isAlive);
+                };
+                probe.setTimeout(1000, () => finish(false));
+                probe.on("connect", () => finish(true));
+                probe.on("error", () => finish(false));
+            });
+            if (alive) {
+                throw new Error(
+                    `codeharbor-bridge: address already in use: a live bridge is listening on ${socketPath}`,
+                );
+            }
+            fs.unlinkSync(socketPath);
+        }
+    } catch (err) {
+        releaseLock();
+        throw err;
     }
     await new Promise<void>((resolve, reject) => {
-        const onError = (err: Error): void => reject(err);
+        const onError = (err: Error): void => {
+            releaseLock();
+            reject(err);
+        };
         server.once("error", onError);
         server.listen(socketPath, () => {
-            // Restrict the socket to the owning user (0600); the default
-            // net.Server socket honours only umask, which may leave it
-            // group/world-accessible. Refuse to run if this security boundary
-            // cannot be established on the host.
             try {
                 fs.chmodSync(socketPath, 0o600);
             } catch (err) {
                 server.removeListener("error", onError);
+                releaseLock();
                 server.close(() => reject(err));
                 return;
             }
             server.removeListener("error", onError);
-            // Past listen(), the ONLY listener for 'error' is gone — and an
-            // EventEmitter 'error' with no listener THROWS. A listening server
-            // can still emit one (an accept() failure such as EMFILE), which
-            // would take down a bridge that had been serving fine for hours,
-            // and with it every harness's status reporting. Report and keep
-            // running: the failed accept cost one producer, not the service.
             server.on("error", (err: Error) => {
                 process.stderr.write(`codeharbor-bridge: ${err.message}\n`);
             });

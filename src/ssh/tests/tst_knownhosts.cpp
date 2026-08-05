@@ -66,6 +66,9 @@ private slots:
     void revokedKeyRefused();
     void certAuthorityIsOpaque();
     void revocationWinsBeforeTrustedEntry();
+    void anUnrecognisedMarkerLineIsDropped();
+    void twoKeysOfOneTypeForOneHostBothMatch();
+    void ipv6LiteralEndpointsAreMatchedAndCanonicalized();
     void malformedBase64LineSkipped();
     void emptyBase64LineSkipped();
     void crlfAndTabWhitespaceParsed();
@@ -350,6 +353,136 @@ void TstKnownHosts::revocationWinsBeforeTrustedEntry()
              KnownHosts::Verdict::Mismatch);
 }
 
+// OpenSSH knows exactly two markers and skips any line that begins with a
+// different @token. Accepting an unknown one here was a silent trust upgrade,
+// because verify() only withholds trust for the two markers it recognises: a
+// revocation whose marker was mistyped — or merely mis-cased, "@Revoked", which
+// is the likeliest way an administrator gets this wrong — stopped revoking and
+// became an ordinary trusted host key for exactly the key that was meant to be
+// refused. The presented key then verified as Match and CodeHarbor connected.
+void TstKnownHosts::anUnrecognisedMarkerLineIsDropped()
+{
+    for (const QString& marker : {QStringLiteral("@Revoked"),
+                                  QStringLiteral("@revocked"),
+                                  QStringLiteral("@CERT-AUTHORITY"),
+                                  QStringLiteral("@some-future-marker")}) {
+        const KnownHosts store = KnownHosts::parse(
+            marker
+            + QStringLiteral(" bad.host ssh-ed25519 "
+                             "ZWQyNTUxOS1rZXktYWxwaGEtMDAwMQ==\n"));
+        QVERIFY2(store.entries().isEmpty(), qPrintable(marker));
+        // Above all: the key on that line is NOT trusted.
+        QCOMPARE(store.verify(QStringLiteral("bad.host"),
+                              QStringLiteral("ssh-ed25519"), kEd25519Alpha),
+                 KnownHosts::Verdict::Unknown);
+    }
+
+    // The two real markers still work, and a dropped line does not take the
+    // rest of the file with it.
+    const KnownHosts mixed = KnownHosts::parse(QStringLiteral(
+        "@Revoked bad.host ssh-ed25519 ZWQyNTUxOS1rZXktYWxwaGEtMDAwMQ==\n"
+        "@revoked bad.host ssh-ed25519 ZWQyNTUxOS1rZXktYmV0YS0wMDAy\n"
+        "good.host ssh-rsa cnNhLWtleS1nYW1tYS0wMDAz\n"));
+    QCOMPARE(mixed.entries().size(), 2);
+    QCOMPARE(mixed.verify(QStringLiteral("bad.host"),
+                          QStringLiteral("ssh-ed25519"), kEd25519Beta),
+             KnownHosts::Verdict::Mismatch);
+    QCOMPARE(mixed.verify(QStringLiteral("good.host"),
+                          QStringLiteral("ssh-rsa"), kRsaGamma),
+             KnownHosts::Verdict::Match);
+}
+
+// A key rotation leaves a real known_hosts file holding two lines of the SAME
+// type for one host for as long as both keys are in service. Both must verify:
+// stopping at the first entry of a matching type would turn the second, equally
+// trusted key into a hard refusal and lock the user out of their own server.
+void TstKnownHosts::twoKeysOfOneTypeForOneHostBothMatch()
+{
+    const KnownHosts store = KnownHosts::parse(QStringLiteral(
+        "rotating.host ssh-ed25519 ZWQyNTUxOS1rZXktYWxwaGEtMDAwMQ==\n"
+        "rotating.host ssh-ed25519 ZWQyNTUxOS1rZXktYmV0YS0wMDAy\n"));
+    QCOMPARE(store.entries().size(), 2);
+    QCOMPARE(store.verify(QStringLiteral("rotating.host"),
+                          QStringLiteral("ssh-ed25519"), kEd25519Alpha),
+             KnownHosts::Verdict::Match);
+    QCOMPARE(store.verify(QStringLiteral("rotating.host"),
+                          QStringLiteral("ssh-ed25519"), kEd25519Beta),
+             KnownHosts::Verdict::Match);
+    // A third, unlisted key is still the hard refusal.
+    QCOMPARE(store.verify(QStringLiteral("rotating.host"),
+                          QStringLiteral("ssh-ed25519"), kEd25519Delta),
+             KnownHosts::Verdict::Mismatch);
+
+    // add() rewrites the FIRST entry it finds for the host+type and leaves the
+    // rest of the file alone: the newly approved key is trusted, the second
+    // rotation key keeps its own line, and no contradictory duplicate is
+    // appended. (Unreachable from the app — the pool only calls add() after a
+    // Verdict::Unknown, which a host with trusted entries never produces — but
+    // it is the store's public contract.)
+    KnownHosts trusted = store;
+    trusted.add(QStringLiteral("rotating.host"), QStringLiteral("ssh-ed25519"),
+                kEd25519Delta);
+    QCOMPARE(trusted.entries().size(), 2);
+    QCOMPARE(trusted.verify(QStringLiteral("rotating.host"),
+                            QStringLiteral("ssh-ed25519"), kEd25519Delta),
+             KnownHosts::Verdict::Match);
+    QCOMPARE(trusted.verify(QStringLiteral("rotating.host"),
+                            QStringLiteral("ssh-ed25519"), kEd25519Beta),
+             KnownHosts::Verdict::Match);
+    QCOMPARE(trusted.verify(QStringLiteral("rotating.host"),
+                            QStringLiteral("ssh-ed25519"), kEd25519Alpha),
+             KnownHosts::Verdict::Mismatch);
+}
+
+// An IPv6 address is a host name like any other here, but its colons collide
+// visually with OpenSSH's "[host]:port" spelling, so both forms are pinned.
+void TstKnownHosts::ipv6LiteralEndpointsAreMatchedAndCanonicalized()
+{
+    using ch::SshConnectionPool;
+
+    // Default port: OpenSSH stores the bare address, brackets and all absent.
+    QCOMPARE(SshConnectionPool::lookupHostFor(QStringLiteral("2001:db8::1"), 22),
+             QStringLiteral("2001:db8::1"));
+    QCOMPARE(
+        SshConnectionPool::lookupHostFor(QStringLiteral("2001:db8::1"), 2222),
+        QStringLiteral("[2001:db8::1]:2222"));
+
+    const KnownHosts store = KnownHosts::parse(QStringLiteral(
+        "2001:db8::1 ssh-ed25519 ZWQyNTUxOS1rZXktYWxwaGEtMDAwMQ==\n"
+        "[2001:db8::1]:2222 ssh-rsa cnNhLWtleS1nYW1tYS0wMDAz\n"
+        "::1 ssh-ed25519 ZWQyNTUxOS1rZXktZGVsdGEtMDAwNA==\n"));
+    QCOMPARE(store.entries().size(), 3);
+    QCOMPARE(store.verify(QStringLiteral("2001:db8::1"),
+                          QStringLiteral("ssh-ed25519"), kEd25519Alpha),
+             KnownHosts::Verdict::Match);
+    QCOMPARE(store.verify(QStringLiteral("[2001:db8::1]:2222"),
+                          QStringLiteral("ssh-rsa"), kRsaGamma),
+             KnownHosts::Verdict::Match);
+    QCOMPARE(store.verify(QStringLiteral("::1"),
+                          QStringLiteral("ssh-ed25519"), kEd25519Delta),
+             KnownHosts::Verdict::Match);
+    // The two spellings of the same address are DIFFERENT endpoints: the ported
+    // one must not inherit the default port's trust, or a server moved to
+    // another port on the same host would silently reuse the old key.
+    QCOMPARE(store.verify(QStringLiteral("2001:db8::1"),
+                          QStringLiteral("ssh-rsa"), kRsaGamma),
+             KnownHosts::Verdict::Mismatch);
+    QCOMPARE(store.verify(QStringLiteral("[2001:db8::1]:3333"),
+                          QStringLiteral("ssh-rsa"), kRsaGamma),
+             KnownHosts::Verdict::Unknown);
+
+    // And the canonical token round-trips through add()/serialize().
+    KnownHosts fresh;
+    fresh.add(SshConnectionPool::lookupHostFor(QStringLiteral("fe80::1%eth0"),
+                                               2200),
+              QStringLiteral("ssh-ed25519"), kEd25519Alpha);
+    const KnownHosts reparsed =
+        KnownHosts::parse(QString::fromUtf8(fresh.serialize()));
+    QCOMPARE(reparsed.verify(QStringLiteral("[fe80::1%eth0]:2200"),
+                             QStringLiteral("ssh-ed25519"), kEd25519Alpha),
+             KnownHosts::Verdict::Match);
+}
+
 void TstKnownHosts::malformedBase64LineSkipped()
 {
     // A line whose base64 key field is invalid is dropped entirely rather than
@@ -589,9 +722,18 @@ void TstKnownHosts::addRejectsNonPlainHostTokens()
                                 QStringLiteral("one.example,two.example"),
                                 QStringLiteral("@marker-looking"),
                                 QStringLiteral("#comment-looking"),
-                                QStringLiteral("line\ninjection")}) {
+                                QStringLiteral("line\ninjection"),
+                                QStringLiteral("two words"),
+                                QStringLiteral("tab\tseparated"),
+                                QStringLiteral("trailing.space "),
+                                QStringLiteral("carriage\rreturn")}) {
         store.add(host, QStringLiteral("ssh-ed25519"), kEd25519Alpha);
     }
+    // An embedded NUL would terminate the C string libssh and the file writer
+    // see, silently changing which host the line names.
+    QString nulHost = QStringLiteral("nul.host");
+    nulHost.insert(3, QChar(u'\0'));
+    store.add(nulHost, QStringLiteral("ssh-ed25519"), kEd25519Alpha);
     store.add(QStringLiteral("host.example"), QStringLiteral("ssh ed25519"),
               kEd25519Alpha);
     QCOMPARE(store.entries().size(), 0);

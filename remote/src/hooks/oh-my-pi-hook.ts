@@ -184,8 +184,18 @@ export function emitHookEvent(
 ): Promise<BridgeMessage> {
     const message = toBridgeMessage(input);
     const { promise, resolve, reject } = Promise.withResolvers<BridgeMessage>();
+    let line: string;
     let socket: net.Socket;
     try {
+        // Serialize BEFORE connecting, inside the guard. Doing it in the
+        // 'connect' handler instead puts JSON.stringify on an event-emitter
+        // callback stack, where a throw is an uncaught exception rather than a
+        // rejection: it would escape this promise entirely and exit the hook
+        // process non-zero, which a harness may read as a failed hook
+        // (SPEC 6.4). The bag in `metadata` is producer-supplied, so a value
+        // stringify refuses — a BigInt, a getter that throws — is its input,
+        // not ours.
+        line = `${JSON.stringify(message)}\n`;
         // createConnection validates its argument synchronously (an empty or
         // non-string path throws right here). This function promises to REPORT
         // failures by rejecting; letting one escape synchronously would bypass
@@ -205,7 +215,7 @@ export function emitHookEvent(
     });
     socket.on("error", reject);
     socket.on("connect", () => {
-        socket.end(`${JSON.stringify(message)}\n`, () => {
+        socket.end(line, () => {
             // Disarm the watchdog: the write succeeded, and a promise that has
             // resolved must never reject afterwards.
             socket.setTimeout(0);

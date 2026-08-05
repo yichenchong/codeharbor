@@ -1,6 +1,7 @@
 import QtQuick
 import QtQuick.Controls.Basic
 import QtQuick.Layouts
+import CodeHarbor
 
 // A Dev Session sidebar row (SPEC 4.2): name + repository subtitle + a status
 // dot colored by the aggregate rowState. Right-click opens a context menu of

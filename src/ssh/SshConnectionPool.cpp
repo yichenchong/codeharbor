@@ -212,6 +212,14 @@ void SshLogRouter::dispatch(int priority, const char* function,
     if (t_dispatchDepth == 0) {
         pruneInactiveThreadRoutes();
         if (s_threadRoutes->isEmpty()) {
+            // Restore before dropping the list, exactly like the scope guard
+            // below. Reachable when a wrong-thread release left the owning
+            // thread's only entry inert and a libssh line arrives here before
+            // that thread takes or drops another route: without this the
+            // thread was left logging at maximum verbosity through a hook
+            // nobody owned until its next acquire() happened to repair it.
+            if (t_ownsThreadState)
+                restoreThreadLoggingState();
             delete s_threadRoutes;
             s_threadRoutes = nullptr;
             return;
@@ -718,8 +726,22 @@ bool SshConnectionPool::connectToHost(const QString& host, quint16 port,
     // guard applies during ordinary teardown, where a replacement handshake
     // would otherwise race the old session's channel sweep. A signal or
     // credential callback also cannot start a nested synchronous handshake.
-    if (m_destroying || m_closingSession || m_handshakeInProgress)
+    if (m_destroying || m_closingSession || m_handshakeInProgress) {
+        // Say why. A connect that answers false with no signal anywhere is a
+        // dead end for the caller: the UI shows neither a banner nor a state
+        // change, and the reason exists only in this comment. The one case that
+        // stays silent is destruction — the destructor is allowed to emit
+        // sessionClosing() and nothing else (see the header), so a slot reached
+        // from it that asks to reconnect must not be answered with a signal
+        // that reaches QML bindings on a pool that is going away.
+        if (!m_destroying) {
+            emit errorOccurred(QStringLiteral(
+                "Cannot connect to %1: this connection is already busy "
+                "connecting or disconnecting")
+                                   .arg(host));
+        }
         return false;
+    }
 
     disconnectFromHost();
     m_handshakeInProgress = true;
@@ -751,9 +773,11 @@ bool SshConnectionPool::connectToHost(const QString& host, quint16 port,
                          .arg(port));
     if (abortRequested())
         return false;
-    m_host = host;
+    // Only the port and the resolved identity path outlive the call: the port
+    // is what verifyHostKey() canonicalizes the known-hosts lookup with, and
+    // the identity path is what authenticationFailure() reports on. The host
+    // and user are parameters of this one handshake and are not retained.
     m_port = port;
-    m_user = user;
     m_identityFile = resolveIdentityFilePath(identityFile);
 
     setState(State::Connecting);

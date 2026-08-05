@@ -213,6 +213,12 @@ private:
     // Re-derive every pane's time-dependent state (SPEC 6.6 activity, and the
     // silence demotion) and emit what changed.
     void onAgeTick();
+    // Whether one pane's state can still change with the passage of time
+    // alone: the exact predicate onAgeTick() finds work by, so rearmAgeTimer()
+    // can never stop the timer while a pane still has a pending transition.
+    // `devSessionUnseen` is the pane's Dev Session's unseen-completion flag,
+    // which onAgeTick() consults before letting time overwrite a completion.
+    bool agesWithTime(const TerminalStatus& st, bool devSessionUnseen) const;
     // Run the tick timer iff some pane's state can still change with time, at
     // an interval fine enough for the shorter of the two windows.
     void rearmAgeTimer();

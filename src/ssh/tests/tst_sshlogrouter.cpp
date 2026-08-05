@@ -88,8 +88,8 @@ private slots:
     void concurrentRoutesOnTwoThreadsNeverSeeEachOthersLines();
     void releasingARouteFromTheWrongThreadStopsItRoutingAnyway();
     void wrongThreadReleaseIsRepairedBeforeNextRoute();
+    void aLogLineAfterAWrongThreadReleaseRestoresTheThreadState();
     void routeOutlivingOwnerThreadIsStillWrongThread();
-    void twoRoutesRunningConcurrentlyKeepSeparateTranscripts();
     void activityAfterARouteEndsNeverReachesItsSink();
     void aRouteLeavesNoRouteBehindAfterRelease();
     void aThreadWithNoPreviousHookIsLeftWithAnInertOne();
@@ -387,58 +387,6 @@ void TstSshLogRouter::concurrentRoutesOnTwoThreadsNeverSeeEachOthersLines()
     QVERIFY(!SshLogRouter::ownsThreadLoggingState());
 }
 
-// Two independent routes that emit at the same time must not see one
-// another's lines. This feeds libssh's own diagnostic dispatcher directly,
-// avoiding a real socket and its platform-dependent connection timeout.
-void TstSshLogRouter::twoRoutesRunningConcurrentlyKeepSeparateTranscripts()
-{
-    constexpr int lineCount = 200;
-    QSemaphore start;
-    QStringList firstLines;
-    QStringList secondLines;
-
-    const auto worker = [&start](const QString& tag, QStringList& sink) {
-        return [&start, tag, &sink] {
-            SshLogRouter::Route route(
-                [&sink](int, const char*, const char* buffer) {
-                    sink << QString::fromUtf8(buffer ? buffer : "");
-                });
-            start.acquire();
-            for (int i = 0; i < lineCount; ++i)
-                emitLibsshLine(QStringLiteral("%1-%2").arg(tag).arg(i));
-        };
-    };
-
-    QThread* const firstThread =
-        QThread::create(worker(QStringLiteral("alpha"), firstLines));
-    QThread* const secondThread =
-        QThread::create(worker(QStringLiteral("beta"), secondLines));
-    firstThread->start();
-    secondThread->start();
-    QTest::qWait(50);
-    start.release(2);
-    QVERIFY(firstThread->wait(60000));
-    QVERIFY(secondThread->wait(60000));
-    delete firstThread;
-    delete secondThread;
-
-    QCOMPARE(firstLines.size(), lineCount);
-    QCOMPARE(secondLines.size(), lineCount);
-    for (const QString& line : std::as_const(firstLines)) {
-        QVERIFY2(line.contains(QStringLiteral("alpha-")),
-                 qPrintable(QStringLiteral("stray line in alpha: %1").arg(line)));
-        QVERIFY(!line.contains(QStringLiteral("beta-")));
-    }
-    for (const QString& line : std::as_const(secondLines)) {
-        QVERIFY2(line.contains(QStringLiteral("beta-")),
-                 qPrintable(QStringLiteral("stray line in beta: %1").arg(line)));
-        QVERIFY(!line.contains(QStringLiteral("alpha-")));
-    }
-
-    QCOMPARE(SshLogRouter::activeRouteCount(), 0);
-    QVERIFY(!SshLogRouter::ownsThreadLoggingState());
-}
-
 // A route that ends after a failed operation must drop its claim and restore
 // the previous libssh state. Emit the diagnostic directly so this unit test
 // never waits on a real network connection.
@@ -626,6 +574,62 @@ void TstSshLogRouter::wrongThreadReleaseIsRepairedBeforeNextRoute()
     QVERIFY(stateRestored);
     QVERIFY(inertHookRemains);
     QCOMPARE(levelAfter, int(SSH_LOG_NOLOG));
+    QCOMPARE(SshLogRouter::activeRouteCount(), 0);
+}
+
+// The same violation, repaired by the OTHER path. After a wrong-thread release
+// the owning thread's stack still holds an inert entry, so the thread still
+// looks like it owns libssh's logging state. If the next thing that happens on
+// that thread is a libssh LOG LINE rather than a new route, the dispatcher is
+// what has to clean up — and it used to drop the empty route list while leaving
+// the thread at the router's maximum verbosity, behind a hook that no longer
+// routed anywhere, until some later acquire() happened to notice. Every libssh
+// line on that thread was then formatted for nobody.
+void TstSshLogRouter::aLogLineAfterAWrongThreadReleaseRestoresTheThreadState()
+{
+    QSemaphore routeTaken;
+    QSemaphore released;
+    SshLogRouter::Route* route = nullptr;
+    int levelWhileHeld = -1;
+    int levelAfterLine = -1;
+    bool ownedAfterLine = true;
+    int linesAfterRelease = 0;
+
+    QThread* const worker = QThread::create([&] {
+        auto doomed = std::make_unique<SshLogRouter::Route>(
+            [&linesAfterRelease](int, const char*, const char*) {
+                ++linesAfterRelease;
+            });
+        route = doomed.get();
+        levelWhileHeld = ssh_get_log_level();
+        routeTaken.release();
+        released.acquire();
+
+        // No replacement route is taken here: the log line is the only thing
+        // that runs on this thread after the violation.
+        emitLibsshLine(QStringLiteral("after-wrong-thread-release"));
+        levelAfterLine = ssh_get_log_level();
+        ownedAfterLine = SshLogRouter::ownsThreadLoggingState();
+        doomed.reset();  // already released; must stay a no-op
+    });
+    worker->start();
+    routeTaken.acquire();
+
+    QTest::ignoreMessage(
+        QtWarningMsg,
+        QRegularExpression(QStringLiteral(
+            "route taken on another thread was released")));
+    route->release();
+    released.release();
+    QVERIFY(worker->wait(60000));
+    delete worker;
+
+    // A fresh thread starts at SSH_LOG_NOLOG, so that is what has to come back.
+    QCOMPARE(levelWhileHeld, int(SSH_LOG_FUNCTIONS));
+    QCOMPARE(levelAfterLine, int(SSH_LOG_NOLOG));
+    QVERIFY(!ownedAfterLine);
+    // And the released sink saw nothing, as the wrong-thread release promised.
+    QCOMPARE(linesAfterRelease, 0);
     QCOMPARE(SshLogRouter::activeRouteCount(), 0);
 }
 // Native thread identifiers may be recycled immediately after a worker exits.

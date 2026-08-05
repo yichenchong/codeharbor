@@ -1,6 +1,7 @@
 import QtQuick
 import QtQuick.Controls.Basic
 import QtQuick.Layouts
+import CodeHarbor
 
 // Sidebar group header (SPEC 4.2): group name with a collapse chevron. Bound to
 // a SessionsModel group row via role names (name, collapsed, itemId). Clicking
