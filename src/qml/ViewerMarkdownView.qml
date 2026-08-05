@@ -34,6 +34,11 @@ Item {
     property var retainedSubresources: ({})
     property string errorText: ""
     property bool pageReady: false
+    // The renderer page has started loading and has not settled yet, read by
+    // the pane header's `busy`. Distinct from `pageReady`, which is about
+    // whether the page can be SCRIPTED: a failed load leaves that false for
+    // ever, and a header bound to it would spin for ever with it.
+    property bool loading: false
 
     readonly property string remotePath: root.url.toString().length > 0
         ? RemotePath.fileUrlToPath(root.url.toString()) : ""
@@ -166,6 +171,7 @@ Item {
         root.pageReady = false
         if (root.internalUrl.toString().length === 0
                 || root.markdownBundleUrl.toString().length === 0) {
+            root.loading = false
             webView.url = ""
             return
         }
@@ -250,14 +256,39 @@ Item {
         profile: root.viewerModel ? root.viewerModel.internalProfile() : null
         settings.javascriptEnabled: true
         settings.localContentCanAccessFileUrls: false
-        // Fetching codeharbor-internal:// is explicitly required for the
-        // server document and images. CSP below allows only that custom scheme;
-        // client file:// and arbitrary network origins remain denied.
+        // SECURITY — THIS SWITCHES A WHOLE BROWSER PROTECTION OFF, and it says
+        // so here rather than reading as a small permission.
+        //
+        // WHAT IS DISABLED: Chromium's cross-origin enforcement for this
+        // locally-loaded document. With it on, a page served from qrc: may
+        // fetch nothing but its own origin; with it off, this page may issue
+        // requests to ANY origin, the open network included.
+        //
+        // WHY IT CANNOT BE AVOIDED: the renderer page is app-owned code loaded
+        // out of the binary's own resources, and the Markdown document it has
+        // to render — plus every image in it — is served through the
+        // codeharbor-internal:// scheme, which Chromium counts as a DIFFERENT
+        // origin from the page. Leaving the enforcement on blocks the very
+        // fetch this view exists to make, and there is no same-origin way to
+        // hand a server-side document to the page (its content deliberately
+        // never arrives as a navigated document).
+        //
+        // WHAT IS LEFT GUARDING IT: nothing in this file. The ONLY remaining
+        // barrier between this privileged page and the network is the
+        // Content-Security-Policy meta tag in src/web/markdown/index.html,
+        // which permits the custom internal scheme and denies everything else.
+        // The two are a PAIR: loosening that policy — or dropping it — silently
+        // turns this line into "the rendering page may talk to the internet",
+        // with a WebChannel image bridge and remote file reads on the other
+        // side of it. A test pins that policy; keep it pinned.
+        //
+        // Client file:// access stays denied above, and is a separate rule.
         settings.localContentCanAccessRemoteUrls: true
         settings.javascriptCanOpenWindows: false
         webChannel: markdownChannel
 
         onLoadingChanged: function(request) {
+            root.loading = request.status === WebEngineView.LoadStartedStatus
             if (request.status === WebEngineView.LoadSucceededStatus) {
                 root.pageReady = true
                 root.applyTheme()

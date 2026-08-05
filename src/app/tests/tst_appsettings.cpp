@@ -230,6 +230,7 @@ void TstAppSettings::viewerDefaultsRejectMalformedAndIncompatibleEntries()
     s.setViewerDefaults(mixed);
     QCOMPARE(s.viewerDefaults(),
              (QVariantMap{{QStringLiteral("future"), QStringLiteral("text")},
+                          {QStringLiteral("has-dash"), QStringLiteral("text")},
                           {QStringLiteral("md"), QStringLiteral("text")}}));
 
     // Hand-edited leading-dot keys and wrong value types are rejected on read,
@@ -244,6 +245,7 @@ void TstAppSettings::viewerDefaultsRejectMalformedAndIncompatibleEntries()
     AppSettings reread(path);
     QCOMPARE(reread.viewerDefaults(),
              (QVariantMap{{QStringLiteral("future"), QStringLiteral("text")},
+                          {QStringLiteral("has-dash"), QStringLiteral("text")},
                           {QStringLiteral("md"), QStringLiteral("text")}}));
 }
 

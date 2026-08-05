@@ -482,6 +482,33 @@ test("every registered adapter is filed under the harness it claims (RA5)", () =
     }
 });
 
+// AG7. Cross-language drift gate for the harness NAMES, the same shape as the
+// agent wire-state gate in test/events.test.ts. The set of coding assistants a
+// status event may come from exists twice and neither language's suite can see
+// the other copy: HARNESSES in src/events.ts here, and the membership test
+// isHarnessWire() in the desktop client's src/agent/AgentEvent.h. The client
+// DROPS an event whose harness name it does not recognise, so adding or
+// renaming an assistant on one side alone makes every status event that
+// assistant produces vanish at the client edge — no state, no badge, no
+// notification, no error, and, until this test, no failing check either.
+//
+// (The client's own suite carries the other direction: it reads HARNESSES out
+// of this file and drives a real event from each name through the parser. This
+// one is the exact set comparison, which is what catches a name that exists
+// only on the C++ side.)
+test("harness names match src/agent/AgentEvent.h (AG7)", () => {
+    const headerPath = fileURLToPath(new URL("../../src/agent/AgentEvent.h", import.meta.url));
+    const header = readFileSync(headerPath, "utf8");
+    // The membership test's body only: the file's comments name harnesses in
+    // prose, and other functions in it quote unrelated string literals.
+    const body = /isHarnessWire\(QStringView h\)\s*\{([\s\S]*?)\n\}/.exec(header);
+    assert.ok(body, "AgentEvent.h must declare isHarnessWire(QStringView)");
+    // Hyphens are part of a harness name ("oh-my-pi", "claude-code").
+    const cppNames = [...body[1].matchAll(/u"([a-z-]+)"/g)].map((match) => match[1]);
+    assert.ok(cppNames.length > 0, "no harness names parsed out of the C++ membership test");
+    assert.deepEqual(cppNames.toSorted(), [...HARNESSES].toSorted());
+});
+
 // RA3. Producers are shell hook configurations that interpolate variables, so a
 // native field routinely arrives with a trailing newline or CR ("ask\n" from a
 // command substitution, "agent_start\r\n" from a CRLF-authored config). Every
@@ -499,6 +526,17 @@ test("adapters tolerate surrounding whitespace in native fields (RA3)", () => {
         claudeCodeAdapter.map({ hook: "Notification", notification_type: " idle_prompt\n" }),
         "waiting_input",
     );
+    // AG4. A blank type is the same statement as no type at all. The producer
+    // is a shell hook config interpolating a variable, so an unset one leaves
+    // "" (or a bare newline) in the payload; reading that as an unrecognised
+    // notification type would drop the prompt that an absent type raises.
+    for (const blank of ["", "   ", "\n", "\r\n", "\t"]) {
+        assert.equal(
+            claudeCodeAdapter.map({ hook: "Notification", notification_type: blank }),
+            "waiting_input",
+            `blank notification_type ${JSON.stringify(blank)} must read as absent`,
+        );
+    }
 
     // The normalization reaches the metadata too, so the client never displays
     // a tool name with a newline glued to it.

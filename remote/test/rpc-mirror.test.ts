@@ -237,6 +237,26 @@ test("the resource-limit error code matches between TypeScript and C++", () => {
     assert.notEqual(RPC_RESOURCE_LIMIT, RPC_DATABASE_BUSY);
 });
 
+// The fourth error code, and the only one of the four the JSON-RPC 2.0
+// specification itself fixes rather than this project. It is pinned for the
+// same reason as the three above and because RpcTypes.h itself says the two
+// copies must not drift: the desktop client tells "the server broke" apart from
+// the three retryable/refusable answers purely by this number, so a typo in
+// either copy turns a genuine server fault into an unrecognised code the client
+// reports as something else — or, worse, silently matches one of the others.
+test("the internal-error code matches between TypeScript and C++", () => {
+    const declared = /^inline constexpr int kInternalError\s*=\s*(-?\d+);/m.exec(header);
+    assert.ok(declared, "RpcTypes.h must declare kInternalError");
+    assert.equal(Number(declared[1]), RPC_INTERNAL_ERROR);
+    // The reserved pre-defined code, NOT one of the implementation-defined
+    // -32000..-32099 server codes: an implementation is free to choose those
+    // three, and is not free to choose this one.
+    assert.equal(RPC_INTERNAL_ERROR, -32603);
+    for (const other of [RPC_REVISION_MISMATCH, RPC_DATABASE_BUSY, RPC_RESOURCE_LIMIT]) {
+        assert.notEqual(RPC_INTERNAL_ERROR, other);
+    }
+});
+
 // The third copy of the schema-version contract. RPC_SCHEMA_VERSION lives in
 // remote/src/codeharbord.ts and is reported by server.info; the client refuses
 // to adopt a server whose reported schemaVersion is below
@@ -414,6 +434,36 @@ test("an oversized response id is replaced with null in the bounded refusal", ()
     const decoded = JSON.parse(line);
     assert.equal(decoded.id, null);
     assert.equal(decoded.error.code, RPC_RESOURCE_LIMIT);
+});
+
+// The two directions must agree on WHAT the cap measures, to the byte. The
+// outbound check used to weigh the payload PLUS its framing newline while the
+// inbound framer weighs only the payload, so a reply of exactly MAX_LINE_BYTES
+// was accepted on the way in and refused on the way out — two comments claiming
+// one rule, differing by one byte. Both now measure the payload alone.
+test("the transport cap measures the payload, not the framing newline", () => {
+    // Grow the result until the serialized payload is EXACTLY the cap.
+    const envelope = JSON.stringify({ jsonrpc: "2.0", id: 1, result: { b: "" } });
+    const exact = "x".repeat(MAX_LINE_BYTES - Buffer.byteLength(envelope));
+    const line = responseLine({ jsonrpc: "2.0", id: 1, result: { b: exact } });
+    // Delivered, not refused: the payload is at the cap, and the newline that
+    // frames it is not part of what the cap bounds.
+    assert.equal(Buffer.byteLength(line), MAX_LINE_BYTES + 1);
+    assert.equal(JSON.parse(line).result.b.length, exact.length);
+
+    // The inbound framer accepts the same payload, which is the whole point.
+    const framed: string[] = [];
+    let overflows = 0;
+    const feed = createLineFramer((l) => framed.push(l), () => {
+        overflows += 1;
+    });
+    feed(Buffer.from(line));
+    assert.equal(overflows, 0);
+    assert.equal(framed.length, 1);
+
+    // One byte more is over the cap in both directions.
+    const over = responseLine({ jsonrpc: "2.0", id: 1, result: { b: `${exact}x` } });
+    assert.equal(JSON.parse(over).error.code, RPC_RESOURCE_LIMIT);
 });
 
 // A payload JSON.stringify cannot render (a reference cycle, a BigInt) still

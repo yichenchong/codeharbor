@@ -251,3 +251,45 @@ test("the child foreign keys reject an orphaning delete rather than cascading", 
     assert.equal(left.n, 0);
     db.close();
 });
+
+// The two per-server key/value stores are single-valued per key, by two
+// different spellings of the same rule (a UNIQUE pair on one, a composite
+// PRIMARY KEY on the other). Without it a repeated write would silently leave
+// two rows for one setting and a reader would get whichever it happened to hit
+// first — and both are the reason server_identity needs a table of its own,
+// since neither offers a conflict target for the server's OWN id.
+test("the per-server key/value tables hold at most one row per (server, key)", () => {
+    const db = loadSchema();
+
+    const setting = db.prepare(
+        "INSERT INTO server_settings (id, server_id, key, value) VALUES (?, ?, ?, ?)",
+    );
+    setting.run("s1", "srv-a", "theme", "dark");
+    // Same key under a DIFFERENT server is a different setting.
+    setting.run("s2", "srv-b", "theme", "light");
+    // Same (server, key) is a duplicate, even under a fresh row id.
+    assert.throws(() => setting.run("s3", "srv-a", "theme", "light"), /UNIQUE constraint failed/);
+
+    const app = db.prepare("INSERT INTO app_settings (server_id, key, value) VALUES (?, ?, ?)");
+    app.run("srv-a", "font", "12");
+    app.run("srv-b", "font", "14");
+    assert.throws(() => app.run("srv-a", "font", "13"), /UNIQUE constraint failed/);
+
+    // An upsert on that key is how a caller actually rewrites a setting.
+    db.prepare(
+        "INSERT INTO app_settings (server_id, key, value) VALUES (?, ?, ?) " +
+            "ON CONFLICT (server_id, key) DO UPDATE SET value = excluded.value",
+    ).run("srv-a", "font", "13");
+    const rows = db
+        .prepare("SELECT server_id, value FROM app_settings ORDER BY server_id")
+        .all() as Array<{ server_id: string; value: string }>;
+    assert.deepEqual(
+        rows.map((r) => [r.server_id, r.value]),
+        [
+            ["srv-a", "13"],
+            ["srv-b", "14"],
+        ],
+    );
+
+    db.close();
+});

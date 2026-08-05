@@ -22,10 +22,15 @@ Item {
     property url internalUrl: ""
     property bool retained: false
     property string errorText: ""
+    // The embedded page has started fetching and has not settled yet, read by
+    // the pane header's `busy`. Same reason as ViewerImageView: a large remote
+    // PDF otherwise arrived as an unexplained blank pane.
+    property bool loading: false
 
     function retarget() {
         root.releaseInternalUrl();
         root.errorText = "";
+        root.loading = false;
         if (root.url.toString().length === 0 || !root.viewerModel)
             return;
         root.internalUrl = root.viewerModel.internalUrlFor(root.url);
@@ -94,6 +99,7 @@ Item {
         // the refusals the scheme handler knows about. The handler's own
         // explanation is better wording, so it is never overwritten.
         onLoadingChanged: function(request) {
+            root.loading = request.status === WebEngineView.LoadStartedStatus
             if (request.status === WebEngineView.LoadFailedStatus
                     && root.errorText.length === 0)
                 root.errorText = request.errorString

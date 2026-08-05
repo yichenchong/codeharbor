@@ -133,6 +133,15 @@ private:
 // The origin is strictly read-only: only GET requests whose authority is the
 // documented "file" host are answered; everything else is refused without ever
 // touching the remote server.
+//
+// THREADS. Qt 6 calls requestStarted() on the Qt UI thread — the thread the
+// profile and this handler live on — so it may talk to the CodeharbordClient
+// directly and emit its signals directly, both of which it does. (Qt 5's docs
+// warned this ran on Chromium's IO thread; that is no longer the case, and any
+// build where it were would need the client call marshalled instead.) Only the
+// QIODevice handed to QWebEngineUrlRequestJob::reply() is touched from another
+// thread: Chromium reads it there until the job is destroyed, which is why the
+// buffer is parented to the job and nothing else ever reads or writes it.
 class InternalUrlSchemeHandler : public QWebEngineUrlSchemeHandler {
     Q_OBJECT
 public:

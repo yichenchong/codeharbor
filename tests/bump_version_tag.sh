@@ -395,4 +395,18 @@ if grep -qE "TypeError|Cannot destructure" "$work/out19"; then
     fail "an unhandled JavaScript error escaped instead of a readable message"
 fi
 
+# --- 19. the continuous-integration wrapper runs and agrees ------------------
+# .github/scripts/check-versions.mjs resolves the repository root from its OWN
+# location, so it can only ever check this checkout. That is exactly why it is
+# worth running here: it is the command both CI jobs invoke, nothing else in
+# this file proves it still starts, still finds bumpctl.mjs at the path it
+# hard-codes, and still forwards the tool's exit status - and running it turns
+# real version drift into a local test failure instead of one first seen on a
+# pull request. It only reads files.
+cd "$root"
+node "$ci_checker" >"$work/out20" 2>&1 \
+    || { cat "$work/out20" >&2; fail "the CI version check fails on this repository"; }
+grep -q "agree" "$work/out20" \
+    || { cat "$work/out20" >&2; fail "the CI version check printed no agreement report"; }
+
 echo "bump.sh refuses mislabelled trees, never half-bumps, preserves staged work, keeps file modes, and keeps release paths intact"

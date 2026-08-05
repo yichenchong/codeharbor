@@ -1,5 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import createDOMPurify from "dompurify";
 import { JSDOM } from "jsdom";
 import {
@@ -133,6 +135,48 @@ test("no image can carry a source the host did not mint", () => {
     assert.doesNotMatch(remote, /src=|data-ch-image-path=/i);
 });
 
+test("an image map cannot navigate out of the remote file namespace", () => {
+    const dom = new JSDOM("");
+    const { window } = dom;
+    // <area href> navigates exactly like a link but is not an <a>, so the link
+    // rewrite never saw it: a relative href stayed relative and resolved
+    // against the page's own qrc: address rather than the remote file
+    // namespace. Markdown never produces an image map, so the element goes.
+    const rewritten = rewriteRelativeUrls(
+        renderMarkdown(
+            '<map name="m"><area shape="rect" coords="0,0,9,9" href="notes.md">'
+            + '<area href="https://evil.example/x"></map>'
+            + '<img src="pic.png" usemap="#m">',
+            sanitizerFor(window),
+        ),
+        "/docs/readme.md",
+        window.document,
+    );
+    assert.doesNotMatch(rewritten, /<area|<map/i);
+    assert.doesNotMatch(rewritten, /evil\.example/i);
+    // The ordinary image beside it still reaches the bridge.
+    assert.match(rewritten, /data-ch-image-path="pic\.png"/);
+});
+
+test("markup hidden inside a template cannot smuggle an image source", () => {
+    const dom = new JSDOM("");
+    const { window } = dom;
+    // rewriteRelativeUrls() walks ONE template's content fragment, and nodes
+    // inside a NESTED <template> are unreachable from that walk, so an <img>
+    // there would keep whatever source it was given. The sanitizer has to drop
+    // the template outright; this is what pins that it does.
+    const html = renderMarkdown(
+        'before <template><img src="data:image/svg+xml;base64,PHN2Zy8+">'
+        + '<a href="//evil.example/x">l</a></template> after',
+        sanitizerFor(window),
+    );
+    assert.doesNotMatch(html, /<template|data:|evil\.example/i);
+    const rewritten = rewriteRelativeUrls(html, "/docs/readme.md", window.document);
+    assert.doesNotMatch(rewritten, /src=|data:|evil\.example/i);
+    assert.match(rewritten, /before/);
+    assert.match(rewritten, /after/);
+});
+
 test("an <input type=image> cannot fetch a URL from the privileged page", () => {
     const dom = new JSDOM("");
     const { window } = dom;
@@ -245,6 +289,33 @@ test("a failing sanitizer falls back to escaped source instead of throwing", () 
         "<pre>&lt;script&gt;alert(1)&lt;/script&gt;</pre>",
     );
 });
+
+test("a sanitizer that cannot even be built falls back to escaped source", () => {
+    // With no sanitizer injected the renderer builds a DOMPurify against the
+    // page's `window`. There is no window here, so construction fails — which
+    // used to throw straight out of renderMarkdown() past the escaped-source
+    // fallback, and in the page that surfaced as an unhandled promise
+    // rejection and a blank pane with no message.
+    assert.equal(
+        renderMarkdown("<script>alert(1)</script>"),
+        "<pre>&lt;script&gt;alert(1)&lt;/script&gt;</pre>",
+    );
+});
+
+test("only the first word of a fence info string names the language", () => {
+    const dom = new JSDOM("");
+    const { window } = dom;
+    // marked hands over the whole info string. Keeping all of it produced extra
+    // bogus classes and printed "ts twoslash" in the corner label the
+    // stylesheet draws from data-language.
+    const html = renderMarkdown(
+        "```ts twoslash\nconst a = 1;\n```",
+        sanitizerFor(window),
+    );
+    assert.match(html, /data-language="ts"/);
+    assert.match(html, /class="language-ts"/);
+    assert.doesNotMatch(html, /twoslash/);
+});
 test("the image bridge also settles direct host return values", async () => {
     const bridge: MarkdownBridge = {
         resolveImage: () => "codeharbor-internal://file/direct-id",
@@ -320,4 +391,47 @@ test("the image bridge answers every caller exactly once, even when it fails", a
         "codeharbor-internal://file/first",
     );
     assert.deepEqual(values, ["a.png"]);
+});
+
+test("the page shell's content-security-policy stays locked down", () => {
+    // The page runs on the privileged profile with local-content-can-access-
+    // remote-urls enabled, which means CORS does not stand between it and the
+    // network: this policy is the only thing that does. Nothing here is
+    // exercised by loading the bundle, so it is asserted as text.
+    const shell = readFileSync(
+        fileURLToPath(new URL("../index.html", import.meta.url)),
+        "utf-8",
+    );
+    const match = /http-equiv="Content-Security-Policy" content="([^"]+)"/
+        .exec(shell);
+    assert.ok(match, "the page shell declares no Content-Security-Policy");
+    const directives = new Map(
+        match[1].split(";")
+            .map((part) => part.trim())
+            .filter((part) => part.length > 0)
+            .map((part) => {
+                const [name, ...values] = part.split(/\s+/);
+                return [name as string, values];
+            }),
+    );
+
+    assert.deepEqual(directives.get("default-src"), ["'none'"]);
+    // The page's own script is the only script. No inline, no eval, and no
+    // Markdown-reachable origin.
+    assert.deepEqual(directives.get("script-src"), ["'self'", "qrc:"]);
+    // Only the controlled read-only scheme may be fetched or displayed: never
+    // http(s), never data:, never the client's own file system.
+    for (const directive of ["connect-src", "img-src", "media-src"]) {
+        assert.deepEqual(directives.get(directive), ["codeharbor-internal:"],
+            `${directive} must name only the internal scheme`);
+    }
+    // No <base> redirection and no form submission out of the page.
+    assert.deepEqual(directives.get("base-uri"), ["'none'"]);
+    assert.deepEqual(directives.get("form-action"), ["'none'"]);
+    assert.deepEqual(directives.get("object-src"), ["'none'"]);
+    // 'unsafe-inline' is permitted for STYLE only, because the host pushes the
+    // theme in as inline custom properties.
+    assert.ok(directives.get("style-src")?.includes("'unsafe-inline'"));
+    assert.doesNotMatch(match[1], /'unsafe-eval'/);
+    assert.doesNotMatch(match[1], /script-src[^;]*'unsafe-inline'/);
 });

@@ -26,6 +26,19 @@ namespace ch {
 //   selectedPane/<devSessionId>
 //   paneSuffix/<devSessionId>/<region>
 //   session/<serverId>/active
+//
+// Only `region` is checked for a '/' (see setNextPaneSuffix()), and the
+// asymmetry is deliberate rather than an oversight. `region` is a two-word
+// vocabulary this client owns, so a separator in it can only be QML misuse and
+// would silently address a key shape that is not the documented one. A Dev
+// Session or server id is an OPAQUE server-minted value that this class only
+// ever uses as a key fragment: every read builds the key the same way the
+// matching write did, so a separator inside one merely nests the key one level
+// deeper and still round-trips, and none of the shapes above can collide with
+// another (`selectedPane/a/b` is a different key from `selectedPane/a`, and the
+// only spelling that could reach `paneSuffix/a/b/c` two ways has the '/' in the
+// region half, which is refused). Rejecting ids here would instead throw away
+// state for sessions the server is perfectly happy with.
 class UiStateStore : public QObject {
     Q_OBJECT
 
@@ -89,10 +102,10 @@ public:
     // A key that is absent, or holds anything that is not a whole number of at
     // least 1, reads back as 1 - a fresh region starts at "<region>-1". A WRITE
     // below 1 is dropped for the same reason, so the two halves cannot disagree
-    // about what is stored. Same
-    // reasoning as the widths above: one hand-edited or half-written line must
-    // fall back to the documented start, never to 0 (which would mint a
-    // "<region>-0") and never to a number below one already in the tree.
+    // about what is stored. Same reasoning as the widths above: one hand-edited
+    // or half-written line must fall back to the documented start, never to 0
+    // (which would mint a "<region>-0") and never to a number below one already
+    // in the tree.
     // SessionLayouts additionally takes the maximum of this counter and the
     // highest suffix its loaded tree carries, so a Dev Session that predates
     // this counter - or one whose settings file was cleared - still cannot

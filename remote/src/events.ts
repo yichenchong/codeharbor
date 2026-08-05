@@ -192,11 +192,21 @@ export function parseEventLine(line: unknown): AgentEvent | null {
  * the coding agent happens to be running — would look for it under a different
  * one, so every status event would silently vanish. Falling back gives both
  * ends the same answer.
+ *
+ * The home directory comes from the SAME `env` the runtime directory does. Every
+ * other input to this function is taken from the caller's environment, so
+ * reading `$HOME` out of the real process environment instead made the answer
+ * only half-overridable: a caller that passes an environment (a hook launched
+ * with a different HOME, or a test) got the runtime directory it asked for but
+ * somebody else's home, i.e. a socket path neither end of the pair agrees on.
+ * `os.homedir()` remains the fallback for an unset or relative $HOME.
  */
 export function resolveSocketPath(env: NodeJS.ProcessEnv = process.env): string {
     const runtimeDir = env.XDG_RUNTIME_DIR;
     if (runtimeDir && path.isAbsolute(runtimeDir)) {
         return path.join(runtimeDir, "codeharbor.sock");
     }
-    return path.join(os.homedir(), ".cache", "codeharbor", "events.sock");
+    const home = env.HOME;
+    const base = home && path.isAbsolute(home) ? home : os.homedir();
+    return path.join(base, ".cache", "codeharbor", "events.sock");
 }

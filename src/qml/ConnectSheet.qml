@@ -96,7 +96,13 @@ Rectangle {
     radius: Theme.radiusMedium
     border.width: 1
     border.color: Theme.borderSubtle
-    focus: true
+    // Focus follows VISIBILITY, not construction. A hidden item can still hold
+    // the window's active focus (Qt does not clear focus when an item is
+    // hidden), and Main.qml builds this sheet at startup with `shown` false —
+    // so a plain `focus: true` handed every keystroke to an invisible sheet
+    // until the user happened to click something: the sidebar's arrow keys and
+    // Escape both went nowhere. Same rule LogView and SettingsWindow follow.
+    focus: root.visible
 
     // This sheet fills the whole window on top of the three regions, but a
     // Rectangle accepts no input of its own: Qt Quick hands an unaccepted press
@@ -534,6 +540,12 @@ Rectangle {
         TextField {
             id: fieldInput
             width: field.width
+            // The visible Label above is a SEPARATE item, so nothing ties the
+            // two together for assistive technology: without this every field
+            // in the one surface a user meets before any server is reachable is
+            // announced as an unnamed edit box.
+            Accessible.name: fieldLabel.text
+            Accessible.description: fieldHint.text
             color: Theme.text
             placeholderTextColor: Theme.textPlaceholder()
             selectByMouse: true
@@ -1418,6 +1430,12 @@ Rectangle {
                     id: secretField
                     objectName: "credentialField"
                     width: parent.width
+                    // A masked field has no visible label of its own, and its
+                    // placeholder is the server's own prompt string, so name it
+                    // explicitly rather than leaving a screen reader to
+                    // announce an unlabelled password box.
+                    Accessible.name: root.credentialKind() === "password"
+                                     ? qsTr("Password") : qsTr("Key passphrase")
                     // The masked field this whole item exists for.
                     echoMode: TextInput.Password
                     passwordCharacter: "\u2022"

@@ -17,6 +17,8 @@ import {
 import { PassThrough } from "node:stream";
 import { resolveSocketPath, type AgentEvent } from "../src/events.ts";
 import {
+    BRIDGE_MESSAGE_VERSION,
+    bridgeLineFits,
     processBridgeLine,
     startBridge,
     makeStreamSink,
@@ -559,6 +561,15 @@ function fakeSource(): {
     } as unknown as net.Socket;
     return state;
 }
+
+const RELAY_EVENT = {
+    harness: "oh-my-pi",
+    state: "running",
+    event: "agent_start",
+    devSessionId: "s",
+    terminalId: "t",
+} as unknown as AgentEvent;
+
 test("makeStreamSink refuses an event whose envelope exceeds the desktop frame", () => {
     const out = new PassThrough();
     const sink = makeStreamSink(out);
@@ -613,14 +624,6 @@ test("a producer destroyed by the sink has the rest of its chunk abandoned", asy
         fs.rmSync(dir, { recursive: true, force: true });
     }
 });
-
-const RELAY_EVENT = {
-    harness: "oh-my-pi",
-    state: "running",
-    event: "agent_start",
-    devSessionId: "s",
-    terminalId: "t",
-} as unknown as AgentEvent;
 
 test("makeStreamSink pauses the source on a full buffer and resumes on drain (RR24)", async () => {
     // A tiny highWaterMark forces write() to report a full buffer on the first
@@ -752,6 +755,96 @@ test("startBridge drops a producer that never sends a newline", async () => {
     }
 });
 
+// The producer-to-relay message gained a format revision. The hook that writes
+// it is the one component living outside this project's update cycle — a user
+// pastes its path into an assistant's configuration once and it can keep
+// pointing at a months-old checkout — so the revision is OPTIONAL on the wire
+// and must stay that way: an unversioned line is what every hook installed
+// before the field existed sends, and it has to keep being accepted as the
+// current revision rather than becoming an unknown producer overnight.
+test("the relay accepts an unversioned producer message and an explicit current one", () => {
+    const base = {
+        harness: "oh-my-pi",
+        devSessionId: "s",
+        terminalId: "t",
+        native: { type: "agent_start" },
+    };
+    const unversioned = processBridgeLine(JSON.stringify(base));
+    assert.ok(unversioned, "a message with no version field must still relay");
+    assert.equal(unversioned.state, "running");
+
+    // What the hook will actually start sending. It must be ACCEPTED, not
+    // refused as an unexpected field.
+    const current = processBridgeLine(
+        JSON.stringify({ version: BRIDGE_MESSAGE_VERSION, ...base }),
+    );
+    assert.ok(current, "an explicitly current version must relay");
+    assert.equal(current.state, "running");
+
+    // A revision this relay does not implement is refused rather than mapped
+    // against a shape whose fields may have moved. The number, not a string:
+    // a producer that quotes it is as wrong as one that invents a revision.
+    for (const version of [0, BRIDGE_MESSAGE_VERSION + 1, "1", null, {}]) {
+        assert.equal(
+            processBridgeLine(JSON.stringify({ version, ...base })),
+            null,
+            `version ${JSON.stringify(version)} must not be relayed`,
+        );
+    }
+});
+
+// A refused message is just a message that produced nothing — exactly like a
+// malformed one. It must NOT tear the producer's connection down: a hook that
+// is one revision out of step still sends well-formed later events, and an
+// out-of-step revision is not the unbounded-producer abuse that the connection
+// drop exists for.
+test("a message the relay refuses does not cost the producer its connection", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ch-bridge-version-"));
+    const socketPath = path.join(dir, "bridge.sock");
+    const relayed = Promise.withResolvers<AgentEvent>();
+    const server = await startBridge(socketPath, (event) => relayed.resolve(event));
+    try {
+        const producer = net.createConnection(socketPath);
+        const up = Promise.withResolvers<void>();
+        producer.once("connect", () => up.resolve());
+        producer.on("error", () => {});
+        await up.promise;
+        const base = {
+            harness: "oh-my-pi",
+            devSessionId: "s1",
+            terminalId: "t1",
+            native: { type: "agent_start" },
+        };
+        // An unknown revision first, a good event second, both on ONE
+        // connection. The second only arrives if the first did not kill it.
+        producer.write(
+            `${JSON.stringify({ version: BRIDGE_MESSAGE_VERSION + 99, ...base })}\n`,
+        );
+        producer.write(`${JSON.stringify(base)}\n`);
+        assert.equal((await relayed.promise).state, "running");
+        assert.equal(producer.destroyed, false, "the producer must still be connected");
+        producer.end();
+    } finally {
+        const closed = Promise.withResolvers<void>();
+        server.close(() => closed.resolve());
+        await closed.promise;
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+// One expression of the line bound, shared with the producers that must respect
+// it. It measures the JSON text WITHOUT the framing newline, which is what the
+// input framer counts; measuring the framed line instead made the outbound
+// refusal exactly one byte stricter than the inbound acceptance.
+test("bridgeLineFits measures the payload, not the framing newline", () => {
+    assert.equal(bridgeLineFits("x".repeat(MAX_BRIDGE_LINE_BYTES)), true);
+    assert.equal(bridgeLineFits("x".repeat(MAX_BRIDGE_LINE_BYTES + 1)), false);
+    // Bytes, not characters. A producer sizing a summary against character
+    // count would write a line the relay is guaranteed to refuse.
+    assert.equal(bridgeLineFits("\u00e9".repeat(MAX_BRIDGE_LINE_BYTES / 2)), true);
+    assert.equal(bridgeLineFits("\u00e9".repeat(MAX_BRIDGE_LINE_BYTES / 2 + 1)), false);
+});
+
 // RA4. The event name is trimmed before use, and so must the other environment
 // inputs be: hook configurations are shell, and `OMP_TOOL="$(current_tool)"`
 // or a config file saved with CRLF line endings leaves a trailing newline on
@@ -782,6 +875,36 @@ test("readHookInput trims the environment values it forwards (RA4)", () => {
     assert.equal(blank.tool, undefined);
     assert.equal(blank.summary, undefined);
     assert.deepEqual(toBridgeMessage(blank).native, { type: "agent_start" });
+
+    // AG6. The session coordinates are the values where NOT trimming does the
+    // most damage. A stray carriage return still counts as real content, so the
+    // missing-coordinates guard is satisfied and the event is emitted — and the
+    // client stores identifiers verbatim, so it files the event under a Dev
+    // Session literally named "sess-t\r", which does not exist. No warning is
+    // printed anywhere; the sidebar just never updates.
+    const padded = readHookInput(["node", "hook.ts", "agent_start"], {
+        OMP_DEV_SESSION_ID: "sess-t\r\n",
+        OMP_TERMINAL_ID: "  term-t  ",
+    } as NodeJS.ProcessEnv);
+    assert.equal(padded.devSessionId, "sess-t");
+    assert.equal(padded.terminalId, "term-t");
+    const wire = toBridgeMessage(padded);
+    assert.equal(wire.devSessionId, "sess-t");
+    assert.equal(wire.terminalId, "term-t");
+
+    // A whitespace-only coordinate collapses to "", which is what
+    // missingCoordinates reports on: the hook refuses to emit rather than
+    // sending an unroutable event.
+    const empty = readHookInput(["node", "hook.ts", "agent_start"], {
+        OMP_DEV_SESSION_ID: "\n",
+        OMP_TERMINAL_ID: "\t",
+    } as NodeJS.ProcessEnv);
+    assert.equal(empty.devSessionId, "");
+    assert.equal(empty.terminalId, "");
+    assert.deepEqual(missingCoordinates(empty), [
+        "OMP_DEV_SESSION_ID",
+        "OMP_TERMINAL_ID",
+    ]);
 });
 
 // RA1. The hook blocks the agent for exactly as long as it runs (SPEC 6.4), and
@@ -823,6 +946,45 @@ test("emitHookEvent closes its socket against a peer that never closes (RA1)", a
         // client's behavior has been observed, otherwise server.close() quite
         // correctly waits forever for this deliberately retained socket.
         serverSocket?.destroy();
+        const closed = Promise.withResolvers<void>();
+        server.close(() => closed.resolve());
+        await closed.promise;
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+// AG5. The agent run is blocked for exactly as long as this hook takes, so the
+// promise must be settled by SOMETHING on every path. A bridge that accepts the
+// connection and hangs up immediately destroys the socket — and destroying a
+// socket also cancels the inactivity watchdog that would otherwise have bounded
+// the wait, so a path that settles only on 'error' or on a completed write can
+// leave the hook waiting with nothing left to wake it.
+//
+// The generous timeout is the point of the test: if the watchdog were the thing
+// doing the work here, this case would take a full minute rather than
+// milliseconds.
+test("emitHookEvent settles when the bridge hangs up without reading (AG5)", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ch-hook-rude-"));
+    const socketPath = path.join(dir, "events.sock");
+    const server = net.createServer((socket) => socket.destroy());
+    const listening = Promise.withResolvers<void>();
+    server.listen(socketPath, () => listening.resolve());
+    await listening.promise;
+
+    try {
+        const started = Date.now();
+        // Either outcome is acceptable — the line may or may not have reached
+        // the kernel before the peer went away. Hanging is not.
+        await emitHookEvent(
+            { event: "agent_start", devSessionId: "s", terminalId: "t" },
+            socketPath,
+            60_000,
+        ).then(() => undefined, () => undefined);
+        assert.ok(
+            Date.now() - started < 5_000,
+            "the hook must not block the agent waiting out its watchdog",
+        );
+    } finally {
         const closed = Promise.withResolvers<void>();
         server.close(() => closed.resolve());
         await closed.promise;
@@ -955,4 +1117,104 @@ test("the installed hook script exits 0 with no bridge listening (AG2)", async (
     } finally {
         fs.rmSync(dir, { recursive: true, force: true });
     }
+});
+
+// AG8, the producer half. The hook is the one component that lives outside the
+// project's update cycle: a user pastes its path into their assistant's
+// configuration and it may keep running out of a months-old checkout for years.
+// So the message it sends now states which revision of the format it is written
+// in, and the relay refuses a revision it does not implement instead of
+// misreading the fields. Two things have to hold, and only one of them is
+// obvious: the field must be present, and it must be the NUMBER — the relay
+// rejects the string "1", so a hook that stringified it would take every event
+// down while looking perfectly healthy.
+test("the hook stamps the bridge message revision, as a number (AG8)", async () => {
+    const raw = await emitAndReceive({
+        event: "agent_start",
+        devSessionId: "sess-v",
+        terminalId: "term-v",
+    });
+    const decoded = JSON.parse(raw.trim());
+    assert.equal(decoded.version, BRIDGE_MESSAGE_VERSION);
+    assert.equal(typeof decoded.version, "number");
+
+    // And the relay accepts what the hook stamps: the round trip is the point,
+    // not the field on its own.
+    const event = processBridgeLine(raw);
+    assert.ok(event, "the relay must accept the revision the hook declares");
+    assert.equal(event.state, "running");
+    assert.equal(event.devSessionId, "sess-v");
+});
+
+// AG9, the producer half. The relay bounds one line and drops the whole
+// producer connection when a message overruns it — deliberately, because the
+// hook writes its entire line in one go, so an oversized message trips the
+// unterminated-line guard before any newline is seen. Resynchronising on the
+// relay side would break that pinned contract, so the pre-check belongs here.
+//
+// The two fields that can plausibly get that big are the two OPTIONAL ones, and
+// both are decoration. Sacrificing them keeps the state transition — the thing
+// the sidebar actually runs on — deliverable, which is the whole point: the
+// user loses a summary they cannot read anyway, not the event and not their
+// agent's status reporting for the rest of the session.
+test("an over-long summary costs the summary, never the event (AG9)", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ch-hook-big-"));
+    const socketPath = resolveSocketPath({ XDG_RUNTIME_DIR: dir } as NodeJS.ProcessEnv);
+    const received = Promise.withResolvers<string>();
+    const server = net.createServer((socket) => {
+        const chunks: Buffer[] = [];
+        socket.on("data", (chunk) => chunks.push(chunk));
+        socket.on("end", () => received.resolve(Buffer.concat(chunks).toString("utf8")));
+    });
+    const listening = Promise.withResolvers<void>();
+    server.listen(socketPath, () => listening.resolve());
+    await listening.promise;
+
+    let logged: string[] = [];
+    try {
+        logged = await captureStderr(async () => {
+            await main(["node", "oh-my-pi-hook.ts", "agent_end"], {
+                XDG_RUNTIME_DIR: dir,
+                OMP_DEV_SESSION_ID: "sess-big",
+                OMP_TERMINAL_ID: "term-big",
+                // Comfortably past the bound on its own.
+                OMP_SUMMARY: "x".repeat(MAX_BRIDGE_LINE_BYTES),
+                OMP_METADATA: '{"model":"pi-2"}',
+            } as NodeJS.ProcessEnv);
+        });
+        const raw = await received.promise;
+
+        // What went out is inside the bound the relay enforces. The framing
+        // newline is outside that bound, so it is measured without it.
+        assert.ok(raw.endsWith("\n"));
+        const payload = raw.trimEnd();
+        assert.ok(
+            bridgeLineFits(payload),
+            `the hook wrote ${Buffer.byteLength(payload)} bytes, past the relay's bound`,
+        );
+
+        // The event survived intact; only the decoration was given up.
+        const decoded = JSON.parse(payload);
+        assert.deepEqual(decoded.native, { type: "agent_end" });
+        assert.equal(decoded.devSessionId, "sess-big");
+        assert.ok(!("summary" in decoded), "the over-long summary must not reach the wire");
+        assert.ok(!("metadata" in decoded), "the bag goes with it, as one trimming step");
+
+        // ...and it is still a real state change once the relay maps it.
+        const event = processBridgeLine(raw);
+        assert.ok(event, "the trimmed message must still map to an AgentEvent");
+        assert.equal(event.state, "idle_unseen");
+    } finally {
+        const closed = Promise.withResolvers<void>();
+        server.close(() => closed.resolve());
+        await closed.promise;
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
+
+    // A silently dropped field is invisible, and the person who set it is
+    // standing in the shell this hook was launched from.
+    assert.equal(logged.length, 1);
+    assert.match(logged[0], /exceeded the bridge line bound/);
+    assert.match(logged[0], /OMP_SUMMARY and OMP_METADATA were dropped/);
+    assert.match(logged[0], /state change was still delivered/);
 });

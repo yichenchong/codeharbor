@@ -212,6 +212,27 @@ test("save sends the buffer as of the save, guarded by the given revision", () =
     ]);
 });
 
+test("save sends the bytes it is GIVEN rather than re-reading the buffer", () => {
+    const clock = new FakeClock();
+    const { bridge, saves } = fakeBridge();
+    let reads = 0;
+    const reporter = new RecoveryReporter(bridge, () => {
+        ++reads;
+        return "a second read of the buffer";
+    }, clock.timers);
+
+    // The page has already taken the bytes (it records them as "handed to the
+    // host" so a successful reply can re-baseline against them), so the save
+    // must carry exactly those and read the buffer no further times.
+    reporter.schedule(true);
+    reporter.save("rev-1", "the bytes the page captured");
+    assert.deepEqual(saves, [
+        { content: "the bytes the page captured", revision: "rev-1" },
+    ]);
+    assert.equal(reads, 0, "the buffer was read again for bytes the caller supplied");
+    assert.equal(reporter.pending, false, "save must still cancel the snapshot");
+});
+
 
 test("report sends immediately even when no debounce timer is armed", () => {
     const clock = new FakeClock();

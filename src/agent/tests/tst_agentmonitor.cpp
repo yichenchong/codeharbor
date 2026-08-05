@@ -4,18 +4,22 @@
 
 #include <QCoreApplication>
 #include <QBuffer>
+#include <QFile>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QJsonValue>
 #include <QLocalServer>
 #include <QLocalSocket>
+#include <QRegularExpression>
 #include <QSignalSpy>
 #include <QString>
+#include <QStringList>
 #include <QStringView>
 #include <QtTest/QtTest>
 
 #include <cstring>
+#include <utility>
 
 using ch::AgentState;
 using ch::AgentStatusMonitor;
@@ -100,6 +104,7 @@ private slots:
     void strictWireMappingSeparatesUnknownFromGarbage(); // pure parser
     void parseRejectsMalformed();         // pure parser
     void parseRejectsBlankIdentifiers();  // pure parser
+    void harnessWireWordsMatchRemoteEventsTs(); // pure parser
     void mapsStatesFromWire();
     void runningToIdleUnseenSetsUnseenAndNotify();
     void markSeenClearsUnseen();
@@ -140,6 +145,8 @@ private slots:
     void onlyTheGenericHarnessDerivesStateFromOutput();
     void genericActivityRegistrationIsSilentUntilTheChannelAttaches();
     void genericIdleUnseenSurvivesAnotherPaneAgeTick();
+    // AG1: a prompt is not activity the generic clock may overwrite.
+    void genericActivityNeverOverwritesAWaitingInputPrompt();
     // Harness registration changes must not leave output-derived state behind.
     void harnessChangesClearDerivedState();
     // Re-entrant eviction must not emit pending transitions for removed panes.
@@ -148,6 +155,9 @@ private slots:
     void aSeenGenericCompletionResumesActivityDerivation();
     // AG6: both windows are policy, and 0 has a defined meaning for each.
     void windowSettersClampNegativeValues();
+    // AG2: a rebind must not carry a pending oversize discard onto the new
+    // producer's first frame.
+    void rebindClearsAPendingOversizeDiscard();
 
 private:
     void makePair();
@@ -487,6 +497,69 @@ void TstAgentMonitor::parseRejectsBlankIdentifiers()
     QVERIFY(ev.has_value());
     QCOMPARE(ev->devSessionId, QStringLiteral(" d "));
     QCOMPARE(ev->terminalId, QStringLiteral("\tt"));
+}
+
+// AG3. The client's list of legal `harness` values (detail::isHarnessWire in
+// AgentEvent.h) is a hand-written copy of HARNESSES in remote/src/events.ts,
+// and an event naming a harness the client does not know is DROPPED, not
+// merely mislabelled. So the day somebody teaches the daemon about a fifth
+// coding agent, every status event that agent produces disappears at the
+// client edge: no state, no badge, no notification, and no error anywhere to
+// explain it. The equivalent list of state words already has a mechanical
+// drift check (TstModels::agentStateWireWordsMatchRemoteEventsTs); this is the
+// same check for the harness names, read out of the same authoritative file.
+//
+// CH_REPO_ROOT is the configure-time source directory, defined in this
+// directory's CMakeLists.txt. A missing file is a hard failure, never a silent
+// skip: a check that can be quietly disabled is not a check.
+void TstAgentMonitor::harnessWireWordsMatchRemoteEventsTs()
+{
+    QFile events(QStringLiteral(CH_REPO_ROOT "/remote/src/events.ts"));
+    QVERIFY2(events.open(QIODevice::ReadOnly | QIODevice::Text),
+             qPrintable(QStringLiteral("cannot open %1: %2")
+                            .arg(events.fileName(), events.errorString())));
+    const QString source = QString::fromUtf8(events.readAll());
+
+    // Cut out exactly the HARNESSES array literal, then take the quoted words
+    // inside it. Anchoring on both brackets keeps unrelated string literals
+    // elsewhere in the file out of the list. Escaped rather than raw string
+    // literals on purpose: moc's preprocessor does not understand a raw string
+    // used as a macro argument.
+    static const QRegularExpression arrayRe(
+        QStringLiteral("export const HARNESSES\\s*=\\s*\\[([^\\]]*)\\]"));
+    const QRegularExpressionMatch arrayMatch = arrayRe.match(source);
+    QVERIFY2(arrayMatch.hasMatch(),
+             qPrintable(QStringLiteral("no HARNESSES array literal in %1")
+                            .arg(events.fileName())));
+
+    static const QRegularExpression wordRe(QStringLiteral("\"([^\"]*)\""));
+    QStringList remoteWords;
+    QRegularExpressionMatchIterator it =
+        wordRe.globalMatch(arrayMatch.captured(1));
+    while (it.hasNext())
+        remoteWords << it.next().captured(1);
+    QVERIFY2(!remoteWords.isEmpty(),
+             qPrintable(QStringLiteral("HARNESSES in %1 parsed as empty")
+                            .arg(events.fileName())));
+
+    for (const QString& harness : std::as_const(remoteWords)) {
+        const auto parsed = ch::parseAgentEventLine(
+            eventLine(QStringLiteral("running"), QStringLiteral("d"),
+                      QStringLiteral("t"), harness));
+        QVERIFY2(parsed.has_value(),
+                 qPrintable(QStringLiteral("the client drops every event from "
+                                           "harness \"%1\"")
+                                .arg(harness)));
+        QCOMPARE(parsed->harness, harness);
+    }
+
+    // The list is still a closed set: a name that is not in it is rejected,
+    // so the check above cannot be satisfied by simply accepting anything.
+    QVERIFY(!ch::parseAgentEventLine(
+                 eventLine(QStringLiteral("running"), QStringLiteral("d"),
+                           QStringLiteral("t"),
+                           QStringLiteral("harness-that-does-not-exist")))
+                 .has_value());
 }
 
 // --- Monitor ---------------------------------------------------------------
@@ -1761,6 +1834,82 @@ void TstAgentMonitor::windowSettersClampNegativeValues()
 
     // The non-generic pane still has not aged: the two windows are independent.
     QCOMPARE(m_monitor->stateFor("dC", "tC"), asInt(AgentState::Running));
+}
+
+// AG1. A pane's CONFIGURED harness (the terminal_panes.harness column, fed in
+// through setTerminalHarness) and the harness that actually reports lifecycle
+// events on the wire are two independent things: a user can leave a pane
+// configured as the adapterless "generic" harness and still run a coding agent
+// in it whose hook is installed, and the monitor keys purely on
+// (devSessionId, terminalId). genericIdleUnseenSurvivesAnotherPaneAgeTick()
+// already pins that arrival for a completion. The prompt state needs the same
+// protection, and needs it MORE: an unseen completion is released when the user
+// views the Dev Session, whereas nothing at all clears waiting_input, so
+// letting the output clock overwrite it deletes the one signal that says the
+// agent is blocked on the user — silently, a fraction of a second later, with
+// no user action involved.
+//
+// Explicit observations still win, exactly as they do over a completion: bytes
+// on the pane's channel mean it is alive again.
+void TstAgentMonitor::genericActivityNeverOverwritesAWaitingInputPrompt()
+{
+    makePair();
+    m_monitor->setFallbackIdleThresholdMs(30);
+
+    m_monitor->setTerminalHarness(QStringLiteral("dPr"), QStringLiteral("tPr"),
+                                  QStringLiteral("generic"));
+    m_monitor->noteTerminalAttached(QStringLiteral("dPr"),
+                                    QStringLiteral("tPr"));
+    QCOMPARE(m_monitor->stateFor("dPr", "tPr"), asInt(AgentState::Starting));
+
+    feed(eventLine("waiting_input", QStringLiteral("dPr"),
+                   QStringLiteral("tPr"), QStringLiteral("oh-my-pi"),
+                   QStringLiteral("ask_started")));
+    QTRY_COMPARE(m_monitor->stateFor("dPr", "tPr"),
+                 asInt(AgentState::WaitingInput));
+
+    // Several quiet windows go by. Before the fix the first tick put the pane
+    // back to Starting (no output had ever been seen on this channel) and the
+    // prompt vanished from the sidebar.
+    QTest::qWait(200);
+    QCOMPARE(m_monitor->stateFor("dPr", "tPr"),
+             asInt(AgentState::WaitingInput));
+
+    // Output is a real observation and still moves the pane on, and the
+    // activity derivation resumes from there.
+    m_monitor->noteTerminalOutput(QStringLiteral("dPr"), QStringLiteral("tPr"));
+    QCOMPARE(m_monitor->stateFor("dPr", "tPr"), asInt(AgentState::Running));
+    QTRY_COMPARE(m_monitor->stateFor("dPr", "tPr"), asInt(AgentState::Idle));
+}
+
+// AG2. The oversize guard leaves the monitor mid-discard: it has thrown away
+// the head of a frame that blew the 1 MiB cap and is waiting for the newline
+// that ends it, so the next bytes it frames are dropped on purpose. That
+// bookkeeping belongs to ONE producer's byte stream. A reconnect hands the
+// monitor a brand-new stream, and carrying the flag across the swap would make
+// the replacement's very first event the "tail" of a frame it never wrote —
+// one real state change lost per reconnect that happened to interrupt a flood.
+// setTransport() clears the flag with the read buffer; nothing pinned it.
+void TstAgentMonitor::rebindClearsAPendingOversizeDiscard()
+{
+    makePair();
+    QSignalSpy stateSpy(m_monitor, &AgentStatusMonitor::agentStateChanged);
+
+    // 1.5 MiB with no newline: past the cap, so the buffer is dropped and the
+    // monitor is left waiting to skip the rest of that frame.
+    feed(QByteArray(3 * 512 * 1024, 'x'));
+    QTRY_COMPARE_WITH_TIMEOUT(m_writerSide->bytesToWrite(), qint64(0), 15000);
+    QTest::qWait(200);
+    QCOMPARE(stateSpy.count(), 0);
+
+    swapPair();
+
+    // The replacement's first frame is a frame of its own, not a discarded
+    // tail.
+    feed(eventLine("running", QStringLiteral("dRB"), QStringLiteral("tRB")));
+    QTRY_COMPARE(stateSpy.count(), 1);
+    QCOMPARE(stateSpy.at(0).at(2).toInt(), asInt(AgentState::Running));
+    QCOMPARE(m_monitor->stateFor("dRB", "tRB"), asInt(AgentState::Running));
 }
 
 QTEST_MAIN(TstAgentMonitor)

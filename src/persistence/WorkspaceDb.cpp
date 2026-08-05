@@ -247,10 +247,20 @@ std::optional<SplitNode> parseLayoutRow(const QJsonObject& row)
 // unset field is genuinely absent on the wire (the server then falls back to its
 // default or the current value), never sent as an explicit null.
 
+// A switch rather than a two-way test on Region::Terminal: an enumerator added
+// later would silently be sent to the server as "viewer", writing one region's
+// layout over another's. The switch makes the compiler point at this function
+// instead (-Wswitch), and the trailing return only satisfies the "control
+// reaches end of non-void function" rule for an out-of-range cast value.
 QString regionKey(Region region)
 {
-    return region == Region::Terminal ? QStringLiteral("terminal")
-                                      : QStringLiteral("viewer");
+    switch (region) {
+    case Region::Viewer:
+        return QStringLiteral("viewer");
+    case Region::Terminal:
+        return QStringLiteral("terminal");
+    }
+    return QStringLiteral("viewer");
 }
 
 template <typename IdType>

@@ -431,7 +431,36 @@ bool TerminalFactory::resolveTarget(TerminalController* controller,
         // delivered before that assignment would be overwritten by it.
         const QString target = cached.target;
         QMetaObject::invokeMethod(
-            this, [this, key, target]() { finishResolution(key, target, QString()); },
+            this,
+            [this, key, target, byRow, devSessionId, paneName]() {
+                finishResolution(key, target, QString());
+                // The row is re-reported from the CACHE too, not only from the
+                // live round trip below, and that is what makes the backfill
+                // retryable instead of one-shot.
+                //
+                // The report exists so the layout LEAF ends up holding the row
+                // id; this factory holding it is not the point. A report that
+                // did not land — the pane was closed while the answer
+                // travelled, the layout was mid-load, the write was refused —
+                // used to be the only one there would ever be, because every
+                // later resolution of the same legacy label is answered from
+                // here and said nothing about the row at all. The leaf then went
+                // on naming its terminal by the recyclable slot label for the
+                // rest of the process: the unsafe key this whole path exists to
+                // retire. Re-reporting costs one signal and cannot double-write,
+                // because ch::SessionLayouts::bindTerminalPaneRow() returns
+                // immediately when the leaf already carries this id.
+                //
+                // Guarded exactly as the live path is: a pane addressed BY its
+                // row id already knows the answer, so it has nothing to backfill.
+                //
+                // Re-read rather than captured, because setServerId() can drop
+                // the whole cache while this call is queued — and a row id from
+                // the previous server must not be written into anything.
+                const ResolvedPane answer = m_resolved.value(key);
+                if (!byRow && !answer.terminalId.isEmpty())
+                    emit paneRowResolved(devSessionId, paneName, answer.terminalId);
+            },
             Qt::QueuedConnection);
         return true;
     }

@@ -9,26 +9,29 @@ import { WebglAddon } from "@xterm/addon-webgl";
 // dist/terminal.css, which the packaged page links (see build.mjs).
 import "@xterm/xterm/css/xterm.css";
 // Pure, DOM-free predicate split out so it can be unit-tested (see visibility.ts).
-import { isRendererVisible } from "./visibility";
+// Relative specifiers carry their .ts extension throughout this package: the
+// modules are also loaded directly by node --test, whose ESM resolver does no
+// extension guessing. esbuild and tsc (allowImportingTsExtensions) accept it.
+import { isRendererVisible } from "./visibility.ts";
 // Output flow control, likewise DOM-free and unit-tested (see writer.ts).
-import { CoalescingWriter } from "./writer";
+import { CoalescingWriter } from "./writer.ts";
 // Input pacing keeps large pastes bounded and preserves ANSI sequence boundaries.
-import { TerminalInputWriter } from "./input";
+import { TerminalInputWriter } from "./input.ts";
 import {
     applyTerminalPreferences,
     terminalFontPointsToCssPixels,
     type TerminalPreferenceValues,
-} from "./preferences";
+} from "./preferences.ts";
 import {
     createDevicePixelRatioController,
     type DevicePixelRatioController,
-} from "./dpr";
+} from "./dpr.ts";
 import {
     applyThemeToDocument,
     defaultThemeRoles,
     type ThemeRoles,
     xtermTheme,
-} from "./theme";
+} from "./theme.ts";
 
 export interface TerminalBridge {
     /** Forward user keystrokes to the remote PTY (SPEC 5.1). */
@@ -234,6 +237,13 @@ export function mountTerminal(element: HTMLElement, bridge: TerminalBridge): Ter
             : event.ctrlKey && event.shiftKey && !event.altKey && key === "c";
         if (copyShortcut) {
             copySelection();
+            // preventDefault() as well as returning false. Returning false only
+            // stops xterm.js from turning the key into PTY input; it does NOT
+            // suppress the browser's own command, so Cmd+C on macOS would still
+            // run Chromium's native copy right after this one and overwrite the
+            // clipboard from the (empty) DOM selection — xterm's selection lives
+            // in its renderer, not in the document.
+            event.preventDefault();
             return false;
         }
         // Do not intercept paste: the browser emits a trusted paste event for

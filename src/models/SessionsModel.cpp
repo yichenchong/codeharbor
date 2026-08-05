@@ -1,8 +1,6 @@
 #include "SessionsModel.h"
 
-#include <QSet>
 #include <algorithm>
-
 #include <limits>
 #include <utility>
 
@@ -72,12 +70,22 @@ void SessionsModel::setGroups(QVector<GroupRow> groups)
         emit sessionPresenceChanged();
 }
 
+void SessionsModel::applyFilters()
+{
+    // Presence deliberately not re-checked: both filters read pinned/archived
+    // out of the UNFILTERED tree, which this does not touch, so hasSessions()
+    // and hasUnarchivedSessions() cannot move here.
+    beginResetModel();
+    groups_ = filteredGroups(allGroups_, pinnedOnly_, showArchived_);
+    endResetModel();
+}
+
 void SessionsModel::setPinnedOnly(bool pinnedOnly)
 {
     if (pinnedOnly_ == pinnedOnly)
         return;
     pinnedOnly_ = pinnedOnly;
-    setGroups(allGroups_);
+    applyFilters();
     emit pinnedOnlyChanged();
 }
 
@@ -86,7 +94,7 @@ void SessionsModel::setShowArchived(bool showArchived)
     if (showArchived_ == showArchived)
         return;
     showArchived_ = showArchived;
-    setGroups(allGroups_);
+    applyFilters();
     emit showArchivedChanged();
 }
 
@@ -158,26 +166,39 @@ void SessionsModel::updateTerminalStates(QVector<GroupRow> groups)
     // is showing: with a filter active the visible row numbers do not line up
     // with the authoritative tree's, and signalling an unfiltered index would
     // repaint the wrong row.
-    QSet<QString> changedSessions;
+    //
+    // The "did this row move?" question is answered POSITIONALLY, against a
+    // snapshot of the visible tree taken before the adoption. Keying it on the
+    // session id instead would announce every row that happens to share an id
+    // with a row that moved - two rows carrying the same (or an empty) id would
+    // repaint together. The snapshot lines up one-for-one with the rebuilt
+    // filtered tree because the filter reads only the pinned and archived bits,
+    // and both were just verified unchanged.
+    QVector<QVector<SessionRowState>> visibleBefore;
+    visibleBefore.reserve(groups_.size());
+    for (const GroupRow &group : std::as_const(groups_)) {
+        QVector<SessionRowState> states;
+        states.reserve(group.sessions.size());
+        for (const SessionRow &session : group.sessions)
+            states.append(aggregateSessionState(session.terminals));
+        visibleBefore.append(std::move(states));
+    }
+
     for (qsizetype gi = 0; gi < groups.size(); ++gi) {
         QVector<SessionRow> &sessions = allGroups_[gi].sessions;
         QVector<SessionRow> &incoming = groups[gi].sessions;
-        for (qsizetype si = 0; si < sessions.size(); ++si) {
-            const SessionRowState before = aggregateSessionState(sessions.at(si).terminals);
+        for (qsizetype si = 0; si < sessions.size(); ++si)
             sessions[si].terminals = std::move(incoming[si].terminals);
-            if (before != aggregateSessionState(sessions.at(si).terminals))
-                changedSessions.insert(sessions.at(si).session.id.value);
-        }
     }
     groups_ = filteredGroups(allGroups_, pinnedOnly_, showArchived_);
-    if (changedSessions.isEmpty())
-        return;
+
     QVector<QModelIndex> changedRows;
-    for (qsizetype gi = 0; gi < groups_.size(); ++gi) {
+    for (qsizetype gi = 0; gi < groups_.size() && gi < visibleBefore.size(); ++gi) {
         const QModelIndex groupIndex = index(static_cast<int>(gi), 0, QModelIndex());
         const QVector<SessionRow> &visible = groups_.at(gi).sessions;
-        for (qsizetype si = 0; si < visible.size(); ++si) {
-            if (changedSessions.contains(visible.at(si).session.id.value))
+        const QVector<SessionRowState> &before = visibleBefore.at(gi);
+        for (qsizetype si = 0; si < visible.size() && si < before.size(); ++si) {
+            if (before.at(si) != aggregateSessionState(visible.at(si).terminals))
                 changedRows.append(index(static_cast<int>(si), 0, groupIndex));
         }
     }

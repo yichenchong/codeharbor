@@ -14,7 +14,6 @@
 #include <QStandardPaths>
 #include <QTemporaryDir>
 #include <QString>
-#include <QStringList>
 #include <QtTest/QtTest>
 
 #include <optional>

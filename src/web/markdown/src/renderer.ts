@@ -1,7 +1,7 @@
 import { marked, Renderer } from "marked";
 import type { Tokens } from "marked";
 import createDOMPurify from "dompurify";
-import type { Config, DOMPurify } from "dompurify";
+import type { Config } from "dompurify";
 
 /** The only bridge capability the page needs for remote subresources. */
 export interface MarkdownSanitizer {
@@ -14,7 +14,12 @@ renderer.code = ({ text, lang }: Tokens.Code): string => {
     // renderer bypasses marked's default code renderer, and then DOMPurify
     // receives the escaped HTML as an additional defence.
     const escaped = escapeHtml(text);
-    const language = lang?.trim() ?? "";
+    // marked hands over the WHOLE info string after the fence ("ts twoslash",
+    // "js title=a.js"), not just the language. Only the first token names a
+    // language: keeping the rest would emit bogus extra `language-*` classes
+    // and print the whole info string in the corner label the stylesheet draws
+    // from data-language.
+    const language = lang?.trim().split(/\s+/, 1)[0] ?? "";
     const safeLanguage = language.length > 0 ? escapeHtml(language) : "";
     const languageClass = safeLanguage.length > 0
         ? ` class="language-${safeLanguage}"`
@@ -62,13 +67,26 @@ const sanitizerConfig: Config = {
         "srcset",
         "style",
     ],
+    // `map`/`area` are an image map: <area href> NAVIGATES exactly like a link
+    // and is not an <a>, so the link rewrite below never sees it and a relative
+    // href would resolve against the page's own qrc: address instead of the
+    // remote file namespace. Markdown never produces an image map, so the
+    // whole element is dropped rather than patched up afterwards.
+    //
+    // `template` is load-bearing for a different reason: rewriteRelativeUrls()
+    // walks ONE template's content fragment, and nodes inside a NESTED
+    // <template> are not reachable from that walk. An <img src="data:...">
+    // hidden in one would keep its source. Nothing in Markdown needs a
+    // template, so it never reaches the rewrite at all.
     FORBID_TAGS: [
+        "area",
         "audio",
         "base",
         "embed",
         "form",
         "iframe",
         "link",
+        "map",
         "math",
         "meta",
         "object",
@@ -93,11 +111,21 @@ function escapeHtml(value: string): string {
         .replaceAll("'", "&#39;");
 }
 
+// One DOMPurify instance per page, created on first use. It is stateless
+// between sanitize() calls (the configuration travels with each call), and
+// building a fresh one per render meant a new instance for every document AND
+// every live theme change, each re-walking DOMPurify's own setup.
+let browserSanitizer: MarkdownSanitizer | null = null;
+
 function createBrowserSanitizer(): MarkdownSanitizer {
+    if (browserSanitizer) {
+        return browserSanitizer;
+    }
     if (typeof window === "undefined") {
         throw new Error("Markdown sanitisation requires a browser document");
     }
-    return createDOMPurify(window) as unknown as DOMPurify;
+    browserSanitizer = createDOMPurify(window);
+    return browserSanitizer;
 }
 
 /**
@@ -122,8 +150,12 @@ export function renderMarkdown(
         dirty = `<pre>${escapeHtml(source)}</pre>`;
     }
 
-    const active = sanitizer ?? createBrowserSanitizer();
     try {
+        // Acquiring the sanitizer is inside the guard on purpose: a host where
+        // DOMPurify cannot even be constructed is exactly the case the escaped
+        // fallback exists for, and letting that throw out of here left the
+        // caller with an unhandled rejection and a silently blank pane.
+        const active = sanitizer ?? createBrowserSanitizer();
         return active.sanitize(dirty, sanitizerConfig);
     } catch {
         // Never return dirty HTML when a host sanitizer fails. Showing escaped

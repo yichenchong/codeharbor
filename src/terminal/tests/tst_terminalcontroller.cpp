@@ -119,6 +119,7 @@ private slots:
     void flushBoundariesNeverSplitAnAnsiEscape();
     void anEvictionCannotOrphanHalfOfACharacterInTheDecoder();
     void unterminatedEscapeIsBoundedAndStringTerminatorsAreCorrect();
+    void cancelAndSubstituteEndASequenceAsTheRendererDoes();
     void releasingRetainedOutputStaysInsideTheCreditWindow();
 };
 
@@ -1210,6 +1211,45 @@ void TstTerminalController::unterminatedEscapeIsBoundedAndStringTerminatorsAreCo
     QCOMPARE(dcsSpy.count(), 0);
     dcs.ingestOutput(QByteArrayLiteral("\x1b\\"));
     QVERIFY(!dcsSpy.isEmpty());
+}
+
+// CAN (0x18) and SUB (0x1a) abandon whatever control sequence is in progress.
+// This scanner has to agree with the parser that consumes the bytes: xterm.js
+// routes both to its GROUND state from every escape, CSI and string state, so a
+// scanner that kept "waiting for the end of the sequence" past one of them
+// would hold back — for up to kMaxPendingEscapeBytes — bytes the renderer would
+// already be printing. That is a visible stall on ordinary output, because an
+// abort byte is exactly what a program emits when it changes its mind mid
+// sequence.
+void TstTerminalController::cancelAndSubstituteEndASequenceAsTheRendererDoes()
+{
+    // An OSC abandoned by CAN. Everything after the CAN is ordinary text, so
+    // the whole thing is a complete batch with nothing left pending.
+    {
+        TerminalController controller;
+        QSignalSpy spy(&controller, &TerminalController::flushReady);
+        const QByteArray aborted = QByteArrayLiteral("\x1b]0;title\x18tail");
+        controller.ingestOutput(aborted);
+        QVERIFY(spy.wait(1000));
+        QCOMPARE(spy.count(), 1);
+        QCOMPARE(spy.at(0).at(0).toByteArray(), aborted);
+    }
+
+    // The same for SUB, and inside a CSI rather than a string control. The tail
+    // is deliberately made of CSI PARAMETER bytes (digits and semicolons): a
+    // letter would be a CSI final byte and would end the sequence on its own,
+    // so the assertion would hold even with the abort rule removed. With
+    // parameters only, the sequence never ends and the whole batch would be
+    // withheld.
+    {
+        TerminalController controller;
+        QSignalSpy spy(&controller, &TerminalController::flushReady);
+        const QByteArray aborted = QByteArrayLiteral("\x1b[1;2\x1a" "12;34");
+        controller.ingestOutput(aborted);
+        QVERIFY(spy.wait(1000));
+        QCOMPARE(spy.count(), 1);
+        QCOMPARE(spy.at(0).at(0).toByteArray(), aborted);
+    }
 }
 
 // WHY (1) above matters, end to end. ch::TerminalBridge decodes statefully, so

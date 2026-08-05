@@ -39,6 +39,7 @@ private slots:
 #if CH_HAVE_LIBSSH
     void aDisconnectDuringHandshakeIsDeferredUntilTheCallReturns();
     void aNestedConnectDuringHandshakeIsRefusedWithAReason();
+    void aNestedConnectDuringTheInitialTeardownIsRefused();
     void destroyingAnUnconnectedPoolChangesNoProperty();
 #endif
 };
@@ -158,6 +159,16 @@ void TstSshConnectionPool::aPortedEndpointIsLookedUpAndStoredOpenSshStyle()
 void TstSshConnectionPool::
     aDisconnectDuringHandshakeIsDeferredUntilTheCallReturns()
 {
+    // The pool parses ~/.ssh/config; point HOME at an empty directory so a
+    // developer's real config cannot influence, or hang, this test.
+    QTemporaryDir emptyHome;
+    QVERIFY(emptyHome.isValid());
+    const QByteArray realHome = qgetenv("HOME");
+    QVERIFY(qputenv("HOME", QFile::encodeName(emptyHome.path())));
+    const auto restoreHome = qScopeGuard([&realHome] {
+        qputenv("HOME", realHome);
+    });
+
     SshConnectionPool pool;
     bool sawConnecting = false;
     connect(&pool, &SshConnectionPool::stateChanged, &pool,
@@ -223,6 +234,66 @@ void TstSshConnectionPool::aNestedConnectDuringHandshakeIsRefusedWithAReason()
              "the refused nested connect reported nothing at all");
     // And the refusal really was a refusal: no second session was started, so
     // the outer attempt still owns the outcome.
+    QCOMPARE(pool.state(), SshConnectionPool::State::Error);
+}
+
+// The same re-entrancy, one moment earlier. Before it does anything else,
+// connectToHost() tears down whatever session the pool already had, and that
+// teardown announces itself: stateChanged(Disconnected). A slot on that signal
+// — an auto-reconnect is the realistic one — used to find the pool completely
+// unguarded, because the guard was only raised AFTER the teardown. The nested
+// handshake then ran to completion and parked its own ssh_session in the pool,
+// which the outer attempt's ssh_new() overwrote a few lines later: the nested
+// session, its socket and every channel on it were leaked for the life of the
+// process, and whatever the nested attempt achieved was silently thrown away.
+void TstSshConnectionPool::aNestedConnectDuringTheInitialTeardownIsRefused()
+{
+    // The pool parses ~/.ssh/config; point HOME at an empty directory so a
+    // developer's real config cannot influence, or hang, this test.
+    QTemporaryDir emptyHome;
+    QVERIFY(emptyHome.isValid());
+    const QByteArray realHome = qgetenv("HOME");
+    QVERIFY(qputenv("HOME", QFile::encodeName(emptyHome.path())));
+    const auto restoreHome = qScopeGuard([&realHome] {
+        qputenv("HOME", realHome);
+    });
+
+    SshConnectionPool pool;
+    // Port 1 is never listening. This first attempt exists only to leave the
+    // pool in State::Error, so that the SECOND attempt's opening teardown has
+    // a state change to announce at all.
+    QVERIFY(!pool.connectToHost(QStringLiteral("127.0.0.1"), 1,
+                                QStringLiteral("nobody")));
+    QCOMPARE(pool.state(), SshConnectionPool::State::Error);
+
+    QSignalSpy errors(&pool, &SshConnectionPool::errorOccurred);
+    int nestedAttempts = 0;
+    bool nestedResult = true;
+    connect(&pool, &SshConnectionPool::stateChanged, &pool,
+            [&](SshConnectionPool::State state) {
+                if (state != SshConnectionPool::State::Disconnected)
+                    return;
+                ++nestedAttempts;
+                nestedResult = pool.connectToHost(QStringLiteral("127.0.0.1"),
+                                                  1, QStringLiteral("nobody"));
+            });
+
+    QVERIFY(!pool.connectToHost(QStringLiteral("127.0.0.1"), 1,
+                                QStringLiteral("nobody")));
+    // The teardown announced itself exactly once, and the slot on it was told
+    // no — out loud, with the same reason every other refused nested connect
+    // gets. Without the guard the nested call ran a whole second handshake and
+    // this message never appeared anywhere.
+    QCOMPARE(nestedAttempts, 1);
+    QVERIFY(!nestedResult);
+    bool sawBusyRefusal = false;
+    for (const QList<QVariant>& arguments : errors) {
+        if (arguments.at(0).toString().contains(
+                QStringLiteral("already busy connecting or disconnecting")))
+            sawBusyRefusal = true;
+    }
+    QVERIFY2(sawBusyRefusal,
+             "the nested connect during the opening teardown reported nothing");
     QCOMPARE(pool.state(), SshConnectionPool::State::Error);
 }
 

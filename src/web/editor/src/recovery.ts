@@ -97,9 +97,14 @@ export class RecoveryReporter {
     }
 
     /** Persist the buffer guarded by `expectedRevision`, cancelling any pending
-     *  snapshot first so a late timer cannot resurrect a stale recovery copy. */
-    save(expectedRevision: string): void {
+     *  snapshot first so a late timer cannot resurrect a stale recovery copy.
+     *
+     *  `content` defaults to reading the buffer, and a caller that has ALREADY
+     *  taken those bytes passes them in: a whole-buffer read can be megabytes,
+     *  and two independent reads are also two chances for the bytes recorded as
+     *  "handed to the host" to differ from the ones actually sent. */
+    save(expectedRevision: string, content = this.getValue()): void {
         this.cancel();
-        this.bridge.save(this.getValue(), expectedRevision);
+        this.bridge.save(content, expectedRevision);
     }
 }

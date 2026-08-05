@@ -4,7 +4,6 @@
 
 #include <QIODevice>
 
-#include <cstring>
 #include <utility>
 
 namespace {

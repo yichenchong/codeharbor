@@ -57,14 +57,4 @@ QColor GroupPaletteService::colorFor(const QString &name, const QString &palette
     return QColor::fromRgbF(colour.red, colour.green, colour.blue);
 }
 
-int GroupPaletteService::indexForName(const QString &name, int paletteSize) const
-{
-    // A direct QML call can transiently pass zero while settings are loading.
-    // The hashing helper needs a positive modulus; return the first slot
-    // instead of allowing an invalid size to reach it.
-    if (paletteSize <= 0)
-        return 0;
-    return GroupPalette::stableIndexForName(name, paletteSize);
-}
-
 } // namespace ch

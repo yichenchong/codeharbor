@@ -18,6 +18,17 @@
 -- Each index covers a column that only ever appears as an equality lookup or a
 -- join key in Workspace's queries (listing a group's sessions, a session's
 -- panes, a server's groups). Without them every listing is a full table scan.
+--
+-- Two lookup columns are deliberately absent because a constraint already
+-- indexes them, and adding a second b-tree over the same column would charge
+-- every write twice for nothing:
+--   * session_layouts.dev_session_id — leftmost column of the implicit index
+--     behind UNIQUE (dev_session_id, region), which serves both the per-region
+--     read and the per-session delete.
+--   * terminal_panes.tmux_target — the implicit index behind UNIQUE
+--     (tmux_target), which serves the "is this target already bound?" lookup.
+-- Removing either constraint therefore turns those reads into full table scans;
+-- whoever does that has to add the index here.
 
 CREATE INDEX IF NOT EXISTS idx_groups_server_id
     ON groups (server_id);

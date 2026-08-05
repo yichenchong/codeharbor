@@ -237,6 +237,15 @@ signals:
     // job — letting ch::SessionLayouts write the id into the layout leaf and
     // persist it, so the leaf never has to ask by label again. A pane resolved
     // by row id already knows the answer and emits nothing.
+    //
+    // Emitted EVERY time such a resolution succeeds, including the ones this
+    // factory answers from its own cache without a round trip. It is the LEAF
+    // that has to end up holding the id, and this factory cannot see whether it
+    // does; reporting once and never again meant a report that failed to land
+    // for any reason at all was the only one there would ever be, and the leaf
+    // kept naming its terminal by the recyclable slot label for the rest of the
+    // process. Repeats are free: bindTerminalPaneRow() returns immediately when
+    // the leaf already carries this id.
     void paneRowResolved(const QString& devSessionId, const QString& paneName,
                          const QString& terminalPaneId);
     // Per-pane connection lifecycle, keyed by the server-reported Dev Session

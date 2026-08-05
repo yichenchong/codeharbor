@@ -755,6 +755,15 @@ Rectangle {
             // called directly; it then uses the path the branch has now.
             property var resizePath: null
 
+            // The extent along the split axis that the sizes currently on the
+            // children were computed for. A resize scales them by the ratio
+            // between this and the new extent, which is what keeps a split
+            // PROPORTIONAL across a window resize.
+            property real appliedExtent: 0
+
+            readonly property real splitExtent: orientation === Qt.Horizontal
+                                                ? width : height
+
             function applyRatios() {
                 if (ratiosApplied || width <= 0 || height <= 0
                         || childRepeater.count === 0)
@@ -772,11 +781,54 @@ Rectangle {
                     else
                         child.SplitView.preferredHeight = height * fraction;
                 }
+                split.appliedExtent = split.splitExtent;
                 ratiosApplied = true;
             }
 
-            onWidthChanged: applyRatios()
-            onHeightChanged: applyRatios()
+            // Keep the proportions when the REGION changes size. SplitView
+            // stretches only its first fill item, so without this every window
+            // resize handed the whole difference to the left-most (or top-most)
+            // pane: a 50/50 split became lopsided the first time the window was
+            // widened, and the stored ratios were only ever seen again after a
+            // reopen. Sizes are read off the children as they are RIGHT NOW —
+            // this runs before SplitView re-lays them out, so it preserves the
+            // proportions the user last dragged rather than the stored ones.
+            function rescaleToExtent() {
+                if (!ratiosApplied)
+                    return;
+                const extent = split.splitExtent;
+                if (!(extent > 0) || !(split.appliedExtent > 0)
+                        || extent === split.appliedExtent)
+                    return;
+                const count = childRepeater.count;
+                if (count < 2) {
+                    split.appliedExtent = extent;
+                    return;
+                }
+                const sizes = [];
+                for (let i = 0; i < count; ++i) {
+                    const child = childRepeater.itemAt(i);
+                    if (!child)
+                        return;
+                    const size = orientation === Qt.Horizontal ? child.width
+                                                               : child.height;
+                    if (!(size > 0))
+                        return; // mid-layout reading; a later change re-runs this
+                    sizes.push(size);
+                }
+                const scale = extent / split.appliedExtent;
+                for (let i = 0; i < count; ++i) {
+                    const child = childRepeater.itemAt(i);
+                    if (orientation === Qt.Horizontal)
+                        child.SplitView.preferredWidth = sizes[i] * scale;
+                    else
+                        child.SplitView.preferredHeight = sizes[i] * scale;
+                }
+                split.appliedExtent = extent;
+            }
+
+            onWidthChanged: { applyRatios(); rescaleToExtent(); }
+            onHeightChanged: { applyRatios(); rescaleToExtent(); }
             Component.onCompleted: applyRatios()
             function updateNodePaths() {
                 for (let i = 0; i < childRepeater.count; ++i) {
@@ -794,10 +846,18 @@ Rectangle {
             // them on the split means no caller can report a drag under the
             // wrong session or against the wrong branch.
             function publishRatios() {
-                const sessionId = split.resizeSessionId;
-                const generation = split.resizeGeneration;
-                const path = split.resizePath !== null ? split.resizePath
-                                                       : region.nodePath;
+                // `resizePath` is the marker for "a drag captured a stamp":
+                // set together with the session pair when the drag STARTED and
+                // cleared together with it when the drag ended. Without the
+                // pair being cleared too, a later direct call reported under
+                // whichever session happened to be open during the LAST drag,
+                // which is the stale-stamp bug the capture exists to prevent.
+                const captured = split.resizePath !== null;
+                const sessionId = captured ? split.resizeSessionId
+                                           : region.paneOwner.devSessionId;
+                const generation = captured ? split.resizeGeneration
+                                            : region.paneOwner.layoutGeneration;
+                const path = captured ? split.resizePath : region.nodePath;
                 const count = childRepeater.count;
                 if (count < 2)
                     return;
@@ -833,6 +893,8 @@ Rectangle {
                 } else {
                     split.publishRatios();
                     split.resizePath = null;
+                    split.resizeSessionId = "";
+                    split.resizeGeneration = 0;
                 }
             }
 
@@ -899,7 +961,7 @@ Rectangle {
                                                        devSessionId: Qt.binding(
                                                            () => region.paneOwner.devSessionId),
                                                        workingDir: Qt.binding(
-                                                           () => region.workingDir),
+                                                           () => region.paneOwner.workingDir),
                                                        layoutGeneration: Qt.binding(
                                                            () => region.paneOwner.layoutGeneration),
                                                        hostStampsWrites: Qt.binding(

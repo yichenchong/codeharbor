@@ -415,6 +415,10 @@ bool AgentStatusMonitor::agesWithTime(const TerminalStatus& st,
                                       bool devSessionUnseen) const
 {
     if (st.generic && st.attached) {
+        // A prompt the user has to answer is never overwritten by time; see
+        // the same arm, and the reasoning, in onAgeTick().
+        if (st.state == AgentState::WaitingInput)
+            return false;
         // A completion the user has not seen is never overwritten by time.
         if (st.state == AgentState::IdleUnseen && devSessionUnseen)
             return false;
@@ -451,12 +455,24 @@ void AgentStatusMonitor::onAgeTick()
             TerminalStatus& st = tit.value();
             std::optional<AgentState> next;
             if (st.generic && st.attached) {
+                // A prompt outranks the activity clock outright, and unlike a
+                // completion it has no "seen" flag that could ever release it:
+                // nothing but a new observation clears WaitingInput, so letting
+                // the quiet window overwrite it would silently delete the one
+                // signal that says the agent is blocked on the user. This pane
+                // is registered as the adapterless "generic" harness yet has
+                // received a lifecycle event anyway — the pane's configured
+                // harness and the harness that actually reported are
+                // independent — which is the same way an unseen completion
+                // lands here.
+                if (st.state == AgentState::WaitingInput)
+                    continue;
                 // A completion remains an explicit user-facing state until
                 // the user has seen it. The generic activity clock must not
                 // resurrect that pane as Starting/Running merely because
                 // another pane caused this shared timer to tick. Explicit
                 // observations (a fresh attach or output) may still replace
-                // IdleUnseen; time alone never may.
+                // WaitingInput/IdleUnseen; time alone never may.
                 if (st.state == AgentState::IdleUnseen
                     && m_unseen.contains(sit.key())) {
                     continue;

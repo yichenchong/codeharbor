@@ -92,11 +92,12 @@ inline constexpr auto kMethodListDirectory = "file.listDirectory";
 // is shown a wall of base64 instead of their file.
 //
 // It lives here, with the reply shape it decodes, rather than beside its
-// caller. TODAY it has ONE caller — both file.readFile replies in
-// ch::EditorController — and that is a fact about right now, not evidence of a
-// second user: ch::ViewerModel::settleTextRead read the same shape and decoded
-// it the same way until the viewer's text-read path was removed in this same
-// round, which is how the two came to disagree in the first place. Anything
+// caller. TODAY every caller sits in ONE translation unit — the three
+// file.readFile replies in ch::EditorController (open, reload, and the
+// crash-recovery snapshot) — and that is a fact about right now, not evidence
+// of a second user: ch::ViewerModel::settleTextRead read the same shape and
+// decoded it the same way until the viewer's text-read path was removed in this
+// same round, which is how the two came to disagree in the first place. Anything
 // that reads a file.readFile reply next needs this, and it must not be
 // rediscovered a third time. There is also nowhere else the two could have
 // shared it: ch_editor deliberately does not link ch_viewers (see

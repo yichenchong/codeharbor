@@ -183,11 +183,13 @@ private slots:
     void fullTreeSaveSupersedesQueuedEdits();
     void staleLayoutWriteErrorsAreDropped();
     void sameSessionReloadFailureClearsTheStaleRegion();
+    void aFailedReloadNeverBlanksARegionTheUserJustEdited();
     void invalidSavedTreeIsRejected();
     void aLayoutBindingTwoPanesToOneTerminalIsRejected();
     void publishedTreeIsConsumableFromQml();
     void splitAfterCloseNeverReusesThePaneId();
     void refillingAnEmptiedRegionNeverReusesThePaneId();
+    void refillingAnEmptiedRegionNeverInheritsThePlaceholdersIdentity();
     void paneNumberingIsPerDevSessionAndSurvivesRestart();
     void legacyTerminalLeafIsBackfilledOnceAndPersisted();
     void anAbsurdPaneCounterCannotHandOutALabelAlreadyOnScreen();
@@ -1324,6 +1326,59 @@ void TstSessionLayouts::sameSessionReloadFailureClearsTheStaleRegion()
              compact(legacyLeaf(QStringLiteral("terminal-old"))));
 }
 
+// The case above, but the user got there first. A reload's answer is history
+// once a local edit has replaced the region's tree - and that is true of a
+// FAILED answer as much as of a successful one. Wiping the region here would
+// blank a layout the user had just built AND that the server had already
+// accepted, which is strictly worse than the failure it was reporting: the
+// error is news, the region is not.
+void TstSessionLayouts::aFailedReloadNeverBlanksARegionTheUserJustEdited()
+{
+    makePair();
+    SessionLayouts layouts(m_db, m_uiState);
+    layouts.setServerId(QStringLiteral("srv-1"));
+    completeLoad(layouts, QStringLiteral("s1"),
+                 layoutRow(leaf(QStringLiteral("viewer-1"))),
+                 layoutRow(legacyLeaf(QStringLiteral("terminal-1"))));
+
+    QSignalSpy errorSpy(&layouts, &SessionLayouts::error);
+    QSignalSpy loadedSpy(&layouts, &SessionLayouts::loaded);
+    layouts.load(QStringLiteral("s1"));
+    const QJsonObject viewerGet = nextRequest();
+    const QJsonObject terminalGet = nextRequest();
+
+    // The user splits a viewer pane before either answer comes back, and that
+    // edit reaches the server.
+    QCOMPARE(layouts.splitPane(QStringLiteral("viewer"),
+                               QStringLiteral("viewer-1"),
+                               QStringLiteral("horizontal")),
+             QStringLiteral("viewer-2"));
+    const QJsonObject setReq = nextRequest();
+    QCOMPARE(setReq.value(QStringLiteral("method")).toString(),
+             QStringLiteral("workspace.setLayout"));
+    const QJsonObject edited = setReq.value(QStringLiteral("params")).toObject()
+                                   .value(QStringLiteral("tree")).toObject();
+    respondResult(setReq.value(QStringLiteral("id")).toInt(), layoutRow(edited));
+
+    // Only now does the pre-edit viewer fetch come back, and it failed.
+    respondError(viewerGet.value(QStringLiteral("id")).toInt(), -32001,
+                 QStringLiteral("viewer reload failed"));
+    respondResult(terminalGet.value(QStringLiteral("id")).toInt(),
+                  layoutRow(legacyLeaf(QStringLiteral("terminal-1"))));
+    QTRY_COMPARE(loadedSpy.count(), 1);
+
+    // Reported once, verbatim - a transport failure is still news...
+    QCOMPARE(errorSpy.count(), 1);
+    QCOMPARE(errorSpy.at(0).at(0).toString(),
+             QStringLiteral("viewer reload failed"));
+    // ...but the user's tree is still on screen, not a null region.
+    QCOMPARE(compact(asObject(layouts.viewerTree())), compact(edited));
+    // The untouched region still adopts what the server sent.
+    QCOMPARE(compact(asObject(layouts.terminalTree())),
+             compact(legacyLeaf(QStringLiteral("terminal-1"))));
+    QVERIFY(noMoreRequests());
+}
+
 void TstSessionLayouts::rpcErrorSurfacesWithoutCorruptingTree()
 {
     makePair();
@@ -1675,6 +1730,61 @@ void TstSessionLayouts::refillingAnEmptiedRegionNeverReusesThePaneId()
              QStringLiteral("terminal-4"));
 }
 
+// A placeholder is defined by having no paneId, not by being blank. The parser
+// accepts a stored leaf with an empty paneId that still carries a custom title
+// and - the damaging one - a `terminal_panes` row id, and another client or a
+// hand edit can put one in the layout. Refilling that slot must mint the new
+// pane its OWN row: inheriting the stored one would attach a brand new pane to
+// whatever shell already owns it, echoing another pane's keystrokes, and the
+// mint started alongside would be orphaned on the server with nothing pointing
+// at it.
+void TstSessionLayouts::refillingAnEmptiedRegionNeverInheritsThePlaceholdersIdentity()
+{
+    makePair();
+    SessionLayouts layouts(m_db, m_uiState);
+    layouts.setServerId(QStringLiteral("srv-1"));
+    // No paneId, but a row id and a title left on it.
+    const QJsonObject dirtyPlaceholder{{"type", "leaf"},
+                                       {"paneId", QString()},
+                                       {"terminalPaneId", "row-ghost"},
+                                       {"customTitle", "Ghost"}};
+    completeLoad(layouts, QStringLiteral("s1"),
+                 layoutRow(leaf(QStringLiteral("viewer-1"))),
+                 layoutRow(dirtyPlaceholder));
+
+    QCOMPARE(layouts.splitPane(QStringLiteral("terminal"), QString(),
+                               QStringLiteral("horizontal")),
+             QStringLiteral("terminal-1"));
+    // Nothing of the placeholder survives: the new leaf is bare, so it is
+    // PENDING (no row id, and not a pre-migration leaf either) and attaches
+    // nothing at all while its own row is on the wire.
+    QCOMPARE(compact(asObject(layouts.terminalTree())),
+             compact(leaf(QStringLiteral("terminal-1"))));
+
+    const QJsonObject mint = nextRequest();
+    QCOMPARE(mint.value(QStringLiteral("method")).toString(),
+             QStringLiteral("workspace.createTerminalPane"));
+    QCOMPARE(mint.value(QStringLiteral("params")).toObject()
+                 .value(QStringLiteral("name")).toString(),
+             QStringLiteral("terminal-1"));
+    respondResult(mint.value(QStringLiteral("id")).toInt(),
+                  terminalPaneRow(QStringLiteral("terminal-1")));
+
+    // The layout write was held back until that id landed, and what reaches the
+    // server carries the new row rather than the ghost.
+    const QJsonObject write = nextRequest();
+    QCOMPARE(write.value(QStringLiteral("method")).toString(),
+             QStringLiteral("workspace.setLayout"));
+    QCOMPARE(compact(write.value(QStringLiteral("params")).toObject()
+                         .value(QStringLiteral("tree")).toObject()),
+             compact(terminalLeaf(QStringLiteral("terminal-1"),
+                                  rowIdFor(QStringLiteral("terminal-1")))));
+    respondResult(write.value(QStringLiteral("id")).toInt(),
+                  layoutRow(terminalLeaf(QStringLiteral("terminal-1"),
+                                         rowIdFor(QStringLiteral("terminal-1")))));
+    QVERIFY(noMoreRequests());
+}
+
 // The counter is per (Dev Session, region) and lives in the settings file, not
 // in the objects: two Dev Sessions never consume each other's numbers, the two
 // regions of one session number independently, and a relaunch does not hand out
@@ -1835,9 +1945,12 @@ void TstSessionLayouts::paneLabelCeilingRefusesASecondDuplicate()
 // nothing but its slot label, so ch::TerminalFactory resolves it by that label
 // once and reports the row it found back through bindTerminalPaneRow(). The id
 // then goes into the leaf and is persisted, and the recyclable label is never
-// used to name a shell again. It must happen exactly ONCE: the factory caches
-// its answer and re-reports it on a reconnect, and a write per attach would be
-// an RPC storm for nothing.
+// used to name a shell again. The leaf must be bound exactly ONCE: the factory
+// reports the row both from the live remote-call callback and, on a later
+// resolution of the same legacy key, from its cached path. A repeated cached
+// report is harmless because bindTerminalPaneRow() returns immediately when
+// the leaf already carries that id; a write per attach would otherwise be an
+// RPC storm for nothing.
 void TstSessionLayouts::legacyTerminalLeafIsBackfilledOnceAndPersisted()
 {
     makePair();

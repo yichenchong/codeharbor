@@ -126,8 +126,10 @@ async function statOrUndefined(target: string): Promise<Stats | undefined> {
 }
 
 // Decode as UTF-8, or report "not text" (undefined) for any NUL byte or any
-// byte sequence that is not valid UTF-8. One decode serves both the verdict and
-// the string that is returned, so the bytes are walked once instead of twice.
+// byte sequence that is not valid UTF-8. The NUL scan is its own pass (a NUL is
+// perfectly valid UTF-8, so the decoder cannot report it), but the decode after
+// it serves both the "is this text" verdict and the string that is returned —
+// there is no separate validation pass over the bytes.
 //
 // ignoreBOM is required for correctness, not speed: TextDecoder DROPS a leading
 // byte-order mark by default, so decoding without it would hand the client a
@@ -211,7 +213,11 @@ async function readToEnd(handle: FileHandle, filePath: string): Promise<Buffer> 
     const chunks: Buffer[] = [];
     let total = 0;
     for (;;) {
-        const chunk = Buffer.alloc(EOF_READ_CHUNK_BYTES);
+        // allocUnsafe, not alloc: readFully reports exactly how many bytes
+        // landed and the chunk is clipped to that below, so no uninitialized
+        // byte is ever readable. Zero-filling would mean writing 16 MiB of
+        // zeroes on the way to reading a 16 MiB file, for nothing.
+        const chunk = Buffer.allocUnsafe(EOF_READ_CHUNK_BYTES);
         const filled = await readFully(handle, chunk, EOF_READ_CHUNK_BYTES, total);
         if (filled === 0) break;
         total += filled;
@@ -235,18 +241,36 @@ export async function stat(params: StatParams): Promise<StatResult> {
     // itself would make every save through a symlink a guaranteed — and
     // unresolvable — revision mismatch: the client would load one token from
     // stat and the write guard would compare it against a different one.
-    // A dangling or looping link has no readable target; fall back to the
-    // link's own token so stat still answers instead of failing.
     const target = stats.isSymbolicLink()
         ? await fsp.stat(params.path).catch(() => undefined)
         : undefined;
+    // A DANGLING link (or one whose chain loops) has no target node at all, so
+    // there is no revision of the target to report. The honest token for "no
+    // file at the path readFile and writeFile act on" is the empty string, which
+    // is exactly what writeFile's create-only guard expects. Reporting the
+    // LINK's own token instead made every save through a dangling link an
+    // unresolvable conflict: the write guard compares the token against the
+    // absent target and always loses, so the user was offered a
+    // reload/overwrite dialog for a file nobody had changed, and the save that
+    // would in fact have succeeded (a save through a dangling link CREATES the
+    // link's target, exactly as open(O_CREAT) does) could never be made.
+    const linkTargetMissing = stats.isSymbolicLink() && target === undefined;
     // Writability is checked against the LINK-FOLLOWED target (X12): a symlink
     // to a read-only file must report writable:false even though the link node
     // itself is writable. fs.access resolves the path, so W_OK reflects the real
-    // target's permissions; any error (no such target, no permission) => false.
+    // target's permissions; any error (no permission, unreadable chain) => false.
+    //
+    // A dangling link has no target to ask about, and asking about the link
+    // itself answers ENOENT — so it reported writable:false for a path a save
+    // can perfectly well write. What decides that save is permission on the
+    // DIRECTORY that will hold the created target, so ask about that instead.
+    // resolveLinkChain throws ELOOP on a cycle, which lands in the same catch.
     let writable = false;
     try {
-        await fsp.access(params.path, fsConstants.W_OK);
+        await fsp.access(
+            linkTargetMissing ? path.dirname(await resolveLinkChain(params.path)) : params.path,
+            fsConstants.W_OK,
+        );
         writable = true;
     } catch {
         writable = false;
@@ -267,7 +291,7 @@ export async function stat(params: StatParams): Promise<StatResult> {
         size: stats.size,
         mtimeMs: stats.mtimeMs,
         mode: stats.mode,
-        revision: revisionFrom(target ?? stats),
+        revision: linkTargetMissing ? "" : revisionFrom(target ?? stats),
         writable,
     };
 }
@@ -362,7 +386,9 @@ export async function readFile(params: ReadFileParams): Promise<ReadFileResult> 
                             `Read it in smaller ranges.`,
                     );
                 }
-                const dest = Buffer.alloc(want);
+                // allocUnsafe: clipped to bytesRead below, so nothing
+                // uninitialized escapes (same reasoning as readToEnd).
+                const dest = Buffer.allocUnsafe(want);
                 const bytesRead = await readFully(handle, dest, want, offset);
                 slice = bytesRead === want ? dest : dest.subarray(0, bytesRead);
             }
@@ -370,7 +396,7 @@ export async function readFile(params: ReadFileParams): Promise<ReadFileResult> 
             // Read exactly the size observed by fstat rather than delegating to
             // readFile(), whose internal growth handling could allocate again if
             // another process appends to the file while this request is running.
-            const dest = Buffer.alloc(size);
+            const dest = Buffer.allocUnsafe(size);
             const bytesRead = await readFully(handle, dest, size, 0);
             slice = bytesRead === size ? dest : dest.subarray(0, bytesRead);
         }
@@ -914,7 +940,7 @@ export class FileWatchService {
         this.armWatcher(sub, existing?.ino);
 
         sub.poll = setInterval(() => {
-            void this.reconcile(sub);
+            this.reconcile(sub);
         }, this.pollIntervalMs);
         sub.poll.unref?.();
 
@@ -965,7 +991,7 @@ export class FileWatchService {
         if (sub.closed) return;
         try {
             const watcher = fsWatch(sub.path, () => {
-                void this.reconcile(sub);
+                this.reconcile(sub);
             });
             watcher.on("error", () => {
                 // A dead handle must not stay in the table pretending to watch:
@@ -1008,7 +1034,11 @@ export class FileWatchService {
             .catch(() => {})
             .then(() => {
                 sub.inFlight = undefined;
-                if (sub.queued) {
+                // `closed` is checked here as well as inside the check itself: a
+                // subscription released while this one was in flight has nobody
+                // left to notify, so the follow-up would spend a stat to
+                // discover it must emit nothing.
+                if (sub.queued && !sub.closed) {
                     // Clear `queued` exactly when the follow-up check BEGINS, not
                     // when it was scheduled: the check reads the filesystem after
                     // this point, so any signal arriving from now on must queue a

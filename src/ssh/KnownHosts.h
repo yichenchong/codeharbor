@@ -48,9 +48,11 @@ public:
     // friendly first-use prompt. @revoked and @cert-authority entries never
     // establish that trust, so they cannot turn an unrelated key into a
     // Mismatch. Unknown only when the host has no trusted entry at all. Hashed
-    // |1| entries are matched via their HMAC-SHA1 salted hostname hash; wildcard
-    // and negated entries via OpenSSH's pattern rules; plain names are compared
-    // case-insensitively, again like OpenSSH.
+    // |1| entries are matched via their HMAC-SHA1 salted hostname hash, tried
+    // against both the spelling asked for and its lowercase form because that
+    // is the one OpenSSH hashes; wildcard and negated entries via OpenSSH's
+    // pattern rules; plain names are compared case-insensitively, again like
+    // OpenSSH.
     Verdict verify(const QString& host, const QString& keyType,
                    const QByteArray& keyBlob) const;
 

@@ -2,6 +2,7 @@
 
 #include <QMutex>
 #include <QMutexLocker>
+#include <QSignalSpy>
 #include <QThread>
 
 #include <atomic>
@@ -35,6 +36,7 @@ private slots:
     void entryAndByteCaps();
     void previousHandlerStillReceivesWarnings();
     void severityAndTextFilters();
+    void remoteTextIsSplitPerLineAndClearAnnouncesItselfOnce();
     void destructionRacesWithLogging();
 };
 
@@ -117,6 +119,49 @@ void TstLogBuffer::severityAndTextFilters()
     const QVariantList remote =
         buffer.filteredEntries(QString(), QStringLiteral("remote"));
     QCOMPARE(remote.size(), 2);
+}
+
+// A daemon reports stderr as a stream, so one signal can carry a whole startup
+// report. Each line has to become its own row (otherwise a long report hides
+// the useful tail and neither filter can reach into it), blank noise has to
+// vanish, and clear() has to announce itself exactly when something actually
+// went away.
+void TstLogBuffer::remoteTextIsSplitPerLineAndClearAnnouncesItselfOnce()
+{
+    LogBuffer buffer(16, 8192);
+    QSignalSpy changed(&buffer, &LogBuffer::entriesChanged);
+
+    buffer.appendRemote(QStringLiteral("daemon"), QStringLiteral("ssh.channel"),
+                        QStringLiteral("rpc"),
+                        QStringLiteral("first\n\n  second  \n"));
+    QCOMPARE(buffer.count(), 2);
+    QCOMPARE(changed.count(), 2);
+
+    const QVariantList rows = buffer.entries();
+    QCOMPARE(rows.at(0).toMap().value(QStringLiteral("message")).toString(),
+             QStringLiteral("first"));
+    // Trimmed, so the daemon's own indentation does not defeat a text filter.
+    QCOMPARE(rows.at(1).toMap().value(QStringLiteral("message")).toString(),
+             QStringLiteral("second"));
+    QCOMPARE(rows.at(0).toMap().value(QStringLiteral("origin")).toString(),
+             QStringLiteral("daemon"));
+    QCOMPARE(rows.at(0).toMap().value(QStringLiteral("category")).toString(),
+             QStringLiteral("ssh.channel"));
+
+    // Whitespace-only output is not a log line and must not become a row - nor
+    // wake every binding on the log pane.
+    buffer.appendRemote(QStringLiteral("daemon"), QStringLiteral("ssh.channel"),
+                        QStringLiteral("rpc"), QStringLiteral("   \n \n"));
+    QCOMPARE(buffer.count(), 2);
+    QCOMPARE(changed.count(), 2);
+
+    buffer.clear();
+    QCOMPARE(buffer.count(), 0);
+    QCOMPARE(buffer.totalBytes(), 0);
+    QCOMPARE(changed.count(), 3);
+    // Clearing an empty buffer changed nothing, so it says nothing.
+    buffer.clear();
+    QCOMPARE(changed.count(), 3);
 }
 
 void TstLogBuffer::destructionRacesWithLogging()

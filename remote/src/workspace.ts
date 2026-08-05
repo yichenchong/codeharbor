@@ -1387,12 +1387,18 @@ export class Workspace {
             this.db
                 .prepare("UPDATE dev_sessions SET group_id = ?, server_id = ?, updated_at = ? WHERE id = ?")
                 .run(params.groupId, targetServerId, ts, params.id);
-            if (targetServerId !== session.serverId) {
-                for (const table of ["viewer_panes", "terminal_panes", "session_layouts"] as const) {
-                    this.db
-                        .prepare(`UPDATE ${table} SET server_id = ? WHERE dev_session_id = ?`)
-                        .run(targetServerId, params.id);
-                }
+            // Unconditionally, not only when the SESSION's own server_id
+            // changed. The two are not the same test: a legacy or hand-edited
+            // database can hold a session that already carries the target
+            // server while its panes and layouts carry a different one, and
+            // gating on the session made the move leave that drift in place —
+            // the pane rows then stayed invisible to the very listing the move
+            // was supposed to bring them into. The write is scoped by
+            // dev_session_id and touches at most a handful of rows.
+            for (const table of ["viewer_panes", "terminal_panes", "session_layouts"] as const) {
+                this.db
+                    .prepare(`UPDATE ${table} SET server_id = ? WHERE dev_session_id = ? AND server_id <> ?`)
+                    .run(targetServerId, params.id, targetServerId);
             }
 
             this.packOrder("dev_sessions", "group_id", params.groupId, ordered, ts);
@@ -1671,7 +1677,11 @@ export class Workspace {
             const tmuxTarget =
                 params.tmuxTarget === undefined || params.tmuxTarget === null
                     ? mintTmuxTarget(params.devSessionId, id)
-                    : requireSafeTmuxTarget(params.tmuxTarget, "workspace.createTerminalPane");
+                    : this.requireUnboundTmuxTarget(
+                          requireSafeTmuxTarget(params.tmuxTarget, "workspace.createTerminalPane"),
+                          null,
+                          "workspace.createTerminalPane",
+                      );
             this.db
                 .prepare(
                     "INSERT INTO terminal_panes (id, server_id, dev_session_id, name, working_directory, tmux_target, startup_command, harness, position, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -1805,7 +1815,14 @@ export class Workspace {
                 params.tmuxTarget !== undefined
                     ? params.tmuxTarget === null
                         ? null
-                        : requireSafeTmuxTarget(params.tmuxTarget, "workspace.updateTerminalPane")
+                        : this.requireUnboundTmuxTarget(
+                              requireSafeTmuxTarget(
+                                  params.tmuxTarget,
+                                  "workspace.updateTerminalPane",
+                              ),
+                              params.id,
+                              "workspace.updateTerminalPane",
+                          )
                     : current.tmuxTarget;
             const startupCommand =
                 params.startupCommand !== undefined ? params.startupCommand : current.startupCommand;
@@ -2181,6 +2198,13 @@ export class Workspace {
     // since every listing query orders by `position, id`, the tie would be broken
     // by UUID, i.e. at random. A client that sends a filtered or stale list gets
     // its requested prefix and a still-packed scope instead of a shuffle.
+    //
+    // A row already sitting on the position it is about to be given is left
+    // untouched. The UPDATE is not free — it rewrites the row and every index
+    // over `position` — but the reason is correctness, not speed: `updated_at`
+    // is a change marker, and rewriting it for every row of a scope told the
+    // client that ALL of a server's groups had changed because one group was
+    // created at the end of the list. Only rows that actually moved are stamped.
     private packOrder<T extends OrderedTable>(
         table: T,
         scopeColumn: OrderedScope[T],
@@ -2188,7 +2212,13 @@ export class Workspace {
         orderedIds: readonly string[],
         ts: number,
     ): void {
-        const current = this.orderedIds(table, scopeColumn, scopeValue);
+        const rows = this.db
+            .prepare(
+                `SELECT id, position FROM ${table} WHERE ${scopeColumn} = ? ORDER BY position, id`,
+            )
+            .all(scopeValue) as unknown as Array<{ id: string; position: number }>;
+        const current = rows.map((r) => r.id);
+        const positions = new Map(rows.map((r) => [r.id, r.position]));
         const inScope = new Set(current);
         const wanted = new Set<string>();
         for (const id of orderedIds) {
@@ -2199,6 +2229,7 @@ export class Workspace {
             `UPDATE ${table} SET position = ?, updated_at = ? WHERE id = ? AND ${scopeColumn} = ?`,
         );
         final.forEach((id, index) => {
+            if (positions.get(id) === index) return;
             stmt.run(index, ts, id, scopeValue);
         });
     }
@@ -2228,6 +2259,39 @@ export class Workspace {
             .get(id) as { server_id: string } | undefined;
         if (!row) throw new Error(`${table} not found: ${id}`);
         return row.server_id;
+    }
+
+    // A client-supplied tmux target must not already belong to a DIFFERENT
+    // pane. `UNIQUE (tmux_target)` says the same thing, but it says it as a raw
+    // SQLite constraint failure, which the dispatcher can only report as an
+    // internal error — telling the user the SERVER broke when in fact their
+    // request asked two panes to drive one remote shell. Adopting an existing
+    // tmux session is a real workflow (the tmux.* method group), so this is a
+    // request a client genuinely makes and genuinely gets wrong; it deserves
+    // the same -32602 as a structurally unsafe target.
+    //
+    // Callers are inside transaction()'s BEGIN IMMEDIATE, so no other
+    // connection can claim the target between this check and the write. The
+    // constraint stays as the backstop for anything that bypasses this path.
+    //
+    // `exceptPaneId` is the row being updated: re-writing a pane's own target
+    // to the value it already holds is a no-op, not a collision.
+    private requireUnboundTmuxTarget(
+        target: string,
+        exceptPaneId: string | null,
+        method: string,
+    ): string {
+        const holder = this.db
+            .prepare("SELECT id FROM terminal_panes WHERE tmux_target = ?")
+            .get(target) as { id: string } | undefined;
+        if (holder !== undefined && holder.id !== exceptPaneId) {
+            throw new InvalidParamsError(
+                `${method}: tmuxTarget ${JSON.stringify(target)} is already bound to terminal ` +
+                    `pane ${JSON.stringify(holder.id)}; two panes on one tmux session share a ` +
+                    "single remote shell and mirror each other's keystrokes",
+            );
+        }
+        return target;
     }
 
     // All-or-nothing wrapper around a group of writes.
@@ -2285,9 +2349,19 @@ let defaultWorkspace: Workspace | undefined;
 
 function workspace(): Workspace {
     if (defaultWorkspace === undefined) {
+        // An override that is present but BLANK counts as absent. `??` only
+        // catches an unset variable, so `CODEHARBOR_DB=` (a trivially easy
+        // typo in a systemd unit or a wrapper script) used to reach SQLite as
+        // the empty filename — which SQLite accepts and answers with a PRIVATE
+        // TEMPORARY database that is deleted when the connection closes. The
+        // daemon came up looking perfectly healthy with an empty workspace, and
+        // everything the user did in it vanished at shutdown. Fall back to the
+        // real location instead.
+        const override = process.env.CODEHARBOR_DB;
         const dbPath =
-            process.env.CODEHARBOR_DB ??
-            path.join(os.homedir(), ".local", "share", "codeharbor", "codeharbor.sqlite");
+            override !== undefined && override.trim() !== ""
+                ? override
+                : path.join(os.homedir(), ".local", "share", "codeharbor", "codeharbor.sqlite");
         defaultWorkspace = openWorkspace(dbPath);
     }
     return defaultWorkspace;

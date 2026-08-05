@@ -1,5 +1,7 @@
 #include "ViewerHandlerRegistry.h"
 
+#include "ViewerKinds.h"
+
 #include <QSet>
 
 namespace ch {
@@ -200,6 +202,11 @@ ViewerResolution ViewerHandlerRegistry::resolveByExtension(const QString &ext)
         QStringLiteral("qml"),        QStringLiteral("qrc"),
         QStringLiteral("pro"),        QStringLiteral("pri"),
         QStringLiteral("ui"),         QStringLiteral("srt"),
+        // The "++" spellings GNU tools accept beside .cc/.cxx/.hpp. They are
+        // storable as a per-extension preference too: ViewerKinds keeps '+'
+        // when it normalises an extension, so a file the editor claims here is
+        // a file the settings page can also reassign.
+        QStringLiteral("c++"),        QStringLiteral("h++"),
     };
     if (kText.contains(e))
         return ViewerResolution::TextEditor;
@@ -207,13 +214,14 @@ ViewerResolution ViewerHandlerRegistry::resolveByExtension(const QString &ext)
     // Raster formats Chromium renders inline. Anything it cannot decode (tiff,
     // heic, psd, ...) deliberately stays a download rather than an image pane
     // showing a permanent broken-image icon.
-    static const QSet<QString> kImage = {
-        QStringLiteral("png"),  QStringLiteral("jpg"),  QStringLiteral("jpeg"),
-        QStringLiteral("gif"),  QStringLiteral("svg"),  QStringLiteral("webp"),
-        QStringLiteral("bmp"),  QStringLiteral("ico"),  QStringLiteral("avif"),
-        QStringLiteral("apng"),
-    };
-    if (kImage.contains(e))
+    //
+    // The set lives in ch::ViewerKinds, which is also what decides whether
+    // "image" may be SAVED as a file's preferred handler. There used to be a
+    // second, identical copy right here, and two copies of one table drift:
+    // adding a format to one alone yields either a file the image pane renders
+    // but nobody can select it for, or the reverse. `e` is already bare and
+    // lower-cased, which is exactly how that table is keyed.
+    if (ViewerKinds::imageExtensions().contains(e))
         return ViewerResolution::ImageViewer;
 
     if (e == QLatin1String("pdf"))
@@ -271,9 +279,11 @@ QStringList ViewerHandlerRegistry::applicableViewKinds(const QUrl &url)
     if (scheme != QLatin1String("file"))
         return {};
 
+    // The trailing-slash directory rule is NOT repeated here: resolve() already
+    // applies it, and the switch below turns its answer into the menu word. A
+    // second copy of the rule made the DirectoryViewer case unreachable, so the
+    // two spellings could drift apart with nothing to notice.
     const QString path = url.path();
-    if (path.endsWith(QLatin1Char('/')))
-        return {QStringLiteral("directory")};
 
     const ViewerResolution resolution = resolve(url);
     switch (resolution) {
@@ -311,8 +321,9 @@ QStringList ViewerHandlerRegistry::applicableViewKinds(const QUrl &url)
         return {QStringLiteral("pdf")};
     case ViewerResolution::Download:
         return {QStringLiteral("binary")};
-    case ViewerResolution::DirectWebNavigation:
     case ViewerResolution::DirectoryViewer:
+        return {QStringLiteral("directory")};
+    case ViewerResolution::DirectWebNavigation:
     case ViewerResolution::Error:
         return {};
     }

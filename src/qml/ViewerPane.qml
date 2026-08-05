@@ -280,7 +280,12 @@ Item {
                 const state = String(result === undefined || result === null
                                      ? "" : result);
                 if (state.length === 0 || state === "loading") {
-                    pane.armFocusRetry();
+                    // Deliberately does NOT re-arm: the unconditional
+                    // armFocusRetry() below already spent one unit of the
+                    // budget and restarted the timer for this attempt. Arming
+                    // again here charged every attempt TWICE, halving the
+                    // twenty-second window the comment on `focusRetryLimit`
+                    // promises.
                     return;
                 }
                 pane.focusPending = false;
@@ -775,13 +780,17 @@ Item {
         title: pane.displayName.length > 0 ? pane.displayName : qsTr("Empty pane")
         subtitle: pane.showingDefault ? qsTr("session root") : pane.kindLabel
         active: pane.paneActive
-        // A listing is in flight, or a path is being probed. Only the directory
-        // view publishes `loading`, so it is the only one asked — the others
-        // (a web page, an image, the Monaco editor) report their own progress
-        // inside themselves.
+        // A path is being probed, or the loaded handler says it is still
+        // fetching. Every handler that can wait on the network publishes
+        // `loading` (the directory listing, and the four WebEngine-backed
+        // views); the ones that cannot — the binary metadata card, the empty
+        // placeholder — simply have no such property, so the test is false for
+        // them. Asking only the DIRECTORY view (which is what this used to do)
+        // left an image, a PDF, a rendered Markdown document and a web page
+        // showing a blank rectangle with nothing anywhere saying they were on
+        // their way.
         busy: pane.probePath.length > 0
-              || (pane.kind === "directory" && contentLoader.item
-                  && contentLoader.item.loading === true)
+              || (contentLoader.item && contentLoader.item.loading === true)
 
         onTitleActivated: pane.focusAddress()
 

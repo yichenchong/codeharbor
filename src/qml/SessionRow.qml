@@ -169,6 +169,9 @@ ItemDelegate {
 
         Rectangle {
             id: dot
+            // Named per row so a test can assert that the SPEC 4.2 states are
+            // told apart by colour AND by glyph, not by colour alone.
+            objectName: "statusDot:" + row.itemId
             width: 14
             height: 14
             radius: row.stateRadius(row.rowState)
@@ -176,6 +179,7 @@ ItemDelegate {
             anchors.verticalCenter: parent.verticalCenter
 
             Label {
+                objectName: "statusGlyph:" + row.itemId
                 anchors.centerIn: parent
                 text: row.stateGlyph(row.rowState)
                 color: Theme.textOnAccent

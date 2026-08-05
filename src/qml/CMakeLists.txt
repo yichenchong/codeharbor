@@ -197,7 +197,20 @@ function(codeharbor_embed_web_bundle)
         if(CODEHARBOR_NPM)
             if(NOT EXISTS ${CMAKE_SOURCE_DIR}/node_modules)
                 message(STATUS "CodeHarbor: installing npm workspaces (first configure)")
-                execute_process(COMMAND ${CODEHARBOR_NPM} install
+                # `npm ci`, NOT `npm install`. A plain install is allowed to
+                # REWRITE package-lock.json (and a workspace package.json's own
+                # version field), and that lock file is one of the files
+                # .bumpversion.json polices — .github/scripts/check-versions.mjs
+                # fails the release when the listed files disagree, which is why
+                # both CI workflows run the version check BEFORE installing
+                # anything. Merely configuring the project locally must not
+                # leave the developer with a modified lock file they did not ask
+                # for. `npm ci` installs exactly what the lock file records and
+                # refuses rather than editing it; it also requires an absent
+                # node_modules, which is precisely the branch we are in. Run
+                # from the repository root because that is where the npm
+                # workspaces (and the single lock file) live.
+                execute_process(COMMAND ${CODEHARBOR_NPM} ci
                                 WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
                                 RESULT_VARIABLE _chb_install_rc
                                 OUTPUT_VARIABLE _chb_install_out
@@ -207,11 +220,11 @@ function(codeharbor_embed_web_bundle)
                 # esbuild) far away from the real cause.
                 if(NOT _chb_install_rc EQUAL 0)
                     message(FATAL_ERROR
-                        "CodeHarbor: `npm install` failed (${_chb_install_rc}), so the "
+                        "CodeHarbor: `npm ci` failed (${_chb_install_rc}), so the "
                         "${CHB_LABEL} bundle cannot be built.\n"
                         "${_chb_install_out}\n"
                         "Fix the dependency install, then re-run CMake:\n"
-                        "    npm install\n"
+                        "    npm ci\n"
                         "Or configure with -DCODEHARBOR_SKIP_WEB_BUNDLE=ON to build a "
                         "client whose ${CHB_PANE} pane is intentionally inert.")
                 endif()
@@ -227,7 +240,7 @@ function(codeharbor_embed_web_bundle)
                     "CodeHarbor: the ${CHB_LABEL} bundle failed to build "
                     "(${_chb_bundle_rc}).\n${_chb_bundle_out}\n"
                     "Fix the web dependency/build, then re-run CMake:\n"
-                    "    npm install\n"
+                    "    npm ci\n"
                     "    npm run ${_chb_npm_script} --workspace src/web/${CHB_DIR}\n"
                     "Or configure with -DCODEHARBOR_SKIP_WEB_BUNDLE=ON to build a "
                     "client whose ${CHB_PANE} pane is intentionally inert.")
@@ -306,7 +319,7 @@ function(codeharbor_embed_web_bundle)
             "The ${CHB_LABEL} bundle (src/web/${CHB_DIR}/dist) is missing and could "
             "not be built automatically.\n"
             "Build it, then re-run CMake:\n"
-            "    npm install\n"
+            "    npm ci\n"
             "    npm run ${_chb_npm_script} --workspace src/web/${CHB_DIR}\n"
             "Or configure with -DCODEHARBOR_SKIP_WEB_BUNDLE=ON to build a client "
             "whose ${CHB_PANE} pane is intentionally inert.")

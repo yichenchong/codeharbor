@@ -146,6 +146,22 @@ test("resolveSocketPath prefers XDG_RUNTIME_DIR, else falls back to cache", () =
     // every status event lost, with nothing logged anywhere.
     assert.equal(resolveSocketPath({ XDG_RUNTIME_DIR: "run/user" }), fallback);
     assert.equal(resolveSocketPath({ XDG_RUNTIME_DIR: "." }), fallback);
+    // The home directory is read from the SAME environment as the runtime
+    // directory. Taking it from the real process instead would make the answer
+    // only half-overridable, so a hook started with a different HOME and the
+    // bridge would look for the socket in two different places.
+    assert.equal(
+        resolveSocketPath({ HOME: "/home/someone" }),
+        "/home/someone/.cache/codeharbor/events.sock",
+    );
+    // An unset or relative HOME falls back to the real home directory.
+    assert.equal(resolveSocketPath({ HOME: "relative/home" }), fallback);
+    assert.equal(resolveSocketPath({ HOME: "" }), fallback);
+    // XDG_RUNTIME_DIR still wins over HOME.
+    assert.equal(
+        resolveSocketPath({ XDG_RUNTIME_DIR: "/run/user/7", HOME: "/home/someone" }),
+        "/run/user/7/codeharbor.sock",
+    );
 });
 
 // The bridge reads JSONL off a socket, and a producer that ends its lines with

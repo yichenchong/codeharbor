@@ -54,6 +54,11 @@ dist/
 *.local
 *.sqlite
 *.sqlite-journal
+# The project mandates WAL mode, so every open database also has -wal and -shm
+# sidecars beside it. Without these two an interrupted run leaves multi-megabyte
+# untracked files in `git status` next to an already-ignored .sqlite.
+*.sqlite-wal
+*.sqlite-shm
 
 # Python virtual environment used by tooling/analysis scripts.
 .venv/
@@ -61,4 +66,6 @@ dist/
 # Live-gate test fixture: generated sshd host/client keypairs + runtime state.
 # NEVER commit these - they are real private keys, regenerated on demand.
 tests/live/.fixture/
+
+# Local environment overrides (never committed).
 .env

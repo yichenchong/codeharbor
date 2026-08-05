@@ -236,7 +236,6 @@ void EditorController::onTransportClosed()
     m_watchSubscriptionId.clear();
 
     // Nothing is open, or the drop has already been reported.
-
     if (m_path.isEmpty() || m_fileState == FileState::Disconnected)
         return;
 
@@ -753,13 +752,17 @@ void EditorController::checkRecovery(const QString& loadedContent, quint64 gener
     if (m_recoveryCheckInFlight)
         return;
     const quint64 recoveryGeneration = m_recoveryGeneration;
+    // Where this pane's slot stood when the probe started; see the check in the
+    // read reply below.
+    const quint64 slotSerial = m_recoverySlotSerial;
     m_recoveryCheckInFlight = true;
 
     QPointer<EditorController> self(this);
     // Stat first: absence (error) simply means there is nothing to recover.
     m_client->call(
         QString::fromLatin1(rpc::kMethodStat), readParams(recoveryPath),
-        [self, recoveryPath, loadedContent, generation, recoveryGeneration](
+        [self, recoveryPath, loadedContent, generation, recoveryGeneration,
+         slotSerial](
             QJsonValue statRes, std::optional<RpcError> statErr) {
             if (!self)
                 return;
@@ -783,7 +786,7 @@ void EditorController::checkRecovery(const QString& loadedContent, quint64 gener
                 QString::fromLatin1(rpc::kMethodReadFile),
                 readFileParams(recoveryPath),
                 [self, snapshotRevision, loadedContent, generation,
-                 recoveryGeneration](
+                 recoveryGeneration, slotSerial](
                     QJsonValue readRes, std::optional<RpcError> readErr) {
                     if (!self)
                         return;
@@ -794,10 +797,22 @@ void EditorController::checkRecovery(const QString& loadedContent, quint64 gener
                         || generation != self->m_loadGeneration)
                         return;
                     const QJsonObject snapshot = readRes.toObject();
-                    // Adopt the snapshot's revision unconditionally so the
-                    // next write to this pane's slot is a guarded overwrite,
-                    // even when nothing below is offered.
-                    self->m_recoveryRevision = snapshotRevision;
+                    // A snapshot write, its retry, or a truncate has installed a
+                    // newer revision for this slot since the probe started, so
+                    // this stat's revision — and the "does the slot hold
+                    // content" verdict below — describe the slot as it was
+                    // BEFORE that write. Adopting either would guard the next
+                    // write with a revision the server has already replaced, and
+                    // a REFUSED truncate leaves a stale snapshot standing behind
+                    // a successful save: the next open then offers to restore
+                    // text that save already superseded.
+                    const bool slotUntouched =
+                        slotSerial == self->m_recoverySlotSerial;
+                    // Otherwise adopt the snapshot's revision, so the next write
+                    // to this pane's slot is a guarded overwrite even when
+                    // nothing below is offered.
+                    if (slotUntouched)
+                        self->m_recoveryRevision = snapshotRevision;
                     // The snapshot is read through the same wire shape as any
                     // other file, so it is decoded the same way (open() and
                     // reload() both do): the daemon sends base64 for bytes its
@@ -824,7 +839,8 @@ void EditorController::checkRecovery(const QString& loadedContent, quint64 gener
                     const bool belongsHere =
                         parsed && snapshotPath == self->m_path
                         && !recovered.isEmpty();
-                    self->m_recoveryHasContent = belongsHere;
+                    if (slotUntouched)
+                        self->m_recoveryHasContent = belongsHere;
                     if (belongsHere && recovered != loadedContent)
                         emit self->recoveryAvailable(recovered);
                 });
@@ -1065,9 +1081,11 @@ void EditorController::issueSave(QString content, QString expectedRevision)
                     QString::fromLatin1(rpc::kMethodStat), readParams(path),
                     [self, path, loadGeneration, saveGeneration](
                         QJsonValue statRes, std::optional<RpcError> statErr) {
-                        // gives a load one more window in which to take the
-                        // buffer over, and a conflict over bytes the pane no
-                        // longer holds is not this pane's conflict.
+                        // The same guards as the write's own reply, re-checked:
+                        // this second round trip gives a load one more window in
+                        // which to take the buffer over, and a conflict over
+                        // bytes the pane no longer holds is not this pane's
+                        // conflict.
                         if (!self || self->m_path != path
                             || self->m_loadGeneration != loadGeneration
                             || self->m_saveGeneration != saveGeneration)
@@ -1175,6 +1193,7 @@ void EditorController::writeRecovery(const QString& content, bool retryOnMismatc
             if (!error.has_value()) {
                 // Track the returned revision so the next snapshot is a guarded
                 // overwrite rather than a create.
+                ++self->m_recoverySlotSerial;
                 self->m_recoveryRevision =
                     result.toObject().value(QStringLiteral("revision")).toString();
                 self->m_recoveryHasContent = !content.isEmpty();
@@ -1217,6 +1236,7 @@ void EditorController::writeRecovery(const QString& content, bool retryOnMismatc
                         self->honourDeferredRecoveryClear();
                         return;
                     }
+                    ++self->m_recoverySlotSerial;
                     self->m_recoveryRevision =
                         statRes.toObject()
                             .value(QStringLiteral("revision"))
@@ -1296,6 +1316,7 @@ void EditorController::clearRecovery()
                 self->honourDeferredRecoveryClear();
                 return; // best-effort: a stale snapshot is a prompt, not data loss
             }
+            ++self->m_recoverySlotSerial;
             self->m_recoveryRevision =
                 result.toObject().value(QStringLiteral("revision")).toString();
             self->m_recoveryHasContent = false;
@@ -1320,33 +1341,20 @@ void EditorController::reload(FileState transitional, bool discardLocalEdits)
     // Supersede any read still in flight: the replies to two overlapping loads
     // can arrive in either order, and the older one must never win.
     const quint64 generation = ++m_loadGeneration;
-    // Where the buffer stands right now. A report landing during the round trip
-    // bumps this, which is how the reply below notices that the bytes it is
-    // about to install would destroy keystrokes typed since it was issued.
-    const quint64 editSerial = m_editSerial;
+    // The revision the buffer is guarded at right now. A save that SETTLES
+    // during the round trip moves it, which is how the reply below notices that
+    // the bytes it is holding are older than the ones on the server.
+    const QString baselineRevision = m_revision;
 
     QPointer<EditorController> self(this);
     m_client->call(
         QString::fromLatin1(rpc::kMethodReadFile), readFileParams(path),
-        [self, generation, editSerial, discardLocalEdits](
+        [self, generation, baselineRevision, discardLocalEdits](
             QJsonValue result, std::optional<RpcError> error) {
             if (!self || generation != self->m_loadGeneration)
                 return;
             if (error.has_value()) {
                 self->setFileState(FileState::Error);
-                return;
-            }
-            // The user typed while this read was in flight. Only a reload the
-            // user ASKED for may overwrite that: for a system-initiated reload
-            // (a watch event, a reconnect reconciliation) the buffer is now
-            // unsaved work that exists nowhere else, and pushing the server's
-            // bytes at the page would silently delete it. Drop the fetched
-            // bytes and flag the divergence instead — the same answer
-            // onNotification() gives for a change that arrives against an
-            // already-dirty buffer (SPEC 8.7).
-            if (!discardLocalEdits && self->m_editSerial != editSerial) {
-                if (self->m_fileState != FileState::Conflict)
-                    self->setFileState(FileState::ExternallyModified);
                 return;
             }
             // A save is in flight. Its bytes are the user's, they are not on
@@ -1357,11 +1365,43 @@ void EditorController::reload(FileState transitional, bool discardLocalEdits)
             // is guarded by, and clear the recovery snapshot holding those
             // bytes, one moment before the reply lands (the reply is then
             // refused as a conflict, and the only copy of the edits is gone).
-            // m_editSerial cannot notice this on its own: a save carries bytes
-            // the controller may never have seen a reportContent for, because
-            // Ctrl/Cmd+S beats the page's 500 ms debounce.
+            // Checked FIRST so the pane keeps reporting the write it is waiting
+            // on rather than being flagged over bytes that write is carrying.
             if (!discardLocalEdits && self->m_fileState == FileState::Saving)
                 return;
+            // A save SETTLED while this read was in flight. The server's bytes
+            // are then this pane's own bytes, and this reply describes a world
+            // that is already gone: installing it would put the PRE-save file
+            // back on screen and, worse, re-adopt the pre-save revision as the
+            // buffer's save guard, so every later save is refused as a conflict
+            // over the user's own write. Silent, like the Saving case above —
+            // that save already reported this file's outcome. Nothing else here
+            // can see it: a save bumps neither the load generation nor, when it
+            // needed no further edits, the dirty flag.
+            if (!discardLocalEdits && self->m_revision != baselineRevision)
+                return;
+            // The user typed while this read was in flight. Only a reload the
+            // user ASKED for may overwrite that: for a system-initiated reload
+            // (a watch event, a reconnect reconciliation) the buffer is now
+            // unsaved work that exists nowhere else, and pushing the server's
+            // bytes at the page would silently delete it. Drop the fetched
+            // bytes and flag the divergence instead — the same answer
+            // onNotification() gives for a change that arrives against an
+            // already-dirty buffer (SPEC 8.7).
+            //
+            // m_dirty, not a count of reports: every reload that can reach this
+            // guard was started against a CLEAN buffer (both system-initiated
+            // sites are gated on !m_dirty), so a dirty flag here means the page
+            // reported unsaved bytes inside the round trip. A report that merely
+            // took the buffer BACK to the loaded bytes leaves it clean, and such
+            // a buffer has nothing to lose — counting reports instead would park
+            // the pane in ExternallyModified over a buffer that matches the file
+            // and leave it there until the next external change.
+            if (!discardLocalEdits && self->m_dirty) {
+                if (self->m_fileState != FileState::Conflict)
+                    self->setFileState(FileState::ExternallyModified);
+                return;
+            }
             const QJsonObject obj = result.toObject();
             // Same rule as open(): a base64 reply is the file's exact bytes,
             // sent that way because the daemon's strict decoder refused them,

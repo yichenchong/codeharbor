@@ -197,6 +197,10 @@ QVector<SrgbColor> GroupPalette::generatePalette(const QVector<SrgbColor> &seed,
         return {};
 
     QVector<SrgbColor> palette = seed;
+    // Reserved for the same reason `converted` below is: the loop appends
+    // exactly one colour per pass, so without this the vector is reallocated
+    // and copied on the way from seed.size() up to requestedCount.
+    palette.reserve(requestedCount);
     // The OKLCH view of `palette`, kept in step with it rather than rebuilt
     // from scratch on every pass: each pass adds exactly one colour, so one
     // conversion per pass is all that changes. Rebuilding converted the whole

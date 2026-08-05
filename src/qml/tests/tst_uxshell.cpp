@@ -129,7 +129,8 @@ QVector<ch::TerminalStatus> terminalsFor(ch::SessionRowState state)
         terminal.agent = ch::AgentState::Idle;
         break;
     case ch::SessionRowState::Disconnected:
-        return {};
+        terminal.connection = ch::TerminalState::Disconnected;
+        break;
     }
     return {terminal};
 }
@@ -781,6 +782,10 @@ private slots:
     void sidebarDeleteActionsAreConfirmedAndNamed();
     void sidebarArchiveFilterToggleIsNamedAndChangesModel();
     void sidebarArchiveEmptyStateExplainsArchivedSessions();
+    // The sidebar row badge is the only place a Dev Session's aggregate state
+    // is shown, and nothing asserted how it is drawn: a swapped case in
+    // SessionRow.stateColor() would paint Error green and no test would care.
+    void sidebarRowBadgeSeparatesEveryRowState();
 
     // A long RPC error must be readable and the banner must be dismissible,
     // then come back for the next failure.
@@ -1306,6 +1311,98 @@ void TstUxShell::sidebarArchiveEmptyStateExplainsArchivedSessions()
     QCOMPARE(textOf(surface.child(QStringLiteral("sidebarEmptyHint"))),
              QStringLiteral("Show archived sessions to see them here."));
     QVERIFY(surface.warnings.isEmpty());
+}
+
+// SPEC 4.2 gives six aggregate row states in a fixed precedence — Error,
+// Waiting for input, Running, Finished with unseen output, Idle, Disconnected —
+// and the sidebar row is where a user reads them. Two things have to hold, and
+// neither was defended anywhere: each state must be drawn as ITSELF (a swapped
+// case in SessionRow's colour table is invisible to every other test), and each
+// must be told apart THREE ways, because a six-shade dot is exactly the
+// encoding a colour-blind reader cannot use and a greyscale screenshot loses.
+//
+// The colours are spelled out rather than read from Theme for the same reason
+// chipExpectations() above spells its own out: which role a state is painted in
+// is a design decision, and pinning it here is the point.
+void TstUxShell::sidebarRowBadgeSeparatesEveryRowState()
+{
+    using S = ch::SessionRowState;
+    const QVector<QPair<QString, S>> sessions{{QStringLiteral("err"), S::Error},
+                                              {QStringLiteral("ask"), S::WaitingForInput},
+                                              {QStringLiteral("run"), S::Running},
+                                              {QStringLiteral("done"), S::FinishedUnseen},
+                                              {QStringLiteral("idle"), S::Idle},
+                                              {QStringLiteral("gone"), S::Disconnected}};
+    // Theme.danger / warning / success / accent / textDim / textFaint, in the
+    // precedence order above.
+    const QStringList expected{QStringLiteral("#f38ba8"), QStringLiteral("#f9e2af"),
+                               QStringLiteral("#a6e3a1"), QStringLiteral("#89b4fa"),
+                               QStringLiteral("#6c7086"), QStringLiteral("#45475a")};
+
+    ch::SessionsModel model;
+    model.setGroups({makeGroup(QStringLiteral("g"), QStringLiteral("G"), sessions)});
+    ShotApp app(&model);
+    app.setConnectionState(QStringLiteral("connected"));
+    Surface surface(moduleUrl(QStringLiteral("SessionsSidebar.qml")), QSize(340, 620), &app);
+    QVERIFY(surface.expose());
+    settle(60);
+
+    QSet<QString> colours;
+    QSet<QString> glyphs;
+    QSet<QString> words;
+    QObject *anyRow = nullptr;
+    for (int i = 0; i < sessions.size(); ++i) {
+        const QString id = sessions.at(i).first;
+        QObject *row = surface.child(QStringLiteral("sessionRow:") + id);
+        QVERIFY2(row, qPrintable(QStringLiteral("no sidebar row for \"%1\"").arg(id)));
+        anyRow = row;
+
+        QObject *dot = surface.child(QStringLiteral("statusDot:") + id);
+        QVERIFY2(dot, qPrintable(QStringLiteral("the \"%1\" row has no status dot").arg(id)));
+        const QColor drawn = dot->property("color").value<QColor>();
+        QCOMPARE(drawn, QColor(expected.at(i)));
+        QVERIFY2(drawn.isValid(),
+                 qPrintable(QStringLiteral("row state %1 has no rendered colour").arg(i)));
+        colours.insert(drawn.name());
+
+        QObject *glyph = surface.child(QStringLiteral("statusGlyph:") + id);
+        QVERIFY2(glyph, qPrintable(QStringLiteral("the \"%1\" row has no status glyph").arg(id)));
+        QVERIFY2(!textOf(glyph).isEmpty(),
+                 qPrintable(QStringLiteral("row state %1 is carried by colour alone").arg(i)));
+        glyphs.insert(textOf(glyph));
+        QVariant expectedGlyph;
+        QVERIFY(QMetaObject::invokeMethod(anyRow, "stateGlyph",
+                                          Q_RETURN_ARG(QVariant, expectedGlyph),
+                                          Q_ARG(QVariant, QVariant(i))));
+        QVERIFY(!expectedGlyph.toString().isEmpty());
+        glyphs.insert(expectedGlyph.toString());
+
+        QVariant expectedColour;
+        QVERIFY(QMetaObject::invokeMethod(anyRow, "stateColor",
+                                          Q_RETURN_ARG(QVariant, expectedColour),
+                                          Q_ARG(QVariant, QVariant(i))));
+        const QColor expectedColor = expectedColour.value<QColor>();
+        QCOMPARE(expectedColor, QColor(expected.at(i)));
+        colours.insert(expectedColor.name());
+    }
+    QVERIFY(anyRow);
+
+    // The words the row's tooltip and its accessible description are built
+    // from. Asked of the row itself, so an unreachable state cannot hide.
+    for (int i = 0; i < sessions.size(); ++i) {
+        QVariant said;
+        QVERIFY(QMetaObject::invokeMethod(anyRow, "stateWords", Q_RETURN_ARG(QVariant, said),
+                                          Q_ARG(QVariant, QVariant(i))));
+        QVERIFY2(!said.toString().isEmpty(),
+                 qPrintable(QStringLiteral("row state %1 has no wording").arg(i)));
+        words.insert(said.toString());
+    }
+
+    QCOMPARE(colours.size(), sessions.size());
+    QCOMPARE(glyphs.size(), sessions.size());
+    QCOMPARE(words.size(), sessions.size());
+
+    QVERIFY2(surface.warnings.isEmpty(), qPrintable(surface.warningReport()));
 }
 
 void TstUxShell::sheetErrorIsReadableAndDismissible()

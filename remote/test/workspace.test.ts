@@ -1204,7 +1204,11 @@ test("createTerminalPane and updateTerminalPane reject a structurally unsafe tmu
 });
 
 // Two panes on one target attach the SAME remote shell: each sees the other's
-// keystrokes and they fight over the terminal size. The database refuses it.
+// keystrokes and they fight over the terminal size. The request is refused, and
+// refused as a BAD REQUEST: adopting an existing tmux session is a real
+// workflow, so naming one that is already taken is a mistake the client made
+// and can act on, not a server malfunction. The UNIQUE index stays underneath
+// as the backstop for anything that writes the column directly.
 test("terminal_panes.tmux_target is UNIQUE, and many NULLs are still allowed", async () => {
     const dbPath = await tmpDbPath();
     const ws = openWorkspace(dbPath);
@@ -1213,18 +1217,36 @@ test("terminal_panes.tmux_target is UNIQUE, and many NULLs are still allowed", a
     assert.equal(uniqueTmuxTargetIndexes(ws).length, 1);
 
     const a = ws.createTerminalPane({ serverId: SERVER, devSessionId: s.id, name: "a", tmuxTarget: "ch_shared" });
-    assert.throws(
-        () => ws.createTerminalPane({ serverId: SERVER, devSessionId: s.id, name: "b", tmuxTarget: "ch_shared" }),
-        /UNIQUE constraint failed: terminal_panes.tmux_target/,
-    );
+    let refused: unknown;
+    try {
+        ws.createTerminalPane({ serverId: SERVER, devSessionId: s.id, name: "b", tmuxTarget: "ch_shared" });
+    } catch (err) {
+        refused = err;
+    }
+    assert.equal(isInvalidParams(refused), true);
+    assert.match((refused as Error).message, /tmuxTarget "ch_shared" is already bound/);
     // Retargeting an existing pane onto a taken target is the same collision
     // reached from the other direction, and is refused the same way.
     const b = ws.createTerminalPane({ serverId: SERVER, devSessionId: s.id, name: "b" });
+    try {
+        refused = undefined;
+        ws.updateTerminalPane({ id: b.id, tmuxTarget: "ch_shared" });
+    } catch (err) {
+        refused = err;
+    }
+    assert.equal(isInvalidParams(refused), true);
+    // Rewriting a pane's own target to the value it already holds is a no-op,
+    // not a collision with itself.
+    assert.equal(ws.updateTerminalPane({ id: a.id, tmuxTarget: "ch_shared" }).tmuxTarget, "ch_shared");
+    assert.equal(ws.getTerminalPane(a.id).tmuxTarget, "ch_shared");
+    // The constraint itself is still live for a writer that bypasses the store.
     assert.throws(
-        () => ws.updateTerminalPane({ id: b.id, tmuxTarget: "ch_shared" }),
+        () =>
+            ws.db
+                .prepare("UPDATE terminal_panes SET tmux_target = 'ch_shared' WHERE id = ?")
+                .run(b.id),
         /UNIQUE constraint failed: terminal_panes.tmux_target/,
     );
-    assert.equal(ws.getTerminalPane(a.id).tmuxTarget, "ch_shared");
 
     const n1 = ws.createTerminalPane({ serverId: SERVER, devSessionId: s.id, name: "n1" });
     const n2 = ws.createTerminalPane({ serverId: SERVER, devSessionId: s.id, name: "n2" });
@@ -1282,9 +1304,17 @@ test("the v3 migration repairs and de-duplicates tmux targets before constrainin
         upgraded.list(SERVER)[0].sessions[0].terminalPanes.map((p) => p.name),
         ["a", "b", "c", "d"],
     );
-    // And the constraint is live from here on.
+    // And the target is claimed from here on: the store refuses a second pane
+    // asking for it, and the index refuses a direct write of it.
     assert.throws(
         () => upgraded.createTerminalPane({ serverId: SERVER, devSessionId: s.id, name: "e", tmuxTarget: "ch_shared" }),
+        /tmuxTarget "ch_shared" is already bound/,
+    );
+    assert.throws(
+        () =>
+            upgraded.db
+                .prepare("UPDATE terminal_panes SET tmux_target = 'ch_shared' WHERE id = ?")
+                .run(d.id),
         /UNIQUE constraint failed: terminal_panes.tmux_target/,
     );
     upgraded.close();
@@ -3304,5 +3334,138 @@ test("closeDefaultWorkspace is a no-op when unused, and idempotent when used", a
         else process.env.CODEHARBOR_DB = previous;
     }
 
+    await cleanup(dbPath);
+});
+
+// `CODEHARBOR_DB` set to the empty string is a plausible misconfiguration (a
+// systemd unit or wrapper script with `CODEHARBOR_DB=` and nothing after it).
+// SQLite accepts "" as a filename and answers with a PRIVATE TEMPORARY database
+// that it deletes when the connection closes — so the daemon came up looking
+// healthy on an empty workspace and threw away everything the user did in it at
+// shutdown. A blank override must count as no override.
+test("a blank CODEHARBOR_DB falls back to the real database instead of a throwaway", async () => {
+    const home = await fs.mkdtemp(path.join(os.tmpdir(), "codeharbord-home-"));
+    const previousDb = process.env.CODEHARBOR_DB;
+    const previousHome = process.env.HOME;
+    closeDefaultWorkspace();
+    process.env.CODEHARBOR_DB = "   ";
+    process.env.HOME = home;
+    const expected = path.join(home, ".local", "share", "codeharbor", "codeharbor.sqlite");
+    try {
+        const created = WORKSPACE_METHODS["workspace.createGroup"]({
+            serverId: SERVER,
+            name: "G",
+        }) as { id: string };
+        closeDefaultWorkspace();
+        // The row is in the documented location, on disk, after the connection
+        // closed — which a temporary database could not manage.
+        const reopened = openWorkspace(expected);
+        assert.deepEqual(
+            reopened.list(SERVER).map((g) => g.id),
+            [created.id],
+        );
+        reopened.close();
+    } finally {
+        closeDefaultWorkspace();
+        if (previousDb === undefined) delete process.env.CODEHARBOR_DB;
+        else process.env.CODEHARBOR_DB = previousDb;
+        if (previousHome === undefined) delete process.env.HOME;
+        else process.env.HOME = previousHome;
+    }
+    await fs.rm(home, { recursive: true, force: true });
+});
+
+// `updated_at` is a change marker. Re-packing a scope rewrote EVERY row in it,
+// so creating one group at the end of a server's list, or reordering two
+// sessions out of ten, reported every other row as freshly modified. Only the
+// rows whose position actually moves may be stamped.
+test("re-packing a scope leaves the rows that did not move untouched", async () => {
+    const dbPath = await tmpDbPath();
+    const ws = openWorkspace(dbPath);
+    const a = ws.createGroup({ serverId: SERVER, name: "A" });
+    const b = ws.createGroup({ serverId: SERVER, name: "B" });
+    const c = ws.createGroup({ serverId: SERVER, name: "C" });
+
+    // A sentinel timestamp, not whatever Date.now() happened to return during
+    // the creates: those can all land in one millisecond, and then "unchanged"
+    // would pass even if every row HAD been rewritten. 1 is a value no live
+    // write can produce.
+    const SENTINEL = 1;
+    ws.db.prepare("UPDATE groups SET updated_at = ? WHERE server_id = ?").run(SENTINEL, SERVER);
+    const stamps = (): Record<string, number> => {
+        const rows = ws.db
+            .prepare("SELECT id, updated_at FROM groups WHERE server_id = ?")
+            .all(SERVER) as unknown as Array<{ id: string; updated_at: number }>;
+        return Object.fromEntries(rows.map((r) => [r.id, r.updated_at]));
+    };
+
+    // Appending at the end moves nothing that was already there.
+    const appended = ws.createGroup({ serverId: SERVER, name: "D", position: 3 });
+    const afterAppend = stamps();
+    for (const id of [a.id, b.id, c.id]) {
+        assert.equal(afterAppend[id], SENTINEL, `appending stamped an unmoved group ${id}`);
+    }
+    assert.notEqual(afterAppend[appended.id], SENTINEL);
+
+    // Swapping the last two leaves the first two alone, and still packs 0..n-1.
+    ws.db.prepare("UPDATE groups SET updated_at = ? WHERE server_id = ?").run(SENTINEL, SERVER);
+    ws.reorderGroups({ serverId: SERVER, orderedIds: [a.id, b.id, appended.id, c.id] });
+    const afterSwap = stamps();
+    assert.equal(afterSwap[a.id], SENTINEL);
+    assert.equal(afterSwap[b.id], SENTINEL);
+    // ...while the two that actually swapped ARE stamped, so this is not a
+    // test that would pass on a packOrder that writes nothing at all.
+    assert.notEqual(afterSwap[c.id], SENTINEL);
+    assert.notEqual(afterSwap[appended.id], SENTINEL);
+    assert.deepEqual(
+        ws.list(SERVER).map((g) => [g.name, g.position]),
+        [["A", 0], ["B", 1], ["D", 2], ["C", 3]],
+    );
+
+    ws.close();
+    await cleanup(dbPath);
+});
+
+// SPEC 3.5's invariant is that a row shares its ancestors' server. Re-homing the
+// panes and layouts used to be gated on the SESSION's own server_id changing,
+// which is a different question: a legacy or hand-edited database can hold a
+// session that already matches the target while its children do not, and there
+// the move left the drift in place — the panes stayed invisible to the very
+// listing the move was meant to bring them into.
+test("moveSessionToGroup re-homes drifted children even when the session already matches", async () => {
+    const dbPath = await tmpDbPath();
+    const ws = openWorkspace(dbPath);
+    const from = ws.createGroup({ serverId: SERVER, name: "From" });
+    const to = ws.createGroup({ serverId: SERVER, name: "To" });
+    const s = ws.createSession({ serverId: SERVER, groupId: from.id, name: "S", repositoryRoot: "/r" });
+    const v = ws.createViewerPane({ serverId: SERVER, devSessionId: s.id, url: "http://x" });
+    const t = ws.createTerminalPane({ serverId: SERVER, devSessionId: s.id, name: "sh" });
+    ws.setLayout({
+        serverId: SERVER,
+        devSessionId: s.id,
+        region: "viewer",
+        tree: { type: "leaf", paneId: v.id },
+    });
+
+    // Only the CHILDREN drift; the session itself still names the right server,
+    // and both groups belong to it too.
+    ws.db.prepare("UPDATE viewer_panes SET server_id = 'srv-stale' WHERE id = ?").run(v.id);
+    ws.db.prepare("UPDATE terminal_panes SET server_id = 'srv-stale' WHERE id = ?").run(t.id);
+    ws.db
+        .prepare("UPDATE session_layouts SET server_id = 'srv-stale' WHERE dev_session_id = ?")
+        .run(s.id);
+    assert.equal(ws.list(SERVER)[0].sessions[0].viewerPanes.length, 0);
+
+    ws.moveSessionToGroup({ id: s.id, groupId: to.id });
+
+    assert.equal(ws.getViewerPane(v.id).serverId, SERVER);
+    assert.equal(ws.getTerminalPane(t.id).serverId, SERVER);
+    assert.equal(ws.getLayout({ devSessionId: s.id, region: "viewer" })?.serverId, SERVER);
+    const moved = ws.list(SERVER).find((g) => g.id === to.id)?.sessions[0];
+    assert.equal(moved?.viewerPanes.length, 1);
+    assert.equal(moved?.terminalPanes.length, 1);
+    assert.notEqual(moved?.layouts.viewer, null);
+
+    ws.close();
     await cleanup(dbPath);
 });

@@ -23,6 +23,10 @@ Item {
     property url internalUrl: ""
     property bool retained: false
     property string errorText: ""
+    // The embedded page has started fetching and has not settled yet, read by
+    // the pane header's `busy`. Without it a slow http(s) page or a large
+    // remote HTML file gave the pane no sign that anything was happening.
+    property bool loading: false
 
     function releaseInternalUrl() {
         if (root.retained && root.viewerModel)
@@ -34,6 +38,7 @@ Item {
     function retarget() {
         root.releaseInternalUrl();
         root.errorText = "";
+        root.loading = false;
         if (!root.remoteFile || root.url.toString().length === 0 || !root.viewerModel)
             return;
         root.internalUrl = root.viewerModel.internalUrlFor(root.url);
@@ -100,6 +105,7 @@ Item {
         // an http(s) failure, and replacing it would also throw away the
         // address the user could retry from.
         onLoadingChanged: function(request) {
+            root.loading = request.status === WebEngineView.LoadStartedStatus
             if (root.remoteFile
                     && request.status === WebEngineView.LoadFailedStatus
                     && root.errorText.length === 0)

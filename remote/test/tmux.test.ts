@@ -468,3 +468,29 @@ test("output past the execFile buffer is reported as output, not as a timeout", 
         rmSync(dir, { recursive: true, force: true });
     }
 });
+
+// The other end of the same classification, and the one that decides what a
+// machine WITHOUT tmux sees. execFile reports a failure to spawn by setting a
+// string errno on the error and handing back an EMPTY stderr — not a null one —
+// so the runner has to fall back to the error's own message to keep the errno
+// text. It used to keep the empty string instead, isMissingTmux then matched
+// nothing, and the very first listing on a tmux-less host failed with
+// "tmux list-sessions failed: exit code -1" instead of answering "no sessions".
+test("a tmux that cannot be spawned reports the errno, and lists as empty", async () => {
+    const dir = mkdtempSync(path.join(os.tmpdir(), "ch-tmux-absent-"));
+    const missing = path.join(dir, "definitely-not-tmux");
+    const previous = process.env.CODEHARBOR_TMUX;
+    process.env.CODEHARBOR_TMUX = missing;
+    try {
+        const result = await execFileRunner(["list-sessions"]);
+        assert.equal(result.code, SPAWN_FAILED);
+        assert.match(result.stderr, /ENOENT/);
+        // Rule 1: absence is not failure.
+        assert.deepEqual(await listSessions(execFileRunner), []);
+        assert.deepEqual(await killSession({ name: "ch_absent" }, execFileRunner), {});
+    } finally {
+        if (previous === undefined) delete process.env.CODEHARBOR_TMUX;
+        else process.env.CODEHARBOR_TMUX = previous;
+        rmSync(dir, { recursive: true, force: true });
+    }
+});

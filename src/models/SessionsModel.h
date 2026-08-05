@@ -117,6 +117,12 @@ signals:
     void sessionPresenceChanged();
 
 private:
+    // Rebuild the filtered view from the authoritative tree under the current
+    // filter values, wrapped in a model reset. Used by the two filter setters:
+    // neither touches the source rows, so re-running setGroups() there would
+    // deep-copy the whole tree only to move it straight back.
+    void applyFilters();
+
     // Keep the authoritative refresh result separate from the filtered view:
     // toggling either client-local filter must not discard rows that should
     // reappear when that filter is turned off.

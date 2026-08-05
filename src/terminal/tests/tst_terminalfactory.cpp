@@ -209,6 +209,7 @@ private slots:
 
     // AG-N1: which answer a pane may adopt as its agent-status identity.
     void aPaneReportsItsOutputUnderTheRowIdTheServerAnswered();
+    void aCachedLegacyAnswerStillReportsItsRowSoTheBackfillCanBeRetried();
     void aPaneRetargetedMidLookupNeverReportsUnderTheSupersededPanesIdentity();
     void aFailedResolutionLeavesThePaneWithNoIdentity();
     void targetCannotCrossAWorkspaceServerSwitch();
@@ -1226,6 +1227,77 @@ void TstTerminalFactory::aPaneReportsItsOutputUnderTheRowIdTheServerAnswered()
     // recycled by closed panes, which is why it is never an identity.
     QCOMPARE(monitor.stateFor(QStringLiteral("s1"), QStringLiteral("terminal-1")),
              asInt(AgentState::Unknown));
+}
+
+// The BACKFILL half of the same answer, and specifically what happens the
+// second time a legacy slot label is resolved.
+//
+// A layout leaf stored before layouts carried a row id is addressed by its slot
+// label, which is recycled across panes and clients — the unsafe key the row id
+// exists to retire. paneRowResolved() is what lets ch::SessionLayouts write the
+// row id into that leaf so it never asks by label again, and this factory
+// cannot see whether that write landed: the pane may have been closed while the
+// answer travelled, the layout may have been mid-load, the write may have been
+// refused. So the report must be repeatable. It used to be emitted ONLY from
+// the live round trip, while every later resolution of the same label is
+// answered from this factory's cache and said nothing about the row at all — so
+// one missed report meant the leaf kept using the recyclable label for the rest
+// of the process, with nothing able to correct it.
+void TstTerminalFactory::aCachedLegacyAnswerStillReportsItsRowSoTheBackfillCanBeRetried()
+{
+    RpcPair rpc;
+    QVERIFY(rpc.start());
+
+    OfflineFactory factory(nullptr);
+    factory.setWorkspace(rpc.db());
+    factory.setServerId(QStringLiteral("srv-1"));
+
+    QObject pane;
+    TerminalController* controller = factory.create(&pane);
+    QSignalSpy resolved(&factory, &TerminalFactory::targetResolved);
+    QSignalSpy rows(&factory, &TerminalFactory::paneRowResolved);
+
+    // The legacy path: no row id on the leaf, so the row exists only in the
+    // server's answer.
+    QVERIFY(factory.resolveTarget(controller, QStringLiteral("s1"),
+                                  QStringLiteral("terminal-1"), QString(),
+                                  QStringLiteral("/repo")));
+    const QJsonObject request = rpc.takeRequest();
+    rpc.answerWithRow(request.value(QStringLiteral("id")).toInt(),
+                      QStringLiteral("row-A"), QStringLiteral("s1"),
+                      QStringLiteral("terminal-1"), QStringLiteral("ch_s1_row-A"),
+                      QStringLiteral("generic"));
+    QTRY_COMPARE(resolved.count(), 1);
+    QCOMPARE(rows.count(), 1);
+    QCOMPARE(rows.at(0).at(0).toString(), QStringLiteral("s1"));
+    QCOMPARE(rows.at(0).at(1).toString(), QStringLiteral("terminal-1"));
+    QCOMPARE(rows.at(0).at(2).toString(), QStringLiteral("row-A"));
+
+    // The SAME label again — a reconnect, or simply a leaf whose backfill did
+    // not land the first time. No second round trip happens: nothing answers
+    // one, so reaching a second targetResolved() at all proves the answer came
+    // from the cache. And it carries the row, exactly as the first one did.
+    QVERIFY(factory.resolveTarget(controller, QStringLiteral("s1"),
+                                  QStringLiteral("terminal-1"), QString(),
+                                  QStringLiteral("/repo")));
+    QTRY_COMPARE(resolved.count(), 2);
+    QCOMPARE(resolved.at(1).at(1).toString(), QStringLiteral("ch_s1_row-A"));
+    QTRY_COMPARE(rows.count(), 2);
+    QCOMPARE(rows.at(1).at(0).toString(), QStringLiteral("s1"));
+    QCOMPARE(rows.at(1).at(1).toString(), QStringLiteral("terminal-1"));
+    QCOMPARE(rows.at(1).at(2).toString(), QStringLiteral("row-A"));
+
+    // The guard is unchanged, on the cached path as on the live one: a pane
+    // addressed BY its row id already knows the answer, so there is nothing to
+    // backfill and nothing is reported. (This resolution is also served from the
+    // cache — the live answer above was remembered under the row id too.)
+    TerminalController* byRow = factory.create(&pane);
+    QVERIFY(factory.resolveTarget(byRow, QStringLiteral("s1"),
+                                  QStringLiteral("terminal-1"),
+                                  QStringLiteral("row-A"), QStringLiteral("/repo")));
+    QTRY_COMPARE(resolved.count(), 3);
+    QCOMPARE(resolved.at(2).at(1).toString(), QStringLiteral("ch_s1_row-A"));
+    QCOMPARE(rows.count(), 2);
 }
 
 // The trap. A lookup is a round trip, and QML can point a pane at a different

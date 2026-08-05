@@ -20,8 +20,14 @@
 # spelling makes the patch stop matching, and dropping its leading space makes
 # git reject the whole hunk as a corrupt patch. Either way the Windows build
 # fails at extraction, before anything is compiled.
+# The download directory on libssh.org is the MAJOR.MINOR series, not the full
+# release, so it is derived from VERSION rather than written out again: a pin
+# moved to a new series (0.13.x) with only vcpkg.json and the SHA512 updated
+# would otherwise 404 on the Windows release runner, ten minutes into a build
+# for a tag that is already permanent.
+string(REGEX MATCH "^[0-9]+\\.[0-9]+" _libssh_series "${VERSION}")
 vcpkg_download_distfile(distfile
-    URLS https://www.libssh.org/files/0.12/libssh-${VERSION}.tar.xz
+    URLS https://www.libssh.org/files/${_libssh_series}/libssh-${VERSION}.tar.xz
     FILENAME libssh-${VERSION}.tar.xz
     SHA512 92b95d64772906fc0fe497fed4dc34a160f2397f71ef3871dc1ea0fe1e8e3c00df699ed0efdc0b754feb23e2140bda17be41d16aee48ff715487384023fdd467
 )

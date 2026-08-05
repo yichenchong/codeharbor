@@ -271,6 +271,7 @@ add_test(NAME tst_logbuffer COMMAND tst_logbuffer)
 if(WIN32)
     set_target_properties(
         tst_appcontroller
+        tst_appsettings
         tst_logbuffer
         tst_notifier
         tst_notifierlive

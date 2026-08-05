@@ -222,13 +222,14 @@ window.applyTheme = applyTheme;
 applyTheme(defaultThemeRoles);
 
 /**
- * Resolve a Monaco language id for the pane's remote path from the live
- * registration list. The precedence rule (exact filename beats extension) and
- * the fallback live in selectLanguage (language.ts), which is DOM-free and
+ * Resolve a Monaco language id for the pane's remote path — and, when the path
+ * itself claims nothing, for the file's first line — from the live registration
+ * list. The precedence rules (exact filename beats extension beats first line)
+ * and the fallback live in selectLanguage (language.ts), which is DOM-free and
  * unit-tested; this wrapper only supplies monaco.languages.getLanguages().
  */
-export function languageForPath(path: string): string {
-    return selectLanguage(path, monaco.languages.getLanguages());
+export function languageForPath(path: string, firstLine = ""): string {
+    return selectLanguage(path, monaco.languages.getLanguages(), firstLine);
 }
 
 /** Handle the page bootstrap keeps so it can tear the editor down when the pane
@@ -281,11 +282,16 @@ export function mountEditor(
     // no foreign-looking scrollbar left in it.
     defineMonacoTheme(activeThemeRoles);
 
+    // Derived ONCE from the pane's remote path. Kept because it is also the
+    // answer to "did the path identify this file at all?", which is what decides
+    // whether the first line of the loaded content gets a say (see below).
+    const pathLanguage = options.path ? languageForPath(options.path) : "plaintext";
+
     const editor = monaco.editor.create(editorEl, {
         value: "",
         // The host drives content; the language comes from the pane's remote
         // path (highlighting only). No client-side file access is implied.
-        language: options.path ? languageForPath(options.path) : "plaintext",
+        language: pathLanguage,
         theme: "codeharbor-dark",
         readOnly: false,
         automaticLayout: true,
@@ -347,6 +353,29 @@ export function mountEditor(
         // fileStateChanged provides the authoritative label; append a dirty mark.
         const base = stateLabel.dataset.state || "";
         stateLabel.textContent = dirty && base ? `${base} \u2022` : base;
+    }
+
+    /**
+     * Give the loaded file's FIRST LINE a say when its path said nothing. A
+     * remote server is full of extensionless executables (`/srv/bin/deploy`),
+     * and Monaco already ships the patterns that recognise their shebangs — this
+     * is the only place the content needed to apply them exists. A path that
+     * already named a language is authoritative and is never second-guessed.
+     */
+    function applyContentLanguage(content: string): void {
+        if (pathLanguage !== "plaintext")
+            return;
+        const model = editor.getModel();
+        if (!model)
+            return;
+        // Bounded before the newline search: a minified single-line file would
+        // otherwise hand a megabyte-long "first line" to every pattern.
+        const head = content.slice(0, 512);
+        const newline = head.indexOf("\n");
+        const id = languageForPath(options.path ?? "",
+                                   newline >= 0 ? head.slice(0, newline) : head);
+        if (id !== "plaintext" && id !== model.getLanguageId())
+            monaco.editor.setModelLanguage(model, id);
     }
 
     // ---- crash-recovery snapshots and saves (both send the buffer to C++) ----
@@ -415,10 +444,12 @@ export function mountEditor(
             return;
         }
         // Capture the exact bytes being handed to C++ so a successful reply can
-        // re-baseline even if the model changes before the round trip returns.
+        // re-baseline even if the model changes before the round trip returns,
+        // and hand those same bytes to the save rather than reading the buffer
+        // a second time.
         pendingSaveContent = bufferText(editor);
         baselineEditSerial = editSerial;
-        reporter.save(revision);
+        reporter.save(revision, pendingSaveContent);
     }
 
     // ---- signals: C++ -> JS ----
@@ -447,6 +478,9 @@ export function mountEditor(
         // A snapshot armed by edits this load supersedes must not be sent: it
         // would re-flag the freshly loaded buffer as dirty.
         reporter.cancel();
+        // Every load, not only the first: the pane can be retargeted at another
+        // file over the same channel, and a shebang is a property of the bytes.
+        applyContentLanguage(content);
         if (bufferText(editor) === content) {
             // Identical buffer (e.g. reload of unchanged file): just re-baseline.
             dirty = false;

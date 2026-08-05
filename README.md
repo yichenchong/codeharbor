@@ -44,7 +44,7 @@ src/            C++/QML client
   qml/          shared QML components
   web/          bundled web assets (terminal, editor, markdown)
 remote/         server-side service, agent bridge, harness adapters
-docs/           SPEC.md, PLAN.md, DEVELOPMENT.md
+docs/           SPEC.md, PLAN.md, DEVELOPMENT.md, plus dated bug-hunt records
 ```
 
 ## Install
@@ -95,8 +95,8 @@ says so and changes nothing: update it with `git pull` and a build instead.
 
 | Platform | Asset | Notes |
 |---|---|---|
-| Linux | `CodeHarbor-x86_64.AppImage` | `chmod +x` then run. Needs FUSE and an X11/XWayland display. |
-| macOS | `codeharbor.dmg` | Unsigned: right-click → **Open**, or `xattr -d com.apple.quarantine`. |
+| Linux | `CodeHarbor-<version>-x86_64.AppImage` | `chmod +x` then run. Needs FUSE and an X11/XWayland display. |
+| macOS | `CodeHarbor-<version>-macos-<arch>.dmg` | Unsigned: right-click → **Open**, or `xattr -d com.apple.quarantine`. |
 | Windows | `CodeHarbor-<version>-windows-x64-setup.exe` | Per-user installer, no admin rights. SmartScreen will warn (unsigned). |
 | Windows (portable) | `codeharbor-windows.zip` | Extract, run `codeharbor.exe`. Same files, no shortcuts or uninstaller. |
 
@@ -154,7 +154,7 @@ shortcuts SPEC 15 originally suggested, in [`docs/SPEC.md`](docs/SPEC.md) — is
 | `Ctrl+Shift+P` (`⌘⇧P` on macOS) | Open the command palette |
 | `Ctrl+Shift+O` | Connect to Server… |
 | `Ctrl+Shift+R` | Refresh Workspace |
-| `Ctrl+Shift+W` | Close Window (the window is frameless, so it has no close button) |
+| `Ctrl+Shift+W` | Close Window (the window is frameless, so the window manager draws no close button; the in-app title bar has one) |
 | `Ctrl+S` | Save the file in the focused editor |
 | `Ctrl+,` | Settings |
 
@@ -263,10 +263,10 @@ reconnect cannot prompt for a newly-unknown host key; and a connect briefly bloc
 the GUI thread. Crash-recovery snapshots now offer an explicit Restore or Discard
 choice when the file is reopened.
 
-**Building requires Node** — the Monaco and xterm.js bundles are build artifacts
-embedded as Qt resources, and CMake builds them at configure time (it refuses to
-configure a client whose editor or terminal pane would silently load nothing;
-`-DCODEHARBOR_SKIP_WEB_BUNDLE=ON` opts out).
+**Building requires Node** — the Monaco, xterm.js and Markdown bundles are build
+artifacts embedded as Qt resources, and CMake builds them at configure time (it
+refuses to configure a client whose editor, terminal or Markdown pane would
+silently load nothing; `-DCODEHARBOR_SKIP_WEB_BUNDLE=ON` opts out).
 
 ## License
 

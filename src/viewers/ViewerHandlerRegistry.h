@@ -51,8 +51,11 @@ public:
 
     // The explorer's "Open as" menu is derived from the same positive claims
     // as resolve(), not from a second extension table. The returned strings
-    // are the QML viewer-kind vocabulary: "editor", "text", "image", "pdf",
-    // "binary", "directory", or "web". The first item is the default.
+    // are ch::ViewerKinds words: "markdown", "text", "image", "pdf", "binary",
+    // "directory", or "web". The first item is the default. "editor" was listed
+    // here once and is NOT one of them — it is not returned by any path and not
+    // in ch::ViewerKinds::all(), so a persisted default spelled that way could
+    // never be saved (see the note in the .cpp).
     static QStringList applicableViewKinds(const QUrl &url);
 
     // Application schemes are user/plugin input, so they are stricter than

@@ -58,6 +58,16 @@ export const claudeCodeAdapter = {
                 if (rawNotificationType === undefined) return "waiting_input";
                 if (typeof rawNotificationType !== "string") return null;
                 const notificationType = rawNotificationType.trim();
+                // A BLANK type is "no type given", not the notification type
+                // whose name is the empty string. Hook producers are shell
+                // configurations that interpolate a variable into the payload,
+                // and an unset variable leaves "" (or a lone newline from a
+                // command substitution) behind; taking that literally sends the
+                // firing down the "unrecognised type" arm and drops the very
+                // prompt the absent-type arm two lines up exists to raise. Both
+                // spellings of "the producer did not say" must mean the same
+                // thing.
+                if (notificationType === "") return "waiting_input";
                 if (notificationType === "elicitation_complete"
                     || notificationType === "elicitation_response")
                     return "running";

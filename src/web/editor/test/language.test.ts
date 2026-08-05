@@ -144,3 +144,57 @@ test("a later filename registration still beats an earlier extension one", () =>
     assert.equal(selectLanguage("/srv/build.mk", conflicting), "exact-name");
     assert.equal(selectLanguage("/srv/other.mk", conflicting), "greedy-ext");
 });
+
+
+// The content-based fallback. Monaco really does ship these patterns (python,
+// javascript and xml in 0.52), and until the loaded bytes are consulted an
+// extensionless `/srv/bin/deploy` renders unhighlighted no matter what its
+// shebang says.
+const withFirstLines: readonly LanguageInfo[] = [
+    { id: "plaintext-lang", extensions: [".txt"] },
+    { id: "python", extensions: [".py"], firstLine: "^#!/.*\\bpython[0-9.-]*\\b" },
+    // Registered WITHOUT the leading anchor, exactly as Monaco tolerates.
+    { id: "javascript", extensions: [".js"], firstLine: "#!.*\\bnode" },
+    { id: "broken", firstLine: "([unterminated" },
+];
+
+test("a shebang identifies a file whose name says nothing", () => {
+    assert.equal(
+        selectLanguage("/srv/bin/deploy", withFirstLines, "#!/usr/bin/python3"),
+        "python");
+    assert.equal(
+        selectLanguage("/srv/bin/deploy", withFirstLines, "#!/usr/bin/env node"),
+        "javascript");
+});
+
+test("a first line that matches nothing still falls back to plaintext", () => {
+    assert.equal(selectLanguage("/srv/bin/deploy", withFirstLines, "not a shebang"),
+                 "plaintext");
+    // No content supplied at all (the caller has not loaded the file yet).
+    assert.equal(selectLanguage("/srv/bin/deploy", withFirstLines), "plaintext");
+});
+
+test("the path is authoritative: an extension is never overridden by content", () => {
+    // A .txt file that happens to start with a shebang is still text: the path
+    // matched, so the first line is not consulted at all.
+    assert.equal(selectLanguage("/srv/notes.txt", withFirstLines, "#!/usr/bin/python3"),
+                 "plaintext-lang");
+});
+
+test("an unanchored firstLine pattern only matches at the start of the line", () => {
+    assert.equal(selectLanguage("/srv/bin/deploy", withFirstLines,
+                                "# a comment mentioning node"),
+                 "plaintext");
+});
+
+test("an unusable firstLine pattern is skipped, not thrown", () => {
+    // "broken" sits ahead of nothing here, so the proof is that the call
+    // returns at all — an uncaught SyntaxError would take the editor's language
+    // resolution (and its mount) down with it.
+    assert.equal(selectLanguage("/srv/bin/deploy", withFirstLines, "#!/bin/sh"),
+                 "plaintext");
+});
+
+test("a shebang decides even with no path at all", () => {
+    assert.equal(selectLanguage("", withFirstLines, "#!/usr/bin/python"), "python");
+});

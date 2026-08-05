@@ -423,13 +423,15 @@ Appearance owns:
 
 - **Theme** — Dark or Light. The theme is a named palette, not a boolean, so further themes need no new plumbing:
   every colour in the application resolves through one role vocabulary (`Theme.qml`), and switching repaints
-  everything, including the two web surfaces, which are handed the same role map (§5.1, §8.1).
+  everything, including the three web surfaces — terminal, editor and Markdown renderer — which are handed the
+  same role map (§5.1, §7.5, §8.1).
 - **Group colour palette** and its size. A group's name is hashed to a stable index into the active palette and
   that colour tints the group's presentation, so groups stay distinguishable without the user choosing colours.
   The hash is stable across runs and machines. `plain` is the default and applies no tint at all — the historical
-  look. `tokyonight` is generated from five seed colours: to produce n colours, the generator repeatedly finds
-  the largest gap between neighbouring colours in OKLCH space and inserts their midpoint, so it only ever ADDS to
-  its seed and n must exceed the seed count.
+  look. `tokyonight` starts from five seed colours and the size is a user preference in the range 5–64. Five is
+  the seed itself and is used unchanged; for a larger n the generator repeatedly finds the largest gap between
+  neighbouring colours in OKLCH space and inserts their midpoint, so it only ever ADDS to the seed and is only
+  invoked when n exceeds the seed count.
 - **Toolbar button order.** Each toolbar button declares a stable id; the stored order is reconciled against the
   buttons a given build actually has (unknown ids ignored, missing ones appended), so the setting survives a
   build that adds or removes one. Reconciliation is a view, never a write: only the user reordering persists.
@@ -576,6 +578,21 @@ For hidden terminals:
 - continue draining the SSH channel;
 - rely on tmux history for older output;
 - do not persist full terminal transcripts by default.
+
+**Escape-sequence boundaries.** A flush is never allowed to cut an ANSI escape
+sequence in half: an incomplete trailing sequence is held back and emitted with
+the bytes that complete it, and the same rule governs a paste (§5.1) and the
+point at which a hidden terminal's rolling buffer is trimmed. A bound on the
+held-back tail keeps malformed remote output from growing the pending buffer
+without limit.
+
+**Backpressure.** Output is emitted to the renderer against an acknowledged
+consumed-byte count: past a fixed window of emitted-but-unacknowledged bytes,
+further flushes go into the same rolling buffer the hidden case uses instead of
+being handed to the renderer. This is what stops a runaway remote process from
+queueing an unbounded amount of data in the JavaScript bridge and the browser
+engine. The renderer acknowledges what it has consumed, and buffered output is
+released as the window reopens.
 
 ### 5.6 Reconnection
 
@@ -1220,6 +1237,16 @@ channel's stdin/stdout. The rules below are the ones the implementation
     `file.listDirectory` whose serialized listing would exceed 15 MiB, or a
     `file.watch` past 512 live subscriptions (sections 8.3 and 8.7).
 
+- **Liveness heartbeat.** JSON-RPC has no keep-alive of its own and a half-open
+  SSH channel can stay silently "open" for hours, so the client probes the
+  daemon with a `ping` request every 15 seconds once a transport is wired. Any
+  inbound bytes at all count as liveness. After four consecutive intervals in
+  which nothing was read — roughly a minute — the transport is declared lost:
+  every pending call fails with the same transport error a real disconnect
+  produces, and the reconnection ladder of section 5.6 takes over. An interval
+  whose probe could not even be written counts as a silent one, because a failed
+  write is not evidence of a live peer.
+
 ---
 
 ## 11. Persistence
@@ -1354,6 +1381,15 @@ Requirements:
 - SSH agent preferred;
 - password or key passphrases stored only in the operating-system credential store;
 - no credentials stored in the workspace database.
+
+> **Implementation status.** No credential store is integrated. A password or
+> key passphrase is prompted for, handed straight to libssh for that one
+> authentication attempt, and then discarded; nothing is written anywhere. The
+> profile store (`src/app/ServerProfiles.h`) applies a field whitelist that
+> drops a stray `password`/`passphrase` key before writing, so a secret cannot
+> reach disk even by accident. The requirement above is therefore met in its
+> strong form — no secret is persisted at all — at the cost of retyping it each
+> connection.
 
 ### 12.2 Viewer Isolation
 

@@ -98,21 +98,27 @@ What it does, in order:
    yet.
 3. Computes the next version — `major` gives `X+1.0.0`, `minor` gives `X.Y+1.0`,
    `patch` gives `X.Y.Z+1` — or uses `--set`.
-4. Refuses to continue if any configured file has uncommitted edits, unless
+4. Aborts if the tag it is about to create already exists, so a re-run of a
+   release that already happened cannot rewrite the tree and then die at
+   `git tag`.
+5. Refuses to continue if any configured file has uncommitted edits, unless
    `--allow-dirty` was passed. `.bumpversion.json` itself is covered by this,
-   because it decides which files the rest of the run looks at.
-5. Rewrites every source. This step is all-or-nothing: it reads and validates
+   because it decides which files the rest of the run looks at. (`--no-commit`
+   edits nothing, so this check does not apply to it.)
+6. Rewrites every source. This step is all-or-nothing: it reads and validates
    every file and prepares all of the replacement text before writing anything,
    and if a write still fails part-way it puts back what it had already
    replaced. A malformed lock file therefore leaves the tree at the version it
    started from, never half-bumped. Each file is replaced by renaming a fresh
    copy over it, and the original's file mode is carried across, so a version
    file that is also an executable script keeps its executable bit.
-6. Re-checks that every file now agrees, then commits **only** those files.
-7. Verifies that the commit about to be tagged really carries the new version —
-   see Safety — and creates the annotated tag.
-8. With `--push`, runs the configured preflight commands and then pushes the
-   commit and the tag.
+7. Re-checks that every file now agrees, then commits **only** those files.
+8. Verifies that the commit about to be tagged really carries the new version —
+   see Safety.
+9. With `--push`, runs the configured preflight commands. They run **before**
+   the tag is created, so a failed build cannot consume another public version
+   number.
+10. Creates the annotated tag, and with `--push` pushes the commit and the tag.
 
 It **does not push by default**; it prints the push command instead. Pushing is
 usually what actually starts a release build.

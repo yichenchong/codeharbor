@@ -37,6 +37,24 @@ bool hashedHostMatches(const QString& hostField, const QString& host)
     QMessageAuthenticationCode mac(QCryptographicHash::Sha1);
     mac.setKey(salt);
     mac.addData(host.toUtf8());
+    if (mac.result() == expected)
+        return true;
+    // OpenSSH lowercases a host name before it hashes it, so a file written by
+    // ssh/ssh-keygen holds the hash of the LOWERCASE spelling. The name looked
+    // up here is whatever the server profile says, which a user may well have
+    // typed as "Build.Example.COM". Comparing only the verbatim spelling meant
+    // a hashed entry named no host at all for such a profile: a changed key
+    // there answered Unknown, so the user was shown the reassuring
+    // trust-this-host prompt instead of the hard refusal — the very downgrade
+    // the plain-host comparison already closes by being case-insensitive.
+    // Widening can only ADD trust the file really grants, never remove it: a
+    // blob that matches still answers Match, and one that does not now answers
+    // the refusal instead of first use.
+    const QString lowered = host.toLower();
+    if (lowered == host)
+        return false;
+    mac.reset();  // keeps the key; only the message is cleared
+    mac.addData(lowered.toUtf8());
     return mac.result() == expected;
 }
 

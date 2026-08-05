@@ -24,7 +24,6 @@ public:
 
     Q_INVOKABLE QColor colorFor(const QString &name, const QString &paletteName,
                                 int requestedCount);
-    Q_INVOKABLE int indexForName(const QString &name, int paletteSize) const;
 
 private:
     const QVector<SrgbColor> &expandedPalette(const QString &paletteName,

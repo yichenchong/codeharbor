@@ -155,6 +155,7 @@ void CodeharbordClient::setTransport(QIODevice* transport)
     m_readPos = 0;
     m_scanOffset = 0;
     m_closed = false;
+    m_streamUntrusted = false;
 
     if (m_transport) {
         connect(m_transport, &QIODevice::readyRead, this,
@@ -450,6 +451,11 @@ void CodeharbordClient::onReadyRead()
             m_readBuffer.clear();
             m_readPos = 0;
             m_scanOffset = 0;
+            // Framing is lost: we no longer know where the next message
+            // begins, so nothing still queued on this transport is a message.
+            // This keeps onTransportClosed() from draining — and re-routing —
+            // those bytes below.
+            m_streamUntrusted = true;
             emit protocolWarning(
                 QStringLiteral("RPC line exceeded %1 bytes; resetting "
                                "transport")
@@ -516,6 +522,7 @@ void CodeharbordClient::onReadyRead()
         m_readBuffer.clear();
         m_readPos = 0;
         m_scanOffset = 0;
+        m_streamUntrusted = true;
         emit protocolWarning(
             QStringLiteral("RPC line exceeded %1 bytes; resetting transport")
                 .arg(kMaxLineBytes));
@@ -529,7 +536,10 @@ void CodeharbordClient::onReadyRead()
     // second readyRead() just because this call left some unread. Continue in
     // the event queue so a large burst is drained without ever allocating an
     // unbounded readAll() result.
-    if (m_transport == sourceTransport && !m_closed &&
+    // m_transport is checked for null in its own right: a callback above may
+    // have deleted the caller-owned device, which nulls BOTH QPointers and makes
+    // them compare equal.
+    if (m_transport && m_transport == sourceTransport && !m_closed &&
         m_transport->bytesAvailable() > 0) {
         QMetaObject::invokeMethod(this, &CodeharbordClient::onReadyRead,
                                   Qt::QueuedConnection);
@@ -766,7 +776,13 @@ void CodeharbordClient::onTransportClosed()
     // chunk waiting. Drain every chunk that makes progress before failing
     // pending requests; otherwise a valid response just beyond the first
     // chunk would be discarded by the close path.
-    while (m_transport && m_transport->bytesAvailable() > 0) {
+    //
+    // Skipped entirely once the byte stream has been declared UNTRUSTWORTHY (an
+    // unframed or over-cap line): there we no longer know where a frame begins,
+    // so those bytes are not messages to deliver — and reading them anyway trips
+    // the same cap again, which re-enters this function once per 16 MiB of
+    // garbage instead of closing the transport.
+    while (!m_streamUntrusted && m_transport && m_transport->bytesAvailable() > 0) {
         const qint64 availableBefore = m_transport->bytesAvailable();
         onReadyRead();
         if (!self)
@@ -778,7 +794,10 @@ void CodeharbordClient::onTransportClosed()
             return;
         if (m_transport != closingTransport)
             return;
-        if (m_transport->bytesAvailable() >= availableBefore)
+        // m_transport, not just the comparison above: a callback may have deleted
+        // the caller-owned device, which nulls BOTH QPointers and makes them
+        // compare equal.
+        if (!m_transport || m_transport->bytesAvailable() >= availableBefore)
             break; // protect against a broken device that reports no progress
     }
     m_closed = true;

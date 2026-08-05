@@ -49,8 +49,11 @@ class TerminalController;
 // meanwhile accumulates in the controller's rolling buffer and is replayed as a
 // single batch by ready(), the page's mount handshake.
 //
-// SECURITY (the bridge is the page's ONLY reach into C++): every slot below is
-// callable by whatever is running in that WebEngineView, so the surface is
+// SECURITY (the bridge is the page's ONLY reach into C++): WebChannel publishes
+// every SLOT *and* every Q_INVOKABLE, so both the slots below AND
+// requestClear() are callable by whatever is running in that WebEngineView (the
+// published surface is pinned byte for byte by
+// tst_terminalfactory bridgeExposesNoRemoteTargetingSlots). The surface is
 // deliberately tiny and target-free. There is no attach, no kill, no
 // tmux-target or working-directory argument anywhere on it — a pane's remote
 // target is chosen by the QML host through ch::TerminalFactory, which the page
@@ -88,7 +91,9 @@ public:
     int rows() const;
 
     // App side (menu/command palette): drop the renderer's visible screen
-    // buffer. Purely a view operation — the remote pane is untouched.
+    // buffer. Purely a view operation — the remote pane is untouched, so it
+    // costs nothing that WebChannel also publishes it to the page: a page that
+    // calls it clears the screen it is itself drawing.
     Q_INVOKABLE void requestClear();
 
 public slots:

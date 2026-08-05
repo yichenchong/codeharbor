@@ -12,6 +12,7 @@
 #include <QFile>
 #include <QFileInfo>
 #include <QLatin1String>
+#include <QLockFile>
 #include <QSaveFile>
 #include <QScopeGuard>
 #include <QStandardPaths>
@@ -1422,9 +1423,27 @@ bool SessionBootstrap::attemptWire()
     // via setTrustUnknownHostKeys().
     KnownHosts hosts;
     QFile store(m_knownHostsPath);
-    if (store.open(QIODevice::ReadOnly | QIODevice::Text))
+    if (store.open(QIODevice::ReadOnly | QIODevice::Text)) {
         hosts = KnownHosts::parse(QString::fromUtf8(store.readAll()));
-    store.close();
+        store.close();
+        // Owner-only, on the way IN. This file is the whole record of which
+        // server keys the user has approved, and an account that can WRITE it
+        // inserts a key of its own and host verification stops meaning
+        // anything - the presented key then matches, so nobody is ever asked.
+        // Qt leaves a file it creates at the umask default, which is 0644 on a
+        // typical box and 0664 wherever the user's primary group is shared, and
+        // QSaveFile below PRESERVES the mode of a file that already exists
+        // (measured) - so a store written loose once stays loose for ever, and
+        // repairing it only when a new key happens to be approved could be
+        // never. Best effort, exactly like ServerProfiles::restrictPermissions():
+        // a filesystem that cannot express it is not a reason to refuse to
+        // connect. The containing DIRECTORY is deliberately left alone; it may
+        // be one the caller named (CH_LIVE_KNOWN_HOSTS) and is not ours to
+        // relock, and a directory owned by this user admits no other account's
+        // writes anyway.
+        QFile::setPermissions(m_knownHostsPath,
+                              QFile::ReadOwner | QFile::WriteOwner);
+    }
     const int knownBefore = hosts.entries().size();
     m_pool->setKnownHosts(hosts);
     // The unattended auto-accept policy is installed for THIS attempt only and
@@ -1459,10 +1478,19 @@ bool SessionBootstrap::attemptWire()
 
     m_lastPoolError.clear();
     if (!connectPool(m_host, m_port, m_user, m_identityFile)) {
-        emit error(withLastPoolError(
-            QStringLiteral("SSH connection to %1:%2 failed")
-                .arg(m_host)
-                .arg(m_port)));
+        // Same rule probeEndpoint() follows above: a cancellation is the user's
+        // own doing, not a fault to report. This one is reachable because the
+        // handshake is synchronous and the pool delivers its progress, its
+        // host-key question and its credential prompt from inside it, so a
+        // handler of any of those can call disconnectSession(). The pool then
+        // aborts the handshake between libssh calls and reports it exactly like
+        // a failure - a bare false - and the user got a "SSH connection failed"
+        // toast for pressing Disconnect.
+        if (!m_cancelRequested)
+            emit error(withLastPoolError(
+                QStringLiteral("SSH connection to %1:%2 failed")
+                    .arg(m_host)
+                    .arg(m_port)));
         return false;
     }
 
@@ -1474,25 +1502,100 @@ bool SessionBootstrap::attemptWire()
         // already up, so this is the one error() that does not abort anything.
         const QFileInfo info(m_knownHostsPath);
         QDir().mkpath(info.absolutePath());
-        // QSaveFile rather than a truncating QFile: this store holds the user's
-        // whole set of trust decisions. Opening it with Truncate and then
-        // failing halfway through the write — a full disk, a network home
-        // directory that went away — left it truncated, so every host the user
-        // had ever approved was gone and the next connect re-prompted for all
-        // of them. QSaveFile writes a temporary beside it and renames only on
-        // commit(), so a failed write leaves the previous store byte for byte.
-        QSaveFile out(m_knownHostsPath);
-        const QByteArray serialized = m_pool->knownHosts().serialize();
-        if (!out.open(QIODevice::WriteOnly)
-            || out.write(serialized) != serialized.size() || !out.commit()) {
+        // Serialize the reread, merge and atomic replacement with other
+        // CodeHarbor processes. QSaveFile prevents torn writes but cannot
+        // prevent two writers from both reading the same old file and the
+        // later rename losing the first writer's approval.
+        const QString lockPath = m_knownHostsPath + QStringLiteral(".merge-lock");
+        QLockFile lock(lockPath);
+        lock.setStaleLockTime(30000);
+        if (!lock.tryLock(1500)) {
             emit error(QStringLiteral(
-                           "connected, but could not record the host key of "
-                           "%1:%2 in %3 (%4); you will be asked to approve it "
-                           "again on the next connect")
-                           .arg(m_host)
-                           .arg(m_port)
-                           .arg(m_knownHostsPath, out.errorString()));
+                           "connected, but could not lock the trusted-host "
+                           "store %1; the approved key was not recorded")
+                           .arg(m_knownHostsPath));
+        } else {
+            const auto unlock = qScopeGuard([&lock] { lock.unlock(); });
+            // MERGE, do not overwrite. `hosts` is the store as it stood when
+            // this attempt STARTED, and the pool's copy is that snapshot plus
+            // whatever this attempt approved. Serialising the snapshot would
+            // throw away a key another window recorded while this handshake
+            // was running, so reread now and add only this attempt's keys.
+            const bool fileExists = QFileInfo::exists(m_knownHostsPath);
+            QByteArray currentData;
+            bool currentReadable = !fileExists;
+            if (fileExists) {
+                QFile current(m_knownHostsPath);
+                if (current.open(QIODevice::ReadOnly | QIODevice::Text)) {
+                    currentData = current.readAll();
+                    currentReadable = current.error() == QFileDevice::NoError;
+                }
+            }
+            if (!currentReadable) {
+                emit error(QStringLiteral(
+                               "connected, but could not read the trusted-host "
+                               "store %1; the approved key was not recorded")
+                               .arg(m_knownHostsPath));
+            } else {
+                // A missing file is the only case where an empty merge base is
+                // safe. An existing file that cannot be read must never be
+                // replaced with a partial store containing only this key.
+                KnownHosts merged = KnownHosts::parse(currentData);
+                int addedHere = 0;
+                for (const KnownHosts::Entry& entry : m_pool->knownHosts().entries()) {
+                    // A hashed, wildcard or @marker entry cannot be re-added as
+                    // a plain line; the reread already carries whatever the file has.
+                    if (!entry.supported)
+                        continue;
+                    if (hosts.verify(entry.host, entry.keyType, entry.key)
+                        != KnownHosts::Verdict::Unknown)
+                        continue;
+                    merged.add(entry.host, entry.keyType, entry.key);
+                    ++addedHere;
+                }
+                // Leave the file untouched when another writer already recorded
+                // every key this attempt approved.
+                if (addedHere > 0) {
+                    // QSaveFile writes beside the original and renames only on
+                    // commit(), so a failed write leaves the previous store intact.
+                    QSaveFile out(m_knownHostsPath);
+                    const QByteArray serialized = merged.serialize();
+                    if (!out.open(QIODevice::WriteOnly)
+                        || out.write(serialized) != serialized.size()
+                        || !out.commit()) {
+                        emit error(QStringLiteral(
+                                       "connected, but could not record the host key of "
+                                       "%1:%2 in %3 (%4); you will be asked to approve it "
+                                       "again on the next connect")
+                                       .arg(m_host)
+                                       .arg(m_port)
+                                       .arg(m_knownHostsPath, out.errorString()));
+                    } else {
+                        QFile::setPermissions(m_knownHostsPath,
+                                              QFile::ReadOwner | QFile::WriteOwner);
+                    }
+                }
+            }
         }
+    }
+
+    // A cancel that was raised DURING the handshake and that the pool did not
+    // manage to abort itself: it checks between libssh calls, so a disconnect
+    // asked for late enough leaves connectToHost() returning true with a live,
+    // authenticated session. The canceller has already run its whole teardown -
+    // including m_pool->disconnectFromHost() - but it ran BEFORE this session
+    // existed, so nothing has dropped it, and the object would sit in
+    // State::Disconnected with an SSH session still up on the server.
+    //
+    // Checked here rather than before the known-hosts write above, so a key the
+    // user approved during that same handshake is still recorded: the approval
+    // was real and the cancel does not retract it.
+    if (m_cancelRequested) {
+        const bool wasTearingDown = m_tearingDown;
+        m_tearingDown = true;
+        m_pool->disconnectFromHost();
+        m_tearingDown = wasTearingDown;
+        return false;
     }
 
     // The session is authenticated; before anything is exec'd on it, make sure

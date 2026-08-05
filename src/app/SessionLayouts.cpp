@@ -573,6 +573,25 @@ void SessionLayouts::applyLoadedTree(quint64 generation, int index,
 
     RegionState& state = m_regions[index];
     state.loading = false;
+    // A local edit has already replaced this region's tree since this load was
+    // issued, so its answer - a tree, or the failure to fetch one - is history
+    // either way: it predates what QML is showing AND what this client has
+    // already persisted over it. Neither outcome may touch the region. Applying
+    // a tree would revert the edit (and on the seeding branch below would
+    // replace it with the region DEFAULT and write THAT to the server); giving
+    // the region the "unusable layout" treatment for a FAILED or duplicate-key
+    // answer would blank a layout the user just built and the server has
+    // already accepted. See RegionState::superseded.
+    //
+    // The error itself was reported above, unconditionally, before this point.
+    if (state.superseded) {
+        // No pending writes can be queued here: a write is only queued while
+        // the region is null, and every path that supersedes a load has already
+        // put a tree in the slot (and cleared the queue).
+        if (m_pendingLoads > 0 && --m_pendingLoads == 0)
+            emit loaded(m_devSessionId);
+        return;
+    }
     if (err) {
         invalidateRegion(index);
     } else if (tree) {
@@ -598,11 +617,7 @@ void SessionLayouts::applyLoadedTree(quint64 generation, int index,
             return;
         }
     }
-    // A local edit has already replaced this region's tree since this load was
-    // issued, so its answer predates the tree QML is already showing. Applying
-    // it would revert the edit - and on the seeding branch below would replace
-    // it with the region default and write THAT to the server. See RegionState.
-    if (!err && !m_regions[index].superseded) {
+    if (!err) {
         // No persisted layout for this region: adopt the default AND write it
         // back, so it becomes the session's real layout instead of a shape that
         // is re-derived on every load and lost the moment anything saves a tree.
@@ -646,13 +661,17 @@ void SessionLayouts::applyLoadedTree(quint64 generation, int index,
             // the last of them lands, so the default reaches the server with
             // its ids already in it rather than as id-less leaves a later load
             // would have to read as pre-migration ones.
-            if (index == kTerminal) {
-                // Not "slots": that is a Qt keyword macro.
-                QStringList labels;
-                collectLeafPaneIds(m_regions[index].tree, labels);
-                for (const QString& label : labels)
-                    mintTerminalPaneRow(generation, label);
-            }
+            //
+            // Through the same funnel a QML-authored tree uses, rather than a
+            // second mint loop of its own: it already skips a leaf that carries
+            // a row id and one whose mint is on the wire, and the seeded tree
+            // is not always brand new — when the region was already showing
+            // exactly this default, setTree() above is skipped and the leaves
+            // still hold the ids of the mints that landed the first time round.
+            // A loop without those guards would order a second `terminal_panes`
+            // row for each of them, and nothing would ever be bound to it.
+            if (index == kTerminal)
+                adoptAuthoredTerminalTree(generation);
             persist(index);
         }
     }
@@ -893,8 +912,10 @@ QString SessionLayouts::setPaneTitleForSession(QString devSessionId,
 void SessionLayouts::setRatios(QString region, QStringList pathIndexes,
                                QVariantList ratios)
 {
-    // Compatibility wrapper for C++ tests; production QML uses the stamped
-    // entry point so a delayed drag cannot be mistaken for current intent.
+    // Stamps itself with the CURRENT selection, so it is only correct for a
+    // synchronous command acting on the session the user is looking at (a
+    // palette/shortcut ratio reset) and for the C++ tests. A drag a pane
+    // reports asynchronously must use setRatiosForSession().
     setRatiosStamped(m_devSessionId, m_generation, region, pathIndexes, ratios,
                      false);
 }
@@ -989,8 +1010,10 @@ QString SessionLayouts::splitPaneForSession(QString devSessionId,
 QString SessionLayouts::splitPane(QString region, QString paneId,
                                   QString orientation)
 {
-    // Compatibility wrapper for C++ tests; production QML uses the stamped
-    // entry point so a delayed command cannot be mistaken for current intent.
+    // Stamps itself with the CURRENT selection, so it is only correct for a
+    // synchronous command acting on the session the user is looking at (the
+    // palette's and the shortcut's "split pane") and for the C++ tests. A split
+    // a pane's own button reports must use splitPaneForSession().
     return splitPaneStamped(m_devSessionId, m_generation, region, paneId,
                             orientation, false);
 }
@@ -1061,6 +1084,16 @@ QString SessionLayouts::splitPaneStamped(const QString& devSessionId,
         // placeholder, not a pane: splitting it would strand a permanently dead
         // half. Fill it in place so an emptied region can be used again - the
         // only handle QML has on a region with no panes.
+        //
+        // Reset first, because a placeholder is not required to be BLANK, only
+        // to have no paneId. dropLeaf() leaves a default-constructed leaf, but
+        // the parser accepts a stored leaf with an empty paneId that still
+        // carries a url, a custom title, or - the damaging one - a
+        // `terminal_panes` row id, and another client (or a hand edit) can put
+        // one in the layout. Inheriting that row would attach this brand new
+        // pane to whatever shell already owns it, and the mint started below
+        // would find the leaf bound and silently orphan its own row.
+        *leaf = SplitNode{};
         leaf->paneId = newPaneId;
     } else {
         SplitNode newLeaf;
@@ -1314,8 +1347,10 @@ void SessionLayouts::closePaneForSession(QString devSessionId,
 
 void SessionLayouts::closePane(QString region, QString paneId)
 {
-    // Compatibility wrapper for C++ tests; production QML uses the stamped
-    // entry point so a delayed close cannot be mistaken for current intent.
+    // Stamps itself with the CURRENT selection, so it is only correct for a
+    // synchronous command acting on the session the user is looking at (the
+    // palette's and the shortcut's "close pane") and for the C++ tests. A close
+    // a pane's own header reports must use closePaneForSession().
     closePaneStamped(m_devSessionId, m_generation, region, paneId, false);
 }
 
@@ -1365,8 +1400,9 @@ void SessionLayouts::setPaneUrlForSession(QString devSessionId,
 
 void SessionLayouts::setPaneUrl(QString region, QString paneId, QString url)
 {
-    // Compatibility wrapper for C++ tests; production QML uses the stamped
-    // entry point so a delayed pane event cannot be mistaken for current intent.
+    // Stamps itself with the CURRENT selection, so it is only correct for the
+    // C++ tests: a url is always something a pane reports after the fact, and
+    // production QML routes every one of those through setPaneUrlForSession().
     setPaneUrlStamped(m_devSessionId, m_generation, region, paneId, url, false);
 }
 
@@ -1478,8 +1514,9 @@ QString SessionLayouts::setPaneTitleStamped(const QString& devSessionId,
 
 QString SessionLayouts::setPaneTitle(QString region, QString paneId, QString title)
 {
-    // Compatibility wrapper for C++ tests; production QML uses the stamped
-    // entry point so a delayed pane event cannot be mistaken for current intent.
+    // Stamps itself with the CURRENT selection, so it is only correct for the
+    // C++ tests: a title is always something a pane reports after the fact, and
+    // production QML routes every one of those through setPaneTitleForSession().
     return setPaneTitleStamped(m_devSessionId, m_generation, region, paneId, title,
                                false);
 }

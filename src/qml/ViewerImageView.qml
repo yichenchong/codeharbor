@@ -38,11 +38,17 @@ Item {
     // inline cap arrived as a blank failed page with nothing to explain it.
     property string errorText: ""
 
+    // The embedded page has started fetching and has not settled yet. Read by
+    // the pane header (ViewerPane's `busy`), which without it drew nothing at
+    // all while a large remote image was on its way and the pane was blank.
+    property bool loading: false
+
     // Point this view at the current URL, pinning the address it will show and
     // letting go of the one it was showing.
     function retarget() {
         root.releaseInternalUrl();
         root.errorText = "";
+        root.loading = false;
         if (root.url.toString().length === 0 || !root.viewerModel)
             return;
         root.internalUrl = root.viewerModel.internalUrlFor(root.url);
@@ -121,6 +127,7 @@ Item {
         // about, and this view's whole job is to show one image. The handler's
         // own explanation is better wording, so it is never overwritten.
         onLoadingChanged: function(request) {
+            root.loading = request.status === WebEngineView.LoadStartedStatus
             if (request.status === WebEngineView.LoadFailedStatus
                     && root.errorText.length === 0)
                 root.errorText = request.errorString

@@ -75,6 +75,7 @@ private slots:
     void hostnamesMatchCaseInsensitively();
     void wildcardHostIsATrustedHost();
     void negatedWildcardHostIsExcluded();
+    void hashedHostMatchesAMixedCaseLookup();
     void wildcardCoversAHostSpelledWithAnAsterisk();
     void commentsAndMarkersSurviveARoundTrip();
     void addIgnoresATripleThatCannotBeStored();
@@ -623,6 +624,48 @@ void TstKnownHosts::negatedWildcardHostIsExcluded()
                           QStringLiteral("ssh-ed25519"), kEd25519Alpha),
              KnownHosts::Verdict::Unknown);
     QVERIFY(store.serialize().contains("*.example.com,!secret.example.com "));
+}
+
+// OpenSSH lowercases a host name before it hashes it, so every hashed line in
+// a real known_hosts file is the hash of the LOWERCASE spelling. The name
+// CodeHarbor looks up is whatever the server profile says, and a user can
+// perfectly well have typed "Secret.Host". Comparing only that verbatim
+// spelling made the hashed entry name no host at all: a changed key at that
+// host answered Unknown, so the user got the reassuring first-use prompt
+// instead of the hard refusal — the same downgrade that
+// hostnamesMatchCaseInsensitively() closes for plain host names.
+void TstKnownHosts::hashedHostMatchesAMixedCaseLookup()
+{
+    const QByteArray salt = QByteArrayLiteral("codeharbor-hash-salt");
+    const KnownHosts store = KnownHosts::parse(
+        hashedHost(QStringLiteral("secret.host"), salt)
+        + QStringLiteral(" ssh-ed25519 ZWQyNTUxOS1rZXktYWxwaGEtMDAwMQ==\n"));
+
+    for (const QString& spelling : {QStringLiteral("Secret.Host"),
+                                    QStringLiteral("SECRET.HOST")}) {
+        QCOMPARE(store.verify(spelling, QStringLiteral("ssh-ed25519"),
+                              kEd25519Alpha),
+                 KnownHosts::Verdict::Match);
+        // And, the point of it: a different key at that host is the refusal.
+        QCOMPARE(store.verify(spelling, QStringLiteral("ssh-ed25519"),
+                              kEd25519Beta),
+                 KnownHosts::Verdict::Mismatch);
+    }
+
+    // Case folding must not invent a match for an unrelated name.
+    QCOMPARE(store.verify(QStringLiteral("Other.Host"),
+                          QStringLiteral("ssh-ed25519"), kEd25519Alpha),
+             KnownHosts::Verdict::Unknown);
+
+    // The ported spelling behaves the same way: only the host part varies in
+    // case, and the bracketed token is what OpenSSH hashes for a non-default
+    // port.
+    const KnownHosts ported = KnownHosts::parse(
+        hashedHost(QStringLiteral("[secret.host]:2222"), salt)
+        + QStringLiteral(" ssh-ed25519 ZWQyNTUxOS1rZXktYWxwaGEtMDAwMQ==\n"));
+    QCOMPARE(ported.verify(QStringLiteral("[Secret.Host]:2222"),
+                           QStringLiteral("ssh-ed25519"), kEd25519Alpha),
+             KnownHosts::Verdict::Match);
 }
 
 void TstKnownHosts::wildcardCoversAHostSpelledWithAnAsterisk()

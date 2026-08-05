@@ -5,12 +5,70 @@
 namespace ch::ViewerKinds {
 namespace {
 
-const QStringList kAllKinds = {
-    QStringLiteral("web"),       QStringLiteral("markdown"),
-    QStringLiteral("text"),      QStringLiteral("image"),
-    QStringLiteral("pdf"),       QStringLiteral("directory"),
-    QStringLiteral("binary"),
-};
+// A function-local static, matching imageExtensions() below: a namespace-scope
+// QStringList would be constructed by dynamic initialization before main(),
+// with no ordering guarantee against other translation units that might read it
+// from their own static initializers.
+const QStringList& allKinds()
+{
+    static const QStringList kinds = {
+        QStringLiteral("web"),       QStringLiteral("markdown"),
+        QStringLiteral("text"),      QStringLiteral("image"),
+        QStringLiteral("pdf"),       QStringLiteral("directory"),
+        QStringLiteral("binary"),
+    };
+    return kinds;
+}
+
+bool isAsciiAlphaNumeric(QChar character)
+{
+    return (character >= QLatin1Char('a') && character <= QLatin1Char('z'))
+           || (character >= QLatin1Char('A') && character <= QLatin1Char('Z'))
+           || (character >= QLatin1Char('0') && character <= QLatin1Char('9'));
+}
+
+// Characters allowed after the first one in a canonical extension. See the
+// header for why exactly these two punctuation marks and nothing else.
+bool isExtensionBodyCharacter(QChar character)
+{
+    return isAsciiAlphaNumeric(character) || character == QLatin1Char('+')
+           || character == QLatin1Char('-');
+}
+
+} // namespace
+
+QStringList all()
+{
+    return allKinds();
+}
+
+bool isKnown(const QString& kind)
+{
+    return allKinds().contains(kind);
+}
+
+QString normaliseExtension(const QString& extension)
+{
+    QString result = extension.trimmed();
+    if (result.startsWith(QLatin1Char('.')))
+        result.remove(0, 1);
+    if (result.isEmpty() || result.size() > 64)
+        return {};
+    // The FIRST character must be alphanumeric. That is what keeps a value made
+    // only of punctuation ("+", "-x") out, and it is also what preserves the
+    // single-leading-dot rule above: ".." strips to "." and "..md" to ".md",
+    // both of which start with a character no extension may begin with.
+    //
+    // The loop variable is not named `ch`: that would shadow the enclosing ch::
+    // namespace inside the loop body.
+    if (!isAsciiAlphaNumeric(result.at(0)))
+        return {};
+    for (const QChar character : result) {
+        if (!isExtensionBodyCharacter(character))
+            return {};
+    }
+    return result.toLower();
+}
 
 const QSet<QString>& imageExtensions()
 {
@@ -21,39 +79,6 @@ const QSet<QString>& imageExtensions()
         QStringLiteral("apng"),
     };
     return extensions;
-}
-
-bool isAsciiAlphaNumeric(const QChar ch)
-{
-    return (ch >= QLatin1Char('a') && ch <= QLatin1Char('z'))
-           || (ch >= QLatin1Char('A') && ch <= QLatin1Char('Z'))
-           || (ch >= QLatin1Char('0') && ch <= QLatin1Char('9'));
-}
-
-} // namespace
-
-QStringList all()
-{
-    return kAllKinds;
-}
-
-bool isKnown(const QString& kind)
-{
-    return kAllKinds.contains(kind);
-}
-
-QString normaliseExtension(const QString& extension)
-{
-    QString result = extension.trimmed();
-    if (result.startsWith(QLatin1Char('.')))
-        result.remove(0, 1);
-    if (result.isEmpty() || result.size() > 64)
-        return {};
-    for (const QChar ch : result) {
-        if (!isAsciiAlphaNumeric(ch))
-            return {};
-    }
-    return result.toLower();
 }
 
 QStringList assignableForExtension(const QString& extension)

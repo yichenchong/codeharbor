@@ -2,6 +2,7 @@
 #include "InternalUrlSchemeHandler.h"
 #include "RpcTypes.h"
 #include "ViewerHandlerRegistry.h"
+#include "ViewerKinds.h"
 #include "ViewerModel.h"
 #include "ViewerProfiles.h"
 
@@ -157,6 +158,7 @@ class TstViewers : public QObject {
     Q_OBJECT
 private slots:
     void resolveByExtensionTable();
+    void imageClaimsComeFromTheOneSharedTable();
     void resolveUrlTable();
     void urlMappingRoundTrip();
     void urlMappingStableAndDistinct();
@@ -253,6 +255,25 @@ void TstViewers::resolveByExtensionTable()
                  ViewerResolution::TextEditor);
     }
 
+    // The "++" source spellings. These used to fall through to the binary
+    // download pane, which for a source file means the user simply cannot read
+    // it. They are only addable now that ch::ViewerKinds::normaliseExtension()
+    // keeps '+', so the same file can also be REASSIGNED by the settings page
+    // — the pairing is asserted directly rather than assumed.
+    for (const QString &ext : {QStringLiteral("c++"), QStringLiteral("h++")}) {
+        QCOMPARE(ViewerHandlerRegistry::resolveByExtension(ext),
+                 ViewerResolution::TextEditor);
+        QCOMPARE(ch::ViewerKinds::normaliseExtension(ext), ext);
+        QVERIFY2(ch::ViewerKinds::canAssign(ext, QStringLiteral("text")),
+                 qPrintable(ext));
+    }
+    QCOMPARE(ViewerHandlerRegistry::resolve(
+                 QUrl(QStringLiteral("file:///repo/main.c++"))),
+             ViewerResolution::TextEditor);
+    QCOMPARE(ViewerHandlerRegistry::resolve(
+                 QUrl(QStringLiteral("file:///repo/vec.H++"))),
+             ViewerResolution::TextEditor);
+
     // Images.
     for (const QString &ext :
          {QStringLiteral("png"), QStringLiteral("jpg"), QStringLiteral("jpeg"),
@@ -286,6 +307,66 @@ void TstViewers::resolveByExtensionTable()
              ViewerResolution::Download);
     QCOMPARE(ViewerHandlerRegistry::resolveByExtension(QStringLiteral("psd")),
              ViewerResolution::Download);
+}
+
+void TstViewers::imageClaimsComeFromTheOneSharedTable()
+{
+    // Which files the image pane RENDERS and which files may have "image"
+    // SAVED as their preferred handler used to be two identical, unconnected
+    // tables — one here, one in ch::ViewerKinds. Two copies of one list drift,
+    // and either direction of drift is a defect a user meets: a picture the
+    // pane shows but the settings page will not let them keep, or a format the
+    // settings page offers that opens as a binary download. There is now one
+    // table, and this is what says so.
+    const QSet<QString> &shared = ch::ViewerKinds::imageExtensions();
+    QVERIFY(!shared.isEmpty());
+    for (const QString &ext : shared) {
+        // The registry claims it...
+        QVERIFY2(ViewerHandlerRegistry::resolveByExtension(ext)
+                     == ViewerResolution::ImageViewer,
+                 qPrintable(QStringLiteral("%1 is in the shared image table but "
+                                           "the registry does not claim it")
+                                .arg(ext)));
+        // ...the "Open as" menu offers it...
+        QCOMPARE(ViewerHandlerRegistry::applicableViewKinds(
+                     QUrl(QStringLiteral("file:///repo/picture.") + ext)),
+                 QStringList({QStringLiteral("image")}));
+        // ...and the settings page will accept it as a stored default.
+        QVERIFY2(ch::ViewerKinds::canAssign(ext, QStringLiteral("image")),
+                 qPrintable(ext));
+    }
+
+    // The reverse direction, which is what a re-introduced private superset
+    // here would break: raster formats Chromium cannot decode are deliberately
+    // absent from the shared table, and the registry must agree rather than
+    // sending them to an image pane stuck on a broken-image icon.
+    for (const QString &ext :
+         {QStringLiteral("tiff"), QStringLiteral("tif"), QStringLiteral("heic"),
+          QStringLiteral("psd"), QStringLiteral("eps")}) {
+        QVERIFY2(!shared.contains(ext), qPrintable(ext));
+        QVERIFY2(ViewerHandlerRegistry::resolveByExtension(ext)
+                     != ViewerResolution::ImageViewer,
+                 qPrintable(QStringLiteral("%1 is not in the shared image table "
+                                           "but the registry claims it anyway")
+                                .arg(ext)));
+    }
+
+    // The shared table holds CANONICAL keys only, so the value handed to it
+    // has to be one. resolveByExtension() is documented as taking a BARE
+    // extension, case-insensitively, and that is the whole of the difference
+    // it absorbs: it folds case, and it does nothing else. A leading dot is
+    // not stripped here, so ".png" is not a picture — pinned so that nobody
+    // starts feeding raw suffixes through this entry point on the assumption
+    // that the table will sort them out.
+    QCOMPARE(ViewerHandlerRegistry::resolveByExtension(QStringLiteral("PNG")),
+             ViewerResolution::ImageViewer);
+    QVERIFY(!shared.contains(QStringLiteral("PNG")));
+    for (const QString &raw :
+         {QStringLiteral(".png"), QStringLiteral(".PNG")}) {
+        QVERIFY2(!shared.contains(raw), qPrintable(raw));
+        QCOMPARE(ViewerHandlerRegistry::resolveByExtension(raw),
+                 ViewerResolution::Download);
+    }
 }
 
 void TstViewers::resolveUrlTable()
@@ -405,6 +486,27 @@ void TstViewers::resolveUrlTable()
 }
 void TstViewers::openAsKindsFollowRegistryClaims()
 {
+    // Markdown is the one extension with two real handlers, and the FIRST entry
+    // is what the menu marks as the default. Losing the order here silently
+    // makes the source view the default for every .md file.
+    for (const QString &name :
+         {QStringLiteral("README.md"), QStringLiteral("notes.markdown")}) {
+        QCOMPARE(ViewerHandlerRegistry::applicableViewKinds(
+                     QUrl(QStringLiteral("file:///repo/") + name)),
+                 QStringList({QStringLiteral("markdown"), QStringLiteral("text")}));
+    }
+    // A well-known text NAME with no extension is claimed by the editor, so it
+    // is offered as text rather than as an unopenable binary.
+    QCOMPARE(ViewerHandlerRegistry::applicableViewKinds(
+                 QUrl(QStringLiteral("file:///repo/Makefile"))),
+             QStringList({QStringLiteral("text")}));
+    // Anything that is not a file:// or http(s) address has no "Open as" menu
+    // at all: the opaque internal scheme is an implementation detail, not a
+    // resource the user picks a handler for.
+    QVERIFY(ViewerHandlerRegistry::applicableViewKinds(
+                QUrl(QStringLiteral("codeharbor-internal://file/abc"))).isEmpty());
+    QVERIFY(ViewerHandlerRegistry::applicableViewKinds(
+                QUrl(QStringLiteral("ftp://host/x"))).isEmpty());
     QCOMPARE(ViewerHandlerRegistry::applicableViewKinds(
                  QUrl(QStringLiteral("file:///repo/main.cpp"))),
              QStringList({QStringLiteral("text")}));
@@ -1014,6 +1116,18 @@ void TstViewers::viewerDefaultKindsResolveBeforeBuiltIns()
              QStringLiteral("web"));
     QCOMPARE(viewers.viewKind(QUrl(QStringLiteral("file:///p/folder/"))),
              QStringLiteral("directory"));
+    // A per-extension default for a PUNCTUATION-bearing extension survives the
+    // filter in setDefaultKinds(). It did not use to: ViewerKinds rejected any
+    // extension containing '+', so this entry was dropped on the way in and the
+    // user's choice for their .c++ files silently did nothing. Both halves have
+    // to agree for it to work — the extension must normalise to itself AND the
+    // registry must claim the file — so the pane's answer is what is asserted.
+    viewers.setDefaultKinds(
+        QHash<QString, QString>{{QStringLiteral("c++"), QStringLiteral("binary")}});
+    QCOMPARE(viewers.viewKind(QUrl(QStringLiteral("file:///p/main.c++"))),
+             QStringLiteral("binary"));
+    QCOMPARE(viewers.viewKind(QUrl(QStringLiteral("file:///p/main.cpp"))),
+             QStringLiteral("text"));
 }
 
 void TstViewers::viewerDefaultKindsNotifyAlreadyOpenPanes()

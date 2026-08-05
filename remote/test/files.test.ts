@@ -245,20 +245,25 @@ test("watch emits a WatchEvent when the file changes", async () => {
     service.pollIntervalMs = 25; // polling fallback covers platforms without fs.watch
     const eventPromise = firstWatchEvent(service);
 
-    const { subscriptionId } = await service.watch({ path: file });
-    // A different length guarantees the revision (mtime-size) changes.
-    await fs.writeFile(file, "two — different length");
+    // An unreleased fs.watch handle keeps Node's event loop alive, so the
+    // release has to survive a failed assertion or a timed-out wait — otherwise
+    // a regression hangs the whole runner instead of reporting the failure.
+    try {
+        const { subscriptionId } = await service.watch({ path: file });
+        // A different length guarantees the revision (mtime-size) changes.
+        await fs.writeFile(file, "two — different length");
 
-    const event = await withTimeout(eventPromise, 5000);
-    service.unwatch({ subscriptionId });
-    service.closeAll();
+        const event = await withTimeout(eventPromise, 5000);
+        service.unwatch({ subscriptionId });
 
-    assert.equal(event.subscriptionId, subscriptionId);
-    assert.equal(event.path, file);
-    assert.equal(event.event, "modified");
-    assert.equal(typeof event.revision, "string");
-
-    await fs.rm(dir, { recursive: true, force: true });
+        assert.equal(event.subscriptionId, subscriptionId);
+        assert.equal(event.path, file);
+        assert.equal(event.event, "modified");
+        assert.equal(typeof event.revision, "string");
+    } finally {
+        service.closeAll();
+        await fs.rm(dir, { recursive: true, force: true });
+    }
 });
 test("watch re-arms after atomic replacement and sees later edits", async () => {
     const dir = await tmpDir();
@@ -267,23 +272,26 @@ test("watch re-arms after atomic replacement and sees later edits", async () => 
 
     const service = new FileWatchService();
     service.pollIntervalMs = 25;
-    const { subscriptionId } = await service.watch({ path: file });
+    try {
+        const { subscriptionId } = await service.watch({ path: file });
 
-    // Atomic replacement is exactly how writeFile saves. It leaves the
-    // original fs.watch handle attached to an unlinked inode on Linux.
-    const replacement = path.join(dir, ".replacement");
-    await fs.writeFile(replacement, "two");
-    await fs.rename(replacement, file);
-    await delay(100);
+        // Atomic replacement is exactly how writeFile saves. It leaves the
+        // original fs.watch handle attached to an unlinked inode on Linux.
+        const replacement = path.join(dir, ".replacement");
+        await fs.writeFile(replacement, "two");
+        await fs.rename(replacement, file);
+        await delay(100);
 
-    const eventPromise = firstWatchEvent(service);
-    await fs.writeFile(file, "three — after replacement");
-    const event = await withTimeout(eventPromise, 5000);
+        const eventPromise = firstWatchEvent(service);
+        await fs.writeFile(file, "three — after replacement");
+        const event = await withTimeout(eventPromise, 5000);
 
-    service.unwatch({ subscriptionId });
-    service.closeAll();
-    assert.equal(event.event, "modified");
-    await fs.rm(dir, { recursive: true, force: true });
+        service.unwatch({ subscriptionId });
+        assert.equal(event.event, "modified");
+    } finally {
+        service.closeAll();
+        await fs.rm(dir, { recursive: true, force: true });
+    }
 });
 
 test("watch reports deletion when a parent is replaced by a file", async () => {
@@ -295,16 +303,19 @@ test("watch reports deletion when a parent is replaced by a file", async () => {
 
     const service = new FileWatchService();
     service.pollIntervalMs = 25;
-    const { subscriptionId } = await service.watch({ path: file });
-    const eventPromise = firstWatchEvent(service);
-    await fs.rm(parent, { recursive: true });
-    await fs.writeFile(parent, "not a directory");
-    const event = await withTimeout(eventPromise, 5000);
+    try {
+        const { subscriptionId } = await service.watch({ path: file });
+        const eventPromise = firstWatchEvent(service);
+        await fs.rm(parent, { recursive: true });
+        await fs.writeFile(parent, "not a directory");
+        const event = await withTimeout(eventPromise, 5000);
 
-    service.unwatch({ subscriptionId });
-    service.closeAll();
-    assert.equal(event.event, "deleted");
-    await fs.rm(dir, { recursive: true, force: true });
+        service.unwatch({ subscriptionId });
+        assert.equal(event.event, "deleted");
+    } finally {
+        service.closeAll();
+        await fs.rm(dir, { recursive: true, force: true });
+    }
 });
 
 
@@ -369,17 +380,19 @@ test("watch emits a deleted WatchEvent when the file is removed", async () => {
     service.pollIntervalMs = 25;
     const eventPromise = firstWatchEvent(service);
 
-    const { subscriptionId } = await service.watch({ path: file });
-    await fs.rm(file);
+    try {
+        const { subscriptionId } = await service.watch({ path: file });
+        await fs.rm(file);
 
-    const event = await withTimeout(eventPromise, 5000);
-    service.unwatch({ subscriptionId });
-    service.closeAll();
+        const event = await withTimeout(eventPromise, 5000);
+        service.unwatch({ subscriptionId });
 
-    assert.equal(event.event, "deleted");
-    assert.equal(event.revision, undefined);
-
-    await fs.rm(dir, { recursive: true, force: true });
+        assert.equal(event.event, "deleted");
+        assert.equal(event.revision, undefined);
+    } finally {
+        service.closeAll();
+        await fs.rm(dir, { recursive: true, force: true });
+    }
 });
 
 test("readFile clamps a negative offset to the start of the file", async () => {
@@ -622,24 +635,26 @@ test("watch emits no WatchEvent for a subscription after unwatch", async () => {
     const seen: WatchEvent[] = [];
     service.onWatchEvent((event) => seen.push(event));
 
-    const first = await service.watch({ path: file });
-    // Release the first subscription, then open a fresh one on the same file.
-    // Awaiting the FRESH subscription's event (a real signal, no sleep) gives
-    // the released one every chance to wrongly fire — including the in-flight
-    // diffAndEmit-after-unwatch race the closed guard must swallow.
-    service.unwatch({ subscriptionId: first.subscriptionId });
-    const second = await service.watch({ path: file });
+    try {
+        const first = await service.watch({ path: file });
+        // Release the first subscription, then open a fresh one on the same file.
+        // Awaiting the FRESH subscription's event (a real signal, no sleep) gives
+        // the released one every chance to wrongly fire — including the in-flight
+        // diffAndEmit-after-unwatch race the closed guard must swallow.
+        service.unwatch({ subscriptionId: first.subscriptionId });
+        const second = await service.watch({ path: file });
 
-    const next = firstWatchEvent(service);
-    await fs.writeFile(file, "two — a clearly different length");
-    const event = await withTimeout(next, 5000);
-    service.closeAll();
+        const next = firstWatchEvent(service);
+        await fs.writeFile(file, "two — a clearly different length");
+        const event = await withTimeout(next, 5000);
 
-    assert.equal(event.subscriptionId, second.subscriptionId);
-    // The released subscription never emitted for anyone.
-    assert.ok(seen.every((e) => e.subscriptionId !== first.subscriptionId));
-
-    await fs.rm(dir, { recursive: true, force: true });
+        assert.equal(event.subscriptionId, second.subscriptionId);
+        // The released subscription never emitted for anyone.
+        assert.ok(seen.every((e) => e.subscriptionId !== first.subscriptionId));
+    } finally {
+        service.closeAll();
+        await fs.rm(dir, { recursive: true, force: true });
+    }
 });
 
 test("resolvePath treats an in-repo name starting with '..' as inside", () => {
@@ -797,17 +812,19 @@ test("watch on a path that does not exist yet emits created when it appears", as
     service.pollIntervalMs = 25;
     const eventPromise = firstWatchEvent(service);
 
-    const { subscriptionId } = await service.watch({ path: file });
-    await fs.writeFile(file, "now I exist");
+    try {
+        const { subscriptionId } = await service.watch({ path: file });
+        await fs.writeFile(file, "now I exist");
 
-    const event = await withTimeout(eventPromise, 5000);
-    service.closeAll();
+        const event = await withTimeout(eventPromise, 5000);
 
-    assert.equal(event.subscriptionId, subscriptionId);
-    assert.equal(event.event, "created");
-    assert.equal(typeof event.revision, "string");
-
-    await fs.rm(dir, { recursive: true, force: true });
+        assert.equal(event.subscriptionId, subscriptionId);
+        assert.equal(event.event, "created");
+        assert.equal(typeof event.revision, "string");
+    } finally {
+        service.closeAll();
+        await fs.rm(dir, { recursive: true, force: true });
+    }
 });
 
 test("writeFile creates a missing parent directory for a new file", async () => {
@@ -933,40 +950,41 @@ test("watch coalesces a burst of rapid changes and observes the final revision",
     const events: WatchEvent[] = [];
     service.onWatchEvent((e) => events.push(e));
 
-    const { subscriptionId } = await service.watch({ path: file });
+    try {
+        const { subscriptionId } = await service.watch({ path: file });
 
-    // Append in a tight loop so change signals arrive faster than a check can
-    // complete: RF14's coalescing must still let the LAST state through — no
-    // lost events — even though intermediate signals collapse into one queued
-    // check rather than one check per signal.
-    let content = "start";
-    for (let i = 0; i < 50; i += 1) {
-        content += ` ${i}`;
-        await fs.writeFile(file, content);
+        // Append in a tight loop so change signals arrive faster than a check can
+        // complete: RF14's coalescing must still let the LAST state through — no
+        // lost events — even though intermediate signals collapse into one queued
+        // check rather than one check per signal.
+        let content = "start";
+        for (let i = 0; i < 50; i += 1) {
+            content += ` ${i}`;
+            await fs.writeFile(file, content);
+        }
+        const finalRevision = revisionFrom(await fs.stat(file));
+
+        // The final revision must eventually be observed by an emitted event.
+        await withTimeout(
+            new Promise<void>((resolve) => {
+                const seen = events.some((e) => e.revision === finalRevision);
+                if (seen) return resolve();
+                const off = service.onWatchEvent((e) => {
+                    if (e.revision === finalRevision) {
+                        off();
+                        resolve();
+                    }
+                });
+            }),
+            5000,
+        );
+
+        service.unwatch({ subscriptionId });
+        assert.equal(events.at(-1)?.revision, finalRevision);
+    } finally {
+        service.closeAll();
+        await fs.rm(dir, { recursive: true, force: true });
     }
-    const finalRevision = revisionFrom(await fs.stat(file));
-
-    // The final revision must eventually be observed by an emitted event.
-    await withTimeout(
-        new Promise<void>((resolve) => {
-            const seen = events.some((e) => e.revision === finalRevision);
-            if (seen) return resolve();
-            const off = service.onWatchEvent((e) => {
-                if (e.revision === finalRevision) {
-                    off();
-                    resolve();
-                }
-            });
-        }),
-        5000,
-    );
-
-    service.unwatch({ subscriptionId });
-    service.closeAll();
-
-    assert.equal(events.at(-1)?.revision, finalRevision);
-
-    await fs.rm(dir, { recursive: true, force: true });
 });
 
 // --- file.* param validation -------------------------------------------------
@@ -1412,6 +1430,49 @@ test("writeFile through a dangling symlink creates the target and keeps the link
     await writeFile({ path: link, content: "again", expectedRevision: created.revision });
     assert.equal((await fs.lstat(link)).isSymbolicLink(), true);
     assert.equal(await fs.readFile(target, "utf-8"), "again");
+
+    await fs.rm(dir, { recursive: true, force: true });
+});
+
+// stat's `revision` and `writable` describe the node readFile and writeFile act
+// on, and through a DANGLING link that node is a file which does not exist yet.
+// Reporting the LINK's own revision made the next save an unresolvable
+// conflict — the write guard compares the token against the absent target and
+// always loses — and writable:false told the editor a save was impossible when
+// the save in fact succeeds by creating the link's target.
+test("stat reports a dangling symlink as creatable, not as a phantom conflict", async () => {
+    const dir = await tmpDir();
+    const target = path.join(dir, "absent.txt");
+    const link = path.join(dir, "dangling.lnk");
+    await fs.symlink(target, link);
+
+    const seen = await stat({ path: link });
+    assert.equal(seen.kind, "symlink");
+    // "" is the create-only token writeFile's revision guard expects.
+    assert.equal(seen.revision, "");
+    // The directory that will hold the created target is writable, so the save
+    // is possible and stat has to say so.
+    assert.equal(seen.writable, true);
+
+    // And that token is exactly the one the save accepts.
+    const created = await writeFile({
+        path: link,
+        content: "made",
+        expectedRevision: seen.revision,
+    });
+    assert.notEqual(created.revision, "");
+    assert.equal(await fs.readFile(target, "utf-8"), "made");
+    assert.equal((await fs.lstat(link)).isSymbolicLink(), true);
+
+    // A link whose chain cycles has no target either, so the same token — but
+    // nothing can write through it, and writable must stay false.
+    const a = path.join(dir, "a");
+    const b = path.join(dir, "b");
+    await fs.symlink(b, a);
+    await fs.symlink(a, b);
+    const cycle = await withTimeout(stat({ path: a }), 5000);
+    assert.equal(cycle.revision, "");
+    assert.equal(cycle.writable, false);
 
     await fs.rm(dir, { recursive: true, force: true });
 });
@@ -1880,6 +1941,35 @@ test("the disposer returned by onWatchEvent really removes the subscriber", asyn
         service.unwatch({ subscriptionId });
         // The removed subscriber saw nothing, while the one still registered did.
         assert.ok(seen.length >= 1);
+        assert.deepEqual(afterOff, []);
+    } finally {
+        service.closeAll();
+        await fs.rm(dir, { recursive: true, force: true });
+    }
+});
+
+// The same wrapper rule applies to the "subscription released" signal, which is
+// registered once per connection by the notification relay: a disposer that
+// fails to match its wrapper keeps a dead connection's callback — and the
+// closure behind it — alive for the life of the daemon.
+test("the disposer returned by onWatchClosed really removes the subscriber", async () => {
+    const dir = await tmpDir();
+    const file = path.join(dir, "released.txt");
+    await fs.writeFile(file, "one");
+
+    const service = new FileWatchService();
+    service.pollIntervalMs = 1_000_000; // nothing here waits for a poll tick
+    const afterOff: string[] = [];
+    const off = service.onWatchClosed((id) => afterOff.push(id));
+    const kept: string[] = [];
+    service.onWatchClosed((id) => kept.push(id));
+    off();
+
+    try {
+        const { subscriptionId } = await service.watch({ path: file });
+        service.unwatch({ subscriptionId });
+        // The signal is emitted synchronously by unwatch, so no waiting.
+        assert.deepEqual(kept, [subscriptionId]);
         assert.deepEqual(afterOff, []);
     } finally {
         service.closeAll();

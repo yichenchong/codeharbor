@@ -15,8 +15,14 @@
   network destination. There is deliberately no unsafe-inline/unsafe-eval in
   script-src, and no frame-src/child-src allowance: default-src 'none' denies
   those content embedding paths.
+
+  script-src and style-src both name `qrc:` beside 'self'. The page and both of
+  its own subresources live on the same qrc origin, so 'self' should match;
+  spelling the scheme out as well means an origin serialisation the browser
+  treats as opaque cannot silently block the stylesheet while the scripts (the
+  only directive that already named it) keep loading.
 -->
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' qrc:; style-src 'self' 'unsafe-inline'; connect-src codeharbor-internal:; img-src codeharbor-internal:; media-src codeharbor-internal:; font-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' qrc:; style-src 'self' qrc: 'unsafe-inline'; connect-src codeharbor-internal:; img-src codeharbor-internal:; media-src codeharbor-internal:; font-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'">
 <title>CodeHarbor Markdown</title>
 <link rel="stylesheet" href="markdown.css">
 </head>

@@ -235,6 +235,9 @@ private slots:
     void recoveryIdArrivingAfterOpenStillOffersSnapshot();
     void aSnapshotFromAPreviousFileIsNotOfferedAsThisOnes();
     void aBase64SnapshotIsDecodedBeforeItIsOffered();
+    void aSaveThatSettledDuringASystemReloadSurvivesItsReply();
+    void aRevertReportedDuringASystemReloadStillLetsTheReloadLand();
+    void aSnapshotWrittenDuringTheRecoveryProbeKeepsItsOwnRevision();
 
     // Out-of-order / superseded replies must never land on the file now open.
     void staleLoadReplyNeverWins();
@@ -3760,6 +3763,201 @@ void TstEditorController::aBase64SnapshotIsDecodedBeforeItIsOffered()
 
     QTRY_COMPARE(recoverySpy.count(), 1);
     QCOMPARE(recoverySpy.at(0).at(0).toString(), QStringLiteral("recovered edits"));
+}
+
+// A save can SETTLE inside a system-initiated reload's round trip: Ctrl/Cmd+S
+// beats the page's 500 ms debounce, so the controller may see no report at all,
+// and a successful write leaves the buffer clean again. Nothing the reload
+// captured moves in that case — not the load generation (a save never bumps it),
+// not the dirty flag — so its reply used to install bytes READ BEFORE the write:
+// the pre-save file would be pushed back at the page and, far worse, its
+// pre-save revision re-adopted as the buffer's save guard, which turns every
+// later save into a conflict over the user's own write.
+void TstEditorController::aSaveThatSettledDuringASystemReloadSurvivesItsReply()
+{
+    makePair();
+    openClean(QStringLiteral("/foo/f.txt"), QStringLiteral("hello"),
+              QStringLiteral("r1"));
+
+    QSignalSpy contentSpy(m_controller, &EditorController::contentLoaded);
+    QSignalSpy savedSpy(m_controller, &EditorController::saved);
+
+    // Clean buffer + external change -> the controller starts re-reading.
+    sendNotification(kWatchEvent, {{"subscriptionId", "sub1"},
+                                   {"path", "/foo/f.txt"},
+                                   {"event", "modified"},
+                                   {"revision", "r5"}});
+    const QJsonObject read = nextRequest();
+    QCOMPARE(method(read), kReadFile);
+    QCOMPARE(reqPath(read), QStringLiteral("/foo/f.txt"));
+
+    // The user types and saves inside the debounce, so no reportContent ever
+    // reached the controller — and this write ANSWERS FIRST.
+    m_controller->save(QStringLiteral("typed, then saved inside the debounce"),
+                       QStringLiteral("r1"));
+    const QJsonObject write = nextRequest();
+    QCOMPARE(method(write), kWriteFile);
+    QCOMPARE(reqPath(write), QStringLiteral("/foo/f.txt"));
+    respondResult(reqId(write), {{"path", "/foo/f.txt"}, {"revision", "r2"}});
+    QTRY_COMPARE(savedSpy.count(), 1);
+    QTRY_COMPARE(m_controller->fileState(), QStringLiteral("clean"));
+    QCOMPARE(m_controller->revision(), QStringLiteral("r2"));
+
+    // ...and only now does the abandoned reload answer, carrying the file as it
+    // was BEFORE that write.
+    respondResult(reqId(read), {{"path", "/foo/f.txt"},
+                                {"encoding", "utf-8"},
+                                {"content", "the pre-save bytes"},
+                                {"revision", "r5"},
+                                {"truncated", false}});
+    QTest::qWait(100);
+
+    QCOMPARE(contentSpy.count(), 0);
+    QCOMPARE(m_controller->revision(), QStringLiteral("r2"));
+    QCOMPARE(m_controller->fileState(), QStringLiteral("clean"));
+    QVERIFY2(nextRequest(300).isEmpty(),
+             "the superseded reload still re-derived permissions or truncated the "
+             "recovery snapshot of a buffer the save had already settled");
+
+    // The save's revision still guards, so the next save goes out against r2
+    // rather than the revision the stale read carried.
+    m_controller->save(QStringLiteral("typed again"), m_controller->revision());
+    const QJsonObject next = nextRequest();
+    QCOMPARE(method(next), kWriteFile);
+    QCOMPARE(reqExpectedRevision(next), QStringLiteral("r2"));
+}
+
+// The other side of that guard. A report that takes the buffer BACK to the
+// loaded bytes (type a character, undo it) is not unsaved work: the page holds
+// exactly what the server had. A system reload in flight must therefore still
+// land, or the pane sits in "externally modified" over a buffer that matches the
+// file, showing stale content, until some LATER external change happens to
+// re-trigger the auto-reload SPEC 8.7 promises for a clean buffer.
+void TstEditorController::aRevertReportedDuringASystemReloadStillLetsTheReloadLand()
+{
+    makePair();
+    openClean(QStringLiteral("/foo/f.txt"), QStringLiteral("hello"),
+              QStringLiteral("r1"));
+
+    QSignalSpy contentSpy(m_controller, &EditorController::contentLoaded);
+
+    sendNotification(kWatchEvent, {{"subscriptionId", "sub1"},
+                                   {"path", "/foo/f.txt"},
+                                   {"event", "modified"},
+                                   {"revision", "r5"}});
+    const QJsonObject read = nextRequest();
+    QCOMPARE(method(read), kReadFile);
+
+    // The debounced report lands inside the round trip and says the buffer is
+    // the loaded bytes: an edit that was undone. No snapshot is written for it.
+    m_controller->reportContent(QStringLiteral("hello"));
+    QVERIFY2(nextRequest(300).isEmpty(),
+             "a buffer equal to the loaded bytes was snapshotted as unsaved work");
+
+    respondResult(reqId(read), {{"path", "/foo/f.txt"},
+                                {"encoding", "utf-8"},
+                                {"content", "externally edited"},
+                                {"revision", "r5"},
+                                {"truncated", false}});
+    servePermissionStat();
+
+    QTRY_COMPARE(contentSpy.count(), 1);
+    QCOMPARE(contentSpy.at(0).at(0).toString(), QStringLiteral("externally edited"));
+    QCOMPARE(m_controller->revision(), QStringLiteral("r5"));
+    QTRY_COMPARE(m_controller->fileState(), QStringLiteral("clean"));
+}
+
+// The recovery probe is two round trips (stat, then read). The page's debounced
+// report can complete a whole snapshot write inside them, and that write is what
+// knows the slot's current revision. The probe's reply describes the slot as it
+// was BEFORE it, so adopting its revision would guard the next write against a
+// revision the server has already replaced — and adopting its "the slot holds
+// nothing for this file" verdict makes the truncate a successful save asks for
+// look unnecessary, leaving a snapshot of pre-save text standing. The next open
+// then offers to restore text the save already superseded.
+void TstEditorController::aSnapshotWrittenDuringTheRecoveryProbeKeepsItsOwnRevision()
+{
+    makePair();
+
+    m_controller->ready();
+    m_controller->open(QStringLiteral("/foo/f.txt"));
+    const QJsonObject read = nextRequest();
+    QCOMPARE(method(read), kReadFile);
+    respondResult(reqId(read), {{"path", "/foo/f.txt"},
+                                {"encoding", "utf-8"},
+                                {"content", "orig"},
+                                {"revision", "r1"},
+                                {"truncated", false}});
+    const QJsonObject watch = nextRequest();
+    QCOMPARE(method(watch), kWatch);
+    respondResult(reqId(watch), {{"subscriptionId", "sub1"}});
+    servePermissionStat();
+
+    // The probe finds a snapshot left by a PREVIOUS session (a different file,
+    // so nothing is offered) and reads it...
+    const QJsonObject probeStat = nextRequest();
+    QCOMPARE(method(probeStat), kStat);
+    QCOMPARE(reqPath(probeStat), recoveryFilePath());
+    respondResult(reqId(probeStat),
+                  {{"path", recoveryFilePath()}, {"revision", "rec0"}});
+    const QJsonObject probeRead = nextRequest();
+    QCOMPARE(method(probeRead), kReadFile);
+    QCOMPARE(reqPath(probeRead), recoveryFilePath());
+    // ...and that read is deliberately left unanswered for now.
+
+    // Meanwhile the page reports unsaved edits. The write is create-only (open()
+    // reset the slot), the stale snapshot refuses it, and the retry chain
+    // establishes the slot's real revision.
+    m_controller->reportContent(QStringLiteral("unsaved work"));
+    const QJsonObject snapshot = nextRequest();
+    QCOMPARE(method(snapshot), kWriteFile);
+    QCOMPARE(reqPath(snapshot), recoveryFilePath());
+    QCOMPARE(reqExpectedRevision(snapshot), QString());
+    respondError(reqId(snapshot), ch::rpc::kRevisionMismatch,
+                 QStringLiteral("stale create guard"), QJsonObject{});
+    const QJsonObject retryStat = nextRequest();
+    QCOMPARE(method(retryStat), kStat);
+    QCOMPARE(reqPath(retryStat), recoveryFilePath());
+    respondResult(reqId(retryStat),
+                  {{"path", recoveryFilePath()}, {"revision", "rec0"}});
+    const QJsonObject retry = nextRequest();
+    QCOMPARE(method(retry), kWriteFile);
+    QCOMPARE(reqExpectedRevision(retry), QStringLiteral("rec0"));
+    QCOMPARE(snapshotContentOf(retry), QStringLiteral("unsaved work"));
+    respondResult(reqId(retry), {{"path", recoveryFilePath()}, {"revision", "rec1"}});
+
+    // Only NOW does the probe's read answer, with the previous file's envelope.
+    QSignalSpy recoverySpy(m_controller, &EditorController::recoveryAvailable);
+    respondResult(reqId(probeRead),
+                  {{"path", recoveryFilePath()},
+                   {"encoding", "utf-8"},
+                   {"content", snapshotEnvelope(QStringLiteral("/foo/other.txt"),
+                                                QStringLiteral("someone else's edits"))},
+                   {"revision", "rec0"},
+                   {"truncated", false}});
+    QTest::qWait(100);
+    QVERIFY2(recoverySpy.isEmpty(),
+             "a snapshot belonging to another file was offered as this one's");
+
+    // The save succeeds, so the snapshot of the bytes it wrote is obsolete and
+    // must be truncated — guarded by the revision the RETRY produced, not the one
+    // the probe saw before it.
+    QSignalSpy savedSpy(m_controller, &EditorController::saved);
+    m_controller->save(QStringLiteral("unsaved work"), QStringLiteral("r1"));
+    const QJsonObject write = nextRequest();
+    QCOMPARE(method(write), kWriteFile);
+    QCOMPARE(reqPath(write), QStringLiteral("/foo/f.txt"));
+    respondResult(reqId(write), {{"path", "/foo/f.txt"}, {"revision", "r2"}});
+    QTRY_COMPARE(savedSpy.count(), 1);
+
+    const QJsonObject truncate = nextRequest();
+    QVERIFY2(!truncate.isEmpty(),
+             "the probe's stale verdict hid the snapshot from the save, so the next "
+             "open would offer to restore text the save had already superseded");
+    QCOMPARE(method(truncate), kWriteFile);
+    QCOMPARE(reqPath(truncate), recoveryFilePath());
+    QCOMPARE(reqContent(truncate), QString());
+    QCOMPARE(reqExpectedRevision(truncate), QStringLiteral("rec1"));
 }
 
 QTEST_GUILESS_MAIN(TstEditorController)

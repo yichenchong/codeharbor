@@ -14,6 +14,7 @@
 #include <cmath>
 #include <functional>
 #include <limits>
+#include <optional>
 #include <utility>
 
 #include "GroupPalette.h"
@@ -107,6 +108,10 @@ private slots:
     void paletteRefusesAnAbsurdlyLargeRequest();
     void sessionsModelFilterSettersIgnoreUnchangedValues();
     void sessionsModelPresenceTracksTheUnfilteredTree();
+    void splitTreeTryFromJsonSeparatesRejectionFromAnEmptyLeaf();
+    void updateTerminalStatesSignalsOnlyTheRowThatMoved();
+    void viewerKindsAcceptPunctuationRealExtensionsCarry();
+    void viewerKindsImageTableIsTheOneSourceOfTruth();
 };
 
 // Group -> DevSession -> viewer + terminal panes tree.
@@ -1926,7 +1931,10 @@ void TstModels::viewerKindsValidateAssignments()
     QCOMPARE(ViewerKinds::normaliseExtension(QStringLiteral(" .Ts ")),
              QStringLiteral("ts"));
     QVERIFY(ViewerKinds::normaliseExtension(QStringLiteral(".")).isEmpty());
-    QVERIFY(ViewerKinds::normaliseExtension(QStringLiteral("a-b")).isEmpty());
+    // '-' is part of the accepted alphabet now (clang-format and friends), so
+    // a hyphenated key survives instead of being refused.
+    QCOMPARE(ViewerKinds::normaliseExtension(QStringLiteral("a-b")),
+             QStringLiteral("a-b"));
     QVERIFY(ViewerKinds::normaliseExtension(QString(65, QLatin1Char('x'))).isEmpty());
 
     QCOMPARE(ViewerKinds::assignableForExtension(QStringLiteral("HTML")),
@@ -2166,6 +2174,166 @@ void TstModels::sessionsModelPresenceTracksTheUnfilteredTree()
     // Re-setting identical contents announces nothing.
     model.setGroups({withArchived});
     QCOMPARE(presence.count(), 2);
+}
+
+// fromJson() reports "this is not a valid split tree" by returning its
+// default-constructed value - an empty leaf - which is ALSO what a legitimately
+// stored empty leaf parses to (closing a region's last pane persists exactly
+// that). tryFromJson() exists so a caller can tell those two apart, and nothing
+// in this suite exercised it: every existing assertion goes through fromJson,
+// where both cases look identical.
+void TstModels::splitTreeTryFromJsonSeparatesRejectionFromAnEmptyLeaf()
+{
+    const QJsonObject storedEmptyLeaf{{"type", "leaf"}, {"paneId", ""}};
+    const QJsonObject rejected{{"type", "gadget"}};
+
+    // fromJson cannot distinguish them: both answer the same empty leaf.
+    QVERIFY(SplitNode::fromJson(storedEmptyLeaf) == SplitNode{});
+    QVERIFY(SplitNode::fromJson(rejected) == SplitNode{});
+
+    // tryFromJson does.
+    const std::optional<SplitNode> parsed = SplitNode::tryFromJson(storedEmptyLeaf);
+    QVERIFY(parsed.has_value());
+    QVERIFY(*parsed == SplitNode{});
+    QVERIFY(!SplitNode::tryFromJson(rejected).has_value());
+
+    // A structurally invalid split is a rejection too, not an empty layout.
+    QVERIFY(!SplitNode::tryFromJson(QJsonObject{
+                                        {"type", "split"},
+                                        {"orientation", "vertical"},
+                                        {"children", QJsonArray{storedEmptyLeaf,
+                                                                storedEmptyLeaf}},
+                                        {"ratios", QJsonArray{1.0}}})
+                 .has_value());
+}
+
+// The targeted update path announces the rows whose aggregate state moved. It
+// must announce THOSE rows and no others, even when neighbouring rows cannot be
+// told apart by their session id - a SessionRow carries an empty id until the
+// server has minted one, so two such rows in one group are an ordinary state.
+// Matching rows by id repainted every row sharing the id of one that moved.
+void TstModels::updateTerminalStatesSignalsOnlyTheRowThatMoved()
+{
+    SessionsModel model;
+
+    const auto session = [](AgentState agent) {
+        SessionRow row; // deliberately no id: not yet minted by the server
+        row.terminals = {terminal(TerminalState::Ready, agent)};
+        return row;
+    };
+
+    GroupRow g;
+    g.group.id = GroupId{QStringLiteral("g1")};
+    g.sessions = {session(AgentState::Idle), session(AgentState::Idle)};
+    model.setGroups({g});
+
+    const QModelIndex groupIndex = model.index(0, 0);
+    const QModelIndex first = model.index(0, 0, groupIndex);
+    const QModelIndex second = model.index(1, 0, groupIndex);
+
+    QSignalSpy reset(&model, &QAbstractItemModel::modelReset);
+    QSignalSpy changed(&model, &QAbstractItemModel::dataChanged);
+
+    // Only the FIRST row moves; the second stays exactly where it was.
+    GroupRow refreshed = g;
+    refreshed.sessions = {session(AgentState::Error), session(AgentState::Idle)};
+    model.updateTerminalStates({refreshed});
+
+    QCOMPARE(reset.count(), 0);
+    QCOMPARE(changed.count(), 1);
+    QCOMPARE(changed.at(0).at(0).value<QModelIndex>(), first);
+    QCOMPARE(model.data(first, SessionsModel::RowStateRole).toInt(),
+             static_cast<int>(SessionRowState::Error));
+    QCOMPARE(model.data(second, SessionsModel::RowStateRole).toInt(),
+             static_cast<int>(SessionRowState::Idle));
+}
+
+// An extension is turned into a canonical key before anything can be remembered
+// about it, and a key that cannot be produced is a preference that cannot be
+// stored. The rule used to accept letters and digits only, so a plain C++ source
+// file called foo.c++ had no representable extension at all and fell through to
+// the binary download pane instead of opening as text. '+' and '-' are now part
+// of the alphabet; everything that could make a stored settings key ambiguous or
+// let it escape its own settings group still has to be refused.
+void TstModels::viewerKindsAcceptPunctuationRealExtensionsCarry()
+{
+    // The suffixes the widening exists for, and the tool-config style names.
+    QCOMPARE(ViewerKinds::normaliseExtension(QStringLiteral("c++")),
+             QStringLiteral("c++"));
+    QCOMPARE(ViewerKinds::normaliseExtension(QStringLiteral(".H++")),
+             QStringLiteral("h++"));
+    QCOMPARE(ViewerKinds::normaliseExtension(QStringLiteral(" clang-format ")),
+             QStringLiteral("clang-format"));
+
+    // Being representable is the whole point: a c++ file can now be offered,
+    // and stored, as text like any other source file.
+    QVERIFY(ViewerKinds::canAssign(QStringLiteral("c++"), QStringLiteral("text")));
+    QCOMPARE(ViewerKinds::assignableForExtension(QStringLiteral("c++")),
+             QStringList({QStringLiteral("text"), QStringLiteral("binary")}));
+    // ...but it is source, not prose: markdown is still not on offer for it.
+    QVERIFY(!ViewerKinds::canAssign(QStringLiteral("c++"), QStringLiteral("markdown")));
+
+    // The first character must still be a letter or a digit, so a value made of
+    // punctuation alone is not a key.
+    QVERIFY(ViewerKinds::normaliseExtension(QStringLiteral("+")).isEmpty());
+    QVERIFY(ViewerKinds::normaliseExtension(QStringLiteral("++")).isEmpty());
+    QVERIFY(ViewerKinds::normaliseExtension(QStringLiteral("-x")).isEmpty());
+    // That same rule is what keeps the one-leading-dot contract: a second dot
+    // survives the strip and is not a legal first character.
+    QVERIFY(ViewerKinds::normaliseExtension(QStringLiteral("..md")).isEmpty());
+    QVERIFY(ViewerKinds::normaliseExtension(QStringLiteral("c.h")).isEmpty());
+
+    // Everything that would be unsafe or ambiguous inside a settings key stays
+    // refused: the group separator, the native-format separator, INI syntax,
+    // whitespace, and non-ASCII.
+    for (const QString &hostile : {QStringLiteral("a/b"), QStringLiteral("a\\b"),
+                                   QStringLiteral("a[b"), QStringLiteral("a]b"),
+                                   QStringLiteral("a=b"), QStringLiteral("a;b"),
+                                   QStringLiteral("a#b"), QStringLiteral("a b"),
+                                   QStringLiteral("a%b"), QStringLiteral("t\u00e4r")}) {
+        QVERIFY2(ViewerKinds::normaliseExtension(hostile).isEmpty(),
+                 qPrintable(hostile));
+    }
+
+    // Widening the alphabet must not widen the length bound, and normalising an
+    // already-canonical value must not change it again.
+    QVERIFY(ViewerKinds::normaliseExtension(QString(63, QLatin1Char('x'))
+                                            + QStringLiteral("++"))
+                    .isEmpty());
+    const QString once = ViewerKinds::normaliseExtension(QStringLiteral(".C++"));
+    QCOMPARE(ViewerKinds::normaliseExtension(once), once);
+}
+
+// The image extension table is exported so the viewer registry can decide
+// "can I draw this?" from the same list that decides "is image even offered as
+// this file type's default?". Those used to be two hand-maintained copies, and
+// a copy that drifted would either offer the image viewer for a file it refuses
+// to draw, or withhold it for one it would draw perfectly well.
+void TstModels::viewerKindsImageTableIsTheOneSourceOfTruth()
+{
+    const QSet<QString> &extensions = ViewerKinds::imageExtensions();
+    QVERIFY(!extensions.isEmpty());
+
+    // Same object every call: consumers hold a reference, nothing is copied.
+    QCOMPARE(&extensions, &ViewerKinds::imageExtensions());
+
+    // Every entry is already in the canonical form callers will look up with,
+    // so a consumer normalising a filename's suffix can query the set directly.
+    for (const QString &extension : extensions) {
+        QCOMPARE(ViewerKinds::normaliseExtension(extension), extension);
+        QVERIFY2(ViewerKinds::canAssign(extension, QStringLiteral("image")),
+                 qPrintable(extension));
+    }
+
+    // The set and assignableForExtension() are the same decision, in both
+    // directions: membership is exactly when "image" is on offer.
+    QVERIFY(extensions.contains(QStringLiteral("png")));
+    QVERIFY(!extensions.contains(QStringLiteral("txt")));
+    QVERIFY(!ViewerKinds::canAssign(QStringLiteral("txt"), QStringLiteral("image")));
+    // A capitalised or dotted spelling is not a member; callers must normalise
+    // first rather than passing a raw filename suffix.
+    QVERIFY(!extensions.contains(QStringLiteral("PNG")));
+    QVERIFY(!extensions.contains(QStringLiteral(".png")));
 }
 
 QTEST_GUILESS_MAIN(TstModels)

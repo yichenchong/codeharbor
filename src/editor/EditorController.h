@@ -186,15 +186,17 @@ private:
     void applyStatPermissions(const QJsonObject& stat);
     // Re-fetch the file, parking the pane in `transitional` for the round trip.
     //
-    // `discardLocalEdits` says what to do when the buffer moved WHILE the read
-    // was in flight — the page debounces its reportContent by 500 ms, so a
-    // keystroke can easily land inside the round trip. False (the default, used
-    // by every reload the SYSTEM starts: a watch event, a reconnect
-    // reconciliation) refuses to overwrite those keystrokes: the fetched bytes
-    // are dropped and the pane is left dirty and flagged ExternallyModified,
-    // exactly as if the change had been noticed one moment later. True is for
-    // reloads the USER asked for (the page's "Reload" affordance, a page that
-    // reloaded and lost its buffer), where replacing the buffer IS the request.
+    // `discardLocalEdits` says what to do when the buffer moved on WHILE the
+    // read was in flight — the page debounces its reportContent by 500 ms, so a
+    // keystroke can easily land inside the round trip, and a save can settle
+    // inside it too. False (the default, used by every reload the SYSTEM starts:
+    // a watch event, a reconnect reconciliation) refuses to overwrite either:
+    // the fetched bytes are dropped, and the pane is flagged ExternallyModified
+    // for unsaved edits (exactly as if the change had been noticed one moment
+    // later) or left alone for a save that has already reported its own outcome.
+    // True is for reloads the USER asked for (the page's "Reload" affordance, a
+    // page that reloaded and lost its buffer), where replacing the buffer IS the
+    // request.
     void reload(FileState transitional, bool discardLocalEdits = false);
     // Put ONE file.writeFile on the wire and own its reply. Split out of save()
     // so the reply can re-enter it for a save that was queued behind this one
@@ -387,6 +389,17 @@ private:
     // snapshot this pane wrote for a different file.
     QString m_recoveryRevision;
     bool m_recoveryHasContent = false;
+    // Bumped every time a reply INSTALLS a revision for this pane's slot (a
+    // snapshot write, its stale-guard retry's stat, a truncate). checkRecovery()
+    // captures it before its stat/read pair and refuses to write either field
+    // above if it has moved: those two round trips describe the slot as it was
+    // before that write, so the older revision would guard the next write
+    // against something the server has already replaced — and a truncate the
+    // server then refuses leaves a stale snapshot standing behind a successful
+    // save, which is precisely the "restore text the save superseded" offer the
+    // deferral machinery below exists to prevent. Reachable because a debounced
+    // report can complete a snapshot write inside the probe's two round trips.
+    quint64 m_recoverySlotSerial = 0;
     // A recovery clear is itself an asynchronous write. Keep it separate from
     // m_recoveryWritesInFlight (which counts snapshot writes) so two successful
     // saves cannot issue duplicate truncates while the first one is still on

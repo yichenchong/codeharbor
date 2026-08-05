@@ -435,7 +435,11 @@ bool SshConnectionPool::applyHostKeyPolicy(const QString& host, quint16 port,
             QStringLiteral("Host key changed for %1 — refusing connection")
                 .arg(host));
         return false;  // hard refusal (SPEC 12.1)
-    case KnownHosts::Verdict::Unknown:
+    case KnownHosts::Verdict::Unknown: {
+        // Braced because this arm DECLARES a variable. Without the braces the
+        // declaration lives in the switch's own scope, and adding any label
+        // after it — a new Verdict, or simply moving this arm above the other
+        // two — would jump across an initialization and stop compiling.
         if (!m_hostKeyCallback) {
             // Nothing here can be decided without asking, and there is nobody
             // to ask. Say so: without this the connect failed with no
@@ -470,6 +474,7 @@ bool SshConnectionPool::applyHostKeyPolicy(const QString& host, quint16 port,
                            "connection refused")
                 .arg(keyType, host));
         return false;
+    }
     }
     return false;
 }
@@ -743,7 +748,15 @@ bool SshConnectionPool::connectToHost(const QString& host, quint16 port,
         return false;
     }
 
-    disconnectFromHost();
+    // The re-entrancy guard goes up BEFORE the previous session is torn down,
+    // not after. closeSession() emits sessionClosing() and the
+    // setState(Disconnected) below emits stateChanged(); a slot on either one
+    // — an auto-reconnect reacting to the state change is the realistic case —
+    // can call straight back into connectToHost(). With the guard still down
+    // that nested handshake ran to completion and left its own ssh_session in
+    // m_session, which the ssh_new() further down then overwrote: the nested
+    // session, its socket and every channel on it were leaked for the lifetime
+    // of the process, and the nested Connected state was silently discarded.
     m_handshakeInProgress = true;
     m_disconnectRequested = false;
     const auto finishHandshake =
@@ -751,6 +764,14 @@ bool SshConnectionPool::connectToHost(const QString& host, quint16 port,
             m_handshakeInProgress = false;
             m_disconnectRequested = false;
         });
+    // disconnectFromHost()'s body, inlined: calling it now would see
+    // m_handshakeInProgress and merely record m_disconnectRequested instead of
+    // actually closing the previous session. A disconnect asked for from one of
+    // the two signals below still lands in m_disconnectRequested and is
+    // honoured by the first abortRequested() further down.
+    closeSession();
+    if (m_state != State::NotAvailable)
+        setState(State::Disconnected);
     const auto failHandshake = [this] {
         const bool cancelledBeforeClose = m_disconnectRequested;
         closeSession();

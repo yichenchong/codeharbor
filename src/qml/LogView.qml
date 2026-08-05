@@ -42,6 +42,29 @@ Rectangle {
     focus: root.shown
     enabled: root.shown
 
+    // The three buttons, the severity ComboBox and the filter field below are
+    // plain QtQuick.Controls controls, so they draw from the STYLE's palette —
+    // which is light. The filter field was the worst of it: its `color` is
+    // Theme.text (a pale grey) while its well stayed the style's white, i.e.
+    // near-invisible text in the one place a user types to find a diagnostic.
+    // An Item's palette propagates down the visual parent chain, so one mapping
+    // here reaches all of them. Same role-by-role mapping as AppDialog.qml,
+    // plus `light`, which is what a ComboBox popup ROW is painted with.
+    palette.window: Theme.surface
+    palette.windowText: Theme.text
+    palette.dark: Theme.border
+    palette.base: Theme.surfaceSunken
+    palette.text: Theme.text
+    palette.placeholderText: Theme.textDim
+    palette.button: Theme.surfaceRaised
+    palette.buttonText: Theme.text
+    palette.mid: Theme.border
+    palette.light: Theme.surfaceDeep
+    palette.midlight: Theme.surfaceRaised
+    palette.highlight: Theme.accent
+    palette.highlightedText: Theme.textOnAccent
+    palette.brightText: Theme.textOnAccent
+
     function rebuild() {
         if (!root.logBuffer) {
             root.filteredEntries = [];

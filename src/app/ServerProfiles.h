@@ -236,9 +236,12 @@ private:
     // True for the native per-user store, whose containing directory is ours to
     // lock down; false for a caller-supplied ini path, where only the file is.
     bool m_ownsDirectory = false;
-    // NO re-entrancy guard: nothing inside the locked region emits, so persist()
-    // can never be re-entered while the lock is held. See the INVARIANT comment
-    // on ServerProfiles::persist(), which is what keeps that true.
+    //
+    // There is deliberately NO re-entrancy guard member here: nothing inside
+    // the locked region emits, so persist() can never be re-entered while the
+    // lock is held. See the INVARIANT comment on ServerProfiles::persist(),
+    // which is what keeps that true.
+
     // Whether the previous save had to go ahead unlocked, so saveDegraded() can
     // be edge-triggered rather than fired on every keystroke of an outage.
     bool m_lastSaveDegraded = false;

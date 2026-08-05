@@ -2,6 +2,7 @@ import QtQuick
 import QtQuick.Controls.Basic
 import QtQuick.Layouts
 import QtWebEngine
+import "RemotePath.js" as RemotePath
 
 // Binary / unpreviewable content view (SPEC 7.5). Shows file metadata and a
 // Download affordance: the file is streamed through the internal scheme (served
@@ -122,9 +123,16 @@ Rectangle {
 
     color: Theme.surface
 
+    // The address as the USER reads it, not as the URL spells it. Every other
+    // viewer surface shows a remote path (SPEC 8.3), and a file:// URL has each
+    // segment percent-encoded — so a remote file called "release notes.bin"
+    // used to be announced here as "release%20notes.bin", and its location as a
+    // "file://" URL nobody typed.
+    readonly property string displayPath: RemotePath.fileUrlToPath(root.url.toString())
+
     function baseName(u) {
-        var s = u.toString();
-        var i = s.lastIndexOf("/");
+        const s = RemotePath.fileUrlToPath(String(u));
+        const i = s.lastIndexOf("/");
         return i >= 0 ? s.substring(i + 1) : s;
     }
 
@@ -158,7 +166,7 @@ Rectangle {
         Label {
             // Same rule: the remote path is data.
             textFormat: Text.PlainText
-            text: root.url
+            text: root.displayPath
             color: Theme.textPlaceholder()
             font.pixelSize: Theme.fontSizeSmall
             elide: Text.ElideMiddle

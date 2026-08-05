@@ -31,6 +31,10 @@
 // OMP_METADATA optionally carries a JSON object of free-form fields (a model
 // name, a turn counter, a run id) through to the client untouched; the bridge
 // merges it over the adapter's own derived metadata (see parseHookMetadata).
+// OMP_SUMMARY and OMP_METADATA are the only parts of the message the hook will
+// ever give up: if the serialized line would overrun the bound the relay
+// enforces, both are dropped so the state change itself still gets through, and
+// the loss is reported on stderr (see emitHookEvent).
 // SPEC 6.4: a broken producer must never take down the agent. Any failure to
 // connect or write is swallowed (logged to stderr) and the process exits 0.
 
@@ -40,6 +44,7 @@ import net from "node:net";
 // import.meta.url, silently turning the CLI entry point below into a no-op.
 import { pathToFileURL } from "node:url";
 import type { NativeEvent } from "../adapters/index.ts";
+import { BRIDGE_MESSAGE_VERSION, bridgeLineFits } from "../bridge.ts";
 import { isEventIdentifier, resolveSocketPath } from "../events.ts";
 
 /** Normalized inputs gathered from a native Oh My Pi hook invocation. */
@@ -59,8 +64,21 @@ export interface HookInput {
 /**
  * Wire format for a single line on the bridge socket (SPEC 6.3). `native`
  * carries the harness-native event; the bridge maps it via the harness adapter.
+ *
+ * `version` declares which revision of THIS shape the message is written in.
+ * The relay treats it as optional — an absent version means "the current
+ * revision", which is what keeps hooks installed before the field existed
+ * working unchanged — but a hook shipped from this tree always states it. The
+ * hook is the one piece of the chain that lives outside the project's update
+ * cycle: a user pastes its path into their assistant's configuration and it may
+ * keep running out of a months-old checkout for as long as that configuration
+ * lives. Without a declared revision, a future field rename reaches the relay
+ * as a message that parses, fails a guard and produces nothing — which looks
+ * exactly like an event that carried no state change. With one, the mismatch is
+ * a nameable condition instead of a silent nothing.
  */
 export interface BridgeMessage {
+    version: typeof BRIDGE_MESSAGE_VERSION;
     harness: "oh-my-pi";
     devSessionId: string;
     terminalId: string;
@@ -122,10 +140,21 @@ export function readHookInput(
     // event stays empty and main() prints usage instead of emitting an event
     // whose type no adapter can ever map.
     const event = (argv[2] ?? "").trim() || (env.OMP_HOOK_EVENT ?? "").trim();
+    // The session coordinates are trimmed for the same reason as everything
+    // else read out of this environment, but the consequence of NOT trimming
+    // them is the worst of the lot. A CRLF-authored hook config (or a value
+    // read out of a file) leaves "sess-1\r" here. That still has real content,
+    // so the missing-coordinates guard below is satisfied and the event goes
+    // out; the client then files it under the Dev Session literally named
+    // "sess-1\r", which does not exist and never will. The client deliberately
+    // stores identifiers verbatim — the server mints them and the client must
+    // echo back exactly what it was handed — so normalising here, at the
+    // producer, is the only place it can happen. Nothing anywhere reports the
+    // loss: the sidebar simply never updates.
     const input: HookInput = {
         event,
-        devSessionId: env.OMP_DEV_SESSION_ID ?? "",
-        terminalId: env.OMP_TERMINAL_ID ?? "",
+        devSessionId: (env.OMP_DEV_SESSION_ID ?? "").trim(),
+        terminalId: (env.OMP_TERMINAL_ID ?? "").trim(),
     };
     // Trimmed for the same reason as the event name above: these come from a
     // shell hook configuration, and a command substitution or a CRLF-authored
@@ -155,6 +184,7 @@ export function toBridgeMessage(input: HookInput): BridgeMessage {
     if (input.tool !== undefined) native.tool = input.tool;
     if (input.error) native.error = true;
     const message: BridgeMessage = {
+        version: BRIDGE_MESSAGE_VERSION,
         harness: "oh-my-pi",
         devSessionId: input.devSessionId,
         terminalId: input.terminalId,
@@ -174,15 +204,19 @@ export const HOOK_TIMEOUT_MS = 2000;
 
 /**
  * Connect to the bridge socket, append the BridgeMessage as one JSONL line, and
- * close. Resolves with the written message. Rejects on a socket-level failure
- * or after `timeoutMs` of inactivity (both swallowed by main per SPEC 6.4).
+ * close. Resolves with the message AS WRITTEN — which is not necessarily the
+ * message `input` describes: an over-long summary or metadata bag is dropped
+ * before the line goes out (see below), and a caller that wants to report the
+ * loss compares what it asked for against what it got back. Rejects on a
+ * socket-level failure, on a message no trimming can make deliverable, or after
+ * `timeoutMs` of inactivity (all swallowed by main per SPEC 6.4).
  */
 export function emitHookEvent(
     input: HookInput,
     socketPath: string = resolveSocketPath(),
     timeoutMs: number = HOOK_TIMEOUT_MS,
 ): Promise<BridgeMessage> {
-    const message = toBridgeMessage(input);
+    let message = toBridgeMessage(input);
     const { promise, resolve, reject } = Promise.withResolvers<BridgeMessage>();
     let line: string;
     let socket: net.Socket;
@@ -195,7 +229,39 @@ export function emitHookEvent(
         // (SPEC 6.4). The bag in `metadata` is producer-supplied, so a value
         // stringify refuses — a BigInt, a getter that throws — is its input,
         // not ours.
-        line = `${JSON.stringify(message)}\n`;
+        let payload = JSON.stringify(message);
+        // The relay bounds one line and DROPS THE WHOLE PRODUCER CONNECTION
+        // when a message overruns it — the hook writes its entire line in one
+        // go, so an oversized message trips the relay's unterminated-line guard
+        // before any newline is seen. Writing it anyway would therefore cost
+        // the event AND the connection while this function reported success.
+        //
+        // The two fields that can plausibly get that big are the two OPTIONAL
+        // ones, and both are decoration: a human-readable summary and a
+        // free-form bag. Sacrificing them keeps the STATE TRANSITION — the
+        // thing the sidebar actually runs on — deliverable. bridgeLineFits is
+        // asked rather than re-deriving the bound here, so the two ends cannot
+        // drift; it measures the payload alone, because the framing newline is
+        // deliberately outside the bound.
+        if (!bridgeLineFits(payload)) {
+            const trimmed: BridgeMessage = { ...message };
+            delete trimmed.summary;
+            delete trimmed.metadata;
+            message = trimmed;
+            payload = JSON.stringify(message);
+            // Still too long with nothing optional left: the event name, the
+            // tool name or an identifier is itself megabyte-sized, so there is
+            // nothing further to give up. Say so — a rejection reaches main(),
+            // which prints one actionable line and exits 0 — rather than write
+            // a line the relay is guaranteed to refuse.
+            if (!bridgeLineFits(payload)) {
+                throw new Error(
+                    `event ${input.event} is too large for the bridge even without its `
+                        + `summary and metadata (${Buffer.byteLength(payload)} bytes)`,
+                );
+            }
+        }
+        line = `${payload}\n`;
         // createConnection validates its argument synchronously (an empty or
         // non-string path throws right here). This function promises to REPORT
         // failures by rejecting; letting one escape synchronously would bypass
@@ -214,6 +280,19 @@ export function emitHookEvent(
         reject(new Error(`bridge socket timed out after ${timeoutMs}ms: ${socketPath}`));
     });
     socket.on("error", reject);
+    // Last-resort bound on the wait. Every other way this promise settles is an
+    // event the socket may simply never emit: a connection destroyed without an
+    // 'error' — a peer that resets between our write being queued and its
+    // flush, or a stream the runtime tears down — fires neither 'error' nor the
+    // end-of-write callback, and destroying a socket also cancels the
+    // inactivity watchdog above. Nothing would then settle this promise, and
+    // the hook, and the agent run blocked on it, would wait forever, which is
+    // the one outcome SPEC 6.4 forbids. 'close' is the event a destroyed socket
+    // always emits; on the success path it arrives after resolve(), where
+    // rejecting an already-settled promise is a no-op.
+    socket.on("close", () => {
+        reject(new Error(`bridge socket closed before the event was written: ${socketPath}`));
+    });
     socket.on("connect", () => {
         socket.end(line, () => {
             // Disarm the watchdog: the write succeeded, and a promise that has
@@ -311,7 +390,24 @@ export async function main(
         );
     }
     try {
-        await emitHookEvent(input, resolveSocketPath(env));
+        const written = await emitHookEvent(input, resolveSocketPath(env));
+        // The state transition was delivered, but part of what the harness
+        // asked to send was sacrificed to keep the line inside the relay's
+        // bound. Same reasoning as the OMP_METADATA warning above: a silently
+        // dropped field is invisible, and the person who set it is standing in
+        // the shell this hook was launched from.
+        const dropped: string[] = [];
+        if (input.summary !== undefined && written.summary === undefined)
+            dropped.push("OMP_SUMMARY");
+        if (input.metadata !== undefined && written.metadata === undefined)
+            dropped.push("OMP_METADATA");
+        if (dropped.length > 0) {
+            writeStderr(
+                `oh-my-pi-hook: ${input.event} exceeded the bridge line bound, so `
+                    + `${dropped.join(" and ")} ${dropped.length > 1 ? "were" : "was"} `
+                    + "dropped; the state change was still delivered\n",
+            );
+        }
     } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         writeStderr(`oh-my-pi-hook: ${message}\n`);

@@ -172,7 +172,9 @@ QVariantList LogBuffer::entries() const
 int LogBuffer::count() const
 {
     QMutexLocker locker(&m_mutex);
-    return m_entries.size();
+    // qsizetype -> int is safe by construction (the ring never holds more than
+    // m_maxEntries, itself an int), but say so rather than narrowing silently.
+    return static_cast<int>(m_entries.size());
 }
 
 int LogBuffer::totalBytes() const

@@ -1,6 +1,7 @@
 #include <QtTest/QtTest>
 
 #include <QByteArray>
+#include <QColor>
 #include <QCoreApplication>
 #include <QCryptographicHash>
 #include <QDir>
@@ -342,7 +343,7 @@ private slots:
     void initTestCase();
     void toGroupRowsMapsNestedNodes();
     void toGroupRowsEmptyIsEmpty();
-    void paletteIndexRejectsNonPositiveSize();
+    void groupPaletteResolvesStableColoursAndDegradesToNoTint();
     void uiStateStorePersistsAcrossInstances();
     void uiStateStoreDocumentedDefaults();
     void toGroupRowsSubtitleHandlesTrailingSlashAndEmpty();
@@ -397,6 +398,7 @@ private slots:
     void serverOlderThanTheSchemaFloorIsRefusedWithBothVersions();
     void serverAtTheSchemaFloorIsAdoptedNormally();
     void uiStateStoreIgnoresCorruptWidths();
+    void uiStateStoreRejectsUnreadableSidebarFilters();
     void uiStateStoreRejectsAnEmptyDevSessionId();
     // A profile save that could not take its interprocess lock has to reach the
     // user, not stop at a signal nothing is connected to.
@@ -471,13 +473,51 @@ void TstAppController::toGroupRowsEmptyIsEmpty()
     QVERIFY(AppController::toGroupRows({}).isEmpty());
 }
 
-void TstAppController::paletteIndexRejectsNonPositiveSize()
+// The one palette surface QML actually calls (SessionsSidebar.qml). "plain" is
+// the deliberate no-tint look, an unrecognised name degrades to the same, and a
+// resolvable palette answers a stable colour for a given group name.
+void TstAppController::groupPaletteResolvesStableColoursAndDegradesToNoTint()
 {
     GroupPaletteService service;
-    QCOMPARE(service.indexForName(QStringLiteral("build"), 0), 0);
-    QCOMPARE(service.indexForName(QStringLiteral("build"), -2), 0);
-    QVERIFY(service.indexForName(QStringLiteral("build"), 7) >= 0);
-    QVERIFY(service.indexForName(QStringLiteral("build"), 7) < 7);
+
+    // No colour at all, so the sidebar keeps its untinted look rather than
+    // showing whatever the first slot happens to be.
+    QVERIFY(!service
+                 .colorFor(QStringLiteral("build"), QStringLiteral("plain"),
+                           AppSettings::kDefaultPaletteSize)
+                 .isValid());
+    QVERIFY(!service
+                 .colorFor(QStringLiteral("build"),
+                           QStringLiteral("no-such-palette"),
+                           AppSettings::kDefaultPaletteSize)
+                 .isValid());
+
+    // A resolvable palette answers a real colour, and the same group name
+    // answers the SAME colour every time - including after the service's cache
+    // has been invalidated by a different size and then asked for the first
+    // size again.
+    const QColor first =
+        service.colorFor(QStringLiteral("build"), QStringLiteral("tokyonight"),
+                         AppSettings::kDefaultPaletteSize);
+    QVERIFY(first.isValid());
+    QCOMPARE(service.colorFor(QStringLiteral("build"),
+                              QStringLiteral("tokyonight"),
+                              AppSettings::kDefaultPaletteSize),
+             first);
+    service.colorFor(QStringLiteral("build"), QStringLiteral("tokyonight"),
+                     AppSettings::kMaxPaletteSize);
+    QCOMPARE(service.colorFor(QStringLiteral("build"),
+                              QStringLiteral("tokyonight"),
+                              AppSettings::kDefaultPaletteSize),
+             first);
+
+    // The smallest size the preference allows is the seed itself. The generator
+    // refuses a request that adds nothing, so this is the one size that must be
+    // served from the seed directly - and it must still resolve.
+    QVERIFY(service
+                .colorFor(QStringLiteral("build"), QStringLiteral("tokyonight"),
+                          AppSettings::kMinPaletteSize)
+                .isValid());
 }
 
 // A fresh store over the same .ini file reads back exactly what a previous
@@ -494,6 +534,11 @@ void TstAppController::uiStateStorePersistsAcrossInstances()
         store.setRegionWidths(200, 0, 400);
         store.setSelectedPane(QStringLiteral("s1"), QStringLiteral("p9"));
         store.setShowArchived(true);
+        // The pin filter is the exact twin of showArchived above and had no
+        // coverage at all: emptying setPinnedOnly()/pinnedOnly() broke nothing,
+        // and a filter that silently forgets itself reopens the sidebar in a
+        // mode the user did not choose.
+        store.setPinnedOnly(true);
     }
 
     UiStateStore reopened(iniPath);
@@ -502,6 +547,7 @@ void TstAppController::uiStateStorePersistsAcrossInstances()
     QCOMPARE(reopened.terminalWidth(), 400);
     QCOMPARE(reopened.selectedPane(QStringLiteral("s1")), QStringLiteral("p9"));
     QVERIFY(reopened.showArchived());
+    QVERIFY(reopened.pinnedOnly());
 }
 
 // Documented defaults when nothing has been written.
@@ -516,6 +562,7 @@ void TstAppController::uiStateStoreDocumentedDefaults()
     QCOMPARE(store.viewerWidth(), 0);
     QCOMPARE(store.terminalWidth(), 520);
     QVERIFY(!store.showArchived());
+    QVERIFY(!store.pinnedOnly());
     QVERIFY(store.selectedPane(QStringLiteral("unknown")).isEmpty());
 }
 
@@ -2187,7 +2234,6 @@ void TstAppController::uiStateStoreIgnoresCorruptWidths()
         raw.setValue(QStringLiteral("layout/viewerWidth"), QStringLiteral("-40"));
         // A line the writer never finished.
         raw.setValue(QStringLiteral("layout/terminalWidth"), QString());
-        raw.setValue(QStringLiteral("layout/sidebarWidth"), 12.5);
         raw.sync();
     }
 
@@ -2195,6 +2241,22 @@ void TstAppController::uiStateStoreIgnoresCorruptWidths()
     QCOMPARE(store.sidebarWidth(), 260);
     QCOMPARE(store.viewerWidth(), 0);
     QCOMPARE(store.terminalWidth(), 520);
+
+    // A FRACTIONAL width, on a region whose default is not 0 so the assertion
+    // can tell the two failure modes apart: QVariant::toInt() answers 13 here
+    // (it rounds), and a 13-pixel terminal region is not something the user can
+    // drag back open. This line used to sit on layout/sidebarWidth immediately
+    // after the "wide" above, silently replacing it, so neither spelling was
+    // really being checked - "wide" was dead, and 12.5 was landing on the
+    // sidebar, whose 260 default the -40/0 cases below already cover.
+    {
+        QSettings raw(iniPath, QSettings::IniFormat);
+        raw.setValue(QStringLiteral("layout/terminalWidth"), 12.5);
+        raw.sync();
+    }
+
+    UiStateStore fractional(iniPath);
+    QCOMPARE(fractional.terminalWidth(), 520);
 
     // A zero is corrupt for the two regions whose width IS their presence on
     // screen, and legitimate for the viewer, where it means "fill the rest".
@@ -2230,6 +2292,59 @@ void TstAppController::uiStateStoreIgnoresCorruptWidths()
     QCOMPARE(normalised.sidebarWidth(), 1);
     QCOMPARE(normalised.viewerWidth(), 0);
     QCOMPARE(normalised.terminalWidth(), 1);
+}
+
+// The two sidebar filters are booleans in the same hand-editable text file, and
+// the wrong repair rule here is worse than the wrong number above: Qt's own
+// QVariant::toBool() answers TRUE for any non-empty text, so a line reading
+// `pinnedOnly=yes` would switch the pin filter on. With it on, every unpinned
+// Dev Session disappears, and the user is looking at what seems to be an empty
+// workspace with nothing on screen explaining why. Only the four documented
+// spellings are accepted; anything else means "show everything".
+void TstAppController::uiStateStoreRejectsUnreadableSidebarFilters()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QString iniPath = dir.filePath(QStringLiteral("filters.ini"));
+
+    const auto writeRaw = [&iniPath](const QString& spelling) {
+        QSettings raw(iniPath, QSettings::IniFormat);
+        raw.setValue(QStringLiteral("sidebar/pinnedOnly"), spelling);
+        raw.setValue(QStringLiteral("sidebar/showArchived"), spelling);
+        raw.sync();
+    };
+
+    // What IS accepted, including the textual forms an ini editor produces, a
+    // capitalisation this client never writes, and surrounding whitespace.
+    const QVector<QPair<QString, bool>> readable = {
+        {QStringLiteral("true"), true},   {QStringLiteral("TRUE"), true},
+        {QStringLiteral(" 1 "), true},    {QStringLiteral("false"), false},
+        {QStringLiteral("0"), false},
+    };
+    for (const auto& spelling : readable) {
+        writeRaw(spelling.first);
+        UiStateStore store(iniPath);
+        QVERIFY2(store.pinnedOnly() == spelling.second,
+                 qPrintable(QStringLiteral("pinnedOnly=%1").arg(spelling.first)));
+        QVERIFY2(store.showArchived() == spelling.second,
+                 qPrintable(QStringLiteral("showArchived=%1").arg(spelling.first)));
+    }
+
+    // Everything else falls back to "show everything" - never to "hide things".
+    const QStringList unreadable = {
+        QStringLiteral("yes"), QStringLiteral("on"),   QStringLiteral("2"),
+        QStringLiteral("-1"),  QStringLiteral("null"), QString(),
+    };
+    for (const QString& spelling : unreadable) {
+        writeRaw(spelling);
+        UiStateStore store(iniPath);
+        QVERIFY2(!store.pinnedOnly(),
+                 qPrintable(QStringLiteral("pinnedOnly=%1 must not hide rows")
+                                .arg(spelling)));
+        QVERIFY2(!store.showArchived(),
+                 qPrintable(QStringLiteral("showArchived=%1 must not be trusted")
+                                .arg(spelling)));
+    }
 }
 
 // The empty devSessionId is not a Dev Session, and is treated exactly as

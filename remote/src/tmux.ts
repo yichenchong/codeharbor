@@ -184,7 +184,15 @@ export const execFileRunner: CommandRunner = (argv) =>
                 } else if (timedOut) {
                     detail = `tmux did not respond within ${TMUX_TIMEOUT_MS}ms`;
                 } else {
-                    detail = stderr ?? err.message;
+                    // `stderr ?? err.message` was wrong: on a SPAWN failure
+                    // (no tmux on PATH) execFile hands back an EMPTY STRING for
+                    // stderr, not null, so `??` kept the empty string and the
+                    // errno text in err.message ("spawn tmux ENOENT") was lost.
+                    // isMissingTmux then matched nothing and a host with no
+                    // tmux answered `tmux list-sessions failed: exit code -1`
+                    // instead of an empty listing — breaking rule 1 above on
+                    // exactly the machine it exists for.
+                    detail = stderr !== "" ? stderr : err.message;
                 }
                 resolve({
                     code: typeof err.code === "number" ? err.code : SPAWN_FAILED,

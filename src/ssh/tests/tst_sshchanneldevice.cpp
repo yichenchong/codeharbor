@@ -1,6 +1,7 @@
 #include "SshChannelDevice.h"
 #include "SshConnectionPool.h"
 
+#include <QByteArray>
 #include <QElapsedTimer>
 #include <QSignalSpy>
 #include <QString>
@@ -47,6 +48,7 @@ private slots:
     void resizeIsRefusedWhenThereIsNoPty();
     void aFinishedStreamReadsAsMinusOneNotZero();
     void waitingForBytesFailsFastWhenNoneCanArrive();
+    void writingWithNoChannelFailsInsteadOfSwallowingTheBytes();
 };
 
 // QIODevice::open() is the obvious thing for a caller to reach for, and on this
@@ -201,6 +203,28 @@ void TstSshChannelDevice::waitingForBytesFailsFastWhenNoneCanArrive()
     QVERIFY2(elapsed.elapsed() < 2000,
              qPrintable(QStringLiteral("waitForReadyRead() blocked for %1 ms")
                             .arg(elapsed.elapsed())));
+}
+
+// A device that is open but has no channel behind it must REFUSE a write, not
+// pretend to have sent it. The distinction is the whole difference between a
+// JSON-RPC caller that reports "the connection is down" and one that believes
+// its request is on the wire and then waits forever for a reply that was never
+// asked for. QIODevice spells the refusal -1, and the reason belongs in
+// errorString(), which is all a generic byte-stream consumer can inspect.
+void TstSshChannelDevice::writingWithNoChannelFailsInsteadOfSwallowingTheBytes()
+{
+    OpenedChannelDevice device;
+    QVERIFY(device.isOpen());
+    QVERIFY(device.isWritable());
+
+    QCOMPARE(device.write(QByteArrayLiteral("ping\n")), qint64(-1));
+#if CH_HAVE_LIBSSH
+    QCOMPARE(device.errorString(), QStringLiteral("no SSH channel"));
+#endif
+    // And it stays a refusal after the read side has finished: a half-closed
+    // stream is still not a place to put bytes.
+    device.finishReadChannel();
+    QCOMPARE(device.write(QByteArrayLiteral("ping\n")), qint64(-1));
 }
 
 QTEST_GUILESS_MAIN(TstSshChannelDevice)

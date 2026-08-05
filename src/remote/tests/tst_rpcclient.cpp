@@ -18,6 +18,7 @@
 #include <QtTest/QtTest>
 #include <QScopeGuard>
 
+#include <cstring> // std::memcpy, in ScriptedDevice::readData
 #include <functional>
 #include <optional>
 #include <type_traits>
@@ -236,6 +237,8 @@ private slots:
     void unwritableTransportIsDeclaredDeadByTheHeartbeat();
     void invalidUtf8FrameWarnsAndTheStreamResynchronises();
     void escapedNewlineInsideAStringDoesNotSplitTheFrame();
+    void overCapLineStopsRoutingFurtherBytes();
+    void pendingCountStaysNonNegativeDuringASweep();
     void decodeFileContentRejectsInvalidBase64();
 
 private:
@@ -1685,12 +1688,21 @@ void TstRpcClient::oversizedDelimitedInputIsRejected()
     m_client->call(QStringLiteral("ping"), QJsonValue(),
                    [&](QJsonValue, std::optional<RpcError> err) { got = err; });
 
-    // The newline is present, but the frame itself is over the 16 MiB cap. It
+    // The COMPLETED-line branch of the cap check, which needs two reads to
+    // reach: one read is bounded to the cap plus one byte, so a chunk that is
+    // over-cap on its own always trips the unframed-remainder check first (that
+    // is what oversizedNewlinelessInputIsBounded drives). Send exactly the cap
+    // with no newline — still legal, still just a partial line — and only then
+    // the bytes that terminate it. Now a COMPLETE frame is over the cap, and it
     // must be rejected before JSON parsing rather than accepted just because
     // the peer remembered to terminate it.
-    QByteArray oversized(16 * 1024 * 1024 + 1, 'x');
-    oversized.append('\n');
-    device.deliver(oversized);
+    const QByteArray atTheCap(16 * 1024 * 1024, 'x');
+    device.deliver(atTheCap);
+    QCOMPARE(warnSpy.count(), 0); // a cap-sized partial line is not yet a fault
+    QCOMPARE(closedSpy.count(), 0);
+    QVERIFY(!got.has_value());
+
+    device.deliver(QByteArray("xxx\n")); // now the finished frame is cap + 3
 
     QCOMPARE(closedSpy.count(), 1);
     QVERIFY(warnSpy.count() >= 1);
@@ -2016,7 +2028,7 @@ void TstRpcClient::liveServerInfoOverProcess()
     QJsonValue result;
     std::optional<RpcError> err;
     bool fired = false;
-    m_client->call(QStringLiteral("server.info"), QJsonObject{},
+    m_client->call(QString::fromLatin1(ch::rpc::kMethodServerInfo), QJsonObject{},
                    [&](QJsonValue r, std::optional<RpcError> e) {
                        result = r;
                        err = e;
@@ -2701,7 +2713,7 @@ void TstRpcClient::outgoingOversizedFrameIsRejectedWithoutClosingTransport()
     QVERIFY(observedError.has_value());
     QCOMPARE(observedError->code, -32603);
     QCOMPARE(m_client->pendingCount(), 0);
-    QVERIFY(!device.takeWritten().contains('\n'));
+    QVERIFY(device.takeWritten().isEmpty()); // not one byte reached the wire
     QCOMPARE(warningSpy.count(), 1);
     QCOMPARE(closedSpy.count(), 0);
 
@@ -2989,6 +3001,83 @@ void TstRpcClient::decodeFileContentRejectsInvalidBase64()
         QJsonObject{{"encoding", "base64"}, {"content", ""}});
     QVERIFY(empty.has_value());
     QVERIFY(empty->isEmpty());
+}
+
+// Once a line has gone past the cap the client no longer knows where the next
+// frame begins, so every byte still queued on that transport is garbage — and it
+// says so: transportClosed() promises that no further frame from that transport
+// is routed. The close path has a last-gasp drain for the ordinary "peer wrote a
+// reply and then shut down" case, and that drain must NOT run here: it would
+// re-read the very bytes just declared untrustworthy and hand a caller a
+// "success" assembled from them, and because each read trips the cap again it
+// re-enters the close path once per 16 MiB of garbage.
+void TstRpcClient::overCapLineStopsRoutingFurtherBytes()
+{
+    ScriptedDevice device;
+    m_client->setTransport(&device);
+
+    QSignalSpy closedSpy(m_client, &CodeharbordClient::transportClosed);
+
+    std::optional<RpcError> got;
+    bool fired = false;
+    const qint64 id = m_client->call(
+        QStringLiteral("file.readFile"), QJsonObject{{"path", "/f"}},
+        [&](QJsonValue, std::optional<RpcError> err) {
+            got = err;
+            fired = true;
+        });
+
+    // An unterminated over-cap line, then — behind it, already queued — a
+    // perfectly well-formed reply for the pending request.
+    QByteArray queued(16 * 1024 * 1024 + 1, 'x');
+    queued.append('\n');
+    queued += jsonLine(
+        {{"jsonrpc", "2.0"}, {"id", id}, {"result", QJsonObject{{"ok", true}}}});
+    device.queueSilently(queued);
+    device.deliver(QByteArray()); // announce, without adding anything
+
+    QVERIFY(fired);
+    QCOMPARE(closedSpy.count(), 1);
+    // THE ASSERTION: the reply behind the garbage was never routed, so the
+    // caller was failed by the close instead of being answered from a stream the
+    // client had already given up on.
+    QVERIFY(got.has_value());
+    QCOMPARE(got->code, -32603);
+    QCOMPARE(got->message,
+             QStringLiteral("transport closed with request pending"));
+    QCOMPARE(m_client->pendingCount(), 0);
+
+    m_client->setTransport(nullptr);
+}
+
+// pendingCount() subtracts the heartbeat probes out of the pending map, and the
+// pending-failure sweep MOVES that map out before dispatching. A consumer that
+// reads the count from inside one of those failure callbacks — plausible, since
+// that is where a reconnect decision is made — would see the subtraction applied
+// to an already-empty map. It must report zero, never a negative size.
+void TstRpcClient::pendingCountStaysNonNegativeDuringASweep()
+{
+    ScriptedDevice device;
+    m_client->enableHeartbeat(20, 1000); // huge tolerance: no teardown here
+    m_client->setTransport(&device);
+
+    QVERIFY2(awaitPing(device) != 0, "the heartbeat never armed");
+
+    qsizetype observed = -1;
+    m_client->call(QStringLiteral("workspace.list"), QJsonValue(),
+                   [&](QJsonValue, std::optional<RpcError> err) {
+                       QVERIFY(err.has_value());
+                       observed = m_client->pendingCount();
+                   });
+    QCOMPARE(m_client->pendingCount(), qsizetype(1)); // the probe is excluded
+
+    m_client->setTransport(nullptr); // sweeps the caller AND the live probe
+
+    QVERIFY2(observed >= 0,
+             qPrintable(QStringLiteral("pendingCount() reported %1 mid-sweep")
+                            .arg(observed)));
+    QCOMPARE(observed, qsizetype(0));
+    QCOMPARE(m_client->pendingCount(), qsizetype(0));
 }
 
 

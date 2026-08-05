@@ -323,6 +323,7 @@ jobs:
         if: matrix.name == 'windows'
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
           $dest = "artifact/codeharbor-windows"
           New-Item -ItemType Directory -Force -Path $dest | Out-Null
           # Qt's qt_standard_project_setup redirects RUNTIME_OUTPUT_DIRECTORY to
@@ -334,6 +335,16 @@ jobs:
           if (-not $exe) { throw "codeharbor.exe not found under build/release" }
           Copy-Item $exe.FullName $dest/
           windeployqt --qmldir src/qml --release "$dest/codeharbor.exe"
+          # windeployqt is a native process, so neither $ErrorActionPreference
+          # nor a `throw` elsewhere covers its exit code (the Inno Setup step
+          # below checks its compiler for exactly this reason). Without this,
+          # a failed deploy left an artifact holding codeharbor.exe and none of
+          # the Qt runtime it needs: `if-no-files-found: error` still passes,
+          # so the first person to notice would be a user downloading a
+          # published release that cannot start.
+          if ($LASTEXITCODE -ne 0) {
+            throw "windeployqt failed with exit code $LASTEXITCODE; the portable Windows tree has no Qt runtime."
+          }
           # Bundle non-Qt runtime deps (libssh) next to the exe.
           Get-ChildItem "$env:VCPKG_INSTALLATION_ROOT/installed/x64-windows/bin/*.dll" |
             ForEach-Object { Copy-Item $_.FullName $dest/ }
@@ -602,6 +613,10 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          # Every other bash step in this workflow is strict; this one was not,
+          # so an unset variable expanded to an empty asset list rather than
+          # stopping the publish.
+          set -euo pipefail
           if gh release view "$GITHUB_REF_NAME" \
             --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             # A retry after a published release exists must replace its assets

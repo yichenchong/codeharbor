@@ -115,11 +115,23 @@ public:
     // for an abandoned Dev Session is dropped (errors are still surfaced).
     Q_INVOKABLE void load(QString devSessionId);
 
-    // Production QML MUST use the stamped entry points below. The session id
-    // and generation are captured when a gesture starts, so a reply or signal
-    // from a Dev Session the user has already left is dropped before it can
-    // inspect or mutate the current tree. The short methods further below stay
-    // only for C++ tests and old standalone callers that have no QML stamp.
+    // Every DELAYED gesture MUST come in through the stamped entry points
+    // below. The session id and generation are captured when the gesture
+    // starts, so a reply or signal from a Dev Session the user has already left
+    // is dropped before it can inspect or mutate the current tree. Everything a
+    // pane reports - a url it opened, a title it took, a splitter it was
+    // dragged by, its own close or split button - travels that way, because
+    // the pane that started it may be gone by the time it lands.
+    //
+    // The unstamped methods further below stamp the call with whatever session
+    // is current AT INVOCATION, so they can only be used where that is provably
+    // the right stamp: a synchronous command acting on the selection the user is
+    // looking at right now (the command palette, a keyboard shortcut, a menu
+    // item), and the C++ tests, which drive the core tree operations directly.
+    // Main.qml uses both for exactly that split of duties. They are NOT a
+    // shorthand for the stamped ones: reached from anything asynchronous they
+    // cannot prove where the gesture came from, which is the whole point of the
+    // stamp.
     Q_INVOKABLE void saveTreeForSession(QString devSessionId, quint64 generation,
                                         QString region, QVariant tree);
     Q_INVOKABLE void setRatiosForSession(QString devSessionId, quint64 generation,
@@ -259,9 +271,16 @@ signals:
     void error(QString message);
     // Both regions of the load for this Dev Session have resolved. Fires once
     // per load that actually issued requests, including when a region errored
-    // (error() reported that separately), so a consumer waiting on it can never
-    // hang. A load with an EMPTY id is a deselection: it fetches nothing and
-    // therefore reports nothing.
+    // (error() reported that separately), so no answer a load waits for can
+    // leave it silent. A load with an EMPTY id is a deselection: it fetches
+    // nothing and therefore reports nothing.
+    //
+    // What it does NOT promise is one signal per load() call: a load that is
+    // SUPERSEDED - another load(), or a deselection, issued before its replies
+    // came back - never reports at all, because its replies are dropped on
+    // arrival. A consumer must therefore key on the newest load it asked for
+    // (or on generation()) rather than counting these, or it will wait for a
+    // signal about a Dev Session nobody is opening any more.
     void loaded(QString devSessionId);
 
 private:
@@ -302,10 +321,14 @@ private:
         QVector<PendingWrite> pendingWrites;
         // A local edit has already replaced this region's tree since the
         // in-flight load for it was issued, so that load's reply is history and
-        // must not be applied. Without it, a getLayout answer that crossed a
-        // saveTree/splitPane on the wire would silently revert the user's edit -
-        // or, when the server had no row yet, overwrite it with the region
-        // DEFAULT and persist that, destroying the edit on the server too.
+        // must not be applied - whatever it says. Without it, a getLayout answer
+        // that crossed a saveTree/splitPane on the wire would silently revert
+        // the user's edit - or, when the server had no row yet, overwrite it
+        // with the region DEFAULT and persist that, destroying the edit on the
+        // server too - and a FAILED (or duplicate-key) answer would give the
+        // region the unusable-layout treatment, blanking a layout the user just
+        // built and the server has already accepted. The error is still
+        // reported; only the region is left alone.
         // Cleared by load() (a deliberate reload must adopt the server's tree)
         // and by clearTrees().
         bool superseded = false;
@@ -439,6 +462,12 @@ private:
     // terminal leaves would be PENDING with nothing on the wire to resolve
     // them, and persist() refuses for the rest of the session to write a region
     // that holds one (see hasPendingTerminalLeaf()).
+    //
+    // Also the mint funnel for the seeded region DEFAULT, which is a tree this
+    // client did not derive from the server either: its leaves need exactly the
+    // same rows, and its "brand new" is exactly as conditional (a reload that
+    // still finds no row on the server re-seeds a tree whose leaves were bound
+    // the first time round, and those must not be re-minted).
     void adoptAuthoredTerminalTree(quint64 generation);
     // Find the terminal leaf labelled `paneId` in the loaded terminal tree, or
     // nullptr. Terminal region only: a viewer leaf has no row to bind.

@@ -8,8 +8,24 @@ trim_trailing_whitespace = true
 indent_style = space
 indent_size = 4
 
-[*.{ts,js,mjs,json,qml,yml,yaml}]
+# 2 spaces for the data/serialisation formats and the small Node scripts.
+# TypeScript and QML are deliberately NOT here: every .ts file under remote/ and
+# src/web/, and every .qml file under src/qml/, is indented with 4 spaces, so
+# listing them here made every editor insert 2-space indentation into files that
+# use 4.
+[*.{js,mjs,json,yml,yaml}]
 indent_size = 2
+
+# Unified diffs are applied byte-for-byte to an upstream tarball on the Windows
+# release runner (packaging/vcpkg-ports/). A blank CONTEXT line in a diff is a
+# line consisting of exactly one space, and a trailing "\ No newline at end of
+# file" marker must stay exactly as generated: stripping that space, or
+# appending a newline, silently corrupts the patch, and the first thing to
+# notice is a tagged release dying during extraction. .gitattributes stops git
+# from rewriting these files; this stops the editor.
+[*.{patch,diff}]
+trim_trailing_whitespace = false
+insert_final_newline = false
 
 [*.md]
 trim_trailing_whitespace = false

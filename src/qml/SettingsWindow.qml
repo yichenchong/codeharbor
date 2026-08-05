@@ -34,6 +34,28 @@ Rectangle {
     border.color: Theme.borderSubtle
     focus: visible
 
+    // The parts of a QtQuick.Controls control this file does NOT replace still
+    // draw from the STYLE's palette, which is light: a ComboBox drops a white
+    // popup with white rows on top of this dark sheet, and a SpinBox's two step
+    // buttons are light grey plates. An Item's palette propagates down the
+    // visual parent chain, so one mapping here reaches every control inside —
+    // the same trick, and the same role-by-role mapping, as AppDialog.qml.
+    // `light` is the extra role a ComboBox popup ROW is drawn with.
+    palette.window: Theme.surface
+    palette.windowText: Theme.text
+    palette.dark: Theme.border
+    palette.base: Theme.surfaceSunken
+    palette.text: Theme.text
+    palette.placeholderText: Theme.textDim
+    palette.button: Theme.surfaceRaised
+    palette.buttonText: Theme.text
+    palette.mid: Theme.border
+    palette.light: Theme.surfaceDeep
+    palette.midlight: Theme.surfaceRaised
+    palette.highlight: Theme.accent
+    palette.highlightedText: Theme.textOnAccent
+    palette.brightText: Theme.textOnAccent
+
     // This sheet fills the whole window on top of the three regions, but a
     // Rectangle accepts no input of its own: Qt Quick hands an unaccepted press
     // to the next item DOWN, so a click that missed one of the controls below
@@ -136,6 +158,10 @@ Rectangle {
         TextField {
             id: fieldInput
             width: field.width
+            // The visible Label above is a separate item; without this the
+            // server fields are announced as unnamed edit boxes. Same rule as
+            // ConnectSheet's LabeledField, which edits the same records.
+            Accessible.name: fieldLabel.text
             implicitHeight: 30
             color: Theme.text
             placeholderTextColor: Theme.textDim
@@ -494,6 +520,10 @@ Rectangle {
             contentWidth: width
             contentHeight: appearanceColumn.implicitHeight
             boundsBehavior: Flickable.StopAtBounds
+            // Every scrollable view in this module uses the one shared bar
+            // (AppScrollBar.qml); it hides itself while the content fits, so a
+            // short pane is unchanged and a long one stops silently clipping.
+            ScrollBar.vertical: AppScrollBar {}
 
             Column {
                 id: appearanceColumn
@@ -612,6 +642,9 @@ Rectangle {
                         anchors.fill: parent
                         anchors.margins: 2
                         clip: true
+                        // This list is capped at four rows tall, so it scrolls
+                        // as soon as a fifth button exists.
+                        ScrollBar.vertical: AppScrollBar {}
                         model: root.toolbarItems
                         delegate: Rectangle {
                             required property string modelData
@@ -711,24 +744,32 @@ Rectangle {
         }
     }
 
+    // The one list the terminal-resolution choice is built from. It used to be
+    // spelled out three times — the ComboBox model above, the index lookup and
+    // the reverse lookup — and the two lookups had drifted: a stored ratio
+    // outside the list (a hand-edited config, or one written by a newer build)
+    // fell through to the last index, so the box claimed "4x" for, say, 1.25.
+    // Entry N here is entry N of that model.
+    readonly property var pixelRatioValues: [0, 1, 1.5, 2, 3, 4]
+
+    // -1 for an unrecognised ratio, deliberately: there is no entry to point
+    // at, and naming the wrong one tells the user their terminal renders at a
+    // resolution it does not.
     function pixelRatioIndex() {
         var settings = root.settingsObject();
         var ratio = settings ? Number(settings.terminalPixelRatio) : 0;
-        if (ratio <= 0)
-            return 0;
-        if (Math.abs(ratio - 1.0) < 0.01)
-            return 1;
-        if (Math.abs(ratio - 1.5) < 0.01)
-            return 2;
-        if (Math.abs(ratio - 2.0) < 0.01)
-            return 3;
-        if (Math.abs(ratio - 3.0) < 0.01)
-            return 4;
-        return 5;
+        if (!isFinite(ratio) || ratio <= 0)
+            return 0; // "Follow screen"
+        for (var i = 1; i < root.pixelRatioValues.length; ++i) {
+            if (Math.abs(ratio - root.pixelRatioValues[i]) < 0.01)
+                return i;
+        }
+        return -1;
     }
 
     function pixelRatioForIndex(index) {
-        return [0, 1, 1.5, 2, 3, 4][index] || 0;
+        return index >= 0 && index < root.pixelRatioValues.length
+             ? root.pixelRatioValues[index] : 0;
     }
 
     Component {
@@ -740,6 +781,7 @@ Rectangle {
             contentWidth: width
             contentHeight: viewerDefaultsColumn.implicitHeight
             boundsBehavior: Flickable.StopAtBounds
+            ScrollBar.vertical: AppScrollBar {}
 
             Column {
                 id: viewerDefaultsColumn
@@ -857,6 +899,7 @@ Rectangle {
                         anchors.fill: parent
                         anchors.margins: 2
                         clip: true
+                        ScrollBar.vertical: AppScrollBar {}
                         model: root.viewerDefaultEntries
                         delegate: Rectangle {
                             required property var modelData
@@ -905,6 +948,7 @@ Rectangle {
             contentWidth: width
             contentHeight: serverColumn.implicitHeight
             boundsBehavior: Flickable.StopAtBounds
+            ScrollBar.vertical: AppScrollBar {}
 
             Column {
                 id: serverColumn
@@ -931,6 +975,7 @@ Rectangle {
                     width: Math.min(parent.width, 620)
                     height: Math.max(36, Math.min(4 * 36, root.profileEntries.length * 36))
                     clip: true
+                    ScrollBar.vertical: AppScrollBar {}
                     model: root.profileEntries
                     delegate: SheetButton {
                         required property var modelData
@@ -1122,6 +1167,7 @@ Rectangle {
             contentWidth: width
             contentHeight: tmuxColumn.implicitHeight
             boundsBehavior: Flickable.StopAtBounds
+            ScrollBar.vertical: AppScrollBar {}
             Column {
                 id: tmuxColumn
                 width: parent.width

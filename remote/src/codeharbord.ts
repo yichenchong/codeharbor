@@ -344,19 +344,27 @@ export async function handleLine(line: string): Promise<RpcResponse | null> {
  *
  *   * The payload is not JSON-serializable (a reference cycle, or a BigInt).
  *     Answer with an internal error naming that.
- *   * The serialized line is past MAX_LINE_BYTES. BOTH ends of this protocol
+ *   * The serialized payload is past MAX_LINE_BYTES. BOTH ends of this protocol
  *     drop the transport on an over-cap frame, so writing it anyway costs the
  *     user the entire workspace connection — every terminal and every editor on
  *     it — over one oversized reply, with nothing on screen saying why. Answer
  *     with RPC_RESOURCE_LIMIT instead, exactly as the handlers that DO know
  *     their own size (file.readFile, file.listDirectory) already do: the one
  *     request is refused, the message names the limit, and the session lives.
+ *
+ * WHAT THE CAP MEASURES: the JSON payload, EXCLUDING the newline that frames
+ * it. That is the convention the inbound framer below already uses (it counts
+ * only the bytes before the newline) and the one the C++ client uses for its
+ * matching kMaxLineBytes. Measuring the framed line here instead — payload plus
+ * newline — made the two directions disagree by exactly one byte: a payload of
+ * precisely MAX_LINE_BYTES was accepted on the way in and refused on the way
+ * out, while both comments claimed to state the same rule.
  */
 export function responseLine(response: RpcResponse): string {
     let refusal: { code: number; message: string };
     try {
-        const line = `${JSON.stringify(response)}\n`;
-        if (Buffer.byteLength(line) <= MAX_LINE_BYTES) return line;
+        const payload = JSON.stringify(response);
+        if (Buffer.byteLength(payload) <= MAX_LINE_BYTES) return `${payload}\n`;
         refusal = {
             code: RPC_RESOURCE_LIMIT,
             message:
@@ -793,7 +801,14 @@ export function runStdio(): StdioHandle {
         // with a small refusal, so nothing should reach here. A frame past the
         // cap makes the peer drop the whole transport, so fail rather than write
         // a line that is known to be doomed.
-        if (bytes > MAX_LINE_BYTES) {
+        //
+        // `line` always ends with the framing newline, and the cap measures the
+        // PAYLOAD without it (see responseLine). Comparing the framed length
+        // here would have made this backstop one byte stricter than the rule
+        // responseLine enforces, so an answer of exactly MAX_LINE_BYTES — which
+        // responseLine deliberately passes — would have torn the transport down
+        // instead of being delivered.
+        if (bytes - 1 > MAX_LINE_BYTES) {
             failOutput();
             return;
         }
@@ -824,11 +839,18 @@ export function runStdio(): StdioHandle {
         // base64 file.writeFile frame duplicates the whole string just to answer
         // "is this blank?". The C++ reader avoids the same copy deliberately.
         if (!/\S/.test(line)) return;
-        void handleLine(line)
-            .then((response) => {
+        // `.then(onFulfilled, onRejected)`, NOT `.then(...).catch(...)`: a
+        // catch chained AFTER the success handler also catches anything the
+        // success handler itself throws, so a failure inside writeOut would
+        // answer the SAME request a second time — an extra id-less error line
+        // the client cannot correlate, on top of the reply it already got.
+        // The two-argument form keeps the rejection handler responsible for
+        // the request's rejection only.
+        void handleLine(line).then(
+            (response) => {
                 if (response) writeOut(responseLine(response));
-            })
-            .catch(() => {
+            },
+            () => {
                 // handleLine is total today. This guard exists because an
                 // unhandled promise rejection is fatal by default in Node: one
                 // future non-total code path would take the whole service — and
@@ -840,7 +862,8 @@ export function runStdio(): StdioHandle {
                         error: { code: RPC_INTERNAL_ERROR, message: "Internal error" },
                     })}\n`,
                 );
-            });
+            },
+        );
     };
     // Replaces Node's readline, which buffers a line without any upper bound
     // (RR13). The framer drops the connection past MAX_LINE_BYTES.

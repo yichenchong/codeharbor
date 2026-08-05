@@ -658,6 +658,15 @@ private slots:
     // stayed open.
     void theMarkdownViewPinsEachImageAddressExactlyOnce();
 
+    // An "Open as" choice belongs to the ADDRESS it was made about, so any
+    // republish of the tree that does not move this pane's address must leave
+    // it alone.
+    void anUnrelatedRepublishKeepsAnOpenAsChoice();
+
+    // Split proportions must survive a window resize. SplitView stretches only
+    // its first fill item, so the region has to rescale the rest itself.
+    void splitProportionsSurviveAWindowResize();
+
 private:
     // Load one qrc component into the harness window with `props` as its
     // initial properties, and hand back the loaded item. The region types are
@@ -3025,6 +3034,118 @@ void TstPaneIdentity::theMarkdownViewPinsEachImageAddressExactlyOnce()
     // Every pin is given back when the view goes away.
     m_shell.reset();
     QTRY_COMPARE(map.retainedCount(), pinnedBefore);
+}
+
+// ---------------------------------------------------------------------------
+// (17) "Open as" is a choice about an ADDRESS, not about a moment.
+//
+// A pane's handler override used to be wiped by every republish of the region
+// tree — and the tree is republished for reasons that have nothing to do with
+// this pane: a sibling being split, a divider being dragged, the layout being
+// reloaded. The user opened a .png in the editor, split another pane, and the
+// .png silently went back to being an image.
+// ---------------------------------------------------------------------------
+void TstPaneIdentity::anUnrelatedRepublishKeepsAnOpenAsChoice()
+{
+    const QString address = QStringLiteral("file:///srv/repos/app/logo.png");
+    QVERIFY(openRegion(QStringLiteral("ViewerRegion.qml"),
+                       leafNode(QStringLiteral("viewer-1"), address),
+                       /*terminal=*/false));
+    const auto panes = [this] { return collect(m_region, isLeafPane); };
+    QTRY_VERIFY(panes().size() == 1);
+    QObject *const pane = panes().constFirst();
+
+    // The registry's own answer for a .png, which is what the override has to
+    // be visibly different from.
+    QTRY_COMPARE(pane->property("kind").toString(), QStringLiteral("image"));
+
+    QVariant accepted;
+    QVERIFY(QMetaObject::invokeMethod(
+        m_region, "openPaneTarget", Q_RETURN_ARG(QVariant, accepted),
+        Q_ARG(QVariant, QStringLiteral("viewer-1")), Q_ARG(QVariant, address),
+        Q_ARG(QVariant, QStringLiteral("binary"))));
+    QVERIFY(accepted.toBool());
+    QTRY_COMPARE(pane->property("kind").toString(), QStringLiteral("binary"));
+
+    // A split of a DIFFERENT pane. viewer-1's leaf keeps the very same address,
+    // so nothing about what it is showing has changed.
+    setNode(branchNode(QStringLiteral("horizontal"),
+                       QVariantList{leafNode(QStringLiteral("viewer-1"), address),
+                                    leafNode(QStringLiteral("viewer-2"))}));
+    QTRY_VERIFY(panes().size() == 2);
+    QTest::qWait(kSettleMs);
+
+    QCOMPARE(paneWithId(m_region, QStringLiteral("viewer-1")), pane);
+    QCOMPARE(pane->property("forcedKind").toString(), QStringLiteral("binary"));
+    QVERIFY2(pane->property("kind").toString() == QStringLiteral("binary"),
+             "splitting another pane threw away this pane's \"Open as\" choice");
+
+    // Pointing the pane at a DIFFERENT address is a real navigation and must
+    // clear the override, so the new file gets the registry's handler.
+    setNode(branchNode(
+        QStringLiteral("horizontal"),
+        QVariantList{leafNode(QStringLiteral("viewer-1"),
+                              QStringLiteral("file:///srv/repos/app/other.png")),
+                     leafNode(QStringLiteral("viewer-2"))}));
+    QTRY_COMPARE(pane->property("forcedKind").toString(), QString());
+    QTRY_COMPARE(pane->property("kind").toString(), QStringLiteral("image"));
+}
+
+// ---------------------------------------------------------------------------
+// (18) Split proportions across a window resize.
+//
+// SplitView stretches exactly ONE of its fill items, so every pixel a window
+// resize adds or removes used to land on the first pane in the region: a 50/50
+// split became lopsided the first time the window was widened, and the stored
+// ratios were only seen again after the Dev Session was reopened.
+// ---------------------------------------------------------------------------
+void TstPaneIdentity::splitProportionsSurviveAWindowResize()
+{
+    QVERIFY(openRegion(QStringLiteral("ViewerRegion.qml"),
+                       branchNode(QStringLiteral("horizontal"),
+                                  QVariantList{leafNode(QStringLiteral("viewer-1")),
+                                               leafNode(QStringLiteral("viewer-2"))}),
+                       /*terminal=*/false));
+    const auto panes = [this] { return collect(m_region, isLeafPane); };
+    QTRY_VERIFY(panes().size() == 2);
+    QTest::qWait(kSettleMs);
+
+    auto *const left = qobject_cast<QQuickItem *>(paneWithId(m_region, QStringLiteral("viewer-1")));
+    auto *const right = qobject_cast<QQuickItem *>(paneWithId(m_region, QStringLiteral("viewer-2")));
+    QVERIFY(left && right);
+    QVERIFY2(qAbs(left->width() - right->width()) <= 12,
+             qPrintable(QStringLiteral("the split did not start out even: %1 vs %2")
+                            .arg(left->width())
+                            .arg(right->width())));
+
+    const qreal startWidth = m_shell->property("width").toReal();
+    QVERIFY(startWidth > 0);
+    const qreal rightBefore = right->width();
+    m_shell->setProperty("width", startWidth + 400);
+    QTRY_VERIFY(left->width() + right->width() > startWidth);
+    QTest::qWait(kSettleMs);
+
+    // The second pane must actually receive a share of the 400 pixels. Before
+    // the region rescaled its children itself, SplitView gave every one of
+    // them to the first fill item and this width did not move at all.
+    QVERIFY2(right->width() >= rightBefore + 120,
+             qPrintable(QStringLiteral("widening the window by 400 moved the second pane from "
+                                       "%1 to %2; the extra space went to the first pane")
+                            .arg(rightBefore)
+                            .arg(right->width())));
+    QVERIFY2(qAbs(left->width() - right->width()) <= 40,
+             qPrintable(QStringLiteral("after widening, the panes are %1 and %2 wide, which is "
+                                       "no longer the even split they started at")
+                            .arg(left->width())
+                            .arg(right->width())));
+
+    // ...and back again, so shrinking is not a one-way trip either.
+    m_shell->setProperty("width", startWidth);
+    QTest::qWait(kSettleMs);
+    QVERIFY2(qAbs(left->width() - right->width()) <= 40,
+             qPrintable(QStringLiteral("narrowing the window again left the panes at %1 and %2")
+                            .arg(left->width())
+                            .arg(right->width())));
 }
 
 // QTEST_MAIN cannot be used: registerUrlScheme() and QtWebEngineQuick::initialize()

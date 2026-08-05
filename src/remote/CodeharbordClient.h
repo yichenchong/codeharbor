@@ -271,8 +271,11 @@ private:
     // QArrayDataPointer::erase has a front-erase fast path that only advances
     // the data pointer, and QByteArray::left() deep-copies rather than sharing,
     // so nothing forced a detach either. Isolating the two disciplines
-    // (80 000 frames, no JSON) puts this one ahead — 29 ms against 12 ms — but
-    // end to end that is invisible next to parsing: 20 000 real frames through
+    // (80 000 frames, no JSON) puts this one ahead by a constant factor — both
+    // shapes are linear; see aBurstOfFramesInOneReadIsRoutedOnce in
+    // tests/tst_rpcclient.cpp, which records the measurement and deliberately
+    // asserts routing rather than wall clock. End to end the difference is
+    // invisible next to parsing: 20 000 real frames through
     // one read measure the same either way. What this shape buys is that the
     // consumption point is a member, so a callback that re-enters the reader
     // advances the same cursor instead of re-dispatching consumed frames.
@@ -313,6 +316,14 @@ private:
     // Set once the transport is gone or untrustworthy; CLEARED again by
     // setTransport(), which is how a reconnect revives the client.
     bool m_closed = false;
+    // Set when the BYTE STREAM has been declared untrustworthy: an unframed or
+    // over-cap line means we can no longer tell where the next frame begins, so
+    // whatever else the peer has queued is not a message any more. It exists
+    // only to suppress onTransportClosed()'s last-gasp drain, which otherwise
+    // reads and routes those very bytes back — and, because each 16 MiB chunk
+    // trips the cap again, re-enters onTransportClosed() once per chunk. Cleared
+    // by setTransport(), like m_closed.
+    bool m_streamUntrusted = false;
     // Set at the top of ~CodeharbordClient and never cleared. m_closed alone is
     // not enough during teardown precisely because setTransport() clears it: a
     // callback being failed by the destructor that reacts with a reconnect would

@@ -142,13 +142,15 @@ void InternalUrlMap::release(const QString &internalUrl)
 int InternalUrlMap::size() const
 {
     QMutexLocker lock(&m_mutex);
-    return m_idToFile.size();
+    // QHash::size() is qsizetype; the cap these are compared against is an int,
+    // so the narrowing is stated rather than left to an implicit conversion.
+    return static_cast<int>(m_idToFile.size());
 }
 
 int InternalUrlMap::retainedCount() const
 {
     QMutexLocker lock(&m_mutex);
-    return m_pins.size();
+    return static_cast<int>(m_pins.size());
 }
 
 void InternalUrlMap::touch(const QString &id) const
@@ -477,18 +479,22 @@ void InternalUrlSchemeHandler::requestStarted(QWebEngineUrlRequestJob *job)
         return;
     }
 
-    if (!m_client) {
-        refuse(Failure::NoClient, QWebEngineUrlRequestJob::RequestFailed);
-        return;
-    }
-
     // Remote path for the read: a remote file:// URL's path is the server path.
+    // Checked BEFORE the client, so that a malformed address is reported as the
+    // malformed address it is. With the two the other way round, every refusal
+    // while offline came back as "no remote client is connected" — which for a
+    // URL naming no file at all sent the user looking at their connection.
     const QString localPath = fileUrl.toLocalFile();
     const QString path = localPath.isEmpty() ? fileUrl.path() : localPath;
     if (path.isEmpty()) {
         // A file URL with no path at all names nothing on the server; asking
         // the file service to read "" would only produce a confusing error.
         refuse(Failure::EmptyPath, QWebEngineUrlRequestJob::UrlNotFound);
+        return;
+    }
+
+    if (!m_client) {
+        refuse(Failure::NoClient, QWebEngineUrlRequestJob::RequestFailed);
         return;
     }
 

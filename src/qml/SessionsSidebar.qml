@@ -758,8 +758,12 @@ Rectangle {
             height: 24
             padding: 0
             focusPolicy: Qt.StrongFocus
-            // A box glyph is intentionally different from the pin star.
-            text: "\u25a3"
+            // A box glyph is intentionally different from the pin star, but it
+            // still has to say whether the filter is ON: this button used to
+            // draw the same character in both states, so the only way to find
+            // out whether archived rows were being hidden was to hover it. The
+            // filled/outline pair is the same encoding the pin star uses.
+            text: sidebar.showArchived ? "\u25a3" : "\u25a1"
 
             readonly property string actionText:
                 sidebar.showArchived ? qsTr("Hide archived sessions")
@@ -882,7 +886,7 @@ Rectangle {
                                                 || sidebar.linkState === "connected"
         readonly property bool allSessionsArchived:
             !sidebar.pinnedOnly && !sidebar.showArchived
-            && app && app.sessionsModel
+            && typeof app !== "undefined" && app && app.sessionsModel
             && app.sessionsModel.hasSessions
             && !app.sessionsModel.hasUnarchivedSessions
         Label {
@@ -1008,7 +1012,12 @@ Rectangle {
 
     DelegateModel {
         id: groupsDelegateModel
-        model: app.sessionsModel
+        // Guarded like every other host lookup in this file. A bare `app` here
+        // is not short-circuited by the `&&` chain above it — an undefined name
+        // throws on evaluation — so the two unguarded references in this file
+        // raised a ReferenceError apiece the moment a harness (or a future
+        // host) built the sidebar without the context property.
+        model: (typeof app !== "undefined" && app) ? app.sessionsModel : null
 
         delegate: Column {
             id: groupBlock

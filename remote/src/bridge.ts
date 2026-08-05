@@ -30,6 +30,36 @@ import {
 // smaller than codeharbord's 16 MiB transport cap: that one has to carry whole
 // file contents, this one never does.
 export const MAX_BRIDGE_LINE_BYTES = 1024 * 1024;
+
+/**
+ * Does one serialized JSONL message fit inside the relay's line bound?
+ *
+ * CALLER REQUIREMENT: pass the JSON text WITHOUT its trailing newline —
+ * `JSON.stringify(message)`, never `` `${JSON.stringify(message)}\n` ``. The
+ * newline is FRAMING and is deliberately outside the bound, because that is
+ * what the input framer measures: it counts the bytes before the newline and
+ * never the newline itself. Handing this the framed line makes the caller one
+ * byte stricter than the relay, which is exactly the disagreement this function
+ * exists to remove.
+ *
+ * Exported so a PRODUCER — the harness hooks, which serialize their own message
+ * and write it themselves — can ask the relay whether a line will be accepted
+ * instead of re-deriving the rule from MAX_BRIDGE_LINE_BYTES and its own idea
+ * of the framing. Two copies of that arithmetic is precisely the drift this
+ * predicate exists to prevent, and a producer that guesses wrong writes a line
+ * the relay is guaranteed to refuse while reporting success. A producer that
+ * gets `false` should shed its OPTIONAL fields (the free-text summary, the
+ * metadata bag) and ask again, rather than write a line that cannot arrive.
+ *
+ * It also fixes an off-by-one the two in-tree callers disagreed on: makeStreamSink
+ * measured the framed line (payload PLUS newline) against the same constant the
+ * framer applies to the payload alone, so a message of exactly
+ * MAX_BRIDGE_LINE_BYTES was refused on the way out and accepted on the way in.
+ */
+export function bridgeLineFits(payload: string): boolean {
+    return Buffer.byteLength(payload) <= MAX_BRIDGE_LINE_BYTES;
+}
+
 const BRIDGE_LOCK_SUFFIX = ".lock";
 
 function bridgeLockPath(socketPath: string): string {
@@ -123,11 +153,38 @@ function acquireBridgeLock(socketPath: string): string {
 // later paused for output back-pressure is never mistaken for an idle one.
 export const BRIDGE_HANDSHAKE_TIMEOUT_MS = 30_000;
 
+// Ceiling on producer connections the bridge holds open at once; see the
+// server.maxConnections assignment in startBridge for why a handshake timeout
+// alone does not bound them.
+export const MAX_BRIDGE_CONNECTIONS = 256;
+
+// Format revision of the PRODUCER-to-relay message, i.e. the line a harness
+// hook writes into the socket. The relay's own output already carries a version
+// the desktop client checks strictly (CH_EVENT_VERSION on AgentEvent); this is
+// the same protection for the other half of the path, which had none.
+//
+// The hook is the component most likely to be out of step: a user pastes its
+// path into their assistant's configuration once, and that path may keep
+// pointing at a months-old checkout for as long as the configuration lives. A
+// future field rename would reach this relay as a message that parses, fails a
+// guard, and produces nothing — indistinguishable from an event that simply
+// carried no state change. With a declared revision the mismatch is a distinct,
+// nameable condition instead.
+//
+// OPTIONAL ON THE WIRE, and that is a compatibility guarantee, not an
+// oversight: every hook installed today sends no `version` at all, and an
+// ABSENT version means "the current revision" forever. Only a message that
+// declares a revision this relay does not implement is rejected. So raising
+// this number is a decision to stop accepting explicitly-old producers, and it
+// can never orphan an unversioned one.
+export const BRIDGE_MESSAGE_VERSION = 1;
+
 // Wire format for a single line arriving on the bridge socket. Every field is
 // optional and `unknown`: this describes what a producer is SUPPOSED to send,
 // and a decoded JSON object is free to omit or mistype any of it — which is
 // what the guards in processBridgeLine are for.
 interface BridgeMessage {
+    version?: unknown;
     harness?: unknown;
     devSessionId?: unknown;
     terminalId?: unknown;
@@ -159,6 +216,15 @@ export function processBridgeLine(line: string): AgentEvent | null {
     // An array or a primitive is likewise not a message.
     if (!isPlainObject(decoded)) return null;
     const message = decoded as BridgeMessage;
+
+    // An ABSENT version is the current revision — that is what keeps every hook
+    // installed before this field existed working unchanged. A version that IS
+    // declared must be one this relay implements; anything else is a producer
+    // speaking a format whose fields this code would misread, so refuse it
+    // rather than map it against the wrong shape.
+    if (message.version !== undefined && message.version !== BRIDGE_MESSAGE_VERSION) {
+        return null;
+    }
 
     if (
         !isHarness(message.harness) ||
@@ -386,20 +452,24 @@ export function makeStreamSink(out: NodeJS.WritableStream): EventSink {
         // source. Keep this guard for custom callers so a full output stream
         // can never be fed another event synchronously.
         if (paused.has(source)) return;
-        let line: string;
+        let payload: string;
         try {
-            line = `${JSON.stringify(event)}\n`;
+            payload = JSON.stringify(event);
         } catch {
             source.destroy();
             return;
         }
-        if (Buffer.byteLength(line) > MAX_BRIDGE_LINE_BYTES) {
+        // The shared predicate, not a second copy of the arithmetic: it
+        // measures the payload without the framing newline, exactly as the
+        // framer on the input side does.
+        if (!bridgeLineFits(payload)) {
             process.stderr.write(
                 `codeharbor-bridge: dropping an event that exceeds the ${MAX_BRIDGE_LINE_BYTES}-byte frame bound\n`,
             );
             source.destroy();
             return;
         }
+        const line = `${payload}\n`;
         let ok: boolean;
         try {
             ok = out.write(line);
@@ -471,6 +541,16 @@ export async function startBridge(
         });
         socket.on("error", () => socket.destroy());
     });
+    // Hard ceiling on producers held open at once. BRIDGE_HANDSHAKE_TIMEOUT_MS
+    // only reclaims a connection that has sent NOTHING; a producer that sends
+    // one byte and then hangs keeps its file descriptor forever, and enough of
+    // those make accept() fail with EMFILE — after which no producer can
+    // connect at all and agent status silently stops updating, with no bound
+    // on the memory the accepted sockets hold either. A real producer connects,
+    // writes one line and ends within milliseconds, so 256 concurrent is orders
+    // of magnitude of headroom; past it Node closes the newcomer immediately
+    // rather than letting the accumulation take the whole relay down.
+    server.maxConnections = MAX_BRIDGE_CONNECTIONS;
     fs.mkdirSync(path.dirname(socketPath), { recursive: true, mode: 0o700 });
     const lockPath = acquireBridgeLock(socketPath);
     let lockReleased = false;
@@ -558,6 +638,19 @@ if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {
                 if (fs.lstatSync(socketPath).isSocket()) fs.unlinkSync(socketPath);
             } catch {
                 // Already unlinked by server.close(), or never created.
+            }
+            // The ownership lock too. server.close() is ASYNCHRONOUS, so the
+            // 'close' event that normally releases it never fires before the
+            // process.exit() below: every signalled stop used to leave a
+            // <socket>.lock behind. The next run then has to fall back to
+            // probing the recorded pid, and once the operating system recycles
+            // that pid onto any live process the bridge refuses to start at all
+            // with "address already in use" — permanently, until somebody
+            // deletes the file by hand.
+            try {
+                fs.unlinkSync(bridgeLockPath(socketPath));
+            } catch {
+                // Already released by server.close(), or never acquired.
             }
             process.exit(0);
         };

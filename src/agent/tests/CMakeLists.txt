@@ -7,6 +7,13 @@ target_link_libraries(tst_agentmonitor PRIVATE
     ch_agent
 )
 
+# Repo root so harnessWireWordsMatchRemoteEventsTs can read the authoritative
+# HARNESSES list out of remote/src/events.ts and check that the client accepts
+# every harness the daemon may name. Same mechanism as src/models/tests.
+target_compile_definitions(tst_agentmonitor PRIVATE
+    CH_REPO_ROOT="${CMAKE_SOURCE_DIR}"
+)
+
 add_test(NAME tst_agentmonitor COMMAND tst_agentmonitor)
 
 # LIVE gate (docs/PLAN.md A): the whole agent-awareness chain against a real

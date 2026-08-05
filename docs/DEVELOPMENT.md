@@ -91,9 +91,9 @@ in the top-level `CMakeLists.txt`):
 | Compiler + make | `build-essential` |
 | CMake + Ninja generator | `cmake`, `ninja-build` |
 | `pkg_check_modules(libssh)` (`ch_libssh`) | `pkg-config`, `libssh-dev` |
-| Qt6 Core / Gui / Network | `qt6-base-dev` |
+| Qt6 Core / Gui / Network (and **Test**, when `CODEHARBOR_BUILD_TESTS=ON`) | `qt6-base-dev` |
 | Qt6 Qml / Quick / **QuickControls2** | `qt6-declarative-dev` |
-| Qt6 **WebEngineQuick** | `qt6-webengine-dev` |
+| Qt6 **WebEngineCore** / **WebEngineQuick** | `qt6-webengine-dev` |
 | Qt6 **WebChannel** | `qt6-webchannel-dev` |
 | `qt_add_qml_module` / `moc` / `qmltc` tooling | `qt6-base-dev-tools`, `qt6-declarative-dev-tools`, `qt6-webengine-dev-tools` |
 | Runtime QML imports for the three-region UI | `qml6-module-qtquick*`, `qml6-module-qtwebengine` |
@@ -128,7 +128,11 @@ Node 23.6+).
   with `-DCMAKE_PREFIX_PATH=$(brew --prefix qt)`.
 - **Cross-platform:** the official [Qt online installer](https://www.qt.io/download-qt-installer)
   or [`aqtinstall`](https://github.com/miurahr/aqtinstall) (what CI uses) work on
-  all three OSes.
+  all three OSes. With either of those, select `qtwebengine`, `qtwebchannel` **and
+  `qtpositioning`**: `Qt6WebEngineCore` hard-depends on Qt Positioning, so without
+  it `find_package(Qt6 COMPONENTS WebEngineCore)` fails at configure time even
+  though `Qt6WebEngineCoreConfig.cmake` is installed. Distribution packages pull
+  it in as a dependency, so the `apt`/`dnf`/`pacman` lines above need nothing extra.
 
 CI provisions the same set on **all three release platforms** — see
 [`.github/workflows/ci.yml`](../.github/workflows/ci.yml). Its `client` job is a
@@ -512,9 +516,9 @@ git push --tags`) or via the **Run workflow** button (manual `workflow_dispatch`
 
 | Job | Runner | Output artifact | Deploy tool |
 |---|---|---|---|
-| `linux` | `ubuntu-latest` | `CodeHarbor-*.AppImage` | linuxdeploy + qt plugin |
+| `linux` | `ubuntu-latest` | `CodeHarbor-<version>-x86_64.AppImage` | linuxdeploy + qt plugin |
 | `windows` | `windows-latest` | `codeharbor-windows/` (`codeharbor.exe` + Qt/libssh DLLs) and `CodeHarbor-<version>-windows-x64-setup.exe` | `windeployqt`, then Inno Setup (`packaging/windows/codeharbor.iss`) |
-| `macos` | `macos-latest` | `codeharbor.dmg` (bundled `.app`) | `macdeployqt` |
+| `macos` | `macos-latest` | `CodeHarbor-<version>-macos-<arch>.dmg` (bundled `.app`; `<arch>` is the runner's `uname -m`) | `macdeployqt` |
 | `remote` | `ubuntu-latest` | `codeharbor-remote.tar.gz` (`dist/` + `sql/` + `package.json`) | `tsc` + tar |
 
 The `publish` job zips the Windows directory into `codeharbor-windows.zip`, then

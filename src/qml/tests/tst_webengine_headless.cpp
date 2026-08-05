@@ -105,8 +105,12 @@ void TstWebEngineHeadless::loadsAndScriptsAPageHeadless_data()
         << QUrl(QStringLiteral("data:text/html,<html><head><title>codeharbor-probe</title>"
                                "</head><body><p>ok</p></body></html>"));
 
-    // file: — how the app-owned Monaco bundle (SPEC 8.1) is actually served
-    // before it is packaged into qrc, so this is the case that matters.
+    // file: — a page loaded off the local filesystem. The app's own Monaco and
+    // xterm bundles ship inside the binary and are served from qrc:, so this
+    // row is not that path; it is the harder one, because a filesystem
+    // document exercises Chromium's sandbox and file access in a way a data:
+    // URL never does, and a recipe that cannot do it is a recipe that will
+    // surprise the first local page anything here tries to open.
     auto *page = new QTemporaryFile(QDir::tempPath() + QStringLiteral("/codeharbor-probe-XXXXXX.html"),
                                     QCoreApplication::instance());
     if (page->open()) {

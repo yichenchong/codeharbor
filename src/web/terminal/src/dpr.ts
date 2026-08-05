@@ -9,6 +9,11 @@
 // Imported rather than restated: two copies of "1 to 4" drift, and a
 // preference the settings layer accepted but this one clamped differently
 // would render at a ratio the diagnostics then report as the user's choice.
+// The specifier carries its .ts extension, and must: these modules are loaded
+// DIRECTLY by node --test (see test/dpr.test.ts), and node's ESM resolver does
+// no extension guessing, so an extension-less specifier resolves to nothing.
+// esbuild and tsc (allowImportingTsExtensions) both accept this form, so it is
+// the one that works in every consumer.
 import {
     kMaxTerminalPixelRatio,
     kMinTerminalPixelRatio,

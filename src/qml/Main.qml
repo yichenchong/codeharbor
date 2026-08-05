@@ -368,13 +368,24 @@ ApplicationWindow {
                 window.persistSplitRatiosForSession("viewer", sessionId,
                                                     generation, pathIndexes,
                                                     ratios)
+            // Persist WHAT a pane is showing, so reopening a Dev Session
+            // restores the files the user had open instead of a set of blank
+            // panes. The write deliberately does not re-publish the tree, so
+            // recording this cannot rebuild the very pane that just opened the
+            // file.
+            //
+            // Only the STAMPED form exists here. A pane reporting a file it has
+            // opened is a DELAYED report — the read that produced it may land
+            // after the user has moved to another Dev Session — so it must
+            // carry the session and layout generation it belonged to. The
+            // region's unstamped `paneUrlReported` is emitted only when
+            // `hostStampsWrites` is false, which is the standalone-component
+            // test configuration; this host sets it true, so a handler for it
+            // here would be dead code that quietly reintroduced the unstamped
+            // path the next time somebody copied it.
             onPaneUrlReportedForSession: (sessionId, generation, paneId, url) =>
                 window.persistPaneUrlForSession(sessionId, generation,
                                                 "viewer", paneId, url)
-            // (SPEC 4.5) so the proportions the user set survive a reopen; the
-            // regions already restore them.
-            onSplitRatiosAdjusted: (pathIndexes, ratios) =>
-                window.persistSplitRatios("viewer", pathIndexes, ratios)
             // The region reports the pane the user last interacted with; record
             // it so pane commands act on THAT pane instead of the region's first
             // leaf. The empty value is deliberately NOT filtered: a focused pane
@@ -384,16 +395,6 @@ ApplicationWindow {
                                         && app.activeSessionId.length > 0)
                                         app.uiState.setSelectedPane(app.activeSessionId,
                                                                     focusedPaneId)
-            // Persist WHAT a pane is showing, so reopening a Dev Session restores
-            // the files the user had open instead of a set of blank panes.
-            // setPaneUrl deliberately does not re-publish the tree, so recording
-            // this cannot rebuild the very pane that just opened the file.
-            onPaneUrlReported: (paneId, url) => {
-                if (app.layouts && app.activeSessionId.length > 0)
-                    app.layouts.setPaneUrl("viewer", paneId, url);
-            }
-            onOpenInNewPaneRequested: (paneId, url, kind) =>
-                window.openViewerInNewPane(paneId, url, kind)
             onMessageRequested: (message) => window.notifyUser(message)
             onOpenInNewPaneRequestedForSession: (sessionId, generation,
                                                  paneId, url, kind) =>
@@ -431,16 +432,19 @@ ApplicationWindow {
                 window.persistSplitRatiosForSession("terminal", sessionId,
                                                     generation, pathIndexes,
                                                     ratios)
-            onPaneTitleReportedForSession: (sessionId, generation, paneId, title) =>
-                app.layouts.setPaneTitleForSession(sessionId, generation,
-                                                   "terminal", paneId, title)
+            // Guarded like every other app.layouts use here: `layouts` is an
+            // injected QPointer that is null until setServices() runs, and a
+            // pane can report a title before then.
+            onPaneTitleReportedForSession: (sessionId, generation, paneId, title) => {
+                if (app.layouts && String(sessionId).length > 0)
+                    app.layouts.setPaneTitleForSession(sessionId, generation,
+                                                       "terminal", paneId, title);
+            }
             // The pane asks only after its AppDialog confirmation. The stamped
             // path also rejects a callback from an old session or layout.
             onKillTerminalRequested: (paneId) => window.killActiveTerminal(paneId)
             onKillTerminalRequestedForSession: (sessionId, generation, paneId) =>
                 window.killActiveTerminalForSession(sessionId, generation, paneId)
-            onSplitRatiosAdjusted: (pathIndexes, ratios) =>
-                window.persistSplitRatios("terminal", pathIndexes, ratios)
             // Persist the display title without republishing the tree: the
             // terminal item already applied it locally, and its identity is
             // still the unchanged server row id in the leaf. Stamp the write
@@ -527,6 +531,13 @@ ApplicationWindow {
         height: errorLabel.implicitHeight + 20
         radius: Theme.radiusMedium
         color: Theme.danger
+
+        // The toast is the ONLY place a shell-level failure is reported, and a
+        // bare Rectangle carries no accessibility at all: without this a screen
+        // reader never learns that anything went wrong. AlertMessage is the
+        // role for a transient notification that is not a dialog.
+        Accessible.role: Accessible.AlertMessage
+        Accessible.name: errorLabel.text
 
         Behavior on opacity { NumberAnimation { duration: 200 } }
 
@@ -771,7 +782,7 @@ ApplicationWindow {
             window.notifyUser(qsTr("Could not open that target in a new pane."));
             return;
         }
-        viewerRegion.noteFocus(newPaneId);
+        viewerRegion.focusPane(newPaneId);
     }
 
     function openViewerInNewPaneForSession(sessionId, generation, sourcePaneId,
@@ -791,7 +802,7 @@ ApplicationWindow {
             window.notifyUser(qsTr("Could not open that target in a new pane."));
             return;
         }
-        viewerRegion.noteFocus(newPaneId);
+        viewerRegion.focusPane(newPaneId);
     }
     // Stamped region callbacks are the production path. C++ drops a callback
     // whose session or generation no longer matches, before it can target a
@@ -849,6 +860,13 @@ ApplicationWindow {
         }
         const target = paneId === undefined
                      ? window.targetPaneId(region) : paneId;
+        // UNSTAMPED on purpose. This runs SYNCHRONOUSLY, inside the keystroke
+        // or menu click that asked for the split, so "whatever session and
+        // layout generation are current right now" IS the answer the user
+        // meant — there is no window in which they could have moved on. The
+        // stamped `splitPaneForSession` is for the DELAYED path, where a pane
+        // reports a gesture that may land after the session changed; do not
+        // convert this call, and do not copy it into a delayed path.
         app.layouts.splitPane(region, target, orientation);
     }
 
@@ -860,6 +878,8 @@ ApplicationWindow {
             window.notifyUser(qsTr("Select a Dev Session before closing a pane."));
             return;
         }
+        // Synchronous command: see splitActivePane() above for why the
+        // unstamped entry point is the correct one here.
         app.layouts.closePane(region, window.targetPaneId(region));
     }
 
@@ -881,6 +901,8 @@ ApplicationWindow {
             window.closeActivePane(region);
             return;
         }
+        // Synchronous command: see splitActivePane() above for why the
+        // unstamped entry point is the correct one here.
         app.layouts.closePane(region, paneId);
     }
 
@@ -890,6 +912,9 @@ ApplicationWindow {
     function persistSplitRatios(region, pathIndexes, ratios) {
         if (!app.layouts || app.activeSessionId.length === 0)
             return;
+        // Synchronous: this is called while the drag that produced the ratios
+        // is still in the user's hands, so the current session and generation
+        // are the right ones. See splitActivePane() for the full reasoning.
         app.layouts.setRatios(region, pathIndexes, ratios);
     }
 

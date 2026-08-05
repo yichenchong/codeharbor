@@ -78,7 +78,22 @@ AppController::AppController(CodeharbordClient* client, QObject* parent)
             [this] { restoreActiveSession(); });
 }
 
-AppController::~AppController() = default;
+AppController::~AppController()
+{
+    // Signal connections bound to `this` are severed by ~QObject, but the
+    // pool's host-key and credential policies are NOT connections: they are
+    // plain std::functions the pool stores, and the pool outlives this
+    // controller (main.cpp declares it first, so it is destroyed last). Left
+    // behind, they are lambdas holding a QPointer that is now null, so every
+    // later handshake runs through a callback that can only ever answer
+    // "reject" - which is the pool's own default anyway, only reached the slow
+    // way and with a dead observer wired into it. Hand the pool its default
+    // back explicitly.
+    if (m_pool) {
+        m_pool->setHostKeyCallback({});
+        m_pool->setCredentialCallback({});
+    }
+}
 
 void AppController::setServerId(const QString& serverId)
 {
@@ -256,6 +271,16 @@ void AppController::setConnection(SshConnectionPool* pool,
         disconnect(m_pool, nullptr, this, nullptr);
     if (m_profiles)
         disconnect(m_profiles, nullptr, this, nullptr);
+    // The pool's host-key and credential policies are std::functions, not
+    // signal connections, so disconnect() above does not touch them. A pool we
+    // are letting go of must not keep callbacks that reach back into this
+    // controller: SessionBootstrap's reconnect ladder re-handshakes through
+    // whatever is installed, and a pool we no longer drive could otherwise
+    // overwrite the pending fingerprint of an attempt running on the NEW pool.
+    if (m_pool && m_pool != pool) {
+        m_pool->setHostKeyCallback({});
+        m_pool->setCredentialCallback({});
+    }
 
     m_pool = pool;
     m_bootstrap = bootstrap;
@@ -367,10 +392,7 @@ void AppController::setConnection(SshConnectionPool* pool,
         // wires us before the first connect, but a late injection is a valid
         // test and reconfiguration path; without this read-back the signal
         // that published the current state has already been missed.
-        connect(m_bootstrap, &SessionBootstrap::stateChanged, this,
-                [mirrorState](SessionBootstrap::State state) {
-                    mirrorState(state);
-                });
+        connect(m_bootstrap, &SessionBootstrap::stateChanged, this, mirrorState);
         mirrorState(m_bootstrap->state());
         if (!self)
             return;
@@ -1356,8 +1378,18 @@ void AppController::refresh()
             // once the call it is meant to guard has already returned has
             // nothing left to protect.
             for (const HarnessRegistration& registration : registrations) {
-                if (!self || !self->m_agentMonitor)
+                if (!self)
                     return;
+                // The monitor vanishing mid-loop stops the REGISTRATIONS, but
+                // must not abandon the rest of this callback. m_lastNodes was
+                // already replaced above, and the sidebar has not been rebuilt
+                // from it yet: returning here would leave every session name,
+                // subtitle, group name and collapsed flag from the PREVIOUS
+                // tree on screen until some later refresh, and would skip
+                // dropActiveSessionIfGone() and `refreshed` (which is what
+                // drives restoreActiveSession) with it.
+                if (!self->m_agentMonitor)
+                    break;
                 self->m_agentMonitor->setTerminalHarness(
                     registration.devSessionId, registration.terminalPaneId,
                     registration.harness);

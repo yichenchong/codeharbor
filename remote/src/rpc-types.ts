@@ -104,7 +104,20 @@ export interface WatchEvent {
 }
 
 // Directory listing (SPEC 7.5 / 8.3). Added to the catalog for the viewer
-// workstream's directory viewer; entries are unordered (the client sorts).
+// workstream's directory viewer.
+//
+// ORDERING IS PART OF THE CONTRACT: `entries` arrives sorted ascending by raw
+// file NAME, compared as byte-for-byte JavaScript strings — not by locale, not
+// by kind, not with directories first. listDirectory (files.ts) sorts before it
+// answers so one directory always has one wire representation, and a test in
+// remote/test/files.test.ts pins that order. This comment used to say the
+// entries were unordered and the client had to sort them, which stopped being
+// true when that sort landed: a client author trusting it would either add a
+// second, redundant sort or assume the order carries no meaning and reshuffle a
+// listing that was already canonical. A client that wants a DIFFERENT
+// presentation order (directories first, case-insensitive, locale-aware) still
+// sorts for itself — what it must not assume is that the server order is
+// arbitrary.
 export interface ListDirectoryParams {
     path: string;
 }
