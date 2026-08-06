@@ -293,9 +293,9 @@ Rectangle {
     // nothing about what to change.
     function validationMessage() {
         if (EndpointField.hasRejectedCharacters(hostField.text))
-            return qsTr("The host cannot contain spaces or line breaks.");
+            return qsTr("The host cannot contain spaces, line breaks or control characters.");
         if (EndpointField.hasRejectedCharacters(userField.text))
-            return qsTr("The user name cannot contain spaces or line breaks.");
+            return qsTr("The user name cannot contain spaces, line breaks or control characters.");
         if (root.formValid())
             return "";
         return qsTr("Host, user and a port in 1-65535 are required.");

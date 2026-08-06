@@ -1159,9 +1159,9 @@ Rectangle {
                     wrapMode: Text.WordWrap
                     visible: root.selectedProfileId.length > 0 && !root.profileValid()
                     text: EndpointField.hasRejectedCharacters(root.profileHost)
-                          ? qsTr("The host cannot contain spaces or line breaks; this edit will not be saved.")
+                          ? qsTr("The host cannot contain spaces, line breaks or control characters; this edit will not be saved.")
                           : EndpointField.hasRejectedCharacters(root.profileUser)
-                            ? qsTr("The user name cannot contain spaces or line breaks; this edit will not be saved.")
+                            ? qsTr("The user name cannot contain spaces, line breaks or control characters; this edit will not be saved.")
                             : qsTr("Host, user and a port in 1-65535 are required; edits are not saved until all three are filled in.")
                     color: Theme.warning
                     font.pixelSize: Theme.fontSizeSmall
