@@ -11,34 +11,59 @@ namespace {
 // sessions eligible for display, while pinnedOnly narrows it to pinned rows.
 //
 // Group visibility follows from that, and the two cases are NOT the same:
-//   * a group that has no sessions at all is a container the user just made
-//     and is about to fill, so it stays visible - except in pinned-only mode,
-//     where it has nothing pinned under it and showing it would contradict the
-//     filter's own promise;
 //   * a group whose every session is hidden by a filter drops out entirely.
 //     That is what lets the sidebar answer an all-archived workspace with one
 //     clear "All your sessions are archived" panel (it keys off rowCount() == 0
 //     plus hasSessions(); see SessionsSidebar.qml) instead of a list of group
 //     headers with nothing under them.
+//   * a group that has no sessions at all is a container the user just made
+//     and is about to fill, so it normally stays visible. Two things take it
+//     away:
+//       - pinned-only mode, where it has nothing pinned under it and showing
+//         it would contradict the filter's own promise;
+//       - a filter hiding EVERY session in the workspace. An empty group left
+//         behind here would keep rowCount() at 1, and the explanation panel
+//         above never appears: the user is shown one bare group header and no
+//         hint that their sessions are merely filtered out. A workspace with
+//         no sessions AT ALL is deliberately not that case - nothing is being
+//         hidden, so there is nothing to explain, and the group the user just
+//         made must stay on screen.
 QVector<GroupRow> filteredGroups(const QVector<GroupRow> &source,
                                  bool pinnedOnly, bool showArchived)
 {
+    const auto hidden = [pinnedOnly, showArchived](const SessionRow &session) {
+        if (pinnedOnly && !session.session.pinned)
+            return true;
+        return !showArchived && session.session.archived;
+    };
+
+    // Decided before anything is copied: whether an empty group survives is a
+    // property of the WHOLE tree, not of the group itself.
+    bool sourceHasSessions = false;
+    bool anySessionVisible = false;
+    for (const GroupRow &group : source) {
+        for (const SessionRow &session : group.sessions) {
+            sourceHasSessions = true;
+            if (!hidden(session)) {
+                anySessionVisible = true;
+                break;
+            }
+        }
+    }
+    const bool keepEmptyGroups =
+        !pinnedOnly && (anySessionVisible || !sourceHasSessions);
+
     QVector<GroupRow> filtered;
     filtered.reserve(source.size());
     for (const GroupRow &group : source) {
         if (group.sessions.isEmpty()) {
-            if (!pinnedOnly)
+            if (keepEmptyGroups)
                 filtered.append(group);
             continue;
         }
         GroupRow visible = group;
         visible.sessions.erase(
-            std::remove_if(visible.sessions.begin(), visible.sessions.end(),
-                           [pinnedOnly, showArchived](const SessionRow &session) {
-                               if (pinnedOnly && !session.session.pinned)
-                                   return true;
-                               return !showArchived && session.session.archived;
-                           }),
+            std::remove_if(visible.sessions.begin(), visible.sessions.end(), hidden),
             visible.sessions.end());
         if (!visible.sessions.isEmpty())
             filtered.append(std::move(visible));

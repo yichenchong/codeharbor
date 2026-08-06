@@ -25,6 +25,11 @@
 //     and the file:// URL the viewer stack passes around, in BOTH directions, and
 //     the two directions have to be exact inverses. They are the module's only
 //     copy of that rule, and getting it wrong reads the wrong remote file.
+//   * the ENDPOINT FIELD gate — EndpointField.js is the client-side copy of the
+//     rule ServerProfiles::isUsableEndpointField() enforces on a saved profile's
+//     host and login name. It decides whether Save is live, so a copy that
+//     disagrees with the store tells the user the server was saved and then no
+//     row appears.
 //
 // Everything runs headless (offscreen QPA + software Quick backend, pinned by
 // the ctest registration). Key events are posted to the QQuickView itself, so
@@ -421,6 +426,11 @@ private slots:
     // a file:// URL, in both directions.
     void remotePathAndFileUrlAreExactInverses();
     void remotePathLeavesANonFileAddressAlone();
+
+    // EndpointField.js: the module's copy of the store's host/user rule, in the
+    // same shape as the RemotePath.js gate above.
+    void endpointFieldTrimsExactlyWhatTheStoreTrims();
+    void endpointFieldRefusesSeparatorsButNotHostnameGrammar();
 };
 
 void TstPalette::harnessLoadsPalette()
@@ -926,6 +936,143 @@ void TstPalette::remotePathLeavesANonFileAddressAlone()
     QCOMPARE(probe.call("toPath", QStringLiteral("/srv/repos/app")),
              QStringLiteral("/srv/repos/app"));
     QCOMPARE(probe.call("toPath", QString()), QString());
+}
+
+// ---------------------------------------------------------------------------
+// EndpointField.js
+//
+// The same treatment RemotePath.js gets, and for the same reason: this is the
+// module's only copy of a rule whose authority lives in C++
+// (ServerProfiles::isUsableEndpointField / ::sanitize). The two must agree
+// character for character, because the whole point of the copy is to refuse a
+// value BEFORE the user presses Save. A copy that is more permissive reports a
+// save the store silently drops; one that is stricter makes a legitimate
+// address — an IPv6 literal with a zone identifier — unstorable.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+class EndpointFieldProbe
+{
+public:
+    EndpointFieldProbe()
+    {
+        m_component.setData(
+            QByteArrayLiteral(
+                "import QtQml\n"
+                // Absolute qrc path: this document is synthetic, so a relative
+                // import has no directory to resolve against.
+                "import \"qrc:/qt/qml/CodeHarbor/EndpointField.js\" as EndpointField\n"
+                "QtObject {\n"
+                "    function trim(text) { return EndpointField.trim(text) }\n"
+                "    function usable(text) { return EndpointField.isUsable(text) }\n"
+                "    function rejected(text) { return EndpointField.hasRejectedCharacters(text) }\n"
+                "}\n"),
+            QUrl(QStringLiteral("qrc:/chtest/EndpointFieldProbe.qml")));
+        m_object.reset(m_component.create());
+    }
+
+    QObject *object() const { return m_object.get(); }
+    QString error() const { return m_component.errorString(); }
+
+    QString trimmed(const QString &text) const { return call("trim", text).toString(); }
+    bool usable(const QString &text) const { return call("usable", text).toBool(); }
+    bool rejected(const QString &text) const { return call("rejected", text).toBool(); }
+
+private:
+    QVariant call(const char *method, const QString &argument) const
+    {
+        QVariant result;
+        if (!m_object
+            || !QMetaObject::invokeMethod(m_object.get(), method, Q_RETURN_ARG(QVariant, result),
+                                          Q_ARG(QVariant, argument)))
+            return {};
+        return result;
+    }
+
+    QQmlEngine m_engine;
+    QQmlComponent m_component{&m_engine};
+    std::unique_ptr<QObject> m_object;
+};
+
+} // namespace
+
+// What the store trims is QString::trimmed(), i.e. QChar::isSpace() — and
+// nothing else. Trimming the whole rejected set instead (the C0/C1 controls
+// included) made this module disagree with the store on exactly the values it
+// exists to catch: "\x01box.local" trimmed to "box.local" here, so Save was
+// live and silent, while ServerProfiles::sanitize() trimmed nothing off it, saw
+// the control character and dropped the record.
+void TstPalette::endpointFieldTrimsExactlyWhatTheStoreTrims()
+{
+    const EndpointFieldProbe probe;
+    QVERIFY2(probe.object() != nullptr, qPrintable(probe.error()));
+
+    // The plumbing first: an ordinary host must come back usable, or every
+    // "refused" assertion below would pass for the wrong reason (an invoke that
+    // failed reads back as false).
+    QVERIFY2(probe.usable(QStringLiteral("box.local")),
+             "an ordinary host name was refused, so nothing below means anything");
+    QCOMPARE(probe.trimmed(QStringLiteral("box.local")), QStringLiteral("box.local"));
+
+    // Surrounding whitespace comes off and what is left is savable.
+    QCOMPARE(probe.trimmed(QStringLiteral("  box.local  ")), QStringLiteral("box.local"));
+    QCOMPARE(probe.trimmed(QStringLiteral("\tbox.local\n")), QStringLiteral("box.local"));
+    QVERIFY(probe.usable(QStringLiteral("  box.local  ")));
+    QVERIFY(!probe.rejected(QStringLiteral("  box.local  ")));
+
+    // A leading CONTROL character is not whitespace. Built with QChar rather
+    // than a \u escape: a universal-character-name below U+00A0 is ill-formed
+    // in C++20.
+    const QString controlPrefixed = QChar(0x0001) + QStringLiteral("box.local");
+    QCOMPARE(probe.trimmed(controlPrefixed), controlPrefixed);
+    QVERIFY2(!probe.usable(controlPrefixed),
+             "a host beginning with a control character was accepted here; the store trims "
+             "nothing off it and drops the record without a word");
+    QVERIFY2(probe.rejected(controlPrefixed),
+             "the sheet has no reason to show, so the refusal is silent");
+
+    // Empty is "you have not filled this in", not "this cannot be a host":
+    // the two are different sentences in front of a user, so neither answer may
+    // stand in for the other.
+    QVERIFY(!probe.usable(QString()));
+    QVERIFY(!probe.rejected(QString()));
+    QVERIFY(!probe.usable(QStringLiteral("   ")));
+    QVERIFY(!probe.rejected(QStringLiteral("   ")));
+}
+
+void TstPalette::endpointFieldRefusesSeparatorsButNotHostnameGrammar()
+{
+    const EndpointFieldProbe probe;
+    QVERIFY2(probe.object() != nullptr, qPrintable(probe.error()));
+
+    // The way a real user gets here: pasting a whole ssh command line into the
+    // host field. An interior separator is refused wherever it sits, and a tab
+    // or a non-breaking space is invisible in the field.
+    const QStringList refused{QStringLiteral("box.local -p 2222"),
+                              QStringLiteral("box\tlocal"),
+                              QStringLiteral("box\u00a0local"),
+                              QStringLiteral("al ice")};
+    for (const QString &value : refused) {
+        QVERIFY2(!probe.usable(value), qPrintable(QStringLiteral("accepted \"%1\"").arg(value)));
+        QVERIFY2(probe.rejected(value),
+                 qPrintable(QStringLiteral("refused \"%1\" with nothing to say about it")
+                                    .arg(value)));
+    }
+
+    // ...and the rule must NOT have turned into hostname grammar: ":", "%" and
+    // "@" stay legal, or an IPv6 literal with a zone identifier — a value people
+    // genuinely store — becomes unsavable.
+    const QStringList accepted{QStringLiteral("fe80::1%eth0"),
+                               QStringLiteral("  fe80::1%eth0  "),
+                               QStringLiteral("192.0.2.4"),
+                               QStringLiteral("user@name"),
+                               QStringLiteral("build-07.internal.example.com")};
+    for (const QString &value : accepted) {
+        QVERIFY2(probe.usable(value), qPrintable(QStringLiteral("refused \"%1\"").arg(value)));
+        QVERIFY2(!probe.rejected(value), qPrintable(value));
+    }
+    QCOMPARE(probe.trimmed(QStringLiteral("  fe80::1%eth0  ")), QStringLiteral("fe80::1%eth0"));
 }
 
 int main(int argc, char *argv[])

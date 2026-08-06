@@ -35,7 +35,7 @@ QByteArray jsonLine(const QJsonObject& obj)
     return QJsonDocument(obj).toJson(QJsonDocument::Compact) + '\n';
 }
 
-// An in-process QIODevice the test drives byte for byte. Three things a real
+// An in-process QIODevice the test drives byte for byte. Four things a real
 // socket cannot be made to do on demand live here:
 //  * queueSilently() followed by announceEof() delivers an end-of-stream while a
 //    COMPLETE frame is still sitting unread. Qt is free to pick that ordering on
@@ -44,6 +44,9 @@ QByteArray jsonLine(const QJsonObject& obj)
 //    observe exactly what one readyRead() of a multi-frame chunk does.
 //  * setShortWrite() makes write() report fewer bytes than it was handed — the
 //    truncated-frame case ch::SshChannelDevice::writeData() really can produce.
+//  * setStallRead() makes bytesAvailable() advertise bytes readData() then
+//    refuses to release, which is how a reader that treats that count as a
+//    promise is caught.
 // No Q_OBJECT: only inherited QIODevice signals are emitted, so no moc is needed.
 class ScriptedDevice : public QIODevice {
 public:
@@ -66,6 +69,13 @@ public:
         m_writeHook = std::move(hook);
     }
     void setShortWrite(bool on) { m_shortWrite = on; }
+    // Advertise queued bytes through bytesAvailable() but hand back NOTHING
+    // from readData(), which is all a QIODevice subclass has to do to make a
+    // reader that trusts bytesAvailable() spin. Real devices do it whenever
+    // their count includes something they will not release yet.
+    void setStallRead(bool on) { m_stallRead = on; }
+    // How many times the client has asked this device for bytes.
+    int readCalls() const { return m_readCalls; }
     // Everything the client has written since the last call, as raw wire bytes.
     QByteArray takeWritten() { return std::exchange(m_out, QByteArray()); }
 
@@ -78,6 +88,9 @@ public:
 protected:
     qint64 readData(char* data, qint64 maxSize) override
     {
+        ++m_readCalls;
+        if (m_stallRead)
+            return 0;
         const qint64 n = qMin<qint64>(maxSize, m_in.size());
         std::memcpy(data, m_in.constData(), static_cast<size_t>(n));
         m_in.remove(0, n);
@@ -96,6 +109,8 @@ protected:
     QByteArray m_out;
     std::function<void(const QByteArray&)> m_writeHook;
     bool m_shortWrite = false;
+    bool m_stallRead = false;
+    int m_readCalls = 0;
 };
 
 // The JSON-RPC ids of every `ping` frame the client has written since the last
@@ -240,6 +255,8 @@ private slots:
     void overCapLineStopsRoutingFurtherBytes();
     void pendingCountStaysNonNegativeDuringASweep();
     void decodeFileContentRejectsInvalidBase64();
+    void frameCapMeasuresThePayloadNotTheNewline();
+    void aDeviceAdvertisingBytesItNeverDeliversDoesNotSpin();
 
 private:
     void makePair();
@@ -446,21 +463,27 @@ void TstRpcClient::unknownAndDuplicateIdWarn()
     m_serverSide->flush();
     QTRY_COMPARE(spy.count(), 1);
 
-    // Duplicate id: a second response after the callback already fired.
-    bool fired = false;
+    // Duplicate id: a second response after the callback already fired. The
+    // warning is not the whole contract — the callback must NOT run a second
+    // time. A counter is what pins that; a bool cannot tell one dispatch from
+    // two, and a double dispatch is the failure that actually hurts (a caller
+    // that allocated per-response state releases it twice).
+    int fired = 0;
     const qint64 id = m_client->call(
         QStringLiteral("ping"), QJsonValue(),
-        [&](QJsonValue, std::optional<RpcError>) { fired = true; });
+        [&](QJsonValue, std::optional<RpcError>) { ++fired; });
     m_serverSide->write(
         jsonLine({{"jsonrpc", "2.0"}, {"id", id}, {"result", QJsonObject{}}}));
     m_serverSide->flush();
-    QTRY_VERIFY(fired);
+    QTRY_COMPARE(fired, 1);
 
     const qsizetype before = spy.count();
     m_serverSide->write(
         jsonLine({{"jsonrpc", "2.0"}, {"id", id}, {"result", QJsonObject{}}}));
     m_serverSide->flush();
     QTRY_COMPARE(spy.count(), before + 1);
+    QCOMPARE(fired, 1);
+    QCOMPARE(m_client->pendingCount(), qsizetype(0));
 }
 
 void TstRpcClient::pendingFailOnClose()
@@ -1906,6 +1929,30 @@ void TstRpcClient::errorWithoutDataYieldsUndefinedData()
     QCOMPARE(got->message, QStringLiteral("Invalid params"));
     QVERIFY(got->data.isUndefined());
     QVERIFY(got->data.toObject().isEmpty());
+
+    // And an EXPLICIT null is preserved as null, not folded into undefined. The
+    // two are documented as distinguishable (RpcError::data), and this is the
+    // only place the distinction is observable: a server that sends `data: null`
+    // said something, a server that omits it said nothing.
+    std::optional<RpcError> explicitNull;
+    bool firedNull = false;
+    const qint64 nullId = m_client->call(
+        QStringLiteral("file.stat"), QJsonObject{{"path", "/b"}},
+        [&](QJsonValue, std::optional<RpcError> err) {
+            explicitNull = err;
+            firedNull = true;
+        });
+    m_serverSide->write(
+        jsonLine({{"jsonrpc", "2.0"},
+                  {"id", nullId},
+                  {"error", QJsonObject{{"code", -32602},
+                                        {"message", "Invalid params"},
+                                        {"data", QJsonValue(QJsonValue::Null)}}}}));
+    m_serverSide->flush();
+    QTRY_VERIFY(firedNull);
+    QVERIFY(explicitNull.has_value());
+    QVERIFY(explicitNull->data.isNull());
+    QVERIFY(!explicitNull->data.isUndefined());
 }
 
 // The transport is owned by the CALLER, which may simply delete it — a
@@ -3078,6 +3125,154 @@ void TstRpcClient::pendingCountStaysNonNegativeDuringASweep()
                             .arg(observed)));
     QCOMPARE(observed, qsizetype(0));
     QCOMPARE(m_client->pendingCount(), qsizetype(0));
+}
+
+// The frame cap is a shared, cross-language number, and what it MEASURES is
+// part of that contract: the JSON payload alone, never the '\n' that frames it.
+// remote/test/rpc-mirror.test.ts pins both of the daemon's directions to that
+// rule; this is the same pin on the client's two directions, at the one byte
+// where a mistake shows. Off by one either way and a reply of exactly the cap —
+// which the daemon considers legal and will happily write — costs the user the
+// whole transport, every terminal and editor on it included.
+void TstRpcClient::frameCapMeasuresThePayloadNotTheNewline()
+{
+    // Deliberately restated rather than exported: kMaxLineBytes is private to
+    // CodeharbordClient.cpp on purpose (the mirror test scrapes it from there),
+    // so a test that shared the symbol could not catch a change to it.
+    constexpr qsizetype kCap = 16 * 1024 * 1024;
+
+    ScriptedDevice device;
+    m_client->setTransport(&device);
+    QSignalSpy warnSpy(m_client, &CodeharbordClient::protocolWarning);
+    QSignalSpy closedSpy(m_client, &CodeharbordClient::transportClosed);
+
+    // --- inbound: a payload of EXACTLY the cap is a legal frame -------------
+    qsizetype delivered = -1;
+    bool fired = false;
+    const qint64 id = m_client->call(
+        QStringLiteral("file.readFile"), QJsonObject{{"path", "/big"}},
+        [&](QJsonValue r, std::optional<RpcError> err) {
+            QVERIFY(!err.has_value());
+            delivered = r.toObject().value(QStringLiteral("content")).toString().size();
+            fired = true;
+        });
+
+    const QByteArray head = QByteArray("{\"jsonrpc\":\"2.0\",\"id\":") +
+                            QByteArray::number(id) + ",\"result\":{\"content\":\"";
+    const QByteArray tail("\"}}");
+    const qsizetype fill = kCap - head.size() - tail.size();
+    QVERIFY(fill > 0);
+    QByteArray frame = head + QByteArray(fill, 'x') + tail;
+    QCOMPARE(frame.size(), kCap);
+    device.deliver(frame + '\n');
+
+    QVERIFY2(fired, "a frame of exactly the cap was rejected");
+    QCOMPARE(delivered, fill);
+    QCOMPARE(warnSpy.count(), 0);
+    QCOMPARE(closedSpy.count(), 0);
+
+    // --- outbound: the same rule on the request side ------------------------
+    // Learn the id the next call() will mint: its digits are part of the frame
+    // whose size is being pinned, so the request cannot be sized without it.
+    const qint64 sizingId =
+        m_client->call(QStringLiteral("sizing"), QJsonValue(), nullptr) + 1;
+    device.takeWritten();
+    // The very shape call() builds, with an empty payload, so the difference
+    // between this and the real frame is exactly the filler. QJsonObject orders
+    // its keys, so both serializations agree on everything but that.
+    const qsizetype base =
+        QJsonDocument(QJsonObject{{"jsonrpc", "2.0"},
+                                  {"id", sizingId},
+                                  {"method", "file.writeFile"},
+                                  {"params", QJsonObject{{"content", QString()}}}})
+            .toJson(QJsonDocument::Compact)
+            .size();
+    const qsizetype outboundFill = kCap - base;
+    QVERIFY(outboundFill > 0);
+
+    const qint64 atCapId = m_client->call(
+        QStringLiteral("file.writeFile"),
+        QJsonObject{{"content", QString(outboundFill, QChar('x'))}}, nullptr);
+    QCOMPARE(atCapId, sizingId);
+    // Written in full: the payload at the cap, plus the newline the cap excludes.
+    QCOMPARE(device.takeWritten().size(), kCap + 1);
+    QCOMPARE(warnSpy.count(), 0);
+
+    // One byte of payload more and the request is refused before it is written.
+    int refused = 0;
+    m_client->call(QStringLiteral("file.writeFile"),
+                   QJsonObject{{"content", QString(outboundFill + 1, QChar('x'))}},
+                   [&](QJsonValue, std::optional<RpcError> err) {
+                       QVERIFY(err.has_value());
+                       ++refused;
+                   });
+    QCOMPARE(refused, 1);
+    QVERIFY(device.takeWritten().isEmpty());
+    QCOMPARE(warnSpy.count(), 1);
+    QCOMPARE(closedSpy.count(), 0); // one refused request is not a lost transport
+
+    // --- inbound: one byte over is the fault, and it costs the transport -----
+    QByteArray overCap = head + QByteArray(fill + 1, 'x') + tail;
+    QCOMPARE(overCap.size(), kCap + 1);
+    device.deliver(overCap + '\n');
+    QCOMPARE(closedSpy.count(), 1);
+    QVERIFY(warnSpy.count() >= 2);
+
+    m_client->setTransport(nullptr);
+}
+
+// bytesAvailable() is what a device ADVERTISES, not a promise it will hand those
+// bytes over. The reader takes one bounded chunk per call and re-posts itself
+// when the device still reports more, so a device that advertises bytes it never
+// releases used to make that re-post unconditional: the client re-entered
+// itself through the event queue forever, burning a core and starving every
+// other timer and socket in the process — including the heartbeat that would
+// otherwise have declared the transport dead. Progress is the precondition for
+// continuing, exactly as it already is inside the close path's drain loop.
+void TstRpcClient::aDeviceAdvertisingBytesItNeverDeliversDoesNotSpin()
+{
+    ScriptedDevice device;
+    m_client->setTransport(&device);
+
+    bool fired = false;
+    const qint64 id = m_client->call(
+        QStringLiteral("ping"), QJsonValue(),
+        [&](QJsonValue, std::optional<RpcError> err) {
+            QVERIFY(!err.has_value());
+            fired = true;
+        });
+
+    const QByteArray full =
+        jsonLine({{"jsonrpc", "2.0"}, {"id", id}, {"result", QJsonObject{}}});
+    const qsizetype half = full.size() / 2;
+
+    // Announced, but readData() hands back nothing while bytesAvailable() keeps
+    // reporting the queue.
+    device.setStallRead(true);
+    device.deliver(full.left(half));
+    const int afterAnnounce = device.readCalls();
+    QVERIFY2(afterAnnounce >= 1, "the client never even tried to read");
+    QVERIFY(device.bytesAvailable() > 0);
+
+    // One announcement costs a small constant number of read attempts. A reader
+    // that re-posts itself on advertised-but-undelivered bytes makes thousands
+    // in this window.
+    QTest::qWait(200);
+    const int spun = device.readCalls() - afterAnnounce;
+    QVERIFY2(spun <= 2,
+             qPrintable(QStringLiteral("the reader re-read a stalled device %1 "
+                                       "times in 200 ms")
+                            .arg(spun)));
+    QVERIFY(!fired);
+
+    // And nothing is broken: the next readyRead with the device releasing bytes
+    // again routes the whole frame.
+    device.setStallRead(false);
+    device.deliver(full.mid(half));
+    QVERIFY(fired);
+    QCOMPARE(m_client->pendingCount(), qsizetype(0));
+
+    m_client->setTransport(nullptr);
 }
 
 

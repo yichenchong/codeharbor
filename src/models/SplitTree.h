@@ -71,34 +71,19 @@ struct SplitNode {
     // what it reads and the writer normalizes again on the way out - so a
     // function that kept changing its own output would make a stored layout
     // differ from the one just written and provoke an endless "the tree
-    // changed, save it again" cycle. Two clean-ups can each expose work for the
-    // other (truncating at the limit can leave a trailing space that had
-    // nothing to trim before, and dropping a half-character left by that
-    // truncation can expose a space in turn), so they run until the value stops
-    // shrinking rather than once each.
-    static QString normalizeCustomTitle(QString title)
-    {
-        title = title.trimmed();
-        if (title.size() > kMaxCustomTitleLength)
-            title.truncate(kMaxCustomTitleLength);
-        for (;;) {
-            // Truncation can split a surrogate pair - the two-unit encoding of
-            // one non-BMP character such as an emoji - leaving half a character
-            // that is not valid text on its own. Drop an unpaired half.
-            const qsizetype last = title.size() - 1;
-            if (last >= 0
-                && (title.at(last).isHighSurrogate()
-                    || (title.at(last).isLowSurrogate()
-                        && (last == 0 || !title.at(last - 1).isHighSurrogate())))) {
-                title.chop(1);
-                continue;
-            }
-            const QString trimmed = title.trimmed();
-            if (trimmed.size() == title.size())
-                return title;
-            title = trimmed;
-        }
-    }
+    // changed, save it again" cycle.
+    //
+    // Three clean-ups run here, and each can expose work for the next, so they
+    // are applied until the value stops shrinking rather than once each:
+    //   * unpaired surrogate halves are dropped wherever they sit. Half of a
+    //     two-unit character is not valid text on its own, and writing one out
+    //     as JSON turns it into a replacement character - so a title carrying
+    //     one would read back DIFFERENT from the tree just written, which is
+    //     the very cycle this function exists to prevent;
+    //   * the value is trimmed and clipped to kMaxCustomTitleLength;
+    //   * clipping can split a surrogate pair or expose a trailing space that
+    //     had nothing to trim before, so both are cleaned up again afterwards.
+    static QString normalizeCustomTitle(QString title);
 
     SplitOrientation orientation = SplitOrientation::Horizontal;
     QVector<SplitNode> children;

@@ -17,12 +17,14 @@
 #include <QQmlComponent>
 #include <QQmlEngine>
 #include <QQuickItem>
+#include <QQuickView>
 #include <QQuickWindow>
+#include <QPoint>
 #include <QSet>
 #include <QString>
 #include <QUrl>
+#include <QtQuickControls2/QQuickStyle>
 #include <QtWebEngineQuick/QtWebEngineQuick>
-#include <memory>
 
 namespace {
 
@@ -172,20 +174,25 @@ void TstUiPolish::appScrollBarBecomesUsableWhenContentOverflows()
 // that the sniffer neither hovers nor imposes a shape.
 void TstUiPolish::viewerPaneSnifferPreservesWebCursor()
 {
-    QQmlEngine engine;
-
-    QQmlComponent component(&engine,
-                            QUrl(QStringLiteral("qrc:/qt/qml/CodeHarbor/ViewerPane.qml")));
-    QVERIFY2(!component.isError(), qPrintable(component.errorString()));
-    std::unique_ptr<QObject> pane(component.create());
-    QVERIFY2(pane != nullptr, qPrintable(component.errorString()));
-
-    auto *item = qobject_cast<QQuickItem *>(pane.get());
-    QVERIFY(item != nullptr);
+    // A REAL, shown, sized window. Built bare — as this used to be — the pane
+    // root is 0x0, so the "covers the whole pane" filter below degenerates
+    // into "any MouseArea at all" (0 >= 0), and `containsMouse`/`hasActiveFocus`
+    // are false for the trivial reason that nothing was ever shown or hovered.
+    // Every assertion then held however the sniffer was written.
+    QQuickView view;
+    view.setResizeMode(QQuickView::SizeRootObjectToView);
+    view.resize(480, 320);
+    view.setSource(QUrl(QStringLiteral("qrc:/qt/qml/CodeHarbor/ViewerPane.qml")));
+    QQuickItem *const item = view.rootObject();
+    QVERIFY2(item != nullptr, "ViewerPane.qml failed to instantiate");
+    view.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&view));
+    QTRY_VERIFY(item->width() > 100 && item->height() > 100);
 
     // The sniffer is the one MouseArea that covers the whole pane.
     QQuickItem *sniffer = nullptr;
-    for (QQuickItem *child : item->childItems()) {
+    const auto children = item->childItems();
+    for (QQuickItem *child : children) {
         if (QByteArray(child->metaObject()->className()).startsWith("QQuickMouseArea")
             && child->width() >= item->width() && child->height() >= item->height()) {
             sniffer = child;
@@ -196,17 +203,27 @@ void TstUiPolish::viewerPaneSnifferPreservesWebCursor()
 
     QVERIFY2(!sniffer->property("hoverEnabled").toBool(),
              "the click sniffer tracks hover, which is what lets it take the cursor");
-    QVERIFY2(!sniffer->hasActiveFocus(),
-             "the click sniffer must not hold focus either");
     QCOMPARE(sniffer->cursor().shape(), Qt::ArrowCursor);
+
+    // Now actually put the pointer on it. A MouseArea that does not track
+    // hover never reports containsMouse and never claims the cursor from the
+    // content underneath, so this is the reading that would change if the
+    // sniffer started hovering.
+    QTest::mouseMove(&view, QPoint(int(item->width() / 2), int(item->height() / 2)));
+    QTest::qWait(150);
     QVERIFY2(!sniffer->property("containsMouse").toBool(),
              "a sniffer that reports containsMouse is hovering after all");
+    QVERIFY2(!sniffer->hasActiveFocus(), "the click sniffer must not hold focus either");
 }
 
 int main(int argc, char **argv)
 {
     QtWebEngineQuick::initialize();
     QGuiApplication app(argc, argv);
+    // Every other QML test in this directory pins the Basic style, so the
+    // controls under test are drawn by the same style the assertions were
+    // written against rather than by whatever this host defaults to.
+    QQuickStyle::setStyle(QStringLiteral("Basic"));
     TstUiPolish testCase;
     return QTest::qExec(&testCase, argc, argv);
 }

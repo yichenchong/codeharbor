@@ -16,6 +16,7 @@
 #include <QProcessEnvironment>
 #include <QRegularExpression>
 #include <QRegularExpressionMatch>
+#include <QScopeGuard>
 #include <QStandardPaths>
 #include <QString>
 #include <QTemporaryDir>
@@ -95,6 +96,8 @@ private slots:
     void workspaceDbCannotBeBuiltWithoutAClient();
     void updateOptionalsOmitUnsetAndSendEmptyStringsVerbatim();
     void pinnedStateCrossesTheWireInBothDirections();
+    void updateGroupSerializesPartialWithFalse();
+    void viewerPaneMethodsSerializeParamsAndForwardOutcomes();
     void liveCreateAndListOverProcess();
 
 private:
@@ -643,6 +646,21 @@ void TstWorkspaceDb::liveCreateAndListOverProcess()
     if (!proc.waitForStarted(3000))
         QSKIP("failed to start node codeharbord");
 
+    // Unbind and reap on EVERY exit path, not just the happy one. A failing
+    // QVERIFY below returns from this function immediately: `proc` would then
+    // be destroyed while the client still held it as its transport, and
+    // cleanup() would delete the client onto that dangling device. Unbinding
+    // also fails every still-pending request synchronously, so the callbacks
+    // below - which capture this frame's locals by reference - all run while
+    // that frame is still alive.
+    const auto teardown = qScopeGuard([&] {
+        m_client->setTransport(nullptr);
+        proc.closeWriteChannel();
+        proc.terminate();
+        if (!proc.waitForFinished(2000))
+            proc.kill();
+    });
+
     m_client->setTransport(&proc);
 
     // Create a group against a fresh temp database...
@@ -677,12 +695,6 @@ void TstWorkspaceDb::liveCreateAndListOverProcess()
     QVERIFY(!listErr.has_value());
     QCOMPARE(listed.size(), 1);
     QCOMPARE(listed[0].group.name, QStringLiteral("Live"));
-
-    m_client->setTransport(nullptr);
-    proc.closeWriteChannel();
-    proc.terminate();
-    if (!proc.waitForFinished(2000))
-        proc.kill();
 }
 
 // A layout row whose tree fails SplitNode validation must arrive as "no layout",
@@ -1620,6 +1632,165 @@ void TstWorkspaceDb::pinnedStateCrossesTheWireInBothDirections()
                                 {"archived", false}, {"pinned", false}}}}));
     m_serverSide->flush();
     QTRY_VERIFY(createFired);
+}
+
+// updateGroup is a partial update whose only two mutable fields are a name and
+// a boolean, and nothing covered it. `collapsed: false` is the interesting
+// case: expanding a collapsed group is spelled as a SET optional holding
+// false, and dropping it because the value is falsy would leave every group
+// permanently collapsed on the server while the sidebar showed it open.
+void TstWorkspaceDb::updateGroupSerializesPartialWithFalse()
+{
+    makePair();
+
+    std::optional<Group> updated;
+    bool fired = false;
+    m_db->updateGroup(
+        ch::UpdateGroupParams{.id = ch::GroupId{QStringLiteral("g1")},
+                              .collapsed = false},
+        [&](std::optional<Group> g, std::optional<RpcError>) {
+            updated = g;
+            fired = true;
+        });
+
+    const QJsonObject req = readRequest();
+    QCOMPARE(req.value(QStringLiteral("method")).toString(),
+             QString::fromLatin1(ch::rpc::kMethodWorkspaceUpdateGroup));
+    const QJsonObject params = req.value(QStringLiteral("params")).toObject();
+    QCOMPARE(params.value(QStringLiteral("id")).toString(), QStringLiteral("g1"));
+    QVERIFY(params.contains(QStringLiteral("collapsed")));
+    QCOMPARE(params.value(QStringLiteral("collapsed")).toBool(), false);
+    // Untouched fields stay absent so the server keeps what it stores.
+    QVERIFY(!params.contains(QStringLiteral("name")));
+    QVERIFY(!params.contains(QStringLiteral("position")));
+
+    m_serverSide->write(jsonLine(
+        {{"jsonrpc", "2.0"},
+         {"id", req.value(QStringLiteral("id")).toInt()},
+         {"result", QJsonObject{{"id", "g1"}, {"serverId", "srv-1"},
+                                {"name", "Alpha"}, {"position", 0},
+                                {"collapsed", false}}}}));
+    m_serverSide->flush();
+    QTRY_VERIFY(fired);
+    QVERIFY(updated.has_value());
+    QCOMPARE(updated->id.value, QStringLiteral("g1"));
+    QCOMPARE(updated->collapsed, false);
+}
+
+// The whole viewer-pane family was untested: create (required url plus three
+// optionals), update (partial), and delete (result discarded, outcome
+// forwarded). A viewer pane's `url` is what the pane actually shows, so losing
+// it on the wire reopens the region blank.
+void TstWorkspaceDb::viewerPaneMethodsSerializeParamsAndForwardOutcomes()
+{
+    makePair();
+
+    // create: the required fields go out, the unset optionals do not.
+    std::optional<ch::ViewerPane> created;
+    bool createFired = false;
+    m_db->createViewerPane(
+        ch::CreateViewerPaneParams{
+            .serverId = ServerId{QStringLiteral("srv-1")},
+            .devSessionId = ch::DevSessionId{QStringLiteral("s1")},
+            .url = QStringLiteral("codeharbor-internal://file/a%20b.md"),
+            .handler = QStringLiteral("markdown")},
+        [&](std::optional<ch::ViewerPane> p, std::optional<RpcError>) {
+            created = p;
+            createFired = true;
+        });
+
+    QJsonObject req = readRequest();
+    QCOMPARE(req.value(QStringLiteral("method")).toString(),
+             QString::fromLatin1(ch::rpc::kMethodWorkspaceCreateViewerPane));
+    QJsonObject params = req.value(QStringLiteral("params")).toObject();
+    QCOMPARE(params.value(QStringLiteral("serverId")).toString(), QStringLiteral("srv-1"));
+    QCOMPARE(params.value(QStringLiteral("devSessionId")).toString(), QStringLiteral("s1"));
+    QCOMPARE(params.value(QStringLiteral("url")).toString(),
+             QStringLiteral("codeharbor-internal://file/a%20b.md"));
+    QCOMPARE(params.value(QStringLiteral("handler")).toString(),
+             QStringLiteral("markdown"));
+    QVERIFY(!params.contains(QStringLiteral("title")));
+    QVERIFY(!params.contains(QStringLiteral("position")));
+
+    m_serverSide->write(jsonLine(
+        {{"jsonrpc", "2.0"},
+         {"id", req.value(QStringLiteral("id")).toInt()},
+         {"result", QJsonObject{{"id", "v7"}, {"serverId", "srv-1"},
+                                {"devSessionId", "s1"},
+                                {"url", "codeharbor-internal://file/a%20b.md"},
+                                {"handler", "markdown"},
+                                {"title", QJsonValue(QJsonValue::Null)},
+                                {"position", 4}}}}));
+    m_serverSide->flush();
+    QTRY_VERIFY(createFired);
+    QVERIFY(created.has_value());
+    QCOMPARE(created->id.value, QStringLiteral("v7"));
+    QCOMPARE(created->url, QStringLiteral("codeharbor-internal://file/a%20b.md"));
+    QCOMPARE(created->position, 4);
+    QVERIFY(created->title.isEmpty()); // documented null -> "" narrowing
+
+    // update: a partial that moves the pane to position 0 and retitles it.
+    // Position 0 is a SET optional and must survive as "first", not vanish.
+    std::optional<ch::ViewerPane> moved;
+    bool updateFired = false;
+    m_db->updateViewerPane(
+        ch::UpdateViewerPaneParams{.id = ch::ViewerPaneId{QStringLiteral("v7")},
+                                   .title = QStringLiteral("Notes"),
+                                   .position = 0},
+        [&](std::optional<ch::ViewerPane> p, std::optional<RpcError>) {
+            moved = p;
+            updateFired = true;
+        });
+    req = readRequest();
+    QCOMPARE(req.value(QStringLiteral("method")).toString(),
+             QString::fromLatin1(ch::rpc::kMethodWorkspaceUpdateViewerPane));
+    params = req.value(QStringLiteral("params")).toObject();
+    QCOMPARE(params.value(QStringLiteral("id")).toString(), QStringLiteral("v7"));
+    QCOMPARE(params.value(QStringLiteral("title")).toString(), QStringLiteral("Notes"));
+    QVERIFY(params.contains(QStringLiteral("position")));
+    QCOMPARE(params.value(QStringLiteral("position")).toInt(), 0);
+    QVERIFY(!params.contains(QStringLiteral("url")));
+    QVERIFY(!params.contains(QStringLiteral("handler")));
+
+    m_serverSide->write(jsonLine(
+        {{"jsonrpc", "2.0"},
+         {"id", req.value(QStringLiteral("id")).toInt()},
+         {"result", QJsonObject{{"id", "v7"}, {"serverId", "srv-1"},
+                                {"devSessionId", "s1"},
+                                {"url", "codeharbor-internal://file/a%20b.md"},
+                                {"handler", "markdown"}, {"title", "Notes"},
+                                {"position", 0}}}}));
+    m_serverSide->flush();
+    QTRY_VERIFY(updateFired);
+    QVERIFY(moved.has_value());
+    QCOMPARE(moved->title, QStringLiteral("Notes"));
+    QCOMPARE(moved->position, 0);
+
+    // delete: id only, and a server refusal reaches the caller verbatim rather
+    // than being reported as a successful removal.
+    std::optional<RpcError> deleteErr;
+    bool deleteFired = false;
+    m_db->deleteViewerPane(ch::ViewerPaneId{QStringLiteral("v7")},
+                           [&](std::optional<RpcError> e) {
+                               deleteErr = e;
+                               deleteFired = true;
+                           });
+    req = readRequest();
+    QCOMPARE(req.value(QStringLiteral("method")).toString(),
+             QString::fromLatin1(ch::rpc::kMethodWorkspaceDeleteViewerPane));
+    QCOMPARE(req.value(QStringLiteral("params")).toObject()
+                 .value(QStringLiteral("id")).toString(),
+             QStringLiteral("v7"));
+
+    m_serverSide->write(jsonLine(
+        {{"jsonrpc", "2.0"},
+         {"id", req.value(QStringLiteral("id")).toInt()},
+         {"error", QJsonObject{{"code", -32602}, {"message", "no such pane"}}}}));
+    m_serverSide->flush();
+    QTRY_VERIFY(deleteFired);
+    QVERIFY(deleteErr.has_value());
+    QCOMPARE(deleteErr->code, -32602);
+    QCOMPARE(deleteErr->message, QStringLiteral("no such pane"));
 }
 
 QTEST_GUILESS_MAIN(TstWorkspaceDb)

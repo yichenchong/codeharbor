@@ -57,8 +57,8 @@ public:
     // handles an exact seed-sized preference by returning the seed unchanged,
     // while this predicate catches a too-small or absurdly large request.
     // Callers that receive user preferences should check it first so a
-    // hand-edited settings file can neither abort the application in a release
-    // build nor hang it in any build.
+    // hand-edited settings file can neither trip generatePalette's Q_ASSERT in
+    // a debug build nor hang the application in any build.
     static bool canGenerate(const QVector<SrgbColor> &seed, int requestedCount);
     // Precondition: canGenerate(seed, requestedCount). Returns an empty vector
     // when that does not hold.

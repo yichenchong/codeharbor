@@ -35,8 +35,6 @@
 
 #include <QElapsedTimer>
 #include <QGuiApplication>
-#include <QJsonArray>
-#include <QJsonDocument>
 #include <QList>
 #include <QMetaObject>
 #include <QObject>
@@ -151,6 +149,17 @@ constexpr auto kJsScreen = R"JS(
         return rows.textContent.replace(/\u00a0/g, " ");
     } catch (e) { return "ERR:" + e; }
 })()
+)JS";
+
+// Has the xterm renderer actually mounted? kJsScreen answers "NO_ROWS" until it
+// has, and a probe for the SCREEN TEXT cannot be waited on with a needle (an
+// empty terminal legitimately renders nothing), so readiness gets its own
+// boolean probe. Waiting on kJsScreen with an empty needle — which is what this
+// used to do — matched every possible answer, including "NO_ROWS" and
+// "INVOKE_FAILED", so the wait returned immediately and the assertion behind it
+// could never fail.
+constexpr auto kJsXtermMounted = R"JS(
+String(!!document.querySelector(".xterm-rows"))
 )JS";
 
 // Monaco's rendered buffer text.
@@ -998,7 +1007,8 @@ void TstPaneIdentity::terminalScrollbackSurvivesASplit()
         QTest::qWait(100);
     if (!original->property("pageLoaded").toBool())
         QSKIP("the terminal page never loaded; WebEngine cannot run under this recipe");
-    QVERIFY2(waitForPage(original, QString::fromLatin1(kJsScreen), QStringLiteral("")),
+    QVERIFY2(waitForPage(original, QString::fromLatin1(kJsXtermMounted),
+                         QStringLiteral("true")),
              "the xterm renderer never mounted");
 
     auto *controller =
@@ -1300,7 +1310,7 @@ void TstPaneIdentity::aClickInsideTheLivePageReportsFocusAndStillReachesThePage(
         QTest::qWait(100);
     if (!pane->property("pageLoaded").toBool())
         QSKIP("the terminal page never loaded; WebEngine cannot run under this recipe");
-    QVERIFY2(waitForPage(pane, QString::fromLatin1(kJsScreen), QStringLiteral("")),
+    QVERIFY2(waitForPage(pane, QString::fromLatin1(kJsXtermMounted), QStringLiteral("true")),
              "the xterm renderer never mounted");
     QTest::qWait(kSettleMs);
 

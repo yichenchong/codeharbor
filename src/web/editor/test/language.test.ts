@@ -198,3 +198,24 @@ test("an unusable firstLine pattern is skipped, not thrown", () => {
 test("a shebang decides even with no path at all", () => {
     assert.equal(selectLanguage("", withFirstLines, "#!/usr/bin/python"), "python");
 });
+
+test("a first line decides a file whose extension nobody registered", () => {
+    // ".sh" is not in this list, so the path "matched nothing at all" even though
+    // it does have an extension — exactly the case Monaco's own resolver hands to
+    // the firstLine patterns.
+    assert.equal(
+        selectLanguage("/srv/bin/deploy.sh", withFirstLines, "#!/usr/bin/python3"),
+        "python");
+});
+
+test("an unusable firstLine pattern does not stop a later one from matching", () => {
+    // The broken pattern is passed over and the scan CONTINUES; without that, one
+    // bad runtime contribution would cost every file registered behind it its
+    // syntax highlighting.
+    const afterBroken: readonly LanguageInfo[] = [
+        { id: "broken", firstLine: "([unterminated" },
+        { id: "python", firstLine: "^#!/.*\\bpython[0-9.-]*\\b" },
+    ];
+    assert.equal(selectLanguage("/srv/bin/deploy", afterBroken, "#!/usr/bin/python3"),
+                 "python");
+});

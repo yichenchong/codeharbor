@@ -51,6 +51,14 @@ Rectangle {
     implicitHeight: Theme.headerHeight
     color: Theme.surfaceDeep
 
+    // This bar REPLACES the window manager's own, which a screen reader would
+    // have announced for free. Without a role it is an anonymous rectangle and
+    // the window's title is never read out at all.
+    Accessible.role: Accessible.TitleBar
+    Accessible.name: bar.sessionLabel.length > 0
+                     ? qsTr("%1 \u2014 %2").arg(bar.title).arg(bar.sessionLabel)
+                     : bar.title
+
     readonly property bool maximised: bar.win ? bar.win.visibility === Window.Maximized : false
 
     function toggleMaximised() {

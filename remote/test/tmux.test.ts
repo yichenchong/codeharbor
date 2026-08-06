@@ -254,6 +254,53 @@ test("killing an absent session is a successful no-op", async () => {
     const tmux = stubRunner({ code: 1, stdout: "", stderr: "can't find session: ghost" });
     assert.deepEqual(await killSession({ name: "ghost" }, tmux.run), {});
 });
+
+// The other absence on the kill path: tmux is installed but no server is
+// running, so the session the caller wants gone is already gone. Same rule 1 as
+// the listing — an absence is a successful no-op, not a failure.
+test("killing a session with no tmux server running is a successful no-op", async () => {
+    const noServer = stubRunner({
+        code: 1,
+        stdout: "",
+        stderr: "no server running on /tmp/tmux-1000/default",
+    });
+    assert.deepEqual(await killSession({ name: "ghost" }, noServer.run), {});
+
+    const noSocket = stubRunner({
+        code: 1,
+        stdout: "",
+        stderr: "error connecting to /tmp/tmux-1000/default (No such file or directory)",
+    });
+    assert.deepEqual(await killSession({ name: "ghost" }, noSocket.run), {});
+});
+
+// SECURITY: tmux's `=` exact-match prefix is not a general quoting mechanism.
+// A LEADING `$` is tmux's session-ID form and is resolved BEFORE the
+// exact-name lookup, so `=` does not shield it. Verified against tmux 3.6:
+// with sessions `victim` ($0) and a second session literally named `$0`,
+// `tmux kill-session -t '=$0'` killed `victim` and left `$0` alive. A target of
+// `$0` therefore destroys an unrelated session and everything running in it,
+// while tmux.sessionExists — which compares against the listing — reports that
+// no such session exists. The name must be refused before the target is built.
+test("killSession refuses a name tmux would read as a session ID", async () => {
+    const tmux = stubRunner(OK(""));
+    for (const name of ["$0", "$1", "$", "$victim"]) {
+        await assert.rejects(
+            () => killSession({ name }, tmux.run),
+            /tmux-safe session name/,
+            name,
+        );
+    }
+    assert.deepEqual(tmux.calls, [], "an ID-shaped target must not reach tmux");
+
+    // Only the FIRST character carries the ID meaning: tmux matches `a$0`
+    // literally, so refusing it would make a legitimately named session
+    // un-killable.
+    const literal = stubRunner(OK(""));
+    assert.deepEqual(await killSession({ name: "a$0" }, literal.run), {});
+    assert.deepEqual(literal.calls, [["kill-session", "-t", "=a$0"]]);
+});
+
 test("killSession rejects tmux target separators instead of killing another session", async () => {
     const tmux = stubRunner(OK(""));
     // A raw control character is refused for the same reason: tmux vis-escapes

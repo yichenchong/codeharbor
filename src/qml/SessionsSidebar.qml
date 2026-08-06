@@ -33,7 +33,10 @@ Rectangle {
     // spaces, so the kind flag is part of the cursor.
     property string currentId: ""
     property bool currentIsGroup: false
-    // Last selected Dev Session; drives the row highlight.
+    // The last Dev Session the cursor landed on, kept for the host to read.
+    // NOT what draws the row highlight: a SessionRow reads `currentId` and
+    // `currentIsGroup`, so the highlight can be on a group while this still
+    // names the session visited before it.
     property string selectedSessionId: ""
     // Client-local presentation filters. Pin/archive bits on each session come
     // from the server, but whether to hide those rows belongs to this sidebar
@@ -46,8 +49,11 @@ Rectangle {
         (typeof app !== "undefined" && app && app.uiState
          && typeof app.uiState.showArchived === "function")
             ? app.uiState.showArchived() : false
-    property bool pinFilterReady: false
-    property bool archiveFilterReady: false
+    // Set once the two filters above have been pushed into the model for the
+    // first time, so the change handlers below can tell "the user pressed the
+    // toggle" apart from "the initial binding just evaluated". One flag, not
+    // one per filter: both filters are applied together, in a single call.
+    property bool filtersReady: false
     // Live drag state, read by the delegates for their drag affordances.
     property string dragKind: "" // "", "session" or "group"
     property var dragItem: null  // the SessionRow / GroupHeader being dragged
@@ -160,33 +166,27 @@ Rectangle {
         }
     }
 
+    // Re-apply the filter pair and ask the host for a fresh tree. Both toggles
+    // take exactly this path, so they cannot drift apart.
+    function refreshForFilterChange() {
+        if (!filtersReady)
+            return
+        applySessionFilters()
+        if (typeof app !== "undefined" && app
+                && typeof app.refresh === "function")
+            app.refresh()
+    }
+
     Component.onCompleted: {
         applySessionFilters()
-        pinFilterReady = true
-        archiveFilterReady = true
+        filtersReady = true
         if (typeof app !== "undefined" && app
                 && typeof app.refresh === "function")
             app.refresh()
     }
 
-    onPinnedOnlyChanged: {
-        if (!pinFilterReady)
-            return
-        applySessionFilters()
-        if (typeof app !== "undefined" && app
-                && typeof app.refresh === "function")
-            app.refresh()
-    }
-
-    onShowArchivedChanged: {
-        if (!archiveFilterReady)
-            return
-        applySessionFilters()
-        if (typeof app !== "undefined" && app
-                && typeof app.refresh === "function")
-            app.refresh()
-    }
-
+    onPinnedOnlyChanged: refreshForFilterChange()
+    onShowArchivedChanged: refreshForFilterChange()
 
 
     // DelegateModel.items is the authoritative ordered set: it contains every
@@ -912,11 +912,14 @@ Rectangle {
             width: parent.width
             horizontalAlignment: Text.AlignHCenter
             wrapMode: Text.WordWrap
+            // Same branch ORDER as the title above, so the two can never
+            // describe different nothings. (They agree either way — the
+            // archived case already requires the pin filter to be off — but a
+            // reader should not have to prove that to trust the pair.)
             text: sidebarEmptyState.serverReachable
-                  ? (sidebarEmptyState.allSessionsArchived
-                     ? qsTr("Show archived sessions to see them here.")
-                     : sidebar.pinnedOnly
-                       ? qsTr("Pin a session to see it here.")
+                  ? (sidebar.pinnedOnly ? qsTr("Pin a session to see it here.")
+                     : sidebarEmptyState.allSessionsArchived
+                       ? qsTr("Show archived sessions to see them here.")
                        : qsTr("Press the \u201c+\u201d at the top of this panel to add a group, then add a Dev Session to it."))
                   : qsTr("Connect to the machine that holds your checkout, and its groups and Dev Sessions appear here.")
             color: Theme.textDim
@@ -1047,7 +1050,12 @@ Rectangle {
 
                 Repeater {
                     model: DelegateModel {
-                        model: app.sessionsModel
+                        // Guarded for the same reason the outer model above is:
+                        // a bare `app` is a ReferenceError, not `undefined`,
+                        // when a harness builds the sidebar with no such
+                        // context property.
+                        model: (typeof app !== "undefined" && app)
+                               ? app.sessionsModel : null
                         rootIndex: groupsDelegateModel.modelIndex(groupBlock.index)
                         delegate: SessionRow {
                             width: sessionsColumn.width

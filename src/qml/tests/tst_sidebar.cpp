@@ -372,15 +372,33 @@ public:
 
     QQuickItem *root() const { return view.rootObject(); }
 
+    // NON-DESTRUCTIVE, and that is load-bearing rather than tidy.
+    // takeLoggedQmlWarnings() DRAINS the log net's queue, so what it hands back
+    // has to be latched here. Every call site is
+    //     QVERIFY2(fixture.warnings().isEmpty(), ... fixture.warnings() ...)
+    // and the two arguments are evaluated in an unspecified order: without the
+    // latch, evaluating the message first emptied the queue and the condition
+    // that followed found nothing, so a logged QML warning passed the gate in
+    // silence. Same fix, same reason, as ShellFixture::allWarnings() in
+    // tst_qmlload.cpp.
     QStringList warnings()
     {
-        QStringList combined = engineWarnings;
         for (const QString &logged : takeLoggedQmlWarnings()) {
+            if (!m_logged.contains(logged))
+                m_logged.append(logged);
+        }
+        QStringList combined = engineWarnings;
+        for (const QString &logged : m_logged) {
             if (!combined.contains(logged))
                 combined.append(logged);
         }
         return combined;
     }
+
+private:
+    // Everything drained out of the log net so far, so warnings() can be asked
+    // twice and answer the same both times.
+    QStringList m_logged;
 };
 
 class TstSidebar : public QObject

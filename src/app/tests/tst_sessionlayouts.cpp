@@ -2,6 +2,7 @@
 
 #include <QByteArray>
 #include <QCoreApplication>
+#include <QEventLoop>
 #include <QDeadlineTimer>
 #include <QJsonArray>
 #include <QJsonDocument>
@@ -186,6 +187,7 @@ private slots:
     void sameSessionReloadFailureClearsTheStaleRegion();
     void aFailedReloadNeverBlanksARegionTheUserJustEdited();
     void invalidSavedTreeIsRejected();
+    void malformedPersistedTreeIsRejectedWithoutPublishing();
     void aLayoutBindingTwoPanesToOneTerminalIsRejected();
     void publishedTreeIsConsumableFromQml();
     void splitAfterCloseNeverReusesThePaneId();
@@ -193,6 +195,7 @@ private slots:
     void refillingAnEmptiedRegionNeverInheritsThePlaceholdersIdentity();
     void paneNumberingIsPerDevSessionAndSurvivesRestart();
     void legacyTerminalLeafIsBackfilledOnceAndPersisted();
+    void saveTreeReconcilesTerminalLegacyMarkersBeforePublishing();
     void anAbsurdPaneCounterCannotHandOutALabelAlreadyOnScreen();
     void paneLabelCeilingRefusesASecondDuplicate();
     void aFailedTerminalMintReportsAndTakesTheHalfMadePaneBack();
@@ -330,9 +333,14 @@ void TstSessionLayouts::respondError(int id, int code, const QString& message)
 bool TstSessionLayouts::noMoreRequests()
 {
     m_clientSide->flush();
-    QTest::qWait(50);
-    if (m_serverSide->bytesAvailable() > 0)
-        m_rxBuffer += m_serverSide->readAll();
+    // Drain already-posted socket notifications without guessing how long a
+    // timer should take. Several passes cover a response that schedules
+    // another write while keeping this negative assertion deterministic.
+    for (int pass = 0; pass < 4; ++pass) {
+        QCoreApplication::processEvents(QEventLoop::AllEvents, 0);
+        if (m_serverSide->bytesAvailable() > 0)
+            m_rxBuffer += m_serverSide->readAll();
+    }
     return m_rxBuffer.isEmpty();
 }
 
@@ -957,7 +965,7 @@ void TstSessionLayouts::staleLoadReplyIsDropped()
                   layoutRow(leaf(QStringLiteral("stale-1"))));
     respondResult(staleTerminal.value(QStringLiteral("id")).toInt(),
                   layoutRow(leaf(QStringLiteral("stale-2"))));
-    QTest::qWait(100);
+    QCoreApplication::processEvents(QEventLoop::AllEvents);
     QCOMPARE(loadedSpy.count(), 0);
     QVERIFY(layouts.viewerTree().isNull());
     QVERIFY(layouts.terminalTree().isNull());
@@ -1024,7 +1032,7 @@ void TstSessionLayouts::rapidSwitchQueuesCurrentWritesAndDropsStaleWrites()
                   layoutRow(leaf(QStringLiteral("wrong-viewer"))));
     respondResult(staleTerminal.value(QStringLiteral("id")).toInt(),
                   layoutRow(leaf(QStringLiteral("wrong-terminal"))));
-    QTest::qWait(50);
+    QCoreApplication::processEvents(QEventLoop::AllEvents);
     layouts.setPaneUrlForSession(QStringLiteral("s2"), freshGeneration,
                                  QStringLiteral("viewer"),
                                  QStringLiteral("viewer-1"),
@@ -1316,7 +1324,7 @@ void TstSessionLayouts::staleLayoutWriteErrorsAreDropped()
     // That failure is historical and must not put an error banner on s2.
     respondError(oldWrite.value(QStringLiteral("id")).toInt(), -32000,
                  QStringLiteral("old layout write failed"));
-    QTest::qWait(50);
+    QCoreApplication::processEvents(QEventLoop::AllEvents);
     QCOMPARE(errorSpy.count(), 0);
     QVERIFY(noMoreRequests());
 }
@@ -1451,6 +1459,78 @@ void TstSessionLayouts::rpcErrorSurfacesWithoutCorruptingTree()
                            {1, 1})));
 }
 
+// Two ways a PERSISTED layout can be unusable, neither of which this client
+// wrote: a row whose tree does not survive SplitNode's parser (a split with
+// fewer ratios than children - a truncated or hand-edited row), and a row that
+// parses but wears one paneId twice.
+//
+// They are deliberately answered DIFFERENTLY, and that is the point of pinning
+// both here. A row the parser rejects is indistinguishable from "there is no
+// layout for this region", so the region seeds its default and writes it back -
+// the user gets a working region rather than a blank one. A row that PARSES but
+// carries duplicate keys is a real layout that cannot be edited safely (every
+// structural edit would hit an arbitrary one of the two leaves), so it is
+// refused with an error and the region stays null instead of inviting the user
+// to work in it.
+void TstSessionLayouts::malformedPersistedTreeIsRejectedWithoutPublishing()
+{
+    makePair();
+    SessionLayouts layouts(m_db, m_uiState);
+    layouts.setServerId(QStringLiteral("srv-1"));
+    layouts.load(QStringLiteral("s1"));
+    const QJsonObject viewerGet = nextRequest();
+    const QJsonObject terminalGet = nextRequest();
+
+    // Truncated: two children, one ratio. SplitNode::tryFromJson refuses it.
+    QJsonObject truncated;
+    truncated.insert(QStringLiteral("type"), QStringLiteral("split"));
+    truncated.insert(QStringLiteral("orientation"), QStringLiteral("horizontal"));
+    truncated.insert(QStringLiteral("children"),
+                     QJsonArray{leaf(QStringLiteral("viewer-a")),
+                                leaf(QStringLiteral("viewer-b"))});
+    truncated.insert(QStringLiteral("ratios"), QJsonArray{1.0});
+    // Parses cleanly, but both leaves claim the same slot label.
+    const QJsonObject duplicate =
+        split(QStringLiteral("vertical"),
+              {leaf(QStringLiteral("terminal-a")),
+               leaf(QStringLiteral("terminal-a"))},
+              {1.0, 1.0});
+
+    QSignalSpy errorSpy(&layouts, &SessionLayouts::error);
+    QSignalSpy loadedSpy(&layouts, &SessionLayouts::loaded);
+    respondResult(viewerGet.value(QStringLiteral("id")).toInt(),
+                  layoutRow(truncated));
+    respondResult(terminalGet.value(QStringLiteral("id")).toInt(),
+                  layoutRow(duplicate));
+    QTRY_COMPARE(loadedSpy.count(), 1);
+
+    // The duplicate-keyed terminal layout is the only one reported, and its
+    // region is left with nothing on screen.
+    QCOMPARE(errorSpy.count(), 1);
+    QVERIFY2(errorSpy.at(0).at(0).toString().contains(
+                 QStringLiteral("duplicate pane ids")),
+             qPrintable(errorSpy.at(0).at(0).toString()));
+    QVERIFY(layouts.terminalTree().isNull());
+
+    // The unparseable viewer row read as "no layout here": the region default
+    // is adopted AND written back, so the user has a usable pane and the next
+    // load reads a valid row instead of the broken one.
+    QCOMPARE(compact(asObject(layouts.viewerTree())),
+             compact(leaf(QStringLiteral("viewer-1"))));
+    const QJsonObject seed = nextRequest();
+    QCOMPARE(seed.value(QStringLiteral("method")).toString(),
+             QStringLiteral("workspace.setLayout"));
+    QCOMPARE(seed.value(QStringLiteral("params")).toObject()
+                 .value(QStringLiteral("region")).toString(),
+             QStringLiteral("viewer"));
+    QCOMPARE(compact(seed.value(QStringLiteral("params")).toObject()
+                         .value(QStringLiteral("tree")).toObject()),
+             compact(leaf(QStringLiteral("viewer-1"))));
+    respondResult(seed.value(QStringLiteral("id")).toInt(),
+                  layoutRow(leaf(QStringLiteral("viewer-1"))));
+    QVERIFY(noMoreRequests());
+}
+
 void TstSessionLayouts::invalidSavedTreeIsRejected()
 {
     makePair();
@@ -1472,21 +1552,38 @@ void TstSessionLayouts::invalidSavedTreeIsRejected()
     bogus.insert(QStringLiteral("ratios"), QVariantList{1.0, 1.0});
     layouts.saveTree(QStringLiteral("viewer"), bogus);
     QCOMPARE(errorSpy.count(), 1);
+    const QJsonObject duplicate =
+        split(QStringLiteral("horizontal"),
+              {leaf(QStringLiteral("viewer-1")),
+               leaf(QStringLiteral("viewer-1"))},
+              {1.0, 1.0});
+    layouts.saveTree(QStringLiteral("viewer"), duplicate.toVariantMap());
+    QCOMPARE(errorSpy.count(), 2);
+    QVariantMap nonFinite =
+        split(QStringLiteral("horizontal"),
+              {leaf(QStringLiteral("viewer-1")),
+               leaf(QStringLiteral("viewer-2"))},
+              {1.0, 1.0})
+            .toVariantMap();
+    nonFinite.insert(QStringLiteral("ratios"),
+                     QVariantList{std::numeric_limits<double>::quiet_NaN(), 1.0});
+    layouts.saveTree(QStringLiteral("viewer"), nonFinite);
+    QCOMPARE(errorSpy.count(), 3);
 
     layouts.saveTree(QStringLiteral("nowhere"), QVariant());
-    QCOMPARE(errorSpy.count(), 2); // unknown region
+    QCOMPARE(errorSpy.count(), 4); // unknown region
 
     QCOMPARE(layouts.splitPane(QStringLiteral("viewer"),
                                QStringLiteral("no-such-pane"),
                                QStringLiteral("horizontal")),
              QString());
-    QCOMPARE(errorSpy.count(), 3);
+    QCOMPARE(errorSpy.count(), 5);
 
     QCOMPARE(layouts.splitPane(QStringLiteral("viewer"),
                                QStringLiteral("viewer-1"),
                                QStringLiteral("sideways")),
              QString()); // unknown orientation
-    QCOMPARE(errorSpy.count(), 4);
+    QCOMPARE(errorSpy.count(), 6);
 
     QCOMPARE(compact(asObject(layouts.viewerTree())),
              compact(leaf(QStringLiteral("viewer-1"))));
@@ -1500,7 +1597,7 @@ void TstSessionLayouts::invalidSavedTreeIsRejected()
               {leaf(QStringLiteral("viewer-1")), leaf(QStringLiteral("viewer-9"))},
               {1, 3});
     layouts.saveTree(QStringLiteral("viewer"), good.toVariantMap());
-    QCOMPARE(errorSpy.count(), 4);
+    QCOMPARE(errorSpy.count(), 6);
     QCOMPARE(viewerSpy.count(), 0);
     const QJsonObject req = nextRequest();
     QCOMPARE(compact(req.value(QStringLiteral("params")).toObject()
@@ -1961,6 +2058,40 @@ void TstSessionLayouts::paneLabelCeilingRefusesASecondDuplicate()
     QVERIFY(noMoreRequests());
 }
 
+void TstSessionLayouts::saveTreeReconcilesTerminalLegacyMarkersBeforePublishing()
+{
+    makePair();
+    SessionLayouts layouts(m_db, m_uiState);
+    layouts.setServerId(QStringLiteral("srv-1"));
+    layouts.load(QStringLiteral("s1"));
+    const QJsonObject viewerGet = nextRequest();
+    const QJsonObject terminalGet = nextRequest();
+    respondResult(viewerGet.value(QStringLiteral("id")).toInt(),
+                  layoutRow(leaf(QStringLiteral("viewer-1"))));
+    respondResult(terminalGet.value(QStringLiteral("id")).toInt(),
+                  layoutRow(legacyLeaf(QStringLiteral("terminal-old"))));
+    QSignalSpy loadedSpy(&layouts, &SessionLayouts::loaded);
+    QTRY_COMPARE(loadedSpy.count(), 1);
+
+    // Replacing the legacy tree with an authored id-less leaf must not leave
+    // the old terminalLegacy marker in the published cache while the new row
+    // is still being minted.
+    layouts.saveTree(QStringLiteral("terminal"),
+                     leaf(QStringLiteral("terminal-new")).toVariantMap());
+    const QJsonObject mint = nextRequest();
+    QCOMPARE(mint.value(QStringLiteral("method")).toString(),
+             QStringLiteral("workspace.createTerminalPane"));
+    QCOMPARE(compact(asObject(layouts.terminalTree())),
+             compact(leaf(QStringLiteral("terminal-new"))));
+    QVERIFY(!asObject(layouts.terminalTree()).contains(
+        QStringLiteral("terminalLegacy")));
+    respondResult(mint.value(QStringLiteral("id")).toInt(),
+                  terminalPaneRow(QStringLiteral("terminal-new")));
+    const QJsonObject save = nextRequest();
+    QCOMPARE(save.value(QStringLiteral("method")).toString(),
+             QStringLiteral("workspace.setLayout"));
+}
+
 // SELF-MIGRATION. A terminal leaf stored before layouts carried a row id has
 // nothing but its slot label, so ch::TerminalFactory resolves it by that label
 // once and reports the row it found back through bindTerminalPaneRow(). The id
@@ -2111,7 +2242,7 @@ void TstSessionLayouts::aClosedTerminalMintFailureIsSilent()
     respondResult(close.value(QStringLiteral("id")).toInt(), layoutRow(stored));
     respondError(mint.value(QStringLiteral("id")).toInt(), -32000,
                  QStringLiteral("terminal pane create failed after close"));
-    QTest::qWait(50);
+    QCoreApplication::processEvents(QEventLoop::AllEvents);
     QCOMPARE(errorSpy.count(), 0);
     QCOMPARE(compact(asObject(layouts.terminalTree())), compact(stored));
     QVERIFY(noMoreRequests());

@@ -46,6 +46,7 @@
 #include <QQmlContext>
 #include <QQmlEngine>
 #include <QQmlError>
+#include <QQmlIncubationController>
 #include <QQuickItem>
 #include <QQuickView>
 #include <QRegularExpression>
@@ -972,6 +973,20 @@ void TstUxShell::everyPublishedStateHasASheetRowAndAGlyph()
     QVERIFY2(dot, "the connection status chip has no stateDot");
     const QColor idleColour = dot->property("color").value<QColor>();
 
+    // The glyph the dot carries. The test's name and the comment above have
+    // always promised this reading, and nothing took it: a state with no case
+    // in ConnectSheet.stateGlyph() falls through to the "nothing is running"
+    // en dash, which is the same thing "disconnected" draws.
+    auto *dotItem = qobject_cast<QQuickItem *>(dot);
+    QVERIFY(dotItem);
+    const auto glyphOfDot = [dotItem]() -> QString {
+        const auto children = dotItem->childItems();
+        return children.size() == 1 ? children.constFirst()->property("text").toString()
+                                    : QString();
+    };
+    const QString idleGlyph = glyphOfDot();
+    QVERIFY2(!idleGlyph.isEmpty(), "the status chip draws no glyph inside its dot");
+
     for (const QString &state : published) {
         if (state == QStringLiteral("disconnected"))
             continue;
@@ -979,6 +994,10 @@ void TstUxShell::everyPublishedStateHasASheetRowAndAGlyph()
         settle(40);
         QVERIFY2(dot->property("color").value<QColor>() != idleColour,
                  qPrintable(QStringLiteral("the sheet paints \"%1\" exactly as it paints "
+                                           "\"disconnected\", so it has no case for it")
+                                    .arg(state)));
+        QVERIFY2(glyphOfDot() != idleGlyph,
+                 qPrintable(QStringLiteral("the sheet gives \"%1\" the same glyph it gives "
                                            "\"disconnected\", so it has no case for it")
                                     .arg(state)));
     }
@@ -1148,11 +1167,14 @@ void TstUxShell::sidebarArchiveButtonCallsArchiveAndUnarchive()
 
         QObject *archive = surface.child(QStringLiteral("archiveButton:s"));
         QVERIFY2(archive, "the row has no archive action");
-        QCOMPARE(textOf(surface.child(QStringLiteral("archivedMarker:s"))), QString());
+        QObject *marker = surface.child(QStringLiteral("archivedMarker:s"));
+        QVERIFY2(marker, "the row has no archived marker at all, so the empty reading "
+                         "below would pass for the wrong reason");
+        QCOMPARE(textOf(marker), QString());
         QMetaObject::invokeMethod(archive, "clicked");
         QCOMPARE(app.archiveCalls(), 1);
         QCOMPARE(app.lastArchiveId(), QStringLiteral("s"));
-        QVERIFY(surface.warnings.isEmpty());
+        QVERIFY2(surface.warnings.isEmpty(), qPrintable(surface.warningReport()));
     }
 
     ch::SessionsModel model;
@@ -1173,12 +1195,13 @@ void TstUxShell::sidebarArchiveButtonCallsArchiveAndUnarchive()
     QVERIFY(model.showArchived());
     QObject *unarchive = surface.child(QStringLiteral("archiveButton:s"));
     QVERIFY2(unarchive, "the archived row has no unarchive action");
-    QCOMPARE(textOf(surface.child(QStringLiteral("archivedMarker:s"))),
-             QStringLiteral("\u25a3"));
+    QObject *marker = surface.child(QStringLiteral("archivedMarker:s"));
+    QVERIFY2(marker, "the archived row has no archived marker");
+    QCOMPARE(textOf(marker), QStringLiteral("\u25a3"));
     QMetaObject::invokeMethod(unarchive, "clicked");
     QCOMPARE(app.unarchiveCalls(), 1);
     QCOMPARE(app.lastArchiveId(), QStringLiteral("s"));
-    QVERIFY(surface.warnings.isEmpty());
+    QVERIFY2(surface.warnings.isEmpty(), qPrintable(surface.warningReport()));
 }
 void TstUxShell::sidebarDeleteActionsAreConfirmedAndNamed()
 {
@@ -1375,15 +1398,16 @@ void TstUxShell::sidebarRowBadgeSeparatesEveryRowState()
                                           Q_RETURN_ARG(QVariant, expectedGlyph),
                                           Q_ARG(QVariant, QVariant(i))));
         QVERIFY(!expectedGlyph.toString().isEmpty());
-        glyphs.insert(expectedGlyph.toString());
+        // COMPARED, not merged into the set: when the drawn glyph and the row's
+        // own table disagreed, both landed in `glyphs` and the size check at the
+        // end started asserting something nobody meant.
+        QCOMPARE(textOf(glyph), expectedGlyph.toString());
 
         QVariant expectedColour;
         QVERIFY(QMetaObject::invokeMethod(anyRow, "stateColor",
                                           Q_RETURN_ARG(QVariant, expectedColour),
                                           Q_ARG(QVariant, QVariant(i))));
-        const QColor expectedColor = expectedColour.value<QColor>();
-        QCOMPARE(expectedColor, QColor(expected.at(i)));
-        colours.insert(expectedColor.name());
+        QCOMPARE(expectedColour.value<QColor>(), drawn);
     }
     QVERIFY(anyRow);
 
@@ -1846,6 +1870,8 @@ void TstUxShell::overlaySheetsSwallowClicksToTheWorkspace()
     settle(60);
     QVERIFY2(surface.root()->property("behindClicks").toInt() == 1,
              "a click on the sheet reached the workspace behind it");
+
+    QVERIFY2(surface.warnings.isEmpty(), qPrintable(surface.warningReport()));
 }
 
 // The pane is a fixed 190-pixel sidebar plus the rest of the window, and the
@@ -1859,6 +1885,23 @@ void TstUxShell::settingsServerFieldsStayInsideThePane()
     QQuickItem *root = surface.root();
     QVERIFY(root);
     root->setProperty("shown", true);
+    // Wait for the sheet's group loader to finish its FIRST pane before asking
+    // for another one. Switching `selectedGroup` while that first creation is
+    // still in flight cancels it, and the cancelled creation logs two QML
+    // warnings ("Cannot create delegate" and "Object or context destroyed
+    // during incubation") that the warning check at the end of this test would
+    // then report. A user cannot outrun the first frame; only a test can.
+    auto *groupLoader = qobject_cast<QQuickItem *>(
+            surface.child(QStringLiteral("settingsGroupLoader")));
+    QVERIFY2(groupLoader, "the Settings sheet has no group loader");
+    const auto firstPaneSettled = [&] {
+        auto *first = groupLoader->property("item").value<QQuickItem *>();
+        if (!first || first->width() <= 0 || first->height() <= 0)
+            return false;
+        const QQmlIncubationController *pending = surface.view.engine()->incubationController();
+        return !pending || pending->incubatingObjectCount() == 0;
+    };
+    QTRY_VERIFY_WITH_TIMEOUT(firstPaneSettled(), 2000);
     root->setProperty("selectedGroup", QStringLiteral("server"));
     settle(120);
 
@@ -1899,6 +1942,8 @@ void TstUxShell::settingsServerFieldsStayInsideThePane()
                                     .arg(right)
                                     .arg(paneRight)));
     }
+
+    QVERIFY2(surface.warnings.isEmpty(), qPrintable(surface.warningReport()));
 }
 
 // QTEST_MAIN cannot be used: QtWebEngineQuick::initialize() must run before the

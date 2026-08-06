@@ -336,6 +336,12 @@ export function mountEditor(
     // arrive after more edits, so it must re-baseline against these bytes rather
     // than whatever the model contains at reply time.
     let pendingSaveContent: string | undefined;
+    // True once this page has REFUSED a host-driven load because the buffer held
+    // edits the host had not been told about (see contentLoaded). It stays true
+    // until the buffer is legitimately re-baselined, so a second reload reply
+    // already in flight behind the first cannot walk over the same edits once the
+    // debounce timer that first caught it has been disarmed.
+    let localEditsHeld = false;
     // Mirror of the host readOnly toggle (SPEC 8.2). A read-only buffer must
     // never issue a save, even via the Ctrl/Cmd+S command binding.
     let readOnly = false;
@@ -361,6 +367,13 @@ export function mountEditor(
      * and Monaco already ships the patterns that recognise their shebangs — this
      * is the only place the content needed to apply them exists. A path that
      * already named a language is authoritative and is never second-guessed.
+     *
+     * Re-run on EVERY load, so the answer has to be allowed to go back down as
+     * well as up: a reload whose new bytes no longer start with the shebang must
+     * leave "python" behind, not keep highlighting the file as Python for the
+     * rest of the pane's life. "plaintext" is the correct language for this pane
+     * whenever the content claims nothing, because the path claimed nothing
+     * either (that is the guard above).
      */
     function applyContentLanguage(content: string): void {
         if (pathLanguage !== "plaintext")
@@ -374,7 +387,7 @@ export function mountEditor(
         const newline = head.indexOf("\n");
         const id = languageForPath(options.path ?? "",
                                    newline >= 0 ? head.slice(0, newline) : head);
-        if (id !== "plaintext" && id !== model.getLanguageId())
+        if (id !== model.getLanguageId())
             monaco.editor.setModelLanguage(model, id);
     }
 
@@ -408,6 +421,49 @@ export function mountEditor(
             requestSave(loadedRevision);
         });
         notice.replaceChildren(msg, retry);
+        notice.style.display = "flex";
+    }
+
+    /**
+     * Show the "the file moved under you" notice (SPEC 8.6): Reload discards the
+     * local edits and takes the server's bytes, Overwrite re-saves guarded by
+     * `currentRevision` — the revision the server holds NOW, which is what makes
+     * the write acceptable instead of another conflict.
+     *
+     * Shared by the host's saveConflict signal and by contentLoaded when it
+     * refuses to drop unsaved edits for a reload the user did not ask for: both
+     * end with a buffer that diverges from a file that has moved on, and these
+     * are exactly the two ways out.
+     */
+    function showConflictNotice(currentRevision: string, message: string): void {
+        clearNotice();
+        const msg = doc.createElement("span");
+        msg.textContent = message;
+        const reload = doc.createElement("button");
+        reload.type = "button";
+        reload.textContent = "Reload";
+        reload.addEventListener("click", () => {
+            clearNotice();
+            // Discarding the local edits is the whole point of this button, so an
+            // armed snapshot must not outlive the click: a timer that fires
+            // inside the reload round trip reports the buffer the user just threw
+            // away, which re-flags the file dirty on the host and rewrites the
+            // crash-recovery snapshot the reload is about to retire (SPEC 11.3).
+            // requestSave() cancels for the same reason; this path bypasses it.
+            reporter.cancel();
+            bridge.requestReload();
+        });
+        const overwrite = doc.createElement("button");
+        overwrite.type = "button";
+        overwrite.textContent = "Overwrite";
+        overwrite.addEventListener("click", () => {
+            // Re-issue the save guarded by the server's now-current revision so
+            // it is accepted; adopt it locally so a subsequent saved lines up.
+            loadedRevision = currentRevision;
+            clearNotice();
+            requestSave(currentRevision);
+        });
+        notice.replaceChildren(msg, reload, overwrite);
         notice.style.display = "flex";
     }
 
@@ -468,9 +524,40 @@ export function mountEditor(
     }
 
     bind(bridge.contentLoaded, (content: string, revision: string) => {
+        const current = bufferText(editor);
+        // A snapshot still ARMED here means the user typed within the last
+        // REPORT_DELAY_MS and the host has not been told yet, so the host's own
+        // refusal to reload over unsaved work (EditorController::reload, gated on
+        // its dirty flag) cannot have seen these edits: this content may be a
+        // system-initiated reload that raced the debounce, and applying it would
+        // destroy the only copy of them in existence.
+        //
+        // Every load that IS allowed to replace the buffer reaches here with
+        // nothing armed and nothing held: the only two host states that lead to a
+        // load the page must accept are an open() and a user-requested reload,
+        // both of which pass through "loading" and clear both flags there; a
+        // system-initiated reload uses "externally_modified" as its transitional
+        // state instead and never clears them. requestSave() and the notice's
+        // Reload button disarm the timer explicitly, and a freshly mounted page
+        // has never scheduled anything.
+        if ((reporter.pending || localEditsHeld) && current !== content) {
+            // Hand the edits to the host NOW: it then holds the crash-recovery
+            // copy (SPEC 11.3) and stops auto-reloading over them (SPEC 8.7).
+            localEditsHeld = true;
+            reporter.report();
+            // loadedRevision is deliberately NOT advanced to `revision`. Keeping
+            // the revision this buffer was loaded at is what makes the next save
+            // come back as a conflict instead of silently overwriting the change
+            // that just landed on the server (SPEC 8.6) — the notice offers the
+            // same two ways out, and its Overwrite re-saves guarded by
+            // `revision`.
+            showConflictNotice(revision, "File changed on disk; unsaved edits kept.");
+            return;
+        }
         loadedRevision = revision;
         baselineContent = content;
         pendingSaveContent = undefined;
+        localEditsHeld = false;
         // The buffer now IS the file, so a save reported later must not be
         // second-guessed by edits this load already superseded.
         baselineEditSerial = editSerial;
@@ -481,12 +568,20 @@ export function mountEditor(
         // Every load, not only the first: the pane can be retargeted at another
         // file over the same channel, and a shebang is a property of the bytes.
         applyContentLanguage(content);
-        if (bufferText(editor) === content) {
+        dirty = false;
+        if (current === content) {
             // Identical buffer (e.g. reload of unchanged file): just re-baseline.
-            dirty = false;
             renderState();
             return;
         }
+        // Where the caret and the viewport were BEFORE the host replaced the
+        // buffer. A reload after an external change (SPEC 8.7) is not something
+        // the user asked for, and setValue() alone drops them at line 1 of a file
+        // they were reading in the middle of. Monaco validates the selections
+        // against the new model, so a file that got shorter simply clamps.
+        const selections = editor.getSelections();
+        const scrollTop = editor.getScrollTop();
+        const scrollLeft = editor.getScrollLeft();
         applyingHostEdit = true;
         try {
             // setValue resets the buffer and its undo stack to the loaded content.
@@ -494,7 +589,13 @@ export function mountEditor(
         } finally {
             applyingHostEdit = false;
         }
-        dirty = false;
+        if (selections && selections.length > 0) {
+            editor.setSelections(selections);
+        }
+        // After the selections: restoring a selection does not scroll, but
+        // Monaco's own layout after setValue does, so the viewport is settled
+        // last.
+        editor.setScrollPosition({ scrollTop, scrollLeft });
         renderState();
     });
 
@@ -503,8 +604,15 @@ export function mountEditor(
         // An open/reload can finish before the old page's debounce callback is
         // delivered to C++. Cancel it at the transition, not only when
         // contentLoaded arrives, so old-file bytes cannot dirty the new file.
+        //
+        // "loading" is reached ONLY by an open() or by the reload the USER asked
+        // for (EditorController::requestReload); a system-initiated reload
+        // transitions to "externally_modified" instead. So this is also the one
+        // transition after which the buffer is allowed to be replaced wholesale,
+        // which is what releases the refusal contentLoaded may have recorded.
         if (state === "loading") {
             reporter.cancel();
+            localEditsHeld = false;
         }
         stateLabel.dataset.state = state;
         renderState();
@@ -525,6 +633,10 @@ export function mountEditor(
         const editedDuringSave = bufferText(editor) !== savedContent;
         dirty = editedDuringSave;
         clearNotice();
+        // The bytes that just landed on the server came from this buffer, and any
+        // edits made since are reported below, so the host is no longer behind:
+        // nothing is being held back from it any more.
+        localEditsHeld = false;
         renderState();
         if (editedDuringSave) {
             // The current bytes are not the bytes that just landed, so the host
@@ -554,42 +666,14 @@ export function mountEditor(
         // The file moved on the server since we loaded it (SPEC 8.6). Offer the
         // user a choice: reload (discard local edits) or overwrite (force save
         // against the server's current revision).
-        clearNotice();
+        //
         // As in saveError: this save did not land, so the bytes it carried must
         // never be adopted as the server's by a later reply.
         pendingSaveContent = undefined;
         // The buffer is still unsaved, so keep the recovery snapshot current
         // while the notice waits for the user (requestSave cancelled it).
         reporter.schedule(dirty);
-        const msg = doc.createElement("span");
-        msg.textContent = "File changed on disk.";
-        const reload = doc.createElement("button");
-        reload.type = "button";
-        reload.textContent = "Reload";
-        reload.addEventListener("click", () => {
-            clearNotice();
-            // Discarding the local edits is the whole point of this button, so
-            // the snapshot armed above must not outlive the click: a timer that
-            // fires inside the reload round trip reports the buffer the user
-            // just threw away, which re-flags the file dirty on the host and
-            // rewrites the crash-recovery snapshot the reload is about to
-            // retire (SPEC 11.3). requestSave() cancels for the same reason;
-            // this path bypasses it.
-            reporter.cancel();
-            bridge.requestReload();
-        });
-        const overwrite = doc.createElement("button");
-        overwrite.type = "button";
-        overwrite.textContent = "Overwrite";
-        overwrite.addEventListener("click", () => {
-            // Re-issue the save guarded by the server's now-current revision so
-            // it is accepted; adopt it locally so a subsequent saved lines up.
-            loadedRevision = currentRevision;
-            clearNotice();
-            requestSave(currentRevision);
-        });
-        notice.replaceChildren(msg, reload, overwrite);
-        notice.style.display = "flex";
+        showConflictNotice(currentRevision, "File changed on disk.");
     });
 
     bind(bridge.saveError, (message: string) => {
@@ -602,9 +686,8 @@ export function mountEditor(
     // ---- slots: JS -> C++ ----
     // Ctrl/Cmd+S persists the buffer guarded by the loaded revision (SPEC 8.4).
     editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, () => {
-        if (readOnly) {
-            return;
-        }
+        // requestSave() is what refuses a read-only buffer, a buffer mid-load and
+        // a disconnected pane, and it is the only place that decision lives.
         requestSave(loadedRevision);
     });
 

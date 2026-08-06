@@ -128,7 +128,14 @@ void SshLogRouter::acquire(Route* route)
     if (!s_threadRoutes)
         s_threadRoutes =
             new QList<std::shared_ptr<SshLogRouter::Route::Entry>>();
-    pruneInactiveThreadRoutes();
+    // Same rule release() and dispatch() follow: housekeeping only when no
+    // OUTER dispatch frame is walking this list. A sink is allowed to re-enter
+    // libssh — its own diagnostics, a nested handshake — and so to take a route
+    // from inside dispatch(); removeIf() would then mutate the very container
+    // that frame is iterating. Skipping it costs nothing, because dispatch()
+    // already ignores inactive entries and prunes them when it unwinds.
+    if (t_dispatchDepth == 0)
+        pruneInactiveThreadRoutes();
     if (s_threadRoutes->isEmpty() && t_ownsThreadState)
         restoreThreadLoggingState();
     const bool firstOnThisThread = s_threadRoutes->isEmpty();
@@ -289,13 +296,11 @@ bool SshConnectionPool::hasBrokenHybridKex(const QString& runtimeVersion)
 SshConnectionPool::AuthRung SshConnectionPool::nextAuthRung(
     const AuthRungsTried& tried, AuthMethods offered, bool canPrompt)
 {
-    // Public-key rungs come first because they need nothing from the user: an
-    // agent key or an unencrypted key file authenticates silently. Only when
-    // those are spent is a human interrupted, and the secret-bearing rungs
-    // (password, then keyboard-interactive) come last.
+    // The public-key rung comes first because it needs nothing from the user:
+    // an agent key or an unencrypted key file authenticates silently. Only when
+    // that is spent is a human interrupted, and the secret-bearing rungs
+    // (passphrase, password, then keyboard-interactive) come last.
     if (offered.publicKey) {
-        if (!tried.agent)
-            return AuthRung::Agent;
         if (!tried.keyFile)
             return AuthRung::KeyFile;
         if (canPrompt && !tried.keyPassphrase)
@@ -461,6 +466,21 @@ bool SshConnectionPool::applyHostKeyPolicy(const QString& host, quint16 port,
             return false;
         if (decision == HostKeyDecision::Accept) {
             m_knownHosts.add(lookupHost, keyType, keyBlob);
+            // add() refuses anything that cannot round-trip as one known_hosts
+            // line — a host token carrying pattern syntax, a comma or
+            // whitespace, which a server profile is free to contain because it
+            // is whatever the user typed. The connection is still the user's to
+            // make, but the trust was NOT recorded, so say so instead of
+            // letting the same prompt reappear on every launch with no
+            // explanation anywhere.
+            if (m_knownHosts.verify(lookupHost, keyType, keyBlob)
+                != KnownHosts::Verdict::Match) {
+                appendDiagnostic(
+                    QStringLiteral("The %1 host key for %2 was trusted for this "
+                                   "session only: \"%2\" cannot be written as a "
+                                   "known_hosts entry.")
+                        .arg(keyType, lookupHost));
+            }
             return true;
         }
         // The user declined. Report it: a refusal the user chose still has to
@@ -557,8 +577,38 @@ int declineLibsshPassphrase(const char*, char*, size_t, int, int, void*)
     return -1;
 }
 
-QStringList identityFileCandidates(ssh_session session,
-                                   const QString& profileIdentityFile)
+// The identity libssh would use, read from the session while it still tells the
+// truth about WHO named it.
+//
+// libssh seeds every fresh session with its own defaults, spelled with the
+// tokens it expands at connect time ("%d/id_ed25519", %d being the .ssh
+// directory), and ssh_options_set(SSH_OPTIONS_IDENTITY) puts a profile or
+// ~/.ssh/config value at the HEAD of that same list. ssh_options_get() hands
+// back the head, so before ssh_connect() a '%' escape means "nobody named a
+// key" and anything else is the user's choice.
+//
+// The timing is the whole point: ssh_connect() runs ssh_options_apply(), which
+// expands every entry in place. Asking afterwards therefore answers
+// "<home>/.ssh/id_ed25519" even for a user who configured nothing — a path that
+// looks exactly like an explicit choice, suppresses the ~/.ssh scan in
+// identityFileCandidates(), and left the Windows named-pipe-agent fallback
+// trying one key that may not even exist while the user's real id_rsa was never
+// looked at.
+QString readConfiguredIdentity(ssh_session session)
+{
+    char* identity = nullptr;
+    if (ssh_options_get(session, SSH_OPTIONS_IDENTITY, &identity) != SSH_OK
+        || !identity)
+        return QString();
+    const QString value = QFile::decodeName(identity);
+    ssh_string_free_char(identity);
+    return value.contains(QLatin1Char('%')) ? QString() : value;
+}
+
+// `configIdentityFile` is the head of libssh's identity list as read BEFORE
+// ssh_connect() — see readConfiguredIdentity() for why the timing matters.
+QStringList identityFileCandidates(const QString& profileIdentityFile,
+                                   const QString& configIdentityFile)
 {
     QStringList candidates;
     const auto add = [&candidates](const QString& file) {
@@ -567,30 +617,12 @@ QStringList identityFileCandidates(ssh_session session,
     };
 
     add(profileIdentityFile);
-
-    // The public API exposes the first identity in libssh's list — the one
-    // parsed from ~/.ssh/config when the config named an IdentityFile. Keep it
-    // after the explicitly saved profile value, which deliberately has
-    // precedence over broader OpenSSH defaults.
-    //
-    // A fresh session's list is NOT empty, though: libssh seeds it with its own
-    // defaults, spelled with the tokens it expands at connect time
-    // ("%d/id_ed25519", %d being the .ssh directory). Those are not paths any
-    // file API can open, and accepting one would ALSO make `candidates`
-    // non-empty and so skip the real ~/.ssh scan below — leaving the Windows
-    // named-pipe-agent fallback, the only caller that reads this list, with a
-    // single unopenable key and no way to reach the user's actual keys. Anything
-    // still carrying a libssh '%' escape is therefore dropped.
-    char* configuredIdentity = nullptr;
-    const int identityResult =
-        ssh_options_get(session, SSH_OPTIONS_IDENTITY, &configuredIdentity);
-    if (identityResult == SSH_OK && configuredIdentity) {
-        const QString identity = QFile::decodeName(configuredIdentity);
-        if (!identity.contains(QLatin1Char('%')))
-            add(identity);
-    }
-    if (configuredIdentity)
-        ssh_string_free_char(configuredIdentity);
+    // The identity parsed from ~/.ssh/config, kept after the explicitly saved
+    // profile value, which deliberately has precedence over broader OpenSSH
+    // defaults. Empty when the config named none — readConfiguredIdentity()
+    // drops libssh's own unexpanded defaults, so reaching the ~/.ssh scan below
+    // stays possible.
+    add(configIdentityFile);
 
     // With a profile or config identity, stop there: each rejected key spends
     // one server authentication attempt. Scan defaults only when neither
@@ -614,10 +646,11 @@ QStringList identityFileCandidates(ssh_session session,
 QString authRungName(SshConnectionPool::AuthRung rung)
 {
     switch (rung) {
-    case SshConnectionPool::AuthRung::Agent:
-        return QStringLiteral("ssh-agent");
     case SshConnectionPool::AuthRung::KeyFile:
-        return QStringLiteral("private key");
+        // One rung, two sources: ssh_userauth_publickey_auto() offers the
+        // agent's identities before it looks at any key file, so a message
+        // naming only "private key" would misdescribe an agent success.
+        return QStringLiteral("ssh-agent or private key");
     case SshConnectionPool::AuthRung::KeyPassphrase:
         return QStringLiteral("private key (with passphrase)");
     case SshConnectionPool::AuthRung::Password:
@@ -949,6 +982,11 @@ bool SshConnectionPool::connectToHost(const QString& host, quint16 port,
             return false;
     }
 
+    // Ask BEFORE ssh_connect() expands libssh's own default identities into
+    // real paths and makes "nobody configured a key" indistinguishable from an
+    // explicit choice (see readConfiguredIdentity()).
+    const QString configuredIdentity = readConfiguredIdentity(m_session);
+
     appendDiagnostic(QStringLiteral("Beginning SSH handshake."));
     if (abortRequested())
         return false;
@@ -1002,7 +1040,7 @@ bool SshConnectionPool::connectToHost(const QString& host, quint16 port,
     setState(State::Authenticating);
     if (abortRequested())
         return false;
-    if (!authenticate(user)) {
+    if (!authenticate(user, configuredIdentity)) {
         if (abortRequested())
             return false;
         const QString error = authenticationFailure();
@@ -1137,7 +1175,8 @@ bool SshConnectionPool::verifyHostKey(const QString& host)
     return applyHostKeyPolicy(host, m_port, keyType, keyBlob);
 }
 
-bool SshConnectionPool::authenticate(const QString& user)
+bool SshConnectionPool::authenticate(const QString& user,
+                                     const QString& configIdentityFile)
 {
     const auto cancelled = [this] {
         return m_disconnectRequested || !m_session;
@@ -1191,8 +1230,13 @@ bool SshConnectionPool::authenticate(const QString& user)
     // AF_UNIX socket. Avoid every libssh auto-auth call in that case: it
     // retries the agent internally and leaves public-key fallback unusable.
     const bool unsupportedWindowsAgent = usesUnsupportedWindowsAgent();
+    // Only the named-pipe fallback ever reads this list, and building it stats
+    // the user's ~/.ssh; every other platform would pay for a list nothing
+    // looks at.
     const QStringList identityFiles =
-        identityFileCandidates(m_session, m_identityFile);
+        unsupportedWindowsAgent
+            ? identityFileCandidates(m_identityFile, configIdentityFile)
+            : QStringList();
     if (cancelled())
         return false;
 
@@ -1201,8 +1245,35 @@ bool SshConnectionPool::authenticate(const QString& user)
     // SSH_AUTH_PARTIAL and then advertises only the method it still wants, so
     // the ladder is re-derived from the server's current offer after every step
     // rather than walked blindly. It terminates because nextAuthRung() never
-    // returns a rung already in `tried`: at most five steps, however many
+    // returns a rung already in `tried`: at most four steps, however many
     // partial successes the server reports.
+    //
+    // HOW MANY TIMES THE ssh-agent IS ASKED, and why it is not once.
+    // ssh_userauth_publickey_auto() — the call behind both public-key rungs —
+    // offers every identity in the ssh-agent BEFORE it looks at a key file
+    // (libssh 0.11.3, src/auth.c:1317-1326), and it frees the per-session
+    // `auto_state` that remembers how far it got on every SSH_AUTH_DENIED
+    // (src/auth.c:1593), so the next call starts that agent walk over from the
+    // beginning. Each agent identity is a real SSH_MSG_USERAUTH_REQUEST, and
+    // OpenSSH counts every failed one against MaxAuthTries (6 by default).
+    // CodeHarbor used to run a THIRD walk from an ssh-agent rung of its own;
+    // that rung is gone because it offered libssh nothing libssh was not about
+    // to do anyway. Two walks remain in the worst case — the KeyFile rung and,
+    // when a credential callback can supply a passphrase and the server still
+    // offers publickey, the KeyPassphrase rung — so a user carrying three or
+    // more unrelated keys in their agent can still be disconnected before their
+    // identity file or password is reached.
+    // The obvious fix, driving ssh_pki_import_privkey_file() plus
+    // ssh_userauth_publickey() ourselves as the Windows named-pipe fallback
+    // below already does, was rejected: it would silently drop certificate
+    // authentication (-cert.pub and SSH_OPTIONS_CERTIFICATE), PKCS#11 URI
+    // identities, and every ~/.ssh/config IdentityFile after the first, because
+    // ssh_options_get(SSH_OPTIONS_IDENTITY) exposes only the head of libssh's
+    // list. libssh offers no way to tell publickey_auto to skip its agent pass:
+    // by then the agent socket is already open on the session, so
+    // SSH_OPTIONS_IDENTITY_AGENT cannot short-circuit ssh_agent_is_running().
+    // The drop is at least explained rather than silent — see the
+    // ssh_is_connected() check at the end of this loop.
     AuthMethods offered = methodsFromMask(ssh_userauth_list(m_session, nullptr));
     if (cancelled())
         return false;
@@ -1221,13 +1292,6 @@ bool SshConnectionPool::authenticate(const QString& user)
         AuthOutcome outcome = AuthOutcome::Refused;
 
         switch (rung) {
-        case AuthRung::Agent:
-            if (!unsupportedWindowsAgent) {
-                outcome =
-                    classifyAuthResult(ssh_userauth_agent(m_session, nullptr));
-            }
-            break;
-
         case AuthRung::KeyFile:
             outcome =
                 unsupportedWindowsAgent

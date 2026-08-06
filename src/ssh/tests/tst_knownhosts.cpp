@@ -77,6 +77,8 @@ private slots:
     void negatedWildcardHostIsExcluded();
     void hashedHostMatchesAMixedCaseLookup();
     void wildcardCoversAHostSpelledWithAnAsterisk();
+    void revocationCoversEveryHostOnACommaSeparatedLine();
+    void aSpecificEntryAndACoveringWildcardAreBothTrusted();
     void commentsAndMarkersSurviveARoundTrip();
     void addIgnoresATripleThatCannotBeStored();
     void addRejectsNonPlainHostTokens();
@@ -694,6 +696,76 @@ void TstKnownHosts::wildcardCoversAHostSpelledWithAnAsterisk()
     QCOMPARE(store.verify(QStringLiteral("db1.example.com"),
                           QStringLiteral("ssh-ed25519"), kEd25519Alpha),
              KnownHosts::Verdict::Unknown);
+}
+
+// One known_hosts line may name several hosts, and parse() expands that into
+// one entry per name. The @revoked marker has to travel with every one of them:
+// if it were kept only on the first, the same key would stay refused at
+// host-a and be quietly accepted at host-b, which is precisely the machine an
+// administrator was trying to lock out.
+void TstKnownHosts::revocationCoversEveryHostOnACommaSeparatedLine()
+{
+    const KnownHosts store = KnownHosts::parse(QStringLiteral(
+        "@revoked one.example,two.example,10.0.0.9 ssh-ed25519 "
+        "ZWQyNTUxOS1rZXktYWxwaGEtMDAwMQ==\n"));
+    QCOMPARE(store.entries().size(), 3);
+    for (const KnownHosts::Entry& entry : store.entries())
+        QCOMPARE(entry.marker, QStringLiteral("@revoked"));
+
+    for (const QString& host : {QStringLiteral("one.example"),
+                                QStringLiteral("two.example"),
+                                QStringLiteral("10.0.0.9")}) {
+        QCOMPARE(store.verify(host, QStringLiteral("ssh-ed25519"),
+                              kEd25519Alpha),
+                 KnownHosts::Verdict::Mismatch);
+        // Revocation grants no trust, so another key at those hosts is still
+        // first use rather than a refusal.
+        QCOMPARE(store.verify(host, QStringLiteral("ssh-ed25519"),
+                              kEd25519Beta),
+                 KnownHosts::Verdict::Unknown);
+    }
+
+    // And every expanded line keeps the marker through a round trip, so the
+    // revocation is not lost the next time CodeHarbor writes the file back.
+    const KnownHosts reparsed =
+        KnownHosts::parse(QString::fromUtf8(store.serialize()));
+    QCOMPARE(reparsed.entries().size(), 3);
+    QCOMPARE(reparsed.verify(QStringLiteral("two.example"),
+                             QStringLiteral("ssh-ed25519"), kEd25519Alpha),
+             KnownHosts::Verdict::Mismatch);
+}
+
+// A real file holds both kinds of line for the same machine: a wildcard for the
+// domain and a specific entry written the day that one host was first
+// approved. Each key must verify against its own line — a wildcard that
+// swallowed the specific host would turn its perfectly good key into a hard
+// refusal and lock the user out.
+void TstKnownHosts::aSpecificEntryAndACoveringWildcardAreBothTrusted()
+{
+    const KnownHosts store = KnownHosts::parse(QStringLiteral(
+        "*.example.com ssh-ed25519 ZWQyNTUxOS1rZXktYWxwaGEtMDAwMQ==\n"
+        "build.example.com ssh-ed25519 ZWQyNTUxOS1rZXktYmV0YS0wMDAy\n"));
+    QCOMPARE(store.entries().size(), 2);
+
+    // The specific host's own key.
+    QCOMPARE(store.verify(QStringLiteral("build.example.com"),
+                          QStringLiteral("ssh-ed25519"), kEd25519Beta),
+             KnownHosts::Verdict::Match);
+    // The domain key, still valid at that host because the wildcard covers it.
+    QCOMPARE(store.verify(QStringLiteral("build.example.com"),
+                          QStringLiteral("ssh-ed25519"), kEd25519Alpha),
+             KnownHosts::Verdict::Match);
+    // A third key there is the refusal, from either line's point of view.
+    QCOMPARE(store.verify(QStringLiteral("build.example.com"),
+                          QStringLiteral("ssh-ed25519"), kEd25519Delta),
+             KnownHosts::Verdict::Mismatch);
+    // The specific line grants nothing to its siblings.
+    QCOMPARE(store.verify(QStringLiteral("web.example.com"),
+                          QStringLiteral("ssh-ed25519"), kEd25519Beta),
+             KnownHosts::Verdict::Mismatch);
+    QCOMPARE(store.verify(QStringLiteral("web.example.com"),
+                          QStringLiteral("ssh-ed25519"), kEd25519Alpha),
+             KnownHosts::Verdict::Match);
 }
 
 void TstKnownHosts::commentsAndMarkersSurviveARoundTrip()

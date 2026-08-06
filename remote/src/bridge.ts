@@ -14,6 +14,7 @@ import path from "node:path";
 // import.meta.url, silently turning the CLI entry point below into a no-op.
 import { pathToFileURL } from "node:url";
 import { adapterFor } from "./adapters/index.ts";
+import { nativeString } from "./adapters/types.ts";
 import {
     isEventIdentifier,
     isHarness,
@@ -153,6 +154,25 @@ function acquireBridgeLock(socketPath: string): string {
 // later paused for output back-pressure is never mistaken for an idle one.
 export const BRIDGE_HANDSHAKE_TIMEOUT_MS = 30_000;
 
+// How long a producer may sit on an INCOMPLETE line — bytes delivered with no
+// terminating newline yet — before the bridge gives up on it.
+//
+// BRIDGE_HANDSHAKE_TIMEOUT_MS above covers only the producer that sends nothing
+// at all: it is disarmed by the first byte. A producer that writes one byte and
+// then hangs used to be reclaimed by nothing whatsoever — it kept its file
+// descriptor AND its buffered partial line in the framer for the whole life of
+// the bridge process, with MAX_BRIDGE_CONNECTIONS merely capping how many such
+// corpses could pile up before accept() stopped answering and agent status
+// silently stopped updating for every harness, permanently.
+//
+// The timer is re-armed on every chunk, so a producer still making progress
+// through a long line is never killed. And it is armed ONLY while a partial
+// line is held, so the two legitimate reasons a connection is quiet are both
+// untouched: a long-lived producer idling between complete lines, and one
+// paused for output back-pressure (whose retained bytes live in the framer's
+// pending queue, not in its partial-line buffer).
+export const BRIDGE_PARTIAL_LINE_TIMEOUT_MS = 30_000;
+
 // Ceiling on producer connections the bridge holds open at once; see the
 // server.maxConnections assignment in startBridge for why a handshake timeout
 // alone does not bound them.
@@ -264,13 +284,23 @@ export function processBridgeLine(line: string): AgentEvent | null {
             ? { ...(derived ?? {}), ...(explicit ?? {}) }
             : undefined;
 
-        const nativeName = native.type ?? native.hook;
+        // The event NAME goes to the client verbatim, so it is normalized the
+        // same way the adapters normalize the name they match on: producers are
+        // shell hook configurations, and one interpolated variable leaves
+        // "agent_start\r\n" here. Untrimmed, the adapter maps the state
+        // correctly (it trims) while the client displays and logs the event
+        // name with a carriage return glued to it.
+        //
+        // `||`, not `??`: a BLANK `type` is "this producer did not name its
+        // event under `type`", not the event whose name is the empty string, so
+        // it must fall through to the Claude Code key rather than shadow it.
+        const nativeName = nativeString(native.type) || nativeString(native.hook);
         return makeEvent({
             harness: message.harness,
             devSessionId: message.devSessionId,
             terminalId: message.terminalId,
             state,
-            event: typeof nativeName === "string" ? nativeName : "unknown",
+            event: nativeName || "unknown",
             summary: typeof message.summary === "string" ? message.summary : undefined,
             metadata,
         });
@@ -287,8 +317,14 @@ export function processBridgeLine(line: string): AgentEvent | null {
  * arrived on and resumes it once the output drains (RR24).
  */
 export type EventSink = (event: AgentEvent, source: net.Socket) => void;
-interface BridgeLineFramer {
+export interface BridgeLineFramer {
     feed(chunk: Buffer): void;
+    /**
+     * True while bytes of an unterminated line are buffered, i.e. the producer
+     * started a line and has not finished it. The caller arms its partial-line
+     * watchdog on exactly this condition; see BRIDGE_PARTIAL_LINE_TIMEOUT_MS.
+     */
+    partial(): boolean;
     // Resume parsing bytes retained from a chunk that arrived just before the
     // source socket was paused for output back-pressure.
     resume(): void;
@@ -397,6 +433,9 @@ export function createBridgeLineFramer(
             }
             processChunk(chunk);
         },
+        partial() {
+            return heldBytes > 0;
+        },
         resume() {
             if (!blocked || closed) return;
             blocked = false;
@@ -488,6 +527,14 @@ export function makeStreamSink(out: NodeJS.WritableStream): EventSink {
     };
 }
 
+/** Watchdog bounds for one accepted producer connection. */
+export interface BridgeOptions {
+    /** Overrides BRIDGE_HANDSHAKE_TIMEOUT_MS. */
+    handshakeTimeoutMs?: number;
+    /** Overrides BRIDGE_PARTIAL_LINE_TIMEOUT_MS. */
+    partialLineTimeoutMs?: number;
+}
+
 /**
  * Start the bridge server on `socketPath`, relaying mapped events to `sink`
  * (defaults to stdout). Resolves with the listening server once it is bound.
@@ -498,19 +545,32 @@ export function makeStreamSink(out: NodeJS.WritableStream): EventSink {
  * (connect refused/absent -> unlink and take it over). A non-socket at the path
  * is never clobbered, so a mistyped path pointing at a regular file makes
  * listen() fail rather than deleting the file.
+ *
+ * `options` exists so the two per-connection watchdogs can be driven in a test
+ * without waiting out their production defaults, which are deliberately tens of
+ * seconds. Omitting it is exactly the production configuration.
  */
 export async function startBridge(
     socketPath: string = resolveSocketPath(),
     sink?: EventSink,
+    options: BridgeOptions = {},
 ): Promise<net.Server> {
-    let activeSink = sink;
+    const handshakeTimeoutMs = options.handshakeTimeoutMs ?? BRIDGE_HANDSHAKE_TIMEOUT_MS;
+    const partialLineTimeoutMs = options.partialLineTimeoutMs ?? BRIDGE_PARTIAL_LINE_TIMEOUT_MS;
+    // Built ONCE, up front, rather than on the first event that needs it. The
+    // sink is what installs the 'error' listener on the output stream, and an
+    // output stream with no 'error' listener turns a failure into an uncaught
+    // exception that kills the relay. In production the output is stdout, i.e.
+    // an SSH channel the client can close at any moment — including before the
+    // first event ever arrives, which is precisely the window a lazily built
+    // sink left unguarded.
+    const activeSink = sink ?? makeStreamSink(process.stdout);
     const server = net.createServer((socket) => {
         const lines = createBridgeLineFramer(
             (line) => {
                 const event = processBridgeLine(line);
                 if (event) {
                     try {
-                        if (!activeSink) activeSink = makeStreamSink(process.stdout);
                         activeSink(event, socket);
                     } catch {
                         socket.destroy();
@@ -530,26 +590,51 @@ export async function startBridge(
                 socket.destroy();
             },
         );
-        const handshake = setTimeout(() => socket.destroy(), BRIDGE_HANDSHAKE_TIMEOUT_MS);
+        const handshake = setTimeout(() => socket.destroy(), handshakeTimeoutMs);
         handshake.unref();
+        // Armed only while the framer holds an unterminated line, re-armed on
+        // every advance; see BRIDGE_PARTIAL_LINE_TIMEOUT_MS for why the
+        // handshake timer above cannot cover this case.
+        let partialWatch: NodeJS.Timeout | undefined;
+        const watchPartialLine = (): void => {
+            if (partialWatch !== undefined) {
+                clearTimeout(partialWatch);
+                partialWatch = undefined;
+            }
+            if (socket.destroyed || !lines.partial()) return;
+            partialWatch = setTimeout(() => socket.destroy(), partialLineTimeoutMs);
+            partialWatch.unref();
+        };
         socket.once("data", () => clearTimeout(handshake));
-        socket.on("data", lines.feed);
-        socket.on("resume", lines.resume);
+        socket.on("data", (chunk: Buffer) => {
+            lines.feed(chunk);
+            watchPartialLine();
+        });
+        socket.on("resume", () => {
+            // Draining bytes retained during a back-pressure stall can leave a
+            // fresh partial line behind, and no 'data' event follows to notice.
+            lines.resume();
+            watchPartialLine();
+        });
         socket.on("close", () => {
             clearTimeout(handshake);
+            if (partialWatch !== undefined) clearTimeout(partialWatch);
             lines.close();
         });
         socket.on("error", () => socket.destroy());
     });
-    // Hard ceiling on producers held open at once. BRIDGE_HANDSHAKE_TIMEOUT_MS
-    // only reclaims a connection that has sent NOTHING; a producer that sends
-    // one byte and then hangs keeps its file descriptor forever, and enough of
-    // those make accept() fail with EMFILE — after which no producer can
-    // connect at all and agent status silently stops updating, with no bound
-    // on the memory the accepted sockets hold either. A real producer connects,
-    // writes one line and ends within milliseconds, so 256 concurrent is orders
-    // of magnitude of headroom; past it Node closes the newcomer immediately
-    // rather than letting the accumulation take the whole relay down.
+    // Hard ceiling on producers held open at once, and a backstop rather than
+    // the primary defence: the two per-connection watchdogs above reclaim a
+    // producer that sends nothing (BRIDGE_HANDSHAKE_TIMEOUT_MS) and one that
+    // stalls part-way through a line (BRIDGE_PARTIAL_LINE_TIMEOUT_MS), but
+    // neither touches a producer that is merely idle between complete lines,
+    // which is legitimate. Enough simultaneously idle connections would make
+    // accept() fail with EMFILE — after which no producer can connect at all
+    // and agent status silently stops updating, with no bound on the memory the
+    // accepted sockets hold either. A real producer connects, writes one line
+    // and ends within milliseconds, so 256 concurrent is orders of magnitude of
+    // headroom; past it Node closes the newcomer immediately rather than
+    // letting the accumulation take the whole relay down.
     server.maxConnections = MAX_BRIDGE_CONNECTIONS;
     fs.mkdirSync(path.dirname(socketPath), { recursive: true, mode: 0o700 });
     const lockPath = acquireBridgeLock(socketPath);
@@ -625,38 +710,55 @@ if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {
     const socketPath = resolveSocketPath();
     try {
         const server = await startBridge(socketPath);
-        process.stderr.write(`codeharbor-bridge listening on ${socketPath}\n`);
-        // Without handlers, SIGHUP/SIGINT/SIGTERM terminate the process
-        // outright and leave the socket file behind, so the next run has to
-        // treat a socket that may still look live as stale. Close the listener
-        // and remove the socket ourselves, then exit immediately: waiting for
-        // open connections to drain would let one stuck producer block
-        // shutdown forever.
-        const shutdown = (): void => {
-            server.close();
+        // Remove the socket file and the ownership lock on the way out, on
+        // EVERY way out. A signal handler alone covers only the signals: a
+        // fatal error anywhere else — an uncaught exception, an out-of-memory
+        // abort — exits without running one, and then BOTH files are left
+        // behind. The socket is the cheap half of that (the next run probes it
+        // and takes it over). The lock is the expensive half: the next run falls
+        // back to probing the recorded pid, and once the operating system
+        // recycles that pid onto any live process the bridge refuses to start at
+        // all with "address already in use" — permanently, until somebody
+        // deletes the file by hand. 'exit' fires for process.exit() and for a
+        // fatal error alike, and only synchronous work is allowed in it, which
+        // is exactly what these two unlinks are.
+        const cleanup = (): void => {
             try {
                 if (fs.lstatSync(socketPath).isSocket()) fs.unlinkSync(socketPath);
             } catch {
                 // Already unlinked by server.close(), or never created.
             }
-            // The ownership lock too. server.close() is ASYNCHRONOUS, so the
-            // 'close' event that normally releases it never fires before the
-            // process.exit() below: every signalled stop used to leave a
-            // <socket>.lock behind. The next run then has to fall back to
-            // probing the recorded pid, and once the operating system recycles
-            // that pid onto any live process the bridge refuses to start at all
-            // with "address already in use" — permanently, until somebody
-            // deletes the file by hand.
             try {
                 fs.unlinkSync(bridgeLockPath(socketPath));
             } catch {
                 // Already released by server.close(), or never acquired.
             }
+        };
+        process.on("exit", cleanup);
+        // Without handlers, SIGHUP/SIGINT/SIGTERM terminate the process outright
+        // and leave the socket file behind, so the next run has to treat a
+        // socket that may still look live as stale. Close the listener and exit
+        // immediately, letting `cleanup` above remove both files: waiting for
+        // open connections to drain would let one stuck producer block shutdown
+        // forever, and server.close() is ASYNCHRONOUS, so its 'close' event —
+        // the thing that normally releases the lock — never fires before the
+        // exit.
+        const shutdown = (): void => {
+            server.close();
             process.exit(0);
         };
         process.on("SIGHUP", shutdown);
         process.on("SIGINT", shutdown);
         process.on("SIGTERM", shutdown);
+        // Announced LAST, after the handlers above are in place. On Linux a
+        // write to a pipe is synchronous, so a supervisor that waits for this
+        // banner and then signals us can be scheduled the instant the bytes land
+        // — while this process has not yet reached the next statement. Announcing
+        // first therefore left a real window in which SIGTERM took its DEFAULT
+        // action, killing the relay outright and leaving both the socket and the
+        // ownership lock on disk: precisely the outcome the handlers exist to
+        // prevent, reachable by the most ordinary way there is to stop a service.
+        process.stderr.write(`codeharbor-bridge listening on ${socketPath}\n`);
     } catch (err) {
         // A live bridge already owns the socket (RR12), or listen failed.
         process.stderr.write(`${err instanceof Error ? err.message : String(err)}\n`);

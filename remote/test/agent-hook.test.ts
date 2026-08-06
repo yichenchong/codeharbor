@@ -20,10 +20,12 @@ import { resolveSocketPath, type AgentEvent } from "../src/events.ts";
 import {
     BRIDGE_MESSAGE_VERSION,
     bridgeLineFits,
+    createBridgeLineFramer,
     processBridgeLine,
     startBridge,
     makeStreamSink,
     MAX_BRIDGE_LINE_BYTES,
+    MAX_BRIDGE_PENDING_BYTES,
     type EventSink,
 } from "../src/bridge.ts";
 
@@ -1302,4 +1304,368 @@ test("an oversized line cannot hide before a later newline (DM6)", async () => {
         await stopped.promise;
         fs.rmSync(dir, { recursive: true, force: true });
     }
+});
+
+// The framer is what turns a producer's byte stream into bridge lines, and every
+// other guard in the relay sits behind it. It was only ever exercised through a
+// live socket, where the interesting states — a held partial line, a chunk tail
+// retained across a back-pressure stall — are not directly observable.
+test("createBridgeLineFramer frames across chunks and reports a held partial line", () => {
+    const lines: string[] = [];
+    let overflows = 0;
+    const framer = createBridgeLineFramer(
+        (line) => {
+            lines.push(line);
+            return true;
+        },
+        () => {
+            overflows += 1;
+        },
+    );
+
+    framer.feed(Buffer.from('{"a":1'));
+    assert.deepEqual(lines, [], "a line with no newline yet is not a line");
+    assert.equal(framer.partial(), true, "its bytes are held");
+    framer.feed(Buffer.from('}\n{"b":2}\n{"c'));
+    assert.deepEqual(lines, ['{"a":1}', '{"b":2}']);
+    assert.equal(framer.partial(), true, "the trailing fragment is held too");
+    framer.feed(Buffer.from('":3}\n'));
+    assert.deepEqual(lines, ['{"a":1}', '{"b":2}', '{"c":3}']);
+    assert.equal(framer.partial(), false, "a completed line leaves nothing held");
+    assert.equal(overflows, 0);
+
+    // close() is terminal: a closed socket's framer must not emit anything from
+    // bytes that were already in flight.
+    framer.close();
+    framer.feed(Buffer.from('{"d":4}\n'));
+    assert.equal(lines.length, 3);
+    assert.equal(framer.partial(), false);
+});
+
+// The consumer returns false when it paused the source for output back-pressure.
+// The unprocessed tail of that chunk arrived BEFORE anything still to come, so
+// it has to go back at the HEAD of the queue: appending it instead glues the
+// bytes of one event onto a later one and loses both.
+test("createBridgeLineFramer retains a blocked chunk's tail in arrival order", () => {
+    const lines: string[] = [];
+    let accept = false;
+    const framer = createBridgeLineFramer(
+        (line) => {
+            lines.push(line);
+            return accept;
+        },
+        () => assert.fail("unexpected overflow"),
+    );
+
+    framer.feed(Buffer.from("a\nb"));
+    assert.deepEqual(lines, ["a"], "parsing stops at the line that blocked");
+    framer.feed(Buffer.from("c\nd\n"));
+    assert.deepEqual(lines, ["a"], "a blocked framer parses nothing further");
+    // Nothing is mid-line as far as the framer is concerned while blocked: the
+    // unparsed bytes sit in its queue, not in its partial-line buffer. That is
+    // what keeps the relay's partial-line watchdog off a producer the relay
+    // itself stopped reading.
+    assert.equal(framer.partial(), false);
+
+    accept = true;
+    framer.resume();
+    assert.deepEqual(
+        lines,
+        ["a", "bc", "d"],
+        "the retained tail must be parsed before the bytes that arrived after it",
+    );
+    assert.equal(framer.partial(), false);
+});
+
+// A paused socket can still finish delivering what was already in flight, so the
+// retained remainder needs its own bound: without one, a single unusually large
+// readable chunk walks straight past the socket-level back-pressure guard.
+test("createBridgeLineFramer bounds the bytes it retains while blocked", () => {
+    const lines: string[] = [];
+    let overflows = 0;
+    const framer = createBridgeLineFramer(
+        (line) => {
+            lines.push(line);
+            return false;
+        },
+        () => {
+            overflows += 1;
+        },
+    );
+
+    framer.feed(Buffer.from("a\n"));
+    assert.deepEqual(lines, ["a"]);
+    const junk = Buffer.alloc(256 * 1024, 0x62);
+    for (let sent = 0; sent <= MAX_BRIDGE_PENDING_BYTES && overflows === 0; sent += junk.length) {
+        framer.feed(junk);
+    }
+    assert.equal(overflows, 1, "retained bytes must be bounded");
+
+    // Overflow is terminal — the caller drops the producer — so neither a
+    // resume nor more input may revive the framer or report a second overflow.
+    framer.resume();
+    framer.feed(Buffer.from("b\n"));
+    assert.deepEqual(lines, ["a"]);
+    assert.equal(overflows, 1, "one dropped producer is reported once");
+});
+
+test("createBridgeLineFramer refuses a line longer than the frame bound", () => {
+    const lines: string[] = [];
+    let overflows = 0;
+    const framer = createBridgeLineFramer(
+        (line) => {
+            lines.push(line);
+            return true;
+        },
+        () => {
+            overflows += 1;
+        },
+    );
+
+    framer.feed(Buffer.alloc(MAX_BRIDGE_LINE_BYTES + 1, 0x41));
+    assert.equal(overflows, 1);
+    assert.deepEqual(lines, [], "no line may be emitted from an over-cap frame");
+    assert.equal(framer.partial(), false, "the held bytes are released, not kept");
+});
+
+async function connectProducer(socketPath: string): Promise<net.Socket> {
+    const producer = net.createConnection(socketPath);
+    // The relay tears these down on purpose in the tests below, which surfaces
+    // here as ECONNRESET.
+    producer.on("error", () => {});
+    const up = Promise.withResolvers<void>();
+    producer.once("connect", () => up.resolve());
+    await up.promise;
+    return producer;
+}
+
+// A producer that connects and never says anything pins a file descriptor for
+// the life of the relay, and enough of them make accept() fail with EMFILE —
+// after which no harness can report status at all and the only symptom is a
+// sidebar that stops updating. The watchdog was written for exactly this and
+// nothing drove it, because its production bound is thirty seconds.
+test("startBridge reclaims a producer that connects and sends nothing", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ch-bridge-silent-"));
+    const socketPath = path.join(dir, "bridge.sock");
+    const server = await startBridge(socketPath, () => {}, { handshakeTimeoutMs: 40 });
+    try {
+        const producer = await connectProducer(socketPath);
+        const closed = Promise.withResolvers<void>();
+        producer.once("close", () => closed.resolve());
+        // Never resolves if the relay keeps the silent producer forever, which
+        // fails this test by timing it out rather than by passing quietly.
+        await closed.promise;
+    } finally {
+        const stopped = Promise.withResolvers<void>();
+        server.close(() => stopped.resolve());
+        await stopped.promise;
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+// The handshake watchdog above is disarmed by the FIRST byte, so a producer that
+// writes one byte and then hangs used to be reclaimed by nothing at all: it kept
+// its file descriptor AND its buffered partial line for the whole life of the
+// relay process, with the connection ceiling merely capping how many such
+// corpses could pile up before accept() stopped answering for good.
+test("startBridge reclaims a producer that stalls part-way through a line", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ch-bridge-partial-"));
+    const socketPath = path.join(dir, "bridge.sock");
+    const relayed = Promise.withResolvers<AgentEvent>();
+    const server = await startBridge(socketPath, (event) => relayed.resolve(event), {
+        partialLineTimeoutMs: 40,
+    });
+    try {
+        const stalled = await connectProducer(socketPath);
+        const closed = Promise.withResolvers<void>();
+        stalled.once("close", () => closed.resolve());
+        // One byte, no newline: enough to disarm the handshake watchdog.
+        stalled.write("{");
+        await closed.promise;
+
+        // ...and the complement, which is what keeps the bound honest: a
+        // producer that FINISHED its line and simply went quiet is left alone.
+        // Idling between complete lines is what a long-lived producer does, and
+        // it is the shape the relay's back-pressure support exists for.
+        const idle = await connectProducer(socketPath);
+        idle.write(
+            `${JSON.stringify({
+                harness: "oh-my-pi",
+                devSessionId: "s",
+                terminalId: "t",
+                native: { type: "agent_start" },
+            })}\n`,
+        );
+        assert.equal((await relayed.promise).state, "running");
+        await new Promise((resolve) => setTimeout(resolve, 200));
+        assert.equal(
+            idle.destroyed,
+            false,
+            "a producer holding no partial line must survive going quiet",
+        );
+        idle.destroy();
+    } finally {
+        const stopped = Promise.withResolvers<void>();
+        server.close(() => stopped.resolve());
+        await stopped.promise;
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+// startBridge removes a leftover socket file before binding. A path that is NOT
+// a socket is a mistyped configuration, and deleting the user's file to make
+// room for a relay is never the right answer.
+test("startBridge never clobbers a regular file at the socket path", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ch-bridge-file-"));
+    const filePath = path.join(dir, "not-a-socket");
+    fs.writeFileSync(filePath, "precious\n");
+    try {
+        await assert.rejects(startBridge(filePath, () => {}));
+        assert.equal(fs.readFileSync(filePath, "utf8"), "precious\n");
+        // The ownership lock taken for the attempt is released again, so a
+        // failed start does not poison the path for the next one.
+        assert.equal(fs.existsSync(`${filePath}.lock`), false);
+    } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+// The metadata bag is producer-supplied, so it can contain a value
+// JSON.stringify refuses (a BigInt, a getter that throws, a cycle). That must
+// cost the producer its connection, not take the relay down with an uncaught
+// throw.
+test("makeStreamSink destroys a producer whose event cannot be serialized", () => {
+    const out = new PassThrough();
+    const sink = makeStreamSink(out);
+    const source = fakeSource();
+    const circular: Record<string, unknown> = { ...RELAY_EVENT };
+    circular.metadata = { self: circular };
+    sink(circular as unknown as AgentEvent, source.socket);
+    assert.equal(source.destroyed, true);
+    assert.equal(out.read(), null, "nothing half-serialized may reach the stream");
+});
+
+// There can be no useful drain after the output fails, so a producer paused
+// waiting for one would be held — with its file descriptor — for the rest of the
+// relay's life. In production the output is an SSH channel the client can drop
+// at any moment, which is exactly this case.
+test("makeStreamSink destroys stalled producers when the output fails", () => {
+    const out = new PassThrough({ highWaterMark: 1 });
+    const sink = makeStreamSink(out);
+    const source = fakeSource();
+
+    let guard = 0;
+    while (!source.paused && guard++ < 10) sink(RELAY_EVENT, source.socket);
+    assert.equal(source.paused, true, "a full output buffer must pause the source");
+
+    out.emit("error", new Error("the ssh channel went away"));
+    assert.equal(
+        source.destroyed,
+        true,
+        "a producer waiting on a drain that can never come must be released",
+    );
+});
+
+// The relay's own CLI entry point, which nothing in the portable suite ran. Two
+// things have to hold and neither is visible from the exported functions: the
+// entry point must recognise itself (it compares import.meta.url against
+// pathToFileURL(process.argv[1]), and a mismatch makes the whole relay a silent
+// no-op), and a signalled stop must leave nothing behind on disk.
+test("the bridge CLI announces itself and cleans up on SIGTERM", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ch-bridge-cli-"));
+    const socketPath = resolveSocketPath({ XDG_RUNTIME_DIR: dir } as NodeJS.ProcessEnv);
+    // The relay derives its ownership lock from the socket path this way; the
+    // suffix is internal, but a leftover FILE is observable and is precisely
+    // what breaks the next run.
+    const lockPath = `${socketPath}.lock`;
+    const bridgePath = fileURLToPath(new URL("../src/bridge.ts", import.meta.url));
+    const child = spawn(process.execPath, [bridgePath], {
+        // Minimal environment: inheriting this process's would let a stray
+        // XDG_RUNTIME_DIR on the developer's machine choose the socket path.
+        env: { PATH: process.env.PATH ?? "", XDG_RUNTIME_DIR: dir },
+        stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    const banner = Promise.withResolvers<void>();
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk: string) => (stdout += chunk));
+    child.stderr.on("data", (chunk: string) => {
+        stderr += chunk;
+        if (stderr.includes(`codeharbor-bridge listening on ${socketPath}`)) banner.resolve();
+    });
+    const exited = Promise.withResolvers<number | null>();
+    child.on("close", (code) => exited.resolve(code));
+    try {
+        await banner.promise;
+        assert.ok(fs.lstatSync(socketPath).isSocket(), "the relay owns its socket while running");
+        assert.ok(fs.existsSync(lockPath), "and the ownership lock that keeps a second one out");
+
+        child.kill("SIGTERM");
+        assert.equal(await exited.promise, 0, "a signalled stop is a clean stop");
+        assert.equal(fs.existsSync(socketPath), false, "the socket file must not be left behind");
+        // The expensive half: a leftover lock records a pid, and once the
+        // operating system recycles that pid onto any live process the relay
+        // refuses to start at all until somebody deletes the file by hand.
+        assert.equal(fs.existsSync(lockPath), false, "nor the ownership lock");
+        assert.equal(stdout, "", "the banner is stderr; stdout carries only relayed events");
+    } finally {
+        child.kill("SIGKILL");
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+// AG9, the other half. Both optional fields used to be dropped together the
+// moment either one pushed the line past the bound, so a megabyte-sized machine
+// bag took the one-line summary a human reads down with it — and main()'s loss
+// report, which names the two variables separately and conjugates its verb for
+// one field or two, could never print its single-field form.
+test("an over-long metadata bag is given up before the readable summary", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ch-hook-bag-"));
+    const socketPath = resolveSocketPath({ XDG_RUNTIME_DIR: dir } as NodeJS.ProcessEnv);
+    const received = Promise.withResolvers<string>();
+    const server = net.createServer((socket) => {
+        const chunks: Buffer[] = [];
+        socket.on("data", (chunk) => chunks.push(chunk));
+        socket.on("end", () => received.resolve(Buffer.concat(chunks).toString("utf8")));
+    });
+    const listening = Promise.withResolvers<void>();
+    server.listen(socketPath, () => listening.resolve());
+    await listening.promise;
+
+    let logged: string[] = [];
+    try {
+        logged = await captureStderr(async () => {
+            await main(["node", "oh-my-pi-hook.ts", "tool_call"], {
+                XDG_RUNTIME_DIR: dir,
+                OMP_DEV_SESSION_ID: "sess-bag",
+                OMP_TERMINAL_ID: "term-bag",
+                OMP_TOOL: "ask",
+                OMP_SUMMARY: "may I run this?",
+                OMP_METADATA: JSON.stringify({ blob: "x".repeat(MAX_BRIDGE_LINE_BYTES) }),
+            } as NodeJS.ProcessEnv);
+        });
+        const raw = await received.promise;
+        const payload = raw.trimEnd();
+        assert.ok(bridgeLineFits(payload));
+
+        const decoded = JSON.parse(payload);
+        assert.ok(!("metadata" in decoded), "the over-long bag must not reach the wire");
+        assert.equal(decoded.summary, "may I run this?", "the readable summary survives it");
+
+        const event = processBridgeLine(raw);
+        assert.ok(event, "the trimmed message must still map to an AgentEvent");
+        assert.equal(event.state, "waiting_input");
+        assert.equal(event.summary, "may I run this?");
+    } finally {
+        const closed = Promise.withResolvers<void>();
+        server.close(() => closed.resolve());
+        await closed.promise;
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
+
+    assert.equal(logged.length, 1);
+    assert.match(logged[0], /OMP_METADATA was dropped/);
+    assert.doesNotMatch(logged[0], /OMP_SUMMARY/);
 });

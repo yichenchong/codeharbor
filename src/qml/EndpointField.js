@@ -29,18 +29,31 @@
 var REJECTED =
     /[\u0000-\u0020\u007f-\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]/;
 
-// QString::trimmed() strips exactly the characters above, so trimming with the
-// same set is what makes the value this module judges the same value the store
-// will judge. Written as a scan rather than a second /.../g regular expression
-// so the character class has ONE spelling; a non-global RegExp has no lastIndex
-// state, so `test` here is safe to call repeatedly.
+// What QString::trimmed() strips, which is NARROWER than REJECTED above: "any
+// character for which QChar::isSpace() returns true", i.e. the separators plus
+// the five ASCII whitespace controls — NOT the rest of the C0/C1 control range.
+//
+// Trimming with REJECTED instead made this module disagree with the store on
+// exactly the values it exists to catch: "\u0001box.local" trimmed to
+// "box.local" here, so isUsable() said yes, Save was enabled and no message was
+// shown — while ServerProfiles::sanitize() trims nothing off that value, sees
+// the control character and drops the record without a word. Trimming with the
+// store's own set is what makes the value this module judges the same value the
+// store will judge.
+//
+// Written as a scan rather than a /.../g regular expression so each character
+// class has ONE spelling; a non-global RegExp has no lastIndex state, so `test`
+// here is safe to call repeatedly.
+var SPACE =
+    /[\u0009-\u000d\u0020\u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]/;
+
 function trim(text) {
     var value = String(text);
     var start = 0;
     var end = value.length;
-    while (start < end && REJECTED.test(value.charAt(start)))
+    while (start < end && SPACE.test(value.charAt(start)))
         ++start;
-    while (end > start && REJECTED.test(value.charAt(end - 1)))
+    while (end > start && SPACE.test(value.charAt(end - 1)))
         --end;
     return value.substring(start, end);
 }

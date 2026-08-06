@@ -15,10 +15,11 @@ namespace ch {
 // takes a resource when it positively claims it — and its four steps between
 // them mint exactly these values. "OpenExternally" used to sit here and was
 // never returned by any path: handing a file to the desktop's own application
-// is an ACTION the binary/download view offers (SPEC 7.5's "Binary | metadata
-// and download/open actions"), taken after resolution has already landed on
-// Download. It is not a disposition the browser can resolve a URL to, so it is
-// not one of these.
+// is an ACTION, offered by the "Open as" menu (which reaches
+// ViewerModel::openWithApplication), taken after resolution has already landed
+// on a kind. The binary view itself only offers what SPEC 7.5 lists for it,
+// "Binary | metadata and a download action". Opening externally is not a
+// disposition the browser can resolve a URL to, so it is not one of these.
 enum class ViewerResolution {
     DirectWebNavigation,
     InternalHtmlRenderer,

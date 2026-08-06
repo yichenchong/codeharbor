@@ -2075,3 +2075,175 @@ test("stdin EOF shuts down the daemon with active watches", async () => {
         await fs.rm(dbDir, { recursive: true, force: true });
     }
 });
+
+// An atomic save renames a temp file over the target's NAME, and nothing in
+// that sequence notices that the name belongs to a directory: the temp file was
+// created in the directory's PARENT (path.dirname of the target), chmod'd to
+// the directory's own mode, and only the final rename failed — with an errno
+// that varies by platform, over a path outside the one the request named. A
+// create-only save did not even reach that point: it was reported as a revision
+// CONFLICT, which makes the editor offer the user reload-or-overwrite for a
+// directory.
+test("writeFile refuses a directory with EISDIR and leaves nothing behind", async () => {
+    const dir = await tmpDir();
+    const target = path.join(dir, "adirectory");
+    await fs.mkdir(target);
+
+    const isEisdir = (err: NodeJS.ErrnoException): boolean => err.code === "EISDIR";
+    // Create-only: must be EISDIR, NOT a revision mismatch.
+    const createOnly = await writeFile({ path: target, content: "x", expectedRevision: "" })
+        .then(() => undefined, (err: unknown) => err);
+    assert.ok(createOnly instanceof Error && isEisdir(createOnly));
+    assert.equal(isRevisionMismatch(createOnly), false);
+
+    // And with the token stat() actually reports for that directory.
+    const seen = await stat({ path: target });
+    assert.equal(seen.kind, "directory");
+    await assert.rejects(
+        () => writeFile({ path: target, content: "x", expectedRevision: seen.revision }),
+        isEisdir,
+    );
+
+    // The directory is untouched and no temp file was dropped in it or beside it.
+    assert.deepEqual(await fs.readdir(target), []);
+    assert.deepEqual(await fs.readdir(dir), ["adirectory"]);
+
+    await fs.rm(dir, { recursive: true, force: true });
+});
+
+// stat() answers "" — the create-only token, meaning "nothing is at this
+// path" — when a symlink's target does not exist. It used to answer the same
+// thing when the target could not be LOOKED AT, which is the opposite
+// situation: the client was told the save would create a file, when in fact
+// every read and every write of that path fails with EACCES.
+test(
+    "stat reports the real error for a symlink whose target cannot be reached",
+    { skip: process.getuid?.() === 0 ? "root ignores directory permissions" : false },
+    async () => {
+        const dir = await tmpDir();
+        const closed = path.join(dir, "closed");
+        const link = path.join(dir, "into-closed.lnk");
+        await fs.mkdir(closed);
+        await fs.writeFile(path.join(closed, "secret.txt"), "data");
+        await fs.symlink(path.join(closed, "secret.txt"), link);
+        await fs.chmod(closed, 0o000);
+
+        try {
+            await assert.rejects(
+                () => stat({ path: link }),
+                (err: NodeJS.ErrnoException) => err.code === "EACCES",
+            );
+        } finally {
+            await fs.chmod(closed, 0o700);
+            await fs.rm(dir, { recursive: true, force: true });
+        }
+    },
+);
+
+test("stat reports ENOENT for a path that does not exist", async () => {
+    const dir = await tmpDir();
+
+    await assert.rejects(
+        () => stat({ path: path.join(dir, "absent.txt") }),
+        (err: NodeJS.ErrnoException) => err.code === "ENOENT",
+    );
+
+    await fs.rm(dir, { recursive: true, force: true });
+});
+
+// A zero-length window is a valid request, not an omitted one: `length: 0` must
+// return no bytes and say so, rather than being confused with "no length given"
+// and returning the whole file.
+test("readFile honors an explicit zero-length window", async () => {
+    const dir = await tmpDir();
+    const file = path.join(dir, "zero.txt");
+    await fs.writeFile(file, "0123456789");
+
+    const none = await readFile({ path: file, offset: 3, length: 0 });
+    assert.equal(none.content, "");
+    assert.equal(none.encoding, "utf-8");
+    assert.equal(none.truncated, true);
+
+    // Zero length at the very start of the file is still not the whole file.
+    const head = await readFile({ path: file, length: 0 });
+    assert.equal(head.content, "");
+    assert.equal(head.truncated, true);
+
+    await fs.rm(dir, { recursive: true, force: true });
+});
+
+// The base64 grammar check strips whitespace and accepts the URL-safe alphabet,
+// because that is what Buffer.from(s, "base64") itself accepts. Both halves of
+// that have to stay true together: accepting a spelling the validator allows but
+// the decoder mangles is exactly the silent corruption the check exists to stop.
+test("writeFile accepts wrapped and URL-safe base64 and stores the same bytes", async () => {
+    const dir = await tmpDir();
+    const bytes = Buffer.from([0xfb, 0xff, 0x00, 0x10, 0x41]);
+
+    // Line-wrapped, the way a MIME encoder emits it.
+    const wrapped = path.join(dir, "wrapped.bin");
+    await writeFile({
+        path: wrapped,
+        content: `${bytes.toString("base64").slice(0, 4)}\n  ${bytes.toString("base64").slice(4)}\n`,
+        encoding: "base64",
+        expectedRevision: "",
+    });
+    assert.deepEqual(await fs.readFile(wrapped), bytes);
+
+    // URL-safe alphabet: "-" and "_" stand in for "+" and "/".
+    const urlSafe = path.join(dir, "urlsafe.bin");
+    const encoded = bytes.toString("base64url");
+    assert.match(encoded, /[-_]/, "precondition: this payload exercises the URL-safe characters");
+    await writeFile({
+        path: urlSafe,
+        content: encoded,
+        encoding: "base64",
+        expectedRevision: "",
+    });
+    assert.deepEqual(await fs.readFile(urlSafe), bytes);
+
+    await fs.rm(dir, { recursive: true, force: true });
+});
+
+test("resolvePath falls back to the process working directory and resolves a relative base", () => {
+    // No base at all: the daemon's own cwd is the root everything is judged
+    // against, so a path under it is inside and its parent is not.
+    const cwd = process.cwd();
+    const implicit = resolvePath({ path: "src/index.ts" });
+    assert.equal(implicit.path, path.join(cwd, "src/index.ts"));
+    assert.equal(implicit.insideRepositoryRoot, true);
+    assert.equal(resolvePath({ path: "../outside.ts" }).insideRepositoryRoot, false);
+
+    // A relative base is resolved against the cwd before anything is compared,
+    // so the answer never depends on an unresolved base leaking into
+    // path.relative.
+    const relative = resolvePath({ path: "b.txt", base: "." });
+    assert.equal(relative.path, path.join(cwd, "b.txt"));
+    assert.equal(relative.insideRepositoryRoot, true);
+
+    // An absolute path that IS the base resolves to it and counts as inside.
+    const root = resolvePath({ path: cwd, base: cwd });
+    assert.equal(root.path, cwd);
+    assert.equal(root.insideRepositoryRoot, true);
+});
+
+test("listDirectory answers an empty directory with no entries", async () => {
+    const dir = await tmpDir();
+
+    const listing = await listDirectory({ path: dir });
+    assert.equal(listing.path, dir);
+    assert.deepEqual(listing.entries, []);
+    // The size bound has nothing to measure and must not refuse it.
+    assertListingFits(dir, []);
+
+    // A path that is not a directory is a plain filesystem error, not an empty
+    // listing: answering "" would present a file as an empty folder.
+    const file = path.join(dir, "notadir.txt");
+    await fs.writeFile(file, "x");
+    await assert.rejects(
+        () => listDirectory({ path: file }),
+        (err: NodeJS.ErrnoException) => err.code === "ENOTDIR",
+    );
+
+    await fs.rm(dir, { recursive: true, force: true });
+});

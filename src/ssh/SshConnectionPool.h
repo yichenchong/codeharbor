@@ -260,10 +260,17 @@ public:
     };
 
     // One step of this client's authentication ladder.
+    //
+    // There is NO separate ssh-agent rung, and that is deliberate rather than
+    // an omission: ssh_userauth_publickey_auto(), which is what KeyFile and
+    // KeyPassphrase drive, tries ssh-agent itself before it looks at any key
+    // file (libssh 0.11.3, src/auth.c:1317-1326). A rung of our own calling
+    // ssh_userauth_agent() offered the server exactly the same identities a
+    // second time — see the note above the ladder in authenticate() for what
+    // that cost.
     enum class AuthRung {
-        Agent,          // ssh-agent
-        KeyFile,        // configured/default private key, no passphrase
-        KeyPassphrase,  // the same keys, with a passphrase asked of the user
+        KeyFile,        // ssh-agent, then configured/default keys, no passphrase
+        KeyPassphrase,  // the same, with a passphrase asked of the user
         Password,       // the account password asked of the user
         KeyboardInteractive,  // PAM/challenge-response, one password prompt
         Exhausted,      // nothing left to try
@@ -273,9 +280,8 @@ public:
     // Which rungs this handshake has already spent. A rung is climbed at most
     // once, and that is what bounds the multi-step loop: a server that keeps
     // answering SSH_AUTH_PARTIAL without ever granting access runs out of the
-    // five distinct rungs after five steps instead of looping forever.
+    // four distinct rungs after four steps instead of looping forever.
     struct AuthRungsTried {
-        bool agent = false;
         bool keyFile = false;
         bool keyPassphrase = false;
         bool password = false;
@@ -284,7 +290,6 @@ public:
         bool contains(AuthRung rung) const
         {
             switch (rung) {
-            case AuthRung::Agent: return agent;
             case AuthRung::KeyFile: return keyFile;
             case AuthRung::KeyPassphrase: return keyPassphrase;
             case AuthRung::Password: return password;
@@ -297,7 +302,6 @@ public:
         void add(AuthRung rung)
         {
             switch (rung) {
-            case AuthRung::Agent: agent = true; return;
             case AuthRung::KeyFile: keyFile = true; return;
             case AuthRung::KeyPassphrase: keyPassphrase = true; return;
             case AuthRung::Password: password = true; return;
@@ -309,11 +313,12 @@ public:
         }
     };
 
-    // The next rung to climb: the first in this client's fixed order (agent ->
-    // key file -> key file with a passphrase -> password -> keyboard-interactive)
-    // that the server still offers and that has not been climbed yet, or
-    // Exhausted. `canPrompt` is false when no credential callback is installed,
-    // so the rungs that need a secret from the user are unreachable.
+    // The next rung to climb: the first in this client's fixed order (agent and
+    // key files -> the same keys with a passphrase -> password ->
+    // keyboard-interactive) that the server still offers and that has not been
+    // climbed yet, or Exhausted. `canPrompt` is false when no credential
+    // callback is installed, so the rungs that need a secret from the user are
+    // unreachable.
     //
     // Pure, and deliberately driven by the CURRENT offer rather than by a fixed
     // sequence: it is re-evaluated after every step, so a partial success that
@@ -368,8 +373,9 @@ public:
     }
 
     // Connect, verify the host key through KnownHosts, then authenticate. The
-    // ladder is agent -> configured/default key -> that key with a passphrase
-    // asked of the user -> the account password -> keyboard-interactive (PAM),
+    // ladder is ssh-agent and the configured/default keys -> those same keys
+    // with a passphrase asked of the user -> the account password ->
+    // keyboard-interactive (PAM),
     // restricted at every step to the methods the server still offers, so a
     // server that requires SEVERAL methods (`AuthenticationMethods
     // publickey,password`) is satisfied one step at a time. `identityFile` is a
@@ -471,7 +477,10 @@ private:
     void setState(State next);
 #if CH_HAVE_LIBSSH
     bool verifyHostKey(const QString& host);
-    bool authenticate(const QString& user);
+    // `configIdentityFile` is the private key ~/.ssh/config or the profile
+    // named, read off the session BEFORE ssh_connect() so libssh's own
+    // unexpanded defaults are still distinguishable from a real choice.
+    bool authenticate(const QString& user, const QString& configIdentityFile);
     QString authenticationFailure() const;
     void closeSession();
 #endif

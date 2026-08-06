@@ -156,6 +156,13 @@ cmake --build --preset dev    # build -> build/dev/src/app/codeharbor
 ./build/dev/src/app/codeharbor
 ```
 
+That output path is the Linux/Unix one. The application target sets
+`MACOSX_BUNDLE` and `WIN32_EXECUTABLE` (`src/app/CMakeLists.txt`), so macOS
+produces `build/dev/src/app/codeharbor.app` and Windows produces
+`codeharbor.exe` beside its DLLs in the build root (`build/dev/`) rather than
+under `src/app/` — which is why the release workflow locates the Windows
+executable instead of assuming a path.
+
 There are three web bundles — the Monaco editor, the xterm.js terminal, and the
 Markdown renderer — all gitignored build artifacts that CMake embeds as
 `qrc:/codeharbor/web/editor/index.html`,

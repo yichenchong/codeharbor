@@ -50,7 +50,11 @@ export class RecoveryReporter {
         this.timers = timers;
     }
 
-    /** Whether a snapshot is currently armed. */
+    /** Whether a snapshot is currently armed — which is the same thing as "the
+     *  host has NOT been told about the edits in this buffer yet", since every
+     *  path that delivers the buffer (schedule's timer firing, report, flush,
+     *  save) disarms it. The editor page reads it that way when it decides
+     *  whether host-driven content may replace the buffer. */
     get pending(): boolean {
         return this.timer !== undefined;
     }
@@ -77,11 +81,15 @@ export class RecoveryReporter {
     }
 
     /** Send the buffer to the host NOW, whether or not a timer is armed, and
-     *  disarm the one that is. Used when the buffer is KNOWN to diverge from
-     *  the file even though nothing is scheduled: an edit that is later undone
-     *  during a save leaves the buffer clean against the OLD baseline, so the
-     *  edit handler scheduled nothing, yet after the save lands those bytes are
-     *  no longer the file's bytes and the host must hold a snapshot of them. */
+     *  disarm the one that is. Used when the buffer is KNOWN to diverge from the
+     *  file the host believes it holds:
+     *
+     *    * an edit that is later undone during a save leaves the buffer clean
+     *      against the OLD baseline, so the edit handler scheduled nothing, yet
+     *      after the save lands those bytes are no longer the file's bytes;
+     *    * a host-driven reload the page REFUSES because the buffer holds edits
+     *      the debounce had not delivered yet — the host must learn about them at
+     *      once, both to hold the only copy and to stop reloading over them. */
     report(): void {
         this.cancel();
         this.bridge.reportContent(this.getValue());

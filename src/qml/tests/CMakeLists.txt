@@ -23,12 +23,6 @@ endif()
 # does and fails on any QML error/warning. Without this the unit suite can be
 # green while the shipped binary cannot start.
 qt_add_executable(tst_qmlload tst_qmlload.cpp)
-if(WIN32)
-    # Keep QTest diagnostics visible on Windows. qt_add_executable otherwise
-    # selects the GUI subsystem, so a failing test exits with code 1 but emits
-    # no assertion or test-case name to the release log.
-    set_target_properties(tst_qmlload PROPERTIES WIN32_EXECUTABLE FALSE)
-endif()
 
 target_link_libraries(tst_qmlload PRIVATE
     Qt6::Test
@@ -269,3 +263,23 @@ set_tests_properties(tst_openas PROPERTIES
     ENVIRONMENT "${CODEHARBOR_QML_TEST_ENV}"
     TIMEOUT 180
 )
+
+if(WIN32)
+    # Keep QTest diagnostics visible on Windows. qt_add_executable selects the
+    # GUI subsystem, and a GUI-subsystem process has no console attached: a
+    # failing test exits with code 1 while its assertion text and test-case name
+    # go nowhere at all. Every target in this directory is a console test, so
+    # every one of them needs this — it used to be set on tst_qmlload alone,
+    # which made exactly one of nine failures diagnosable from a release log.
+    set_target_properties(
+        tst_qmlload
+        tst_paneidentity
+        tst_sidebar
+        tst_webengine_headless
+        tst_palette
+        tst_uxshell
+        tst_ui_polish
+        tst_logview
+        tst_openas
+        PROPERTIES WIN32_EXECUTABLE FALSE)
+endif()

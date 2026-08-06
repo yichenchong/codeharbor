@@ -659,8 +659,46 @@ void TstAppController::uiStateStoreWritesSchemaVersion()
                               QStringLiteral("pane-1"));
     }
 
-    QSettings raw(iniPath, QSettings::IniFormat);
-    QCOMPARE(raw.value(QStringLiteral("meta/schemaVersion")).toInt(), 1);
+    {
+        QSettings raw(iniPath, QSettings::IniFormat);
+        QCOMPARE(raw.value(QStringLiteral("meta/schemaVersion")).toInt(), 1);
+    }
+
+    // A pure READ never stamps anything: merely opening the store on a legacy
+    // file (or on a machine where the user changes nothing) must leave the file
+    // exactly as it was.
+    const QString virginPath = dir.filePath(QStringLiteral("virgin.ini"));
+    {
+        UiStateStore store(virginPath);
+        QCOMPARE(store.sidebarWidth(), 260);
+        QVERIFY(store.selectedPane(QStringLiteral("session-1")).isEmpty());
+    }
+    {
+        QSettings raw(virginPath, QSettings::IniFormat);
+        QVERIFY(!raw.contains(QStringLiteral("meta/schemaVersion")));
+    }
+
+    // A file a NEWER build already migrated carries a HIGHER version. Stamping
+    // it back down to ours would erase the only record that the newer schema
+    // ever touched it, and that build would then re-migrate converted data.
+    const QString futurePath = dir.filePath(QStringLiteral("future.ini"));
+    {
+        QSettings raw(futurePath, QSettings::IniFormat);
+        raw.setValue(QStringLiteral("meta/schemaVersion"), 99);
+        raw.sync();
+    }
+    {
+        UiStateStore store(futurePath);
+        store.setSelectedPane(QStringLiteral("session-1"),
+                              QStringLiteral("pane-1"));
+    }
+    {
+        QSettings raw(futurePath, QSettings::IniFormat);
+        QCOMPARE(raw.value(QStringLiteral("meta/schemaVersion")).toInt(), 99);
+        // ...and the write itself still landed.
+        QCOMPARE(raw.value(QStringLiteral("selectedPane/session-1")).toString(),
+                 QStringLiteral("pane-1"));
+    }
 }
 
 // setServerId to a new value must reload the sidebar from that server: nothing
@@ -2395,6 +2433,33 @@ void TstAppController::uiStateStoreRejectsAnEmptyDevSessionId()
         QCOMPARE(store.nextPaneSuffix(QStringLiteral("s1"),
                                       QStringLiteral("viewer")),
                  3);
+        // The write side carries the same floor the read side enforces: a
+        // counter stored below 1 would be repaired to 1 on the way out, which
+        // silently forgets every id already spent and hands the next pane a
+        // label a live pane is already wearing.
+        store.setNextPaneSuffix(QStringLiteral("s1"),
+                                QStringLiteral("viewer"), 0);
+        store.setNextPaneSuffix(QStringLiteral("s1"),
+                                QStringLiteral("viewer"), -7);
+        QCOMPARE(store.nextPaneSuffix(QStringLiteral("s1"),
+                                      QStringLiteral("viewer")),
+                 3);
+        // No Dev Session, no counter: the two regions of the NEXT session must
+        // not inherit a number parked under the bare key.
+        store.setNextPaneSuffix(QString(), QStringLiteral("viewer"), 11);
+        QCOMPARE(store.nextPaneSuffix(QString(), QStringLiteral("viewer")), 1);
+        QCOMPARE(store.nextPaneSuffix(QStringLiteral("s2"),
+                                      QStringLiteral("viewer")),
+                 1);
+        // The same rule for the remembered session, scoped by server: an empty
+        // serverId is the window before server.info has answered, and a value
+        // parked there would be reopened against whichever server connects.
+        store.setActiveSession(QString(), QStringLiteral("ghost"));
+        QVERIFY(store.activeSession(QString()).isEmpty());
+        store.setActiveSession(QStringLiteral("srv-a"), QStringLiteral("s1"));
+        QCOMPARE(store.activeSession(QStringLiteral("srv-a")),
+                 QStringLiteral("s1"));
+        QVERIFY(store.activeSession(QStringLiteral("srv-b")).isEmpty());
     }
 
     UiStateStore reopened(iniPath);

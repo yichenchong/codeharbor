@@ -158,6 +158,16 @@ private slots:
     // AG2: a rebind must not carry a pending oversize discard onto the new
     // producer's first frame.
     void rebindClearsAPendingOversizeDiscard();
+    // The wire version constant is a hand-written mirror of the daemon's.
+    void eventVersionMatchesRemoteEventsTs();
+    // The activity clock owns Starting/Running/Idle and nothing else.
+    void genericActivityNeverOverwritesErrorOrStopped();
+    // A reattach is a transport event, not evidence about the agent.
+    void reattachPreservesStatesTheActivityClockCannotExpress();
+    // Coalescing: a repeated attention state is not a second notification.
+    void repeatedWaitingInputDoesNotRenotify();
+    // The data signals are emitted before the notification hook.
+    void dataSignalsPrecedeTheNotificationHook();
 
 private:
     void makePair();
@@ -1134,11 +1144,13 @@ void TstAgentMonitor::oversizedFrameTailIsNeverParsedAsItsOwnEvent()
 // event was therefore accepted or rejected purely on read granularity, which is
 // not a property any producer or test can control.
 //
-// The window is reachable rather than theoretical: codeharbor-bridge caps the
-// message it accepts at MAX_BRIDGE_LINE_BYTES (1 MiB, the same number) and then
-// emits a strictly LARGER event line — it adds version, timestamp and harness
-// fields — so a harness whose summary is close to a megabyte produces exactly
-// this frame.
+// The shipped relay does not produce such a line: makeStreamSink in
+// remote/src/bridge.ts measures every outbound payload with bridgeLineFits()
+// and drops both the event and the producer connection once it passes 1 MiB.
+// The guard exists because the client does not get to assume the thing on the
+// other end of the socket IS the shipped relay — a buggy or hostile producer
+// is exactly what a size cap is for — and because a cap whose verdict depends
+// on socket chunking is not a cap at all.
 //
 // A QBuffer is used instead of the socket pair on purpose: setTransport()
 // drains it in one synchronous read, so the whole over-cap line is guaranteed to
@@ -1910,6 +1922,252 @@ void TstAgentMonitor::rebindClearsAPendingOversizeDiscard()
     QTRY_COMPARE(stateSpy.count(), 1);
     QCOMPARE(stateSpy.at(0).at(2).toInt(), asInt(AgentState::Running));
     QCOMPARE(m_monitor->stateFor("dRB", "tRB"), asInt(AgentState::Running));
+}
+
+// The wire schema version is a hand-written mirror: kAgentEventVersion in
+// AgentEvent.h against CH_EVENT_VERSION in remote/src/events.ts. The parser
+// rejects any event whose `version` is not exactly that number, so the day the
+// daemon bumps its constant and the client does not, EVERY event is dropped at
+// the client edge — no state, no badge, no notification, and nothing anywhere
+// saying why. The harness list and the state list already have drift checks
+// against the same authoritative file; the number that gates all of them did
+// not.
+void TstAgentMonitor::eventVersionMatchesRemoteEventsTs()
+{
+    QFile events(QStringLiteral(CH_REPO_ROOT "/remote/src/events.ts"));
+    QVERIFY2(events.open(QIODevice::ReadOnly | QIODevice::Text),
+             qPrintable(QStringLiteral("cannot open %1: %2")
+                            .arg(events.fileName(), events.errorString())));
+    const QString source = QString::fromUtf8(events.readAll());
+
+    static const QRegularExpression versionRe(
+        QStringLiteral("export const CH_EVENT_VERSION\\s*=\\s*(\\d+)"));
+    const QRegularExpressionMatch match = versionRe.match(source);
+    QVERIFY2(match.hasMatch(),
+             qPrintable(QStringLiteral("no CH_EVENT_VERSION in %1")
+                            .arg(events.fileName())));
+    bool ok = false;
+    const int remoteVersion = match.captured(1).toInt(&ok);
+    QVERIFY(ok);
+    QCOMPARE(ch::kAgentEventVersion, remoteVersion);
+
+    // And the number really is the gate: one off in either direction is
+    // dropped, so the comparison above is not decorative.
+    const auto versioned = [](int version) {
+        QJsonObject o{{"version", version},
+                      {"timestamp", "2026-07-25T00:00:00.000Z"},
+                      {"harness", "generic"},
+                      {"devSessionId", "d"},
+                      {"terminalId", "t"},
+                      {"state", "running"},
+                      {"event", "tick"}};
+        return QByteArray(QJsonDocument(o).toJson(QJsonDocument::Compact));
+    };
+    QVERIFY(ch::parseAgentEventLine(versioned(remoteVersion)).has_value());
+    QVERIFY(!ch::parseAgentEventLine(versioned(remoteVersion - 1)).has_value());
+    QVERIFY(!ch::parseAgentEventLine(versioned(remoteVersion + 1)).has_value());
+}
+
+// The SPEC 6.6 activity clock can only ever say Starting, Running or Idle, so
+// a pane holding a state it cannot express is holding information the clock
+// does not have. genericActivityNeverOverwritesAWaitingInputPrompt() pins that
+// for a prompt; Error and Stopped are the same defect through a different
+// door, and they used to be silently rewritten a tick later.
+//
+// A pane's CONFIGURED harness and the harness that actually reports lifecycle
+// events are independent (a user may leave a pane on the adapterless "generic"
+// harness and still run an agent whose hook is installed), so these states do
+// reach a generic pane. Losing Error means a failed agent reads as busy;
+// losing Stopped means a process that no longer exists reads as starting.
+void TstAgentMonitor::genericActivityNeverOverwritesErrorOrStopped()
+{
+    makePair();
+    m_monitor->setFallbackIdleThresholdMs(30);
+
+    struct Case {
+        const char* wire;
+        AgentState state;
+        const char* term;
+    };
+    const Case cases[] = {
+        {"error", AgentState::Error, "tErr"},
+        {"stopped", AgentState::Stopped, "tStop"},
+    };
+
+    for (const Case& c : cases) {
+        const QString term = QString::fromLatin1(c.term);
+        m_monitor->setTerminalHarness(QStringLiteral("dX"), term,
+                                      QStringLiteral("generic"));
+        m_monitor->noteTerminalAttached(QStringLiteral("dX"), term);
+        // Output first, so the pane has a live output age: that is the arm the
+        // clock would otherwise drive it round to Running and then Idle on.
+        m_monitor->noteTerminalOutput(QStringLiteral("dX"), term);
+        QCOMPARE(m_monitor->stateFor("dX", term), asInt(AgentState::Running));
+
+        feed(eventLine(QString::fromLatin1(c.wire), QStringLiteral("dX"), term));
+        QTRY_COMPARE(m_monitor->stateFor("dX", term), asInt(c.state));
+    }
+
+    // Several quiet windows. Neither pane moves, and neither is an unseen
+    // completion, so nothing but this rule is holding them.
+    QTest::qWait(200);
+    for (const Case& c : cases) {
+        QCOMPARE(m_monitor->stateFor("dX", QString::fromLatin1(c.term)),
+                 asInt(c.state));
+    }
+    QVERIFY(!m_monitor->hasUnseen(QStringLiteral("dX")));
+
+    // Real output is still an observation and still moves the pane on, and the
+    // activity derivation resumes from there.
+    m_monitor->noteTerminalOutput(QStringLiteral("dX"), QStringLiteral("tErr"));
+    QCOMPARE(m_monitor->stateFor("dX", "tErr"), asInt(AgentState::Running));
+    QTRY_COMPARE(m_monitor->stateFor("dX", "tErr"), asInt(AgentState::Idle));
+}
+
+// A reattach is a TRANSPORT event. SPEC 5.6 rewires every open pane onto a
+// fresh channel on reconnect with no user action and nothing new learned about
+// what is running in the pane, so it may only move a generic pane inside the
+// activity clock's own vocabulary.
+//
+// It used to force Starting unconditionally, which meant one reconnect turned
+// a blocked, failed or finished agent into "starting" — and left it there,
+// because a generic pane with no output never leaves Starting, so the sidebar
+// reported a phantom launch until the pane happened to print something.
+void TstAgentMonitor::reattachPreservesStatesTheActivityClockCannotExpress()
+{
+    makePair();
+    m_monitor->setFallbackIdleThresholdMs(30);
+
+    struct Case {
+        const char* wire;
+        AgentState state;
+        const char* term;
+    };
+    const Case preserved[] = {
+        {"waiting_input", AgentState::WaitingInput, "tW"},
+        {"error", AgentState::Error, "tE"},
+        {"stopped", AgentState::Stopped, "tS"},
+        {"idle_unseen", AgentState::IdleUnseen, "tU"},
+    };
+
+    for (const Case& c : preserved) {
+        const QString term = QString::fromLatin1(c.term);
+        m_monitor->setTerminalHarness(QStringLiteral("dRa"), term,
+                                      QStringLiteral("generic"));
+        m_monitor->noteTerminalAttached(QStringLiteral("dRa"), term);
+        QCOMPARE(m_monitor->stateFor("dRa", term), asInt(AgentState::Starting));
+        feed(eventLine(QString::fromLatin1(c.wire), QStringLiteral("dRa"), term));
+        QTRY_COMPARE(m_monitor->stateFor("dRa", term), asInt(c.state));
+    }
+    QVERIFY(m_monitor->hasUnseen(QStringLiteral("dRa")));
+
+    // The reconnect: every open pane is rebound onto the replacement channel.
+    QSignalSpy stateSpy(m_monitor, &AgentStatusMonitor::agentStateChanged);
+    for (const Case& c : preserved) {
+        m_monitor->noteTerminalAttached(QStringLiteral("dRa"),
+                                        QString::fromLatin1(c.term));
+    }
+    QCOMPARE(stateSpy.count(), 0);
+    for (const Case& c : preserved) {
+        QCOMPARE(m_monitor->stateFor("dRa", QString::fromLatin1(c.term)),
+                 asInt(c.state));
+    }
+    // ...and no tick undoes it either.
+    QTest::qWait(150);
+    for (const Case& c : preserved) {
+        QCOMPARE(m_monitor->stateFor("dRa", QString::fromLatin1(c.term)),
+                 asInt(c.state));
+    }
+    QVERIFY(m_monitor->hasUnseen(QStringLiteral("dRa")));
+
+    // A state the clock DOES own is still reset by the reattach: that is the
+    // "fresh channel, no output observed yet" arm, and it must keep working.
+    m_monitor->setTerminalHarness(QStringLiteral("dRa"), QStringLiteral("tR"),
+                                  QStringLiteral("generic"));
+    m_monitor->noteTerminalAttached(QStringLiteral("dRa"), QStringLiteral("tR"));
+    m_monitor->noteTerminalOutput(QStringLiteral("dRa"), QStringLiteral("tR"));
+    QCOMPARE(m_monitor->stateFor("dRa", "tR"), asInt(AgentState::Running));
+    m_monitor->noteTerminalAttached(QStringLiteral("dRa"), QStringLiteral("tR"));
+    QCOMPARE(m_monitor->stateFor("dRa", "tR"), asInt(AgentState::Starting));
+
+    // Once the user views the Dev Session the completion is released, and the
+    // pane that was holding it goes back under activity derivation.
+    m_monitor->markSeen(QStringLiteral("dRa"));
+    QTRY_COMPARE(m_monitor->stateFor("dRa", "tU"), asInt(AgentState::Starting));
+}
+
+// The transition gate is the whole defence against a chatty agent becoming a
+// notification storm, and waiting_input is the state a harness is most likely
+// to re-announce: an adapter that re-emits its prompt event on every poll must
+// not raise a desktop bubble each time. Only a genuine ENTRY into the state
+// notifies, and the summary changing does not make a repeat into an entry.
+// (The idle_unseen half of this rule is deliberately different, and is pinned
+// by completionAfterMarkSeenReArmsUnseen().)
+void TstAgentMonitor::repeatedWaitingInputDoesNotRenotify()
+{
+    makePair();
+    QSignalSpy stateSpy(m_monitor, &AgentStatusMonitor::agentStateChanged);
+    QSignalSpy notifySpy(m_monitor, &AgentStatusMonitor::notify);
+
+    feed(eventLine("waiting_input", QStringLiteral("dW"), QStringLiteral("tW"),
+                   QStringLiteral("oh-my-pi"), QStringLiteral("ask_started"),
+                   QStringLiteral("first question")));
+    QTRY_COMPARE(notifySpy.count(), 1);
+
+    feed(eventLine("waiting_input", QStringLiteral("dW"), QStringLiteral("tW"),
+                   QStringLiteral("oh-my-pi"), QStringLiteral("ask_started"),
+                   QStringLiteral("first question")));
+    feed(eventLine("waiting_input", QStringLiteral("dW"), QStringLiteral("tW"),
+                   QStringLiteral("oh-my-pi"), QStringLiteral("ask_started"),
+                   QStringLiteral("a different summary")));
+    QTest::qWait(150);
+    QCOMPARE(notifySpy.count(), 1);
+    QCOMPARE(stateSpy.count(), 1);
+
+    // Leaving and re-entering the state IS a new prompt and does notify again.
+    feed(eventLine("running", QStringLiteral("dW"), QStringLiteral("tW")));
+    QTRY_COMPARE(stateSpy.count(), 2);
+    QCOMPARE(notifySpy.count(), 1);
+    feed(eventLine("waiting_input", QStringLiteral("dW"), QStringLiteral("tW"),
+                   QStringLiteral("oh-my-pi"), QStringLiteral("ask_started"),
+                   QStringLiteral("second question")));
+    QTRY_COMPARE(notifySpy.count(), 2);
+    QCOMPARE(notifySpy.at(1).at(1).toString(),
+             QStringLiteral("second question"));
+}
+
+// notify() is a side effect, never a source of truth: the display layer must
+// have already re-derived the sidebar row by the time the desktop bubble is
+// raised, so both data signals go out first. A notification handler that reads
+// stateFor()/hasUnseen() — the Notifier does exactly that to decide whether the
+// Dev Session is the one on screen — would otherwise see the pre-event world
+// for one of the two, depending on the emit order.
+void TstAgentMonitor::dataSignalsPrecedeTheNotificationHook()
+{
+    makePair();
+
+    QStringList order;
+    connect(m_monitor, &AgentStatusMonitor::agentStateChanged, this,
+            [&order](const QString&, const QString&, int) {
+                order << QStringLiteral("state");
+            });
+    connect(m_monitor, &AgentStatusMonitor::unseenChanged, this,
+            [&order](const QString&, bool) { order << QStringLiteral("unseen"); });
+    connect(m_monitor, &AgentStatusMonitor::notify, this,
+            [this, &order](const QString&, const QString&) {
+                order << QStringLiteral("notify");
+                // Both observables are already settled when the hook runs.
+                QCOMPARE(m_monitor->stateFor("dOrd", "tOrd"),
+                         asInt(AgentState::IdleUnseen));
+                QVERIFY(m_monitor->hasUnseen(QStringLiteral("dOrd")));
+            });
+
+    feed(eventLine("idle_unseen", QStringLiteral("dOrd"),
+                   QStringLiteral("tOrd")));
+    const QStringList expected{QStringLiteral("state"),
+                               QStringLiteral("unseen"),
+                               QStringLiteral("notify")};
+    QTRY_COMPARE(order, expected);
 }
 
 QTEST_MAIN(TstAgentMonitor)

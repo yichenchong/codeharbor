@@ -34,6 +34,13 @@ Rectangle {
     border.color: Theme.borderSubtle
     focus: visible
 
+    // A full-surface sheet that takes the keyboard and swallows every click
+    // behind it is a dialog in everything but type; without a role and a name
+    // a screen reader announces it as an unlabelled rectangle and never tells
+    // the user the window changed.
+    Accessible.role: Accessible.Dialog
+    Accessible.name: qsTr("Settings")
+
     // The parts of a QtQuick.Controls control this file does NOT replace still
     // draw from the STYLE's palette, which is light: a ComboBox drops a white
     // popup with white rows on top of this dark sheet, and a SpinBox's two step
@@ -91,8 +98,13 @@ Rectangle {
             color: !button.enabled ? Theme.surfaceHover
                  : button.down ? Theme.border
                  : button.hovered ? Theme.surfaceHover : Theme.surfaceRaised
-            border.width: button.visualFocus ? 2 : 1
-            border.color: button.visualFocus ? Theme.accent
+            // A checked SheetButton is the SELECTED row of a list (the server
+            // profiles). Selection has to be visible: the fill cannot carry it
+            // because Theme.surfaceSelected and Theme.surfaceRaised are the
+            // same colour in the dark palette, so it is drawn as the accent
+            // outline instead — the same weight the focus ring uses.
+            border.width: button.visualFocus || button.checked ? 2 : 1
+            border.color: button.visualFocus || button.checked ? Theme.accent
                         : button.enabled ? button.accent : Theme.borderSubtle
         }
     }
@@ -356,6 +368,12 @@ Rectangle {
     }
 
     function closeSheet() {
+        // Drop the flag here as well as telling the host. `shown` is this
+        // component's own state, and a host that only WATCHES it (rather than
+        // wiring onDismissed back into it) would otherwise be left with a
+        // sheet that says it is open after Escape or Close. LogView.qml does
+        // the same, so the two sheets behave alike.
+        root.shown = false;
         root.dismissed();
     }
 
@@ -463,6 +481,14 @@ Rectangle {
                         implicitHeight: 34
                         focusPolicy: Qt.StrongFocus
                         checkable: true
+                        // These four are a radio set: exactly one group is
+                        // open. Without autoExclusive, clicking the group that
+                        // is ALREADY selected toggles `checked` to false from
+                        // C++, which does not re-run the binding below (its
+                        // dependency, selectedGroup, did not change), so the
+                        // row that is still showing its pane stops looking
+                        // selected until another group is picked.
+                        autoExclusive: true
                         checked: root.selectedGroup === modelData.key
                         onClicked: {
                             root.selectedGroup = modelData.key;
@@ -647,17 +673,19 @@ Rectangle {
                         ScrollBar.vertical: AppScrollBar {}
                         model: root.toolbarItems
                         delegate: Rectangle {
+                            id: toolbarRow
                             required property string modelData
                             required property int index
                             width: toolbarList.width - 4
                             height: 32
-                            color: index % 2 === 0 ? Theme.surfaceSunken : Theme.surfaceDeep
+                            color: toolbarRow.index % 2 === 0 ? Theme.surfaceSunken
+                                                              : Theme.surfaceDeep
                             Label {
                                 anchors.left: parent.left
                                 anchors.leftMargin: 10
                                 anchors.right: moveButtons.left
                                 anchors.verticalCenter: parent.verticalCenter
-                                text: root.toolbarLabel(modelData)
+                                text: root.toolbarLabel(toolbarRow.modelData)
                                 textFormat: Text.PlainText
                                 color: Theme.text
                                 font.pixelSize: Theme.fontSizeBody
@@ -669,20 +697,20 @@ Rectangle {
                                 anchors.verticalCenter: parent.verticalCenter
                                 spacing: 2
                                 SheetButton {
-                                    objectName: "toolbarUp:" + modelData
+                                    objectName: "toolbarUp:" + toolbarRow.modelData
                                     text: qsTr("Up")
-                                    enabled: index > 0
+                                    enabled: toolbarRow.index > 0
                                     implicitWidth: 42
                                     implicitHeight: 26
-                                    onClicked: root.moveToolbar(index, -1)
+                                    onClicked: root.moveToolbar(toolbarRow.index, -1)
                                 }
                                 SheetButton {
-                                    objectName: "toolbarDown:" + modelData
+                                    objectName: "toolbarDown:" + toolbarRow.modelData
                                     text: qsTr("Down")
-                                    enabled: index + 1 < root.toolbarItems.length
+                                    enabled: toolbarRow.index + 1 < root.toolbarItems.length
                                     implicitWidth: 52
                                     implicitHeight: 26
-                                    onClicked: root.moveToolbar(index, 1)
+                                    onClicked: root.moveToolbar(toolbarRow.index, 1)
                                 }
                             }
                         }
@@ -840,12 +868,15 @@ Rectangle {
                             return choices;
                         }
                         // Reset on every model change rather than as a
-                        // `currentIndex:` binding. Picking an entry writes
-                        // currentIndex imperatively, which DESTROYS such a
-                        // binding — after one pick, typing a different
-                        // extension left the box pointing at whatever slot the
-                        // old list had, so "Add or update" either stored the
-                        // wrong viewer or silently did nothing.
+                        // `currentIndex:` binding. The list of valid kinds is
+                        // rebuilt for each extension the user types, so a slot
+                        // that meant "Rendered Markdown" for `md` means
+                        // something else — or nothing — for the next
+                        // extension, and a binding cannot express "start again
+                        // at the top of whatever list this now is" without
+                        // depending on the selection it would be overwriting.
+                        // Without the reset, "Add or update" stored whatever
+                        // viewer happened to sit at the stale index.
                         onModelChanged: viewerKindChoice.currentIndex =
                             viewerKindChoice.model.length > 0 ? 0 : -1
                         Component.onCompleted: viewerKindChoice.currentIndex =
@@ -902,19 +933,21 @@ Rectangle {
                         ScrollBar.vertical: AppScrollBar {}
                         model: root.viewerDefaultEntries
                         delegate: Rectangle {
+                            id: viewerDefaultRow
                             required property var modelData
                             required property int index
                             width: viewerDefaultsList.width - 4
                             height: 36
-                            color: index % 2 === 0
+                            color: viewerDefaultRow.index % 2 === 0
                                    ? Theme.surfaceSunken : Theme.surfaceDeep
                             Label {
                                 anchors.left: parent.left
                                 anchors.leftMargin: 10
                                 anchors.right: removeButton.left
                                 anchors.verticalCenter: parent.verticalCenter
-                                text: "." + modelData.extension + "  \u2014  "
-                                      + root.viewerKindLabel(modelData.kind)
+                                text: "." + viewerDefaultRow.modelData.extension
+                                      + "  \u2014  "
+                                      + root.viewerKindLabel(viewerDefaultRow.modelData.kind)
                                 textFormat: Text.PlainText
                                 color: Theme.text
                                 font.pixelSize: Theme.fontSizeBody
@@ -923,14 +956,14 @@ Rectangle {
                             SheetButton {
                                 id: removeButton
                                 objectName: "viewerDefaultRemove:"
-                                            + modelData.extension
+                                            + viewerDefaultRow.modelData.extension
                                 anchors.right: parent.right
                                 anchors.rightMargin: 4
                                 anchors.verticalCenter: parent.verticalCenter
                                 text: qsTr("Remove")
                                 implicitHeight: 26
                                 onClicked: root.removeViewerDefault(
-                                               modelData.extension)
+                                               viewerDefaultRow.modelData.extension)
                             }
                         }
                     }
@@ -989,6 +1022,11 @@ Rectangle {
                               || root.profileText(modelData, "host")
                               || qsTr("Unnamed profile")
                         checkable: true
+                        // One profile is selected at a time, and clicking the
+                        // selected one must not leave it looking unselected:
+                        // see the group list above for why a plain checkable
+                        // button desynchronises from its `checked` binding.
+                        autoExclusive: true
                         checked: root.selectedProfileId === root.profileText(modelData, "id")
                         onClicked: {
                             root.selectedProfileId = root.profileText(modelData, "id");

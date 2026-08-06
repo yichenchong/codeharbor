@@ -7,16 +7,18 @@ import { DatabaseSync } from "node:sqlite";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { isInvalidParams, requireStringArray } from "../src/validate.ts";
+import { isResourceLimit } from "../src/files.ts";
 
 import {
     applyConnectionPragmas,
     closeDefaultWorkspace,
     isDatabaseBusy,
+    MAX_LAYOUT_TREE_BYTES,
     openWorkspace,
+    Workspace,
     WORKSPACE_SCHEMA_VERSION,
     WORKSPACE_METHODS,
 } from "../src/workspace.ts";
-import type { Workspace } from "../src/workspace.ts";
 
 // A fresh temp-file database path (never :memory:) so the reopen tests exercise
 // real on-disk persistence, simulating a codeharbord restart (SPEC 11.1).
@@ -3465,6 +3467,296 @@ test("moveSessionToGroup re-homes drifted children even when the session already
     assert.equal(moved?.viewerPanes.length, 1);
     assert.equal(moved?.terminalPanes.length, 1);
     assert.notEqual(moved?.layouts.viewer, null);
+
+    ws.close();
+    await cleanup(dbPath);
+});
+
+// An in-process `position` is a placement REQUEST that placeAt truncates and
+// clamps — but every create used to BIND that same raw value into the row's
+// `position` column first, and only then call placeAt. A non-finite index
+// therefore never reached the clamp: SQLite binds NaN as NULL, so the insert
+// died on "NOT NULL constraint failed: <table>.position" and the whole create
+// failed, for the one input the clamp exists to absorb. Every create now
+// inserts at the scope's append slot and lets placeAt do the placing.
+test("a non-finite in-process position appends instead of failing the create", async () => {
+    const dbPath = await tmpDbPath();
+    const ws = openWorkspace(dbPath);
+
+    const group = ws.createGroup({ serverId: SERVER, name: "A" });
+    const second = ws.createGroup({ serverId: SERVER, name: "B", position: Number.NaN });
+    assert.deepEqual(
+        ws.list(SERVER).map((g) => [g.name, g.position]),
+        [["A", 0], ["B", 1]],
+    );
+
+    const first = ws.createSession({
+        serverId: SERVER,
+        groupId: group.id,
+        name: "S1",
+        repositoryRoot: "/r",
+    });
+    ws.createSession({
+        serverId: SERVER,
+        groupId: group.id,
+        name: "S2",
+        repositoryRoot: "/r",
+        position: Number.NaN,
+    });
+    // Infinity is finite-checked by the same clamp and must append too, not sit
+    // in the column as a REAL.
+    ws.createSession({
+        serverId: SERVER,
+        groupId: group.id,
+        name: "S3",
+        repositoryRoot: "/r",
+        position: Number.POSITIVE_INFINITY,
+    });
+
+    ws.createViewerPane({ serverId: SERVER, devSessionId: first.id, url: "a" });
+    ws.createViewerPane({ serverId: SERVER, devSessionId: first.id, url: "b", position: Number.NaN });
+    ws.createTerminalPane({ serverId: SERVER, devSessionId: first.id, name: "t1" });
+    ws.createTerminalPane({ serverId: SERVER, devSessionId: first.id, name: "t2", position: Number.NaN });
+
+    const node = ws.list(SERVER).find((g) => g.id === group.id)?.sessions;
+    assert.deepEqual(
+        node?.map((s) => [s.name, s.position]),
+        [["S1", 0], ["S2", 1], ["S3", 2]],
+    );
+    assert.deepEqual(node?.[0].viewerPanes.map((p) => [p.url, p.position]), [["a", 0], ["b", 1]]);
+    assert.deepEqual(node?.[0].terminalPanes.map((p) => [p.name, p.position]), [["t1", 0], ["t2", 1]]);
+    // Every column really holds an integer, not a REAL that merely prints like
+    // one: a stored 2.0 would order correctly today and break the first
+    // packOrder that compares it to an index.
+    const kinds = ws.db
+        .prepare("SELECT typeof(position) AS t FROM dev_sessions UNION SELECT typeof(position) FROM groups")
+        .all() as unknown as Array<{ t: string }>;
+    assert.deepEqual(kinds.map((k) => k.t), ["integer"]);
+    assert.equal(second.position, 1);
+
+    ws.close();
+    await cleanup(dbPath);
+});
+
+// serverId() answers from the row when there is one. It used to run
+// INSERT OR IGNORE first and let the primary key absorb the duplicate, which is
+// correct but makes READING a months-old identity a WRITE: it takes the
+// database's write lock on the first server.info of every daemon start, and it
+// fails outright on a workspace that is only readable — a read-only mount, a
+// full disk — even though the answer is sitting in the file.
+test("serverId reads an existing identity without writing", async () => {
+    const dbPath = await tmpDbPath();
+    const writable = openWorkspace(dbPath);
+    const minted = writable.serverId();
+    // Closing checkpoints the WAL away, so the read-only open below needs no
+    // -wal/-shm of its own.
+    writable.close();
+
+    const readOnly = new Workspace(new DatabaseSync(dbPath, { readOnly: true }));
+    assert.equal(readOnly.serverId(), minted);
+    // ...and again from the cache, still without a write.
+    assert.equal(readOnly.serverId(), minted);
+    readOnly.close();
+
+    await cleanup(dbPath);
+});
+
+// A split with THREE children exercises the arithmetic a two-child split never
+// reaches: with two, removing one promotes the survivor and the ratios are
+// discarded outright. With three, the two survivors must keep their RELATIVE
+// sizes and be renormalized to sum to 1 — SplitNode::parseNode in
+// src/models/SplitTree.cpp requires one finite, positive ratio per child, so a
+// short, stale or unnormalized ratio array is a layout the client cannot load.
+test("RW13: removing one pane of a three-way split renormalizes the survivors", async () => {
+    const dbPath = await tmpDbPath();
+    const ws = openWorkspace(dbPath);
+    const group = ws.createGroup({ serverId: SERVER, name: "Work" });
+    const session = ws.createSession({
+        serverId: SERVER,
+        groupId: group.id,
+        name: "S",
+        repositoryRoot: "/r",
+    });
+    const mk = (url: string) => ws.createViewerPane({ serverId: SERVER, devSessionId: session.id, url });
+    const [a, b, c] = [mk("a"), mk("b"), mk("c")];
+    ws.setLayout({
+        serverId: SERVER,
+        devSessionId: session.id,
+        region: "viewer",
+        tree: {
+            type: "split",
+            orientation: "horizontal",
+            ratios: [0.2, 0.3, 0.5],
+            children: [
+                { type: "leaf", paneId: a.id },
+                { type: "leaf", paneId: b.id },
+                { type: "leaf", paneId: c.id },
+            ],
+        },
+    });
+
+    ws.deleteViewerPane({ id: b.id });
+
+    const tree = ws.getLayout({ devSessionId: session.id, region: "viewer" })?.tree as {
+        type: string;
+        orientation: string;
+        ratios: number[];
+        children: Array<{ paneId: string }>;
+    };
+    assert.equal(tree.type, "split");
+    // The split is NOT collapsed: two children are still a split.
+    assert.deepEqual(tree.children.map((child) => child.paneId), [a.id, c.id]);
+    // Unchanged structure travels with the tree.
+    assert.equal(tree.orientation, "horizontal");
+    // One ratio per child, summing to 1, in the survivors' original proportion
+    // (0.2 : 0.5 becomes 2/7 : 5/7).
+    assert.equal(tree.ratios.length, tree.children.length);
+    assert.equal(tree.ratios.every((r) => Number.isFinite(r) && r > 0), true);
+    assert.equal(Math.abs(tree.ratios.reduce((x, y) => x + y, 0) - 1) < 1e-9, true);
+    assert.equal(Math.abs(tree.ratios[0] - 2 / 7) < 1e-9, true, `got ${tree.ratios[0]}`);
+    assert.equal(Math.abs(tree.ratios[1] - 5 / 7) < 1e-9, true, `got ${tree.ratios[1]}`);
+
+    // A ratio array that is short, zero, negative or not a number at all is
+    // client data too, and every survivor still has to come out with a usable
+    // one rather than NaN or a hole.
+    const [d, e, f] = [mk("d"), mk("e"), mk("f")];
+    ws.setLayout({
+        serverId: SERVER,
+        devSessionId: session.id,
+        region: "terminal",
+        tree: {
+            type: "split",
+            ratios: [0, "half", -1],
+            children: [
+                { type: "leaf", paneId: d.id },
+                { type: "leaf", paneId: e.id },
+                { type: "leaf", paneId: f.id },
+            ],
+        },
+    });
+    ws.deleteViewerPane({ id: e.id });
+    const repaired = ws.getLayout({ devSessionId: session.id, region: "terminal" })?.tree as {
+        ratios: number[];
+        children: Array<{ paneId: string }>;
+    };
+    assert.deepEqual(repaired.children.map((child) => child.paneId), [d.id, f.id]);
+    assert.deepEqual(repaired.ratios, [0.5, 0.5]);
+
+    ws.close();
+    await cleanup(dbPath);
+});
+
+// A split tree is free-form client JSON and used to have no size bound at all,
+// which made it the one input to this store a client could grow without limit.
+// The damage is not to the write but to the READ: workspace.list embeds every
+// stored tree of every session in ONE reply, and responseLine (codeharbord.ts)
+// refuses a reply past MAX_LINE_BYTES. So a single oversized stored tree made
+// workspace.list fail from then on, for every session on the server, and the
+// workspace could not be loaded again without hand-editing the session_layouts
+// row out of the database. Refusing the WRITE is the only moment the user is
+// still there to be told.
+//
+// Sized exactly at the boundary in both directions, because an off-by-one in a
+// `>` would be invisible against any round test value.
+function treeOfSerializedBytes(paneId: string, bytes: number): Record<string, unknown> {
+    const make = (title: string) => ({
+        type: "split",
+        orientation: "horizontal",
+        ratios: [1],
+        children: [{ type: "leaf", paneId, customTitle: title }],
+    });
+    // ASCII padding only, so one character is one serialized byte and the
+    // arithmetic below is exact rather than approximate.
+    const baseline = Buffer.byteLength(JSON.stringify(make("")));
+    const tree = make("x".repeat(bytes - baseline));
+    assert.equal(Buffer.byteLength(JSON.stringify(tree)), bytes);
+    return tree;
+}
+
+test("setLayout accepts a tree exactly at the size limit and round trips it", async () => {
+    const dbPath = await tmpDbPath();
+    const ws = openWorkspace(dbPath);
+    const { session, viewer } = seed(ws);
+
+    const atLimit = treeOfSerializedBytes(viewer.id, MAX_LAYOUT_TREE_BYTES);
+    ws.setLayout({ serverId: SERVER, devSessionId: session.id, region: "viewer", tree: atLimit });
+
+    // Unchanged through the read path the cap exists to protect.
+    assert.deepEqual(ws.list(SERVER)[0].sessions[0].layouts.viewer, atLimit);
+    assert.deepEqual(ws.getLayout({ devSessionId: session.id, region: "viewer" })?.tree, atLimit);
+
+    ws.close();
+    await cleanup(dbPath);
+});
+
+test("setLayout refuses a tree one byte over the limit and writes nothing", async () => {
+    const dbPath = await tmpDbPath();
+    const ws = openWorkspace(dbPath);
+    const { session, viewer } = seed(ws);
+    const stored = ws.getLayout({ devSessionId: session.id, region: "viewer" });
+    assert.notEqual(stored, null);
+
+    const overLimit = treeOfSerializedBytes(viewer.id, MAX_LAYOUT_TREE_BYTES + 1);
+    let thrown: unknown;
+    try {
+        ws.setLayout({
+            serverId: SERVER,
+            devSessionId: session.id,
+            region: "viewer",
+            tree: overLimit,
+        });
+    } catch (err) {
+        thrown = err;
+    }
+
+    // The resource-limit code (-32003), not invalid-params: the tree is
+    // well-formed, the server simply will not carry it at that size.
+    assert.equal(isResourceLimit(thrown), true, `wrong error: ${String(thrown)}`);
+    assert.equal(isInvalidParams(thrown), false);
+    // The message has to be usable on screen: both the limit and what arrived.
+    assert.match((thrown as Error).message, new RegExp(`${MAX_LAYOUT_TREE_BYTES}-byte`));
+    assert.match((thrown as Error).message, new RegExp(`${MAX_LAYOUT_TREE_BYTES + 1} bytes`));
+
+    // Nothing was written: the row still holds the tree seed() stored, byte for
+    // byte, and its updated_at was not bumped by a transaction that opened and
+    // rolled back.
+    const after = ws.getLayout({ devSessionId: session.id, region: "viewer" });
+    assert.deepEqual(after, stored);
+
+    // ...and on a region that had NO row, the refusal must not create one.
+    const empty = ws.createSession({
+        serverId: SERVER,
+        groupId: ws.getSession(session.id).groupId,
+        name: "Empty",
+        repositoryRoot: "/r",
+    });
+    assert.throws(
+        () =>
+            ws.setLayout({
+                serverId: SERVER,
+                devSessionId: empty.id,
+                region: "terminal",
+                tree: overLimit,
+            }),
+        (err: unknown) => isResourceLimit(err),
+    );
+    assert.equal(ws.getLayout({ devSessionId: empty.id, region: "terminal" }), null);
+    const rows = ws.db
+        .prepare("SELECT COUNT(*) AS n FROM session_layouts WHERE dev_session_id = ?")
+        .get(empty.id) as { n: number };
+    assert.equal(rows.n, 0);
+
+    // The connection is still usable: the refusal happened before any BEGIN.
+    ws.setLayout({
+        serverId: SERVER,
+        devSessionId: empty.id,
+        region: "terminal",
+        tree: { type: "leaf", paneId: "" },
+    });
+    assert.deepEqual(ws.getLayout({ devSessionId: empty.id, region: "terminal" })?.tree, {
+        type: "leaf",
+        paneId: "",
+    });
 
     ws.close();
     await cleanup(dbPath);

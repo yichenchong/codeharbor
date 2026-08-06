@@ -42,6 +42,12 @@ Rectangle {
     focus: root.shown
     enabled: root.shown
 
+    // Same rule as SettingsWindow: a full-surface sheet that takes the
+    // keyboard and blocks the window behind it is a dialog to assistive
+    // technology, and needs to say so and name itself.
+    Accessible.role: Accessible.Dialog
+    Accessible.name: qsTr("Application log")
+
     // The three buttons, the severity ComboBox and the filter field below are
     // plain QtQuick.Controls controls, so they draw from the STYLE's palette —
     // which is light. The filter field was the worst of it: its `color` is
@@ -106,7 +112,16 @@ Rectangle {
         if (root.shown) {
             root.followTail = true;
             root.scrollToTail();
-            logText.forceActiveFocus();
+            // DEFERRED. `shown` is what the host binds its own `visible` to,
+            // and this handler is connected before that binding, so at this
+            // instant the sheet is still hidden and forceActiveFocus() on a
+            // hidden item is dropped: the log text never took the keyboard and
+            // the arrow keys did nothing until the user clicked in the well.
+            // One turn later the sheet is on screen and the focus sticks.
+            Qt.callLater(function () {
+                if (root.shown)
+                    logText.forceActiveFocus();
+            });
         }
     }
 
@@ -158,10 +173,24 @@ Rectangle {
 
             Label {
                 objectName: "logCount"
-                text: root.logBuffer
-                      ? qsTr("%1 of %2 entries").arg(root.logBuffer.count)
-                                                    .arg(root.logBuffer.maxEntries)
-                      : qsTr("No log source")
+                // With a filter on, the buffer's own occupancy describes
+                // something the user is NOT looking at: the well can be empty
+                // while this said "37 of 500 entries", which reads as a broken
+                // view rather than a filter that matched nothing. Say how many
+                // of the held entries are on screen instead, and keep the
+                // capacity reading for the unfiltered case.
+                readonly property bool filtering: root.severityFilter.length > 0
+                                                  || root.textFilter.length > 0
+                readonly property int shownCount: root.filteredEntries
+                                                  && root.filteredEntries.length !== undefined
+                                                  ? root.filteredEntries.length : 0
+                text: !root.logBuffer
+                      ? qsTr("No log source")
+                      : filtering
+                        ? qsTr("%1 of %2 entries match").arg(shownCount)
+                                                        .arg(root.logBuffer.count)
+                        : qsTr("%1 of %2 entries").arg(root.logBuffer.count)
+                                                  .arg(root.logBuffer.maxEntries)
                 color: Theme.textDim
                 font.pixelSize: Theme.fontSizeSmall
             }
@@ -183,6 +212,10 @@ Rectangle {
             ComboBox {
                 id: severityBox
                 objectName: "severityFilter"
+                // The control has no visible label of its own, so without this
+                // a screen reader announces the severity filter as an unnamed
+                // combo box.
+                Accessible.name: qsTr("Severity filter")
                 Layout.preferredWidth: 130
                 model: [qsTr("All"), qsTr("Debug"), qsTr("Info"),
                         qsTr("Warning"), qsTr("Critical"), qsTr("Fatal")]
@@ -200,6 +233,7 @@ Rectangle {
                 id: textFilterField
                 objectName: "textFilter"
                 Layout.fillWidth: true
+                Accessible.name: qsTr("Message filter")
                 placeholderText: qsTr("Filter messages")
                 color: Theme.text
                 selectByMouse: true

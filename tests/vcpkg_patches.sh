@@ -61,6 +61,7 @@ while IFS= read -r -d '' patch; do
             completed = 1
         }
         /^@@ / {
+            seen_hunk = 1
             flush()
             if (match($0, /^@@ -[0-9]+(,[0-9]+)? \+[0-9]+(,[0-9]+)? @@/) == 0) {
                 printf "%s:%d: malformed hunk header\n", file, NR
@@ -116,7 +117,14 @@ while IFS= read -r -d '' patch; do
         # it: everything outside a hunk body is metadata this check does not
         # police.
         { flush() }
-        END { flush(); exit bad ? 1 : 0 }
+        END {
+            flush()
+            if (!seen_hunk) {
+                printf "%s: no unified-diff hunks found\n", file
+                bad = 1
+            }
+            exit bad ? 1 : 0
+        }
     ' "$patch"; then
         status=1
     fi

@@ -20,6 +20,7 @@
 #include <QByteArray>
 #include <QCoreApplication>
 #include <QDir>
+#include <QElapsedTimer>
 #include <QFileInfo>
 #include <QGuiApplication>
 #include <QMetaObject>

@@ -4,6 +4,7 @@
 #include <QGuiApplication>
 #include <QList>
 #include <QMetaObject>
+#include <QPointer>
 #include <QQuickItem>
 #include <QQuickView>
 #include <QQuickWindow>
@@ -234,6 +235,16 @@ void TstOpenAs::menuContentsForTextFile()
     QVERIFY(findText(menu, QStringLiteral("Text")));
     QVERIFY(!findText(menu, QStringLiteral("Image")));
     QVERIFY(!findText(menu, QStringLiteral("PDF")));
+
+    // The entry is not decoration: choosing it has to ask for THIS row with
+    // THAT handler, in the pane it was opened from.
+    QSignalSpy openAs(view->rootObject(), SIGNAL(openAsRequested(QString, QString, bool)));
+    QVERIFY(openAs.isValid());
+    QVERIFY(QMetaObject::invokeMethod(findText(menu, QStringLiteral("Text")), "triggered"));
+    QCOMPARE(openAs.size(), 1);
+    QCOMPARE(openAs.constFirst().at(0).toString(), QStringLiteral("/repo/main.cpp"));
+    QCOMPARE(openAs.constFirst().at(1).toString(), QStringLiteral("text"));
+    QCOMPARE(openAs.constFirst().at(2).toBool(), false);
 }
 
 void TstOpenAs::menuContentsForImageFile()
@@ -267,6 +278,15 @@ void TstOpenAs::menuContentsForImageFile()
     QVERIFY(!findText(menu, QStringLiteral("Editor")));
     QVERIFY(!findText(menu, QStringLiteral("Text")));
     QVERIFY(!findText(menu, QStringLiteral("PDF")));
+
+    QSignalSpy openAs(view->rootObject(), SIGNAL(openAsRequested(QString, QString, bool)));
+    QVERIFY(openAs.isValid());
+    QVERIFY(QMetaObject::invokeMethod(findText(menu, QStringLiteral("Image (default)")),
+                                      "triggered"));
+    QCOMPARE(openAs.size(), 1);
+    QCOMPARE(openAs.constFirst().at(0).toString(), QStringLiteral("/repo/logo.png"));
+    QCOMPARE(openAs.constFirst().at(1).toString(), QStringLiteral("image"));
+    QCOMPARE(openAs.constFirst().at(2).toBool(), false);
 }
 
 void TstOpenAs::openAsNewPanePreservesOriginal()
@@ -299,6 +319,21 @@ void TstOpenAs::openAsNewPanePreservesOriginal()
     region->setProperty("node", branch(first, second));
     QTest::qWait(100);
 
+    // The pane that is already showing something must be RE-HOMED by the open,
+    // never rebuilt: counting panes afterwards cannot tell the two apart, and a
+    // rebuilt pane throws away whatever the user had on screen in it.
+    QList<QObject *> beforePanes;
+    QSet<QObject *> beforeSeen;
+    collectPanes(window.get(), beforePanes, beforeSeen);
+    QCOMPARE(beforePanes.size(), 2);
+    QObject *existing = nullptr;
+    for (QObject *pane : beforePanes) {
+        if (pane->property("paneId").toString() == QStringLiteral("pane-1"))
+            existing = pane;
+    }
+    QVERIFY(existing);
+    const QPointer<QObject> originalGuard(existing);
+
     QVariant accepted;
     QVERIFY(QMetaObject::invokeMethod(
         region, "openPaneTarget", Q_RETURN_ARG(QVariant, accepted),
@@ -322,6 +357,10 @@ void TstOpenAs::openAsNewPanePreservesOriginal()
     }
     QVERIFY(original);
     QVERIFY(newPane);
+    QVERIFY2(!originalGuard.isNull(),
+             "opening a target in the second pane DESTROYED the first one");
+    QVERIFY2(original == existing,
+             "\"pane-1\" is a different object after the open, so it was rebuilt");
     QCOMPARE(original->property("url").toUrl(),
              QUrl(QStringLiteral("file:///repo/original/")));
     QCOMPARE(newPane->property("url").toUrl(),

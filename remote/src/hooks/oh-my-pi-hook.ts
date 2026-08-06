@@ -17,7 +17,7 @@
 // the client's AgentStatusMonitor.
 //
 // Installation (add to your Oh My Pi hook config, e.g. ~/.config/oh-my-pi/hooks):
-//     session_start   -> node /path/to/oh-my-pi-hook.ts session_start
+//     session_start    -> node /path/to/oh-my-pi-hook.ts session_start
 //     agent_start      -> node /path/to/oh-my-pi-hook.ts agent_start
 //     tool_call        -> node /path/to/oh-my-pi-hook.ts tool_call     (export OMP_TOOL)
 //     tool_result      -> node /path/to/oh-my-pi-hook.ts tool_result   (export OMP_TOOL)
@@ -33,8 +33,9 @@
 // merges it over the adapter's own derived metadata (see parseHookMetadata).
 // OMP_SUMMARY and OMP_METADATA are the only parts of the message the hook will
 // ever give up: if the serialized line would overrun the bound the relay
-// enforces, both are dropped so the state change itself still gets through, and
-// the loss is reported on stderr (see emitHookEvent).
+// enforces, they are dropped — the bag first, then the summary if that was not
+// enough — so the state change itself still gets through, and the loss is
+// reported on stderr (see emitHookEvent).
 // SPEC 6.4: a broken producer must never take down the agent. Any failure to
 // connect or write is swallowed (logged to stderr) and the process exits 0.
 
@@ -243,12 +244,28 @@ export function emitHookEvent(
         // asked rather than re-deriving the bound here, so the two ends cannot
         // drift; it measures the payload alone, because the framing newline is
         // deliberately outside the bound.
+        //
+        // Given up ONE AT A TIME, least useful first. The metadata bag is
+        // machine-readable auxiliary data the client merely carries; the summary
+        // is the line a human reads in the sidebar. Dropping both together
+        // whenever either is too big threw away readable text to make room for a
+        // bag nobody asked to see, and it made the per-field loss report in
+        // main() — which names OMP_SUMMARY and OMP_METADATA separately, and
+        // conjugates its verb for one field or two — unable to ever print its
+        // single-field form.
         if (!bridgeLineFits(payload)) {
-            const trimmed: BridgeMessage = { ...message };
-            delete trimmed.summary;
-            delete trimmed.metadata;
-            message = trimmed;
-            payload = JSON.stringify(message);
+            if (message.metadata !== undefined) {
+                const withoutMetadata: BridgeMessage = { ...message };
+                delete withoutMetadata.metadata;
+                message = withoutMetadata;
+                payload = JSON.stringify(message);
+            }
+            if (!bridgeLineFits(payload) && message.summary !== undefined) {
+                const withoutSummary: BridgeMessage = { ...message };
+                delete withoutSummary.summary;
+                message = withoutSummary;
+                payload = JSON.stringify(message);
+            }
             // Still too long with nothing optional left: the event name, the
             // tool name or an identifier is itself megabyte-sized, so there is
             // nothing further to give up. Say so — a rejection reaches main(),

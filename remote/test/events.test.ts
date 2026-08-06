@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import {
     AGENT_STATES,
     CH_EVENT_VERSION,
+    HARNESSES,
     makeEvent,
     parseEventLine,
     validateEvent,
@@ -233,4 +234,23 @@ test("agent wire-state tokens match src/agent/AgentEvent.h", () => {
     const cppTokens = [...body[1].matchAll(/u"([a-z_]+)"/g)].map((match) => match[1]);
     assert.ok(cppTokens.length > 0, "no wire tokens parsed out of the C++ mapping");
     assert.deepEqual(cppTokens.toSorted(), [...AGENT_STATES].toSorted());
+});
+
+// The SECOND token list on the same wire, and the one the gate above missed:
+// the harness names exist twice as well — HARNESSES here and
+// detail::isHarnessWire() in src/agent/AgentEvent.h, whose own comment says it
+// mirrors isHarness() in events.ts. Nothing checked that claim, so teaching one
+// side about a new harness alone would leave the client dropping every event
+// that harness emits (validateEvent/isHarnessWire reject an unlisted name) with
+// no error anywhere to explain it.
+test("harness wire tokens match src/agent/AgentEvent.h", () => {
+    const headerPath = fileURLToPath(new URL("../../src/agent/AgentEvent.h", import.meta.url));
+    const header = readFileSync(headerPath, "utf8");
+    // Body of the membership test only: the surrounding comments name harnesses
+    // in prose and would otherwise be scraped as tokens.
+    const body = /isHarnessWire\(QStringView h\)\s*\{([\s\S]*?)\n\}/.exec(header);
+    assert.ok(body, "AgentEvent.h must declare detail::isHarnessWire(QStringView)");
+    const cppTokens = [...body[1].matchAll(/u"([a-z-]+)"/g)].map((match) => match[1]);
+    assert.ok(cppTokens.length > 0, "no harness tokens parsed out of the C++ mapping");
+    assert.deepEqual(cppTokens.toSorted(), [...HARNESSES].toSorted());
 });

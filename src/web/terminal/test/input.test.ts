@@ -105,30 +105,33 @@ test("chunk bounds are counted in UTF-8 bytes, astral characters included", () =
     assert.deepEqual(chunkTerminalInput("aé界aé界", 6), ["aé界", "aé界"]);
 });
 
-// A sink that throws must cost one chunk, not the rest of the paste: the drain
-// is rescheduled from a finally block, so the queue behind the failure still
-// reaches the remote PTY.
-test("a throwing sink loses one chunk and keeps draining the rest", async () => {
+// A sink that throws must retain the failed chunk rather than silently lose
+// input. A later write is the retry opportunity; close() remains the way to
+// abandon it when the bridge is genuinely being torn down.
+test("a throwing sink retains the failed chunk for a later retry", async () => {
     const sent: string[] = [];
     let failures = 0;
+    let available = false;
     const writer = new TerminalInputWriter({
         sendInput(data) {
-            if (data === "ab") {
+            if (!available) {
                 failures += 1;
-                throw new Error("bridge gone");
+                throw new Error("bridge temporarily unavailable");
             }
             sent.push(data);
         },
     }, 2);
 
-    // "ab" throws straight out of write(); "cd", "ef" and "gh" are queued
-    // behind it and must still be delivered.
-    assert.throws(() => writer.write("abcdefgh"), /bridge gone/);
+    assert.throws(() => writer.write("abcdefgh"), /bridge temporarily unavailable/);
     assert.equal(failures, 1);
+    assert.equal(writer.backlogSize, 8);
+
+    available = true;
+    writer.write("!");
     while (writer.backlogSize > 0) {
         await new Promise<void>((resolve) => setImmediate(resolve));
     }
-    assert.deepEqual(sent, ["cd", "ef", "gh"]);
+    assert.deepEqual(sent, ["ab", "cd", "ef", "gh", "!"]);
 });
 
 test("fractional chunk bounds are rejected", () => {

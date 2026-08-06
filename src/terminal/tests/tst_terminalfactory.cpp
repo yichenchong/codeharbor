@@ -185,6 +185,7 @@ private slots:
     void attachWithoutAConnectionFailsAndReportsWhy();
     void attachRejectsTargetNotResolvedByServer();
     void attachWithoutATargetIsRefused();
+    void attachRefusesATargetTmuxWouldReadAsAnIdRatherThanAName();
     void resolveTargetWithoutAServerRefuses();
     void paneKeysAddressOneSlotOfOneDevSession();
     void resolveAddressesAPaneByItsRowIdAndNeverByItsLabel();
@@ -213,6 +214,7 @@ private slots:
     void aPaneRetargetedMidLookupNeverReportsUnderTheSupersededPanesIdentity();
     void aFailedResolutionLeavesThePaneWithNoIdentity();
     void targetCannotCrossAWorkspaceServerSwitch();
+    void aServerAnswerWithAnUnusableTmuxTargetFailsTheResolution();
     void changingTheWorkspaceServerForgetsRememberedRowIdentities();
 };
 
@@ -366,6 +368,62 @@ void TstTerminalFactory::attachWithoutATargetIsRefused()
     QCOMPARE(errors.count(), 1);
     QVERIFY(factory.targetFor(controller).isEmpty());
     QVERIFY(controller->state() == TerminalState::Unloaded);
+}
+
+// A target is not just a string that gets quoted; it is TMUX GRAMMAR. tmux
+// resolves an ID sigil before it looks a name up, and the `=` exact-match prefix
+// every call site uses does not suppress that: with a session `victim` holding
+// id `$0` and a second session literally named `$0`, `tmux kill-session -t '=$0'`
+// destroys `victim` (verified on tmux 3.6). attach() puts the target in two such
+// positions — `set-option -t '=<target>:'`, and `new-session -s <target>` where
+// it is not even shielded — so a name tmux reads as something else has to be
+// refused before any of that is built.
+void TstTerminalFactory::attachRefusesATargetTmuxWouldReadAsAnIdRatherThanAName()
+{
+    RpcPair rpc;
+    QVERIFY(rpc.start());
+
+    OfflineFactory factory(nullptr);
+    factory.setWorkspace(rpc.db());
+    factory.setServerId(QStringLiteral("srv-1"));
+
+    QObject pane;
+    TerminalController* controller = factory.create(&pane);
+    QSignalSpy errors(&factory, &TerminalFactory::error);
+
+    // Every shape tmux would read as something other than this name.
+    const QStringList unusable{
+        QStringLiteral("$0"),          // session id
+        QStringLiteral("@1"),          // window id
+        QStringLiteral("%2"),          // pane id
+        QStringLiteral("ch_*_t1"),     // fnmatch wildcard
+        QStringLiteral("=ch_s1_row"),  // the exact-match prefix itself
+        QStringLiteral("ch_s1:0"),     // session/window separator
+        QStringLiteral("-d"),          // an option to `new-session -s`
+    };
+    int seen = 0;
+    for (const QString& target : unusable) {
+        QVERIFY2(!factory.attach(controller, target, QStringLiteral("/repo"), 80, 24),
+                 qPrintable(target));
+        QCOMPARE(errors.count(), ++seen);
+        QCOMPARE(errors.at(seen - 1).at(0).value<TerminalController*>(), controller);
+        // The pane says which name it refused, so the user is not left with a
+        // silent dead terminal.
+        QVERIFY2(errors.at(seen - 1).at(1).toString().contains(target), qPrintable(target));
+        // And nothing was recorded: kill() reads targetFor(), so a refused
+        // target must never become something this pane could later destroy.
+        QVERIFY(factory.targetFor(controller).isEmpty());
+        QVERIFY(controller->state() == TerminalState::Unloaded);
+        QVERIFY(!controller->transport());
+    }
+
+    // The gate is about the GRAMMAR and nothing else: a well-formed target gets
+    // past it and is refused one check later, for not having been resolved by
+    // the server. Two different refusals, so this test cannot pass by accident.
+    QVERIFY(!factory.attach(controller, QStringLiteral("ch_s1_row-A"),
+                            QStringLiteral("/repo"), 80, 24));
+    QCOMPARE(errors.count(), seen + 1);
+    QVERIFY(errors.at(seen).at(1).toString().contains(QStringLiteral("resolved")));
 }
 
 // resolveTarget() reaches the server for a row, so with no connection it has to
@@ -1464,6 +1522,79 @@ void TstTerminalFactory::targetCannotCrossAWorkspaceServerSwitch()
     factory.setServerId(QStringLiteral("srv-2"));
     QVERIFY(factory.targetFor(controller).isEmpty());
     QVERIFY(errors.count() >= 1);
+}
+
+// The other end of the same rule. A tmux target arrives as DATA, from a server,
+// and it is then used as tmux GRAMMAR. codeharbord validates what it mints and
+// repairs stored rows, so what is left is a row written by an older daemon or a
+// server that is not the one we think it is — and a target such as `$0` selects
+// whichever session holds that id, which is a session belonging to somebody
+// else. The answer must fail the resolution rather than be adopted: no target,
+// no identity, and nothing cached, so a retry actually asks again.
+void TstTerminalFactory::aServerAnswerWithAnUnusableTmuxTargetFailsTheResolution()
+{
+    RpcPair rpc;
+    QVERIFY(rpc.start());
+
+    AgentStatusMonitor monitor;
+    monitor.setFallbackIdleThresholdMs(60000);
+
+    OfflineFactory factory(nullptr);
+    factory.setWorkspace(rpc.db());
+    factory.setServerId(QStringLiteral("srv-1"));
+    factory.setAgentMonitor(&monitor);
+
+    QObject pane;
+    TerminalController* controller = factory.create(&pane);
+    QSignalSpy resolved(&factory, &TerminalFactory::targetResolved);
+    QSignalSpy errors(&factory, &TerminalFactory::error);
+    QSignalSpy rows(&factory, &TerminalFactory::paneRowResolved);
+
+    QVERIFY(factory.resolveTarget(controller, QStringLiteral("s1"),
+                                  QStringLiteral("terminal-1"), QString(),
+                                  QStringLiteral("/repo")));
+    const QJsonObject request = rpc.takeRequest();
+    rpc.answerWithRow(request.value(QStringLiteral("id")).toInt(), QStringLiteral("row-A"),
+                      QStringLiteral("s1"), QStringLiteral("terminal-1"),
+                      QStringLiteral("$0"), QStringLiteral("generic"));
+
+    // Reported as a failure: an empty target, with the reason naming the value.
+    QTRY_COMPARE(resolved.count(), 1);
+    QVERIFY(resolved.at(0).at(1).toString().isEmpty());
+    QCOMPARE(errors.count(), 1);
+    QVERIFY(errors.at(0).at(1).toString().contains(QStringLiteral("$0")));
+    // Nothing to backfill into the layout leaf either: the row was not adopted.
+    QCOMPARE(rows.count(), 0);
+
+    // No identity, so the pane's output is attributed to nobody. row-A is
+    // registered and attached BY HAND here, so the monitor demonstrably knows
+    // the id and would move it to Running the instant a report arrived — without
+    // this the assertion could pass simply because the monitor had never heard
+    // of row-A. The factory refused to register it, which is itself part of the
+    // outcome: the resolution never produced an identity to register.
+    monitor.setTerminalHarness(QStringLiteral("s1"), QStringLiteral("row-A"),
+                               QStringLiteral("generic"));
+    monitor.noteTerminalAttached(QStringLiteral("s1"), QStringLiteral("row-A"));
+    QCOMPARE(monitor.stateFor(QStringLiteral("s1"), QStringLiteral("row-A")),
+             asInt(AgentState::Starting));
+    controller->ingestOutput(QByteArrayLiteral("printing under no identity"));
+    QCOMPARE(monitor.stateFor(QStringLiteral("s1"), QStringLiteral("row-A")),
+             asInt(AgentState::Starting));
+
+    // And nothing was cached: a retry reaches the server again rather than being
+    // answered from a remembered bad target. This time the answer is usable.
+    QVERIFY(factory.resolveTarget(controller, QStringLiteral("s1"),
+                                  QStringLiteral("terminal-1"), QString(),
+                                  QStringLiteral("/repo")));
+    const QJsonObject retry = rpc.takeRequest();
+    QCOMPARE(retry.value(QStringLiteral("method")).toString(),
+             QString::fromLatin1(rpc::kMethodWorkspaceResolveTerminalPane));
+    rpc.answerWithRow(retry.value(QStringLiteral("id")).toInt(), QStringLiteral("row-A"),
+                      QStringLiteral("s1"), QStringLiteral("terminal-1"),
+                      QStringLiteral("ch_s1_row-A"), QStringLiteral("generic"));
+    QTRY_COMPARE(resolved.count(), 2);
+    QCOMPARE(resolved.at(1).at(1).toString(), QStringLiteral("ch_s1_row-A"));
+    QCOMPARE(rows.count(), 1);
 }
 
 // A remembered answer names rows on ONE server. Both halves of it — the tmux

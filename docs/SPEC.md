@@ -295,9 +295,12 @@ Sidebar operations:
 - archive session;
 - move session between groups;
 - reorder sessions;
-- open repository shell;
-- reconnect all terminals;
 - mark activity as seen.
+
+Two operations in earlier drafts of this list are NOT implemented and no client
+path offers them: "open repository shell" and "reconnect all terminals". A
+repository shell is reached by creating a terminal pane in the Dev Session, and
+terminals reconnect individually.
 
 Duplicating a Dev Session should copy viewer definitions, terminal definitions, split layouts, repository root, and task metadata, while generating new tmux targets.
 
@@ -337,8 +340,9 @@ Supported operations currently implemented in the client:
 - navigate to another URL;
 - reload;
 - choose another applicable viewer handler ("Open as");
-- open externally where the resolved download/metadata view offers a desktop
-  application scheme.
+- hand a directory-listing entry to a local desktop application through an
+  `<appName>://` scheme, from the same "Open as" menu. The binary/metadata view
+  itself offers a download action only.
 
 Pane duplication and moving within the viewer region are not implemented. Zoom
 controls and an in-app developer-tools action are not implemented either.
@@ -897,7 +901,7 @@ Initial handlers:
 | Image | PNG, JPEG, WebP, GIF, SVG |
 | PDF | PDF |
 | Directory | remote directories |
-| Binary | metadata and download/open actions |
+| Binary | metadata and a download action |
 
 **Markdown renders; it does not open in the editor.** A `.md` file resolves to a
 rendered document, and its SOURCE is reached by "Open as -> Editor" (§4.3), which
@@ -1095,7 +1099,7 @@ live watch with the resource-limit error.
 | Images | image viewer |
 | PDF | PDF viewer |
 | Directory | remote directory browser |
-| Binary | metadata and download/open options |
+| Binary | metadata and a download action |
 | Very large text file | no streaming viewer yet; oversized inline reads are refused with “file is too large to display inline” |
 | Anything not matched above | metadata and download view. The editor is reached on a positive match only, never as a fallback (§7.5). |
 

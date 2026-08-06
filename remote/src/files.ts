@@ -125,6 +125,41 @@ async function statOrUndefined(target: string): Promise<Stats | undefined> {
     }
 }
 
+// Same question as statOrUndefined, but asked about the node at the END of a
+// symbolic-link chain, where "no node" has a THIRD errno: ELOOP, for a chain
+// that cycles and therefore never reaches one.
+//
+// The distinction from statOrUndefined's two codes matters because every OTHER
+// error means the opposite thing: EACCES on a directory along the chain, or
+// EIO, says there may well be a file there and we simply cannot look at it.
+// Swallowing those as "absent" made stat() report `revision: ""` — the
+// create-only token, i.e. "nothing is at this path" — for a file that exists,
+// so the client was told the save would CREATE a file when it will in fact
+// fail. Report the real error instead; it is the same one readFile and
+// writeFile will hit.
+const LINK_TARGET_ABSENT_CODES: Record<string, true> = {
+    ENOENT: true,
+    ENOTDIR: true,
+    ELOOP: true,
+};
+
+async function statLinkTarget(target: string): Promise<Stats | undefined> {
+    try {
+        return await fsp.stat(target);
+    } catch (err) {
+        if (
+            err &&
+            typeof err === "object" &&
+            "code" in err &&
+            typeof err.code === "string" &&
+            LINK_TARGET_ABSENT_CODES[err.code] === true
+        ) {
+            return undefined;
+        }
+        throw err;
+    }
+}
+
 // Decode as UTF-8, or report "not text" (undefined) for any NUL byte or any
 // byte sequence that is not valid UTF-8. The NUL scan is its own pass (a NUL is
 // perfectly valid UTF-8, so the decoder cannot report it), but the decode after
@@ -241,9 +276,7 @@ export async function stat(params: StatParams): Promise<StatResult> {
     // itself would make every save through a symlink a guaranteed — and
     // unresolvable — revision mismatch: the client would load one token from
     // stat and the write guard would compare it against a different one.
-    const target = stats.isSymbolicLink()
-        ? await fsp.stat(params.path).catch(() => undefined)
-        : undefined;
+    const target = stats.isSymbolicLink() ? await statLinkTarget(params.path) : undefined;
     // A DANGLING link (or one whose chain loops) has no target node at all, so
     // there is no revision of the target to report. The honest token for "no
     // file at the path readFile and writeFile act on" is the empty string, which
@@ -643,6 +676,21 @@ async function writeFileLocked(params: WriteFileParams): Promise<WriteFileResult
         );
     }
     const existing = await statOrUndefined(params.path);
+    // A directory is not a file this method can replace. Without this check the
+    // atomic save ran its whole course against it: `path.dirname(target)` is the
+    // directory's PARENT, so a temp file was created — and chmod'd to the
+    // directory's own mode — outside the path the request named, and the failure
+    // the client finally saw came from `rename`, which reports EISDIR or ENOTDIR
+    // depending on the platform. A create-only save (expectedRevision "") did
+    // not even get that far: it was reported as a revision CONFLICT, so the
+    // editor offered a reload/overwrite choice for a directory. Say what it is,
+    // with the errno an ordinary open-for-writing produces.
+    if (existing?.isDirectory()) {
+        throw Object.assign(
+            new Error(`EISDIR: illegal operation on a directory, write '${params.path}'`),
+            { code: "EISDIR" },
+        );
+    }
 
     assertRevisionMatches(params.path, params.expectedRevision, existing);
 
@@ -716,9 +764,6 @@ async function writeFileLocked(params: WriteFileParams): Promise<WriteFileResult
     let handle: FileHandle | undefined = await fsp.open(tmp, "wx", pinMode ? 0o600 : finalMode);
     try {
         await handle.writeFile(buf);
-        await handle.sync();
-        await handle.close();
-        handle = undefined;
         // Preserve ownership. The temp file belongs to the daemon's own user, so
         // renaming it over a file owned by somebody else — the daemon running as
         // root over a user's file, or over a file in a shared group — silently
@@ -727,6 +772,14 @@ async function writeFileLocked(params: WriteFileParams): Promise<WriteFileResult
         // longer write it. Best effort: an unprivileged process may not give a
         // file away, and the save is still the right thing to do. Done BEFORE
         // the chmod, because chown clears the setuid and setgid bits.
+        //
+        // Both are applied through the DESCRIPTOR rather than the temp file's
+        // NAME. The temp lives in the target's own directory, which may be
+        // writable by other users (/tmp, a shared group tree); a path-based
+        // chown or chmod can then be redirected onto an unrelated file by
+        // swapping the name for a symlink in the window between the write and
+        // the call. The descriptor names the inode this save created with
+        // O_EXCL and can name nothing else.
         const uid = process.getuid?.();
         const gid = process.getgid?.();
         if (
@@ -735,10 +788,15 @@ async function writeFileLocked(params: WriteFileParams): Promise<WriteFileResult
             gid !== undefined &&
             (existing.uid !== uid || existing.gid !== gid)
         ) {
-            await fsp.chown(tmp, existing.uid, existing.gid).catch(() => {});
+            await handle.chown(existing.uid, existing.gid).catch(() => {});
         }
         // open()'s mode is masked by umask; chmod pins the exact mode.
-        if (pinMode) await fsp.chmod(tmp, finalMode);
+        if (pinMode) await handle.chmod(finalMode);
+        // Flushed LAST, so the ownership and mode set above are durable together
+        // with the bytes rather than being left behind in the page cache.
+        await handle.sync();
+        await handle.close();
+        handle = undefined;
         // Re-verify as late as possible — right before the atomic replace — so a
         // file changed during the write + flush above is caught instead of being
         // silently overwritten (SPEC 8.6). This shrinks but cannot fully close
@@ -1095,7 +1153,7 @@ export const fileWatchService = new FileWatchService();
 // six for the viewer workstream). getMimeType below stays an internal helper.
 
 // Fixed JSON overhead of one DirectoryEntry: `{"name":,"kind":"directory"},` —
-// the quotes around the name are already counted by JSON.stringify above, and
+// the quotes around the name are counted by the JSON.stringify call below, and
 // "directory" is the longest kind nodeKind can report.
 const LISTING_ENTRY_ENVELOPE_BYTES = 29;
 

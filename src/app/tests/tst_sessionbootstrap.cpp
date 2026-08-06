@@ -121,6 +121,9 @@ public:
 
     bool connectOk = true;
     bool channelsOk = true;
+    bool agentChannelOk = true;
+    QString poolFailureMessage;
+    SshConnectionPool* poolForError = nullptr;
     // The pre-flight is faked like the handshake is, EXCEPT where a case asks
     // for the production probe by setting realProbe (see the latency cases).
     bool probeOk = true;
@@ -151,6 +154,8 @@ protected:
                      const QString&) override
     {
         ++connectCalls;
+        if (!connectOk && poolForError && !poolFailureMessage.isEmpty())
+            emit poolForError->errorOccurred(poolFailureMessage);
         return connectOk;
     }
 
@@ -170,9 +175,10 @@ protected:
         return false;
     }
 
-    SshChannelDevice* openChannelDevice(const QString&, const QString&) override
+    SshChannelDevice* openChannelDevice(const QString&, const QString& role) override
     {
-        if (!channelsOk)
+        if (!channelsOk || (role == QStringLiteral("codeharbor-bridge")
+                            && !agentChannelOk))
             return nullptr;
         auto* channel = new FakeChannel(this);
         channels.append(channel);
@@ -249,6 +255,10 @@ struct Harness {
     Harness()
     {
         boot.setKnownHostsPath(dir.filePath(QStringLiteral("known_hosts")));
+        // The pool the seam reports a handshake diagnostic on, so a failed
+        // connect can reproduce the real errorOccurred() -> withLastPoolError()
+        // path without a live libssh handshake.
+        boot.poolForError = &pool;
         boot.setReconnectTimeScale(kTimeScale);
         // No user interface in this gate, and connectPool() is a test seam that
         // never performs a real handshake — but attemptWire() refuses to connect
@@ -960,13 +970,36 @@ void TstSessionBootstrap::genuineChannelSetupFailureStillErrors()
     QVERIFY(h.boot.rpcDevice() == nullptr);
     QVERIFY(h.client.transport() == nullptr);
 
-    // A pool that refuses the connection outright is reported too.
+    // The SECOND channel open failing is its own path: the codeharbord device
+    // is already wired to the client by then, so the failure has to unwire it
+    // again rather than leave a half-connected session behind.
+    Harness agentFailure;
+    agentFailure.boot.agentChannelOk = false;
+    QSignalSpy agentErrors(&agentFailure.boot, &SessionBootstrap::error);
+    QVERIFY(!agentFailure.wire());
+    QCOMPARE(agentErrors.size(), 1);
+    QVERIFY2(agentErrors.at(0).at(0).toString().contains(
+                 QStringLiteral("could not start codeharbor-bridge over SSH")),
+             qPrintable(agentErrors.at(0).at(0).toString()));
+    QCOMPARE(agentFailure.boot.state(), State::Failed);
+    QVERIFY(agentFailure.boot.rpcDevice() == nullptr);
+    QVERIFY(agentFailure.boot.agentDevice() == nullptr);
+    QVERIFY(agentFailure.client.transport() == nullptr);
+    QVERIFY(agentFailure.monitor.transport() == nullptr);
+
+    // A pool that refuses the connection outright is reported too, and the
+    // diagnosis the pool emitted while failing is carried into that report
+    // (withLastPoolError) instead of leaving the user a bare "failed".
     Harness dead;
     dead.boot.connectOk = false;
+    dead.boot.poolFailureMessage = QStringLiteral("authentication rejected");
     QSignalSpy deadErrors(&dead.boot, &SessionBootstrap::error);
     QVERIFY(!dead.wire());
     QCOMPARE(deadErrors.size(), 1);
-    QVERIFY(deadErrors.at(0).at(0).toString().contains(QStringLiteral("failed")));
+    const QString deadMessage = deadErrors.at(0).at(0).toString();
+    QVERIFY2(deadMessage.contains(QStringLiteral("failed")), qPrintable(deadMessage));
+    QVERIFY2(deadMessage.contains(QStringLiteral("authentication rejected")),
+             qPrintable(deadMessage));
 }
 
 // ---------------------------------------------------------------------------

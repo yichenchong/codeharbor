@@ -304,21 +304,44 @@ Rectangle {
     function save() {
         if (!root.formValid())
             return;
+
+        // Normalise the form to the values the store will actually hold BEFORE
+        // emitting them. ServerProfiles::sanitize() trims every field and
+        // defaults an empty name to the host, so leaving the raw text on screen
+        // left the form permanently disagreeing with storage: the very next
+        // profilesChanged() ran formDiffersFrom(), saw a difference the user
+        // never typed, concluded the form was an unsaved draft and stopped
+        // reconciling it from then on. `loadingForm` keeps these writes from
+        // being mistaken for edits of the user's own.
+        root.loadingForm = true;
+        // EndpointField.trim() for EVERY field, not JavaScript's String.trim():
+        // it is the module's one copy of what QString::trimmed() strips, and the
+        // store trims all seven with that. The two sets are not the same (they
+        // disagree on U+0085 and U+FEFF), and a field trimmed by a different
+        // rule than the store's is exactly the mismatch described above.
+        hostField.text = EndpointField.trim(hostField.text);
+        userField.text = EndpointField.trim(userField.text);
+        portField.text = String(root.portValue());
+        var name = EndpointField.trim(nameField.text);
+        nameField.text = name === "" ? hostField.text : name;
+        identityFileField.text = EndpointField.trim(identityFileField.text);
+        nodePathField.text = EndpointField.trim(nodePathField.text);
+        repoRootField.text = EndpointField.trim(repoRootField.text);
+        root.loadingForm = false;
+
         if (root.editingId === "") {
             root.awaitingNewProfile = true;
             root.knownProfileCount = root.profileList().length;
         }
         root.profileSaved({
             "id": root.editingId,
-            "name": nameField.text.trim(),
-            // Trimmed with the STORE's character set (EndpointField.trim), so
-            // the value that was validated above is the value that is sent.
-            "host": EndpointField.trim(hostField.text),
+            "name": nameField.text,
+            "host": hostField.text,
             "port": root.portValue(),
-            "user": EndpointField.trim(userField.text),
-            "identityFile": identityFileField.text.trim(),
-            "nodePath": nodePathField.text.trim(),
-            "repoRoot": repoRootField.text.trim()
+            "user": userField.text,
+            "identityFile": identityFileField.text,
+            "nodePath": nodePathField.text,
+            "repoRoot": repoRootField.text
         });
         root.profileDirty = false;
     }
@@ -380,10 +403,12 @@ Rectangle {
     // ---- connection status vocabulary -------------------------------------
     //
     // `connectionState` is free-form text from the host. These map it onto the
-    // seven states ch::AppController::setConnectionState() actually publishes
-    // (disconnected / connecting / hostkey / credential / connected /
-    // reconnecting / failed), keeping the older libssh-level words the pool can
-    // still surface.
+    // eight states ch::AppController::setConnectionState() actually publishes
+    // (disconnected / connecting / provisioning / hostkey / credential /
+    // connected / reconnecting / failed), keeping the older libssh-level words
+    // the pool can still surface. Every one of them needs a case in all five
+    // functions below; falling through to the default paints an attempt that is
+    // making progress as a grey "nothing is running".
     //
     // Every state is encoded THREE ways — colour, glyph and word — because a
     // colour-only dot is unreadable to a colour-blind user and vanishes in a

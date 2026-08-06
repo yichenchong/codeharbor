@@ -493,6 +493,9 @@ Item {
     // ordinary navigation clears this override before assigning a new URL.
     property string forcedKind: ""
 
+    readonly property bool contentDirty:
+        contentLoader.item && contentLoader.item.dirty === true
+
     // View kind for the current URL: "web" | "markdown" | "text" | "image" |
     // "pdf" | "directory" | "binary" (nothing to show -> a neutral placeholder).
     property string kind: {
@@ -732,6 +735,15 @@ Item {
         addressField.selectAll();
     }
 
+    function requestClose() {
+        const handler = contentLoader.item;
+        if (handler && handler.dirty === true) {
+            closeEditorDialog.open();
+            return;
+        }
+        pane.closeRequested(pane.paneId);
+    }
+
     // The address as the field should read it RIGHT NOW.
     //
     // COMPUTED, deliberately, rather than read off `displayPath`. That property
@@ -763,7 +775,11 @@ Item {
     }
 
     Component.onCompleted: {
-        addressField.text = pane.displayPath;
+        // The effective address may come from the active session's repository
+        // root even while `url` is empty. Use the same computed value as every
+        // later refresh; reading displayPath here would leave a newly-created
+        // pane's address bar blank until the root changed again.
+        addressField.text = pane.shownPath();
         pane.navigationReady = true;
         pane.initializeNavigationHistory();
         pane.checkRepoRoot();
@@ -778,9 +794,11 @@ Item {
         anchors.top: parent.top
 
         title: pane.displayName.length > 0 ? pane.displayName : qsTr("Empty pane")
-        subtitle: pane.showingDefault ? qsTr("session root") : pane.kindLabel
         active: pane.paneActive
-        // A path is being probed, or the loaded handler says it is still
+        subtitle: pane.showingDefault ? qsTr("session root")
+                                     : pane.kindLabel
+                                       + (pane.contentDirty
+                                          ? qsTr(" \u00b7 unsaved changes") : "")
         // fetching. Every handler that can wait on the network publishes
         // `loading` (the directory listing, and the four WebEngine-backed
         // views); the ones that cannot — the binary metadata card, the empty
@@ -824,7 +842,7 @@ Item {
                     // Report focus first: the host closes the pane this
                     // request names, not a remembered fallback pane.
                     pane.paneActivated(pane.paneId);
-                    pane.closeRequested(pane.paneId);
+                    pane.requestClose();
                 }
             }
         ]
@@ -1037,6 +1055,34 @@ Item {
                 Accessible.role: Accessible.Button
                 Accessible.name: text
                 onClicked: pane.goHome()
+            }
+        }
+    }
+
+    AppDialog {
+        id: closeEditorDialog
+        objectName: "viewerCloseUnsavedDialog"
+        title: qsTr("Unsaved changes")
+        modal: true
+        standardButtons: Dialog.Ok | Dialog.Cancel
+        anchors.centerIn: Overlay.overlay
+        closePolicy: Popup.NoAutoClose
+        onOpened: {
+            const closeButton = closeEditorDialog.standardButton(Dialog.Ok);
+            if (closeButton)
+                closeButton.text = qsTr("Close without saving");
+        }
+        onAccepted: pane.closeRequested(pane.paneId)
+
+        Column {
+            width: 380
+            spacing: 8
+            Label {
+                width: parent.width
+                wrapMode: Text.WordWrap
+                textFormat: Text.PlainText
+                text: qsTr("This editor has unsaved changes. Close it without saving?")
+                color: Theme.text
             }
         }
     }

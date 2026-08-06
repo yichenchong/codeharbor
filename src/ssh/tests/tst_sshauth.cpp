@@ -45,15 +45,14 @@ private slots:
 #endif
 };
 
-// Nothing that needs a human comes first: agent, then the key files, and only
-// then a passphrase. A user must not be interrupted for a secret while a key
-// that authenticates silently has not been tried.
+// Nothing that needs a human comes first: the silent public-key rung (which is
+// ssh-agent and then the key files, in that order, inside
+// ssh_userauth_publickey_auto), and only then a passphrase. A user must not be
+// interrupted for a secret while a key that authenticates silently has not been
+// tried.
 void TstSshAuth::publicKeyLadderIsClimbedBeforeAnySecretIsAsked()
 {
     AuthRungsTried tried;
-    QCOMPARE(SshConnectionPool::nextAuthRung(tried, kBoth, true),
-             AuthRung::Agent);
-    tried.add(AuthRung::Agent);
     QCOMPARE(SshConnectionPool::nextAuthRung(tried, kBoth, true),
              AuthRung::KeyFile);
     tried.add(AuthRung::KeyFile);
@@ -76,7 +75,7 @@ void TstSshAuth::partialSuccessRoutesToTheMethodTheServerStillWants()
     // `AuthenticationMethods publickey,password`: the key was accepted, the
     // remaining offer is password.
     AuthRungsTried afterKey;
-    afterKey.add(AuthRung::Agent);
+    afterKey.add(AuthRung::KeyFile);
     QCOMPARE(SshConnectionPool::nextAuthRung(afterKey, kPasswordOnly, true),
              AuthRung::Password);
 
@@ -86,7 +85,7 @@ void TstSshAuth::partialSuccessRoutesToTheMethodTheServerStillWants()
     AuthRungsTried afterPassword;
     afterPassword.add(AuthRung::Password);
     QCOMPARE(SshConnectionPool::nextAuthRung(afterPassword, kPublicKeyOnly, true),
-             AuthRung::Agent);
+             AuthRung::KeyFile);
 }
 
 // A server may keep answering "partial" forever. The ladder is bounded by the
@@ -106,7 +105,7 @@ void TstSshAuth::serverThatKeepsReportingPartialRunsOutOfRungs()
         climbed.append(rung);
         tried.add(rung);  // every step answered SSH_AUTH_PARTIAL
     }
-    QCOMPARE(climbed.size(), 4);
+    QCOMPARE(climbed.size(), 3);
     QCOMPARE(SshConnectionPool::nextAuthRung(tried, kBoth, true),
              AuthRung::Exhausted);
 }
@@ -124,15 +123,12 @@ void TstSshAuth::passwordOnlyServerSpendsNoPublicKeyAttempt()
              AuthRung::Exhausted);
 }
 
-// With no credential callback installed there is nobody to ask, so the two
-// rungs that need a secret are unreachable — the handshake must fail rather
-// than call a callback that does not exist.
+// With no credential callback installed there is nobody to ask, so every rung
+// that needs a secret is unreachable — the handshake must fail rather than call
+// a callback that does not exist.
 void TstSshAuth::withoutACredentialCallbackOnlySilentMethodsAreOffered()
 {
     AuthRungsTried tried;
-    QCOMPARE(SshConnectionPool::nextAuthRung(tried, kBoth, false),
-             AuthRung::Agent);
-    tried.add(AuthRung::Agent);
     QCOMPARE(SshConnectionPool::nextAuthRung(tried, kBoth, false),
              AuthRung::KeyFile);
     tried.add(AuthRung::KeyFile);
@@ -151,11 +147,9 @@ void TstSshAuth::withoutACredentialCallbackOnlySilentMethodsAreOffered()
 void TstSshAuth::aRungIsNeverClimbedTwiceEvenIfStillOffered()
 {
     AuthRungsTried tried;
-    tried.add(AuthRung::Agent);
     tried.add(AuthRung::KeyFile);
     tried.add(AuthRung::KeyPassphrase);
     tried.add(AuthRung::Password);
-    QVERIFY(tried.contains(AuthRung::Agent));
     QVERIFY(tried.contains(AuthRung::KeyFile));
     QVERIFY(tried.contains(AuthRung::KeyPassphrase));
     QVERIFY(tried.contains(AuthRung::Password));
@@ -194,7 +188,7 @@ void TstSshAuth::keyboardInteractiveIsClimbedAfterPasswordWithACallback()
              AuthRung::KeyboardInteractive);
 }
 
-// The rung count still bounds the loop with every method on offer: five
+// The rung count still bounds the loop with every method on offer: four
 // distinct rungs, each climbed at most once, then Exhausted — a server that
 // keeps answering "partial" cannot spin the handshake forever.
 void TstSshAuth::everyMethodOfferedIsClimbedOnceThenExhausted()
@@ -211,7 +205,7 @@ void TstSshAuth::everyMethodOfferedIsClimbedOnceThenExhausted()
         climbed.append(rung);
         tried.add(rung);  // every step answered SSH_AUTH_PARTIAL
     }
-    QCOMPARE(climbed.size(), 5);
+    QCOMPARE(climbed.size(), 4);
     QVERIFY(climbed.contains(AuthRung::KeyboardInteractive));
     QCOMPARE(SshConnectionPool::nextAuthRung(tried, kAll, true),
              AuthRung::Exhausted);
@@ -234,7 +228,7 @@ void TstSshAuth::aServerOfferingNoSupportedMethodIsExhaustedImmediately()
     // Public-key-only with every key rung already spent and no callback: the
     // secret-bearing rungs stay unreachable instead of looping.
     AuthRungsTried spent;
-    spent.add(AuthRung::Agent);
+    // The silent rung is spent; without a callback nothing else is reachable.
     spent.add(AuthRung::KeyFile);
     QCOMPARE(SshConnectionPool::nextAuthRung(spent, kPublicKeyOnly, false),
              AuthRung::Exhausted);

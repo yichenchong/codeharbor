@@ -43,6 +43,14 @@ QString InternalUrlMap::internalUrlFor(const QUrl &fileUrl)
 {
     if (!fileUrl.isValid())
         return {};
+    // The opaque origin is exclusively a bridge for remote file URLs.  Do not
+    // mint entries for arbitrary schemes: those entries can never be served by
+    // this handler (which rejects them), but would still consume an LRU slot
+    // and make the model hand QML a URL that is guaranteed to fail.
+    if (fileUrl.scheme().compare(QLatin1String("file"), Qt::CaseInsensitive)
+        != 0
+        || fileUrl.path().isEmpty())
+        return {};
     const QString key = fileUrl.toString();
     QMutexLocker lock(&m_mutex);
     const auto it = m_fileToId.constFind(key);

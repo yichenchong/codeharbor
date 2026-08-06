@@ -887,8 +887,17 @@ void SessionLayouts::saveTreeStamped(const QString& devSessionId,
     // per-leaf bookkeeping has to be brought back in step with it before the
     // write goes out - notably, any brand new terminal leaf in it needs a row
     // minted or the region would never be writable again.
-    if (index == kTerminal)
+    //
+    // The tree is then republished, because setTreeQuietly() above cached it
+    // while m_legacyTerminalSlots still described the PREVIOUS tree: a leaf the
+    // authored tree dropped would keep its "terminalLegacy" marker in the cache,
+    // and a brand new id-less leaf wearing a label the old tree had could
+    // resolve by that recyclable label - attaching to a shell it does not own -
+    // instead of waiting for the row being minted for it right here.
+    if (index == kTerminal) {
         adoptAuthoredTerminalTree(generation);
+        publishTreeQuietly(index);
+    }
     persist(index);
 }
 

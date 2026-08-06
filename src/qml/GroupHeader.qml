@@ -18,7 +18,18 @@ ItemDelegate {
     // Count from the last authoritative workspace tree, not the filtered
     // sidebar model: a group delete also destroys archived/unpinned sessions
     // that may currently be hidden.
+    //
+    // The sidebar seeds this, but that seed is a plain function call with no
+    // change signal behind it, so it never updated again: a group that gained
+    // or lost sessions after its header was built quoted the count it had at
+    // construction time in a confirmation that cannot be undone. Re-asked from
+    // the host at the moment the button is pressed (see deleteGroupButton).
     property int sessionCount: 0
+
+    function refreshSessionCount() {
+        if (header.host && typeof header.host.sessionCountForGroup === "function")
+            header.sessionCount = header.host.sessionCountForGroup(header.itemId);
+    }
 
     // The SessionsSidebar that instantiated this header; null-guarded so the
     // header stays usable standalone.
@@ -90,6 +101,9 @@ ItemDelegate {
         Rectangle {
             anchors.fill: parent
             anchors.margins: 1
+            // Same ring SessionRow draws, so the keyboard cursor looks like one
+            // thing whether it is sitting on a group or on a session.
+            radius: 3
             color: "transparent"
             border.width: 2
             border.color: Theme.accent
@@ -265,7 +279,10 @@ ItemDelegate {
             border.width: deleteGroupButton.visualFocus ? 2 : 1
             border.color: deleteGroupButton.visualFocus ? Theme.accent : Theme.danger
         }
-        onClicked: deleteDialog.open()
+        onClicked: {
+            header.refreshSessionCount();
+            deleteDialog.open();
+        }
     }
 
     AppDialog {

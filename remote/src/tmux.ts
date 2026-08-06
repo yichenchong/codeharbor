@@ -13,7 +13,10 @@
 //     so a session name can contain spaces, quotes, `$`, or `;` without any
 //     interpolation risk. Names are additionally passed to `-t` with tmux's `=`
 //     exact-match prefix, which stops a leading `-` from being read as an option
-//     and stops fnmatch/prefix matching from hitting the wrong session.
+//     and stops fnmatch/prefix matching from hitting the wrong session. `=` is
+//     NOT total, though: a LEADING `$` is tmux's session-ID form and is
+//     resolved before the exact-name lookup, so it is rejected outright rather
+//     than shielded — see requireKillName.
 //
 // The command runner is injectable (CommandRunner) so the unit tests drive
 // realistic tmux output without a live server; the real thing is exercised by
@@ -353,13 +356,28 @@ function requireName(params: unknown, method: string): string {
     }
     throw new InvalidParamsError(`${method} requires a non-empty string name`);
 }
-// `=` makes tmux use an exact target, but it does not make `:` or `.` literal:
-// tmux still interprets those as window/pane separators. Reject them (and
-// control characters) before building a kill target so a malformed name such
-// as `other:0` can never kill another session.
+// `=` makes tmux use an exact target, but it does not make every character
+// literal.
+//
+//  * `:` and `.` remain the window/pane separators, so `other:0` under an
+//    unshielded target addresses another session's window.
+//  * A LEADING `$` is tmux's session-ID form, and it is read BEFORE the
+//    exact-name lookup, so `=` does not shield it. Verified against the tmux
+//    3.6 on this host: with sessions `victim` ($0) and a second session
+//    literally NAMED `$0`, `tmux kill-session -t '=$0'` killed `victim` — the
+//    session whose ID is 0 — and left the one actually called `$0` alive. A
+//    stored or relayed target of `$0` therefore destroys an unrelated session
+//    and the user's work in it, while tmux.sessionExists (which compares
+//    against the listing) reports that no such session exists at all. Only the
+//    first character matters: `a$0` is an ordinary name and tmux matches it
+//    literally, which is why this is a prefix check and not a ban on `$`.
+//  * Control characters come back vis-escaped in tmux's own output, so a stored
+//    name carrying one never matches the session tmux actually made.
+//
+// Reject all of them before a kill target is built.
 function requireKillName(params: unknown): string {
     const name = requireName(params, RPC_TMUX_METHODS.killSession);
-    if (/[:.\u0000-\u001f\u007f]/.test(name)) {
+    if (/[:.\u0000-\u001f\u007f]/.test(name) || name.startsWith("$")) {
         throw new InvalidParamsError(
             `${RPC_TMUX_METHODS.killSession} requires a tmux-safe session name`,
         );
@@ -387,10 +405,11 @@ export async function sessionExists(
  * calling this where tmux is not installed, is a successful no-op.
  *
  * `=` pins the lookup to an exact name, so neither an option-shaped nor a glob
- * name can reach another session. The target grammar still treats `:` and `.`
- * as session/window/pane structure; requireKillName rejects those before the
- * argument is built. Other command failures are surfaced instead of reported
- * as a successful kill.
+ * name can reach another session. It is not a general quoting mechanism: the
+ * target grammar still treats `:` and `.` as session/window/pane structure, and
+ * a LEADING `$` still selects a session by ID in preference to any name.
+ * requireKillName rejects all of those before the argument is built. Other
+ * command failures are surfaced instead of reported as a successful kill.
  */
 export async function killSession(
     params: KillSessionParams,

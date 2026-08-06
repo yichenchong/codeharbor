@@ -66,6 +66,12 @@ body {
     width: 100%;
     overflow: auto;
     padding: 24px clamp(20px, 5vw, 72px) 48px;
+    /* A bare URL, a long identifier or a wide inline code span has no break
+       opportunity of its own. Without this it pushes the whole document wider
+       than the pane and every paragraph gains a horizontal scroll. Code blocks
+       are unaffected: `white-space: pre` forbids wrapping outright, so they
+       keep their own scroll bar. */
+    overflow-wrap: break-word;
     outline: none;
 }
 
@@ -118,7 +124,12 @@ body {
 }
 .ch-markdown pre {
     position: relative;
-    overflow: auto;
+    /* The <code> inside is the scroll box, NOT the <pre>. The language label
+       below is positioned against the <pre>'s padding box, and an absolutely
+       positioned child of a scroll container scrolls with its content: with
+       the scroll on the <pre>, scrolling a wide code block sideways dragged
+       the label out of the pane and uncovered the code beneath it. */
+    overflow: hidden;
     padding: 28px 14px 14px;
     background: var(--ch-surface-deep);
     border: 1px solid var(--ch-border);
@@ -126,11 +137,18 @@ body {
 }
 .ch-markdown pre code {
     display: block;
+    overflow: auto;
     padding: 0;
     color: var(--ch-text);
     background: transparent;
     border: 0;
     white-space: pre;
+}
+/* Every block this renderer emits has a <code> child, but a raw HTML <pre> in
+   the document need not. Such a block has no inner scroll box, so it keeps the
+   scroll on the <pre> itself rather than clipping its long lines away. */
+.ch-markdown pre:not(:has(> code)) {
+    overflow: auto;
 }
 .ch-markdown pre[data-language]::before {
     content: attr(data-language);

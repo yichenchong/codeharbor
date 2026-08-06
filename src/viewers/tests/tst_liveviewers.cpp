@@ -54,6 +54,7 @@
 #include <QQuickWindow>
 #include <QRectF>
 #include <QSet>
+#include <QSignalSpy>
 #include <QStandardPaths>
 #include <QString>
 #include <QStringList>
@@ -310,6 +311,28 @@ int distinctColours(const QImage &image, int cap = 4096)
 bool isRegionSplitView(QObject *object)
 {
     return hasProperty(object, "ratiosApplied") && hasProperty(object, "orientation");
+}
+
+// `ratiosApplied` says the sizing latch has RUN; it does not say Qt Quick has
+// applied the resulting geometry. SplitView lays its children out on a polish
+// pass, and polish runs as part of producing the next frame, so a measurement
+// taken in the same event-loop turn as the latch reads the pre-layout rects
+// (every pane 0x0). Waiting for two swapped frames is the deterministic way to
+// say "the layout that the latch asked for is now on screen": the first frame
+// carries the polish, and the second proves the first one completed. This
+// replaces a fixed 400 ms sleep, which was both slower and only accidentally
+// long enough.
+bool waitForRenderedFrames(QQuickWindow *window, int frames, int timeoutMs)
+{
+    QSignalSpy swapped(window, &QQuickWindow::frameSwapped);
+    QElapsedTimer timer;
+    timer.start();
+    while (swapped.size() < frames && timer.elapsed() < timeoutMs) {
+        window->update();
+        if (!swapped.wait(timeoutMs))
+            break;
+    }
+    return swapped.size() >= frames;
 }
 
 // One measured split: the panes ordered along the split axis, their extent on
@@ -856,8 +879,16 @@ void TstLiveViewers::splitTreeRendersLiveDirectoryPanes()
                                              .arg(dumpTree(region))),
                               kExecTimeoutMs);
 
-    // Let the layout settle and the live directory RPCs land.
-    QTest::qWait(400);
+    // Wait for the asynchronous layout and first directory requests to settle.
+    QTRY_VERIFY_WITH_TIMEOUT(
+        [&] {
+            const QList<QObject *> views = collect(region, isRegionSplitView);
+            return views.size() == 1
+                   && views.constFirst()->property("ratiosApplied").toBool();
+        }(),
+        kExecTimeoutMs);
+    QVERIFY2(waitForRenderedFrames(window, 2, kExecTimeoutMs),
+             "the window never rendered after the sizing latch fired");
 
     // The one-shot sizing latch must have fired; without it every pane after the
     // first collapses to a Loader's implicit size of zero.
@@ -979,7 +1010,8 @@ void TstLiveViewers::splitTreeRendersLiveDirectoryPanes()
     // adaptation, so it works under the offscreen platform plugin with no
     // display and no GL context. A null grab here is a real failure, not an
     // environment quirk to route around.
-    QTest::qWait(300);
+    QTRY_VERIFY_WITH_TIMEOUT(distinctColours(window->grabWindow()) >= 3,
+                             kExecTimeoutMs);
     const QImage frame = window->grabWindow();
     QVERIFY2(!frame.isNull(), "QQuickWindow::grabWindow() returned a null frame");
     QCOMPARE(frame.width(), kWindowWidth);
@@ -1020,15 +1052,22 @@ void TstLiveViewers::splitTreeSizesPaneAddedAfterFirstLayout()
     const QVariantMap threePane{
         {QStringLiteral("orientation"), QStringLiteral("horizontal")},
         {QStringLiteral("children"), QVariantList{leaf(0), leaf(1), leaf(2)}}};
-
     std::unique_ptr<QObject> shell;
     QQuickWindow *window = nullptr;
+
     QQuickItem *region = nullptr;
     QVERIFY(openSplitShell(twoPane, &shell, &window, &region) != nullptr);
 
     const auto panes = [region] { return collect(region, isLeafPane); };
-    QTRY_VERIFY_WITH_TIMEOUT(panes().size() == 2, kExecTimeoutMs);
-    QTest::qWait(400);
+    QTRY_VERIFY_WITH_TIMEOUT(
+        [&] {
+            const QList<QObject *> views = collect(region, isRegionSplitView);
+            return views.size() == 1
+                   && views.constFirst()->property("ratiosApplied").toBool();
+        }(),
+        kExecTimeoutMs);
+    QVERIFY2(waitForRenderedFrames(window, 2, kExecTimeoutMs),
+             "the window never rendered after the sizing latch fired");
 
     const SplitMeasurement before = measureSplit(region, true, panes());
     qInfo("before growth: %s", qPrintable(before.describe()));
@@ -1048,7 +1087,15 @@ void TstLiveViewers::splitTreeSizesPaneAddedAfterFirstLayout()
                               qPrintable(QStringLiteral("third pane never appeared\n%1")
                                              .arg(dumpTree(region))),
                               kExecTimeoutMs);
-    QTest::qWait(400);
+    QTRY_VERIFY_WITH_TIMEOUT(
+        [&] {
+            const QList<QObject *> views = collect(region, isRegionSplitView);
+            return views.size() == 1
+                   && views.constFirst()->property("ratiosApplied").toBool();
+        }(),
+        kExecTimeoutMs);
+    QVERIFY2(waitForRenderedFrames(window, 2, kExecTimeoutMs),
+             "the window never rendered after the third pane was added");
 
     // The SAME SplitView must have been re-sized: if the Loader had rebuilt the
     // branch from scratch the latch reset would never have been exercised.

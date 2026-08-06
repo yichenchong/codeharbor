@@ -173,6 +173,7 @@ private slots:
     void malformedWatchLossPayloadsAreNoOps();
     void lostWatchEventsAfterUnwatchingAreIgnored();
     void recoverySnapshotWrittenAndOfferedOnReopen();
+    void emptyRecoverySnapshotIsOfferedOnReopen();
     void unwatchIssuedOnDestruction();
     void reopenUnwatchesPreviousSubscription();
     void contentBufferedUntilPageReportsReady();
@@ -220,6 +221,7 @@ private slots:
     void aStaleSnapshotReplyDoesNotDisturbTheNextFilesBookkeeping();
     void aSecondSaveOfTheSameBufferIsNotASecondWriteAndNotAConflict();
     void aSecondSaveOfChangedBytesIsRewrittenAgainstTheRevisionItNowNeeds();
+    void aLaterRevertReplacesAnOlderQueuedSave();
     void aQueuedSaveIsDroppedWhenTheWriteItWaitedOnIsRefused();
     void aSaveOnANewFileDoesNotJoinThePreviousFilesSaveChain();
     void anUnownedControllerIsKeptAliveByTheFactory();
@@ -921,6 +923,49 @@ void TstEditorController::recoverySnapshotWrittenAndOfferedOnReopen()
     QTRY_COMPARE(recoverySpy.count(), 1);
     QCOMPARE(recoverySpy.at(0).at(0).toString(), QStringLiteral("recovered edits"));
 }
+void TstEditorController::emptyRecoverySnapshotIsOfferedOnReopen()
+{
+    makePair();
+    openClean(QStringLiteral("/foo/f.txt"), QStringLiteral("orig"),
+              QStringLiteral("r1"));
+
+    QSignalSpy recoverySpy(m_controller, &EditorController::recoveryAvailable);
+    m_controller->reportContent(QString());
+    const QJsonObject rec = nextRequest();
+    QCOMPARE(method(rec), kWriteFile);
+    QCOMPARE(snapshotContentOf(rec), QString());
+    respondResult(reqId(rec), {{"path", recoveryFilePath()}, {"revision", "rec1"}});
+
+    m_controller->open(QStringLiteral("/foo/f.txt"));
+    QCOMPARE(method(nextRequest()), kUnwatch);
+    const QJsonObject read = nextRequest();
+    QCOMPARE(method(read), kReadFile);
+    respondResult(reqId(read), {{"path", "/foo/f.txt"},
+                                {"encoding", "utf-8"},
+                                {"content", "orig"},
+                                {"revision", "r1"},
+                                {"truncated", false}});
+    QCOMPARE(method(nextRequest()), kWatch);
+    servePermissionStat();
+
+    const QJsonObject stat = nextRequest();
+    QCOMPARE(method(stat), kStat);
+    respondResult(reqId(stat), {{"path", recoveryFilePath()},
+                                {"revision", "rec1"}});
+    const QJsonObject recRead = nextRequest();
+    QCOMPARE(method(recRead), kReadFile);
+    respondResult(reqId(recRead), {{"path", recoveryFilePath()},
+                                   {"encoding", "utf-8"},
+                                   {"content", snapshotEnvelope(
+                                                    QStringLiteral("/foo/f.txt"),
+                                                    QString())},
+                                   {"revision", "rec1"},
+                                   {"truncated", false}});
+
+    QTRY_COMPARE(recoverySpy.count(), 1);
+    QCOMPARE(recoverySpy.at(0).at(0).toString(), QString());
+}
+
 
 // The server identity can arrive after a pane has already loaded its file. Once
 // the recovery directory becomes known, an existing snapshot must be probed
@@ -3028,6 +3073,39 @@ void TstEditorController::aSecondSaveOfChangedBytesIsRewrittenAgainstTheRevision
     QTRY_COMPARE(m_controller->fileState(), QStringLiteral("clean"));
     QCOMPARE(m_controller->revision(), QStringLiteral("r3"));
 }
+// If a later save returns to the bytes already in flight, it is still the
+// latest buffer observation and must replace an older distinct queued save.
+void TstEditorController::aLaterRevertReplacesAnOlderQueuedSave()
+{
+    makePair();
+    openClean(QStringLiteral("/foo/f.txt"), QStringLiteral("hello"),
+              QStringLiteral("r1"));
+
+    QSignalSpy savedSpy(m_controller, &EditorController::saved);
+    QSignalSpy conflictSpy(m_controller, &EditorController::saveConflict);
+
+    m_controller->save(QStringLiteral("first"), QStringLiteral("r1"));
+    const QJsonObject write1 = nextRequest();
+    QCOMPARE(reqContent(write1), QStringLiteral("first"));
+
+    m_controller->save(QStringLiteral("intermediate"), QStringLiteral("r1"));
+    m_controller->save(QStringLiteral("first"), QStringLiteral("r1"));
+    QVERIFY2(nextRequest(300).isEmpty(),
+             "queued saves must remain serialized");
+
+    respondResult(reqId(write1), {{"path", "/foo/f.txt"}, {"revision", "r2"}});
+    const QJsonObject write2 = nextRequest();
+    QCOMPARE(method(write2), kWriteFile);
+    QCOMPARE(reqContent(write2), QStringLiteral("first"));
+    QCOMPARE(reqExpectedRevision(write2), QStringLiteral("r2"));
+
+    respondResult(reqId(write2), {{"path", "/foo/f.txt"}, {"revision", "r3"}});
+    QTRY_COMPARE(savedSpy.count(), 1);
+    QCOMPARE(conflictSpy.count(), 0);
+    QCOMPARE(m_controller->revision(), QStringLiteral("r3"));
+    QTRY_COMPARE(m_controller->fileState(), QStringLiteral("clean"));
+}
+
 
 // A genuine conflict — someone else moved the file — still reports exactly one
 // notice. The queued bytes are dropped rather than fired at a server that just

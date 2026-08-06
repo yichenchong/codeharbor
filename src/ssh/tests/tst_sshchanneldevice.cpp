@@ -8,6 +8,8 @@
 #include <QStringList>
 #include <QtTest/QtTest>
 
+#include <memory>
+
 using ch::SshChannelDevice;
 using ch::SshConnectionPool;
 
@@ -49,6 +51,7 @@ private slots:
     void aFinishedStreamReadsAsMinusOneNotZero();
     void waitingForBytesFailsFastWhenNoneCanArrive();
     void writingWithNoChannelFailsInsteadOfSwallowingTheBytes();
+    void aDeviceOutlivingItsPoolStaysSafeToUse();
 };
 
 // QIODevice::open() is the obvious thing for a caller to reach for, and on this
@@ -225,6 +228,33 @@ void TstSshChannelDevice::writingWithNoChannelFailsInsteadOfSwallowingTheBytes()
     // stream is still not a place to put bytes.
     device.finishReadChannel();
     QCOMPARE(device.write(QByteArrayLiteral("ping\n")), qint64(-1));
+}
+
+// A terminal pane deliberately outlives an SSH drop, and nothing orders the
+// pool's destruction after every device that was built on it. The device holds
+// the pool through a QPointer for exactly that reason, so once the pool is gone
+// every path that would otherwise call into it — starting a channel, handing
+// one back from closeChannel() or from the destructor — must find no pool
+// rather than a dangling one.
+void TstSshChannelDevice::aDeviceOutlivingItsPoolStaysSafeToUse()
+{
+    auto pool = std::make_unique<SshConnectionPool>();
+    SshChannelDevice device(pool.get());
+    QSignalSpy finished(&device, &SshChannelDevice::readChannelFinished);
+
+    pool.reset();
+
+    QVERIFY(!device.startExec(QStringLiteral("echo hi")));
+    QVERIFY(!device.isOpen());
+    QVERIFY(!device.resizePty(80, 24));
+    QVERIFY(!device.errorString().isEmpty());
+
+    // The end of the read channel is still announced exactly once, and the
+    // destructor that runs when this scope ends must be just as harmless.
+    device.closeChannel();
+    QCOMPARE(finished.size(), 1);
+    device.closeChannel();
+    QCOMPARE(finished.size(), 1);
 }
 
 QTEST_GUILESS_MAIN(TstSshChannelDevice)

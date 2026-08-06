@@ -1,7 +1,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { RecoveryReporter, type ReportBridge, type ReportTimers } from "../src/recovery.ts";
+import { RecoveryReporter, REPORT_DELAY_MS, type ReportBridge, type ReportTimers }
+    from "../src/recovery.ts";
 
 // A fake timer: setTimeout hands back an id and remembers the handler; fire()
 // runs every armed handler, standing in for the 500 ms elapsing. This drives
@@ -10,9 +11,13 @@ class FakeClock {
     private handlers = new Map<number, () => void>();
     private nextId = 1;
 
+    /** Every delay the reporter has asked for, in order. */
+    readonly delays: number[] = [];
+
     readonly timers: ReportTimers = {
-        set: (handler) => {
+        set: (handler, ms) => {
             const id = this.nextId++;
+            this.delays.push(ms);
             this.handlers.set(id, handler);
             return id;
         },
@@ -254,4 +259,48 @@ test("report replaces a pending timer instead of sending twice", () => {
     clock.fire();
     assert.deepEqual(reports, ["latest"]);
     assert.equal(clock.armed, 0);
+});
+
+test("the snapshot is armed at the SPEC 11.3 debounce delay", () => {
+    const clock = new FakeClock();
+    const { bridge } = fakeBridge();
+    const reporter = new RecoveryReporter(bridge, () => "x", clock.timers);
+
+    // The delay is the contract, not an implementation detail: the page treats a
+    // still-armed snapshot as "the host cannot know about these edits yet" when it
+    // decides whether a host-driven reload may replace the buffer, so an
+    // accidental 0 (report on every keystroke) or a much larger value (a longer
+    // window in which a crash loses work) both change observable behaviour.
+    reporter.schedule(true);
+    assert.deepEqual(clock.delays, [REPORT_DELAY_MS]);
+
+    reporter.schedule(true);
+    assert.deepEqual(clock.delays, [REPORT_DELAY_MS, REPORT_DELAY_MS]);
+});
+
+test("pending is false after every path that hands the buffer to the host", () => {
+    // The editor page reads `pending` as "there are edits the host has not been
+    // told about", and refuses to let host-driven content replace the buffer while
+    // it is true. Every call that actually delivers the buffer must therefore
+    // clear it, or a legitimate load would be refused forever.
+    const clock = new FakeClock();
+    const { bridge } = fakeBridge();
+    const reporter = new RecoveryReporter(bridge, () => "x", clock.timers);
+
+    reporter.schedule(true);
+    reporter.flush();
+    assert.equal(reporter.pending, false, "flush must clear pending");
+
+    reporter.schedule(true);
+    reporter.report();
+    assert.equal(reporter.pending, false, "report must clear pending");
+
+    reporter.schedule(true);
+    reporter.save("rev-1");
+    assert.equal(reporter.pending, false, "save must clear pending");
+
+    reporter.schedule(true);
+    clock.fire();
+    assert.equal(reporter.pending, false,
+                 "a fired timer must clear pending, not leave it armed forever");
 });

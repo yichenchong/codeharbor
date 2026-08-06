@@ -112,6 +112,10 @@ private slots:
     void updateTerminalStatesSignalsOnlyTheRowThatMoved();
     void viewerKindsAcceptPunctuationRealExtensionsCarry();
     void viewerKindsImageTableIsTheOneSourceOfTruth();
+    void updateTerminalStatesResetsWhenAPinOrArchiveBitMoves();
+    void updateTerminalStatesSignalsIndicesInFilteredCoordinates();
+    void splitTreeCustomTitleDropsUnpairedSurrogatesAnywhere();
+    void sessionsModelHidesEmptyGroupsWhenEverySessionIsFiltered();
 };
 
 // Group -> DevSession -> viewer + terminal panes tree.
@@ -2334,6 +2338,232 @@ void TstModels::viewerKindsImageTableIsTheOneSourceOfTruth()
     // first rather than passing a raw filename suffix.
     QVERIFY(!extensions.contains(QStringLiteral("PNG")));
     QVERIFY(!extensions.contains(QStringLiteral(".png")));
+}
+
+// A pin or archive bit that moves is NOT a terminal-state update: either bit
+// can add or remove a visible row, so the filtered view has to be rebuilt with
+// a reset rather than patched in place. Nothing covered this branch, and a
+// regression in it would leave a row the user just unpinned still showing under
+// the pin filter until the next full refresh.
+void TstModels::updateTerminalStatesResetsWhenAPinOrArchiveBitMoves()
+{
+    const auto session = [](const QString &id, bool pinned, bool archived) {
+        SessionRow row;
+        row.session.id = DevSessionId{id};
+        row.session.name = id;
+        row.session.pinned = pinned;
+        row.session.archived = archived;
+        row.terminals = {terminal(TerminalState::Ready, AgentState::Idle)};
+        return row;
+    };
+
+    GroupRow baseline;
+    baseline.group.id = GroupId{QStringLiteral("g1")};
+    baseline.sessions = {session(QStringLiteral("s1"), true, false),
+                         session(QStringLiteral("s2"), false, false)};
+
+    // Unpinning s1 while the pin filter is on must make the row disappear.
+    {
+        SessionsModel model;
+        model.setGroups({baseline});
+        model.setPinnedOnly(true);
+        QCOMPARE(model.rowCount(model.index(0, 0)), 1);
+
+        QSignalSpy reset(&model, &QAbstractItemModel::modelReset);
+        GroupRow unpinned = baseline;
+        unpinned.sessions[0].session.pinned = false;
+        model.updateTerminalStates({unpinned});
+
+        QCOMPARE(reset.count(), 1);
+        QCOMPARE(model.rowCount(), 0); // no pinned session left anywhere
+    }
+
+    // Archiving s2 while archived rows are hidden must do the same.
+    {
+        SessionsModel model;
+        model.setGroups({baseline});
+        QCOMPARE(model.rowCount(model.index(0, 0)), 2);
+
+        QSignalSpy reset(&model, &QAbstractItemModel::modelReset);
+        GroupRow archived = baseline;
+        archived.sessions[1].session.archived = true;
+        model.updateTerminalStates({archived});
+
+        QCOMPARE(reset.count(), 1);
+        QCOMPARE(model.rowCount(model.index(0, 0)), 1);
+        QCOMPARE(model.data(model.index(0, 0, model.index(0, 0)),
+                            SessionsModel::IdRole)
+                     .toString(),
+                 QStringLiteral("s1"));
+    }
+}
+
+// The rows updateTerminalStates announces are the rows the VIEW is showing, so
+// their indices must be filtered-tree coordinates. With a hidden row in front
+// of the one that moved, an index taken from the authoritative tree would name
+// a different visible row - or a row past the end of the group - and repaint
+// the wrong session.
+void TstModels::updateTerminalStatesSignalsIndicesInFilteredCoordinates()
+{
+    const auto session = [](const QString &id, bool archived, AgentState agent) {
+        SessionRow row;
+        row.session.id = DevSessionId{id};
+        row.session.name = id;
+        row.session.archived = archived;
+        row.terminals = {terminal(TerminalState::Ready, agent)};
+        return row;
+    };
+
+    GroupRow g;
+    g.group.id = GroupId{QStringLiteral("g1")};
+    // Two hidden rows in front, so an unfiltered index would be row 2 - past
+    // the end of the one-row filtered group.
+    g.sessions = {session(QStringLiteral("hidden-a"), true, AgentState::Idle),
+                  session(QStringLiteral("hidden-b"), true, AgentState::Idle),
+                  session(QStringLiteral("visible"), false, AgentState::Idle)};
+
+    SessionsModel model;
+    model.setGroups({g});
+    const QModelIndex groupIndex = model.index(0, 0);
+    QCOMPARE(model.rowCount(groupIndex), 1);
+    const QModelIndex visible = model.index(0, 0, groupIndex);
+
+    QSignalSpy reset(&model, &QAbstractItemModel::modelReset);
+    QSignalSpy changed(&model, &QAbstractItemModel::dataChanged);
+
+    GroupRow refreshed = g;
+    refreshed.sessions[2].terminals = {terminal(TerminalState::Ready, AgentState::Error)};
+    model.updateTerminalStates({refreshed});
+
+    QCOMPARE(reset.count(), 0);
+    QCOMPARE(changed.count(), 1);
+    const QModelIndex announced = changed.at(0).at(0).value<QModelIndex>();
+    QCOMPARE(announced, visible);
+    QCOMPARE(announced.row(), 0);
+    QVERIFY(announced.isValid());
+    QCOMPARE(model.data(visible, SessionsModel::RowStateRole).toInt(),
+             static_cast<int>(SessionRowState::Error));
+
+    // A hidden row that moves is not announced at all - it has no visible index
+    // to name - and its state is still adopted, so unhiding it shows the new
+    // value rather than a stale one.
+    QSignalSpy changedAgain(&model, &QAbstractItemModel::dataChanged);
+    refreshed.sessions[0].terminals = {terminal(TerminalState::Ready, AgentState::Error)};
+    model.updateTerminalStates({refreshed});
+    QCOMPARE(changedAgain.count(), 0);
+
+    model.setShowArchived(true);
+    QCOMPARE(model.data(model.index(0, 0, model.index(0, 0)),
+                        SessionsModel::RowStateRole)
+                 .toInt(),
+             static_cast<int>(SessionRowState::Error));
+}
+
+// A surrogate half that is not part of a pair is not a character. QString will
+// carry one, but a layout is stored as JSON text, and encoding replaces the
+// lone half with a replacement character - so a title holding one would read
+// back different from the tree just written and be re-saved on every load.
+// Truncation only ever orphans a half at the END; one that arrives INSIDE a
+// server-supplied or hand-edited title used to survive normalization untouched.
+void TstModels::splitTreeCustomTitleDropsUnpairedSurrogatesAnywhere()
+{
+    // A lone low surrogate at the front, and a lone high surrogate in the
+    // middle, both well inside the length limit.
+    QString messy;
+    messy.append(QChar(0xDE00)); // orphan low half
+    messy.append(QLatin1String("ab"));
+    messy.append(QChar(0xD83D)); // orphan high half
+    messy.append(QLatin1String("cd"));
+    messy.append(QChar(0xD83D)); // a COMPLETE pair, which must survive
+    messy.append(QChar(0xDE00));
+
+    QString expected = QStringLiteral("abcd");
+    expected.append(QChar(0xD83D));
+    expected.append(QChar(0xDE00));
+
+    const QString normalized = SplitNode::normalizeCustomTitle(messy);
+    QCOMPARE(normalized, expected);
+    QCOMPARE(SplitNode::normalizeCustomTitle(normalized), normalized);
+
+    // And the whole point: such a title now survives an actual JSON encode /
+    // decode cycle, which is what a stored layout goes through.
+    SplitNode leaf;
+    leaf.paneId = QStringLiteral("terminal-1");
+    leaf.customTitle = messy;
+    const QJsonObject json = wire(leaf);
+    const QByteArray encoded = QJsonDocument(json).toJson(QJsonDocument::Compact);
+    const SplitNode restored =
+        SplitNode::fromJson(QJsonDocument::fromJson(encoded).object());
+    QCOMPARE(restored.customTitle, expected);
+    QVERIFY(restored == leaf);
+}
+
+// An empty group is normally kept - the user just made it and is about to fill
+// it. But when a filter is hiding EVERY session in the workspace, keeping it
+// leaves rowCount() at 1, and the sidebar's "All your sessions are archived"
+// panel only appears at rowCount() == 0 (SessionsSidebar.qml). The user was
+// then shown one bare group header and no hint that their sessions still
+// exist. A workspace that genuinely has no sessions is the opposite case:
+// nothing is hidden, so the group must stay.
+void TstModels::sessionsModelHidesEmptyGroupsWhenEverySessionIsFiltered()
+{
+    const auto session = [](const QString &id, bool archived, bool pinned) {
+        SessionRow row;
+        row.session.id = DevSessionId{id};
+        row.session.name = id;
+        row.session.archived = archived;
+        row.session.pinned = pinned;
+        return row;
+    };
+    const auto group = [](const QString &id, QVector<SessionRow> sessions) {
+        GroupRow row;
+        row.group.id = GroupId{id};
+        row.group.name = id;
+        row.sessions = std::move(sessions);
+        return row;
+    };
+
+    const GroupRow empty = group(QStringLiteral("empty"), {});
+
+    // One empty group beside a group whose only session is archived. With
+    // archived rows hidden there is nothing left to show, so the tree must be
+    // empty and the sidebar can explain itself.
+    SessionsModel model;
+    model.setGroups({empty, group(QStringLiteral("work"),
+                                  {session(QStringLiteral("s1"), true, false)})});
+    QCOMPARE(model.rowCount(), 0);
+    QVERIFY(model.hasSessions());
+    QVERIFY(!model.hasUnarchivedSessions());
+
+    // Turning the filter off brings BOTH groups back, empty one included.
+    model.setShowArchived(true);
+    QCOMPARE(model.rowCount(), 2);
+    QCOMPARE(model.data(model.index(0, 0), SessionsModel::IdRole).toString(),
+             QStringLiteral("empty"));
+    QCOMPARE(model.data(model.index(1, 0), SessionsModel::IdRole).toString(),
+             QStringLiteral("work"));
+
+    // The same shape under the pin filter: nothing pinned anywhere means
+    // nothing to show, empty group included.
+    model.setShowArchived(false);
+    model.setPinnedOnly(true);
+    QCOMPARE(model.rowCount(), 0);
+
+    // One surviving session is enough to bring the empty group back, because
+    // the sidebar is no longer hiding the whole workspace.
+    model.setPinnedOnly(false);
+    model.setGroups({empty, group(QStringLiteral("work"),
+                                  {session(QStringLiteral("s1"), true, false),
+                                   session(QStringLiteral("s2"), false, false)})});
+    QCOMPARE(model.rowCount(), 2);
+    QCOMPARE(model.rowCount(model.index(1, 0)), 1);
+
+    // A workspace with no sessions at all is NOT a filtered-away workspace:
+    // nothing is being hidden, so the group the user just made stays visible.
+    SessionsModel fresh;
+    fresh.setGroups({empty, group(QStringLiteral("other"), {})});
+    QCOMPARE(fresh.rowCount(), 2);
+    QVERIFY(!fresh.hasSessions());
 }
 
 QTEST_GUILESS_MAIN(TstModels)

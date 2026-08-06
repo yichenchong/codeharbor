@@ -36,6 +36,47 @@ QString bodyFor(const AgentEvent& ev)
     return QStringLiteral("%1 / %2").arg(ev.devSessionId, ev.terminalId);
 }
 
+// Whether the SPEC 6.6 activity clock may replace this state with one it
+// derived itself. The clock's entire vocabulary is Starting/Running/Idle, so a
+// pane sitting in a state the clock cannot express is carrying information the
+// clock does not have, and neither the passage of time nor a transport event
+// may overwrite it:
+//
+//   * WaitingInput - the agent is blocked on the user, and NOTHING else clears
+//     it, so expiring it deletes the one signal this subsystem exists to raise.
+//   * Error - a failure nobody has acted on. Re-deriving the pane as "running"
+//     a tick later hides the failure completely.
+//   * Stopped - the agent process is gone. "Starting" would be a claim about a
+//     process that does not exist.
+//   * IdleUnseen - a completion. Overwritable only once the user has seen it,
+//     which every caller checks separately against m_unseen; this answers true.
+//
+// Starting/Running/Idle are the clock's own outputs and Unknown is the absence
+// of knowledge it starts from, so re-deriving those is exactly its job.
+//
+// An explicit observation of OUTPUT still overrides any of these: bytes on the
+// pane's channel are new evidence that the pane is alive. Time and a channel
+// reattach are not evidence of anything, and are what this restrains.
+//
+// Exhaustive switch with no default: adding an AgentState enumerator must be a
+// compiler warning here, not a silent fall into one of the two answers.
+bool activityClockMayOverwrite(AgentState state)
+{
+    switch (state) {
+    case AgentState::Starting:
+    case AgentState::Running:
+    case AgentState::Idle:
+    case AgentState::IdleUnseen:
+    case AgentState::Unknown:
+        return true;
+    case AgentState::WaitingInput:
+    case AgentState::Error:
+    case AgentState::Stopped:
+        return false;
+    }
+    return false;
+}
+
 } // namespace
 
 AgentStatusMonitor::AgentStatusMonitor(QObject* parent) : QObject(parent)
@@ -136,10 +177,13 @@ void AgentStatusMonitor::onReadyRead()
         // arrive. An over-cap line that comes in one read would otherwise be
         // parsed and applied, while the same line split across reads trips the
         // unterminated-buffer guard below and is dropped — the same event
-        // accepted or rejected depending on socket chunking. It is reachable:
-        // the bridge caps its INPUT at MAX_BRIDGE_LINE_BYTES (also 1 MiB) and
-        // then emits a strictly larger event line, so a producer with a
-        // near-megabyte summary lands in that window. Drop it either way.
+        // accepted or rejected depending on socket chunking. Drop it either
+        // way. The shipped relay cannot produce such a line (makeStreamSink in
+        // remote/src/bridge.ts measures every outbound payload with
+        // bridgeLineFits() and drops both the event and the producer past
+        // 1 MiB), but this side does not get to assume its peer is the shipped
+        // relay: the guard is defence against an untrusted or buggy producer,
+        // and it must not depend on how that producer chunks its writes.
         if (newline > kMaxLineBytes) {
             m_readBuffer.remove(0, newline + 1);
             continue;
@@ -366,7 +410,21 @@ void AgentStatusMonitor::noteTerminalAttached(const QString& devSessionId,
     // A new channel: the previous one's output age says nothing about this one.
     st->lastOutputMs = -1;
     st->lastEventMs = m_clock.elapsed();
-    const bool changed = st->generic && st->state != AgentState::Starting;
+    // A reattach is a TRANSPORT event, not evidence about the agent. SPEC 5.6
+    // rewires every open pane onto a fresh channel on reconnect, with no user
+    // action and nothing new learned about what is running in the pane, so it
+    // may only move the pane inside the activity clock's own vocabulary. A pane
+    // parked at WaitingInput/Error/Stopped, or holding a completion the user
+    // has not seen, keeps that state: rewriting it as Starting would leave a
+    // blocked, failed or finished agent reading "starting" for as long as it
+    // stays quiet, since a silent generic pane never leaves Starting. Real
+    // output (noteTerminalOutput) still overrides all of them.
+    const bool derivable =
+        activityClockMayOverwrite(st->state)
+        && !(st->state == AgentState::IdleUnseen
+             && m_unseen.contains(devSessionId));
+    const bool changed =
+        st->generic && derivable && st->state != AgentState::Starting;
     if (changed)
         st->state = AgentState::Starting;
     rearmAgeTimer();
@@ -415,9 +473,9 @@ bool AgentStatusMonitor::agesWithTime(const TerminalStatus& st,
                                       bool devSessionUnseen) const
 {
     if (st.generic && st.attached) {
-        // A prompt the user has to answer is never overwritten by time; see
-        // the same arm, and the reasoning, in onAgeTick().
-        if (st.state == AgentState::WaitingInput)
+        // A state the activity clock cannot express is never overwritten by
+        // time; see the same arm, and the reasoning, in onAgeTick().
+        if (!activityClockMayOverwrite(st.state))
             return false;
         // A completion the user has not seen is never overwritten by time.
         if (st.state == AgentState::IdleUnseen && devSessionUnseen)
@@ -455,24 +513,26 @@ void AgentStatusMonitor::onAgeTick()
             TerminalStatus& st = tit.value();
             std::optional<AgentState> next;
             if (st.generic && st.attached) {
-                // A prompt outranks the activity clock outright, and unlike a
-                // completion it has no "seen" flag that could ever release it:
-                // nothing but a new observation clears WaitingInput, so letting
-                // the quiet window overwrite it would silently delete the one
-                // signal that says the agent is blocked on the user. This pane
-                // is registered as the adapterless "generic" harness yet has
+                // A state the activity clock cannot express outranks it
+                // outright: WaitingInput (nothing but a new observation ever
+                // clears it, so letting the quiet window overwrite it would
+                // silently delete the one signal that says the agent is
+                // blocked on the user), Error (a failure the clock would hide
+                // by re-deriving the pane as running) and Stopped (a process
+                // that no longer exists cannot be "starting"). This pane is
+                // registered as the adapterless "generic" harness yet has
                 // received a lifecycle event anyway — the pane's configured
                 // harness and the harness that actually reported are
                 // independent — which is the same way an unseen completion
                 // lands here.
-                if (st.state == AgentState::WaitingInput)
+                if (!activityClockMayOverwrite(st.state))
                     continue;
                 // A completion remains an explicit user-facing state until
                 // the user has seen it. The generic activity clock must not
                 // resurrect that pane as Starting/Running merely because
-                // another pane caused this shared timer to tick. Explicit
-                // observations (a fresh attach or output) may still replace
-                // WaitingInput/IdleUnseen; time alone never may.
+                // another pane caused this shared timer to tick. An explicit
+                // observation of OUTPUT may still replace it; time, and a
+                // channel reattach, never may.
                 if (st.state == AgentState::IdleUnseen
                     && m_unseen.contains(sit.key())) {
                     continue;

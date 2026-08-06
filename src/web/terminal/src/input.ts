@@ -231,14 +231,22 @@ export class TerminalInputWriter {
             return;
         }
         this.inFlight = true;
+        let sent = false;
         try {
             this.sink.sendInput(chunk);
+            sent = true;
+        } catch (error) {
+            // A transient WebChannel failure must not silently lose a key or
+            // part of a paste. Keep the failed chunk at the front; a later
+            // write() can retry it, while close() still discards it during
+            // teardown.
+            this.backlog.unshift(chunk);
+            throw error;
         } finally {
             this.inFlight = false;
-            // Scheduled from the finally block so a sink that throws (a bridge
-            // torn down mid-paste) costs one chunk rather than stranding every
-            // chunk behind it with nothing left to restart the drain.
-            if (this.backlog.length > 0 && !this.closed) {
+            // Do not spin retrying a failed bridge call in microtasks. The
+            // next write is the explicit opportunity to retry.
+            if (sent && this.backlog.length > 0 && !this.closed) {
                 queueMicrotask(() => this.pump());
             }
         }

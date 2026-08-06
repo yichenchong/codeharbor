@@ -40,13 +40,24 @@ renderer.checkbox = ({ checked }: Tokens.Checkbox): string => {
 // also rejects protocol-relative URLs ("//host/x"), which could otherwise reach
 // an external host from a link in the privileged page.
 //
+// `file:` is spelled with its full empty authority ("file:///") on purpose.
+// remotePathToFileUrl() only ever mints that form, and it mints it AFTER
+// sanitisation, so the only thing a looser `file:` alternative would admit is
+// an author-written authority ("file://host/x") that names a machine rather
+// than a remote path. There is no reason to carry one into the privileged
+// page, so the policy refuses it.
+//
+// `codeharbor-internal:` is deliberately absent for the same reason: every
+// internal URL this page displays is minted by the host after sanitisation and
+// attached by rewriteRelativeUrls(), never written by the document.
+//
 // It is not the whole story for images. DOMPurify exempts `src` on <img> (and
 // its DATA_URI_TAGS siblings) from this expression whenever the value starts
 // with "data:", and that exemption is not configurable away. Nothing here can
 // stop a data: image source, so rewriteRelativeUrls() is what removes it: that
 // function drops `src` from EVERY image unconditionally and puts back only an
 // opaque codeharbor-internal:// URL minted by the host.
-const allowedUri = /^(?:(?:https?|mailto|file|codeharbor-internal):|#|\/(?!\/)|\.{0,2}\/(?!\/)|[^:\/?#]+(?:[\/?#]|$))/i;
+const allowedUri = /^(?:https?:|mailto:|file:\/\/\/|#|\/(?!\/)|\.{0,2}\/(?!\/)|[^:\/?#]+(?:[\/?#]|$))/i;
 
 const sanitizerConfig: Config = {
     ALLOW_DATA_ATTR: false,
@@ -137,6 +148,11 @@ export function renderMarkdown(
     source: string,
     sanitizer?: MarkdownSanitizer,
 ): string {
+    // The stylesheet makes <pre> a clipping box and its <code> child the scroll
+    // box, so the escaped fallback wraps the source in both. A bare <pre> would
+    // have every long line silently cut off at the pane edge.
+    const escapedSource = (): string =>
+        `<pre><code>${escapeHtml(source)}</code></pre>`;
     let dirty: string;
     try {
         dirty = String(marked.parse(source, {
@@ -147,7 +163,7 @@ export function renderMarkdown(
         // A malformed extension token must not turn a readable document into a
         // blank pane. The fallback is plain escaped text, still passed through
         // the sanitizer before it reaches the caller.
-        dirty = `<pre>${escapeHtml(source)}</pre>`;
+        dirty = escapedSource();
     }
 
     try {
@@ -162,7 +178,7 @@ export function renderMarkdown(
         // source is safer and more useful than replacing the whole pane with a
         // blank error page. It is already escaped, so this final fallback does
         // not need to call the broken sanitizer a second time.
-        return `<pre>${escapeHtml(source)}</pre>`;
+        return escapedSource();
     }
 }
 
@@ -186,7 +202,13 @@ export function renderMarkdown(
 //   * where this side treats an empty documentPath as "/", it answers "". The
 //     page cannot reach that state: its document path is the ?path= query the
 //     QML side wrote. That view can, before a url arrives.
-function isRelativeResource(value: string): boolean {
+/**
+ * True for a reference that names another remote file relative to (or
+ * absolute within) the server's own path namespace. Exported so the shared
+ * table described above can be pinned directly, the same way the QML side
+ * pins it.
+ */
+export function isRelativeResource(value: string): boolean {
     return value.length > 0
         && !/^(?:[a-z][a-z0-9+.-]*:|\/\/)/i.test(value)
         && !value.startsWith("#")

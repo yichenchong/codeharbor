@@ -35,6 +35,12 @@ import {
     InvalidParamsError,
 } from "./validate.ts";
 import { isSafeTmuxTarget, tmuxSafeName, TMUX_TARGET_MAX_LENGTH } from "./tmux.ts";
+// The shared resource-limit error (RPC_RESOURCE_LIMIT), not a second class
+// saying the same thing: the dispatcher recognizes it structurally by its
+// `code`, and file.readFile / file.listDirectory already raise this exact type
+// for "valid request, too big to move". files.ts has no import-time side
+// effects and does not import this module, so there is no cycle.
+import { ResourceLimitError } from "./files.ts";
 
 // Current schema version. Mirrors schema_version in remote/sql/schema.sql and
 // WorkspaceDb::kSchemaVersion (bump all three together — see schema.sql header).
@@ -564,6 +570,57 @@ function requireSafeTmuxTarget(target: string, method: string): string {
 //     dead peer. And the heartbeat is the backstop that tears down a truly
 //     wedged transport, so this value does not have to guard against infinity.
 const DB_BUSY_TIMEOUT_MS = 5000;
+
+// Ceiling on the SERIALIZED bytes of one region's split tree, enforced by
+// setLayout on the way IN. The stored tree is free-form client JSON and nothing
+// bounded it, which is the one input to this store that a client can grow
+// without limit.
+//
+// WHAT BREAKS ABOVE IT. `workspace.list` embeds every stored tree of every
+// session in a single reply, and responseLine (remote/src/codeharbord.ts)
+// refuses a reply past MAX_LINE_BYTES — 16 MiB — with RPC_RESOURCE_LIMIT rather
+// than writing an over-cap frame that would drop the transport. So one
+// oversized stored tree does not kill the connection, it does something quieter
+// and worse: `workspace.list` fails from then on, for EVERY session on the
+// server, and the workspace can never be loaded again without hand-editing the
+// session_layouts row out of the database. The write is the only place this can
+// still be refused while the user is there to be told, so it is refused there.
+//
+// WHY 256 KiB. The cap has to clear the largest tree a client can legitimately
+// draw while staying small enough that a plausible WORKSPACE still fits one
+// frame — and the second constraint is the binding one, because nothing bounds
+// how many Dev Sessions a workspace holds (see below). Measured against
+// SplitNode::tryToJson (src/models/SplitTree.cpp), whose leaf carries `type`, a
+// `paneId`, an optional `url`, an optional `terminalPaneId` and an optional
+// `customTitle` bounded by kMaxCustomTitleLength = 128 UTF-16 units:
+//
+//     4 panes, 120-char URLs, no titles                     1.3 KiB
+//    16 panes, 256-char URLs, 40-char titles                8.5 KiB
+//    32 panes, 256-char URLs, max titles   (realistic max) 19.8 KiB
+//    32 panes, 2 KiB URLs,    max titles   (aggressive)    75.8 KiB
+//  1024 panes, 2 KiB URLs, fully escaped max titles         3.0 MiB
+//
+// 256 KiB is 12.9x the realistic maximum and 3.4x the aggressive one, so no
+// layout a user can produce — 32 tiles in one region is already a wall of
+// panes — comes near it. The 1024-pane row is the pathological case, about
+// eight pixels per pane at 4K; refusing it is the entire point.
+//
+// And the frame still holds a real workspace. A listed session costs ~1.8 KiB
+// of rows (measured: the session plus two viewer and two terminal panes) on top
+// of its two trees, so 200 sessions carrying REALISTIC worst-case layouts come
+// to ~8.1 MiB, half the frame; ~396 such sessions is where it runs out, and
+// that ceiling belongs to the session count, not to this constant. To brick
+// `workspace.list` a workspace would need 31 Dev Sessions holding a 256 KiB
+// layout in BOTH regions at once. A 4 MiB cap — the first number tried here —
+// failed exactly this test: TWO such sessions already exceeded the frame.
+//
+// It still does NOT make `workspace.list` unconditionally safe, and cannot:
+// neither this schema nor the client bounds the number of Dev Sessions, so a
+// large enough workspace of ordinary trees can outgrow the frame no matter what
+// this value is. Fixing that residual case would mean bounding the READ, i.e.
+// omitting stored data from a listing, which is a worse contract than refusing
+// absurd input on the way in.
+export const MAX_LAYOUT_TREE_BYTES = 256 * 1024;
 
 /**
  * Apply the connection-level settings every workspace connection needs, in the
@@ -1138,17 +1195,28 @@ export class Workspace {
      * caller then reads the one committed row. Both statements run in SQLite's
      * implicit per-statement transaction, and the row is never updated or
      * deleted, so there is no read-modify-write window to protect.
+     *
+     * The mint runs only when the READ found nothing. Minting unconditionally
+     * and letting OR IGNORE absorb the duplicate is equally correct, but it
+     * makes reading an identity that has existed for months a WRITE: it takes
+     * the database's write lock on the first `server.info` of every daemon
+     * start — serialising against a second daemon's migration for no reason —
+     * and it fails outright on a workspace that is merely readable (a
+     * read-only mount, a full disk), where the answer was sitting in the file
+     * all along.
      */
     serverId(): string {
         if (this.cachedServerId !== undefined) return this.cachedServerId;
-        this.db
-            .prepare(
-                "INSERT OR IGNORE INTO server_identity (id, server_id, created_at) VALUES (1, ?, ?)",
-            )
-            .run(randomUUID(), Date.now());
-        const row = this.db
-            .prepare("SELECT server_id FROM server_identity WHERE id = 1")
-            .get() as { server_id: string } | undefined;
+        const read = this.db.prepare("SELECT server_id FROM server_identity WHERE id = 1");
+        let row = read.get() as { server_id: string } | undefined;
+        if (!row) {
+            this.db
+                .prepare(
+                    "INSERT OR IGNORE INTO server_identity (id, server_id, created_at) VALUES (1, ?, ?)",
+                )
+                .run(randomUUID(), Date.now());
+            row = read.get() as { server_id: string } | undefined;
+        }
         if (!row) throw new Error("server identity missing after mint");
         // Immutable once written, so caching it is safe for this connection's
         // lifetime; every later server.info answers without touching the DB.
@@ -1171,16 +1239,22 @@ export class Workspace {
         return this.transaction(() => {
             const id = randomUUID();
             const ts = Date.now();
-            const position =
-                params.position ?? this.nextPosition("groups", "server_id", params.serverId);
+            // ALWAYS the append slot, never `params.position` itself. An
+            // explicit position is a placement REQUEST, not a column value:
+            // placeAt below truncates and clamps it and then re-packs the whole
+            // scope, so whatever goes in here is overwritten a statement later
+            // — but only if the INSERT gets that far. Binding the raw request
+            // meant a non-finite in-process index reached SQLite as NULL and
+            // failed the create with "NOT NULL constraint failed: groups.position",
+            // the one input placeAt's clamp is written to absorb.
+            const position = this.nextPosition("groups", "server_id", params.serverId);
             this.db
                 .prepare(
                     "INSERT INTO groups (id, server_id, name, position, collapsed, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
                 )
                 .run(id, params.serverId, params.name, position, params.collapsed ? 1 : 0, ts, ts);
-            // An explicit position is a placement REQUEST, not a raw column
-            // value: re-pack so the new row really is the Nth and no two rows
-            // share a position. See placeAt.
+            // See placeAt: this is what makes the new row really be the Nth,
+            // with no two rows sharing a position.
             if (params.position !== undefined) {
                 this.placeAt("groups", "server_id", params.serverId, id, params.position, ts);
             }
@@ -1262,8 +1336,8 @@ export class Workspace {
             // could surface this session under a foreign server's group. The wire
             // param is still accepted (C1) but overridden here.
             const serverId = this.parentServerId("groups", params.groupId);
-            const position =
-                params.position ?? this.nextPosition("dev_sessions", "group_id", params.groupId);
+            // The append slot, never the raw request — see createGroup.
+            const position = this.nextPosition("dev_sessions", "group_id", params.groupId);
             this.db
                 .prepare(
                     "INSERT INTO dev_sessions (id, server_id, group_id, name, repository_root, default_working_directory, task_description, position, archived, pinned, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -1566,9 +1640,8 @@ export class Workspace {
             // from the param, so a mismatched serverId cannot detach this pane from
             // its session's server.
             const serverId = this.parentServerId("dev_sessions", params.devSessionId);
-            const position =
-                params.position ??
-                this.nextPosition("viewer_panes", "dev_session_id", params.devSessionId);
+            // The append slot, never the raw request — see createGroup.
+            const position = this.nextPosition("viewer_panes", "dev_session_id", params.devSessionId);
             this.db
                 .prepare(
                     "INSERT INTO viewer_panes (id, server_id, dev_session_id, url, handler, title, position, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -1671,9 +1744,8 @@ export class Workspace {
             // SPEC 3.5: server_id derived from the parent session (see
             // createViewerPane); the client-sent serverId is overridden.
             const serverId = this.parentServerId("dev_sessions", params.devSessionId);
-            const position =
-                params.position ??
-                this.nextPosition("terminal_panes", "dev_session_id", params.devSessionId);
+            // The append slot, never the raw request — see createGroup.
+            const position = this.nextPosition("terminal_panes", "dev_session_id", params.devSessionId);
             const tmuxTarget =
                 params.tmuxTarget === undefined || params.tmuxTarget === null
                     ? mintTmuxTarget(params.devSessionId, id)
@@ -1930,6 +2002,22 @@ export class Workspace {
                 `workspace.setLayout: 'tree' must be a JSON-serializable split tree (${
                     err instanceof Error ? err.message : String(err)
                 })`,
+            );
+        }
+        // Bounded here, still before the transaction opens, so an over-cap tree
+        // costs the database nothing at all: no BEGIN, no upsert, no rollback,
+        // and whatever was already stored for the region is left untouched. See
+        // MAX_LAYOUT_TREE_BYTES for the measurement behind the number and for
+        // what an unbounded tree does to `workspace.list`. Raised as a
+        // ResourceLimitError (-32003), not invalid-params: the tree is
+        // well-formed, the server simply will not carry it at that size.
+        const treeBytes = Buffer.byteLength(serializedTree);
+        if (treeBytes > MAX_LAYOUT_TREE_BYTES) {
+            throw new ResourceLimitError(
+                `Cannot store the ${params.region} layout: its split tree serializes to ` +
+                    `${treeBytes} bytes, above this server's ${MAX_LAYOUT_TREE_BYTES}-byte ` +
+                    "per-region limit. Nothing was changed; the previously stored layout is " +
+                    "still in place. Close some panes, or shorten their custom titles.",
             );
         }
         return this.transaction(() => {

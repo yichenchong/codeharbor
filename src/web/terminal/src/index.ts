@@ -569,19 +569,31 @@ function showFatal(element: HTMLElement, message: string): void {
     element.replaceChildren(status);
 }
 
+// A host may call the exported entry point more than once while replacing a
+// WebEngine page. Keep one channel handshake per root; otherwise each call
+// appends another xterm surface and permanently duplicates every signal.
+const connectingElements = new WeakSet<HTMLElement>();
+
+
 /**
  * Page entry point: open the WebChannel injected by the QML host and mount the
  * terminal against the "terminal" object (the C++ ch::TerminalBridge proxy).
  */
 export function connectTerminal(element: HTMLElement): void {
+    if (connectingElements.has(element)) {
+        return;
+    }
+    connectingElements.add(element);
     if (typeof QWebChannel === "undefined" || typeof qt === "undefined"
         || !qt.webChannelTransport) {
+        connectingElements.delete(element);
         showFatal(element, "This page requires the CodeHarbor host: no WebChannel transport.");
         return;
     }
     new QWebChannel(qt.webChannelTransport, (channel: QWebChannelInstance) => {
         const bridge = channel.objects.terminal as TerminalChannelObject | undefined;
         if (!bridge) {
+            connectingElements.delete(element);
             showFatal(element, "The terminal bridge is missing from this window.");
             return;
         }
@@ -593,6 +605,7 @@ export function connectTerminal(element: HTMLElement): void {
         try {
             host = mountTerminal(element, bridge);
         } catch (error) {
+            connectingElements.delete(element);
             showFatal(element, `The terminal could not start: ${String(error)}`);
             return;
         }
@@ -624,6 +637,7 @@ export function connectTerminal(element: HTMLElement): void {
             bridge.write.disconnect(onWrite);
             bridge.connectionStateChanged.disconnect(onConnectionStateChanged);
             bridge.clearRequested.disconnect(onClearRequested);
+            connectingElements.delete(element);
             host.dispose();
         }, { once: true });
         // Handshake LAST, once every host callback is connected: the controller

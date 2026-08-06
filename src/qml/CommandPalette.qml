@@ -378,7 +378,7 @@ Item {
                           ? String(resultRow.modelData.shortcut) : ""
                     textFormat: Text.PlainText
                     color: Theme.textDim
-                    font.pixelSize: 11
+                    font.pixelSize: Theme.fontSizeSmall
                     visible: text.length > 0
                 }
 
@@ -417,7 +417,7 @@ Item {
                 width: parent.width
                 horizontalAlignment: Text.AlignHCenter
                 color: Theme.textFaint
-                font.pixelSize: 11
+                font.pixelSize: Theme.fontSizeSmall
                 visible: (Array.isArray(root.commands) ? root.commands.length : 0) > 0
                 text: qsTr("Esc closes \u2014 %1 reopens").arg(root.activationHint)
             }

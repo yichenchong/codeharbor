@@ -290,7 +290,21 @@ bool TerminalController::sendInput(const QByteArray &bytes)
         return false;
     if (bytes.isEmpty())
         return true; // nothing to send, but the pane is writable
-    return m_transport->write(bytes) == bytes.size();
+    // RESUMED, not truncated. ch::SshChannelDevice::writeData() reports a short
+    // write rather than failing when libssh accepts only part of a chunk (it
+    // deliberately keeps the accepted prefix so a caller cannot duplicate those
+    // bytes on the remote side), and a single `write() == size()` compare would
+    // silently throw the remainder away — half of a pasted command line, or the
+    // tail of a multi-byte keystroke, typed into the user's shell.
+    qint64 sent = 0;
+    while (sent < bytes.size()) {
+        const qint64 written =
+            m_transport->write(bytes.constData() + sent, bytes.size() - sent);
+        if (written <= 0)
+            return false; // error, or no progress possible: report the loss
+        sent += written;
+    }
+    return true;
 }
 
 bool TerminalController::resize(int cols, int rows)
@@ -430,10 +444,38 @@ void TerminalController::flush()
     //   * something is ALREADY retained. This one is about ORDER, not volume:
     //     the retained bytes are older, so a batch emitted past them would
     //     reach the terminal out of sequence.
-    if (!m_viewVisible || m_unacknowledged >= kMaxUnacknowledgedBytes
-        || !m_hidden.isEmpty()) {
+    const qint64 allowance = kMaxUnacknowledgedBytes - m_unacknowledged;
+    if (!m_viewVisible || allowance <= 0 || !m_hidden.isEmpty()) {
         appendHidden(batch);
         return;
+    }
+
+    // A batch can be LARGER than the credit that remains: one drain of the
+    // transport is up to a couple of hundred KiB (SshChannelDevice's per-pump
+    // bound), so `cat`ing a big file arrives in pieces the window has no room
+    // for. Emitting such a batch whole is the same bug releaseRetained() used
+    // to have — kMaxUnacknowledgedBytes overshot by the very code that is
+    // supposed to enforce it, and that much data queued in the WebChannel
+    // transport and inside Chromium. Emit the largest safe prefix the window
+    // has room for and retain the rest, in order; the next acknowledgement
+    // releases it through releaseRetained().
+    if (batch.size() > allowance) {
+        const qsizetype cut =
+            safePrefixBoundary(batch, static_cast<qsizetype>(allowance));
+        // cut == 0 means a single indivisible control sequence longer than the
+        // whole window. Splitting it would corrupt the renderer's parser, so it
+        // goes out whole — the same last resort releaseRetained() takes.
+        if (cut > 0) {
+            QByteArray head = batch.left(cut);
+            batch.remove(0, cut);
+            // Retained BEFORE the emission: a page that acknowledges inline
+            // would otherwise find an empty buffer and leave the remainder
+            // waiting for the next acknowledgement.
+            appendHidden(batch);
+            m_unacknowledged += head.size();
+            emit flushReady(head);
+            return;
+        }
     }
 
     m_unacknowledged += batch.size();
@@ -644,6 +686,43 @@ bool TerminalController::isLiveState(TerminalState state)
         return false;
     }
     return false;
+}
+
+bool TerminalController::isSafeTmuxTarget(const QString &target)
+{
+    // A WHITELIST, character by character, mirroring TMUX_TARGET_SAFE in
+    // remote/src/tmux.ts (`^[A-Za-z0-9_][A-Za-z0-9_-]*$`). Written out rather
+    // than done with QRegularExpression so the two implementations of one rule
+    // are trivially comparable, and so this is cheap enough to call on every
+    // attach.
+    //
+    // Every excluded character is excluded for a reason tmux gives it:
+    //   `$`, `@`, `%`  session/window/pane ID sigils, resolved BEFORE a name
+    //                  lookup and NOT suppressed by the `=` exact-match prefix,
+    //   `=`            the exact-match prefix itself,
+    //   `*`, `?`       fnmatch wildcards in a target position,
+    //   `:`, `.`       session/window/pane separators, which tmux also rewrites
+    //                  in a name it creates,
+    //   a leading `-`  read as an option by `new-session -s <target>`, which is
+    //                  the one place the target is passed unshielded,
+    //   anything else  not something codeharbord ever mints, so refusing it
+    //                  costs nothing and removes a whole class of question.
+    if (target.isEmpty() || target.size() > kMaxTmuxTargetLength)
+        return false;
+    for (qsizetype index = 0; index < target.size(); ++index) {
+        const QChar ch = target.at(index);
+        const bool word = (ch >= QLatin1Char('A') && ch <= QLatin1Char('Z'))
+            || (ch >= QLatin1Char('a') && ch <= QLatin1Char('z'))
+            || (ch >= QLatin1Char('0') && ch <= QLatin1Char('9'))
+            || ch == QLatin1Char('_');
+        if (word)
+            continue;
+        // `-` is legal everywhere except first, where getopt would claim it.
+        if (index > 0 && ch == QLatin1Char('-'))
+            continue;
+        return false;
+    }
+    return true;
 }
 
 QString TerminalController::tmuxNewSessionCommand(const QString &target,

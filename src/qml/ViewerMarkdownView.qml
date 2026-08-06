@@ -185,8 +185,16 @@ Item {
         if (!root.pageReady)
             return
         const roles = JSON.stringify(Theme.roles)
-        webView.runJavaScript("if (typeof window.applyTheme === 'function')"
-                              + " window.applyTheme(" + roles + ");")
+        // Theme changes re-render the markdown document. Preserve the user's
+        // reading position instead of jumping back to the beginning whenever
+        // the palette changes.
+        webView.runJavaScript(
+            "(function () {"
+          + "var y = window.scrollY || document.documentElement.scrollTop || 0;"
+          + "if (typeof window.applyTheme === 'function') window.applyTheme("
+          + roles + ");"
+          + "window.requestAnimationFrame(function () { window.scrollTo(0, y); });"
+          + "})()")
     }
 
     onUrlChanged: {

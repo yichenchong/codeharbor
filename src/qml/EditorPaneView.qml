@@ -181,10 +181,15 @@ Item {
         onLoadingChanged: function(request) {
             if (request.status === WebEngineView.LoadSucceededStatus) {
                 root.pageReady = true
+                root.pageError = ""
                 root.applyTheme()
-            } else if (request.status === WebEngineView.LoadStartedStatus
-                       || request.status === WebEngineView.LoadFailedStatus
-                       || request.status === WebEngineView.LoadStoppedStatus) {
+            } else if (request.status === WebEngineView.LoadStartedStatus) {
+                root.pageReady = false
+                root.pageError = ""
+            } else if (request.status === WebEngineView.LoadFailedStatus) {
+                root.pageReady = false
+                root.pageError = request.errorString
+            } else if (request.status === WebEngineView.LoadStoppedStatus) {
                 root.pageReady = false
             }
         }
@@ -226,13 +231,20 @@ Item {
         }
     }
 
-    // ---- observable file state (SPEC 8.2) --------------------------------
-    // The lifecycle word ch::EditorController publishes (see toString(FileState)
-    // in src/models/SessionState.cpp): "loading", "clean", "modified", "saving",
-    // "saved", "externally_modified", "conflict", "read_only", "error",
-    // "disconnected".
+    // A close can destroy this delegate immediately, so expose the controller's
+    // unsaved states to ViewerPane before it forwards a close request. Saving
+    // remains dirty until the confirmation arrives; conflict also means the
+    // buffer cannot be discarded silently.
+    readonly property bool dirty: root.fileState === "modified"
+                                  || root.fileState === "saving"
+                                  || root.fileState === "conflict"
+                                  || root.fileState === "externally_modified"
     readonly property string fileState: root.controller ? root.controller.fileState : ""
-
+    readonly property bool loading: (!root.pageReady && root.pageError.length === 0)
+                                    || root.fileState === "loading"
+    readonly property bool failed: root.fileState === "error"
+                                 || root.pageError.length > 0
+    property string pageError: ""
     // The two states in which the buffer on screen is NOT what the server holds
     // and the next save cannot simply succeed. The editor page prints the state
     // word in its status line, which is far too quiet for either: a user who
@@ -276,15 +288,19 @@ Item {
         anchors.top: parent.top
         height: 22
         // Drawn over the editor page rather than beside it: this item is
-        // declared after the WebEngineView, and delivery order is declaration
-        // order, so the banner is on top of Monaco's first line instead of
-        // being hidden behind it.
+        // declared after the WebEngineView, so it is painted above Monaco.
+        //
+        // A file that is merely LOADING says nothing here. This strip is for
+        // the states in which the text on screen cannot be saved; a progress
+        // message would cover the top of every file for the first moments of
+        // every open. The header's busy indicator reports loading instead
+        // (ViewerPane reads `root.loading` for exactly that).
+        color: root.conflicted || root.failed ? Theme.errorSurface() : Theme.warningSurface()
+        visible: root.dropped || root.conflicted || root.failed
         z: 1
         // These are dim fills behind danger/warning text and have no direct
         // Theme role; the palette's errorSurface() and warningSurface()
         // helpers keep both shades aligned across dark and light themes.
-        color: root.conflicted ? Theme.errorSurface() : Theme.warningSurface()
-        visible: root.dropped || root.conflicted
         // Red for the state that puts the user's edits at risk, amber for the
         // one that merely suspends them — the same split, and the same two
         // colours, TerminalPaneView uses for "error" versus a plain drop.
@@ -301,8 +317,10 @@ Item {
             // condition without telling anyone what it means for their file.
             text: root.conflicted
                   ? qsTr("This file changed on the server since it was opened, so the last save was refused. Reload to take the server's copy, or save again to overwrite it.")
-                  : qsTr("The connection to the server is down. This file cannot be saved or reloaded until it comes back.")
-            color: Theme.warning
+                  : root.failed
+                    ? qsTr("The editor could not load this file.")
+                    : qsTr("The connection to the server is down. This file cannot be saved or reloaded until it comes back.")
+            color: root.conflicted || root.failed ? Theme.danger : Theme.warning
             font.pixelSize: Theme.fontSizeSmall
         }
     }

@@ -382,9 +382,13 @@ private:
 
     // Recovery snapshot bookkeeping (SPEC 11.3). Empty revision => the next
     // write is create-only (expectedRevision ""). m_recoveryHasContent tracks
-    // whether the snapshot currently holds a buffer worth offering FOR THE OPEN
-    // FILE, so a save truncates it at most once and an already-empty snapshot is
-    // never rewritten. The snapshot is a small JSON envelope carrying the remote
+    // whether the slot currently holds a live envelope FOR THE OPEN FILE, so a
+    // save truncates it at most once and an already-truncated snapshot is never
+    // rewritten. An envelope whose buffer is EMPTY still counts: deleting every
+    // line is unsaved work like any other, and the snapshot must be offered on
+    // reopen and cleared by the next successful save. Only the zero-length
+    // tombstone clearRecovery() writes means "nothing held".
+    // The snapshot is a small JSON envelope carrying the remote
     // path alongside the buffer, so checkRecovery() can refuse to offer a
     // snapshot this pane wrote for a different file.
     QString m_recoveryRevision;

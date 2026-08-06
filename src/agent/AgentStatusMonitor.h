@@ -113,6 +113,15 @@ public:
     // channel that produced it. For a generic pane this is SPEC 6.6's "no
     // output observed yet" arm, i.e. Starting. For every other harness it only
     // refreshes the liveness clock the silence timeout below reads.
+    //
+    // Attaching is a TRANSPORT event, though, not evidence about the agent —
+    // SPEC 5.6 rewires every open pane onto a fresh channel on reconnect with
+    // no user action — so a generic pane parked in a state the activity clock
+    // cannot express keeps it: WaitingInput, Error, Stopped, and a completion
+    // the Dev Session still has unseen all survive the reattach. Rewriting one
+    // of those as Starting would leave a blocked, failed or finished agent
+    // reading "starting" indefinitely, because a silent generic pane never
+    // leaves Starting. Only real output (noteTerminalOutput) overrides them.
     Q_INVOKABLE void noteTerminalAttached(const QString& devSessionId,
                                           const QString& terminalId);
 

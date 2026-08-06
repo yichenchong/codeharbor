@@ -284,6 +284,26 @@ private:
     // once it has drained: without that, one legitimately multi-megabyte frame
     // pinned its whole buffer for the client's remaining life.
     void compactReadBuffer();
+    // Drop every buffered byte and rebase both cursors. Used by the paths that
+    // abandon the stream outright — a rebind, a close, an untrustworthy stream
+    // — as opposed to compactReadBuffer(), which only retires the prefix that
+    // has already been dispatched.
+    //
+    // clear(), not remove(0, size()): QByteArray::clear() hands the allocation
+    // back while remove() keeps it, and every caller here is releasing a buffer
+    // that may hold up to the 16 MiB line cap.
+    void releaseReadBuffer();
+    // The byte stream is no longer framable: a line arrived unframed, or past
+    // the size cap, so we can no longer tell where the next message begins and
+    // nothing else the peer queued is a message. Release the garbage, latch the
+    // stream untrusted, announce it, and take the ordinary transport-loss path
+    // against `sourceTransport` — the device the offending bytes came from, which
+    // a protocolWarning slot may already have replaced.
+    //
+    // Touch NO member after this returns: it emits a signal and dispatches
+    // pending failures, either of which may delete this client. Both call sites
+    // return immediately, which is why nothing is reported back.
+    void dropUntrustedStream(const QPointer<QIODevice>& sourceTransport);
 
     // QPointer, not a raw pointer: the transport is owned by the CALLER and can
     // be destroyed while still bound. A raw pointer would dangle, and the next

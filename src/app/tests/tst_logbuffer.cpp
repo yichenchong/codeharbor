@@ -37,6 +37,7 @@ private slots:
     void previousHandlerStillReceivesWarnings();
     void severityAndTextFilters();
     void remoteTextIsSplitPerLineAndClearAnnouncesItselfOnce();
+    void zeroCapacityBufferKeepsNothing();
     void destructionRacesWithLogging();
 };
 
@@ -119,6 +120,55 @@ void TstLogBuffer::severityAndTextFilters()
     const QVariantList remote =
         buffer.filteredEntries(QString(), QStringLiteral("remote"));
     QCOMPARE(remote.size(), 2);
+    // "all" is the log pane's own sentinel for "no severity filter" and must
+    // behave exactly like an empty string, including when a text filter is
+    // combined with it.
+    QCOMPARE(buffer.filteredEntries(QStringLiteral("all")).size(), 3);
+    QCOMPARE(buffer.filteredEntries(QStringLiteral("ALL"),
+                                    QStringLiteral("remote"))
+                 .size(),
+             2);
+    QCOMPARE(buffer.filteredEntries(QString(), QString()).size(), 3);
+    // A severity nothing carries hides everything rather than showing all.
+    QVERIFY(buffer.filteredEntries(QStringLiteral("fatal")).isEmpty());
+
+    // Filtering preserves the buffer's oldest-to-newest order, which is what
+    // makes following the tail useful.
+    QCOMPARE(remote.at(0).toMap().value(QStringLiteral("message")).toString(),
+             QStringLiteral("remote refused host"));
+    QCOMPARE(remote.at(1).toMap().value(QStringLiteral("message")).toString(),
+             QStringLiteral("remote crashed"));
+}
+
+// Both caps are enforced BEFORE an entry is published, so a buffer configured
+// with no room at all must publish nothing and wake nobody - not push a row
+// and trim it afterwards. A negative configuration is clamped to zero, not
+// treated as unbounded.
+void TstLogBuffer::zeroCapacityBufferKeepsNothing()
+{
+    LogBuffer noEntries(0, 4096);
+    QSignalSpy noEntriesChanged(&noEntries, &LogBuffer::entriesChanged);
+    noEntries.append(QtWarningMsg, QStringLiteral("test"),
+                     QStringLiteral("unit"), QStringLiteral("dropped"));
+    QCOMPARE(noEntries.count(), 0);
+    QCOMPARE(noEntries.totalBytes(), 0);
+    QCOMPARE(noEntriesChanged.count(), 0);
+
+    // The fixed fields (timestamp, severity and the separators) alone exceed a
+    // byte budget this small, so there is no honest way to keep the row.
+    LogBuffer noBytes(8, 4);
+    QSignalSpy noBytesChanged(&noBytes, &LogBuffer::entriesChanged);
+    noBytes.append(QtWarningMsg, QStringLiteral("test"), QStringLiteral("unit"),
+                   QStringLiteral("dropped"));
+    QCOMPARE(noBytes.count(), 0);
+    QCOMPARE(noBytesChanged.count(), 0);
+
+    LogBuffer negative(-3, -3);
+    QCOMPARE(negative.maxEntries(), 0);
+    QCOMPARE(negative.maxBytes(), 0);
+    negative.append(QtWarningMsg, QStringLiteral("test"),
+                    QStringLiteral("unit"), QStringLiteral("dropped"));
+    QCOMPARE(negative.count(), 0);
 }
 
 // A daemon reports stderr as a stream, so one signal can carry a whole startup

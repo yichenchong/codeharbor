@@ -208,8 +208,12 @@ Requires Qt 6.9+, a C++20 compiler, CMake 3.25+, Ninja, and libssh.
 ```bash
 npm install                   # once: builds need the web-asset workspaces
 cmake --preset dev            # configure (also builds the web bundles)
-cmake --build --preset dev    # -> build/dev/src/app/codeharbor
+cmake --build --preset dev    # -> build/dev/src/app/codeharbor (Linux/Unix path)
 ```
+
+macOS builds an app bundle (`build/dev/src/app/codeharbor.app`) and Windows puts
+`codeharbor.exe` in the build root beside its DLLs; see
+[`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md).
 
 ### Remote service (Node)
 

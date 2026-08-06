@@ -43,11 +43,14 @@ public:
     // sequence, far less than the buffer it trims.
     static constexpr int kHiddenResyncWindowBytes = 4 * 1024;
     // Upper bound on output that has been emitted to the renderer but not yet
-    // acknowledged as consumed (see acknowledgeOutput()). Past it, flushes are
-    // retained in the SAME rolling buffer the hidden case uses instead of being
-    // emitted, which is what stops a runaway remote process (`yes`, a `cat` of a
+    // acknowledged as consumed (see acknowledgeOutput()). A batch bigger than
+    // the credit that remains is CUT at it and the rest is retained in the SAME
+    // rolling buffer the hidden case uses; past the bound nothing is emitted at
+    // all. That is what stops a runaway remote process (`yes`, a `cat` of a
     // large log) from queueing an unbounded amount of data in the WebChannel
-    // transport and inside Chromium.
+    // transport and inside Chromium — on both emitting paths, flush() and
+    // releaseRetained(), because a single drain of the transport can already be
+    // hundreds of KiB.
     //
     // 512 KiB, chosen from both ends:
     //   * It must never stall ordinary work. A full-screen redraw is the
@@ -196,6 +199,36 @@ public:
     // hand-written copies of the list would drift apart unnoticed.
     static bool isLiveState(TerminalState state);
 
+    // Longest tmux target this client will use. Mirrors TMUX_TARGET_MAX_LENGTH
+    // in remote/src/tmux.ts: a bound so an absurd name cannot be shipped
+    // through a command line and truncated downstream into a DIFFERENT
+    // session's name. `ch_` plus two UUIDs is 75 characters.
+    static constexpr int kMaxTmuxTargetLength = 200;
+
+    // Is `target` usable verbatim as a tmux session name AND as an exact-match
+    // `-t '=<target>'` argument? A whitelist, mirroring isSafeTmuxTarget() in
+    // remote/src/tmux.ts entry for entry: 1..kMaxTmuxTargetLength characters of
+    // [A-Za-z0-9_-], and the first one may not be `-`.
+    //
+    // The `=` sigil is NOT a complete shield, which is why this exists on the
+    // client too and is not left to the server that mints the names. tmux's
+    // target grammar resolves an ID sigil BEFORE it looks a name up, and `=`
+    // does not suppress that: with a session `victim` holding id `$0` and a
+    // second session literally named `$0`, `tmux kill-session -t '=$0'` kills
+    // `victim` (verified on tmux 3.6). `@` and `%` introduce window and pane
+    // ids the same way, `*` and `?` are fnmatch wildcards, and `:`/`.` are
+    // tmux's own session/window/pane separators. A leading `-` is worse still:
+    // `=` shields it in every `-t` position, but tmuxNewSessionCommand() also
+    // passes the target UNSHIELDED to `new-session -s`, one getopt away from
+    // being read as an option.
+    //
+    // Freshly minted names always pass; the risk this closes is an OLD or
+    // attacker-influenced name reaching a target position by another route — a
+    // row written by an earlier codeharbord, or a compromised server answering
+    // ch::TerminalFactory::resolveTarget(). Both are gated on this before the
+    // value is ever used (attach(), kill()).
+    static bool isSafeTmuxTarget(const QString &target);
+
     // Attach-or-create command for the tmux session `target`, rooted at
     // workingDir (SPEC 5.2):
     //   tmux new-session -A -s '<target>' -c '<workingDir>' \; \
@@ -211,6 +244,11 @@ public:
     // re-minted `terminal-2` and the second one attached the first one's
     // still-running shell. There is now exactly one minting site, and it is on
     // the server. This function's only job is to build the command.
+    //
+    // PRECONDITION: `target` has passed isSafeTmuxTarget(). The POSIX quoting
+    // here stops a name breaking out of the remote SHELL; it does nothing about
+    // names that are meaningful to TMUX itself, which is a separate grammar and
+    // a separate check. ch::TerminalFactory::attach() is the gate in production.
     //
     // The second tmux command switches mouse reporting on for THIS SESSION ONLY
     // (never `-g`, which would reconfigure every tmux session the user owns), so

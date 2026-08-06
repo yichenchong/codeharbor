@@ -51,6 +51,15 @@ public:
 
     const QByteArray& written() const { return m_written; }
 
+    // Accept at most `bytes` per write(), as ch::SshChannelDevice does when
+    // libssh takes only part of a chunk: writeData() keeps the accepted prefix
+    // and reports the short write rather than failing. 0 = accept everything;
+    // a negative limit accepts nothing, i.e. a channel making no progress.
+    void setWriteLimit(qint64 bytes) { m_writeLimit = bytes; }
+    // How many write() calls the transport has seen, so a test can tell one
+    // whole-buffer write from a resumed sequence of short ones.
+    int writeCalls() const { return m_writeCalls; }
+
     bool isSequential() const override { return true; }
     qint64 bytesAvailable() const override
     {
@@ -69,13 +78,19 @@ protected:
     }
     qint64 writeData(const char* data, qint64 maxSize) override
     {
-        m_written.append(data, maxSize);
-        return maxSize;
+        ++m_writeCalls;
+        const qint64 accepted = m_writeLimit == 0
+            ? maxSize
+            : qMax<qint64>(0, qMin(m_writeLimit, maxSize));
+        m_written.append(data, accepted);
+        return accepted;
     }
 
 private:
     QByteArray m_incoming;
     QByteArray m_written;
+    qint64 m_writeLimit = 0;
+    int m_writeCalls = 0;
 };
 
 } // namespace
@@ -103,6 +118,7 @@ private slots:
     void tmuxNewSessionCommandEscapesShellMetacharacters();
     void tmuxNewSessionCommandEscapesSubstitutionBacktickNewline();
     void tmuxCommandEscapesAdversarialIds();
+    void safeTmuxTargetsExcludeEveryNameTmuxReadsAsSomethingElse();
     void hiddenReplayPrecedesLaterVisibleOutput();
     void isLiveStateClassifiesEveryState();
     void transportOutputIsIngestedIncludingBytesBufferedBeforeAttach();
@@ -113,6 +129,7 @@ private slots:
     void channelEndDropsOnlyALivePane();
     void silentAttachIsBoundedAndReportedAsAnError();
     void sendInputNeedsAWritableTransport();
+    void sendInputResumesAShortWrite();
     void resizeRejectsNonPositiveGeometry();
     void hiddenEvictionResumesOnACleanBoundary();
     void flushBoundariesNeverSplitAMultiByteCharacter();
@@ -121,6 +138,7 @@ private slots:
     void unterminatedEscapeIsBoundedAndStringTerminatorsAreCorrect();
     void cancelAndSubstituteEndASequenceAsTheRendererDoes();
     void releasingRetainedOutputStaysInsideTheCreditWindow();
+    void aFlushBiggerThanTheCreditWindowIsCutNotEmittedWhole();
 };
 
 // A single ingest at or above the size cap flushes synchronously (SPEC 5.5).
@@ -596,6 +614,67 @@ void TstTerminalController::tmuxCommandEscapesAdversarialIds()
                             "'=ch_dev'\\''; rm -rf / #_t`whoami`$(id):' mouse on"));
 }
 
+// Shell quoting and tmux's `=` exact-match prefix are two DIFFERENT grammars,
+// and neither covers the other. `=` pins an exact name match, but tmux resolves
+// an ID sigil before it looks a name up at all: with a session `victim` holding
+// id `$0` and a second session literally named `$0`, `kill-session -t '=$0'`
+// destroys `victim` (verified on tmux 3.6). Quoting does nothing about that —
+// the string reaches tmux exactly as intended, and tmux is the one that reads
+// it as an id. So a target has to be validated as tmux grammar too, which is
+// what this whitelist is, and it must agree with isSafeTmuxTarget() in
+// remote/src/tmux.ts character for character.
+void TstTerminalController::safeTmuxTargetsExcludeEveryNameTmuxReadsAsSomethingElse()
+{
+    // What codeharbord actually mints, and the rest of the accepted set.
+    QVERIFY(TerminalController::isSafeTmuxTarget(
+        QStringLiteral("ch_9f6c1e0a-2b3d-4e5f-8a90-112233445566_"
+                       "7d8e9f00-1122-3344-5566-778899aabbcc")));
+    QVERIFY(TerminalController::isSafeTmuxTarget(QStringLiteral("a")));
+    QVERIFY(TerminalController::isSafeTmuxTarget(QStringLiteral("_")));
+    QVERIFY(TerminalController::isSafeTmuxTarget(QStringLiteral("0")));
+    QVERIFY(TerminalController::isSafeTmuxTarget(QStringLiteral("ch_dev-1_term-2")));
+
+    // The ID sigils. These are the ones the `=` prefix does NOT shield, and
+    // `$` is the one with a demonstrated kill of the wrong session.
+    QVERIFY(!TerminalController::isSafeTmuxTarget(QStringLiteral("$0")));
+    QVERIFY(!TerminalController::isSafeTmuxTarget(QStringLiteral("$ch_dev_t1")));
+    QVERIFY(!TerminalController::isSafeTmuxTarget(QStringLiteral("@1")));
+    QVERIFY(!TerminalController::isSafeTmuxTarget(QStringLiteral("%2")));
+    // A sigil anywhere is refused, not merely a leading one: a name is never
+    // used only at the front of a target expression.
+    QVERIFY(!TerminalController::isSafeTmuxTarget(QStringLiteral("ch$0")));
+
+    // tmux's own target syntax: the exact-match prefix, the fnmatch wildcards,
+    // and the session/window/pane separators (which tmux also rewrites in a
+    // name it creates, so a stored one never named the session it looks like).
+    QVERIFY(!TerminalController::isSafeTmuxTarget(QStringLiteral("=ch_dev_t1")));
+    QVERIFY(!TerminalController::isSafeTmuxTarget(QStringLiteral("ch_*_t1")));
+    QVERIFY(!TerminalController::isSafeTmuxTarget(QStringLiteral("ch_?_t1")));
+    QVERIFY(!TerminalController::isSafeTmuxTarget(QStringLiteral("ch_dev:0")));
+    QVERIFY(!TerminalController::isSafeTmuxTarget(QStringLiteral("ch_dev.0")));
+
+    // A LEADING dash only: `new-session -s <target>` passes the target
+    // unshielded, where getopt would claim it as an option.
+    QVERIFY(!TerminalController::isSafeTmuxTarget(QStringLiteral("-d")));
+    QVERIFY(TerminalController::isSafeTmuxTarget(QStringLiteral("c-d")));
+
+    // Shell metacharacters, whitespace and control bytes are outside the
+    // whitelist too, so the quoting above is a second line of defence rather
+    // than the only one.
+    QVERIFY(!TerminalController::isSafeTmuxTarget(QStringLiteral("ch_dev'; rm -rf /")));
+    QVERIFY(!TerminalController::isSafeTmuxTarget(QStringLiteral("ch dev")));
+    QVERIFY(!TerminalController::isSafeTmuxTarget(QStringLiteral("ch\ndev")));
+    QVERIFY(!TerminalController::isSafeTmuxTarget(QString::fromUtf8("ch_dév")));
+
+    // Bounded at both ends, and the bound matches the server's.
+    QVERIFY(!TerminalController::isSafeTmuxTarget(QString()));
+    QCOMPARE(TerminalController::kMaxTmuxTargetLength, 200);
+    QVERIFY(TerminalController::isSafeTmuxTarget(
+        QString(TerminalController::kMaxTmuxTargetLength, QLatin1Char('a'))));
+    QVERIFY(!TerminalController::isSafeTmuxTarget(
+        QString(TerminalController::kMaxTmuxTargetLength + 1, QLatin1Char('a'))));
+}
+
 // On becoming visible, the retained hidden buffer replays first and exactly
 // once; output that was still pending (sub-threshold, not yet flushed) is NOT
 // part of that replay and flushes afterwards, preserving order across the
@@ -883,6 +962,34 @@ void TstTerminalController::sendInputNeedsAWritableTransport()
     channel.closeRemote();
     QVERIFY(!controller.sendInput(QByteArrayLiteral("more")));
     QCOMPARE(channel.written(), QByteArrayLiteral("ls\n"));
+}
+
+// A SHORT write must be resumed, not truncated. The production transport
+// (ch::SshChannelDevice::writeData) deliberately returns the accepted prefix
+// instead of an error when libssh takes only part of a chunk, so a single
+// write()-and-compare would drop the remainder on the floor: half of a pasted
+// command line, or the tail of a multi-byte keystroke, typed into the shell.
+void TstTerminalController::sendInputResumesAShortWrite()
+{
+    TerminalController controller;
+    FakeChannel channel;
+    channel.setWriteLimit(3); // three bytes accepted per write() call
+    controller.setTransport(&channel);
+
+    const QByteArray line = QByteArrayLiteral("echo hello world\n");
+    QVERIFY(controller.sendInput(line));
+    // Every byte arrived, in order, and it genuinely took several writes — so
+    // the assertion above is about resuming and not about a lenient transport.
+    QCOMPARE(channel.written(), line);
+    QVERIFY(channel.writeCalls() > 1);
+
+    // A transport that accepts NOTHING makes no progress: report the loss
+    // rather than spinning forever on a wedged channel.
+    FakeChannel stuck;
+    stuck.setWriteLimit(-1); // negative limit: qMin() yields 0 accepted bytes
+    controller.setTransport(&stuck);
+    QVERIFY(!controller.sendInput(line));
+    QVERIFY(stuck.written().isEmpty());
 }
 
 // A renderer that has not been laid out yet reports 0 rows and columns. Taking
@@ -1391,6 +1498,68 @@ void TstTerminalController::releasingRetainedOutputStaysInsideTheCreditWindow()
         QCOMPARE(first.size(), escapeStart);
         QCOMPARE(controller.unacknowledgedBytes(), static_cast<qint64>(escapeStart));
         QVERIFY(controller.hiddenBuffer().startsWith(QByteArrayLiteral("\x1b[31m")));
+    }
+}
+
+// The SAME rule on the OTHER emitting path. A single drain of the production
+// transport is up to a couple of hundred KiB (ch::SshChannelDevice's per-pump
+// bound), so `cat`ing a large file reaches flush() in pieces the credit window
+// has no room for. Emitting such a batch whole overshoots
+// kMaxUnacknowledgedBytes by the whole batch — the bound broken by the code
+// meant to enforce it, and exactly the unbounded WebChannel/Chromium queue it
+// exists to prevent (the same bug releasingRetainedOutputStaysInsideTheCredit-
+// Window covers for the replay path).
+void TstTerminalController::aFlushBiggerThanTheCreditWindowIsCutNotEmittedWhole()
+{
+    constexpr qsizetype kWindow = TerminalController::kMaxUnacknowledgedBytes;
+
+    TerminalController controller; // visible: a renderer is listening
+    QSignalSpy spy(&controller, &TerminalController::flushReady);
+
+    // One ingest carrying two and a half windows of output, all in one batch.
+    const QByteArray flood(kWindow * 5 / 2, 'F');
+    controller.ingestOutput(flood);
+
+    QCOMPARE(spy.count(), 1);
+    QCOMPARE(spy.at(0).at(0).toByteArray().size(), kWindow);
+    QCOMPARE(controller.unacknowledgedBytes(), static_cast<qint64>(kWindow));
+    QCOMPARE(controller.hiddenBuffer().size(), flood.size() - kWindow);
+
+    // Nothing was dropped: the remainder drains in order as the renderer
+    // acknowledges, and never more than a window at a time.
+    QByteArray delivered = spy.at(0).at(0).toByteArray();
+    while (!controller.hiddenBuffer().isEmpty()) {
+        const int before = spy.count();
+        controller.acknowledgeOutput(controller.unacknowledgedBytes());
+        QCOMPARE(spy.count(), before + 1);
+        QVERIFY(spy.at(before).at(0).toByteArray().size() <= kWindow);
+        delivered += spy.at(before).at(0).toByteArray();
+    }
+    QCOMPARE(delivered, flood);
+
+    // A batch that fits inside the remaining credit is still emitted whole and
+    // in one piece: the cut is a bound, not a chunker.
+    controller.acknowledgeOutput(controller.unacknowledgedBytes());
+    const int settled = spy.count();
+    const QByteArray small(TerminalController::kFlushSizeBytes, 'S');
+    controller.ingestOutput(small);
+    QCOMPARE(spy.count(), settled + 1);
+    QCOMPARE(spy.at(settled).at(0).toByteArray(), small);
+
+    // And an indivisible control sequence longer than the whole window still
+    // goes out whole rather than deadlocking: it cannot be split without
+    // corrupting the renderer's parser, and nothing else can release it.
+    {
+        TerminalController stuck;
+        QSignalSpy stuckSpy(&stuck, &TerminalController::flushReady);
+        QByteArray osc = QByteArrayLiteral("\x1b]0;");
+        osc += QByteArray(kWindow + 1000, 't');
+        osc += QByteArrayLiteral("\x07");
+        stuck.ingestOutput(osc);
+        QCOMPARE(stuckSpy.count(), 1);
+        QCOMPARE(stuckSpy.at(0).at(0).toByteArray(), osc);
+        QVERIFY(stuck.unacknowledgedBytes() > static_cast<qint64>(kWindow));
+        QVERIFY(stuck.hiddenBuffer().isEmpty());
     }
 }
 

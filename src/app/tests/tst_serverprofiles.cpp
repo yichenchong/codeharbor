@@ -333,11 +333,11 @@ void TstServerProfiles::addRoundTripsEveryFieldAcrossInstances()
         QSignalSpy profilesSpy(&store, &ServerProfiles::profilesChanged);
         QSignalSpy activeSpy(&store, &ServerProfiles::activeIdChanged);
 
-        id = store.addProfile(profileFields(QStringLiteral("Prod box"),
-                                            QStringLiteral("10.0.0.4"), 2222,
-                                            QStringLiteral("yichen"),
-                                            QStringLiteral("/home/yichen/.local/bin/node"),
-                                            QStringLiteral("/srv/codeharbor")));
+        id = store.addProfile(profileFields(
+            QStringLiteral("Prod box"), QStringLiteral("10.0.0.4"), 65535,
+            QStringLiteral("yichen"), QStringLiteral("/home/yichen/.local/bin/node"),
+            QStringLiteral("/srv/codeharbor"),
+            QStringLiteral("/home/yichen/.ssh/id_ed25519")));
         QVERIFY(!id.isEmpty());
         // Ids are QUuids without braces, so they are safe as INI key fragments.
         QVERIFY(!QUuid::fromString(id).isNull());
@@ -353,13 +353,15 @@ void TstServerProfiles::addRoundTripsEveryFieldAcrossInstances()
         QCOMPARE(stored.value(QStringLiteral("name")).toString(), QStringLiteral("Prod box"));
         QCOMPARE(stored.value(QStringLiteral("host")).toString(), QStringLiteral("10.0.0.4"));
         QCOMPARE(stored.value(QStringLiteral("user")).toString(), QStringLiteral("yichen"));
+        QCOMPARE(stored.value(QStringLiteral("identityFile")).toString(),
+                 QStringLiteral("/home/yichen/.ssh/id_ed25519"));
         QCOMPARE(stored.value(QStringLiteral("nodePath")).toString(),
                  QStringLiteral("/home/yichen/.local/bin/node"));
         QCOMPARE(stored.value(QStringLiteral("repoRoot")).toString(),
                  QStringLiteral("/srv/codeharbor"));
         // The port stays an int, both in value and in metatype: QML binds it to
         // a spin/int field and SshConnectionPool takes a quint16.
-        QCOMPARE(stored.value(QStringLiteral("port")).toInt(), 2222);
+        QCOMPARE(stored.value(QStringLiteral("port")).toInt(), 65535);
         QCOMPARE(stored.value(QStringLiteral("port")).typeId(), QMetaType::Int);
         // profiles() and profile() agree.
         QCOMPARE(store.profiles().first().toMap(), stored);
@@ -372,9 +374,11 @@ void TstServerProfiles::addRoundTripsEveryFieldAcrossInstances()
     const QVariantMap stored = reopened.profile(id);
     QCOMPARE(stored.value(QStringLiteral("name")).toString(), QStringLiteral("Prod box"));
     QCOMPARE(stored.value(QStringLiteral("host")).toString(), QStringLiteral("10.0.0.4"));
-    QCOMPARE(stored.value(QStringLiteral("port")).toInt(), 2222);
+    QCOMPARE(stored.value(QStringLiteral("port")).toInt(), 65535);
     QCOMPARE(stored.value(QStringLiteral("port")).typeId(), QMetaType::Int);
     QCOMPARE(stored.value(QStringLiteral("user")).toString(), QStringLiteral("yichen"));
+    QCOMPARE(stored.value(QStringLiteral("identityFile")).toString(),
+             QStringLiteral("/home/yichen/.ssh/id_ed25519"));
     QCOMPARE(stored.value(QStringLiteral("nodePath")).toString(),
              QStringLiteral("/home/yichen/.local/bin/node"));
     QCOMPARE(stored.value(QStringLiteral("repoRoot")).toString(),
@@ -388,7 +392,7 @@ void TstServerProfiles::addRoundTripsEveryFieldAcrossInstances()
     // IniFormat escapes the '/' inside a key as '\', so `servers/<id>/host`
     // lands as key `<id>\host` under [servers].
     QVERIFY2(ini.contains(id + QStringLiteral("\\host=10.0.0.4")), qPrintable(ini));
-    QVERIFY2(ini.contains(id + QStringLiteral("\\port=2222")), qPrintable(ini));
+    QVERIFY2(ini.contains(id + QStringLiteral("\\port=65535")), qPrintable(ini));
     QVERIFY2(ini.contains(QStringLiteral("active=") + id), qPrintable(ini));
 }
 
@@ -1208,11 +1212,8 @@ void TstServerProfiles::twoWritersRacingInSeparateProcessesLoseNothing()
                 QStringList({QStringLiteral("interprocessWriterChild")}));
     QVERIFY2(child.waitForStarted(30000), qPrintable(child.errorString()));
 
-    QElapsedTimer rendezvous;
-    rendezvous.start();
-    while (!QFile::exists(ready) && rendezvous.elapsed() < 30000)
-        QThread::msleep(1);
-    QVERIFY2(QFile::exists(ready), "the child never reached its first write");
+    QVERIFY2(QTest::qWaitFor([&] { return QFile::exists(ready); }, 30000),
+             "the child never reached its first write");
 
     ServerProfiles store(path);
     QStringList mine;
@@ -1703,6 +1704,7 @@ void TstServerProfiles::sheetLoadsSilentlyAndExposesItsApi()
         {QByteArrayLiteral("activeId"), QMetaType::QString},
         {QByteArrayLiteral("connectionState"), QMetaType::QString},
         {QByteArrayLiteral("errorText"), QMetaType::QString},
+        {QByteArrayLiteral("diagnosticText"), QMetaType::QString},
         {QByteArrayLiteral("pendingHostKey"), QMetaType::QVariant},
         {QByteArrayLiteral("pendingCredential"), QMetaType::QVariant},
     };
@@ -2164,6 +2166,8 @@ void TstServerProfiles::sheetOpensSshDiagnostics()
 
     QMetaObject::invokeMethod(details, "clicked");
     QVERIFY(dialog->property("visible").toBool());
+    QVERIFY(QMetaObject::invokeMethod(dialog, "close"));
+    QTRY_VERIFY(!dialog->property("visible").toBool());
     CH_ASSERT_SILENT();
 }
 

@@ -495,6 +495,25 @@ bool TerminalFactory::resolveTarget(TerminalController* controller,
                     QStringLiteral("the server returned this terminal without a tmux target"));
                 return;
             }
+            if (!TerminalController::isSafeTmuxTarget(pane->tmuxTarget)) {
+                // The answer is data, and a target is a piece of tmux GRAMMAR:
+                // one beginning `$`, `@` or `%` names an ID rather than a
+                // session, and the `=` exact-match prefix every call site uses
+                // does not suppress that. codeharbord validates what it mints
+                // (isSafeTmuxTarget in remote/src/tmux.ts) and repairs stored
+                // rows in the schema v3 migration, so this covers what that
+                // cannot: a row written by an older daemon, and a server that
+                // is not the one we think we are talking to. Failing the
+                // resolution leaves the pane with no identity and no attach
+                // authorisation, which is the right outcome — nothing is
+                // silently retargeted at somebody else's session.
+                self->finishResolution(
+                    key, QString(),
+                    QStringLiteral("the server returned an unusable tmux target (%1) for "
+                                   "this terminal")
+                        .arg(pane->tmuxTarget));
+                return;
+            }
             ResolvedPane answer;
             answer.target = pane->tmuxTarget;
             answer.terminalId = pane->id.value;
@@ -594,6 +613,21 @@ bool TerminalFactory::attach(TerminalController* controller,
         // than defaulted: every locally-plausible default is a name some other
         // pane may already be using.
         emit error(pane.data(), QStringLiteral("no tmux target for this pane"));
+        return false;
+    }
+    if (!TerminalController::isSafeTmuxTarget(tmuxTarget)) {
+        // The name is about to be used in TWO tmux positions that the shell
+        // quoting below does nothing for: `new-session -s <target>`, where the
+        // target is UNSHIELDED, and `set-option -t '=<target>:'`, where the `=`
+        // exact-match prefix is not the complete shield it looks like — tmux
+        // resolves an ID sigil before it looks a name up, so a target beginning
+        // `$` selects the session holding THAT ID rather than the session with
+        // that name (verified on tmux 3.6). Refused here, unconditionally,
+        // rather than made safe: every name codeharbord mints passes, so the
+        // only values this rejects are ones no pane should be attaching to.
+        emit error(pane.data(),
+                   QStringLiteral("the tmux target %1 is not a usable session name")
+                       .arg(tmuxTarget));
         return false;
     }
     if (m_workspace) {
@@ -769,6 +803,19 @@ void TerminalFactory::kill(TerminalController* controller)
 
     if (target.isEmpty())
         return;  // never attached: there is no remote session to destroy
+    if (!TerminalController::isSafeTmuxTarget(target)) {
+        // Unreachable through attach(), which refuses such a target before it
+        // is ever recorded — and kept anyway, because this is the call that
+        // DESTROYS a session and `kill-session -t '=<target>'` is exactly the
+        // command tmux's ID sigils defeat: a stored `$0` would kill whichever
+        // session happens to hold that id, processes and all. The target is not
+        // cleared, so nothing is silently forgotten either.
+        emit error(pane.data(),
+                   QStringLiteral("the tmux target %1 is not a usable session name; "
+                                  "nothing was killed")
+                       .arg(target));
+        return;
+    }
     if (!connected()) {
         // The target is deliberately KEPT. Forgetting it here (which is what
         // this used to do, unconditionally, before the command had even been

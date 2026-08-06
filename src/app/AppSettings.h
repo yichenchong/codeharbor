@@ -133,8 +133,14 @@ public:
     // Generic access for settings groups that have no named property yet (the
     // server and tmux groups). `group` and `key` must both be non-empty and
     // must not contain '/', so a caller cannot reach outside the `settings/`
-    // subtree or forge one of the validated keys above; a rejected write is
-    // dropped and a rejected read answers `fallback`.
+    // subtree. Refusing '/' alone does NOT keep a pair away from the validated
+    // keys above — group "appearance" with key "theme" composes to
+    // settings/appearance/theme without a separator anywhere — so those exact
+    // paths (and the whole viewerDefaults subtree) are reserved as well: a
+    // generic write there would store a value the named setter would have
+    // clamped or rejected AND move the property without emitting its NOTIFY
+    // signal. A rejected write is dropped and a rejected read answers
+    // `fallback`; the named properties are the only way in or out of them.
     Q_INVOKABLE QVariant value(const QString& group, const QString& key,
                                const QVariant& fallback = QVariant()) const;
     Q_INVOKABLE void setValue(const QString& group, const QString& key,

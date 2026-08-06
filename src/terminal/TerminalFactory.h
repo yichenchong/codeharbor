@@ -218,6 +218,12 @@ public:
     // rule as TerminalController's attach command), and tmux's `=` exact-match
     // sigil keeps a glob- or prefix-shaped id from resolving to somebody else's
     // session. Static and public because both guarantees deserve their own test.
+    //
+    // Neither is a substitute for the THIRD one, which is not in this function:
+    // `=` pins an exact NAME match but does not stop tmux reading an ID sigil
+    // first, so a target beginning `$` still selects the session holding that
+    // id. kill() therefore refuses a target that fails
+    // ch::TerminalController::isSafeTmuxTarget() before it gets here.
     static QString tmuxKillSessionCommand(const QString& target);
 
 signals:

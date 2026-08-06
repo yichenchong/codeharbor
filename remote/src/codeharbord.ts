@@ -2,9 +2,11 @@
 // `codeharbord rpc --stdio` and speaks newline-delimited JSON-RPC 2.0 on
 // stdin/stdout. It need not run permanently.
 //
-// Bootstrap scope: request framing, dispatch, and two introspection methods so
-// the transport can be exercised end-to-end. Workspace DB, file, watch, tmux,
-// and agent methods (SPEC 10.2) land in the workstreams in docs/PLAN.md.
+// Scope: the transport itself — request framing, dispatch, backpressure and
+// shutdown — plus the two introspection handlers (`ping`, `server.info`) that
+// belong to no method group. The `file.*`, `workspace.*` and `tmux.*` groups
+// (SPEC 10.2) are implemented in files.ts, workspace.ts and tmux.ts and spread
+// into the method table below.
 
 // pathToFileURL, not string concatenation: process.argv[1] is a filesystem
 // path, and a path containing a space (or any character a URL must
@@ -12,7 +14,7 @@
 // turning the CLI entry point below into a no-op.
 import { pathToFileURL } from "node:url";
 import { homedir } from "node:os";
-import { join as pathJoin } from "node:path";
+import { isAbsolute, join as pathJoin } from "node:path";
 
 // Frozen file-method catalog (C1, docs/PLAN.md). RPC_METHODS/RPC_REVISION_MISMATCH
 // are re-exported so the wire names and error code stay linked to the transport.
@@ -127,9 +129,41 @@ export type RpcResponse = RpcSuccess | RpcError;
 // remote/test/rpc-mirror.test.ts pins this to the C++ constant.
 export const MAX_LINE_BYTES = 16 * 1024 * 1024;
 
+// Longest string request id responseLine will echo back inside a refusal it had
+// to synthesize. A kilobyte is orders of magnitude beyond every id the C++
+// client mints (a decimal counter) while keeping the refusal comfortably inside
+// one frame.
+const MAX_REFUSAL_ID_BYTES = 1024;
+
 type MethodHandler = (params: unknown) => unknown | Promise<unknown>;
 
-// Static method table (SPEC 10.2 methods are added here as they land).
+/**
+ * The remote user's XDG data directory, which server.info's `recoveryDir` is
+ * built under.
+ *
+ * A RELATIVE $XDG_DATA_HOME is ignored rather than honoured, the same rule
+ * resolveSocketPath applies to $XDG_RUNTIME_DIR (events.ts) and for the same
+ * reason: the variable is DEFINED to be an absolute path, and joining a
+ * relative one produces a recoveryDir that depends on this process's working
+ * directory. The client stores that string, appends its per-pane id and sends
+ * it back as a file.writeFile path, and files.ts passes a relative path
+ * straight to the fs — so the snapshots would land under whatever directory the
+ * daemon happened to be launched in, and a daemon started from anywhere else
+ * would look for them somewhere different. Silently no crash recovery, which is
+ * the one feature whose failure is only discovered after a crash.
+ *
+ * Read per request, not captured at import time, so a value exported after this
+ * module was loaded is honoured (the same choice execFileRunner makes for
+ * $CODEHARBOR_TMUX in tmux.ts).
+ */
+function recoveryBaseDir(): string {
+    const dataHome = process.env.XDG_DATA_HOME;
+    if (dataHome !== undefined && isAbsolute(dataHome)) return dataHome;
+    return pathJoin(homedir(), ".local", "share");
+}
+
+// Static method table. Anything outside the three spread-in method groups is
+// declared here; a new group is added to the spread rather than to this literal.
 const methods: Record<string, MethodHandler> = {
     // Transport keepalive (RPC_PING_METHOD). Deliberately the cheapest possible
     // handler: the C++ client's heartbeat drops the transport when several
@@ -156,13 +190,7 @@ const methods: Record<string, MethodHandler> = {
         version: RPC_SERVER_VERSION,
         schemaVersion: RPC_SCHEMA_VERSION,
         serverId: serverIdentity(),
-        recoveryDir: pathJoin(
-            process.env.XDG_DATA_HOME && process.env.XDG_DATA_HOME.length > 0
-                ? process.env.XDG_DATA_HOME
-                : pathJoin(homedir(), ".local", "share"),
-            "codeharbor",
-            "recovery",
-        ),
+        recoveryDir: pathJoin(recoveryBaseDir(), "codeharbor", "recovery"),
     }),
     ...fileMethods,
     ...WORKSPACE_METHODS,
@@ -273,11 +301,13 @@ export async function dispatch(value: unknown): Promise<RpcResponse | null> {
                 error: { code: RPC_INVALID_PARAMS, message: err.message },
             };
         }
-        // A valid request whose answer would blow a server bound (a directory
-        // listing too big for one transport frame, or one watch too many). Not
-        // -32603 for the same reason as the busy code below: nothing
-        // malfunctioned and nothing was half-applied. The message already names
-        // the limit and what to do, and the client shows it verbatim.
+        // A valid request whose answer, or whose payload, would blow a server
+        // bound: a directory listing too big for one transport frame, one watch
+        // too many, or a workspace.setLayout split tree past
+        // MAX_LAYOUT_TREE_BYTES (workspace.ts). Not -32603 for the same reason
+        // as the busy code below: nothing malfunctioned and nothing was
+        // half-applied. The message already names the limit and what to do, and
+        // the client shows it verbatim.
         if (isResourceLimit(err)) {
             return {
                 jsonrpc: "2.0",
@@ -359,6 +389,14 @@ export async function handleLine(line: string): Promise<RpcResponse | null> {
  * newline — made the two directions disagree by exactly one byte: a payload of
  * precisely MAX_LINE_BYTES was accepted on the way in and refused on the way
  * out, while both comments claimed to state the same rule.
+ *
+ * THE REFUSAL MUST ITSELF FIT. Its message is a fixed string, but the id is
+ * echoed from the request, and a client is free to send a string id as long as
+ * the frame allows — so a refusal that copied a 16 MiB id would be over the cap
+ * for exactly the reason it exists. An id past MAX_REFUSAL_ID_BYTES is therefore
+ * replaced with null: that call cannot be correlated, but it is the one case
+ * where the peer chose an id it could not be answered with, and the alternative
+ * is dropping the whole transport.
  */
 export function responseLine(response: RpcResponse): string {
     let refusal: { code: number; message: string };
@@ -376,7 +414,7 @@ export function responseLine(response: RpcResponse): string {
     }
     const refusalId =
         typeof response.id === "string" &&
-        Buffer.byteLength(response.id) > 1024
+        Buffer.byteLength(response.id) > MAX_REFUSAL_ID_BYTES
             ? null
             : response.id;
     return `${JSON.stringify({
@@ -686,11 +724,11 @@ export const SHUTDOWN_SIGNALS = ["SIGTERM", "SIGINT", "SIGHUP"] as const;
 export const MAX_PENDING_RPC_RESPONSES = 512;
 export const MAX_PENDING_RPC_RESPONSE_BYTES = MAX_LINE_BYTES;
 
-
 // How long the shutdown backstop waits for in-flight work before forcing the
 // exit. Two seconds is beyond any handler that is making progress and well
 // inside the patience of a supervisor's own SIGTERM-then-SIGKILL window.
 export const SHUTDOWN_GRACE_MS = 2000;
+
 export interface StdioHandle {
     /**
      * Run the orderly shutdown now, exactly as an incoming SIGTERM would.
@@ -731,10 +769,23 @@ export function runStdio(): StdioHandle {
             outputStalled = false;
         },
     );
-    fileWatchService.onWatchEvent((event) => watchRelay.deliver(event));
+    // KEEP the unsubscribe functions the watch service hands back. runStdio owns
+    // process-global state (the fileWatchService singleton, process.stdout), and
+    // `shutdown` is deliberately exposed so a caller can stop this transport
+    // without signalling the process — which means a second runStdio() in the
+    // same process is a supported shape and must not inherit the first one's
+    // listeners. Discarding these left the retired relay subscribed: one watch
+    // event would then be written to stdout once per retired transport, i.e.
+    // duplicate notifications, and the retired failOutput would answer a stdout
+    // error by calling closeAll() on the LIVE transport's subscriptions.
+    const releaseWatchEvents = fileWatchService.onWatchEvent((event) =>
+        watchRelay.deliver(event),
+    );
     // No queue outlives its subscriber: unwatch, and closeAll on stdin close,
     // both announce the release here.
-    fileWatchService.onWatchClosed((id) => watchRelay.forget(id));
+    const releaseWatchClosed = fileWatchService.onWatchClosed((id) =>
+        watchRelay.forget(id),
+    );
     // CONCURRENCY AND ORDERING, stated plainly because the wire cannot show it:
     //
     // Each input line starts its handler IMMEDIATELY, without awaiting the
@@ -902,6 +953,11 @@ export function runStdio(): StdioHandle {
         // Releases every OS watch handle and poll timer, and announces each
         // release so the relay drops its queued notifications with it.
         fileWatchService.closeAll();
+        // Detach this transport's watch relay, AFTER closeAll() so the relay is
+        // still subscribed to hear each release and drop the notifications it
+        // was holding for it.
+        releaseWatchEvents();
+        releaseWatchClosed();
         // Stop reading requests. Answering a new one while shutting down would
         // start work whose reply cannot be guaranteed to reach the wire.
         process.stdin.removeListener("data", feed);
@@ -926,6 +982,15 @@ export function runStdio(): StdioHandle {
         pendingResponses.length = 0;
         pendingResponseIndex = 0;
         pendingResponseBytes = 0;
+        // Detach the stdout listeners this transport installed. The queue above
+        // is now empty and flushed by hand, so there is nothing left for a
+        // 'drain' to do, and a retired failOutput answering a later stdout error
+        // would call closeAll() on whatever transport is live by then. The two
+        // no-op 'error' swallowers stay: an EPIPE from the flush just above, or
+        // from Node draining its writable buffer after this returns, must not
+        // become an uncaught exception, and a no-op listener can do no harm.
+        process.stdout.removeListener("drain", flushResponses);
+        process.stdout.removeListener("error", failOutput);
         // Exit 0 rather than re-raising a clean signal. Preserve a non-zero
         // status when the output transport itself failed.
         process.exitCode = outputFailed ? 1 : 0;

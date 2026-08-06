@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import createDOMPurify from "dompurify";
 import { JSDOM } from "jsdom";
 import {
+    isRelativeResource,
     remotePathToFileUrl,
     renderMarkdown,
     resolveRemotePath,
@@ -14,6 +15,13 @@ import { requestImageUrl, type MarkdownBridge } from "../src/bridge.ts";
 
 function sanitizerFor(documentWindow: unknown) {
     return createDOMPurify(documentWindow as never);
+}
+
+/** Parse rendered HTML so a test can assert structure instead of substrings. */
+function parse(window: JSDOM["window"], html: string): HTMLElement {
+    const host = window.document.createElement("div");
+    host.innerHTML = html;
+    return host;
 }
 
 test("renders the supported GitHub-style Markdown structures", () => {
@@ -30,18 +38,64 @@ test("renders the supported GitHub-style Markdown structures", () => {
         + "`inline`\n\n```typescript\nconst answer = 42;\n```",
         sanitizerFor(window),
     );
+    const root = parse(window, html);
 
-    assert.match(html, /<h1[^>]*>Heading<\/h1>/);
-    assert.match(html, /<strong>bold<\/strong>/);
-    assert.match(html, /<em>italic<\/em>/);
-    assert.match(html, /<ul>/);
-    assert.match(html, /<ol>/);
-    assert.match(html, /<blockquote>/);
-    assert.match(html, /<table>/);
-    assert.match(html, /<hr>/);
-    assert.match(html, /type="checkbox"/);
-    assert.match(html, /data-language="typescript"/);
-    assert.match(html, /inline/);
+    assert.equal(root.querySelector("h1")?.textContent, "Heading");
+    assert.equal(root.querySelector("strong")?.textContent, "bold");
+    assert.equal(root.querySelector("em")?.textContent, "italic");
+    assert.equal(root.querySelector("blockquote")?.textContent?.trim(), "quoted");
+    assert.ok(root.querySelector("hr"), "the thematic break renders");
+
+    // A nested bullet list must be a child of its parent item, not a sibling
+    // list flattened beside it.
+    const outer = root.querySelector("ul");
+    const outerItems = Array.from(outer?.children ?? []);
+    assert.equal(outerItems.length, 2);
+    const nested = outerItems[0]?.querySelector("ul");
+    assert.equal(nested?.textContent?.trim(), "nested");
+    assert.match(outerItems[1]?.textContent ?? "", /^two/);
+
+    // The ordered list keeps both items in order.
+    assert.deepEqual(
+        Array.from(root.querySelectorAll("ol > li"), (item) => item.textContent?.trim()),
+        ["first", "second"],
+    );
+
+    // A table keeps its header and body cells, in order and in the right rows.
+    assert.deepEqual(
+        Array.from(root.querySelectorAll("thead th"), (cell) => cell.textContent),
+        ["A", "B"],
+    );
+    assert.deepEqual(
+        Array.from(root.querySelectorAll("tbody tr"), (row) =>
+            Array.from(row.querySelectorAll("td"), (cell) => cell.textContent)),
+        [["1", "2"]],
+    );
+
+    // Both task-list states render, and only the ticked one is checked.
+    const boxes = Array.from(root.querySelectorAll('input[type="checkbox"]'));
+    assert.equal(boxes.length, 2);
+    assert.deepEqual(
+        boxes.map((box) => (box as HTMLInputElement).checked),
+        [true, false],
+    );
+    assert.ok(boxes.every((box) => (box as HTMLInputElement).disabled),
+        "a rendered task list is never interactive");
+
+    // An inline span and a fenced block are different elements: the inline one
+    // has no <pre> parent, the fenced one carries the language on both.
+    const inline = Array.from(root.querySelectorAll("code"))
+        .find((code) => code.parentElement?.tagName !== "PRE");
+    assert.equal(inline?.textContent, "inline");
+    const block = root.querySelector("pre");
+    assert.equal(block?.getAttribute("data-language"), "typescript");
+    assert.equal(block?.querySelector("code")?.className, "language-typescript");
+    assert.equal(block?.textContent, "const answer = 42;");
+
+    // The relative link and image are still unresolved at this stage: the
+    // rewrite, not the renderer, is what moves them into the file namespace.
+    assert.equal(root.querySelector("a")?.getAttribute("href"), "notes.md");
+    assert.equal(root.querySelector("img")?.getAttribute("src"), "images/logo.png");
 });
 
 test("sanitises executable and embedding markup without losing surrounding text", () => {
@@ -252,18 +306,73 @@ test("link rewriting keeps every address inside the remote file namespace", () =
 });
 
 test("relative paths resolve the same wherever the document sits", () => {
-    // The document's own address decides the base directory. These are the
-    // spellings a real remote path arrives in.
+    // This is the shared table the comment above resolveRemotePath() names.
+    // src/qml/tests/tst_paneidentity.cpp's
+    // theMarkdownImagePathResolverAgreesWithTheRendererBundle pins the same
+    // cases on the QML side, and the two must stay in step.
+    const doc = "/srv/repos/app/docs/guide.md";
+
+    // The ordinary cases: a sibling, an explicit "./", a climb, and interior
+    // "." / ".." segments.
+    assert.equal(resolveRemotePath(doc, "diagram.png"), "/srv/repos/app/docs/diagram.png");
+    assert.equal(resolveRemotePath(doc, "./diagram.png"), "/srv/repos/app/docs/diagram.png");
+    assert.equal(resolveRemotePath(doc, "../img/logo.png"), "/srv/repos/app/img/logo.png");
+    assert.equal(resolveRemotePath(doc, ".."), "/srv/repos/app");
+    assert.equal(resolveRemotePath(doc, "a/../b/./c.png"), "/srv/repos/app/docs/b/c.png");
+
+    // ".." is CLAMPED at the server root. It does not escape and it does not
+    // produce a relative fragment; it simply stops climbing.
+    assert.equal(
+        resolveRemotePath(doc, "../../../../../../../etc/passwd"),
+        "/etc/passwd",
+    );
+    // DIVERGENCE 2 from the QML side, which answers "" here: a reference that
+    // climbs all the way to the root is a fine link target, just not a file.
+    assert.equal(resolveRemotePath("/a.md", "../.."), "/");
+
+    // An absolute server path is taken as it stands.
+    assert.equal(resolveRemotePath(doc, "/srv/other/a.png"), "/srv/other/a.png");
+
+    // Query and fragment are cut before resolving, on both sides of the pair.
+    assert.equal(resolveRemotePath(doc, "img.png?v=2"), "/srv/repos/app/docs/img.png");
+    assert.equal(resolveRemotePath(doc, "img.png#frag"), "/srv/repos/app/docs/img.png");
+    assert.equal(resolveRemotePath("/docs/readme.md?v=2", "a.png"), "/docs/a.png");
+
+    // A backslash is an ORDINARY CHARACTER in a POSIX remote path, not a
+    // separator, so a name containing one stays a single segment.
+    assert.equal(
+        resolveRemotePath(doc, "sub\\odd name.png"),
+        "/srv/repos/app/docs/sub\\odd name.png",
+    );
+
+    // Other document-path spellings.
     assert.equal(resolveRemotePath("/README.md", "docs/a.png"), "/docs/a.png");
     assert.equal(resolveRemotePath("/docs/", "a.png"), "/docs/a.png");
-    assert.equal(resolveRemotePath("/docs/readme.md", "./a.png"), "/docs/a.png");
-    assert.equal(resolveRemotePath("/docs/readme.md", "b/../a.png"), "/docs/a.png");
-    assert.equal(resolveRemotePath("/docs/readme.md", "/abs.png"), "/abs.png");
-    // A query or fragment belongs to neither path.
-    assert.equal(resolveRemotePath("/docs/readme.md?v=2", "a.png"), "/docs/a.png");
-    assert.equal(resolveRemotePath("/docs/readme.md", "a.png#top"), "/docs/a.png");
-    // No document path at all still yields an absolute server path.
+    // DIVERGENCE 1: no document path at all still yields an absolute server
+    // path here, where the QML side answers "".
     assert.equal(resolveRemotePath("", "a.png"), "/a.png");
+});
+
+test("only a document-relative reference is treated as a remote resource", () => {
+    // The refusals half of the shared table. Everything here is left exactly as
+    // the author wrote it rather than being pointed at the remote namespace.
+    assert.equal(isRelativeResource("diagram.png"), true);
+    assert.equal(isRelativeResource("../img/logo.png"), true);
+    assert.equal(isRelativeResource("/srv/other/a.png"), true);
+    assert.equal(isRelativeResource("sub\\odd name.png"), true);
+
+    // A protocol-relative reference is the dangerous one: it reaches an
+    // external host, and resolving it as a path would hide that.
+    assert.equal(isRelativeResource("//host/x.png"), false);
+    assert.equal(isRelativeResource("https://host/x.png"), false);
+    assert.equal(isRelativeResource("data:image/png;base64,AAAA"), false);
+    assert.equal(isRelativeResource("mailto:someone@example.test"), false);
+    assert.equal(isRelativeResource(""), false);
+    // A "#" or "?" prefix is a same-document reference, not a resource:
+    // everything from the first "?" or "#" is cut before resolving, so
+    // "#anchor" would otherwise resolve to the document's own directory.
+    assert.equal(isRelativeResource("#anchor"), false);
+    assert.equal(isRelativeResource("?v=2"), false);
 });
 
 test("an empty sanitizer result is returned as-is, never as the dirty HTML", () => {
@@ -286,7 +395,7 @@ test("a failing sanitizer falls back to escaped source instead of throwing", () 
     };
     assert.equal(
         renderMarkdown("<script>alert(1)</script>", sanitizer),
-        "<pre>&lt;script&gt;alert(1)&lt;/script&gt;</pre>",
+        "<pre><code>&lt;script&gt;alert(1)&lt;/script&gt;</code></pre>",
     );
 });
 
@@ -298,7 +407,7 @@ test("a sanitizer that cannot even be built falls back to escaped source", () =>
     // rejection and a blank pane with no message.
     assert.equal(
         renderMarkdown("<script>alert(1)</script>"),
-        "<pre>&lt;script&gt;alert(1)&lt;/script&gt;</pre>",
+        "<pre><code>&lt;script&gt;alert(1)&lt;/script&gt;</code></pre>",
     );
 });
 
@@ -315,6 +424,85 @@ test("only the first word of a fence info string names the language", () => {
     assert.match(html, /data-language="ts"/);
     assert.match(html, /class="language-ts"/);
     assert.doesNotMatch(html, /twoslash/);
+});
+
+test("a code fence cannot break out of its own block", () => {
+    const dom = new JSDOM("");
+    const { window } = dom;
+    // The custom code renderer bypasses marked's default one, so escaping the
+    // fence body is this bundle's own job. If it slipped, the body below would
+    // close the block and start live markup inside the privileged page.
+    const root = parse(window, renderMarkdown(
+        "```\n</code></pre><img src=x onerror=alert(1)><b>bold</b>\n```",
+        sanitizerFor(window),
+    ));
+    const blocks = root.querySelectorAll("pre");
+    assert.equal(blocks.length, 1, "the fence body must not close its own block");
+    assert.equal(root.querySelectorAll("img, b").length, 0);
+    assert.equal(
+        blocks[0]?.textContent,
+        "</code></pre><img src=x onerror=alert(1)><b>bold</b>",
+    );
+});
+
+test("a fence info string cannot escape the language attributes", () => {
+    const dom = new JSDOM("");
+    const { window } = dom;
+    // The language is interpolated straight into class="" and data-language="".
+    // An info string carrying a quote must not be able to close either one and
+    // add an attribute of its own.
+    const root = parse(window, renderMarkdown(
+        '```ts"onload="alert(1)\nconst a = 1;\n```',
+        sanitizerFor(window),
+    ));
+    const block = root.querySelector("pre");
+    assert.equal(block?.getAttribute("onload"), null);
+    assert.equal(block?.getAttribute("data-language"), 'ts"onload="alert(1)');
+    assert.equal(block?.querySelector("code")?.getAttribute("onload"), null);
+    assert.equal(
+        block?.querySelector("code")?.className,
+        'language-ts"onload="alert(1)',
+    );
+});
+
+test("Markdown link and image syntax cannot name an executable scheme", () => {
+    const dom = new JSDOM("");
+    const { window } = dom;
+    // The raw-HTML spellings are covered above. These are the ones an author
+    // writes in plain Markdown, which never passes through an HTML parser
+    // before the sanitizer sees it.
+    const root = parse(window, renderMarkdown(
+        "[a](javascript:alert(1)) [b](JaVaScRiPt:alert(2)) "
+        + "[c](data:text/html,<script>alert(3)</script>) [d](vbscript:msgbox) "
+        + "![e](javascript:alert(4))",
+        sanitizerFor(window),
+    ));
+    for (const link of root.querySelectorAll("a")) {
+        assert.equal(link.getAttribute("href"), null,
+            `${link.textContent} kept an executable href`);
+    }
+    assert.equal(root.querySelector("img")?.getAttribute("src"), null);
+    // The link text itself is still readable.
+    assert.match(root.textContent ?? "", /a.*b.*c.*d/s);
+});
+
+test("a file: address may not name a host", () => {
+    const dom = new JSDOM("");
+    const { window } = dom;
+    // remotePathToFileUrl() only ever mints "file:///<remote path>", and it
+    // mints it after sanitisation. An authority names a machine rather than a
+    // remote path, so the URL policy refuses it; the rooted spelling an author
+    // may legitimately write is the same thing an absolute path resolves to.
+    const root = parse(window, renderMarkdown(
+        '<a id="host" href="file://evil.example/x">a</a>'
+        + '<a id="root" href="file:///srv/notes.md">b</a>',
+        sanitizerFor(window),
+    ));
+    assert.equal(root.querySelector("#host")?.getAttribute("href"), null);
+    assert.equal(
+        root.querySelector("#root")?.getAttribute("href"),
+        "file:///srv/notes.md",
+    );
 });
 test("the image bridge also settles direct host return values", async () => {
     const bridge: MarkdownBridge = {

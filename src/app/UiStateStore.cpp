@@ -89,15 +89,23 @@ UiStateStore::UiStateStore(const QString& iniPath, QObject* parent)
             std::make_unique<QSettings>(iniPath, QSettings::IniFormat);
     }
 }
+
+UiStateStore::~UiStateStore() = default;
+
 void UiStateStore::ensureSchemaVersion()
 {
-    if (storedInt(*m_settings, kSchemaVersionKey, 0, 0)
-        == kUiStateSchemaVersion)
+    const int stored = storedInt(*m_settings, kSchemaVersionKey, 0, 0);
+    if (stored == kUiStateSchemaVersion)
+        return;
+    // Only ever move the stamp FORWARD. A file a NEWER build has already
+    // migrated carries a HIGHER version, and stamping it back down to ours
+    // would erase the only record that the newer schema ever touched it - so
+    // that build, run again, would re-migrate data it had already converted.
+    // An older or unreadable stamp is ours to claim; a newer one is not.
+    if (stored > kUiStateSchemaVersion)
         return;
     m_settings->setValue(kSchemaVersionKey, kUiStateSchemaVersion);
 }
-
-UiStateStore::~UiStateStore() = default;
 
 void UiStateStore::setRegionWidths(int sidebar, int viewer, int terminal)
 {

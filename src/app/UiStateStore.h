@@ -26,6 +26,13 @@ namespace ch {
 //   selectedPane/<devSessionId>
 //   paneSuffix/<devSessionId>/<region>
 //   session/<serverId>/active
+//   meta/schemaVersion
+//
+// meta/schemaVersion is stamped by the first write of any of the keys above
+// (never by a read, so merely opening the store leaves the file untouched). It
+// exists so a future layout change can tell an already-migrated file from a
+// legacy one; there is only one version today, so no migration runs. The stamp
+// only ever moves forward — a file a newer build wrote is left alone.
 //
 // Only `region` is checked for a '/' (see setNextPaneSuffix()), and the
 // asymmetry is deliberate rather than an oversight. `region` is a two-word

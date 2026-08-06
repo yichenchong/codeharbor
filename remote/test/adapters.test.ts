@@ -639,3 +639,81 @@ test("each adapter reads only its own event-name key (AG3)", () => {
     assert.deepEqual(ohMyPiAdapter.metadata?.(bothTools), { tool: "ask" });
     assert.deepEqual(claudeCodeAdapter.metadata?.(bothTools), { tool: "Bash" });
 });
+
+// The relayed AgentEvent carries the harness-native event NAME, and the client
+// displays and logs it. The adapters trim the name they MATCH on, so a producer
+// whose shell config interpolated a variable still maps to the right state — but
+// the name that went out kept its carriage return, and a blank `type` shadowed a
+// perfectly good Claude Code `hook` because absent and blank were not the same
+// statement here the way they are everywhere else.
+test("processBridgeLine normalizes the native event name it relays", () => {
+    const claudeLine = (native: Record<string, unknown>): string =>
+        JSON.stringify({ harness: "claude-code", devSessionId: "s", terminalId: "t", native });
+
+    // Claude Code names its event under `hook`, not `type`.
+    const fromHook = processBridgeLine(claudeLine({ hook: "SessionStart" }));
+    assert.ok(fromHook);
+    assert.equal(fromHook.event, "SessionStart");
+
+    const padded = processBridgeLine(claudeLine({ hook: " Stop\r\n" }));
+    assert.ok(padded);
+    assert.equal(padded.state, "idle_unseen");
+    assert.equal(padded.event, "Stop", "the name the client shows must be trimmed too");
+
+    // A BLANK `type` is "this producer did not name its event under type", not
+    // the event whose name is the empty string, so it must not shadow `hook`.
+    const blankType = processBridgeLine(claudeLine({ type: "  ", hook: "SessionStart" }));
+    assert.ok(blankType);
+    assert.equal(blankType.event, "SessionStart");
+
+    // Nothing usable under either key: the state came from the error marker, and
+    // the name falls back rather than being relayed blank.
+    const unnamed = processBridgeLine(
+        JSON.stringify({
+            harness: "oh-my-pi",
+            devSessionId: "s",
+            terminalId: "t",
+            native: { type: 7, error: true },
+        }),
+    );
+    assert.ok(unnamed);
+    assert.equal(unnamed.state, "error");
+    assert.equal(unnamed.event, "unknown");
+});
+
+// `metadata` is a JSON object on the wire and a QJsonObject in the client, so
+// anything else is not a usable bag. It is also OPTIONAL, so an unusable one
+// must cost the metadata and nothing else — never the state transition, and
+// never the adapter's own derived bag, which it has no business overriding.
+test("processBridgeLine ignores a metadata field that is not a JSON object", () => {
+    for (const metadata of [["tool", "ask"], "ask", 7, null, true]) {
+        const label = JSON.stringify(metadata) ?? String(metadata);
+        const event = processBridgeLine(
+            JSON.stringify({
+                harness: "oh-my-pi",
+                devSessionId: "s",
+                terminalId: "t",
+                native: { type: "tool_call", tool: "ask" },
+                metadata,
+            }),
+        );
+        assert.ok(event, `metadata ${label} must not cost the event`);
+        assert.equal(event.state, "waiting_input", label);
+        assert.deepEqual(event.metadata, { tool: "ask" }, `metadata ${label}`);
+    }
+
+    // With no derived bag either, the field is absent rather than an empty
+    // object: the wire field is optional and an empty bag is not the same as no
+    // bag.
+    const bare = processBridgeLine(
+        JSON.stringify({
+            harness: "oh-my-pi",
+            devSessionId: "s",
+            terminalId: "t",
+            native: { type: "agent_start" },
+            metadata: [1, 2],
+        }),
+    );
+    assert.ok(bare);
+    assert.ok(!("metadata" in bare));
+});

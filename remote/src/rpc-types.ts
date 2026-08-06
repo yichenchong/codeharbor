@@ -249,9 +249,10 @@ export const RPC_REVISION_MISMATCH = -32001;
 export const RPC_DATABASE_BUSY = -32002;
 
 // Implementation-defined server error code for a request that is perfectly
-// well-formed but whose ANSWER would exceed a server resource bound, so it was
-// refused outright and nothing was changed. Four conditions raise it today, all
-// in files.ts:
+// well-formed but whose ANSWER — or, for the last entry, whose own PAYLOAD —
+// would exceed a server resource bound, so it was refused outright and nothing
+// was changed. Five conditions raise it today: the first four in files.ts, the
+// last in workspace.ts.
 //
 //   * file.listDirectory on a directory whose listing would not fit in one
 //     transport frame (MAX_DIRECTORY_LISTING_BYTES). Serializing it anyway put
@@ -267,12 +268,18 @@ export const RPC_DATABASE_BUSY = -32002;
 //   * file.readFile whose ENCODED answer is past MAX_FILE_RESPONSE_BYTES, which
 //     is the same wire problem as the directory case above: base64 expansion and
 //     JSON escaping can make a within-limit file into an over-cap frame.
+//   * workspace.setLayout whose serialized split tree is past
+//     MAX_LAYOUT_TREE_BYTES. The bound is on the way IN rather than on the
+//     reply, because a stored tree is read back by workspace.list: an absurd
+//     one accepted once would make every later listing of that workspace
+//     unanswerable. Checked before the transaction opens, so the previously
+//     stored layout for the region is left exactly as it was.
 //
 // Deliberately NOT -32603: nothing malfunctioned and nothing is half-applied.
 // Not -32602 either: the params are valid, the server simply will not answer at
 // that size. The C++ client has no special case for it and shows the message to
-// the USER verbatim, so both messages are phrased for a person and name the
-// limit that bit.
+// the USER verbatim, so every one of these messages is phrased for a person and
+// names the limit that bit.
 export const RPC_RESOURCE_LIMIT = -32003;
 
 // JSON-RPC 2.0 reserved error codes. They live in this contract module rather

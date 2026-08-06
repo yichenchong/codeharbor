@@ -151,9 +151,7 @@ void CodeharbordClient::setTransport(QIODevice* transport)
         m_transport->disconnect(this);
 
     m_transport = transport;
-    m_readBuffer.clear();
-    m_readPos = 0;
-    m_scanOffset = 0;
+    releaseReadBuffer();
     m_closed = false;
     m_streamUntrusted = false;
 
@@ -264,11 +262,6 @@ qint64 CodeharbordClient::call(const QString& method, const QJsonValue& params,
     if (!params.isUndefined() && !params.isNull())
         request.insert(QStringLiteral("params"), params);
 
-    // Serialize BEFORE the transmit decision below: the frame's SIZE is one of
-    // the things that decides it, so the bytes have to exist first.
-    QByteArray line = QJsonDocument(request).toJson(QJsonDocument::Compact);
-    line.append('\n');
-
     // Decide whether we can actually transmit BEFORE registering the pending
     // callback. If we cannot, the callback would otherwise be orphaned forever
     // (leak + caller hangs, never learning it failed). Instead we fail it once
@@ -296,24 +289,6 @@ qint64 CodeharbordClient::call(const QString& method, const QJsonValue& params,
              !request.value(QStringLiteral("params")).isArray())
         failReason =
             QStringLiteral("outgoing params is neither object nor array");
-    // Both ends of this wire agree that a frame past kMaxLineBytes is a FAULT,
-    // not something to buffer: the daemon's framer destroys its stdin on one
-    // (createLineFramer in remote/src/codeharbord.ts), which drops the whole SSH
-    // RPC channel and with it every editor and terminal in the session. The
-    // daemon already refuses to WRITE an over-cap response for exactly that
-    // reason; this is the missing mirror of that check on the request side.
-    //
-    // It is reachable, not theoretical: file.writeFile carries the buffer's full
-    // text, and JSON escaping is not size preserving — 8 MiB of C0 control bytes
-    // (valid UTF-8, so the daemon returns them as `utf-8` text a pane may edit)
-    // becomes 48 MiB of \uXXXX escapes. Refusing the one request keeps the
-    // session alive and tells the caller which write was too big, instead of
-    // silently taking the connection down.
-    else if (line.size() - 1 > kMaxLineBytes)
-        failReason = QStringLiteral("outgoing frame is %1 bytes, past the "
-                                    "%2-byte line cap")
-                         .arg(qint64(line.size() - 1))
-                         .arg(kMaxLineBytes);
     else if (m_destroying)
         failReason = QStringLiteral("client is being destroyed");
     else if (m_closed)
@@ -322,6 +297,39 @@ qint64 CodeharbordClient::call(const QString& method, const QJsonValue& params,
         failReason = QStringLiteral("no transport bound");
     else if (!m_transport->isOpen() || !m_transport->isWritable())
         failReason = QStringLiteral("transport not writable");
+
+    // Serialize LAST, and only for a request that is otherwise going out. The
+    // size check below needs the bytes, but nothing above does, and building
+    // them for a client with no live transport is pure waste: a file.writeFile
+    // of an 8 MiB buffer whose C0 bytes escape to 48 MiB of \uXXXX was
+    // serialized and thrown away on every attempt while SessionBootstrap's
+    // reconnect ladder was still trying to get a transport back.
+    QByteArray line;
+    if (failReason.isEmpty()) {
+        line = QJsonDocument(request).toJson(QJsonDocument::Compact);
+        line.append('\n');
+        // Both ends of this wire agree that a frame past kMaxLineBytes is a
+        // FAULT, not something to buffer: the daemon's framer destroys its stdin
+        // on one (createLineFramer in remote/src/codeharbord.ts), which drops the
+        // whole SSH RPC channel and with it every editor and terminal in the
+        // session. The daemon already refuses to WRITE an over-cap response for
+        // exactly that reason; this is the mirror of that check on the request
+        // side. The cap measures the PAYLOAD, not the framing newline, which is
+        // the same thing the inbound check above measures and what
+        // remote/test/rpc-mirror.test.ts pins on the daemon's two directions.
+        //
+        // It is reachable, not theoretical: file.writeFile carries the buffer's
+        // full text, and JSON escaping is not size preserving — 8 MiB of C0
+        // control bytes (valid UTF-8, so the daemon returns them as `utf-8` text
+        // a pane may edit) becomes 48 MiB of \uXXXX escapes. Refusing the one
+        // request keeps the session alive and tells the caller which write was
+        // too big, instead of silently taking the connection down.
+        if (line.size() - 1 > kMaxLineBytes)
+            failReason = QStringLiteral("outgoing frame is %1 bytes, past the "
+                                        "%2-byte line cap")
+                             .arg(qint64(line.size() - 1))
+                             .arg(kMaxLineBytes);
+    }
 
     if (!failReason.isEmpty()) {
         // A protocolWarning slot is free to delete this client, so do not touch
@@ -412,7 +420,8 @@ void CodeharbordClient::onReadyRead()
     // multi-megabyte file.readFile frame its reply to our probe physically
     // cannot arrive — waiting for the reply alone would tear down exactly the
     // slow, healthy, large transfer the heartbeat is supposed to protect.
-    if (m_readBuffer.size() != bufferedBefore)
+    const bool readProgress = m_readBuffer.size() != bufferedBefore;
+    if (readProgress)
         m_heartbeatMisses = 0;
 
     // processLine() invokes a user callback that may delete this client. Watch
@@ -448,22 +457,7 @@ void CodeharbordClient::onReadyRead()
         if (newline == -1)
             break;
         if (newline - m_readPos > kMaxLineBytes) {
-            m_readBuffer.clear();
-            m_readPos = 0;
-            m_scanOffset = 0;
-            // Framing is lost: we no longer know where the next message
-            // begins, so nothing still queued on this transport is a message.
-            // This keeps onTransportClosed() from draining — and re-routing —
-            // those bytes below.
-            m_streamUntrusted = true;
-            emit protocolWarning(
-                QStringLiteral("RPC line exceeded %1 bytes; resetting "
-                               "transport")
-                    .arg(kMaxLineBytes));
-            if (!self)
-                return;
-            if (m_transport == sourceTransport && !m_closed)
-                onTransportClosed();
+            dropUntrustedStream(sourceTransport);
             return;
         }
         // A DEEP copy, not sliced()/left(): those share m_readBuffer's
@@ -493,9 +487,7 @@ void CodeharbordClient::onReadyRead()
         // connection that no longer exists: dispatching it would emit
         // notifications AFTER the close and warn about ids we just swept.
         if (m_closed) {
-            m_readBuffer.clear();
-            m_readPos = 0;
-            m_scanOffset = 0;
+            releaseReadBuffer();
             return;
         }
         if (m_transport != sourceTransport)
@@ -516,31 +508,28 @@ void CodeharbordClient::onReadyRead()
     // belongs to the caller and may still be physically healthy); what is gone
     // is our ability to trust a single byte on it, so nothing more is read.
     if (m_readBuffer.size() > kMaxLineBytes) {
-        // Drop the garbage BEFORE announcing anything: a protocolWarning slot
-        // may delete this client, and the release must not depend on surviving
-        // the emit. Frees up to the cap (16 MiB) as a side effect.
-        m_readBuffer.clear();
-        m_readPos = 0;
-        m_scanOffset = 0;
-        m_streamUntrusted = true;
-        emit protocolWarning(
-            QStringLiteral("RPC line exceeded %1 bytes; resetting transport")
-                .arg(kMaxLineBytes));
-        if (!self)
-            return;
-        if (m_transport == sourceTransport && !m_closed)
-            onTransportClosed();
+        dropUntrustedStream(sourceTransport);
+        return;
     }
     // QIODevice::read() intentionally takes only one bounded chunk. A socket
     // may already have more bytes queued, but it will not necessarily emit a
     // second readyRead() just because this call left some unread. Continue in
     // the event queue so a large burst is drained without ever allocating an
     // unbounded readAll() result.
+    //
+    // `readProgress` is the termination condition, and it is not decoration:
+    // bytesAvailable() is only ADVERTISED capacity, so a device that reports
+    // readable bytes and then hands back none — a subclass whose count includes
+    // a partial record it will not release, say — would have this function
+    // re-post itself forever and starve the event loop while never consuming a
+    // byte. Rescheduling only after a read that actually delivered something
+    // makes progress a precondition for continuing, the same rule
+    // onTransportClosed()'s drain loop already applies to its own iteration.
     // m_transport is checked for null in its own right: a callback above may
     // have deleted the caller-owned device, which nulls BOTH QPointers and makes
     // them compare equal.
-    if (m_transport && m_transport == sourceTransport && !m_closed &&
-        m_transport->bytesAvailable() > 0) {
+    if (readProgress && m_transport && m_transport == sourceTransport &&
+        !m_closed && m_transport->bytesAvailable() > 0) {
         QMetaObject::invokeMethod(this, &CodeharbordClient::onReadyRead,
                                   Qt::QueuedConnection);
     }
@@ -561,6 +550,41 @@ void CodeharbordClient::compactReadBuffer()
         m_readBuffer.capacity() > kIdleReadCapacityBytes) {
         m_readBuffer.squeeze();
     }
+}
+
+void CodeharbordClient::releaseReadBuffer()
+{
+    // clear(), not remove(0, size()): QByteArray::clear() drops the allocation
+    // outright where remove() keeps it, and every caller is abandoning a buffer
+    // that may hold up to kMaxLineBytes rather than retiring a dispatched
+    // prefix it will refill again in a moment.
+    m_readBuffer.clear();
+    m_readPos = 0;
+    m_scanOffset = 0;
+}
+
+void CodeharbordClient::dropUntrustedStream(
+    const QPointer<QIODevice>& sourceTransport)
+{
+    // Release the garbage BEFORE announcing anything: a protocolWarning slot may
+    // delete this client, and the release must not depend on surviving the emit.
+    releaseReadBuffer();
+    // Framing is lost: we no longer know where the next message begins, so
+    // nothing still queued on this transport is a message. This is what keeps
+    // onTransportClosed()'s last-gasp drain from reading — and routing — those
+    // very bytes back, which, because each 16 MiB chunk trips the cap again,
+    // re-entered the close path once per chunk of garbage.
+    m_streamUntrusted = true;
+    QPointer<CodeharbordClient> self(this);
+    emit protocolWarning(
+        QStringLiteral("RPC line exceeded %1 bytes; resetting transport")
+            .arg(kMaxLineBytes));
+    if (!self)
+        return;
+    // Only the transport those bytes came from: a warning slot is free to have
+    // rebound a replacement, and this close belongs to the device we gave up on.
+    if (m_transport == sourceTransport && !m_closed)
+        onTransportClosed();
 }
 
 void CodeharbordClient::processLine(const QByteArray& line)
@@ -806,9 +830,7 @@ void CodeharbordClient::onTransportClosed()
     // them pins up to the 16 MiB cap for the client's whole remaining life, and
     // a later rebind must never splice a dead producer's tail onto the first
     // frame of the new one.
-    m_readBuffer.clear();
-    m_readPos = 0;
-    m_scanOffset = 0;
+    releaseReadBuffer();
     // Nothing left to probe: stop the timer and forget any outstanding probe
     // before failAllPending() dispatches its callback. m_closed is already
     // latched, so restartHeartbeat() cannot restart it here.

@@ -596,6 +596,12 @@ void TstViewers::urlMappingRoundTrip()
     InternalUrlMap map;
     QVERIFY(map.internalUrlFor(QUrl()).isEmpty());
     QCOMPARE(map.size(), 0);
+    // Only non-empty file URLs can be served by the internal handler.  Other
+    // valid URLs must not consume a mapping that can never resolve.
+    QVERIFY(map.internalUrlFor(QUrl(QStringLiteral("https://example.test/a")))
+                .isEmpty());
+    QVERIFY(map.internalUrlFor(QUrl(QStringLiteral("file:"))).isEmpty());
+    QCOMPARE(map.size(), 0);
     const QList<QUrl> files = {
         QUrl(QStringLiteral("file:///home/yc/project/README.md")),
         QUrl(QStringLiteral("file:///home/yc/project/src/main.cpp")),

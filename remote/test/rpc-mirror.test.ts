@@ -16,7 +16,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import {
@@ -479,4 +481,66 @@ test("an unserializable response still answers the request", () => {
     assert.equal(decoded.id, "abc");
     assert.equal(decoded.error.code, RPC_INTERNAL_ERROR);
     assert.match(decoded.error.message, /could not be serialized/);
+});
+
+// The last piece of the server.info payload the client stores and acts on, and
+// the only one that is a PATH: `recoveryDir` is where the editor writes its
+// crash-recovery snapshots, on the SERVER. The client appends its per-pane id
+// and sends the result back as a file.writeFile path, and files.ts hands a
+// relative path straight to the filesystem — so a relative recoveryDir puts the
+// snapshots under whatever directory this daemon happened to be launched in, and
+// a daemon started from anywhere else looks for them somewhere different. That
+// is silently no crash recovery, discovered only after a crash. $XDG_DATA_HOME
+// is DEFINED to be absolute, so a relative one is ignored rather than joined —
+// the same rule resolveSocketPath applies to $XDG_RUNTIME_DIR.
+test("server.info reports an absolute recoveryDir even for a relative XDG_DATA_HOME", async () => {
+    // server.info reads its serverId from the workspace database; point the
+    // lazily-opened default connection at a throwaway file rather than the real
+    // one, exactly as test/adapters.test.ts does.
+    const dbDir = mkdtempSync(path.join(os.tmpdir(), "codeharbord-mirror-"));
+    const previousDb = process.env.CODEHARBOR_DB;
+    const previousDataHome = process.env.XDG_DATA_HOME;
+    process.env.CODEHARBOR_DB = path.join(dbDir, "codeharbor.sqlite");
+    const recoveryDirOf = async (): Promise<string> => {
+        const response = await dispatch({
+            jsonrpc: "2.0",
+            id: 1,
+            method: RPC_SERVER_INFO_METHOD,
+        });
+        assert.ok(response !== null && "result" in response);
+        const { recoveryDir } = response.result as { recoveryDir?: unknown };
+        assert.equal(typeof recoveryDir, "string");
+        return recoveryDir as string;
+    };
+    try {
+        // An absolute value is honoured verbatim...
+        process.env.XDG_DATA_HOME = path.join(dbDir, "data");
+        assert.equal(
+            await recoveryDirOf(),
+            path.join(dbDir, "data", "codeharbor", "recovery"),
+        );
+
+        // ...and a relative one is ignored, not joined onto the daemon's cwd.
+        // Read per request, so this reassignment must take effect.
+        const absoluteFallback = path.join(
+            os.homedir(),
+            ".local",
+            "share",
+            "codeharbor",
+            "recovery",
+        );
+        for (const relative of ["share", "./share", "..", ""]) {
+            process.env.XDG_DATA_HOME = relative;
+            assert.equal(await recoveryDirOf(), absoluteFallback, relative);
+        }
+
+        delete process.env.XDG_DATA_HOME;
+        assert.equal(await recoveryDirOf(), absoluteFallback);
+    } finally {
+        if (previousDb === undefined) delete process.env.CODEHARBOR_DB;
+        else process.env.CODEHARBOR_DB = previousDb;
+        if (previousDataHome === undefined) delete process.env.XDG_DATA_HOME;
+        else process.env.XDG_DATA_HOME = previousDataHome;
+        rmSync(dbDir, { recursive: true, force: true });
+    }
 });

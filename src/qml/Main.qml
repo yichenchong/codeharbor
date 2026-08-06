@@ -597,7 +597,16 @@ ApplicationWindow {
     // opens itself on first run; afterwards it is reachable from the palette.
     ConnectSheet {
         id: connectSheet
-        anchors.fill: parent
+        // Below the title bar, never over it. These sheets fill everything
+        // they are given and swallow every click that misses one of their
+        // controls, so anchoring them to the whole window buried the ONLY
+        // move/minimise/maximise/close affordance a frameless window has: with
+        // the log or the settings sheet up there was no way to move the window
+        // or send it to the taskbar until the sheet was dismissed.
+        anchors.top: titleBar.bottom
+        anchors.left: parent.left
+        anchors.right: parent.right
+        anchors.bottom: parent.bottom
         z: 900
         visible: shown
         property bool shown: false
@@ -654,7 +663,10 @@ ApplicationWindow {
 
     LogView {
         id: logView
-        anchors.fill: parent
+        anchors.top: titleBar.bottom
+        anchors.left: parent.left
+        anchors.right: parent.right
+        anchors.bottom: parent.bottom
         z: 900
         visible: logView.shown
         logBuffer: app.logBuffer
@@ -662,7 +674,10 @@ ApplicationWindow {
     }
     SettingsWindow {
         id: settingsWindow
-        anchors.fill: parent
+        anchors.top: titleBar.bottom
+        anchors.left: parent.left
+        anchors.right: parent.right
+        anchors.bottom: parent.bottom
         z: 910
         visible: shown
         onDismissed: shown = false
@@ -870,6 +885,22 @@ ApplicationWindow {
         app.layouts.splitPane(region, target, orientation);
     }
 
+    // Hand the close to the PANE when the pane knows how to take it.
+    // ViewerPane.requestClose() puts a modified, saving or conflicted editor
+    // buffer behind a "Close without saving / Cancel" confirmation and only
+    // emits its own closeRequested once the user has agreed; that report comes
+    // back here as the region's stamped close. Closing the layout node from
+    // under such a pane instead would discard the user's edits with no
+    // warning at all. Returns true when the pane has taken the request over.
+    function requestPaneClose(region, paneId) {
+        const host = region === "viewer" ? viewerRegion : terminalRegion;
+        const pane = host.paneCache ? host.paneCache[paneId] : null;
+        if (!pane || typeof pane.requestClose !== "function")
+            return false;
+        pane.requestClose();
+        return true;
+    }
+
     // Close the pane the user last worked in. SessionLayouts collapses the parent
     // branch and leaves an empty leaf behind if the region ends up bare, so a
     // region is never left with nothing to show.
@@ -878,9 +909,15 @@ ApplicationWindow {
             window.notifyUser(qsTr("Select a Dev Session before closing a pane."));
             return;
         }
+        const target = window.targetPaneId(region);
+        // The command palette reaches a pane the user never pressed a button
+        // on, so this is the one close path that has not already passed the
+        // pane's own unsaved-changes confirmation.
+        if (window.requestPaneClose(region, target))
+            return;
         // Synchronous command: see splitActivePane() above for why the
         // unstamped entry point is the correct one here.
-        app.layouts.closePane(region, window.targetPaneId(region));
+        app.layouts.closePane(region, target);
     }
 
     // Close the pane a REGION asked about. A pane's own header close button names

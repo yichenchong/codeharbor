@@ -134,13 +134,25 @@ async function renderCurrent(): Promise<void> {
     // The serial prevents a theme change or retarget from allowing an older
     // asynchronous image minting pass to put stale content back on screen.
     const serial = ++renderSerial;
-    clearError();
+    // Nothing is cleared from the status strip here. mountMarkdown() already
+    // clears it before it fetches a new document, and this function also runs
+    // for a live theme change on the document already on screen — where the
+    // strip may be carrying a message the host put there (a failed image, say)
+    // that a repaint has no business erasing.
     const sanitized = renderMarkdown(currentSource);
     const html = rewriteRelativeUrls(sanitized, mountedPath);
-    if (token !== mountedToken || mountedRoot !== root || mountedBridge !== bridge) {
-        return;
-    }
+    // Both calls above are synchronous, so the mount cannot have changed under
+    // us between the guard at the top and here.
+    //
+    // A theme change re-renders the document that is already on screen, and
+    // replacing the markup resets the scroll box to the top. Put the reader
+    // back where they were; on a fresh mount the element was just emptied, so
+    // this restores 0 onto 0.
+    const scrollTop = root.scrollTop;
+    const scrollLeft = root.scrollLeft;
     root.innerHTML = html;
+    root.scrollTop = scrollTop;
+    root.scrollLeft = scrollLeft;
 
     const images = Array.from(root.querySelectorAll("img[data-ch-image-path]"));
     await Promise.all(images.map(async (image) => {
@@ -318,14 +330,22 @@ export function connectMarkdown(
         showError("This page requires the CodeHarbor host: no WebChannel transport.");
         return;
     }
-    new QWebChannel(qt.webChannelTransport, (channel: QWebChannelInstance) => {
-        const bridge = channel.objects.markdown as MarkdownBridge | undefined;
-        if (!bridge || typeof bridge.resolveImage !== "function") {
-            showError("The Markdown bridge is missing from this window.");
-            return;
-        }
-        void mountMarkdown(element, bridge, options);
-    });
+    // qwebchannel.js sends the handshake from the constructor and throws
+    // straight back out of it when the transport rejects it. Uncaught, that
+    // ends bootstrap() with a blank pane and no message at all — the one state
+    // this page must never reach, because nothing else reports it.
+    try {
+        new QWebChannel(qt.webChannelTransport, (channel: QWebChannelInstance) => {
+            const bridge = channel.objects.markdown as MarkdownBridge | undefined;
+            if (!bridge || typeof bridge.resolveImage !== "function") {
+                showError("The Markdown bridge is missing from this window.");
+                return;
+            }
+            void mountMarkdown(element, bridge, options);
+        });
+    } catch {
+        showError("This page could not reach the CodeHarbor host.");
+    }
 }
 
 function bootstrap(): void {

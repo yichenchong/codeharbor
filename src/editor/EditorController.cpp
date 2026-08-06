@@ -837,8 +837,7 @@ void EditorController::checkRecovery(const QString& loadedContent, quint64 gener
                     // path is this pane's snapshot of a PREVIOUS file and must
                     // never be handed back as the current file's unsaved work.
                     const bool belongsHere =
-                        parsed && snapshotPath == self->m_path
-                        && !recovered.isEmpty();
+                        parsed && snapshotPath == self->m_path;
                     if (slotUntouched)
                         self->m_recoveryHasContent = belongsHere;
                     if (belongsHere && recovered != loadedContent)
@@ -921,9 +920,20 @@ void EditorController::save(QString content, QString expectedRevision)
     // Saving until the last write of the chain answers, and that one reply is
     // the single outcome the page sees.
     if (m_saveInFlight) {
-        m_queuedSaveContent = content == m_inFlightSaveContent
-                                  ? std::nullopt
-                                  : std::optional<QString>(std::move(content));
+        if (content == m_inFlightSaveContent) {
+            // If a newer save is already queued, this request is the latest
+            // buffer observation and must replace it with the in-flight bytes.
+            // Otherwise the write already on the wire will produce exactly
+            // these bytes, so no second write is needed.
+            if (m_queuedSaveContent.has_value())
+                m_queuedSaveContent = content;
+            else
+                m_queuedSaveContent.reset();
+        } else {
+            // Keep only the newest distinct buffer; an intermediate save is
+            // superseded by the content currently shown by the page.
+            m_queuedSaveContent = std::optional<QString>(std::move(content));
+        }
         return;
     }
 
@@ -1196,7 +1206,11 @@ void EditorController::writeRecovery(const QString& content, bool retryOnMismatc
                 ++self->m_recoverySlotSerial;
                 self->m_recoveryRevision =
                     result.toObject().value(QStringLiteral("revision")).toString();
-                self->m_recoveryHasContent = !content.isEmpty();
+                // An empty buffer is valid unsaved work (the user may have
+                // deleted the whole file). The envelope remains meaningful and
+                // must be offered on reopen, and a later save must be able to
+                // clear it just like a non-empty snapshot.
+                self->m_recoveryHasContent = true;
                 self->honourDeferredRecoveryClear();
                 return;
             }

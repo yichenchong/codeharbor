@@ -10,6 +10,34 @@ namespace ch {
 
 namespace {
 
+// Drop every surrogate half that is not part of a valid pair. A lone half is
+// not a character: QString will hold it, but encoding it as JSON (which every
+// stored layout goes through) replaces it with U+FFFD, so a value carrying one
+// reads back differently from the one just written. Removing them here is what
+// lets a normalized title survive the round trip unchanged.
+void removeUnpairedSurrogates(QString &text)
+{
+    qsizetype kept = 0;
+    for (qsizetype i = 0; i < text.size(); ++i) {
+        const QChar unit = text.at(i);
+        if (unit.isHighSurrogate()) {
+            // Keep the pair, skip the lone half.
+            if (i + 1 >= text.size() || !text.at(i + 1).isLowSurrogate())
+                continue;
+            text[kept++] = unit;
+            text[kept++] = text.at(i + 1);
+            ++i;
+            continue;
+        }
+        // Any low surrogate reached here is unpaired: a paired one was already
+        // consumed by its high half above.
+        if (unit.isLowSurrogate())
+            continue;
+        text[kept++] = unit;
+    }
+    text.truncate(kept);
+}
+
 // Writes `node` into `obj`, returning false if `node` is not a tree the parser
 // below would accept back: a split whose ratio count does not match its child
 // count, a ratio that is not finite and > 0, or nesting deeper than kMaxDepth.
@@ -209,6 +237,29 @@ bool parseNode(const QJsonObject &obj, SplitNode &out, int depth)
 }
 
 } // namespace
+
+QString SplitNode::normalizeCustomTitle(QString title)
+{
+    removeUnpairedSurrogates(title);
+    title = title.trimmed();
+    if (title.size() > kMaxCustomTitleLength)
+        title.truncate(kMaxCustomTitleLength);
+    for (;;) {
+        // Truncation is the one clean-up that can still split a surrogate pair
+        // - the two-unit encoding of one non-BMP character such as an emoji -
+        // and it can only ever orphan the HIGH half, at the very end. Dropping
+        // it can in turn expose a trailing space, so both run until the value
+        // stops shrinking.
+        if (!title.isEmpty() && title.back().isHighSurrogate()) {
+            title.chop(1);
+            continue;
+        }
+        const QString trimmed = title.trimmed();
+        if (trimmed.size() == title.size())
+            return title;
+        title = trimmed;
+    }
+}
 
 std::optional<QJsonObject> SplitNode::tryToJson() const
 {

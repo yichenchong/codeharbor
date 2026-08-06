@@ -216,10 +216,16 @@ ItemDelegate {
             // available width (the delegate's width less its padding) — not
             // from the Row's implicit width, which is derived from these very
             // children and would be a cycle.
+            // The Row's width less everything else in it: its left padding,
+            // every sibling, and one gap per gap BETWEEN visible children —
+            // six children when the archived marker is drawn and five when it
+            // is not, hence five gaps or four. (The delegate's own rightPadding
+            // is what keeps the last button off the row's edge; the Row itself
+            // has no trailing padding to subtract.)
             width: Math.max(0, parent.width - parent.leftPadding - dot.width
                             - (archivedMarker.visible ? archivedMarker.width : 0)
                             - pinButton.width - archiveButton.width - deleteButton.width
-                            - parent.spacing * (archivedMarker.visible ? 4 : 3) - 8)
+                            - parent.spacing * (archivedMarker.visible ? 5 : 4))
 
             Label {
                 width: parent.width
@@ -250,6 +256,11 @@ ItemDelegate {
             implicitWidth: 24
             implicitHeight: 24
             padding: 0
+            // Reachable and visibly focusable without a pointer, like the
+            // delete button below and both buttons on a group header. Without
+            // this a CLICK on the star left the keyboard cursor behind on
+            // whatever had focus before, so Space then hit the wrong control.
+            focusPolicy: Qt.StrongFocus
             anchors.verticalCenter: parent.verticalCenter
             text: row.pinned ? "\u2605" : "\u2606" // filled / outline star
 
@@ -292,6 +303,7 @@ ItemDelegate {
             implicitWidth: 24
             implicitHeight: 24
             padding: 0
+            focusPolicy: Qt.StrongFocus
             anchors.verticalCenter: parent.verticalCenter
             text: row.archived ? "\u21a9" : "\u25a3"
 

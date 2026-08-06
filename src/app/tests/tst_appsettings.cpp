@@ -32,6 +32,8 @@ private slots:
     void writingTheSameValueIsSilent();
     void viewerDefaultsStoreAndNormalise();
     void viewerDefaultsRejectMalformedAndIncompatibleEntries();
+    void genericPairsCannotForgeAValidatedKey();
+    void viewerDefaultsCanBeClearedOneAtATime();
     void genericPairsCannotEscapeTheirGroup();
     void valuesSurviveAReopen();
     void resetRestoresDefaultsAndAnnouncesWhatMoved();
@@ -279,6 +281,108 @@ void TstAppSettings::genericPairsCannotEscapeTheirGroup()
                      QStringLiteral("fallback"))
                  .toString(),
              QStringLiteral("fallback"));
+
+    // A validated key is still a validated key when it is spelt as a group and
+    // a key with no separator in either half.
+    s.setValue(QStringLiteral("appearance"), QStringLiteral("theme"),
+               QStringLiteral("solarized"));
+    QCOMPARE(spy.count(), 1);
+    QCOMPARE(s.theme(), QStringLiteral("dark"));
+    QCOMPARE(s.value(QStringLiteral("appearance"), QStringLiteral("theme"),
+                     QStringLiteral("fallback"))
+                 .toString(),
+             QStringLiteral("fallback"));
+}
+
+// The '/' rule alone never protected the validated keys: group "appearance" and
+// key "theme" carry no separator at all and compose to the theme key exactly. A
+// generic write landing there would park a value the named setter rejects AND
+// move the property with no NOTIFY signal, so every binding on it would keep
+// rendering the old value.
+void TstAppSettings::genericPairsCannotForgeAValidatedKey()
+{
+    const QString path = scratchIni(m_dir, QStringLiteral("forge"));
+    AppSettings s(path);
+    QSignalSpy settingSpy(&s, &AppSettings::settingChanged);
+    QSignalSpy fontSpy(&s, &AppSettings::terminalFontSizeChanged);
+    QSignalSpy paletteSpy(&s, &AppSettings::groupPaletteChanged);
+    QSignalSpy toolbarSpy(&s, &AppSettings::toolbarOrderChanged);
+    QSignalSpy ratioSpy(&s, &AppSettings::terminalPixelRatioChanged);
+    QSignalSpy viewerSpy(&s, &AppSettings::viewerDefaultsChanged);
+
+    // Every named key, reached the only way the '/' rule still allows.
+    s.setValue(QStringLiteral("appearance"), QStringLiteral("terminalFontSize"),
+               0);
+    s.setValue(QStringLiteral("appearance"), QStringLiteral("groupPalette"),
+               QStringLiteral("solarized"));
+    s.setValue(QStringLiteral("appearance"), QStringLiteral("groupPaletteSize"),
+               999);
+    s.setValue(QStringLiteral("appearance"), QStringLiteral("toolbarOrder"),
+               QStringLiteral("not-a-list"));
+    s.setValue(QStringLiteral("appearance"),
+               QStringLiteral("terminalPixelRatio"), 99.0);
+    s.setValue(QStringLiteral("viewerDefaults"), QStringLiteral("md"),
+               QStringLiteral("binary"));
+
+    // Nothing was written, so nothing moved and nothing was announced.
+    QCOMPARE(settingSpy.count(), 0);
+    QCOMPARE(fontSpy.count(), 0);
+    QCOMPARE(paletteSpy.count(), 0);
+    QCOMPARE(toolbarSpy.count(), 0);
+    QCOMPARE(ratioSpy.count(), 0);
+    QCOMPARE(viewerSpy.count(), 0);
+    QCOMPARE(s.terminalFontSize(), AppSettings::kDefaultTerminalFontSize);
+    QCOMPARE(s.groupPalette(), QStringLiteral("plain"));
+    QCOMPARE(s.groupPaletteSize(), AppSettings::kDefaultPaletteSize);
+    QVERIFY(s.toolbarOrder().isEmpty());
+    QCOMPARE(s.terminalPixelRatio(), 0.0);
+    QVERIFY(s.viewerDefaults().isEmpty());
+
+    // And nothing reached the file either, so a reopen cannot resurrect it.
+    AppSettings reopened(path);
+    QCOMPARE(reopened.terminalFontSize(), AppSettings::kDefaultTerminalFontSize);
+    QVERIFY(reopened.viewerDefaults().isEmpty());
+
+    // A group that owns no named key is unaffected by the new rule.
+    s.setValue(QStringLiteral("server"), QStringLiteral("keepAlive"), 30);
+    QCOMPARE(settingSpy.count(), 1);
+}
+
+// The settings page removes one extension at a time (SettingsWindow.qml calls
+// clearViewerDefault directly), and the return value is what tells it whether
+// the row it just deleted existed at all.
+void TstAppSettings::viewerDefaultsCanBeClearedOneAtATime()
+{
+    const QString path = scratchIni(m_dir, QStringLiteral("clearviewer"));
+    AppSettings s(path);
+    QVERIFY(s.setViewerDefault(QStringLiteral("md"), QStringLiteral("text")));
+    QVERIFY(s.setViewerDefault(QStringLiteral("json"), QStringLiteral("text")));
+
+    QSignalSpy changed(&s, &AppSettings::viewerDefaultsChanged);
+
+    // A malformed extension names nothing and is not a removal.
+    QVERIFY(!s.clearViewerDefault(QString()));
+    // Neither is one that was never stored.
+    QVERIFY(!s.clearViewerDefault(QStringLiteral("png")));
+    QCOMPARE(changed.count(), 0);
+
+    // Normalisation applies on the way in, so the dotted upper-case spelling
+    // removes the canonical row.
+    QVERIFY(s.clearViewerDefault(QStringLiteral(".MD")));
+    QCOMPARE(changed.count(), 1);
+    QCOMPARE(s.viewerDefaults(),
+             (QVariantMap{{QStringLiteral("json"), QStringLiteral("text")}}));
+    // Removing it twice is not a second removal.
+    QVERIFY(!s.clearViewerDefault(QStringLiteral("md")));
+    QCOMPARE(changed.count(), 1);
+
+    // The strongly typed view C++ wiring uses agrees with the QML-facing map.
+    const QHash<QString, QString> kinds = s.viewerDefaultKinds();
+    QCOMPARE(kinds.size(), 1);
+    QCOMPARE(kinds.value(QStringLiteral("json")), QStringLiteral("text"));
+
+    AppSettings reopened(path);
+    QCOMPARE(reopened.viewerDefaults(), s.viewerDefaults());
 }
 
 void TstAppSettings::valuesSurviveAReopen()

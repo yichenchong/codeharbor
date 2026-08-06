@@ -282,11 +282,18 @@ void AppController::setConnection(SshConnectionPool* pool,
         m_pool->setCredentialCallback({});
     }
 
+    // Only reset the suffix guard when the pool actually CHANGES. Re-injecting
+    // the same pool is an explicitly supported path (see the disconnect above),
+    // and clearing the guard unconditionally made syncSshDiagnostics() treat
+    // the whole transcript as new again, copying every line the log buffer
+    // already held a second time.
+    const bool poolChanged = m_pool != pool;
     m_pool = pool;
     m_bootstrap = bootstrap;
     m_profiles = profiles;
     m_layouts = layouts;
-    m_lastSshDiagnostics.clear();
+    if (poolChanged)
+        m_lastSshDiagnostics.clear();
 
     // setConnection may land after a serverId is already known (test order, or
     // a re-injection); seed the layouts key so it is never one server behind.
@@ -529,12 +536,14 @@ void AppController::upgradeRemoteService(QString profileId)
     // The install replaces the very files the live session is running from, so
     // the session goes first. This also clears the chain, which is why the arm
     // below comes after it.
+    QPointer<AppController> self(this);
     disconnectServer();
     // disconnectServer() drives the bootstrap's teardown and emits both
     // activeSessionChanged and connectionStateChanged, and a listener is
-    // allowed to tear the connection spine down while those are delivered. The
-    // QPointer reads back null in that case; dereferencing it would not.
-    if (!m_bootstrap)
+    // allowed to tear the connection spine - or this very controller - down
+    // while those are delivered. `self` covers the controller; the QPointer
+    // member covers the bootstrap. Reading either raw would not.
+    if (!self || !m_bootstrap)
         return;
     m_bootstrap->requestRemoteUpgrade();
     startConnect(profileId, QString());
@@ -543,6 +552,13 @@ void AppController::upgradeRemoteService(QString profileId)
 void AppController::startConnect(const QString& profileId,
                                  QString acceptedFingerprint)
 {
+    // Every setConnectionState() below, and connectAndWire() itself, delivers
+    // signals synchronously to QML and to the bootstrap handlers installed in
+    // setConnection(). A listener there is allowed to destroy this controller -
+    // the rest of the class already assumes exactly that - so the members
+    // touched after each of those points have to be reached through a guard
+    // rather than through a `this` that may already be gone.
+    QPointer<AppController> self(this);
     if (!m_bootstrap || !m_profiles || !m_pool) {
         // There is no spine to dial with, so the chain is over before it began
         // and nothing it armed may survive it. An upgrade request left standing
@@ -591,6 +607,8 @@ void AppController::startConnect(const QString& profileId,
     m_credentialLabel.clear();
     m_credentialKind = CredentialKind::KeyPassphrase;
     setConnectionState(QStringLiteral("connecting"));
+    if (!self)
+        return;
 
     // Copies, not moves: the chain keeps its secrets so the NEXT attempt in the
     // same chain can re-satisfy the method this one already got past. A server
@@ -606,6 +624,12 @@ void AppController::startConnect(const QString& profileId,
         profile.value(QStringLiteral("nodePath")).toString(),
         profile.value(QStringLiteral("repoRoot")).toString(),
         profile.value(QStringLiteral("identityFile")).toString());
+    // connectAndWire() runs the whole handshake inline and emits stateChanged,
+    // error, provisioning, channelDiagnostic and (on success) wired along the
+    // way. Nothing below may touch this controller until it is known to be
+    // alive.
+    if (!self)
+        return;
 
     // The attempt is over as far as the pool is concerned, so re-install the
     // very same policy with NOTHING armed. Both callbacks stay installed on
@@ -643,6 +667,8 @@ void AppController::startConnect(const QString& profileId,
         // error is dropped rather than shown.
         m_heldConnectError.clear();
         setConnectionState(QStringLiteral("hostkey"));
+        if (!self)
+            return;
         // displayFingerprint(), not the bare value: what leaves here is read by
         // a person and compared against ssh-keygen's output.
         emit hostKeyPrompt(m_pendingHostKeyInfo.first, m_pendingHostKeyInfo.second,
@@ -655,6 +681,8 @@ void AppController::startConnect(const QString& profileId,
         // reclassifying a private-key passphrase.
         m_heldConnectError.clear();
         setConnectionState(QStringLiteral("credential"));
+        if (!self)
+            return;
         emit credentialPrompt(m_credentialUser,
                               profile.value(QStringLiteral("host")).toString(),
                               m_credentialLabel,
@@ -680,6 +708,8 @@ void AppController::startConnect(const QString& profileId,
         m_heldConnectError.clear();
         emit error(held);
     }
+    if (!self)
+        return;
     setConnectionState(QStringLiteral("failed"), m_connectionError);
 }
 

@@ -36,6 +36,9 @@ private slots:
     void anAcceptedUnknownKeyIsTrustedAndPersisted();
     void aDeclinedUnknownKeyIsRefusedWithAnExplanation();
     void aPortedEndpointIsLookedUpAndStoredOpenSshStyle();
+    void aChangedKeyNeverReachesTheTrustPrompt();
+    void aRevokedKeyIsRefusedWithoutAsking();
+    void anAcceptedKeyThatCannotBeStoredSaysSo();
 #if CH_HAVE_LIBSSH
     void aDisconnectDuringHandshakeIsDeferredUntilTheCallReturns();
     void aNestedConnectDuringHandshakeIsRefusedWithAReason();
@@ -153,6 +156,113 @@ void TstSshConnectionPool::aPortedEndpointIsLookedUpAndStoredOpenSshStyle()
     // And it is NOT trust for the same host on the default port.
     QCOMPARE(pool.knownHosts().verify(kHost, kKeyType, kKeyBlob),
              KnownHosts::Verdict::Unknown);
+}
+
+// The header promises it and SPEC 12.1 depends on it: a CHANGED key is a hard
+// refusal, never a question. If it ever reached the callback the user would be
+// shown a trust prompt for a key that contradicts one they already approved —
+// which is exactly what a man-in-the-middle needs, since Accept is also the one
+// answer that persists the presented key into the store.
+void TstSshConnectionPool::aChangedKeyNeverReachesTheTrustPrompt()
+{
+    KnownHosts hosts;
+    hosts.add(kHost, kKeyType, kKeyBlob);
+
+    SshConnectionPool pool;
+    pool.setKnownHosts(hosts);
+    int prompts = 0;
+    pool.setHostKeyCallback([&prompts](const QString&, const QString&,
+                                       const QByteArray&, KnownHosts::Verdict) {
+        // Accept, deliberately: if the refusal ever leaked into the prompt, the
+        // most dangerous possible answer is the one that must not be reachable.
+        ++prompts;
+        return SshConnectionPool::HostKeyDecision::Accept;
+    });
+
+    // A changed key of the SAME type, and a key of a type this host was never
+    // trusted with — the downgrade route around the refusal.
+    QVERIFY(!pool.applyHostKeyPolicy(kHost, 22, kKeyType, kOtherKeyBlob));
+    QVERIFY(!pool.applyHostKeyPolicy(kHost, 22, QStringLiteral("ssh-rsa"),
+                                     kOtherKeyBlob));
+    QCOMPARE(prompts, 0);
+    // And neither refused key was recorded, whatever the callback would have
+    // answered.
+    QCOMPARE(pool.knownHosts().verify(kHost, kKeyType, kKeyBlob),
+             KnownHosts::Verdict::Match);
+    QCOMPARE(pool.knownHosts().verify(kHost, QStringLiteral("ssh-rsa"),
+                                      kOtherKeyBlob),
+             KnownHosts::Verdict::Mismatch);
+}
+
+// An administrator writes @revoked into known_hosts to make one key
+// unusable. The store answers Mismatch for it, so the pool must treat it as the
+// same hard refusal a changed key gets: reported, flagged as a mismatch, and
+// never offered to the user as a first-use decision.
+void TstSshConnectionPool::aRevokedKeyIsRefusedWithoutAsking()
+{
+    const KnownHosts hosts = KnownHosts::parse(
+        QStringLiteral("@revoked %1 %2 %3\n")
+            .arg(kHost, kKeyType, QString::fromUtf8(kKeyBlob.toBase64())));
+
+    SshConnectionPool pool;
+    pool.setKnownHosts(hosts);
+    int prompts = 0;
+    pool.setHostKeyCallback([&prompts](const QString&, const QString&,
+                                       const QByteArray&, KnownHosts::Verdict) {
+        ++prompts;
+        return SshConnectionPool::HostKeyDecision::Accept;
+    });
+    QSignalSpy errors(&pool, &SshConnectionPool::errorOccurred);
+    QSignalSpy mismatches(&pool, &SshConnectionPool::hostKeyMismatch);
+
+    QVERIFY(!pool.applyHostKeyPolicy(kHost, 22, kKeyType, kKeyBlob));
+    QCOMPARE(prompts, 0);
+    QCOMPARE(mismatches.size(), 1);
+    QCOMPARE(errors.size(), 1);
+
+    // A revocation grants no trust, so a DIFFERENT key at that host is still
+    // ordinary first use — the refusal must not make the host unconnectable.
+    QVERIFY(pool.applyHostKeyPolicy(kHost, 22, kKeyType, kOtherKeyBlob));
+    QCOMPARE(prompts, 1);
+}
+
+// The host token comes from the server profile, i.e. from whatever the user
+// typed, and KnownHosts::add() refuses anything that cannot round-trip as a
+// single known_hosts line. The connection is still the user's to make, but the
+// trust was not written down, and staying silent about that is what would make
+// the same prompt reappear on every launch for no visible reason.
+void TstSshConnectionPool::anAcceptedKeyThatCannotBeStoredSaysSo()
+{
+    // '*' is known_hosts pattern syntax, so this token can never be stored as a
+    // literal host name.
+    const QString unstorable = QStringLiteral("web*.example.test");
+
+    SshConnectionPool pool;
+    pool.setHostKeyCallback([](const QString&, const QString&,
+                               const QByteArray&, KnownHosts::Verdict) {
+        return SshConnectionPool::HostKeyDecision::Accept;
+    });
+    QSignalSpy errors(&pool, &SshConnectionPool::errorOccurred);
+
+    QVERIFY(pool.applyHostKeyPolicy(unstorable, 22, kKeyType, kKeyBlob));
+    // Accepting is not an error, so no banner is raised...
+    QCOMPARE(errors.size(), 0);
+    // ...but nothing was recorded, and the transcript says as much.
+    QVERIFY(pool.knownHosts().entries().isEmpty());
+    QVERIFY2(pool.diagnosticLog().contains(
+                 QStringLiteral("trusted for this session only")),
+             qPrintable(pool.diagnosticLog()));
+
+    // The ordinary case still records silently.
+    SshConnectionPool storable;
+    storable.setHostKeyCallback([](const QString&, const QString&,
+                                   const QByteArray&, KnownHosts::Verdict) {
+        return SshConnectionPool::HostKeyDecision::Accept;
+    });
+    QVERIFY(storable.applyHostKeyPolicy(kHost, 22, kKeyType, kKeyBlob));
+    QVERIFY2(!storable.diagnosticLog().contains(
+                 QStringLiteral("trusted for this session only")),
+             qPrintable(storable.diagnosticLog()));
 }
 
 #if CH_HAVE_LIBSSH

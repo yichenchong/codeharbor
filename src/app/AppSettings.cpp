@@ -132,15 +132,31 @@ QVariantMap readViewerDefaults(QSettings& settings)
     return clean;
 }
 
+// Every key a named property owns. Refusing '/' in a generic pair is NOT enough
+// to keep it away from these: group "appearance" and key "theme" carry no
+// separator at all, yet they compose to settings/appearance/theme exactly. A
+// generic write landing there would store a value the named setter would have
+// clamped or rejected outright, and would move the property WITHOUT emitting
+// its NOTIFY signal - so every binding on it would keep showing the old value
+// until something unrelated happened to re-read the store. The named
+// properties are the only way in or out of these keys.
+bool isReservedPath(const QString& path)
+{
+    return path == kThemeKey || path == kPaletteKey || path == kPaletteSizeKey
+           || path == kToolbarKey || path == kFontSizeKey
+           || path == kPixelRatioKey
+           || path.startsWith(kViewerDefaultsGroup + QLatin1Char('/'));
+}
+
 // A generic pair may not carry '/': the separator is what keeps one group's
 // keys inside its own subtree, and a key containing it could otherwise be spelt
-// so that it lands on one of the validated appearance keys above (and be
-// written without passing that key's validation).
+// so that it lands somewhere under `settings/` that this pair does not name.
 bool isAddressable(const QString& group, const QString& key)
 {
     return !group.isEmpty() && !key.isEmpty()
            && !group.contains(QLatin1Char('/'))
-           && !key.contains(QLatin1Char('/'));
+           && !key.contains(QLatin1Char('/'))
+           && !isReservedPath(kPrefix + group + QLatin1Char('/') + key);
 }
 
 } // namespace
@@ -370,16 +386,14 @@ void AppSettings::resetToDefaults()
 
     // The whole subtree, so the generic groups go too. Anything outside
     // `settings/` (UiStateStore's own keys share this file) is untouched.
+    // One list, shared with isAddressable(): two copies of "which keys a named
+    // property owns" would drift, and a key missing from this one would make
+    // resetToDefaults() announce a generic change that never happened.
     bool hadGeneric = false;
-    for (const QString& key : m_settings->allKeys()) {
-        if (!key.startsWith(kPrefix))
+    const QStringList allKeys = m_settings->allKeys();
+    for (const QString& key : allKeys) {
+        if (!key.startsWith(kPrefix) || isReservedPath(key))
             continue;
-        if (key == kThemeKey || key == kPaletteKey
-            || key == kPaletteSizeKey || key == kToolbarKey
-            || key == kFontSizeKey || key == kPixelRatioKey
-            || key.startsWith(kViewerDefaultsGroup + QLatin1Char('/'))) {
-            continue;
-        }
         hadGeneric = true;
         break;
     }
