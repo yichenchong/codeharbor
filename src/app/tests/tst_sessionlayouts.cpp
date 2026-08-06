@@ -172,6 +172,7 @@ private slots:
     void splitPersistsAndReloadsByteIdentical();
     void closeCollapsesBranchIntoSurvivor();
     void closeLastPaneYieldsEmptyLeaf();
+    void closeAndUrlEditsIgnoreEmptyPlaceholder();
     void ratiosPersistedAtNestedPath();
     void paneUrlPersistsWithoutRebuildingPanes();
     void paneTitlePersistsAndKeepsTerminalIdentity();
@@ -719,6 +720,25 @@ void TstSessionLayouts::closeLastPaneYieldsEmptyLeaf()
                          .value(QStringLiteral("tree")).toObject()),
              compact(bound));
     QCOMPARE(compact(asObject(layouts.terminalTree())), compact(bound));
+}
+
+void TstSessionLayouts::closeAndUrlEditsIgnoreEmptyPlaceholder()
+{
+    makePair();
+    SessionLayouts layouts(m_db, m_uiState);
+    layouts.setServerId(QStringLiteral("srv-1"));
+    completeLoad(layouts, QStringLiteral("s1"), layoutRow(leaf(QString())),
+                 layoutRow(leaf(QString())));
+    QSignalSpy errorSpy(&layouts, &SessionLayouts::error);
+
+    layouts.closePane(QStringLiteral("viewer"), QString());
+    layouts.setPaneUrl(QStringLiteral("viewer"), QString(),
+                       QStringLiteral("https://ignored.example"));
+
+    QCOMPARE(errorSpy.count(), 0);
+    QCOMPARE(compact(asObject(layouts.viewerTree())),
+             compact(leaf(QString())));
+    QVERIFY(noMoreRequests());
 }
 
 void TstSessionLayouts::ratiosPersistedAtNestedPath()

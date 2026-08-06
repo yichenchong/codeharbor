@@ -337,6 +337,7 @@ class TstSessionBootstrap : public QObject {
 private slots:
     void wiresAndReportsState();
     void initialConnectFailureDoesNotRetry();
+    void existingUnreadableKnownHostsFailsClosed();
     void unknownHostKeyIsNeverTrustedWithoutADecisionPolicy();
     void unattendedTrustDoesNotOutliveTheAttempt();
     void environmentTrustDoesNotLeakIntoAttendedConnect();
@@ -440,6 +441,23 @@ void TstSessionBootstrap::initialConnectFailureDoesNotRetry()
     QTest::qWait(50);
     QCOMPARE(h.boot.state(), State::Failed);
     QCOMPARE(h.boot.connectCalls, 1);
+}
+
+void TstSessionBootstrap::existingUnreadableKnownHostsFailsClosed()
+{
+    Harness h;
+    const QString path = h.dir.filePath(QStringLiteral("known_hosts"));
+    QVERIFY(QDir().mkpath(path));
+    h.boot.setKnownHostsPath(path);
+    QSignalSpy errorSpy(&h.boot, &SessionBootstrap::error);
+
+    QVERIFY2(!h.wire(),
+             "an existing unreadable trusted-host store was treated as empty");
+    QCOMPARE(h.boot.connectCalls, 0);
+    QCOMPARE(h.boot.state(), State::Failed);
+    QCOMPARE(errorSpy.size(), 1);
+    QVERIFY(errorSpy.at(0).at(0).toString().contains(
+        QStringLiteral("trusted-host store")));
 }
 
 // SPEC 12.1: an unknown host key is the USER's decision. A wire attempt that
@@ -579,6 +597,11 @@ void TstSessionBootstrap::channelLossReconnectsAndRewires()
     QPointer<FakeChannel> dead = h.boot.rpcChannel();
     QPointer<FakeChannel> deadAgent =
         static_cast<FakeChannel*>(h.boot.agentDevice());
+    QStringList notifications;
+    QObject::connect(&h.boot, &SessionBootstrap::stateChanged, &h.boot,
+                     [&notifications] { notifications.append(QStringLiteral("state")); });
+    QObject::connect(&h.boot, &SessionBootstrap::error, &h.boot,
+                     [&notifications] { notifications.append(QStringLiteral("error")); });
     QSignalSpy stateSpy(&h.boot, &SessionBootstrap::stateChanged);
     QSignalSpy wiredSpy(&h.boot, &SessionBootstrap::wired);
     QSignalSpy scheduleSpy(&h.boot, &SessionBootstrap::reconnectScheduled);
@@ -586,6 +609,8 @@ void TstSessionBootstrap::channelLossReconnectsAndRewires()
     dead->dropRemote();
 
     // Torn down at once, both sides, and armed for the first retry.
+    QCOMPARE(notifications, (QStringList{QStringLiteral("state"),
+                                         QStringLiteral("error")}));
     QCOMPARE(h.boot.state(), State::Reconnecting);
     QVERIFY(h.client.transport() == nullptr);
     QVERIFY(h.monitor.transport() == nullptr);

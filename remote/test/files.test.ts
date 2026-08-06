@@ -2031,3 +2031,47 @@ test("file methods reject a path containing a NUL character", async () => {
     assert.equal(base.code, RPC_INVALID_PARAMS);
     assert.match(base.message, /field 'base' must not contain a NUL character/);
 });
+// Normal SSH disconnect is stdin EOF, not necessarily a signal. Keep a real
+// polling watch open so this specifically proves EOF releases daemon handles
+// and reaches the same graceful exit path as SIGTERM/SIGHUP.
+test("stdin EOF shuts down the daemon with active watches", async () => {
+    const dir = await tmpDir();
+    const dbDir = await tmpDir();
+    const watched = path.join(dir, "eof.txt");
+    await fs.writeFile(watched, "one");
+    const child = spawn(process.execPath, [DAEMON_ENTRY, "rpc", "--stdio"], {
+        stdio: ["pipe", "pipe", "pipe"],
+        env: { ...process.env, CODEHARBOR_DB: path.join(dbDir, "codeharbor.sqlite") },
+    });
+    const lines: string[] = [];
+    child.stdout.on("data", (chunk: Buffer) => {
+        lines.push(...chunk.toString("utf8").split("\n").filter(Boolean));
+    });
+    const exited = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) => {
+        child.once("exit", (code, signal) => resolve({ code, signal }));
+    });
+    try {
+        child.stdin.write(
+            `${JSON.stringify({
+                jsonrpc: "2.0",
+                id: 8,
+                method: "file.watch",
+                params: { path: watched },
+            })}\n`,
+        );
+        await withTimeout(
+            (async () => {
+                while (!lines.some((line) => line.includes('"id":8'))) await delay(5);
+            })(),
+            20_000,
+        );
+        child.stdin.end();
+        const result = await withTimeout(exited, 20_000);
+        assert.equal(result.signal, null);
+        assert.equal(result.code, 0);
+    } finally {
+        if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+        await fs.rm(dir, { recursive: true, force: true });
+        await fs.rm(dbDir, { recursive: true, force: true });
+    }
+});

@@ -5,6 +5,7 @@ import os from "node:os";
 import fs from "node:fs";
 import path from "node:path";
 import { spawn } from "node:child_process";
+import { EventEmitter } from "node:events";
 import { fileURLToPath } from "node:url";
 import {
     emitHookEvent,
@@ -23,6 +24,7 @@ import {
     startBridge,
     makeStreamSink,
     MAX_BRIDGE_LINE_BYTES,
+    type EventSink,
 } from "../src/bridge.ts";
 
 test("toBridgeMessage wraps the raw native event without mapping", () => {
@@ -1217,4 +1219,87 @@ test("an over-long summary costs the summary, never the event (AG9)", async () =
     assert.match(logged[0], /exceeded the bridge line bound/);
     assert.match(logged[0], /OMP_SUMMARY and OMP_METADATA were dropped/);
     assert.match(logged[0], /state change was still delivered/);
+});
+
+// Draining one producer can synchronously deliver buffered input. The paused
+// set must be cleared BEFORE resume(), otherwise this second write is ignored
+// as "already paused" and the source is left flowing into a full output.
+test("a drain that immediately stalls again keeps the source paused (DM8)", () => {
+    const out = new EventEmitter() as unknown as NodeJS.WritableStream & {
+        write: (line: string) => boolean;
+    };
+    let writes = 0;
+    out.write = () => {
+        writes += 1;
+        return false;
+    };
+    let sink: EventSink;
+    const source: {
+        destroyed: boolean;
+        paused: boolean;
+        pauses: number;
+        resumes: number;
+        pause(): void;
+        resume(): void;
+        destroy(): void;
+        once(): void;
+    } = {
+        destroyed: false,
+        paused: false,
+        pauses: 0,
+        resumes: 0,
+        pause() {
+            this.paused = true;
+            this.pauses += 1;
+        },
+        resume() {
+            this.paused = false;
+            this.resumes += 1;
+            if (this.resumes === 1) sink(RELAY_EVENT, source as unknown as net.Socket);
+        },
+        destroy() {
+            this.destroyed = true;
+        },
+        once() {},
+    };
+    sink = makeStreamSink(out);
+    sink(RELAY_EVENT, source as unknown as net.Socket);
+    assert.equal(source.paused, true);
+    (out as unknown as EventEmitter).emit("drain");
+    assert.equal(writes, 2);
+    assert.equal(source.resumes, 1);
+    assert.equal(source.pauses, 2);
+    assert.equal(source.paused, true);
+});
+
+// Check every newline-delimited segment in a chunk. A long producer line
+// followed by a short valid line used to evade the old last-newline counter.
+test("an oversized line cannot hide before a later newline (DM6)", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ch-bridge-framing-"));
+    const socketPath = path.join(dir, "bridge.sock");
+    const relayed: AgentEvent[] = [];
+    const server = await startBridge(socketPath, (event) => relayed.push(event));
+    try {
+        const producer = net.createConnection(socketPath);
+        producer.on("error", () => {});
+        const connected = Promise.withResolvers<void>();
+        const closed = Promise.withResolvers<void>();
+        producer.once("connect", () => connected.resolve());
+        producer.once("close", () => closed.resolve());
+        await connected.promise;
+        const valid = JSON.stringify({
+            harness: "oh-my-pi",
+            devSessionId: "s",
+            terminalId: "t",
+            native: { type: "agent_start" },
+        });
+        producer.write(`${"x".repeat(MAX_BRIDGE_LINE_BYTES + 1)}\n${valid}\n`);
+        await closed.promise;
+        assert.deepEqual(relayed, []);
+    } finally {
+        const stopped = Promise.withResolvers<void>();
+        server.close(() => stopped.resolve());
+        await stopped.promise;
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
 });

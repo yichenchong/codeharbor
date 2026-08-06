@@ -663,20 +663,20 @@ void SessionBootstrap::handleConnectionLost(const QString& reason)
     if (m_pool)
         m_pool->disconnectFromHost();
     m_tearingDown = wasTearingDown;
-    emit error(reason);
-
     if (!m_reconnectEnabled) {
         setState(State::Disconnected);
-        return;
+    } else {
+        m_attempt = 0;
+        // A loss of a LIVE session is, by definition, not a cancelled attempt.
+        // The flag is scoped to one attempt but only cleared where an attempt
+        // STARTS, so a cancel that outlived its attempt would otherwise make
+        // scheduleReconnect() return without arming a retry.
+        m_cancelRequested = false;
+        scheduleReconnect();
     }
-    m_attempt = 0;
-    // A loss of a LIVE session is, by definition, not a cancelled attempt. The
-    // flag is scoped to one attempt but only cleared where an attempt STARTS,
-    // so a cancel that outlived its attempt would make scheduleReconnect()
-    // return here without arming anything - leaving the object reporting Wired
-    // with both devices already torn down and no path back.
-    m_cancelRequested = false;
-    scheduleReconnect();
+    // Publish the stable disconnected/reconnecting state before the diagnostic
+    // so observers can safely inspect the state from their error handlers.
+    emit error(reason);
 }
 
 void SessionBootstrap::disconnectSession()
@@ -1422,25 +1422,36 @@ bool SessionBootstrap::attemptWire()
     // path and live tests — and only when that caller has explicitly opted in
     // via setTrustUnknownHostKeys().
     KnownHosts hosts;
+    const QFileInfo storeInfo(m_knownHostsPath);
+    const bool storeExists = storeInfo.exists();
     QFile store(m_knownHostsPath);
-    if (store.open(QIODevice::ReadOnly | QIODevice::Text)) {
-        hosts = KnownHosts::parse(QString::fromUtf8(store.readAll()));
+    if (storeExists) {
+        if (!store.open(QIODevice::ReadOnly | QIODevice::Text)) {
+            emit error(QStringLiteral(
+                           "refusing to connect to %1:%2: could not read the "
+                           "trusted-host store %3 (%4)")
+                           .arg(m_host)
+                           .arg(m_port)
+                           .arg(m_knownHostsPath, store.errorString()));
+            return false;
+        }
+        const QByteArray contents = store.readAll();
+        if (store.error() != QFileDevice::NoError) {
+            emit error(QStringLiteral(
+                           "refusing to connect to %1:%2: could not read the "
+                           "trusted-host store %3 (%4)")
+                           .arg(m_host)
+                           .arg(m_port)
+                           .arg(m_knownHostsPath, store.errorString()));
+            return false;
+        }
+        hosts = KnownHosts::parse(QString::fromUtf8(contents));
         store.close();
         // Owner-only, on the way IN. This file is the whole record of which
         // server keys the user has approved, and an account that can WRITE it
         // inserts a key of its own and host verification stops meaning
         // anything - the presented key then matches, so nobody is ever asked.
-        // Qt leaves a file it creates at the umask default, which is 0644 on a
-        // typical box and 0664 wherever the user's primary group is shared, and
-        // QSaveFile below PRESERVES the mode of a file that already exists
-        // (measured) - so a store written loose once stays loose for ever, and
-        // repairing it only when a new key happens to be approved could be
-        // never. Best effort, exactly like ServerProfiles::restrictPermissions():
-        // a filesystem that cannot express it is not a reason to refuse to
-        // connect. The containing DIRECTORY is deliberately left alone; it may
-        // be one the caller named (CH_LIVE_KNOWN_HOSTS) and is not ours to
-        // relock, and a directory owned by this user admits no other account's
-        // writes anyway.
+        // Best effort, exactly like ServerProfiles::restrictPermissions().
         QFile::setPermissions(m_knownHostsPath,
                               QFile::ReadOwner | QFile::WriteOwner);
     }
