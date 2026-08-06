@@ -156,6 +156,7 @@ public:
     Q_INVOKABLE QString activeSession(const QString& serverId) const;
 
 private:
+    void ensureSchemaVersion();
     std::unique_ptr<QSettings> m_settings;
 };
 

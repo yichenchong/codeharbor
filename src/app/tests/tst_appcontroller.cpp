@@ -349,6 +349,7 @@ private slots:
     void toGroupRowsSubtitleHandlesTrailingSlashAndEmpty();
     void uiStateStoreDistinctAndSpecialIds();
     void uiStateStoreRegionWidthsPersistWithoutPerCallSync();
+    void uiStateStoreWritesSchemaVersion();
     void setServerIdRefreshesForNewServer();
     void setServerIdUnchangedDoesNotRefresh();
     void refreshUpdatesModelAndEmitsRefreshed();
@@ -645,6 +646,21 @@ void TstAppController::uiStateStoreRegionWidthsPersistWithoutPerCallSync()
     QCOMPARE(reopened.sidebarWidth(), 300);
     QCOMPARE(reopened.viewerWidth(), 0);
     QCOMPARE(reopened.terminalWidth(), 340);
+}
+
+void TstAppController::uiStateStoreWritesSchemaVersion()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QString iniPath = dir.filePath(QStringLiteral("schema.ini"));
+    {
+        UiStateStore store(iniPath);
+        store.setSelectedPane(QStringLiteral("session-1"),
+                              QStringLiteral("pane-1"));
+    }
+
+    QSettings raw(iniPath, QSettings::IniFormat);
+    QCOMPARE(raw.value(QStringLiteral("meta/schemaVersion")).toInt(), 1);
 }
 
 // setServerId to a new value must reload the sidebar from that server: nothing

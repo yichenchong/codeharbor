@@ -17,6 +17,8 @@ const QString kViewerKey = QStringLiteral("layout/viewerWidth");
 const QString kTerminalKey = QStringLiteral("layout/terminalWidth");
 const QString kPinnedOnlyKey = QStringLiteral("sidebar/pinnedOnly");
 const QString kShowArchivedKey = QStringLiteral("sidebar/showArchived");
+const QString kSchemaVersionKey = QStringLiteral("meta/schemaVersion");
+constexpr int kUiStateSchemaVersion = 1;
 // A stored value, or `fallback` when the key is absent, holds something that is
 // not a whole number, or is smaller than `minimum`.
 //
@@ -87,6 +89,13 @@ UiStateStore::UiStateStore(const QString& iniPath, QObject* parent)
             std::make_unique<QSettings>(iniPath, QSettings::IniFormat);
     }
 }
+void UiStateStore::ensureSchemaVersion()
+{
+    if (storedInt(*m_settings, kSchemaVersionKey, 0, 0)
+        == kUiStateSchemaVersion)
+        return;
+    m_settings->setValue(kSchemaVersionKey, kUiStateSchemaVersion);
+}
 
 UiStateStore::~UiStateStore() = default;
 
@@ -104,6 +113,7 @@ void UiStateStore::setRegionWidths(int sidebar, int viewer, int terminal)
     const int storedSidebar = std::max(1, sidebar);
     const int storedViewer = std::max(0, viewer);
     const int storedTerminal = std::max(1, terminal);
+    ensureSchemaVersion();
     m_settings->setValue(kSidebarKey, storedSidebar);
     m_settings->setValue(kViewerKey, storedViewer);
     m_settings->setValue(kTerminalKey, storedTerminal);
@@ -133,6 +143,7 @@ void UiStateStore::setPinnedOnly(bool pinnedOnly)
     // timestamp precisely to prove a no-op launch leaves it alone.
     if (pinnedOnly == this->pinnedOnly())
         return;
+    ensureSchemaVersion();
     m_settings->setValue(kPinnedOnlyKey, pinnedOnly);
     // A discrete toolbar choice, not a drag stream; flush it before returning
     // so a restart cannot reopen the sidebar in the wrong mode after the
@@ -152,6 +163,7 @@ void UiStateStore::setShowArchived(bool showArchived)
     // before returning so an immediate restart keeps the user's choice.
     if (showArchived == this->showArchived())
         return;
+    ensureSchemaVersion();
     m_settings->setValue(kShowArchivedKey, showArchived);
     m_settings->sync();
 }
@@ -177,6 +189,7 @@ void UiStateStore::setSelectedPane(const QString& devSessionId,
     // disk per focus change.
     if (paneId == selectedPane(devSessionId))
         return;
+    ensureSchemaVersion();
     m_settings->setValue(selectedPaneKey(devSessionId), paneId);
     m_settings->sync();
 }
@@ -206,6 +219,7 @@ void UiStateStore::setNextPaneSuffix(const QString& devSessionId,
     // one rather than something every reader has to keep patching up.
     if (suffix < kFirstPaneSuffix)
         return;
+    ensureSchemaVersion();
     m_settings->setValue(paneSuffixKey(devSessionId, region), suffix);
     // sync() here, unlike setRegionWidths(): this is called once per pane
     // created (not once per mouse move), and a counter lost to a crash before
@@ -236,6 +250,7 @@ void UiStateStore::setActiveSession(const QString& serverId,
     // the write and its flush when nothing moved.
     if (devSessionId == activeSession(serverId))
         return;
+    ensureSchemaVersion();
     m_settings->setValue(activeSessionKey(serverId), devSessionId);
     m_settings->sync();
 }
