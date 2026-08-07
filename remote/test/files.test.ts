@@ -15,7 +15,6 @@ import {
     resolvePath,
     listDirectory,
     assertListingFits,
-    getMimeType,
     revisionFrom,
     isRevisionMismatch,
     fileWatchService,
@@ -337,10 +336,6 @@ test("listDirectory (RPC) sorts entries, includes hidden files, and classifies t
     assert.equal(byName["readme.md"], "file");
     assert.equal(byName["sub"], "directory");
     assert.equal(byName[".hidden"], "file");
-
-    assert.equal(getMimeType("a/b/readme.md"), "text/markdown");
-    assert.equal(getMimeType("photo.PNG"), "image/png");
-    assert.equal(getMimeType("mystery.xyz"), "application/octet-stream");
 
     // revisionFrom folds mtime, ctime, inode, and size so a same-size edit
     // within one mtime tick still changes the token (SPEC 8.6).

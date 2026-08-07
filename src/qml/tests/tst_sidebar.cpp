@@ -892,7 +892,7 @@ void TstSidebar::hintsAreDrawnInTheApplicationsOwnPalette()
     const Site sites[] = {
         { "newGroupButton", "newGroupButtonTip" },
         { "newSessionButton:g1", "newSessionButtonTip:g1" },
-        { "sessionRow:s1", "sessionRowTip" },
+        { "sessionRow:s1", "sessionRowTip:s1" },
     };
 
     for (const Site &site : sites) {

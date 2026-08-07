@@ -4,8 +4,10 @@
 // minted here server-side; clients never parse them. Writes are revision-guarded
 // (SPEC 8.4) and atomic (SPEC 8.5). Watching uses fs.watch with a polling
 // fallback and an EventEmitter sink so codeharbord can relay WatchEvents as
-// JSON-RPC notifications. getMimeType stays an internal helper (the client
-// resolves viewer types by extension in ViewerHandlerRegistry).
+// JSON-RPC notifications. Nothing here maps a file to a MIME type: the client
+// picks a viewer by extension in ViewerHandlerRegistry, and the one page that
+// needs a real content type asks Qt's own MIME database
+// (src/viewers/InternalUrlSchemeHandler.cpp).
 
 import { promises as fsp, watch as fsWatch, constants as fsConstants } from "node:fs";
 import type { Dirent, FSWatcher, Stats } from "node:fs";
@@ -1150,7 +1152,7 @@ export class FileWatchService {
 export const fileWatchService = new FileWatchService();
 
 // listDirectory (SPEC 7.5) is a registered RPC method (added after the initial
-// six for the viewer workstream). getMimeType below stays an internal helper.
+// six for the viewer workstream).
 
 // Fixed JSON overhead of one DirectoryEntry: `{"name":,"kind":"directory"},` —
 // the quotes around the name are counted by the JSON.stringify call below, and
@@ -1268,32 +1270,6 @@ export async function listDirectory(
         );
     }
     return { path: params.path, entries };
-}
-
-const MIME_TYPES: Record<string, string> = {
-    ".ts": "text/typescript",
-    ".tsx": "text/typescript",
-    ".js": "text/javascript",
-    ".mjs": "text/javascript",
-    ".json": "application/json",
-    ".md": "text/markdown",
-    ".html": "text/html",
-    ".css": "text/css",
-    ".txt": "text/plain",
-    ".yaml": "text/yaml",
-    ".yml": "text/yaml",
-    ".toml": "text/toml",
-    ".png": "image/png",
-    ".jpg": "image/jpeg",
-    ".jpeg": "image/jpeg",
-    ".gif": "image/gif",
-    ".svg": "image/svg+xml",
-    ".webp": "image/webp",
-    ".pdf": "application/pdf",
-};
-
-export function getMimeType(filePath: string): string {
-    return MIME_TYPES[path.extname(filePath).toLowerCase()] ?? "application/octet-stream";
 }
 
 // --- RPC handler table ------------------------------------------------------

@@ -40,6 +40,11 @@ public:
     bool nativeEventFilter(const QByteArray &eventType, void *message,
                            qintptr *result) override;
 
+    // Watches the registered window for its native handle being destroyed and
+    // recreated. Windows does that on its own — see the definition — and every
+    // other member here is keyed on the cached handle.
+    bool eventFilter(QObject *watched, QEvent *event) override;
+
 private:
     void installShellStyles(QWindow *window);
     QRect maximizeButtonRect() const;

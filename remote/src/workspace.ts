@@ -1303,6 +1303,11 @@ export class Workspace {
     // told the second attempt failed.
     deleteGroup(params: { id: string }): { ok: true } {
         return this.transaction(() => {
+            // Read the owning server BEFORE the row goes, so the scope whose
+            // positions need closing up afterwards can still be named.
+            const row = this.db
+                .prepare("SELECT server_id FROM groups WHERE id = ?")
+                .get(params.id) as { server_id: string } | undefined;
             for (const table of ["viewer_panes", "terminal_panes", "session_layouts"] as const) {
                 this.db
                     .prepare(
@@ -1312,6 +1317,11 @@ export class Workspace {
             }
             this.db.prepare("DELETE FROM dev_sessions WHERE group_id = ?").run(params.id);
             this.db.prepare("DELETE FROM groups WHERE id = ?").run(params.id);
+            // Only when the group was really there: the no-op delete above
+            // changed nothing, so there is no hole and nothing to stamp. The
+            // deleted group's own sessions and panes need no repacking — their
+            // whole scope went with it.
+            if (row) this.repackScope("groups", "server_id", row.server_id, Date.now());
             return { ok: true } as const;
         });
     }
@@ -1407,9 +1417,16 @@ export class Workspace {
         });
     }
 
+    // Deleting a session that is not there is a successful no-op, for the same
+    // reason deleteGroup's is.
     deleteSession(params: { id: string }): { ok: true } {
         return this.transaction(() => {
+            // Read the owning group BEFORE the row goes — see deleteGroup.
+            const row = this.db
+                .prepare("SELECT group_id FROM dev_sessions WHERE id = ?")
+                .get(params.id) as { group_id: string } | undefined;
             this.deleteSessionRows(params.id);
+            if (row) this.repackScope("dev_sessions", "group_id", row.group_id, Date.now());
             return { ok: true } as const;
         });
     }
@@ -1712,15 +1729,19 @@ export class Workspace {
     // Deleting a pane that is not there is a successful no-op (nothing to
     // delete, and no session to repair layouts for), on purpose: a client
     // retrying after a dropped connection must not be told its second attempt
-    // failed. Both regions are repaired against ONE timestamp, so a delete that
-    // touches both leaves them agreeing on when it happened.
+    // failed. The layout repair and the position repack share ONE timestamp, so
+    // a delete that touches both leaves them agreeing on when it happened.
     deleteViewerPane(params: { id: string }): { ok: true } {
         return this.transaction(() => {
             const row = this.db
                 .prepare("SELECT dev_session_id FROM viewer_panes WHERE id = ?")
                 .get(params.id) as { dev_session_id: string } | undefined;
+            const ts = Date.now();
             this.db.prepare("DELETE FROM viewer_panes WHERE id = ?").run(params.id);
-            if (row) this.repairLayoutsForPane(row.dev_session_id, params.id, Date.now());
+            if (row) {
+                this.repairLayoutsForPane(row.dev_session_id, params.id, ts);
+                this.repackScope("viewer_panes", "dev_session_id", row.dev_session_id, ts);
+            }
             return { ok: true } as const;
         });
     }
@@ -1923,15 +1944,20 @@ export class Workspace {
     // session so no leaf still references it. Layout trees are client-authored,
     // so a malformed client can put a terminal id in the viewer region; the
     // server's integrity guarantee must cover both regions. Deleting a pane
-    // that is not there is a successful no-op, and both regions are repaired
-    // against one timestamp — see deleteViewerPane for both.
+    // that is not there is a successful no-op, both regions are repaired, and
+    // the position gap is closed — all against one timestamp; see
+    // deleteViewerPane for each.
     deleteTerminalPane(params: { id: string }): { ok: true } {
         return this.transaction(() => {
             const row = this.db
                 .prepare("SELECT dev_session_id FROM terminal_panes WHERE id = ?")
                 .get(params.id) as { dev_session_id: string } | undefined;
+            const ts = Date.now();
             this.db.prepare("DELETE FROM terminal_panes WHERE id = ?").run(params.id);
-            if (row) this.repairLayoutsForPane(row.dev_session_id, params.id, Date.now());
+            if (row) {
+                this.repairLayoutsForPane(row.dev_session_id, params.id, ts);
+                this.repackScope("terminal_panes", "dev_session_id", row.dev_session_id, ts);
+            }
             return { ok: true } as const;
         });
     }
@@ -2320,6 +2346,33 @@ export class Workspace {
             if (positions.get(id) === index) return;
             stmt.run(index, ts, id, scopeValue);
         });
+    }
+
+    // Close the gap a delete leaves in an ordered scope. Callers must already be
+    // inside a transaction.
+    //
+    // A scope is supposed to hold contiguous positions 0..n-1 (see packOrder),
+    // and creates and reorders both keep that promise. Deletes did not: the row
+    // was removed and the hole stayed, while every later create claimed
+    // nextPosition, i.e. MAX+1. A scope that is added to and deleted from over
+    // and over therefore drifted further from the contract with every cycle and
+    // its position numbers climbed without bound. Nothing reads a position
+    // directly — every listing is ORDER BY position, id — which is why this was
+    // survivable rather than visible, but "contiguous" was a promise only two of
+    // the three writers kept.
+    //
+    // Requesting no particular order is the whole point: packOrder keeps the
+    // current relative order of every row the caller did not list, so an empty
+    // request renumbers the scope exactly as it already reads. It still writes
+    // only the rows whose position actually changes, so the rows in front of the
+    // hole keep their updated_at and the client is not told they changed.
+    private repackScope<T extends OrderedTable>(
+        table: T,
+        scopeColumn: OrderedScope[T],
+        scopeValue: string,
+        ts: number,
+    ): void {
+        this.packOrder(table, scopeColumn, scopeValue, [], ts);
     }
 
     // Next free position in a scope: one past the current maximum, so the first

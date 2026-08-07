@@ -105,7 +105,10 @@ ItemDelegate {
     // form is drawn by the Basic style in that style's own light palette, so a
     // hint about this dark sidebar arrived as a white box.
     AppToolTip {
-        objectName: "sessionRowTip"
+        // Suffixed with the row id, like every other per-row tooltip in this
+        // file: several rows are realised at once, so a bare name would let a
+        // findChild() lookup answer with an arbitrary one of them.
+        objectName: "sessionRowTip:" + row.itemId
         // Long enough that crossing the row on the way somewhere else does not
         // flash it.
         delay: 600

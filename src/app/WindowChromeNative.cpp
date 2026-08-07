@@ -6,6 +6,8 @@
 #include <QWindow>
 
 #ifdef Q_OS_WIN
+#  include <QEvent>
+#  include <QPlatformSurfaceEvent>
 #  include <QtMath>
 #  include <windowsx.h>
 #endif
@@ -48,6 +50,10 @@ void WindowChromeNative::registerMaximizeButton(QObject *window, QObject *button
     clear();
     m_window = nextWindow;
     m_button = nextButton;
+    // Watch the window itself, not just the message queue: the handle cached on
+    // the next line stops being the window's handle if Windows recreates it,
+    // and eventFilter() is where that is noticed.
+    nextWindow->installEventFilter(this);
     m_hwnd = reinterpret_cast<HWND>(nextWindow->winId());
     installShellStyles(nextWindow);
     setNativeButtonState(false, false);
@@ -61,6 +67,8 @@ void WindowChromeNative::clear()
 {
 #ifdef Q_OS_WIN
     setNativeButtonState(false, false);
+    if (m_window)
+        m_window->removeEventFilter(this);
     m_window = nullptr;
     m_button = nullptr;
     m_hwnd = nullptr;
@@ -101,6 +109,54 @@ void WindowChromeNative::installShellStyles(QWindow *window)
                          | SWP_NOACTIVATE);
     }
     m_stylesInstalled = true;
+}
+
+// Keep the cached HWND honest across a native handle being recreated.
+//
+// A QWindow and its Win32 handle are not the same lifetime. Windows destroys
+// and recreates the handle behind a living QWindow in ordinary circumstances —
+// changing a window flag is enough — and the replacement is a different HWND.
+// Everything in this class is keyed on the cached one: nativeEventFilter drops
+// every message whose hwnd does not match, so a stale cache silently switches
+// the maximise hit-test and the Windows 11 Snap Layouts flyout off for the rest
+// of the session, and maximizeButtonRect() would ask Windows about a handle
+// that no longer exists. The QPointer above covers the QWindow dying; it says
+// nothing about the handle underneath it.
+//
+// The surface event is the honest place to notice, and the only cheap one.
+// Re-reading winId() from inside the message filter is not an option: winId()
+// CREATES the platform window when there is none, which is the last thing to do
+// from inside a message loop. QEvent::PlatformSurface is delivered around
+// exactly the two moments that matter, and at each of them the answer is
+// already settled.
+//
+// This never consumes the event: it only observes, and Qt's own handling of a
+// surface being created or destroyed must still run.
+bool WindowChromeNative::eventFilter(QObject *watched, QEvent *event)
+{
+    if (watched == m_window && event->type() == QEvent::PlatformSurface) {
+        switch (static_cast<QPlatformSurfaceEvent *>(event)->surfaceEventType()) {
+        case QPlatformSurfaceEvent::SurfaceAboutToBeDestroyed:
+            // Let go of the handle while it is still valid rather than after.
+            // Dropping m_stylesInstalled with it matters too: the hit-test
+            // answers HTCLIENT on the strength of that flag, and a window with
+            // no surface has no styles installed on anything.
+            setNativeButtonState(false, false);
+            m_hwnd = nullptr;
+            m_stylesInstalled = false;
+            m_nativeDown = false;
+            break;
+        case QPlatformSurfaceEvent::SurfaceCreated:
+            // The surface exists by now, so winId() inside installShellStyles()
+            // reads the new handle instead of creating one. The replacement
+            // window does not carry the shell styles either, so re-caching the
+            // handle and re-applying them is one call.
+            installShellStyles(m_window);
+            setNativeButtonState(false, false);
+            break;
+        }
+    }
+    return QObject::eventFilter(watched, event);
 }
 
 QRect WindowChromeNative::maximizeButtonRect() const

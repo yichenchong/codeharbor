@@ -948,6 +948,132 @@ test("session ordering stays tie-free and stable across repeated reads after mov
     await cleanup(dbPath);
 });
 
+// --- Deletes close the gap they leave ---------------------------------------
+//
+// Positions in one scope are meant to be 0..n-1. Creates and reorders always
+// kept that; deletes used to leave a hole, and because every later create takes
+// MAX+1, a scope that is added to and deleted from repeatedly drifted further
+// from the contract each time and its numbers climbed without bound.
+
+test("deleting a session closes the gap and leaves the rows in front of it alone", async () => {
+    const dbPath = await tmpDbPath();
+    const ws = openWorkspace(dbPath);
+    const group = ws.createGroup({ serverId: SERVER, name: "Alpha" });
+    const a0 = mkSession(ws, group.id, "A0");
+    const a1 = mkSession(ws, group.id, "A1");
+    const a2 = mkSession(ws, group.id, "A2");
+    assert.deepEqual(ordered(ws, group.id), { names: ["A0", "A1", "A2"], positions: [0, 1, 2] });
+
+    // `updated_at` is the change marker a client watches, and which rows carry a
+    // new one after the delete is the whole point of this test, so it is read
+    // straight out of the table rather than through the listing.
+    const stampOf = (id: string): number => {
+        const row = ws.db
+            .prepare("SELECT updated_at FROM dev_sessions WHERE id = ?")
+            .get(id) as { updated_at: number };
+        return row.updated_at;
+    };
+    const a0Stamp = stampOf(a0.id);
+    const a2Stamp = stampOf(a2.id);
+
+    ws.deleteSession({ id: a1.id });
+
+    // The hole is closed, not left with A2 sitting on position 2.
+    assert.deepEqual(ordered(ws, group.id), { names: ["A0", "A2"], positions: [0, 1] });
+    // A0 did not move, so the client is not told it changed. A2 did move, and a
+    // position is part of what a client reads, so it is stamped exactly as an
+    // ordinary reorder would stamp it.
+    assert.equal(stampOf(a0.id), a0Stamp);
+    assert.ok(stampOf(a2.id) >= a2Stamp);
+
+    // The freed slot is reused rather than skipped: without the repack the new
+    // row would take MAX+1 and land on 3.
+    const a3 = mkSession(ws, group.id, "A3");
+    assert.equal(a3.position, 2);
+    assert.deepEqual(ordered(ws, group.id), { names: ["A0", "A2", "A3"], positions: [0, 1, 2] });
+
+    ws.close();
+    await cleanup(dbPath);
+});
+
+test("deleting a group closes the gap among the server's groups", async () => {
+    const dbPath = await tmpDbPath();
+    const ws = openWorkspace(dbPath);
+    const alpha = ws.createGroup({ serverId: SERVER, name: "Alpha" });
+    const beta = ws.createGroup({ serverId: SERVER, name: "Beta" });
+    ws.createGroup({ serverId: SERVER, name: "Gamma" });
+    // A session under the doomed group, so this really is the multi-table delete
+    // and not one row quietly going away.
+    mkSession(ws, beta.id, "B0");
+    assert.deepEqual(
+        ws.list(SERVER).map((g) => [g.name, g.position]),
+        [["Alpha", 0], ["Beta", 1], ["Gamma", 2]],
+    );
+
+    ws.deleteGroup({ id: beta.id });
+    assert.deepEqual(
+        ws.list(SERVER).map((g) => [g.name, g.position]),
+        [["Alpha", 0], ["Gamma", 1]],
+    );
+
+    // Deleting something that is not there stays a no-op: no hole was made, so
+    // no row may be renumbered and no row may be stamped either.
+    const before = ws.db
+        .prepare("SELECT id, position, updated_at FROM groups ORDER BY position")
+        .all() as unknown as Array<{ id: string; position: number; updated_at: number }>;
+    ws.deleteGroup({ id: beta.id });
+    const after = ws.db
+        .prepare("SELECT id, position, updated_at FROM groups ORDER BY position")
+        .all() as unknown as Array<{ id: string; position: number; updated_at: number }>;
+    assert.deepEqual(after, before);
+    assert.equal(ws.list(SERVER)[0]?.id, alpha.id);
+
+    ws.close();
+    await cleanup(dbPath);
+});
+
+test("deleting a pane closes the gap among its session's panes", async () => {
+    const dbPath = await tmpDbPath();
+    const ws = openWorkspace(dbPath);
+    const group = ws.createGroup({ serverId: SERVER, name: "Alpha" });
+    const session = mkSession(ws, group.id, "A0");
+    const viewers = ["one", "two", "three"].map((name) =>
+        ws.createViewerPane({
+            serverId: SERVER,
+            devSessionId: session.id,
+            url: `file:///repo/${name}`,
+            handler: "text",
+        }),
+    );
+    assert.deepEqual(
+        (ws.list(SERVER)[0]?.sessions[0]?.viewerPanes ?? []).map((p) => p.position),
+        [0, 1, 2],
+    );
+
+    ws.deleteViewerPane({ id: viewers[0]!.id });
+    assert.deepEqual(
+        (ws.list(SERVER)[0]?.sessions[0]?.viewerPanes ?? []).map((p) => p.position),
+        [0, 1],
+    );
+
+    // The terminal region has its own delete, and it had the same hole.
+    const terminals = ["t1", "t2"].map((name) =>
+        ws.createTerminalPane({ serverId: SERVER, devSessionId: session.id, name }),
+    );
+    assert.deepEqual(
+        (ws.list(SERVER)[0]?.sessions[0]?.terminalPanes ?? []).map((p) => p.position),
+        [0, 1],
+    );
+    ws.deleteTerminalPane({ id: terminals[0]!.id });
+    assert.deepEqual(
+        (ws.list(SERVER)[0]?.sessions[0]?.terminalPanes ?? []).map((p) => p.position),
+        [0],
+    );
+
+    ws.close();
+    await cleanup(dbPath);
+});
+
 // --- Server identity (SPEC 3.5) ---------------------------------------------
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;

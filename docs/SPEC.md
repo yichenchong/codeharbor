@@ -1025,11 +1025,13 @@ createDirectory(path)
 rename(source, destination)
 copy(source, destination)
 delete(path)
-getMimeType(path)
 ```
 
-`getMimeType` is currently an internal server helper; the client resolves
-viewer types through its handler registry.
+There is no MIME-type call, and none is planned. The client picks a viewer by
+file extension in `ViewerHandlerRegistry`, and the one place a real content type
+is needed — serving bytes to the embedded browser — reads it from Qt's own MIME
+database in `src/viewers/InternalUrlSchemeHandler.cpp`. A server-side table
+existed for a while and was never called by anything; it has been removed.
 
 ### 8.4 Revision Tokens
 
