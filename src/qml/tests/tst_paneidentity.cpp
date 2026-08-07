@@ -97,6 +97,14 @@ Window {
     function regionItem() { return regionLoader.item }
     function setNode(n) { if (regionLoader.item) regionLoader.item.node = n }
 
+    // Destroy the component under test WITHOUT destroying this window. A test
+    // that wants to prove something about a view's teardown wants exactly this
+    // much torn down; dropping the whole window instead also destroys the last
+    // WebEngineView in the process and then rebuilds one in the next test, and
+    // that sequence is fragile in Qt 6.9's WebEngine (a repeatable crash on
+    // every CI platform, which never reproduced against 6.10 locally).
+    function unloadRegion() { regionLoader.active = false }
+
     // The pane's WebEngineView, found structurally: the pane keeps it inside a
     // Loader with no objectName, and a test has no business editing that.
     function findView(item) {
@@ -3041,8 +3049,12 @@ void TstPaneIdentity::theMarkdownViewPinsEachImageAddressExactlyOnce()
     QCOMPARE(resolve(QStringLiteral("#anchor")), QString());
     QCOMPARE(map.retainedCount(), pinnedBefore + 3);
 
-    // Every pin is given back when the view goes away.
-    m_shell.reset();
+    // Every pin is given back when the VIEW goes away — so take away the view,
+    // not the window it happens to be sitting in. The window is torn down by
+    // cleanup() like every other test's, which keeps this test's exit from
+    // being the one shape of teardown no other test in this file performs.
+    QVERIFY(QMetaObject::invokeMethod(m_shell.get(), "unloadRegion"));
+    m_region = nullptr;
     QTRY_COMPARE(map.retainedCount(), pinnedBefore);
 }
 

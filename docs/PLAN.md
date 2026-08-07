@@ -145,7 +145,10 @@ graph TD
   - **TODO:** [x] file methods (`stat/readFile/writeFile/resolvePath`) with
     revision tokens (SPEC 8.4) + atomic save (SPEC 8.5); [x] `watch`/`unwatch`
     (fs.watch + poll fallback); [x] `listDirectory` (RPC, schema v2, for viewers)
-    + `getMimeType` (internal helper); [x] `workspace.*` (with P); [x] `tmux.*`
+    — a `getMimeType` helper was written alongside it and later removed, because
+    nothing ever called it (the client picks a viewer by extension, and Qt's own
+    MIME database answers the one place a content type is needed);
+    [x] `workspace.*` (with P); [x] `tmux.*`
     discovery (`listSessions`/`sessionExists`/`killSession`), with absent tmux
     treated as an empty/false result.
   - **Stop gate:** [x] MET — `node --test` covers revision-mismatch rejection,
