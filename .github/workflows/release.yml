@@ -30,9 +30,11 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  # Must be >= the CMake floor (6.9). 6.8.1 predates
-  # QQuickWebEngineProfile(storageName, parent) and does not compile.
-  QT_VERSION: "6.9.*"
+  # Must be >= the CMake floor (6.10). 6.8.1 predates
+  # QQuickWebEngineProfile(storageName, parent) and does not compile; 6.9
+  # compiles but segfaults when a viewer pane swaps handlers while a page is
+  # still loading (see the floor comment in CMakeLists.txt).
+  QT_VERSION: "6.10.*"
 
 jobs:
   build:

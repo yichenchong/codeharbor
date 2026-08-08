@@ -203,7 +203,7 @@ Full environment setup (all platforms, exact packages, troubleshooting) is in
 
 ### Client (Qt / CMake)
 
-Requires Qt 6.9+, a C++20 compiler, CMake 3.25+, Ninja, and libssh.
+Requires Qt 6.10+, a C++20 compiler, CMake 3.25+, Ninja, and libssh.
 
 ```bash
 npm install                   # once: builds need the web-asset workspaces

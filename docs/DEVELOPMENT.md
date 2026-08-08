@@ -17,7 +17,7 @@ This stack has been confirmed to configure, build, and link the full tree
 | C++ compiler | GCC 15.2 | C++20 (GCC 12+/Clang 15+) |
 | CMake | 4.2.3 | 3.25 (CMakePresets schema v6) |
 | Ninja | 1.13.2 | any |
-| Qt 6 | 6.10.2 | 6.9 |
+| Qt 6 | 6.10.2 | 6.10 |
 | libssh | 0.11.3 (verified runtime) | audited runtime floor 0.11.2; exactly 0.12.0 is warned about and worked around |
 | Node.js | 24.16 | 23.6 (native TS type-stripping) |
 
@@ -25,9 +25,24 @@ The Windows release uses the separate in-tree vcpkg overlay, pinned to libssh
 0.12.2. That overlay pin does not change the runtime floor for ordinary Linux
 and macOS builds, which use libssh 0.11.2 or newer.
 
-The CMake floor is Qt **6.9**; newer (6.10 here) works unchanged. 6.9 is not a
-guess: it is the first release with `QQuickWebEngineProfile(storageName, parent)`,
-and CI builds and runs the portable suite on 6.9 to keep the claim honest.
+The CMake floor is Qt **6.10**, and CI builds and runs the portable suite on
+6.10 to keep the claim honest. The floor was 6.9 until a crash forced it up:
+
+- 6.9 is the first release with `QQuickWebEngineProfile(storageName, parent)`,
+  the only profile-creation form that does not emit a deprecation warning the
+  QML load test treats as a failure, so 6.8 and older do not build at all.
+- 6.9 builds but **segfaults when a viewer pane swaps handlers while its page is
+  still loading** - the ordinary "Open as" action on a slow or large file.
+  Destroying a `WebEngineView` with a navigation still outstanding leaves
+  Chromium to deliver the navigation decision afterwards, and
+  `QQuickWebEngineViewPrivate::navigationRequested()` then wraps it for
+  JavaScript through the QML engine the dead view no longer has, so
+  `QJSEngine::newQObject()` dereferences null. It reproduces deterministically
+  on 6.9.3 (`tst_paneidentity anUnrelatedRepublishKeepsAnOpenAsChoice`, ~1.4 s)
+  and is absent on 6.10 in Debug, Release and under AddressSanitizer. No
+  client-side mitigation exists: QML cannot give a dying object an engine, and
+  `WebEngineView::stop()` on the still-live outgoing view was measured and does
+  not prevent the callback.
 
 **libssh 0.12.0 cannot complete a handshake against a modern sshd.** Its hybrid
 ML-KEM key exchange (`mlkem768x25519-sha256`, first in libssh's own default list)

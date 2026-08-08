@@ -22,8 +22,8 @@ concurrency:
 
 env:
   # One Qt line for the whole workflow, kept equal to release.yml's QT_VERSION
-  # and >= the CMake floor (6.9): CI must compile what the release builds.
-  QT_VERSION: "6.9.*"
+  # and >= the CMake floor (6.10): CI must compile what the release builds.
+  QT_VERSION: "6.10.*"
 
 jobs:
   remote:

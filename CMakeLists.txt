@@ -86,15 +86,29 @@ endif()
 option(CODEHARBOR_TEST_MINIMAL_DEBUGINFO
        "Compile tst_* with -g1 (line tables only, no local variables) for faster test builds" OFF)
 
-# Qt 6.9+ is required: QQuickWebEngineProfile's (storageName, parent) constructor
-# arrived in 6.9, and it is the only profile-creation form that does not emit the
-# "use WebEngineProfilePrototype" deprecation warning that tst_qmlload treats as a
-# failure. 6.6/6.8 do not compile (see src/viewers/ViewerProfiles.cpp).
+# Qt 6.10+ is required. Two independent reasons:
+#
+# 1. QQuickWebEngineProfile's (storageName, parent) constructor arrived in 6.9,
+#    and it is the only profile-creation form that does not emit the
+#    "use WebEngineProfilePrototype" deprecation warning that tst_qmlload treats
+#    as a failure. 6.6/6.8 do not compile (see src/viewers/ViewerProfiles.cpp).
+# 2. Qt 6.9 crashes when a WebEngineView is destroyed while one of its
+#    navigations is still outstanding: Chromium delivers the navigation decision
+#    afterwards and QQuickWebEngineViewPrivate::navigationRequested() wraps it
+#    for JavaScript through the QML engine the dead view no longer has, so
+#    QJSEngine::newQObject() dereferences null. The viewer panes hit this every
+#    time the user picks "Open as" on a page that has not finished loading
+#    (reproduced deterministically on 6.9.3 by tst_paneidentity's
+#    anUnrelatedRepublishKeepsAnOpenAsChoice). Nothing in QML can hand a dying
+#    object an engine or cancel a decision Chromium already dispatched -
+#    WebEngineView::stop() on the live outgoing view was measured and does not
+#    prevent it - so the floor is the fix. 6.10 is clean in Debug, Release and
+#    under AddressSanitizer.
 #
 # The list is exactly what the tree links. Qt6::Sql is deliberately absent: all
 # persistence goes through codeharbord over RPC (SPEC 11.2), so the client owns
 # no local database and nothing links Qt6::Sql (see src/persistence/CMakeLists.txt).
-find_package(Qt6 6.9 REQUIRED COMPONENTS
+find_package(Qt6 6.10 REQUIRED COMPONENTS
     Core
     Gui
     Quick
@@ -109,10 +123,10 @@ find_package(Qt6 6.9 REQUIRED COMPONENTS
 # behind `if(CODEHARBOR_BUILD_TESTS)`. Requiring it unconditionally made the
 # tests-off release configure fail on a Qt install that ships no Test module.
 if(CODEHARBOR_BUILD_TESTS)
-    find_package(Qt6 6.9 REQUIRED COMPONENTS Test)
+    find_package(Qt6 6.10 REQUIRED COMPONENTS Test)
 endif()
 
-qt_standard_project_setup(REQUIRES 6.9)
+qt_standard_project_setup(REQUIRES 6.10)
 
 # libssh provides SSH connection/channel/PTY transport (see src/ssh). Discovery
 # is normalized behind the interface target `ch_libssh` so the ssh module does

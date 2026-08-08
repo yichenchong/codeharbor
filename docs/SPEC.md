@@ -1501,7 +1501,7 @@ remote/
 
 Technologies actually used:
 
-- Qt 6 (floor 6.9);
+- Qt 6 (floor 6.10);
 - Qt Quick and QML;
 - C++20;
 - Qt WebEngine;
