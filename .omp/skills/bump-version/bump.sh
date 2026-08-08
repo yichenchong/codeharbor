@@ -120,12 +120,17 @@ done <<<"$settings"
 [ -n "$GIT_REMOTE" ] || die "could not read the configuration (is .bumpversion.json valid?)"
 [ -n "$COMMIT_TEMPLATE" ] || die "could not read the release commit message from .bumpversion.json"
 
-# `mapfile < <(...)` reports the status of `mapfile`, never of the command
-# inside the process substitution, and `set -o pipefail` does not reach in
-# there either. So check both arrays: a tool that died would otherwise leave an
-# empty file list, and the run would go on to "commit" nothing and tag it.
-mapfile -t VERSION_FILES < <(ctl paths)
-mapfile -t INPUT_FILES < <(ctl inputs)
+# Read with a `while` loop, not `mapfile`: macOS ships bash 3.2, where `mapfile`
+# does not exist, and the script would die here with "command not found".
+#
+# Either way the exit status of the command inside the process substitution is
+# lost - `set -o pipefail` does not reach in there - so check both arrays: a
+# tool that died would otherwise leave an empty file list, and the run would go
+# on to "commit" nothing and tag it.
+VERSION_FILES=()
+while IFS= read -r line; do VERSION_FILES+=("$line"); done < <(ctl paths)
+INPUT_FILES=()
+while IFS= read -r line; do INPUT_FILES+=("$line"); done < <(ctl inputs)
 [ "${#VERSION_FILES[@]}" -gt 0 ] \
     || die "could not list the version files from .bumpversion.json (see above)"
 [ "${#INPUT_FILES[@]}" -ge "${#VERSION_FILES[@]}" ] \
