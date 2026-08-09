@@ -830,6 +830,7 @@ private slots:
     // Cold start: the sheet has to say what this dialog is for, not just show
     // an empty list.
     void sheetColdStartExplainsItself();
+    void sheetProfileRowsCenterAndElideTheirContent();
     void sheetRejectsPartiallyNumericPorts();
     void sheetModelRefreshKeepsUnsavedEdits();
 
@@ -1469,6 +1470,33 @@ void TstUxShell::sidebarRowBadgeSeparatesEveryRowState()
     QCOMPARE(glyphs.size(), sessions.size());
     QCOMPARE(words.size(), sessions.size());
 
+    QVERIFY2(surface.warnings.isEmpty(), qPrintable(surface.warningReport()));
+}
+
+void TstUxShell::sheetProfileRowsCenterAndElideTheirContent()
+{
+    Surface surface(moduleUrl(QStringLiteral("ConnectSheet.qml")), QSize(900, 560));
+    QVERIFY(surface.expose());
+    QQuickItem *root = surface.root();
+    QVERIFY(root);
+    root->setProperty("profiles", twoProfiles());
+    settle(40);
+
+    auto *row = qobject_cast<QQuickItem *>(surface.child(QStringLiteral("profileRow0")));
+    auto *name = qobject_cast<QQuickItem *>(surface.child(QStringLiteral("profileName0")));
+    auto *endpoint =
+            qobject_cast<QQuickItem *>(surface.child(QStringLiteral("profileEndpoint0")));
+    QVERIFY(row && name && endpoint);
+    auto *content = row->property("contentItem").value<QQuickItem *>();
+    QVERIFY(content);
+
+    const qreal expectedTop = (row->height() - content->height()) / 2.0;
+    QVERIFY2(qAbs(content->y() - expectedTop) <= 0.5,
+             qPrintable(QStringLiteral("profile content starts at %1; expected %2")
+                                .arg(content->y())
+                                .arg(expectedTop)));
+    QVERIFY(name->width() > 0);
+    QVERIFY(endpoint->width() > 0);
     QVERIFY2(surface.warnings.isEmpty(), qPrintable(surface.warningReport()));
 }
 

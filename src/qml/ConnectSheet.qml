@@ -1023,15 +1023,21 @@ Rectangle {
                     }
 
                     contentItem: Column {
+                        anchors.verticalCenter: parent.verticalCenter
+                        width: parent.width
                         spacing: 2
 
                         Row {
+                            width: parent.width
                             spacing: 6
                             Label {
                                 objectName: "profileName" + profileDelegate.index
                                 // Same rule as errorLabel: a stored profile is
                                 // data (it can also arrive hand-edited from
                                 // disk), never markup.
+                                width: Math.max(0, parent.width - parent.spacing
+                                                   - (activeBadge.visible
+                                                      ? activeBadge.implicitWidth : 0))
                                 textFormat: Text.PlainText
                                 text: root.textOf(profileDelegate.modelData, "name")
                                 color: Theme.text
@@ -1039,6 +1045,7 @@ Rectangle {
                                 elide: Text.ElideRight
                             }
                             Label {
+                                id: activeBadge
                                 objectName: "activeBadge" + profileDelegate.index
                                 text: qsTr("active")
                                 color: Theme.accent
@@ -1049,6 +1056,7 @@ Rectangle {
                         }
                         Label {
                             objectName: "profileEndpoint" + profileDelegate.index
+                            width: parent.width
                             textFormat: Text.PlainText
                             text: root.textOf(profileDelegate.modelData, "user") + "@"
                                   + root.textOf(profileDelegate.modelData, "host") + ":"
