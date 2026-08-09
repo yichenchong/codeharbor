@@ -1486,14 +1486,16 @@ void TstUxShell::sheetProfileRowsCenterAndElideTheirContent()
     auto *name = qobject_cast<QQuickItem *>(surface.child(QStringLiteral("profileName0")));
     auto *endpoint =
             qobject_cast<QQuickItem *>(surface.child(QStringLiteral("profileEndpoint0")));
-    QVERIFY(row && name && endpoint);
+    auto *contentGroup =
+            qobject_cast<QQuickItem *>(surface.child(QStringLiteral("profileContent0")));
+    QVERIFY(row && name && endpoint && contentGroup);
     auto *content = row->property("contentItem").value<QQuickItem *>();
     QVERIFY(content);
 
-    const qreal expectedTop = (row->height() - content->height()) / 2.0;
-    QVERIFY2(qAbs(content->y() - expectedTop) <= 0.5,
+    const qreal expectedTop = (content->height() - contentGroup->height()) / 2.0;
+    QVERIFY2(qAbs(contentGroup->y() - expectedTop) <= 0.5,
              qPrintable(QStringLiteral("profile content starts at %1; expected %2")
-                                .arg(content->y())
+                                .arg(contentGroup->y())
                                 .arg(expectedTop)));
     QVERIFY(name->width() > 0);
     QVERIFY(endpoint->width() > 0);

@@ -1022,48 +1022,52 @@ Rectangle {
                         }
                     }
 
-                    contentItem: Column {
-                        anchors.verticalCenter: parent.verticalCenter
-                        width: parent.width
-                        spacing: 2
-
-                        Row {
+                    contentItem: Item {
+                        Column {
+                            id: profileContent
+                            objectName: "profileContent" + profileDelegate.index
+                            anchors.centerIn: parent
                             width: parent.width
-                            spacing: 6
+                            spacing: 2
+
+                            Row {
+                                width: parent.width
+                                spacing: 6
+                                Label {
+                                    objectName: "profileName" + profileDelegate.index
+                                    // Same rule as errorLabel: a stored profile is
+                                    // data (it can also arrive hand-edited from
+                                    // disk), never markup.
+                                    width: Math.max(0, parent.width - parent.spacing
+                                                       - (activeBadge.visible
+                                                          ? activeBadge.implicitWidth : 0))
+                                    textFormat: Text.PlainText
+                                    text: root.textOf(profileDelegate.modelData, "name")
+                                    color: Theme.text
+                                    font.pixelSize: Theme.fontSizeLabel
+                                    elide: Text.ElideRight
+                                }
+                                Label {
+                                    id: activeBadge
+                                    objectName: "activeBadge" + profileDelegate.index
+                                    text: qsTr("active")
+                                    color: Theme.accent
+                                    font.pixelSize: Theme.fontSizeSmall
+                                    anchors.verticalCenter: parent.verticalCenter
+                                    visible: root.textOf(profileDelegate.modelData, "id") === root.activeId
+                                }
+                            }
                             Label {
-                                objectName: "profileName" + profileDelegate.index
-                                // Same rule as errorLabel: a stored profile is
-                                // data (it can also arrive hand-edited from
-                                // disk), never markup.
-                                width: Math.max(0, parent.width - parent.spacing
-                                                   - (activeBadge.visible
-                                                      ? activeBadge.implicitWidth : 0))
+                                objectName: "profileEndpoint" + profileDelegate.index
+                                width: parent.width
                                 textFormat: Text.PlainText
-                                text: root.textOf(profileDelegate.modelData, "name")
-                                color: Theme.text
-                                font.pixelSize: Theme.fontSizeLabel
+                                text: root.textOf(profileDelegate.modelData, "user") + "@"
+                                      + root.textOf(profileDelegate.modelData, "host") + ":"
+                                      + root.textOf(profileDelegate.modelData, "port")
+                                color: Theme.textDim
+                                font.pixelSize: 11
                                 elide: Text.ElideRight
                             }
-                            Label {
-                                id: activeBadge
-                                objectName: "activeBadge" + profileDelegate.index
-                                text: qsTr("active")
-                                color: Theme.accent
-                                font.pixelSize: Theme.fontSizeSmall
-                                anchors.verticalCenter: parent.verticalCenter
-                                visible: root.textOf(profileDelegate.modelData, "id") === root.activeId
-                            }
-                        }
-                        Label {
-                            objectName: "profileEndpoint" + profileDelegate.index
-                            width: parent.width
-                            textFormat: Text.PlainText
-                            text: root.textOf(profileDelegate.modelData, "user") + "@"
-                                  + root.textOf(profileDelegate.modelData, "host") + ":"
-                                  + root.textOf(profileDelegate.modelData, "port")
-                            color: Theme.textDim
-                            font.pixelSize: 11
-                            elide: Text.ElideRight
                         }
                     }
                 }
