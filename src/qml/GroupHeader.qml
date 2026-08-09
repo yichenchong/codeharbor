@@ -330,6 +330,104 @@ ItemDelegate {
         onAccepted: if (header.host) header.host.deleteGroup(header.itemId)
     }
 
+    // Right-click opens the group's own menu, exactly as it does on a session
+    // row. Restricted to the right button so the left-button drag that reorders
+    // groups is untouched.
+    TapHandler {
+        acceptedButtons: Qt.RightButton
+        onTapped: groupMenu.popup()
+    }
+
+    // The same set of actions the header already offers, plus the rename that
+    // had no affordance at all: AppController::renameGroup existed and nothing
+    // on screen could reach it. Nothing here is a new operation — collapsing,
+    // adding a session and deleting are the header's click, "+" button and "✕"
+    // button respectively, gathered where a user looks for them.
+    Menu {
+        id: groupMenu
+        // Several headers are realised at once, so the menu carries its group's
+        // id like every other named part of this delegate; a bare name would
+        // let a findChild() lookup answer with an arbitrary group's menu.
+        objectName: "groupMenu:" + header.itemId
+
+        MenuItem {
+            text: qsTr("Rename")
+            onTriggered: renameGroupDialog.open()
+        }
+        MenuItem {
+            text: qsTr("Add Dev Session")
+            // The header's "+" button hides itself on a collapsed group,
+            // because the row it would add is not visible there either.
+            enabled: !header.collapsed
+            onTriggered: if (header.host) header.host.requestNewSession(header.itemId)
+        }
+        MenuItem {
+            text: header.collapsed ? qsTr("Expand") : qsTr("Collapse")
+            // The same two calls the header's own onClicked makes: the toggle
+            // acts on the sidebar's keyboard cursor, so the cursor has to be
+            // moved here first or the wrong group would fold.
+            onTriggered: {
+                if (!header.host)
+                    return;
+                header.host.selectGroup(header);
+                header.host.toggleCurrentGroup();
+            }
+        }
+        MenuItem {
+            text: qsTr("Delete")
+            // Destructive, so it asks first — and it re-reads the session count
+            // at press time for the same reason the button does.
+            onTriggered: {
+                header.refreshSessionCount();
+                deleteDialog.open();
+            }
+        }
+    }
+
+    AppDialog {
+        id: renameGroupDialog
+        objectName: "renameGroupDialog:" + header.itemId
+        title: qsTr("Rename group")
+        modal: true
+        standardButtons: Dialog.Ok | Dialog.Cancel
+        anchors.centerIn: Overlay.overlay
+        // Account for the dialog's horizontal padding around the fixed-width
+        // field; the Basic-style default is four pixels too narrow.
+        width: renameGroupField.Layout.preferredWidth + leftPadding + rightPadding
+
+        // Reset to the current name each open: imperative edits break the
+        // `text: header.name` binding, so without this a cancelled edit would
+        // resurface as stale text on the next open. Focused and selected, so
+        // "rename" starts by replacing the old name rather than appending to it.
+        onOpened: {
+            renameGroupField.text = header.name;
+            renameGroupField.forceActiveFocus();
+            renameGroupField.selectAll();
+        }
+
+        // A Dialog sizes itself from its content item's IMPLICIT width, which a
+        // bare TextField under-reports even when given an explicit `width`, so
+        // the field spills out past the dialog's edge. A ColumnLayout reports
+        // its children's preferred widths, so the dialog grows to hold it.
+        ColumnLayout {
+            implicitWidth: 300
+            spacing: 8
+
+            TextField {
+                id: renameGroupField
+                objectName: "renameGroupField:" + header.itemId
+                Layout.preferredWidth: 300
+                text: header.name
+                placeholderText: qsTr("Group name")
+            }
+        }
+
+        onAccepted: {
+            if (header.host && renameGroupField.text.length > 0)
+                header.host.renameGroup(header.itemId, renameGroupField.text);
+        }
+    }
+
     // Selecting the header first is what makes the toggle unambiguous: the
     // sidebar's toggleCurrentGroup() acts on the keyboard cursor, which
     // selectGroup() has just moved here — so the click and the Space key take

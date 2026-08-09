@@ -319,9 +319,10 @@ ApplicationWindow {
             // Clicking (or Enter-ing) a session makes it current: AppController
             // loads both region layouts and remembers it for the next launch.
             onSessionActivated: (devSessionId) => app.activateSession(devSessionId)
-            // The status footer exposes this control at every connection state.
-            // Reopen the sheet so saved servers can be edited or selected again.
-            onServerSettingsRequested: connectSheet.shown = true
+            // The sidebar's one settings affordance, in its header and visible
+            // at every connection state. The window it opens owns the server
+            // profiles as well as the appearance and viewer settings.
+            onAppSettingsRequested: settingsWindow.shown = true
         }
 
         // The regions are recursive split trees, inert until given a node. The
@@ -618,16 +619,10 @@ ApplicationWindow {
         diagnosticText: app.sshDiagnostics
 
         onConnectRequested: (profileId) => app.connectToProfile(profileId)
-        onUpgradeRequested: (profileId) => app.upgradeRemoteService(profileId)
-        onProfileSaved: (fields) => {
-            if (!app.serverProfiles)
-                return;
-            if (fields.id && fields.id.length > 0)
-                app.serverProfiles.updateProfile(fields.id, fields);
-            else
-                app.serverProfiles.addProfile(fields);
-        }
-        onProfileRemoved: (id) => { if (app.serverProfiles) app.serverProfiles.removeProfile(id); }
+        // The sheet cannot create a server. Hand the user to the window that
+        // can — it sits at z 910, above this sheet, so it is usable while the
+        // cold-start sheet is still up with nothing to connect to.
+        onSettingsRequested: settingsWindow.shown = true
         onHostKeyDecision: (accept) => { pendingHostKey = null; app.resolveHostKey(accept); }
         onCredentialSubmitted: (secret, kind) => {
             // Cleared here BEFORE the secret is handed over, so the sheet is

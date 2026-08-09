@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <limits>
 
 namespace ch {
 namespace {
@@ -58,16 +59,6 @@ double normalizeHue(double hue)
     return hue;
 }
 
-double shortestHueDelta(double from, double to)
-{
-    double delta = std::fmod(to - from, kTwoPi);
-    if (delta > kPi)
-        delta -= kTwoPi;
-    else if (delta < -kPi)
-        delta += kTwoPi;
-    return delta;
-}
-
 Oklab toLab(const Oklch &color)
 {
     return {color.lightness, color.chroma * std::cos(color.hue),
@@ -81,50 +72,98 @@ Oklch fromLab(const Oklab &color)
     return {color.lightness, chroma, hue};
 }
 
-double labDistance(const Oklch &first, const Oklch &second)
+double labDistance(const Oklab &first, const Oklab &second)
 {
     // The gap metric is Euclidean distance in OKLab (the Cartesian form of
     // OKLCH), not distance between 8-bit RGB channels. That makes a colour's
-    // perceptual lightness and chroma count in the same space, and the
-    // Cartesian projection makes the hue seam at 0 == 2*pi disappear.
-    const Oklab a = toLab(first);
-    const Oklab b = toLab(second);
-    return std::sqrt((a.lightness - b.lightness) * (a.lightness - b.lightness)
-                     + (a.a - b.a) * (a.a - b.a) + (a.b - b.b) * (a.b - b.b));
+    // perceptual lightness and chroma count in the same space, and working in
+    // the Cartesian projection makes the hue seam at 0 == 2*pi disappear.
+    return std::sqrt((first.lightness - second.lightness) * (first.lightness - second.lightness)
+                     + (first.a - second.a) * (first.a - second.a)
+                     + (first.b - second.b) * (first.b - second.b));
 }
 
-Oklch halfway(const Oklch &first, const Oklch &second)
+LinearRgb oklchToLinearRgb(const Oklch &color)
 {
-    double firstHue = first.hue;
-    double secondHue = second.hue;
-
-    // Hue has no direction at C == 0. Borrow the chromatic endpoint's hue in
-    // that case, then use the shortest circular arc so red/purple hues near the
-    // 0/2*pi seam do not travel through every unrelated colour in between.
-    if (first.chroma <= kHueEpsilon && second.chroma > kHueEpsilon)
-        firstHue = secondHue;
-    else if (second.chroma <= kHueEpsilon && first.chroma > kHueEpsilon)
-        secondHue = firstHue;
-
-    const double delta = shortestHueDelta(firstHue, secondHue);
-    return {(first.lightness + second.lightness) * 0.5,
-            (first.chroma + second.chroma) * 0.5,
-            normalizeHue(firstHue + delta * 0.5)};
-}
-
-Oklch diversified(const Oklch &base)
-{
-    const double lightness = clamp01(base.lightness);
-    const double chroma = std::isfinite(base.chroma)
-            ? std::clamp(base.chroma, 0.0, 1.0)
+    const double lightness = clamp01(color.lightness);
+    const double chroma = std::isfinite(color.chroma)
+            ? std::clamp(color.chroma, 0.0, 1.0)
             : 0.0;
-    const double hue = std::isfinite(base.hue) ? normalizeHue(base.hue) : 0.0;
-    const double shiftedLightness = lightness <= 0.5
-            ? std::min(1.0, lightness + 0.25)
-            : std::max(0.0, lightness - 0.25);
-    return {shiftedLightness,
-            chroma <= kHueEpsilon ? 0.08 : chroma,
-            normalizeHue(hue + kPi)};
+    const double hue = std::isfinite(color.hue) ? normalizeHue(color.hue) : 0.0;
+    const double a = chroma * std::cos(hue);
+    const double b = chroma * std::sin(hue);
+
+    const double l = lightness + 0.3963377774 * a + 0.2158037573 * b;
+    const double m = lightness - 0.1055613458 * a - 0.0638541728 * b;
+    const double s = lightness - 0.0894841775 * a - 1.2914855480 * b;
+
+    const double l3 = l * l * l;
+    const double m3 = m * m * m;
+    const double s3 = s * s * s;
+    return {4.0767416621 * l3 - 3.3077115913 * m3 + 0.2309699292 * s3,
+            -1.2684380046 * l3 + 2.6097574011 * m3 - 0.3413193965 * s3,
+            -0.0041960863 * l3 - 0.7034186147 * m3 + 1.7076147010 * s3};
+}
+
+bool insideSrgbGamut(const Oklch &color)
+{
+    // A colour whose linear components fall outside [0, 1] gets clipped on the
+    // way to sRGB, and clipping moves it: two OKLab points that were far apart
+    // can clip onto the very same displayable colour. Expansion therefore only
+    // offers colours that survive the conversion untouched, so the separation
+    // it measures is the separation the user actually sees.
+    const LinearRgb rgb = oklchToLinearRgb(color);
+    constexpr double tolerance = 1.0e-6;
+    return rgb.red >= -tolerance && rgb.red <= 1.0 + tolerance
+            && rgb.green >= -tolerance && rgb.green <= 1.0 + tolerance
+            && rgb.blue >= -tolerance && rgb.blue <= 1.0 + tolerance;
+}
+
+struct Candidate {
+    Oklch color;
+    Oklab lab;
+};
+
+// The colours expansion is allowed to choose from. A fixed lattice over OKLCH
+// is what keeps the generator both pure and well spread: the hue ring is walked
+// in even steps at several lightness and chroma levels, so whatever the seed
+// looks like there is always a genuinely distant colour left to pick. The
+// ranges deliberately exclude near-black, near-white and near-grey, because a
+// group tint has to stay legible against both the light and the dark surface
+// colours in Theme.qml.
+constexpr int kLightnessSteps = 7;
+constexpr int kChromaSteps = 5;
+constexpr int kHueSteps = 48;
+constexpr double kMinLightness = 0.45;
+constexpr double kMaxLightness = 0.87;
+constexpr double kMinChroma = 0.06;
+constexpr double kMaxChroma = 0.26;
+
+const QVector<Candidate> &candidateColours()
+{
+    // Built once and reused. The lattice depends on nothing but the constants
+    // above, so this is a cache of a constant rather than hidden state: every
+    // call in every process sees the same colours in the same order.
+    static const QVector<Candidate> candidates = [] {
+        QVector<Candidate> built;
+        built.reserve(kLightnessSteps * kChromaSteps * kHueSteps);
+        for (int lightnessStep = 0; lightnessStep < kLightnessSteps; ++lightnessStep) {
+            const double lightness = kMinLightness
+                    + (kMaxLightness - kMinLightness) * lightnessStep / (kLightnessSteps - 1);
+            for (int chromaStep = 0; chromaStep < kChromaSteps; ++chromaStep) {
+                const double chroma = kMinChroma
+                        + (kMaxChroma - kMinChroma) * chromaStep / (kChromaSteps - 1);
+                for (int hueStep = 0; hueStep < kHueSteps; ++hueStep) {
+                    const Oklch candidate{lightness, chroma, kTwoPi * hueStep / kHueSteps};
+                    if (!insideSrgbGamut(candidate))
+                        continue;
+                    built.append({candidate, toLab(candidate)});
+                }
+            }
+        }
+        return built;
+    }();
+    return candidates;
 }
 
 SrgbColor fromHex(unsigned int red, unsigned int green, unsigned int blue)
@@ -156,33 +195,21 @@ Oklch GroupPalette::srgbToOklch(const SrgbColor &color)
 
 SrgbColor GroupPalette::oklchToSrgb(const Oklch &color)
 {
-    const double lightness = clamp01(color.lightness);
-    const double chroma = std::isfinite(color.chroma)
-            ? std::clamp(color.chroma, 0.0, 1.0)
-            : 0.0;
-    const double hue = std::isfinite(color.hue) ? normalizeHue(color.hue) : 0.0;
-    const double a = chroma * std::cos(hue);
-    const double b = chroma * std::sin(hue);
+    const LinearRgb rgb = oklchToLinearRgb(color);
+    return {linearToSrgb(rgb.red), linearToSrgb(rgb.green), linearToSrgb(rgb.blue)};
+}
 
-    const double l = lightness + 0.3963377774 * a + 0.2158037573 * b;
-    const double m = lightness - 0.1055613458 * a - 0.0638541728 * b;
-    const double s = lightness - 0.0894841775 * a - 1.2914855480 * b;
-
-    const double l3 = l * l * l;
-    const double m3 = m * m * m;
-    const double s3 = s * s * s;
-    const double red = 4.0767416621 * l3 - 3.3077115913 * m3 + 0.2309699292 * s3;
-    const double green = -1.2684380046 * l3 + 2.6097574011 * m3 - 0.3413193965 * s3;
-    const double blue = -0.0041960863 * l3 - 0.7034186147 * m3 + 1.7076147010 * s3;
-
-    return {linearToSrgb(red), linearToSrgb(green), linearToSrgb(blue)};
+double GroupPalette::perceptualDistance(const SrgbColor &first, const SrgbColor &second)
+{
+    return labDistance(toLab(srgbToOklch(first)), toLab(srgbToOklch(second)));
 }
 
 bool GroupPalette::canGenerate(const QVector<SrgbColor> &seed, int requestedCount)
 {
-    // The upper bound is not cosmetic: expansion is cubic in the requested
-    // count (see kMaxPaletteSize), so an out-of-range preference would hang the
-    // application rather than merely look wrong.
+    // The upper bound is not cosmetic: expansion measures every candidate
+    // colour against every colour already chosen, so its cost grows with the
+    // square of the requested count (see kMaxPaletteSize). An out-of-range
+    // preference would hang the application rather than merely look wrong.
     return !seed.isEmpty() && requestedCount > seed.size()
             && requestedCount <= kMaxPaletteSize;
 }
@@ -197,45 +224,56 @@ QVector<SrgbColor> GroupPalette::generatePalette(const QVector<SrgbColor> &seed,
         return {};
 
     QVector<SrgbColor> palette = seed;
-    // Reserved for the same reason `converted` below is: the loop appends
-    // exactly one colour per pass, so without this the vector is reallocated
-    // and copied on the way from seed.size() up to requestedCount.
+    // Reserved for the same reason `chosen` below is: the loop appends exactly
+    // one colour per pass, so without this the vector is reallocated and copied
+    // on the way from seed.size() up to requestedCount.
     palette.reserve(requestedCount);
-    // The OKLCH view of `palette`, kept in step with it rather than rebuilt
+    // The OKLab view of `palette`, kept in step with it rather than rebuilt
     // from scratch on every pass: each pass adds exactly one colour, so one
-    // conversion per pass is all that changes. Rebuilding converted the whole
-    // palette again for every colour added, which is pure repeated work.
-    QVector<Oklch> converted;
-    converted.reserve(requestedCount);
+    // conversion per pass is all that changes.
+    QVector<Oklab> chosen;
+    chosen.reserve(requestedCount);
     for (const SrgbColor &colour : palette)
-        converted.append(srgbToOklch(colour));
+        chosen.append(toLab(srgbToOklch(colour)));
 
-    // This is recursive expansion in iterative form: each pass starts with the
-    // complete (n-1)-colour result and appends exactly one midpoint. Ties
-    // retain the first pair in palette order, making output stable even when
-    // two gaps have the same floating-point distance.
+    // Farthest-point selection: each new colour is the candidate whose nearest
+    // already-chosen neighbour is as far away as possible, which is what makes
+    // the whole palette spread out instead of merely differ.
+    //
+    // The earlier version halved the perceptual gap between the two most
+    // distant colours instead. Inserting a midpoint does not shorten the
+    // distance between the pair it came from, so that pair stayed the widest
+    // apart on the next pass and the very same midpoint was appended again:
+    // from the seventh colour onwards every entry in the palette was the
+    // identical colour, which is why differently named groups kept sharing a
+    // tint at every palette size.
+    //
+    // Ties keep the first candidate in lattice order, so the output is stable
+    // even when two candidates are equally far away to the last bit.
+    const QVector<Candidate> &candidates = candidateColours();
     while (palette.size() < requestedCount) {
-        int first = 0;
-        int second = 1;
-        double largestGap = -1.0;
-        for (qsizetype i = 0; i < converted.size(); ++i) {
-            for (qsizetype j = i + 1; j < converted.size(); ++j) {
-                const double gap = labDistance(converted.at(i), converted.at(j));
-                if (gap > largestGap) {
-                    largestGap = gap;
-                    first = static_cast<int>(i);
-                    second = static_cast<int>(j);
-                }
+        qsizetype best = 0;
+        double bestSeparation = -1.0;
+        for (qsizetype i = 0; i < candidates.size(); ++i) {
+            double nearest = std::numeric_limits<double>::max();
+            for (const Oklab &taken : chosen) {
+                nearest = std::min(nearest, labDistance(candidates.at(i).lab, taken));
+                // This candidate can no longer beat the leader, so there is no
+                // point measuring it against the rest of the palette.
+                if (nearest <= bestSeparation)
+                    break;
+            }
+            if (nearest > bestSeparation) {
+                bestSeparation = nearest;
+                best = i;
             }
         }
-        // Fewer than two colours, or every colour identical: there is no gap to
-        // halve, so shift the first colour instead of duplicating it.
-        const Oklch next = largestGap <= kHueEpsilon
-                ? diversified(converted.first())
-                : halfway(converted.at(first), converted.at(second));
-        const SrgbColor appended = oklchToSrgb(next);
+        const SrgbColor appended = oklchToSrgb(candidates.at(best).color);
         palette.append(appended);
-        converted.append(srgbToOklch(appended));
+        // Measured back from the colour that will actually be displayed rather
+        // than from the candidate, so the next choice accounts for the small
+        // shift the OKLCH to sRGB conversion introduces.
+        chosen.append(toLab(srgbToOklch(appended)));
     }
     return palette;
 }

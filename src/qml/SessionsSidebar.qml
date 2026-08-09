@@ -24,9 +24,11 @@ Rectangle {
     // keyboard cursor). The host wires this to layout loading; the sidebar
     // itself owns no navigation.
     signal sessionActivated(string devSessionId)
-    // Emitted by the always-visible server control. The window owns the
-    // connection sheet, keeping server-profile editing outside the sidebar.
-    signal serverSettingsRequested()
+    // Emitted by the always-visible settings control in the header. The host
+    // owns the settings window, which is the one place server profiles,
+    // appearance, viewer defaults and shortcuts are managed — the sidebar
+    // itself edits none of them.
+    signal appSettingsRequested()
 
 
     // Keyboard/selection cursor. Groups and sessions have independent id
@@ -501,6 +503,10 @@ Rectangle {
         var parentIndex = app.sessionsModel.index(entry.index, 0);
         return app.sessionsModel.rowCount(parentIndex);
     }
+    function renameGroup(groupId, name) {
+        if (app && typeof app.renameGroup === "function")
+            app.renameGroup(groupId, name);
+    }
     function deleteGroup(groupId) {
         if (app && typeof app.deleteGroup === "function")
             app.deleteGroup(groupId);
@@ -703,6 +709,54 @@ Rectangle {
             anchors.leftMargin: 12
             anchors.verticalCenter: parent.verticalCenter
         }
+        // Application settings had no pointer-reachable entry point at all:
+        // the window chrome carries only minimise/maximise/close, the footer's
+        // "Server…" opens the CONNECTION sheet, and everything else lived
+        // behind Ctrl+, or the command palette. A user who did not already know
+        // the shortcut could not open the settings window with a mouse. This
+        // header is the right host because it is always present, unlike the
+        // status footer, which disappears whenever no link state is published.
+        Button {
+            id: appSettingsButton
+            objectName: "appSettingsButton"
+            anchors.right: pinFilterButton.left
+            anchors.rightMargin: 6
+            anchors.verticalCenter: parent.verticalCenter
+            implicitWidth: 24
+            implicitHeight: 24
+            width: 24
+            height: 24
+            padding: 0
+            focusPolicy: Qt.StrongFocus
+            text: "\u2699"
+
+            readonly property string actionText: qsTr("Settings")
+            Accessible.role: Accessible.Button
+            Accessible.name: appSettingsButton.actionText
+
+            AppToolTip {
+                objectName: "appSettingsButtonTip"
+                text: appSettingsButton.actionText
+                visible: appSettingsButton.hovered
+                delay: 600
+            }
+
+            contentItem: Label {
+                text: appSettingsButton.text
+                color: appSettingsButton.down ? Theme.accent : Theme.text
+                font.pixelSize: Theme.fontSizeTitle
+                horizontalAlignment: Text.AlignHCenter
+                verticalAlignment: Text.AlignVCenter
+            }
+            background: Rectangle {
+                radius: Theme.radiusSmall
+                color: appSettingsButton.down ? Theme.surfaceRaised
+                     : appSettingsButton.hovered ? Theme.surfaceHover : "transparent"
+                border.width: appSettingsButton.visualFocus ? 2 : 1
+                border.color: appSettingsButton.visualFocus ? Theme.accent : Theme.borderSubtle
+            }
+            onClicked: sidebar.appSettingsRequested()
+        }
         Button {
             id: pinFilterButton
             objectName: "pinFilterButton"
@@ -758,12 +812,15 @@ Rectangle {
             height: 24
             padding: 0
             focusPolicy: Qt.StrongFocus
-            // A box glyph is intentionally different from the pin star, but it
-            // still has to say whether the filter is ON: this button used to
-            // draw the same character in both states, so the only way to find
-            // out whether archived rows were being hidden was to hover it. The
-            // filled/outline pair is the same encoding the pin star uses.
-            text: sidebar.showArchived ? "\u25a3" : "\u25a1"
+            // The archive arrow is intentionally different from the pin star,
+            // but it still has to say whether the filter is ON: this button
+            // used to draw the same character in both states, so the only way
+            // to find out whether archived rows were being hidden was to hover
+            // it. Mirroring the arrow is the same kind of encoding the pin star
+            // gets from its filled/outline pair, and it matches the arrow on
+            // the row action: down means archived rows are filed away out of
+            // the list, up means they have been lifted back into it.
+            text: sidebar.showArchived ? "\u21a5" : "\u21a7"
 
             readonly property string actionText:
                 sidebar.showArchived ? qsTr("Hide archived sessions")
@@ -947,36 +1004,14 @@ Rectangle {
             color: Theme.borderSubtle
         }
 
-        Button {
-            id: serverSettingsButton
-            objectName: "serverSettingsButton"
-            anchors.right: parent.right
-            anchors.rightMargin: 6
-            anchors.verticalCenter: parent.verticalCenter
-            text: qsTr("Server…")
-            leftPadding: 6
-            rightPadding: 6
-
-            contentItem: Label {
-                text: serverSettingsButton.text
-                color: Theme.text
-                font: serverSettingsButton.font
-                horizontalAlignment: Text.AlignHCenter
-                verticalAlignment: Text.AlignVCenter
-            }
-            background: Rectangle {
-                color: serverSettingsButton.down ? Theme.border
-                                                  : (serverSettingsButton.hovered ? Theme.surfaceRaised
-                                                                                  : "transparent")
-                radius: Theme.radiusSmall
-            }
-            onClicked: sidebar.serverSettingsRequested()
-        }
+        // No settings control here: the header's appSettingsButton is the
+        // sidebar's single way into the settings window, and a second one in
+        // the footer only made the status row narrower.
 
         Row {
             anchors.left: parent.left
             anchors.leftMargin: 12
-            anchors.right: serverSettingsButton.left
+            anchors.right: parent.right
             anchors.rightMargin: 6
             anchors.verticalCenter: parent.verticalCenter
             clip: true

@@ -106,6 +106,8 @@ private slots:
     void paletteHandlesSingleSeedAndNonFiniteValues();
     void splitTreeCustomTitleNormalisationIsIdempotent();
     void paletteRefusesAnAbsurdlyLargeRequest();
+    void paletteColoursStayVisiblyApart();
+    void groupNamesLandOnDistinguishableColours();
     void sessionsModelFilterSettersIgnoreUnchangedValues();
     void sessionsModelPresenceTracksTheUnfilteredTree();
     void splitTreeTryFromJsonSeparatesRejectionFromAnEmptyLeaf();
@@ -2068,11 +2070,12 @@ void TstModels::splitTreeCustomTitleNormalisationIsIdempotent()
     QVERIFY(restored == leaf);
 }
 
-// Palette expansion compares every pair of colours chosen so far for each new
-// one, so its cost grows with the cube of the requested count. Without an upper
-// bound a hand-edited preference asking for a few thousand colours would freeze
-// the application instead of merely looking wrong, so canGenerate refuses it -
-// the same preflight that already refuses a too-small request.
+// Palette expansion measures every candidate colour against every colour
+// already chosen, so its cost grows with the square of the requested count.
+// Without an upper bound a hand-edited preference asking for a few thousand
+// colours would freeze the application instead of merely looking wrong, so
+// canGenerate refuses it - the same preflight that already refuses a too-small
+// request.
 void TstModels::paletteRefusesAnAbsurdlyLargeRequest()
 {
     const QVector<SrgbColor> seed = GroupPalette::tokyoNightSeed();
@@ -2086,6 +2089,116 @@ void TstModels::paletteRefusesAnAbsurdlyLargeRequest()
     // would produce no palette at all.
     QVERIFY(GroupPalette::kMaxPaletteSize >= 64);
     QCOMPARE(GroupPalette::generatePalette(seed, 64).size(), 64);
+}
+
+// The expansion used to insert the midpoint of the two most distant colours.
+// Inserting a midpoint does not move the pair it came from, so that pair stayed
+// the most distant on the next pass and the identical midpoint was appended
+// again and again: every palette of eight or more colours ended with a run of
+// byte-for-byte identical entries, and groups whose names hashed into that run
+// all showed the same tint. A size check or a "the colours are not equal" check
+// would not have caught it either, so this asserts the property that actually
+// matters - every colour in the palette is far enough from every other colour
+// to be told apart by eye.
+void TstModels::paletteColoursStayVisiblyApart()
+{
+    const QVector<SrgbColor> seed = GroupPalette::tokyoNightSeed();
+
+    // 64 is the largest palette the user-facing preference can ask for, and the
+    // guarantee is stated for that whole range rather than for one lucky size.
+    for (int size = seed.size() + 1; size <= 64; ++size) {
+        const QVector<SrgbColor> palette = GroupPalette::generatePalette(seed, size);
+        QCOMPARE(palette.size(), size);
+        for (int i = 0; i < palette.size(); ++i) {
+            for (int j = i + 1; j < palette.size(); ++j) {
+                const double separation =
+                        GroupPalette::perceptualDistance(palette.at(i), palette.at(j));
+                QVERIFY2(separation >= GroupPalette::kMinPerceptualSeparation,
+                         qPrintable(QStringLiteral("size %1, colours %2 and %3 are only "
+                                                   "%4 apart")
+                                            .arg(size)
+                                            .arg(i)
+                                            .arg(j)
+                                            .arg(separation)));
+            }
+        }
+    }
+
+    // The cap allows more colours than the preference does. They are packed
+    // closer together by necessity, but no two of them may coincide.
+    const QVector<SrgbColor> largest =
+            GroupPalette::generatePalette(seed, GroupPalette::kMaxPaletteSize);
+    for (int i = 0; i < largest.size(); ++i) {
+        for (int j = i + 1; j < largest.size(); ++j)
+            QVERIFY(GroupPalette::perceptualDistance(largest.at(i), largest.at(j)) > 0.0);
+    }
+}
+
+// The user-visible complaint behind the test above was that a handful of groups
+// kept sharing a colour, so this checks the end-to-end mapping from name to
+// colour rather than the palette alone.
+void TstModels::groupNamesLandOnDistinguishableColours()
+{
+    const QVector<SrgbColor> seed = GroupPalette::tokyoNightSeed();
+    const QStringList names{QStringLiteral("Dev Tooling"),   QStringLiteral("EDC Apps"),
+                            QStringLiteral("Miscellaneous"), QStringLiteral("Work"),
+                            QStringLiteral("Personal"),      QStringLiteral("Home Lab"),
+                            QStringLiteral("Clients"),       QStringLiteral("Staging"),
+                            QStringLiteral("Production")};
+
+    // The three names from the report, tracked separately: they were the ones
+    // observed sharing a tint at every size in this range.
+    const QStringList reported = names.mid(0, 3);
+    int sizesWhereReportedNamesAllDiffer = 0;
+
+    for (int size = 8; size <= 15; ++size) {
+        const QVector<SrgbColor> palette = GroupPalette::generatePalette(seed, size);
+        // Not `slots`: Qt defines that as a macro, so a variable of that name
+        // expands to nothing and the file stops compiling.
+        QVector<int> slotOfName;
+        for (const QString &name : names) {
+            const int slot = GroupPalette::stableIndexForName(name, palette.size());
+            QVERIFY(slot >= 0 && slot < palette.size());
+            // Same name, same slot, every call - no per-process seeding, so the
+            // colour a group shows is the same on every run and machine.
+            QCOMPARE(GroupPalette::stableIndexForName(name, palette.size()), slot);
+            slotOfName.append(slot);
+        }
+
+        // Two names may legitimately land on the same slot - with nine names and
+        // as few as eight colours some must - but any two that land on
+        // *different* slots have to be tellable apart.
+        for (int i = 0; i < names.size(); ++i) {
+            for (int j = i + 1; j < names.size(); ++j) {
+                if (slotOfName.at(i) == slotOfName.at(j))
+                    continue;
+                const double separation = GroupPalette::perceptualDistance(
+                        palette.at(slotOfName.at(i)), palette.at(slotOfName.at(j)));
+                QVERIFY2(separation >= GroupPalette::kMinPerceptualSeparation,
+                         qPrintable(QStringLiteral("size %1: %2 and %3 are only %4 apart")
+                                            .arg(size)
+                                            .arg(names.at(i), names.at(j))
+                                            .arg(separation)));
+            }
+        }
+
+        QSet<int> reportedSlots;
+        for (const QString &name : reported)
+            reportedSlots.insert(GroupPalette::stableIndexForName(name, palette.size()));
+        if (reportedSlots.size() == reported.size())
+            ++sizesWhereReportedNamesAllDiffer;
+    }
+
+    // Three names cannot be guaranteed three different slots: any pure function
+    // of a single name will occasionally send two of them to the same one, which
+    // for these three happens at size 11 and nowhere else in this range. What a
+    // clustering hash would look like is a collision at most or all sizes, so
+    // this allows one and no more. Under the broken expansion this counted zero
+    // - the colours were identical however the slots fell.
+    QVERIFY2(sizesWhereReportedNamesAllDiffer >= 7,
+             qPrintable(QStringLiteral("only %1 of the 8 sizes in 8..15 gave the three "
+                                       "reported names three different colours")
+                                .arg(sizesWhereReportedNamesAllDiffer)));
 }
 
 // Both sidebar filters are written from QML on every binding pass, usually with

@@ -52,6 +52,7 @@
 #include <QQmlEngine>
 #include <QQuickItem>
 #include <QQuickWindow>
+#include <QScopeGuard>
 #include <QSet>
 #include <QSignalSpy>
 #include <QStandardPaths>
@@ -729,6 +730,13 @@ private slots:
     // panes on one shell, which is the failure the whole resolution path
     // exists to prevent.
     void aTerminalPaneNeverAdoptsTheAnswerToASupersededLookup();
+
+    // TERMINAL IDENTITY, the split half. A pane created by a split has no
+    // `terminal_panes` row yet: ch::SessionLayouts publishes the new leaf at
+    // once and mints the row behind it, then republishes the tree with the id
+    // in it. The new pane must wait for that id and then attach — a pane that
+    // never notices the republished id is blank and unusable for ever.
+    void aSplitPaneAttachesOnceItsRowIdArrives();
 
     // CRASH RECOVERY (SPEC 11.3). ch::EditorController snapshots the unsaved
     // buffer while the user types and finds it again on the next open, but
@@ -2412,6 +2420,103 @@ void TstPaneIdentity::aTerminalPaneNeverAdoptsTheAnswerToASupersededLookup()
     emit factory.targetResolved(factory.controller(), QStringLiteral("ch-dev-b-terminal-1"));
     QTRY_COMPARE(pane->property("tmuxTarget").toString(), QStringLiteral("ch-dev-b-terminal-1"));
     QCOMPARE(factory.attached(), QStringList{QStringLiteral("ch-dev-b-terminal-1")});
+}
+
+// ---------------------------------------------------------------------------
+// (12b) The pane a SPLIT creates. It is published with no `terminal_panes` row
+// — ch::SessionLayouts mints one behind it and republishes the tree carrying
+// the id — so the whole of its identity arrives on a LATER republish than the
+// one that put it on screen. A pane that does not pick the id up off that
+// second tree never resolves, never attaches and never renders: it is the
+// blank, untypeable half of a split.
+// ---------------------------------------------------------------------------
+namespace {
+
+// A terminal leaf as ch::SessionLayouts publishes one: the slot label plus the
+// server row that IS the pane's identity. An empty `rowId` is the leaf a split
+// publishes before its mint has landed.
+QVariantMap terminalLeafNode(const QString &paneId, const QString &rowId)
+{
+    QVariantMap leaf = leafNode(paneId);
+    leaf.insert(QStringLiteral("terminalPaneId"), rowId);
+    return leaf;
+}
+
+} // namespace
+
+void TstPaneIdentity::aSplitPaneAttachesOnceItsRowIdArrives()
+{
+    // The stub replaces the real factory for this test only: the shared one is
+    // backed by an unconnected pool, which refuses every attach before the
+    // identity path is reached at all.
+    TerminalFactoryStub factory;
+    m_engine->rootContext()->setContextProperty(QStringLiteral("terminalFactory"), &factory);
+    const auto restore = qScopeGuard([this] {
+        m_engine->rootContext()->setContextProperty(QStringLiteral("terminalFactory"),
+                                                    &m_terminalFactory);
+    });
+
+    // The Dev Session default: two stacked panes, both already bound to rows.
+    QVERIFY(openRegion(
+        QStringLiteral("TerminalRegion.qml"),
+        branchNode(QStringLiteral("vertical"),
+                   QVariantList{terminalLeafNode(QStringLiteral("terminal-1"),
+                                                 QStringLiteral("row-1")),
+                                terminalLeafNode(QStringLiteral("terminal-2"),
+                                                 QStringLiteral("row-2"))}),
+        /*terminal=*/true));
+
+    const auto panes = [this] { return collect(m_region, isLeafPane); };
+    QTRY_COMPARE(panes().size(), 2);
+    QTRY_COMPARE(factory.resolutions().size(), 2);
+
+    // The user splits terminal-2. Its leaf becomes a branch holding itself and
+    // a brand new leaf whose row is still being minted.
+    setNode(branchNode(
+        QStringLiteral("vertical"),
+        QVariantList{terminalLeafNode(QStringLiteral("terminal-1"), QStringLiteral("row-1")),
+                     branchNode(QStringLiteral("horizontal"),
+                                QVariantList{terminalLeafNode(QStringLiteral("terminal-2"),
+                                                              QStringLiteral("row-2")),
+                                             terminalLeafNode(QStringLiteral("terminal-3"),
+                                                              QString())})}));
+    QTRY_VERIFY2(panes().size() == 3,
+                 qPrintable(QStringLiteral("the split never produced 3 panes: %1")
+                                .arg(describePanes(panes()))));
+    QObject *const fresh = paneWithId(m_region, QStringLiteral("terminal-3"));
+    QVERIFY(fresh);
+    QTest::qWait(kSettleMs);
+    // Waiting, deliberately: resolving by the recyclable slot label instead is
+    // how a new pane used to be handed a closed pane's still-running shell.
+    QCOMPARE(factory.resolutions().size(), 2);
+
+    // The mint lands and the tree is republished with the id on the new leaf.
+    setNode(branchNode(
+        QStringLiteral("vertical"),
+        QVariantList{terminalLeafNode(QStringLiteral("terminal-1"), QStringLiteral("row-1")),
+                     branchNode(QStringLiteral("horizontal"),
+                                QVariantList{terminalLeafNode(QStringLiteral("terminal-2"),
+                                                              QStringLiteral("row-2")),
+                                             terminalLeafNode(QStringLiteral("terminal-3"),
+                                                              QStringLiteral("row-3"))})}));
+
+    QTRY_VERIFY2(fresh->property("terminalPaneId").toString() == QStringLiteral("row-3"),
+                 qPrintable(QStringLiteral("the republished row id never reached the new pane; "
+                                           "it still holds \"%1\"")
+                                .arg(fresh->property("terminalPaneId").toString())));
+    QTRY_VERIFY2(factory.resolutions().size() == 3,
+                 "the pane the split created never asked the server for its shell, so it stays "
+                 "blank and cannot be typed into");
+    QCOMPARE(factory.resolutions().constLast().terminalPaneId, QStringLiteral("row-3"));
+
+    // ...and the answer brings the PTY up.
+    QObject *const controller = asObject(fresh->property("controller"));
+    QVERIFY(controller);
+    emit factory.targetResolved(controller, QStringLiteral("ch-dev-identity-terminal-3"));
+    QTRY_COMPARE(fresh->property("tmuxTarget").toString(),
+                 QStringLiteral("ch-dev-identity-terminal-3"));
+    QVERIFY2(factory.attached().contains(QStringLiteral("ch-dev-identity-terminal-3")),
+             "the split pane resolved its shell and then never attached a PTY to it");
 }
 
 namespace {

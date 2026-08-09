@@ -6,12 +6,15 @@ pragma ComponentBehavior: Bound
 import QtQuick
 import QtQuick.Controls.Basic
 import CodeHarbor
-import "EndpointField.js" as EndpointField
 
 // Server connection sheet (SPEC 4.1, 12.1): the one piece of UI that lets a
-// user with a fresh config reach a server at all — list saved connection
-// profiles, add/edit/remove one, connect, and answer the first-use host-key
-// prompt.
+// user reach a server at all — pick one of the saved connection profiles,
+// connect, and answer the first-use host-key and credential prompts.
+//
+// It is a CONNECTOR, not an editor. Profiles are created, edited and deleted in
+// the application settings window's Server pane, which is the single place that
+// owns them; this sheet only displays what is stored and asks to be pointed at
+// that window (settingsRequested) when there is nothing to connect to yet.
 //
 // Deliberately self-contained: it reads NO application singleton and mutates
 // NOTHING. Every input arrives as a property and every user intent leaves as a
@@ -34,11 +37,9 @@ import "EndpointField.js" as EndpointField
 //
 // Outputs
 //   connectRequested(profileId)  connect using that stored profile
-//   upgradeRequested(profileId)  install this client's matching remote release
-//   profileSaved(fields)         create (fields.id === "") or update a profile
-//   profileRemoved(id)           delete that profile
+//   settingsRequested()          open the settings window that owns profiles
 //   credentialSubmitted(secret, kind) answer pending credential; "" cancels
-//   dismissed()                  user closed the sheet (Esc / Close / Cancel)
+//   dismissed()                  user closed the sheet (Esc / Close)
 Rectangle {
     id: root
 
@@ -54,26 +55,17 @@ Rectangle {
     property var pendingCredential: null
 
     signal connectRequested(string profileId)
-    signal upgradeRequested(string profileId)
-    signal profileSaved(var fields)
-    signal profileRemoved(string id)
+    signal settingsRequested()
     signal hostKeyDecision(bool accept)
     signal credentialSubmitted(string secret, string kind)
     signal dismissed()
 
     // ---- internal state ---------------------------------------------------
-    // Profile the form is editing; empty means "new, unsaved profile".
-    property string editingId: ""
-    // Set while a create round-trip is in flight so the appended profile can be
-    // selected as soon as the host hands back a longer list.
-    property bool awaitingNewProfile: false
-    property int knownProfileCount: 0
-    // Keep an in-progress form intact when a background profile refresh swaps
-    // the model. `profilesChanged` is not an acknowledgement that this form
-    // changed; it can be another profile being added or a reconnect update.
-    property bool loadingForm: false
-    property bool profileDirty: false
-    property bool creatingNewProfile: false
+    // The profile the list has picked out; "" when there is nothing to connect
+    // to. Connect and the detail panel both read it.
+    property string selectedId: ""
+    // The last explicit choice survives asynchronous model replacement.
+    property string pendingSelectionId: ""
 
     // A host-key or credential prompt is up, so the connection this sheet is
     // about is parked on that one answer.
@@ -144,116 +136,41 @@ Rectangle {
         return -1;
     }
 
-    function loadForm(entry) {
-        root.loadingForm = true;
-        nameField.text = root.textOf(entry, "name");
-        hostField.text = root.textOf(entry, "host");
-        portField.text = root.textOf(entry, "port") === "" ? "22" : root.textOf(entry, "port");
-        userField.text = root.textOf(entry, "user");
-        identityFileField.text = root.textOf(entry, "identityFile");
-        nodePathField.text = root.textOf(entry, "nodePath");
-        repoRootField.text = root.textOf(entry, "repoRoot");
-        root.loadingForm = false;
-        root.profileDirty = false;
-    }
-    function formDiffersFrom(entry) {
-        if (!entry || !nameField || !hostField || !portField || !userField
-                || !identityFileField || !nodePathField || !repoRootField)
-            return false;
-        var storedPort = root.textOf(entry, "port");
-        if (storedPort === "")
-            storedPort = "22";
-        return root.textOf(entry, "name") !== nameField.text
-                || root.textOf(entry, "host") !== hostField.text
-                || storedPort !== portField.text
-                || root.textOf(entry, "user") !== userField.text
-                || root.textOf(entry, "identityFile") !== identityFileField.text
-                || root.textOf(entry, "nodePath") !== nodePathField.text
-                || root.textOf(entry, "repoRoot") !== repoRootField.text;
-    }
-
     function selectIndex(index) {
         var list = root.profileList();
         if (index < 0 || index >= list.length)
             return;
-        root.awaitingNewProfile = false;
-        root.creatingNewProfile = false;
-        root.editingId = root.textOf(list[index], "id");
-        root.loadForm(list[index]);
+        root.selectedId = root.textOf(list[index], "id");
         profileSelector.currentIndex = index;
     }
 
-    function beginNew() {
-        root.awaitingNewProfile = false;
-        root.knownProfileCount = root.profileList().length;
-        profileSelector.currentIndex = -1;
-        root.editingId = "";
-        root.creatingNewProfile = true;
-        root.loadForm(null);
-        nameField.input.forceActiveFocus();
+    // The profile Connect would use, or null when nothing is picked.
+    function selectedEntry() {
+        var index = root.indexOfId(root.selectedId);
+        return index >= 0 ? root.profileList()[index] : null;
     }
 
-    // The ListView owns currentIndex for key navigation, but `editingId` is the
-    // selection: a model swap can clamp or reset currentIndex behind our back,
-    // so the highlight follows editingId and currentIndex is re-applied once the
-    // new model has actually been installed.
+    // The ListView owns currentIndex for key navigation, but `selectedId` is
+    // the selection: a model swap can clamp or reset currentIndex behind our
+    // back, so the highlight follows selectedId and currentIndex is re-applied
+    // once the new model has actually been installed.
     function applyCurrentIndex() {
-        profileSelector.currentIndex = root.indexOfId(root.editingId);
+        profileSelector.currentIndex = root.indexOfId(root.selectedId);
     }
 
-    // Re-anchor the selection after the host swapped the list in. Keeps editing
-    // the same profile when it survived, otherwise falls back to the active one.
+    // Re-anchor the selection after the host swapped the list in: stay on the
+    // same profile when it survived, otherwise fall back to the host's active
+    // one and finally to the first row, so Connect is never aimed at nothing
+    // while there is something to connect to.
     //
     // Gaining a selection out of nothing (first load with saved servers, or the
-    // first profile just being saved) also moves focus to the list, so the very
-    // next keystroke can pick a server and Enter connects to it. An edit already
-    // in progress is never interrupted.
-    function syncFromModel() {
+    // first profile arriving from the settings window) also moves focus to the
+    // list, so the very next keystroke can pick a server and Enter connects.
+    function syncFromModel(preferredId) {
         var list = root.profileList();
-        var hadSelection = root.editingId !== "";
-        if (root.awaitingNewProfile && list.length > root.knownProfileCount) {
-            root.awaitingNewProfile = false;
-            root.knownProfileCount = list.length;
-            root.selectIndex(list.length - 1); // new profiles are appended
-            Qt.callLater(root.applyCurrentIndex);
-            if (!hadSelection)
-                profileSelector.forceActiveFocus();
-            return;
-        }
-
-        root.knownProfileCount = list.length;
-        var index = root.indexOfId(root.editingId);
-        var dirty = root.profileDirty
-                     || (root.editingId !== "" && index >= 0
-                         && root.formDiffersFrom(list[index]));
-
-        // A model refresh is not permission to overwrite a form the user is
-        // still editing. Keep the ListView highlight aligned, but do not call
-        // selectIndex(), because that reloads every field from the old model.
-        if (dirty && root.editingId !== "" && index >= 0) {
-            profileSelector.currentIndex = index;
-            Qt.callLater(root.applyCurrentIndex);
-            return;
-        }
-
-        if (root.creatingNewProfile) {
-            // A pristine first-run form is only a placeholder. Once the host
-            // supplies saved profiles, select one and give the list keyboard
-            // focus. A dirty new form, however, belongs to the user and must
-            // remain untouched across the same background refresh.
-            if (!root.profileDirty && list.length > 0) {
-                if (index < 0)
-                    index = root.indexOfId(root.activeId);
-                if (index < 0)
-                    index = 0;
-                root.selectIndex(index);
-                profileSelector.forceActiveFocus();
-            } else {
-                Qt.callLater(root.applyCurrentIndex);
-            }
-            return;
-        }
-
+        var preservedId = preferredId || root.selectedId;
+        var hadSelection = preservedId !== "";
+        var index = root.indexOfId(preservedId);
         if (index < 0)
             index = root.indexOfId(root.activeId);
         if (index < 0 && list.length > 0)
@@ -261,104 +178,16 @@ Rectangle {
         if (index >= 0)
             root.selectIndex(index);
         else
-            root.beginNew();
+            root.selectedId = "";
+        root.pendingSelectionId = "";
         Qt.callLater(root.applyCurrentIndex);
-        if (!hadSelection && root.editingId !== "")
+        if (!hadSelection && root.selectedId !== "")
             profileSelector.forceActiveFocus();
     }
 
-    function portValue() {
-        const text = portField.text.trim();
-        if (!/^[0-9]+$/.test(text))
-            return 0;
-        const parsed = parseInt(text, 10);
-        return isFinite(parsed) ? parsed : 0;
-    }
-
-    // The Save gate. It has to be the STORE's rule, not a looser one: whatever
-    // ServerProfiles::sanitize() refuses is dropped on the floor without a
-    // word, so a Save button that is enabled for a value the store will reject
-    // reports success and produces nothing — no new row in the list, no error.
-    // Pasting a whole command line ("box.local -p 2222") into the host field is
-    // exactly how a user gets there.
-    function formValid() {
-        return EndpointField.isUsable(hostField.text)
-            && EndpointField.isUsable(userField.text)
-            && root.portValue() >= 1 && root.portValue() <= 65535;
-    }
-
-    // Why the form cannot be saved, in the user's own terms; empty when it can.
-    // "Fill these in" and "what you pasted cannot be a host" are different
-    // problems and a single sentence covering both tells the second user
-    // nothing about what to change.
-    function validationMessage() {
-        if (EndpointField.hasRejectedCharacters(hostField.text))
-            return qsTr("The host cannot contain spaces, line breaks or control characters.");
-        if (EndpointField.hasRejectedCharacters(userField.text))
-            return qsTr("The user name cannot contain spaces, line breaks or control characters.");
-        if (root.formValid())
-            return "";
-        return qsTr("Host, user and a port in 1-65535 are required.");
-    }
-
-    function save() {
-        if (!root.formValid())
-            return;
-
-        // Normalise the form to the values the store will actually hold BEFORE
-        // emitting them. ServerProfiles::sanitize() trims every field and
-        // defaults an empty name to the host, so leaving the raw text on screen
-        // left the form permanently disagreeing with storage: the very next
-        // profilesChanged() ran formDiffersFrom(), saw a difference the user
-        // never typed, concluded the form was an unsaved draft and stopped
-        // reconciling it from then on. `loadingForm` keeps these writes from
-        // being mistaken for edits of the user's own.
-        root.loadingForm = true;
-        // EndpointField.trim() for EVERY field, not JavaScript's String.trim():
-        // it is the module's one copy of what QString::trimmed() strips, and the
-        // store trims all seven with that. The two sets are not the same (they
-        // disagree on U+0085 and U+FEFF), and a field trimmed by a different
-        // rule than the store's is exactly the mismatch described above.
-        hostField.text = EndpointField.trim(hostField.text);
-        userField.text = EndpointField.trim(userField.text);
-        portField.text = String(root.portValue());
-        var name = EndpointField.trim(nameField.text);
-        nameField.text = name === "" ? hostField.text : name;
-        identityFileField.text = EndpointField.trim(identityFileField.text);
-        nodePathField.text = EndpointField.trim(nodePathField.text);
-        repoRootField.text = EndpointField.trim(repoRootField.text);
-        root.loadingForm = false;
-
-        if (root.editingId === "") {
-            root.awaitingNewProfile = true;
-            root.knownProfileCount = root.profileList().length;
-        }
-        root.profileSaved({
-            "id": root.editingId,
-            "name": nameField.text,
-            "host": hostField.text,
-            "port": root.portValue(),
-            "user": userField.text,
-            "identityFile": identityFileField.text,
-            "nodePath": nodePathField.text,
-            "repoRoot": repoRootField.text
-        });
-        root.profileDirty = false;
-    }
-
     function connectNow() {
-        if (root.editingId !== "")
-            root.connectRequested(root.editingId);
-    }
-
-    function upgradeNow() {
-        if (root.editingId !== "")
-            root.upgradeRequested(root.editingId);
-    }
-
-    function removeSelected() {
-        if (root.editingId !== "")
-            root.profileRemoved(root.editingId);
+        if (root.selectedId !== "")
+            root.connectRequested(root.selectedId);
     }
 
     // Which secret the pending prompt is asking for. Anything the host did not
@@ -490,13 +319,18 @@ Rectangle {
         }
     }
 
-    onProfilesChanged: root.syncFromModel()
+    // A QVariantList property can notify before the ListView has installed the
+    // replacement model. Defer the reconciliation so the lookup sees the new
+    // rows; otherwise a preserved selection can be replaced by activeId.
+    onProfilesChanged: {
+        if (root.selectedId !== "")
+            root.pendingSelectionId = root.selectedId;
+        Qt.callLater(() => root.syncFromModel(root.pendingSelectionId));
+    }
     onActiveIdChanged: {
-        // Follow the host's active profile, but never onto a form the user is
-        // editing. Selecting it would reload every field from storage and
-        // discard text that has not been saved yet.
-        if (root.profileDirty || root.creatingNewProfile
-                || root.activeId === root.editingId)
+        // Follow the host's active profile: whatever it just connected to is
+        // what this sheet should be describing.
+        if (root.activeId === root.selectedId)
             return;
         var index = root.indexOfId(root.activeId);
         if (index >= 0)
@@ -529,7 +363,9 @@ Rectangle {
             else if (root.profileList().length > 0)
                 profileSelector.forceActiveFocus();
             else
-                nameField.input.forceActiveFocus();
+                // Nothing to pick: the only useful thing on screen is the way
+                // out to the window that can create a server.
+                openSettingsButton.forceActiveFocus();
         });
     }
     Component.onCompleted: root.syncFromModel()
@@ -544,50 +380,32 @@ Rectangle {
         event.accepted = true;
     }
 
-    // ---- one labelled text field -----------------------------------------
-    component LabeledField: Column {
-        id: field
-        property alias label: fieldLabel.text
-        property alias text: fieldInput.text
-        property alias placeholder: fieldInput.placeholderText
-        property alias validator: fieldInput.validator
-        property alias hint: fieldHint.text
-        property alias input: fieldInput // so the host can focus the editor itself
-        signal accepted()
+    // ---- one read-only detail row -----------------------------------------
+    component DetailRow: Row {
+        id: detailRow
+        property string label: ""
+        property string value: ""
 
-        spacing: 3
+        spacing: 8
+        // A profile need not carry an identity file or a repository root, and a
+        // row reading "Private key file:" with nothing after it is noise.
+        visible: detailRow.value.length > 0
 
         Label {
-            id: fieldLabel
+            width: 116
+            text: detailRow.label
             color: Theme.statusText()
             font.pixelSize: 11
         }
-        TextField {
-            id: fieldInput
-            width: field.width
-            // The visible Label above is a SEPARATE item, so nothing ties the
-            // two together for assistive technology: without this every field
-            // in the one surface a user meets before any server is reachable is
-            // announced as an unnamed edit box.
-            Accessible.name: fieldLabel.text
-            Accessible.description: fieldHint.text
-            color: Theme.text
-            placeholderTextColor: Theme.textPlaceholder()
-            selectByMouse: true
-            font.pixelSize: Theme.fontSizeLabel
-            background: Rectangle {
-                color: Theme.surfaceSunken
-                radius: 3
-                border.width: 1
-                border.color: fieldInput.activeFocus ? Theme.accent : Theme.borderSubtle
-            }
-            onAccepted: field.accepted()
-        }
         Label {
-            id: fieldHint
-            color: Theme.textDim
-            font.pixelSize: Theme.fontSizeSmall
-            visible: text.length > 0
+            width: Math.max(0, detailRow.width - 116 - detailRow.spacing)
+            // Same rule as errorLabel below: a stored profile is data (it can
+            // arrive hand-edited from disk), never markup.
+            textFormat: Text.PlainText
+            text: detailRow.value
+            color: Theme.text
+            font.pixelSize: Theme.fontSizeBody
+            elide: Text.ElideRight
         }
     }
 
@@ -930,7 +748,7 @@ Rectangle {
                 anchors.top: parent.top
                 anchors.left: parent.left
                 anchors.right: parent.right
-                anchors.bottom: listActions.top
+                anchors.bottom: parent.bottom
                 anchors.margins: 6
                 clip: true
                 focus: true
@@ -956,14 +774,7 @@ Rectangle {
                     if (profileSelector.currentIndex < 0
                             || profileSelector.currentIndex >= list.length)
                         return;
-                    // A model replacement can move currentIndex while the
-                    // user is typing. Keep the draft; an explicit row click
-                    // calls selectIndex() directly and remains intentional.
-                    if (root.profileDirty) {
-                        Qt.callLater(root.applyCurrentIndex);
-                        return;
-                    }
-                    if (root.textOf(list[profileSelector.currentIndex], "id") !== root.editingId)
+                    if (root.textOf(list[profileSelector.currentIndex], "id") !== root.selectedId)
                         root.selectIndex(profileSelector.currentIndex);
                 }
 
@@ -990,10 +801,10 @@ Rectangle {
                                             + root.textOf(profileDelegate.modelData, "host") + ":"
                                             + root.textOf(profileDelegate.modelData, "port")
                     Accessible.selected: root.textOf(profileDelegate.modelData, "id")
-                                         === root.editingId
+                                         === root.selectedId
 
                     background: Rectangle {
-                        color: root.textOf(profileDelegate.modelData, "id") === root.editingId
+                        color: root.textOf(profileDelegate.modelData, "id") === root.selectedId
                                ? Theme.surfaceSelected : (profileDelegate.hovered ? Theme.surfaceHover : "transparent")
                         radius: 3
 
@@ -1093,203 +904,123 @@ Rectangle {
                     wrapMode: Text.WordWrap
                     color: Theme.textDim
                     font.pixelSize: Theme.fontSizeBody
-                    text: qsTr("No servers yet.\nFill in the form and press Save.")
-                }
-            }
-
-            Row {
-                id: listActions
-                anchors.bottom: parent.bottom
-                anchors.left: parent.left
-                anchors.margins: 6
-                spacing: 6
-
-                SheetButton {
-                    objectName: "addButton"
-                    text: qsTr("Add")
-                    onClicked: root.beginNew()
-                }
-                SheetButton {
-                    objectName: "removeButton"
-                    accent: Theme.danger
-                    text: qsTr("Remove")
-                    enabled: root.editingId !== ""
-                    onClicked: root.removeSelected()
+                    text: qsTr("No servers yet.\nAdd one in the settings window.")
                 }
             }
         }
 
-        // Edit form for the selected (or new) profile.
+        // What Connect will actually use. Read-only on purpose: profiles are
+        // created and edited in the settings window's Server pane, so this
+        // sheet has no second copy of that form to disagree with the store.
         Item {
-            id: formPane
+            id: detailPane
             anchors.top: parent.top
             anchors.left: listPane.right
             anchors.right: parent.right
             anchors.bottom: parent.bottom
 
             Column {
-                id: form
+                id: detail
                 anchors.top: parent.top
                 anchors.left: parent.left
                 anchors.right: parent.right
                 anchors.margins: 14
                 spacing: 8
 
-                // First run: an empty list and an empty form say nothing about
-                // what CodeHarbor wants from you. It goes away the moment there
-                // is a server to pick, so it never becomes chrome to scroll past.
+                // First run: an empty list says nothing about what CodeHarbor
+                // wants from you, and there is no form here to fill in any
+                // more. The only way forward is the settings window, so name it
+                // and point at the button below that opens it.
                 Label {
                     objectName: "coldStartIntro"
-                    width: form.width
+                    width: detail.width
                     visible: root.profileList().length === 0
                     wrapMode: Text.WordWrap
                     color: Theme.statusText()
                     font.pixelSize: Theme.fontSizeBody
                     text: qsTr("CodeHarbor edits a checkout that lives on another machine, over SSH. "
-                               + "Describe that machine below — its address, your login, and the "
-                               + "absolute path to node on it — then Save it and press Connect.")
+                               + "No such machine is described yet. Press \u201cServer settings\u2026\u201d "
+                               + "below to add one — its address, your login, and the absolute path "
+                               + "to node on it — then come back here and press Connect.")
                 }
 
                 Label {
-                    objectName: "formTitle"
-                    text: root.editingId === "" ? qsTr("New server") : qsTr("Edit server")
+                    objectName: "detailTitle"
+                    width: detail.width
+                    visible: root.selectedId !== ""
+                    textFormat: Text.PlainText
+                    text: root.textOf(root.selectedEntry(), "name")
                     color: Theme.text
                     font.pixelSize: Theme.fontSizeLabel
                     font.bold: true
+                    elide: Text.ElideRight
                 }
 
-                LabeledField {
-                    id: nameField
-                    objectName: "nameField"
-                    width: form.width
-                    label: qsTr("Name")
-                    placeholder: qsTr("Defaults to the host name")
-                    onAccepted: root.save()
-                    onTextChanged: if (!root.loadingForm) root.profileDirty = true
+                DetailRow {
+                    objectName: "detailEndpoint"
+                    width: detail.width
+                    label: qsTr("Address")
+                    value: root.selectedId === ""
+                           ? "" : root.textOf(root.selectedEntry(), "user") + "@"
+                                  + root.textOf(root.selectedEntry(), "host") + ":"
+                                  + root.textOf(root.selectedEntry(), "port")
                 }
-
-                Row {
-                    width: form.width
-                    spacing: 8
-
-                    LabeledField {
-                        id: hostField
-                        objectName: "hostField"
-                        width: form.width - 108 - parent.spacing
-                        label: qsTr("Host")
-                        placeholder: qsTr("hostname or address")
-                        onAccepted: root.save()
-                        onTextChanged: if (!root.loadingForm) root.profileDirty = true
-                    }
-                    LabeledField {
-                        id: portField
-                        objectName: "portField"
-                        width: 108
-                        label: qsTr("Port")
-                        text: "22"
-                        validator: IntValidator { bottom: 1; top: 65535 }
-                        onAccepted: root.save()
-                        onTextChanged: if (!root.loadingForm) root.profileDirty = true
-                    }
-                }
-
-                LabeledField {
-                    id: userField
-                    objectName: "userField"
-                    width: form.width
-                    label: qsTr("User")
-                    placeholder: qsTr("login name")
-                    onAccepted: root.save()
-                    onTextChanged: if (!root.loadingForm) root.profileDirty = true
-                }
-
-                LabeledField {
-                    id: identityFileField
-                    objectName: "identityFileField"
-                    width: form.width
+                DetailRow {
+                    objectName: "detailIdentityFile"
+                    width: detail.width
                     label: qsTr("Private key file")
-                    placeholder: qsTr("Optional; ~/.ssh/config is also read")
-                    hint: qsTr("Local path. Its passphrase is requested separately and never stored.")
-                    onAccepted: root.save()
-                    onTextChanged: if (!root.loadingForm) root.profileDirty = true
+                    value: root.textOf(root.selectedEntry(), "identityFile")
                 }
-
-                LabeledField {
-                    id: nodePathField
-                    objectName: "nodePathField"
-                    width: form.width
+                DetailRow {
+                    objectName: "detailNodePath"
+                    width: detail.width
                     label: qsTr("Node path")
-                    placeholder: qsTr("/usr/bin/node")
-                    hint: qsTr("Absolute path to node on the server; it need not be on the login PATH.")
-                    onAccepted: root.save()
-                    onTextChanged: if (!root.loadingForm) root.profileDirty = true
+                    value: root.textOf(root.selectedEntry(), "nodePath")
+                }
+                DetailRow {
+                    objectName: "detailRepoRoot"
+                    width: detail.width
+                    label: qsTr("Repository root")
+                    value: root.textOf(root.selectedEntry(), "repoRoot")
                 }
 
-                LabeledField {
-                    id: repoRootField
-                    objectName: "repoRootField"
-                    width: form.width
-                    label: qsTr("Repository root")
-                    placeholder: qsTr("/srv/codeharbor")
-                    hint: qsTr("Remote CodeHarbor install providing codeharbord: an unpacked release tarball or a git checkout.")
-                    onAccepted: root.save()
-                    onTextChanged: if (!root.loadingForm) root.profileDirty = true
+                Label {
+                    objectName: "editHint"
+                    width: detail.width
+                    visible: root.selectedId !== ""
+                    wrapMode: Text.WordWrap
+                    color: Theme.textDim
+                    font.pixelSize: 11
+                    text: qsTr("Servers are added, changed and removed in the settings window.")
                 }
             }
 
             Row {
-                id: formActions
+                id: paneActions
                 anchors.bottom: parent.bottom
                 anchors.right: parent.right
                 anchors.margins: 14
                 spacing: 8
 
-                Label {
-                    objectName: "validationHint"
-                    anchors.verticalCenter: parent.verticalCenter
-                    color: Theme.warning
-                    font.pixelSize: 11
-                    // Naming the actual reason: the old sentence said only
-                    // "these are required", which is no help at all to
-                    // somebody who HAS filled the host in and whose value is
-                    // refused for a different reason.
-                    text: root.validationMessage()
-                    visible: text.length > 0
-                }
                 SheetButton {
-                    objectName: "cancelButton"
-                    text: qsTr("Cancel")
-                    onClicked: root.dismissed()
-                }
-                SheetButton {
-                    objectName: "saveButton"
-                    text: qsTr("Save")
-                    enabled: root.formValid()
-                    onClicked: root.save()
-                }
-                SheetButton {
-                    objectName: "upgradeButton"
-                    text: qsTr("Update server")
-                    enabled: root.editingId !== ""
-                    onClicked: root.upgradeNow()
+                    id: openSettingsButton
+                    objectName: "openSettingsButton"
+                    text: qsTr("Server settings\u2026")
+                    onClicked: root.settingsRequested()
 
-                    HoverHandler { id: upgradeHover }
+                    HoverHandler { id: settingsHover }
                     AppToolTip {
-                        objectName: "upgradeButtonTip"
-                        visible: upgradeHover.hovered
-                        // Says what it WRITES and where, because this is the
-                        // one button in the sheet that changes the server.
-                        text: qsTr("Install the CodeHarbor service release that "
-                                   + "matches this client into the repository "
-                                   + "root on the server, then connect. A source "
-                                   + "checkout there is left alone.")
+                        objectName: "openSettingsButtonTip"
+                        visible: settingsHover.hovered
+                        text: qsTr("Open the settings window, where servers are added, "
+                                   + "edited, removed and updated.")
                     }
                 }
                 SheetButton {
                     objectName: "connectButton"
                     accent: Theme.accent
                     text: qsTr("Connect")
-                    enabled: root.editingId !== ""
+                    enabled: root.selectedId !== ""
                     onClicked: root.connectNow()
                 }
             }

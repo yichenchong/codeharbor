@@ -12,7 +12,10 @@ Rectangle {
     id: root
     objectName: "settingsWindow"
     property bool shown: false
-    property string selectedGroup: "appearance"
+    // Source-loaded tests can choose the initial pane before Loader creation;
+    // the application leaves this unset and therefore keeps Appearance first.
+    property string selectedGroup: typeof initialSettingsGroup === "string"
+                                   ? initialSettingsGroup : "appearance"
     property var toolbarItems: []
     property var viewerDefaultEntries: []
     property var profileEntries: []
@@ -26,7 +29,14 @@ Rectangle {
     property string profileRepoRoot: ""
     property bool loadingProfile: false
     property bool profileDirty: false
+    // Captured when the delete confirmation opens, so the question names the
+    // profile the user picked even if the list changes underneath the dialog.
+    property string pendingDeleteId: ""
+    property string pendingDeleteName: ""
     signal dismissed()
+    // The Name field lives inside the server pane's Component and cannot be
+    // reached from here by id; the pane listens for this instead.
+    signal profileNameFocusRequested()
 
     // The host owns visibility; this component only manages its sheet content.
     color: Theme.surface
@@ -354,7 +364,12 @@ Rectangle {
     }
 
     function saveProfile() {
-        if (root.loadingProfile || root.selectedProfileId.length === 0)
+        // `selectedProfileId` naming a profile is not the same as that profile
+        // still existing: a delete (ours or another window's, arriving through
+        // profilesChanged) leaves the id behind for one turn, and updateProfile()
+        // on a dead id would silently resurrect nothing while the user watched
+        // their typing disappear. hasSelection() checks the LIST, not the id.
+        if (root.loadingProfile || !root.hasSelection())
             return;
         // An unsaveable draft stays DIRTY: clearing the flag would tell the
         // rest of this file the fields match the stored profile when the store
@@ -374,6 +389,106 @@ Rectangle {
             repoRoot: root.profileRepoRoot
         });
         root.profileDirty = false;
+    }
+
+    // The seven fields, the validation hint and the delete button all act on
+    // "the profile currently selected", which is only meaningful while that
+    // profile is in the list the store last published.
+    function hasSelection() {
+        return root.selectedProfileId.length > 0
+            && root.profileAt(root.selectedProfileId) !== null;
+    }
+
+    function profileIndexOf(id) {
+        for (var i = 0; i < root.profileEntries.length; ++i) {
+            if (root.profileText(root.profileEntries[i], "id") === id)
+                return i;
+        }
+        return -1;
+    }
+
+    // A new profile is written to the store IMMEDIATELY rather than being held
+    // on screen as a draft, because this pane has no Save button: every field
+    // writes through on editingFinished, and a field can only write through to
+    // a record that exists. That means seeding host and user, since
+    // ServerProfiles refuses a profile that could never connect (see
+    // sanitize()) and would hand back an empty id for a blank one. The seeds
+    // are deliberately not plausible addresses — they are there to be typed
+    // over, and the row shows the name, not them.
+    //
+    // Nothing here touches the network: this is the first-run path, where no
+    // server is reachable by definition.
+    function addProfile() {
+        if (typeof app === "undefined" || !app || !app.serverProfiles)
+            return;
+        var id = app.serverProfiles.addProfile({
+            name: qsTr("New server"),
+            host: "new-server",
+            port: 22,
+            user: "user",
+            identityFile: "",
+            nodePath: "",
+            repoRoot: ""
+        });
+        if (!id)
+            return;
+        // addProfile() has already emitted profilesChanged, so syncProfiles()
+        // ran with the OLD selection and profileEntries is current: selecting
+        // the new id and reloading is all that is left. The dirty flag belongs
+        // to the profile we are leaving, and that one is saved or refused
+        // already; carrying it over would make the next refresh protect this
+        // pristine form from itself.
+        root.profileDirty = false;
+        root.selectedProfileId = id;
+        root.loadSelectedProfile();
+        // The name is the one field with no useful seed, and typing over the
+        // seeded host/user is what the user does next, so the caret starts
+        // where the first keystroke belongs.
+        root.profileNameFocusRequested();
+    }
+
+    // Deleting is destructive and the store keeps no undo, so the button only
+    // gets as far as the confirmation; this is the other half.
+    function confirmDeleteProfile() {
+        if (!root.hasSelection())
+            return;
+        root.pendingDeleteId = root.selectedProfileId;
+        root.pendingDeleteName = root.profileText(root.profileAt(root.selectedProfileId), "name")
+                                 || root.profileText(root.profileAt(root.selectedProfileId), "host")
+                                 || qsTr("Unnamed profile");
+        deleteProfileDialog.open();
+    }
+
+    function deletePendingProfile() {
+        var removedId = root.pendingDeleteId;
+        root.pendingDeleteId = "";
+        if (removedId.length === 0 || typeof app === "undefined" || !app || !app.serverProfiles)
+            return;
+        // Pick the neighbour BEFORE the store rewrites the list: afterwards the
+        // removed profile's position is gone and there is nothing left to be a
+        // neighbour OF. The one BELOW takes the deleted row's place on screen,
+        // which is what the eye expects; deleting the last row falls back to
+        // the one above, and deleting the only row leaves no selection at all.
+        var index = root.profileIndexOf(removedId);
+        var neighbour = "";
+        if (index >= 0) {
+            if (index + 1 < root.profileEntries.length)
+                neighbour = root.profileText(root.profileEntries[index + 1], "id");
+            else if (index > 0)
+                neighbour = root.profileText(root.profileEntries[index - 1], "id");
+        }
+        // The draft in the fields belongs to the profile being destroyed, so it
+        // dies with it: leaving the flag set would stop syncProfiles() from
+        // loading the neighbour and strand the old values in the form.
+        root.profileDirty = false;
+        root.selectedProfileId = neighbour;
+        app.serverProfiles.removeProfile(removedId);
+        // removeProfile() emits profilesChanged, and syncProfiles() has already
+        // reloaded the form from the neighbour by now. Run it again anyway: a
+        // store that refused the removal must leave the pane agreeing with what
+        // is actually stored rather than pointing at a neighbour it never
+        // moved to.
+        root.syncProfiles();
     }
 
     function closeSheet() {
@@ -419,6 +534,37 @@ Rectangle {
     Keys.onEscapePressed: function(event) {
         root.closeSheet();
         event.accepted = true;
+    }
+
+    // Declared here rather than inside the server pane's Component so it is not
+    // destroyed the instant the group selector switches panes, which is exactly
+    // what happens if the dialog is left open and something else takes the
+    // selection. Same shape as the sidebar's delete-group confirmation.
+    AppDialog {
+        id: deleteProfileDialog
+        objectName: "serverDeleteDialog"
+        title: qsTr("Delete server profile")
+        modal: true
+        standardButtons: Dialog.Ok | Dialog.Cancel
+        anchors.centerIn: Overlay.overlay
+        width: 400
+
+        Label {
+            objectName: "serverDeleteMessage"
+            // The dialog has an explicit width, so the message wraps to the
+            // content area it is given rather than sizing the frame itself;
+            // a Label's implicitWidth is read-only and cannot ask for one.
+            width: parent ? parent.width : 360
+            textFormat: Text.PlainText
+            wrapMode: Text.WordWrap
+            color: Theme.text
+            font.pixelSize: Theme.fontSizeBody
+            text: qsTr("Delete the server profile \"%1\"? This permanently removes its address, user and paths from this computer. This cannot be undone.")
+                      .arg(root.pendingDeleteName)
+        }
+
+        onAccepted: root.deletePendingProfile()
+        onRejected: root.pendingDeleteId = ""
     }
 
     Rectangle {
@@ -533,6 +679,10 @@ Rectangle {
         Loader {
             id: paneLoader
             objectName: "settingsGroupLoader"
+            // Group panes are small and switching them must finish before the
+            // old pane is destroyed; asynchronous incubation can otherwise
+            // leave a delegate attached to a disappearing settings window.
+            asynchronous: false
             anchors.top: header.bottom
             anchors.left: sidebar.right
             anchors.right: parent.right
@@ -1006,7 +1156,7 @@ Rectangle {
                 Label {
                     width: parent.width
                     wrapMode: Text.WordWrap
-                    text: qsTr("These fields are the saved ServerProfiles connection values. Editing a field updates the profile immediately; use the Connect sheet to add or remove profiles.")
+                    text: qsTr("Every saved server lives here. Editing a field updates the selected profile immediately \u2014 there is no separate Save. Adding one needs no reachable server, so this is also where a first-run setup starts.")
                     color: Theme.textDim
                     font.pixelSize: Theme.fontSizeBody
                 }
@@ -1014,6 +1164,9 @@ Rectangle {
                 ListView {
                     id: serverProfileListView
                     objectName: "serverProfileList"
+                    // An empty list is a 36-pixel gap that reads as a missing
+                    // row; the hint below says what is going on instead.
+                    visible: root.profileEntries.length > 0
                     width: Math.min(parent.width, 620)
                     // One row height for both the view and its delegate. The
                     // delegate is a SheetButton, whose implicit height is a
@@ -1057,21 +1210,57 @@ Rectangle {
                     }
                 }
                 Label {
+                    objectName: "serverEmptyHint"
                     visible: root.profileEntries.length === 0
                     width: parent.width
                     wrapMode: Text.WordWrap
-                    text: qsTr("No saved profile is available. Use Connect to Server from the command palette to add one.")
+                    text: qsTr("No server is configured yet. Choose Add server below, then fill in the host and the user name you log in with.")
                     color: Theme.textDim
                     font.pixelSize: Theme.fontSizeBody
                 }
 
+                Row {
+                    spacing: 8
+                    SheetButton {
+                        objectName: "serverAddButton"
+                        text: qsTr("Add server")
+                        enabled: typeof app !== "undefined" && app && app.serverProfiles
+                        onClicked: root.addProfile()
+                    }
+                    SheetButton {
+                        objectName: "serverDeleteButton"
+                        text: qsTr("Delete server")
+                        accent: Theme.danger
+                        enabled: root.hasSelection()
+                                  && typeof app !== "undefined" && app && app.serverProfiles
+                        onClicked: root.confirmDeleteProfile()
+                    }
+                }
+
+                // Add server hands the caret to the Name field, which lives in
+                // here and cannot be reached from the root by id.
+                Connections {
+                    target: root
+                    function onProfileNameFocusRequested() {
+                        serverNameField.input.forceActiveFocus();
+                    }
+                }
+
+                // Editing fields with nothing selected would be typing into a
+                // record that does not exist: saveProfile() refuses such a
+                // write, so the keystrokes would simply vanish. The form is not
+                // shown at all in that state and the hint above stands in its
+                // place, which also keeps a blank form from reading as a
+                // profile whose every value happens to be empty.
                 Grid {
+                    visible: root.hasSelection()
                     columns: 2
                     columnSpacing: 14
                     rowSpacing: 10
                     width: Math.min(parent.width, 640)
 
                     Field {
+                        id: serverNameField
                         objectName: "serverField:name"
                         width: 300
                         label: qsTr("Name")
@@ -1158,6 +1347,7 @@ Rectangle {
                 // below the grid.
                 Field {
                     objectName: "serverField:repoRoot"
+                    visible: root.hasSelection()
                     width: Math.min(parent.width, 614)
                     label: qsTr("Remote CodeHarbor directory")
                     text: root.profileRepoRoot
@@ -1175,11 +1365,18 @@ Rectangle {
                 // bad edit corrupt a working profile), so without this the
                 // fields simply stopped saving and nothing on screen said why.
                 // Same sentence the Connect sheet shows for the same rule.
+                //
+                // Gated on hasSelection(), not on the id being non-empty: a
+                // just-added profile that the user has half emptied out is
+                // exactly the case this sentence exists for, while an id left
+                // over from a deleted profile has no fields on screen to
+                // explain and must not raise a warning about a record that is
+                // already gone.
                 Label {
                     objectName: "serverValidationHint"
                     width: parent.width
                     wrapMode: Text.WordWrap
-                    visible: root.selectedProfileId.length > 0 && !root.profileValid()
+                    visible: root.hasSelection() && !root.profileValid()
                     text: EndpointField.hasRejectedCharacters(root.profileHost)
                           ? qsTr("The host cannot contain spaces, line breaks or control characters; this edit will not be saved.")
                           : EndpointField.hasRejectedCharacters(root.profileUser)
@@ -1194,7 +1391,7 @@ Rectangle {
                     SheetButton {
                         objectName: "serverConnectButton"
                         text: qsTr("Connect")
-                        enabled: root.selectedProfileId.length > 0
+                        enabled: root.hasSelection()
                                   && typeof app !== "undefined" && app
                         accent: Theme.success
                         onClicked: app.connectToProfile(root.selectedProfileId)
@@ -1208,7 +1405,7 @@ Rectangle {
                     SheetButton {
                         objectName: "serverUpgradeButton"
                         text: qsTr("Update Remote Service")
-                        enabled: root.selectedProfileId.length > 0
+                        enabled: root.hasSelection()
                                   && typeof app !== "undefined" && app
                         accent: Theme.warning
                         onClicked: app.upgradeRemoteService(root.selectedProfileId)

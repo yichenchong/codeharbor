@@ -39,12 +39,28 @@ public:
     static Oklch srgbToOklch(const SrgbColor &color);
     static SrgbColor oklchToSrgb(const Oklch &color);
 
-    // Largest palette this generator will produce. Expansion compares every
-    // pair of colours already chosen for each new one, so the work grows with
-    // the CUBE of the requested count: asking for a few thousand colours would
-    // freeze the user interface for minutes while it computed a palette nobody
-    // could tell apart. Group tints need dozens, not thousands, so an
-    // out-of-range request is refused outright instead.
+    // How far apart two colours look, as the straight-line distance between
+    // them in OKLab. Zero means identical; roughly 0.02 is the point where two
+    // colours stop being tellable apart side by side. Exposed because "these
+    // colours are different numbers" is not the property group tints need -
+    // "these colours look different" is - so callers and tests can check the
+    // one that matters.
+    static double perceptualDistance(const SrgbColor &first, const SrgbColor &second);
+
+    // The separation the expansion holds between any two colours of a palette
+    // no larger than the 64-colour maximum the user-facing preference allows.
+    // Measured worst case there is 0.082; the guarantee is stated a little
+    // lower so a future seed tweak does not fail the check for a change nobody
+    // can see. Larger palettes stay duplicate-free but necessarily pack closer
+    // together (about 0.031 at kMaxPaletteSize).
+    static constexpr double kMinPerceptualSeparation = 0.08;
+
+    // Largest palette this generator will produce. Expansion measures every
+    // candidate colour against every colour already chosen for each new one, so
+    // the work grows with the SQUARE of the requested count: asking for a few
+    // thousand colours would stall the user interface while it computed a
+    // palette nobody could tell apart. Group tints need dozens, not thousands,
+    // so an out-of-range request is refused outright instead.
     //
     // This must stay at or above ch::AppSettings::kMaxPaletteSize (64), the
     // upper end of the user-facing preference; if that preference is ever

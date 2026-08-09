@@ -792,6 +792,157 @@ int renderShots()
 
 } // namespace
 
+// A stand-in for ch::ServerProfiles with the two behaviours SettingsWindow's
+// server pane actually depends on: a profile with no host or no user is
+// REFUSED rather than stored (the real store's sanitize() rule, which is why
+// the pane has to seed a new profile instead of creating a blank one), and
+// every mutation republishes the whole list. Linking the real class would drag
+// AppController and QSettings into a QML surface test; its own behaviour is
+// gated by src/app/tests/tst_serverprofiles.cpp.
+class StubServerProfiles : public QObject
+{
+    Q_OBJECT
+    Q_PROPERTY(QVariantList profiles READ profiles NOTIFY profilesChanged)
+    Q_PROPERTY(QString activeId READ activeId WRITE setActiveId NOTIFY activeIdChanged)
+
+public:
+    using QObject::QObject;
+
+    QVariantList profiles() const { return m_profiles; }
+    QString activeId() const { return m_activeId; }
+    void setActiveId(QString id)
+    {
+        if (id == m_activeId)
+            return;
+        m_activeId = id;
+        emit activeIdChanged();
+    }
+
+    void seed(const QVariantList &profiles)
+    {
+        m_profiles = profiles;
+        m_activeId = profiles.isEmpty() ? QString()
+                                        : profiles.first().toMap().value(kId).toString();
+        emit profilesChanged();
+    }
+
+    Q_INVOKABLE QString addProfile(QVariantMap fields)
+    {
+        if (!usableEndpoint(fields.value(kHost).toString())
+            || !usableEndpoint(fields.value(kUser).toString()))
+            return QString();
+        const QString id = QStringLiteral("new-%1").arg(++m_minted);
+        fields[kId] = id;
+        m_profiles.append(fields);
+        emit profilesChanged();
+        if (m_activeId.isEmpty())
+            setActiveId(id);
+        return id;
+    }
+
+    Q_INVOKABLE void updateProfile(QString id, QVariantMap fields)
+    {
+        const int index = indexOf(id);
+        if (index < 0)
+            return;
+        QVariantMap merged = m_profiles.at(index).toMap();
+        for (auto it = fields.cbegin(); it != fields.cend(); ++it)
+            merged.insert(it.key(), it.value());
+        if (!usableEndpoint(merged.value(kHost).toString())
+            || !usableEndpoint(merged.value(kUser).toString()))
+            return; // an invalid edit must not corrupt a working profile
+        merged[kId] = id;
+        m_profiles[index] = merged;
+        ++m_updates;
+        emit profilesChanged();
+    }
+
+    Q_INVOKABLE void removeProfile(QString id)
+    {
+        const int index = indexOf(id);
+        if (index < 0)
+            return;
+        m_profiles.removeAt(index);
+        emit profilesChanged();
+        if (m_activeId != id)
+            return;
+        // The real store advances the selection to whatever took the removed
+        // profile's place, or to the new last one.
+        const int next = qMin(index, int(m_profiles.size()) - 1);
+        setActiveId(next < 0 ? QString() : m_profiles.at(next).toMap().value(kId).toString());
+    }
+
+    int updateCount() const { return m_updates; }
+
+signals:
+    void profilesChanged();
+    void activeIdChanged();
+
+private:
+    static constexpr auto kId = "id";
+    static constexpr auto kHost = "host";
+    static constexpr auto kUser = "user";
+
+    static bool usableEndpoint(const QString &value)
+    {
+        const QString trimmed = value.trimmed();
+        if (trimmed.isEmpty())
+            return false;
+        for (const QChar c : trimmed) {
+            if (c.isSpace() || c.category() == QChar::Other_Control)
+                return false;
+        }
+        return true;
+    }
+
+    int indexOf(const QString &id) const
+    {
+        for (int i = 0; i < m_profiles.size(); ++i) {
+            if (m_profiles.at(i).toMap().value(kId).toString() == id)
+                return i;
+        }
+        return -1;
+    }
+
+    QVariantList m_profiles;
+    QString m_activeId;
+    int m_minted = 0;
+    int m_updates = 0;
+};
+
+// The `app` the settings window sees. `settings` is deliberately null: these
+// tests are about the server pane, and a null settings object is exactly the
+// state the other SettingsWindow tests already run in.
+class StubProfilesApp : public QObject
+{
+    Q_OBJECT
+    Q_PROPERTY(QObject *settings READ settings CONSTANT)
+    Q_PROPERTY(QObject *serverProfiles READ serverProfiles CONSTANT)
+
+public:
+    explicit StubProfilesApp(QObject *parent = nullptr)
+        : QObject(parent), m_profiles(new StubServerProfiles(this))
+    {
+    }
+
+    QObject *settings() const { return nullptr; }
+    QObject *serverProfiles() const { return m_profiles; }
+    StubServerProfiles *store() const { return m_profiles; }
+
+    Q_INVOKABLE void connectToProfile(QString) {}
+    Q_INVOKABLE void disconnectServer() {}
+    // Recorded, not ignored: Update Remote Service has to carry the SELECTED
+    // profile id. An empty one installs onto whatever profile happens to be
+    // active, which is not necessarily the one the pane is showing.
+    Q_INVOKABLE void upgradeRemoteService(QString id) { m_upgradeRequests.append(id); }
+
+    QStringList upgradeRequests() const { return m_upgradeRequests; }
+
+private:
+    StubServerProfiles *m_profiles;
+    QStringList m_upgradeRequests;
+};
+
 // ---------------------------------------------------------------------------
 // Assertions
 // ---------------------------------------------------------------------------
@@ -828,11 +979,14 @@ private slots:
     void sheetErrorIsReadableAndDismissible();
 
     // Cold start: the sheet has to say what this dialog is for, not just show
-    // an empty list.
+    // an empty list. It can no longer create a server itself, so it also has to
+    // offer the way out to the window that can.
     void sheetColdStartExplainsItself();
+    void sheetOffersAWayToTheSettingsWindow();
     void sheetProfileRowsCenterAndElideTheirContent();
-    void sheetRejectsPartiallyNumericPorts();
-    void sheetModelRefreshKeepsUnsavedEdits();
+    // The sheet is a picker now, so what a background refresh must preserve is
+    // the SELECTION, not a half-typed form.
+    void sheetModelRefreshKeepsTheSelectedProfile();
 
     // A pane with nothing behind it explains itself instead of showing an id.
     void inertTerminalPaneExplainsItself();
@@ -846,9 +1000,10 @@ private slots:
     void titleBarButtonsAreNamedAndCloseIsWired();
     void titleBarDragUsesTheSystemMoveOperation();
 
-    // The one control in the sheet that WRITES to the server: it has to be
-    // wired to a profile and, like Connect, unreachable behind a prompt.
-    void sheetUpdateServerButtonNamesItsProfile();
+    // The one control that WRITES to the server. It lives in the settings
+    // window's server pane now, and like Connect it has to be wired to the
+    // profile on screen rather than to whatever happens to be active.
+    void settingsServerUpdateButtonNamesItsProfile();
 
     // The three full-window sheets sit ON TOP of the workspace. A Rectangle
     // accepts no input of its own, so without a shield every click that missed
@@ -866,9 +1021,23 @@ private slots:
     // rather than run over the row's own border.
     void settingsServerRowsCentreAndElideTheirName();
 
-    // The sheet's Save gate has to be the STORE's rule. Anything looser reports
-    // a save that ServerProfiles silently drops on the floor.
-    void sheetRejectsAHostOrUserThatIsNotASingleWord();
+    // The settings window is the ONLY place a server profile can be created,
+    // so the first-run state — nothing configured at all — has to be a state
+    // the user can get OUT of, and adding has to leave the new profile
+    // selected and ready to type into.
+    void settingsServerAddCreatesSelectsAndFocusesAProfile();
+
+    // Deleting a profile is unrecoverable, so it is confirmed, the question
+    // names the profile, and cancelling really does nothing.
+    void settingsServerDeleteIsConfirmedAndNamesTheProfile();
+
+    // After a delete the form must point at a profile that still exists.
+    void settingsServerDeleteReselectsANeighbour();
+
+    // The server pane's save gate has to be the STORE's rule. Anything looser
+    // reports a save that ServerProfiles silently drops on the floor.
+    void settingsServerPaneRejectsPartiallyNumericPorts();
+    void settingsServerPaneRejectsAHostOrUserThatIsNotASingleWord();
 };
 
 // The states ch::AppController publishes, read out of the SOURCE rather than
@@ -1064,10 +1233,10 @@ void TstUxShell::sheetChromeIsDisabledWhileAPromptIsUp()
     auto *closeButton = qobject_cast<QQuickItem *>(surface.child(QStringLiteral("closeButton")));
     auto *connectButton =
             qobject_cast<QQuickItem *>(surface.child(QStringLiteral("connectButton")));
-    auto *upgradeButton =
-            qobject_cast<QQuickItem *>(surface.child(QStringLiteral("upgradeButton")));
+    auto *openSettings =
+            qobject_cast<QQuickItem *>(surface.child(QStringLiteral("openSettingsButton")));
     auto *profileList = qobject_cast<QQuickItem *>(surface.child(QStringLiteral("profileList")));
-    QVERIFY(closeButton && connectButton && upgradeButton && profileList);
+    QVERIFY(closeButton && connectButton && openSettings && profileList);
     QVERIFY(closeButton->isEnabled());
 
     root->setProperty("pendingHostKey",
@@ -1080,9 +1249,10 @@ void TstUxShell::sheetChromeIsDisabledWhileAPromptIsUp()
              "Close is still reachable behind the host-key prompt: dismissing the sheet there "
              "abandons a connect attempt that is waiting for the answer");
     QVERIFY2(!connectButton->isEnabled(), "Connect is still reachable behind the host-key prompt");
-    QVERIFY2(!upgradeButton->isEnabled(),
-             "Update server is still reachable behind the host-key prompt: it tears the "
-             "parked attempt down and reinstalls the service under it");
+    QVERIFY2(!openSettings->isEnabled(),
+             "the way out to the settings window is still reachable behind the host-key "
+             "prompt: the connection is parked on this one answer, and wandering off to "
+             "edit profiles is not an answer");
     QVERIFY2(!profileList->isEnabled(), "the profile list is still usable behind the prompt");
 
     // ...while the panel that must be answered stays live.
@@ -1112,38 +1282,35 @@ void TstUxShell::sheetChromeIsDisabledWhileAPromptIsUp()
     QVERIFY2(surface.warnings.isEmpty(), qPrintable(surface.warningReport()));
 }
 
-// The button is the only way most people will ever update the service on their
-// server, and it must carry the profile the sheet is showing: an upgrade
-// request with an empty id installs onto whatever profile happens to be active,
-// which is not necessarily the one on screen.
-void TstUxShell::sheetUpdateServerButtonNamesItsProfile()
+// The one control that installs software onto the user's server. It has to
+// carry the profile the pane is SHOWING: an upgrade request with an empty id
+// installs onto whatever profile happens to be active, which is not
+// necessarily the one on screen.
+void TstUxShell::settingsServerUpdateButtonNamesItsProfile()
 {
-    Surface surface(moduleUrl(QStringLiteral("ConnectSheet.qml")), QSize(900, 560));
+    StubProfilesApp app;
+    Surface surface(moduleUrl(QStringLiteral("SettingsWindow.qml")), QSize(900, 560), &app);
     QVERIFY(surface.expose());
-    QQuickItem *root = surface.root();
-    QVERIFY(root);
+    QVERIFY2(showServerPane(surface), "the Settings sheet never showed its server pane");
 
-    auto *upgradeButton =
-            qobject_cast<QQuickItem *>(surface.child(QStringLiteral("upgradeButton")));
-    QVERIFY(upgradeButton);
+    auto *upgrade =
+            qobject_cast<QQuickItem *>(surface.child(QStringLiteral("serverUpgradeButton")));
+    QVERIFY2(upgrade, "the server pane has no Update Remote Service button");
 
-    // Nothing selected: there is no server to install onto, so the button is
-    // dead rather than firing a request with an empty id.
-    root->setProperty("profiles", QVariantList());
+    // Nothing stored: there is no server to install onto, so the button is dead
+    // rather than firing a request with an empty id.
+    QVERIFY2(!upgrade->isEnabled(), "Update Remote Service is live with no profile to update");
+
+    app.store()->seed(twoProfiles());
+    settle(80);
+    surface.root()->setProperty("selectedProfileId", QStringLiteral("id-b"));
+    settle(80);
+    QCOMPARE(surface.root()->property("selectedProfileId").toString(), QStringLiteral("id-b"));
+    QVERIFY(upgrade->isEnabled());
+
+    QMetaObject::invokeMethod(upgrade, "clicked");
     settle(40);
-    QVERIFY2(!upgradeButton->isEnabled(),
-             "Update server is live with no profile to update");
-
-    root->setProperty("profiles", twoProfiles());
-    root->setProperty("activeId", QStringLiteral("id-b"));
-    settle(40);
-    QVERIFY(upgradeButton->isEnabled());
-
-    QSignalSpy requested(root, SIGNAL(upgradeRequested(QString)));
-    QMetaObject::invokeMethod(upgradeButton, "clicked");
-    settle(40);
-    QCOMPARE(requested.size(), 1);
-    QCOMPARE(requested.at(0).at(0).toString(), QStringLiteral("id-b"));
+    QCOMPARE(app.upgradeRequests(), QStringList{QStringLiteral("id-b")});
 
     QVERIFY2(surface.warnings.isEmpty(), qPrintable(surface.warningReport()));
 }
@@ -1213,6 +1380,15 @@ void TstUxShell::sidebarArchiveButtonCallsArchiveAndUnarchive()
         QVERIFY2(marker, "the row has no archived marker at all, so the empty reading "
                          "below would pass for the wrong reason");
         QCOMPARE(textOf(marker), QString());
+        // The archive action has to read as archiving rather than as a second
+        // pin: a user complained that the old square said nothing. The glyph
+        // is the "file it away" arrow, and it must not collide with either
+        // half of the pin star beside it.
+        QObject *pin = surface.child(QStringLiteral("pinButton:s"));
+        QVERIFY2(pin, "the row has no pin action to stay distinct from");
+        QCOMPARE(textOf(archive), QStringLiteral("\u21a7"));
+        QVERIFY2(textOf(archive) != textOf(pin),
+                 "the archive action draws the same character as the pin beside it");
         QMetaObject::invokeMethod(archive, "clicked");
         QCOMPARE(app.archiveCalls(), 1);
         QCOMPARE(app.lastArchiveId(), QStringLiteral("s"));
@@ -1239,7 +1415,10 @@ void TstUxShell::sidebarArchiveButtonCallsArchiveAndUnarchive()
     QVERIFY2(unarchive, "the archived row has no unarchive action");
     QObject *marker = surface.child(QStringLiteral("archivedMarker:s"));
     QVERIFY2(marker, "the archived row has no archived marker");
-    QCOMPARE(textOf(marker), QStringLiteral("\u25a3"));
+    QCOMPARE(textOf(marker), QStringLiteral("\u21a7"));
+    // Archived rows offer the mirror-image arrow, so the row action says which
+    // way the click will go without waiting for a tooltip.
+    QCOMPARE(textOf(unarchive), QStringLiteral("\u21a5"));
     QMetaObject::invokeMethod(unarchive, "clicked");
     QCOMPARE(app.unarchiveCalls(), 1);
     QCOMPARE(app.lastArchiveId(), QStringLiteral("s"));
@@ -1350,11 +1529,16 @@ void TstUxShell::sidebarArchiveFilterToggleIsNamedAndChangesModel()
     QVERIFY2(toggle, "the sidebar has no show-archived toggle");
     QCOMPARE(toggle->property("actionText").toString(),
              QStringLiteral("Show archived sessions"));
+    // Hovering for a tooltip is not an acceptable way to learn whether the
+    // filter is on, so the glyph itself has to change with the state, and it
+    // must be the archive arrow rather than the pin star.
+    QCOMPARE(textOf(toggle), QStringLiteral("\u21a7"));
     QMetaObject::invokeMethod(toggle, "clicked");
     settle(40);
     QVERIFY(model.showArchived());
     QCOMPARE(toggle->property("actionText").toString(),
              QStringLiteral("Hide archived sessions"));
+    QCOMPARE(textOf(toggle), QStringLiteral("\u21a5"));
     QVERIFY(surface.warnings.isEmpty());
 }
 
@@ -1563,6 +1747,13 @@ void TstUxShell::sheetColdStartExplainsItself()
     QVERIFY2(intro, "nothing tells a first-time user what this sheet is for");
     QVERIFY(intro->isVisible());
     QVERIFY(textOf(intro).length() > 20);
+    // The sheet has no form of its own any more, so the explainer must send the
+    // user to the one surface that can create a server. Without that sentence a
+    // first-time user is told what CodeHarbor needs and given no way to supply
+    // it.
+    QVERIFY2(textOf(intro).contains(QStringLiteral("settings"), Qt::CaseInsensitive),
+             qPrintable(QStringLiteral("the cold-start text never mentions settings: \"%1\"")
+                                .arg(textOf(intro))));
 
     // ...and it gets out of the way once there is something to connect to.
     surface.root()->setProperty("profiles", twoProfiles());
@@ -1572,32 +1763,81 @@ void TstUxShell::sheetColdStartExplainsItself()
     QVERIFY2(surface.warnings.isEmpty(), qPrintable(surface.warningReport()));
 }
 
-void TstUxShell::sheetRejectsPartiallyNumericPorts()
+// A user with no profiles meets this sheet and nothing else: it opens itself on
+// first run and there is no server to connect to. If the only escape were the
+// sidebar behind it, the cold-start path would be a dead end, so the sheet
+// carries its own labelled way into the settings window.
+void TstUxShell::sheetOffersAWayToTheSettingsWindow()
 {
     Surface surface(moduleUrl(QStringLiteral("ConnectSheet.qml")), QSize(900, 560));
     QVERIFY(surface.expose());
     QQuickItem *root = surface.root();
     QVERIFY(root);
 
-    QObject *host = surface.child(QStringLiteral("hostField"));
-    QObject *user = surface.child(QStringLiteral("userField"));
-    QObject *port = surface.child(QStringLiteral("portField"));
-    QVERIFY(host && user && port);
+    auto *openSettings =
+            qobject_cast<QQuickItem *>(surface.child(QStringLiteral("openSettingsButton")));
+    QVERIFY2(openSettings, "a sheet with no profiles offers no way to create one");
+    QVERIFY2(openSettings->isVisible() && openSettings->isEnabled(),
+             "the only way out of the cold-start sheet is not usable");
+    // Labelled, not a bare glyph: this is the one control that matters on an
+    // otherwise empty sheet.
+    QVERIFY2(textOf(openSettings).contains(QStringLiteral("server"), Qt::CaseInsensitive),
+             qPrintable(QStringLiteral("the escape hatch is labelled \"%1\"")
+                                .arg(textOf(openSettings))));
+
+    QSignalSpy requested(root, SIGNAL(settingsRequested()));
+    QVERIFY(requested.isValid());
+    QMetaObject::invokeMethod(openSettings, "clicked");
+    settle(40);
+    QCOMPARE(requested.size(), 1);
+
+    // And it does NOT try to edit anything here: the sheet lost its form.
+    for (const char *gone : {"nameField", "hostField", "portField", "userField",
+                             "identityFileField", "nodePathField", "repoRootField",
+                             "addButton", "removeButton", "saveButton", "upgradeButton"}) {
+        QVERIFY2(!surface.child(QLatin1String(gone)),
+                 qPrintable(QStringLiteral("the connect sheet still carries %1")
+                                    .arg(QLatin1String(gone))));
+    }
+
+    QVERIFY2(surface.warnings.isEmpty(), qPrintable(surface.warningReport()));
+}
+
+// Port is the one field the store parses rather than merely trims, and
+// QString::toInt()-style leniency would turn "22abc" into 22 and connect to the
+// wrong port without a word.
+void TstUxShell::settingsServerPaneRejectsPartiallyNumericPorts()
+{
+    StubProfilesApp app;
+    Surface surface(moduleUrl(QStringLiteral("SettingsWindow.qml")), QSize(900, 560), &app);
+    QVERIFY(surface.expose());
+    QVERIFY2(showServerPane(surface), "the Settings sheet never showed its server pane");
+    app.store()->seed(twoProfiles());
+    settle(80);
+
+    QObject *host = surface.child(QStringLiteral("serverField:host"));
+    QObject *user = surface.child(QStringLiteral("serverField:user"));
+    QObject *port = surface.child(QStringLiteral("serverField:port"));
+    auto *hint = qobject_cast<QQuickItem *>(surface.child(QStringLiteral("serverValidationHint")));
+    QVERIFY(host && user && port && hint);
     host->setProperty("text", QStringLiteral("example.test"));
     user->setProperty("text", QStringLiteral("alice"));
     port->setProperty("text", QStringLiteral("22abc"));
+    settle(40);
 
     QVariant valid;
-    QVERIFY(QMetaObject::invokeMethod(root, "formValid", Q_RETURN_ARG(QVariant, valid)));
+    QVERIFY(QMetaObject::invokeMethod(surface.root(), "profileValid",
+                                      Q_RETURN_ARG(QVariant, valid)));
     QVERIFY2(!valid.toBool(), "a port with a numeric prefix was accepted as valid");
-    QVERIFY(QMetaObject::invokeMethod(root, "portValue", Q_RETURN_ARG(QVariant, valid)));
-    QCOMPARE(valid.toInt(), 0);
+    QVERIFY2(hint->isVisible(), "nothing on screen says the port will not be saved");
 
     port->setProperty("text", QStringLiteral("2200"));
-    QVERIFY(QMetaObject::invokeMethod(root, "formValid", Q_RETURN_ARG(QVariant, valid)));
+    settle(40);
+    QVERIFY(QMetaObject::invokeMethod(surface.root(), "profileValid",
+                                      Q_RETURN_ARG(QVariant, valid)));
     QVERIFY(valid.toBool());
-    QVERIFY(QMetaObject::invokeMethod(root, "portValue", Q_RETURN_ARG(QVariant, valid)));
-    QCOMPARE(valid.toInt(), 2200);
+    QVERIFY2(!hint->isVisible(), "a saveable profile still shows a validation hint");
+
     QVERIFY2(surface.warnings.isEmpty(), qPrintable(surface.warningReport()));
 }
 
@@ -1605,28 +1845,30 @@ void TstUxShell::sheetRejectsPartiallyNumericPorts()
 // or a control character: no hostname, IP literal or POSIX user name can
 // contain one, so such a profile could only ever fail at connect time with an
 // opaque resolver error. The refusal is silent by design (an invalid edit must
-// not corrupt a working profile), which is exactly why the SHEET has to apply
-// the same rule: a Save button that is live for a value the store will drop
-// tells the user the server was saved and then produces no row at all.
+// not corrupt a working profile), which is exactly why the PANE has to apply
+// the same rule: a form that accepts a value the store will drop tells the user
+// the server was saved and then changes nothing at all.
 //
 // The rule is whitespace and control characters ONLY, never hostname grammar:
 // ':' and '%' have to stay legal or an IPv6 literal with a zone identifier
 // becomes unsavable.
-void TstUxShell::sheetRejectsAHostOrUserThatIsNotASingleWord()
+void TstUxShell::settingsServerPaneRejectsAHostOrUserThatIsNotASingleWord()
 {
-    Surface surface(moduleUrl(QStringLiteral("ConnectSheet.qml")), QSize(900, 560));
+    StubProfilesApp app;
+    Surface surface(moduleUrl(QStringLiteral("SettingsWindow.qml")), QSize(900, 560), &app);
     QVERIFY(surface.expose());
-    QQuickItem *root = surface.root();
-    QVERIFY(root);
+    QVERIFY2(showServerPane(surface), "the Settings sheet never showed its server pane");
+    app.store()->seed(twoProfiles());
+    settle(80);
 
-    QObject *host = surface.child(QStringLiteral("hostField"));
-    QObject *user = surface.child(QStringLiteral("userField"));
-    QObject *port = surface.child(QStringLiteral("portField"));
-    auto *hint = qobject_cast<QQuickItem *>(surface.child(QStringLiteral("validationHint")));
-    auto *save = qobject_cast<QQuickItem *>(surface.child(QStringLiteral("saveButton")));
-    QVERIFY(host && user && port && hint && save);
+    QObject *host = surface.child(QStringLiteral("serverField:host"));
+    QObject *user = surface.child(QStringLiteral("serverField:user"));
+    QObject *port = surface.child(QStringLiteral("serverField:port"));
+    auto *hint = qobject_cast<QQuickItem *>(surface.child(QStringLiteral("serverValidationHint")));
+    QVERIFY(host && user && port && hint);
 
     QVariant valid;
+    QQuickItem *root = surface.root();
 
     // The way a real user gets here: pasting a whole ssh command line into the
     // host field.
@@ -1635,20 +1877,22 @@ void TstUxShell::sheetRejectsAHostOrUserThatIsNotASingleWord()
     port->setProperty("text", QStringLiteral("22"));
     settle(40);
 
-    QVERIFY(QMetaObject::invokeMethod(root, "formValid", Q_RETURN_ARG(QVariant, valid)));
+    QVERIFY(QMetaObject::invokeMethod(root, "profileValid", Q_RETURN_ARG(QVariant, valid)));
     QVERIFY2(!valid.toBool(), "a host containing a space was accepted as valid");
-    QVERIFY2(!save->isEnabled(),
-             "Save is live for a host the store will silently drop");
     QVERIFY2(hint->isVisible(), "nothing on screen says why the host is refused");
     QVERIFY2(textOf(hint).contains(QStringLiteral("host"), Qt::CaseInsensitive),
              qPrintable(QStringLiteral("the hint does not name the host: \"%1\"")
                                 .arg(textOf(hint))));
+    // The store must not have taken it either: an accepted-looking edit that
+    // vanishes on the next refresh is the bug this gate exists for.
+    QCOMPARE(app.store()->profiles().at(0).toMap().value(QStringLiteral("host")).toString(),
+             QStringLiteral("10.0.0.4"));
 
     // Same rule for the login name, and it has to say so.
     host->setProperty("text", QStringLiteral("box.local"));
     user->setProperty("text", QStringLiteral("al ice"));
     settle(40);
-    QVERIFY(QMetaObject::invokeMethod(root, "formValid", Q_RETURN_ARG(QVariant, valid)));
+    QVERIFY(QMetaObject::invokeMethod(root, "profileValid", Q_RETURN_ARG(QVariant, valid)));
     QVERIFY2(!valid.toBool(), "a user name containing a space was accepted as valid");
     QVERIFY2(textOf(hint).contains(QStringLiteral("user"), Qt::CaseInsensitive),
              qPrintable(QStringLiteral("the hint does not name the user: \"%1\"")
@@ -1658,32 +1902,34 @@ void TstUxShell::sheetRejectsAHostOrUserThatIsNotASingleWord()
     host->setProperty("text", QStringLiteral("box\tlocal"));
     user->setProperty("text", QStringLiteral("alice"));
     settle(40);
-    QVERIFY(QMetaObject::invokeMethod(root, "formValid", Q_RETURN_ARG(QVariant, valid)));
+    QVERIFY(QMetaObject::invokeMethod(root, "profileValid", Q_RETURN_ARG(QVariant, valid)));
     QVERIFY2(!valid.toBool(), "a host containing a tab was accepted as valid");
 
     // ...and the gate must not have become hostname grammar. Surrounding
     // whitespace is trimmed, exactly as the store trims it, so it is not a
     // reason to refuse anything either.
-    QSignalSpy saved(root, SIGNAL(profileSaved(QVariant)));
-    QVERIFY(saved.isValid());
     host->setProperty("text", QStringLiteral("  fe80::1%eth0  "));
     settle(40);
-    QVERIFY(QMetaObject::invokeMethod(root, "formValid", Q_RETURN_ARG(QVariant, valid)));
+    QVERIFY(QMetaObject::invokeMethod(root, "profileValid", Q_RETURN_ARG(QVariant, valid)));
     QVERIFY2(valid.toBool(),
              "an IPv6 address with a zone identifier was refused; the gate has "
              "turned into hostname grammar");
-    QVERIFY(save->isEnabled());
-    QVERIFY2(!hint->isVisible(), "a saveable form still shows a validation hint");
+    QVERIFY2(!hint->isVisible(), "a saveable profile still shows a validation hint");
 
-    // The accepted path is not merely un-blocked, it actually saves.
-    QMetaObject::invokeMethod(root, "save");
+    // The accepted path is not merely un-blocked, it actually reaches the store.
+    QVERIFY(QMetaObject::invokeMethod(root, "saveProfile"));
     settle(40);
-    QCOMPARE(saved.size(), 1);
+    QCOMPARE(app.store()->profiles().at(0).toMap().value(QStringLiteral("host")).toString(),
+             QStringLiteral("  fe80::1%eth0  "));
 
     QVERIFY2(surface.warnings.isEmpty(), qPrintable(surface.warningReport()));
 }
 
-void TstUxShell::sheetModelRefreshKeepsUnsavedEdits()
+// The sheet holds no draft any more, but it does hold the choice of which
+// server Connect will use. A background refresh (another profile added, the
+// host catching up on activeId) must not silently move that choice onto a
+// different machine.
+void TstUxShell::sheetModelRefreshKeepsTheSelectedProfile()
 {
     Surface surface(moduleUrl(QStringLiteral("ConnectSheet.qml")), QSize(900, 560));
     QVERIFY(surface.expose());
@@ -1693,10 +1939,13 @@ void TstUxShell::sheetModelRefreshKeepsUnsavedEdits()
     root->setProperty("activeId", QStringLiteral("id-a"));
     settle(40);
 
-    QObject *host = surface.child(QStringLiteral("hostField"));
-    QVERIFY(host);
-    host->setProperty("text", QStringLiteral("draft.example"));
-    QCOMPARE(host->property("text").toString(), QStringLiteral("draft.example"));
+    // Pick the profile that is NOT the active one, the way a user clicking the
+    // second row does.
+    auto *row = qobject_cast<QQuickItem *>(surface.child(QStringLiteral("profileRow1")));
+    QVERIFY(row);
+    QMetaObject::invokeMethod(row, "clicked");
+    settle(40);
+    QCOMPARE(root->property("selectedId").toString(), QStringLiteral("id-b"));
 
     QVariantList refreshed = twoProfiles();
     refreshed.append(QVariantMap{{QStringLiteral("id"), QStringLiteral("id-c")},
@@ -1706,14 +1955,22 @@ void TstUxShell::sheetModelRefreshKeepsUnsavedEdits()
                                  {QStringLiteral("user"), QStringLiteral("alice")}});
     root->setProperty("profiles", refreshed);
     settle(40);
-    QCOMPARE(host->property("text").toString(), QStringLiteral("draft.example"));
+    QCOMPARE(root->property("selectedId").toString(), QStringLiteral("id-b"));
 
-    // activeId is a host-side background update, not a profile-row click.
-    // A real click calls selectIndex() and intentionally loads that profile;
-    // this refresh must not destroy the draft while the host catches up.
-    root->setProperty("activeId", QStringLiteral("id-b"));
+    // The detail panel is what tells the user which machine Connect will dial,
+    // so it has to name the selected profile, not the active one.
+    QCOMPARE(textOf(surface.child(QStringLiteral("detailTitle"))),
+             QStringLiteral("Fixture box"));
+
+    // A profile disappearing under the selection is the one case where it must
+    // move: it falls back to the host's active profile rather than leaving
+    // Connect aimed at a record that no longer exists.
+    QVariantList shrunk = twoProfiles();
+    shrunk.removeAt(1);
+    root->setProperty("profiles", shrunk);
     settle(40);
-    QCOMPARE(host->property("text").toString(), QStringLiteral("draft.example"));
+    QCOMPARE(root->property("selectedId").toString(), QStringLiteral("id-a"));
+
     QVERIFY2(surface.warnings.isEmpty(), qPrintable(surface.warningReport()));
 }
 
@@ -1959,6 +2216,13 @@ void TstUxShell::settingsServerFieldsStayInsideThePane()
     QVERIFY(root);
     QVERIFY2(showServerPane(surface), "the Settings sheet never showed its server pane");
 
+    // The form is only shown for a profile that exists — with nothing
+    // configured the pane shows its "add a server" hint instead — so give the
+    // pane a selection before measuring the fields.
+    root->setProperty("profileEntries", twoProfiles());
+    root->setProperty("selectedProfileId", QStringLiteral("id-a"));
+    settle(120);
+
     auto *pane = qobject_cast<QQuickItem *>(surface.child(QStringLiteral("serverPane")));
     QVERIFY2(pane, "the Settings sheet has no server pane");
 
@@ -2071,6 +2335,169 @@ void TstUxShell::settingsServerRowsCentreAndElideTheirName()
              "a name that fits is being shortened");
     QVERIFY2(longRow->property("contentItem").value<QQuickItem *>()->property("truncated").toBool(),
              "a name too wide for its row is not elided");
+
+    QVERIFY2(surface.warnings.isEmpty(), qPrintable(surface.warningReport()));
+}
+
+// The settings window is now the only server manager in the application, so a
+// user whose store is empty — every first run — must be able to get a profile
+// out of it. Nothing here touches a network: creating a profile is a local
+// write, and it has to work with no server reachable.
+void TstUxShell::settingsServerAddCreatesSelectsAndFocusesAProfile()
+{
+    StubProfilesApp app;
+    Surface surface(moduleUrl(QStringLiteral("SettingsWindow.qml")), QSize(900, 560), &app);
+    QVERIFY(surface.expose());
+    QQuickItem *root = surface.root();
+    QVERIFY(root);
+    QVERIFY2(showServerPane(surface), "the Settings sheet never showed its server pane");
+
+    // The empty state: no form to type into, a sentence saying what to do, and
+    // a delete button that cannot act on a profile that is not there.
+    auto *emptyHint = qobject_cast<QQuickItem *>(surface.child(QStringLiteral("serverEmptyHint")));
+    QVERIFY2(emptyHint && emptyHint->isVisible(),
+             "the server pane says nothing when no profile is configured");
+    QVERIFY2(!textOf(emptyHint).trimmed().isEmpty(), "the empty-state hint is blank");
+    auto *hostField = qobject_cast<QQuickItem *>(surface.child(QStringLiteral("serverField:host")));
+    QVERIFY(hostField);
+    QVERIFY2(!hostField->isVisible(),
+             "the server pane offers an editable form with no profile behind it");
+    auto *deleteButton =
+            qobject_cast<QQuickItem *>(surface.child(QStringLiteral("serverDeleteButton")));
+    QVERIFY(deleteButton);
+    QVERIFY2(!deleteButton->isEnabled(), "Delete is offered with nothing selected");
+
+    auto *addButton = qobject_cast<QQuickItem *>(surface.child(QStringLiteral("serverAddButton")));
+    QVERIFY2(addButton, "the server pane has no Add button");
+    QVERIFY(addButton->isEnabled());
+    QMetaObject::invokeMethod(addButton, "clicked");
+    settle(120);
+
+    // Stored, listed, and selected — not merely drafted on screen.
+    QCOMPARE(app.store()->profiles().size(), 1);
+    const QString newId = app.store()->profiles().first().toMap().value(QStringLiteral("id")).toString();
+    QCOMPARE(root->property("selectedProfileId").toString(), newId);
+    QVERIFY2(surface.child(QStringLiteral("serverProfile:") + newId),
+             "the new profile has no row in the list");
+    QVERIFY2(!emptyHint->isVisible(), "the empty-state hint survives the first profile");
+    QVERIFY2(hostField->isVisible(), "the form is still hidden after a profile was added");
+
+    // The caret has to land in Name: it is the one field with no useful seed,
+    // and the point of Add is that the next keystroke goes somewhere.
+    auto *nameField = qobject_cast<QQuickItem *>(surface.child(QStringLiteral("serverField:name")));
+    QVERIFY(nameField);
+    auto *nameInput = nameField->property("input").value<QQuickItem *>();
+    QVERIFY(nameInput);
+    QVERIFY2(nameInput->hasActiveFocus(), "Add did not put the caret in the Name field");
+
+    // A freshly added profile is seeded, so it is savable; emptying the host
+    // makes it incomplete and the pane must SAY the edit will not be stored,
+    // exactly as it does for a profile that was there all along.
+    auto *hint = qobject_cast<QQuickItem *>(surface.child(QStringLiteral("serverValidationHint")));
+    QVERIFY(hint);
+    QVERIFY2(!hint->isVisible(), "a newly added profile is reported as unsavable");
+    hostField->setProperty("text", QString());
+    settle(60);
+    QVERIFY2(hint->isVisible(), "an incomplete new profile is not warned about");
+
+    QVERIFY2(surface.warnings.isEmpty(), qPrintable(surface.warningReport()));
+}
+
+// Removing a server profile cannot be undone and the store keeps no copy, so
+// the button asks first and the question has to identify which profile is
+// about to go.
+void TstUxShell::settingsServerDeleteIsConfirmedAndNamesTheProfile()
+{
+    StubProfilesApp app;
+    app.store()->seed(twoProfiles());
+    Surface surface(moduleUrl(QStringLiteral("SettingsWindow.qml")), QSize(900, 560), &app);
+    QVERIFY(surface.expose());
+    QQuickItem *root = surface.root();
+    QVERIFY(root);
+    QVERIFY2(showServerPane(surface), "the Settings sheet never showed its server pane");
+    QCOMPARE(root->property("selectedProfileId").toString(), QStringLiteral("id-a"));
+
+    auto *deleteButton =
+            qobject_cast<QQuickItem *>(surface.child(QStringLiteral("serverDeleteButton")));
+    QVERIFY(deleteButton);
+    QVERIFY(deleteButton->isEnabled());
+    QMetaObject::invokeMethod(deleteButton, "clicked");
+    settle(120);
+
+    QObject *dialog = surface.child(QStringLiteral("serverDeleteDialog"));
+    QVERIFY2(dialog, "the server pane deletes without confirming");
+    QVERIFY2(dialog->property("visible").toBool(), "the delete confirmation never opened");
+    QVERIFY2(dialog->property("modal").toBool(), "the delete confirmation is not modal");
+    const QString question = textOf(surface.child(QStringLiteral("serverDeleteMessage")));
+    QVERIFY2(question.contains(QStringLiteral("Workstation")),
+             qPrintable(QStringLiteral("the confirmation does not name the profile: ") + question));
+    QCOMPARE(app.store()->profiles().size(), 2);
+
+    // Cancelling is the whole point of asking.
+    QMetaObject::invokeMethod(dialog, "reject");
+    settle(120);
+    QCOMPARE(app.store()->profiles().size(), 2);
+    QCOMPARE(root->property("selectedProfileId").toString(), QStringLiteral("id-a"));
+
+    QMetaObject::invokeMethod(deleteButton, "clicked");
+    settle(120);
+    QMetaObject::invokeMethod(dialog, "accept");
+    settle(120);
+    QCOMPARE(app.store()->profiles().size(), 1);
+    QCOMPARE(app.store()->profiles().first().toMap().value(QStringLiteral("id")).toString(),
+             QStringLiteral("id-b"));
+
+    QVERIFY2(surface.warnings.isEmpty(), qPrintable(surface.warningReport()));
+}
+
+// A form left pointing at a profile that no longer exists is a form whose
+// every keystroke is silently dropped, so the selection has to move to a
+// neighbour — and to nothing at all once the last profile is gone.
+void TstUxShell::settingsServerDeleteReselectsANeighbour()
+{
+    StubProfilesApp app;
+    app.store()->seed(twoProfiles());
+    Surface surface(moduleUrl(QStringLiteral("SettingsWindow.qml")), QSize(900, 560), &app);
+    QVERIFY(surface.expose());
+    QQuickItem *root = surface.root();
+    QVERIFY(root);
+    QVERIFY2(showServerPane(surface), "the Settings sheet never showed its server pane");
+
+    // Delete the LAST row: there is nothing below it, so the selection has to
+    // fall back to the row above rather than to nothing.
+    root->setProperty("selectedProfileId", QStringLiteral("id-b"));
+    QMetaObject::invokeMethod(root, "loadSelectedProfile");
+    settle(60);
+    auto *deleteButton =
+            qobject_cast<QQuickItem *>(surface.child(QStringLiteral("serverDeleteButton")));
+    QVERIFY(deleteButton);
+    QMetaObject::invokeMethod(deleteButton, "clicked");
+    settle(120);
+    QObject *dialog = surface.child(QStringLiteral("serverDeleteDialog"));
+    QVERIFY(dialog);
+    QMetaObject::invokeMethod(dialog, "accept");
+    settle(120);
+
+    QCOMPARE(root->property("selectedProfileId").toString(), QStringLiteral("id-a"));
+    // The form followed the selection instead of keeping the dead profile's
+    // values on screen.
+    QCOMPARE(root->property("profileHost").toString(), QStringLiteral("10.0.0.4"));
+
+    // Deleting the only remaining profile leaves no selection, no form and the
+    // empty-state hint back on screen.
+    QMetaObject::invokeMethod(deleteButton, "clicked");
+    settle(120);
+    QMetaObject::invokeMethod(dialog, "accept");
+    settle(120);
+    QCOMPARE(app.store()->profiles().size(), 0);
+    QCOMPARE(root->property("selectedProfileId").toString(), QString());
+    auto *hostField = qobject_cast<QQuickItem *>(surface.child(QStringLiteral("serverField:host")));
+    QVERIFY(hostField);
+    QVERIFY2(!hostField->isVisible(), "the form outlives the last profile");
+    auto *emptyHint = qobject_cast<QQuickItem *>(surface.child(QStringLiteral("serverEmptyHint")));
+    QVERIFY2(emptyHint && emptyHint->isVisible(),
+             "deleting the last profile leaves the pane saying nothing");
+    QVERIFY2(!deleteButton->isEnabled(), "Delete stays enabled with nothing left to delete");
 
     QVERIFY2(surface.warnings.isEmpty(), qPrintable(surface.warningReport()));
 }

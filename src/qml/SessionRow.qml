@@ -207,14 +207,15 @@ ItemDelegate {
                 font.bold: true
             }
         }
-        // Archived is a separate marker from the status dot and pin star: the
-        // box glyph remains visible when archived rows are shown and uses the
-        // muted text role rather than any status colour.
+        // Archived is a separate marker from the status dot and pin star. It
+        // draws the same "filed below the line" arrow the archive action uses,
+        // so the marker and the verb that produced it are the same shape, and
+        // it uses the muted text role rather than any status colour.
         Label {
             id: archivedMarker
             objectName: "archivedMarker:" + row.itemId
             width: 14
-            text: row.archived ? "\u25a3" : ""
+            text: row.archived ? "\u21a7" : ""
             color: Theme.textDim
             font.pixelSize: Theme.fontSizeLabel
             horizontalAlignment: Text.AlignHCenter
@@ -321,8 +322,13 @@ ItemDelegate {
             }
             onClicked: if (row.host) row.host.togglePinned(row.itemId, !row.pinned)
         }
-        // Archive is deliberately a box/return glyph rather than a star, so
-        // this action cannot be confused with the pin marker beside it.
+        // Archive is an arrow leaving a shelf rather than a star, so this
+        // action cannot be confused with the pin marker beside it. There is no
+        // literal box or tray character that every platform's default fonts
+        // carry (the tray-shaped ones live in Supplemental Arrows-B or the
+        // emoji planes and fall back to a missing-glyph box), so the metaphor
+        // is the motion instead of the container: down off the list to file it
+        // away, back up off the shelf to bring it out again.
         Button {
             id: archiveButton
             objectName: "archiveButton:" + row.itemId
@@ -333,7 +339,7 @@ ItemDelegate {
             padding: 0
             focusPolicy: Qt.StrongFocus
             anchors.verticalCenter: parent.verticalCenter
-            text: row.archived ? "\u21a9" : "\u25a3"
+            text: row.archived ? "\u21a5" : "\u21a7" // up off / down onto the shelf
 
             readonly property string actionText:
                 row.archived ? qsTr("Unarchive %1").arg(row.name)

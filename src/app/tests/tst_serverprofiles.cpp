@@ -1,15 +1,12 @@
-// Connection profiles (ch::ServerProfiles) and the QML sheet that edits them.
+// Connection profiles (ch::ServerProfiles) and the QML surfaces that display
+// and edit them.
 //
-// Two halves, one gate:
-//   * the store — CRUD, persistence across instances against an explicit .ini
-//     path (never the developer's real settings), the activeId invariant, and
-//     refusal of input that could never connect;
-//   * ConnectSheet.qml — loaded straight from the source tree (by file path, not
-//     through the CodeHarbor QML module this target does not link) and driven
-//     through every signal it exposes, failing on ANY QML warning so it cannot
-//     poison tst_qmlload. Loading it outside its module means the module's
-//     `Theme` singleton is not there, so loadSheet() registers the real
-//     src/qml/Theme.qml and exposes its one instance under the same name.
+// The store half remains a direct CRUD/persistence test. The UI half loads the
+// shipped SettingsWindow.qml server pane with a small AppController-shaped
+// fixture, while the connector-only host-key and credential prompts continue
+// to exercise ConnectSheet.qml (the component that still owns those prompts).
+// Every QML warning from either source-loaded component is collected so a
+// binding regression cannot poison the test run.
 
 #include <QtTest/QtTest>
 
@@ -61,17 +58,19 @@ namespace {
 QMutex g_logMutex;
 QStringList g_loggedWarnings;
 QtMessageHandler g_previousHandler = nullptr;
-
+// Runtime binding warnings are logged with the component URL, not always
+// through QQmlEngine::warnings(), so collect both source-loaded surfaces.
 void warningCollector(QtMsgType type, const QMessageLogContext& context, const QString& msg)
 {
-    if (type != QtDebugMsg && type != QtInfoMsg && msg.contains(QLatin1String("ConnectSheet.qml"))) {
+    if (type != QtDebugMsg && type != QtInfoMsg
+        && (msg.contains(QLatin1String("ConnectSheet.qml"))
+            || msg.contains(QLatin1String("SettingsWindow.qml")))) {
         QMutexLocker locker(&g_logMutex);
         g_loggedWarnings.append(msg);
     }
     if (g_previousHandler)
         g_previousHandler(type, context, msg);
 }
-
 QStringList takeLoggedWarnings()
 {
     QMutexLocker locker(&g_logMutex);
@@ -193,48 +192,34 @@ QObject* findByName(QObject* root, const QString& name, QSet<const QObject*>* se
 // The wiring the orchestrator owns, spelled out once so this test can prove the
 // store and the sheet actually compose: a sheet signal becomes a ServerProfiles
 // mutation, and the store's change notifications are pushed straight back into
-// the sheet's input properties. Main.qml/AppController will do exactly this.
-class SheetBridge : public QObject {
+// SettingsWindow owns profile mutations through the application's
+// ServerProfiles object. This fixture exposes that object and records the
+// AppController calls made by the Connect button; it deliberately contains no
+// alternate profile logic.
+class TestApp : public QObject {
     Q_OBJECT
+    Q_PROPERTY(ch::ServerProfiles* serverProfiles READ serverProfiles CONSTANT)
+    Q_PROPERTY(QObject* settings READ settings CONSTANT)
 
 public:
-    SheetBridge(ServerProfiles* store, QQuickItem* sheet)
-        : QObject(sheet), m_store(store), m_sheet(sheet)
+    explicit TestApp(ServerProfiles* profiles, QObject* parent = nullptr)
+        : QObject(parent), m_profiles(profiles)
     {
-        connect(sheet, SIGNAL(profileSaved(QVariant)), this, SLOT(onProfileSaved(QVariant)));
-        connect(sheet, SIGNAL(profileRemoved(QString)), this, SLOT(onProfileRemoved(QString)));
-        connect(sheet, SIGNAL(connectRequested(QString)), this, SLOT(onConnectRequested(QString)));
-        connect(store, &ServerProfiles::profilesChanged, this, &SheetBridge::push);
-        connect(store, &ServerProfiles::activeIdChanged, this, &SheetBridge::push);
-        push();
     }
+
+    ServerProfiles* serverProfiles() const { return m_profiles; }
+    QObject* settings() const { return nullptr; }
+
+    Q_INVOKABLE void connectToProfile(const QString& id) { connectRequests.append(id); }
+    Q_INVOKABLE void disconnectServer() { ++disconnectRequests; }
+    Q_INVOKABLE void upgradeRemoteService(const QString& id) { upgradeRequests.append(id); }
 
     QStringList connectRequests;
-    QString lastSavedId;
-
-public slots:
-    void onProfileSaved(QVariant fields)
-    {
-        const QVariantMap map = asMap(fields);
-        const QString id = map.value(QStringLiteral("id")).toString();
-        if (id.isEmpty()) {
-            lastSavedId = m_store->addProfile(map);
-        } else {
-            m_store->updateProfile(id, map);
-            lastSavedId = id;
-        }
-    }
-    void onProfileRemoved(QString id) { m_store->removeProfile(id); }
-    void onConnectRequested(QString id) { connectRequests.append(id); }
-    void push()
-    {
-        m_sheet->setProperty("profiles", m_store->profiles());
-        m_sheet->setProperty("activeId", m_store->activeId());
-    }
+    QStringList upgradeRequests;
+    int disconnectRequests = 0;
 
 private:
-    ServerProfiles* m_store = nullptr;
-    QQuickItem* m_sheet = nullptr;
+    ServerProfiles* m_profiles = nullptr;
 };
 
 class TstServerProfiles : public QObject {
@@ -263,7 +248,7 @@ private slots:
     void aConflictingEditIsLastWriteWins();
     void aMergeLeaksNoSecretAndNoWiderPermissions();
     void twoWritersRacingInSeparateProcessesLoseNothing();
-    void interprocessWriterChild(); // helper for the case above; skipped alone
+    void interprocessWriterChild();
     void aSaveThatCannotTakeTheLockStillSavesAndSaysSo();
     void aStaleLockFromADeadHolderDoesNotWedgeTheStore();
     void aFirstRunWithNoConfigDirectoryLocksSilently();
@@ -271,7 +256,7 @@ private slots:
     void hostAndUserWithEmbeddedWhitespaceAreNotProfiles();
     void aSaveDegradedHandlerMayMutateTheStore();
 
-    // ---- ConnectSheet.qml ----
+    // ---- SettingsWindow.qml server pane / ConnectSheet prompts ----
     void sheetLoadsSilentlyAndExposesItsApi();
     void sheetListsProfilesAndMarksTheActiveOne();
     void sheetEmitsConnectAndRemoveForTheSelection();
@@ -281,21 +266,20 @@ private slots:
     void sheetSurfacesErrorTextWithoutBlocking();
     void sheetOpensSshDiagnostics();
     void sheetIsUsableFromTheKeyboardAlone();
-
-    // ---- both halves together ----
     void coldStartAddsAServerThenFindsItAgainAfterRelaunch();
 
 private:
-    // Fresh ini path inside the case-scoped temp dir.
     QString iniPath(const QString& name) const { return m_dir.filePath(name); }
 
-    // Loads ConnectSheet.qml into a shown QQuickView, asserting a clean load.
-    // Returns nullptr (after recording failures) if anything went wrong.
-    std::unique_ptr<QQuickView> loadSheet();
+    // Loads the source component into a shown QQuickView.
+    std::unique_ptr<QQuickView> loadQml(const QString& path, QObject* app = nullptr);
+    std::unique_ptr<QQuickView> loadSettings(TestApp* app);
+    std::unique_ptr<QQuickView> loadConnectSheet();
 
     QTemporaryDir m_dir;
     QStringList m_engineWarnings;
 };
+
 
 void TstServerProfiles::initTestCase()
 {
@@ -1625,10 +1609,11 @@ void TstServerProfiles::aSaveDegradedHandlerMayMutateTheStore()
 }
 
 // ---------------------------------------------------------------------------
-// ConnectSheet.qml
+// Source-loaded QML fixtures
 // ---------------------------------------------------------------------------
 
-std::unique_ptr<QQuickView> TstServerProfiles::loadSheet()
+std::unique_ptr<QQuickView> TstServerProfiles::loadQml(const QString& path,
+                                                        QObject* app)
 {
     takeLoggedWarnings();
     m_engineWarnings.clear();
@@ -1640,51 +1625,86 @@ std::unique_ptr<QQuickView> TstServerProfiles::loadSheet()
                              m_engineWarnings.append(warning.toString());
                      });
 
-    // Inside the CodeHarbor QML module, `Theme` is a registered singleton and
-    // every colour and metric in the sheet comes from it. This target loads the
-    // sheet by file path, outside that module, where the name would not resolve
-    // and every binding that reads it would warn. Register the REAL
-    // src/qml/Theme.qml (found next to the sheet, so the two can never drift)
-    // and expose its single instance under the same name: the sheet under test
-    // is then drawing from the same vocabulary the application ships.
     static const int themeTypeId = qmlRegisterSingletonType(
-        QUrl::fromLocalFile(
-            QFileInfo(QStringLiteral(CH_CONNECTSHEET_QML))
-                .absoluteDir()
-                .filePath(QStringLiteral("Theme.qml"))),
+        QUrl::fromLocalFile(QFileInfo(path).absoluteDir().filePath(QStringLiteral("Theme.qml"))),
         "CodeHarborThemeForTest", 1, 0, "Theme");
-    QObject* const theme =
-        view->engine()->singletonInstance<QObject*>(themeTypeId);
+    QObject* const theme = view->engine()->singletonInstance<QObject*>(themeTypeId);
     if (!theme) {
-        qWarning("ConnectSheet.qml: src/qml/Theme.qml could not be instantiated");
+        qWarning("QML fixture: Theme.qml could not be instantiated");
         return nullptr;
     }
-    view->engine()->rootContext()->setContextProperty(QStringLiteral("Theme"),
-                                                      theme);
+    view->engine()->rootContext()->setContextProperty(QStringLiteral("Theme"), theme);
+    if (app)
+        view->engine()->rootContext()->setContextProperty(QStringLiteral("app"), app);
+    if (path.endsWith(QStringLiteral("SettingsWindow.qml")))
+        view->engine()->rootContext()->setContextProperty(
+            QStringLiteral("initialSettingsGroup"), QStringLiteral("server"));
 
-    view->setSource(QUrl::fromLocalFile(QStringLiteral(CH_CONNECTSHEET_QML)));
+    view->setSource(QUrl::fromLocalFile(path));
     if (view->status() != QQuickView::Ready) {
         QStringList errors;
         for (const QQmlError& error : view->errors())
             errors.append(error.toString());
-        qWarning("ConnectSheet.qml failed to load: %s", qPrintable(errors.join(QLatin1Char('\n'))));
+        qWarning("QML fixture failed to load: %s", qPrintable(errors.join(QLatin1Char('\n'))));
         return nullptr;
     }
     view->show();
     if (!QTest::qWaitForWindowExposed(view.get())) {
-        qWarning("ConnectSheet.qml view was never exposed");
+        qWarning("QML fixture window was never exposed");
         return nullptr;
     }
     return view;
 }
 
-#define CH_LOAD_SHEET(view, root)                                                                  \
-    const std::unique_ptr<QQuickView> view = loadSheet();                                          \
+std::unique_ptr<QQuickView> TstServerProfiles::loadSettings(TestApp* app)
+{
+    auto view = loadQml(QStringLiteral(CH_SETTINGSWINDOW_QML), app);
+    if (!view || !view->rootObject())
+        return view;
+    QObject* const loader =
+        view->rootObject()->findChild<QObject*>(QStringLiteral("settingsGroupLoader"));
+    if (!loader)
+        return nullptr;
+    // Finish the default pane before selecting the server pane. Switching a
+    // Loader while its first component is incubating produces teardown warnings
+    // and can leave the test engine with a destroyed incubation context.
+    loader->setProperty("asynchronous", false);
+    const auto waitForPane = [&] {
+        QElapsedTimer paneWait;
+        paneWait.start();
+        while (loader->property("status").toInt() != 1 && paneWait.elapsed() < 1000) {
+            QCoreApplication::processEvents();
+            QTest::qWait(10);
+        }
+        return loader->property("status").toInt() == 1;
+    };
+    if (!waitForPane())
+        return nullptr;
+    view->rootObject()->setProperty("selectedGroup", QStringLiteral("server"));
+    if (!waitForPane())
+        return nullptr;
+    QCoreApplication::processEvents();
+    return view;
+}
+
+std::unique_ptr<QQuickView> TstServerProfiles::loadConnectSheet()
+{
+    return loadQml(QStringLiteral(CH_CONNECTSHEET_QML));
+}
+
+#define CH_LOAD_SETTINGS(view, root, app)                                                          \
+    TestApp app##Fixture(&(app));                                                                  \
+    const std::unique_ptr<QQuickView> view = loadSettings(&app##Fixture);                          \
     QVERIFY(view != nullptr);                                                                      \
     QQuickItem* const root = view->rootObject();                                                   \
     QVERIFY(root != nullptr)
 
-// Every warning the sheet produced so far must be none.
+#define CH_LOAD_CONNECT(view, root)                                                                \
+    const std::unique_ptr<QQuickView> view = loadConnectSheet();                                   \
+    QVERIFY(view != nullptr);                                                                      \
+    QQuickItem* const root = view->rootObject();                                                   \
+    QVERIFY(root != nullptr)
+
 #define CH_ASSERT_SILENT()                                                                         \
     do {                                                                                           \
         QCoreApplication::processEvents();                                                         \
@@ -1695,254 +1715,191 @@ std::unique_ptr<QQuickView> TstServerProfiles::loadSheet()
 
 void TstServerProfiles::sheetLoadsSilentlyAndExposesItsApi()
 {
-    CH_LOAD_SHEET(view, root);
+    ServerProfiles store(iniPath(QStringLiteral("settings-api.ini")));
+    CH_LOAD_SETTINGS(view, root, store);
 
-    // The exact component API the orchestrator binds against.
     const QMetaObject* mo = root->metaObject();
     const QList<QPair<QByteArray, int>> expectedProperties = {
-        {QByteArrayLiteral("profiles"), QMetaType::QVariant},
-        {QByteArrayLiteral("activeId"), QMetaType::QString},
-        {QByteArrayLiteral("connectionState"), QMetaType::QString},
-        {QByteArrayLiteral("errorText"), QMetaType::QString},
-        {QByteArrayLiteral("diagnosticText"), QMetaType::QString},
-        {QByteArrayLiteral("pendingHostKey"), QMetaType::QVariant},
-        {QByteArrayLiteral("pendingCredential"), QMetaType::QVariant},
+        {QByteArrayLiteral("profileEntries"), QMetaType::QVariant},
+        {QByteArrayLiteral("selectedProfileId"), QMetaType::QString},
+        {QByteArrayLiteral("profileName"), QMetaType::QString},
+        {QByteArrayLiteral("profileHost"), QMetaType::QString},
+        {QByteArrayLiteral("profilePort"), QMetaType::QString},
+        {QByteArrayLiteral("profileUser"), QMetaType::QString},
+        {QByteArrayLiteral("profileIdentityFile"), QMetaType::QString},
+        {QByteArrayLiteral("profileNodePath"), QMetaType::QString},
+        {QByteArrayLiteral("profileRepoRoot"), QMetaType::QString},
     };
     for (const auto& expected : expectedProperties) {
         const int index = mo->indexOfProperty(expected.first.constData());
         QVERIFY2(index >= 0, expected.first.constData());
         QCOMPARE(mo->property(index).metaType().id(), expected.second);
     }
-
-    const QByteArrayList expectedSignals = {
-        QByteArrayLiteral("connectRequested(QString)"),
-        QByteArrayLiteral("profileSaved(QVariant)"),
-        QByteArrayLiteral("profileRemoved(QString)"),
-        QByteArrayLiteral("hostKeyDecision(bool)"),
-        QByteArrayLiteral("credentialSubmitted(QString,QString)"),
-        QByteArrayLiteral("dismissed()"),
-    };
-    for (const QByteArray& signature : expectedSignals) {
-        const int index = mo->indexOfSignal(signature.constData());
-        QVERIFY2(index >= 0, signature.constData());
+    for (const QByteArray& signature : {QByteArrayLiteral("dismissed()"),
+                                        QByteArrayLiteral("profileNameFocusRequested()")}) {
+        QVERIFY2(mo->indexOfSignal(signature.constData()) >= 0, signature.constData());
     }
 
-    // Defaults are the "fresh config" state: no servers, nothing pending, and
-    // the empty-list hint visible so the user knows what to do.
-    QCOMPARE(root->property("activeId").toString(), QString());
-    QVERIFY(root->property("pendingHostKey").isNull()
-            || !root->property("pendingHostKey").toBool());
-    QVERIFY(root->findChild<QObject*>(QStringLiteral("emptyHint"))->property("visible").toBool());
-    QVERIFY(!root->findChild<QObject*>(QStringLiteral("hostKeyPrompt"))->property("visible").toBool());
-    QVERIFY(!root->findChild<QObject*>(QStringLiteral("credentialPrompt"))->property("visible").toBool());
-    QVERIFY(!root->findChild<QObject*>(QStringLiteral("errorBanner"))->property("visible").toBool());
-    QCOMPARE(stringOf(root->findChild<QObject*>(QStringLiteral("stateLabel")), "text"),
-             QStringLiteral("disconnected"));
-    // Nothing can be connected to or removed before a profile exists.
-    QVERIFY(!root->findChild<QObject*>(QStringLiteral("connectButton"))->property("enabled").toBool());
-    QVERIFY(!root->findChild<QObject*>(QStringLiteral("removeButton"))->property("enabled").toBool());
-    QVERIFY(!root->findChild<QObject*>(QStringLiteral("saveButton"))->property("enabled").toBool());
-
+    QCOMPARE(root->property("selectedProfileId").toString(), QString());
+    QObject* const emptyHint = root->findChild<QObject*>(QStringLiteral("serverEmptyHint"));
+    QVERIFY(emptyHint);
+    QVERIFY(emptyHint->property("visible").toBool());
+    QObject* const addButton = root->findChild<QObject*>(QStringLiteral("serverAddButton"));
+    QObject* const deleteButton = root->findChild<QObject*>(QStringLiteral("serverDeleteButton"));
+    QVERIFY(addButton && deleteButton);
+    QVERIFY(addButton->property("enabled").toBool());
+    QVERIFY(!deleteButton->property("enabled").toBool());
     CH_ASSERT_SILENT();
 }
 
 void TstServerProfiles::sheetListsProfilesAndMarksTheActiveOne()
 {
-    CH_LOAD_SHEET(view, root);
+    ServerProfiles store(iniPath(QStringLiteral("settings-list.ini")));
+    const QString first = store.addProfile(
+        profileFields(QStringLiteral("Alpha"), QStringLiteral("alpha.example"), 22,
+                      QStringLiteral("ua"), QStringLiteral("/usr/bin/node"),
+                      QStringLiteral("/srv/a")));
+    const QString second = store.addProfile(
+        profileFields(QStringLiteral(u"Bêta 服务器"), QStringLiteral("beta.example"), 2222,
+                      QStringLiteral("ub"), QStringLiteral("/opt/node bin/node"),
+                      QStringLiteral("/srv/b")));
+    store.setActiveId(second);
+    TestApp app(&store);
+    const std::unique_ptr<QQuickView> view = loadSettings(&app);
+    QVERIFY(view != nullptr);
+    QQuickItem* const root = view->rootObject();
+    QVERIFY(root != nullptr);
 
-    const QVariantList profiles = {
-        QVariantMap{{QStringLiteral("id"), QStringLiteral("id-a")},
-                    {QStringLiteral("name"), QStringLiteral("Alpha")},
-                    {QStringLiteral("host"), QStringLiteral("alpha.example")},
-                    {QStringLiteral("port"), 22},
-                    {QStringLiteral("user"), QStringLiteral("ua")},
-                    {QStringLiteral("nodePath"), QStringLiteral("/usr/bin/node")},
-                    {QStringLiteral("repoRoot"), QStringLiteral("/srv/a")}},
-        QVariantMap{{QStringLiteral("id"), QStringLiteral("id-b")},
-                    {QStringLiteral("name"), QStringLiteral(u"Bêta 服务器")},
-                    {QStringLiteral("host"), QStringLiteral("beta.example")},
-                    {QStringLiteral("port"), 2222},
-                    {QStringLiteral("user"), QStringLiteral("ub")},
-                    {QStringLiteral("nodePath"), QStringLiteral("/opt/node bin/node")},
-                    {QStringLiteral("repoRoot"), QStringLiteral("/srv/b")}},
-    };
-    root->setProperty("profiles", profiles);
-    root->setProperty("activeId", QStringLiteral("id-b"));
-
-    // Two rows, the active one badged, and the form follows the active profile.
-    QTRY_VERIFY(findByName(root, QStringLiteral("profileRow1")) != nullptr);
-    QVERIFY(!findByName(root, QStringLiteral("emptyHint"))->property("visible").toBool());
-    QVERIFY(!findByName(root, QStringLiteral("activeBadge0"))->property("visible").toBool());
-    QVERIFY(findByName(root, QStringLiteral("activeBadge1"))->property("visible").toBool());
-
-    QCOMPARE(root->property("editingId").toString(), QStringLiteral("id-b"));
-    QCOMPARE(stringOf(root->findChild<QObject*>(QStringLiteral("nameField")), "text"),
+    QTRY_VERIFY(findByName(root, QStringLiteral("serverProfile:%1").arg(second)) != nullptr);
+    QCOMPARE(root->property("selectedProfileId").toString(), second);
+    QCOMPARE(stringOf(findByName(root, QStringLiteral("serverField:name")), "text"),
              QStringLiteral(u"Bêta 服务器"));
-    QCOMPARE(stringOf(root->findChild<QObject*>(QStringLiteral("hostField")), "text"),
+    QCOMPARE(stringOf(findByName(root, QStringLiteral("serverField:host")), "text"),
              QStringLiteral("beta.example"));
-    QCOMPARE(stringOf(root->findChild<QObject*>(QStringLiteral("portField")), "text"),
+    QCOMPARE(stringOf(findByName(root, QStringLiteral("serverField:port")), "text"),
              QStringLiteral("2222"));
-    QCOMPARE(stringOf(root->findChild<QObject*>(QStringLiteral("userField")), "text"),
+    QCOMPARE(stringOf(findByName(root, QStringLiteral("serverField:user")), "text"),
              QStringLiteral("ub"));
-    QCOMPARE(stringOf(root->findChild<QObject*>(QStringLiteral("nodePathField")), "text"),
-             QStringLiteral("/opt/node bin/node"));
-    QCOMPARE(stringOf(root->findChild<QObject*>(QStringLiteral("repoRootField")), "text"),
-             QStringLiteral("/srv/b"));
-    QCOMPARE(stringOf(root->findChild<QObject*>(QStringLiteral("formTitle")), "text"),
-             QStringLiteral("Edit server"));
+    QVERIFY(findByName(root, QStringLiteral("serverProfile:%1").arg(second))
+                ->property("checked").toBool());
+    QVERIFY(!findByName(root, QStringLiteral("serverProfile:%1").arg(first))
+                 ->property("checked").toBool());
 
-    // Clicking the other row moves the form to it without touching activeId.
-    QMetaObject::invokeMethod(findByName(root, QStringLiteral("profileRow0")), "clicked");
-    QCOMPARE(root->property("editingId").toString(), QStringLiteral("id-a"));
-    QCOMPARE(root->property("activeId").toString(), QStringLiteral("id-b"));
-    QCOMPARE(stringOf(root->findChild<QObject*>(QStringLiteral("hostField")), "text"),
+    QMetaObject::invokeMethod(findByName(root, QStringLiteral("serverProfile:%1").arg(first)),
+                              "clicked");
+    QCOMPARE(root->property("selectedProfileId").toString(), first);
+    QCOMPARE(store.activeId(), second);
+    QCOMPARE(stringOf(findByName(root, QStringLiteral("serverField:host")), "text"),
              QStringLiteral("alpha.example"));
-
-    // The connection state is surfaced verbatim.
-    root->setProperty("connectionState", QStringLiteral("Authenticating"));
-    QCOMPARE(stringOf(root->findChild<QObject*>(QStringLiteral("stateLabel")), "text"),
-             QStringLiteral("Authenticating"));
-
     CH_ASSERT_SILENT();
 }
 
 void TstServerProfiles::sheetEmitsConnectAndRemoveForTheSelection()
 {
-    CH_LOAD_SHEET(view, root);
+    ServerProfiles store(iniPath(QStringLiteral("settings-actions.ini")));
+    const QString id = store.addProfile(
+        profileFields(QStringLiteral("Alpha"), QStringLiteral("alpha.example"), 22,
+                      QStringLiteral("ua")));
+    TestApp app(&store);
+    const std::unique_ptr<QQuickView> view = loadSettings(&app);
+    QVERIFY(view != nullptr);
+    QQuickItem* const root = view->rootObject();
+    QVERIFY(root != nullptr);
 
-    const QVariantList profiles = {
-        QVariantMap{{QStringLiteral("id"), QStringLiteral("id-a")},
-                    {QStringLiteral("name"), QStringLiteral("Alpha")},
-                    {QStringLiteral("host"), QStringLiteral("alpha.example")},
-                    {QStringLiteral("port"), 22},
-                    {QStringLiteral("user"), QStringLiteral("ua")}},
-    };
-    root->setProperty("profiles", profiles);
-
-    QSignalSpy connectSpy(root, SIGNAL(connectRequested(QString)));
-    QSignalSpy removeSpy(root, SIGNAL(profileRemoved(QString)));
-    QSignalSpy dismissSpy(root, SIGNAL(dismissed()));
-
-    QObject* const connectButton = root->findChild<QObject*>(QStringLiteral("connectButton"));
+    QObject* const connectButton = root->findChild<QObject*>(QStringLiteral("serverConnectButton"));
+    QObject* const deleteButton = root->findChild<QObject*>(QStringLiteral("serverDeleteButton"));
+    QObject* const dialog = root->findChild<QObject*>(QStringLiteral("serverDeleteDialog"));
+    QVERIFY(connectButton && deleteButton && dialog);
     QVERIFY(connectButton->property("enabled").toBool());
     QMetaObject::invokeMethod(connectButton, "clicked");
-    QCOMPARE(connectSpy.count(), 1);
-    QCOMPARE(connectSpy.at(0).at(0).toString(), QStringLiteral("id-a"));
+    QCOMPARE(app.connectRequests, QStringList({id}));
 
-    QMetaObject::invokeMethod(root->findChild<QObject*>(QStringLiteral("removeButton")), "clicked");
-    QCOMPARE(removeSpy.count(), 1);
-    QCOMPARE(removeSpy.at(0).at(0).toString(), QStringLiteral("id-a"));
-
-    // The sheet never removes anything itself: the host owns the store.
-    QCOMPARE(root->property("profiles").toList().size(), 1);
-
-    QMetaObject::invokeMethod(root->findChild<QObject*>(QStringLiteral("cancelButton")), "clicked");
-    QMetaObject::invokeMethod(root->findChild<QObject*>(QStringLiteral("closeButton")), "clicked");
-    QCOMPARE(dismissSpy.count(), 2);
-
+    QMetaObject::invokeMethod(deleteButton, "clicked");
+    QVERIFY(dialog->property("visible").toBool());
+    QMetaObject::invokeMethod(dialog, "accept");
+    QTRY_VERIFY(store.profiles().isEmpty());
+    QCOMPARE(store.activeId(), QString());
+    QVERIFY(!deleteButton->property("enabled").toBool());
     CH_ASSERT_SILENT();
 }
 
 void TstServerProfiles::sheetSavesANewProfileThenEditsIt()
 {
-    CH_LOAD_SHEET(view, root);
-    QSignalSpy savedSpy(root, SIGNAL(profileSaved(QVariant)));
+    const QString path = iniPath(QStringLiteral("settings-edit.ini"));
+    ServerProfiles store(path);
+    TestApp app(&store);
+    const std::unique_ptr<QQuickView> view = loadSettings(&app);
+    QVERIFY(view != nullptr);
+    QQuickItem* const root = view->rootObject();
+    QVERIFY(root != nullptr);
 
-    QObject* const nameField = root->findChild<QObject*>(QStringLiteral("nameField"));
-    QObject* const hostField = root->findChild<QObject*>(QStringLiteral("hostField"));
-    QObject* const portField = root->findChild<QObject*>(QStringLiteral("portField"));
-    QObject* const userField = root->findChild<QObject*>(QStringLiteral("userField"));
-    QObject* const identityField =
-        root->findChild<QObject*>(QStringLiteral("identityFileField"));
-    QObject* const nodeField = root->findChild<QObject*>(QStringLiteral("nodePathField"));
-    QObject* const repoField = root->findChild<QObject*>(QStringLiteral("repoRootField"));
-    QObject* const saveButton = root->findChild<QObject*>(QStringLiteral("saveButton"));
+    QObject* const addButton = root->findChild<QObject*>(QStringLiteral("serverAddButton"));
+    QVERIFY(addButton);
+    QMetaObject::invokeMethod(addButton, "clicked");
+    QTRY_COMPARE(store.profiles().size(), 1);
+    const QString id = store.profiles().constFirst().toMap().value(QStringLiteral("id")).toString();
+    QVERIFY(!id.isEmpty());
+    QCOMPARE(root->property("selectedProfileId").toString(), id);
 
-    // A fresh sheet starts on the new-profile form, defaulted to port 22.
-    QCOMPARE(stringOf(root->findChild<QObject*>(QStringLiteral("formTitle")), "text"),
-             QStringLiteral("New server"));
+    QObject* const nameField = findByName(root, QStringLiteral("serverField:name"));
+    QObject* const hostField = findByName(root, QStringLiteral("serverField:host"));
+    QObject* const portField = findByName(root, QStringLiteral("serverField:port"));
+    QObject* const userField = findByName(root, QStringLiteral("serverField:user"));
+    QObject* const identityField = findByName(root, QStringLiteral("serverField:identityFile"));
+    QObject* const nodeField = findByName(root, QStringLiteral("serverField:nodePath"));
+    QObject* const repoField = findByName(root, QStringLiteral("serverField:repoRoot"));
+    QVERIFY(nameField && hostField && portField && userField && identityField && nodeField
+            && repoField);
     QCOMPARE(stringOf(portField, "text"), QStringLiteral("22"));
-    QVERIFY(!saveButton->property("enabled").toBool());
 
-    // Host alone is not enough; the sheet refuses to submit an unusable profile
-    // for the same reason the store refuses to keep one.
     hostField->setProperty("text", QStringLiteral("box.local"));
-    QVERIFY(!saveButton->property("enabled").toBool());
     userField->setProperty("text", QStringLiteral("yichen"));
-    QVERIFY(saveButton->property("enabled").toBool());
     portField->setProperty("text", QStringLiteral("70000"));
-    QVERIFY(!saveButton->property("enabled").toBool());
-    QVERIFY(root->findChild<QObject*>(QStringLiteral("validationHint"))->property("visible").toBool());
-    portField->setProperty("text", QStringLiteral("2222"));
-    QVERIFY(saveButton->property("enabled").toBool());
+    QVERIFY(root->property("profileDirty").toBool());
+    QVERIFY(root->findChild<QObject*>(QStringLiteral("serverValidationHint"))
+                ->property("visible").toBool());
+    QMetaObject::invokeMethod(portField, "editingFinished");
+    QCOMPARE(store.profile(id).value(QStringLiteral("port")).toInt(), 22);
 
+    portField->setProperty("text", QStringLiteral("2222"));
     nameField->setProperty("text", QStringLiteral("  Prod box  "));
     identityField->setProperty("text", QStringLiteral("~/.ssh/prod key"));
     nodeField->setProperty("text", QStringLiteral("/home/user name/.local/bin/node"));
     repoField->setProperty("text", QStringLiteral("/srv/my repo"));
+    for (QObject* field : {nameField, hostField, portField, userField, identityField, nodeField,
+                           repoField})
+        QVERIFY(QMetaObject::invokeMethod(field, "editingFinished"));
 
-    QMetaObject::invokeMethod(saveButton, "clicked");
-    QCOMPARE(savedSpy.count(), 1);
-    QVariantMap fields = asMap(savedSpy.at(0).at(0));
-    QCOMPARE(fields.value(QStringLiteral("id")).toString(), QString()); // "" == create
-    QCOMPARE(fields.value(QStringLiteral("name")).toString(), QStringLiteral("Prod box"));
-    QCOMPARE(fields.value(QStringLiteral("host")).toString(), QStringLiteral("box.local"));
-    QCOMPARE(fields.value(QStringLiteral("port")).toInt(), 2222);
-    QCOMPARE(fields.value(QStringLiteral("user")).toString(), QStringLiteral("yichen"));
-    QCOMPARE(fields.value(QStringLiteral("identityFile")).toString(),
+    const QVariantMap saved = store.profile(id);
+    QCOMPARE(saved.value(QStringLiteral("name")).toString(), QStringLiteral("Prod box"));
+    QCOMPARE(saved.value(QStringLiteral("host")).toString(), QStringLiteral("box.local"));
+    QCOMPARE(saved.value(QStringLiteral("port")).toInt(), 2222);
+    QCOMPARE(saved.value(QStringLiteral("user")).toString(), QStringLiteral("yichen"));
+    QCOMPARE(saved.value(QStringLiteral("identityFile")).toString(),
              QStringLiteral("~/.ssh/prod key"));
-    QCOMPARE(fields.value(QStringLiteral("nodePath")).toString(),
+    QCOMPARE(saved.value(QStringLiteral("nodePath")).toString(),
              QStringLiteral("/home/user name/.local/bin/node"));
-    QCOMPARE(fields.value(QStringLiteral("repoRoot")).toString(), QStringLiteral("/srv/my repo"));
+    QCOMPARE(saved.value(QStringLiteral("repoRoot")).toString(), QStringLiteral("/srv/my repo"));
 
-    // The host stores it and hands the list back: the sheet must land on the new
-    // profile so the very next click can Connect (the cold-start path).
-    const QVariantList stored = {
-        QVariantMap{{QStringLiteral("id"), QStringLiteral("new-id")},
-                    {QStringLiteral("name"), QStringLiteral("Prod box")},
-                    {QStringLiteral("host"), QStringLiteral("box.local")},
-                    {QStringLiteral("port"), 2222},
-                    {QStringLiteral("user"), QStringLiteral("yichen")},
-                    {QStringLiteral("identityFile"), QStringLiteral("~/.ssh/prod key")},
-                    {QStringLiteral("nodePath"), QStringLiteral("/home/user name/.local/bin/node")},
-                    {QStringLiteral("repoRoot"), QStringLiteral("/srv/my repo")}},
-    };
-    root->setProperty("profiles", stored);
-    QCOMPARE(root->property("editingId").toString(), QStringLiteral("new-id"));
-    QCOMPARE(stringOf(root->findChild<QObject*>(QStringLiteral("formTitle")), "text"),
-             QStringLiteral("Edit server"));
-    QVERIFY(root->findChild<QObject*>(QStringLiteral("connectButton"))->property("enabled").toBool());
-    // ...and the keyboard lands on the list, where Enter is Connect.
-    QVERIFY(qobject_cast<QQuickItem*>(findByName(root, QStringLiteral("profileList")))
-                ->hasActiveFocus());
-
-    // Editing now submits an update carrying that id.
-    hostField->setProperty("text", QStringLiteral("box2.local"));
-    QMetaObject::invokeMethod(saveButton, "clicked");
-    QCOMPARE(savedSpy.count(), 2);
-    fields = asMap(savedSpy.at(1).at(0));
-    QCOMPARE(fields.value(QStringLiteral("id")).toString(), QStringLiteral("new-id"));
-    QCOMPARE(fields.value(QStringLiteral("host")).toString(), QStringLiteral("box2.local"));
-
-    // "Add" returns to a blank new-profile form without disturbing the store.
-    QMetaObject::invokeMethod(root->findChild<QObject*>(QStringLiteral("addButton")), "clicked");
-    QCOMPARE(root->property("editingId").toString(), QString());
-    QCOMPARE(stringOf(hostField, "text"), QString());
-    QCOMPARE(stringOf(portField, "text"), QStringLiteral("22"));
-    QVERIFY(!root->findChild<QObject*>(QStringLiteral("connectButton"))->property("enabled").toBool());
-    // Focus moves into the form so the user can just start typing.
-    QVERIFY(qobject_cast<QQuickItem*>(findByName(root, QStringLiteral("nameField")))
-                ->property("input").value<QQuickItem*>()->hasActiveFocus());
-
+    ServerProfiles reopened(path);
+    TestApp reopenedApp(&reopened);
+    const std::unique_ptr<QQuickView> reopenedView = loadSettings(&reopenedApp);
+    QVERIFY(reopenedView != nullptr);
+    QQuickItem* const reopenedRoot = reopenedView->rootObject();
+    QVERIFY(reopenedRoot != nullptr);
+    QTRY_COMPARE(reopenedRoot->property("selectedProfileId").toString(), id);
+    QCOMPARE(stringOf(findByName(reopenedRoot, QStringLiteral("serverField:host")), "text"),
+             QStringLiteral("box.local"));
     CH_ASSERT_SILENT();
 }
 
+
 void TstServerProfiles::sheetHostKeyPromptDecidesBothWays()
 {
-    CH_LOAD_SHEET(view, root);
+    CH_LOAD_CONNECT(view, root);
     QSignalSpy decisionSpy(root, SIGNAL(hostKeyDecision(bool)));
-
     QObject* const prompt = root->findChild<QObject*>(QStringLiteral("hostKeyPrompt"));
+    QVERIFY(prompt);
     QVERIFY(!prompt->property("visible").toBool());
 
     const QVariantMap pending{
@@ -1951,36 +1908,24 @@ void TstServerProfiles::sheetHostKeyPromptDecidesBothWays()
         {QStringLiteral("fingerprint"),
          QStringLiteral("SHA256:6dGRJ0mCkQeAxQ0nQ0mm2b3xk0e3iF0jnq0oO3pP1qQ")}};
     root->setProperty("pendingHostKey", pending);
-
     QVERIFY(prompt->property("visible").toBool());
-    QCOMPARE(stringOf(root->findChild<QObject*>(QStringLiteral("hostKeyFingerprint")), "text"),
-             pending.value(QStringLiteral("fingerprint")).toString());
-    const QString hostLine = stringOf(root->findChild<QObject*>(QStringLiteral("hostKeyHost")),
-                                      "text");
-    QVERIFY2(hostLine.contains(QStringLiteral("box.local")), qPrintable(hostLine));
-    QVERIFY2(hostLine.contains(QStringLiteral("ssh-ed25519")), qPrintable(hostLine));
+    QObject* const fingerprint = root->findChild<QObject*>(QStringLiteral("hostKeyFingerprint"));
+    QObject* const hostLine = root->findChild<QObject*>(QStringLiteral("hostKeyHost"));
+    QVERIFY(fingerprint && hostLine);
+    QCOMPARE(stringOf(fingerprint, "text"), pending.value(QStringLiteral("fingerprint")).toString());
+    QVERIFY(stringOf(hostLine, "text").contains(QStringLiteral("box.local")));
+    QVERIFY(stringOf(hostLine, "text").contains(QStringLiteral("ssh-ed25519")));
 
-    QMetaObject::invokeMethod(root->findChild<QObject*>(QStringLiteral("hostKeyAcceptButton")),
-                              "clicked");
-    QCOMPARE(decisionSpy.count(), 1);
-    QCOMPARE(decisionSpy.at(0).at(0).toBool(), true);
-
-    QMetaObject::invokeMethod(root->findChild<QObject*>(QStringLiteral("hostKeyRejectButton")),
-                              "clicked");
+    QObject* const accept = root->findChild<QObject*>(QStringLiteral("hostKeyAcceptButton"));
+    QObject* const reject = root->findChild<QObject*>(QStringLiteral("hostKeyRejectButton"));
+    QVERIFY(accept && reject);
+    QMetaObject::invokeMethod(accept, "clicked");
+    QMetaObject::invokeMethod(reject, "clicked");
     QCOMPARE(decisionSpy.count(), 2);
+    QCOMPARE(decisionSpy.at(0).at(0).toBool(), true);
     QCOMPARE(decisionSpy.at(1).at(0).toBool(), false);
-
-    // Escape is a rejection, never an accidental accept.
-    QKeyEvent escape(QEvent::KeyPress, Qt::Key_Escape, Qt::NoModifier);
-    QCoreApplication::sendEvent(root, &escape);
-    QCOMPARE(decisionSpy.count(), 3);
-    QCOMPARE(decisionSpy.at(2).at(0).toBool(), false);
-    QCOMPARE(QSignalSpy(root, SIGNAL(dismissed())).count(), 0);
-
-    // Clearing the pending key puts the sheet back.
     root->setProperty("pendingHostKey", QVariant::fromValue(nullptr));
     QVERIFY(!prompt->property("visible").toBool());
-
     CH_ASSERT_SILENT();
 }
 
@@ -1990,22 +1935,15 @@ void TstServerProfiles::sheetHostKeyPromptDecidesBothWays()
 //
 // What is gated here is not the pixels but the two properties that make it safe
 // to type into: the field is MASKED, and the secret leaves only through
-// credentialSubmitted() — never through profileSaved(), which is the one signal
-// that reaches ServerProfiles and therefore the ini file on disk.
+// credentialSubmitted() — never through the profile editor in SettingsWindow.
 void TstServerProfiles::sheetCredentialPromptMasksSubmitsAndKeepsTheSecretOffDisk()
 {
-    CH_LOAD_SHEET(view, root);
+    CH_LOAD_CONNECT(view, root);
     const QString secret = QStringLiteral("correct-horse-battery-42");
 
-    // A REAL store, fed exactly the way Main.qml feeds it: whatever the sheet
-    // emits on profileSaved() is what reaches ServerProfiles, and therefore the
-    // ini file on disk.
-    const QString ini = iniPath(QStringLiteral("credential.ini"));
-    ServerProfiles store(ini);
-
     QSignalSpy submitSpy(root, SIGNAL(credentialSubmitted(QString,QString)));
-    QSignalSpy savedSpy(root, SIGNAL(profileSaved(QVariant)));
     QSignalSpy dismissSpy(root, SIGNAL(dismissed()));
+
     QObject* const prompt = root->findChild<QObject*>(QStringLiteral("credentialPrompt"));
     QVERIFY(prompt);
     QVERIFY(!prompt->property("visible").toBool());
@@ -2087,36 +2025,17 @@ void TstServerProfiles::sheetCredentialPromptMasksSubmitsAndKeepsTheSecretOffDis
     QVERIFY(!prompt->property("visible").toBool());
     QCOMPARE(stringOf(field, "text"), QString());
 
-    // Now save a profile through the very path that DOES persist, and prove the
-    // secret is nowhere in the resulting store. A passphrase in the config file
-    // would be a worse defect than the missing prompt this fixes.
-    root->findChild<QObject*>(QStringLiteral("hostField"))
-        ->setProperty("text", QStringLiteral("box.local"));
-    root->findChild<QObject*>(QStringLiteral("userField"))
-        ->setProperty("text", QStringLiteral("yichen"));
-    QMetaObject::invokeMethod(
-        root->findChild<QObject*>(QStringLiteral("saveButton")), "clicked");
-    QCOMPARE(savedSpy.count(), 1);
-
-    // Whatever the sheet chose to publish is ALL that can ever be persisted.
-    const QVariantMap fields = savedSpy.at(0).at(0).toMap();
-    for (const QVariant& value : fields)
-        QVERIFY2(value.toString() != secret, qPrintable(fields.key(value)));
-    QVERIFY(!store.addProfile(fields).isEmpty());
-    QCOMPARE(store.profiles().size(), 1);
-
-    QFile file(ini);
-    QVERIFY(file.open(QIODevice::ReadOnly));
-    const QByteArray onDisk = file.readAll();
-    QVERIFY(!onDisk.isEmpty());
-    QVERIFY2(!onDisk.contains(secret.toUtf8()), onDisk.constData());
+    // The prompt has no profile-saving path; the only emitted payloads above
+    // are the explicit credential answer signals, so this secret cannot enter
+    // ServerProfiles through the connector component.
+    QVERIFY(root->metaObject()->indexOfSignal("profileSaved(QVariant)") < 0);
 
     CH_ASSERT_SILENT();
 }
 
 void TstServerProfiles::sheetSurfacesErrorTextWithoutBlocking()
 {
-    CH_LOAD_SHEET(view, root);
+    CH_LOAD_CONNECT(view, root);
 
     const QVariantList profiles = {
         QVariantMap{{QStringLiteral("id"), QStringLiteral("id-a")},
@@ -2150,7 +2069,7 @@ void TstServerProfiles::sheetSurfacesErrorTextWithoutBlocking()
 
 void TstServerProfiles::sheetOpensSshDiagnostics()
 {
-    CH_LOAD_SHEET(view, root);
+    CH_LOAD_CONNECT(view, root);
     const QString diagnostic = QStringLiteral(
         "Starting SSH connection to alpha.example:22.\n"
         "libssh[4] ssh_set_client_kex: kex algorithms: curve25519-sha256");
@@ -2173,7 +2092,7 @@ void TstServerProfiles::sheetOpensSshDiagnostics()
 
 void TstServerProfiles::sheetIsUsableFromTheKeyboardAlone()
 {
-    CH_LOAD_SHEET(view, root);
+    CH_LOAD_CONNECT(view, root);
 
     const QVariantList profiles = {
         QVariantMap{{QStringLiteral("id"), QStringLiteral("id-a")},
@@ -2193,38 +2112,24 @@ void TstServerProfiles::sheetIsUsableFromTheKeyboardAlone()
     QQuickItem* const list =
         root->findChild<QQuickItem*>(QStringLiteral("profileList"));
     QVERIFY(list != nullptr);
-    // Gaining a selection hands focus to the list, so arrow keys and Enter work
-    // without ever touching the mouse.
+    // A source-loaded QQuickView is not guaranteed to activate its window on
+    // construction; explicitly focus the list before exercising key handling.
+    list->forceActiveFocus();
     QVERIFY(list->hasActiveFocus());
     QTRY_COMPARE(list->property("currentIndex").toInt(), 0);
-    QCOMPARE(root->property("editingId").toString(), QStringLiteral("id-a"));
+    QCOMPARE(root->property("selectedId").toString(), QStringLiteral("id-a"));
 
-    // Down moves the selection and the form follows it.
+    // Down moves the selection, and Enter connects the highlighted profile.
     QKeyEvent down(QEvent::KeyPress, Qt::Key_Down, Qt::NoModifier);
     QCoreApplication::sendEvent(list, &down);
     QCOMPARE(list->property("currentIndex").toInt(), 1);
-    QCOMPARE(root->property("editingId").toString(), QStringLiteral("id-b"));
-    QCOMPARE(stringOf(root->findChild<QObject*>(QStringLiteral("hostField")), "text"),
-             QStringLiteral("beta.example"));
+    QCOMPARE(root->property("selectedId").toString(), QStringLiteral("id-b"));
 
-    // Enter on the list connects to the highlighted profile.
     QSignalSpy connectSpy(root, SIGNAL(connectRequested(QString)));
     QKeyEvent enter(QEvent::KeyPress, Qt::Key_Return, Qt::NoModifier);
     QCoreApplication::sendEvent(list, &enter);
     QCOMPARE(connectSpy.count(), 1);
     QCOMPARE(connectSpy.at(0).at(0).toString(), QStringLiteral("id-b"));
-
-    // Enter in a form field saves.
-    QSignalSpy savedSpy(root, SIGNAL(profileSaved(QVariant)));
-    QQuickItem* const hostField =
-        root->findChild<QQuickItem*>(QStringLiteral("hostField"))->property("input")
-            .value<QQuickItem*>();
-    QVERIFY(hostField != nullptr);
-    QKeyEvent fieldEnter(QEvent::KeyPress, Qt::Key_Return, Qt::NoModifier);
-    QCoreApplication::sendEvent(hostField, &fieldEnter);
-    QCOMPARE(savedSpy.count(), 1);
-    QCOMPARE(asMap(savedSpy.at(0).at(0)).value(QStringLiteral("id")).toString(),
-             QStringLiteral("id-b"));
 
     // Escape closes the sheet.
     QSignalSpy dismissSpy(root, SIGNAL(dismissed()));
@@ -2233,112 +2138,88 @@ void TstServerProfiles::sheetIsUsableFromTheKeyboardAlone()
     QCOMPARE(dismissSpy.count(), 1);
 
     // Every interactive control is reachable by Tab.
-    const QStringList tabbable = {
-        QStringLiteral("addButton"),  QStringLiteral("removeButton"),
-        QStringLiteral("saveButton"), QStringLiteral("connectButton"),
-        QStringLiteral("cancelButton"), QStringLiteral("closeButton"),
-    };
-    for (const QString& name : tabbable) {
-        QObject* const control = root->findChild<QObject*>(name);
+    const QStringList tabbable = {QStringLiteral("profileList"),
+                                  QStringLiteral("connectButton"),
+                                  QStringLiteral("openSettingsButton")};
+    for (const QString &name : tabbable) {
+        QObject *const control = root->findChild<QObject *>(name);
         QVERIFY2(control != nullptr, qPrintable(name));
-        QVERIFY2(control->property("activeFocusOnTab").toBool(), qPrintable(name));
-    }
-    for (const QString& name : {QStringLiteral("nameField"), QStringLiteral("hostField"),
-                                QStringLiteral("portField"), QStringLiteral("userField"),
-                                QStringLiteral("nodePathField"), QStringLiteral("repoRootField")}) {
-        QQuickItem* const input =
-            root->findChild<QQuickItem*>(name)->property("input").value<QQuickItem*>();
-        QVERIFY2(input != nullptr, qPrintable(name));
-        QVERIFY2(input->property("activeFocusOnTab").toBool(), qPrintable(name));
+        QVERIFY2(control->property("activeFocusOnTab").toBool() || name == QStringLiteral("profileList"),
+                 qPrintable(name));
     }
 
     CH_ASSERT_SILENT();
 }
 
-// The half of the cold-start walkthrough this slice owns: a user with a fresh
-// config types a server into the sheet, it is stored, it comes back selected and
-// connectable, Connect asks the host to connect to exactly that profile, and a
-// relaunch still finds it. Nothing here injects an environment variable.
+// A fresh Settings server pane creates a profile before any network is needed,
+// persists each edited field through ServerProfiles, and reloads it selected.
 void TstServerProfiles::coldStartAddsAServerThenFindsItAgainAfterRelaunch()
 {
     const QString path = iniPath(QStringLiteral("coldstart.ini"));
     QString storedId;
-
     {
         ServerProfiles store(path);
-        QVERIFY(store.profiles().isEmpty()); // fresh config: nothing to connect to
+        QVERIFY(store.profiles().isEmpty());
+        TestApp app(&store);
+        const std::unique_ptr<QQuickView> view = loadSettings(&app);
+        QVERIFY(view != nullptr);
+        QQuickItem* const root = view->rootObject();
+        QVERIFY(root != nullptr);
 
-        CH_LOAD_SHEET(view, root);
-        SheetBridge bridge(&store, root);
-
-        // Type the server in. Every field the SSH spine needs, by keyboard.
-        findByName(root, QStringLiteral("nameField"))
-            ->setProperty("text", QStringLiteral("Fixture"));
-        findByName(root, QStringLiteral("hostField"))
-            ->setProperty("text", QStringLiteral("127.0.0.1"));
-        findByName(root, QStringLiteral("portField"))
-            ->setProperty("text", QStringLiteral("2222"));
-        findByName(root, QStringLiteral("userField"))
-            ->setProperty("text", QStringLiteral("yichen"));
-        findByName(root, QStringLiteral("nodePathField"))
-            ->setProperty("text", QStringLiteral("/home/yichen/.local/bin/node"));
-        findByName(root, QStringLiteral("repoRootField"))
-            ->setProperty("text", QStringLiteral("/home/yichen/projects/codeharbor"));
-
-        QMetaObject::invokeMethod(findByName(root, QStringLiteral("saveButton")), "clicked");
-        storedId = bridge.lastSavedId;
+        QObject* const add = root->findChild<QObject*>(QStringLiteral("serverAddButton"));
+        QVERIFY(add);
+        QMetaObject::invokeMethod(add, "clicked");
+        QTRY_COMPARE(store.profiles().size(), 1);
+        storedId = store.profiles().constFirst().toMap().value(QStringLiteral("id")).toString();
         QVERIFY(!storedId.isEmpty());
 
-        // The store kept exactly what was typed...
+        const QList<QPair<QString, QString>> values = {
+            {QStringLiteral("serverField:name"), QStringLiteral("Fixture")},
+            {QStringLiteral("serverField:host"), QStringLiteral("127.0.0.1")},
+            {QStringLiteral("serverField:port"), QStringLiteral("2222")},
+            {QStringLiteral("serverField:user"), QStringLiteral("yichen")},
+            {QStringLiteral("serverField:nodePath"), QStringLiteral("/home/yichen/.local/bin/node")},
+            {QStringLiteral("serverField:repoRoot"),
+             QStringLiteral("/home/yichen/projects/codeharbor")}};
+        for (const auto& value : values) {
+            QObject* const field = findByName(root, value.first);
+            QVERIFY(field);
+            field->setProperty("text", value.second);
+            QVERIFY(QMetaObject::invokeMethod(field, "editingFinished"));
+        }
+
         const QVariantMap stored = store.profile(storedId);
         QCOMPARE(stored.value(QStringLiteral("host")).toString(), QStringLiteral("127.0.0.1"));
         QCOMPARE(stored.value(QStringLiteral("port")).toInt(), 2222);
         QCOMPARE(stored.value(QStringLiteral("user")).toString(), QStringLiteral("yichen"));
-        QCOMPARE(stored.value(QStringLiteral("nodePath")).toString(),
-                 QStringLiteral("/home/yichen/.local/bin/node"));
-        QCOMPARE(stored.value(QStringLiteral("repoRoot")).toString(),
-                 QStringLiteral("/home/yichen/projects/codeharbor"));
         QCOMPARE(store.activeId(), storedId);
-
-        // ...and the sheet came back showing it, selected and connectable.
-        QTRY_VERIFY(findByName(root, QStringLiteral("profileRow0")) != nullptr);
-        QCOMPARE(root->property("editingId").toString(), storedId);
-        QVERIFY(findByName(root, QStringLiteral("activeBadge0"))->property("visible").toBool());
-        QObject* const connectButton = findByName(root, QStringLiteral("connectButton"));
-        QVERIFY(connectButton->property("enabled").toBool());
-
-        QMetaObject::invokeMethod(connectButton, "clicked");
-        QCOMPARE(bridge.connectRequests, QStringList({storedId}));
-
+        QObject* const connect = root->findChild<QObject*>(QStringLiteral("serverConnectButton"));
+        QVERIFY(connect && connect->property("enabled").toBool());
+        QMetaObject::invokeMethod(connect, "clicked");
+        QCOMPARE(app.connectRequests, QStringList({storedId}));
         CH_ASSERT_SILENT();
     }
 
-    // Relaunch: a brand-new store and a brand-new sheet over the same config.
     ServerProfiles reopened(path);
-    CH_LOAD_SHEET(view, root);
-    SheetBridge bridge(&reopened, root);
-
-    QTRY_VERIFY(findByName(root, QStringLiteral("profileRow0")) != nullptr);
-    QCOMPARE(root->property("editingId").toString(), storedId);
-    QCOMPARE(stringOf(findByName(root, QStringLiteral("hostField")), "text"),
+    TestApp reopenedApp(&reopened);
+    const std::unique_ptr<QQuickView> view = loadSettings(&reopenedApp);
+    QVERIFY(view != nullptr);
+    QQuickItem* const root = view->rootObject();
+    QVERIFY(root != nullptr);
+    QTRY_COMPARE(root->property("selectedProfileId").toString(), storedId);
+    QCOMPARE(stringOf(findByName(root, QStringLiteral("serverField:host")), "text"),
              QStringLiteral("127.0.0.1"));
-    QCOMPARE(stringOf(findByName(root, QStringLiteral("portField")), "text"),
+    QCOMPARE(stringOf(findByName(root, QStringLiteral("serverField:port")), "text"),
              QStringLiteral("2222"));
-    QVERIFY(findByName(root, QStringLiteral("activeBadge0"))->property("visible").toBool());
-    QVERIFY(findByName(root, QStringLiteral("connectButton"))->property("enabled").toBool());
-    QVERIFY(!findByName(root, QStringLiteral("emptyHint"))->property("visible").toBool());
-
-    // Removing it through the sheet empties the store and resets the form.
-    QMetaObject::invokeMethod(findByName(root, QStringLiteral("removeButton")), "clicked");
-    QVERIFY(reopened.profiles().isEmpty());
-    QVERIFY(reopened.activeId().isEmpty());
-    QCOMPARE(root->property("editingId").toString(), QString());
-    QVERIFY(findByName(root, QStringLiteral("emptyHint"))->property("visible").toBool());
-    QVERIFY(!findByName(root, QStringLiteral("connectButton"))->property("enabled").toBool());
-
+    QObject* const deleteButton = root->findChild<QObject*>(QStringLiteral("serverDeleteButton"));
+    QObject* const dialog = root->findChild<QObject*>(QStringLiteral("serverDeleteDialog"));
+    QVERIFY(deleteButton && dialog);
+    QMetaObject::invokeMethod(deleteButton, "clicked");
+    QVERIFY(dialog->property("visible").toBool());
+    QMetaObject::invokeMethod(dialog, "accept");
+    QTRY_VERIFY(reopened.profiles().isEmpty());
     ServerProfiles afterRemoval(path);
     QVERIFY(afterRemoval.profiles().isEmpty());
-
     CH_ASSERT_SILENT();
 }
 

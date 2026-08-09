@@ -432,13 +432,14 @@ private slots:
     void keyboardSelectionActivatesSession();
     void spaceTogglesGroupCollapse();
     void newSessionButtonTargetsItsGroupWithoutCollapsing();
-    void serverSettingsButtonEmitsRequest();
+    void appSettingsButtonEmitsRequest();
     void dialogContentFitsInsideItsDialog();
     void addButtonsAreLabelledWithoutAPointer();
     void hintsAreDrawnInTheApplicationsOwnPalette();
     void longNamesAreElidedInsteadOfOverflowingTheSidebar();
     void rowNameGetsTheRoomItsSiblingsLeave();
     void rowMenuActionsReachTheWorkspace();
+    void groupMenuRenamesTheGroup();
     void rowArchiveButtonIsClickable();
 
 private:
@@ -740,21 +741,29 @@ void TstSidebar::newSessionButtonTargetsItsGroupWithoutCollapsing()
              qPrintable(fixture.warnings().join(QLatin1Char('\n'))));
 }
 
-// The server profile sheet must remain reachable after a failed/disconnected
-// start, not only through an undocumented command-palette shortcut.
-void TstSidebar::serverSettingsButtonEmitsRequest()
+// The settings window must remain reachable after a failed/disconnected start,
+// not only through an undocumented command-palette shortcut. It is the sidebar's
+// ONE settings affordance: the footer used to carry a second "Server…" button
+// that opened the connect sheet's editor, and that editor no longer exists.
+void TstSidebar::appSettingsButtonEmitsRequest()
 {
     SidebarFixture fixture(twoGroups());
     expose(fixture);
 
-    QSignalSpy requested(fixture.root(), SIGNAL(serverSettingsRequested()));
+    QSignalSpy requested(fixture.root(), SIGNAL(appSettingsRequested()));
     QVERIFY(requested.isValid());
 
-    QQuickItem *button = findByName(fixture.root(), QStringLiteral("serverSettingsButton"));
-    QVERIFY2(button, "the connection status footer offers no server settings control");
+    QQuickItem *button = findByName(fixture.root(), QStringLiteral("appSettingsButton"));
+    QVERIFY2(button, "the sidebar header offers no settings control");
     QTest::mouseClick(&fixture.view, Qt::LeftButton, Qt::NoModifier, centerOf(button));
 
     QCOMPARE(requested.size(), 1);
+
+    // Exactly one: a second control in the footer is what this replaced, and
+    // two ways to reach the same window is how they drift apart again.
+    QVERIFY2(!findByName(fixture.root(), QStringLiteral("serverSettingsButton")),
+             "the sidebar still carries the old footer server-settings button");
+
     QVERIFY2(fixture.warnings().isEmpty(), qPrintable(fixture.warnings().join(QLatin1Char('\n'))));
 }
 
@@ -1131,6 +1140,62 @@ void TstSidebar::rowMenuActionsReachTheWorkspace()
     QMetaObject::invokeMethod(dialog, "accept");
     QTest::qWait(50);
     QCOMPARE(fixture.app.calls(), (QStringList{QStringLiteral("renameSession(s2,renamed)")}));
+
+    QVERIFY2(fixture.warnings().isEmpty(), qPrintable(fixture.warnings().join(QLatin1Char('\n'))));
+}
+
+// The reported defect: a session row can be renamed from its right-click menu,
+// but a group could not be renamed at all. AppController::renameGroup existed
+// and nothing on screen reached it. This drives the real gesture — a right-click
+// on the header — rather than poking the menu's model, because the missing part
+// was the affordance, not the call.
+void TstSidebar::groupMenuRenamesTheGroup()
+{
+    SidebarFixture fixture(twoGroups());
+    expose(fixture);
+
+    QQuickItem *header = findByName(fixture.root(), QStringLiteral("groupHeader:g1"));
+    QVERIFY(header);
+    QObject *const menu = header->findChild<QObject *>(QStringLiteral("groupMenu:g1"));
+    QVERIFY2(menu, "the group header has no context menu");
+    QVERIFY2(!menu->property("visible").toBool(), "the group menu is open before anything asked");
+
+    fixture.app.clearCalls();
+
+    // Left of the header's trailing buttons, so the press reaches the header
+    // itself rather than a control sitting on top of it.
+    const QPoint hit = header->mapToScene(QPointF(24, header->height() / 2)).toPoint();
+    QTest::mouseClick(&fixture.view, Qt::RightButton, Qt::NoModifier, hit);
+    QTest::qWait(100);
+    QVERIFY2(menu->property("visible").toBool(), "right-clicking a group header opened no menu");
+
+    QObject *const renameEntry = menuItemNamed(header, QStringLiteral("Rename"));
+    QVERIFY2(renameEntry, "the group menu has no \"Rename\" action");
+    QObject *const dialog = header->findChild<QObject *>(QStringLiteral("renameGroupDialog:g1"));
+    QQuickItem *const field =
+        header->findChild<QQuickItem *>(QStringLiteral("renameGroupField:g1"));
+    QVERIFY(dialog && field);
+
+    // Cancelling must leave the workspace exactly as it was.
+    QVERIFY(QMetaObject::invokeMethod(renameEntry, "triggered"));
+    QTest::qWait(100);
+    QVERIFY2(dialog->property("visible").toBool(), "\"Rename\" opened no dialog");
+    QCOMPARE(field->property("text").toString(), QStringLiteral("Alpha"));
+    QMetaObject::invokeMethod(dialog, "reject");
+    QTest::qWait(50);
+    QVERIFY2(fixture.app.calls().isEmpty(), "cancelling the rename still renamed the group");
+
+    // And the accepted path, typed the way a user types it: the dialog selects
+    // the old name on open, so the first keystroke replaces it.
+    QVERIFY(QMetaObject::invokeMethod(renameEntry, "triggered"));
+    QTest::qWait(100);
+    for (const QChar character : QStringLiteral("Renamed"))
+        QTest::keyClick(&fixture.view, character.toLatin1());
+    QTest::qWait(50);
+    QCOMPARE(field->property("text").toString(), QStringLiteral("Renamed"));
+    QMetaObject::invokeMethod(dialog, "accept");
+    QTest::qWait(50);
+    QCOMPARE(fixture.app.calls(), (QStringList{QStringLiteral("renameGroup(g1,Renamed)")}));
 
     QVERIFY2(fixture.warnings().isEmpty(), qPrintable(fixture.warnings().join(QLatin1Char('\n'))));
 }

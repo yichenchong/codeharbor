@@ -18,11 +18,9 @@ target_link_libraries(tst_appsettings PRIVATE
 )
 add_test(NAME tst_appsettings COMMAND tst_appsettings)
 
-# Connection profiles (SPEC 4.1/12.1) plus the QML sheet that edits them. The
-# sheet is loaded straight from the source tree — it is not in the QML module
-# yet — so the path is compiled in; Quick/QuickControls2 provide the QQuickView
-# and the Basic style it is written against. Headless recipe pinned like the
-# other QML-touching targets (no WebEngine here, so no Chromium flags).
+# Connection profiles plus the source-loaded SettingsWindow server pane and
+# connector prompts. Quick/QuickControls2 provide the QQuickView and Basic style
+# used by both components; the generated QML plugin registers CodeHarbor.
 qt_add_executable(tst_serverprofiles tst_serverprofiles.cpp)
 target_link_libraries(tst_serverprofiles PRIVATE
     ch_app
@@ -32,12 +30,10 @@ target_link_libraries(tst_serverprofiles PRIVATE
     Qt6::Qml
     Qt6::Quick
     Qt6::QuickControls2
-    # ConnectSheet imports the CodeHarbor module for the shared Theme singleton.
-    # Linking the generated plugin registers that module for this source-loaded
-    # test just as it is registered for the shipped application.
     codeharbor_qmlplugin
 )
 target_compile_definitions(tst_serverprofiles PRIVATE
+    CH_SETTINGSWINDOW_QML="${CMAKE_CURRENT_SOURCE_DIR}/../../qml/SettingsWindow.qml"
     CH_CONNECTSHEET_QML="${CMAKE_CURRENT_SOURCE_DIR}/../../qml/ConnectSheet.qml"
 )
 add_test(NAME tst_serverprofiles COMMAND tst_serverprofiles)
