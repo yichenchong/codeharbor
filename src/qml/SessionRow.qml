@@ -53,6 +53,15 @@ ItemDelegate {
     width: parent ? parent.width : implicitWidth
     height: 44
 
+    // The size of every trailing action (pin, archive, delete), as one value
+    // rather than three: they are read back as a group when the name Label's
+    // width is worked out below, and a row whose actions had drifted to
+    // different sizes would look accidental. 22 is a step down from the 24 the
+    // group header's buttons used to share with them — still an easy pointer
+    // target, and the six pixels it returns go to the session name, which is
+    // the one thing in this row anybody reads.
+    readonly property int actionButtonSize: 22
+
     // SPEC 4.2 precedence: Error red > WaitingForInput amber > Running green >
     // FinishedUnseen blue > Idle gray > Disconnected dark. rowState is the int
     // value of ch::SessionRowState.
@@ -163,9 +172,17 @@ ItemDelegate {
         }
     }
 
+    // The delegate's inset is the genuine nesting offset. Keeping it on the
+    // control (rather than inventing a padding property on Row) also means
+    // QtQuick can lay out the content item with the correct available width.
+    leftPadding: 12
+    rightPadding: 12
     contentItem: Row {
-        spacing: 8
-        leftPadding: 24
+        // The same gap the group header uses between its own chevron and name,
+        // so the two rows read as one panel rather than two.
+        spacing: 6
+        // The delegate above owns the 12-pixel nesting inset. A Row is a plain
+        // QtQuick positioner and has no padding of its own.
         // Stale rows are dimmed as a block: the status they show is the last
         // one the server managed to report, not the current one.
         opacity: row.stale ? 0.55 : 1.0
@@ -207,6 +224,9 @@ ItemDelegate {
         }
 
         Column {
+            // Named so a test can check the hand-computed width below against
+            // the children it is derived from.
+            objectName: "sessionNames:" + row.itemId
             spacing: 2
             anchors.verticalCenter: parent.verticalCenter
             // Text elides only against a WIDTH, and a Label inside a Column
@@ -225,7 +245,10 @@ ItemDelegate {
             // is not, hence five gaps or four. (The delegate's own rightPadding
             // is what keeps the last button off the row's edge; the Row itself
             // has no trailing padding to subtract.)
-            width: Math.max(0, parent.width - parent.leftPadding - dot.width
+            // Every term is read back off the actual children and the Row's
+            // own spacing, so resizing an action cannot leave a stale constant
+            // behind here; only the number of GAPS is counted by hand.
+            width: Math.max(0, parent.width - dot.width
                             - (archivedMarker.visible ? archivedMarker.width : 0)
                             - pinButton.width - archiveButton.width - deleteButton.width
                             - parent.spacing * (archivedMarker.visible ? 5 : 4))
@@ -254,10 +277,10 @@ ItemDelegate {
         Button {
             id: pinButton
             objectName: "pinButton:" + row.itemId
-            width: 24
-            height: 24
-            implicitWidth: 24
-            implicitHeight: 24
+            width: row.actionButtonSize
+            height: row.actionButtonSize
+            implicitWidth: row.actionButtonSize
+            implicitHeight: row.actionButtonSize
             padding: 0
             // Reachable and visibly focusable without a pointer, like the
             // delete button below and both buttons on a group header. Without
@@ -283,7 +306,9 @@ ItemDelegate {
             contentItem: Label {
                 text: pinButton.text
                 color: pinButton.down ? Theme.accent : Theme.text
-                font.pixelSize: Theme.fontSizeTitle
+                // One step down with the box, so the glyph keeps the same
+                // proportion of it that it had at 24 pixels.
+                font.pixelSize: Theme.fontSizeLabel
                 horizontalAlignment: Text.AlignHCenter
                 verticalAlignment: Text.AlignVCenter
             }
@@ -301,10 +326,10 @@ ItemDelegate {
         Button {
             id: archiveButton
             objectName: "archiveButton:" + row.itemId
-            width: 24
-            height: 24
-            implicitWidth: 24
-            implicitHeight: 24
+            width: row.actionButtonSize
+            height: row.actionButtonSize
+            implicitWidth: row.actionButtonSize
+            implicitHeight: row.actionButtonSize
             padding: 0
             focusPolicy: Qt.StrongFocus
             anchors.verticalCenter: parent.verticalCenter
@@ -326,7 +351,7 @@ ItemDelegate {
             contentItem: Label {
                 text: archiveButton.text
                 color: archiveButton.down ? Theme.accent : Theme.text
-                font.pixelSize: Theme.fontSizeTitle
+                font.pixelSize: Theme.fontSizeLabel
                 horizontalAlignment: Text.AlignHCenter
                 verticalAlignment: Text.AlignVCenter
             }
@@ -345,10 +370,10 @@ ItemDelegate {
         Button {
             id: deleteButton
             objectName: "deleteButton:" + row.itemId
-            width: 24
-            height: 24
-            implicitWidth: 24
-            implicitHeight: 24
+            width: row.actionButtonSize
+            height: row.actionButtonSize
+            implicitWidth: row.actionButtonSize
+            implicitHeight: row.actionButtonSize
             padding: 0
             focusPolicy: Qt.StrongFocus
             anchors.verticalCenter: parent.verticalCenter
@@ -369,7 +394,7 @@ ItemDelegate {
             contentItem: Label {
                 text: deleteButton.text
                 color: deleteButton.down ? Theme.textOnAccent : Theme.danger
-                font.pixelSize: Theme.fontSizeTitle
+                font.pixelSize: Theme.fontSizeLabel
                 horizontalAlignment: Text.AlignHCenter
                 verticalAlignment: Text.AlignVCenter
             }

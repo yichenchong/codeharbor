@@ -707,15 +707,30 @@ void TstViewers::urlMappingLruEviction()
 
 void TstViewers::schemeFlags()
 {
-    // The internal scheme is registered in main() before WebEngine init. It
-    // must NOT carry LocalAccessAllowed: the privileged origin serves every
-    // resource via CodeharbordClient/readFile and must never reach client
-    // file:// resources (SPEC 2.4/7). It stays a secure origin.
+    // The internal scheme is registered in main() before WebEngine init, and
+    // this pins the WHOLE flag word rather than a few chosen bits, because both
+    // directions have already cost us:
+    //
+    //   * a flag that must stay OFF. LocalAccessAllowed would give the
+    //     privileged origin client file:// reach; everything is served via
+    //     CodeharbordClient/readFile instead (SPEC 2.4/7).
+    //   * a flag that must stay ON, and whose absence is invisible to every
+    //     other test in this repository. Without FetchApiAllowed, Chromium
+    //     refuses fetch() on this scheme before a request exists, and the
+    //     Markdown renderer page showed "Unable to render Markdown: Failed to
+    //     fetch" for every file. CorsEnabled is the second half of that pair:
+    //     it makes QWebEngineUrlRequestJob emit the CORS response headers the
+    //     qrc:-origin page needs in order to read the reply.
+    //
+    // An exact comparison is therefore the point. Testing the bits one at a
+    // time is what let the missing one ship.
     const QWebEngineUrlScheme s =
         QWebEngineUrlScheme::schemeByName(QByteArrayLiteral("codeharbor-internal"));
     QCOMPARE(s.name(), QByteArrayLiteral("codeharbor-internal"));
-    QVERIFY(!s.flags().testFlag(QWebEngineUrlScheme::LocalAccessAllowed));
-    QVERIFY(s.flags().testFlag(QWebEngineUrlScheme::SecureScheme));
+    QCOMPARE(s.flags(),
+             QWebEngineUrlScheme::Flags(QWebEngineUrlScheme::SecureScheme
+                                        | QWebEngineUrlScheme::CorsEnabled
+                                        | QWebEngineUrlScheme::FetchApiAllowed));
 }
 
 void TstViewers::mimeForPathByExtension()

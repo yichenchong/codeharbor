@@ -66,6 +66,9 @@ target_link_libraries(tst_paneidentity PRIVATE
     Qt6::Test
     Qt6::Core
     Qt6::Gui
+    # QLocalServer/QLocalSocket: the local RPC pair that lets the Markdown page
+    # fetch real document bytes with no server behind it.
+    Qt6::Network
     Qt6::Qml
     Qt6::Quick
     Qt6::QuickControls2

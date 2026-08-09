@@ -25,6 +25,7 @@
 #include "EditorController.h"
 #include "EditorFactory.h"
 #include "InternalUrlSchemeHandler.h"
+#include "RpcTypes.h"
 #include "SshConnectionPool.h"
 #include "TerminalController.h"
 #include "TerminalFactory.h"
@@ -33,9 +34,16 @@
 
 #include <QtTest>
 
+#include <QCoreApplication>
 #include <QElapsedTimer>
 #include <QGuiApplication>
+#include <QHash>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QJsonValue>
 #include <QList>
+#include <QLocalServer>
+#include <QLocalSocket>
 #include <QMetaObject>
 #include <QObject>
 #include <QPointer>
@@ -180,6 +188,127 @@ constexpr auto kJsMonacoText = R"JS(
     } catch (e) { return "ERR:" + e; }
 })()
 )JS";
+
+// The rendered Markdown document, as the page actually put it on screen.
+constexpr auto kJsMarkdownBody = R"JS(
+(function () {
+    try {
+        var root = document.getElementById("ch-markdown-root");
+        if (!root) return "NO_ROOT";
+        return root.textContent;
+    } catch (e) { return "ERR:" + e; }
+})()
+)JS";
+
+// The page's own failure banner. Read alongside the body so a test that never
+// sees the document can report WHY the page said it could not render it,
+// instead of only that nothing appeared.
+constexpr auto kJsMarkdownStatus = R"JS(
+(function () {
+    try {
+        var status = document.getElementById("ch-markdown-status");
+        if (!status) return "NO_STATUS";
+        return status.textContent;
+    } catch (e) { return "ERR:" + e; }
+})()
+)JS";
+
+// A `codeharbord` that answers file.readFile out of a small in-memory table and
+// refuses everything else, over the QLocalSocket pair CodeharbordClient takes as
+// a transport. Same shape as the harness in src/viewers/tests/tst_viewers.cpp,
+// kept local because only one test in this file needs real document bytes to
+// arrive: the Markdown page fetches its document itself, from inside Chromium,
+// over the codeharbor-internal scheme, so a stubbed QML model cannot stand in
+// for the server the way it can everywhere else here.
+class ReadFileServer : public QObject
+{
+public:
+    ~ReadFileServer() override
+    {
+        // The sockets die with this object; leaving them bound would hand the
+        // shared client a transport made of dangling pointers.
+        if (m_client)
+            m_client->setTransport(nullptr);
+    }
+
+    bool bind(ch::CodeharbordClient *client)
+    {
+        static int seq = 0;
+        const QString name = QStringLiteral("ch_paneidentity_md_%1_%2")
+                                 .arg(QCoreApplication::applicationPid())
+                                 .arg(++seq);
+        QLocalServer::removeServer(name);
+        if (!m_server.listen(name))
+            return false;
+        m_clientSide.connectToServer(name);
+        if (!m_clientSide.waitForConnected(2000))
+            return false;
+        if (!m_server.waitForNewConnection(2000))
+            return false;
+        m_serverSide = m_server.nextPendingConnection();
+        if (!m_serverSide)
+            return false;
+        connect(m_serverSide, &QLocalSocket::readyRead, this, [this] { serve(); });
+        m_client = client;
+        client->setTransport(&m_clientSide);
+        return true;
+    }
+
+    void setFile(const QString &path, const QString &content)
+    {
+        m_files.insert(path, content);
+    }
+
+private:
+    void serve()
+    {
+        m_buffer += m_serverSide->readAll();
+        forever {
+            const qsizetype newline = m_buffer.indexOf('\n');
+            if (newline < 0)
+                return;
+            const QJsonObject request =
+                QJsonDocument::fromJson(m_buffer.left(newline)).object();
+            m_buffer.remove(0, newline + 1);
+            if (request.value(QStringLiteral("method")).toString()
+                != QString::fromLatin1(ch::rpc::kMethodReadFile))
+                continue;
+            const QString path = request.value(QStringLiteral("params"))
+                                     .toObject()
+                                     .value(QStringLiteral("path"))
+                                     .toString();
+            QJsonObject response{{QStringLiteral("jsonrpc"), QStringLiteral("2.0")},
+                                 {QStringLiteral("id"),
+                                  request.value(QStringLiteral("id"))}};
+            const auto it = m_files.constFind(path);
+            if (it == m_files.constEnd()) {
+                response.insert(
+                    QStringLiteral("error"),
+                    QJsonObject{{QStringLiteral("code"), -32000},
+                                {QStringLiteral("message"),
+                                 QStringLiteral("no such file: %1").arg(path)}});
+            } else {
+                response.insert(
+                    QStringLiteral("result"),
+                    QJsonObject{{QStringLiteral("path"), path},
+                                {QStringLiteral("encoding"), QStringLiteral("utf-8")},
+                                {QStringLiteral("content"), *it},
+                                {QStringLiteral("revision"), QStringLiteral("r1")},
+                                {QStringLiteral("truncated"), false}});
+            }
+            m_serverSide->write(
+                QJsonDocument(response).toJson(QJsonDocument::Compact) + '\n');
+            m_serverSide->flush();
+        }
+    }
+
+    QLocalServer m_server;
+    QLocalSocket m_clientSide;
+    QLocalSocket *m_serverSide = nullptr;  // owned by m_server
+    QByteArray m_buffer;
+    QHash<QString, QString> m_files;
+    QPointer<ch::CodeharbordClient> m_client;
+};
 
 QUrl moduleUrl(const QString &file)
 {
@@ -545,7 +674,7 @@ private slots:
     // PANE ACTIONS. Every header action must name its own pane, even when the
     // remembered-pane fallback would otherwise choose the first leaf.
     void paneHeaderRequestsNameTheirOwnPane();
-    void terminalKillRequiresConfirmation();
+    void terminalCloseKillsOnlyAfterConfirmation();
     void paneHeaderTravelsWithThePaneAcrossASplit();
     void terminalCustomTitleAppearsAndClearsInTheHeader();
 
@@ -660,6 +789,17 @@ private slots:
     // this pane started is pending, so a request that never reaches the handler
     // left the pane's one affordance dead for good.
     void theBinaryViewStopsWaitingForADownloadThatNeverStarts();
+
+    // THE MARKDOWN PAGE MUST BE ABLE TO FETCH ITS OWN DOCUMENT. The renderer
+    // page is app code loaded from qrc:, the document is served from
+    // codeharbor-internal://, and those are two different web origins — so the
+    // one thing the whole view exists to do is a cross-origin fetch() out of
+    // Chromium. Nothing below the browser can tell whether Chromium will permit
+    // it: every unit test over the renderer, the scheme handler and the URL map
+    // passed while the shipped viewer showed "Unable to render Markdown: Failed
+    // to fetch" on every file. Only the real page, fetching a real
+    // internal-scheme document, answers the question.
+    void theMarkdownPageRendersADocumentFetchedFromTheInternalScheme();
 
     // THE MARKDOWN IMAGE PATH IS RESOLVED TWICE, in two languages. The rendered
     // page resolves its own links in TypeScript; the WebChannel image bridge
@@ -1383,7 +1523,7 @@ void TstPaneIdentity::paneHeaderRequestsNameTheirOwnPane()
              QStringLiteral("viewer-2"));
 }
 
-void TstPaneIdentity::terminalKillRequiresConfirmation()
+void TstPaneIdentity::terminalCloseKillsOnlyAfterConfirmation()
 {
     QVERIFY(openRegion(QStringLiteral("TerminalRegion.qml"),
                        branchNode(QStringLiteral("vertical"),
@@ -1396,26 +1536,33 @@ void TstPaneIdentity::terminalKillRequiresConfirmation()
 
     QObject *const second = paneWithId(m_region, QStringLiteral("terminal-2"));
     QVERIFY(second);
-    QObject *const killButton = childNamed(second, QStringLiteral("terminalKillButton"));
-    QVERIFY2(killButton, "the terminal pane has no kill button");
+    QObject *const closeButton = childNamed(second, QStringLiteral("terminalCloseButton"));
+    QVERIFY2(closeButton, "the terminal pane has no close button");
+    QVERIFY(!childNamed(second, QStringLiteral("terminalKillButton")));
     QSignalSpy killRequested(m_region, SIGNAL(killTerminalRequested(QString)));
+    QSignalSpy closeRequested(m_region, SIGNAL(closePaneRequested(QString)));
     QVERIFY(killRequested.isValid());
+    QVERIFY(closeRequested.isValid());
 
-    // Declining the dialog emits no request.
-    QVERIFY(QMetaObject::invokeMethod(killButton, "clicked"));
+    // Declining the destructive close emits neither request.
+    QVERIFY(QMetaObject::invokeMethod(closeButton, "clicked"));
     QObject *const dialog = childNamed(second, QStringLiteral("terminalPaneKillDialog"));
-    QVERIFY2(dialog, "the terminal kill button did not open its confirmation dialog");
+    QVERIFY2(dialog, "the terminal close button did not open its confirmation dialog");
     QTRY_VERIFY(dialog->property("visible").toBool());
     QVERIFY(QMetaObject::invokeMethod(dialog, "reject"));
     QTest::qWait(50);
     QCOMPARE(killRequested.size(), 0);
+    QCOMPARE(closeRequested.size(), 0);
 
-    // Accepting the same dialog emits exactly the named pane id.
-    QVERIFY(QMetaObject::invokeMethod(killButton, "clicked"));
+    // Acceptance emits kill first, then the layout close, for this pane.
+    QVERIFY(QMetaObject::invokeMethod(closeButton, "clicked"));
     QTRY_VERIFY(dialog->property("visible").toBool());
     QVERIFY(QMetaObject::invokeMethod(dialog, "accept"));
     QTRY_COMPARE(killRequested.size(), 1);
+    QTRY_COMPARE(closeRequested.size(), 1);
     QCOMPARE(killRequested.constFirst().constFirst().toString(),
+             QStringLiteral("terminal-2"));
+    QCOMPARE(closeRequested.constFirst().constFirst().toString(),
              QStringLiteral("terminal-2"));
 }
 
@@ -2989,6 +3136,69 @@ void TstPaneIdentity::theMarkdownImagePathResolverAgreesWithTheRendererBundle()
                                        Q_ARG(QVariant, reference)),
              "ViewerMarkdownView has no resolveImagePath()");
     QCOMPARE(resolved.toString(), expected);
+}
+
+// ---------------------------------------------------------------------------
+// The renderer page fetching its own document, end to end.
+//
+// Everything below the browser was already covered and all of it passed while
+// the feature was completely broken in the shipped app: the URL map minted the
+// address, the scheme handler served the bytes, and the TypeScript renderer
+// turned Markdown into sanitised HTML. What none of them could see is that
+// Chromium refused the request before it became a request at all, because the
+// custom scheme was not registered as reachable by the Fetch API. That refusal
+// exists only inside the browser, so only the real page can prove it is gone.
+//
+// The assertion is deliberately on the DOCUMENT TEXT rather than on the absence
+// of an error: a page that renders nothing and says nothing is just as broken
+// as one that shows a banner, and only "the user's words are on the screen"
+// rules both out.
+// ---------------------------------------------------------------------------
+void TstPaneIdentity::theMarkdownPageRendersADocumentFetchedFromTheInternalScheme()
+{
+    const QString path = QStringLiteral("/srv/repos/app/docs/guide.md");
+    ReadFileServer server;
+    QVERIFY2(server.bind(&m_client),
+             "the local RPC transport pair could not be created");
+    server.setFile(path,
+                   QStringLiteral("# Harbor Notes\n\nThe body of the document.\n"));
+
+    // The REAL bundle url, unlike every other Markdown test in this file: those
+    // blank it precisely so no page loads, and that is why they never saw this.
+    QObject *const view =
+        openInShell(QStringLiteral("ViewerMarkdownView.qml"),
+                    {{QStringLiteral("url"), QStringLiteral("file://") + path}});
+    QVERIFY(view);
+
+    QElapsedTimer clock;
+    clock.start();
+    while (!view->property("pageReady").toBool() && clock.elapsed() < kPageLoadTimeoutMs)
+        QTest::qWait(100);
+    // Whether Chromium can start at all is a property of the box, so it QSKIPs
+    // here exactly as the terminal and editor page tests above do. What the
+    // page then does with a document it CAN load is our code, and fails.
+    if (!view->property("pageReady").toBool())
+        QSKIP("the Markdown page never loaded; WebEngine cannot run under this recipe");
+
+    const bool rendered = waitForJs(view, QString::fromLatin1(kJsMarkdownBody),
+                                    QStringLiteral("Harbor Notes"), kPageLoadTimeoutMs);
+    const QString status = evalJs(view, QString::fromLatin1(kJsMarkdownStatus));
+    QVERIFY2(rendered,
+             qPrintable(QStringLiteral("the page never rendered the document it was "
+                                       "pointed at; it reported: \"%1\"")
+                            .arg(status)));
+    QVERIFY2(status.isEmpty(),
+             qPrintable(QStringLiteral("the page rendered the document and still showed "
+                                       "an error: \"%1\"")
+                            .arg(status)));
+    QVERIFY2(evalJs(view, QString::fromLatin1(kJsMarkdownBody))
+                 .contains(QStringLiteral("The body of the document.")),
+             "only part of the document survived the fetch");
+
+    // QML's own failure channel must agree with the page: a view that rendered
+    // the file while ViewerPane's banner said the read had failed would be two
+    // contradictory answers on one screen.
+    QCOMPARE(view->property("errorText").toString(), QString());
 }
 
 // ---------------------------------------------------------------------------

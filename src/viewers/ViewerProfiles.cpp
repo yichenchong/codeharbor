@@ -38,11 +38,29 @@ void ViewerProfiles::registerUrlScheme()
     scheme.setDefaultPort(QWebEngineUrlScheme::PortUnspecified);
     // Treated as a secure origin (HTTPS-like) so pages served from it run in a
     // secure context, and CORS-enabled so the privileged viewers can fetch
-    // internal-scheme subresources. LocalAccessAllowed is deliberately NOT set:
-    // everything is served via CodeharbordClient/readFile, never file://, so the
-    // internal origin must not be granted client file:// reach (SPEC 2.4/7).
+    // internal-scheme subresources.
+    //
+    // FetchApiAllowed is what actually lets fetch()/XMLHttpRequest NAME this
+    // scheme. It is a separate gate from CorsEnabled and it comes FIRST:
+    // Chromium keeps a list of schemes the Fetch API may request at all, and a
+    // scheme missing from it is rejected before any request, response or CORS
+    // check exists. Without it the Markdown renderer page — the one surface
+    // that fetches its document instead of navigating to it — logged
+    //
+    //   Fetch API cannot load codeharbor-internal://file/<id>.
+    //   URL scheme "codeharbor-internal" is not supported.
+    //
+    // and showed "Unable to render Markdown: Failed to fetch" for every file,
+    // while every test below the browser passed. CorsEnabled remains required
+    // as well: it is what makes QWebEngineUrlRequestJob emit the CORS response
+    // headers, so the qrc:-origin page is allowed to READ the reply it gets.
+    //
+    // LocalAccessAllowed is deliberately NOT set: everything is served via
+    // CodeharbordClient/readFile, never file://, so the internal origin must not
+    // be granted client file:// reach (SPEC 2.4/7).
     scheme.setFlags(QWebEngineUrlScheme::SecureScheme
-                    | QWebEngineUrlScheme::CorsEnabled);
+                    | QWebEngineUrlScheme::CorsEnabled
+                    | QWebEngineUrlScheme::FetchApiAllowed);
     QWebEngineUrlScheme::registerScheme(scheme);
 }
 

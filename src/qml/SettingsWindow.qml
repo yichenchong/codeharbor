@@ -81,6 +81,11 @@ Rectangle {
     component SheetButton: Button {
         id: button
         property color accent: Theme.border
+        // A SheetButton is used both as a stand-alone command button, whose
+        // label is centred over it, and as a row of the server list, where a
+        // centred name reads as a heading rather than as an entry to pick. The
+        // row form sets this to Text.AlignLeft; nothing else changes.
+        property int textAlignment: Text.AlignHCenter
         implicitHeight: 30
         leftPadding: 12
         rightPadding: 12
@@ -90,8 +95,13 @@ Rectangle {
             textFormat: Text.PlainText
             color: button.enabled ? Theme.text : Theme.textFaint
             font.pixelSize: Theme.fontSizeBody
-            horizontalAlignment: Text.AlignHCenter
+            horizontalAlignment: button.textAlignment
             verticalAlignment: Text.AlignVCenter
+            // A command button is as wide as its own label, so this never
+            // fires for one; a list row is as wide as the list, and without it
+            // a profile name longer than the row spilled over both of its
+            // borders and was then cut mid-glyph by the view's clip.
+            elide: Text.ElideRight
         }
         background: Rectangle {
             radius: Theme.radiusSmall
@@ -269,7 +279,6 @@ Rectangle {
         case "pane.split.horizontal": return qsTr("Split side by side");
         case "pane.split.vertical": return qsTr("Split top and bottom");
         case "pane.close": return qsTr("Close pane");
-        case "terminal.kill": return qsTr("Kill terminal session");
         default: return String(id);
         }
     }
@@ -1006,7 +1015,18 @@ Rectangle {
                     id: serverProfileListView
                     objectName: "serverProfileList"
                     width: Math.min(parent.width, 620)
-                    height: Math.max(36, Math.min(4 * 36, root.profileEntries.length * 36))
+                    // One row height for both the view and its delegate. The
+                    // delegate is a SheetButton, whose implicit height is a
+                    // stand-alone button's 30, while this height reserved 36
+                    // per row: the rows tiled 30 tall inside a box six pixels
+                    // per row taller than them, so with one profile the row —
+                    // and the name in it — sat three pixels above the centre
+                    // of the box, and with five or more the viewport ended
+                    // mid-row and cut a name in half.
+                    readonly property int rowHeight: 36
+                    height: Math.max(rowHeight,
+                                     Math.min(4 * rowHeight,
+                                              root.profileEntries.length * rowHeight))
                     clip: true
                     ScrollBar.vertical: AppScrollBar {}
                     model: root.profileEntries
@@ -1018,6 +1038,8 @@ Rectangle {
                         // width, so the rows came out an arbitrary size. Same
                         // rule the two lists in the Appearance pane follow.
                         width: serverProfileListView.width
+                        implicitHeight: serverProfileListView.rowHeight
+                        textAlignment: Text.AlignLeft
                         text: root.profileText(modelData, "name")
                               || root.profileText(modelData, "host")
                               || qsTr("Unnamed profile")

@@ -446,6 +446,41 @@ void settle(int ms = 120)
     QCoreApplication::processEvents();
 }
 
+// Opens the Settings sheet on its server group and waits until that pane has a
+// size, because the positioners inside it lay out on a polish pass and any
+// geometry read before that is meaningless.
+//
+// The wait on the loader's FIRST pane is not padding: switching `selectedGroup`
+// while that creation is still in flight cancels it, and the cancelled
+// incubation logs two QML warnings ("Cannot create delegate" and "Object or
+// context destroyed during incubation") that the warning check at the end of a
+// test would then report. A user cannot outrun the first frame; only a test can.
+bool showServerPane(Surface &surface)
+{
+    QQuickItem *root = surface.root();
+    auto *groupLoader =
+            qobject_cast<QQuickItem *>(surface.child(QStringLiteral("settingsGroupLoader")));
+    if (!root || !groupLoader)
+        return false;
+    root->setProperty("shown", true);
+    const bool firstPaneSettled = QTest::qWaitFor(
+            [&] {
+                auto *first = groupLoader->property("item").value<QQuickItem *>();
+                if (!first || first->width() <= 0 || first->height() <= 0)
+                    return false;
+                const QQmlIncubationController *pending =
+                        surface.view.engine()->incubationController();
+                return !pending || pending->incubatingObjectCount() == 0;
+            },
+            2000);
+    if (!firstPaneSettled)
+        return false;
+    root->setProperty("selectedGroup", QStringLiteral("server"));
+    settle(120);
+    auto *pane = qobject_cast<QQuickItem *>(surface.child(QStringLiteral("serverPane")));
+    return pane && QTest::qWaitFor([&] { return pane->width() > 0 && pane->height() > 0; }, 2000);
+}
+
 // ---------------------------------------------------------------------------
 // Fixtures, shared by the shot mode and the assertions so a screenshot always
 // shows the same state a test made a claim about.
@@ -823,6 +858,12 @@ private slots:
     // The Settings server pane lays its fields out in a two-column grid; one
     // over-wide entry pushes the whole second column off the pane.
     void settingsServerFieldsStayInsideThePane();
+
+    // The rows of that pane's profile list are the control the user picks a
+    // server with: their name has to sit in the middle of the row, the rows
+    // have to fill the box drawn around them, and a long name has to elide
+    // rather than run over the row's own border.
+    void settingsServerRowsCentreAndElideTheirName();
 
     // The sheet's Save gate has to be the STORE's rule. Anything looser reports
     // a save that ServerProfiles silently drops on the floor.
@@ -1232,8 +1273,10 @@ void TstUxShell::sidebarDeleteActionsAreConfirmedAndNamed()
     QCOMPARE(sessionDelete->property("actionText").toString(),
              QStringLiteral("Delete s-visible"));
     QVERIFY((sessionDelete->property("focusPolicy").toInt() & int(Qt::TabFocus)) != 0);
-    QVERIFY(sessionDelete->property("width").toReal() >= 24);
-    QVERIFY(sessionDelete->property("height").toReal() >= 24);
+    // 22 is the sidebar's square-action size; anything under it stops being a
+    // comfortable pointer target for a destructive action.
+    QVERIFY(sessionDelete->property("width").toReal() >= 22);
+    QVERIFY(sessionDelete->property("height").toReal() >= 22);
 
     QMetaObject::invokeMethod(sessionDelete, "clicked");
     settle(40);
@@ -1263,8 +1306,8 @@ void TstUxShell::sidebarDeleteActionsAreConfirmedAndNamed()
     QCOMPARE(groupDelete->property("actionText").toString(),
              QStringLiteral("Delete group \"Client work\""));
     QVERIFY((groupDelete->property("focusPolicy").toInt() & int(Qt::TabFocus)) != 0);
-    QVERIFY(groupDelete->property("width").toReal() >= 24);
-    QVERIFY(groupDelete->property("height").toReal() >= 24);
+    QVERIFY(groupDelete->property("width").toReal() >= 22);
+    QVERIFY(groupDelete->property("height").toReal() >= 22);
 
     QMetaObject::invokeMethod(groupDelete, "clicked");
     settle(40);
@@ -1884,32 +1927,10 @@ void TstUxShell::settingsServerFieldsStayInsideThePane()
     QVERIFY(surface.expose());
     QQuickItem *root = surface.root();
     QVERIFY(root);
-    root->setProperty("shown", true);
-    // Wait for the sheet's group loader to finish its FIRST pane before asking
-    // for another one. Switching `selectedGroup` while that first creation is
-    // still in flight cancels it, and the cancelled creation logs two QML
-    // warnings ("Cannot create delegate" and "Object or context destroyed
-    // during incubation") that the warning check at the end of this test would
-    // then report. A user cannot outrun the first frame; only a test can.
-    auto *groupLoader = qobject_cast<QQuickItem *>(
-            surface.child(QStringLiteral("settingsGroupLoader")));
-    QVERIFY2(groupLoader, "the Settings sheet has no group loader");
-    const auto firstPaneSettled = [&] {
-        auto *first = groupLoader->property("item").value<QQuickItem *>();
-        if (!first || first->width() <= 0 || first->height() <= 0)
-            return false;
-        const QQmlIncubationController *pending = surface.view.engine()->incubationController();
-        return !pending || pending->incubatingObjectCount() == 0;
-    };
-    QTRY_VERIFY_WITH_TIMEOUT(firstPaneSettled(), 2000);
-    root->setProperty("selectedGroup", QStringLiteral("server"));
-    settle(120);
+    QVERIFY2(showServerPane(surface), "the Settings sheet never showed its server pane");
 
     auto *pane = qobject_cast<QQuickItem *>(surface.child(QStringLiteral("serverPane")));
     QVERIFY2(pane, "the Settings sheet has no server pane");
-    // The positioners inside the pane lay out on a polish pass, so the
-    // geometry below is only meaningful once the pane itself has a size.
-    QTRY_VERIFY_WITH_TIMEOUT(pane->width() > 0 && pane->height() > 0, 2000);
 
     // Every field the pane is required to show, named at the source rather
     // than sniffed out by C++ class name: a Qt Quick Controls TextField is
@@ -1942,6 +1963,84 @@ void TstUxShell::settingsServerFieldsStayInsideThePane()
                                     .arg(right)
                                     .arg(paneRight)));
     }
+
+    QVERIFY2(surface.warnings.isEmpty(), qPrintable(surface.warningReport()));
+}
+
+// The profile list is how the user picks which saved server the fields below
+// are editing, so it is read as a list of rows: the name has to sit in the
+// middle of its row, the rows have to fill the box the view draws around them,
+// and a name too long for the row has to end in an ellipsis instead of running
+// out over the row's own border and being cut mid-glyph by the view's clip.
+void TstUxShell::settingsServerRowsCentreAndElideTheirName()
+{
+    Surface surface(moduleUrl(QStringLiteral("SettingsWindow.qml")), QSize(900, 560));
+    QVERIFY(surface.expose());
+    QQuickItem *root = surface.root();
+    QVERIFY(root);
+    QVERIFY2(showServerPane(surface), "the Settings sheet never showed its server pane");
+
+    // The second name is far wider than any row this window can draw, which is
+    // what makes the elide claim below a real one.
+    QVariantList profiles = twoProfiles();
+    auto longNamed = profiles.at(1).toMap();
+    longNamed[QStringLiteral("name")] = QString(QStringLiteral("Fixture box ")).repeated(24);
+    profiles[1] = longNamed;
+    root->setProperty("profileEntries", profiles);
+    settle(120);
+
+    auto *list = qobject_cast<QQuickItem *>(surface.child(QStringLiteral("serverProfileList")));
+    QVERIFY2(list, "the server pane has no profile list");
+    const qreal rowHeight = list->property("rowHeight").toReal();
+    QVERIFY2(rowHeight > 0, "the profile list does not publish a row height");
+
+    // The rows tile the viewport exactly. When they do not, the block of rows
+    // ends short of the bottom of the box around it and the whole list reads as
+    // sitting too high, and a viewport that is not a whole number of rows cuts
+    // the last one it shows in half.
+    QCOMPARE(list->height(), 2 * rowHeight);
+    QCOMPARE(list->property("contentHeight").toReal(), list->height());
+
+    const QStringList rowNames{QStringLiteral("serverProfile:id-a"),
+                               QStringLiteral("serverProfile:id-b")};
+    for (const QString &name : rowNames) {
+        auto *row = qobject_cast<QQuickItem *>(surface.child(name));
+        QVERIFY2(row, qPrintable(QStringLiteral("the profile list has no %1").arg(name)));
+        QCOMPARE(row->height(), rowHeight);
+
+        auto *label = row->property("contentItem").value<QQuickItem *>();
+        QVERIFY2(label, qPrintable(QStringLiteral("%1 draws no label").arg(name)));
+        // Two independent halves of "centred": the label BOX is centred in the
+        // row, and the text is centred inside that box rather than sitting on
+        // its top edge.
+        QCOMPARE(label->property("verticalAlignment").toInt(), int(Qt::AlignVCenter));
+        const qreal labelCentre = label->y() + label->height() / 2;
+        QVERIFY2(qAbs(labelCentre - row->height() / 2) <= 0.5,
+                 qPrintable(QStringLiteral("%1 centres its label at y=%2 in a %3-pixel row")
+                                    .arg(name)
+                                    .arg(labelCentre)
+                                    .arg(row->height())));
+        // A label collapsed to nothing would satisfy every claim above.
+        QVERIFY2(label->height() >= 12, qPrintable(QStringLiteral("%1 has a %2-pixel label")
+                                                           .arg(name)
+                                                           .arg(label->height())));
+        const qreal labelRight = label->mapToItem(row, QPointF(label->width(), 0)).x();
+        QVERIFY2(labelRight <= row->width() + 0.5,
+                 qPrintable(QStringLiteral("%1 draws its label out to x=%2 in a %3-pixel row")
+                                    .arg(name)
+                                    .arg(labelRight)
+                                    .arg(row->width())));
+    }
+
+    auto *shortRow = qobject_cast<QQuickItem *>(
+            surface.child(QStringLiteral("serverProfile:id-a")));
+    auto *longRow = qobject_cast<QQuickItem *>(
+            surface.child(QStringLiteral("serverProfile:id-b")));
+    QVERIFY(shortRow && longRow);
+    QVERIFY2(!shortRow->property("contentItem").value<QQuickItem *>()->property("truncated").toBool(),
+             "a name that fits is being shortened");
+    QVERIFY2(longRow->property("contentItem").value<QQuickItem *>()->property("truncated").toBool(),
+             "a name too wide for its row is not elided");
 
     QVERIFY2(surface.warnings.isEmpty(), qPrintable(surface.warningReport()));
 }

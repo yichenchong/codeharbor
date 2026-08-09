@@ -90,6 +90,12 @@ Rectangle {
     // Both plain and stamped variants remain available: standalone component
     // tests use the plain signals, while production uses the immutable session
     // and layout-generation stamp to reject delayed callbacks.
+    //
+    // The kill pair is a RELAY and nothing more. This region never originates
+    // one: a pane raises it only from its confirmed close, so every teardown
+    // this file performs itself — destroyAllPanes(), a Loader replacing a
+    // pane, a republished or repaired tree, a Dev Session switch, the window
+    // going away — destroys panes without any kill travelling with them.
     signal splitRequestedForSession(string sessionId, double generation,
                                     string paneId, string orientation)
     signal closePaneRequestedForSession(string sessionId, double generation,
@@ -432,8 +438,10 @@ Rectangle {
     }
 
     // A pane asking to be closed from its own header. Relayed rather than acted
-    // on: closing a pane is a layout change only the host can publish, and it
-    // deliberately leaves the remote tmux session running.
+    // on: closing a pane is a layout change only the host can publish. A
+    // TERMINAL pane's close arrives paired with the kill request below, in that
+    // order, because the user confirmed both; a viewer pane's close still
+    // arrives alone.
     function notePaneCloseForSession(sessionId, generation, paneId) {
         if (region.hostStampsWrites) {
             if (String(sessionId).length === 0)
@@ -445,6 +453,10 @@ Rectangle {
         region.closePaneRequested(paneId);
     }
 
+    // The other half of a terminal pane's confirmed close: end the remote tmux
+    // session. Reached ONLY from TerminalPaneView's confirmation dialog, never
+    // from pane teardown, so a disconnect, a session switch or the application
+    // quitting leaves the remote session running.
     function notePaneKillForSession(sessionId, generation, paneId) {
         if (region.hostStampsWrites) {
             if (String(sessionId).length === 0)

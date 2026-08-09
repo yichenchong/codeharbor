@@ -363,24 +363,37 @@ never runs anything itself.
 
 The terminal region contains one or more terminal panes arranged using a recursive split tree.
 
-Closing a terminal pane must not kill its tmux session by default.
+Closing a terminal pane from that pane's own close button kills its tmux session. The two used to be
+separate controls and they are now one: the button asks for confirmation, then ends the remote tmux
+session and removes the pane.
+
+**Nothing else kills.** Only a deliberate press of a terminal pane's own close button ends a remote
+session. Every other way a pane can disappear leaves the tmux session running on the server, to be
+re-attached later: closing the application window or quitting the client, a dropped SSH connection and
+every rung of the reconnect ladder, switching to another Dev Session, a layout being replaced, reloaded
+or repaired from the server, closing a region/group/session from the sidebar, and a terminal region
+destroying a pane for any internal reason. Those paths all end at the pane's destruction handler, which
+DETACHES. This is the point of running the shells under tmux at all, and wiring the kill to pane
+destruction rather than to the button press would silently destroy every long-running remote session
+the moment the user closed the window.
 
 Possible operations:
 
-- **Close pane:** remove the pane from the current layout and detach locally.
-- **Detach:** disconnect while preserving the pane definition.
-- **Kill terminal:** explicitly kill the remote tmux session.
+- **Close pane:** confirm, kill the pane's remote tmux session, then remove the pane from the layout.
+- **Detach:** disconnect while preserving the pane definition, leaving the remote session running.
 - **Reconnect:** reattach to the same tmux target.
 
-**Pane controls belong to the PANE.** Splitting, closing and killing are offered
-on each pane's own header, and each acts on the pane whose header was used. They
-are deliberately not region-level controls acting on "the focused pane": with
+**Pane controls belong to the PANE.** Splitting and closing are offered on each
+pane's own header, and each acts on the pane whose header was used. They are
+deliberately not region-level controls acting on "the focused pane": with
 several panes open, the pane a region-level button would act on is a guess, and a
-wrong guess splits or closes something the user was not looking at. The command
-palette still carries the same operations for keyboard use, and only there — where
-no pane was named — does the remembered pane decide the target. Killing a terminal
-destroys running remote work, so it is confirmed before it happens; closing a pane
-is not, because it leaves the tmux session alive.
+wrong guess splits or closes something the user was not looking at. Because
+closing a terminal pane is now irreversible, that guess would destroy running
+remote work, so there is no palette command to kill a terminal at all: the
+palette's "Close Focused Terminal Pane" removes the pane and leaves its session
+running, and only the pane's own button — which names itself — kills. Closing a
+terminal pane is confirmed before it happens; closing a viewer pane is not,
+because it destroys nothing on the server.
 
 ### 4.5 Split Trees
 
@@ -1558,9 +1571,10 @@ restores those (keeping the caption itself absent) and answers the hit test for 
 is what the snap-layouts flyout is attached to. Nothing about this changes behaviour on Linux or macOS.
 
 Every remaining command — splitting a viewer or terminal pane, closing a focused
-pane, killing a terminal's remote tmux session, disconnecting from the server,
-marking agent output seen — is reachable through the palette only and carries no key
-sequence.
+pane, disconnecting from the server, marking agent output seen — is reachable
+through the palette only and carries no key sequence. Killing a terminal's remote
+tmux session is not among them and has no key sequence either: it happens only
+as part of a terminal pane's own confirmed close (§4.4).
 
 Originally suggested defaults, and how they were reconciled:
 

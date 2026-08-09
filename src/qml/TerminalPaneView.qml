@@ -70,12 +70,24 @@ Rectangle {
         renameDialog.open()
     }
 
-    function beginKill() {
-        // The request is emitted only after the user accepts the confirmation,
-        // but activation still happens first so the host records this pane as
-        // the source of the destructive action.
+    // The pane's close control. Closing a terminal pane now ENDS its remote
+    // tmux session too, so it is confirmed first. Activation still happens
+    // before the dialog opens, so the host records this pane as the source of
+    // the destructive action.
+    function beginClose() {
         pane.paneActivated(pane.paneId)
         killDialog.open()
+    }
+
+    // What the confirmation actually does, in the order that matters. The kill
+    // request goes FIRST, while this pane is still in its region's cache and
+    // still owns the controller Main.qml has to reach the server through; the
+    // close request that follows republishes the layout and takes the pane
+    // away. Reversed, the host would look up a pane that no longer exists and
+    // the remote session would survive a close the user was told was final.
+    function closeAndKill() {
+        pane.killRequested(pane.paneId)
+        pane.closeRequested(pane.paneId)
     }
 
     function commitRename(value) {
@@ -154,9 +166,19 @@ Rectangle {
     // a pane cannot see its siblings.
     property bool paneActive: false
 
-    // Pane-header requests carry this pane's id all the way to Main.qml. Closing
-    // leaves the remote session running; killing is separate and confirmed
-    // below because it ends the remote tmux session and its processes.
+    // Pane-header requests carry this pane's id all the way to Main.qml.
+    // Closing a terminal pane is destructive: it kills the remote tmux session
+    // AND removes the pane, which is why closeAndKill() emits both and is
+    // reached only from the confirmation dialog below.
+    //
+    // That dialog is the ONLY emitter of `killRequested` in this file, and that
+    // is the safety boundary: every other way a pane can disappear — the
+    // application window closing, a Dev Session switch, a layout republished or
+    // repaired by the server, a region or group closed from the sidebar, a
+    // dropped or reconnecting SSH connection, a Loader tearing its pane down —
+    // arrives at Component.onDestruction, which calls detachNow() and leaves
+    // the remote session running. Killing must stay wired to the button press,
+    // never to pane destruction.
     signal splitRequested(string paneId, string orientation)
     signal closeRequested(string paneId)
     signal killRequested(string paneId)
@@ -633,27 +655,21 @@ Rectangle {
             AppPaneHeader.Action {
                 objectName: "terminalCloseButton"
                 toolbarId: "pane.close"
-                text: qsTr("Close this pane")
+                // ONE control, deliberately. The separate kill button beside
+                // this one told the user nothing that close did not — both made
+                // the pane go away, and only a tiny skull glyph distinguished
+                // the one that also ended their shell. It carries no size of
+                // its own either: the shared AppPaneHeader.Action metrics are
+                // what make it the same comfortable target as split and rename.
+                text: qsTr("Close this pane and kill its remote session")
                 glyph: "\u00d7"
-                onClicked: {
-                    // Activation precedes the request so this pane's id, not a
-                    // remembered fallback, is the one the host closes.
-                    pane.paneActivated(pane.paneId)
-                    pane.closeRequested(pane.paneId)
-                }
+                onClicked: pane.beginClose()
             },
             AppPaneHeader.Action {
                 objectName: "terminalRenameButton"
                 text: qsTr("Rename this pane")
                 glyph: "R"
                 onClicked: pane.beginRename()
-            },
-            AppPaneHeader.Action {
-                objectName: "terminalKillButton"
-                toolbarId: "terminal.kill"
-                text: qsTr("Kill this terminal's remote session")
-                glyph: "\u2620"
-                onClicked: pane.beginKill()
             }
         ]
     }
@@ -689,12 +705,15 @@ Rectangle {
         onAccepted: pane.commitRename(renameField.text)
     }
 
-    // Killing is deliberately confirmed here, at the pane that owns the
-    // destructive action. Declining or dismissing the dialog emits no request.
+    // Closing a terminal pane is confirmed here, at the pane that owns the
+    // destructive action, because it ends the user's remote work and not just
+    // their view of it. Declining or dismissing emits nothing at all — not even
+    // the plain close — so a mis-click on a one-click destructive control costs
+    // the user nothing.
     AppDialog {
         id: killDialog
         objectName: "terminalPaneKillDialog"
-        title: qsTr("Kill terminal session")
+        title: qsTr("Close terminal pane")
         modal: true
         standardButtons: Dialog.Ok | Dialog.Cancel
         anchors.centerIn: Overlay.overlay
@@ -708,7 +727,11 @@ Rectangle {
                 Layout.fillWidth: true
                 textFormat: Text.PlainText
                 wrapMode: Text.WordWrap
-                text: qsTr("Kill the remote tmux session for \"%1\"? Running processes will be lost.")
+                // Both consequences, spelled out, because the pane closing is
+                // the visible half and the session ending is the irreversible
+                // one.
+                text: qsTr("Close \"%1\"? The remote tmux session ends and its running "
+                           + "processes are lost, and then the pane closes. This cannot be undone.")
                       .arg(pane.customTitle.length > 0
                            ? pane.customTitle
                            : (pane.terminalId.length > 0
@@ -716,7 +739,7 @@ Rectangle {
             }
         }
 
-        onAccepted: pane.killRequested(pane.paneId)
+        onAccepted: pane.closeAndKill()
     }
 
 

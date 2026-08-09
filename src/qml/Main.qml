@@ -955,16 +955,16 @@ ApplicationWindow {
         app.layouts.setRatios(region, pathIndexes, ratios);
     }
 
-    // End a terminal pane's REMOTE tmux session. Pane headers pass their own
-    // pane id; the command palette calls this without one and keeps its
-    // remembered-pane/first-leaf resolution.
-    function killActiveTerminal(requestedPaneId) {
+    // End a terminal pane's REMOTE tmux session, as the first half of that
+    // pane's confirmed close (TerminalPaneView.closeAndKill). `paneId` is
+    // always supplied and always names the pane whose close button was pressed:
+    // there is deliberately no palette command and no remembered-pane fallback
+    // for a destructive action nobody aimed at a specific pane.
+    function killActiveTerminal(paneId) {
         if (app.activeSessionId.length === 0) {
             window.notifyUser(qsTr("No active Dev Session."));
             return;
         }
-        const paneId = requestedPaneId === undefined
-                     ? window.targetPaneId("terminal") : requestedPaneId;
         const pane = terminalRegion.paneCache ? terminalRegion.paneCache[paneId] : null;
         if (!pane) {
             window.notifyUser(qsTr("No live terminal pane to kill."));
@@ -1025,11 +1025,11 @@ ApplicationWindow {
           invoke: () => window.closeActivePane("viewer") },
         { id: "pane.close.terminal", title: qsTr("Close Focused Terminal Pane"),
           invoke: () => window.closeActivePane("terminal") },
-        // Detaching leaves the remote tmux session running (that is the point of
-        // tmux); killing it is the only way to actually end the remote shell, and
-        // until now nothing in the UI could reach TerminalPaneView.killSession().
-        { id: "terminal.kill", title: qsTr("Kill Focused Terminal's Remote Session"),
-          invoke: () => window.killActiveTerminal() },
+        // No "kill terminal" command: a terminal pane's own close button is the
+        // one control that ends a remote session, and it names the pane the
+        // user pressed it on. A palette command could only guess at "the
+        // focused terminal", and guessing wrong here destroys running work.
+
         // `agentMonitor` is a context property main.cpp injects, so it follows
         // the same rule as `windowChrome` above: checked with typeof, because a
         // headless QML fixture that mirrors an older context set would

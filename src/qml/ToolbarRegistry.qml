@@ -26,8 +26,7 @@ QtObject {
     // reference-count these ids when panes come and go.
     readonly property var defaultIds: [
         "nav.back", "nav.forward", "nav.reload", "nav.home",
-        "pane.split.horizontal", "pane.split.vertical", "pane.close",
-        "terminal.kill"
+        "pane.split.horizontal", "pane.split.vertical", "pane.close"
     ]
 
     signal orderChanged()

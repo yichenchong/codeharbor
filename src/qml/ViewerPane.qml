@@ -12,7 +12,7 @@ import "RemotePath.js" as RemotePath
 // THE PANE IS FILLED FROM HERE. Until now a viewer pane could only be filled by
 // something else handing it a URL, and nothing in the application did: the
 // sidebar lists Dev Sessions and has no file browser, and the command palette
-// carries only split/close/kill commands. So a pane's own header now carries an
+// carries only split and close commands. So a pane's own header now carries an
 // ADDRESS BAR — a remote absolute path or a URL, Enter opens it in this pane —
 // an empty pane falls back to LISTING the active Dev Session's repository root
 // so there is always something to click, and the directory listing itself is

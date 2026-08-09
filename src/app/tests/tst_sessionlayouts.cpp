@@ -1762,14 +1762,13 @@ QtObject {
     QCOMPARE(probe->property("rootPaneId").toString(), QString());
 }
 
-// A pane id is spent for good. Closing a pane leaves its REMOTE tmux session
-// running on purpose (TerminalRegion.qml detaches instead of killing, so a pane
-// survives a disconnect), and the id IS that session's name
-// ("ch_<devSessionId>_<paneId>", attached with `tmux new-session -A`). Minting
-// the id again therefore does not create a new shell at all: it re-attaches the
-// closed one, complete with its scrollback, its working directory and whatever
-// was still running in it, and the working directory the new pane asked for is
-// silently discarded (`-c <dir>` only applies when the session is created).
+// A pane id is spent for good. Layout-level close operations leave the REMOTE
+// tmux session running on purpose: only the terminal pane's own confirmed
+// close button emits the separate kill request before asking the layout to
+// close. TerminalRegion.qml detaches on every automatic teardown, so a pane
+// survives a disconnect and the shell remains available for reattachment.
+// Layout identity is still spent for good after that close: the replacement
+// pane gets a fresh label rather than silently reusing the old slot.
 void TstSessionLayouts::splitAfterCloseNeverReusesThePaneId()
 {
     makePair();

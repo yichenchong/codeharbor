@@ -334,6 +334,19 @@ public:
     {
         m_calls.append(QStringLiteral("deleteSession(%1)").arg(id));
     }
+    Q_INVOKABLE void setSessionPinned(QString id, bool pinned)
+    {
+        m_calls.append(QStringLiteral("setSessionPinned(%1,%2)")
+                               .arg(id, pinned ? QStringLiteral("true") : QStringLiteral("false")));
+    }
+    Q_INVOKABLE void archiveSession(QString id)
+    {
+        m_calls.append(QStringLiteral("archiveSession(%1)").arg(id));
+    }
+    Q_INVOKABLE void unarchiveSession(QString id)
+    {
+        m_calls.append(QStringLiteral("unarchiveSession(%1)").arg(id));
+    }
     Q_INVOKABLE void reorderSessions(QString groupId, QStringList orderedIds)
     {
         m_calls.append(QStringLiteral("reorderSessions(%1,[%2])")
@@ -424,7 +437,9 @@ private slots:
     void addButtonsAreLabelledWithoutAPointer();
     void hintsAreDrawnInTheApplicationsOwnPalette();
     void longNamesAreElidedInsteadOfOverflowingTheSidebar();
+    void rowNameGetsTheRoomItsSiblingsLeave();
     void rowMenuActionsReachTheWorkspace();
+    void rowArchiveButtonIsClickable();
 
 private:
     // Two expanded groups: Alpha[s1,s2,s3], Beta[s4,s5].
@@ -855,10 +870,13 @@ void TstSidebar::addButtonsAreLabelledWithoutAPointer()
     QCOMPARE(groupHint->property("text").toString(), groupName);
     QCOMPARE(alphaHint->property("text").toString(), alphaName);
 
-    // Compact, but not smaller than a reliable pointer target.
+    // Compact, but not smaller than a reliable pointer target. The sidebar's
+    // square actions were trimmed from 24 to 22 to give the session names back
+    // the room they were taking; 22 is the floor below which they stop being
+    // comfortable to hit.
     for (QQuickItem *button : {addGroup, addToAlpha}) {
-        QVERIFY2(button->width() >= 24 && button->height() >= 24,
-                 qPrintable(QStringLiteral("%1 is %2x%3, below the 24x24 hit-area floor")
+        QVERIFY2(button->width() >= 22 && button->height() >= 22,
+                 qPrintable(QStringLiteral("%1 is %2x%3, below the 22x22 hit-area floor")
                                     .arg(button->objectName())
                                     .arg(button->width())
                                     .arg(button->height())));
@@ -989,6 +1007,57 @@ void TstSidebar::longNamesAreElidedInsteadOfOverflowingTheSidebar()
     QVERIFY2(fixture.warnings().isEmpty(), qPrintable(fixture.warnings().join(QLatin1Char('\n'))));
 }
 
+// The session name is the only thing in a row the user actually reads, and its
+// width is not laid out by a positioner: it is computed in QML by subtracting
+// the row's indent, its status dot and its three action buttons from the row's
+// own width. Any one of those terms going stale is invisible — the label just
+// quietly loses or steals room — so the same sum is re-derived here from the
+// children the row really draws.
+void TstSidebar::rowNameGetsTheRoomItsSiblingsLeave()
+{
+    SidebarFixture fixture(twoGroups());
+    expose(fixture);
+
+    QQuickItem *row = findByName(fixture.root(), QStringLiteral("sessionRow:s1"));
+    QQuickItem *names = findByName(fixture.root(), QStringLiteral("sessionNames:s1"));
+    QQuickItem *dot = findByName(fixture.root(), QStringLiteral("statusDot:s1"));
+    QQuickItem *pin = findByName(fixture.root(), QStringLiteral("pinButton:s1"));
+    QQuickItem *archive = findByName(fixture.root(), QStringLiteral("archiveButton:s1"));
+    QQuickItem *remove = findByName(fixture.root(), QStringLiteral("deleteButton:s1"));
+    QVERIFY(row && names && dot && pin && archive && remove);
+
+    auto *content = row->property("contentItem").value<QQuickItem *>();
+    QVERIFY(content);
+    const qreal spacing = content->property("spacing").toReal();
+
+    // s1 is not archived, so the archived marker is not drawn: five visible
+    // children, and therefore four gaps between them. The delegate's padding
+    // is already excluded from content.width by Qt Quick.
+    const qreal expected = content->width() - dot->width() - pin->width()
+                           - archive->width() - remove->width() - spacing * 4;
+    QVERIFY2(qAbs(names->width() - expected) <= 0.5,
+             qPrintable(QStringLiteral("the name column is %1 wide, but its siblings "
+                                       "leave %2")
+                                .arg(names->width())
+                                .arg(expected)));
+
+    // Self-consistent arithmetic is not enough: it also has to stop the name
+    // before the first action button rather than under it.
+    QVERIFY2(names->mapToItem(row, QPointF(names->width(), 0)).x()
+                     <= pin->mapToItem(row, QPointF(0, 0)).x() + 0.5,
+             "the session name runs under the pin button");
+
+    // The report behind this test was that the name had nowhere to go: the
+    // indent in front of the row and the buttons behind it together claimed
+    // more of the row than the name they surround.
+    QVERIFY2(names->width() >= row->width() / 2,
+             qPrintable(QStringLiteral("the name column gets %1 pixels of a %2-pixel row")
+                                .arg(names->width())
+                                .arg(row->width())));
+
+    QVERIFY2(fixture.warnings().isEmpty(), qPrintable(fixture.warnings().join(QLatin1Char('\n'))));
+}
+
 // The row's right-click menu is the only place Rename, Duplicate, Move to top
 // and Delete exist at all. Nothing exercised it, so it could be — and was —
 // wired in a way that works only by accident: the entries called `app.*`
@@ -1063,6 +1132,33 @@ void TstSidebar::rowMenuActionsReachTheWorkspace()
     QTest::qWait(50);
     QCOMPARE(fixture.app.calls(), (QStringList{QStringLiteral("renameSession(s2,renamed)")}));
 
+    QVERIFY2(fixture.warnings().isEmpty(), qPrintable(fixture.warnings().join(QLatin1Char('\n'))));
+}
+
+void TstSidebar::rowArchiveButtonIsClickable()
+{
+    SidebarFixture fixture(twoGroups());
+    expose(fixture);
+
+    QQuickItem *archive = findByName(fixture.root(), QStringLiteral("archiveButton:s2"));
+    QVERIFY(archive);
+    fixture.app.clearCalls();
+    QTest::mouseClick(&fixture.view, Qt::LeftButton, Qt::NoModifier, centerOf(archive));
+    QTest::qWait(50);
+    QCOMPARE(fixture.app.calls(), (QStringList{QStringLiteral("archiveSession(s2)")}));
+
+    QVector<ch::GroupRow> archived = twoGroups();
+    archived[0].sessions[1].session.archived = true;
+    fixture.model.setGroups(archived);
+    QTest::qWait(100);
+    QVERIFY(!visibleSessionOrder(fixture.root()).contains(QStringLiteral("s2")));
+
+    QQuickItem *filter = findByName(fixture.root(), QStringLiteral("archiveFilterButton"));
+    QVERIFY(filter);
+    fixture.app.clearCalls();
+    QTest::mouseClick(&fixture.view, Qt::LeftButton, Qt::NoModifier, centerOf(filter));
+    QTest::qWait(100);
+    QVERIFY(visibleSessionOrder(fixture.root()).contains(QStringLiteral("s2")));
     QVERIFY2(fixture.warnings().isEmpty(), qPrintable(fixture.warnings().join(QLatin1Char('\n'))));
 }
 

@@ -67,6 +67,11 @@ ItemDelegate {
     width: parent ? parent.width : implicitWidth
     height: 32
 
+    // The size of this header's trailing actions, matching SessionRow's own
+    // `actionButtonSize`: a header and the sessions under it are read as one
+    // column, so their buttons cannot be two different sizes.
+    readonly property int actionButtonSize: 22
+
     // Where this header's own text has to stop: the LEFTMOST of the buttons
     // pinned to the right edge, or that edge itself while both are hidden. The
     // buttons are children of the HEADER rather than of the content row, so they
@@ -74,7 +79,10 @@ ItemDelegate {
     // alone was not enough - the add-session button sits to its left, so a long
     // group name ran underneath it.
     readonly property real contentRightEdge: {
-        var edge = header.width - 8;
+        // The delegate insets its content by 12, so the trailing button stops
+        // 12 short of the edge too; this is the same edge the session rows
+        // below end their own actions on.
+        var edge = header.width - 12;
         if (deleteGroupButton.visible)
             edge = Math.min(edge, deleteGroupButton.x - 4);
         if (newSessionButton.visible)
@@ -110,10 +118,12 @@ ItemDelegate {
             visible: header.selected && header.host !== null && header.host.activeFocus
         }
     }
-
+    leftPadding: 12
+    rightPadding: 12
     contentItem: Row {
         spacing: 6
-        leftPadding: 8
+        // The delegate owns the sidebar inset; Row is only the horizontal
+        // positioner and has no padding of its own.
         opacity: (header.host !== null && header.host.stale === true) ? 0.55 : 1.0
 
         Label {
@@ -145,7 +155,7 @@ ItemDelegate {
             // Row's own implicit width is derived from these children and would
             // be a cycle.
             width: Math.max(0, header.contentRightEdge - header.leftPadding
-                            - parent.leftPadding - chevron.width - parent.spacing
+                            - chevron.width - parent.spacing
                             - (collapsedTag.visible
                                ? collapsedTag.implicitWidth + parent.spacing : 0)
                             - 6)
@@ -178,17 +188,18 @@ ItemDelegate {
         visible: !header.collapsed
         // A compact square instead of a "+ Session" word button: one of these
         // sits on every group header, and the words were wide enough to crowd
-        // the group name they belong to. 24 logical pixels is the floor for a
-        // pointer target on a high-density display, so the box stays 24 even
-        // though the glyph in it is smaller.
-        implicitWidth: 24
-        implicitHeight: 24
+        // the group name they belong to. The box stays square and stays well
+        // clear of the pointer-target floor even though the glyph in it is
+        // smaller.
+        implicitWidth: header.actionButtonSize
+        implicitHeight: header.actionButtonSize
         padding: 0
         // Reachable without a pointer: Tab lands here, and the accessible name
         // below is what a screen reader announces.
         focusPolicy: Qt.StrongFocus
         anchors.right: deleteGroupButton.left
-        anchors.rightMargin: 4
+        // The same gap the session rows put between two adjacent actions.
+        anchors.rightMargin: 6
         anchors.verticalCenter: parent.verticalCenter
 
         // The label is a bare "+", so this sentence is the button's only real
@@ -218,7 +229,9 @@ ItemDelegate {
         contentItem: Label {
             text: newSessionButton.text
             color: newSessionButton.down ? Theme.textOnAccent : Theme.text
-            font.pixelSize: Theme.fontSizeTitle
+            // One step down with the box, so the glyph keeps the same
+            // proportion of it that it had at 24 pixels.
+            font.pixelSize: Theme.fontSizeLabel
             horizontalAlignment: Text.AlignHCenter
             verticalAlignment: Text.AlignVCenter
         }
@@ -242,14 +255,16 @@ ItemDelegate {
     Button {
         id: deleteGroupButton
         objectName: "deleteGroupButton:" + header.itemId
-        implicitWidth: 24
-        implicitHeight: 24
-        width: 24
-        height: 24
+        implicitWidth: header.actionButtonSize
+        implicitHeight: header.actionButtonSize
+        width: header.actionButtonSize
+        height: header.actionButtonSize
         padding: 0
         focusPolicy: Qt.StrongFocus
         anchors.right: parent.right
-        anchors.rightMargin: 8
+        // Ends where the session rows below end their own last action: the
+        // delegate's 12-pixel inset, so the two right edges line up.
+        anchors.rightMargin: 12
         anchors.verticalCenter: parent.verticalCenter
         text: "\u2715"
 
@@ -268,7 +283,7 @@ ItemDelegate {
         contentItem: Label {
             text: deleteGroupButton.text
             color: deleteGroupButton.down ? Theme.textOnAccent : Theme.danger
-            font.pixelSize: Theme.fontSizeTitle
+            font.pixelSize: Theme.fontSizeLabel
             horizontalAlignment: Text.AlignHCenter
             verticalAlignment: Text.AlignVCenter
         }
