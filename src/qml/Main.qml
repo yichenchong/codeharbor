@@ -1023,12 +1023,12 @@ ApplicationWindow {
           invoke: () => window.splitActivePane("terminal", "vertical") },
         { id: "pane.close.viewer", title: qsTr("Close Focused Viewer Pane"),
           invoke: () => window.closeActivePane("viewer") },
-        { id: "pane.close.terminal", title: qsTr("Close Focused Terminal Pane"),
+        { id: "pane.close.terminal", title: qsTr("Close and Kill Focused Terminal Pane"),
           invoke: () => window.closeActivePane("terminal") },
-        // No "kill terminal" command: a terminal pane's own close button is the
-        // one control that ends a remote session, and it names the pane the
-        // user pressed it on. A palette command could only guess at "the
-        // focused terminal", and guessing wrong here destroys running work.
+        // The terminal palette command resolves the focused pane, then routes
+        // through TerminalPaneView.requestClose(). That gives it the same
+        // confirmation and kill-before-close ordering as the pane header; it
+        // must never bypass the pane and close only the layout node.
 
         // `agentMonitor` is a context property main.cpp injects, so it follows
         // the same rule as `windowChrome` above: checked with typeof, because a

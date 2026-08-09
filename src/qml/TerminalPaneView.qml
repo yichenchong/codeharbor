@@ -79,6 +79,13 @@ Rectangle {
         killDialog.open()
     }
 
+    // Main.qml uses the same entry point for a palette request and a pane
+    // header request. Keeping the confirmation here prevents the palette from
+    // silently turning the destructive action into a layout-only close.
+    function requestClose() {
+        pane.beginClose()
+    }
+
     // What the confirmation actually does, in the order that matters. The kill
     // request goes FIRST, while this pane is still in its region's cache and
     // still owns the controller Main.qml has to reach the server through; the
