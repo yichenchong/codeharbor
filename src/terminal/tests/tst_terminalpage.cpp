@@ -494,17 +494,19 @@ void TstTerminalPage::apparentTextSizeIgnoresThePixelRatio()
     }
 
     // ...and the font size still does what it says, at a raised ratio.
-    const Measurement small = measure(6, 1.5);
-    const Measurement large = measure(12, 1.5);
-    QVERIFY2(small.cellHeight < plain.cellHeight && large.cellHeight > plain.cellHeight,
+    // Not `small`/`large`: Windows' rpcndr.h defines `small` as a macro for
+    // `char`, so a variable of that name stops the file compiling on MSVC.
+    const Measurement smaller = measure(6, 1.5);
+    const Measurement larger = measure(12, 1.5);
+    QVERIFY2(smaller.cellHeight < plain.cellHeight && larger.cellHeight > plain.cellHeight,
              qPrintable(QStringLiteral("the font size stopped changing the text size at ratio "
                                        "1.5: 6pt gave %1, 9pt gave %2, 12pt gave %3")
-                            .arg(small.cellHeight)
+                            .arg(smaller.cellHeight)
                             .arg(plain.cellHeight)
-                            .arg(large.cellHeight)));
+                            .arg(larger.cellHeight)));
     // A smaller cell must also mean more of them, or the grid the remote shell
     // is told about has stopped following what is on screen.
-    QVERIFY2(small.rows > large.rows && small.cols > large.cols,
+    QVERIFY2(smaller.rows > larger.rows && smaller.cols > larger.cols,
              "the grid did not follow the cell size");
 
     measure(13, 0.0);
