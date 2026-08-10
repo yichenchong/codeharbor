@@ -2,8 +2,12 @@
 // WebEngine's page can report a different value from the physical screen when
 // the WebEngine surface is composited into a scaled Qt Quick item, which makes
 // a canvas backing store too small and lets Chromium blur it. This controller
-// keeps the screen value for diagnostics, and temporarily exposes the user's
-// explicit ratio to xterm when requested.
+// keeps the screen value for diagnostics and applies the user's explicit ratio
+// on top of it — but only ever DOWNWARDS. A ratio above the display's own has
+// no extra physical pixels to fill and makes xterm allocate a picture buffer
+// larger than its box on screen; a compositor that maps that buffer straight
+// to physical pixels draws the whole terminal magnified by the ratio, which is
+// the defect where raising the resolution also enlarged the text.
 
 // The SAME bounds normalizeTerminalPreferences() clamps the stored setting to.
 // Imported rather than restated: two copies of "1 to 4" drift, and a

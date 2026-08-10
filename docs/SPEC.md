@@ -512,6 +512,17 @@ the size changes how big the cells are, the resolution changes how many physical
 and a resolution of "follow the screen" is the default. Changing either re-fits the grid and tells the remote
 PTY its new dimensions, so the shell re-wraps rather than drawing into a size it does not know about.
 
+The resolution preference may only LOWER the ratio below the display's own. There are no physical pixels above
+it for the extra detail to occupy, and a canvas larger than its box on screen can be mapped straight to physical
+pixels by the compositor, which draws the whole terminal magnified by the ratio — the two preferences must stay
+independent, and this is what keeps them so.
+
+A WebGL context is capped per renderer process, so opening panes can take one away from a pane that already has
+it, and a WebGL renderer that loses its context never paints again while its buffer, its bridge and its remote
+shell all stay healthy. A pane that loses its context therefore reloads its page once with WebGL disabled: the
+mount handshake replays the controller's retained output, and one window-change request makes the remote shell
+repaint the screen.
+
 **Clipboard.** Selecting text and copying it (the platform's terminal shortcut) puts it on the system clipboard;
 pasting sends the clipboard to the shell, guarded by bracketed paste where the application asked for it. A paste
 is chunked through the same flow control as ordinary output and, like it, is never split inside an escape

@@ -257,8 +257,10 @@ void AppSettings::setTerminalFontSize(int points)
 qreal AppSettings::terminalPixelRatio() const
 {
     // Default 0 means "whatever the screen reports": the renderer asks the
-    // window for its own ratio, which is right on every ordinary display and is
-    // what this preference exists to OVERRIDE, not to replace.
+    // window for its own ratio, which is right on every ordinary display. A
+    // stored value only ever LOWERS it — the page refuses anything above the
+    // display's own — so this preference trades sharpness for speed and never
+    // the other way around.
     const QVariant raw = m_settings->value(kPixelRatioKey);
     if (!raw.isValid())
         return 0.0;

@@ -72,9 +72,12 @@ class AppSettings : public QObject {
                    NOTIFY toolbarOrderChanged)
 
     // Terminal cell text size in points, and the device pixel ratio its
-    // renderer draws at. The ratio is separate from the size on purpose: a
-    // larger ratio makes the SAME text sharper (more physical pixels per cell)
-    // rather than bigger.
+    // renderer draws at. The two are independent on purpose: the ratio decides
+    // how many physical pixels back one logical pixel, never how big the text
+    // looks. The renderer refuses a ratio above the display's own — there are
+    // no extra physical pixels for it to use, and asking for them made the
+    // whole terminal draw magnified — so this preference can only lower the
+    // render resolution below the screen's, trading sharpness for speed.
     Q_PROPERTY(int terminalFontSize READ terminalFontSize WRITE
                    setTerminalFontSize NOTIFY terminalFontSizeChanged)
     Q_PROPERTY(qreal terminalPixelRatio READ terminalPixelRatio WRITE
