@@ -1362,7 +1362,11 @@ void TstLiveShell::qmlRestoresAndPersistsRegionWidths()
              qPrintable(afterDrag));
 
     // --- 3. a layout-driven width change persists NOTHING -------------------
-    const QDateTime beforeResize = QFileInfo(configFilePath()).lastModified();
+    // The contents of the file, not its timestamp. What must not change is the
+    // stored state; an unrelated flush that rewrites the same bytes moves the
+    // modification time without changing anything the user could observe, and
+    // asserting on the time made this gate fail at random on a loaded machine.
+    const QString beforeResize = readConfigFile();
     window->setWidth(900); // forces SplitView to squeeze the regions
     QTRY_VERIFY(qRound(evalReal("sidebarRegion.width")) != persistedSidebar
                 || qRound(evalReal("terminalRegion.width")) != persistedTerminal);
@@ -1383,7 +1387,7 @@ void TstLiveShell::qmlRestoresAndPersistsRegionWidths()
                                 .arg(stored.sidebarWidth())
                                 .arg(stored.terminalWidth())));
     }
-    QCOMPARE(QFileInfo(configFilePath()).lastModified(), beforeResize);
+    QCOMPARE(readConfigFile(), beforeResize);
     QVERIFY2(qmlWarnings.isEmpty(), qPrintable(qmlWarnings.join(QLatin1Char('\n'))));
 }
 
