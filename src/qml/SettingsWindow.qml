@@ -927,6 +927,21 @@ Rectangle {
                         }
                     }
                 }
+                Label {
+                    width: parent.width
+                    wrapMode: Text.WordWrap
+                    // Says what the control can and cannot do, because the
+                    // page refuses a value above the screen's own resolution:
+                    // claiming more pixels than the display has adds no detail
+                    // and used to make the whole terminal draw magnified.
+                    text: qsTr("Text size is set above and never changes with this. "
+                               + "\"Follow screen\" renders at your display's own "
+                               + "resolution, which is the sharpest it can be; a lower "
+                               + "value trades sharpness for speed, and a value above "
+                               + "your display's is ignored.")
+                    color: Theme.textDim
+                    font.pixelSize: Theme.fontSizeSmall
+                }
             }
         }
     }

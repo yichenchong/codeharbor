@@ -362,6 +362,16 @@ Rectangle {
     // the double attach silently. Not part of the pane's observable contract.
     property bool attaching: false
 
+    // The user ended this pane's remote session ON PURPOSE. Nothing may bring
+    // it back except the user asking again: the attach command is
+    // `tmux new-session -A`, which CREATES the session when it is missing, so a
+    // single automatic attachNow() — the renderer's next refit, a visibility
+    // change, a reconnect — would silently resurrect exactly what they just
+    // destroyed. Lifted by reconnectNow(), which is what this pane's Connect
+    // and Retry controls call, and by retarget(), which points the pane at a
+    // different terminal altogether.
+    property bool sessionKilled: false
+
     // The identity an outstanding resolution was started FOR: Dev Session, slot
     // label and row id. Used to tell an answer meant for what this pane is NOW
     // from one meant for what it was when the question was asked.
@@ -379,7 +389,7 @@ Rectangle {
     // resolved, the target stays on the pane, so a reconnect or a Retry goes
     // straight to the attach.
     function attachNow() {
-        if (pane.attaching || pane.attached || pane.resolving
+        if (pane.attaching || pane.attached || pane.resolving || pane.sessionKilled
                 || !pane.factory || !pane.controller)
             return
         if (pane.devSessionId.length === 0 || pane.terminalId.length === 0) {
@@ -436,8 +446,31 @@ Rectangle {
         } finally {
             pane.attaching = false
         }
-        if (pane.attached)
+        if (pane.attached) {
             pane.statusText = ""
+            return
+        }
+        // REFUSED. The factory only lets a pane attach a target IT resolved for
+        // THIS controller (ch::TerminalFactory::attach), and it drops that
+        // authorization whenever the pane's remote session is killed or the
+        // client is pointed at another server. `tmuxTarget` outlives the
+        // authorization, and the branch above treats a non-empty target as the
+        // whole answer — so a pane that keeps one re-offers the same dead name
+        // for ever and is refused every single time, its own Retry button
+        // included. That is a terminal with no shell, no keyboard and no way
+        // back, which is worse than the round trip this costs.
+        //
+        // Dropping the target sends the NEXT attempt through resolveTarget(),
+        // which asks the server for this pane's ROW again. It is emphatically
+        // not the slot-label fallback: a leaf with no `terminal_panes` row id
+        // and no legacy marker still waits (awaitingIdentity above), so no
+        // freshly minted pane can reach a closed pane's shell through here.
+        //
+        // Deliberately not retried inline. The re-resolution is a server round
+        // trip, and driving it from inside the failure would spin against a
+        // server that keeps refusing; the pane asks again the next time
+        // something asks it to attach.
+        pane.tmuxTarget = ""
     }
 
     // Release the PTY channel; the remote tmux session keeps running.
@@ -485,8 +518,26 @@ Rectangle {
             // `statusText` through error(); leave it there.
             return false
         }
+        // The factory has thrown this target away — the emptiness just checked
+        // is what proves the kill reached the server — so the pane must not
+        // keep a copy of it. An authorization nobody holds any more is exactly
+        // what makes every later attach refuse (see attachNow), and the flag is
+        // what stops the very next automatic attempt from running
+        // `tmux new-session -A` and recreating the session the user just ended.
+        // Together they make the sentence below true: nothing happens until the
+        // user presses Connect, and then a NEW session comes up.
+        pane.tmuxTarget = ""
+        pane.sessionKilled = true
         pane.statusText = qsTr("Session killed. Connect to start a new one.")
         return true
+    }
+
+    // What this pane's Connect and Retry controls do, and the ONLY difference
+    // from attachNow() is that this is the USER asking: it lifts the guard that
+    // keeps a deliberately killed session from coming back on its own.
+    function reconnectNow() {
+        pane.sessionKilled = false
+        pane.attachNow()
     }
 
     // A pane retargeted at another session/terminal must follow it: drop the
@@ -507,7 +558,10 @@ Rectangle {
         if (pane.resolving)
             pane.resolveStale = true
         // The new slot gets a fresh window, and a stalled report about the old
-        // one must not stick to it.
+        // one must not stick to it. Neither may "the user killed this one":
+        // that verdict belongs to the terminal this pane has just left, and
+        // keeping it would leave the pane it is now showing permanently inert.
+        pane.sessionKilled = false
         pane.clearIdentityWait()
         pane.attachNow()
     }
@@ -983,6 +1037,7 @@ Rectangle {
             }
             Button {
                 id: attachButton
+                objectName: "terminalConnectButton"
                 anchors.horizontalCenter: parent.horizontalCenter
                 visible: pane.factory !== null && !pane.attached
                 text: qsTr("Connect")
@@ -1007,7 +1062,7 @@ Rectangle {
                     border.width: attachButton.visualFocus ? 2 : 1
                     border.color: attachButton.visualFocus ? Theme.accent : Theme.border
                 }
-                onClicked: pane.attachNow()
+                onClicked: pane.reconnectNow()
             }
         }
     }
@@ -1048,10 +1103,11 @@ Rectangle {
             // style's default is a light plate at its own metrics, which both
             // overflowed the banner and read as somebody else's chrome.
             AppPaneHeader.Action {
+                objectName: "terminalRetryButton"
                 anchors.verticalCenter: parent.verticalCenter
                 visible: pane.factory !== null && !pane.attached
                 text: qsTr("Retry")
-                onClicked: pane.attachNow()
+                onClicked: pane.reconnectNow()
             }
         }
     }

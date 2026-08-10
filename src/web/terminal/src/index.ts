@@ -17,6 +17,8 @@ import { isRendererVisible } from "./visibility.ts";
 import { CoalescingWriter } from "./writer.ts";
 // Input pacing keeps large pastes bounded and preserves ANSI sequence boundaries.
 import { TerminalInputWriter } from "./input.ts";
+// Renderer choice and the WebGL context-loss fallback (see renderer.ts).
+import { installRenderer } from "./renderer.ts";
 import {
     applyTerminalPreferences,
     terminalFontPointsToCssPixels,
@@ -158,20 +160,62 @@ export function mountTerminal(element: HTMLElement, bridge: TerminalBridge): Ter
     }
     applyPageTheme(activeTheme);
     term.open(surface);
-    // xterm 5 uses the DOM renderer unless an addon replaces it. The DOM
-    // fallback is useful on hosts without WebGL, but it cannot correct a
-    // device-pixel/content-box mismatch. Prefer WebGL so the canvas backing
-    // store is sized in physical pixels; the addon observes the actual device
-    // content box and redraws instead of stretching a low-resolution surface.
-    let renderer = "dom";
+    // xterm 5 uses the DOM renderer unless an addon replaces it. Preferring
+    // WebGL, and surviving the loss of its context, both live in renderer.ts.
+    //
+    // Recovery from a lost context is a ONE-SHOT RELOAD of this page with WebGL
+    // switched off. Swapping the renderer in place is what xterm advises, but
+    // disposing an addon whose context has already gone throws from inside
+    // xterm and leaves the terminal with no renderer at all — measured, not
+    // assumed. The reload is a path the bridge already supports: ch::
+    // TerminalBridge::ready() re-announces the connection state and replays the
+    // controller's retained output into the fresh page.
+    //
+    // The flag lives in sessionStorage because it has to outlive the very
+    // navigation it triggers while dying with the pane: each WebEngineView has
+    // its own, so a later pane still gets its own attempt at the fast renderer.
+    const kDomOnlyKey = "codeharbor.terminal.disableWebgl";
+    let recoveredFromContextLoss = false;
     try {
-        term.loadAddon(new WebglAddon());
-        renderer = "webgl";
-    } catch (error) {
-        // WebGL2 is unavailable in some software-only WebEngine builds. Keep
-        // the DOM renderer usable there rather than making a terminal vanish.
-        console.warn("CodeHarbor terminal WebGL renderer unavailable", error);
+        recoveredFromContextLoss =
+            pageWindow.sessionStorage?.getItem(kDomOnlyKey) === "1";
+    } catch {
+        // Storage can be denied outright on a local origin. Without it there is
+        // no way to remember the decision across a reload, so reloading would
+        // loop; installRenderer falls back in place instead.
     }
+    const rendererState = installRenderer(
+        term,
+        () => new WebglAddon(),
+        () => fitToSurface(),
+        (message, detail) => {
+            if (detail === undefined) {
+                console.warn(message);
+            } else {
+                console.warn(message, detail);
+            }
+        },
+        {
+            surface,
+            preferDom: recoveredFromContextLoss,
+            recover: () => {
+                try {
+                    if (!pageWindow.sessionStorage
+                        || pageWindow.sessionStorage.getItem(kDomOnlyKey) === "1") {
+                        return false;
+                    }
+                    pageWindow.sessionStorage.setItem(kDomOnlyKey, "1");
+                } catch {
+                    return false;
+                }
+                console.warn("CodeHarbor terminal is reloading without WebGL");
+                // Deferred: this runs inside a browser event handler, and
+                // navigating from one is refused by some embedders.
+                pageWindow.setTimeout(() => pageWindow.location.reload(), 0);
+                return true;
+            },
+        },
+    );
 
     // There is deliberately no application context menu. xterm's own
     // right-click handler still selects a word and prepares the textarea for a
@@ -303,6 +347,19 @@ export function mountTerminal(element: HTMLElement, bridge: TerminalBridge): Ter
     term.onResize(({ cols, rows }) => bridge.resize(cols, rows));
     bridge.resize(term.cols, term.rows);
 
+    // A page that replaced a dead renderer starts with an EMPTY screen. The
+    // bridge replays whatever output the controller still holds, but everything
+    // already handed to the renderer that died is gone, and tmux keeps the
+    // visible screen on the alternate buffer where there is nothing to scroll
+    // back to. tmux does redraw a client whose size changed, so tell the remote
+    // shell about one different size and then the real one: two window-change
+    // requests and one full repaint, which is the cheapest way to get the
+    // user's screen back without a C++ round trip.
+    if (recoveredFromContextLoss && term.cols > 2) {
+        bridge.resize(term.cols - 1, term.rows);
+        pageWindow.setTimeout(() => bridge.resize(term.cols, term.rows), 120);
+    }
+
     // Re-fit on container resize; fit() emits onResize only when dims change.
     // BOTH boxes are observed, because either one alone misses a real resize:
     //   * element — the pane itself was resized by the host.
@@ -404,6 +461,11 @@ export function mountTerminal(element: HTMLElement, bridge: TerminalBridge): Ter
     const terminalDiagnostics = (): Record<string, unknown> => {
         const canvas = surface.querySelector("canvas");
         const canvasRect = canvas?.getBoundingClientRect();
+        // Both renderers size xterm's screen element to the grid, but only the
+        // canvas ones have a canvas: measuring the screen element is the one
+        // way to read the apparent cell size that works under the DOM renderer
+        // too, which is what a host without WebGL falls back to.
+        const screenRect = surface.querySelector(".xterm-screen")?.getBoundingClientRect();
         // What the user is looking at, read out of xterm's OWN buffer rather
         // than out of the DOM. The .xterm-rows element only carries glyphs
         // while the DOM renderer is active; loading the WebGL addon disposes
@@ -415,11 +477,18 @@ export function mountTerminal(element: HTMLElement, bridge: TerminalBridge): Ter
             viewport.push(buffer.getLine(buffer.viewportY + row)?.translateToString(true) ?? "");
         }
         return {
-            renderer,
+            renderer: rendererState.name,
             screenText: viewport.join("\n"),
             windowDevicePixelRatio: pageWindow.devicePixelRatio,
             actualDevicePixelRatio: pixelRatio.state.actual,
             effectiveDevicePixelRatio: pixelRatio.state.effective,
+            // The grid, and the apparent size of one cell in CSS pixels. The
+            // cell size is what a user calls "how big the text is": it must
+            // follow the font-size setting and must not move when the pixel
+            // ratio changes, which is only checkable if both are reported.
+            cols: term.cols,
+            rows: term.rows,
+            fontCssPixels: term.options.fontSize ?? null,
             surfaceCssPixels: {
                 width: surface.clientWidth,
                 height: surface.clientHeight,
@@ -429,6 +498,10 @@ export function mountTerminal(element: HTMLElement, bridge: TerminalBridge): Ter
                 : null,
             canvasDevicePixels: canvas
                 ? { width: canvas.width, height: canvas.height }
+                : null,
+            cellCssPixels: screenRect && term.cols > 0 && term.rows > 0
+                ? { width: screenRect.width / term.cols,
+                    height: screenRect.height / term.rows }
                 : null,
         };
     };

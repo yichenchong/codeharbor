@@ -35,6 +35,8 @@
 
 #include <QtTest/QtTest>
 
+#include <cmath>
+
 #include <QBuffer>
 #include <QByteArray>
 #include <QCoreApplication>
@@ -231,6 +233,23 @@ constexpr auto kJsPasteTemplate = R"JS(
 })()
 )JS";
 
+// Apply the two renderer preferences the way TerminalPaneView.qml applies them,
+// then report the apparent cell size the page ended up with. The reply is
+// "cellWidth|cellHeight|fontCssPixels|cols|rows", or a diagnostic string.
+constexpr auto kJsMeasureTemplate = R"JS(
+(function () {
+    try {
+        if (typeof window.codeharborSetTerminalPreferences !== "function")
+            return "NO_PREFERENCES_HOOK";
+        window.codeharborSetTerminalPreferences(%1, %2);
+        var d = window.codeharborTerminalDiagnostics();
+        if (!d.cellCssPixels) return "NO_CELL";
+        return d.cellCssPixels.width.toFixed(3) + "|" + d.cellCssPixels.height.toFixed(3)
+             + "|" + d.fontCssPixels + "|" + d.cols + "|" + d.rows;
+    } catch (e) { return "ERR:" + e; }
+})()
+)JS";
+
 } // namespace
 
 class TstTerminalPage : public QObject {
@@ -243,6 +262,10 @@ private slots:
     void rendererReportsItsInitialSizeToTheController();
     void controllerStateAndOutputReachTheRenderer();
     void keystrokesReachTheControllerTransport();
+    // The two renderer preferences must not be multiplied together: raising the
+    // pixel ratio buys sharpness, and only the font size decides how big the
+    // text looks.
+    void apparentTextSizeIgnoresThePixelRatio();
     // Declared last: it takes the pane live and leaves it attached to a real
     // remote shell.
     void livePaneRendersARealRemoteShell();
@@ -412,6 +435,79 @@ void TstTerminalPage::keystrokesReachTheControllerTransport()
     qInfo() << "keystroke reached the transport as" << transport.data().toHex();
 
     m_controller->setTransport(nullptr);
+}
+
+// (4) The two renderer preferences are independent. The pixel ratio decides how
+// many physical pixels back one logical pixel — it buys sharpness — while the
+// font size alone decides how big the text looks. Multiplying them, as the page
+// once effectively did, means a user who wants nine-point text at one-and-a-half
+// times the resolution has to ask for six points and guess at the arithmetic.
+void TstTerminalPage::apparentTextSizeIgnoresThePixelRatio()
+{
+    struct Measurement {
+        double cellWidth = 0.0;
+        double cellHeight = 0.0;
+        double fontCssPixels = 0.0;
+        int cols = 0;
+        int rows = 0;
+    };
+    const auto measure = [this](int points, double ratio) {
+        const QString reply = evalJs(QString::fromLatin1(kJsMeasureTemplate)
+                                         .arg(points)
+                                         .arg(ratio));
+        const QStringList parts = reply.split(QLatin1Char('|'));
+        Measurement measurement;
+        if (parts.size() != 5) {
+            qWarning().noquote() << "measurement probe replied" << reply;
+            return measurement;
+        }
+        measurement.cellWidth = parts.at(0).toDouble();
+        measurement.cellHeight = parts.at(1).toDouble();
+        measurement.fontCssPixels = parts.at(2).toDouble();
+        measurement.cols = parts.at(3).toInt();
+        measurement.rows = parts.at(4).toInt();
+        return measurement;
+    };
+
+    const Measurement plain = measure(9, 1.0);
+    QVERIFY2(plain.cellWidth > 0.0 && plain.cellHeight > 0.0,
+             "the page reported no cell size at all");
+
+    // The user's exact complaint: nine points at one-and-a-half times the
+    // resolution must look like nine points, not like thirteen and a half.
+    for (const double ratio : {1.5, 2.0, 4.0}) {
+        const Measurement scaled = measure(9, ratio);
+        // A tolerance of half a CSS pixel, because the renderer rounds its cell
+        // to whole device pixels and a fractional ratio can move that rounding
+        // by a fraction of a logical pixel. A ratio being multiplied into the
+        // font size would move it by tens of per cent, never by this much.
+        QVERIFY2(std::abs(scaled.cellWidth - plain.cellWidth) <= 0.5
+                     && std::abs(scaled.cellHeight - plain.cellHeight) <= 0.5,
+                 qPrintable(QStringLiteral("pixel ratio %1 changed the apparent text size: "
+                                           "%2x%3 CSS pixels per cell against %4x%5 at ratio 1")
+                                .arg(ratio)
+                                .arg(scaled.cellWidth)
+                                .arg(scaled.cellHeight)
+                                .arg(plain.cellWidth)
+                                .arg(plain.cellHeight)));
+        QCOMPARE(scaled.fontCssPixels, plain.fontCssPixels);
+    }
+
+    // ...and the font size still does what it says, at a raised ratio.
+    const Measurement small = measure(6, 1.5);
+    const Measurement large = measure(12, 1.5);
+    QVERIFY2(small.cellHeight < plain.cellHeight && large.cellHeight > plain.cellHeight,
+             qPrintable(QStringLiteral("the font size stopped changing the text size at ratio "
+                                       "1.5: 6pt gave %1, 9pt gave %2, 12pt gave %3")
+                            .arg(small.cellHeight)
+                            .arg(plain.cellHeight)
+                            .arg(large.cellHeight)));
+    // A smaller cell must also mean more of them, or the grid the remote shell
+    // is told about has stopped following what is on screen.
+    QVERIFY2(small.rows > large.rows && small.cols > large.cols,
+             "the grid did not follow the cell size");
+
+    measure(13, 0.0);
 }
 
 bool TstTerminalPage::pasteUntilScreenContains(const QString& line, const QString& needle,

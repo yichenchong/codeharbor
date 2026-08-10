@@ -7,7 +7,7 @@
 // heard of a server — and walks the whole way to working:
 //
 //   1. first run                -> the connect sheet is on screen, not a dead shell
-//   2. add a server             -> through the sheet's own fields and buttons
+//   2. add a server             -> in the settings window's own Server pane
 //   3. host key                 -> unknown key prompted, accepted, PERSISTED
 //   4. workspace                -> group + Dev Session, activated from the sidebar
 //   5. terminal                 -> the pane in the tree runs a REAL remote shell
@@ -19,16 +19,18 @@
 //   * The object graph is EXACTLY the one src/app/main.cpp builds — same
 //     objects, same wiring order, same context property names — and the QML is
 //     the real qrc:/qt/qml/CodeHarbor/Main.qml. Nothing is stubbed.
-//   * The app is driven through its UI objects: the sheet's fields and its
-//     Save/Connect/Accept buttons, the sidebar's sessionActivated signal, the
-//     pane's own controller/bridge. Not through private C++ shortcuts.
+//   * The app is driven through its UI objects: the sheet's Server settings…
+//     button, the settings window's group list, its Server pane's fields and
+//     Add/Delete buttons, the sheet's Connect/Accept buttons, the sidebar's
+//     sessionActivated signal, the pane's own controller/bridge. Not through
+//     private C++ shortcuts.
 //   * NO CH_LIVE_* VARIABLE REACHES THE APP. main() below reads them once and
 //     then qunsetenv()s every one of them, so the graph built afterwards cannot
 //     fall back on the environment for anything: the host, port, user, node
-//     path and repo root can only come from the profile the test typed into the
-//     sheet, and the known_hosts store can only be the default one under the
-//     fresh config dir. If any of that were still env-driven, this file would
-//     fail to connect at all.
+//     path and repo root can only come from the profile the test typed into
+//     the settings window, and the known_hosts store can only be the default
+//     one under the fresh config dir. If any of that were still env-driven,
+//     this file would fail to connect at all.
 //   * QSettings/QStandardPaths are redirected to a throwaway XDG_CONFIG_HOME
 //     before anything exists, so the developer's ~/.config/CodeHarbor is never
 //     read or written.
@@ -452,7 +454,7 @@ private slots:
     void cleanupTestCase();
 
     void step1_firstRunOffersTheConnectSheet();
-    void step2_addAServerThroughTheSheet();
+    void step2_addAServerThroughTheSettingsWindow();
     void step3_hostKeyIsPromptedAcceptedAndPersisted();
     void step4_workspaceAndSessionActivation();
     void step5_terminalPaneRunsARemoteShell();
@@ -773,52 +775,141 @@ void TstColdStart::step1_firstRunOffersTheConnectSheet()
     QVERIFY(sheetItem->z() > 0);
     QVERIFY(sheetItem->width() > 0 && sheetItem->height() > 0);
 
+    // It SAYS there is nothing stored and offers the only move that helps: the
+    // sheet cannot create a profile, so a cold start that did not point at the
+    // settings window would be a dead end with a Connect button that can never
+    // be enabled.
+    QQuickItem* emptyHint = findByName(sheet, QStringLiteral("emptyHint"));
+    QVERIFY2(emptyHint != nullptr, "ConnectSheet has no emptyHint");
+    QTRY_VERIFY2(emptyHint->isVisible(),
+                 "a client with no servers did not say so");
+    QQuickItem* intro = findByName(sheet, QStringLiteral("coldStartIntro"));
+    QVERIFY2(intro != nullptr, "ConnectSheet has no coldStartIntro");
+    QVERIFY(intro->isVisible());
+    QQuickItem* openSettings = findByName(sheet, QStringLiteral("openSettingsButton"));
+    QVERIFY2(openSettings != nullptr, "ConnectSheet has no openSettingsButton");
+    QVERIFY(openSettings->isVisible() && openSettings->property("enabled").toBool());
+    QQuickItem* connectButton = findByName(sheet, QStringLiteral("connectButton"));
+    QVERIFY2(connectButton != nullptr, "ConnectSheet has no connectButton");
+    QVERIFY2(!connectButton->property("enabled").toBool(),
+             "Connect was offered with nothing to connect to");
+
     QVERIFY2(m_graph->qmlWarnings.isEmpty(),
              qPrintable(m_graph->qmlWarnings.join(QLatin1Char('\n'))));
 }
 
 // ---------------------------------------------------------------------------
-// 2. ADD A SERVER. Typed into the sheet's own fields and committed with its own
-//    Save button, so the whole path (field -> profileSaved -> ServerProfiles ->
-//    QSettings) is the one a user walks.
+// 2. ADD A SERVER. The connect sheet is a picker, not an editor: profiles are
+//    created, edited and deleted in the settings window's Server pane, which is
+//    the single place that owns them. So this step walks the path a first-run
+//    user has to walk — the sheet's "Server settings…" button, the settings
+//    window's Server group, Add server, then the seven fields — and the whole
+//    chain behind it (field -> saveProfile -> ServerProfiles -> QSettings).
 // ---------------------------------------------------------------------------
-void TstColdStart::step2_addAServerThroughTheSheet()
+void TstColdStart::step2_addAServerThroughTheSettingsWindow()
 {
     g_phase = QStringLiteral("step2 add server");
     QObject* sheet = m_graph->evalObject(QStringLiteral("connectSheet"));
     QVERIFY(sheet != nullptr);
 
-    const auto field = [sheet](const char* name) {
-        return sheet->findChild<QQuickItem*>(QLatin1String(name));
-    };
-    const auto button = [sheet](const char* name) {
-        return sheet->findChild<QQuickItem*>(QLatin1String(name));
+    // The way out of the cold start, taken the way the user takes it.
+    QQuickItem* openSettings = findByName(sheet, QStringLiteral("openSettingsButton"));
+    QVERIFY2(openSettings != nullptr, "ConnectSheet has no openSettingsButton");
+    QVERIFY(QMetaObject::invokeMethod(openSettings, "clicked"));
+
+    QObject* settings = m_graph->evalObject(QStringLiteral("settingsWindow"));
+    QVERIFY2(settings != nullptr, "Main.qml has no settingsWindow");
+    QTRY_VERIFY2(settings->property("shown").toBool(),
+                 "the sheet's Server settings button did not open the settings window");
+    auto* settingsItem = qobject_cast<QQuickItem*>(settings);
+    QVERIFY(settingsItem != nullptr);
+    QTRY_VERIFY(settingsItem->isVisible());
+    // Above the sheet, or it could not be used while the cold-start sheet is
+    // still up with nothing to connect to.
+    QVERIFY(settingsItem->z() > qobject_cast<QQuickItem*>(sheet)->z());
+
+    // The Server group, chosen from the settings window's own group list.
+    QQuickItem* serverGroup = findByName(settings, QStringLiteral("settingsGroup:server"));
+    QVERIFY2(serverGroup != nullptr, "the settings window has no Server group");
+    QVERIFY(QMetaObject::invokeMethod(serverGroup, "clicked"));
+    QCOMPARE(settings->property("selectedGroup").toString(), QStringLiteral("server"));
+
+    // The pane is loaded on demand; nothing below exists until the Loader is
+    // Ready (QQuickLoader::Ready == 1).
+    QObject* paneLoader = settings->findChild<QObject*>(QStringLiteral("settingsGroupLoader"));
+    QVERIFY2(paneLoader != nullptr, "the settings window has no settingsGroupLoader");
+    QTRY_COMPARE(paneLoader->property("status").toInt(), 1);
+    QTRY_VERIFY2(findByName(settings, QStringLiteral("serverPane")) != nullptr,
+                 qPrintable(QStringLiteral("the Server pane never loaded; named items=[%1]")
+                                .arg(objectNamesOf(settings).join(QLatin1Char(',')))));
+
+    const auto paneItem = [settings](const char* name) {
+        return findByName(settings, QLatin1String(name));
     };
 
-    for (const char* name : {"nameField", "hostField", "portField", "userField",
-                             "nodePathField", "repoRootField", "saveButton",
-                             "connectButton"}) {
-        QVERIFY2(sheet->findChild<QQuickItem*>(QLatin1String(name)) != nullptr,
-                 qPrintable(QStringLiteral("ConnectSheet has no %1")
+    for (const char* name : {"serverEmptyHint", "serverAddButton", "serverDeleteButton",
+                             "serverConnectButton", "serverValidationHint",
+                             "serverField:name", "serverField:host", "serverField:port",
+                             "serverField:user", "serverField:identityFile",
+                             "serverField:nodePath", "serverField:repoRoot"}) {
+        QVERIFY2(paneItem(name) != nullptr,
+                 qPrintable(QStringLiteral("the Server pane has no %1")
                                 .arg(QLatin1String(name))));
     }
 
-    field("nameField")->setProperty("text", QStringLiteral("Cold start %1").arg(m_runId));
-    field("hostField")->setProperty("text", g_live.host);
-    field("portField")->setProperty("text", QString::number(g_live.port));
-    field("userField")->setProperty("text", g_live.user);
-    field("nodePathField")->setProperty("text", g_live.node);
-    field("repoRootField")->setProperty("text", g_live.repo);
+    // It says the store is empty and offers exactly one useful action.
+    QVERIFY2(paneItem("serverEmptyHint")->isVisible(),
+             "the Server pane did not say the store is empty");
+    QVERIFY(paneItem("serverAddButton")->property("enabled").toBool());
+    QVERIFY2(!paneItem("serverDeleteButton")->property("enabled").toBool(),
+             "Delete server was offered with nothing selected");
+    QVERIFY2(!paneItem("serverConnectButton")->property("enabled").toBool(),
+             "the Server pane offered Connect with nothing selected");
 
-    // The sheet's own validity gate, not ours.
-    QVERIFY2(button("saveButton")->property("enabled").toBool(),
-             "ConnectSheet refused a fully filled, valid form");
-    QVERIFY(QMetaObject::invokeMethod(button("saveButton"), "clicked"));
-
+    // Add server. The pane has no Save button on purpose: the record is created
+    // in the store at once (seeded so ServerProfiles cannot refuse it) and each
+    // field writes through when the user leaves it.
+    QVERIFY(QMetaObject::invokeMethod(paneItem("serverAddButton"), "clicked"));
     QTRY_COMPARE(m_graph->serverProfiles.profiles().size(), 1);
-    const QVariantMap stored = m_graph->serverProfiles.profiles().constFirst().toMap();
-    m_profileId = stored.value(QStringLiteral("id")).toString();
+    m_profileId =
+        m_graph->serverProfiles.profiles().constFirst().toMap().value(QStringLiteral("id"))
+            .toString();
     QVERIFY(!m_profileId.isEmpty());
+    QTRY_COMPARE(settings->property("selectedProfileId").toString(), m_profileId);
+    QVERIFY2(!paneItem("serverEmptyHint")->isVisible(),
+             "the Server pane still claimed the store was empty after Add server");
+    QVERIFY(paneItem("serverDeleteButton")->property("enabled").toBool());
+
+    // Type the fixture in, leaving each field the way a user does. identityFile
+    // is deliberately left as it came: this connect authenticates through
+    // ssh-agent/the default keys, which is what the fixture provides.
+    const QList<QPair<QString, QString>> typed = {
+        {QStringLiteral("serverField:name"), QStringLiteral("Cold start %1").arg(m_runId)},
+        {QStringLiteral("serverField:host"), g_live.host},
+        {QStringLiteral("serverField:port"), QString::number(g_live.port)},
+        {QStringLiteral("serverField:user"), g_live.user},
+        {QStringLiteral("serverField:nodePath"), g_live.node},
+        {QStringLiteral("serverField:repoRoot"), g_live.repo}};
+    for (const auto& entry : typed) {
+        QQuickItem* field = findByName(settings, entry.first);
+        QVERIFY2(field != nullptr, qPrintable(entry.first));
+        field->setProperty("text", entry.second);
+        QVERIFY2(QMetaObject::invokeMethod(field, "editingFinished"),
+                 qPrintable(entry.first));
+    }
+
+    // The PANE's own validity verdict, not ours: a form it considers unstorable
+    // says so instead of writing through, and this one has to be storable.
+    QVERIFY2(!paneItem("serverValidationHint")->isVisible(),
+             qPrintable(QStringLiteral("the Server pane refused a fully filled, valid "
+                                       "form: %1")
+                            .arg(paneItem("serverValidationHint")
+                                     ->property("text").toString())));
+    QVERIFY2(!settings->property("profileDirty").toBool(),
+             "the Server pane still holds an unsaved draft");
+
+    const QVariantMap stored = m_graph->serverProfiles.profiles().constFirst().toMap();
+    QCOMPARE(stored.value(QStringLiteral("id")).toString(), m_profileId);
     QCOMPARE(stored.value(QStringLiteral("host")).toString(), g_live.host);
     QCOMPARE(stored.value(QStringLiteral("port")).toInt(), int(g_live.port));
     QCOMPARE(stored.value(QStringLiteral("user")).toString(), g_live.user);
@@ -831,13 +922,32 @@ void TstColdStart::step2_addAServerThroughTheSheet()
                  qPrintable(QStringLiteral("%1 does not mention the host:\n%2")
                                 .arg(configFilePath(), readFileText(configFilePath()))));
 
-    // The sheet re-anchored onto the profile it just created, which is what
-    // makes Connect reachable at all.
-    QTRY_COMPARE(sheet->property("editingId").toString(), m_profileId);
-    QVERIFY2(button("connectButton")->property("enabled").toBool(),
-             "ConnectSheet cannot connect to the profile it just saved");
+    // The pane can act on what it just saved...
+    QVERIFY2(paneItem("serverConnectButton")->property("enabled").toBool(),
+             "the Server pane cannot connect to the profile it just created");
 
-    qInfo().noquote() << "profile saved through the sheet:" << m_profileId;
+    // ...and so can the sheet, which is the surface step 3 connects from: the
+    // new profile reached it through ServerProfiles and it re-anchored its
+    // selection onto it, which is what makes Connect reachable at all.
+    QTRY_COMPARE(sheet->property("selectedId").toString(), m_profileId);
+    QQuickItem* sheetConnect = findByName(sheet, QStringLiteral("connectButton"));
+    QVERIFY(sheetConnect != nullptr);
+    QVERIFY2(sheetConnect->property("enabled").toBool(),
+             "the connect sheet cannot connect to the profile just created");
+
+    // Leave the settings window the way the user does, uncovering the sheet.
+    QQuickItem* closeSettings = findByName(settings, QStringLiteral("settingsCloseButton"));
+    QVERIFY2(closeSettings != nullptr, "the settings window has no settingsCloseButton");
+    QVERIFY(QMetaObject::invokeMethod(closeSettings, "clicked"));
+    QTRY_VERIFY(!settings->property("shown").toBool());
+    QTRY_VERIFY(!settingsItem->isVisible());
+    QVERIFY2(sheet->property("shown").toBool(),
+             "closing the settings window also dismissed the connect sheet");
+
+    QVERIFY2(m_graph->qmlWarnings.isEmpty(),
+             qPrintable(m_graph->qmlWarnings.join(QLatin1Char('\n'))));
+
+    qInfo().noquote() << "profile created in the settings window:" << m_profileId;
 }
 
 // ---------------------------------------------------------------------------
