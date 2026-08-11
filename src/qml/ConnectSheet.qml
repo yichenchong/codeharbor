@@ -405,17 +405,20 @@ Rectangle {
             if (holder && !root.itemWithin(root, holder))
                 root.focusReturnItem = holder;
         }
+        // Through the same ownership guard as the prompt handlers: this grab is
+        // queued too, so a modal dialog raised in the turn between can own the
+        // keyboard by the time it runs.
         Qt.callLater(() => {
             if (root.pendingCredential)
-                secretField.forceActiveFocus();
+                root.focusWhenStillOurs(secretField);
             else if (root.pendingHostKey)
-                hostKeyReject.forceActiveFocus();
+                root.focusWhenStillOurs(hostKeyReject);
             else if (root.profileList().length > 0)
-                profileSelector.forceActiveFocus();
+                root.focusWhenStillOurs(profileSelector);
             else
                 // Nothing to pick: the only useful thing on screen is the way
                 // out to the window that can create a server.
-                openSettingsButton.forceActiveFocus();
+                root.focusWhenStillOurs(openSettingsButton);
         });
     }
     Component.onCompleted: root.syncFromModel()

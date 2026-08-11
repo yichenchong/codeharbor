@@ -363,6 +363,7 @@ private slots:
     void viewerDefaultControlsAreLabelledAndRowActionsSayWhichRow();
     void validationErrorsAndTheErrorBannerAreAlerts();
     void tabbingCannotLeaveTheConnectSheetOrItsPrompts();
+    void aDialogOpenedAsTheSheetAppearsKeepsTheKeyboard();
     void tabbingCannotLeaveTheSettingsSheet();
     void closingASheetHandsTheKeyboardBack();
 
@@ -2657,6 +2658,53 @@ void TstServerProfiles::tabbingCannotLeaveTheConnectSheetOrItsPrompts()
         QTest::qWait(50);
         QCOMPARE(view->activeFocusItem(), inDialog);
     }
+    QMetaObject::invokeMethod(diagnostics, "close");
+    QTRY_VERIFY(!diagnostics->property("visible").toBool());
+    CH_ASSERT_SILENT();
+}
+
+// The sheet takes the keyboard one turn AFTER it becomes visible, because the
+// control that should get it depends on state that is still settling. Anything
+// can happen in that turn, and the thing that does happen is a modal dialog
+// opening on top. The queued grab must not then pull the user out of it.
+void TstServerProfiles::aDialogOpenedAsTheSheetAppearsKeepsTheKeyboard()
+{
+    const std::unique_ptr<QQuickView> view = loadFocusHarness(
+        QStringLiteral(CH_CONNECTSHEET_QML), QStringLiteral("focus-open-race.qml"));
+    QVERIFY(view != nullptr);
+    QQuickItem* const harness = view->rootObject();
+    QVERIFY(harness != nullptr);
+    QQuickItem* const sheet = harnessSheet(harness);
+    QVERIFY(sheet != nullptr);
+    sheet->setProperty("profiles", oneProfile());
+    QTRY_VERIFY(findByName(sheet, QStringLiteral("profileRow0")) != nullptr);
+
+    QObject* const diagnostics =
+        sheet->findChild<QObject*>(QStringLiteral("sshDiagnosticsDialog"));
+    QVERIFY(diagnostics != nullptr);
+
+    // Down, then up again: becoming visible is what queues the grab.
+    sheet->setProperty("visible", false);
+    QTest::qWait(50);
+    sheet->setProperty("visible", true);
+    // Same turn, before the queued grab has run.
+    sheet->setProperty("diagnosticText", QStringLiteral("libssh trace"));
+    QMetaObject::invokeMethod(diagnostics, "open");
+    QTRY_VERIFY(diagnostics->property("visible").toBool());
+
+    QQuickItem* const inDialog = view->activeFocusItem();
+    QVERIFY2(inDialog != nullptr && !sheet->isAncestorOf(inDialog),
+             "the dialog never took the keyboard, so this proves nothing");
+
+    // Long enough for the queued grab, and for anything it queues in turn.
+    QTest::qWait(150);
+    QVERIFY2(!sheet->isAncestorOf(view->activeFocusItem()),
+             qPrintable(QStringLiteral("the sheet pulled the keyboard out of the open dialog "
+                                       "and gave it to \"%1\"")
+                                .arg(view->activeFocusItem()
+                                         ? view->activeFocusItem()->objectName()
+                                         : QStringLiteral("nothing"))));
+
     QMetaObject::invokeMethod(diagnostics, "close");
     QTRY_VERIFY(!diagnostics->property("visible").toBool());
     CH_ASSERT_SILENT();
