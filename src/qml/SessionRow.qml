@@ -110,6 +110,15 @@ ItemDelegate {
         }
     }
 
+    // The status as a sentence, including the fact that it may be out of date.
+    // Written once and read by both the tooltip and the accessible description
+    // below: a hovering user was told the link was down while a screen-reader
+    // user was told the stale status as if it were current.
+    readonly property string statusText:
+        row.stale
+        ? qsTr("%1 (last known \u2014 the link is down)").arg(row.stateWords(row.rowState))
+        : row.stateWords(row.rowState)
+
     // The module's one tooltip (AppToolTip.qml). The attached `ToolTip.text`
     // form is drawn by the Basic style in that style's own light palette, so a
     // hint about this dark sidebar arrived as a white box.
@@ -122,9 +131,7 @@ ItemDelegate {
         // flash it.
         delay: 600
         visible: row.hovered
-        text: row.stale
-              ? qsTr("%1 (last known \u2014 the link is down)").arg(row.stateWords(row.rowState))
-              : row.stateWords(row.rowState)
+        text: row.statusText
     }
 
     // A screen reader gets nothing from this row otherwise: the delegate's own
@@ -135,9 +142,13 @@ ItemDelegate {
     Accessible.name: row.name
     Accessible.description: (row.archived ? qsTr("Archived") + qsTr(" \u2014 ") : "")
                             + (row.subtitle.length > 0
-                               ? qsTr("%1 \u2014 %2").arg(row.stateWords(row.rowState))
+                               ? qsTr("%1 \u2014 %2").arg(row.statusText)
                                                      .arg(row.subtitle)
-                               : row.stateWords(row.rowState))
+                               : row.statusText)
+    // The selection is drawn as a wash and a rail, and neither of those is
+    // anything a screen reader can see: without this the whole list announces
+    // as rows with no current one among them.
+    Accessible.selected: row.selected
 
     // Selection wins over hover; the source row of a live drag dims so the
     // floating proxy reads as the thing being moved.
@@ -420,6 +431,24 @@ ItemDelegate {
         onTapped: contextMenu.popup()
     }
 
+    // Keyboard entry points for the two things that used to need a right-click.
+    // The sidebar's key handler calls these on whichever row its cursor is on:
+    // Rename lived ONLY in the menu below, so without them a user who never
+    // touches a pointer could not rename a session at all. Escape closes the
+    // menu and the dialog, and either way the keyboard lands back on the
+    // sidebar, so neither one can swallow the cursor.
+    //
+    // Popped at the row's own bottom-left corner rather than at the pointer:
+    // there is no pointer in this path, and popup() with no arguments would
+    // open the menu wherever the mouse happens to be resting.
+    function openContextMenu() {
+        contextMenu.popup(row, 12, row.height);
+    }
+
+    function openRenameDialog() {
+        renameDialog.open();
+    }
+
     // Left click selects AND activates: the sidebar emits sessionActivated for
     // the host to load the session's layout.
     onClicked: if (host) host.selectSession(row)
@@ -449,6 +478,10 @@ ItemDelegate {
 
     Menu {
         id: contextMenu
+        // Several rows are realised at once, so the menu carries its session's
+        // id like every other named part of this delegate; a bare name would
+        // let a findChild() lookup answer with an arbitrary row's menu.
+        objectName: "sessionMenu:" + row.itemId
 
         MenuItem {
             text: qsTr("Rename")
@@ -506,12 +539,29 @@ ItemDelegate {
             implicitWidth: 300
             spacing: 8
 
+            // The field arrives PREFILLED with the current name, so its
+            // placeholder never shows and the box was announced — and read —
+            // as an unlabelled edit box holding a word. Same visible-label
+            // convention as SettingsWindow's Field component.
+            Label {
+                id: renameFieldLabel
+                objectName: "renameFieldLabel:" + row.itemId
+                Layout.preferredWidth: 300
+                text: qsTr("Session name")
+                color: Theme.textDim
+                font.pixelSize: Theme.fontSizeSmall
+            }
+
             TextField {
                 id: renameField
                 objectName: "renameField:" + row.itemId
                 Layout.preferredWidth: 300
                 text: row.name
                 placeholderText: qsTr("Session name")
+                // The visible Label above is a separate item, so the field has
+                // no name of its own; bound rather than repeated so the two
+                // cannot drift apart.
+                Accessible.name: renameFieldLabel.text
             }
         }
 
@@ -527,6 +577,10 @@ ItemDelegate {
         modal: true
         standardButtons: Dialog.Ok | Dialog.Cancel
         anchors.centerIn: Overlay.overlay
+        // Enter cancels here rather than deleting: this dialog's affirmative
+        // answer destroys a Dev Session, and a stray keypress must not be able
+        // to do that. The delete button is still one Tab and a Space away.
+        defaultButton: Dialog.Cancel
         width: 400
 
         ColumnLayout {

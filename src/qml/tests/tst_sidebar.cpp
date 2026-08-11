@@ -37,6 +37,7 @@
 #include <QString>
 #include <QStringList>
 #include <QUrl>
+#include <QVariant>
 #include <QVector>
 
 #include <utility>
@@ -161,6 +162,33 @@ QString attachedString(QQuickItem *item, const QString &name)
     return property.read().toString();
 }
 
+// The same read for an attached property that is not a string. Kept separate
+// from attachedString so a MISSING property can be told apart from one that is
+// present and false: an accessible state nobody declared and an accessible
+// state declared as "off" are different defects, and only the first of them is
+// invisible to a screen reader.
+QVariant attachedValue(QQuickItem *item, const QString &name)
+{
+    const QQmlProperty property(item, name, QQmlEngine::contextForObject(item));
+    if (!property.isValid())
+        return QVariant();
+    return property.read();
+}
+
+// The `Accessible` attached object itself, which is what carries the action
+// handlers (toggleAction and its siblings). QML creates it as a QObject child
+// of the item it is attached to, so this is how a test can perform the action
+// an assistive technology would perform, rather than only reading state back.
+QObject *accessibleAttached(QQuickItem *item)
+{
+    const auto children = item->findChildren<QObject *>(QString(), Qt::FindDirectChildrenOnly);
+    for (QObject *child : children) {
+        if (child->inherits("QQuickAccessibleAttached"))
+            return child;
+    }
+    return nullptr;
+}
+
 // Reads the hint carried by the module's own AppToolTip. The attached
 // `ToolTip.text` form is deliberately no longer used here — the Basic style
 // draws it in the style's light palette, i.e. a white box beside a dark panel —
@@ -280,7 +308,11 @@ class StubApp : public QObject
 {
     Q_OBJECT
     Q_PROPERTY(QAbstractItemModel *sessionsModel READ sessionsModel CONSTANT)
-    Q_PROPERTY(QString connectionState READ connectionState CONSTANT)
+    // Settable, with a change signal, because "the link is down" is a state the
+    // rows have to describe differently: a CONSTANT here would leave the
+    // recovered case untestable. It still STARTS disconnected, which is what
+    // every other test in this file was written against.
+    Q_PROPERTY(QString connectionState READ connectionState NOTIFY connectionStateChanged)
 
 
 public:
@@ -290,7 +322,14 @@ public:
     }
 
     QAbstractItemModel *sessionsModel() const { return m_model; }
-    QString connectionState() const { return QStringLiteral("disconnected"); }
+    QString connectionState() const { return m_connectionState; }
+    void setConnectionState(const QString &state)
+    {
+        if (m_connectionState == state)
+            return;
+        m_connectionState = state;
+        emit connectionStateChanged();
+    }
 
     const QStringList &calls() const { return m_calls; }
     void clearCalls() { m_calls.clear(); }
@@ -353,9 +392,13 @@ public:
                                .arg(groupId, orderedIds.join(QLatin1Char(','))));
     }
 
+signals:
+    void connectionStateChanged();
+
 private:
     QAbstractItemModel *m_model = nullptr;
     QStringList m_calls;
+    QString m_connectionState = QStringLiteral("disconnected");
 };
 
 // Loads the real sidebar QML over a real SessionsModel.
@@ -441,6 +484,15 @@ private slots:
     void rowMenuActionsReachTheWorkspace();
     void groupMenuRenamesTheGroup();
     void rowArchiveButtonIsClickable();
+    void enterPressesTheDialogsDefaultButton();
+    void enterDoesNotAnswerADestructiveDialogWithDeletion();
+    void theDefaultButtonIsMarkedForTheEyeAndForAScreenReader();
+    void theSelectedRowIsAnnouncedAndNotOnlyDrawn();
+    void aGroupsCollapseStateCanBeReadAndOperatedWithoutSight();
+    void theFilterTogglesSayWhetherTheyAreOn();
+    void everyDialogFieldCarriesAVisibleLabelThatNamesIt();
+    void aStaleRowSaysSoToAScreenReaderToo();
+    void everyRowActionIsReachableWithoutAPointer();
 
 private:
     // Two expanded groups: Alpha[s1,s2,s3], Beta[s4,s5].
@@ -1224,6 +1276,532 @@ void TstSidebar::rowArchiveButtonIsClickable()
     QTest::mouseClick(&fixture.view, Qt::LeftButton, Qt::NoModifier, centerOf(filter));
     QTest::qWait(100);
     QVERIFY(visibleSessionOrder(fixture.root()).contains(QStringLiteral("s2")));
+    QVERIFY2(fixture.warnings().isEmpty(), qPrintable(fixture.warnings().join(QLatin1Char('\n'))));
+}
+
+// A dialog with a name typed into it is answered with the keyboard, so Enter has
+// to mean something. Before this it meant nothing at all: the only way to finish
+// a rename was to take your hands off the keys and click OK.
+//
+// Driven with a REAL key press at the window rather than by calling accept(),
+// because "the key reaches the dialog" is the entire behaviour under test.
+void TstSidebar::enterPressesTheDialogsDefaultButton()
+{
+    SidebarFixture fixture(twoGroups());
+    expose(fixture);
+
+    QQuickItem *const row = findByName(fixture.root(), QStringLiteral("sessionRow:s2"));
+    QVERIFY(row);
+    QObject *const renameEntry = menuItemNamed(row, QStringLiteral("Rename"));
+    QVERIFY(renameEntry);
+    QVERIFY(QMetaObject::invokeMethod(renameEntry, "triggered"));
+    QTest::qWait(100);
+
+    QObject *const dialog = row->findChild<QObject *>(QStringLiteral("renameDialog:s2"));
+    QQuickItem *const field =
+        row->findChild<QQuickItem *>(QStringLiteral("renameField:s2"));
+    QVERIFY(dialog && field);
+    QVERIFY2(dialog->property("visible").toBool(), "the rename dialog did not open");
+
+    // Typed, not assigned: the dialog opens with the field focused and its text
+    // selected, and this must survive that.
+    fixture.app.clearCalls();
+    for (const QChar character : QStringLiteral("Typed"))
+        QTest::keyClick(&fixture.view, character.toLatin1());
+    QTest::qWait(50);
+    QCOMPARE(field->property("text").toString(), QStringLiteral("Typed"));
+
+    QTest::keyClick(&fixture.view, Qt::Key_Return);
+    QTest::qWait(100);
+
+    QCOMPARE(fixture.app.calls(), (QStringList{QStringLiteral("renameSession(s2,Typed)")}));
+    QVERIFY2(!dialog->property("visible").toBool(),
+             "Enter renamed the session but left the dialog open");
+    QVERIFY2(fixture.warnings().isEmpty(), qPrintable(fixture.warnings().join(QLatin1Char('\n'))));
+}
+
+// The other half of the rule, and the reason it is safe to have at all: a dialog
+// whose affirmative answer DESTROYS something answers Enter with Cancel. A user
+// dismissing a stack of dialogs by holding Enter must not be able to delete a
+// Dev Session by accident.
+void TstSidebar::enterDoesNotAnswerADestructiveDialogWithDeletion()
+{
+    SidebarFixture fixture(twoGroups());
+    expose(fixture);
+
+    QQuickItem *const row = findByName(fixture.root(), QStringLiteral("sessionRow:s2"));
+    QVERIFY(row);
+    QObject *const deleteEntry = menuItemNamed(row, QStringLiteral("Delete"));
+    QVERIFY(deleteEntry);
+    QVERIFY(QMetaObject::invokeMethod(deleteEntry, "triggered"));
+    QTest::qWait(100);
+
+    QObject *const dialog =
+        row->findChild<QObject *>(QStringLiteral("deleteSessionDialog:s2"));
+    QVERIFY(dialog);
+    QVERIFY2(dialog->property("visible").toBool(), "the delete confirmation did not open");
+
+    fixture.app.clearCalls();
+    QTest::keyClick(&fixture.view, Qt::Key_Return);
+    QTest::qWait(100);
+
+    QVERIFY2(fixture.app.calls().isEmpty(),
+             qPrintable(QStringLiteral("Enter on the delete confirmation destroyed something: %1")
+                                .arg(fixture.app.calls().join(QLatin1Char(',')))));
+    // Cancel, not "ignored": the key still answers the question, it just answers
+    // it the safe way, so the dialog is gone and the user is not stuck.
+    QVERIFY2(!dialog->property("visible").toBool(),
+             "Enter left the delete confirmation on screen with no visible effect");
+    QVERIFY2(fixture.warnings().isEmpty(), qPrintable(fixture.warnings().join(QLatin1Char('\n'))));
+}
+
+// A key that answers a dialog is useless if the answer is a secret. The button
+// Enter presses is drawn in the accent colour and says what it is to a screen
+// reader, and BOTH have to name the same button as the key does — otherwise the
+// dialog lies about what Enter will do, which is worse than doing nothing.
+void TstSidebar::theDefaultButtonIsMarkedForTheEyeAndForAScreenReader()
+{
+    SidebarFixture fixture(twoGroups());
+    expose(fixture);
+
+    QQuickItem *const row = findByName(fixture.root(), QStringLiteral("sessionRow:s2"));
+    struct Case {
+        QString menuEntry;
+        QString dialogName;
+        QString expectedButtonText;
+        QString otherButtonText;
+    };
+    // Two opposite answers: the rename's default is its affirmative button, the
+    // delete's is deliberately Cancel.
+    const QList<Case> cases{
+        {QStringLiteral("Rename"), QStringLiteral("renameDialog:s2"), QStringLiteral("OK"),
+         QStringLiteral("Cancel")},
+        {QStringLiteral("Delete"), QStringLiteral("deleteSessionDialog:s2"),
+         QStringLiteral("Cancel"), QStringLiteral("OK")},
+    };
+
+    for (const Case &testCase : cases) {
+        QObject *const entry = menuItemNamed(row, testCase.menuEntry);
+        QVERIFY(entry);
+        QVERIFY(QMetaObject::invokeMethod(entry, "triggered"));
+        QTest::qWait(100);
+
+        QObject *const dialog = row->findChild<QObject *>(testCase.dialogName);
+        QVERIFY(dialog);
+
+        // The dialog's own answer to "which button does Enter press", which is
+        // the same object it marks and the same one the shortcut activates.
+        auto *const button =
+            qobject_cast<QQuickItem *>(dialog->property("defaultButtonItem").value<QObject *>());
+        QVERIFY2(button, qPrintable(QStringLiteral("%1 names no default button")
+                                            .arg(testCase.dialogName)));
+        QCOMPARE(button->property("text").toString(), testCase.expectedButtonText);
+
+        // Drawn differently from the button beside it, so the eye can see which
+        // one answers. Compared against the sibling rather than against a colour
+        // literal, so the check still means something under another theme.
+        QQuickItem *other = nullptr;
+        const auto candidates = dialog->findChildren<QQuickItem *>();
+        for (QQuickItem *candidate : candidates) {
+            if (candidate->property("text").toString() == testCase.otherButtonText)
+                other = candidate;
+        }
+        QVERIFY2(other, qPrintable(QStringLiteral("%1 has no %2 button to compare against")
+                                           .arg(testCase.dialogName, testCase.otherButtonText)));
+        const auto colourOf = [](QQuickItem *item) {
+            return QQmlProperty(item, QStringLiteral("palette.button"),
+                                QQmlEngine::contextForObject(item))
+                .read()
+                .value<QColor>();
+        };
+        QVERIFY2(colourOf(button).isValid(), "the default button exposes no button colour");
+        QVERIFY2(colourOf(button) != colourOf(other),
+                 qPrintable(QStringLiteral("the %1 button is drawn exactly like the %2 button "
+                                           "beside it, so nothing shows which one Enter presses")
+                                    .arg(testCase.expectedButtonText,
+                                         testCase.otherButtonText)));
+
+        // And announced, so a screen reader user is told the same thing.
+        const QString description = attachedString(button, QStringLiteral("Accessible.description"));
+        QVERIFY2(description.contains(QStringLiteral("Enter"), Qt::CaseInsensitive),
+                 qPrintable(QStringLiteral("the %1 button does not say it answers Enter: \"%2\"")
+                                    .arg(testCase.expectedButtonText, description)));
+
+        QMetaObject::invokeMethod(dialog, "reject");
+        QTest::qWait(50);
+    }
+
+    QVERIFY2(fixture.warnings().isEmpty(), qPrintable(fixture.warnings().join(QLatin1Char('\n'))));
+}
+
+// Selection in this panel is drawn three ways — a wash, a coloured rail and a
+// focus ring — and a screen reader can see none of them. Without
+// Accessible.selected the sidebar is announced as a stack of rows with no
+// current one among them, so a blind user cannot tell which Dev Session they
+// are about to open, or which one Enter would load.
+void TstSidebar::theSelectedRowIsAnnouncedAndNotOnlyDrawn()
+{
+    SidebarFixture fixture(twoGroups());
+    expose(fixture);
+
+    QQuickItem *const first = findByName(fixture.root(), QStringLiteral("sessionRow:s1"));
+    QQuickItem *const second = findByName(fixture.root(), QStringLiteral("sessionRow:s2"));
+    QQuickItem *const header = findByName(fixture.root(), QStringLiteral("groupHeader:g1"));
+    QVERIFY(first && second && header);
+
+    // Read by value throughout: the attached property resolves whether or not
+    // the QML ever set it, and an undeclared one simply reads false forever —
+    // which is precisely the defect, so the value is the only honest check.
+    const QString selected = QStringLiteral("Accessible.selected");
+
+    QTest::mouseClick(&fixture.view, Qt::LeftButton, Qt::NoModifier, centerOf(second));
+    QTest::qWait(50);
+    QVERIFY2(attachedValue(second, selected).toBool(),
+             "clicking a session row does not announce it as the selected one");
+    QVERIFY2(!attachedValue(first, selected).toBool(),
+             "two session rows announce themselves as selected at once");
+    QVERIFY2(!attachedValue(header, selected).toBool(),
+             "a group header announces itself as selected while a session row is");
+
+    // The cursor is one list over both kinds of row, so the announcement has to
+    // follow it onto a group header and off the session it left.
+    QTest::keyClick(&fixture.view, Qt::Key_Up); // s2 -> s1
+    QTest::keyClick(&fixture.view, Qt::Key_Up); // s1 -> the Alpha header
+    QTest::qWait(50);
+    QCOMPARE(fixture.root()->property("currentId").toString(), QStringLiteral("g1"));
+    QVERIFY2(attachedValue(header, selected).toBool(),
+             "moving the keyboard cursor onto a group header does not announce it as selected");
+    QVERIFY2(!attachedValue(second, selected).toBool(),
+             "the session row still claims to be selected after the cursor moved off it");
+
+    QVERIFY2(fixture.warnings().isEmpty(), qPrintable(fixture.warnings().join(QLatin1Char('\n'))));
+}
+
+// A group header described its collapse in prose and nowhere else. Prose is not
+// a state: it cannot be queried, it cannot be acted on, and a user of assistive
+// technology therefore had no way to open a folded group at all. Qt's QML
+// Accessible attached type has no `expanded`, so the open/shut pair is
+// checkable + checked, and the toggle action is what actually opens it.
+void TstSidebar::aGroupsCollapseStateCanBeReadAndOperatedWithoutSight()
+{
+    SidebarFixture fixture(twoGroups(/*betaCollapsed=*/true));
+    expose(fixture);
+
+    QQuickItem *const alpha = findByName(fixture.root(), QStringLiteral("groupHeader:g1"));
+    QQuickItem *const beta = findByName(fixture.root(), QStringLiteral("groupHeader:g2"));
+    QVERIFY(alpha && beta);
+
+    for (QQuickItem *item : {alpha, beta}) {
+        QVERIFY2(attachedValue(item, QStringLiteral("Accessible.checkable")).toBool(),
+                 qPrintable(QStringLiteral("%1 is announced as a plain list item, so nothing "
+                                           "says it is a group that opens and shuts")
+                                    .arg(item->objectName())));
+    }
+    QVERIFY2(attachedValue(alpha, QStringLiteral("Accessible.checked")).toBool(),
+             "the expanded group does not announce itself as open");
+    QVERIFY2(!attachedValue(beta, QStringLiteral("Accessible.checked")).toBool(),
+             "the collapsed group announces itself as open, so its hidden sessions look "
+             "like sessions that do not exist");
+
+    // The words stay too: the state and the sentence say the same thing.
+    QVERIFY2(attachedString(beta, QStringLiteral("Accessible.description"))
+                     .contains(QStringLiteral("Collapsed")),
+             qPrintable(attachedString(beta, QStringLiteral("Accessible.description"))));
+
+    // And it can be operated, not only read. This is the action assistive
+    // technology invokes, and it has to take the same route the click takes —
+    // through the sidebar, which is the object that holds `app`.
+    QObject *const attached = accessibleAttached(beta);
+    QVERIFY2(attached, "the group header exposes no Accessible object to act on");
+    fixture.app.clearCalls();
+    QVERIFY(QMetaObject::invokeMethod(attached, "toggleAction"));
+    QTest::qWait(50);
+    QCOMPARE(fixture.app.calls(),
+             (QStringList{QStringLiteral("setGroupCollapsed(g2,false)")}));
+
+    QVERIFY2(fixture.warnings().isEmpty(), qPrintable(fixture.warnings().join(QLatin1Char('\n'))));
+}
+
+// The two filters in the header bar are toggles, and the ONLY thing that used to
+// change when one went on was the sentence naming what the next click would do.
+// A control that renames itself is indistinguishable from a different control:
+// a screen-reader user could not find out whether archived sessions were being
+// hidden, which is the difference between "I have no archived sessions" and "I
+// cannot see them".
+void TstSidebar::theFilterTogglesSayWhetherTheyAreOn()
+{
+    SidebarFixture fixture(twoGroups());
+    expose(fixture);
+
+    struct Case {
+        QString buttonName;
+        QByteArray sidebarProperty;
+        QString expectedLabel;
+    };
+    const QList<Case> cases{
+        {QStringLiteral("pinFilterButton"), QByteArrayLiteral("pinnedOnly"),
+         QStringLiteral("Pinned sessions only")},
+        {QStringLiteral("archiveFilterButton"), QByteArrayLiteral("showArchived"),
+         QStringLiteral("Include archived sessions")},
+    };
+
+    for (const Case &testCase : cases) {
+        QQuickItem *const button = findByName(fixture.root(), testCase.buttonName);
+        QVERIFY2(button, qPrintable(QStringLiteral("no %1").arg(testCase.buttonName)));
+
+        QVERIFY2(attachedValue(button, QStringLiteral("Accessible.checkable")).toBool(),
+                 qPrintable(QStringLiteral("%1 is announced as a plain button, so nothing "
+                                           "says it is a filter that is on or off")
+                                    .arg(testCase.buttonName)));
+        QVERIFY2(!attachedValue(button, QStringLiteral("Accessible.checked")).toBool(),
+                 qPrintable(QStringLiteral("%1 starts announced as on while its filter is off")
+                                    .arg(testCase.buttonName)));
+
+        // The name is the FILTER, not the click. The verb stays on the tooltip,
+        // which is a pointer hint and must not be the thing carrying state.
+        const QString restingName = attachedString(button, QStringLiteral("Accessible.name"));
+        QCOMPARE(restingName, testCase.expectedLabel);
+        const QString hint = button->property("actionText").toString();
+        QVERIFY2(!hint.isEmpty(), "the filter button lost its pointer hint");
+
+        QTest::mouseClick(&fixture.view, Qt::LeftButton, Qt::NoModifier, centerOf(button));
+        QTest::qWait(100);
+        QVERIFY2(fixture.root()->property(testCase.sidebarProperty.constData()).toBool(),
+                 qPrintable(QStringLiteral("clicking %1 did not turn its filter on")
+                                    .arg(testCase.buttonName)));
+        QVERIFY2(attachedValue(button, QStringLiteral("Accessible.checked")).toBool(),
+                 qPrintable(QStringLiteral("%1 filters the list but still announces itself as "
+                                           "off, so a screen-reader user cannot tell that rows "
+                                           "are being hidden")
+                                    .arg(testCase.buttonName)));
+        QCOMPARE(attachedString(button, QStringLiteral("Accessible.name")), restingName);
+        QVERIFY2(button->property("actionText").toString() != hint,
+                 "the pointer hint no longer says what the next click would do");
+
+        // Operable through the accessibility action as well as the pointer, and
+        // it leaves the sidebar exactly as it found it.
+        QObject *const attached = accessibleAttached(button);
+        QVERIFY2(attached, "the filter button exposes no Accessible object to act on");
+        QVERIFY(QMetaObject::invokeMethod(attached, "toggleAction"));
+        QTest::qWait(100);
+        QVERIFY2(!fixture.root()->property(testCase.sidebarProperty.constData()).toBool(),
+                 qPrintable(QStringLiteral("the accessibility toggle on %1 does not switch the "
+                                           "filter it announces")
+                                    .arg(testCase.buttonName)));
+        QVERIFY(!attachedValue(button, QStringLiteral("Accessible.checked")).toBool());
+    }
+
+    QVERIFY2(fixture.warnings().isEmpty(), qPrintable(fixture.warnings().join(QLatin1Char('\n'))));
+}
+
+// Every text field the sidebar owns had a placeholder and nothing else — and
+// three of them open PREFILLED, so even the placeholder was never on screen. A
+// sighted user met a box with a word in it and no title; a screen-reader user
+// met an unnamed edit box. Each one now carries a visible label above it, and
+// the field's accessible name is that same label rather than a second copy of
+// the words that can drift away from it.
+void TstSidebar::everyDialogFieldCarriesAVisibleLabelThatNamesIt()
+{
+    SidebarFixture fixture(twoGroups());
+    expose(fixture);
+    fixture.app.clearCalls();
+
+    struct Case {
+        // Empty means the sidebar root; the two rename dialogs are declared per
+        // delegate, which is parented visually rather than as a QObject child.
+        QString ownerName;
+        QString dialogName;
+        QString fieldName;
+        QString labelName;
+        QString expectedLabel;
+    };
+    const QList<Case> cases{
+        {QString(), QStringLiteral("newGroupDialog"), QStringLiteral("newGroupField"),
+         QStringLiteral("newGroupFieldLabel"), QStringLiteral("Group name")},
+        {QString(), QStringLiteral("newSessionDialog"), QStringLiteral("newSessionField"),
+         QStringLiteral("newSessionFieldLabel"), QStringLiteral("Session name")},
+        {QString(), QStringLiteral("newSessionDialog"), QStringLiteral("newSessionRepoField"),
+         QStringLiteral("newSessionRepoFieldLabel"),
+         QStringLiteral("Repository path on the server")},
+        {QStringLiteral("sessionRow:s1"), QStringLiteral("renameDialog:s1"),
+         QStringLiteral("renameField:s1"), QStringLiteral("renameFieldLabel:s1"),
+         QStringLiteral("Session name")},
+        {QStringLiteral("groupHeader:g1"), QStringLiteral("renameGroupDialog:g1"),
+         QStringLiteral("renameGroupField:g1"), QStringLiteral("renameGroupFieldLabel:g1"),
+         QStringLiteral("Group name")},
+    };
+
+    for (const Case &testCase : cases) {
+        QQuickItem *owner = fixture.root();
+        if (!testCase.ownerName.isEmpty()) {
+            owner = findByName(fixture.root(), testCase.ownerName);
+            QVERIFY2(owner, qPrintable(QStringLiteral("no %1").arg(testCase.ownerName)));
+        }
+
+        QObject *const dialog = owner->findChild<QObject *>(testCase.dialogName);
+        QVERIFY2(dialog, qPrintable(QStringLiteral("no %1").arg(testCase.dialogName)));
+        QQuickItem *const field = owner->findChild<QQuickItem *>(testCase.fieldName);
+        QVERIFY2(field, qPrintable(QStringLiteral("no %1").arg(testCase.fieldName)));
+
+        QMetaObject::invokeMethod(dialog, "open");
+        QTest::qWait(100);
+
+        QQuickItem *const label = owner->findChild<QQuickItem *>(testCase.labelName);
+        QVERIFY2(label,
+                 qPrintable(QStringLiteral("%1 has no visible label, so the only thing naming "
+                                           "it is a placeholder — which a prefilled field never "
+                                           "shows")
+                                    .arg(testCase.fieldName)));
+        QVERIFY2(label->isVisible(),
+                 qPrintable(QStringLiteral("the label for %1 is not on screen")
+                                    .arg(testCase.fieldName)));
+        QCOMPARE(label->property("text").toString(), testCase.expectedLabel);
+        QVERIFY2(sceneTop(label) < sceneTop(field),
+                 qPrintable(QStringLiteral("the label for %1 is not above the field it names")
+                                    .arg(testCase.fieldName)));
+
+        QCOMPARE(attachedString(field, QStringLiteral("Accessible.name")),
+                 label->property("text").toString());
+
+        QMetaObject::invokeMethod(dialog, "reject");
+        QTest::qWait(50);
+    }
+
+    // Reading a dialog must not have created or renamed anything.
+    QVERIFY2(fixture.app.calls().isEmpty(), qPrintable(fixture.app.calls().join(QLatin1Char(','))));
+    QVERIFY2(fixture.warnings().isEmpty(), qPrintable(fixture.warnings().join(QLatin1Char('\n'))));
+}
+
+// While the link is down every status in the sidebar is the last one the server
+// managed to report. The tooltip has always said so and the rows dim, but the
+// accessible description repeated the stale status as if it were current — so
+// the one user who cannot see the dimming was the one user told nothing.
+void TstSidebar::aStaleRowSaysSoToAScreenReaderToo()
+{
+    SidebarFixture fixture(twoGroups());
+    expose(fixture);
+
+    QQuickItem *const row = findByName(fixture.root(), QStringLiteral("sessionRow:s1"));
+    QVERIFY(row);
+    QObject *const hint = hintOf(row, QStringLiteral("sessionRowTip:s1"));
+    QVERIFY2(hint, "the session row carries no status hint");
+
+    // The stub starts disconnected, which is exactly the case this is about.
+    QVERIFY2(fixture.root()->property("stale").toBool(),
+             "the fixture is not in the stale state this test exists to check");
+
+    const QString warned = QStringLiteral("last known");
+    const QString staleDescription =
+        attachedString(row, QStringLiteral("Accessible.description"));
+    QVERIFY2(staleDescription.contains(warned),
+             qPrintable(QStringLiteral("a row whose status predates a dropped link is described "
+                                       "as \"%1\", which reads as the truth right now")
+                                .arg(staleDescription)));
+    QVERIFY2(hint->property("text").toString().contains(warned),
+             "the tooltip stopped warning that the status is out of date");
+
+    // ...and it stops saying it when the link comes back. A warning that never
+    // clears is the same as no warning.
+    fixture.app.setConnectionState(QStringLiteral("connected"));
+    QTest::qWait(100);
+    QVERIFY2(!fixture.root()->property("stale").toBool(),
+             "the sidebar still considers itself stale after the link came back");
+    const QString liveDescription =
+        attachedString(row, QStringLiteral("Accessible.description"));
+    QVERIFY2(!liveDescription.isEmpty(), "a connected row is described as nothing at all");
+    QVERIFY2(!liveDescription.contains(warned),
+             qPrintable(QStringLiteral("a live row is still described as out of date: \"%1\"")
+                                .arg(liveDescription)));
+
+    QVERIFY2(fixture.warnings().isEmpty(), qPrintable(fixture.warnings().join(QLatin1Char('\n'))));
+}
+
+// Rename, Duplicate, Move to top and Archive lived in a menu that only a
+// right-click opened, so a user who works from the keyboard could not reach any
+// of them — and renaming had no other affordance anywhere in the product. The
+// menu key opens that menu on whichever row the cursor is on, Shift+F10 is the
+// same request from a keyboard without one, and F2 goes straight to the rename.
+// Escape gets back out of both, which is the other half of the rule: a surface
+// the keyboard can enter and not leave is worse than one it cannot enter.
+void TstSidebar::everyRowActionIsReachableWithoutAPointer()
+{
+    SidebarFixture fixture(twoGroups());
+    expose(fixture);
+
+    fixture.root()->forceActiveFocus();
+    QTest::keyClick(&fixture.view, Qt::Key_Down); // the Alpha header
+    QTest::keyClick(&fixture.view, Qt::Key_Down); // s1
+    QCOMPARE(fixture.root()->property("currentId").toString(), QStringLiteral("s1"));
+
+    QQuickItem *const row = findByName(fixture.root(), QStringLiteral("sessionRow:s1"));
+    QVERIFY(row);
+    QObject *const rowMenu = row->findChild<QObject *>(QStringLiteral("sessionMenu:s1"));
+    QVERIFY2(rowMenu, "the session row has no context menu to reach");
+    QVERIFY2(!rowMenu->property("visible").toBool(), "the row menu is open before anything asked");
+
+    QTest::keyClick(&fixture.view, Qt::Key_Menu);
+    QTest::qWait(100);
+    QVERIFY2(rowMenu->property("visible").toBool(),
+             "the menu key on the focused session row opened nothing, so Rename, Duplicate, "
+             "Move to top and Archive stay behind a right-click");
+
+    QTest::keyClick(&fixture.view, Qt::Key_Escape);
+    QTest::qWait(100);
+    QVERIFY2(!rowMenu->property("visible").toBool(), "Escape did not close the row menu");
+    QVERIFY2(fixture.root()->hasActiveFocus(),
+             "closing the row menu left the keyboard nowhere: the sidebar no longer has focus, "
+             "so the next arrow key goes to whatever does");
+
+    // F2 skips the menu entirely and renames the cursor's row, typed and
+    // answered with real keys the whole way.
+    fixture.app.clearCalls();
+    QTest::keyClick(&fixture.view, Qt::Key_F2);
+    QTest::qWait(100);
+    QObject *const renameDialog = row->findChild<QObject *>(QStringLiteral("renameDialog:s1"));
+    QVERIFY(renameDialog);
+    QVERIFY2(renameDialog->property("visible").toBool(),
+             "F2 on the focused session row opened no rename dialog");
+    for (const QChar character : QStringLiteral("Typed"))
+        QTest::keyClick(&fixture.view, character.toLatin1());
+    QTest::keyClick(&fixture.view, Qt::Key_Return);
+    QTest::qWait(100);
+    QCOMPARE(fixture.app.calls(), (QStringList{QStringLiteral("renameSession(s1,Typed)")}));
+
+    // The same two keys on a group header, where Rename was equally unreachable.
+    fixture.root()->forceActiveFocus();
+    QTest::keyClick(&fixture.view, Qt::Key_Up); // s1 -> the Alpha header
+    QCOMPARE(fixture.root()->property("currentId").toString(), QStringLiteral("g1"));
+
+    QQuickItem *const header = findByName(fixture.root(), QStringLiteral("groupHeader:g1"));
+    QVERIFY(header);
+    QObject *const groupMenu = header->findChild<QObject *>(QStringLiteral("groupMenu:g1"));
+    QVERIFY(groupMenu);
+
+    QTest::keyClick(&fixture.view, Qt::Key_F10, Qt::ShiftModifier);
+    QTest::qWait(100);
+    QVERIFY2(groupMenu->property("visible").toBool(),
+             "Shift+F10 on the focused group header opened nothing, so a keyboard without a "
+             "menu key cannot reach the group's actions");
+    QTest::keyClick(&fixture.view, Qt::Key_Escape);
+    QTest::qWait(100);
+    QVERIFY2(!groupMenu->property("visible").toBool(), "Escape did not close the group menu");
+    QVERIFY2(fixture.root()->hasActiveFocus(),
+             "closing the group menu left the keyboard nowhere");
+
+    fixture.app.clearCalls();
+    QTest::keyClick(&fixture.view, Qt::Key_F2);
+    QTest::qWait(100);
+    QObject *const renameGroupDialog =
+        header->findChild<QObject *>(QStringLiteral("renameGroupDialog:g1"));
+    QVERIFY(renameGroupDialog);
+    QVERIFY2(renameGroupDialog->property("visible").toBool(),
+             "F2 on the focused group header opened no rename dialog");
+    for (const QChar character : QStringLiteral("Renamed"))
+        QTest::keyClick(&fixture.view, character.toLatin1());
+    QTest::keyClick(&fixture.view, Qt::Key_Return);
+    QTest::qWait(100);
+    QCOMPARE(fixture.app.calls(), (QStringList{QStringLiteral("renameGroup(g1,Renamed)")}));
+
     QVERIFY2(fixture.warnings().isEmpty(), qPrintable(fixture.warnings().join(QLatin1Char('\n'))));
 }
 

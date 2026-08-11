@@ -33,6 +33,17 @@ ScrollBar {
     implicitHeight: Theme.scrollBarThickness
     padding: 0
 
+    // A scrollbar with no name is announced as an unlabelled slider, and with
+    // no actions there is nothing an assistive technology can do with it: the
+    // whole point of a scrollbar in that tree is to be steppable. increase()
+    // and decrease() are ScrollBar's own, so a step here is the same step a
+    // page key gives, and it goes through the attached Flickable exactly as a
+    // drag would.
+    Accessible.name: control.orientation === Qt.Vertical ? qsTr("Vertical scroll bar")
+                                                         : qsTr("Horizontal scroll bar")
+    Accessible.onIncreaseAction: control.increase()
+    Accessible.onDecreaseAction: control.decrease()
+
     // No track: the surface behind the bar is the panel's own, so a filled
     // track would draw a second, competing gutter beside every list.
     background: null

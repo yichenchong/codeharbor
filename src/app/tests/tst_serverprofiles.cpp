@@ -10,6 +10,7 @@
 
 #include <QtTest/QtTest>
 
+#include <QAccessible>
 #include <QCoreApplication>
 #include <QDir>
 #include <QElapsedTimer>
@@ -27,6 +28,7 @@
 #include <QQmlContext>
 #include <QQmlEngine>
 #include <QQmlError>
+#include <QQmlProperty>
 #include <QQuickItem>
 #include <QQuickView>
 #include <QSettings>
@@ -187,6 +189,93 @@ QObject* findByName(QObject* root, const QString& name, QSet<const QObject*>* se
     return nullptr;
 }
 
+// Reads an ATTACHED property such as `Accessible.name`. The attached type is
+// resolved through the imports of the QML file that declared it, so the item's
+// own QML context has to be handed to QQmlProperty; the two-argument
+// constructor has no context and would silently yield an invalid property.
+QVariant attached(QObject* item, const QString& name)
+{
+    const QQmlProperty property(item, name, QQmlEngine::contextForObject(item));
+    return property.isValid() ? property.read() : QVariant();
+}
+
+QString attachedName(QObject* item)
+{
+    return attached(item, QStringLiteral("Accessible.name")).toString();
+}
+
+// -1 for "no role at all", which is what an unannotated Rectangle has and what
+// every assertion below is really about.
+int attachedRole(QObject* item)
+{
+    const QVariant role = attached(item, QStringLiteral("Accessible.role"));
+    return role.isValid() ? role.toInt() : -1;
+}
+
+// Switches the settings sheet to another preference pane and waits for the
+// Loader, the same way loadSettings() does for the server pane.
+bool showSettingsPane(QQuickItem* root, const QString& group)
+{
+    QObject* const loader =
+        root->findChild<QObject*>(QStringLiteral("settingsGroupLoader"));
+    if (!loader)
+        return false;
+    root->setProperty("selectedGroup", group);
+    QElapsedTimer paneWait;
+    paneWait.start();
+    while (loader->property("status").toInt() != 1 && paneWait.elapsed() < 1000) {
+        QCoreApplication::processEvents();
+        QTest::qWait(10);
+    }
+    QCoreApplication::processEvents();
+    return loader->property("status").toInt() == 1;
+}
+
+// The sheet a focus harness loaded, or null.
+QQuickItem* harnessSheet(QQuickItem* harness)
+{
+    QObject* const loader = harness
+        ? harness->findChild<QObject*>(QStringLiteral("sheetLoader")) : nullptr;
+    return loader ? loader->property("item").value<QQuickItem*>() : nullptr;
+}
+
+// Presses Tab (or Shift+Tab) `steps` times and names the first stop that is not
+// inside `boundary`. Delivered to the WINDOW, which is what makes this a real
+// test: an unhandled Tab is turned into focus navigation by the window, so this
+// travels the same path a user's Tab does.
+bool tabStaysInside(QQuickView* view, QQuickItem* boundary, int steps, bool forward,
+                    QString* escapedTo)
+{
+    for (int step = 0; step < steps; ++step) {
+        if (forward)
+            QTest::keyClick(view, Qt::Key_Tab);
+        else
+            QTest::keyClick(view, Qt::Key_Backtab, Qt::ShiftModifier);
+        QQuickItem* const focused = view->activeFocusItem();
+        if (!focused) {
+            *escapedTo = QStringLiteral("nothing at all");
+            return false;
+        }
+        if (focused != boundary && !boundary->isAncestorOf(focused)) {
+            *escapedTo = focused->objectName().isEmpty()
+                             ? QString::fromLatin1(focused->metaObject()->className())
+                             : focused->objectName();
+            return false;
+        }
+    }
+    return true;
+}
+
+// One profile, enough for the sheet to have a list with something in it.
+QVariantList oneProfile()
+{
+    return QVariantList{QVariantMap{{QStringLiteral("id"), QStringLiteral("id-a")},
+                                    {QStringLiteral("name"), QStringLiteral("Alpha")},
+                                    {QStringLiteral("host"), QStringLiteral("alpha.example")},
+                                    {QStringLiteral("port"), 22},
+                                    {QStringLiteral("user"), QStringLiteral("ua")}}};
+}
+
 } // namespace
 
 // The wiring the orchestrator owns, spelled out once so this test can prove the
@@ -268,6 +357,15 @@ private slots:
     void sheetIsUsableFromTheKeyboardAlone();
     void coldStartAddsAServerThenFindsItAgainAfterRelaunch();
 
+    // ---- accessibility of both surfaces ----
+    void everySheetAndPromptIdentifiesItselfAsADialog();
+    void appearanceControlsCarryTheirVisibleLabel();
+    void viewerDefaultControlsAreLabelledAndRowActionsSayWhichRow();
+    void validationErrorsAndTheErrorBannerAreAlerts();
+    void tabbingCannotLeaveTheConnectSheetOrItsPrompts();
+    void tabbingCannotLeaveTheSettingsSheet();
+    void closingASheetHandsTheKeyboardBack();
+
 private:
     QString iniPath(const QString& name) const { return m_dir.filePath(name); }
 
@@ -275,6 +373,11 @@ private:
     std::unique_ptr<QQuickView> loadQml(const QString& path, QObject* app = nullptr);
     std::unique_ptr<QQuickView> loadSettings(TestApp* app);
     std::unique_ptr<QQuickView> loadConnectSheet();
+    // Loads a sheet inside a harness that also holds focusable controls the
+    // sheet is covering, which is the only way the boundary can be observed.
+    std::unique_ptr<QQuickView> loadFocusHarness(const QString& sheetPath,
+                                                 const QString& harnessName,
+                                                 QObject* app = nullptr);
 
     QTemporaryDir m_dir;
     QStringList m_engineWarnings;
@@ -1625,8 +1728,13 @@ std::unique_ptr<QQuickView> TstServerProfiles::loadQml(const QString& path,
                              m_engineWarnings.append(warning.toString());
                      });
 
+    // Theme is resolved from the shipped sheet's own directory rather than from
+    // `path`, because a fixture document written into the temporary directory
+    // has no Theme.qml beside it.
     static const int themeTypeId = qmlRegisterSingletonType(
-        QUrl::fromLocalFile(QFileInfo(path).absoluteDir().filePath(QStringLiteral("Theme.qml"))),
+        QUrl::fromLocalFile(QFileInfo(QStringLiteral(CH_CONNECTSHEET_QML))
+                                .absoluteDir()
+                                .filePath(QStringLiteral("Theme.qml"))),
         "CodeHarborThemeForTest", 1, 0, "Theme");
     QObject* const theme = view->engine()->singletonInstance<QObject*>(themeTypeId);
     if (!theme) {
@@ -1690,6 +1798,58 @@ std::unique_ptr<QQuickView> TstServerProfiles::loadSettings(TestApp* app)
 std::unique_ptr<QQuickView> TstServerProfiles::loadConnectSheet()
 {
     return loadQml(QStringLiteral(CH_CONNECTSHEET_QML));
+}
+
+// Main.qml draws both sheets over the three workspace regions as ordinary
+// anchored items (Main.qml:555 and :626) — neither is a separate Window — so
+// the window's focus chain runs straight through them and out into the controls
+// they are covering. This fixture reproduces exactly that: one focusable
+// control ahead of the sheet in the chain and one behind it.
+std::unique_ptr<QQuickView> TstServerProfiles::loadFocusHarness(const QString& sheetPath,
+                                                                const QString& harnessName,
+                                                                QObject* app)
+{
+    const QString document =
+        QStringLiteral("import QtQuick\n"
+                       "import QtQuick.Controls.Basic\n"
+                       "\n"
+                       "Item {\n"
+                       "    width: 900\n"
+                       "    height: 620\n"
+                       "    Button {\n"
+                       "        objectName: \"decoyBefore\"\n"
+                       "        text: \"workspace, before\"\n"
+                       "        focusPolicy: Qt.StrongFocus\n"
+                       "        width: 150\n"
+                       "        height: 24\n"
+                       "    }\n"
+                       "    Loader {\n"
+                       "        objectName: \"sheetLoader\"\n"
+                       "        anchors.fill: parent\n"
+                       "        asynchronous: false\n"
+                       "        z: 900\n"
+                       "        source: \"%1\"\n"
+                       "    }\n"
+                       "    Button {\n"
+                       "        objectName: \"decoyAfter\"\n"
+                       "        text: \"workspace, after\"\n"
+                       "        focusPolicy: Qt.StrongFocus\n"
+                       "        y: 30\n"
+                       "        width: 150\n"
+                       "        height: 24\n"
+                       "    }\n"
+                       "}\n")
+            .arg(QUrl::fromLocalFile(sheetPath).toString());
+
+    const QString path = m_dir.filePath(harnessName);
+    QFile file(path);
+    if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+        qWarning("QML fixture: focus harness could not be written");
+        return nullptr;
+    }
+    file.write(document.toUtf8());
+    file.close();
+    return loadQml(path, app);
 }
 
 #define CH_LOAD_SETTINGS(view, root, app)                                                          \
@@ -2223,5 +2383,358 @@ void TstServerProfiles::coldStartAddsAServerThenFindsItAgainAfterRelaunch()
     CH_ASSERT_SILENT();
 }
 
+// ---------------------------------------------------------------------------
+// Accessibility
+// ---------------------------------------------------------------------------
+
+// A surface that fills the window, takes the keyboard and disables everything
+// behind it is a dialog whatever its QML type is. Without a role and a name,
+// the only thing assistive technology can say about a connection sheet — or
+// about a blocking host-key decision that appeared over it — is "rectangle".
+void TstServerProfiles::everySheetAndPromptIdentifiesItselfAsADialog()
+{
+    CH_LOAD_CONNECT(view, root);
+
+    QCOMPARE(attachedRole(root), static_cast<int>(QAccessible::Dialog));
+    QVERIFY(!attachedName(root).isEmpty());
+
+    QObject* const hostKeyPanel = root->findChild<QObject*>(QStringLiteral("hostKeyPanel"));
+    QObject* const credentialPanel =
+        root->findChild<QObject*>(QStringLiteral("credentialPanel"));
+    QVERIFY(hostKeyPanel && credentialPanel);
+
+    root->setProperty("pendingHostKey",
+                      QVariantMap{{QStringLiteral("host"), QStringLiteral("box.local")},
+                                  {QStringLiteral("keyType"), QStringLiteral("ssh-ed25519")},
+                                  {QStringLiteral("fingerprint"), QStringLiteral("SHA256:zz")}});
+    QVERIFY(hostKeyPanel->property("visible").toBool());
+    QCOMPARE(attachedRole(hostKeyPanel), static_cast<int>(QAccessible::Dialog));
+    // The name is the panel's own heading, not a second copy of it.
+    QCOMPARE(attachedName(hostKeyPanel), QStringLiteral("Unknown host key"));
+    root->setProperty("pendingHostKey", QVariant::fromValue(nullptr));
+
+    root->setProperty("pendingCredential",
+                      QVariantMap{{QStringLiteral("user"), QStringLiteral("yichen")},
+                                  {QStringLiteral("host"), QStringLiteral("box.local")},
+                                  {QStringLiteral("kind"), QStringLiteral("password")}});
+    QVERIFY(credentialPanel->property("visible").toBool());
+    QCOMPARE(attachedRole(credentialPanel), static_cast<int>(QAccessible::Dialog));
+    QCOMPARE(attachedName(credentialPanel), QStringLiteral("Password required"));
+
+    // The masked field keeps its spoken name AND now has a visible label
+    // carrying the same words, so the label does not vanish with the
+    // placeholder at the first keystroke.
+    QObject* const secret = root->findChild<QObject*>(QStringLiteral("credentialField"));
+    QObject* const secretLabel =
+        root->findChild<QObject*>(QStringLiteral("credentialFieldLabel"));
+    QVERIFY(secret && secretLabel);
+    QCOMPARE(attachedName(secret), QStringLiteral("Password"));
+    QCOMPARE(stringOf(secretLabel, "text"), attachedName(secret));
+    QVERIFY(secretLabel->property("visible").toBool());
+    root->setProperty("pendingCredential", QVariant::fromValue(nullptr));
+
+    // The status chip is the only place the meaning of a connection state is
+    // written down, and it used to be a hover-only tooltip.
+    QObject* const chip = root->findChild<QObject*>(QStringLiteral("statusChip"));
+    QVERIFY(chip);
+    root->setProperty("connectionState", QStringLiteral("provisioning"));
+    QCOMPARE(attachedName(chip), QStringLiteral("provisioning"));
+    QVERIFY(attached(chip, QStringLiteral("Accessible.description"))
+                .toString()
+                .contains(QStringLiteral("Installing the CodeHarbor service")));
+    QVERIFY(chip->property("activeFocusOnTab").toBool());
+    CH_ASSERT_SILENT();
+
+    ServerProfiles store(iniPath(QStringLiteral("a11y-settings-dialog.ini")));
+    CH_LOAD_SETTINGS(settingsView, settingsRoot, store);
+    QCOMPARE(attachedRole(settingsRoot), static_cast<int>(QAccessible::Dialog));
+    QCOMPARE(attachedName(settingsRoot), QStringLiteral("Settings"));
+    CH_ASSERT_SILENT();
+}
+
+// A ComboBox announces its current value and a SpinBox its number; the Label
+// that says what the value is FOR is a separate item, so without a name each of
+// these is read out as a bare word with no subject.
+void TstServerProfiles::appearanceControlsCarryTheirVisibleLabel()
+{
+    ServerProfiles store(iniPath(QStringLiteral("a11y-appearance.ini")));
+    CH_LOAD_SETTINGS(view, root, store);
+    QVERIFY(showSettingsPane(root, QStringLiteral("appearance")));
+
+    const QList<QPair<QString, QString>> named = {
+        {QStringLiteral("themeChoice"), QStringLiteral("Theme")},
+        {QStringLiteral("groupPaletteChoice"), QStringLiteral("Group colour palette")},
+        {QStringLiteral("groupPaletteSizeSpin"), QStringLiteral("Palette size")},
+        {QStringLiteral("terminalFontSizeSpin"), QStringLiteral("Terminal text size")},
+        {QStringLiteral("terminalPixelRatioChoice"),
+         QStringLiteral("Terminal rendering resolution")}};
+    for (const auto& entry : named) {
+        QObject* const control = findByName(root, entry.first);
+        QVERIFY2(control, qPrintable(entry.first));
+        QCOMPARE(attachedName(control), entry.second);
+    }
+
+    // One Up and one Down per row: the word alone names nothing, so the row's
+    // own subject has to be in the name.
+    root->setProperty("toolbarItems",
+                      QStringList{QStringLiteral("nav.back"), QStringLiteral("nav.forward")});
+    QObject* up = nullptr;
+    QObject* down = nullptr;
+    QTRY_VERIFY((up = findByName(root, QStringLiteral("toolbarUp:nav.forward"))) != nullptr);
+    QTRY_VERIFY((down = findByName(root, QStringLiteral("toolbarDown:nav.back"))) != nullptr);
+    QCOMPARE(attachedName(up), QStringLiteral("Move Forward up"));
+    QCOMPARE(attachedName(down), QStringLiteral("Move Back down"));
+    CH_ASSERT_SILENT();
+}
+
+void TstServerProfiles::viewerDefaultControlsAreLabelledAndRowActionsSayWhichRow()
+{
+    ServerProfiles store(iniPath(QStringLiteral("a11y-viewers.ini")));
+    CH_LOAD_SETTINGS(view, root, store);
+    QVERIFY(showSettingsPane(root, QStringLiteral("viewerDefaults")));
+
+    QObject* const extension = findByName(root, QStringLiteral("viewerDefaultExtensionInput"));
+    QObject* const kind = findByName(root, QStringLiteral("viewerDefaultKindChoice"));
+    QVERIFY(extension && kind);
+    // Both names have to be real words on screen, not placeholder text that
+    // disappears and not nothing at all.
+    QCOMPARE(attachedName(extension), QStringLiteral("File extension"));
+    QCOMPARE(attachedName(kind), QStringLiteral("Viewer"));
+
+    // The warning about an unusable extension is announced, not merely drawn.
+    QObject* const hint = findByName(root, QStringLiteral("viewerExtensionHint"));
+    QVERIFY(hint);
+    QVERIFY(!hint->property("visible").toBool());
+    extension->setProperty("text", QStringLiteral("not a real extension"));
+    QTRY_VERIFY(hint->property("visible").toBool());
+    QCOMPARE(attachedRole(hint), static_cast<int>(QAccessible::AlertMessage));
+    QCOMPARE(attachedName(hint), stringOf(hint, "text"));
+    QVERIFY(!attachedName(hint).isEmpty());
+    extension->setProperty("text", QString());
+
+    // One Remove per row, all reading "Remove".
+    root->setProperty(
+        "viewerDefaultEntries",
+        QVariantList{QVariantMap{{QStringLiteral("extension"), QStringLiteral("md")},
+                                 {QStringLiteral("kind"), QStringLiteral("markdown")}}});
+    QObject* remove = nullptr;
+    QTRY_VERIFY((remove = findByName(root, QStringLiteral("viewerDefaultRemove:md"))) != nullptr);
+    QCOMPARE(attachedName(remove), QStringLiteral("Remove the default viewer for .md"));
+    CH_ASSERT_SILENT();
+}
+
+// An error that is only painted is an error the person who caused it never
+// hears about: the profile editor saves nothing while a field is invalid, and
+// the connection banner is the only account of a failed attempt.
+void TstServerProfiles::validationErrorsAndTheErrorBannerAreAlerts()
+{
+    ServerProfiles store(iniPath(QStringLiteral("a11y-validation.ini")));
+    const QString id = store.addProfile(
+        profileFields(QStringLiteral("Alpha"), QStringLiteral("alpha.example"), 22,
+                      QStringLiteral("ua")));
+    QVERIFY(!id.isEmpty());
+    TestApp app(&store);
+    const std::unique_ptr<QQuickView> view = loadSettings(&app);
+    QVERIFY(view != nullptr);
+    QQuickItem* const root = view->rootObject();
+    QVERIFY(root != nullptr);
+
+    QObject* const hint = findByName(root, QStringLiteral("serverValidationHint"));
+    QVERIFY(hint);
+    QTRY_COMPARE(root->property("selectedProfileId").toString(), id);
+    QVERIFY(!hint->property("visible").toBool());
+    root->setProperty("profilePort", QStringLiteral("70000"));
+    QTRY_VERIFY(hint->property("visible").toBool());
+    QCOMPARE(attachedRole(hint), static_cast<int>(QAccessible::AlertMessage));
+    QCOMPARE(attachedName(hint), stringOf(hint, "text"));
+    QVERIFY(!attachedName(hint).isEmpty());
+    CH_ASSERT_SILENT();
+
+    CH_LOAD_CONNECT(sheetView, sheetRoot);
+    QObject* const banner = sheetRoot->findChild<QObject*>(QStringLiteral("errorBanner"));
+    QVERIFY(banner);
+    QVERIFY(!banner->property("visible").toBool());
+    const QString failure =
+        QStringLiteral("box.local:22 refused the connection: no route to host");
+    sheetRoot->setProperty("errorText", failure);
+    QVERIFY(banner->property("visible").toBool());
+    QCOMPARE(attachedRole(banner), static_cast<int>(QAccessible::AlertMessage));
+    QCOMPARE(attachedName(banner), failure);
+    CH_ASSERT_SILENT();
+}
+
+// Main.qml anchors this sheet over the three workspace regions (Main.qml:555)
+// and the MouseArea shield stops clicks reaching them — but Tab is not a click.
+// The focus chain used to run straight out of the sheet into controls the user
+// cannot see, acting on a session they are not looking at.
+void TstServerProfiles::tabbingCannotLeaveTheConnectSheetOrItsPrompts()
+{
+    const std::unique_ptr<QQuickView> view = loadFocusHarness(
+        QStringLiteral(CH_CONNECTSHEET_QML), QStringLiteral("focus-connect.qml"));
+    QVERIFY(view != nullptr);
+    QQuickItem* const harness = view->rootObject();
+    QVERIFY(harness != nullptr);
+    QQuickItem* const sheet = harnessSheet(harness);
+    QQuickItem* const before = harness->findChild<QQuickItem*>(QStringLiteral("decoyBefore"));
+    QQuickItem* const after = harness->findChild<QQuickItem*>(QStringLiteral("decoyAfter"));
+    QVERIFY(sheet && before && after);
+
+    sheet->setProperty("profiles", oneProfile());
+    QTRY_VERIFY(findByName(sheet, QStringLiteral("profileRow0")) != nullptr);
+
+    // The containment is not vacuous: both workspace stand-ins really are tab
+    // stops, and Qt's own chain crosses from one of them into the sheet, which
+    // is the crossing that used to happen in the other direction too.
+    QVERIFY(before->activeFocusOnTab());
+    QVERIFY(after->activeFocusOnTab());
+    QVERIFY(sheet->isAncestorOf(before->nextItemInFocusChain(true)));
+
+    QQuickItem* const list = sheet->findChild<QQuickItem*>(QStringLiteral("profileList"));
+    QVERIFY(list != nullptr);
+    list->forceActiveFocus();
+    QVERIFY(list->hasActiveFocus());
+
+    // More presses than the sheet has controls, so the chain is walked round
+    // several times and every wrap is checked, not just the first.
+    QString escaped;
+    QVERIFY2(tabStaysInside(view.get(), sheet, 24, true, &escaped),
+             qPrintable(QStringLiteral("Tab left the connect sheet and landed on \"%1\"")
+                            .arg(escaped)));
+    QVERIFY2(tabStaysInside(view.get(), sheet, 24, false, &escaped),
+             qPrintable(QStringLiteral("Shift+Tab left the connect sheet and landed on \"%1\"")
+                            .arg(escaped)));
+
+    // While a prompt is up the boundary is the PROMPT. Containing only the
+    // sheet would leave Tab free to wander the body the prompt is blocking,
+    // which solves nothing.
+    QQuickItem* const hostKeyPanel =
+        sheet->findChild<QQuickItem*>(QStringLiteral("hostKeyPanel"));
+    QVERIFY(hostKeyPanel != nullptr);
+    sheet->setProperty("pendingHostKey",
+                       QVariantMap{{QStringLiteral("host"), QStringLiteral("box.local")},
+                                   {QStringLiteral("keyType"), QStringLiteral("ssh-ed25519")},
+                                   {QStringLiteral("fingerprint"), QStringLiteral("SHA256:zz")}});
+    QTRY_VERIFY(view->activeFocusItem() != nullptr
+                && hostKeyPanel->isAncestorOf(view->activeFocusItem()));
+    QVERIFY2(tabStaysInside(view.get(), hostKeyPanel, 12, true, &escaped),
+             qPrintable(QStringLiteral("Tab left the host-key prompt and landed on \"%1\"")
+                            .arg(escaped)));
+    QVERIFY2(tabStaysInside(view.get(), hostKeyPanel, 12, false, &escaped),
+             qPrintable(QStringLiteral("Shift+Tab left the host-key prompt and landed on \"%1\"")
+                            .arg(escaped)));
+    sheet->setProperty("pendingHostKey", QVariant::fromValue(nullptr));
+
+    QQuickItem* const credentialPanel =
+        sheet->findChild<QQuickItem*>(QStringLiteral("credentialPanel"));
+    QVERIFY(credentialPanel != nullptr);
+    sheet->setProperty("pendingCredential",
+                       QVariantMap{{QStringLiteral("user"), QStringLiteral("yichen")},
+                                   {QStringLiteral("host"), QStringLiteral("box.local")},
+                                   {QStringLiteral("kind"), QStringLiteral("password")}});
+    QTRY_VERIFY(view->activeFocusItem() != nullptr
+                && credentialPanel->isAncestorOf(view->activeFocusItem()));
+    QVERIFY2(tabStaysInside(view.get(), credentialPanel, 12, true, &escaped),
+             qPrintable(QStringLiteral("Tab left the credential prompt and landed on \"%1\"")
+                            .arg(escaped)));
+    QVERIFY2(tabStaysInside(view.get(), credentialPanel, 12, false, &escaped),
+             qPrintable(QStringLiteral("Shift+Tab left the credential prompt and landed on \"%1\"")
+                            .arg(escaped)));
+    sheet->setProperty("pendingCredential", QVariant::fromValue(nullptr));
+
+    // Containment corrects focus that leaves the sheet, so it must recognise
+    // the one case where leaving is correct: the SSH details view is a modal
+    // AppDialog drawn into the window's overlay, not a child of this sheet.
+    QObject* const diagnostics =
+        sheet->findChild<QObject*>(QStringLiteral("sshDiagnosticsDialog"));
+    QVERIFY(diagnostics != nullptr);
+    sheet->setProperty("diagnosticText", QStringLiteral("libssh trace"));
+    QMetaObject::invokeMethod(diagnostics, "open");
+    QTRY_VERIFY(diagnostics->property("visible").toBool());
+    QQuickItem* const inDialog = view->activeFocusItem();
+    if (inDialog && !sheet->isAncestorOf(inDialog)) {
+        // It took the keyboard; it must still have it once every queued focus
+        // notification has been answered.
+        QTest::qWait(50);
+        QCOMPARE(view->activeFocusItem(), inDialog);
+    }
+    QMetaObject::invokeMethod(diagnostics, "close");
+    QTRY_VERIFY(!diagnostics->property("visible").toBool());
+    CH_ASSERT_SILENT();
+}
+
+// Despite its name SettingsWindow is not a Window: Main.qml:626 anchors it over
+// the same three regions as an ordinary item, so the window boundary provides
+// nothing and it needs exactly the treatment the connect sheet needs.
+void TstServerProfiles::tabbingCannotLeaveTheSettingsSheet()
+{
+    ServerProfiles store(iniPath(QStringLiteral("focus-settings.ini")));
+    QVERIFY(!store
+                 .addProfile(profileFields(QStringLiteral("Alpha"),
+                                           QStringLiteral("alpha.example"), 22,
+                                           QStringLiteral("ua")))
+                 .isEmpty());
+    TestApp app(&store);
+    const std::unique_ptr<QQuickView> view =
+        loadFocusHarness(QStringLiteral(CH_SETTINGSWINDOW_QML),
+                         QStringLiteral("focus-settings.qml"), &app);
+    QVERIFY(view != nullptr);
+    QQuickItem* const harness = view->rootObject();
+    QVERIFY(harness != nullptr);
+    QQuickItem* const sheet = harnessSheet(harness);
+    QQuickItem* const before = harness->findChild<QQuickItem*>(QStringLiteral("decoyBefore"));
+    QVERIFY(sheet && before);
+
+    QObject* const paneLoader =
+        sheet->findChild<QObject*>(QStringLiteral("settingsGroupLoader"));
+    QVERIFY(paneLoader != nullptr);
+    paneLoader->setProperty("asynchronous", false);
+    QVERIFY(showSettingsPane(sheet, QStringLiteral("appearance")));
+
+    QVERIFY(before->activeFocusOnTab());
+    QVERIFY(sheet->isAncestorOf(before->nextItemInFocusChain(true)));
+
+    sheet->forceActiveFocus();
+    QString escaped;
+    QVERIFY2(tabStaysInside(view.get(), sheet, 30, true, &escaped),
+             qPrintable(QStringLiteral("Tab left the settings sheet and landed on \"%1\"")
+                            .arg(escaped)));
+    QVERIFY2(tabStaysInside(view.get(), sheet, 30, false, &escaped),
+             qPrintable(QStringLiteral("Shift+Tab left the settings sheet and landed on \"%1\"")
+                            .arg(escaped)));
+    CH_ASSERT_SILENT();
+}
+
+// Closing a sheet has to give the keyboard back to whoever had it. Dropping
+// focus at the window root leaves the next Tab starting from nowhere, which for
+// a keyboard-only user is the same as losing their place.
+void TstServerProfiles::closingASheetHandsTheKeyboardBack()
+{
+    const std::unique_ptr<QQuickView> view = loadFocusHarness(
+        QStringLiteral(CH_CONNECTSHEET_QML), QStringLiteral("focus-return.qml"));
+    QVERIFY(view != nullptr);
+    QQuickItem* const harness = view->rootObject();
+    QVERIFY(harness != nullptr);
+    QQuickItem* const sheet = harnessSheet(harness);
+    QQuickItem* const before = harness->findChild<QQuickItem*>(QStringLiteral("decoyBefore"));
+    QVERIFY(sheet && before);
+    sheet->setProperty("profiles", oneProfile());
+
+    // Put the sheet down first, so opening it is a real transition from a
+    // workspace the user was already working in.
+    sheet->setProperty("visible", false);
+    before->forceActiveFocus();
+    QTRY_VERIFY(before->hasActiveFocus());
+
+    sheet->setProperty("visible", true);
+    QTRY_VERIFY(view->activeFocusItem() != nullptr
+                && sheet->isAncestorOf(view->activeFocusItem()));
+
+    sheet->setProperty("visible", false);
+    QTRY_VERIFY2(before->hasActiveFocus(),
+                 "closing the sheet did not give the keyboard back to the control that had it");
+    CH_ASSERT_SILENT();
+}
+
 QTEST_MAIN(TstServerProfiles)
 #include "tst_serverprofiles.moc"
+

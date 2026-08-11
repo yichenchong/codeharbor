@@ -10,9 +10,9 @@
 //
 // The right button is therefore never reported: index.ts swallows it in the
 // capture phase, and this menu takes its place. It is ordinary DOM, so a moving
-// pointer cannot disturb it, and it closes on exactly the three actions a
-// desktop menu closes on: choosing an item, pressing Escape, and pressing a
-// mouse button somewhere else.
+// pointer cannot disturb it, and it closes on exactly the ways a desktop menu
+// closes: choosing an item, pressing Escape, pressing a mouse button somewhere
+// else, and focus leaving it (a Tab out of the menu, or the window losing it).
 
 /** The commands the menu can run. Values double as `data-action` attributes. */
 export type TerminalMenuAction = "copy" | "paste" | "select-all";
@@ -79,6 +79,36 @@ export function clampMenuOrigin(point: Point, size: Size, bounds: Size): Point {
     return { x, y };
 }
 
+/**
+ * Where the arrow keys move inside an open menu. `current` is the index of the
+ * focused item, or -1 when focus is on the menu itself rather than on an item;
+ * `count` counts only the items a user can actually focus (a disabled item is
+ * skipped, which is why this works on a pre-filtered list rather than on the
+ * whole menu). Both ends wrap, the way a desktop menu does. Returns null for a
+ * key this menu does not claim, so the caller leaves it to the terminal.
+ */
+export function menuFocusTarget(
+    key: string,
+    current: number,
+    count: number,
+): number | null {
+    if (count === 0) {
+        return null;
+    }
+    switch (key) {
+        case "ArrowDown":
+            return current < 0 ? 0 : (current + 1) % count;
+        case "ArrowUp":
+            return current < 0 ? count - 1 : (current - 1 + count) % count;
+        case "Home":
+            return 0;
+        case "End":
+            return count - 1;
+        default:
+            return null;
+    }
+}
+
 /** What the menu needs from the terminal it belongs to. */
 export interface TerminalMenuHost {
     /** Whether the page currently holds a selection (`Terminal.hasSelection`). */
@@ -130,6 +160,25 @@ export class TerminalContextMenu {
         const root = this._document.createElement("div");
         root.className = "ch-terminal-menu";
         root.setAttribute("role", "menu");
+        // A role=menu with no name is announced as an anonymous menu, which is
+        // no help at all in a window that has several. The name says which
+        // menu this is, not what it can do — the items do that.
+        root.setAttribute("aria-label", "Terminal actions");
+        // The menu closes as soon as focus leaves it, the way a desktop menu
+        // does: a Tab out of the last item, or the window being deactivated,
+        // must not leave a floating menu behind over the terminal. Focus is
+        // NOT pulled back to the terminal here — the user is deliberately
+        // moving it somewhere else, and yanking it back would trap them.
+        root.addEventListener("focusout", (event) => {
+            if (this._root !== root) {
+                return;
+            }
+            const next = (event as FocusEvent).relatedTarget;
+            if (next instanceof Node && root.contains(next)) {
+                return;
+            }
+            this.close(false);
+        });
         for (const item of terminalMenuItems(this._host.hasSelection())) {
             const button = this._document.createElement("button");
             button.className = "ch-terminal-menu-item";
@@ -137,6 +186,10 @@ export class TerminalContextMenu {
             button.dataset.action = item.action;
             button.textContent = item.label;
             button.setAttribute("role", "menuitem");
+            // Roving tabindex: the menu is one stop, and the arrow keys move
+            // within it (see _onDocumentKeyDown). Tab therefore leaves the menu
+            // rather than walking its items, which is what closes it.
+            button.tabIndex = -1;
             if (!item.enabled) {
                 button.disabled = true;
             }
@@ -180,14 +233,20 @@ export class TerminalContextMenu {
         first?.focus();
     }
 
-    close(): void {
+    /**
+     * Close the menu. `restoreFocus` hands focus back to the terminal, which is
+     * right for every way the user finishes WITH the menu — running an item,
+     * Escape, a press elsewhere — and wrong when the menu is closing precisely
+     * because focus has already moved somewhere the user chose.
+     */
+    close(restoreFocus = true): void {
         const root = this._root;
         if (!root) {
             return;
         }
         this._root = null;
         root.remove();
-        if (!this._disposed) {
+        if (restoreFocus && !this._disposed) {
             this._host.focusTerminal();
         }
     }
@@ -215,13 +274,35 @@ export class TerminalContextMenu {
     };
 
     private readonly _onDocumentKeyDown = (event: KeyboardEvent): void => {
-        if (!this._root || event.key !== "Escape") {
+        const root = this._root;
+        if (!root) {
             return;
         }
-        // Swallowed: with the menu open, Escape belongs to the menu. Left alone
-        // it would also reach xterm.js and go to the remote shell as ESC.
+        if (event.key === "Escape") {
+            // Swallowed: with the menu open, Escape belongs to the menu. Left
+            // alone it would also reach xterm.js and go to the remote shell as
+            // ESC.
+            event.preventDefault();
+            event.stopPropagation();
+            this.close();
+            return;
+        }
+        const items = [...root.querySelectorAll<HTMLButtonElement>(
+            ".ch-terminal-menu-item:not([disabled])",
+        )];
+        const target = menuFocusTarget(
+            event.key,
+            items.indexOf(this._document.activeElement as HTMLButtonElement),
+            items.length,
+        );
+        if (target === null) {
+            return;
+        }
+        // Same reason as Escape: an arrow key that reached xterm.js would be
+        // sent to the remote shell as a cursor key while the user was only
+        // moving through this menu.
         event.preventDefault();
         event.stopPropagation();
-        this.close();
+        items[target].focus();
     };
 }

@@ -228,6 +228,7 @@ Rectangle {
         }
 
         Label {
+            id: sessionText
             objectName: "sessionLabel"
             visible: bar.sessionLabel.length > 0
             text: bar.sessionLabel
@@ -243,6 +244,22 @@ Rectangle {
                             Math.max(0, titleRow.width - titleLabel.width
                                      - titleRow.spacing * 2 - 1))
             verticalAlignment: Text.AlignVCenter
+
+            // Eliding cuts the FRONT off a session name, which is exactly the
+            // part that distinguishes ~/src/codeharbor-old from
+            // ~/src/codeharbor. Said explicitly rather than left to the
+            // implicit name a Text sets for itself, and repeated in a hint so
+            // that a sighted user with no screen reader can read it too.
+            Accessible.name: bar.sessionLabel
+
+            HoverHandler {
+                id: sessionHover
+            }
+
+            AppToolTip {
+                text: bar.sessionLabel
+                visible: sessionHover.hovered && sessionText.truncated
+            }
         }
     }
 }

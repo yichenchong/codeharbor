@@ -52,7 +52,7 @@ const defaultThemeRoles: Record<ThemeRoleName, string> = {
     border: "#45475a",
     borderSubtle: "#313244",
     text: "#cdd6f4",
-    textDim: "#6c7086",
+    textDim: "#949ab3",
     textFaint: "#45475a",
     textOnAccent: "#11111b",
     accent: "#89b4fa",

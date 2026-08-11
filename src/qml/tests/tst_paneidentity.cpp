@@ -667,6 +667,19 @@ private slots:
     // INSIDE the live web page, not on the pane's chrome.
     void aClickInsideTheLivePageReportsFocusAndStillReachesThePage();
 
+    // THE KEYBOARD MUST BE ABLE TO LEAVE. Both pane types push focus into an
+    // embedded Chromium page — xterm's textarea, Monaco's input area — and both
+    // pages answer every key themselves, Tab and Escape included. Without an
+    // application-defined way out, a keyboard user who enters a pane can never
+    // leave it: that is a keyboard trap, and no amount of correct labelling
+    // elsewhere makes up for one.
+    void theEscapeKeyTakesTheKeyboardOutOfTheTerminalPage();
+    // ...and the other half of "which pane am I in": arriving by keyboard has
+    // to make a pane the active one, exactly as clicking it does. Otherwise a
+    // keyboard user can be typing in one pane while every split and close
+    // command lands on another.
+    void keyboardFocusEnteringAPaneMakesItTheActivePane();
+
     // CONTENT (SPEC 4.5). Geometry alone is not a restored Dev Session: the
     // region has to tell the host WHAT each pane has open, or reopening a
     // session brings back the right split with a set of blank panes in it.
@@ -694,6 +707,10 @@ private slots:
     void reloadRefreshesNonWebContent();
     void reloadKeepsTheEditorHandlerAlive();
     void homeUsesTheActiveSessionRootAndDisablesWithoutOne();
+    // The field's VALUE is a path that changes with every navigation, so
+    // without a name of its own a screen reader announces the address and never
+    // what the control is FOR.
+    void theAddressFieldSaysWhatItIsFor();
 
     // OUTSIDE THE REPOSITORY ROOT (SPEC 9). A path outside the Dev Session's
     // repository root is allowed and stays openable, but the pane has to SAY
@@ -847,6 +864,10 @@ private:
     // Wait until the pane's page has loaded; false means Chromium never got
     // there (a machine property — callers QSKIP rather than fail).
     bool waitForPage(QObject *paneItem, const QString &readyProbe, const QString &needle);
+    // The pane's embedded WebEngineView, found the same structural way the
+    // harness finds one to run script in. Null means Chromium produced no view
+    // at all, which is a machine property — callers QSKIP rather than fail.
+    QObject *webViewIn(QObject *paneItem);
     // Click the middle of a pane, the way a user selects it.
     void clickPane(QObject *paneObject);
     // Put `text` in the viewer pane's address field and press Enter on it, the
@@ -984,6 +1005,16 @@ bool TstPaneIdentity::waitForPage(QObject *paneItem, const QString &readyProbe,
         QTest::qWait(200);
     }
     return false;
+}
+
+QObject *TstPaneIdentity::webViewIn(QObject *paneItem)
+{
+    QVariant view;
+    if (!paneItem
+        || !QMetaObject::invokeMethod(m_shell.get(), "findView", Q_RETURN_ARG(QVariant, view),
+                                      Q_ARG(QVariant, QVariant::fromValue(paneItem))))
+        return nullptr;
+    return asObject(view);
 }
 
 // ---------------------------------------------------------------------------
@@ -1487,6 +1518,87 @@ void TstPaneIdentity::aClickInsideTheLivePageReportsFocusAndStillReachesThePage(
                        QStringLiteral("true"), kProbeTimeoutMs),
              "the focus sniffer SWALLOWED the click: the region learned which pane the user is "
              "in, but the terminal page never saw the press");
+}
+
+// ---------------------------------------------------------------------------
+// (8) THE KEYBOARD TRAP. Focus is pushed into the xterm page on purpose — that
+// is what makes a terminal pane typeable — and the page then answers every key
+// itself bar one copy shortcut, so Tab, Shift+Tab and Escape all travel to the
+// remote shell. A user who reaches this pane with the keyboard and cannot leave
+// it with the keyboard has lost the window: no split command, no close command,
+// no other pane, no sidebar. Ctrl+Shift+F6 is the way out, and it has to be
+// matched BEFORE the page is offered the key or it is no way out at all.
+//
+// The assertion is deliberately about the WebEngineView's own activeFocus and
+// not about anything the pane merely reports: the whole defect was a pane that
+// believed its bookkeeping while Chromium held the keyboard.
+// ---------------------------------------------------------------------------
+void TstPaneIdentity::theEscapeKeyTakesTheKeyboardOutOfTheTerminalPage()
+{
+    QVERIFY(openRegion(QStringLiteral("TerminalRegion.qml"), leafNode(QStringLiteral("terminal-1")),
+                       /*terminal=*/true));
+    const auto panes = [this] { return collect(m_region, isLeafPane); };
+    QTRY_VERIFY(panes().size() == 1);
+    QTest::qWait(kSettleMs);
+    QObject *const pane = panes().constFirst();
+
+    auto *const view = qobject_cast<QQuickItem *>(webViewIn(pane));
+    if (!view)
+        QSKIP("the terminal pane produced no WebEngineView; Chromium cannot run under this recipe");
+
+    auto *window = qobject_cast<QQuickWindow *>(m_shell.get());
+    QVERIFY2(window != nullptr, "the test shell is not a window");
+
+    // The trap, set. Focus is placed on the embedded view directly rather than
+    // by clicking, because the click path is already covered above and this
+    // test is about getting back OUT of a page that has the keyboard however it
+    // came by it.
+    view->forceActiveFocus();
+    QTRY_VERIFY2(view->hasActiveFocus(),
+                 "the embedded page never took the keyboard, so there is no trap to escape");
+
+    QTest::keyClick(window, Qt::Key_F6, Qt::ControlModifier | Qt::ShiftModifier);
+
+    QTRY_VERIFY2(!view->hasActiveFocus(),
+                 "Ctrl+Shift+F6 left the keyboard inside the terminal page: the pane is a "
+                 "keyboard trap, because the page answers every other key itself and there is "
+                 "no other way back to the pane's chrome");
+    auto *const paneItem = qobject_cast<QQuickItem *>(pane);
+    QVERIFY2(paneItem && paneItem->hasActiveFocus(),
+             "the keyboard left the page and landed nowhere, which is a different way of "
+             "losing it");
+}
+
+// Arriving by keyboard says "I am working here" exactly as a click does. Until
+// this, activation came only from the pane's MouseArea, so a keyboard user
+// could be typing in one pane while the header's active mark — and every split
+// and close command — pointed at whichever pane was last clicked.
+void TstPaneIdentity::keyboardFocusEnteringAPaneMakesItTheActivePane()
+{
+    QVERIFY(openRegion(QStringLiteral("ViewerRegion.qml"),
+                       branchNode(QStringLiteral("horizontal"),
+                                  QVariantList{leafNode(QStringLiteral("viewer-1")),
+                                               leafNode(QStringLiteral("viewer-2"))}),
+                       /*terminal=*/false));
+    const auto panes = [this] { return collect(m_region, isLeafPane); };
+    QTRY_VERIFY(panes().size() == 2);
+    QTest::qWait(kSettleMs);
+
+    clickPane(paneWithId(m_region, QStringLiteral("viewer-1")));
+    QTRY_COMPARE(m_region->property("focusedPaneId").toString(), QStringLiteral("viewer-1"));
+
+    // No pointer anywhere near the second pane: the keyboard lands in a control
+    // inside it, which is all a Tab from the first pane's last control does.
+    auto *const field = qobject_cast<QQuickItem *>(
+        childNamed(paneWithId(m_region, QStringLiteral("viewer-2")),
+                   QStringLiteral("viewerAddressField")));
+    QVERIFY2(field != nullptr, "the second viewer pane has no address field to tab into");
+    field->forceActiveFocus();
+    QTRY_VERIFY(field->hasActiveFocus());
+
+    QTRY_VERIFY2(m_region->property("focusedPaneId").toString() == QLatin1String("viewer-2"),
+                 "keyboard focus entered the second pane and the region still names the first: "
+                 "a split or close command would act on a pane the user has left");
 }
 
 // ---------------------------------------------------------------------------
@@ -2013,6 +2125,38 @@ void TstPaneIdentity::homeUsesTheActiveSessionRootAndDisablesWithoutOne()
     QTRY_COMPARE(pane->property("url").toUrl(), QUrl());
     QCOMPARE(pane->property("effectiveUrl").toUrl(),
              QUrl(QStringLiteral("file:///srv/repos/other/")));
+}
+
+// The address field's VALUE is the path the pane is showing, and it changes
+// with every navigation. A screen reader given only that announces a path and
+// never says what the control is — so the field needs a NAME, fixed, and one
+// that is not simply the address read out twice.
+void TstPaneIdentity::theAddressFieldSaysWhatItIsFor()
+{
+    QVERIFY(openRegion(QStringLiteral("ViewerRegion.qml"),
+                       leafNode(QStringLiteral("viewer-1"),
+                                QStringLiteral("file:///srv/repos/app/README.md")),
+                       /*terminal=*/false));
+    const auto panes = [this] { return collect(m_region, isLeafPane); };
+    QTRY_VERIFY(panes().size() == 1);
+    QTest::qWait(kSettleMs);
+
+    QObject *const field =
+        childNamed(panes().constFirst(), QStringLiteral("viewerAddressField"));
+    QVERIFY2(field != nullptr, "the viewer pane has no address field");
+
+    const QString name = accessibleNameOf(field);
+    QVERIFY2(!name.isEmpty(),
+             "the address field has no accessible name, so it announces the path it happens to "
+             "hold and never says what it is for");
+    QVERIFY2(name != field->property("text").toString(),
+             "the address field's accessible name is just its current value, which is the same "
+             "as having no name at all");
+    // The placeholder is not a name: it disappears the moment the field holds
+    // anything, which is almost always.
+    QVERIFY2(name != field->property("placeholderText").toString(),
+             "the address field is named by its placeholder, which is gone whenever the pane "
+             "has something open");
 }
 
 

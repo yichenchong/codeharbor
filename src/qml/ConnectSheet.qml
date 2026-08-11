@@ -5,6 +5,7 @@ pragma ComponentBehavior: Bound
 
 import QtQuick
 import QtQuick.Controls.Basic
+import QtQuick.Window
 import CodeHarbor
 
 // Server connection sheet (SPEC 4.1, 12.1): the one piece of UI that lets a
@@ -66,6 +67,14 @@ Rectangle {
     property string selectedId: ""
     // The last explicit choice survives asynchronous model replacement.
     property string pendingSelectionId: ""
+    // What held the keyboard before this sheet covered the workspace, so
+    // closing it puts the user back where they were rather than dropping focus
+    // at the window root. Maintained by containKeyboard() below.
+    property var focusReturnItem: null
+    // The last item inside the boundary that held the keyboard. It is what says
+    // which DIRECTION an escape was travelling in, and it is where focus goes
+    // if the chain cannot be re-entered at all.
+    property var lastInsideFocus: null
 
     // A host-key or credential prompt is up, so the connection this sheet is
     // about is parked on that one answer.
@@ -95,6 +104,13 @@ Rectangle {
     // until the user happened to click something: the sidebar's arrow keys and
     // Escape both went nowhere. Same rule LogView and SettingsWindow follow.
     focus: root.visible
+
+    // A full-surface sheet that takes the keyboard and blocks every region
+    // behind it is a dialog in everything but type; without a role and a name
+    // a screen reader announces an unlabelled rectangle and never says that a
+    // connection sheet has opened. Same rule LogView and SettingsWindow follow.
+    Accessible.role: Accessible.Dialog
+    Accessible.name: qsTr("Connect to a server")
 
     // This sheet fills the whole window on top of the three regions, but a
     // Rectangle accepts no input of its own: Qt Quick hands an unaccepted press
@@ -336,11 +352,27 @@ Rectangle {
         if (index >= 0)
             root.selectIndex(index);
     }
+    // A focus grab that has been queued with Qt.callLater runs a turn later, by
+    // which time something else can legitimately own the keyboard — a modal
+    // AppDialog opened in between is the case that actually happens, since
+    // dismissing a prompt and opening the SSH details view are two clicks a user
+    // makes in a row. Taking focus back then would drag the user out of the
+    // dialog they just opened, so a queued grab checks that the sheet is still
+    // the right place for the keyboard before it takes it.
+    function focusWhenStillOurs(item) {
+        if (!root.visible || !item || !item.visible || !item.enabled)
+            return;
+        const holder = root.Window.activeFocusItem;
+        if (holder && root.itemWithin(Overlay.overlay, holder))
+            return;
+        item.forceActiveFocus();
+    }
+
     onPendingHostKeyChanged: {
         if (root.pendingHostKey)
-            Qt.callLater(() => hostKeyReject.forceActiveFocus());
+            Qt.callLater(() => root.focusWhenStillOurs(hostKeyReject));
         else if (root.visible)
-            Qt.callLater(() => profileSelector.forceActiveFocus());
+            Qt.callLater(() => root.focusWhenStillOurs(profileSelector));
     }
     onPendingCredentialChanged: {
         // Cleared on BOTH edges: on open so a previous attempt's keystrokes can
@@ -348,13 +380,31 @@ Rectangle {
         // in a live QML item (and its undo stack) after it has been spent.
         secretField.clear();
         if (root.pendingCredential)
-            Qt.callLater(() => secretField.forceActiveFocus());
+            Qt.callLater(() => root.focusWhenStillOurs(secretField));
         else if (root.visible)
-            Qt.callLater(() => profileSelector.forceActiveFocus());
+            Qt.callLater(() => root.focusWhenStillOurs(profileSelector));
     }
     onVisibleChanged: {
-        if (!root.visible)
+        if (!root.visible) {
+            // Re-checked for liveness: the item can have been destroyed, hidden
+            // or disabled while the sheet was up.
+            var previous = root.focusReturnItem;
+            root.focusReturnItem = null;
+            if (previous && previous.visible && previous.enabled)
+                previous.forceActiveFocus(Qt.OtherFocusReason);
             return;
+        }
+        // Normally containKeyboard() has already recorded where the keyboard
+        // was, because it records on every focus change while this sheet is
+        // down. The exception is the very first open of a session in which
+        // focus has never moved since startup: nothing changed, so nothing was
+        // recorded, and closing would drop the user at the window root. Take
+        // the reading here too, before the focus binding below moves it.
+        if (!root.focusReturnItem) {
+            const holder = root.Window.activeFocusItem;
+            if (holder && !root.itemWithin(root, holder))
+                root.focusReturnItem = holder;
+        }
         Qt.callLater(() => {
             if (root.pendingCredential)
                 secretField.forceActiveFocus();
@@ -369,6 +419,87 @@ Rectangle {
         });
     }
     Component.onCompleted: root.syncFromModel()
+
+    // ---- keyboard containment ---------------------------------------------
+    // This sheet has to contain the KEYBOARD as well as the pointer. The
+    // MouseArea shield above stops clicks reaching the regions behind it, but
+    // Tab is not a click: Qt Quick's focus chain runs over the whole item tree,
+    // so tabbing off the last control here walked straight into workspace
+    // controls the user cannot see — acting on a session they are not looking
+    // at — and nothing told a screen reader the dialog had been left.
+    //
+    // Corrected AFTER the move rather than intercepted before it. Intercepting
+    // is not available: Qt performs Tab navigation inside the FOCUSED item's
+    // own key handling, so a Keys handler on this root never sees the press —
+    // measured, not assumed. Watching where focus actually landed works for
+    // every route into an item, including a programmatic one.
+
+    // The subtree the keyboard may not leave. While a prompt is up that is the
+    // PROMPT, not the whole sheet: the prompt is what the connection is parked
+    // on, and containing only the sheet would leave Tab free to wander the body
+    // behind it.
+    function focusBoundary() {
+        if (root.pendingCredential)
+            return credentialPanel;
+        if (root.pendingHostKey)
+            return hostKeyPanel;
+        return root;
+    }
+
+    function itemWithin(scope, item) {
+        for (var walk = item; walk; walk = walk.parent) {
+            if (walk === scope)
+                return true;
+        }
+        return false;
+    }
+
+    function containKeyboard() {
+        var holder = root.Window.activeFocusItem;
+        if (!holder)
+            return;
+        if (!root.visible) {
+            // Down: remember where the keyboard is, so opening and closing the
+            // sheet returns the user to the control they were on.
+            if (!root.itemWithin(root, holder))
+                root.focusReturnItem = holder;
+            return;
+        }
+        // A modal AppDialog (the SSH details view) draws into the window's
+        // overlay, which is not a child of this sheet. It owns the keyboard
+        // while it is up and must not be fought for it.
+        if (root.itemWithin(Overlay.overlay, holder))
+            return;
+        var boundary = root.focusBoundary();
+        if (root.itemWithin(boundary, holder)) {
+            root.lastInsideFocus = holder;
+            return;
+        }
+        var previous = root.lastInsideFocus;
+        if (!previous)
+            return;
+        // Keep going the way the user was going: continuing forward past the
+        // item Tab escaped to re-enters the boundary at its FIRST control,
+        // which is the wrap, and continuing backward re-enters at its last.
+        var forward = previous.nextItemInFocusChain(true) === holder;
+        var step = holder;
+        for (var guard = 0; guard < 500; ++guard) {
+            step = step.nextItemInFocusChain(forward);
+            if (!step || step === holder)
+                break;
+            if (root.itemWithin(boundary, step)) {
+                step.forceActiveFocus(forward ? Qt.TabFocusReason : Qt.BacktabFocusReason);
+                return;
+            }
+        }
+        // Nothing else in the boundary is reachable; stay where we were.
+        previous.forceActiveFocus();
+    }
+
+    Connections {
+        target: root.Window.window
+        function onActiveFocusItemChanged() { root.containKeyboard(); }
+    }
 
     Keys.onEscapePressed: (event) => {
         if (root.pendingCredential)
@@ -495,17 +626,33 @@ Rectangle {
                 height: 26
                 radius: 13
                 color: Theme.surfaceSunken
-                border.width: 1
-                border.color: root.stateColor(root.connectionState)
+                // Focusable on purpose: the one sentence that says what the
+                // current state MEANS used to be reachable by hovering only, so
+                // a keyboard user could never read it. Tab stops here and Tab
+                // again leaves, so nothing is trapped.
+                activeFocusOnTab: true
+                border.width: statusChip.activeFocus ? 2 : 1
+                border.color: statusChip.activeFocus
+                              ? Theme.accent : root.stateColor(root.connectionState)
+
+                // The chip says the state three ways on screen but had no
+                // identity at all to assistive technology. The word stays the
+                // name; the explanation is the description, so it is announced
+                // without a pointer anywhere near it.
+                Accessible.role: Accessible.StaticText
+                Accessible.name: stateLabel.text
+                Accessible.description: root.stateExplanation(root.connectionState)
 
                 HoverHandler { id: chipHover }
                 // The module's one tooltip (AppToolTip.qml). The attached
                 // `ToolTip.text` form is drawn by the Basic style in that
                 // style's own light palette, so an explanation of this dark
-                // sheet's status chip arrived as a white box.
+                // sheet's status chip arrived as a white box. Shown on keyboard
+                // focus too, because a hover-only explanation does not exist
+                // for anyone without a pointer.
                 AppToolTip {
                     objectName: "statusChipTip"
-                    visible: chipHover.hovered
+                    visible: chipHover.hovered || statusChip.activeFocus
                     text: root.stateExplanation(root.connectionState)
                 }
 
@@ -555,7 +702,19 @@ Rectangle {
                                 }
 
                                 RotationAnimator on rotation {
-                                    running: connectingIndicator.running
+                                    // Nothing in this project tells QML that
+                                    // the user prefers reduced motion: Qt
+                                    // 6.10's accessibility hints carry contrast
+                                    // preference and nothing else, and there is
+                                    // no CodeHarbor setting for it either. The
+                                    // one honest gate is visibility — an
+                                    // infinite animator used to keep turning
+                                    // while the sheet was hidden, which is
+                                    // motion nobody can see and nobody asked
+                                    // for. Progress is still carried without
+                                    // any movement by the dot's glyph and the
+                                    // state word beside it.
+                                    running: connectingIndicator.running && root.visible
                                     loops: Animation.Infinite
                                     from: 0
                                     to: 360
@@ -583,6 +742,7 @@ Rectangle {
                     }
 
                     Label {
+                        id: stateLabel
                         objectName: "stateLabel"
                         anchors.verticalCenter: parent.verticalCenter
                         // SECURITY: see errorLabel below — connectionState is
@@ -626,6 +786,12 @@ Rectangle {
         // port and a reason, and one elided line of it tells nobody anything.
         height: visible ? Math.max(40, errorLabel.implicitHeight + 20) : 0
         color: Theme.errorSurface()
+        // An error that is only drawn is an error a screen reader user editing
+        // the field that caused it never hears about. AlertMessage is the role
+        // for a notification that is not a dialog; Main.qml's toast uses it for
+        // the same reason.
+        Accessible.role: Accessible.AlertMessage
+        Accessible.name: errorLabel.text
 
         // A red wash is the only thing separating this from the rest of the
         // sheet; the rule and the glyph say "error" without relying on hue.
@@ -1049,6 +1215,7 @@ Rectangle {
 
         Rectangle {
             id: hostKeyPanel
+            objectName: "hostKeyPanel"
             anchors.centerIn: parent
             width: Math.min(520, hostKeyPrompt.width - 48)
             height: hostKeyColumn.implicitHeight + 32
@@ -1056,6 +1223,13 @@ Rectangle {
             color: Theme.surfaceDeep
             border.width: 1
             border.color: Theme.warning
+
+            // A panel that covers the sheet and disables every control under it
+            // is a modal dialog. Without a role and a name a screen reader is
+            // never told that a blocking security decision took over the
+            // surface the user was working on.
+            Accessible.role: Accessible.Dialog
+            Accessible.name: hostKeyTitle.text
 
             Keys.onEscapePressed: (event) => {
                 root.hostKeyDecision(false);
@@ -1069,6 +1243,7 @@ Rectangle {
                 spacing: 8
 
                 Label {
+                    id: hostKeyTitle
                     text: qsTr("Unknown host key")
                     color: Theme.warning
                     font.bold: true
@@ -1160,6 +1335,7 @@ Rectangle {
 
         Rectangle {
             id: credentialPanel
+            objectName: "credentialPanel"
             anchors.centerIn: parent
             width: Math.min(520, credentialPrompt.width - 48)
             height: credentialColumn.implicitHeight + 32
@@ -1168,6 +1344,11 @@ Rectangle {
             border.width: 1
             border.color: Theme.accent
 
+            // Modal for the same reason the host-key panel is, and announced
+            // the same way: the connection is parked on this one answer.
+            Accessible.role: Accessible.Dialog
+            Accessible.name: credentialTitle.text
+
             Column {
                 id: credentialColumn
                 anchors.centerIn: parent
@@ -1175,6 +1356,7 @@ Rectangle {
                 spacing: 8
 
                 Label {
+                    id: credentialTitle
                     text: root.credentialKind() === "password"
                           ? qsTr("Password required") : qsTr("Unlock your key")
                     color: Theme.accent
@@ -1194,16 +1376,27 @@ Rectangle {
                     font.pixelSize: Theme.fontSizeBody
                     text: root.credentialExplanation()
                 }
+                Label {
+                    id: secretFieldLabel
+                    objectName: "credentialFieldLabel"
+                    // The field below is masked and its placeholder is the
+                    // server's own prompt string, which disappears the moment
+                    // the first character is typed. A low-vision user then has
+                    // nothing on screen saying what the box wants, so the label
+                    // is drawn rather than only spoken.
+                    text: root.credentialKind() === "password"
+                          ? qsTr("Password") : qsTr("Key passphrase")
+                    color: Theme.textDim
+                    font.pixelSize: Theme.fontSizeSmall
+                }
                 TextField {
                     id: secretField
                     objectName: "credentialField"
                     width: parent.width
-                    // A masked field has no visible label of its own, and its
-                    // placeholder is the server's own prompt string, so name it
-                    // explicitly rather than leaving a screen reader to
-                    // announce an unlabelled password box.
-                    Accessible.name: root.credentialKind() === "password"
-                                     ? qsTr("Password") : qsTr("Key passphrase")
+                    // The visible Label above is a separate item, so without
+                    // this the masked box is announced as an unlabelled
+                    // password field.
+                    Accessible.name: secretFieldLabel.text
                     // The masked field this whole item exists for.
                     echoMode: TextInput.Password
                     passwordCharacter: "\u2022"

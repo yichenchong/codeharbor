@@ -257,8 +257,13 @@ Rectangle {
             Layout.fillWidth: true
             Layout.fillHeight: true
             color: Theme.surfaceSunken
-            border.color: Theme.border
-            border.width: 1
+            // The well IS the focus indicator for the text area inside it: the
+            // sheet focuses that area for itself as it opens (see onShownChanged
+            // above), and with a null background and no caret to watch — the
+            // text is read-only — there was nothing on screen saying which
+            // control the arrow keys and Ctrl+A were about to act on.
+            border.color: logText.activeFocus ? Theme.accent : Theme.border
+            border.width: logText.activeFocus ? 2 : 1
             radius: Theme.radiusSmall
 
             Flickable {
@@ -290,6 +295,10 @@ Rectangle {
                 TextArea {
                     id: logText
                     objectName: "logText"
+                    // Read-only, so it never gets the name a text field gets
+                    // from its placeholder or its label: without this a screen
+                    // reader lands on the log and announces an unnamed edit box.
+                    Accessible.name: qsTr("Log output")
                     // Never narrower than the viewport, so a short log still
                     // fills the well and the click target for `selectAll` is
                     // the whole area; wider when a line demands it, which is

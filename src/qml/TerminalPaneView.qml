@@ -1,5 +1,6 @@
 import QtQuick
 import QtQuick.Layouts
+import QtQuick.Window
 import QtQuick.Controls.Basic
 import QtWebEngine
 import QtWebChannel
@@ -778,6 +779,9 @@ Rectangle {
         modal: true
         standardButtons: Dialog.Ok | Dialog.Cancel
         anchors.centerIn: Overlay.overlay
+        // Enter cancels rather than closing: the affirmative answer ends the
+        // remote session and loses whatever it was running. See SessionRow.qml.
+        defaultButton: Dialog.Cancel
         width: 400
 
         ColumnLayout {
@@ -826,6 +830,77 @@ Rectangle {
           + "})()");
         pane.focusPending = false;
     }
+
+    // ---- getting the keyboard back OUT of the page -------------------------
+    //
+    // THE ESCAPE KEY IS Ctrl+Shift+F6, and it is not a convenience: without it
+    // this pane is a keyboard trap. The xterm page answers "yes, I handled it"
+    // to every key except its copy shortcut, so Tab, Shift+Tab and Escape all
+    // travel to the remote shell and nothing at all moves the keyboard back to
+    // the pane's own chrome. A pointer user clicks their way out; a keyboard
+    // user cannot leave the pane once they have entered it.
+    //
+    // A Shortcut is what makes this work AT ALL: it is matched before the key
+    // is delivered to the focused item, so the page never sees it (the same
+    // property Main.qml's palette shortcuts rely on). The choice of key follows
+    // the rule Main.qml states for Ctrl+Shift+R and Ctrl+Shift+W — a bare Ctrl
+    // chord belongs to the shell — and adds one more: a bare function key
+    // belongs to the shell too, because full-screen terminal programs bind
+    // F1-F10. F6 is the platform convention for "move to the next pane", so
+    // Ctrl+Shift+F6 is that convention spelled in the one namespace no remote
+    // program can claim.
+    //
+    // Enabled ONLY while the keyboard is actually inside this pane. Every pane
+    // in the window declares this shortcut, and Qt calls two enabled shortcuts
+    // on one sequence ambiguous and activates neither; exactly one item in a
+    // window has the focus, so exactly one pane's shortcut is live.
+    Shortcut {
+        sequences: ["Ctrl+Shift+F6"]
+        enabled: pane.holdsKeyboardFocus
+        onActivated: pane.releaseKeyboard()
+    }
+
+    // Is the window's focus item this pane or something inside it? Asked of the
+    // window rather than of this Rectangle, because a plain Item never reports
+    // `activeFocus` for a descendant — and the descendant that matters here is
+    // a WebEngineView several levels down inside a Loader.
+    readonly property bool holdsKeyboardFocus: {
+        let item = pane.Window.activeFocusItem;
+        while (item) {
+            if (item === pane)
+                return true;
+            item = item.parent;
+        }
+        return false;
+    }
+
+    // Take the keyboard off the page and put it on the pane itself, which is
+    // the chrome-level stop the pane header's actions sit under: Tab from here
+    // walks into them, Shift+Tab leaves the pane backwards, and neither key has
+    // to pass through the shell to do it.
+    function releaseKeyboard() {
+        pane.focusPending = false;
+        pane.forceActiveFocus(Qt.OtherFocusReason);
+    }
+
+    // Keyboard focus arriving is the same statement a click makes: the user is
+    // working HERE. Without this a keyboard user could tab into a pane and
+    // still have the split and close commands act on whichever pane was last
+    // clicked, with the header's active mark pointing at that other pane.
+    //
+    // Guarded on `paneActive` so a PROGRAMMATIC restore stays silent: the
+    // region sets the flag and only then calls acceptFocus(), so focus landing
+    // in an already-active pane is the region's own doing and must not be
+    // counted as a fresh user choice (Main.qml drops a pending restore when the
+    // user's focus serial moves).
+    onHoldsKeyboardFocusChanged: {
+        if (pane.holdsKeyboardFocus && !pane.paneActive)
+            pane.paneActivated(pane.paneId);
+    }
+
+    // A real focus stop, so Tab can reach the pane at all rather than only ever
+    // landing inside its page.
+    activeFocusOnTab: true
 
     // ---- renderer preferences and theme ------------------------------------
 
@@ -1050,11 +1125,14 @@ Rectangle {
                 anchors.horizontalCenter: parent.horizontalCenter
                 // Same rule: terminalId is the client-minted layout pane id
                 // (see the header above), drawn as plain text like every other
-                // identifier on this pane.
+                // identifier on this pane. In the DIM role rather than the faint
+                // one: it is the only thing on screen naming this pane, so it
+                // has to be readable, and the faint role is for decoration and
+                // disabled controls.
                 textFormat: Text.PlainText
                 text: pane.terminalId
                 visible: pane.terminalId.length > 0
-                color: Theme.textFaint
+                color: Theme.textDim
                 font.pixelSize: Theme.fontSizeSmall
                 font.family: Theme.monoFamily
             }

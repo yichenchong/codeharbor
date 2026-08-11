@@ -32,7 +32,7 @@ QtObject {
             border: "#45475a",
             borderSubtle: "#313244",
             text: "#cdd6f4",
-            textDim: "#6c7086",
+            textDim: "#949ab3",
             textOnAccent: "#11111b",
             textFaint: "#45475a",
             accent: "#89b4fa",
@@ -66,7 +66,7 @@ QtObject {
             border: "#9ca0b0",
             borderSubtle: "#bcc0cc",
             text: "#4c4f69",
-            textDim: "#7c7f93",
+            textDim: "#555871",
             textOnAccent: "#ffffff",
             textFaint: "#9ca0b0",
             // Accent meanings stay the same, but these values are deep enough
@@ -131,12 +131,22 @@ QtObject {
     // ---- text --------------------------------------------------------------
 
     readonly property color text: activePalette.text
-    // Secondary text: hints, subtitles, placeholder text, disabled labels.
+    // Secondary text: hints, subtitles, status lines, explanations.
+    //
+    // "Secondary" is about importance, not about being hard to read. Both values
+    // are chosen so that this colour reaches the 4.5:1 contrast ratio that normal
+    // text needs against EVERY surface role above, including the raised one used
+    // by pane headers and selected rows — a call site should not have to know
+    // which background it landed on to know its text is legible. The visible
+    // step down from `text` is carried by size and weight instead, which most of
+    // these call sites already use (`Theme.fontSizeSmall`).
     readonly property color textDim: activePalette.textDim
     // Text that has to sit ON an accent fill.
     readonly property color textOnAccent: activePalette.textOnAccent
-    // Decorative glyphs and the very faintest labels (an internal identifier
-    // kept reachable for a bug report).
+    // Decoration ONLY: placeholder glyphs, hairlines drawn as text, and disabled
+    // labels (a disabled control is exempt from the contrast rule because it is
+    // not offering anything to read). Anything a user is expected to READ uses
+    // `textDim` or `text`, never this.
     readonly property color textFaint: activePalette.textFaint
 
     // ---- accents -----------------------------------------------------------
