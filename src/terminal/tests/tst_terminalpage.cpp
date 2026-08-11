@@ -1008,14 +1008,24 @@ void TstTerminalPage::realMouseInputTravelsThroughTheQmlPane()
     m_controller->ingestOutput(QByteArrayLiteral("\x1b[?1000h"));
     QTest::qWait(300);
 
+    // The modifier is not the same everywhere, and that is xterm.js's rule, not
+    // this application's: it forces a local selection on Alt (the Option key)
+    // on macOS and on Shift on every other platform. A test that hardcoded
+    // Shift passed on Linux and failed on macOS for the correct reason — the
+    // drag went to the program, exactly as an unmodified drag should.
+#ifdef Q_OS_MACOS
+    constexpr Qt::KeyboardModifier kSelectionModifier = Qt::AltModifier;
+#else
+    constexpr Qt::KeyboardModifier kSelectionModifier = Qt::ShiftModifier;
+#endif
     const QPoint dragStart(120, window->height() / 2);
-    QTest::mousePress(window, Qt::LeftButton, Qt::ShiftModifier, dragStart);
+    QTest::mousePress(window, Qt::LeftButton, kSelectionModifier, dragStart);
     for (int step = 1; step <= 6; ++step) {
         QTest::mouseMove(window, dragStart + QPoint(step * 60, step * 4));
         QTest::qWait(30);
     }
     const QPoint dragEnd = dragStart + QPoint(360, 24);
-    QTest::mouseRelease(window, Qt::LeftButton, Qt::ShiftModifier, dragEnd);
+    QTest::mouseRelease(window, Qt::LeftButton, kSelectionModifier, dragEnd);
 
     QString dragged;
     QElapsedTimer dragClock;
