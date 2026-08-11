@@ -523,10 +523,18 @@ shell all stay healthy. A pane that loses its context therefore reloads its page
 mount handshake replays the controller's retained output, and one window-change request makes the remote shell
 repaint the screen.
 
-**Clipboard.** Selecting text and copying it (the platform's terminal shortcut) puts it on the system clipboard;
-pasting sends the clipboard to the shell, guarded by bracketed paste where the application asked for it. A paste
-is chunked through the same flow control as ordinary output and, like it, is never split inside an escape
-sequence (§5.5). Scrolling and scrollback behaviour are unchanged by any of this.
+**Clipboard.** The pane's tmux session runs with mouse reporting on, so an ordinary drag inside the grid belongs
+to the program in the terminal rather than to the browser. A local selection is therefore made by holding the
+modifier xterm.js reserves for exactly this — Shift and drag, or Option and drag on macOS — and that selection
+stays until it is replaced. Nothing is ever put on the clipboard without being asked for: copying is
+`Ctrl+Shift+C` (`⌘C` on macOS) or the terminal's own menu, and it puts the current selection on the system
+clipboard. Pasting the system clipboard is `Ctrl+Shift+V` (`⌘V` on macOS) or the menu, and sends it to
+the shell, guarded by bracketed paste where the application asked for it. (A middle click is a mouse button like
+any other and is reported to the remote side, where tmux answers it by pasting its OWN most recent copy — which
+is not the system clipboard and is empty until something has been copied inside tmux.) A paste is chunked through the same
+flow control as ordinary output and, like it, is never split inside an escape sequence (§5.5). Scrolling and
+scrollback behaviour are unchanged by any of this: the wheel is reported to the remote side, so it scrolls
+tmux's history. The full division of mouse actions between the remote program and the application is §5.7.
 
 ### 5.2 Terminal Creation
 
@@ -645,6 +653,37 @@ Suggested retry delays:
 ```
 
 Manual reconnect should bypass the wait.
+
+### 5.7 Mouse Behaviour
+
+The pane's tmux session is created with mouse reporting on (§5.2), and that is deliberate: it is what lets the
+wheel scroll tmux's history and lets a program that asked for the mouse — vim, htop, and the like — receive it.
+The consequence is that almost every mouse action inside the grid belongs to the program in the terminal, not to
+CodeHarbor, and the application must not quietly take actions away from it.
+
+| Action | Who handles it | What happens |
+|---|---|---|
+| Wheel | The remote program | Scrolls the tmux session's history; a program that asked for the mouse gets the wheel itself. |
+| Left click | The remote program | Reported to whatever is running, which is how you move the cursor or hit a button in a full-screen program. |
+| Left drag | The remote program | Inside tmux this starts tmux's copy-mode highlight, which tmux clears again on release. That is tmux's own default binding, and the application cannot change it for one session because tmux key tables are global. |
+| Shift+drag (Option+drag on macOS) | The application | Makes a local selection in xterm.js, the modifier xterm.js documents for this. The selection stays until it is replaced, and nothing is copied automatically. |
+| Double click, triple click | The remote program | Reported like any other press, so a word or line selection inside tmux is tmux's, with tmux's release behaviour. Hold the same Shift (Option) modifier to select a word or line locally instead. |
+| Right click | The application | Never reported to the remote side. It opens CodeHarbor's own menu — see below. |
+| Middle click | The remote program | Reported like any other button. Inside tmux that pastes tmux's own most recent copy, which is not the system clipboard. |
+| `Ctrl+Shift+C` (`⌘C` on macOS) | The application | Copies the local selection to the system clipboard. |
+| `Ctrl+Shift+V` (`⌘V` on macOS) | The application | Pastes the clipboard into the shell (§5.1). |
+
+**Why the right button is the exception.** tmux's default right-button binding draws a menu inside the terminal
+grid, and that menu closes again on the next mouse report — so simply moving the pointer dismissed it before it
+could be used. Making the right button usable therefore means not reporting it at all: a right press is
+swallowed in the browser's capture phase, before xterm.js can turn it into a mouse report, and CodeHarbor opens
+its own menu instead. This is the only button the application withholds from the remote side.
+
+The menu offers **Copy**, **Paste** and **Select All**. Copy is greyed out when there is no selection, because
+with nothing selected there is nothing to copy. The menu also names the modifier for local selection, so the
+Shift (Option) rule is discoverable from the terminal rather than only from this document. It closes when an
+item is chosen, on Escape, and on a mouse press outside it — and, unlike tmux's, never on pointer movement.
+Nothing here copies anything the user did not ask for: there is no copy-on-select and no copy-on-release.
 
 ---
 
@@ -1554,6 +1593,8 @@ Ctrl+Shift+R    Refresh Workspace
 Ctrl+Shift+W    Close Window
 Ctrl+,          Settings
 Ctrl+S          Save active remote file (inside the focused editor)
+Ctrl+Shift+C    Copy the selection (inside the focused terminal; ⌘C on macOS)
+Ctrl+Shift+V    Paste the clipboard (inside the focused terminal; ⌘V on macOS)
 ```
 
 `Ctrl+Shift+P` opens the palette (`activationSequence` in
@@ -1563,7 +1604,10 @@ so it is `⌘⇧P` there). `Ctrl+Shift+O`, `Ctrl+Shift+R`, `Ctrl+Shift+W` and `C
 turns into real window-wide `Shortcut` objects, so they fire whether or not the
 palette is open. `Ctrl+S` is registered on the Monaco instance itself in
 `src/web/editor/src/index.ts`, so it applies to the focused editor rather than
-window-wide.
+window-wide. `Ctrl+Shift+C` and `Ctrl+Shift+V` are likewise the terminal page's
+own, so they apply to the focused terminal and leave the rest of the window
+alone; they are the keyboard half of the terminal's mouse and clipboard rules
+(§5.7).
 
 Two of these deviate from the plain sequence this section originally suggested,
 for the same reason: a window-wide `Shortcut` is matched before the key ever
@@ -1594,7 +1638,7 @@ Originally suggested defaults, and how they were reconciled:
 | `Ctrl+K` Command palette | Superseded by `Ctrl+Shift+P` (`activationSequence` in `src/qml/CommandPalette.qml`). `Ctrl+K` is not bound at all. |
 | `Ctrl+P` Switch Dev Session | Not implemented — there is no session switcher. |
 | `Ctrl+Shift+T` New terminal | Not implemented as a key sequence; a new terminal pane comes from the palette's "Split Terminal Pane Horizontally/Vertically". |
-| `Ctrl+Shift+V` New viewer | Not implemented as a key sequence; a new viewer pane comes from the palette's "Split Viewer Pane Horizontally/Vertically". |
+| `Ctrl+Shift+V` New viewer | Not implemented as a key sequence, and it will not be: inside a terminal pane `Ctrl+Shift+V` is paste (§5.7). A new viewer pane comes from the palette's "Split Viewer Pane Horizontally/Vertically". |
 | `Ctrl+S` Save active remote file | Implemented, in the viewer pane's text-editor handler (§8.1). |
 | `Ctrl+W` Close active pane | Not implemented as a key sequence; "Close Focused Viewer/Terminal Pane" are palette commands. Note `Ctrl+Shift+W` is **not** this — it closes the whole window. |
 | `Ctrl+Tab` Next pane | Not implemented. Pane focus is click-based today, so a "focus next pane" command would first have to be able to move focus (see `docs/PLAN.md`). |

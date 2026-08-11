@@ -43,13 +43,67 @@
         --ch-border: #45475a;
         --ch-text-dim: #6c7086;
         --ch-text: #cdd6f4;
+        --ch-surface: #1e1e2e;
+        --ch-surface-hover: #232338;
+        --ch-text-faint: #45475a;
     }
     html, body { height: 100%; margin: 0; padding: 0; overflow: hidden; }
     body { background: var(--ch-surface-sunken); color: var(--ch-text, #cdd6f4); } /* surfaceSunken, text */
     /* Column layout: a status strip that only appears when the pane is NOT
        live, above a surface that takes all remaining height. FitAddon measures
        the surface, so it needs a definite height — hence flex:1 + min-height:0. */
-    #ch-terminal-root { height: 100%; width: 100%; display: flex; flex-direction: column; }
+    /* `position: relative` because the right-click menu is positioned inside
+       this box: the menu is placed at the pointer and then pulled back so it
+       cannot hang off the pane (see menu.ts, clampMenuOrigin). */
+    #ch-terminal-root { height: 100%; width: 100%; display: flex; flex-direction: column;
+                        position: relative; }
+
+    /* ---- right-click menu ----------------------------------------------
+       This application's terminal menu, which replaces both Chromium's empty
+       one and tmux's in-grid one (see src/web/terminal/src/menu.ts). Colours
+       are the same Theme.qml roles the rest of this page mirrors. */
+    .ch-terminal-menu {
+        position: absolute;
+        z-index: 10;
+        min-width: 168px;
+        padding: 4px 0;
+        background: var(--ch-surface);               /* surface */
+        border: 1px solid var(--ch-border);          /* border */
+        border-radius: 4px;
+        box-shadow: 0 6px 18px rgba(0, 0, 0, 0.45);
+        font: 12px/1.7 system-ui, sans-serif;
+        user-select: none;
+    }
+    .ch-terminal-menu-item {
+        display: block;
+        width: 100%;
+        box-sizing: border-box;
+        padding: 3px 16px;
+        border: 0;
+        background: transparent;
+        color: var(--ch-text);                       /* text */
+        font: inherit;
+        text-align: left;
+        cursor: pointer;
+    }
+    .ch-terminal-menu-item:hover:not(:disabled),
+    .ch-terminal-menu-item:focus {
+        background: var(--ch-surface-hover);         /* surfaceHover */
+        outline: none;
+    }
+    .ch-terminal-menu-item:disabled {
+        color: var(--ch-text-faint);                 /* textFaint */
+        cursor: default;
+    }
+    /* Not a menu item: the one place a user who just tried to drag-select is
+       looking, so it is where the modifier is named. */
+    .ch-terminal-menu-hint {
+        margin-top: 4px;
+        padding: 4px 16px 1px;
+        border-top: 1px solid var(--ch-border-subtle); /* borderSubtle */
+        color: var(--ch-text-dim);                     /* textDim */
+        font-size: 11px;
+    }
     .ch-terminal-status {
         flex: 0 0 auto;
         padding: 2px 8px;

@@ -156,6 +156,8 @@ shortcuts SPEC 15 originally suggested, in [`docs/SPEC.md`](docs/SPEC.md) — is
 | `Ctrl+Shift+R` | Refresh Workspace |
 | `Ctrl+Shift+W` | Close Window (the window is frameless, so the window manager draws no close button; the in-app title bar has one) |
 | `Ctrl+S` | Save the file in the focused editor |
+| `Ctrl+Shift+C` (`⌘C` on macOS) | Copy the selection in the focused terminal |
+| `Ctrl+Shift+V` (`⌘V` on macOS) | Paste into the focused terminal |
 | `Ctrl+,` | Settings |
 
 Splitting and closing panes, killing a terminal's remote tmux session, disconnecting,
@@ -192,7 +194,19 @@ A few things worth knowing about the shipped client:
 - **Sessions and groups can be deleted.** Both ask first and name what they are
   about to destroy; deleting a group also states how many sessions go with it.
   Deleting is permanent — archiving is the reversible option.
-- **Copy and paste work in terminals** with the usual terminal shortcuts.
+- **The mouse in a terminal mostly belongs to the program you are running.** Each
+  tmux session has mouse reporting on, so the wheel scrolls tmux's history and a
+  program that wants the mouse — vim, htop — gets it, including plain clicks and
+  drags. To select text for yourself instead, hold **Shift and drag** (**Option and
+  drag** on macOS); that selection stays put, and nothing is copied until you ask.
+  Copy with `Ctrl+Shift+C` (`⌘C` on macOS), paste with `Ctrl+Shift+V` (`⌘V`) or from
+  the right-click menu. (A middle click goes to tmux, which pastes its own last copy
+  rather than the system clipboard.)
+- **Right-click opens CodeHarbor's own terminal menu** — Copy, Paste and Select All,
+  with Copy greyed out when nothing is selected. The right button is the one button
+  that is not passed to the remote side, because tmux's own right-button menu is
+  drawn inside the terminal grid and closes on the next mouse report, so moving the
+  pointer towards it made it vanish.
 - **Several servers can be saved** and switched between; closing the app leaves the
   remote tmux sessions running, so a reconnect finds the shells where they were.
 
