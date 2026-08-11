@@ -43,6 +43,7 @@
 
 #include <QBuffer>
 #include <QByteArray>
+#include <QClipboard>
 #include <QCoreApplication>
 #include <QElapsedTimer>
 #include <QGuiApplication>
@@ -380,6 +381,11 @@ constexpr auto kJsInstallInputSpy = R"JS(
         if (!window.__chInputSpy) {
             window.__chInputSpy = function (event) {
                 window.__chInput.push(event.type + ":" + event.button);
+                // Where the page believes the pointer was. The window and the
+                // page do not share a coordinate system — the pane's header and
+                // borders sit between them — and this is what lets a caller
+                // work out the offset from one real press.
+                window.__chLastPoint = { x: event.clientX, y: event.clientY };
             };
             ["mousedown", "mouseup", "contextmenu"].forEach(function (type) {
                 document.addEventListener(type, window.__chInputSpy, true);
@@ -394,6 +400,24 @@ constexpr auto kJsReadInputSpy = R"JS(
 (function () {
     try {
         return (window.__chInput || []).join(",");
+    } catch (e) { return "ERR:" + e; }
+})()
+)JS";
+
+// The offset between the window's coordinates and the page's, and the middle of
+// the menu's Paste item in the page's: "pointerX|pointerY|itemX|itemY". Used to
+// click a menu item with REAL input, which is the only way to give the page the
+// user activation a browser demands before it will touch the clipboard.
+constexpr auto kJsPasteItemGeometry = R"JS(
+(function () {
+    try {
+        var point = window.__chLastPoint;
+        var item = document.querySelector('.ch-terminal-menu-item[data-action="paste"]');
+        if (!point || !item) return "NO_GEOMETRY";
+        var rect = item.getBoundingClientRect();
+        return Math.round(point.x) + "|" + Math.round(point.y)
+             + "|" + Math.round(rect.left + rect.width / 2)
+             + "|" + Math.round(rect.top + rect.height / 2);
     } catch (e) { return "ERR:" + e; }
 })()
 )JS";
@@ -472,6 +496,22 @@ constexpr auto kJsChooseSelectAll = R"JS(
 })()
 )JS";
 
+// Choose the menu's Paste item. Unlike the others this one finishes
+// asynchronously: the page has to ask the browser for the clipboard's contents
+// before it can hand them to the terminal, so the caller waits for the result
+// at the far end rather than for this reply.
+constexpr auto kJsChoosePaste = R"JS(
+(function () {
+    try {
+        var item = document.querySelector('.ch-terminal-menu-item[data-action="paste"]');
+        if (!item) return "NO_ITEM";
+        if (item.disabled) return "DISABLED";
+        item.click();
+        return "CHOSEN";
+    } catch (e) { return "ERR:" + e; }
+})()
+)JS";
+
 } // namespace
 
 class TstTerminalPage : public QObject {
@@ -497,6 +537,11 @@ private slots:
     void escapeClosesTheMenu();
     void rightClickSendsNothingToTheRemoteSide();
     void copyIsOfferedOnlyWhenThereIsSomethingToCopy();
+    // Paste is the one menu command that leaves the page: it reads the system
+    // clipboard through the browser and hands the text to the terminal, which
+    // sends it to the remote side. Every step of that is a place it can fail
+    // silently, so it is checked at the far end.
+    void pasteFromTheMenuReachesTheRemoteSide();
     // Everything above drives the page with events the page makes for itself.
     // This one uses REAL Qt input, delivered to the window and through the QML
     // pane, because that path has an input-sniffing MouseArea over the whole
@@ -951,7 +996,61 @@ void TstTerminalPage::copyIsOfferedOnlyWhenThereIsSomethingToCopy()
     closeTerminalMenu();
 }
 
-// (10) REAL mouse input, from Qt, through the QML pane, into the page.
+// (10) Paste, from the menu, all the way to the remote side.
+//
+// This is the only menu command whose work happens outside the page: the item's
+// handler asks the browser for the system clipboard, which is an asynchronous
+// request that Chromium refuses unless the view allows JavaScript both to reach
+// the clipboard and to paste (both are set in TerminalPaneView.qml). If any of
+// that is wrong the failure is silent — the menu closes, and nothing is pasted.
+// So the clipboard is filled here, the item is chosen the way a user chooses it,
+// and the marker is looked for at the far end of the pane's transport: the same
+// place a keystroke arrives, which means it travelled the page's terminal, its
+// input pacing and the WebChannel bridge to get there.
+void TstTerminalPage::pasteFromTheMenuReachesTheRemoteSide()
+{
+    QClipboard* clipboard = QGuiApplication::clipboard();
+    QVERIFY2(clipboard != nullptr, "this platform has no clipboard, so paste cannot be tested");
+    // Distinctive, and free of anything a terminal would treat as a control
+    // sequence, so finding it in the transport means the whole string arrived.
+    const QString marker = QStringLiteral("codeharbor-menu-paste-marker-4711");
+    clipboard->setText(marker);
+    QCOMPARE(clipboard->text(), marker);
+
+    // WriteOnly for the same reason as the keystroke case: a readable QBuffer
+    // would feed everything written into it back to the controller as output.
+    QBuffer transport;
+    QVERIFY(transport.open(QIODevice::WriteOnly));
+    m_controller->setTransport(&transport);
+
+    const QString state = openTerminalMenu();
+    QVERIFY2(state.startsWith(QStringLiteral("menu=1")),
+             qPrintable(QStringLiteral("the menu did not open: %1").arg(state)));
+    QCOMPARE(evalJs(QString::fromLatin1(kJsChoosePaste)), QStringLiteral("CHOSEN"));
+
+    // The clipboard read, the paste into the terminal and the trip across the
+    // bridge are all asynchronous, so this waits for the text rather than for a
+    // fixed delay.
+    QElapsedTimer clock;
+    clock.start();
+    while (clock.elapsed() < kProbeTimeoutMs) {
+        if (QString::fromUtf8(transport.data()).contains(marker))
+            break;
+        QTest::qWait(50);
+    }
+    const QString sent = QString::fromUtf8(transport.data());
+    QVERIFY2(sent.contains(marker),
+             qPrintable(QStringLiteral("choosing Paste sent %1 to the remote side, which does "
+                                       "not contain the clipboard's text")
+                            .arg(sent.isEmpty() ? QStringLiteral("nothing") : sent)));
+    // Choosing an item closes the menu; nothing else here does.
+    QVERIFY2(evalJs(QString::fromLatin1(kJsMenuState)).startsWith(QStringLiteral("menu=0")),
+             "the menu stayed open after Paste was chosen");
+
+    m_controller->setTransport(nullptr);
+}
+
+// (11) REAL mouse input, from Qt, through the QML pane, into the page.
 //
 // Everything above dispatches events inside the document, which cannot see the
 // two things between a user's mouse and that document: TerminalPaneView.qml
@@ -1063,6 +1162,45 @@ void TstTerminalPage::realMouseInputTravelsThroughTheQmlPane()
              qPrintable(QStringLiteral("a real right click did not open the page's menu "
                                        "(state %1; the page saw %2)")
                             .arg(state, seen)));
+
+    // ...and the menu can be USED with real input, which the synthetic case
+    // above cannot show: a browser refuses some commands — the clipboard is the
+    // obvious one — unless the click that asked for them was a real one. The
+    // window and the page do not share a coordinate system, so the offset
+    // between them is taken from the press that has just been delivered.
+    const QStringList geometry =
+        evalJs(QString::fromLatin1(kJsPasteItemGeometry)).split(QLatin1Char('|'));
+    QVERIFY2(geometry.size() == 4,
+             qPrintable(QStringLiteral("the menu geometry probe replied %1")
+                            .arg(geometry.join(QLatin1Char('|')))));
+    const QPoint pageOrigin = point - QPoint(geometry.at(0).toInt(), geometry.at(1).toInt());
+    const QPoint pasteItem = pageOrigin + QPoint(geometry.at(2).toInt(), geometry.at(3).toInt());
+
+    QClipboard* clipboard = QGuiApplication::clipboard();
+    QVERIFY(clipboard != nullptr);
+    const QString marker = QStringLiteral("codeharbor-real-click-paste-8823");
+    clipboard->setText(marker);
+    QBuffer transport;
+    QVERIFY(transport.open(QIODevice::WriteOnly));
+    m_controller->setTransport(&transport);
+
+    QTest::mouseClick(window, Qt::LeftButton, Qt::NoModifier, pasteItem);
+    QElapsedTimer pasteClock;
+    pasteClock.start();
+    while (pasteClock.elapsed() < kProbeTimeoutMs) {
+        if (QString::fromUtf8(transport.data()).contains(marker))
+            break;
+        QTest::qWait(50);
+    }
+    const QString pasted = QString::fromUtf8(transport.data());
+    m_controller->setTransport(nullptr);
+    QVERIFY2(pasted.contains(marker),
+             qPrintable(QStringLiteral("a real click on the menu's Paste item sent %1 to the "
+                                       "remote side, which does not contain the clipboard's "
+                                       "text (item at %2,%3 in the window)")
+                            .arg(pasted.isEmpty() ? QStringLiteral("nothing") : pasted)
+                            .arg(pasteItem.x())
+                            .arg(pasteItem.y())));
 
     closeTerminalMenu();
 }

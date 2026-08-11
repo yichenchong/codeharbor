@@ -508,12 +508,34 @@ export function mountTerminal(element: HTMLElement, bridge: TerminalBridge): Ter
                 term.selectAll();
                 return;
             }
-            // Paste. term.paste() is the same path the browser's own paste event
-            // takes, so the text is bracketed when the remote program asked for
-            // bracketed paste, and it is chunked by the input writer like any
-            // other input. Reading the clipboard is asynchronous and can be
-            // refused outright (no clipboard permission, an empty clipboard on a
-            // headless host); a refusal pastes nothing rather than throwing.
+            // Paste.
+            //
+            // The browser's OWN paste command is used, not a read of the
+            // clipboard: the asynchronous clipboard API needs a permission this
+            // page is not granted (Chromium answers readText() with a refusal —
+            // measured, not assumed), while the paste command is what the
+            // embedder's "JavaScript can paste" setting exists to allow. It also
+            // costs nothing to route the text correctly: the command fires a
+            // real paste event on the terminal's own input element, which is the
+            // path Ctrl+Shift+V already takes, so the text is bracketed when the
+            // remote program asked for bracketed paste and is chunked by the
+            // input writer like any other input.
+            //
+            // Focus first: the command applies to whatever is focused, and the
+            // menu's own button was focused while the menu was open.
+            focusTerminal();
+            let pasted = false;
+            try {
+                pasted = element.ownerDocument.execCommand("paste");
+            } catch {
+                pasted = false;
+            }
+            if (pasted) {
+                return;
+            }
+            // The embedder refused. Reading the clipboard directly is the only
+            // path left, and it may be refused as well; a refusal pastes
+            // nothing rather than throwing.
             const clipboard = pageWindow.navigator.clipboard;
             if (!clipboard?.readText) {
                 console.warn("CodeHarbor terminal cannot read the clipboard");
