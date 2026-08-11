@@ -925,6 +925,20 @@ Rectangle {
                 // page has any reason to open a window.
                 settings.javascriptCanOpenWindows: false
 
+                // CLIPBOARD: the pane's own right-click menu has a Paste
+                // command, and reading the clipboard from JavaScript needs both
+                // of these — the first allows access at all, the second allows
+                // the read half. Writing was already permitted, because a copy
+                // triggered by the user's own keypress always is.
+                //
+                // The page this applies to is the application's own bundle and
+                // nothing else: its Content-Security-Policy admits no script but
+                // this one, and the view is pinned to that single URL below, so
+                // the remote shell's output cannot reach the clipboard through
+                // it. Terminal output is drawn, never executed.
+                settings.javascriptCanAccessClipboard: true
+                settings.javascriptCanPaste: true
+
                 webChannel: terminalChannel
 
                 // SECURITY (SPEC 7.2): this view carries the WebChannel, and Qt
@@ -942,6 +956,15 @@ Rectangle {
                         return
                     request.action = WebEngineNavigationRequest.IgnoreRequest
                     console.warn("TerminalPaneView: refused navigation to", request.url)
+                }
+
+                // The view's own menu is refused as well. The page already
+                // answers the right button with the terminal's menu and calls
+                // preventDefault(), but Qt WebEngine offers a second menu of its
+                // own (Reload, Back, View Source), and accepting the request
+                // here is what stops it appearing on top of the page's one.
+                onContextMenuRequested: function(request) {
+                    request.accepted = true
                 }
 
                 // Belt and braces for the same rule: a new window would be a

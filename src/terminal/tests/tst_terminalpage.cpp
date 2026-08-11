@@ -8,13 +8,17 @@
 // half that was missing entirely: that a pane actually renders a terminal and
 // that bytes cross the bridge in BOTH directions.
 //
-// Three claims, each one a regression that would otherwise ship silently:
+// Four claims, each one a regression that would otherwise ship silently:
 //   1. the renderer's initial size reaches C++ (a pane whose PTY is stuck at
 //      the channel default is unusable, and the handshake is easy to lose),
 //   2. C++ -> JS works: a lifecycle state lands in the page's status strip and
 //      output lands in xterm's screen,
 //   3. JS -> C++ works: a keystroke in the terminal reaches the controller's
-//      transport.
+//      transport,
+//   4. the right mouse button belongs to the application: it opens the page's
+//      own menu, that menu is unaffected by pointer movement, Escape closes it,
+//      and none of it reaches the remote side. The menu it replaces was tmux's,
+//      drawn inside the terminal grid, which closed again on every movement.
 //
 // Labelled `live` and QSKIPs (rather than fails) when the box cannot host
 // WebEngine at all — the same rule as tst_webengine_headless, since that is a
@@ -52,6 +56,7 @@
 #include <QString>
 #include <QUrl>
 #include <QVariant>
+#include <QtQuick/QQuickWindow>
 #include <QtQuickControls2/QQuickStyle>
 #include <QtWebEngineQuick/QtWebEngineQuick>
 
@@ -250,6 +255,223 @@ constexpr auto kJsMeasureTemplate = R"JS(
 })()
 )JS";
 
+// A real right-button press on the terminal, at a point inside the grid.
+//
+// Dispatched on the innermost element under the pointer — xterm's own screen
+// when it exists — rather than on the surface itself, because that is where a
+// user's pointer actually lands and it is the only way the swallowing can be
+// shown to work: the page's handlers sit on `.ch-terminal-surface` in the
+// CAPTURE phase, so an event aimed at a descendant still passes through them
+// on its way down, while xterm.js's own handlers further in only see what the
+// capture phase let through.
+//
+// The three events are the ones a browser really produces for a right click,
+// in the order it produces them.
+constexpr auto kJsRightPress = R"JS(
+(function () {
+    try {
+        var surface = document.querySelector(".ch-terminal-surface");
+        if (!surface) return "NO_SURFACE";
+        var target = surface.querySelector(".xterm-screen") || surface;
+        var rect = target.getBoundingClientRect();
+        var x = Math.round(rect.left + rect.width / 3);
+        var y = Math.round(rect.top + rect.height / 3);
+        function press(type, button, buttons) {
+            target.dispatchEvent(new MouseEvent(type, {
+                button: button, buttons: buttons, clientX: x, clientY: y,
+                bubbles: true, cancelable: true
+            }));
+        }
+        press("mousedown", 2, 2);
+        press("contextmenu", 2, 2);
+        press("mouseup", 2, 0);
+        return "PRESSED";
+    } catch (e) { return "ERR:" + e; }
+})()
+)JS";
+
+// Press the left button and then the right one on the same spot, with a spy
+// listening on the document in the BUBBLE phase, and report what got through.
+//
+// This is how "the right button never reaches the remote side" is shown without
+// a remote side: the page swallows that button at the surface in the CAPTURE
+// phase, so an event aimed at anything inside the terminal is stopped on its
+// way DOWN and never comes back up to the document. Everything xterm.js listens
+// on is inside the surface, so what the spy cannot see, xterm.js cannot see
+// either — and what xterm.js never sees, it cannot report.
+//
+// The left button is the control, and it is a control that cannot lie: it is
+// dispatched on the same element, from the same code, and the only difference
+// is which button it claims to be.
+//
+// The reply is "buttonN=<reached the document>,<was cancelled>" for each button.
+constexpr auto kJsComparePresses = R"JS(
+(function () {
+    try {
+        var surface = document.querySelector(".ch-terminal-surface");
+        if (!surface) return "NO_SURFACE";
+        var target = surface.querySelector(".xterm-screen") || surface;
+        var rect = target.getBoundingClientRect();
+        var x = Math.round(rect.left + rect.width / 3);
+        var y = Math.round(rect.top + rect.height / 3);
+        var seen = 0;
+        var spy = function () { seen += 1; };
+        document.addEventListener("mousedown", spy, false);
+        var parts = [];
+        try {
+            [0, 2].forEach(function (button) {
+                seen = 0;
+                var down = new MouseEvent("mousedown", {
+                    button: button, buttons: button === 2 ? 2 : 1,
+                    clientX: x, clientY: y, bubbles: true, cancelable: true
+                });
+                var uncancelled = target.dispatchEvent(down);
+                parts.push("button" + button + "=" + seen + "," + (uncancelled ? 0 : 1));
+                target.dispatchEvent(new MouseEvent("mouseup", {
+                    button: button, buttons: 0, clientX: x, clientY: y,
+                    bubbles: true, cancelable: true
+                }));
+                if (button === 2) {
+                    target.dispatchEvent(new MouseEvent("contextmenu", {
+                        button: 2, buttons: 2, clientX: x, clientY: y,
+                        bubbles: true, cancelable: true
+                    }));
+                }
+            });
+        } finally {
+            document.removeEventListener("mousedown", spy, false);
+        }
+        return parts.join("|");
+    } catch (e) { return "ERR:" + e; }
+})()
+)JS";
+
+// Everything worth knowing about the menu in one delimited reply, read the same
+// way the measurement probe above reads the cell size:
+// "menu=|open=|items=|copyDisabled=|hint=|selection=".
+// `menu` is the DOM element, `open` is the page's own diagnostics; they must
+// always agree, and a case that only asked one of them would miss a menu that
+// was left on screen after being logically closed.
+constexpr auto kJsMenuState = R"JS(
+(function () {
+    try {
+        var menu = document.querySelector("div.ch-terminal-menu");
+        var d = window.codeharborTerminalDiagnostics();
+        var copy = document.querySelector('.ch-terminal-menu-item[data-action="copy"]');
+        return "menu=" + (menu ? 1 : 0)
+             + "|open=" + (d.menuOpen ? 1 : 0)
+             + "|items=" + (menu ? menu.querySelectorAll("button.ch-terminal-menu-item").length : 0)
+             + "|copyDisabled=" + (copy ? (copy.disabled ? 1 : 0) : -1)
+             + "|hint=" + (menu && menu.querySelector("div.ch-terminal-menu-hint") ? 1 : 0)
+             + "|selection=" + (d.hasSelection ? 1 : 0);
+    } catch (e) { return "ERR:" + e; }
+})()
+)JS";
+
+// A recorder for input the page receives from OUTSIDE itself. Every other probe
+// here makes its own events, which proves what the page does with an event but
+// says nothing about whether a real one ever arrives: between the user's mouse
+// and this document sit the QML pane's full-size MouseArea and the
+// WebEngineView. Installed once, read as often as wanted.
+constexpr auto kJsInstallInputSpy = R"JS(
+(function () {
+    try {
+        window.__chInput = [];
+        if (!window.__chInputSpy) {
+            window.__chInputSpy = function (event) {
+                window.__chInput.push(event.type + ":" + event.button);
+            };
+            ["mousedown", "mouseup", "contextmenu"].forEach(function (type) {
+                document.addEventListener(type, window.__chInputSpy, true);
+            });
+        }
+        return "SPY";
+    } catch (e) { return "ERR:" + e; }
+})()
+)JS";
+
+constexpr auto kJsReadInputSpy = R"JS(
+(function () {
+    try {
+        return (window.__chInput || []).join(",");
+    } catch (e) { return "ERR:" + e; }
+})()
+)JS";
+
+// An ordinary left press and release inside the page, used to clear a selection
+// left behind by an earlier case: with no program holding the mouse, xterm.js
+// drops its selection on the next press, which is what a user's next click does.
+constexpr auto kJsPlainLeftPress = R"JS(
+(function () {
+    try {
+        var surface = document.querySelector(".ch-terminal-surface");
+        if (!surface) return "NO_SURFACE";
+        var target = surface.querySelector(".xterm-screen") || surface;
+        var rect = target.getBoundingClientRect();
+        ["mousedown", "mouseup"].forEach(function (type) {
+            target.dispatchEvent(new MouseEvent(type, {
+                button: 0, buttons: type === "mousedown" ? 1 : 0, detail: 1,
+                clientX: Math.round(rect.left + 4), clientY: Math.round(rect.top + 4),
+                bubbles: true, cancelable: true,
+            }));
+        });
+        return "PRESSED";
+    } catch (e) { return "ERR:" + e; }
+})()
+)JS";
+
+// A pointer wandering across the terminal with no button held. This is the
+// reported bug in one line: tmux's in-grid menu closed on the first of these.
+constexpr auto kJsMovePointer = R"JS(
+(function () {
+    try {
+        var surface = document.querySelector(".ch-terminal-surface");
+        if (!surface) return "NO_SURFACE";
+        var target = surface.querySelector(".xterm-screen") || surface;
+        var rect = surface.getBoundingClientRect();
+        for (var i = 1; i <= 8; ++i) {
+            target.dispatchEvent(new MouseEvent("mousemove", {
+                button: 0, buttons: 0,
+                clientX: Math.round(rect.left + (rect.width * i) / 10),
+                clientY: Math.round(rect.top + (rect.height * i) / 10),
+                bubbles: true, cancelable: true
+            }));
+        }
+        return "MOVED";
+    } catch (e) { return "ERR:" + e; }
+})()
+)JS";
+
+// Escape, sent to whatever holds the keyboard — the menu focuses its first
+// usable item when it opens, so that is the menu itself while it is up.
+constexpr auto kJsPressEscape = R"JS(
+(function () {
+    try {
+        var target = document.activeElement || document.querySelector(".ch-terminal-surface");
+        if (!target) return "NO_TARGET";
+        target.dispatchEvent(new KeyboardEvent("keydown", {
+            key: "Escape", code: "Escape", keyCode: 27, which: 27,
+            bubbles: true, cancelable: true
+        }));
+        return "SENT";
+    } catch (e) { return "ERR:" + e; }
+})()
+)JS";
+
+// Choose the menu's Select All item, the way a user chooses it: a click on the
+// button. That both closes the menu and gives the terminal a selection, which
+// is what the Copy item's enabled state is supposed to follow.
+constexpr auto kJsChooseSelectAll = R"JS(
+(function () {
+    try {
+        var item = document.querySelector('.ch-terminal-menu-item[data-action="select-all"]');
+        if (!item) return "NO_ITEM";
+        item.click();
+        return "CHOSEN";
+    } catch (e) { return "ERR:" + e; }
+})()
+)JS";
+
 } // namespace
 
 class TstTerminalPage : public QObject {
@@ -266,6 +488,20 @@ private slots:
     // pixel ratio buys sharpness, and only the font size decides how big the
     // text looks.
     void apparentTextSizeIgnoresThePixelRatio();
+    // The right mouse button belongs to the application, not to the remote
+    // side: it opens the page's own menu, that menu stays put while the pointer
+    // moves, Escape closes it, and nothing about the press ever reaches the
+    // terminal's transport.
+    void rightClickOpensTheApplicationMenu();
+    void theMenuOutlivesPointerMovement();
+    void escapeClosesTheMenu();
+    void rightClickSendsNothingToTheRemoteSide();
+    void copyIsOfferedOnlyWhenThereIsSomethingToCopy();
+    // Everything above drives the page with events the page makes for itself.
+    // This one uses REAL Qt input, delivered to the window and through the QML
+    // pane, because that path has an input-sniffing MouseArea over the whole
+    // pane and a WebEngineView with a context menu of its own.
+    void realMouseInputTravelsThroughTheQmlPane();
     // Declared last: it takes the pane live and leaves it attached to a real
     // remote shell.
     void livePaneRendersARealRemoteShell();
@@ -277,6 +513,12 @@ private:
     // shows up on xterm's screen. The retype matters: the first keystrokes can
     // land before the shell inside a freshly created tmux session has readline.
     bool pasteUntilScreenContains(const QString& line, const QString& needle, int timeoutMs);
+    // Open the page's menu with a real right-button press and return the
+    // delimited state reply, having first insisted the menu is up.
+    QString openTerminalMenu();
+    // Escape, then wait for the menu to be gone. Every case that opens the menu
+    // ends with this, so the next one starts from a closed menu.
+    void closeTerminalMenu();
 
     ch::CodeharbordClient m_client;
     ch::ViewerProfiles m_profiles{&m_client};
@@ -512,6 +754,309 @@ void TstTerminalPage::apparentTextSizeIgnoresThePixelRatio()
     measure(13, 0.0);
 }
 
+QString TstTerminalPage::openTerminalMenu()
+{
+    if (evalJs(QString::fromLatin1(kJsRightPress)) != QStringLiteral("PRESSED"))
+        return QStringLiteral("PRESS_FAILED");
+    // The menu is built synchronously inside the contextmenu handler, but the
+    // reply above and the reply below are two separate trips into the renderer,
+    // so the state is polled rather than read once.
+    QString state;
+    QElapsedTimer clock;
+    clock.start();
+    while (clock.elapsed() < kProbeTimeoutMs) {
+        state = evalJs(QString::fromLatin1(kJsMenuState));
+        if (state.startsWith(QStringLiteral("menu=1")))
+            return state;
+        QTest::qWait(50);
+    }
+    return state;
+}
+
+void TstTerminalPage::closeTerminalMenu()
+{
+    evalJs(QString::fromLatin1(kJsPressEscape));
+    QElapsedTimer clock;
+    clock.start();
+    while (clock.elapsed() < kProbeTimeoutMs) {
+        if (evalJs(QString::fromLatin1(kJsMenuState)).startsWith(QStringLiteral("menu=0")))
+            return;
+        QTest::qWait(50);
+    }
+}
+
+// (5) The right button opens the APPLICATION's menu.
+//
+// The pane's tmux session runs with mouse reporting on, so tmux used to get the
+// right button and answer it with a menu drawn inside the terminal grid. That
+// menu could not be used with a mouse (see the next case), and tmux's binding
+// for it is global, so the fix is to keep the button out of the remote side
+// altogether and put a real menu of the page's own in its place.
+void TstTerminalPage::rightClickOpensTheApplicationMenu()
+{
+    const QString state = openTerminalMenu();
+    QVERIFY2(state.startsWith(QStringLiteral("menu=1")),
+             qPrintable(QStringLiteral("a right-button press did not put a "
+                                       "div.ch-terminal-menu on the page: %1")
+                            .arg(state)));
+    // The page's own diagnostics must agree with the DOM: a menu that is on
+    // screen while the page believes it is closed answers to nothing.
+    QVERIFY2(state.contains(QStringLiteral("|open=1")),
+             qPrintable(QStringLiteral("the page does not report its menu as open: %1")
+                            .arg(state)));
+    // Copy, Paste and Select All, plus the line naming the modifier that draws
+    // a local selection — without it the menu is the only discoverable place
+    // that behaviour is written down.
+    QVERIFY2(state.contains(QStringLiteral("|items=3")),
+             qPrintable(QStringLiteral("the menu did not offer three items: %1").arg(state)));
+    QVERIFY2(state.contains(QStringLiteral("|hint=1")),
+             qPrintable(QStringLiteral("the menu lost its selection hint: %1").arg(state)));
+
+    closeTerminalMenu();
+}
+
+// (6) The bug as it was reported: the menu vanished as soon as the mouse
+// moved. tmux redraws its in-grid menu away on the next mouse report, and a
+// moving pointer produces one per motion. The replacement is ordinary DOM, so
+// motion over the terminal must leave it exactly where it is.
+void TstTerminalPage::theMenuOutlivesPointerMovement()
+{
+    QVERIFY2(openTerminalMenu().startsWith(QStringLiteral("menu=1")),
+             "the menu did not open, so its survival cannot be judged");
+
+    QCOMPARE(evalJs(QString::fromLatin1(kJsMovePointer)), QStringLiteral("MOVED"));
+    QTest::qWait(250);
+
+    const QString state = evalJs(QString::fromLatin1(kJsMenuState));
+    QVERIFY2(state.startsWith(QStringLiteral("menu=1")) && state.contains(QStringLiteral("|open=1")),
+             qPrintable(QStringLiteral("moving the pointer over the terminal closed the menu: %1")
+                            .arg(state)));
+
+    closeTerminalMenu();
+}
+
+// (7) Escape closes it, because a menu the keyboard cannot dismiss is a trap.
+// Both the element and the page's own view of the menu must go.
+void TstTerminalPage::escapeClosesTheMenu()
+{
+    QVERIFY2(openTerminalMenu().startsWith(QStringLiteral("menu=1")),
+             "the menu did not open, so closing it cannot be judged");
+
+    QCOMPARE(evalJs(QString::fromLatin1(kJsPressEscape)), QStringLiteral("SENT"));
+
+    QString state;
+    QElapsedTimer clock;
+    clock.start();
+    while (clock.elapsed() < kProbeTimeoutMs) {
+        state = evalJs(QString::fromLatin1(kJsMenuState));
+        if (state.startsWith(QStringLiteral("menu=0")))
+            break;
+        QTest::qWait(50);
+    }
+    QVERIFY2(state.startsWith(QStringLiteral("menu=0")),
+             qPrintable(QStringLiteral("Escape left the menu element on the page: %1").arg(state)));
+    QVERIFY2(state.contains(QStringLiteral("|open=0")),
+             qPrintable(QStringLiteral("Escape removed the menu but the page still "
+                                       "believes it is open: %1")
+                            .arg(state)));
+}
+
+// (8) A right click produces no terminal input at all.
+//
+// Two things have to hold, and one without the other proves little. The page
+// must write nothing to the controller's transport, which is read here exactly
+// the way the keystroke case above reads it — a QBuffer standing in for the
+// remote end. And the press must not get as far as xterm.js in the first place,
+// because a terminal only reports mouse events while the program on the far end
+// has asked for them, so silence alone could just mean nobody was asking.
+//
+// The second half is checked in the page: the press is swallowed at the surface
+// in the capture phase, so it never reaches anything inside — which is where
+// all of xterm.js's listeners are — and never comes back up to the document
+// either. A left press dispatched by the same code on the same spot is the
+// control, and it must arrive.
+//
+// Mouse reporting is switched on for the duration with the DECSET sequence a
+// remote program (tmux, here) sends when it wants the mouse, so the terminal is
+// in the state where a forwarded button WOULD be reported.
+void TstTerminalPage::rightClickSendsNothingToTheRemoteSide()
+{
+    // WriteOnly for the same reason as the keystroke case above: a readable
+    // QBuffer would feed everything written into it back to the controller as
+    // terminal output.
+    QBuffer transport;
+    QVERIFY(transport.open(QIODevice::WriteOnly));
+    m_controller->setTransport(&transport);
+
+    m_controller->ingestOutput(QByteArrayLiteral("\x1b[?1000h"));
+    QTest::qWait(500);
+
+    const QString reply = evalJs(QString::fromLatin1(kJsComparePresses));
+    qInfo().noquote() << "presses seen at the document (reached,cancelled):" << reply;
+    const QStringList parts = reply.split(QLatin1Char('|'));
+    QVERIFY2(parts.size() == 2, qPrintable(QStringLiteral("the press probe replied %1").arg(reply)));
+    // The control: an ordinary left press travels the whole way, so the probe
+    // itself works and the terminal really is being clicked on.
+    QVERIFY2(!parts.at(0).startsWith(QStringLiteral("button0=0,")),
+             qPrintable(QStringLiteral("the left button did not reach the terminal either, so "
+                                       "this case proves nothing: %1")
+                            .arg(reply)));
+    // The claim: the right press is stopped and cancelled at the surface, so
+    // nothing inside — xterm.js included — ever sees it.
+    QCOMPARE(parts.at(1), QStringLiteral("button2=0,1"));
+
+    // ...and, the whole point of stopping it there, nothing was sent to the
+    // remote side. Nothing to wait FOR, so the wait is for the absence: long
+    // enough that a report crossing the bridge would have arrived.
+    QTest::qWait(1000);
+    QVERIFY2(transport.data().isEmpty(),
+             qPrintable(QStringLiteral("a right click sent %1 to the remote side")
+                            .arg(QString::fromLatin1(transport.data().toHex()))));
+
+    m_controller->ingestOutput(QByteArrayLiteral("\x1b[?1000l"));
+    m_controller->setTransport(nullptr);
+    // The probe's right press opened the menu; leave the page closed.
+    closeTerminalMenu();
+}
+
+// (9) Copy is offered only when there is something to copy.
+//
+// A Copy item that is always live is worse than none: it silently does nothing,
+// and the user cannot tell whether the selection they made was taken. The state
+// is read from the menu the page actually built, and the selection is made the
+// way a user makes one here — by choosing Select All from the menu itself.
+void TstTerminalPage::copyIsOfferedOnlyWhenThereIsSomethingToCopy()
+{
+    const QString empty = openTerminalMenu();
+    QVERIFY2(empty.contains(QStringLiteral("|selection=0")),
+             qPrintable(QStringLiteral("the terminal already held a selection, so a "
+                                       "disabled Copy would prove nothing: %1")
+                            .arg(empty)));
+    QVERIFY2(empty.contains(QStringLiteral("|copyDisabled=1")),
+             qPrintable(QStringLiteral("Copy was offered with nothing selected: %1").arg(empty)));
+
+    // Choosing Select All closes the menu and leaves a selection behind.
+    QCOMPARE(evalJs(QString::fromLatin1(kJsChooseSelectAll)), QStringLiteral("CHOSEN"));
+    QTest::qWait(250);
+
+    const QString selected = openTerminalMenu();
+    QVERIFY2(selected.contains(QStringLiteral("|selection=1")),
+             qPrintable(QStringLiteral("Select All left the terminal with no selection: %1")
+                            .arg(selected)));
+    QVERIFY2(selected.contains(QStringLiteral("|copyDisabled=0")),
+             qPrintable(QStringLiteral("Copy stayed disabled with the whole screen "
+                                       "selected: %1")
+                            .arg(selected)));
+
+    closeTerminalMenu();
+}
+
+// (10) REAL mouse input, from Qt, through the QML pane, into the page.
+//
+// Everything above dispatches events inside the document, which cannot see the
+// two things between a user's mouse and that document: TerminalPaneView.qml
+// puts a full-size MouseArea over the pane to notice which pane is being worked
+// in, and the WebEngineView underneath has a context menu of its own (Reload,
+// Back, View Source) that Qt shows unless the request is accepted. Either one
+// could swallow the button or cover the page's menu, and neither is reachable
+// from JavaScript. So this case clicks the WINDOW.
+void TstTerminalPage::realMouseInputTravelsThroughTheQmlPane()
+{
+    auto* window = qobject_cast<QQuickWindow*>(m_window.get());
+    QVERIFY2(window != nullptr, "the test shell is not a QQuickWindow");
+    if (!QTest::qWaitForWindowExposed(window))
+        QSKIP("the window was never exposed, so real input cannot be delivered");
+
+    QCOMPARE(evalJs(QString::fromLatin1(kJsInstallInputSpy)), QStringLiteral("SPY"));
+
+    // Well inside the terminal: below the pane header, away from every border.
+    const QPoint point(window->width() / 2, window->height() / 2 + 40);
+
+    // The left button must still arrive. It is the control for the claim below
+    // and a claim in its own right: the pane's MouseArea observes presses and
+    // then declines them, so a press that stopped there would leave the
+    // terminal unclickable.
+    QTest::mouseClick(window, Qt::LeftButton, Qt::NoModifier, point);
+    QVERIFY2(waitForJs(QString::fromLatin1(kJsReadInputSpy),
+                       QStringLiteral("mousedown:0"), kProbeTimeoutMs),
+             qPrintable(QStringLiteral("a real left click never reached the terminal page; "
+                                       "the page saw: %1")
+                            .arg(evalJs(QString::fromLatin1(kJsReadInputSpy)))));
+
+
+    // The selection the user asked for, made with real input.
+    //
+    // Mouse reporting is switched on first, because that is the state that
+    // makes this interesting: with a program holding the mouse, a plain drag is
+    // its business, and the modifier is the documented way to take one drag
+    // back for the page. The screen is filled first so the drag crosses real
+    // characters rather than blank cells.
+    for (int line = 0; line < 24; ++line) {
+        m_controller->ingestOutput(
+            QByteArrayLiteral("selectable terminal text on a line of its own\r\n"));
+    }
+    m_controller->ingestOutput(QByteArrayLiteral("\x1b[?1000h"));
+    QTest::qWait(500);
+    // An earlier case leaves the whole screen selected; a plain press drops it,
+    // so what this case observes can only be what this case selected.
+    m_controller->ingestOutput(QByteArrayLiteral("\x1b[?1000l"));
+    QTest::qWait(200);
+    QCOMPARE(evalJs(QString::fromLatin1(kJsPlainLeftPress)), QStringLiteral("PRESSED"));
+    QTest::qWait(200);
+    QVERIFY2(evalJs(QString::fromLatin1(kJsMenuState)).contains(QStringLiteral("|selection=0")),
+             "the terminal still held a selection, so the drag below would prove nothing");
+    m_controller->ingestOutput(QByteArrayLiteral("\x1b[?1000h"));
+    QTest::qWait(300);
+
+    const QPoint dragStart(120, window->height() / 2);
+    QTest::mousePress(window, Qt::LeftButton, Qt::ShiftModifier, dragStart);
+    for (int step = 1; step <= 6; ++step) {
+        QTest::mouseMove(window, dragStart + QPoint(step * 60, step * 4));
+        QTest::qWait(30);
+    }
+    const QPoint dragEnd = dragStart + QPoint(360, 24);
+    QTest::mouseRelease(window, Qt::LeftButton, Qt::ShiftModifier, dragEnd);
+
+    QString dragged;
+    QElapsedTimer dragClock;
+    dragClock.start();
+    while (dragClock.elapsed() < kProbeTimeoutMs) {
+        dragged = evalJs(QString::fromLatin1(kJsMenuState));
+        if (dragged.contains(QStringLiteral("|selection=1")))
+            break;
+        QTest::qWait(50);
+    }
+    QVERIFY2(dragged.contains(QStringLiteral("|selection=1")),
+             qPrintable(QStringLiteral("a real Shift-drag left no selection behind: %1")
+                            .arg(dragged)));
+    // The complaint that started this: the selection disappeared the moment the
+    // button came up. A second later it must still be there.
+    QTest::qWait(1200);
+    QVERIFY2(evalJs(QString::fromLatin1(kJsMenuState)).contains(QStringLiteral("|selection=1")),
+             "the selection was dropped shortly after the button was released");
+    m_controller->ingestOutput(QByteArrayLiteral("\x1b[?1000l"));
+    // And the right button opens the page's own menu, from a real press.
+    QCOMPARE(evalJs(QString::fromLatin1(kJsInstallInputSpy)), QStringLiteral("SPY"));
+    QTest::mouseClick(window, Qt::RightButton, Qt::NoModifier, point);
+    QString state;
+    QElapsedTimer clock;
+    clock.start();
+    while (clock.elapsed() < kProbeTimeoutMs) {
+        state = evalJs(QString::fromLatin1(kJsMenuState));
+        if (state.startsWith(QStringLiteral("menu=1")))
+            break;
+        QTest::qWait(50);
+    }
+    const QString seen = evalJs(QString::fromLatin1(kJsReadInputSpy));
+    qInfo().noquote() << "the page saw, from real input:" << seen;
+    QVERIFY2(state.startsWith(QStringLiteral("menu=1")) && state.contains(QStringLiteral("|open=1")),
+             qPrintable(QStringLiteral("a real right click did not open the page's menu "
+                                       "(state %1; the page saw %2)")
+                            .arg(state, seen)));
+
+    closeTerminalMenu();
+}
+
 bool TstTerminalPage::pasteUntilScreenContains(const QString& line, const QString& needle,
                                                int timeoutMs)
 {
@@ -555,7 +1100,7 @@ bool TstTerminalPage::pasteUntilScreenContains(const QString& line, const QStrin
     return false;
 }
 
-// (4) The whole slice in one go: a REAL remote shell rendered by the REAL pane.
+// (10) The whole slice in one go: a REAL remote shell rendered by the REAL pane.
 // The pane attaches through its own attachNow() (the button a user presses),
 // the PTY runs a real tmux session on the fixture server, and the command is
 // "typed" into xterm from the PAGE — so the marker on screen can only have come

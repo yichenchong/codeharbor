@@ -19,6 +19,8 @@ import { CoalescingWriter } from "./writer.ts";
 import { TerminalInputWriter } from "./input.ts";
 // Renderer choice and the WebGL context-loss fallback (see renderer.ts).
 import { installRenderer } from "./renderer.ts";
+// The pane's own right-click menu, and the mouse policy behind it (see menu.ts).
+import { TerminalContextMenu } from "./menu.ts";
 import {
     applyTerminalPreferences,
     terminalFontPointsToCssPixels,
@@ -217,14 +219,9 @@ export function mountTerminal(element: HTMLElement, bridge: TerminalBridge): Ter
         },
     );
 
-    // There is deliberately no application context menu. xterm's own
-    // right-click handler still selects a word and prepares the textarea for a
-    // native copy, while this listener prevents Chromium's empty menu from
-    // appearing on top of the terminal.
-    const suppressContextMenu = (event: MouseEvent): void => {
-        event.preventDefault();
-    };
-    surface.addEventListener("contextmenu", suppressContextMenu);
+    // The mouse policy — which button belongs to this application and which
+    // belongs to the program running in the terminal — is set up further down,
+    // next to the copy helper and the focus helper it needs.
 
     const input = new TerminalInputWriter({
         sendInput: (data) => bridge.sendInput(data),
@@ -458,6 +455,85 @@ export function mountTerminal(element: HTMLElement, bridge: TerminalBridge): Ter
         if (textarea instanceof HTMLTextAreaElement)
             textarea.focus();
     };
+
+    // ---- mouse -------------------------------------------------------------
+    // WHAT GOES WHERE. The pane's tmux session is started with mouse reporting
+    // on, so xterm.js forwards button presses and wheel turns to it as mouse
+    // reports (see ch::TerminalController::tmuxNewSessionCommand for why the
+    // wheel needs that). Two consequences are deliberate and left alone:
+    //   * the wheel scrolls the session's history, and a program that asked for
+    //     the mouse (vim, htop) gets the wheel itself;
+    //   * a plain drag belongs to that program, and the page's own selection is
+    //     reached with xterm.js's documented modifier — Alt on macOS, Shift
+    //     everywhere else. That selection stays until it is replaced, and
+    //     nothing is copied without being asked for.
+    //
+    // The RIGHT button is the exception, and it is taken away from the remote
+    // side entirely. Forwarded, it reaches tmux, whose default binding draws a
+    // menu of its own inside the grid and then closes it on the very next mouse
+    // report — every pointer movement produces one, so that menu cannot be used
+    // with a mouse. Swallowing the button in the CAPTURE phase, at the surface,
+    // is what stops it: xterm.js listens on descendants of this element (and,
+    // mid-drag, on the document, which the event can only reach by bubbling
+    // through here), so none of its handlers run and no report is sent.
+    const swallowRightButton = (event: MouseEvent): void => {
+        if (event.button !== 2) {
+            return;
+        }
+        event.preventDefault();
+        event.stopPropagation();
+    };
+    for (const type of ["mousedown", "mouseup", "auxclick"] as const) {
+        surface.addEventListener(type, swallowRightButton, true);
+    }
+
+    const menu = new TerminalContextMenu(element, {
+        hasSelection: () => term.hasSelection(),
+        focusTerminal: () => focusTerminal(),
+        isMac,
+        run: (action) => {
+            if (action === "copy") {
+                copySelection();
+                return;
+            }
+            if (action === "select-all") {
+                term.selectAll();
+                return;
+            }
+            // Paste. term.paste() is the same path the browser's own paste event
+            // takes, so the text is bracketed when the remote program asked for
+            // bracketed paste, and it is chunked by the input writer like any
+            // other input. Reading the clipboard is asynchronous and can be
+            // refused outright (no clipboard permission, an empty clipboard on a
+            // headless host); a refusal pastes nothing rather than throwing.
+            const clipboard = pageWindow.navigator.clipboard;
+            if (!clipboard?.readText) {
+                console.warn("CodeHarbor terminal cannot read the clipboard");
+                return;
+            }
+            void clipboard.readText().then(
+                (text) => {
+                    if (text.length > 0 && !disposed) {
+                        term.paste(text);
+                    }
+                },
+                (error: unknown) => console.warn(
+                    "CodeHarbor terminal could not read the clipboard", error),
+            );
+        },
+    });
+    // The browser's own menu is empty on this page and would cover the terminal;
+    // this is where it is replaced rather than merely suppressed. Capture phase
+    // and stopPropagation, for the same reason the buttons above are swallowed:
+    // xterm.js has a contextmenu handler of its own that selects the word under
+    // the pointer (its default on macOS), and selecting something the user did
+    // not ask for is exactly what this change is removing.
+    const openTerminalMenu = (event: MouseEvent): void => {
+        event.preventDefault();
+        event.stopPropagation();
+        menu.openAt(event.clientX, event.clientY);
+    };
+    surface.addEventListener("contextmenu", openTerminalMenu, true);
     const terminalDiagnostics = (): Record<string, unknown> => {
         const canvas = surface.querySelector("canvas");
         const canvasRect = canvas?.getBoundingClientRect();
@@ -488,6 +564,10 @@ export function mountTerminal(element: HTMLElement, bridge: TerminalBridge): Ter
             // ratio changes, which is only checkable if both are reported.
             cols: term.cols,
             rows: term.rows,
+            // What the mouse is doing: whether the page holds a selection of
+            // its own, and whether this application's menu is on screen.
+            hasSelection: term.hasSelection(),
+            menuOpen: menu.isOpen,
             fontCssPixels: term.options.fontSize ?? null,
             surfaceCssPixels: {
                 width: surface.clientWidth,
@@ -560,7 +640,11 @@ export function mountTerminal(element: HTMLElement, bridge: TerminalBridge): Ter
             resizeObserver.disconnect();
             visibilityObserver.disconnect();
             element.ownerDocument.removeEventListener("visibilitychange", reportVisibility);
-            surface.removeEventListener("contextmenu", suppressContextMenu);
+            surface.removeEventListener("contextmenu", openTerminalMenu, true);
+            for (const type of ["mousedown", "mouseup", "auxclick"] as const) {
+                surface.removeEventListener(type, swallowRightButton, true);
+            }
+            menu.dispose();
             pixelRatio.restore();
             writer.close();
             // The renderer is going away (pane closed, or the page is about to
