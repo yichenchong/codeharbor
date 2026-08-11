@@ -1,6 +1,6 @@
 {
   "name": "@codeharbor/web-editor",
-  "version": "0.1.24",
+  "version": "0.1.25",
   "private": true,
   "description": "Monaco editor bundle bridged to the remote file service via Qt WebChannel",
   "type": "module",
