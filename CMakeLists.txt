@@ -5,7 +5,7 @@
 cmake_minimum_required(VERSION 3.25)
 
 project(CodeHarbor
-    VERSION 0.1.25
+    VERSION 0.1.26
     DESCRIPTION "Remote-first development workspace client"
     LANGUAGES CXX)
 
