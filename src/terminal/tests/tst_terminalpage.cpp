@@ -146,6 +146,17 @@ Window {
         return null
     }
 
+    // Keyboard focus for the page, so a key sent to the WINDOW is delivered to
+    // the terminal rather than dropped. A user gets this by clicking in the
+    // pane; a test that only wants to press a key should not have to.
+    function focusPane() {
+        var view = findView(paneLoader.item)
+        if (!view)
+            return false
+        view.forceActiveFocus()
+        return view.activeFocus
+    }
+
     function evalJs(script) {
         win.jsFinished = false
         win.jsResult = ""
@@ -422,6 +433,43 @@ constexpr auto kJsPasteItemGeometry = R"JS(
 })()
 )JS";
 
+// What the PAGE saw of the last key press: "ctrl=|meta=|shift=|key=".
+//
+// Qt and the browser do not agree about modifier names on every platform —
+// macOS swaps Control and Command somewhere between QTest and Chromium — and
+// which way round it comes out is a property of the machine, not of this
+// application. A test that hardcoded a guess would pass on one platform and
+// fail on another for a reason that has nothing to do with the behaviour under
+// test, so the mapping is measured with one harmless key press instead.
+constexpr auto kJsInstallKeySpy = R"JS(
+(function () {
+    try {
+        window.__chKey = null;
+        if (!window.__chKeySpy) {
+            window.__chKeySpy = function (event) {
+                window.__chKey = {
+                    ctrl: event.ctrlKey, meta: event.metaKey,
+                    shift: event.shiftKey, key: event.key,
+                };
+            };
+            document.addEventListener("keydown", window.__chKeySpy, true);
+        }
+        return "SPY";
+    } catch (e) { return "ERR:" + e; }
+})()
+)JS";
+
+constexpr auto kJsReadKeySpy = R"JS(
+(function () {
+    try {
+        var k = window.__chKey;
+        if (!k) return "NO_KEY";
+        return "ctrl=" + (k.ctrl ? 1 : 0) + "|meta=" + (k.meta ? 1 : 0)
+             + "|shift=" + (k.shift ? 1 : 0) + "|key=" + k.key;
+    } catch (e) { return "ERR:" + e; }
+})()
+)JS";
+
 // An ordinary left press and release inside the page, used to clear a selection
 // left behind by an earlier case: with no program holding the mouse, xterm.js
 // drops its selection on the next press, which is what a user's next click does.
@@ -542,6 +590,11 @@ private slots:
     // sends it to the remote side. Every step of that is a place it can fail
     // silently, so it is checked at the far end.
     void pasteFromTheMenuReachesTheRemoteSide();
+    // The copy shortcut, and the key it is deliberately NOT: Ctrl+C is the
+    // interrupt every shell user relies on, so copying is Ctrl+Shift+C (Cmd+C
+    // on macOS). Both halves are checked, because getting either wrong is a
+    // daily annoyance.
+    void copyShortcutReachesTheSystemClipboard();
     // Everything above drives the page with events the page makes for itself.
     // This one uses REAL Qt input, delivered to the window and through the QML
     // pane, because that path has an input-sniffing MouseArea over the whole
@@ -1050,7 +1103,148 @@ void TstTerminalPage::pasteFromTheMenuReachesTheRemoteSide()
     m_controller->setTransport(nullptr);
 }
 
-// (11) REAL mouse input, from Qt, through the QML pane, into the page.
+// (11) Ctrl+C copies when something is selected, and interrupts when nothing is.
+//
+// Ctrl+C is how a shell user stops a running command, so it can never simply
+// become copy. With text selected, though, there is nothing the user could have
+// meant to interrupt — they have just selected something — so it copies, and
+// copying clears the selection. That last part is the safety: the very next
+// Ctrl+C interrupts, so a forgotten selection costs one keypress, never more.
+// Ctrl+Shift+C copies whatever the selection state is.
+//
+// All three are driven with REAL key presses at the window, and the copy is
+// checked on the system clipboard rather than on the page's own account of it.
+void TstTerminalPage::copyShortcutReachesTheSystemClipboard()
+{
+    auto* window = qobject_cast<QQuickWindow*>(m_window.get());
+    QVERIFY2(window != nullptr, "the test shell is not a QQuickWindow");
+    if (!QTest::qWaitForWindowExposed(window))
+        QSKIP("the window was never exposed, so real input cannot be delivered");
+    QVariant focused;
+    QVERIFY(QMetaObject::invokeMethod(m_window.get(), "focusPane",
+                                      Q_RETURN_ARG(QVariant, focused)));
+    QVERIFY2(focused.toBool(), "the terminal page never took keyboard focus");
+
+    QClipboard* clipboard = QGuiApplication::clipboard();
+    QVERIFY2(clipboard != nullptr, "this platform has no clipboard");
+    const QString marker = QStringLiteral("copy-shortcut-marker-5150");
+    m_controller->ingestOutput(marker.toUtf8() + QByteArrayLiteral("\r\n"));
+    QTest::qWait(300);
+    // A sentinel rather than an empty clipboard: "the marker is not there" is
+    // also true of a copy that silently wrote nothing at all.
+    const QString sentinel = QStringLiteral("clipboard-untouched-sentinel");
+
+    // WHICH Qt modifier arrives as which browser modifier is measured, not
+    // assumed: macOS swaps Control and Command somewhere between QTest and
+    // Chromium, and getting the guess backwards would fail this case for a
+    // reason that has nothing to do with copying. One harmless press settles it.
+    QCOMPARE(evalJs(QString::fromLatin1(kJsInstallKeySpy)), QStringLiteral("SPY"));
+    QTest::keyClick(window, Qt::Key_A, Qt::ControlModifier);
+    QString probe;
+    QElapsedTimer probeClock;
+    probeClock.start();
+    while (probeClock.elapsed() < kProbeTimeoutMs) {
+        probe = evalJs(QString::fromLatin1(kJsReadKeySpy));
+        if (probe.startsWith(QStringLiteral("ctrl=")))
+            break;
+        QTest::qWait(50);
+    }
+    qInfo().noquote() << "Qt::ControlModifier reached the page as:" << probe;
+    const bool qtControlIsCommand = probe.contains(QStringLiteral("meta=1"));
+    QVERIFY2(qtControlIsCommand || probe.contains(QStringLiteral("ctrl=1")),
+             qPrintable(QStringLiteral("a key press with Qt::ControlModifier reached the page "
+                                       "as neither Control nor Command: %1")
+                            .arg(probe)));
+    // The browser-side Control key, which is the interrupt's modifier here.
+    const Qt::KeyboardModifiers kPlainCtrlC =
+        qtControlIsCommand ? Qt::MetaModifier : Qt::ControlModifier;
+#ifdef Q_OS_MACOS
+    // Copy is Cmd+C, and Ctrl+C is left alone: it is the interrupt whether or
+    // not anything is selected.
+    const Qt::KeyboardModifiers kExplicitCopy =
+        qtControlIsCommand ? Qt::ControlModifier : Qt::MetaModifier;
+    constexpr bool kPlainCtrlCCopies = false;
+#else
+    const Qt::KeyboardModifiers kExplicitCopy = kPlainCtrlC | Qt::ShiftModifier;
+    constexpr bool kPlainCtrlCCopies = true;
+#endif
+
+    const auto selectEverything = [this]() {
+        const QString opened = openTerminalMenu();
+        QVERIFY2(opened.startsWith(QStringLiteral("menu=1")), qPrintable(opened));
+        QCOMPARE(evalJs(QString::fromLatin1(kJsChooseSelectAll)), QStringLiteral("CHOSEN"));
+        QTest::qWait(300);
+        QVERIFY2(evalJs(QString::fromLatin1(kJsMenuState)).contains(QStringLiteral("|selection=1")),
+                 "Select All left the terminal with no selection");
+    };
+    const auto waitForClipboard = [clipboard](const QString& needle) {
+        QElapsedTimer clock;
+        clock.start();
+        while (clock.elapsed() < kProbeTimeoutMs) {
+            if (clipboard->text().contains(needle))
+                return true;
+            QTest::qWait(50);
+        }
+        return false;
+    };
+
+    // 1. The explicit shortcut copies.
+    selectEverything();
+    clipboard->setText(sentinel);
+    QTest::keyClick(window, Qt::Key_C, kExplicitCopy);
+    QVERIFY2(waitForClipboard(marker),
+             qPrintable(QStringLiteral("the copy shortcut left the clipboard holding %1")
+                            .arg(clipboard->text())));
+
+    // 2. Plain Ctrl+C with a selection: copies where that is the platform's
+    //    rule, and takes the selection away so the next press interrupts.
+    QBuffer transport;
+    QVERIFY(transport.open(QIODevice::WriteOnly));
+    m_controller->setTransport(&transport);
+    selectEverything();
+    clipboard->setText(sentinel);
+    QTest::keyClick(window, Qt::Key_C, kPlainCtrlC);
+    if (kPlainCtrlCCopies) {
+        QVERIFY2(waitForClipboard(marker),
+                 qPrintable(QStringLiteral("Ctrl+C with a selection left the clipboard "
+                                           "holding %1")
+                                .arg(clipboard->text())));
+        // Nothing to wait FOR, so this waits for the absence: an interrupt
+        // crossing the bridge would have arrived well inside this.
+        QTest::qWait(800);
+        QVERIFY2(!transport.data().contains('\x03'),
+                 "Ctrl+C interrupted the remote program as well as copying");
+        QElapsedTimer cleared;
+        cleared.start();
+        while (cleared.elapsed() < kProbeTimeoutMs) {
+            if (evalJs(QString::fromLatin1(kJsMenuState)).contains(QStringLiteral("|selection=0")))
+                break;
+            QTest::qWait(50);
+        }
+        QVERIFY2(evalJs(QString::fromLatin1(kJsMenuState)).contains(QStringLiteral("|selection=0")),
+                 "copying with Ctrl+C kept the selection, so the next Ctrl+C would copy again "
+                 "instead of interrupting");
+    }
+
+    // 3. ...and now Ctrl+C is the interrupt again, which is the whole point.
+    QTest::keyClick(window, Qt::Key_C, kPlainCtrlC);
+    QElapsedTimer clock;
+    clock.start();
+    while (clock.elapsed() < kProbeTimeoutMs) {
+        if (transport.data().contains('\x03'))
+            break;
+        QTest::qWait(50);
+    }
+    const QByteArray sent = transport.data();
+    m_controller->setTransport(nullptr);
+    QVERIFY2(sent.contains('\x03'),
+             qPrintable(QStringLiteral("Ctrl+C with nothing selected sent %1 to the remote "
+                                       "side instead of the interrupt character")
+                            .arg(sent.isEmpty() ? QStringLiteral("nothing")
+                                                : QString::fromLatin1(sent.toHex()))));
+}
+
+// (12) REAL mouse input, from Qt, through the QML pane, into the page.
 //
 // Everything above dispatches events inside the document, which cannot see the
 // two things between a user's mouse and that document: TerminalPaneView.qml

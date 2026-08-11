@@ -527,7 +527,9 @@ repaint the screen.
 to the program in the terminal rather than to the browser. A local selection is therefore made by holding the
 modifier xterm.js reserves for exactly this — Shift and drag, or Option and drag on macOS — and that selection
 stays until it is replaced. Nothing is ever put on the clipboard without being asked for: copying is
-`Ctrl+Shift+C` (`⌘C` on macOS) or the terminal's own menu, and it puts the current selection on the system
+`Ctrl+Shift+C` (`⌘C` on macOS), the terminal's own menu, or — with something selected, and outside macOS —
+plain `Ctrl+C`, which then clears the selection so that the next `Ctrl+C` is the interrupt again (§5.7). All
+three put the current selection on the system
 clipboard. Pasting the system clipboard is `Ctrl+Shift+V` (`⌘V` on macOS) or the menu, and sends it to
 the shell, guarded by bracketed paste where the application asked for it. (A middle click is a mouse button like
 any other and is reported to the remote side, where tmux answers it by pasting its OWN most recent copy — which
@@ -671,6 +673,8 @@ CodeHarbor, and the application must not quietly take actions away from it.
 | Right click | The application | Never reported to the remote side. It opens CodeHarbor's own menu — see below. |
 | Middle click | The remote program | Reported like any other button. Inside tmux that pastes tmux's own most recent copy, which is not the system clipboard. |
 | `Ctrl+Shift+C` (`⌘C` on macOS) | The application | Copies the local selection to the system clipboard. |
+| `Ctrl+C` with a selection (not macOS) | The application | Copies, and clears the selection. See below. |
+| `Ctrl+C` with nothing selected | The remote program | The interrupt, unchanged. On macOS `Ctrl+C` is always the interrupt. |
 | `Ctrl+Shift+V` (`⌘V` on macOS) | The application | Pastes the clipboard into the shell (§5.1). |
 
 **Why the right button is the exception.** tmux's default right-button binding draws a menu inside the terminal
@@ -684,6 +688,12 @@ with nothing selected there is nothing to copy. The menu also names the modifier
 Shift (Option) rule is discoverable from the terminal rather than only from this document. It closes when an
 item is chosen, on Escape, and on a mouse press outside it — and, unlike tmux's, never on pointer movement.
 Nothing here copies anything the user did not ask for: there is no copy-on-select and no copy-on-release.
+
+**`Ctrl+C`.** With text selected, `Ctrl+C` copies rather than interrupting, as Windows Terminal does: the user
+has just selected something, so there is nothing they could have meant to interrupt. Copying then CLEARS the
+selection, and that is what makes the rule safe — the very next `Ctrl+C` is the interrupt again, so a selection
+left behind by accident can cost one keypress and never more. macOS is excluded: copy has a key of its own
+there (`⌘C`), so `Ctrl+C` has nothing to disambiguate and stays the interrupt in every state.
 
 ---
 
@@ -1594,6 +1604,9 @@ Ctrl+Shift+W    Close Window
 Ctrl+,          Settings
 Ctrl+S          Save active remote file (inside the focused editor)
 Ctrl+Shift+C    Copy the selection (inside the focused terminal; ⌘C on macOS)
+Ctrl+C          Copy the selection, if there is one, and clear it; otherwise the
+                interrupt (inside the focused terminal; never on macOS, where
+                Ctrl+C is always the interrupt)
 Ctrl+Shift+V    Paste the clipboard (inside the focused terminal; ⌘V on macOS)
 ```
 

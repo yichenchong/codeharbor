@@ -157,6 +157,7 @@ shortcuts SPEC 15 originally suggested, in [`docs/SPEC.md`](docs/SPEC.md) — is
 | `Ctrl+Shift+W` | Close Window (the window is frameless, so the window manager draws no close button; the in-app title bar has one) |
 | `Ctrl+S` | Save the file in the focused editor |
 | `Ctrl+Shift+C` (`⌘C` on macOS) | Copy the selection in the focused terminal |
+| `Ctrl+C` | In a terminal with text selected: copy it and clear the selection. With nothing selected it is the usual interrupt, and on macOS it is always the interrupt |
 | `Ctrl+Shift+V` (`⌘V` on macOS) | Paste into the focused terminal |
 | `Ctrl+,` | Settings |
 
@@ -199,9 +200,11 @@ A few things worth knowing about the shipped client:
   program that wants the mouse — vim, htop — gets it, including plain clicks and
   drags. To select text for yourself instead, hold **Shift and drag** (**Option and
   drag** on macOS); that selection stays put, and nothing is copied until you ask.
-  Copy with `Ctrl+Shift+C` (`⌘C` on macOS), paste with `Ctrl+Shift+V` (`⌘V`) or from
-  the right-click menu. (A middle click goes to tmux, which pastes its own last copy
-  rather than the system clipboard.)
+  Copy with `Ctrl+Shift+C` (`⌘C` on macOS) or, with something selected, plain `Ctrl+C` —
+  which clears the selection, so the next `Ctrl+C` interrupts as usual. (On macOS `Ctrl+C`
+  is always the interrupt.) Paste with `Ctrl+Shift+V` (`⌘V`) or from the right-click menu.
+  (A middle click goes to tmux, which pastes its own last copy rather than the system
+  clipboard.)
 - **Right-click opens CodeHarbor's own terminal menu** — Copy, Paste and Select All,
   with Copy greyed out when nothing is selected. The right button is the one button
   that is not passed to the remote side, because tmux's own right-button menu is
