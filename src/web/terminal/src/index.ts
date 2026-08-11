@@ -281,11 +281,37 @@ export function mountTerminal(element: HTMLElement, bridge: TerminalBridge): Ter
             return true;
         }
         const key = event.key?.toLowerCase() ?? "";
+        if (key !== "c") {
+            // Do not intercept paste: the browser emits a trusted paste event
+            // for Ctrl+Shift+V / Cmd+V, and xterm's handler is where bracketed
+            // paste markers are added. Intercepting the key and reading
+            // navigator.clipboard would lose the middle-click selection path.
+            return true;
+        }
+        // The explicit copy shortcut, which copies whenever there is anything to
+        // copy and never means anything else.
         const copyShortcut = isMac
-            ? event.metaKey && !event.ctrlKey && !event.altKey && key === "c"
-            : event.ctrlKey && event.shiftKey && !event.altKey && key === "c";
-        if (copyShortcut) {
+            ? event.metaKey && !event.ctrlKey && !event.altKey
+            : event.ctrlKey && event.shiftKey && !event.altKey;
+        // ...and the convenient one. Ctrl+C is the interrupt: it is how a shell
+        // user stops a running command, and it MUST keep working. But with text
+        // selected there is nothing to interrupt that the user could have meant
+        // — they just selected something — so Ctrl+C copies instead, as Windows
+        // Terminal does. Copying then CLEARS the selection, which is what makes
+        // this safe: the very next Ctrl+C interrupts, so a forgotten selection
+        // can cost one keypress and never more.
+        //
+        // Not on macOS. There Ctrl+C is the interrupt and Cmd+C is copy — two
+        // separate keys, so there is nothing to disambiguate and a Mac user
+        // pressing Ctrl+C means the interrupt every time.
+        const copyBecauseSomethingIsSelected = !isMac
+            && event.ctrlKey && !event.shiftKey && !event.altKey && !event.metaKey
+            && term.hasSelection();
+        if (copyShortcut || copyBecauseSomethingIsSelected) {
             copySelection();
+            if (copyBecauseSomethingIsSelected) {
+                term.clearSelection();
+            }
             // preventDefault() as well as returning false. Returning false only
             // stops xterm.js from turning the key into PTY input; it does NOT
             // suppress the browser's own command, so Cmd+C on macOS would still
@@ -295,10 +321,8 @@ export function mountTerminal(element: HTMLElement, bridge: TerminalBridge): Ter
             event.preventDefault();
             return false;
         }
-        // Do not intercept paste: the browser emits a trusted paste event for
-        // Ctrl+Shift+V / Cmd+V, and xterm's handler is where bracketed paste
-        // markers are added. Intercepting the key and reading navigator.clipboard
-        // would lose the X11 primary-selection middle-click path.
+        // Ctrl+C with nothing selected, and every other key, is the remote
+        // program's: it reaches the shell as the interrupt character.
         return true;
     });
     term.onData((data) => input.write(data));
