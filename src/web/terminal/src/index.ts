@@ -120,6 +120,14 @@ export function mountTerminal(element: HTMLElement, bridge: TerminalBridge): Ter
         // the 5000 it held while xterm.js was believed to own the history:
         // every line costs memory per pane, and there can be many panes.
         scrollback: 500,
+        // macOS: Option and drag must make a local selection even while the
+        // program in the terminal holds the mouse — the counterpart of Shift
+        // and drag everywhere else, and what this page's menu tells a macOS
+        // user to do. xterm.js has the behaviour but leaves it OFF by default,
+        // so without this line there is no way at all to select text in a pane
+        // running tmux on a Mac. Measured on CI's macOS runner: the drag went
+        // to the remote side and the page kept no selection.
+        macOptionClickForcesSelection: true,
         // The host may replace this immediately after page load through
         // window.applyTheme(); these dark roles are the standalone fallback.
         theme: xtermTheme(activeTheme),
