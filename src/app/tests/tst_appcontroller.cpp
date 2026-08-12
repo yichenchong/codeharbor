@@ -406,6 +406,7 @@ private slots:
     void observedHarnessUpgradeKeepsTheTriggeringState();
     void observedHarnessLeavesAPlainShellAlone();
     void observedHarnessArrivingBeforeTheTreeIsNotLost();
+    void aParkedObservationSurvivesIdsWithSeparators();
     void observedHarnessLeavesAnExplicitAdapterAlone();
     void aGenericPaneFromTheTreeReachesRunningInTheSidebar();
     void refreshResultAfterControllerDestroyedIsNoop();
@@ -1316,6 +1317,51 @@ void TstAppController::observedHarnessArrivingBeforeTheTreeIsNotLost()
     const QModelIndex session = model->index(0, 0, group);
     QCOMPARE(model->data(session, SessionsModel::RowStateRole).toInt(),
              static_cast<int>(SessionRowState::Running));
+    QCOMPARE(errors.count(), 0);
+}
+
+// The ids in an event are only required to be non-blank — events.ts and
+// AgentEvent.h both say so, and the workspace has always tolerated ids carrying
+// separators. A parked observation therefore cannot be filed under a joined
+// "<session>/<pane>" string: with a slash inside either half, splitting the key
+// again hands back a different pair, and the observation is applied to the
+// wrong pane or dropped. Nothing about the wire forbids these ids, so nothing
+// but this test would notice.
+void TstAppController::aParkedObservationSurvivesIdsWithSeparators()
+{
+    const QString dev = QStringLiteral("sess/one");
+    const QString pane = QStringLiteral("term/one");
+
+    FakeTransport transport;
+    CodeharbordClient client;
+    AppController controller(&client);
+    client.setTransport(&transport);
+    QSignalSpy errors(&controller, &AppController::error);
+
+    FakeTransport agentTransport;
+    AgentStatusMonitor monitor;
+    monitor.setTransport(&agentTransport);
+    controller.setAgentMonitor(&monitor);
+
+    controller.refresh();
+    const QJsonObject pendingList = takeRequest(transport);
+
+    // Before any tree, so the observation has to be parked and re-found.
+    agentTransport.deliver(agentEventLine(QStringLiteral("running"), dev, pane,
+                                          QStringLiteral("oh-my-pi")));
+    QVERIFY(transport.takeSent().isEmpty());
+
+    transport.deliver(listWithTerminalFrame(
+        pendingList.value(QStringLiteral("id")).toInt(), QStringLiteral("G"), dev,
+        pane, QStringLiteral("generic")));
+
+    const QJsonObject update = takeRequest(transport);
+    QCOMPARE(update.value(QStringLiteral("method")).toString(),
+             QStringLiteral("workspace.updateTerminalPane"));
+    const QJsonObject params = update.value(QStringLiteral("params")).toObject();
+    QCOMPARE(params.value(QStringLiteral("id")).toString(), pane);
+    QCOMPARE(params.value(QStringLiteral("harness")).toString(),
+             QStringLiteral("oh-my-pi"));
     QCOMPARE(errors.count(), 0);
 }
 

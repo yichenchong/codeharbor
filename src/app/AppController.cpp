@@ -13,6 +13,7 @@
 #include <QPointer>
 #include <QSet>
 #include <QTimer>
+#include <utility>
 
 namespace ch {
 
@@ -109,6 +110,12 @@ void AppController::setServerId(const QString& serverId)
     ++m_refreshGeneration;
     m_lastNodes.clear();
     m_terminalStates.clear();
+    // Pane and Dev Session ids are only unique WITHIN a server, so an
+    // observation parked against the old one must not be judged against the new
+    // one's tree: at best it is discarded a moment later, at worst it names a
+    // pane id this server also uses and writes a harness onto somebody else's
+    // pane. Same reason the two caches above are dropped here.
+    m_pendingObservedHarness.clear();
     rebuildRows();
     if (!self)
         return;
@@ -1668,8 +1675,7 @@ void AppController::adoptObservedHarness(const QString& devSessionId,
         // reports an observation only when the harness CHANGES, so the ordinary
         // stream of same-harness events that follows will never mention it
         // again, and letting this one go would lose the detection for good.
-        m_pendingObservedHarness.insert(devSessionId + QLatin1Char('/') + terminalPaneId,
-                                        harness);
+        m_pendingObservedHarness[devSessionId].insert(terminalPaneId, harness);
         return;
     }
     // The ONLY value an observation may overwrite. Read from the last
@@ -1686,32 +1692,32 @@ void AppController::adoptObservedHarness(const QString& devSessionId,
 void AppController::drainPendingObservedHarnesses(
     const QHash<QString, QSet<QString>>& liveTerminalIds)
 {
-    for (auto it = m_pendingObservedHarness.begin();
-         it != m_pendingObservedHarness.end();) {
-        const qsizetype slash = it.key().indexOf(QLatin1Char('/'));
-        const QString devSessionId = it.key().left(slash);
-        const QString paneId = it.key().mid(slash + 1);
-        const auto sessionIt = liveTerminalIds.constFind(devSessionId);
-        if (sessionIt == liveTerminalIds.constEnd()) {
-            // The tree does not list the Dev Session at all. AG7 above treats
-            // exactly that as "genuinely gone" and evicts its agent state, so
-            // holding an observation for it would be the one place that
-            // disagreed with the authoritative tree.
-            it = m_pendingObservedHarness.erase(it);
+    // Taken by value: adoptObservedHarness() below writes back into the member
+    // for anything this tree still cannot judge, and iterating a container while
+    // a call inside the loop may rehash it is exactly the dangling-iterator bug
+    // the workspace walk above is commented against.
+    const QHash<QString, QHash<QString, QString>> pending =
+        std::exchange(m_pendingObservedHarness, {});
+    for (auto sessionIt = pending.constBegin(); sessionIt != pending.constEnd();
+         ++sessionIt) {
+        const auto liveIt = liveTerminalIds.constFind(sessionIt.key());
+        // No entry for the Dev Session means the tree does not list it. AG7
+        // above treats exactly that as "genuinely gone" and evicts its agent
+        // state, so keeping an observation for it would be the one place that
+        // disagreed with the authoritative tree.
+        if (liveIt == liveTerminalIds.constEnd())
             continue;
-        }
-        if (!sessionIt->contains(paneId)) {
-            // The session IS listed and this pane is not one of its panes. A
+        for (auto paneIt = sessionIt.value().constBegin();
+             paneIt != sessionIt.value().constEnd(); ++paneIt) {
+            // The session IS listed and this pane is not among its panes: a
             // session's pane list is complete, so the pane is gone.
-            it = m_pendingObservedHarness.erase(it);
-            continue;
+            if (!liveIt->contains(paneIt.key()))
+                continue;
+            // Judged at last. adoptObservedHarness() re-reads the pane from the
+            // tree and applies the same overwrite rule a live observation gets —
+            // the delay changes when the answer is known, never what it is.
+            adoptObservedHarness(sessionIt.key(), paneIt.key(), paneIt.value());
         }
-        // Judged at last. adoptObservedHarness() re-reads the pane from the tree
-        // and applies the same overwrite rule a live observation gets — the
-        // delay changes when the answer is known, never what it is.
-        const QString harness = it.value();
-        it = m_pendingObservedHarness.erase(it);
-        adoptObservedHarness(devSessionId, paneId, harness);
     }
 }
 

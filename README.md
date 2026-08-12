@@ -192,7 +192,8 @@ A few things worth knowing about the shipped client:
   (running, waiting for you, finished); an ordinary terminal is worked out from
   whether it is printing anything. Panes are set to that second mode when they are
   created, and the gear button in a terminal's header changes it — name the agent
-  the pane runs, or pick "Plain shell" to have it report nothing at all.
+  the pane runs, or pick "Plain shell" to stop CodeHarbor guessing from output. A
+  pane whose agent reports its own status still shows it either way.
 - **Dev Sessions can be pinned**, and the sidebar can be filtered to show only pinned
   ones. Pins live on the server; the filter is local to the machine.
 - **Dev Sessions can be archived** to get them out of the sidebar without losing

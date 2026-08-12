@@ -343,12 +343,16 @@ private:
     // trip when an agent event arrives.
     QVector<GroupNode> m_lastNodes;
 
-    // Observations that arrived before any tree could judge them, keyed by
-    // "<devSessionId>/<terminalPaneId>". Bounded by the panes that have spoken,
-    // and emptied by the next authoritative tree: an entry is settled (adopted
-    // or discarded) the moment a tree either lists the pane or proves, by
-    // listing its Dev Session without it, that the pane is gone.
-    QHash<QString, QString> m_pendingObservedHarness;
+    // Observations that arrived before any tree could judge them: Dev Session id
+    // -> terminal pane id -> observed harness. Nested rather than keyed by a
+    // joined string because an id is only required to be non-blank (see
+    // isEventIdentifier in events.ts and AgentEvent.h), so any separator chosen
+    // could appear inside one and a split would route the observation to the
+    // wrong pane or to none. Bounded by the panes that have spoken, and emptied
+    // by the next authoritative tree: an entry is settled (adopted or discarded)
+    // the moment a tree either lists the pane or proves, by listing its Dev
+    // Session without it, that the pane is gone.
+    QHash<QString, QHash<QString, QString>> m_pendingObservedHarness;
 
     // --- connection spine (injected, not owned) ---
     //
