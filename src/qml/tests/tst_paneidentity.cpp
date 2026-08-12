@@ -492,18 +492,32 @@ QVariantMap branchNode(const QString &orientation, const QVariantList &children)
                        {QStringLiteral("ratios"), QVariantList{1.0, 1.0}}};
 }
 
-// The `app` context property, cut down to the one thing a viewer pane reads out
-// of it: the ACTIVE Dev Session's repository root. That root is what "outside
-// the project" (SPEC 9) is measured against, so without it a pane has nothing
-// to be outside OF and asks nothing. Mirrors AppController's property name and
-// its NOTIFY-on-session-change shape.
-class RepoRootApp : public QObject
+// The `app` context property (ch::AppController), cut down to the two things a
+// pane reaches for on it.
+//
+// The first is the ACTIVE Dev Session's repository root, which a viewer pane
+// reads: that root is what "outside the project" (SPEC 9) is measured against,
+// so without it a pane has nothing to be outside OF and asks nothing. Mirrors
+// AppController's property name and its NOTIFY-on-session-change shape.
+//
+// The second is the harness stored against a terminal pane's `terminal_panes`
+// row — what the pane RUNS, which is what the sidebar's per-session status is
+// computed from (SPEC 6.6). Both halves of the real pair are here: a reading,
+// so a dialog can open on what is stored, and a WRITE that is recorded rather
+// than performed, because "the user's choice reached the controller intact" is
+// the whole assertion.
+class AppControllerStub : public QObject
 {
     Q_OBJECT
     Q_PROPERTY(QString activeSessionRepoRoot READ activeSessionRepoRoot
                        NOTIFY activeSessionChanged)
 
 public:
+    struct HarnessWrite {
+        QString terminalPaneId;
+        QString harness;
+    };
+
     QString activeSessionRepoRoot() const { return m_repoRoot; }
 
     void setActiveSessionRepoRoot(const QString &root)
@@ -514,11 +528,40 @@ public:
         emit activeSessionChanged();
     }
 
+    Q_INVOKABLE QString terminalPaneHarness(const QString &terminalPaneId) const
+    {
+        return m_harness.value(terminalPaneId);
+    }
+
+    Q_INVOKABLE void setTerminalPaneHarness(const QString &terminalPaneId,
+                                            const QString &harness)
+    {
+        m_writes.append({terminalPaneId, harness});
+        m_harness.insert(terminalPaneId, harness);
+    }
+
+    // What the server is pretending to hold already, so a dialog can be opened
+    // on a pane that HAS a harness without that seeding counting as a write.
+    void seedTerminalPaneHarness(const QString &terminalPaneId, const QString &harness)
+    {
+        m_harness.insert(terminalPaneId, harness);
+    }
+
+    const QList<HarnessWrite> &harnessWrites() const { return m_writes; }
+
+    void clearHarness()
+    {
+        m_harness.clear();
+        m_writes.clear();
+    }
+
 signals:
     void activeSessionChanged();
 
 private:
     QString m_repoRoot;
+    QHash<QString, QString> m_harness;
+    QList<HarnessWrite> m_writes;
 };
 
 // The slice of ch::TerminalFactory a terminal pane drives, with the two-phase
@@ -849,6 +892,12 @@ private slots:
     // its first fill item, so the region has to rescale the rest itself.
     void splitProportionsSurviveAWindowResize();
 
+    // A terminal pane's sidebar status is computed from the harness stored
+    // against its row, and a pane the user simply opened has none. The pane's
+    // header must therefore let them say what it runs, and must send the WIRE
+    // value for that choice against the right pane id.
+    void aTerminalPaneWritesTheHarnessTheUserChose();
+
 private:
     // Load one qrc component into the harness window with `props` as its
     // initial properties, and hand back the loaded item. The region types are
@@ -884,7 +933,7 @@ private:
     ch::ViewerModel m_viewers{&m_client};
     // The `app` context property. Empty by default, so every OTHER test sees a
     // pane with no Dev Session behind it, exactly as before this existed.
-    RepoRootApp m_app;
+    AppControllerStub m_app;
     ch::EditorFactory m_editorFactory{&m_client};
     // Never connected: attach() refuses, so the pane shows its "not connected"
     // chrome. Identity is about the objects, not about a remote shell — the
@@ -913,6 +962,7 @@ void TstPaneIdentity::cleanup()
     m_region = nullptr;
     m_shell.reset();
     m_app.setActiveSessionRepoRoot(QString());
+    m_app.clearHarness();
     QTest::qWait(50);
 }
 
@@ -3627,6 +3677,89 @@ void TstPaneIdentity::splitProportionsSurviveAWindowResize()
              qPrintable(QStringLiteral("narrowing the window again left the panes at %1 and %2")
                             .arg(left->width())
                             .arg(right->width())));
+}
+
+// ---------------------------------------------------------------------------
+// (19) Saying what a terminal pane runs.
+//
+// The sidebar's per-session status (SPEC 6.6) is derived from the harness held
+// against each `terminal_panes` row. A pane driven by an agent hook announces
+// its harness on the wire; a pane the user opened themselves and then started
+// something in cannot, and a row with no harness at all is deliberately kept
+// quiet. So the pane header carries the only affordance that can ever set one,
+// and what it must get right is small and exact: the WIRE value of the choice
+// the user made, against the id of the row this pane owns — not its recyclable
+// slot label, and not the human label off the button.
+// ---------------------------------------------------------------------------
+void TstPaneIdentity::aTerminalPaneWritesTheHarnessTheUserChose()
+{
+    // The pane already has a harness, so the dialog has something to be opened
+    // ON: a control that always offered the same default would look identical
+    // in every other assertion here.
+    m_app.seedTerminalPaneHarness(QStringLiteral("row-a"), QStringLiteral("claude-code"));
+
+    TerminalFactoryStub factory;
+    QObject *const pane = openInShell(
+        QStringLiteral("TerminalPaneView.qml"),
+        {{QStringLiteral("factory"), QVariant::fromValue<QObject *>(&factory)},
+         {QStringLiteral("paneId"), QStringLiteral("terminal-1")},
+         {QStringLiteral("devSessionId"), QStringLiteral("dev-a")},
+         {QStringLiteral("terminalPaneId"), QStringLiteral("row-a")},
+         {QStringLiteral("workingDir"), QStringLiteral("/srv/a")}});
+    QVERIFY(pane);
+
+    QObject *const button = childNamed(pane, QStringLiteral("terminalHarnessButton"));
+    QVERIFY2(button, "the terminal pane header has no control for what the pane runs, so its "
+                     "sidebar status can never be anything but Idle");
+    QVERIFY2(button->property("enabled").toBool(),
+             "the control is disabled on a pane that HAS a server row to write to");
+    // Glyph-only, so the words are the whole of what a screen reader and the
+    // tooltip have to go on.
+    QVERIFY2(!button->property("text").toString().isEmpty(),
+             "the header control is a bare glyph with no words: it announces nothing");
+
+    QVERIFY(QMetaObject::invokeMethod(button, "clicked"));
+    QObject *const dialog = childNamed(pane, QStringLiteral("terminalPaneHarnessDialog"));
+    QVERIFY2(dialog, "the header control opened no dialog");
+    QTRY_VERIFY(dialog->property("visible").toBool());
+
+    QObject *const generic =
+        childNamed(dialog, QStringLiteral("terminalPaneHarnessOption_generic"));
+    QObject *const claude =
+        childNamed(dialog, QStringLiteral("terminalPaneHarnessOption_claude-code"));
+    QObject *const shell =
+        childNamed(dialog, QStringLiteral("terminalPaneHarnessOption_shell"));
+    QVERIFY2(generic && claude && shell,
+             "the dialog does not offer the harness vocabulary the wire accepts");
+    // "Plain shell" is a CHOICE, not the absence of one, and it is the option
+    // "generic" has to be told apart from.
+    QCOMPARE(accessibleNameOf(shell), QStringLiteral("Plain shell"));
+    QVERIFY2(!accessibleNameOf(generic).isEmpty(),
+             "a radio button with no accessible name is unreachable by anything but the mouse");
+    QVERIFY2(claude->property("checked").toBool(),
+             "the dialog did not open on the harness the pane already has, so accepting it "
+             "unchanged would silently change the pane");
+    QVERIFY(!generic->property("checked").toBool());
+
+    // Dismissing writes nothing at all: this is a stored choice, not a preview.
+    QVERIFY(QMetaObject::invokeMethod(dialog, "reject"));
+    QTest::qWait(50);
+    QVERIFY2(m_app.harnessWrites().isEmpty(),
+             "a dismissed dialog still wrote the pane's harness");
+
+    QVERIFY(QMetaObject::invokeMethod(button, "clicked"));
+    QTRY_VERIFY(dialog->property("visible").toBool());
+    QVERIFY(QMetaObject::invokeMethod(generic, "clicked"));
+    QVERIFY(QMetaObject::invokeMethod(dialog, "accept"));
+
+    QTRY_COMPARE(m_app.harnessWrites().size(), 1);
+    const AppControllerStub::HarnessWrite &write = m_app.harnessWrites().constFirst();
+    // The ROW id, never "terminal-1": the slot label is recycled when a pane is
+    // closed, so writing against it would eventually hand another pane's shell
+    // this harness.
+    QCOMPARE(write.terminalPaneId, QStringLiteral("row-a"));
+    // ...and the wire value, not the words on the button.
+    QCOMPARE(write.harness, QStringLiteral("generic"));
 }
 
 // QTEST_MAIN cannot be used: registerUrlScheme() and QtWebEngineQuick::initialize()

@@ -216,6 +216,8 @@ private slots:
     void targetCannotCrossAWorkspaceServerSwitch();
     void aServerAnswerWithAnUnusableTmuxTargetFailsTheResolution();
     void changingTheWorkspaceServerForgetsRememberedRowIdentities();
+    void aChangedHarnessSurvivesTheResolutionCache();
+    void repeatingAnUnchangedHarnessDoesNotRestartTheClock();
 };
 
 // Every pane owns its controller: it must be parented to the pane so closing
@@ -643,15 +645,22 @@ void TstTerminalFactory::killCommandQuotesAdversarialTargets()
 // and the `-t` target with one.
 void TstTerminalFactory::attachCommandQuotesAdversarialIdsAndWorkingDir()
 {
+    // The pane identity is left unknown throughout: this case is about the
+    // target and the working directory, and the quoting of the exported
+    // OMP_DEV_SESSION_ID / OMP_TERMINAL_ID values is pinned next to the builder
+    // in tst_terminalcontroller. An unidentified pane exports neither, which
+    // keeps the quoted-argument count below meaningful.
     QCOMPARE(TerminalController::tmuxNewSessionCommand(QStringLiteral("ch_dev_t1"),
-                                                       QStringLiteral("/srv/repo")),
+                                                       QStringLiteral("/srv/repo"),
+                                                       QString(), QString()),
              QStringLiteral("tmux new-session -A -s 'ch_dev_t1' -c '/srv/repo'"
                             " \\; set-option -t '=ch_dev_t1:' mouse on"));
 
     // A working directory is the field most likely to carry a real quote, and
     // the one a user can type. Breaking out of it would run `id` on the host.
     QCOMPARE(TerminalController::tmuxNewSessionCommand(
-                 QStringLiteral("ch_dev_t1"), QStringLiteral("/tmp/x'; id; echo '")),
+                 QStringLiteral("ch_dev_t1"), QStringLiteral("/tmp/x'; id; echo '"),
+                 QString(), QString()),
              QStringLiteral("tmux new-session -A -s 'ch_dev_t1' "
                             "-c '/tmp/x'\\''; id; echo '\\'''"
                             " \\; set-option -t '=ch_dev_t1:' mouse on"));
@@ -660,7 +669,8 @@ void TstTerminalFactory::attachCommandQuotesAdversarialIdsAndWorkingDir()
     // reaches the command TWICE — as the new session's name and as the target
     // of the mouse option — so both copies are checked.
     QCOMPARE(TerminalController::tmuxNewSessionCommand(
-                 QStringLiteral("ch_d'; rm -rf ~; '_t`whoami`"), QStringLiteral("/w")),
+                 QStringLiteral("ch_d'; rm -rf ~; '_t`whoami`"), QStringLiteral("/w"),
+                 QString(), QString()),
              QStringLiteral("tmux new-session -A -s 'ch_d'\\''; rm -rf ~; '\\''_t`whoami`' "
                             "-c '/w'"
                             " \\; set-option -t "
@@ -670,7 +680,8 @@ void TstTerminalFactory::attachCommandQuotesAdversarialIdsAndWorkingDir()
     // getopt, and a newline is inert inside the quotes: neither adds a word to
     // the command.
     const QString command = TerminalController::tmuxNewSessionCommand(
-        QStringLiteral("ch_dev_t1"), QStringLiteral("-rf /\nrm -rf ~"));
+        QStringLiteral("ch_dev_t1"), QStringLiteral("-rf /\nrm -rf ~"), QString(),
+        QString());
     QCOMPARE(command,
              QStringLiteral("tmux new-session -A -s 'ch_dev_t1' -c '-rf /\nrm -rf ~'"
                             " \\; set-option -t '=ch_dev_t1:' mouse on"));
@@ -1671,6 +1682,127 @@ void TstTerminalFactory::changingTheWorkspaceServerForgetsRememberedRowIdentitie
              asInt(AgentState::Running));
     QCOMPARE(monitor.stateFor(QStringLiteral("s1"), QStringLiteral("row-A")),
              asInt(AgentState::Idle));
+}
+
+// The resolution cache outlives a disconnect on purpose, and a remembered
+// answer carries the harness the pane resolved with. So a harness the user
+// changes has to reach that memory as well: left alone, the next rebind would
+// re-apply the old value and put the pane back to reporting exactly as it did
+// before, with nothing on screen to explain why.
+void TstTerminalFactory::aChangedHarnessSurvivesTheResolutionCache()
+{
+    RpcPair rpc;
+    QVERIFY(rpc.start());
+
+    AgentStatusMonitor monitor;
+    OfflineFactory factory(nullptr);
+    factory.setWorkspace(rpc.db());
+    factory.setServerId(QStringLiteral("srv-1"));
+    factory.setAgentMonitor(&monitor);
+
+    QObject pane;
+    TerminalController* controller = factory.create(&pane);
+    QSignalSpy resolved(&factory, &TerminalFactory::targetResolved);
+
+    // Resolved as a plain shell: no clock, so output says nothing about it.
+    QVERIFY(factory.resolveTarget(controller, QStringLiteral("s1"),
+                                  QStringLiteral("terminal-1"), QStringLiteral("row-A"),
+                                  QStringLiteral("/repo")));
+    const QJsonObject first = rpc.takeRequest();
+    rpc.answerWithRow(first.value(QStringLiteral("id")).toInt(), QStringLiteral("row-A"),
+                      QStringLiteral("s1"), QStringLiteral("terminal-1"),
+                      QStringLiteral("ch_s1_row-A"), QString());
+    QTRY_COMPARE(resolved.count(), 1);
+
+    monitor.noteTerminalAttached(QStringLiteral("s1"), QStringLiteral("row-A"));
+    controller->ingestOutput(QByteArrayLiteral("printing"));
+    QCOMPARE(monitor.stateFor(QStringLiteral("s1"), QStringLiteral("row-A")),
+             asInt(AgentState::Unknown));
+
+    // The user asks for the activity clock. In production the factory also
+    // re-reports the live channel here, which is what makes the change take
+    // effect at once; this harness has no PTY to attach, so the attach is made
+    // by hand exactly as the note at the top of these monitor tests describes.
+    factory.noteHarnessChanged(QStringLiteral("row-A"), QStringLiteral("generic"));
+    monitor.noteTerminalAttached(QStringLiteral("s1"), QStringLiteral("row-A"));
+    controller->ingestOutput(QByteArrayLiteral("printing again"));
+    QCOMPARE(monitor.stateFor(QStringLiteral("s1"), QStringLiteral("row-A")),
+             asInt(AgentState::Running));
+
+    // Now the part the cache used to undo: the pane is resolved again, which
+    // after a reconnect is answered from memory rather than from the server.
+    // The answer it hands the monitor must be the harness the user chose.
+    QVERIFY(factory.resolveTarget(controller, QStringLiteral("s1"),
+                                  QStringLiteral("terminal-1"), QStringLiteral("row-A"),
+                                  QStringLiteral("/repo")));
+    QTRY_COMPARE(resolved.count(), 2);
+    QVERIFY2(rpc.takeRequest().isEmpty(),
+             "the second resolution went to the server instead of being answered from "
+             "memory, so it proves nothing about the cache");
+
+    controller->ingestOutput(QByteArrayLiteral("still printing"));
+    QCOMPARE(monitor.stateFor(QStringLiteral("s1"), QStringLiteral("row-A")),
+             asInt(AgentState::Running));
+}
+
+
+// The workspace refresh republishes every pane's harness, and a refresh follows
+// every mutation. So "the harness did not change" has to cost nothing at all:
+// the work a real change does includes re-announcing the pane's attach, and an
+// attach restarts SPEC 6.6's clock at "attached and silent", which would drag a
+// working pane back to Starting several times a minute.
+//
+// What this can check is that a repeat says nothing and changes nothing, and
+// that a real change is still heard. The attach half needs a pane holding a
+// live PTY channel, which no unit harness here can build (see the note above
+// aPaneReportsItsOutputUnderTheRowIdTheServerAnswered), so that half rests on
+// the guard being read, not on this test.
+void TstTerminalFactory::repeatingAnUnchangedHarnessDoesNotRestartTheClock()
+{
+    RpcPair rpc;
+    QVERIFY(rpc.start());
+
+    AgentStatusMonitor monitor;
+    OfflineFactory factory(nullptr);
+    factory.setWorkspace(rpc.db());
+    factory.setServerId(QStringLiteral("srv-1"));
+    factory.setAgentMonitor(&monitor);
+
+    QObject pane;
+    TerminalController* controller = factory.create(&pane);
+    QSignalSpy resolved(&factory, &TerminalFactory::targetResolved);
+
+    QVERIFY(factory.resolveTarget(controller, QStringLiteral("s1"),
+                                  QStringLiteral("terminal-1"), QStringLiteral("row-A"),
+                                  QStringLiteral("/repo")));
+    const QJsonObject first = rpc.takeRequest();
+    rpc.answerWithRow(first.value(QStringLiteral("id")).toInt(), QStringLiteral("row-A"),
+                      QStringLiteral("s1"), QStringLiteral("terminal-1"),
+                      QStringLiteral("ch_s1_row-A"), QStringLiteral("generic"));
+    QTRY_COMPARE(resolved.count(), 1);
+
+    monitor.noteTerminalAttached(QStringLiteral("s1"), QStringLiteral("row-A"));
+    controller->ingestOutput(QByteArrayLiteral("working"));
+    QCOMPARE(monitor.stateFor(QStringLiteral("s1"), QStringLiteral("row-A")),
+             asInt(AgentState::Running));
+
+    // What a refresh does, several times over. The pane is already generic, so
+    // every one of these has to be a complete no-op: not one word to the
+    // monitor, because the words it would say are "this harness again" and
+    // "this pane attached again", and the second of those restarts the clock.
+    QSignalSpy states(&monitor, &AgentStatusMonitor::agentStateChanged);
+    for (int i = 0; i < 5; ++i)
+        factory.noteHarnessChanged(QStringLiteral("row-A"), QStringLiteral("generic"));
+    QCOMPARE(states.count(), 0);
+    QCOMPARE(monitor.stateFor(QStringLiteral("s1"), QStringLiteral("row-A")),
+             asInt(AgentState::Running));
+
+    // ...and the silence above is not the spy being deaf: a harness that really
+    // does change is heard immediately.
+    factory.noteHarnessChanged(QStringLiteral("row-A"), QStringLiteral("oh-my-pi"));
+    QCOMPARE(states.count(), 1);
+    QCOMPARE(monitor.stateFor(QStringLiteral("s1"), QStringLiteral("row-A")),
+             asInt(AgentState::Unknown));
 }
 
 QTEST_GUILESS_MAIN(TstTerminalFactory)

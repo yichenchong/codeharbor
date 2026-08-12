@@ -231,8 +231,25 @@ public:
 
     // Attach-or-create command for the tmux session `target`, rooted at
     // workingDir (SPEC 5.2):
-    //   tmux new-session -A -s '<target>' -c '<workingDir>' \; \
-    //       set-option -t '=<target>:' mouse on
+    //   tmux new-session -A -s '<target>' -c '<workingDir>' \
+    //       -e 'OMP_DEV_SESSION_ID=<dev>' -e 'OMP_TERMINAL_ID=<term>' \; \
+    //       set-option -t '=<target>:' mouse on \; \
+    //       set-environment -t '=<target>:' OMP_DEV_SESSION_ID '<dev>' \; \
+    //       set-environment -t '=<target>:' OMP_TERMINAL_ID '<term>'
+    //
+    // `devSessionId` and `terminalId` are this pane's identity — the Dev Session
+    // and the `terminal_panes` row id — and they are PARAMETERS on purpose. The
+    // target embeds them in its minted name, but that name is a formatted
+    // string, not a data source, and parsing ids back out of it would invent a
+    // second, guessing copy of an identity the caller already holds. Both empty
+    // means "identity unknown", and then neither variable is exported: a hook
+    // needs both halves to name a pane.
+    //
+    // They are exported because an agent hook has no other way to say which
+    // pane it is in: remote/src/hooks/oh-my-pi-hook.ts reads exactly these two
+    // variables and the daemon drops an event that arrives without them. See
+    // the implementation for what `-A` does and does not repair — in short, a
+    // session (and a process) that already exists is NOT retrofitted.
     //
     // `target` is NOT minted here, and deliberately no longer can be. It is the
     // `tmuxTarget` column of this pane's row in the server's `terminal_panes`
@@ -255,7 +272,9 @@ public:
     // a wheel turn reaches tmux's own scrollback instead of being translated
     // into cursor keys by the renderer. See the implementation for the full
     // reasoning and the tmux 3.6 verification.
-    static QString tmuxNewSessionCommand(const QString &target, const QString &workingDir);
+    static QString tmuxNewSessionCommand(const QString &target, const QString &workingDir,
+                                         const QString &devSessionId,
+                                         const QString &terminalId);
 
 signals:
     void stateChanged(ch::TerminalState state);

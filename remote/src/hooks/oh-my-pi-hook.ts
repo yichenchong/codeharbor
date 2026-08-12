@@ -23,8 +23,14 @@
 //     tool_result      -> node /path/to/oh-my-pi-hook.ts tool_result   (export OMP_TOOL)
 //     agent_end        -> node /path/to/oh-my-pi-hook.ts agent_end
 //     session_shutdown -> node /path/to/oh-my-pi-hook.ts session_shutdown
-// Each invocation must export OMP_DEV_SESSION_ID and OMP_TERMINAL_ID so the
-// event can be attributed to the right terminal.
+// Every invocation needs OMP_DEV_SESSION_ID and OMP_TERMINAL_ID in its
+// environment so the event can be attributed to the right terminal. For a pane
+// CodeHarbor created, both are already there: the client exports them into the
+// tmux session (see tmuxNewSessionCommand in src/terminal/TerminalController.cpp),
+// so an agent started inside that pane inherits them and nothing has to be set
+// by hand. A hook run outside such a pane — by hand, or in a tmux session that
+// was already running before CodeHarbor attached to it — still has to export
+// them itself.
 // Without both of them the hook emits NOTHING and explains why on stderr (see
 // missingCoordinates): an event carrying a blank id reaches the client as a
 // valid event that belongs to no Dev Session.

@@ -187,6 +187,21 @@ public:
     Q_INVOKABLE void moveSession(QString id, QString groupId, int position);
     Q_INVOKABLE void deleteSession(QString id);
     Q_INVOKABLE void reorderSessions(QString groupId, QStringList orderedIds);
+    // Terminal pane mutations.
+    //
+    // Set a terminal pane's harness (SPEC 6.6). `harness` must be one of the
+    // four wire values or "" for a plain shell, which is the pane opting out of
+    // the output-activity clock; anything else is refused through `error` rather
+    // than sent, because the server would take an unknown string and the monitor
+    // would then never match it.
+    // On success refresh() re-reads the tree, and its harness walk is what
+    // re-registers the pane with the agent monitor.
+    Q_INVOKABLE void setTerminalPaneHarness(QString terminalPaneId, QString harness);
+    // The harness currently stored for a pane, from the last authoritative
+    // tree. Empty for a pane with no harness AND for one this tree does not
+    // know: the caller is QML asking about a pane that may have been closed by
+    // another client, which is a question, not a programming error.
+    Q_INVOKABLE QString terminalPaneHarness(const QString& terminalPaneId) const;
 
 signals:
     void serverIdChanged();
@@ -228,6 +243,47 @@ private:
     // aggregate state changed. Wired to the monitor's agent events so a status
     // flip does not reset (and re-create) the whole sidebar.
     void applyAgentStateUpdate();
+
+    // A live agent named its harness for a pane (AgentStatusMonitor::
+    // harnessObserved). Store it — through setTerminalPaneHarness(), the same
+    // mutation the pane's gear control uses — ONLY when the pane's stored
+    // harness is exactly "generic".
+    //
+    // That is the whole overwrite rule, and each arm is deliberate:
+    //   * "generic" means "an agent, adapter unknown", which is also what a
+    //     freshly minted pane gets, so a real adapter name is a strict upgrade;
+    //   * an EMPTY harness is the user's "plain shell": they have said this pane
+    //     is not an agent, so nothing may relabel it on their behalf. Note what
+    //     that does and does not mean — it bars OUTPUT from being read as
+    //     activity (SPEC 6.6) and bars this write; it does not gag the wire. A
+    //     real event naming the pane is still displayed, exactly as it was
+    //     before autodetection existed;
+    //   * a different explicit adapter is the user's answer to this exact
+    //     question, and an observation does not outrank it.
+    // A user who deliberately chose "Generic agent" is indistinguishable from
+    // the mint default and will be upgraded. That is accepted: the alternative
+    // is a schema column to record which of two identical values was meant, for
+    // a distinction with no observable consequence beyond this one upgrade.
+    // A pane the CURRENT tree does not list cannot be judged yet: the bridge
+    // can deliver an agent's first event before workspace.list() has answered,
+    // and an observation is reported only when the observed harness CHANGES, so
+    // dropping that first one would lose the detection until the agent switched
+    // harness — which for a normal session never happens. Such an observation is
+    // parked in m_pendingObservedHarness instead and judged against the next
+    // authoritative tree.
+    void adoptObservedHarness(const QString& devSessionId,
+                              const QString& terminalPaneId, const QString& harness);
+
+    // Apply every parked observation against the freshly loaded tree, then
+    // forget the ones it settles. `liveTerminalIds` is the tree's own pane index,
+    // already built by the caller for the terminal-state retain walk.
+    void drainPendingObservedHarnesses(
+        const QHash<QString, QSet<QString>>& liveTerminalIds);
+
+    // The pane's stored harness, or nullopt when the current tree does not list
+    // the pane at all. terminalPaneHarness() flattens both to an empty string,
+    // which is ambiguous here: an empty harness is also "plain shell".
+    std::optional<QString> lookupTerminalPaneHarness(const QString& terminalPaneId) const;
 
     // Build a WorkspaceDb callback that, once the async response arrives, is a
     // no-op if this controller was already destroyed (the shared client keeps
@@ -286,6 +342,17 @@ private:
     // re-derive rows (and re-merge agent state) without another server round-
     // trip when an agent event arrives.
     QVector<GroupNode> m_lastNodes;
+
+    // Observations that arrived before any tree could judge them: Dev Session id
+    // -> terminal pane id -> observed harness. Nested rather than keyed by a
+    // joined string because an id is only required to be non-blank (see
+    // isEventIdentifier in events.ts and AgentEvent.h), so any separator chosen
+    // could appear inside one and a split would route the observation to the
+    // wrong pane or to none. Bounded by the panes that have spoken, and emptied
+    // by the next authoritative tree: an entry is settled (adopted or discarded)
+    // the moment a tree either lists the pane or proves, by listing its Dev
+    // Session without it, that the pane is gone.
+    QHash<QString, QHash<QString, QString>> m_pendingObservedHarness;
 
     // --- connection spine (injected, not owned) ---
     //

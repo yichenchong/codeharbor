@@ -560,10 +560,32 @@ Suggested command:
 tmux new-session -A \
   -s 'ch_<dev-session-uuid>_<terminal-uuid>' \
   -c '/remote/working/directory' \
-  \; set-option -t '=ch_<dev-session-uuid>_<terminal-uuid>:' mouse on
+  -e 'OMP_DEV_SESSION_ID=<dev-session-uuid>' \
+  -e 'OMP_TERMINAL_ID=<terminal-uuid>' \
+  \; set-option -t '=ch_<dev-session-uuid>_<terminal-uuid>:' mouse on \
+  \; set-environment -t '=ch_<dev-session-uuid>_<terminal-uuid>:' \
+      OMP_DEV_SESSION_ID '<dev-session-uuid>' \
+  \; set-environment -t '=ch_<dev-session-uuid>_<terminal-uuid>:' \
+      OMP_TERMINAL_ID '<terminal-uuid>'
 ```
 
 Stable IDs should be used for tmux names rather than user-facing display names.
+
+PANE IDENTITY IN THE ENVIRONMENT. The two `OMP_*` variables are how an agent hook
+says which pane it is in: `remote/src/hooks/oh-my-pi-hook.ts` reads exactly these
+two names, and an event that arrives without them names no pane and is dropped.
+They are passed to the command builder as values, never parsed back out of the
+tmux target — the target is a formatted name, not a data source. Both are
+exported or neither is: a hook needs both halves.
+
+This does NOT retrofit a pane that is already running. `new-session -e` applies
+at session creation, and the command uses `-A`, so an attach to a session that
+already exists ignores every `-e`; the `set-environment` commands correct that
+session's environment, but a variable set now reaches only processes started
+afterwards, never the shell tmux is already running or an agent already running
+in it. Both limits verified on tmux 3.6. So the variables reach newly created
+sessions, new windows and panes, and agents started after the attach — an
+already-live agent keeps whatever environment it was forked with.
 
 The server owns the target string. Terminal targets supplied through the
 workspace RPC are accepted only when they are 1–200 characters from
@@ -845,6 +867,48 @@ Only a pane whose `terminal_panes.harness` column is literally `generic` takes i
 this way. A pane with no harness configured is a plain shell, and treating a shell's
 output as agent activity would light up every terminal in the sidebar; a pane with an
 adapter harness gets its state from the wire, which is strictly better information.
+
+A pane the client mints is created WITH `harness = "generic"`
+(`ch::SessionLayouts::mintTerminalPaneRow`), so this detection is on by default for
+terminals opened from the UI. It has to be set at creation by somebody: for a long time
+nothing wrote the column at all, which left every pane NULL, meant the clock never ran for
+anyone, and made the sidebar row permanently read "Idle" — the visible bug that is the
+reason this paragraph exists. The column remains the switch, not the default: a user can
+change a pane's harness from the pane itself (naming its adapter, or "plain shell" to opt
+out of the clock entirely), and a pane stored before this was fixed keeps its NULL,
+and stays off the clock, until somebody sets one.
+
+AUTODETECTION. A live agent event names the harness it came from, which is better
+information than the column: an event can only come from an adapter that exists.
+When one names a harness for a pane whose stored harness is exactly `generic`, the
+client writes the observed name to the column, through the same
+`workspace.updateTerminalPane` mutation the pane's own harness control uses, and
+only on a real change — an agent repeats its harness on every event and this must
+not become a write per event.
+
+An observation can arrive before the client has any workspace tree to judge it
+against: the agent bridge relays as soon as its socket is up, which on a cold
+start is before `workspace.list` has answered. Because an observation is reported
+only when the observed harness CHANGES, discarding that first one would lose the
+detection for the whole session — the steady stream of same-harness events that
+follows never mentions it again. Such an observation is held and settled against
+the next authoritative tree, which either lists the pane (judge it by the rule
+above) or proves it gone by listing its Dev Session without it (discard it). The
+state the agent reported survives that wait: a pane row that exists only because
+an event created it has never been registered from the tree, so registering it —
+as `generic` first, and as the observed adapter once the write lands — must not
+discard what the wire already said about it.
+
+`generic` is the ONLY value an observation may overwrite. A NULL or empty harness
+is the user's "plain shell" — they have said this pane is not an agent, so
+nothing may relabel it on their behalf. That governs where the pane's state may
+be DERIVED from, not what may be reported about it: output is never read as
+activity for such a pane, and this write never happens, but a real agent event
+naming the pane is a fact rather than a guess and is displayed like any other.
+An explicit adapter is the user's answer to this same question and outranks an
+observation. A user who deliberately chose "Generic agent" is indistinguishable
+from the mint default and will be upgraded — accepted deliberately, rather than
+recording which of two identical values was meant in the schema.
 
 Loss of the SSH channel is a TRANSPORT condition, reported by the client's own connection
 state, so there is deliberately no `disconnected` agent state here.

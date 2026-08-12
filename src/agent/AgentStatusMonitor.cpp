@@ -222,13 +222,25 @@ void AgentStatusMonitor::applyEvent(const AgentEvent& ev)
     const bool hadPrev = (it != terms.end());
     const bool changed = !hadPrev || it.value().state != next;
 
+    // A validated event always names a harness the client knows (parseEvent
+    // rejects one that does not), so this is the pane's real, running harness —
+    // which the pane's CONFIGURED harness may not be: a pane minted as "generic"
+    // is a pane nobody has told which adapter it runs. Remembered here so the
+    // signal below reports a change and not an event.
+    const bool harnessMoved =
+        !ev.harness.isEmpty()
+        && (!hadPrev || it.value().observedHarness != ev.harness);
+
     if (hadPrev) {
         it.value().state = next;
         it.value().lastEventMs = m_clock.elapsed();
+        if (harnessMoved)
+            it.value().observedHarness = ev.harness;
     } else {
         TerminalStatus fresh;
         fresh.state = next;
         fresh.lastEventMs = m_clock.elapsed();
+        fresh.observedHarness = ev.harness;
         terms.insert(term, fresh);
     }
 
@@ -264,6 +276,12 @@ void AgentStatusMonitor::applyEvent(const AgentEvent& ev)
         emit agentStateChanged(dev, term, static_cast<int>(next));
     if (armedUnseen)
         emit unseenChanged(dev, true);
+    // After the state signals: a consumer of this one may write to the server
+    // and refresh the workspace tree, which calls back into setTerminalHarness()
+    // here, and the sidebar should already be showing the state this event
+    // carried by then.
+    if (harnessMoved)
+        emit harnessObserved(dev, term, ev.harness);
 
     // Desktop-notification hook: a genuine transition into an attention-worthy
     // state, or a completion that re-arms a badge the user had already cleared.
@@ -357,10 +375,31 @@ void AgentStatusMonitor::setTerminalHarness(const QString& devSessionId,
             const bool preserveCompletion =
                 st->state == AgentState::IdleUnseen
                 && m_unseen.contains(devSessionId);
+            // ...UNLESS this very harness is the one that produced the state.
+            // That is what the autodetection round trip looks like from here: an
+            // oh-my-pi event set the pane Running, the display layer stored
+            // "oh-my-pi" on the row because the pane said "generic", and the
+            // refresh that follows the write lands back here naming the harness
+            // that just spoke. Clearing then would throw away the event that
+            // caused the upgrade and leave the pane Unknown until the agent
+            // happened to speak again — which for a quiet agent may be never.
+            //
+            // Equality of the OBSERVED harness is the whole proof: it says the
+            // state came from THIS adapter on the wire, so there is no
+            // generic-derived value to discard. It deliberately does not cover
+            // the case the clear was written for — a user retargeting a busy
+            // generic pane onto an adapter that has never spoken (observed
+            // harness empty, or naming a different one) still drops to Unknown,
+            // because that pane was only busy because generic mode was watching
+            // its output. An empty `harness` ("plain shell") never preserves
+            // anything either: no adapter can have produced that state.
+            const bool spokeAsThisHarness =
+                !harness.isEmpty() && st->observedHarness == harness;
             const bool clearStale =
-                wasGeneric && !preserveCompletion
+                wasGeneric && !preserveCompletion && !spokeAsThisHarness
                 && st->state != AgentState::Unknown;
             st->generic = false;
+            st->registered = true;
             if (clearStale)
                 st->state = AgentState::Unknown;
             rearmAgeTimer();
@@ -376,6 +415,17 @@ void AgentStatusMonitor::setTerminalHarness(const QString& devSessionId,
     // changes while a channel is attached, begin a fresh silent observation;
     // output from the old harness must not be mistaken for generic activity.
     TerminalStatus& st = m_states[devSessionId][terminalId];
+    // ...but a row an EVENT created, which the tree has never registered, is not
+    // a pane changing harness: it is the first thing anyone has said about this
+    // pane, and what it said came off the wire. That happens on every cold start
+    // where the bridge relays before list() answers, and discarding it here
+    // threw away the live agent's own report of itself — the pane fell to
+    // Unknown and the next same-harness event, being no CHANGE, never revived
+    // it. Requires an observed harness, so a row created by an attach (no wire
+    // state at all) still takes the fresh-observation path below.
+    const bool wireStateBeforeAnyRegistration =
+        !st.registered && !st.observedHarness.isEmpty();
+    st.registered = true;
     if (!st.generic) {
         const AgentState previous = st.state;
         st.generic = true;
@@ -384,7 +434,7 @@ void AgentStatusMonitor::setTerminalHarness(const QString& devSessionId,
             previous == AgentState::IdleUnseen
             && m_unseen.contains(devSessionId);
         const AgentState next =
-            preserveCompletion
+            preserveCompletion || wireStateBeforeAnyRegistration
                 ? previous
                 : st.attached ? AgentState::Starting : AgentState::Unknown;
         const bool changed = next != previous;
