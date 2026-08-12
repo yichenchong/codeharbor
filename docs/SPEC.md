@@ -875,8 +875,8 @@ nothing wrote the column at all, which left every pane NULL, meant the clock nev
 anyone, and made the sidebar row permanently read "Idle" — the visible bug that is the
 reason this paragraph exists. The column remains the switch, not the default: a user can
 change a pane's harness from the pane itself (naming its adapter, or "plain shell" to opt
-out of the clock entirely), and a pane stored before this was fixed keeps its NULL, and
-its silence, until somebody sets one.
+out of the clock entirely), and a pane stored before this was fixed keeps its NULL,
+and stays off the clock, until somebody sets one.
 
 AUTODETECTION. A live agent event names the harness it came from, which is better
 information than the column: an event can only come from an adapter that exists.

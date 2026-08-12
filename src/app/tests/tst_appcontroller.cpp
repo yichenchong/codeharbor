@@ -1089,7 +1089,7 @@ void TstAppController::setTerminalPaneHarnessRefusesAnUnknownValue()
     QVERIFY(transport.takeSent().isEmpty());
 
     // The empty string is legal and IS sent: it is how a pane is put back to
-    // being a plain shell that stays quiet.
+    // being a plain shell, off the output-activity clock.
     controller.setTerminalPaneHarness(QStringLiteral("term-1"), QString());
     const QJsonObject update = takeRequest(transport);
     QCOMPARE(update.value(QStringLiteral("method")).toString(),

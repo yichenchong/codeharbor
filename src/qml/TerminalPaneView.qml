@@ -876,12 +876,13 @@ Rectangle {
                 wrapMode: Text.WordWrap
                 // The one distinction this dialog exists to draw. Everything
                 // else in the list names an agent the user already recognises;
-                // these two differ only in whether the sidebar watches the
-                // pane at all, and nothing on screen would say so otherwise.
+                // these two differ only in whether CodeHarbor reads the pane's
+                // OUTPUT as agent activity, and nothing on screen would say so.
                 text: qsTr("Choose \"Generic agent\" for a pane with no agent adapter: "
                            + "CodeHarbor then works out whether it is starting, running or "
-                           + "idle from what the terminal prints. \"Plain shell\" reports "
-                           + "nothing, so the sidebar stays quiet for this pane.")
+                           + "idle from what the terminal prints. \"Plain shell\" turns that "
+                           + "off: nothing is guessed from output, and a status appears only "
+                           + "if an agent reports one itself.")
                 color: Theme.textDim
                 font.pixelSize: Theme.fontSizeSmall
                 Accessible.role: Accessible.StaticText
