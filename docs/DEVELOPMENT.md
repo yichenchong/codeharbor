@@ -645,8 +645,15 @@ apply to the GUI client and is out of scope today.
   - `destroy-unattached on` in the user's `~/.tmux.conf` destroys a session as
     soon as its last client leaves. CodeHarbor turns it off per session at
     creation (`tmuxNewSessionCommand`), which covers every session it makes and
-    any surviving session it re-attaches to; a session created before that guard
-    existed is still lost once.
+    any surviving session it re-attaches to. A session created BEFORE that guard
+    existed is not covered: it inherits the global `on` and dies at its next
+    detach, before anything can be set on it. Those can be guarded by hand,
+    while they are still alive, on the remote host:
+
+    ```bash
+    tmux ls -F '#{session_name}' | grep '^ch_' \
+      | xargs -I{} tmux set-option -t '={}:' destroy-unattached off
+    ```
   - `systemd-logind` with `KillUserProcesses=yes` kills every process a user
     owns when their last login session ends, tmux server included. Nothing in
     the client can prevent this. The host fix is
