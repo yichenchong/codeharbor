@@ -206,6 +206,12 @@ void AppController::setAgentMonitor(AgentStatusMonitor* monitor)
     // connection firing rebuildRows() from a stale monitor.
     if (m_agentMonitor)
         disconnect(m_agentMonitor, nullptr, this, nullptr);
+    // Parked observations were produced by the monitor being dropped, off its
+    // transport, and they are only ever applied by calling back into the
+    // monitor. Carrying them across a swap would let the outgoing monitor's
+    // work land on the incoming one — the same rule setTerminalFactory()
+    // follows for m_terminalStates, for the same reason.
+    m_pendingObservedHarness.clear();
     m_agentMonitor = monitor;
     if (m_agentMonitor) {
         // Any agent transition or unseen-flag flip re-derives the badges from
