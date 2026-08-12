@@ -399,6 +399,7 @@ void AgentStatusMonitor::setTerminalHarness(const QString& devSessionId,
                 wasGeneric && !preserveCompletion && !spokeAsThisHarness
                 && st->state != AgentState::Unknown;
             st->generic = false;
+            st->registered = true;
             if (clearStale)
                 st->state = AgentState::Unknown;
             rearmAgeTimer();
@@ -414,6 +415,17 @@ void AgentStatusMonitor::setTerminalHarness(const QString& devSessionId,
     // changes while a channel is attached, begin a fresh silent observation;
     // output from the old harness must not be mistaken for generic activity.
     TerminalStatus& st = m_states[devSessionId][terminalId];
+    // ...but a row an EVENT created, which the tree has never registered, is not
+    // a pane changing harness: it is the first thing anyone has said about this
+    // pane, and what it said came off the wire. That happens on every cold start
+    // where the bridge relays before list() answers, and discarding it here
+    // threw away the live agent's own report of itself — the pane fell to
+    // Unknown and the next same-harness event, being no CHANGE, never revived
+    // it. Requires an observed harness, so a row created by an attach (no wire
+    // state at all) still takes the fresh-observation path below.
+    const bool wireStateBeforeAnyRegistration =
+        !st.registered && !st.observedHarness.isEmpty();
+    st.registered = true;
     if (!st.generic) {
         const AgentState previous = st.state;
         st.generic = true;
@@ -422,7 +434,7 @@ void AgentStatusMonitor::setTerminalHarness(const QString& devSessionId,
             previous == AgentState::IdleUnseen
             && m_unseen.contains(devSessionId);
         const AgentState next =
-            preserveCompletion
+            preserveCompletion || wireStateBeforeAnyRegistration
                 ? previous
                 : st.attached ? AgentState::Starting : AgentState::Unknown;
         const bool changed = next != previous;

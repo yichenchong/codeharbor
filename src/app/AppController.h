@@ -260,7 +260,26 @@ private:
     // the mint default and will be upgraded. That is accepted: the alternative
     // is a schema column to record which of two identical values was meant, for
     // a distinction with no observable consequence beyond this one upgrade.
-    void adoptObservedHarness(const QString& terminalPaneId, const QString& harness);
+    // A pane the CURRENT tree does not list cannot be judged yet: the bridge
+    // can deliver an agent's first event before workspace.list() has answered,
+    // and an observation is reported only when the observed harness CHANGES, so
+    // dropping that first one would lose the detection until the agent switched
+    // harness — which for a normal session never happens. Such an observation is
+    // parked in m_pendingObservedHarness instead and judged against the next
+    // authoritative tree.
+    void adoptObservedHarness(const QString& devSessionId,
+                              const QString& terminalPaneId, const QString& harness);
+
+    // Apply every parked observation against the freshly loaded tree, then
+    // forget the ones it settles. `liveTerminalIds` is the tree's own pane index,
+    // already built by the caller for the terminal-state retain walk.
+    void drainPendingObservedHarnesses(
+        const QHash<QString, QSet<QString>>& liveTerminalIds);
+
+    // The pane's stored harness, or nullopt when the current tree does not list
+    // the pane at all. terminalPaneHarness() flattens both to an empty string,
+    // which is ambiguous here: an empty harness is also "plain shell".
+    std::optional<QString> lookupTerminalPaneHarness(const QString& terminalPaneId) const;
 
     // Build a WorkspaceDb callback that, once the async response arrives, is a
     // no-op if this controller was already destroyed (the shared client keeps
@@ -319,6 +338,13 @@ private:
     // re-derive rows (and re-merge agent state) without another server round-
     // trip when an agent event arrives.
     QVector<GroupNode> m_lastNodes;
+
+    // Observations that arrived before any tree could judge them, keyed by
+    // "<devSessionId>/<terminalPaneId>". Bounded by the panes that have spoken,
+    // and emptied by the next authoritative tree: an entry is settled (adopted
+    // or discarded) the moment a tree either lists the pane or proves, by
+    // listing its Dev Session without it, that the pane is gone.
+    QHash<QString, QString> m_pendingObservedHarness;
 
     // --- connection spine (injected, not owned) ---
     //

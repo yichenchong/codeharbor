@@ -886,6 +886,19 @@ client writes the observed name to the column, through the same
 only on a real change — an agent repeats its harness on every event and this must
 not become a write per event.
 
+An observation can arrive before the client has any workspace tree to judge it
+against: the agent bridge relays as soon as its socket is up, which on a cold
+start is before `workspace.list` has answered. Because an observation is reported
+only when the observed harness CHANGES, discarding that first one would lose the
+detection for the whole session — the steady stream of same-harness events that
+follows never mentions it again. Such an observation is held and settled against
+the next authoritative tree, which either lists the pane (judge it by the rule
+above) or proves it gone by listing its Dev Session without it (discard it). The
+state the agent reported survives that wait: a pane row that exists only because
+an event created it has never been registered from the tree, so registering it —
+as `generic` first, and as the observed adapter once the write lands — must not
+discard what the wire already said about it.
+
 `generic` is the ONLY value an observation may overwrite. A NULL or empty harness
 is the user's "plain shell, stay silent", and that choice exists precisely to
 report nothing, so something speaking in the pane is not a reason to overrule it;

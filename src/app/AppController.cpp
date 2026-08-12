@@ -216,9 +216,9 @@ void AppController::setAgentMonitor(AgentStatusMonitor* monitor)
         // rather than in the monitor because the authoritative tree — and the
         // only sanctioned write path to it — live on this side.
         connect(m_agentMonitor, &AgentStatusMonitor::harnessObserved, this,
-                [this](const QString&, const QString& terminalId,
+                [this](const QString& devSessionId, const QString& terminalId,
                        const QString& harness) {
-                    adoptObservedHarness(terminalId, harness);
+                    adoptObservedHarness(devSessionId, terminalId, harness);
                 });
     }
     // Re-merge immediately so a monitor set after the initial load reflects any
@@ -1368,6 +1368,14 @@ void AppController::refresh()
             }
             ++sessionIt;
         }
+        // The tree that just landed is the first thing able to judge an
+        // observation that arrived before it (the bridge can deliver an agent's
+        // first event while list() is still in flight). Safe either side of the
+        // harness walk below: adopting only SENDS updateTerminalPane, it does
+        // not register anything with the monitor, so the walk still sees the
+        // pane as the tree describes it and the row still carries the wire state
+        // no registration has touched yet.
+        self->drainPendingObservedHarnesses(liveTerminalIds);
         // Only HERE: past the error return (an RpcError means "we do not know",
         // not "it is gone") and past the generation guard, so a stale list()
         // can never retire a session the newest tree still has.
@@ -1622,17 +1630,24 @@ void AppController::setTerminalPaneHarness(QString terminalPaneId, QString harne
     m_db->updateTerminalPane(params, refreshOnSuccess<std::optional<TerminalPane>>());
 }
 
-QString AppController::terminalPaneHarness(const QString& terminalPaneId) const
+std::optional<QString>
+AppController::lookupTerminalPaneHarness(const QString& terminalPaneId) const
 {
     for (const GroupNode& group : m_lastNodes)
         for (const SessionNode& session : group.sessions)
             for (const TerminalPane& pane : session.terminalPanes)
                 if (pane.id.value == terminalPaneId)
                     return pane.harness;
-    return {};
+    return std::nullopt;
 }
 
-void AppController::adoptObservedHarness(const QString& terminalPaneId,
+QString AppController::terminalPaneHarness(const QString& terminalPaneId) const
+{
+    return lookupTerminalPaneHarness(terminalPaneId).value_or(QString());
+}
+
+void AppController::adoptObservedHarness(const QString& devSessionId,
+                                         const QString& terminalPaneId,
                                          const QString& harness)
 {
     if (terminalPaneId.isEmpty())
@@ -1647,15 +1662,57 @@ void AppController::adoptObservedHarness(const QString& terminalPaneId,
         || !detail::isHarnessWire(harness)) {
         return;
     }
+    const std::optional<QString> stored = lookupTerminalPaneHarness(terminalPaneId);
+    if (!stored) {
+        // No tree yet, or a tree older than this pane. Park it: the monitor
+        // reports an observation only when the harness CHANGES, so the ordinary
+        // stream of same-harness events that follows will never mention it
+        // again, and letting this one go would lose the detection for good.
+        m_pendingObservedHarness.insert(devSessionId + QLatin1Char('/') + terminalPaneId,
+                                        harness);
+        return;
+    }
     // The ONLY value an observation may overwrite. Read from the last
     // authoritative tree, so this is the value the server actually holds — see
     // the overwrite rule in the header for why the other two arms are left
     // alone. It is also what stops this looping: the write is followed by a
     // refresh, after which the pane is no longer generic and a repeat
     // observation finds nothing to do.
-    if (terminalPaneHarness(terminalPaneId) != QLatin1String("generic"))
+    if (*stored != QLatin1String("generic"))
         return;
     setTerminalPaneHarness(terminalPaneId, harness);
+}
+
+void AppController::drainPendingObservedHarnesses(
+    const QHash<QString, QSet<QString>>& liveTerminalIds)
+{
+    for (auto it = m_pendingObservedHarness.begin();
+         it != m_pendingObservedHarness.end();) {
+        const qsizetype slash = it.key().indexOf(QLatin1Char('/'));
+        const QString devSessionId = it.key().left(slash);
+        const QString paneId = it.key().mid(slash + 1);
+        const auto sessionIt = liveTerminalIds.constFind(devSessionId);
+        if (sessionIt == liveTerminalIds.constEnd()) {
+            // The tree does not list the Dev Session at all. AG7 above treats
+            // exactly that as "genuinely gone" and evicts its agent state, so
+            // holding an observation for it would be the one place that
+            // disagreed with the authoritative tree.
+            it = m_pendingObservedHarness.erase(it);
+            continue;
+        }
+        if (!sessionIt->contains(paneId)) {
+            // The session IS listed and this pane is not one of its panes. A
+            // session's pane list is complete, so the pane is gone.
+            it = m_pendingObservedHarness.erase(it);
+            continue;
+        }
+        // Judged at last. adoptObservedHarness() re-reads the pane from the tree
+        // and applies the same overwrite rule a live observation gets — the
+        // delay changes when the answer is known, never what it is.
+        const QString harness = it.value();
+        it = m_pendingObservedHarness.erase(it);
+        adoptObservedHarness(devSessionId, paneId, harness);
+    }
 }
 
 } // namespace ch

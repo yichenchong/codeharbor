@@ -229,6 +229,12 @@ private:
         qint64 lastOutputMs = -1;  // last terminal output observed
         bool attached = false;     // a PTY channel is (or was) bound
         bool generic = false;      // harness == "generic": SPEC 6.6 owns the state
+        // Whether the workspace tree has ever named this pane's harness. A row
+        // can exist without that: an event creates one the moment an agent
+        // speaks, which on a cold start happens before list() has answered. Such
+        // a row is NOT an adapter-driven pane being retargeted, so registering it
+        // as "generic" must not discard the state the wire just supplied.
+        bool registered = false;
         // The harness the last event for this pane came from, so harnessObserved
         // fires on a change and not on every event. Empty until one arrives, and
         // NOT the pane's configured harness (`generic` above is that one).

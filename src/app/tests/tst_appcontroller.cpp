@@ -405,6 +405,7 @@ private slots:
     void observedHarnessUpgradesAGenericPaneOnce();
     void observedHarnessUpgradeKeepsTheTriggeringState();
     void observedHarnessLeavesAPlainShellAlone();
+    void observedHarnessArrivingBeforeTheTreeIsNotLost();
     void observedHarnessLeavesAnExplicitAdapterAlone();
     void aGenericPaneFromTheTreeReachesRunningInTheSidebar();
     void refreshResultAfterControllerDestroyedIsNoop();
@@ -1240,6 +1241,82 @@ void TstAppController::observedHarnessUpgradeKeepsTheTriggeringState()
     QCOMPARE(monitor.stateFor(QStringLiteral("sess-1"), QStringLiteral("term-1")),
              static_cast<int>(AgentState::Running));
     QCOMPARE(sessionState(), static_cast<int>(SessionRowState::Running));
+}
+
+// Ordering that really happens on a cold start: the agent bridge can be live
+// and relaying before workspace.list() has answered, so a pane's FIRST event
+// arrives while the client still has no tree to judge it against. An
+// observation is reported only when the observed harness CHANGES, so the steady
+// stream of same-harness events that follows never mentions it again — drop
+// that first one and the pane stays "generic" for the life of the session,
+// which for an agent that never switches harness is forever.
+void TstAppController::observedHarnessArrivingBeforeTheTreeIsNotLost()
+{
+    FakeTransport transport;
+    CodeharbordClient client;
+    AppController controller(&client);
+    client.setTransport(&transport);
+    QSignalSpy errors(&controller, &AppController::error);
+
+    FakeTransport agentTransport;
+    AgentStatusMonitor monitor;
+    monitor.setTransport(&agentTransport);
+    controller.setAgentMonitor(&monitor);
+
+    // list() is in flight, deliberately left unanswered.
+    controller.refresh();
+    const QJsonObject pendingList = takeRequest(transport);
+    QCOMPARE(pendingList.value(QStringLiteral("method")).toString(),
+             QStringLiteral("workspace.list"));
+
+    // The agent speaks first. There is no tree, so nothing can be written yet.
+    agentTransport.deliver(agentEventLine(QStringLiteral("running"),
+                                          QStringLiteral("sess-1"),
+                                          QStringLiteral("term-1"),
+                                          QStringLiteral("oh-my-pi")));
+    QVERIFY(transport.takeSent().isEmpty());
+
+    // The tree lands, and the observation parked a moment ago is judged against
+    // it exactly as a live one would be.
+    transport.deliver(listWithTerminalFrame(
+        pendingList.value(QStringLiteral("id")).toInt(), QStringLiteral("G"),
+        QStringLiteral("sess-1"), QStringLiteral("term-1"),
+        QStringLiteral("generic")));
+
+    const QJsonObject update = takeRequest(transport);
+    QCOMPARE(update.value(QStringLiteral("method")).toString(),
+             QStringLiteral("workspace.updateTerminalPane"));
+    const QJsonObject params = update.value(QStringLiteral("params")).toObject();
+    QCOMPARE(params.value(QStringLiteral("id")).toString(),
+             QStringLiteral("term-1"));
+    QCOMPARE(params.value(QStringLiteral("harness")).toString(),
+             QStringLiteral("oh-my-pi"));
+
+    // Settled by that one tree: a second tree must not re-issue the write.
+    transport.deliver(terminalPaneResultFrame(
+        update.value(QStringLiteral("id")).toInt(), QStringLiteral("term-1"),
+        QStringLiteral("sess-1"), QStringLiteral("oh-my-pi")));
+    const QJsonObject listAgain = takeRequest(transport);
+    QCOMPARE(listAgain.value(QStringLiteral("method")).toString(),
+             QStringLiteral("workspace.list"));
+    transport.deliver(listWithTerminalFrame(
+        listAgain.value(QStringLiteral("id")).toInt(), QStringLiteral("G"),
+        QStringLiteral("sess-1"), QStringLiteral("term-1"),
+        QStringLiteral("oh-my-pi")));
+    QVERIFY(transport.takeSent().isEmpty());
+
+    // The point of detecting the harness at all. Between the parked event and
+    // here the refresh registered this pane as "generic" (the tree still said
+    // so) and then as "oh-my-pi" (the tree now says so); neither registration
+    // may discard what the agent itself reported.
+    QCOMPARE(monitor.stateFor(QStringLiteral("sess-1"), QStringLiteral("term-1")),
+             static_cast<int>(AgentState::Running));
+    SessionsModel* model = controller.sessionsModel();
+    const QModelIndex group = model->index(0, 0);
+    const QModelIndex session = model->index(0, 0, group);
+    QCOMPARE(model->data(session, SessionsModel::RowStateRole).toInt(),
+             static_cast<int>(SessionRowState::Running));
+    QCOMPARE(errors.count(), 0);
 }
 
 // A pane with NO harness is the user's "plain shell, stay silent", and that is
