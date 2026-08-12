@@ -595,6 +595,65 @@ void TerminalFactory::finishResolution(const QString& key, const QString& target
     }
 }
 
+void TerminalFactory::noteHarnessChanged(const QString& terminalPaneId,
+                                         const QString& harness)
+{
+    if (terminalPaneId.isEmpty())
+        return;
+    // Nothing below runs unless the value actually MOVED. The workspace refresh
+    // calls this for every pane every time it runs — which is after every
+    // mutation — and the work below re-announces the pane's attach. An attach
+    // is what starts SPEC 6.6's clock over at "attached and silent", so doing
+    // it on an unchanged pane would drag a Running pane back to Starting a few
+    // times a minute and the sidebar would never settle. A no-op has to be a
+    // no-op.
+    bool changed = false;
+    // An answer is remembered under its row id and, for a pane that was
+    // addressed by its legacy slot label, under that label as well. Both copies
+    // have to move together: whichever key the next resolution uses is the one
+    // that will hand a rebind its harness.
+    for (auto it = m_resolved.begin(); it != m_resolved.end(); ++it) {
+        if (it->terminalId != terminalPaneId || it->harness == harness)
+            continue;
+        it->harness = harness;
+        changed = true;
+    }
+    if (!changed || !m_agentMonitor)
+        return;
+    // Panes attached RIGHT NOW have already been registered under the old
+    // value, and no rebind is coming for them until something else disturbs
+    // them, so without this the change would not take effect until the next
+    // reconnect. Re-stating the registration fixes that; re-stating the ATTACH
+    // with it is what actually starts the clock, because a pane that has just
+    // become generic has no attach on record — it was not generic when its
+    // channel came up, so that attach was ignored, and the monitor treats
+    // output from a pane it has not seen attach as belonging to nothing it is
+    // watching. Only a pane holding a live channel qualifies, which is the same
+    // condition the real attach path reports on.
+    // Snapshotted before either call, for the reason finishResolution() gives:
+    // both of these emit, anything they reach is free to attach or close a pane
+    // on this factory, and a single insert rehashes m_attached and turns a held
+    // iterator into a dangling read.
+    struct LivePane {
+        QString devSessionId;
+        QString terminalId;
+        bool attached;
+    };
+    QVector<LivePane> live;
+    for (auto it = m_attached.constBegin(); it != m_attached.constEnd(); ++it) {
+        if (it->terminalId == terminalPaneId && !it->devSessionId.isEmpty())
+            live.push_back({it->devSessionId, it->terminalId, it->device != nullptr});
+    }
+    for (const LivePane& pane : live) {
+        if (!m_agentMonitor)
+            return;
+        m_agentMonitor->setTerminalHarness(pane.devSessionId, pane.terminalId, harness);
+        if (!pane.attached || !m_agentMonitor)
+            continue;
+        m_agentMonitor->noteTerminalAttached(pane.devSessionId, pane.terminalId);
+    }
+}
+
 bool TerminalFactory::attach(TerminalController* controller,
                              const QString& tmuxTarget,
                              const QString& workingDir,

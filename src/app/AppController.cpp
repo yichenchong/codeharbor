@@ -1425,6 +1425,19 @@ void AppController::refresh()
                     registration.devSessionId, registration.terminalPaneId,
                     registration.harness);
             }
+            // The factory remembers the harness each pane RESOLVED with, and
+            // that memory deliberately survives a disconnect. Left alone it
+            // would re-apply the old value at the next rebind and quietly undo
+            // a harness the user (or another client) has since changed, so the
+            // authoritative tree corrects it here, in the same walk.
+            if (self->m_terminalFactory) {
+                for (const HarnessRegistration& registration : registrations) {
+                    if (!self || !self->m_terminalFactory)
+                        break;
+                    self->m_terminalFactory->noteHarnessChanged(
+                        registration.terminalPaneId, registration.harness);
+                }
+            }
         }
         if (!self)
             return;

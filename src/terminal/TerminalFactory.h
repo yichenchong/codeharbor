@@ -148,6 +148,20 @@ public:
     void setWorkspace(WorkspaceDb* workspace);
     void setServerId(const QString& serverId);
 
+
+    // A pane's harness changed on the server, so the remembered answer for it
+    // is out of date.
+    //
+    // The resolution cache deliberately survives a disconnect (see m_resolved),
+    // and a remembered answer carries the harness it was resolved with. Without
+    // this, changing a pane's harness and then reconnecting would re-bind the
+    // OLD value from the cache and silently undo the change — the pane would go
+    // back to reporting (or not reporting) exactly as it did before, with
+    // nothing on screen to say why. Cheap and idempotent: a pane whose harness
+    // has not changed, and a pane that has never been resolved, both cost a
+    // lookup and no write.
+    void noteHarnessChanged(const QString& terminalPaneId, const QString& harness);
+
     // Feed SPEC 6.6 activity detection for the adapterless "generic" harness.
     // Not owned; nullptr disables the reporting entirely, which is what every
     // test that does not care about agent state gets.
