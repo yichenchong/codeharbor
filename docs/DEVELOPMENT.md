@@ -654,10 +654,19 @@ apply to the GUI client and is out of scope today.
     tmux ls -F '#{session_name}' | grep '^ch_' \
       | xargs -I{} tmux set-option -t '={}:' destroy-unattached off
     ```
-  - `systemd-logind` with `KillUserProcesses=yes` kills every process a user
-    owns when their last login session ends, tmux server included. Nothing in
-    the client can prevent this. The host fix is
-    `sudo loginctl enable-linger <user>`.
+  - `systemd-logind` with `KillUserProcesses=yes` kills the processes in a
+    user's SESSION SCOPE when their last login session ends — a tmux server
+    started from an SSH session is in that scope, so it dies with it. Nothing in
+    the client prevents this, and `loginctl enable-linger` alone does NOT fix
+    it: lingering keeps a user manager running, it does not move an
+    already-running tmux out of the session scope it was started in. The
+    remedies are, on the host:
+    - the administrator setting `KillUserProcesses=no` in `logind.conf`, or
+      naming the user in `KillExcludeUsers=`; or
+    - starting tmux under the user manager instead of the session scope, e.g.
+      `systemd-run --user --scope tmux …`, which places it in the user slice.
+      CodeHarbor does not do this today — it runs plain `tmux new-session`, so
+      on such a host the session's lifetime is the login session's.
 
   To tell them apart after it happens: if the user's own unrelated tmux sessions
   died too, it was logind (one tmux server holds them all — the command passes
