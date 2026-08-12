@@ -187,6 +187,12 @@ A few things worth knowing about the shipped client:
   a new pane, and can hand it to a local application by `<appName>://` scheme.
 - **Terminal panes can be renamed** from their header, and the name travels with the
   layout, so it is there after a restart and on another machine.
+- **Each Dev Session shows what it is doing** — the coloured dot beside its name in
+  the sidebar. A pane running a supported coding agent reports its own status
+  (running, waiting for you, finished); an ordinary terminal is worked out from
+  whether it is printing anything. Panes are set to that second mode when they are
+  created, and the gear button in a terminal's header changes it — name the agent
+  the pane runs, or pick "Plain shell" to have it report nothing at all.
 - **Dev Sessions can be pinned**, and the sidebar can be filtered to show only pinned
   ones. Pins live on the server; the filter is local to the machine.
 - **Dev Sessions can be archived** to get them out of the sidebar without losing

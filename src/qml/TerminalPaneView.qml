@@ -104,6 +104,54 @@ Rectangle {
         pane.customTitle = title
         pane.titleChangedRequested(pane.paneId, title)
     }
+
+    // ---- what this pane RUNS (SPEC 6.6) ------------------------------------
+    // The sidebar decides whether a session looks busy from the harness stored
+    // against each terminal pane. A pane driven by an agent hook announces its
+    // own harness on the wire; a pane the user opened and then started
+    // something in cannot, so the user says so here.
+    //
+    // The vocabulary is fixed: these five values are exactly what
+    // ch::detail::isHarnessWire accepts, with the empty string meaning "plain
+    // shell, no harness". The labels are for a human and the values are for the
+    // wire, and the two are deliberately not the same words.
+    readonly property var harnessOptions: [
+        { value: "", label: qsTr("Plain shell") },
+        { value: "generic", label: qsTr("Generic agent") },
+        { value: "oh-my-pi", label: qsTr("Oh My Pi") },
+        { value: "pi", label: qsTr("Pi") },
+        { value: "claude-code", label: qsTr("Claude Code") }
+    ]
+
+    // The `app` context property (ch::AppController), reached the same guarded
+    // way as `settingsObject` above so a bare QML load gets inert chrome rather
+    // than a ReferenceError, and a test can inject a stub through it.
+    property var appController: (typeof app !== "undefined" && app) ? app : null
+
+    function beginSetHarness() {
+        pane.paneActivated(pane.paneId)
+        harnessDialog.open()
+    }
+
+    // What the server currently has stored for THIS pane's `terminal_panes`
+    // row. Empty for a pane with no harness, and equally empty for a pane whose
+    // row has not been minted yet — the dialog then simply opens on "Plain
+    // shell", which is the truthful reading of "nothing stored".
+    function currentHarness() {
+        if (!pane.appController || pane.terminalPaneId.length === 0
+                || typeof pane.appController.terminalPaneHarness !== "function")
+            return ""
+        return String(pane.appController.terminalPaneHarness(pane.terminalPaneId))
+    }
+
+    // Named by the `terminal_panes` row id, never by the recyclable slot label:
+    // this writes to the server row, and the label is not its key.
+    function commitHarness(value) {
+        if (!pane.appController || pane.terminalPaneId.length === 0
+                || typeof pane.appController.setTerminalPaneHarness !== "function")
+            return
+        pane.appController.setTerminalPaneHarness(pane.terminalPaneId, value)
+    }
     property string workingDir: ""
 
     // The terminal's REAL identity: the id of its row in the server's
@@ -731,6 +779,22 @@ Rectangle {
                 text: qsTr("Rename this pane")
                 glyph: "R"
                 onClicked: pane.beginRename()
+            },
+            AppPaneHeader.Action {
+                objectName: "terminalHarnessButton"
+                // A gear, because this is the only control in this header that
+                // configures the pane rather than acting on it, and it is the
+                // one glyph the header does not already spend (split uses
+                // \u25eb and \u229f, close \u00d7, rename "R"). The words live
+                // in `text`, which is both the tooltip and the accessible name
+                // a screen reader reads out — nobody has to recognise the
+                // symbol to know what it does.
+                text: qsTr("Choose what this pane runs")
+                glyph: "\u2699"
+                // Nothing to write against until the server has minted this
+                // pane's row.
+                enabled: pane.terminalPaneId.length > 0
+                onClicked: pane.beginSetHarness()
             }
         ]
     }
@@ -764,6 +828,92 @@ Rectangle {
         }
 
         onAccepted: pane.commitRename(renameField.text)
+    }
+
+    // What this pane runs, which is what the sidebar's per-session status is
+    // computed from (SPEC 6.6). Only ever reached from the header action above:
+    // the value is stored on the server against this pane's row, so it is a
+    // deliberate choice and not something to infer.
+    AppDialog {
+        id: harnessDialog
+        objectName: "terminalPaneHarnessDialog"
+        title: qsTr("What does this pane run?")
+        modal: true
+        standardButtons: Dialog.Ok | Dialog.Cancel
+        anchors.centerIn: Overlay.overlay
+        width: 420
+
+        // The choice so far, as a WIRE value. Held here rather than read back
+        // off the buttons because the empty string is a real answer ("plain
+        // shell") and not the absence of one.
+        property string selected: ""
+
+        // Open on what is actually stored, and put the keyboard on that choice,
+        // so the arrow keys move through the list from where the user is rather
+        // than from the top. The buttons are set imperatively — a binding on
+        // `checked` would be broken by the first click, which is the click that
+        // matters.
+        onOpened: {
+            harnessDialog.selected = pane.currentHarness()
+            for (let i = 0; i < harnessOptions.count; ++i) {
+                const option = harnessOptions.itemAt(i)
+                if (!option)
+                    continue
+                option.checked = option.wireValue === harnessDialog.selected
+                if (option.checked)
+                    option.forceActiveFocus()
+            }
+        }
+
+        ColumnLayout {
+            implicitWidth: 380
+            spacing: 8
+
+            Label {
+                objectName: "terminalPaneHarnessExplanation"
+                Layout.fillWidth: true
+                textFormat: Text.PlainText
+                wrapMode: Text.WordWrap
+                // The one distinction this dialog exists to draw. Everything
+                // else in the list names an agent the user already recognises;
+                // these two differ only in whether the sidebar watches the
+                // pane at all, and nothing on screen would say so otherwise.
+                text: qsTr("Choose \"Generic agent\" for a pane with no agent adapter: "
+                           + "CodeHarbor then works out whether it is starting, running or "
+                           + "idle from what the terminal prints. \"Plain shell\" reports "
+                           + "nothing, so the sidebar stays quiet for this pane.")
+                color: Theme.textDim
+                font.pixelSize: Theme.fontSizeSmall
+                Accessible.role: Accessible.StaticText
+                Accessible.name: text
+            }
+
+            Repeater {
+                id: harnessOptions
+                model: pane.harnessOptions
+
+                RadioButton {
+                    required property var modelData
+                    // The wire value this choice stands for, kept beside the
+                    // human label so the dialog never has to map one back to
+                    // the other by matching text.
+                    readonly property string wireValue: modelData.value
+                    objectName: "terminalPaneHarnessOption_"
+                                + (wireValue.length > 0 ? wireValue : "shell")
+                    Layout.fillWidth: true
+                    text: modelData.label
+                    // Spelled out rather than left to the style, the same way
+                    // ViewerPane's header buttons do it: this is the whole of
+                    // what a screen reader has to tell five otherwise identical
+                    // radio buttons apart.
+                    Accessible.role: Accessible.RadioButton
+                    Accessible.name: text
+                    onClicked: harnessDialog.selected = wireValue
+                }
+            }
+        }
+
+        onAccepted: pane.commitHarness(harnessDialog.selected)
     }
 
     // Closing a terminal pane is confirmed here, at the pane that owns the

@@ -503,6 +503,11 @@ void TstSessionLayouts::terminalDefaultIsTwoStackedPanesAndIsPersisted()
         QCOMPARE(mintParams.value(QStringLiteral("devSessionId")).toString(),
                  QStringLiteral("s1"));
         QCOMPARE(mintParams.value(QStringLiteral("name")).toString(), label);
+        // Every minted pane is `generic`: SPEC 6.6 derives its state from what
+        // the terminal prints, and a row stored without a harness leaves the
+        // activity clock switched off, so the sidebar could only say Idle.
+        QCOMPARE(mintParams.value(QStringLiteral("harness")).toString(),
+                 QStringLiteral("generic"));
         respondResult(mint.value(QStringLiteral("id")).toInt(),
                       terminalPaneRow(label));
     }

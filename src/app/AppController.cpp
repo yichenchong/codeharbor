@@ -1,5 +1,6 @@
 #include "AppController.h"
 
+#include "AgentEvent.h"
 #include "EditorFactory.h"
 #include "TerminalFactory.h"
 #include "UiStateStore.h"
@@ -1578,6 +1579,35 @@ void AppController::reorderSessions(QString groupId, QStringList orderedIds)
     for (const QString& id : orderedIds)
         ids.push_back(DevSessionId{id});
     m_db->reorderSessions(GroupId{std::move(groupId)}, ids, refreshOnSuccess<>());
+}
+
+void AppController::setTerminalPaneHarness(QString terminalPaneId, QString harness)
+{
+    // The vocabulary lives in one place, next to the parser that has to agree
+    // with it; an empty string is the fifth legal value and means "plain shell,
+    // no harness", which isHarnessWire deliberately does not accept.
+    if (!harness.isEmpty() && !detail::isHarnessWire(harness)) {
+        emit error(tr("\"%1\" is not a terminal harness CodeHarbor knows.")
+                       .arg(harness));
+        return;
+    }
+    UpdateTerminalPaneParams params;
+    params.id = TerminalId{std::move(terminalPaneId)};
+    params.harness = std::move(harness);
+    // refresh() on success is not bookkeeping here: its harness walk is the one
+    // thing that re-registers the pane with the agent monitor, so without it
+    // the new value would sit on the server and change nothing on screen.
+    m_db->updateTerminalPane(params, refreshOnSuccess<std::optional<TerminalPane>>());
+}
+
+QString AppController::terminalPaneHarness(const QString& terminalPaneId) const
+{
+    for (const GroupNode& group : m_lastNodes)
+        for (const SessionNode& session : group.sessions)
+            for (const TerminalPane& pane : session.terminalPanes)
+                if (pane.id.value == terminalPaneId)
+                    return pane.harness;
+    return {};
 }
 
 } // namespace ch

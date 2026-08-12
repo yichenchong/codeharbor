@@ -846,6 +846,16 @@ this way. A pane with no harness configured is a plain shell, and treating a she
 output as agent activity would light up every terminal in the sidebar; a pane with an
 adapter harness gets its state from the wire, which is strictly better information.
 
+A pane the client mints is created WITH `harness = "generic"`
+(`ch::SessionLayouts::mintTerminalPaneRow`), so this detection is on by default for
+terminals opened from the UI. It has to be set at creation by somebody: for a long time
+nothing wrote the column at all, which left every pane NULL, meant the clock never ran for
+anyone, and made the sidebar row permanently read "Idle" — the visible bug that is the
+reason this paragraph exists. The column remains the switch, not the default: a user can
+change a pane's harness from the pane itself (naming its adapter, or "plain shell" to opt
+out of the clock entirely), and a pane stored before this was fixed keeps its NULL, and
+its silence, until somebody sets one.
+
 Loss of the SSH channel is a TRANSPORT condition, reported by the client's own connection
 state, so there is deliberately no `disconnected` agent state here.
 

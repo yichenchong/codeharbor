@@ -35,6 +35,7 @@
 #include "AgentStatusMonitor.h"
 #include "SessionState.h"
 #include "TerminalFactory.h"
+#include "TerminalController.h"
 
 using namespace ch;
 
@@ -116,12 +117,17 @@ QByteArray listResultFrame(int id, const QString& groupName)
 
 // A workspace.list success frame carrying one group with one session that owns a
 // single terminal pane, so the AppController caches terminalPanes that
-// rebuildRows() can merge live agent state onto.
+// rebuildRows() can merge live agent state onto. `harness` is what the row
+// stores for that pane; the default is a row with no harness at all, which is
+// what every pane created before SPEC 6.6's mint carried.
 QByteArray listWithTerminalFrame(int id, const QString& groupName,
                                  const QString& sessionId,
-                                 const QString& terminalId)
+                                 const QString& terminalId,
+                                 const QString& harness = QString())
 {
-    const QJsonObject terminal{{"id", terminalId}, {"devSessionId", sessionId}};
+    QJsonObject terminal{{"id", terminalId}, {"devSessionId", sessionId}};
+    if (!harness.isEmpty())
+        terminal.insert(QStringLiteral("harness"), harness);
     const QJsonObject session{{"id", sessionId},
                               {"name", sessionId},
                               {"terminalPanes", QJsonArray{terminal}}};
@@ -131,6 +137,24 @@ QByteArray listWithTerminalFrame(int id, const QString& groupName,
     const QJsonObject resp{{"jsonrpc", "2.0"},
                            {"id", id},
                            {"result", QJsonArray{group}}};
+    return QJsonDocument(resp).toJson(QJsonDocument::Compact) + '\n';
+}
+
+// One `terminal_panes` row in the shape remote/src/workspace.ts returns it,
+// which is what both updateTerminalPane and resolveTerminalPane answer with.
+QByteArray terminalPaneResultFrame(int id, const QString& rowId,
+                                   const QString& sessionId,
+                                   const QString& harness)
+{
+    const QJsonObject row{{"id", rowId},
+                          {"serverId", "srv-1"},
+                          {"devSessionId", sessionId},
+                          {"name", rowId},
+                          {"workingDirectory", "/repo"},
+                          {"tmuxTarget", QStringLiteral("ch_%1_%2").arg(sessionId, rowId)},
+                          {"harness", harness},
+                          {"position", 0}};
+    const QJsonObject resp{{"jsonrpc", "2.0"}, {"id", id}, {"result", row}};
     return QJsonDocument(resp).toJson(QJsonDocument::Compact) + '\n';
 }
 
@@ -334,6 +358,16 @@ SshConnectionPool::HostKeyDecision offerUnknownHostKey(SshConnectionPool& pool)
                                   KnownHosts::Verdict::Unknown);
 }
 
+// TerminalFactory::resolveTarget() refuses unless the SSH pool reports
+// Connected, which no unit test can reach. Opening that one gate (and nothing
+// else) is what lets a test drive a pane's real identity binding and its real
+// output hook; tst_terminalfactory uses the same subclass for the same reason.
+class OfflineFactory : public TerminalFactory {
+public:
+    using TerminalFactory::TerminalFactory;
+    bool connected() const override { return true; }
+};
+
 } // namespace
 
 class TstAppController : public QObject {
@@ -361,6 +395,10 @@ private slots:
     void deleteSessionErrorEmitsErrorWithoutRefresh();
     void archiveSessionSendsArchivedAndRefreshes();
     void archiveSessionErrorEmitsErrorWithoutRefresh();
+    void setTerminalPaneHarnessWritesTheRowAndRefreshes();
+    void setTerminalPaneHarnessRefusesAnUnknownValue();
+    void terminalPaneHarnessReadsTheAuthoritativeTree();
+    void aGenericPaneFromTheTreeReachesRunningInTheSidebar();
     void refreshResultAfterControllerDestroyedIsNoop();
     void agentMonitorMergesStateIntoSidebar();
     void terminalConnectionStateMergesIntoSidebar();
@@ -992,6 +1030,89 @@ void TstAppController::archiveSessionErrorEmitsErrorWithoutRefresh()
     QVERIFY(transport.takeSent().isEmpty());
 }
 
+// Setting a pane's harness is one workspace.updateTerminalPane carrying just
+// that field, and the refresh it chains is not cosmetic: refresh()'s harness
+// walk is the only thing that re-registers the pane with the agent monitor, so
+// without it the new value would change nothing the user can see.
+void TstAppController::setTerminalPaneHarnessWritesTheRowAndRefreshes()
+{
+    FakeTransport transport;
+    CodeharbordClient client;
+    AppController controller(&client);
+    client.setTransport(&transport);
+    QSignalSpy errors(&controller, &AppController::error);
+
+    controller.setTerminalPaneHarness(QStringLiteral("term-1"),
+                                      QStringLiteral("claude-code"));
+    const QJsonObject update = takeRequest(transport);
+    QCOMPARE(update.value(QStringLiteral("method")).toString(),
+             QStringLiteral("workspace.updateTerminalPane"));
+    const QJsonObject params = update.value(QStringLiteral("params")).toObject();
+    QCOMPARE(params.value(QStringLiteral("id")).toString(),
+             QStringLiteral("term-1"));
+    QCOMPARE(params.value(QStringLiteral("harness")).toString(),
+             QStringLiteral("claude-code"));
+
+    transport.deliver(terminalPaneResultFrame(
+        update.value(QStringLiteral("id")).toInt(), QStringLiteral("term-1"),
+        QStringLiteral("sess-1"), QStringLiteral("claude-code")));
+    QCOMPARE(takeRequest(transport).value(QStringLiteral("method")).toString(),
+             QStringLiteral("workspace.list"));
+    QCOMPARE(errors.count(), 0);
+}
+
+// The four wire values plus "" are the whole vocabulary (ch::detail::
+// isHarnessWire). Anything else is refused where the user can be told, rather
+// than stored: the server would take the string and the monitor would then
+// never match it, so the pane would go quiet with nothing to explain why.
+void TstAppController::setTerminalPaneHarnessRefusesAnUnknownValue()
+{
+    FakeTransport transport;
+    CodeharbordClient client;
+    AppController controller(&client);
+    client.setTransport(&transport);
+    QSignalSpy errors(&controller, &AppController::error);
+
+    controller.setTerminalPaneHarness(QStringLiteral("term-1"),
+                                      QStringLiteral("codex"));
+    QCOMPARE(errors.count(), 1);
+    QVERIFY(errors.at(0).at(0).toString().contains(QStringLiteral("codex")));
+    QVERIFY(transport.takeSent().isEmpty());
+
+    // The empty string is legal and IS sent: it is how a pane is put back to
+    // being a plain shell that stays quiet.
+    controller.setTerminalPaneHarness(QStringLiteral("term-1"), QString());
+    const QJsonObject update = takeRequest(transport);
+    QCOMPARE(update.value(QStringLiteral("method")).toString(),
+             QStringLiteral("workspace.updateTerminalPane"));
+    QVERIFY(update.value(QStringLiteral("params")).toObject()
+                .value(QStringLiteral("harness")).toString().isEmpty());
+    QCOMPARE(errors.count(), 1);
+}
+
+// The getter reports what the last authoritative tree holds, and answers for a
+// pane that tree has never heard of instead of asserting: the caller is the UI
+// asking about a pane another client may have closed.
+void TstAppController::terminalPaneHarnessReadsTheAuthoritativeTree()
+{
+    FakeTransport transport;
+    CodeharbordClient client;
+    AppController controller(&client);
+    client.setTransport(&transport);
+
+    QVERIFY(controller.terminalPaneHarness(QStringLiteral("term-1")).isEmpty());
+
+    controller.refresh();
+    transport.deliver(listWithTerminalFrame(
+        takeRequest(transport).value(QStringLiteral("id")).toInt(),
+        QStringLiteral("G"), QStringLiteral("sess-1"), QStringLiteral("term-1"),
+        QStringLiteral("oh-my-pi")));
+
+    QCOMPARE(controller.terminalPaneHarness(QStringLiteral("term-1")),
+             QStringLiteral("oh-my-pi"));
+    QVERIFY(controller.terminalPaneHarness(QStringLiteral("gone")).isEmpty());
+}
+
 // A late response after the controller is destroyed must be a no-op: the shared
 // client keeps the pending callback alive past our lifetime, and the QPointer
 // guard on every callback makes the delayed dispatch safe (no use-after-free).
@@ -1150,6 +1271,83 @@ void TstAppController::refreshDoesNotWipeAgentDerivedState()
 
     QCOMPARE(sessionState(),
              static_cast<int>(SessionRowState::WaitingForInput));
+}
+
+// THE regression this whole change exists for. A pane the UI mints is stored
+// with harness `generic`, and SPEC 6.6 then derives its state from terminal
+// output alone - no agent hook, no wire events. Before the fix the mint sent no
+// harness at all, so refresh()'s walk registered nothing, the activity clock
+// never started, and the sidebar row for the session said Idle no matter what
+// the shell was doing. Driven through the production route end to end: the tree
+// registers the harness, and the pane's own bytes reach the monitor through
+// TerminalFactory's outputReceived hook.
+void TstAppController::aGenericPaneFromTheTreeReachesRunningInTheSidebar()
+{
+    CodeharbordClient client;
+    AppController controller(&client);
+    // Seeded before the transport, so the only request in flight is the
+    // refresh below (see terminalConnectionStateMergesIntoSidebar).
+    controller.setServerId(QStringLiteral("srv-1"));
+
+    FakeTransport agentTransport;
+    AgentStatusMonitor monitor;
+    monitor.setTransport(&agentTransport);
+    controller.setAgentMonitor(&monitor);
+
+    FakeTransport transport;
+    client.setTransport(&transport);
+    controller.refresh();
+    transport.deliver(listWithTerminalFrame(
+        takeRequest(transport).value(QStringLiteral("id")).toInt(),
+        QStringLiteral("G"), QStringLiteral("sess-1"), QStringLiteral("term-1"),
+        QStringLiteral("generic")));
+
+    SessionsModel* model = controller.sessionsModel();
+    const auto sessionState = [model]() {
+        const QModelIndex group = model->index(0, 0);
+        const QModelIndex session = model->index(0, 0, group);
+        return model->data(session, SessionsModel::RowStateRole).toInt();
+    };
+    QCOMPARE(sessionState(), static_cast<int>(SessionRowState::Idle));
+
+    // The pane attaches. Only a pane the monitor knows to be generic moves to
+    // Starting, and nothing but the tree has registered anything yet, so this
+    // is the harness arriving through refresh()'s walk. (The attach itself is
+    // made by hand: the real one needs an SSH channel. Same call, same
+    // argument - tst_terminalfactory stands in the same way.)
+    monitor.noteTerminalAttached(QStringLiteral("sess-1"),
+                                 QStringLiteral("term-1"));
+    QCOMPARE(monitor.stateFor(QStringLiteral("sess-1"), QStringLiteral("term-1")),
+             static_cast<int>(AgentState::Starting));
+
+    // A real factory over the controller's own repository, resolving the pane
+    // exactly as opening it does, so the output hook below is the production
+    // one and not a hand-made call into the monitor.
+    OfflineFactory factory(nullptr);
+    factory.setWorkspace(controller.workspaceDb());
+    factory.setServerId(QStringLiteral("srv-1"));
+    factory.setAgentMonitor(&monitor);
+    controller.setTerminalFactory(&factory);
+
+    QObject pane;
+    TerminalController* paneController = factory.create(&pane);
+    QVERIFY(factory.resolveTarget(paneController, QStringLiteral("sess-1"),
+                                  QStringLiteral("terminal-1"),
+                                  QStringLiteral("term-1"),
+                                  QStringLiteral("/repo")));
+    const QJsonObject resolve = takeRequest(transport);
+    QCOMPARE(resolve.value(QStringLiteral("method")).toString(),
+             QStringLiteral("workspace.resolveTerminalPane"));
+    transport.deliver(terminalPaneResultFrame(
+        resolve.value(QStringLiteral("id")).toInt(), QStringLiteral("term-1"),
+        QStringLiteral("sess-1"), QStringLiteral("generic")));
+
+    // The shell prints. That is the only evidence SPEC 6.6 has, and it is
+    // enough: the sidebar row must read Running, not Idle.
+    paneController->ingestOutput(QByteArrayLiteral("$ make\n"));
+    QCOMPARE(monitor.stateFor(QStringLiteral("sess-1"), QStringLiteral("term-1")),
+             static_cast<int>(AgentState::Running));
+    QCOMPARE(sessionState(), static_cast<int>(SessionRowState::Running));
 }
 
 // MANDATORY (markSeen semantics): a terminal reaching idle_unseen puts the row

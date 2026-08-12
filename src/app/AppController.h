@@ -187,6 +187,20 @@ public:
     Q_INVOKABLE void moveSession(QString id, QString groupId, int position);
     Q_INVOKABLE void deleteSession(QString id);
     Q_INVOKABLE void reorderSessions(QString groupId, QStringList orderedIds);
+    // Terminal pane mutations.
+    //
+    // Set a terminal pane's harness (SPEC 6.6). `harness` must be one of the
+    // four wire values or "" for a plain shell that is to stay quiet; anything
+    // else is refused through `error` rather than sent, because the server
+    // would take an unknown string and the monitor would then never match it.
+    // On success refresh() re-reads the tree, and its harness walk is what
+    // re-registers the pane with the agent monitor.
+    Q_INVOKABLE void setTerminalPaneHarness(QString terminalPaneId, QString harness);
+    // The harness currently stored for a pane, from the last authoritative
+    // tree. Empty for a pane with no harness AND for one this tree does not
+    // know: the caller is QML asking about a pane that may have been closed by
+    // another client, which is a question, not a programming error.
+    Q_INVOKABLE QString terminalPaneHarness(const QString& terminalPaneId) const;
 
 signals:
     void serverIdChanged();

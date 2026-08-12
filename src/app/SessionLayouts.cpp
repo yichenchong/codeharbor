@@ -1164,6 +1164,12 @@ void SessionLayouts::mintTerminalPaneRow(quint64 generation, const QString& pane
     // leaf. It is sent so the row is legible in the Dev Session's terminal pane
     // list rather than being an anonymous UUID.
     params.name = paneId;
+    // Every pane the UI mints is a `generic` harness: its state comes from what
+    // the terminal prints, which is exactly the fallback SPEC 6.6 describes.
+    // Left out, the row is stored with no harness at all, AgentStatusMonitor
+    // never starts the activity clock for it, and the sidebar row for the
+    // session can only ever say Idle no matter what the shell is doing.
+    params.harness = QStringLiteral("generic");
     const QString devSessionId = m_devSessionId;
     QPointer<SessionLayouts> self(this);
     // One mint, one outcome. Whichever of the answer and the deadline arrives
