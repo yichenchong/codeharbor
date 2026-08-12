@@ -1,5 +1,6 @@
 import QtQuick
 import QtQuick.Controls.Basic
+import QtQuick.Window
 import "RemotePath.js" as RemotePath
 
 // A single viewer pane (SPEC 3.3, 7.5) — a leaf of the viewer split tree, and a
@@ -65,12 +66,22 @@ Item {
         pane.focusRetriesLeft -= 1
         focusRetry.restart()
     }
-    onPaneActiveChanged: {
-        if (!pane.paneActive) {
-            pane.focusPending = false
-            focusRetry.stop()
-        }
+    // Abandon a restore that has not landed yet. Losing it costs nothing — the
+    // pane simply does not place the keyboard — while letting it run costs the
+    // user their keystrokes: the retry fires ten times a second for up to
+    // twenty seconds and each attempt pushes the focus back into the handler's
+    // page, so a restore armed as the pane came up would yank the cursor out of
+    // the address bar mid-path.
+    function cancelFocusRestore() {
+        if (!pane.focusPending)
+            return;
+        pane.focusPending = false;
+        focusRetry.stop();
     }
+    // The region gave focus to a DIFFERENT pane. Same cancellation, different
+    // reason, and the only one this used to have: a restore that outlives its
+    // own pane's turn would fight whatever the user did next.
+    onPaneActiveChanged: if (!pane.paneActive) pane.cancelFocusRestore()
 
     // ---- browser navigation history ----------------------------------------
     //
@@ -299,6 +310,73 @@ Item {
     Connections {
         target: contentLoader
         function onLoaded() { pane.focusContent(); }
+    }
+
+    // ---- getting the keyboard back OUT of the page -------------------------
+    //
+    // THE ESCAPE KEY IS Ctrl+Shift+F6, the same key TerminalPaneView uses and
+    // for the same reason: without it this pane is a keyboard trap. Most of the
+    // handlers below are Chromium pages, and focusContent() above deliberately
+    // pushes the keyboard INTO one of them — Monaco's input area, in the case a
+    // user spends all day in. Monaco answers Tab with an indent and Escape with
+    // a suggestion dismissal, so nothing a user can press moves the keyboard
+    // back to this pane's own chrome.
+    //
+    // A Shortcut is what makes this work at all: it is matched before the key
+    // reaches the focused item, so the page never sees it. See the block in
+    // TerminalPaneView.qml for why the key is spelled this way, and for why it
+    // is enabled only while the keyboard is inside THIS pane.
+    Shortcut {
+        sequences: ["Ctrl+Shift+F6"]
+        enabled: pane.holdsKeyboardFocus
+        onActivated: pane.releaseKeyboard()
+    }
+
+    // Is the window's focus item this pane or something inside it? Asked of the
+    // window rather than of this Item, because a plain Item never reports
+    // `activeFocus` for a descendant — and the descendant that matters here is
+    // a WebEngineView several levels down inside a Loader.
+    readonly property bool holdsKeyboardFocus: {
+        let item = pane.Window.activeFocusItem;
+        while (item) {
+            if (item === pane)
+                return true;
+            item = item.parent;
+        }
+        return false;
+    }
+
+    // Take the keyboard off the handler's page and put it in the address bar:
+    // the one piece of this pane's chrome that is always present, always
+    // visible, and draws a focus ring, so the user can SEE where the keyboard
+    // went. Tab from there reaches the pane header's actions.
+    function releaseKeyboard() {
+        pane.cancelFocusRestore();
+        addressField.forceActiveFocus(Qt.OtherFocusReason);
+        addressField.deselect();
+    }
+
+    // Keyboard focus arriving is the same statement a click makes: the user is
+    // working HERE. Without this a keyboard user could tab into a pane and
+    // still have the split and close commands act on whichever pane was last
+    // clicked, with the header's active mark pointing at that other pane.
+    //
+    // Guarded on `paneActive` so a PROGRAMMATIC restore stays silent: the
+    // region sets the flag and only then calls acceptFocus(), so focus landing
+    // in an already-active pane is the region's own doing and must not be
+    // counted as a fresh user choice (Main.qml drops a pending restore when the
+    // user's focus serial moves).
+    onHoldsKeyboardFocusChanged: {
+        if (pane.holdsKeyboardFocus && !pane.paneActive)
+            pane.paneActivated(pane.paneId);
+    }
+
+    // Any key pressed anywhere in this pane's chrome is the user working, so a
+    // restore that has not landed yet is stale. Declined, never consumed: this
+    // watches the keys, it does not answer them.
+    Keys.onPressed: function (event) {
+        pane.cancelFocusRestore();
+        event.accepted = false;
     }
 
     // ---- content reporting (SPEC 4.5) --------------------------------------
@@ -785,6 +863,39 @@ Item {
         pane.checkRepoRoot();
     }
 
+    // ---- what this pane is doing, in words ---------------------------------
+    //
+    // A handler that is waiting on the network publishes one BOOLEAN, `loading`
+    // (the directory listing is the exception — it prints "Listing…" on screen).
+    // The header turns that boolean into a coloured dot, which is the whole of
+    // what the pane says while an image, a PDF, a rendered Markdown document or
+    // a web page is on its way: a blank rectangle and a spinner nobody using a
+    // screen reader can perceive. So the sentence is composed HERE, where the
+    // address and the handler kind are both known, rather than asking each
+    // handler to grow a status string of its own.
+    readonly property string statusDescription: {
+        if (pane.probePath.length > 0)
+            return qsTr("Asking the server what is at %1.").arg(pane.probePath);
+        const where = pane.displayPath;
+        if (contentLoader.item && contentLoader.item.loading === true) {
+            return where.length > 0 ? qsTr("Loading %1.").arg(where)
+                                    : qsTr("Loading.");
+        }
+        if (where.length === 0) {
+            return qsTr("Nothing is open in this pane. Type a remote path or an https:// "
+                        + "address in the address bar and press Enter.");
+        }
+        return pane.kindLabel.length > 0
+               ? qsTr("Showing the %1 at %2.").arg(pane.kindLabel).arg(where)
+               : qsTr("Showing %1.").arg(where);
+    }
+
+    Accessible.role: Accessible.Pane
+    Accessible.name: pane.displayName.length > 0
+                     ? qsTr("Viewer pane showing %1").arg(pane.displayName)
+                     : qsTr("Empty viewer pane")
+    Accessible.description: pane.statusDescription
+
     // ---- chrome ------------------------------------------------------------
 
     AppPaneHeader {
@@ -889,6 +1000,20 @@ Item {
             rightPadding: 8
             topPadding: 0
             bottomPadding: 0
+
+            // The field's VALUE is the address it is showing, so a screen
+            // reader given nothing else announces a path and never says what
+            // the control is for. The name is the purpose, said once and
+            // unchanging; the value follows it on its own.
+            Accessible.role: Accessible.EditableText
+            Accessible.name: qsTr("Address of the file or page this pane is showing")
+            Accessible.description: qsTr("Type a remote path or an https:// address and press "
+                                         + "Enter to open it in this pane.")
+
+            // The user is typing HERE. A restore still counting down would push
+            // the keyboard back into the handler's page mid-path, which is the
+            // one thing this field must never do to a half-typed address.
+            onActiveFocusChanged: if (addressField.activeFocus) pane.cancelFocusRestore()
 
             background: Rectangle {
                 color: Theme.surfaceSunken
@@ -1067,6 +1192,9 @@ Item {
         standardButtons: Dialog.Ok | Dialog.Cancel
         anchors.centerIn: Overlay.overlay
         closePolicy: Popup.NoAutoClose
+        // Enter cancels rather than closing: the affirmative answer throws away
+        // unsaved work. See SessionRow.qml.
+        defaultButton: Dialog.Cancel
         onOpened: {
             const closeButton = closeEditorDialog.standardButton(Dialog.Ok);
             if (closeButton)
@@ -1152,6 +1280,9 @@ Item {
         hoverEnabled: false
         onPressed: function(mouse) {
             pane.paneActivated(pane.paneId);
+            // The press decides where the keyboard goes. A restore still
+            // counting down would take it back off whatever the user clicked.
+            pane.cancelFocusRestore();
             mouse.accepted = false;
         }
     }
@@ -1237,11 +1368,14 @@ Item {
                     anchors.horizontalCenter: parent.horizontalCenter
                     // The id still has to be reachable for a bug report; it is
                     // just no longer the message. Never markup: pane ids are
-                    // built from server-supplied session ids.
+                    // built from server-supplied session ids. Drawn in the DIM
+                    // role, not the faint one: it is small print a user is asked
+                    // to READ OUT, and the faint role is for decoration and
+                    // disabled controls.
                     textFormat: Text.PlainText
                     text: pane.paneId
                     visible: pane.paneId.length > 0
-                    color: Theme.textFaint
+                    color: Theme.textDim
                     font.pixelSize: Theme.fontSizeSmall
                     font.family: Theme.monoFamily
                 }

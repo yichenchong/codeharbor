@@ -141,7 +141,7 @@ const defaultThemeRoles: Record<ThemeRoleName, string> = {
     border: "#45475a",
     borderSubtle: "#313244",
     text: "#cdd6f4",
-    textDim: "#6c7086",
+    textDim: "#949ab3",
     textFaint: "#45475a",
     textOnAccent: "#11111b",
     accent: "#89b4fa",
@@ -183,7 +183,10 @@ function defineMonacoTheme(roles: Record<ThemeRoleName, string>): void {
         colors: {
             "editor.background": roles.surfaceSunken,
             "editorGutter.background": roles.surfaceSunken,
-            "editorLineNumber.foreground": roles.textFaint,
+            // Line numbers are text a user reads, so they take the dim role.
+            // The faint role is decoration and disabled controls only, and at
+            // 2.06:1 against the gutter it made the numbers unreadable.
+            "editorLineNumber.foreground": roles.textDim,
             "editorLineNumber.activeForeground": roles.text,
             "minimap.background": roles.surfaceSunken,
             "scrollbarSlider.background": roles.border,
@@ -259,13 +262,29 @@ export function mountEditor(
     const statusEl = doc.createElement("div");
     statusEl.className = "ch-editor-status";
 
+    // Polite live region: the state label is the only place that says the file
+    // is loading, saved, or read-only, and it is rewritten in place, so without
+    // this a screen reader user never hears any of it. Polite because it
+    // reports what already happened while the user is typing, and aria-atomic
+    // because the label is one short phrase (including the dirty mark) rather
+    // than a list of independently interesting words.
     const stateLabel = doc.createElement("span");
     stateLabel.className = "ch-editor-state";
+    stateLabel.setAttribute("role", "status");
+    stateLabel.setAttribute("aria-live", "polite");
+    stateLabel.setAttribute("aria-atomic", "true");
     statusEl.appendChild(stateLabel);
 
-    // Conflict/error affordance, hidden until a save fails.
+    // Conflict/error affordance, hidden until a save fails. role=alert makes it
+    // assertive: a save that did not happen, or a file that moved under the
+    // user, interrupts whatever else is being announced because the buffer is
+    // now at risk and the user's next keystroke depends on knowing it. Focus is
+    // deliberately NOT moved here — the Retry / Reload / Overwrite buttons are
+    // in the tab order right after the editor, and stealing focus mid-sentence
+    // from someone who is typing is its own bug.
     const notice = doc.createElement("span");
     notice.className = "ch-editor-notice";
+    notice.setAttribute("role", "alert");
     notice.style.display = "none";
     statusEl.appendChild(notice);
 
@@ -292,6 +311,14 @@ export function mountEditor(
         // The host drives content; the language comes from the pane's remote
         // path (highlighting only). No client-side file access is implied.
         language: pathLanguage,
+        // Monaco's own default name for its textarea is "Editor content", which
+        // in a window holding several editor panes says nothing about which
+        // file the user just landed in. The pane's remote path is the one thing
+        // that distinguishes them; a pane mounted without one (the standalone
+        // bundle) still gets a stable name rather than none.
+        ariaLabel: options.path
+            ? `Code editor for ${options.path}`
+            : "Code editor",
         theme: "codeharbor-dark",
         readOnly: false,
         automaticLayout: true,
@@ -420,8 +447,11 @@ export function mountEditor(
             clearNotice();
             requestSave(loadedRevision);
         });
-        notice.replaceChildren(msg, retry);
+        // Shown BEFORE the content goes in: a live region inside a display:none
+        // element is not in the accessibility tree, so text inserted while the
+        // notice is still hidden is never announced.
         notice.style.display = "flex";
+        notice.replaceChildren(msg, retry);
     }
 
     /**
@@ -463,8 +493,9 @@ export function mountEditor(
             clearNotice();
             requestSave(currentRevision);
         });
-        notice.replaceChildren(msg, reload, overwrite);
+        // Shown first, for the reason given in showSaveError().
         notice.style.display = "flex";
+        notice.replaceChildren(msg, reload, overwrite);
     }
 
     /**

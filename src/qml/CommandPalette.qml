@@ -253,6 +253,24 @@ Item {
             radius: Theme.radiusMedium
         }
 
+        // The palette is a modal overlay that TAKES the keyboard, so it has to
+        // say what it is before it says anything else: without this a screen
+        // reader announces an unlabelled text field floating over the window
+        // and never mentions the list underneath it or the keys that drive it.
+        //
+        // Declared on the content item rather than on the Popup: Accessible is
+        // an Item attachment (QQuickAccessibleAttached refuses a plain QObject),
+        // and this Item is what actually holds the field and the results, so a
+        // screen reader reads the dialog and its contents as one thing. The
+        // field, the list and the empty state below are contentData, which the
+        // Popup parents into exactly this item.
+        contentItem: Item {
+            Accessible.role: Accessible.Dialog
+            Accessible.name: qsTr("Command palette")
+            Accessible.description:
+                qsTr("Type to filter. Up and Down choose a command, Enter runs it, Escape closes.")
+        }
+
         onOpened: filterField.forceActiveFocus()
 
         TextField {
@@ -382,15 +400,25 @@ Item {
                     visible: text.length > 0
                 }
 
+                // Naming a row is only half of it: an assistive technology user
+                // can hear "Save File" and still have no way to run it, because
+                // a TapHandler is a POINTER gesture and nothing else here is
+                // invokable. The press action is that missing verb, and it goes
+                // through the same call the tap does — the arrow-key + Enter
+                // route in the filter field is untouched.
+                Accessible.onPressAction: resultRow.activate()
+
+                function activate() {
+                    root.highlightedIndex = resultRow.index;
+                    root._invoke(resultRow.modelData);
+                }
+
                 HoverHandler {
                     id: rowHover
                 }
 
                 TapHandler {
-                    onTapped: {
-                        root.highlightedIndex = resultRow.index;
-                        root._invoke(resultRow.modelData);
-                    }
+                    onTapped: resultRow.activate()
                 }
             }
         }
@@ -416,7 +444,7 @@ Item {
             Label {
                 width: parent.width
                 horizontalAlignment: Text.AlignHCenter
-                color: Theme.textFaint
+                color: Theme.textDim
                 font.pixelSize: Theme.fontSizeSmall
                 visible: (Array.isArray(root.commands) ? root.commands.length : 0) > 0
                 text: qsTr("Esc closes \u2014 %1 reopens").arg(root.activationHint)

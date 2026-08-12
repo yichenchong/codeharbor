@@ -150,10 +150,22 @@ Rectangle {
                 ToolbarRegistry.unregisterButton(action.registeredToolbarId);
         }
 
-        // Never takes focus: these sit on top of a terminal or an editor, and a
-        // header button that stole the keyboard would send the user's next
-        // keystroke to their shell.
-        focusPolicy: Qt.NoFocus
+        // Reachable by Tab, but never by a click.
+        //
+        // These sit on top of a terminal or an editor, so a header button that
+        // took focus when it was CLICKED would send the user's next keystroke to
+        // the button instead of their shell — which is why this was NoFocus, and
+        // why it must not go back to being Qt.StrongFocus. Qt.TabFocus keeps the
+        // click behaviour exactly as it was and adds the only thing that was
+        // missing: a user with no mouse can now reach split, close and rename at
+        // all. The focus border below is what that user sees when they arrive.
+        focusPolicy: Qt.TabFocus
+
+        // The glyph is drawn, the words are announced. Without this a screen
+        // reader would be left reading out a symbol like "×".
+        Accessible.role: Accessible.Button
+        Accessible.name: action.text
+        Accessible.onPressAction: action.clicked()
         topPadding: 0
         bottomPadding: 0
         leftPadding: 6
@@ -183,12 +195,15 @@ Rectangle {
         // The module's one tooltip (AppToolTip.qml): the ATTACHED ToolTip.text
         // form is drawn by the Basic style in that style's own light palette,
         // so a hint about a dark header would arrive as a white box.
+        // Shown on keyboard focus as well as hover: a user who arrives here by
+        // Tab needs the words at least as much as one who arrived by pointer,
+        // and hovering is not available to them.
         AppToolTip {
             id: actionTip
             x: 0
             y: action.height + 4
             text: action.text
-            visible: action.hovered && action.text.length > 0
+            visible: (action.hovered || action.visualFocus) && action.text.length > 0
         }
     }
 
@@ -229,6 +244,23 @@ Rectangle {
         anchors.rightMargin: 6
         anchors.verticalCenter: parent.verticalCenter
         spacing: 6
+
+        // Busy is a coloured dot and nothing else, and the active pane is an
+        // accent edge and nothing else: both are invisible to a screen reader
+        // and to a user who cannot separate those colours. The header therefore
+        // says all three things in words, in one place.
+        Accessible.role: Accessible.Grouping
+        Accessible.name: header.title
+        Accessible.description: {
+            const parts = [];
+            if (header.subtitle.length > 0)
+                parts.push(header.subtitle);
+            if (header.busy)
+                parts.push(qsTr("Working"));
+            parts.push(header.active ? qsTr("Active pane")
+                                     : qsTr("Inactive pane"));
+            return parts.join(qsTr(", "));
+        }
 
         Rectangle {
             anchors.verticalCenter: parent.verticalCenter

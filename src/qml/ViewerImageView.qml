@@ -1,6 +1,7 @@
 import QtQuick
 import QtQuick.Controls.Basic
 import QtWebEngine
+import "RemotePath.js" as RemotePath
 
 // Remote image view (SPEC 7.4/7.5). The image is loaded through the privileged
 // internal scheme (codeharbor-internal://file/<id>) on the INTERNAL profile,
@@ -37,6 +38,13 @@ Item {
     // interface carries only Chromium's coarse error enum, so an image over the
     // inline cap arrived as a blank failed page with nothing to explain it.
     property string errorText: ""
+
+    // The remote path this view is showing, as a person reads it (SPEC 8.3:
+    // file:// always means the remote server). The internal address the
+    // WebEngineView is actually pointed at is an opaque id, so it is this — and
+    // only this — that can say WHICH image is on screen.
+    readonly property string displayPath: root.url.toString().length > 0
+        ? RemotePath.fileUrlToPath(root.url.toString()) : ""
 
     // The embedded page has started fetching and has not settled yet. Read by
     // the pane header (ViewerPane's `busy`), which without it drew nothing at
@@ -95,8 +103,29 @@ Item {
         return text
     }
 
+    // A displayed image used to expose nothing at all: no name, no description,
+    // no file name. Chromium's own document for an internal address has an
+    // opaque URL and no alt text to offer, so everything a screen reader can
+    // learn about this pane's content is said here.
+    Accessible.role: Accessible.Graphic
+    Accessible.name: root.displayPath.length > 0
+                     ? qsTr("Image %1").arg(root.displayPath)
+                     : qsTr("Image")
+    Accessible.description: root.errorText.length > 0
+        ? qsTr("This image could not be shown: %1").arg(root.errorText)
+        : root.loading
+          ? qsTr("Loading the image at %1.").arg(root.displayPath)
+          : qsTr("The image at %1. Give it keyboard focus with Tab and scroll it with the "
+                 + "arrow keys.").arg(root.displayPath)
+
     WebEngineView {
         anchors.fill: parent
+        // An image larger than the pane SCROLLS, and until this the only way to
+        // scroll it was the wheel or a drag: the view was reachable by clicking
+        // and by nothing else. Chromium moves the viewport for the arrow and
+        // page keys itself — that is browser behaviour, not script, so it works
+        // with JavaScript disabled below.
+        activeFocusOnTab: true
         // Hidden once the resource is known to have been refused: Chromium's
         // own blank failure page says nothing, and leaving it under the
         // explanation below only makes the pane look half-loaded.

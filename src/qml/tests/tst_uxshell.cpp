@@ -31,6 +31,7 @@
 #include <QtTest>
 
 #include <QAbstractItemModel>
+#include <QAccessible>
 #include <QByteArray>
 #include <QColor>
 #include <QCoreApplication>
@@ -534,6 +535,15 @@ Item {
     width: 900
     height: 560
 
+    // Same reason titleBarHarness carries one: the Accessible attachment has no
+    // C++ accessor, so every claim about it has to be read from inside the
+    // document. The role comes back as a plain number (QAccessible::Role).
+    function accessibleName(item) { return item ? String(item.Accessible.name) : ""; }
+    function accessibleRole(item) { return item ? Number(item.Accessible.role) : -1; }
+    function accessibleDescription(item) {
+        return item ? String(item.Accessible.description) : "";
+    }
+
     Rectangle { anchors.fill: parent; color: Theme.surface }
 
     CommandPalette {
@@ -634,6 +644,100 @@ Item {
     return qml;
 }
 
+// The split handle only exists inside a SplitView: the view instantiates it,
+// parents it to itself and stretches it across the split, so a handle on its
+// own is not the thing that ships. Three panes, therefore two handles — the
+// second one sits beside the FILL item, which is the case where a resize has to
+// move the other neighbour instead.
+QByteArray splitHandleHarness()
+{
+    return R"QML(
+import QtQuick
+import QtQuick.Controls.Basic
+import CodeHarbor
+
+Item {
+    id: harness
+    width: 900
+    height: 400
+
+    // Counts the handle's own resized() signal, which is what Main.qml hangs
+    // its region-width persistence on for a keyboard resize.
+    property int resizeCount: 0
+
+    function accessibleName(item) { return item ? String(item.Accessible.name) : ""; }
+    function accessibleRole(item) { return item ? Number(item.Accessible.role) : -1; }
+    function accessibleDescription(item) {
+        return item ? String(item.Accessible.description) : "";
+    }
+
+    SplitView {
+        id: split
+        objectName: "split"
+        anchors.fill: parent
+        orientation: Qt.Horizontal
+        handle: AppSplitHandle { objectName: "splitHandle"; onResized: harness.resizeCount++ }
+
+        Rectangle {
+            objectName: "leftPane"
+            color: Theme.surfaceDeep
+            SplitView.preferredWidth: 260
+            SplitView.minimumWidth: 120
+        }
+        Rectangle {
+            objectName: "centrePane"
+            color: Theme.surface
+            SplitView.fillWidth: true
+            SplitView.minimumWidth: 200
+        }
+        Rectangle {
+            objectName: "rightPane"
+            color: Theme.surfaceSunken
+            SplitView.preferredWidth: 200
+            SplitView.minimumWidth: 120
+        }
+    }
+}
+)QML";
+}
+
+// The shell's error toast, hosted the way Main.qml hosts it: anchored to the
+// top of the surface it covers and raised only through show(). Main.qml is an
+// ApplicationWindow and cannot be loaded into a QQuickView at all, which is
+// exactly why the toast is its own component.
+QByteArray errorBannerHarness()
+{
+    return R"QML(
+import QtQuick
+import CodeHarbor
+
+Item {
+    id: harness
+    width: 900
+    height: 400
+
+    function accessibleName(item) { return item ? String(item.Accessible.name) : ""; }
+    function accessibleRole(item) { return item ? Number(item.Accessible.role) : -1; }
+    function accessibleDescription(item) {
+        return item ? String(item.Accessible.description) : "";
+    }
+
+    Rectangle { anchors.fill: parent; color: Theme.surface }
+
+    // Main.qml's notifyUser(), said the same way.
+    function notifyUser(message) { banner.show(message); }
+
+    AppErrorBanner {
+        id: banner
+        z: 1000
+        anchors.top: parent.top
+        anchors.horizontalCenter: parent.horizontalCenter
+        anchors.topMargin: 12
+    }
+}
+)QML";
+}
+
 // Accessible.name of an item in the document above.
 QString accessibleName(QObject *harness, QObject *item)
 {
@@ -643,6 +747,29 @@ QString accessibleName(QObject *harness, QObject *item)
                                       Q_ARG(QVariant, QVariant::fromValue(item))))
         return QString();
     return name.toString();
+}
+
+// Accessible.role of an item in one of the documents above, as the plain
+// QAccessible::Role number the attached property carries.
+int accessibleRole(QObject *harness, QObject *item)
+{
+    QVariant role;
+    if (!harness || !item
+        || !QMetaObject::invokeMethod(harness, "accessibleRole", Q_RETURN_ARG(QVariant, role),
+                                      Q_ARG(QVariant, QVariant::fromValue(item))))
+        return -1;
+    return role.toInt();
+}
+
+QString accessibleDescription(QObject *harness, QObject *item)
+{
+    QVariant description;
+    if (!harness || !item
+        || !QMetaObject::invokeMethod(harness, "accessibleDescription",
+                                      Q_RETURN_ARG(QVariant, description),
+                                      Q_ARG(QVariant, QVariant::fromValue(item))))
+        return QString();
+    return description.toString();
 }
 
 // ---------------------------------------------------------------------------
@@ -1038,6 +1165,15 @@ private slots:
     // reports a save that ServerProfiles silently drops on the floor.
     void settingsServerPaneRejectsPartiallyNumericPorts();
     void settingsServerPaneRejectsAHostOrUserThatIsNotASingleWord();
+
+    // Accessibility gates. Each of these covers a control that a pointer user
+    // never notices is missing and a keyboard or screen-reader user cannot work
+    // around: a modal overlay that never says what it is, a toast whose only
+    // dismissal was a bare MouseArea, and the divider between the three
+    // regions, which had no role, no name, no focus and no keys at all.
+    void paletteAnnouncesItselfAsADialog();
+    void shellErrorBannerIsDismissedFromTheKeyboard();
+    void splitHandleResizesRegionsFromTheKeyboard();
 };
 
 // The states ch::AppController publishes, read out of the SOURCE rather than
@@ -1093,7 +1229,7 @@ struct ChipExpectation {
 static QHash<QString, ChipExpectation> chipExpectations()
 {
     return {
-        {QStringLiteral("disconnected"), {"#6c7086", false}},
+        {QStringLiteral("disconnected"), {"#949ab3", false}},
         {QStringLiteral("connecting"), {"#f9e2af", true}},
         {QStringLiteral("hostkey"), {"#f9e2af", true}},
         {QStringLiteral("credential"), {"#f9e2af", true}},
@@ -1588,7 +1724,7 @@ void TstUxShell::sidebarRowBadgeSeparatesEveryRowState()
     // precedence order above.
     const QStringList expected{QStringLiteral("#f38ba8"), QStringLiteral("#f9e2af"),
                                QStringLiteral("#a6e3a1"), QStringLiteral("#89b4fa"),
-                               QStringLiteral("#6c7086"), QStringLiteral("#45475a")};
+                               QStringLiteral("#949ab3"), QStringLiteral("#45475a")};
 
     ch::SessionsModel model;
     model.setGroups({makeGroup(QStringLiteral("g"), QStringLiteral("G"), sessions)});
@@ -2498,6 +2634,215 @@ void TstUxShell::settingsServerDeleteReselectsANeighbour()
     QVERIFY2(emptyHint && emptyHint->isVisible(),
              "deleting the last profile leaves the pane saying nothing");
     QVERIFY2(!deleteButton->isEnabled(), "Delete stays enabled with nothing left to delete");
+
+    QVERIFY2(surface.warnings.isEmpty(), qPrintable(surface.warningReport()));
+}
+
+// ---------------------------------------------------------------------------
+// The palette is a MODAL overlay that takes the keyboard the moment it opens.
+// Without an identity on the thing that holds the field and the results, a
+// screen reader announces an unlabelled text box hanging in the middle of the
+// window: not what it is, not that there is a list under it, and not one of the
+// three keys that drive it. The dialog role and its description are the entire
+// announcement, so they are asserted rather than assumed.
+// ---------------------------------------------------------------------------
+void TstUxShell::paletteAnnouncesItselfAsADialog()
+{
+    Surface surface(paletteHarness(), QSize(900, 560), QString(), nullptr);
+    QVERIFY2(surface.componentError().isEmpty(), qPrintable(surface.componentError()));
+    QVERIFY(surface.expose());
+    QVERIFY(QMetaObject::invokeMethod(surface.root(), "openPalette"));
+    settle(200);
+
+    auto *field = qobject_cast<QQuickItem *>(surface.child(QStringLiteral("filterField")));
+    QVERIFY2(field, "the palette has no filter field, so it never opened");
+
+    // The palette's content item: the Popup parents everything declared inside
+    // it into that one item, so it is both the field's parent and the node an
+    // assistive technology reads the palette as.
+    QQuickItem *body = field->parentItem();
+    QVERIFY2(body, "the filter field is not inside a content item");
+
+    QCOMPARE(accessibleRole(surface.root(), body), int(QAccessible::Dialog));
+    QCOMPARE(accessibleName(surface.root(), body), QStringLiteral("Command palette"));
+
+    // Arrow, Enter and Escape are the only way out of, and through, a modal
+    // overlay that owns the keyboard. Each has to be said.
+    const QString hint = accessibleDescription(surface.root(), body);
+    const QStringList keys{QStringLiteral("Up"), QStringLiteral("Down"), QStringLiteral("Enter"),
+                           QStringLiteral("Escape")};
+    for (const QString &key : keys) {
+        QVERIFY2(hint.contains(key),
+                 qPrintable(QStringLiteral("the palette's description never mentions %1: \"%2\"")
+                                    .arg(key, hint)));
+    }
+
+    QVERIFY2(surface.warnings.isEmpty(), qPrintable(surface.warningReport()));
+}
+
+// ---------------------------------------------------------------------------
+// The error toast is the ONLY report of a shell-level failure, and dismissing
+// it used to be a bare MouseArea over the whole banner: no name, no focus, no
+// key. A keyboard or screen-reader user could not get rid of an error at all
+// and had to sit out the six-second timer — which is itself the trap this
+// checks last, because a toast that hides while the user is reaching for its
+// button leaves the focus on nothing.
+// ---------------------------------------------------------------------------
+void TstUxShell::shellErrorBannerIsDismissedFromTheKeyboard()
+{
+    Surface surface(errorBannerHarness(), QSize(900, 400), QString(), nullptr);
+    QVERIFY2(surface.componentError().isEmpty(), qPrintable(surface.componentError()));
+    QVERIFY(surface.expose());
+    settle();
+
+    auto *banner = qobject_cast<QQuickItem *>(surface.child(QStringLiteral("shellErrorBanner")));
+    auto *dismiss = qobject_cast<QQuickItem *>(surface.child(QStringLiteral("shellErrorDismiss")));
+    QVERIFY2(banner && dismiss, "the shell toast has no named dismiss control");
+    QVERIFY2(!dismiss->isVisible(),
+             "the dismiss control of a toast that is DOWN is still visible, so it leaves a dead "
+             "stop in the window's tab order");
+
+    QVERIFY(QMetaObject::invokeMethod(surface.root(), "notifyUser",
+                                      Q_ARG(QVariant, QStringLiteral("the remote refused"))));
+    settle(300);
+    QVERIFY2(banner->opacity() > 0.9, "notifyUser did not raise the toast");
+    QCOMPARE(accessibleName(surface.root(), banner), QStringLiteral("the remote refused"));
+    QCOMPARE(accessibleRole(surface.root(), dismiss), int(QAccessible::Button));
+    QVERIFY2(!accessibleName(surface.root(), dismiss).isEmpty(),
+             "the dismiss control has no Accessible.name, so a screen reader announces an "
+             "unlabelled button on the only report of a failure");
+
+    dismiss->forceActiveFocus();
+    settle(60);
+    QVERIFY2(dismiss->hasActiveFocus(),
+             "the dismiss control cannot take keyboard focus, so it cannot be pressed by key");
+
+    QTest::keyClick(&surface.view, Qt::Key_Space);
+    settle(300);
+    QVERIFY2(banner->opacity() < 0.01,
+             qPrintable(QStringLiteral("Space on the focused dismiss control left the toast at "
+                                       "opacity %1").arg(banner->opacity())));
+
+    // Enter is the other press key a button owes the keyboard.
+    QVERIFY(QMetaObject::invokeMethod(surface.root(), "notifyUser",
+                                      Q_ARG(QVariant, QStringLiteral("and again"))));
+    settle(300);
+    dismiss->forceActiveFocus();
+    settle(60);
+    QTest::keyClick(&surface.view, Qt::Key_Return);
+    settle(300);
+    QVERIFY2(banner->opacity() < 0.01, "Enter on the focused dismiss control did not dismiss it");
+
+    // Reaching the button takes longer than the auto-hide, so the auto-hide has
+    // to wait while the button holds the keyboard. Without this the control is
+    // named and focusable and STILL unusable.
+    QVERIFY(QMetaObject::invokeMethod(surface.root(), "notifyUser",
+                                      Q_ARG(QVariant, QStringLiteral("held open"))));
+    settle(200);
+    dismiss->forceActiveFocus();
+    settle(6500);
+    QVERIFY2(banner->opacity() > 0.9,
+             "the toast auto-hid while its dismiss button had the keyboard, which drops the focus "
+             "onto nothing mid-press");
+
+    QTest::keyClick(&surface.view, Qt::Key_Space);
+    settle(300);
+    QVERIFY2(!dismiss->hasActiveFocus(),
+             "dismissing left the keyboard on an invisible button");
+
+    QVERIFY2(surface.warnings.isEmpty(), qPrintable(surface.warningReport()));
+}
+
+// ---------------------------------------------------------------------------
+// The divider between the three regions was a bare Item: no role, no name, no
+// focus, no keys. Region sizing was therefore a pointer-only feature, and an
+// assistive technology could not see that there was a divider there at all.
+//
+// SplitView.view is NOT resolvable from a handle delegate — the attached object
+// looks for its view two parents up, which is right for a content child and
+// wrong for a handle, since SplitView parents handles directly to itself — so
+// the resize goes through the handle's own `parent`. That is the part worth
+// gating: it is an assumption about SplitView's internals, and the whole
+// keyboard route is dead if it ever stops holding.
+// ---------------------------------------------------------------------------
+void TstUxShell::splitHandleResizesRegionsFromTheKeyboard()
+{
+    Surface surface(splitHandleHarness(), QSize(900, 400), QString(), nullptr);
+    QVERIFY2(surface.componentError().isEmpty(), qPrintable(surface.componentError()));
+    QVERIFY(surface.expose());
+    settle();
+
+    auto *split = qobject_cast<QQuickItem *>(surface.child(QStringLiteral("split")));
+    QVERIFY(split);
+    QList<QQuickItem *> handles;
+    const auto splitChildren = split->childItems();
+    for (QQuickItem *child : splitChildren) {
+        if (child->objectName() == QStringLiteral("splitHandle"))
+            handles.append(child);
+    }
+    QCOMPARE(handles.size(), 2);
+
+    auto *left = qobject_cast<QQuickItem *>(surface.child(QStringLiteral("leftPane")));
+    auto *right = qobject_cast<QQuickItem *>(surface.child(QStringLiteral("rightPane")));
+    QVERIFY(left && right);
+
+    QQuickItem *first = handles.constFirst();
+    QCOMPARE(accessibleRole(surface.root(), first), int(QAccessible::Splitter));
+    QVERIFY2(!accessibleName(surface.root(), first).isEmpty(),
+             "the divider has no Accessible.name, so it is invisible to assistive technology");
+    const QString hint = accessibleDescription(surface.root(), first);
+    QVERIFY2(hint.contains(QStringLiteral("Left")) && hint.contains(QStringLiteral("Right")),
+             qPrintable(QStringLiteral("a divider between side-by-side panels must name the keys "
+                                       "that move it; it says \"%1\"").arg(hint)));
+
+    const qreal leftWidth = left->width();
+    first->forceActiveFocus();
+    settle(60);
+    QVERIFY2(first->hasActiveFocus(),
+             "the split handle does not take keyboard focus, so a region cannot be resized "
+             "without a pointer");
+
+    QTest::keyClick(&surface.view, Qt::Key_Right);
+    settle(80);
+    const qreal step = left->width() - leftWidth;
+    QVERIFY2(step > 0, qPrintable(QStringLiteral("Right did not widen the left pane; it went from "
+                                                 "%1 to %2").arg(leftWidth).arg(left->width())));
+
+    QTest::keyClick(&surface.view, Qt::Key_Left);
+    settle(80);
+    QVERIFY2(qAbs(left->width() - leftWidth) < 0.5,
+             qPrintable(QStringLiteral("Left did not undo Right: %1 rather than %2")
+                                .arg(left->width()).arg(leftWidth)));
+
+    QTest::keyClick(&surface.view, Qt::Key_PageDown);
+    settle(80);
+    QVERIFY2(left->width() - leftWidth > step,
+             qPrintable(QStringLiteral("Page Down takes no bigger step than an arrow: %1 against "
+                                       "%2").arg(left->width() - leftWidth).arg(step)));
+
+    // Every key move is reported, which is what Main.qml persists region widths
+    // on: SplitView.resizing only ever describes a pointer drag.
+    QCOMPARE(surface.root()->property("resizeCount").toInt(), 3);
+
+    // The second divider sits between the FILL pane and the right one. The fill
+    // pane's preferred size is ignored by SplitView, so a resize there has to
+    // move the right pane instead — the case a naive "grow the pane before the
+    // handle" would silently do nothing for.
+    const qreal rightWidth = right->width();
+    handles.at(1)->forceActiveFocus();
+    settle(60);
+    QTest::keyClick(&surface.view, Qt::Key_Right);
+    settle(80);
+    QVERIFY2(right->width() < rightWidth,
+             qPrintable(QStringLiteral("moving the divider beside the fill pane right did not "
+                                       "shrink the right pane; it is still %1")
+                                .arg(right->width())));
+
+    // A focusable divider must not be a focus trap.
+    QTest::keyClick(&surface.view, Qt::Key_Tab);
+    settle(80);
+    QVERIFY2(!handles.at(1)->hasActiveFocus(),
+             "Tab does not release the split handle, so the keyboard is stuck on the divider");
 
     QVERIFY2(surface.warnings.isEmpty(), qPrintable(surface.warningReport()));
 }

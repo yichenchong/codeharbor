@@ -13,6 +13,9 @@
 
 #include <QtTest>
 
+#include <cmath>
+#include <algorithm>
+
 #include <QGuiApplication>
 #include <QQmlComponent>
 #include <QQmlEngine>
@@ -107,6 +110,7 @@ private slots:
     void appScrollBarIsDisabledAndHiddenWhenContentFits();
     void appScrollBarBecomesUsableWhenContentOverflows();
     void viewerPaneSnifferPreservesWebCursor();
+    void themeTextColoursAreReadableOnEverySurface();
 };
 
 void TstUiPolish::appScrollBarIsDisabledAndHiddenWhenContentFits()
@@ -214,6 +218,98 @@ void TstUiPolish::viewerPaneSnifferPreservesWebCursor()
     QVERIFY2(!sniffer->property("containsMouse").toBool(),
              "a sniffer that reports containsMouse is hovering after all");
     QVERIFY2(!sniffer->hasActiveFocus(), "the click sniffer must not hold focus either");
+}
+
+// Text has to be readable, and "readable" has a number.
+//
+// WCAG 2 asks for a contrast ratio of at least 4.5 between normal-size text and
+// what is behind it. Both palettes had a "secondary text" colour that missed
+// that on every surface it was used on — 3.36 on the window, 2.57 on a pane
+// header — and it is used for status lines, hints, explanations and file paths
+// throughout the application, so a large amount of what the app says was hard
+// to read for anyone with less than good vision.
+//
+// This computes the real ratio from the real palette rather than pinning the
+// hex values, so a future theme has to be readable too, and so the test says
+// what is wrong rather than merely that something changed.
+void TstUiPolish::themeTextColoursAreReadableOnEverySurface()
+{
+    // Relative luminance, exactly as WCAG 2 defines it.
+    const auto luminance = [](const QColor &colour) {
+        const auto channel = [](double value) {
+            return value <= 0.03928 ? value / 12.92
+                                    : std::pow((value + 0.055) / 1.055, 2.4);
+        };
+        return 0.2126 * channel(colour.redF()) + 0.7152 * channel(colour.greenF())
+               + 0.0722 * channel(colour.blueF());
+    };
+    const auto contrast = [&luminance](const QColor &a, const QColor &b) {
+        const double la = luminance(a);
+        const double lb = luminance(b);
+        return (std::max(la, lb) + 0.05) / (std::min(la, lb) + 0.05);
+    };
+
+    QQmlEngine engine;
+    // Both palettes, not just the one this machine happens to be set to: the
+    // light theme is a supported choice and used to fail worse than the dark.
+    const QStringList themes{QStringLiteral("dark"), QStringLiteral("light")};
+    // Every surface a Label can be drawn on, by the role name it has in Theme.
+    const QStringList surfaces{QStringLiteral("surface"), QStringLiteral("surfaceDeep"),
+                               QStringLiteral("surfaceSunken"), QStringLiteral("surfaceRaised"),
+                               QStringLiteral("surfaceHover"), QStringLiteral("surfaceSelected")};
+    // The roles used for text a user is expected to READ. `textFaint` is
+    // deliberately absent: it is documented as decoration and disabled labels,
+    // and a disabled control is exempt from the contrast rule.
+    const QStringList inks{QStringLiteral("text"), QStringLiteral("textDim")};
+
+    for (const QString &theme : themes) {
+        const QString harness = QStringLiteral(
+            "import QtQuick\n"
+            "import CodeHarbor\n"
+            "QtObject {\n"
+            "    property var palette: Theme.palettes[\"%1\"]\n"
+            "}\n").arg(theme);
+        QQmlComponent component(&engine);
+        component.setData(harness.toUtf8(), QUrl(QStringLiteral("qrc:/themeprobe.qml")));
+        QVERIFY2(!component.isError(), qPrintable(component.errorString()));
+        QScopedPointer<QObject> probe(component.create());
+        QVERIFY2(!probe.isNull(), qPrintable(component.errorString()));
+
+        const QVariantMap palette = probe->property("palette").toMap();
+        QVERIFY2(!palette.isEmpty(), qPrintable(QStringLiteral("no %1 palette").arg(theme)));
+
+        for (const QString &inkName : inks) {
+            const QColor ink(palette.value(inkName).toString());
+            QVERIFY2(ink.isValid(), qPrintable(QStringLiteral("%1.%2 is not a colour")
+                                                       .arg(theme, inkName)));
+            for (const QString &surfaceName : surfaces) {
+                const QColor surface(palette.value(surfaceName).toString());
+                QVERIFY2(surface.isValid(),
+                         qPrintable(QStringLiteral("%1.%2 is not a colour")
+                                            .arg(theme, surfaceName)));
+                const double ratio = contrast(ink, surface);
+                QVERIFY2(ratio >= 4.5,
+                         qPrintable(QStringLiteral(
+                                        "%1 theme: %2 (%3) on %4 (%5) has a contrast ratio of "
+                                        "%6, below the 4.5 that normal-size text needs. Text in "
+                                        "this combination is hard to read.")
+                                            .arg(theme, inkName, ink.name(), surfaceName,
+                                                 surface.name())
+                                            .arg(ratio, 0, 'f', 2)));
+            }
+        }
+
+        // The one pairing that is not ink-on-surface: text drawn on an accent
+        // fill, which is what a default button and a selected chip use.
+        const QColor onAccent(palette.value(QStringLiteral("textOnAccent")).toString());
+        const QColor accent(palette.value(QStringLiteral("accent")).toString());
+        const double accentRatio = contrast(onAccent, accent);
+        QVERIFY2(accentRatio >= 4.5,
+                 qPrintable(QStringLiteral("%1 theme: text on the accent fill has a contrast "
+                                           "ratio of %2, below 4.5")
+                                    .arg(theme)
+                                    .arg(accentRatio, 0, 'f', 2)));
+    }
 }
 
 int main(int argc, char **argv)

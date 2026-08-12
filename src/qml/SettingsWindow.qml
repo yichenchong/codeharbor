@@ -2,6 +2,7 @@ pragma ComponentBehavior: Bound
 
 import QtQuick
 import QtQuick.Controls.Basic
+import QtQuick.Window
 import CodeHarbor
 import "EndpointField.js" as EndpointField
 
@@ -33,6 +34,14 @@ Rectangle {
     // profile the user picked even if the list changes underneath the dialog.
     property string pendingDeleteId: ""
     property string pendingDeleteName: ""
+    // What held the keyboard before this sheet covered the workspace, so
+    // closing it puts the user back where they were rather than dropping focus
+    // at the window root. Maintained by containKeyboard() below.
+    property var focusReturnItem: null
+    // The last item inside the sheet that held the keyboard. It is what says
+    // which DIRECTION an escape was travelling in, and it is where focus goes
+    // if the chain cannot be re-entered at all.
+    property var lastInsideFocus: null
     signal dismissed()
     // The Name field lives inside the server pane's Component and cannot be
     // reached from here by id; the pane listens for this instead.
@@ -131,6 +140,12 @@ Rectangle {
 
     component ChoiceBox: ComboBox {
         id: choice
+        // The Label beside one of these is a separate item, so a screen reader
+        // announced the current value and nothing that said what the value was
+        // for. Every instance passes the text of its own visible label, the
+        // same way Field below does.
+        property string label: ""
+        Accessible.name: choice.label
         implicitWidth: 190
         implicitHeight: 30
         focusPolicy: Qt.StrongFocus
@@ -154,6 +169,10 @@ Rectangle {
 
     component NumberBox: SpinBox {
         id: numberBox
+        // Same rule as ChoiceBox above: the visible label is a sibling item, so
+        // a bare number was all a screen reader had to go on.
+        property string label: ""
+        Accessible.name: numberBox.label
         implicitWidth: 110
         implicitHeight: 30
         focusPolicy: Qt.StrongFocus
@@ -502,12 +521,18 @@ Rectangle {
     }
 
     onVisibleChanged: {
-        if (root.visible) {
-            root.reconcileToolbar();
-            root.syncViewerDefaults();
-            root.syncProfiles();
-            root.forceActiveFocus();
+        if (!root.visible) {
+            // Re-checked for liveness: the item can have been destroyed, hidden
+            // or disabled while the sheet was up.
+            var previous = root.focusReturnItem;
+            if (previous && previous.visible && previous.enabled)
+                previous.forceActiveFocus(Qt.OtherFocusReason);
+            return;
         }
+        root.reconcileToolbar();
+        root.syncViewerDefaults();
+        root.syncProfiles();
+        root.forceActiveFocus();
     }
     Component.onCompleted: {
         root.reconcileToolbar();
@@ -536,6 +561,72 @@ Rectangle {
         event.accepted = true;
     }
 
+    // ---- keyboard containment ---------------------------------------------
+    // Despite the name this is not a window: Main.qml:626 anchors it over the
+    // three regions as an ordinary item, so no window boundary applies and the
+    // focus chain runs straight through it into the workspace behind. The
+    // MouseArea shield above stops clicks getting there; Tab is not a click,
+    // and used to walk right out of the sheet into controls the user cannot
+    // see.
+    //
+    // Corrected AFTER the move rather than intercepted before it, for the
+    // reason spelled out in ConnectSheet.qml: Qt performs Tab navigation inside
+    // the FOCUSED item's own key handling, so a Keys handler here never sees
+    // the press.
+    function itemWithin(scope, item) {
+        for (var walk = item; walk; walk = walk.parent) {
+            if (walk === scope)
+                return true;
+        }
+        return false;
+    }
+
+    function containKeyboard() {
+        var holder = root.Window.activeFocusItem;
+        if (!holder)
+            return;
+        if (!root.visible) {
+            // Down: remember where the keyboard is, so opening and closing the
+            // sheet returns the user to the control they were on.
+            if (!root.itemWithin(root, holder))
+                root.focusReturnItem = holder;
+            return;
+        }
+        // The delete confirmation is a modal AppDialog drawn into the window's
+        // overlay, which is not a child of this sheet. It owns the keyboard
+        // while it is up and must not be fought for it.
+        if (root.itemWithin(Overlay.overlay, holder))
+            return;
+        if (root.itemWithin(root, holder)) {
+            root.lastInsideFocus = holder;
+            return;
+        }
+        var previous = root.lastInsideFocus;
+        if (!previous)
+            return;
+        // Keep going the way the user was going: continuing forward past the
+        // item Tab escaped to re-enters the sheet at its FIRST control, which
+        // is the wrap, and continuing backward re-enters at its last.
+        var forward = previous.nextItemInFocusChain(true) === holder;
+        var step = holder;
+        for (var guard = 0; guard < 500; ++guard) {
+            step = step.nextItemInFocusChain(forward);
+            if (!step || step === holder)
+                break;
+            if (root.itemWithin(root, step)) {
+                step.forceActiveFocus(forward ? Qt.TabFocusReason : Qt.BacktabFocusReason);
+                return;
+            }
+        }
+        // Nothing else in the sheet is reachable; stay where we were.
+        previous.forceActiveFocus();
+    }
+
+    Connections {
+        target: root.Window.window
+        function onActiveFocusItemChanged() { root.containKeyboard(); }
+    }
+
     // Declared here rather than inside the server pane's Component so it is not
     // destroyed the instant the group selector switches panes, which is exactly
     // what happens if the dialog is left open and something else takes the
@@ -547,6 +638,8 @@ Rectangle {
         modal: true
         standardButtons: Dialog.Ok | Dialog.Cancel
         anchors.centerIn: Overlay.overlay
+        // Enter cancels rather than deleting the profile. See SessionRow.qml.
+        defaultButton: Dialog.Cancel
         width: 400
 
         Label {
@@ -732,6 +825,7 @@ Rectangle {
                 Row {
                     spacing: 14
                     Label {
+                        id: themeLabel
                         width: 170
                         anchors.verticalCenter: parent.verticalCenter
                         text: qsTr("Theme")
@@ -740,6 +834,7 @@ Rectangle {
                     }
                     ChoiceBox {
                         objectName: "themeChoice"
+                        label: themeLabel.text
                         model: [qsTr("Dark"), qsTr("Light")]
                         currentIndex: root.settingsObject()
                                      && root.settingsObject().theme === "light" ? 1 : 0
@@ -754,6 +849,7 @@ Rectangle {
                 Row {
                     spacing: 14
                     Label {
+                        id: groupPaletteLabel
                         width: 170
                         anchors.verticalCenter: parent.verticalCenter
                         text: qsTr("Group colour palette")
@@ -762,6 +858,7 @@ Rectangle {
                     }
                     ChoiceBox {
                         objectName: "groupPaletteChoice"
+                        label: groupPaletteLabel.text
                         model: [qsTr("Plain"), qsTr("Tokyo Night")]
                         currentIndex: root.settingsObject()
                                      && root.settingsObject().groupPalette === "tokyonight" ? 1 : 0
@@ -776,6 +873,7 @@ Rectangle {
                 Row {
                     spacing: 14
                     Label {
+                        id: paletteSizeLabel
                         width: 170
                         anchors.verticalCenter: parent.verticalCenter
                         text: qsTr("Palette size")
@@ -784,6 +882,7 @@ Rectangle {
                     }
                     NumberBox {
                         objectName: "groupPaletteSizeSpin"
+                        label: paletteSizeLabel.text
                         from: 5
                         to: 64
                         value: root.settingsObject()
@@ -840,6 +939,7 @@ Rectangle {
                             color: toolbarRow.index % 2 === 0 ? Theme.surfaceSunken
                                                               : Theme.surfaceDeep
                             Label {
+                                id: toolbarRowLabel
                                 anchors.left: parent.left
                                 anchors.leftMargin: 10
                                 anchors.right: moveButtons.left
@@ -857,6 +957,10 @@ Rectangle {
                                 spacing: 2
                                 SheetButton {
                                     objectName: "toolbarUp:" + toolbarRow.modelData
+                                    // "Up" alone does not say WHICH button is
+                                    // being moved, and there is one of these per
+                                    // row.
+                                    Accessible.name: qsTr("Move %1 up").arg(toolbarRowLabel.text)
                                     text: qsTr("Up")
                                     enabled: toolbarRow.index > 0
                                     implicitWidth: 42
@@ -865,6 +969,7 @@ Rectangle {
                                 }
                                 SheetButton {
                                     objectName: "toolbarDown:" + toolbarRow.modelData
+                                    Accessible.name: qsTr("Move %1 down").arg(toolbarRowLabel.text)
                                     text: qsTr("Down")
                                     enabled: toolbarRow.index + 1 < root.toolbarItems.length
                                     implicitWidth: 52
@@ -879,6 +984,7 @@ Rectangle {
                 Row {
                     spacing: 14
                     Label {
+                        id: terminalFontSizeLabel
                         width: 170
                         anchors.verticalCenter: parent.verticalCenter
                         text: qsTr("Terminal text size")
@@ -887,6 +993,7 @@ Rectangle {
                     }
                     NumberBox {
                         objectName: "terminalFontSizeSpin"
+                        label: terminalFontSizeLabel.text
                         from: 6
                         to: 48
                         value: root.settingsObject()
@@ -908,6 +1015,7 @@ Rectangle {
                 Row {
                     spacing: 14
                     Label {
+                        id: terminalPixelRatioLabel
                         width: 170
                         anchors.verticalCenter: parent.verticalCenter
                         text: qsTr("Terminal rendering resolution")
@@ -916,6 +1024,7 @@ Rectangle {
                     }
                     ChoiceBox {
                         objectName: "terminalPixelRatioChoice"
+                        label: terminalPixelRatioLabel.text
                         model: [qsTr("Follow screen"), qsTr("1x"), qsTr("1.5x"),
                                 qsTr("2x"), qsTr("3x"), qsTr("4x")]
                         currentIndex: root.pixelRatioIndex()
@@ -1006,58 +1115,88 @@ Rectangle {
 
                 Row {
                     spacing: 8
-                    TextField {
-                        id: viewerExtensionInput
-                        objectName: "viewerDefaultExtensionInput"
-                        width: 190
-                        implicitHeight: 30
-                        color: Theme.text
-                        placeholderText: qsTr("Extension, for example md")
-                        placeholderTextColor: Theme.textDim
-                        selectByMouse: true
-                        font.pixelSize: Theme.fontSizeBody
-                        background: Rectangle {
-                            color: Theme.surfaceSunken
-                            radius: Theme.radiusSmall
-                            border.width: viewerExtensionInput.activeFocus ? 2 : 1
-                            border.color: viewerExtensionInput.activeFocus
-                                          ? Theme.accent : Theme.borderSubtle
+                    Column {
+                        spacing: 3
+                        Label {
+                            id: viewerExtensionLabel
+                            // A placeholder is not a label: it disappears at the
+                            // first keystroke, so the field it names stops
+                            // saying what it wants exactly when it is in use.
+                            text: qsTr("File extension")
+                            color: Theme.textDim
+                            font.pixelSize: Theme.fontSizeSmall
+                        }
+                        TextField {
+                            id: viewerExtensionInput
+                            objectName: "viewerDefaultExtensionInput"
+                            Accessible.name: viewerExtensionLabel.text
+                            width: 190
+                            implicitHeight: 30
+                            color: Theme.text
+                            placeholderText: qsTr("for example md")
+                            placeholderTextColor: Theme.textDim
+                            selectByMouse: true
+                            font.pixelSize: Theme.fontSizeBody
+                            background: Rectangle {
+                                color: Theme.surfaceSunken
+                                radius: Theme.radiusSmall
+                                border.width: viewerExtensionInput.activeFocus ? 2 : 1
+                                border.color: viewerExtensionInput.activeFocus
+                                              ? Theme.accent : Theme.borderSubtle
+                            }
                         }
                     }
-                    ChoiceBox {
-                        id: viewerKindChoice
-                        objectName: "viewerDefaultKindChoice"
-                        implicitWidth: 220
-                        textRole: "label"
-                        model: {
-                            var kinds =
-                                    root.validViewerKindsForExtension(
-                                        viewerExtensionInput.text);
-                            var choices = [];
-                            for (var i = 0; i < kinds.length; ++i)
-                                choices.push({
-                                    value: String(kinds[i]),
-                                    label: root.viewerKindLabel(kinds[i])
-                                });
-                            return choices;
+                    Column {
+                        spacing: 3
+                        Label {
+                            // Named for the control rather than for the helper
+                            // function root.viewerKindLabel(), which is a
+                            // different thing entirely.
+                            id: viewerKindFieldLabel
+                            text: qsTr("Viewer")
+                            color: Theme.textDim
+                            font.pixelSize: Theme.fontSizeSmall
                         }
-                        // Reset on every model change rather than as a
-                        // `currentIndex:` binding. The list of valid kinds is
-                        // rebuilt for each extension the user types, so a slot
-                        // that meant "Rendered Markdown" for `md` means
-                        // something else — or nothing — for the next
-                        // extension, and a binding cannot express "start again
-                        // at the top of whatever list this now is" without
-                        // depending on the selection it would be overwriting.
-                        // Without the reset, "Add or update" stored whatever
-                        // viewer happened to sit at the stale index.
-                        onModelChanged: viewerKindChoice.currentIndex =
-                            viewerKindChoice.model.length > 0 ? 0 : -1
-                        Component.onCompleted: viewerKindChoice.currentIndex =
-                            viewerKindChoice.model.length > 0 ? 0 : -1
+                        ChoiceBox {
+                            id: viewerKindChoice
+                            objectName: "viewerDefaultKindChoice"
+                            label: viewerKindFieldLabel.text
+                            implicitWidth: 220
+                            textRole: "label"
+                            model: {
+                                var kinds =
+                                        root.validViewerKindsForExtension(
+                                            viewerExtensionInput.text);
+                                var choices = [];
+                                for (var i = 0; i < kinds.length; ++i)
+                                    choices.push({
+                                        value: String(kinds[i]),
+                                        label: root.viewerKindLabel(kinds[i])
+                                    });
+                                return choices;
+                            }
+                            // Reset on every model change rather than as a
+                            // `currentIndex:` binding. The list of valid kinds
+                            // is rebuilt for each extension the user types, so
+                            // a slot that meant "Rendered Markdown" for `md`
+                            // means something else — or nothing — for the next
+                            // extension, and a binding cannot express "start
+                            // again at the top of whatever list this now is"
+                            // without depending on the selection it would be
+                            // overwriting. Without the reset, "Add or update"
+                            // stored whatever viewer sat at the stale index.
+                            onModelChanged: viewerKindChoice.currentIndex =
+                                viewerKindChoice.model.length > 0 ? 0 : -1
+                            Component.onCompleted: viewerKindChoice.currentIndex =
+                                viewerKindChoice.model.length > 0 ? 0 : -1
+                        }
                     }
                     SheetButton {
                         objectName: "viewerDefaultAddButton"
+                        // The two inputs beside it now carry a label above
+                        // them, so the button lines up with their boxes rather
+                        // than with their labels.
+                        anchors.bottom: parent.bottom
                         text: qsTr("Add or update")
                         enabled: viewerKindChoice.model.length > 0
                         onClicked: {
@@ -1077,6 +1216,14 @@ Rectangle {
                 }
 
                 Label {
+                    id: viewerExtensionHint
+                    objectName: "viewerExtensionHint"
+                    // Drawn AND announced: the person who just typed an
+                    // unusable extension is the one who has to be told the
+                    // entry cannot be added, and a warning they cannot see
+                    // tells them nothing.
+                    Accessible.role: Accessible.AlertMessage
+                    Accessible.name: viewerExtensionHint.text
                     visible: viewerExtensionInput.text.length > 0
                              && viewerKindChoice.model.length === 0
                     text: qsTr("Use letters and numbers only; specialised viewers are offered only for compatible file types.")
@@ -1131,6 +1278,11 @@ Rectangle {
                                 id: removeButton
                                 objectName: "viewerDefaultRemove:"
                                             + viewerDefaultRow.modelData.extension
+                                // One of these per row, all reading "Remove":
+                                // the name has to say what it removes.
+                                Accessible.name:
+                                    qsTr("Remove the default viewer for .%1")
+                                        .arg(viewerDefaultRow.modelData.extension)
                                 anchors.right: parent.right
                                 anchors.rightMargin: 4
                                 anchors.verticalCenter: parent.verticalCenter
@@ -1388,7 +1540,13 @@ Rectangle {
                 // explain and must not raise a warning about a record that is
                 // already gone.
                 Label {
+                    id: serverValidationHint
                     objectName: "serverValidationHint"
+                    // Announced, not merely drawn: the user is typing in the
+                    // very field this sentence is about, and nothing else tells
+                    // them the edit is being thrown away.
+                    Accessible.role: Accessible.AlertMessage
+                    Accessible.name: serverValidationHint.text
                     width: parent.width
                     wrapMode: Text.WordWrap
                     visible: root.hasSelection() && !root.profileValid()

@@ -164,10 +164,13 @@ Rectangle {
             Layout.alignment: Qt.AlignHCenter
         }
         Label {
-            // Same rule: the remote path is data.
+            // Same rule: the remote path is data. Drawn in the DIM role and not
+            // the placeholder one: this is the identity of the file the pane is
+            // showing, which a user has to be able to read, and the placeholder
+            // role is reserved for decoration and disabled controls.
             textFormat: Text.PlainText
             text: root.displayPath
-            color: Theme.textPlaceholder()
+            color: Theme.textDim
             font.pixelSize: Theme.fontSizeSmall
             elide: Text.ElideMiddle
             Layout.fillWidth: true

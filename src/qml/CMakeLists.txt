@@ -27,6 +27,7 @@ qt_add_qml_module(codeharbor_qml
         AppScrollBar.qml
         AppToolTip.qml
         AppPaneHeader.qml
+        AppErrorBanner.qml
         SessionsSidebar.qml
         GroupHeader.qml
         SessionRow.qml

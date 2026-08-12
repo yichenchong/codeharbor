@@ -672,6 +672,38 @@ Rectangle {
         app.setGroupCollapsed(currentId, !collapsed);
     }
 
+    // The delegate the keyboard cursor is sitting on, session row or group
+    // header. Resolved through navItems() so it can never disagree with what
+    // Up/Down just moved through.
+    function currentItem() {
+        var items = navItems();
+        for (var i = 0; i < items.length; ++i) {
+            if (items[i].id === currentId && items[i].isGroup === currentIsGroup)
+                return items[i].item;
+        }
+        return null;
+    }
+
+    // Rename, Duplicate, Move to top, Archive and Delete all live in a menu that
+    // only a right-click opened, so a user without a pointer could reach none of
+    // them — renaming in particular had no other affordance anywhere. The menu
+    // key opens that menu on the cursor's own row; Shift+F10 is the same request
+    // from a keyboard that has no menu key. Escape closes the menu and the
+    // keyboard lands back on the sidebar, so this cannot strand the cursor.
+    function openCurrentContextMenu() {
+        var item = currentItem();
+        if (item && typeof item.openContextMenu === "function")
+            item.openContextMenu();
+    }
+
+    // F2 is the rename key every other in-place-renamed list uses, and it skips
+    // the menu entirely. Escape closes the dialog it opens.
+    function renameCurrent() {
+        var item = currentItem();
+        if (item && typeof item.openRenameDialog === "function")
+            item.openRenameDialog();
+    }
+
     Keys.onPressed: (event) => {
         if (event.key === Qt.Key_Down) {
             moveSelection(1);
@@ -684,6 +716,13 @@ Rectangle {
             event.accepted = true;
         } else if (event.key === Qt.Key_Space) {
             toggleCurrentGroup();
+            event.accepted = true;
+        } else if (event.key === Qt.Key_Menu
+                   || (event.key === Qt.Key_F10 && (event.modifiers & Qt.ShiftModifier))) {
+            openCurrentContextMenu();
+            event.accepted = true;
+        } else if (event.key === Qt.Key_F2) {
+            renameCurrent();
             event.accepted = true;
         } else if (event.key === Qt.Key_Escape && dragKind !== "") {
             cancelDrag();
@@ -774,8 +813,19 @@ Rectangle {
             readonly property string actionText:
                 sidebar.pinnedOnly ? qsTr("Show all sessions")
                                     : qsTr("Show pinned sessions only")
+            // The name is the FILTER, not the click: `actionText` names what
+            // pressing the button would do next, and a name that flips between
+            // two verbs told a screen-reader user nothing about which way the
+            // filter is currently set. The state is carried by checked instead
+            // — Qt's QML Accessible attached type has no `pressed` for a toggle
+            // button, so checkable/checked is the pair that says on or off —
+            // and the toggle action is wired up so it can be switched, not only
+            // read. The tooltip keeps the verb, as a pointer hint.
             Accessible.role: Accessible.Button
-            Accessible.name: pinFilterButton.actionText
+            Accessible.name: qsTr("Pinned sessions only")
+            Accessible.checkable: true
+            Accessible.checked: sidebar.pinnedOnly
+            Accessible.onToggleAction: sidebar.pinnedOnly = !sidebar.pinnedOnly
 
             AppToolTip {
                 objectName: "pinFilterButtonTip"
@@ -825,8 +875,14 @@ Rectangle {
             readonly property string actionText:
                 sidebar.showArchived ? qsTr("Hide archived sessions")
                                      : qsTr("Show archived sessions")
+            // Same reasoning as the pin filter above: the name is the filter,
+            // the checked state is whether it is on, and the verb stays on the
+            // tooltip.
             Accessible.role: Accessible.Button
-            Accessible.name: archiveFilterButton.actionText
+            Accessible.name: qsTr("Include archived sessions")
+            Accessible.checkable: true
+            Accessible.checked: sidebar.showArchived
+            Accessible.onToggleAction: sidebar.showArchived = !sidebar.showArchived
 
             AppToolTip {
                 objectName: "archiveFilterButtonTip"
@@ -1202,12 +1258,28 @@ Rectangle {
             implicitWidth: 300
             spacing: 8
 
+            // The field arrives PREFILLED with "New group", so its placeholder
+            // is never on screen and the box was an unlabelled edit box holding
+            // a word. Same visible-label convention as SettingsWindow's Field.
+            Label {
+                id: newGroupFieldLabel
+                objectName: "newGroupFieldLabel"
+                Layout.preferredWidth: 300
+                text: qsTr("Group name")
+                color: Theme.textDim
+                font.pixelSize: Theme.fontSizeSmall
+            }
+
             TextField {
                 id: newGroupField
                 objectName: "newGroupField"
                 Layout.preferredWidth: 300
                 placeholderText: qsTr("Group name")
                 text: qsTr("New group")
+                // The visible Label above is a separate item, so the field has
+                // no name of its own; bound rather than repeated so the two
+                // cannot drift apart.
+                Accessible.name: newGroupFieldLabel.text
             }
         }
 
@@ -1254,22 +1326,43 @@ Rectangle {
             implicitWidth: 300
             spacing: 8
 
+            // Prefilled with "New session", so the placeholder never shows.
+            Label {
+                id: newSessionFieldLabel
+                objectName: "newSessionFieldLabel"
+                Layout.preferredWidth: 300
+                text: qsTr("Session name")
+                color: Theme.textDim
+                font.pixelSize: Theme.fontSizeSmall
+            }
+
             TextField {
                 id: newSessionField
                 objectName: "newSessionField"
                 Layout.preferredWidth: 300
                 placeholderText: qsTr("Session name")
+                Accessible.name: newSessionFieldLabel.text
             }
 
             // The repository root is not decoration: it becomes the working
             // directory of every terminal in the session and the root the
             // viewers browse, so a session without one opens in the remote
             // home directory instead of the project.
+            Label {
+                id: newSessionRepoFieldLabel
+                objectName: "newSessionRepoFieldLabel"
+                Layout.preferredWidth: 300
+                text: qsTr("Repository path on the server")
+                color: Theme.textDim
+                font.pixelSize: Theme.fontSizeSmall
+            }
+
             TextField {
                 id: newSessionRepoField
                 objectName: "newSessionRepoField"
                 Layout.preferredWidth: 300
                 placeholderText: qsTr("Repository path on the server, e.g. /srv/repos/app")
+                Accessible.name: newSessionRepoFieldLabel.text
             }
 
             Label {
