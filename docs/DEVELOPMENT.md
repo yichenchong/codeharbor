@@ -636,3 +636,22 @@ apply to the GUI client and is out of scope today.
 - **Clean reconfigure:** `rm -rf build/dev && cmake --preset dev`.
 - **Qt not found:** pass `-DCMAKE_PREFIX_PATH=/path/to/qt/6.x/gcc_64` (or set
   `CMAKE_PREFIX_PATH` in the environment) when Qt is not on the default path.
+- **Remote sessions that vanish on disconnect.** SPEC 2.2 promises terminal
+  processes outlive a disconnect, and tmux delivers that — but two things on the
+  REMOTE host can break it, neither of them visible from the client. A session
+  that dies this way is not reported: the next attach runs
+  `tmux new-session -A`, which silently creates a fresh empty session under the
+  same name, so the pane simply comes back blank.
+  - `destroy-unattached on` in the user's `~/.tmux.conf` destroys a session as
+    soon as its last client leaves. CodeHarbor turns it off per session at
+    creation (`tmuxNewSessionCommand`), which covers every session it makes and
+    any surviving session it re-attaches to; a session created before that guard
+    existed is still lost once.
+  - `systemd-logind` with `KillUserProcesses=yes` kills every process a user
+    owns when their last login session ends, tmux server included. Nothing in
+    the client can prevent this. The host fix is
+    `sudo loginctl enable-linger <user>`.
+
+  To tell them apart after it happens: if the user's own unrelated tmux sessions
+  died too, it was logind (one tmux server holds them all — the command passes
+  no `-L`/`-S`); if only CodeHarbor's died, it was `destroy-unattached`.
