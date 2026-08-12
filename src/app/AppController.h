@@ -251,9 +251,12 @@ private:
     // That is the whole overwrite rule, and each arm is deliberate:
     //   * "generic" means "an agent, adapter unknown", which is also what a
     //     freshly minted pane gets, so a real adapter name is a strict upgrade;
-    //   * an EMPTY harness is the user's "plain shell, stay silent" — the one
-    //     choice whose entire purpose is to report nothing, so overwriting it
-    //     because something spoke in the pane would be a bug, not a fix;
+    //   * an EMPTY harness is the user's "plain shell": they have said this pane
+    //     is not an agent, so nothing may relabel it on their behalf. Note what
+    //     that does and does not mean — it bars OUTPUT from being read as
+    //     activity (SPEC 6.6) and bars this write; it does not gag the wire. A
+    //     real event naming the pane is still displayed, exactly as it was
+    //     before autodetection existed;
     //   * a different explicit adapter is the user's answer to this exact
     //     question, and an observation does not outrank it.
     // A user who deliberately chose "Generic agent" is indistinguishable from

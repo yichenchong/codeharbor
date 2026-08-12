@@ -1319,10 +1319,14 @@ void TstAppController::observedHarnessArrivingBeforeTheTreeIsNotLost()
     QCOMPARE(errors.count(), 0);
 }
 
-// A pane with NO harness is the user's "plain shell, stay silent", and that is
-// the one choice whose entire purpose is to report nothing. Something speaking
-// in the pane is not a reason to overrule it: a plain shell is exactly where a
-// user runs an agent by hand and still does not want the sidebar reacting.
+// A pane with NO harness is the user's "plain shell": the column is theirs, and
+// an observation does not get to overwrite it. What "plain shell" governs is
+// where the pane's state may be DERIVED from — never from output activity, the
+// SPEC 6.6 clock that would otherwise light up every terminal in the sidebar.
+// It does not gag the wire: a real agent event naming this pane is a fact, not
+// a guess, and it is displayed exactly as it is for any other pane (see
+// refreshDoesNotWipeAgentDerivedState, which has asserted that since long before
+// autodetection existed). Both halves are checked below.
 void TstAppController::observedHarnessLeavesAPlainShellAlone()
 {
     FakeTransport transport;
@@ -1349,6 +1353,14 @@ void TstAppController::observedHarnessLeavesAPlainShellAlone()
 
     QVERIFY(transport.takeSent().isEmpty());
     QVERIFY(controller.terminalPaneHarness(QStringLiteral("term-1")).isEmpty());
+    // The event still shows. That is deliberate, and it is the difference
+    // between the column (the user's, untouched above) and the row's state
+    // (whatever is true right now, which here the agent itself reported).
+    SessionsModel* model = controller.sessionsModel();
+    const QModelIndex group = model->index(0, 0);
+    const QModelIndex session = model->index(0, 0, group);
+    QCOMPARE(model->data(session, SessionsModel::RowStateRole).toInt(),
+             static_cast<int>(SessionRowState::Running));
     QCOMPARE(errors.count(), 0);
 }
 

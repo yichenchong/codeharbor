@@ -900,9 +900,12 @@ as `generic` first, and as the observed adapter once the write lands — must no
 discard what the wire already said about it.
 
 `generic` is the ONLY value an observation may overwrite. A NULL or empty harness
-is the user's "plain shell, stay silent", and that choice exists precisely to
-report nothing, so something speaking in the pane is not a reason to overrule it;
-an explicit adapter is the user's answer to this same question and outranks an
+is the user's "plain shell" — they have said this pane is not an agent, so
+nothing may relabel it on their behalf. That governs where the pane's state may
+be DERIVED from, not what may be reported about it: output is never read as
+activity for such a pane, and this write never happens, but a real agent event
+naming the pane is a fact rather than a guess and is displayed like any other.
+An explicit adapter is the user's answer to this same question and outranks an
 observation. A user who deliberately chose "Generic agent" is indistinguishable
 from the mint default and will be upgraded — accepted deliberately, rather than
 recording which of two identical values was meant in the schema.
