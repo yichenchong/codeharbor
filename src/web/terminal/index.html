@@ -41,11 +41,12 @@
         --ch-warning-surface: #3a2f1e;
         --ch-warning: #f9e2af;
         --ch-border: #45475a;
-        --ch-text-dim: #6c7086;
+        --ch-text-dim: #949ab3;
         --ch-text: #cdd6f4;
         --ch-surface: #1e1e2e;
         --ch-surface-hover: #232338;
         --ch-text-faint: #45475a;
+        --ch-accent: #89b4fa;
     }
     html, body { height: 100%; margin: 0; padding: 0; overflow: hidden; }
     body { background: var(--ch-surface-sunken); color: var(--ch-text, #cdd6f4); } /* surfaceSunken, text */
@@ -90,6 +91,14 @@
     .ch-terminal-menu-item:focus {
         background: var(--ch-surface-hover);         /* surfaceHover */
         outline: none;
+    }
+    /* The hover tint alone is a very small difference against the menu's own
+       background, so a keyboard user could not see which item the arrow keys
+       had reached. The accent outline is the visible one; the tint stays so
+       that a focused item still looks the same as a hovered one. */
+    .ch-terminal-menu-item:focus-visible {
+        outline: 2px solid var(--ch-accent);         /* accent */
+        outline-offset: -2px;
     }
     .ch-terminal-menu-item:disabled {
         color: var(--ch-text-faint);                 /* textFaint */

@@ -1,6 +1,11 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { clampMenuOrigin, selectionHintText, terminalMenuItems } from "../src/menu.ts";
+import {
+    clampMenuOrigin,
+    menuFocusTarget,
+    selectionHintText,
+    terminalMenuItems,
+} from "../src/menu.ts";
 
 test("copy is offered only when there is something to copy", () => {
     const withSelection = terminalMenuItems(true);
@@ -60,4 +65,37 @@ test("a menu larger than the pane starts at the top-left corner", () => {
         { width: 120, height: 40 },
     );
     assert.deepEqual(origin, { x: 0, y: 0 });
+});
+
+test("the arrow keys walk the menu's items and wrap at both ends", () => {
+    // Three items, focus on the first: Down steps, Up from the first wraps to
+    // the last, and Down from the last wraps back to the first, which is what a
+    // desktop menu does and what lets a keyboard user reach every command
+    // without knowing how many there are.
+    assert.equal(menuFocusTarget("ArrowDown", 0, 3), 1);
+    assert.equal(menuFocusTarget("ArrowDown", 2, 3), 0);
+    assert.equal(menuFocusTarget("ArrowUp", 1, 3), 0);
+    assert.equal(menuFocusTarget("ArrowUp", 0, 3), 2);
+    assert.equal(menuFocusTarget("Home", 2, 3), 0);
+    assert.equal(menuFocusTarget("End", 0, 3), 2);
+});
+
+test("the first arrow press enters the menu from either end", () => {
+    // -1 is "focus is not on an item" — the menu root itself, or a press that
+    // arrived before the first item took focus. Down enters at the top and Up
+    // enters at the bottom, so neither key is a no-op.
+    assert.equal(menuFocusTarget("ArrowDown", -1, 3), 0);
+    assert.equal(menuFocusTarget("ArrowUp", -1, 3), 2);
+});
+
+test("keys the menu does not own are left to the terminal", () => {
+    // Anything that returns null is NOT swallowed by the menu's key handler, so
+    // it still reaches xterm.js and the remote shell.
+    assert.equal(menuFocusTarget("Tab", 0, 3), null);
+    assert.equal(menuFocusTarget("ArrowLeft", 0, 3), null);
+    assert.equal(menuFocusTarget("a", 0, 3), null);
+    // A menu whose every item is disabled has nothing to move to; the arrows
+    // must not be swallowed into a menu that cannot answer them.
+    assert.equal(menuFocusTarget("ArrowDown", -1, 0), null);
+    assert.equal(menuFocusTarget("Home", -1, 0), null);
 });

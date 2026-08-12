@@ -742,7 +742,11 @@ Rectangle {
             // The application's one divider (SPEC 4.1). Without it the Basic
             // style draws a filled plate in its own light palette, which is the
             // pale gutter that made this window look unfinished.
-            handle: AppSplitHandle {}
+            // `onResized` covers the KEYBOARD case: the write side below hangs
+            // off `onResizingChanged`, and SplitView only reports `resizing`
+            // for a pointer drag, so a split resized with the arrow keys would
+            // move on screen and then be forgotten at the next reload.
+            handle: AppSplitHandle { onResized: split.publishRatios() }
 
             // SplitView stretches only the FIRST fillWidth/fillHeight item, so
             // every later child would fall back to a Loader's implicit size of 0

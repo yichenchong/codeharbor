@@ -300,7 +300,11 @@ Rectangle {
         anchors.fill: parent
         clip: true
         cacheBuffer: 320
-        focus: true
+        // Reachable by Tab, but never GRABBED on creation. `focus: true` here
+        // took the keyboard the moment a directory pane was built or reloaded,
+        // which stole it from wherever the user was actually typing — the
+        // address bar of this very pane, most often, since that is where the
+        // path came from.
         activeFocusOnTab: true
         model: root.rows
         visible: root.errorText.length === 0

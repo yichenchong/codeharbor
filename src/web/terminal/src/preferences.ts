@@ -54,6 +54,59 @@ export function terminalFontPointsToCssPixels(points: number): number {
     return points / kPointsPerCssPixel;
 }
 
+/** The media query that answers "has this user asked for less animation?". */
+export const kReducedMotionQuery = "(prefers-reduced-motion: reduce)";
+
+/** What followMotionPreference() needs from a MediaQueryList. Narrowed to the
+ *  two members it touches so a test can hand it a plain object. */
+export interface MotionPreferenceQuery {
+    readonly matches: boolean;
+    addEventListener(
+        type: "change",
+        listener: (event: { matches: boolean }) => void,
+    ): void;
+    removeEventListener(
+        type: "change",
+        listener: (event: { matches: boolean }) => void,
+    ): void;
+}
+
+/** The one xterm option followMotionPreference() drives. */
+export interface CursorBlinkTarget {
+    options: { cursorBlink?: boolean };
+}
+
+/**
+ * Hold `terminal.options.cursorBlink` to the user's motion preference and keep
+ * following it. A blinking cursor is a small animation that never stops for as
+ * long as the pane is open, which is exactly what a user who asked the system
+ * for reduced motion asked to be rid of; it is also this page's entire motion
+ * budget, since nothing else here moves on its own. The preference can be
+ * changed while the pane is open, so a pane that read it once and stopped
+ * listening would keep blinking for the rest of its life.
+ *
+ * Returns the unsubscribe the caller runs on teardown. A null query is a host
+ * with no matchMedia at all: there is no preference to read, so the cursor
+ * keeps xterm's own default.
+ */
+export function followMotionPreference(
+    query: MotionPreferenceQuery | null,
+    terminal: CursorBlinkTarget,
+): () => void {
+    const apply = (prefersReducedMotion: boolean): void => {
+        if (terminal.options.cursorBlink !== !prefersReducedMotion) {
+            terminal.options.cursorBlink = !prefersReducedMotion;
+        }
+    };
+    if (!query) {
+        return () => {};
+    }
+    apply(query.matches);
+    const onChange = (event: { matches: boolean }): void => apply(event.matches);
+    query.addEventListener("change", onChange);
+    return () => query.removeEventListener("change", onChange);
+}
+
 /**
  * Apply settings without rebuilding the page. xterm's option setter remeasures
  * its character cell, then FitAddon recomputes cols/rows; the final explicit

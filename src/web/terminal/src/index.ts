@@ -23,6 +23,8 @@ import { installRenderer } from "./renderer.ts";
 import { TerminalContextMenu } from "./menu.ts";
 import {
     applyTerminalPreferences,
+    followMotionPreference,
+    kReducedMotionQuery,
     terminalFontPointsToCssPixels,
     type TerminalPreferenceValues,
 } from "./preferences.ts";
@@ -104,7 +106,20 @@ export function mountTerminal(element: HTMLElement, bridge: TerminalBridge): Ter
     // mouse report.
     let activeTheme: ThemeRoles = { ...defaultThemeRoles };
     const term = new Terminal({
-        cursorBlink: true,
+        // cursorBlink is deliberately absent: followMotionPreference() below
+        // sets it from the user's reduced-motion preference and keeps it in
+        // step with later changes.
+        //
+        // ACCESSIBILITY: without screenReaderMode xterm renders the grid to a
+        // canvas (or to positioned spans) that carries no readable text at
+        // all, so a screen reader user hears nothing the remote program
+        // prints. With it, xterm maintains a parallel live-region DOM copy of
+        // the viewport and announces what changes. That copy is a real cost —
+        // extra DOM per rendered row and extra work on every write — which is
+        // why xterm ships it off by default, and why it is the one thing here
+        // that trades throughput for the pane being usable at all without
+        // sight.
+        screenReaderMode: true,
         fontFamily: "monospace",
         // AppSettings stores the default in points; use the same conversion as
         // live preference updates so the first frame does not use a different
@@ -153,8 +168,18 @@ export function mountTerminal(element: HTMLElement, bridge: TerminalBridge): Ter
     term.loadAddon(fit);
 
     // Status strip reflecting the ch::TerminalState reported by C++ (SPEC 5.6).
+    // It is a live region: the strip is the only thing that says the pane lost
+    // its connection or failed to attach, and its text is replaced in place, so
+    // without one a screen reader user is never told. Polite, not assertive —
+    // the state changes while the user is reading terminal output, and an
+    // assertive region would cut that off. aria-atomic because the whole strip
+    // is one short phrase: it should be read as a phrase rather than as the
+    // words that happened to change.
     const status = element.ownerDocument.createElement("div");
     status.className = "ch-terminal-status";
+    status.setAttribute("role", "status");
+    status.setAttribute("aria-live", "polite");
+    status.setAttribute("aria-atomic", "true");
     status.dataset.state = "unloaded";
     status.textContent = "unloaded";
     element.appendChild(status);
@@ -170,6 +195,20 @@ export function mountTerminal(element: HTMLElement, bridge: TerminalBridge): Ter
     }
     applyPageTheme(activeTheme);
     term.open(surface);
+    // xterm's hidden textarea IS the terminal as far as assistive technology is
+    // concerned: it is the element that takes focus and the one screenReaderMode
+    // points its live region at. xterm labels it "Terminal input" with no way to
+    // configure that, which says nothing about WHICH pane the user landed in, so
+    // name it after the thing the user opened.
+    term.textarea?.setAttribute("aria-label", "Remote shell terminal");
+    // The blinking cursor is the page's only animation; honour the system
+    // reduced-motion setting for as long as the pane lives (see preferences.ts).
+    const stopFollowingMotion = followMotionPreference(
+        typeof pageWindow.matchMedia === "function"
+            ? pageWindow.matchMedia(kReducedMotionQuery)
+            : null,
+        term,
+    );
     // xterm 5 uses the DOM renderer unless an addon replaces it. Preferring
     // WebGL, and surviving the loss of its context, both live in renderer.ts.
     //
@@ -694,6 +733,7 @@ export function mountTerminal(element: HTMLElement, bridge: TerminalBridge): Ter
             resizeObserver.disconnect();
             visibilityObserver.disconnect();
             element.ownerDocument.removeEventListener("visibilitychange", reportVisibility);
+            stopFollowingMotion();
             surface.removeEventListener("contextmenu", openTerminalMenu, true);
             for (const type of ["mousedown", "mouseup", "auxclick"] as const) {
                 surface.removeEventListener(type, swallowRightButton, true);

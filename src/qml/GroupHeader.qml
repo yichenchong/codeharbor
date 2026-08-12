@@ -89,6 +89,35 @@ ItemDelegate {
             edge = Math.min(edge, newSessionButton.x - 4);
         return edge;
     }
+    // Collapsing is what the whole header does, so it is written once here and
+    // called from the click, the menu entry and the accessibility toggle
+    // action. Routed through `host` rather than app.setGroupCollapsed: the
+    // sidebar owns every app.* call, and toggleCurrentGroup() acts on the
+    // keyboard cursor, so the cursor has to be moved here first or the wrong
+    // group would fold.
+    function toggleCollapse() {
+        if (!header.host)
+            return;
+        header.host.selectGroup(header);
+        header.host.toggleCurrentGroup();
+    }
+
+    // Keyboard entry points, called by the sidebar's key handler on whichever
+    // header its cursor is on. Renaming a group lived ONLY behind a right-click,
+    // so without these it was unreachable without a pointer. Escape closes the
+    // menu and the dialog and hands the keyboard back to the sidebar, so
+    // neither can swallow the cursor.
+    //
+    // Popped at the header's own bottom-left corner rather than at the pointer,
+    // which in this path is wherever the mouse was last left.
+    function openContextMenu() {
+        groupMenu.popup(header, 12, header.height);
+    }
+
+    function openRenameDialog() {
+        renameGroupDialog.open();
+    }
+
     // Without this a screen reader announces an unnamed item: the delegate's own
     // `text` property is unused (the name arrives in `name`, a SessionsModel
     // role) and the collapse state is drawn as a chevron glyph.
@@ -96,6 +125,18 @@ ItemDelegate {
     Accessible.name: header.name
     Accessible.description: header.collapsed ? qsTr("Collapsed group")
                                              : qsTr("Expanded group")
+    // The prose above is the only place the collapse state existed, and prose
+    // is not a state: assistive technology could read "Collapsed group" but had
+    // no way to know the header was a thing that opens, nor to open it. Qt's
+    // QML Accessible attached type has no `expanded`, so the open/shut pair is
+    // carried by the checkable/checked pair, with the toggle action wired to
+    // the same call the click makes.
+    Accessible.checkable: true
+    Accessible.checked: !header.collapsed
+    Accessible.onToggleAction: header.toggleCollapse()
+    // The keyboard cursor is drawn as a wash and a focus ring, neither of which
+    // a screen reader can see.
+    Accessible.selected: header.selected
 
     background: Rectangle {
         // This is presentation-only rather than a public role, but it still
@@ -307,6 +348,9 @@ ItemDelegate {
         modal: true
         standardButtons: Dialog.Ok | Dialog.Cancel
         anchors.centerIn: Overlay.overlay
+        // Enter cancels rather than deleting: this dialog's affirmative answer
+        // destroys a group and everything in it. See SessionRow.qml.
+        defaultButton: Dialog.Cancel
         width: 400
 
         ColumnLayout {
@@ -363,15 +407,8 @@ ItemDelegate {
         }
         MenuItem {
             text: header.collapsed ? qsTr("Expand") : qsTr("Collapse")
-            // The same two calls the header's own onClicked makes: the toggle
-            // acts on the sidebar's keyboard cursor, so the cursor has to be
-            // moved here first or the wrong group would fold.
-            onTriggered: {
-                if (!header.host)
-                    return;
-                header.host.selectGroup(header);
-                header.host.toggleCurrentGroup();
-            }
+            // The same call the header's own onClicked makes.
+            onTriggered: header.toggleCollapse()
         }
         MenuItem {
             text: qsTr("Delete")
@@ -413,12 +450,29 @@ ItemDelegate {
             implicitWidth: 300
             spacing: 8
 
+            // The field arrives PREFILLED with the current name, so its
+            // placeholder never shows and the box was announced — and read —
+            // as an unlabelled edit box holding a word. Same visible-label
+            // convention as SettingsWindow's Field component.
+            Label {
+                id: renameGroupFieldLabel
+                objectName: "renameGroupFieldLabel:" + header.itemId
+                Layout.preferredWidth: 300
+                text: qsTr("Group name")
+                color: Theme.textDim
+                font.pixelSize: Theme.fontSizeSmall
+            }
+
             TextField {
                 id: renameGroupField
                 objectName: "renameGroupField:" + header.itemId
                 Layout.preferredWidth: 300
                 text: header.name
                 placeholderText: qsTr("Group name")
+                // The visible Label above is a separate item, so the field has
+                // no name of its own; bound rather than repeated so the two
+                // cannot drift apart.
+                Accessible.name: renameGroupFieldLabel.text
             }
         }
 
@@ -431,18 +485,8 @@ ItemDelegate {
     // Selecting the header first is what makes the toggle unambiguous: the
     // sidebar's toggleCurrentGroup() acts on the keyboard cursor, which
     // selectGroup() has just moved here — so the click and the Space key take
-    // exactly the same path.
-    //
-    // Deliberately routed through `host` rather than calling app.setGroupCollapsed
-    // directly: the sidebar owns every app.* call (see its drag-and-drop
-    // contract), and a header with no host is documented to stay usable
-    // standalone, which a bare `app` lookup would break with a ReferenceError.
-    onClicked: {
-        if (!header.host)
-            return;
-        header.host.selectGroup(header);
-        header.host.toggleCurrentGroup();
-    }
+    // exactly the same path. See toggleCollapse() above.
+    onClicked: header.toggleCollapse()
 
     // Vertical drag = reorder groups. Same grab discipline as SessionRow: the
     // header stays put and the sidebar draws the insertion line.

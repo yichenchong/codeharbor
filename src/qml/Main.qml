@@ -301,7 +301,9 @@ ApplicationWindow {
         anchors.right: parent.right
         anchors.bottom: parent.bottom
         orientation: Qt.Horizontal
-        handle: AppSplitHandle {}
+        // A key resize never sets SplitView.resizing, so the Connections block
+        // above cannot see it; the handle says so itself instead.
+        handle: AppSplitHandle { onResized: window.persistRegionWidths() }
 
         Component.onCompleted: {
             var sidebar = app.uiState.sidebarWidth();
@@ -518,60 +520,14 @@ ApplicationWindow {
 
     // Non-blocking error banner: surfaces app.error (RPC failures forwarded
     // verbatim, SPEC 10.3) as a transient toast so shell-level failures are
-    // visible instead of silently swallowed.
-    Rectangle {
+    // visible instead of silently swallowed. Raised only through notifyUser()
+    // below, which is the window's single funnel for all of them.
+    AppErrorBanner {
         id: errorBanner
-        objectName: "shellErrorBanner"
         z: 1000
-        visible: opacity > 0
-        opacity: 0
         anchors.top: parent.top
         anchors.horizontalCenter: parent.horizontalCenter
         anchors.topMargin: 12
-        width: Math.min(errorLabel.implicitWidth + 32, parent.width - 24)
-        height: errorLabel.implicitHeight + 20
-        radius: Theme.radiusMedium
-        color: Theme.danger
-
-        // The toast is the ONLY place a shell-level failure is reported, and a
-        // bare Rectangle carries no accessibility at all: without this a screen
-        // reader never learns that anything went wrong. AlertMessage is the
-        // role for a transient notification that is not a dialog.
-        Accessible.role: Accessible.AlertMessage
-        Accessible.name: errorLabel.text
-
-        Behavior on opacity { NumberAnimation { duration: 200 } }
-
-        Label {
-            id: errorLabel
-            objectName: "shellErrorLabel"
-            anchors.centerIn: parent
-            width: parent.width - 32
-            // SECURITY: a Label defaults to Text.AutoText, which promotes any
-            // string that merely LOOKS like markup to StyledText — and
-            // StyledText fetches <img src="http://..."> and turns <a href> into
-            // a live link. What lands here is app.error / SessionLayouts.error,
-            // i.e. RPC and libssh failure text forwarded VERBATIM from the
-            // server (SPEC 10.3), so a hostile server must not be able to turn
-            // this toast into a network callback. Same rule as every other
-            // server-fed Label in this module.
-            textFormat: Text.PlainText
-            color: Theme.textOnAccent
-            font.pixelSize: Theme.fontSizeLabel
-            wrapMode: Text.WordWrap
-            horizontalAlignment: Text.AlignHCenter
-        }
-
-        MouseArea {
-            anchors.fill: parent
-            onClicked: errorBanner.opacity = 0
-        }
-
-        Timer {
-            id: errorHideTimer
-            interval: 6000
-            onTriggered: errorBanner.opacity = 0
-        }
     }
 
     Connections {
@@ -714,9 +670,7 @@ ApplicationWindow {
     // all come through here. QML cannot emit app.error (a C++ signal), so a
     // command that cannot run says so here rather than no-oping.
     function notifyUser(message) {
-        errorLabel.text = message;
-        errorBanner.opacity = 0.97;
-        errorHideTimer.restart();
+        errorBanner.show(message);
     }
 
     // Deepest-first leaf of a split tree: the pane a split acts on when the user

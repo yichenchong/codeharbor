@@ -79,6 +79,11 @@ test("renders the supported GitHub-style Markdown structures", () => {
         boxes.map((box) => (box as HTMLInputElement).checked),
         [true, false],
     );
+    assert.deepEqual(
+        boxes.map((box) => box.getAttribute("aria-label")),
+        ["done", "todo"],
+        "each box is named after its own task, not left anonymous",
+    );
     assert.ok(boxes.every((box) => (box as HTMLInputElement).disabled),
         "a rendered task list is never interactive");
 
@@ -249,9 +254,13 @@ test("an <input type=image> cannot fetch a URL from the privileged page", () => 
     );
     assert.doesNotMatch(rewritten, /src=/i);
     assert.doesNotMatch(rewritten, /evil\.example/i);
-    // The task-list checkbox the renderer itself emits is untouched.
+    // The task-list checkbox the renderer itself emits is untouched: it keeps
+    // its checked/disabled state and its accessible name, and gains no src.
     const checklist = renderMarkdown("- [x] done", sanitizerFor(window));
-    assert.match(checklist, /<input type="checkbox" checked="" disabled="">/);
+    assert.match(
+        checklist,
+        /<input type="checkbox" checked="" disabled="" aria-label="done">/,
+    );
 });
 
 test("attributes that fetch or redirect on the document's behalf are removed", () => {
