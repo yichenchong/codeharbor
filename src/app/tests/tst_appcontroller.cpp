@@ -192,13 +192,17 @@ QByteArray listWithSessionFrame(int id, const QString& groupName,
     return QJsonDocument(resp).toJson(QJsonDocument::Compact) + '\n';
 }
 
-// One framed (newline-terminated) AgentEvent JSONL line for the monitor.
+// One framed (newline-terminated) AgentEvent JSONL line for the monitor. The
+// harness defaults to "generic", which is the value that asserts nothing about
+// which adapter is running and so never upgrades the pane's stored column; a
+// case about that upgrade names a real adapter instead.
 QByteArray agentEventLine(const QString& state, const QString& dev,
-                          const QString& term)
+                          const QString& term,
+                          const QString& harness = QStringLiteral("generic"))
 {
     const QJsonObject o{{"version", 1},
                         {"timestamp", "2026-07-25T00:00:00.000Z"},
-                        {"harness", "generic"},
+                        {"harness", harness},
                         {"devSessionId", dev},
                         {"terminalId", term},
                         {"state", state},
@@ -398,6 +402,10 @@ private slots:
     void setTerminalPaneHarnessWritesTheRowAndRefreshes();
     void setTerminalPaneHarnessRefusesAnUnknownValue();
     void terminalPaneHarnessReadsTheAuthoritativeTree();
+    void observedHarnessUpgradesAGenericPaneOnce();
+    void observedHarnessUpgradeKeepsTheTriggeringState();
+    void observedHarnessLeavesAPlainShellAlone();
+    void observedHarnessLeavesAnExplicitAdapterAlone();
     void aGenericPaneFromTheTreeReachesRunningInTheSidebar();
     void refreshResultAfterControllerDestroyedIsNoop();
     void agentMonitorMergesStateIntoSidebar();
@@ -1111,6 +1119,194 @@ void TstAppController::terminalPaneHarnessReadsTheAuthoritativeTree()
     QCOMPARE(controller.terminalPaneHarness(QStringLiteral("term-1")),
              QStringLiteral("oh-my-pi"));
     QVERIFY(controller.terminalPaneHarness(QStringLiteral("gone")).isEmpty());
+}
+
+// Route A: a pane minted as "generic" is a pane nobody has told which adapter it
+// runs, and a live agent event says exactly that. The upgrade goes through
+// setTerminalPaneHarness — the same workspace.updateTerminalPane the pane's gear
+// control issues — and it fires ONCE. A repeat is what makes this worth pinning:
+// an agent emits events continuously and every one of them repeats its harness,
+// so a write per event would be a write per keystroke of agent progress.
+void TstAppController::observedHarnessUpgradesAGenericPaneOnce()
+{
+    FakeTransport transport;
+    CodeharbordClient client;
+    AppController controller(&client);
+    client.setTransport(&transport);
+    QSignalSpy errors(&controller, &AppController::error);
+
+    FakeTransport agentTransport;
+    AgentStatusMonitor monitor;
+    monitor.setTransport(&agentTransport);
+    controller.setAgentMonitor(&monitor);
+
+    controller.refresh();
+    transport.deliver(listWithTerminalFrame(
+        takeRequest(transport).value(QStringLiteral("id")).toInt(),
+        QStringLiteral("G"), QStringLiteral("sess-1"), QStringLiteral("term-1"),
+        QStringLiteral("generic")));
+
+    agentTransport.deliver(agentEventLine(QStringLiteral("running"),
+                                          QStringLiteral("sess-1"),
+                                          QStringLiteral("term-1"),
+                                          QStringLiteral("oh-my-pi")));
+    const QJsonObject update = takeRequest(transport);
+    QCOMPARE(update.value(QStringLiteral("method")).toString(),
+             QStringLiteral("workspace.updateTerminalPane"));
+    const QJsonObject params = update.value(QStringLiteral("params")).toObject();
+    QCOMPARE(params.value(QStringLiteral("id")).toString(),
+             QStringLiteral("term-1"));
+    QCOMPARE(params.value(QStringLiteral("harness")).toString(),
+             QStringLiteral("oh-my-pi"));
+
+    // Answer the write and the refresh it chains, so the authoritative tree now
+    // holds the observed value.
+    transport.deliver(terminalPaneResultFrame(
+        update.value(QStringLiteral("id")).toInt(), QStringLiteral("term-1"),
+        QStringLiteral("sess-1"), QStringLiteral("oh-my-pi")));
+    const QJsonObject listAgain = takeRequest(transport);
+    QCOMPARE(listAgain.value(QStringLiteral("method")).toString(),
+             QStringLiteral("workspace.list"));
+    transport.deliver(listWithTerminalFrame(
+        listAgain.value(QStringLiteral("id")).toInt(), QStringLiteral("G"),
+        QStringLiteral("sess-1"), QStringLiteral("term-1"),
+        QStringLiteral("oh-my-pi")));
+    QCOMPARE(controller.terminalPaneHarness(QStringLiteral("term-1")),
+             QStringLiteral("oh-my-pi"));
+
+    // Further events from the same harness write nothing at all.
+    agentTransport.deliver(agentEventLine(QStringLiteral("idle"),
+                                          QStringLiteral("sess-1"),
+                                          QStringLiteral("term-1"),
+                                          QStringLiteral("oh-my-pi")));
+    QVERIFY(transport.takeSent().isEmpty());
+    QCOMPARE(errors.count(), 0);
+}
+
+// The autodetection round trip must not eat the event that triggered it. Every
+// mutation chains a refresh, and refresh()'s harness walk re-registers the pane
+// with the monitor — now naming the observed adapter, which used to clear the
+// pane's state because a pane leaving "generic" has its output-derived state
+// discarded. The state here did not come from output, it came from the very
+// event that caused the upgrade, so the sidebar has to still read Running once
+// the dust settles. Driven end to end (real event bytes, real write, real
+// refresh) and asserted through RowStateRole, the surface the sidebar reads,
+// because the fault only appears with the write and the refresh in that order.
+void TstAppController::observedHarnessUpgradeKeepsTheTriggeringState()
+{
+    FakeTransport transport;
+    CodeharbordClient client;
+    AppController controller(&client);
+    client.setTransport(&transport);
+
+    FakeTransport agentTransport;
+    AgentStatusMonitor monitor;
+    monitor.setTransport(&agentTransport);
+    controller.setAgentMonitor(&monitor);
+
+    controller.refresh();
+    transport.deliver(listWithTerminalFrame(
+        takeRequest(transport).value(QStringLiteral("id")).toInt(),
+        QStringLiteral("G"), QStringLiteral("sess-1"), QStringLiteral("term-1"),
+        QStringLiteral("generic")));
+
+    SessionsModel* model = controller.sessionsModel();
+    const auto sessionState = [model]() {
+        const QModelIndex group = model->index(0, 0);
+        const QModelIndex session = model->index(0, 0, group);
+        return model->data(session, SessionsModel::RowStateRole).toInt();
+    };
+
+    agentTransport.deliver(agentEventLine(QStringLiteral("running"),
+                                          QStringLiteral("sess-1"),
+                                          QStringLiteral("term-1"),
+                                          QStringLiteral("oh-my-pi")));
+    QCOMPARE(sessionState(), static_cast<int>(SessionRowState::Running));
+
+    // Now let the upgrade complete: the write, and the refresh it chains.
+    const QJsonObject update = takeRequest(transport);
+    QCOMPARE(update.value(QStringLiteral("method")).toString(),
+             QStringLiteral("workspace.updateTerminalPane"));
+    transport.deliver(terminalPaneResultFrame(
+        update.value(QStringLiteral("id")).toInt(), QStringLiteral("term-1"),
+        QStringLiteral("sess-1"), QStringLiteral("oh-my-pi")));
+    transport.deliver(listWithTerminalFrame(
+        takeRequest(transport).value(QStringLiteral("id")).toInt(),
+        QStringLiteral("G"), QStringLiteral("sess-1"), QStringLiteral("term-1"),
+        QStringLiteral("oh-my-pi")));
+
+    QCOMPARE(controller.terminalPaneHarness(QStringLiteral("term-1")),
+             QStringLiteral("oh-my-pi"));
+    QCOMPARE(monitor.stateFor(QStringLiteral("sess-1"), QStringLiteral("term-1")),
+             static_cast<int>(AgentState::Running));
+    QCOMPARE(sessionState(), static_cast<int>(SessionRowState::Running));
+}
+
+// A pane with NO harness is the user's "plain shell, stay silent", and that is
+// the one choice whose entire purpose is to report nothing. Something speaking
+// in the pane is not a reason to overrule it: a plain shell is exactly where a
+// user runs an agent by hand and still does not want the sidebar reacting.
+void TstAppController::observedHarnessLeavesAPlainShellAlone()
+{
+    FakeTransport transport;
+    CodeharbordClient client;
+    AppController controller(&client);
+    client.setTransport(&transport);
+    QSignalSpy errors(&controller, &AppController::error);
+
+    FakeTransport agentTransport;
+    AgentStatusMonitor monitor;
+    monitor.setTransport(&agentTransport);
+    controller.setAgentMonitor(&monitor);
+
+    controller.refresh();
+    // No harness argument: the row stores none, which is the plain-shell case.
+    transport.deliver(listWithTerminalFrame(
+        takeRequest(transport).value(QStringLiteral("id")).toInt(),
+        QStringLiteral("G"), QStringLiteral("sess-1"), QStringLiteral("term-1")));
+
+    agentTransport.deliver(agentEventLine(QStringLiteral("running"),
+                                          QStringLiteral("sess-1"),
+                                          QStringLiteral("term-1"),
+                                          QStringLiteral("oh-my-pi")));
+
+    QVERIFY(transport.takeSent().isEmpty());
+    QVERIFY(controller.terminalPaneHarness(QStringLiteral("term-1")).isEmpty());
+    QCOMPARE(errors.count(), 0);
+}
+
+// An explicit adapter is the user's answer to this exact question, and an
+// observation does not outrank it. A pane set to claude-code that somehow emits
+// oh-my-pi events (a leftover hook, a shell the user re-purposed) keeps the value
+// it was given: the client is not the authority on what the user meant.
+void TstAppController::observedHarnessLeavesAnExplicitAdapterAlone()
+{
+    FakeTransport transport;
+    CodeharbordClient client;
+    AppController controller(&client);
+    client.setTransport(&transport);
+    QSignalSpy errors(&controller, &AppController::error);
+
+    FakeTransport agentTransport;
+    AgentStatusMonitor monitor;
+    monitor.setTransport(&agentTransport);
+    controller.setAgentMonitor(&monitor);
+
+    controller.refresh();
+    transport.deliver(listWithTerminalFrame(
+        takeRequest(transport).value(QStringLiteral("id")).toInt(),
+        QStringLiteral("G"), QStringLiteral("sess-1"), QStringLiteral("term-1"),
+        QStringLiteral("claude-code")));
+
+    agentTransport.deliver(agentEventLine(QStringLiteral("running"),
+                                          QStringLiteral("sess-1"),
+                                          QStringLiteral("term-1"),
+                                          QStringLiteral("oh-my-pi")));
+
+    QVERIFY(transport.takeSent().isEmpty());
+    QCOMPARE(controller.terminalPaneHarness(QStringLiteral("term-1")),
+             QStringLiteral("claude-code"));
+    QCOMPARE(errors.count(), 0);
 }
 
 // A late response after the controller is destroyed must be a no-op: the shared

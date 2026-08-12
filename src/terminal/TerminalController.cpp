@@ -726,9 +726,11 @@ bool TerminalController::isSafeTmuxTarget(const QString &target)
 }
 
 QString TerminalController::tmuxNewSessionCommand(const QString &target,
-                                                  const QString &workingDir)
+                                                  const QString &workingDir,
+                                                  const QString &devSessionId,
+                                                  const QString &terminalId)
 {
-    // TWO tmux commands in ONE invocation, separated by an escaped semicolon:
+    // SEVERAL tmux commands in ONE invocation, separated by escaped semicolons:
     // the shell unescapes `\;` into a literal `;` argument, which is tmux's own
     // command separator (a bare `;` would end the shell command instead).
     //
@@ -756,9 +758,53 @@ QString TerminalController::tmuxNewSessionCommand(const QString &target,
     // reconfigure somebody else's session. Verified against tmux 3.6: with
     // `ch_victim_t1` live, `set-option -t 'ch_*_t1:' mouse on` set the option on
     // it, while `-t '=ch_*_t1:'` refused with "no such session" (SPEC 5.2).
-    return QStringLiteral("tmux new-session -A -s %1 -c %2 \\; set-option -t %3 mouse on")
-        .arg(shellSingleQuote(target), shellSingleQuote(workingDir),
-             shellSingleQuote(QLatin1Char('=') + target + QLatin1Char(':')));
+    // The pane's identity is EXPORTED INTO the session, because that is the
+    // only channel an agent hook has for saying which pane it belongs to.
+    // remote/src/hooks/oh-my-pi-hook.ts reads OMP_DEV_SESSION_ID and
+    // OMP_TERMINAL_ID out of its own environment (readHookInput) and stamps
+    // every event it emits with them; with the variables unset it emits blank
+    // coordinates, the daemon drops the event as unroutable, and the pane never
+    // reports anything. Nothing else in the product ever set them.
+    //
+    // Both ids or neither: a hook needs BOTH to name a pane, and exporting one
+    // half would only turn "no coordinates" into "half-wrong coordinates".
+    //
+    // WHAT THIS DOES AND DOES NOT REPAIR. `new-session -e` applies at session
+    // CREATION only, and this command carries `-A`, so an attach to a session
+    // that already exists ignores every `-e` (verified on tmux 3.6: attaching
+    // with a different `-e OMP_DEV_SESSION_ID` left the stored value
+    // untouched). set-environment is issued as well so the attach case at least
+    // corrects the SESSION environment — but that too only reaches processes
+    // started AFTER it runs: the shell tmux is already running in keeps the
+    // environment it was forked with (also verified on 3.6). So a pane that is
+    // already live, and any agent already running in it, is NOT repaired by
+    // this; it takes a new session, a new window, or a newly started agent
+    // process. There is no tmux mechanism that would fix the others.
+    //
+    // `-e` on new-session and set-environment's value are both plain argv, so
+    // the whole `NAME=value` (and the bare value) goes through the same shell
+    // quoting as everything else here — an id is never interpolated bare.
+    const bool identified = !devSessionId.isEmpty() && !terminalId.isEmpty();
+    const QString sessionTarget = shellSingleQuote(QLatin1Char('=') + target
+                                                   + QLatin1Char(':'));
+    QString command =
+        QStringLiteral("tmux new-session -A -s %1 -c %2")
+            .arg(shellSingleQuote(target), shellSingleQuote(workingDir));
+    if (identified) {
+        command += QStringLiteral(" -e %1 -e %2")
+                       .arg(shellSingleQuote(QStringLiteral("OMP_DEV_SESSION_ID=")
+                                             + devSessionId),
+                            shellSingleQuote(QStringLiteral("OMP_TERMINAL_ID=")
+                                             + terminalId));
+    }
+    command += QStringLiteral(" \\; set-option -t %1 mouse on").arg(sessionTarget);
+    if (identified) {
+        command += QStringLiteral(" \\; set-environment -t %1 OMP_DEV_SESSION_ID %2")
+                       .arg(sessionTarget, shellSingleQuote(devSessionId));
+        command += QStringLiteral(" \\; set-environment -t %1 OMP_TERMINAL_ID %2")
+                       .arg(sessionTarget, shellSingleQuote(terminalId));
+    }
+    return command;
 }
 
 } // namespace ch

@@ -103,7 +103,10 @@ public:
     // its derived state. Switching away from generic clears a previous
     // generic-derived or stale lifecycle state to Unknown and emits that
     // transition, without creating a row for an adapter-driven pane that has
-    // never spoken.
+    // never spoken — EXCEPT when the new harness is the one already observed on
+    // the wire for this pane, which is the autodetection round trip (an event
+    // named the harness, the row was upgraded, the refresh lands back here) and
+    // must not discard the state that event carried. See the implementation.
     Q_INVOKABLE void setTerminalHarness(const QString& devSessionId,
                                         const QString& terminalId,
                                         const QString& harness);
@@ -189,6 +192,20 @@ signals:
     // which observation produced it.
     void agentStateChanged(const QString& devSessionId,
                            const QString& terminalId, int state);
+    // A live agent NAMED its harness for this pane, and it is not the value this
+    // monitor last heard for it. Raised from the event stream, so it reports what
+    // is actually RUNNING in the pane — which is independent of the harness the
+    // pane is configured with (`terminal_panes.harness`), and better informed:
+    // an event can only come from an adapter that exists. The display layer
+    // decides what, if anything, to store; see
+    // AppController::adoptObservedHarness for the overwrite rule.
+    //
+    // Only on a CHANGE of the observed value, never per event: a chatty agent
+    // emits events continuously and each one repeats its harness, so an
+    // unconditional signal would put a database write behind every keystroke of
+    // agent progress.
+    void harnessObserved(const QString& devSessionId, const QString& terminalId,
+                         const QString& harness);
     // The Dev Session's unseen-completion flag flipped.
     void unseenChanged(const QString& devSessionId, bool unseen);
     // Desktop-notification hook, emitted on a transition into waiting_input or
@@ -212,6 +229,10 @@ private:
         qint64 lastOutputMs = -1;  // last terminal output observed
         bool attached = false;     // a PTY channel is (or was) bound
         bool generic = false;      // harness == "generic": SPEC 6.6 owns the state
+        // The harness the last event for this pane came from, so harnessObserved
+        // fires on a change and not on every event. Empty until one arrives, and
+        // NOT the pane's configured harness (`generic` above is that one).
+        QString observedHarness;
     };
 
     // The pane's status, or nullptr when it has never been registered or

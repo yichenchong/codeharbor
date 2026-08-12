@@ -243,6 +243,25 @@ private:
     // flip does not reset (and re-create) the whole sidebar.
     void applyAgentStateUpdate();
 
+    // A live agent named its harness for a pane (AgentStatusMonitor::
+    // harnessObserved). Store it — through setTerminalPaneHarness(), the same
+    // mutation the pane's gear control uses — ONLY when the pane's stored
+    // harness is exactly "generic".
+    //
+    // That is the whole overwrite rule, and each arm is deliberate:
+    //   * "generic" means "an agent, adapter unknown", which is also what a
+    //     freshly minted pane gets, so a real adapter name is a strict upgrade;
+    //   * an EMPTY harness is the user's "plain shell, stay silent" — the one
+    //     choice whose entire purpose is to report nothing, so overwriting it
+    //     because something spoke in the pane would be a bug, not a fix;
+    //   * a different explicit adapter is the user's answer to this exact
+    //     question, and an observation does not outrank it.
+    // A user who deliberately chose "Generic agent" is indistinguishable from
+    // the mint default and will be upgraded. That is accepted: the alternative
+    // is a schema column to record which of two identical values was meant, for
+    // a distinction with no observable consequence beyond this one upgrade.
+    void adoptObservedHarness(const QString& terminalPaneId, const QString& harness);
+
     // Build a WorkspaceDb callback that, once the async response arrives, is a
     // no-op if this controller was already destroyed (the shared client keeps
     // pending callbacks alive past our lifetime), emits `error` verbatim on

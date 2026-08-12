@@ -114,6 +114,9 @@ private slots:
     void stateTransitionsEmitInOrder();
     void unchangedStateDoesNotEmit();
     void tmuxNewSessionCommandFormat();
+    void tmuxNewSessionCommandExportsPaneIdentity();
+    void tmuxNewSessionCommandQuotesAwkwardPaneIdentity();
+    void tmuxNewSessionCommandOmitsHalfKnownPaneIdentity();
     void tmuxNewSessionCommandEnablesMouseForThisSessionOnly();
     void tmuxNewSessionCommandEscapesShellMetacharacters();
     void tmuxNewSessionCommandEscapesSubstitutionBacktickNewline();
@@ -519,9 +522,10 @@ void TstTerminalController::unchangedStateDoesNotEmit()
     QCOMPARE(spy.count(), 0);
 }
 
-// Attach-or-create command formatting (SPEC 5.2). The invocation carries TWO
-// tmux commands separated by an escaped semicolon: the attach itself, and the
-// mouse-reporting option that makes the wheel scroll tmux's history.
+// Attach-or-create command formatting (SPEC 5.2). One invocation carries several
+// tmux commands separated by escaped semicolons: the attach itself, the
+// mouse-reporting option that makes the wheel scroll tmux's history, and the
+// pane-identity exports the agent hooks read (covered on their own below).
 //
 // The target is now a PARAMETER, not something this class derives. It used to
 // be built here as `ch_<devSessionId>_<terminalId>` from the layout pane id, and
@@ -529,14 +533,99 @@ void TstTerminalController::unchangedStateDoesNotEmit()
 // the server's — with recycling layout ids, which is how two client machines
 // ended up attaching one shell. The one minting site is codeharbord's
 // mintTmuxTarget(); this function only formats a command around whatever it is
-// given.
+// given. The two ids are parameters for the same reason: the target NAME embeds
+// them, but nothing may read them back out of it.
 void TstTerminalController::tmuxNewSessionCommandFormat()
 {
     const QString command = TerminalController::tmuxNewSessionCommand(
-        QStringLiteral("ch_dev1_term1"), QStringLiteral("/home/dev/project"));
+        QStringLiteral("ch_dev1_term1"), QStringLiteral("/home/dev/project"),
+        QStringLiteral("dev-1"), QStringLiteral("term-1"));
     QCOMPARE(command,
              QStringLiteral("tmux new-session -A -s 'ch_dev1_term1' -c '/home/dev/project'"
-                            " \\; set-option -t '=ch_dev1_term1:' mouse on"));
+                            " -e 'OMP_DEV_SESSION_ID=dev-1' -e 'OMP_TERMINAL_ID=term-1'"
+                            " \\; set-option -t '=ch_dev1_term1:' mouse on"
+                            " \\; set-environment -t '=ch_dev1_term1:'"
+                            " OMP_DEV_SESSION_ID 'dev-1'"
+                            " \\; set-environment -t '=ch_dev1_term1:'"
+                            " OMP_TERMINAL_ID 'term-1'"));
+}
+
+// The two variables an agent hook needs to say which pane it is in
+// (remote/src/hooks/oh-my-pi-hook.ts reads exactly these, and the daemon drops
+// an event that arrives without them). They are exported TWICE on purpose:
+// `new-session -e` applies at session creation only, and this command carries
+// `-A`, so an attach to a session that already exists ignores every `-e` —
+// set-environment is what corrects that session's environment. Neither repairs
+// a shell or an agent that is already running (verified on tmux 3.6).
+void TstTerminalController::tmuxNewSessionCommandExportsPaneIdentity()
+{
+    const QString command = TerminalController::tmuxNewSessionCommand(
+        QStringLiteral("ch_dev1_term1"), QStringLiteral("/w"),
+        QStringLiteral("11111111-2222-3333-4444-555555555555"),
+        QStringLiteral("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"));
+
+    // Set at creation...
+    QVERIFY(command.contains(
+        QStringLiteral("-e 'OMP_DEV_SESSION_ID=11111111-2222-3333-4444-555555555555'")));
+    QVERIFY(command.contains(
+        QStringLiteral("-e 'OMP_TERMINAL_ID=aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'")));
+    // ...and again for the attach case, on this session only.
+    QVERIFY(command.contains(
+        QStringLiteral("set-environment -t '=ch_dev1_term1:' OMP_DEV_SESSION_ID "
+                       "'11111111-2222-3333-4444-555555555555'")));
+    QVERIFY(command.contains(
+        QStringLiteral("set-environment -t '=ch_dev1_term1:' OMP_TERMINAL_ID "
+                       "'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'")));
+    // Never globally: -g here would export one pane's identity to every tmux
+    // session the user owns, and every hook in them would then lie about which
+    // pane it is in.
+    QVERIFY(!command.contains(QStringLiteral("-g")));
+}
+
+// An awkward id — a space, a single quote, a newline, shell metacharacters —
+// reaches a remote SHELL before tmux ever sees it, so every occurrence goes
+// through the same single-quoting as the target and the working directory. The
+// value itself is passed through verbatim: the server mints these ids and the
+// client echoes back exactly what it was handed.
+void TstTerminalController::tmuxNewSessionCommandQuotesAwkwardPaneIdentity()
+{
+    const QString command = TerminalController::tmuxNewSessionCommand(
+        QStringLiteral("ch_dev1_term1"), QStringLiteral("/w"),
+        QStringLiteral("d'; rm -rf ~; '"), QStringLiteral("t`whoami`$(id)\nnext"));
+    QCOMPARE(command,
+             QStringLiteral("tmux new-session -A -s 'ch_dev1_term1' -c '/w'"
+                            " -e 'OMP_DEV_SESSION_ID=d'\\''; rm -rf ~; '\\'''"
+                            " -e 'OMP_TERMINAL_ID=t`whoami`$(id)\nnext'"
+                            " \\; set-option -t '=ch_dev1_term1:' mouse on"
+                            " \\; set-environment -t '=ch_dev1_term1:'"
+                            " OMP_DEV_SESSION_ID 'd'\\''; rm -rf ~; '\\'''"
+                            " \\; set-environment -t '=ch_dev1_term1:'"
+                            " OMP_TERMINAL_ID 't`whoami`$(id)\nnext'"));
+}
+
+// BOTH ids or neither. A hook needs both halves to name a pane, so exporting
+// one of them would turn "no coordinates" into half-wrong coordinates — and an
+// empty OMP_DEV_SESSION_ID is worse than an absent one, because the hook trims
+// it to "" and emits an event the daemon then drops for a reason nothing
+// reports. A pane with no recorded identity (a test with no workspace, a pane
+// whose row has not been resolved) exports nothing at all.
+void TstTerminalController::tmuxNewSessionCommandOmitsHalfKnownPaneIdentity()
+{
+    const QString expected =
+        QStringLiteral("tmux new-session -A -s 'ch_dev1_term1' -c '/w'"
+                       " \\; set-option -t '=ch_dev1_term1:' mouse on");
+    QCOMPARE(TerminalController::tmuxNewSessionCommand(
+                 QStringLiteral("ch_dev1_term1"), QStringLiteral("/w"), QString(),
+                 QStringLiteral("term-1")),
+             expected);
+    QCOMPARE(TerminalController::tmuxNewSessionCommand(
+                 QStringLiteral("ch_dev1_term1"), QStringLiteral("/w"),
+                 QStringLiteral("dev-1"), QString()),
+             expected);
+    QCOMPARE(TerminalController::tmuxNewSessionCommand(
+                 QStringLiteral("ch_dev1_term1"), QStringLiteral("/w"), QString(),
+                 QString()),
+             expected);
 }
 
 // Mouse reporting is what routes a wheel turn into tmux's own scrollback instead
@@ -547,8 +636,10 @@ void TstTerminalController::tmuxNewSessionCommandFormat()
 // somebody else created (SPEC 5.2 hardening).
 void TstTerminalController::tmuxNewSessionCommandEnablesMouseForThisSessionOnly()
 {
+    // No pane identity here: this is about the mouse option, and an unidentified
+    // pane keeps the invocation down to the two commands the count below asserts.
     const QString command = TerminalController::tmuxNewSessionCommand(
-        QStringLiteral("ch_dev1_term1"), QStringLiteral("/w"));
+        QStringLiteral("ch_dev1_term1"), QStringLiteral("/w"), QString(), QString());
 
     // The option is set, and it is set on this session's target.
     QVERIFY(command.contains(QStringLiteral("set-option -t '=ch_dev1_term1:' mouse on")));
@@ -568,7 +659,8 @@ void TstTerminalController::tmuxNewSessionCommandEnablesMouseForThisSessionOnly(
 void TstTerminalController::tmuxNewSessionCommandEscapesShellMetacharacters()
 {
     const QString command = TerminalController::tmuxNewSessionCommand(
-        QStringLiteral("ch_dev1_term1"), QStringLiteral("/home/dev/it's here; rm -rf /"));
+        QStringLiteral("ch_dev1_term1"), QStringLiteral("/home/dev/it's here; rm -rf /"),
+        QString(), QString());
     QCOMPARE(command,
              QStringLiteral("tmux new-session -A -s 'ch_dev1_term1' "
                             "-c '/home/dev/it'\\''s here; rm -rf /'"
@@ -582,7 +674,8 @@ void TstTerminalController::tmuxNewSessionCommandEscapesShellMetacharacters()
 void TstTerminalController::tmuxNewSessionCommandEscapesSubstitutionBacktickNewline()
 {
     const QString command = TerminalController::tmuxNewSessionCommand(
-        QStringLiteral("ch_dev1_term1"), QStringLiteral("/w/$(rm -rf ~)`whoami`\nnext"));
+        QStringLiteral("ch_dev1_term1"), QStringLiteral("/w/$(rm -rf ~)`whoami`\nnext"),
+        QString(), QString());
     QCOMPARE(command,
              QStringLiteral("tmux new-session -A -s 'ch_dev1_term1' "
                             "-c '/w/$(rm -rf ~)`whoami`\nnext'"
@@ -605,8 +698,8 @@ void TstTerminalController::tmuxCommandEscapesAdversarialIds()
 {
     const QString target = QStringLiteral("ch_dev'; rm -rf / #_t`whoami`$(id)");
 
-    const QString command =
-        TerminalController::tmuxNewSessionCommand(target, QStringLiteral("/w"));
+    const QString command = TerminalController::tmuxNewSessionCommand(
+        target, QStringLiteral("/w"), QString(), QString());
     QCOMPARE(command,
              QStringLiteral("tmux new-session -A -s "
                             "'ch_dev'\\''; rm -rf / #_t`whoami`$(id)' -c '/w'"

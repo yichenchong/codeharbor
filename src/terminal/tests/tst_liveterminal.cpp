@@ -152,8 +152,12 @@ void TstLiveTerminal::initTestCase()
     // under a real name and survives a detach; the production helper that
     // builds the attach command around that name is still the one under test.
     m_sessionName = QStringLiteral("ch_live_") + terminalRowId;
-    m_attachCommand =
-        TerminalController::tmuxNewSessionCommand(m_sessionName, m_repo);
+    // The identity handed to the builder is this gate's own: no workspace means
+    // no server-minted Dev Session id, so the "dev session" is the name this
+    // test invented and the terminal id is the row id it minted above. It only
+    // has to be non-empty for the two OMP_* variables to be exported.
+    m_attachCommand = TerminalController::tmuxNewSessionCommand(
+        m_sessionName, m_repo, QStringLiteral("ch_live"), terminalRowId);
     m_marker = QByteArrayLiteral("CH_LIVE_MARKER_") + terminalRowId.toLatin1();
 
     // Collect what the renderer would see, and acknowledge it as the renderer

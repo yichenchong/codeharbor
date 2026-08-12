@@ -211,6 +211,15 @@ void AppController::setAgentMonitor(AgentStatusMonitor* monitor)
                 [this](const QString&, const QString&, int) { applyAgentStateUpdate(); });
         connect(m_agentMonitor, &AgentStatusMonitor::unseenChanged, this,
                 [this](const QString&, bool) { applyAgentStateUpdate(); });
+        // A live agent tells us which harness a pane ACTUALLY runs, which is
+        // better information than the column a pane was minted with. Wired here
+        // rather than in the monitor because the authoritative tree — and the
+        // only sanctioned write path to it — live on this side.
+        connect(m_agentMonitor, &AgentStatusMonitor::harnessObserved, this,
+                [this](const QString&, const QString& terminalId,
+                       const QString& harness) {
+                    adoptObservedHarness(terminalId, harness);
+                });
     }
     // Re-merge immediately so a monitor set after the initial load reflects any
     // state it already accumulated, and a clear drops back to bare rows.
@@ -1621,6 +1630,32 @@ QString AppController::terminalPaneHarness(const QString& terminalPaneId) const
                 if (pane.id.value == terminalPaneId)
                     return pane.harness;
     return {};
+}
+
+void AppController::adoptObservedHarness(const QString& terminalPaneId,
+                                         const QString& harness)
+{
+    if (terminalPaneId.isEmpty())
+        return;
+    // "generic" is what the pane already says, and an empty observation says
+    // nothing at all; neither is an upgrade. isHarnessWire is checked here rather
+    // than left to the setter because an unknown name there is reported to the
+    // USER as a mistake, and an event the client does not understand is not the
+    // user's mistake. (parseEvent already drops such an event, so this arm is
+    // defence in depth against the two vocabularies drifting apart.)
+    if (harness.isEmpty() || harness == QLatin1String("generic")
+        || !detail::isHarnessWire(harness)) {
+        return;
+    }
+    // The ONLY value an observation may overwrite. Read from the last
+    // authoritative tree, so this is the value the server actually holds — see
+    // the overwrite rule in the header for why the other two arms are left
+    // alone. It is also what stops this looping: the write is followed by a
+    // refresh, after which the pane is no longer generic and a repeat
+    // observation finds nothing to do.
+    if (terminalPaneHarness(terminalPaneId) != QLatin1String("generic"))
+        return;
+    setTerminalPaneHarness(terminalPaneId, harness);
 }
 
 } // namespace ch

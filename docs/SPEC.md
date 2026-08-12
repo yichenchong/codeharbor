@@ -560,10 +560,32 @@ Suggested command:
 tmux new-session -A \
   -s 'ch_<dev-session-uuid>_<terminal-uuid>' \
   -c '/remote/working/directory' \
-  \; set-option -t '=ch_<dev-session-uuid>_<terminal-uuid>:' mouse on
+  -e 'OMP_DEV_SESSION_ID=<dev-session-uuid>' \
+  -e 'OMP_TERMINAL_ID=<terminal-uuid>' \
+  \; set-option -t '=ch_<dev-session-uuid>_<terminal-uuid>:' mouse on \
+  \; set-environment -t '=ch_<dev-session-uuid>_<terminal-uuid>:' \
+      OMP_DEV_SESSION_ID '<dev-session-uuid>' \
+  \; set-environment -t '=ch_<dev-session-uuid>_<terminal-uuid>:' \
+      OMP_TERMINAL_ID '<terminal-uuid>'
 ```
 
 Stable IDs should be used for tmux names rather than user-facing display names.
+
+PANE IDENTITY IN THE ENVIRONMENT. The two `OMP_*` variables are how an agent hook
+says which pane it is in: `remote/src/hooks/oh-my-pi-hook.ts` reads exactly these
+two names, and an event that arrives without them names no pane and is dropped.
+They are passed to the command builder as values, never parsed back out of the
+tmux target — the target is a formatted name, not a data source. Both are
+exported or neither is: a hook needs both halves.
+
+This does NOT retrofit a pane that is already running. `new-session -e` applies
+at session creation, and the command uses `-A`, so an attach to a session that
+already exists ignores every `-e`; the `set-environment` commands correct that
+session's environment, but a variable set now reaches only processes started
+afterwards, never the shell tmux is already running or an agent already running
+in it. Both limits verified on tmux 3.6. So the variables reach newly created
+sessions, new windows and panes, and agents started after the attach — an
+already-live agent keeps whatever environment it was forked with.
 
 The server owns the target string. Terminal targets supplied through the
 workspace RPC are accepted only when they are 1–200 characters from
@@ -855,6 +877,22 @@ reason this paragraph exists. The column remains the switch, not the default: a 
 change a pane's harness from the pane itself (naming its adapter, or "plain shell" to opt
 out of the clock entirely), and a pane stored before this was fixed keeps its NULL, and
 its silence, until somebody sets one.
+
+AUTODETECTION. A live agent event names the harness it came from, which is better
+information than the column: an event can only come from an adapter that exists.
+When one names a harness for a pane whose stored harness is exactly `generic`, the
+client writes the observed name to the column, through the same
+`workspace.updateTerminalPane` mutation the pane's own harness control uses, and
+only on a real change — an agent repeats its harness on every event and this must
+not become a write per event.
+
+`generic` is the ONLY value an observation may overwrite. A NULL or empty harness
+is the user's "plain shell, stay silent", and that choice exists precisely to
+report nothing, so something speaking in the pane is not a reason to overrule it;
+an explicit adapter is the user's answer to this same question and outranks an
+observation. A user who deliberately chose "Generic agent" is indistinguishable
+from the mint default and will be upgraded — accepted deliberately, rather than
+recording which of two identical values was meant in the schema.
 
 Loss of the SSH channel is a TRANSPORT condition, reported by the client's own connection
 state, so there is deliberately no `disconnected` agent state here.

@@ -645,15 +645,22 @@ void TstTerminalFactory::killCommandQuotesAdversarialTargets()
 // and the `-t` target with one.
 void TstTerminalFactory::attachCommandQuotesAdversarialIdsAndWorkingDir()
 {
+    // The pane identity is left unknown throughout: this case is about the
+    // target and the working directory, and the quoting of the exported
+    // OMP_DEV_SESSION_ID / OMP_TERMINAL_ID values is pinned next to the builder
+    // in tst_terminalcontroller. An unidentified pane exports neither, which
+    // keeps the quoted-argument count below meaningful.
     QCOMPARE(TerminalController::tmuxNewSessionCommand(QStringLiteral("ch_dev_t1"),
-                                                       QStringLiteral("/srv/repo")),
+                                                       QStringLiteral("/srv/repo"),
+                                                       QString(), QString()),
              QStringLiteral("tmux new-session -A -s 'ch_dev_t1' -c '/srv/repo'"
                             " \\; set-option -t '=ch_dev_t1:' mouse on"));
 
     // A working directory is the field most likely to carry a real quote, and
     // the one a user can type. Breaking out of it would run `id` on the host.
     QCOMPARE(TerminalController::tmuxNewSessionCommand(
-                 QStringLiteral("ch_dev_t1"), QStringLiteral("/tmp/x'; id; echo '")),
+                 QStringLiteral("ch_dev_t1"), QStringLiteral("/tmp/x'; id; echo '"),
+                 QString(), QString()),
              QStringLiteral("tmux new-session -A -s 'ch_dev_t1' "
                             "-c '/tmp/x'\\''; id; echo '\\'''"
                             " \\; set-option -t '=ch_dev_t1:' mouse on"));
@@ -662,7 +669,8 @@ void TstTerminalFactory::attachCommandQuotesAdversarialIdsAndWorkingDir()
     // reaches the command TWICE — as the new session's name and as the target
     // of the mouse option — so both copies are checked.
     QCOMPARE(TerminalController::tmuxNewSessionCommand(
-                 QStringLiteral("ch_d'; rm -rf ~; '_t`whoami`"), QStringLiteral("/w")),
+                 QStringLiteral("ch_d'; rm -rf ~; '_t`whoami`"), QStringLiteral("/w"),
+                 QString(), QString()),
              QStringLiteral("tmux new-session -A -s 'ch_d'\\''; rm -rf ~; '\\''_t`whoami`' "
                             "-c '/w'"
                             " \\; set-option -t "
@@ -672,7 +680,8 @@ void TstTerminalFactory::attachCommandQuotesAdversarialIdsAndWorkingDir()
     // getopt, and a newline is inert inside the quotes: neither adds a word to
     // the command.
     const QString command = TerminalController::tmuxNewSessionCommand(
-        QStringLiteral("ch_dev_t1"), QStringLiteral("-rf /\nrm -rf ~"));
+        QStringLiteral("ch_dev_t1"), QStringLiteral("-rf /\nrm -rf ~"), QString(),
+        QString());
     QCOMPARE(command,
              QStringLiteral("tmux new-session -A -s 'ch_dev_t1' -c '-rf /\nrm -rf ~'"
                             " \\; set-option -t '=ch_dev_t1:' mouse on"));

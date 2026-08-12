@@ -716,7 +716,20 @@ bool TerminalFactory::attach(TerminalController* controller,
 
     // Shell-safe quoting, from the hardened SPEC 5.2 helper. Nothing about the
     // command is assembled here, and nothing about the TARGET is decided here.
-    const QString command = TerminalController::tmuxNewSessionCommand(tmuxTarget, workingDir);
+    //
+    // The pane's identity comes out of the attachment record — the ids the
+    // SERVER reported for this pane — and is handed to the builder explicitly so
+    // it can export them into the tmux session for the agent hooks (SPEC 6.4).
+    // A pane that has not been resolved yet (tests without a workspace) has no
+    // recorded identity, and empty ids export nothing rather than a guess.
+    QString paneDevSessionId;
+    QString paneTerminalId;
+    if (const auto it = m_attached.constFind(pane.data()); it != m_attached.constEnd()) {
+        paneDevSessionId = it->devSessionId;
+        paneTerminalId = it->terminalId;
+    }
+    const QString command = TerminalController::tmuxNewSessionCommand(
+        tmuxTarget, workingDir, paneDevSessionId, paneTerminalId);
 
     // Record the tmux target BEFORE anything below can fail. targetFor() is
     // what kill() destroys, and it has to name the session THIS pane is now
