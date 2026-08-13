@@ -6,6 +6,7 @@
 #include "WorkspaceTypes.h"
 
 #include <QString>
+#include <QStringList>
 #include <QVector>
 
 #include <cstddef>
@@ -231,6 +232,19 @@ public:
     using LayoutCallback =
         std::function<void(std::optional<SplitNode>, std::optional<RpcError>)>;
     using OkCallback = std::function<void(std::optional<RpcError>)>;
+    // Answer of a delete that can destroy terminal panes. `tmuxTargets` is what
+    // the SERVER reports it actually destroyed (remote/src/rpc-types.ts
+    // DeleteWithTmuxTargetsResult), collected inside the deleting transaction.
+    //
+    // It exists because the client cannot work this out for itself: it would
+    // have to read its own last workspace.list, and a pane another client
+    // created or retargeted since then is destroyed by the same delete. Killing
+    // from that snapshot would leave the pane's shell running under a name
+    // nothing can ever produce again (SPEC 4.4). Empty on a server too old to
+    // report the field, which reads as "nothing to kill" — the safe direction,
+    // since the only alternative is inventing a target.
+    using DeleteCallback =
+        std::function<void(QStringList tmuxTargets, std::optional<RpcError>)>;
 
     explicit WorkspaceDb(CodeharbordClient* client);
     // No repository without a client: every method here dereferences it
@@ -252,14 +266,14 @@ public:
     // Groups.
     void createGroup(const CreateGroupParams& params, GroupCallback cb);
     void updateGroup(const UpdateGroupParams& params, GroupCallback cb);
-    void deleteGroup(const GroupId& id, OkCallback cb);
+    void deleteGroup(const GroupId& id, DeleteCallback cb);
     void reorderGroups(const ServerId& serverId,
                        const QVector<GroupId>& orderedIds, OkCallback cb);
 
     // Sessions.
     void createSession(const CreateSessionParams& params, SessionCallback cb);
     void updateSession(const UpdateSessionParams& params, SessionCallback cb);
-    void deleteSession(const DevSessionId& id, OkCallback cb);
+    void deleteSession(const DevSessionId& id, DeleteCallback cb);
     void reorderSessions(const GroupId& groupId,
                          const QVector<DevSessionId>& orderedIds, OkCallback cb);
     void moveSessionToGroup(const MoveSessionParams& params, SessionCallback cb);

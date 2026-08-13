@@ -221,6 +221,129 @@ test("deleteGroup cascades to sessions, panes, and layouts", async () => {
     await cleanup(dbPath);
 });
 
+// A deleted `terminal_panes` row is the last record of its tmux target, so the
+// delete itself has to report what it destroyed: after it returns, nothing in
+// the product can name those sessions again (SPEC 4.4).
+//
+// The pane created AFTER the caller's last read is the case that matters. A
+// client killing from its own cached tree would miss it entirely and leave a
+// shell running under a name it can never produce; the server reports it
+// because it collects inside the same transaction that deletes it.
+test("deleteSession reports the tmux targets of every pane it destroyed", async () => {
+    const dbPath = await tmpDbPath();
+    const ws = openWorkspace(dbPath);
+    const { session } = seed(ws);
+
+    // What a client's last workspace.list would have seen.
+    assert.deepEqual(
+        ws.list(SERVER)[0].sessions[0].terminalPanes.map((p) => p.tmuxTarget),
+        [`ch_${session.id}_orig`],
+    );
+
+    // Another client adds a pane after that read, and a pre-mint legacy row
+    // sits beside it with no target at all (every pane created THROUGH this
+    // API is born with one, so the NULL has to be written directly).
+    ws.createTerminalPane({
+        serverId: SERVER,
+        devSessionId: session.id,
+        name: "late",
+        tmuxTarget: `ch_${session.id}_late`,
+    });
+    const legacy = ws.createTerminalPane({
+        serverId: SERVER,
+        devSessionId: session.id,
+        name: "unattached",
+    });
+    ws.db.prepare("UPDATE terminal_panes SET tmux_target = NULL WHERE id = ?").run(legacy.id);
+
+    const result = ws.deleteSession({ id: session.id });
+    assert.equal(result.ok, true);
+    assert.deepEqual(result.tmuxTargets.slice().sort(), [
+        `ch_${session.id}_late`,
+        `ch_${session.id}_orig`,
+    ]);
+
+    ws.close();
+    await cleanup(dbPath);
+});
+
+// The same for the group cascade, across every session it takes with it.
+test("deleteGroup reports the tmux targets of every pane in every session", async () => {
+    const dbPath = await tmpDbPath();
+    const ws = openWorkspace(dbPath);
+    const { group, session } = seed(ws);
+    const second = ws.createSession({
+        serverId: SERVER,
+        groupId: group.id,
+        name: "second",
+        repositoryRoot: "/home/dev/other",
+    });
+    ws.createTerminalPane({
+        serverId: SERVER,
+        devSessionId: second.id,
+        name: "shell",
+        tmuxTarget: `ch_${second.id}_a`,
+    });
+    // No target: a pre-mint legacy row with nothing to kill behind it, so it
+    // must not be reported.
+    const legacy = ws.createTerminalPane({
+        serverId: SERVER,
+        devSessionId: second.id,
+        name: "unattached",
+    });
+    ws.db.prepare("UPDATE terminal_panes SET tmux_target = NULL WHERE id = ?").run(legacy.id);
+    // A sibling group's pane must NOT be swept up by the subquery.
+    const other = ws.createGroup({ serverId: SERVER, name: "Other" });
+    const otherSession = ws.createSession({
+        serverId: SERVER,
+        groupId: other.id,
+        name: "keep",
+        repositoryRoot: "/home/dev/keep",
+    });
+    ws.createTerminalPane({
+        serverId: SERVER,
+        devSessionId: otherSession.id,
+        name: "shell",
+        tmuxTarget: `ch_${otherSession.id}_keep`,
+    });
+
+    const result = ws.deleteGroup({ id: group.id });
+    assert.equal(result.ok, true);
+    assert.deepEqual(
+        result.tmuxTargets.slice().sort(),
+        [`ch_${second.id}_a`, `ch_${session.id}_orig`].sort(),
+    );
+
+    ws.close();
+    await cleanup(dbPath);
+});
+
+// deleteTerminalPane answers on the same terms, so all three deletes obey one
+// rule; a pane with no target reports an empty list rather than a blank string.
+test("deleteTerminalPane reports its own target, and nothing for an unattached pane", async () => {
+    const dbPath = await tmpDbPath();
+    const ws = openWorkspace(dbPath);
+    const { session, terminal } = seed(ws);
+    const unattached = ws.createTerminalPane({
+        serverId: SERVER,
+        devSessionId: session.id,
+        name: "unattached",
+    });
+    ws.db.prepare("UPDATE terminal_panes SET tmux_target = NULL WHERE id = ?").run(unattached.id);
+
+    assert.deepEqual(ws.deleteTerminalPane({ id: terminal.id }), {
+        ok: true,
+        tmuxTargets: [`ch_${session.id}_orig`],
+    });
+    assert.deepEqual(ws.deleteTerminalPane({ id: unattached.id }), {
+        ok: true,
+        tmuxTargets: [],
+    });
+
+    ws.close();
+    await cleanup(dbPath);
+});
+
 test("reorderGroups rewrites positions to match the given order", async () => {
     const dbPath = await tmpDbPath();
     const ws = openWorkspace(dbPath);
@@ -2300,7 +2423,10 @@ test("a retired index is dropped from an existing database", async () => {
     // find the referencing sessions through the surviving composite index.
     assert.throws(() => upgraded.db.prepare("DELETE FROM groups WHERE id = ?").run(group.id));
     // And the real cascade still works.
-    assert.deepEqual(upgraded.deleteGroup({ id: group.id }), { ok: true });
+    assert.deepEqual(upgraded.deleteGroup({ id: group.id }), {
+        ok: true,
+        tmuxTargets: [`ch_${session.id}_orig`],
+    });
     assert.deepEqual(upgraded.list(SERVER), []);
     upgraded.close();
 
@@ -3276,13 +3402,21 @@ test("deleting a row that is already gone succeeds instead of throwing", async (
 
     assert.deepEqual(ws.deleteViewerPane({ id: viewer.id }), { ok: true });
     assert.deepEqual(ws.deleteViewerPane({ id: viewer.id }), { ok: true });
-    assert.deepEqual(ws.deleteTerminalPane({ id: terminal.id }), { ok: true });
-    assert.deepEqual(ws.deleteTerminalPane({ id: terminal.id }), { ok: true });
-    assert.deepEqual(ws.deleteSession({ id: session.id }), { ok: true });
-    assert.deepEqual(ws.deleteSession({ id: session.id }), { ok: true });
-    assert.deepEqual(ws.deleteGroup({ id: group.id }), { ok: true });
-    assert.deepEqual(ws.deleteGroup({ id: group.id }), { ok: true });
-    assert.deepEqual(ws.deleteGroup({ id: "never-existed" }), { ok: true });
+    // The first delete really destroys the pane, so it reports the target the
+    // client has to kill; the repeat destroyed nothing and reports nothing.
+    assert.deepEqual(ws.deleteTerminalPane({ id: terminal.id }), {
+        ok: true,
+        tmuxTargets: [`ch_${session.id}_orig`],
+    });
+    assert.deepEqual(ws.deleteTerminalPane({ id: terminal.id }), {
+        ok: true,
+        tmuxTargets: [],
+    });
+    assert.deepEqual(ws.deleteSession({ id: session.id }), { ok: true, tmuxTargets: [] });
+    assert.deepEqual(ws.deleteSession({ id: session.id }), { ok: true, tmuxTargets: [] });
+    assert.deepEqual(ws.deleteGroup({ id: group.id }), { ok: true, tmuxTargets: [] });
+    assert.deepEqual(ws.deleteGroup({ id: group.id }), { ok: true, tmuxTargets: [] });
+    assert.deepEqual(ws.deleteGroup({ id: "never-existed" }), { ok: true, tmuxTargets: [] });
 
     // Reading a row that is gone is still an error — a delete answering "ok" is
     // about repeating a request, not about pretending the row is there.

@@ -842,7 +842,7 @@ Rectangle {
         modal: true
         standardButtons: Dialog.Ok | Dialog.Cancel
         anchors.centerIn: Overlay.overlay
-        width: 420
+        preferredWidth: 420
 
         // The choice so far, as a WIRE value. Held here rather than read back
         // off the buttons because the empty string is a real answer ("plain
@@ -867,6 +867,10 @@ Rectangle {
         }
 
         ColumnLayout {
+            // Fill the dialog's content area — see the note on the close
+            // confirmation below. Without it this layout keeps its own implicit
+            // width and its wrapped text paints outside a clamped frame.
+            anchors.fill: parent
             implicitWidth: 380
             spacing: 8
 
@@ -933,9 +937,16 @@ Rectangle {
         // Enter cancels rather than closing: the affirmative answer ends the
         // remote session and loses whatever it was running. See SessionRow.qml.
         defaultButton: Dialog.Cancel
-        width: 400
+        preferredWidth: 400
 
         ColumnLayout {
+            // Fill the dialog's content area. A Dialog does NOT lay its
+            // content out: a child declared here keeps its own implicit
+            // width, so without this the layout stayed 360 wide inside a
+            // frame clamped narrower than that and the text painted
+            // outside the sheet (measured: a 529-wide label in a 344-wide
+            // dialog). Anchored, the fillWidth children wrap to fit.
+            anchors.fill: parent
             implicitWidth: 360
 
             Label {

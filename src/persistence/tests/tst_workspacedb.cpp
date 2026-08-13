@@ -989,17 +989,21 @@ void TstWorkspaceDb::malformedResultsDeliverRpcErrorInsteadOfBlankRecords()
     QVERIFY(!layoutErr.has_value());
 }
 
-// The delete methods discard the result entirely and report only success or
-// failure. Nothing covered one, so neither the parameter shape nor the fact that
-// a server error reaches the caller was pinned for this whole family.
+// The delete methods that can destroy terminal panes report WHICH remote tmux
+// sessions went with them (remote/src/rpc-types.ts DeleteWithTmuxTargetsResult),
+// because after the delete nothing else can name them. Nothing covered one, so
+// neither the parameter shape, nor that the targets reach the caller, nor that
+// a server error does, was pinned for this whole family.
 void TstWorkspaceDb::deleteSessionSerializesIdAndForwardsOutcome()
 {
     makePair();
 
+    QStringList targets;
     std::optional<RpcError> err;
     bool fired = false;
     m_db->deleteSession(ch::DevSessionId{QStringLiteral("s1")},
-                        [&](std::optional<RpcError> e) {
+                        [&](QStringList t, std::optional<RpcError> e) {
+                            targets = t;
                             err = e;
                             fired = true;
                         });
@@ -1011,18 +1015,46 @@ void TstWorkspaceDb::deleteSessionSerializesIdAndForwardsOutcome()
                  .value(QStringLiteral("id")).toString(),
              QStringLiteral("s1"));
 
+    m_serverSide->write(jsonLine(
+        {{"jsonrpc", "2.0"},
+         {"id", req.value(QStringLiteral("id")).toInt()},
+         {"result", QJsonObject{{"ok", true},
+                                {"tmuxTargets",
+                                 QJsonArray{QStringLiteral("ch_s1_a"),
+                                            QStringLiteral("ch_s1_b")}}}}}));
+    m_serverSide->flush();
+    QTRY_VERIFY(fired);
+    QVERIFY(!err.has_value());
+    QCOMPARE(targets, QStringList({QStringLiteral("ch_s1_a"),
+                                   QStringLiteral("ch_s1_b")}));
+
+    // A `codeharbord` too old to report the field answers with `ok` alone. That
+    // decodes to "nothing to kill" rather than to a guess: the client has no
+    // way to name a tmux session the server did not hand it (SPEC 5.2).
+    targets = QStringList{QStringLiteral("stale")};
+    fired = false;
+    m_db->deleteSession(ch::DevSessionId{QStringLiteral("s2")},
+                        [&](QStringList t, std::optional<RpcError> e) {
+                            targets = t;
+                            err = e;
+                            fired = true;
+                        });
+    req = readRequest();
     m_serverSide->write(jsonLine({{"jsonrpc", "2.0"},
                                   {"id", req.value(QStringLiteral("id")).toInt()},
                                   {"result", QJsonObject{{"ok", true}}}}));
     m_serverSide->flush();
     QTRY_VERIFY(fired);
     QVERIFY(!err.has_value());
+    QVERIFY(targets.isEmpty());
 
     // A server-side failure is forwarded verbatim rather than swallowed.
     err.reset();
+    targets = QStringList{QStringLiteral("stale")};
     fired = false;
     m_db->deleteSession(ch::DevSessionId{QStringLiteral("gone")},
-                        [&](std::optional<RpcError> e) {
+                        [&](QStringList t, std::optional<RpcError> e) {
+                            targets = t;
                             err = e;
                             fired = true;
                         });
@@ -1036,6 +1068,48 @@ void TstWorkspaceDb::deleteSessionSerializesIdAndForwardsOutcome()
     QVERIFY(err.has_value());
     QCOMPARE(err->code, -32602);
     QCOMPARE(err->message, QStringLiteral("no such session"));
+    // A failed delete destroyed nothing, so it reports nothing to kill.
+    QVERIFY(targets.isEmpty());
+
+    // Shapes the client does NOT understand are reported, not read as "success,
+    // nothing to kill". That reading is the dangerous one: it looks exactly like
+    // a clean delete of a session with no terminals, so the sidebar refreshes as
+    // though the rows are gone while any tmux session behind that response keeps
+    // running with nobody told. `{ok: true}` alone stays legal (an older server,
+    // covered above); everything here does not.
+    const QVector<QJsonValue> rejected{
+        QJsonValue(true),                                     // a bare boolean
+        QJsonValue(QJsonArray{}),                             // not an object
+        QJsonValue(QJsonObject{}),                            // no `ok` at all
+        QJsonValue(QJsonObject{{"ok", false}}),               // `ok` says no
+        QJsonValue(QJsonObject{{"ok", true}, {"tmuxTargets", 7}}),
+        QJsonValue(QJsonObject{{"ok", true},
+                               {"tmuxTargets", QJsonArray{7}}}),
+    };
+    for (const QJsonValue& result : rejected) {
+        err.reset();
+        targets = QStringList{QStringLiteral("stale")};
+        fired = false;
+        m_db->deleteSession(ch::DevSessionId{QStringLiteral("s3")},
+                            [&](QStringList t, std::optional<RpcError> e) {
+                                targets = t;
+                                err = e;
+                                fired = true;
+                            });
+        req = readRequest();
+        m_serverSide->write(jsonLine({{"jsonrpc", "2.0"},
+                                      {"id", req.value(QStringLiteral("id")).toInt()},
+                                      {"result", result}}));
+        m_serverSide->flush();
+        QTRY_VERIFY(fired);
+        QVERIFY2(err.has_value(),
+                 qPrintable(QStringLiteral("accepted a malformed delete result: %1")
+                                .arg(QString::fromUtf8(
+                                    QJsonDocument(QJsonArray{result}).toJson(
+                                        QJsonDocument::Compact)))));
+        QVERIFY(err->message.contains(QStringLiteral("malformed")));
+        QVERIFY(targets.isEmpty());
+    }
 }
 
 // reorderSessions is keyed by groupId, not serverId (unlike reorderGroups), and

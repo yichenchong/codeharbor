@@ -581,9 +581,16 @@ ItemDelegate {
         // answer destroys a Dev Session, and a stray keypress must not be able
         // to do that. The delete button is still one Tab and a Space away.
         defaultButton: Dialog.Cancel
-        width: 400
+        preferredWidth: 400
 
         ColumnLayout {
+            // Fill the dialog's content area. A Dialog does NOT lay its
+            // content out: a child declared here keeps its own implicit
+            // width, so without this the layout stayed 360 wide inside a
+            // frame clamped narrower than that and the text painted
+            // outside the sheet (measured: a 529-wide label in a 344-wide
+            // dialog). Anchored, the fillWidth children wrap to fit.
+            anchors.fill: parent
             implicitWidth: 360
 
             Label {
@@ -591,7 +598,7 @@ ItemDelegate {
                 Layout.fillWidth: true
                 textFormat: Text.PlainText
                 wrapMode: Text.WordWrap
-                text: qsTr("Delete the Dev Session \"%1\"? This permanently destroys it and cannot be undone.")
+                text: qsTr("Delete the Dev Session \"%1\"? This permanently destroys it, kills the remote tmux sessions of its terminal panes, and cannot be undone.")
                       .arg(row.name)
             }
         }

@@ -20,7 +20,7 @@ import os from "node:os";
 import path from "node:path";
 
 import { RPC_WORKSPACE_METHODS as M } from "./rpc-types.ts";
-import type { RpcWorkspaceMethodName } from "./rpc-types.ts";
+import type { RpcWorkspaceMethodName, DeleteWithTmuxTargetsResult } from "./rpc-types.ts";
 import {
     requireObject,
     requireString,
@@ -1301,13 +1301,20 @@ export class Workspace {
     // Deleting a group that does not exist is a successful no-op, deliberately:
     // a client that retries a delete after a dropped connection must not be
     // told the second attempt failed.
-    deleteGroup(params: { id: string }): { ok: true } {
+    deleteGroup(params: { id: string }): DeleteWithTmuxTargetsResult {
         return this.transaction(() => {
             // Read the owning server BEFORE the row goes, so the scope whose
             // positions need closing up afterwards can still be named.
             const row = this.db
                 .prepare("SELECT server_id FROM groups WHERE id = ?")
                 .get(params.id) as { server_id: string } | undefined;
+            // Same "before the row goes" rule, for the same reason, applied to
+            // the tmux sessions the client has to kill afterwards: this is the
+            // last moment anything can name them (SPEC 4.4).
+            const tmuxTargets = this.collectTmuxTargets(
+                "SELECT tmux_target FROM terminal_panes WHERE dev_session_id IN (SELECT id FROM dev_sessions WHERE group_id = ?)",
+                params.id,
+            );
             for (const table of ["viewer_panes", "terminal_panes", "session_layouts"] as const) {
                 this.db
                     .prepare(
@@ -1322,7 +1329,7 @@ export class Workspace {
             // deleted group's own sessions and panes need no repacking — their
             // whole scope went with it.
             if (row) this.repackScope("groups", "server_id", row.server_id, Date.now());
-            return { ok: true } as const;
+            return { ok: true, tmuxTargets } as const;
         });
     }
 
@@ -1419,15 +1426,19 @@ export class Workspace {
 
     // Deleting a session that is not there is a successful no-op, for the same
     // reason deleteGroup's is.
-    deleteSession(params: { id: string }): { ok: true } {
+    deleteSession(params: { id: string }): DeleteWithTmuxTargetsResult {
         return this.transaction(() => {
             // Read the owning group BEFORE the row goes — see deleteGroup.
             const row = this.db
                 .prepare("SELECT group_id FROM dev_sessions WHERE id = ?")
                 .get(params.id) as { group_id: string } | undefined;
+            const tmuxTargets = this.collectTmuxTargets(
+                "SELECT tmux_target FROM terminal_panes WHERE dev_session_id = ?",
+                params.id,
+            );
             this.deleteSessionRows(params.id);
             if (row) this.repackScope("dev_sessions", "group_id", row.group_id, Date.now());
-            return { ok: true } as const;
+            return { ok: true, tmuxTargets } as const;
         });
     }
 
@@ -1947,18 +1958,27 @@ export class Workspace {
     // that is not there is a successful no-op, both regions are repaired, and
     // the position gap is closed — all against one timestamp; see
     // deleteViewerPane for each.
-    deleteTerminalPane(params: { id: string }): { ok: true } {
+    // Answers with the pane's tmux target too, on the same terms as
+    // deleteSession/deleteGroup. This caller — the pane's own confirmed close —
+    // already killed the session before removing the row, so the list is
+    // normally acted on by nobody; reporting it anyway keeps one rule for all
+    // three deletes instead of a special case a later caller has to know about.
+    deleteTerminalPane(params: { id: string }): DeleteWithTmuxTargetsResult {
         return this.transaction(() => {
             const row = this.db
                 .prepare("SELECT dev_session_id FROM terminal_panes WHERE id = ?")
                 .get(params.id) as { dev_session_id: string } | undefined;
+            const tmuxTargets = this.collectTmuxTargets(
+                "SELECT tmux_target FROM terminal_panes WHERE id = ?",
+                params.id,
+            );
             const ts = Date.now();
             this.db.prepare("DELETE FROM terminal_panes WHERE id = ?").run(params.id);
             if (row) {
                 this.repairLayoutsForPane(row.dev_session_id, params.id, ts);
                 this.repackScope("terminal_panes", "dev_session_id", row.dev_session_id, ts);
             }
-            return { ok: true } as const;
+            return { ok: true, tmuxTargets } as const;
         });
     }
 
@@ -2251,6 +2271,24 @@ export class Workspace {
         this.db.prepare("DELETE FROM terminal_panes WHERE dev_session_id = ?").run(id);
         this.db.prepare("DELETE FROM session_layouts WHERE dev_session_id = ?").run(id);
         this.db.prepare("DELETE FROM dev_sessions WHERE id = ?").run(id);
+    }
+
+    // The tmux targets selected by `sql` (one `?`, bound to `param`), for the
+    // terminal panes a delete is ABOUT to destroy. Always called inside the
+    // deleting transaction, so what it reports is exactly what went: a pane
+    // another client added or retargeted a moment ago is included, and a client
+    // killing from its own last workspace read would have missed it.
+    //
+    // A NULL or empty target means the pane was never attached and has no
+    // remote session, so it is dropped here — the caller receives targets it
+    // can act on and nothing else.
+    private collectTmuxTargets(sql: string, param: string): string[] {
+        const rows = this.db.prepare(sql).all(param) as unknown as Array<{
+            tmux_target: string | null;
+        }>;
+        return rows
+            .map((r) => r.tmux_target)
+            .filter((t): t is string => typeof t === "string" && t.length > 0);
     }
 
     // Ids of one ordered scope, in listing order. See OrderedScope on why the

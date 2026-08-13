@@ -640,6 +640,16 @@ Rectangle {
         anchors.centerIn: Overlay.overlay
         // Enter cancels rather than deleting the profile. See SessionRow.qml.
         defaultButton: Dialog.Cancel
+        // A CONSTANT width, not AppDialog's clamped `preferredWidth`, and that
+        // is deliberate. This dialog's content is a Label that binds its own
+        // width back to the frame (below), and making the frame's width dynamic
+        // as well made Qt report a binding loop on the dialog's implicitHeight —
+        // reproduced by switching this one line and gone when it is switched
+        // back. The clamp buys little here anyway: the message already tracks
+        // whatever width the frame has, so only the frame itself could overhang,
+        // and only in a window narrower than 400 — which the settings surface
+        // never is. The dialogs that needed the clamp are the sidebar's and the
+        // terminal's, and they have it.
         width: 400
 
         Label {

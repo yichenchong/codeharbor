@@ -2643,7 +2643,7 @@ void TstSessionLayouts::liveLayoutRoundTripOverSsh()
     // rejection visible instead of silently carrying rows into the next run.
     bool cleaned = false;
     std::optional<RpcError> cleanupError;
-    db.deleteGroup(group->id, [&](std::optional<RpcError> error) {
+    db.deleteGroup(group->id, [&](QStringList, std::optional<RpcError> error) {
         cleanupError = error;
         cleaned = true;
     });

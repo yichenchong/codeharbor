@@ -1585,7 +1585,7 @@ void TstTerminalPage::livePaneRendersARealRemoteShell()
 
     bool cleaned = false;
     std::optional<ch::RpcError> cleanupError;
-    db.deleteGroup(group->id, [&](std::optional<ch::RpcError> error) {
+    db.deleteGroup(group->id, [&](QStringList, std::optional<ch::RpcError> error) {
         cleanupError = error;
         cleaned = true;
     });

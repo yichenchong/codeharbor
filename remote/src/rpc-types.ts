@@ -364,6 +364,27 @@ export interface WorkspaceListParams {
     pinnedOnly?: boolean;
 }
 
+// What a workspace delete that can destroy terminal panes answers with.
+//
+// `ok` is unchanged and still the whole answer for a caller that only wanted
+// the rows gone; `tmuxTargets` is the addition: the tmux target of every
+// `terminal_panes` row the delete ACTUALLY destroyed, read inside the same
+// transaction that destroyed it.
+//
+// Only the server can answer this. A client kills from its last workspace read,
+// and a pane another client created or retargeted since that read is deleted
+// here just the same — killing from the stale snapshot would leave that pane's
+// shell (and any agent in it) running under a name nothing can ever produce
+// again, which is the exact orphan the kill exists to prevent (SPEC 4.4).
+//
+// A row whose target is NULL or empty was never attached and has no remote
+// session, so it is omitted here rather than reported as a blank the caller
+// has to filter.
+export interface DeleteWithTmuxTargetsResult {
+    ok: true;
+    tmuxTargets: string[];
+}
+
 export const RPC_WORKSPACE_METHODS = {
     list: "workspace.list",
     createGroup: "workspace.createGroup",

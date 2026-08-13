@@ -1602,6 +1602,28 @@ void TstUxShell::sidebarDeleteActionsAreConfirmedAndNamed()
         surface.child(QStringLiteral("deleteSessionMessage:s-visible"));
     QVERIFY2(sessionDialog && sessionDialog->property("visible").toBool(),
              "deleting a Dev Session did not open its confirmation");
+    // A confirmation wider than the window it opens in hangs off the side of the
+    // application, with its buttons — including Cancel — partly or wholly off
+    // screen. The surface above is 360 wide on purpose: it is the sidebar's own
+    // width, and the narrowest thing this dialog can legitimately open over.
+    {
+        const qreal dialogWidth = sessionDialog->property("width").toReal();
+        QVERIFY2(dialogWidth <= surface.view.width(),
+                 qPrintable(QStringLiteral("the confirmation is %1 wide in a %2 wide "
+                                           "window, so it hangs outside it")
+                                .arg(dialogWidth)
+                                .arg(surface.view.width())));
+        // Clamping the frame is only half of it: the message inside carries its
+        // own width, and text painted wider than the sheet it sits on runs
+        // outside the box just as visibly as the sheet running off the window.
+        QVERIFY(sessionMessage);
+        const qreal messageWidth = sessionMessage->property("width").toReal();
+        QVERIFY2(messageWidth <= dialogWidth,
+                 qPrintable(QStringLiteral("the message is %1 wide inside a %2 wide "
+                                           "confirmation")
+                                .arg(messageWidth)
+                                .arg(dialogWidth)));
+    }
     QVERIFY(sessionMessage);
     QVERIFY(sessionMessage->property("text").toString().contains(
         QStringLiteral("s-visible")));
