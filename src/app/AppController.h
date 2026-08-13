@@ -171,6 +171,9 @@ public:
     Q_INVOKABLE void createGroup(QString name);
     Q_INVOKABLE void renameGroup(QString id, QString name);
     Q_INVOKABLE void setGroupCollapsed(QString id, bool collapsed);
+    // Destroys the group's Dev Sessions with it, and therefore also kills the
+    // remote tmux sessions of every terminal pane those Dev Sessions own — see
+    // deleteSession() for why destroying a row is the one path that kills.
     Q_INVOKABLE void deleteGroup(QString id);
     // Count the sessions in the last authoritative tree, including rows hidden
     // by client-local pin/archive filters. The group confirmation uses this
@@ -185,6 +188,14 @@ public:
     Q_INVOKABLE void unarchiveSession(QString id);
     Q_INVOKABLE void duplicateSession(QString id);
     Q_INVOKABLE void moveSession(QString id, QString groupId, int position);
+    // Destroys the Dev Session's panes and layouts, and kills the remote tmux
+    // sessions of its terminal panes (SPEC 4.4). That is the one deviation from
+    // "nothing but the pane's own close button kills": every other path leaves
+    // the pane's row behind with its server-minted target in it, so the session
+    // can be re-attached later, whereas a deleted row can never name its
+    // session again and would strand it running for ever. WHICH sessions are
+    // killed is the server's answer, not this client's guess: the delete
+    // reports the targets it destroyed (WorkspaceDb::DeleteCallback).
     Q_INVOKABLE void deleteSession(QString id);
     Q_INVOKABLE void reorderSessions(QString groupId, QStringList orderedIds);
     // Terminal pane mutations.
@@ -284,6 +295,31 @@ private:
     // the pane at all. terminalPaneHarness() flattens both to an empty string,
     // which is ambiguous here: an empty harness is also "plain shell".
     std::optional<QString> lookupTerminalPaneHarness(const QString& terminalPaneId) const;
+
+    // The name to blame in a kill-failure message: the Dev Session's or the
+    // group's own name from the last authoritative tree, falling back to the id
+    // when this client has never seen that row. Presentation only — the targets
+    // themselves come from the server's delete result and never from this tree.
+    QString sessionLabel(const QString& devSessionId) const;
+    QString groupLabel(const QString& groupId) const;
+
+    // Kill the remote sessions the SERVER reported it destroyed, one
+    // tmux.killSession per target (SPEC 4.4). `subject` is what the user
+    // deleted, for the message below.
+    //
+    // The targets are never derived from m_lastNodes: that is a snapshot of our
+    // last read, and a pane another client created or retargeted since then is
+    // destroyed by the same delete. Killing from the snapshot would miss it and
+    // strand exactly the orphan this exists to prevent, so the server reports
+    // what it destroyed (WorkspaceDb::DeleteCallback) and this kills that.
+    //
+    // Called only after the server has CONFIRMED the deletion, so a failure
+    // here cannot and must not undo anything: it is reported through `error`,
+    // naming the subject and the target, and left for the user to clean up by
+    // hand. Nothing is retried — the row is already gone, so a retry has no
+    // state to work from and the daemon's kill is idempotent anyway.
+    void killReportedTerminals(const QStringList& tmuxTargets,
+                               const QString& subject);
 
     // Build a WorkspaceDb callback that, once the async response arrives, is a
     // no-op if this controller was already destroyed (the shared client keeps

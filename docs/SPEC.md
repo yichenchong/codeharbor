@@ -315,13 +315,18 @@ distinguishably from the pin marker.
 
 Deleting is permanent. Deleting a Dev Session destroys its panes and layouts with
 it; deleting a GROUP destroys every session inside it, because the server removes
-the group's sessions and their panes and layouts in one transaction. Both are
+the group's sessions and their panes and layouts in one transaction. Both also
+kill the remote tmux sessions of the terminal panes they destroy (§4.4), and the
+confirmation says so: the destroyed row is the only record of a pane's tmux
+target, so a session left running after it could never be reached again. Both are
 therefore confirmed before anything happens, and the confirmation NAMES its
 subject — a group's confirmation states how many sessions will be destroyed with
 it, counted from the authoritative workspace rather than from the filtered
 sidebar, so hidden rows are included in the number. A deletion the server refuses
-leaves the row where it is and reports the failure; the row must never disappear
-optimistically and reappear on the next refresh.
+leaves the row where it is, kills nothing, and reports the failure; the row must
+never disappear optimistically and reappear on the next refresh. A kill that
+fails after a deletion the server accepted is reported by name and changes
+nothing about the deletion.
 
 Both filters are presentation only. Neither may narrow what the client believes
 the workspace contains: the same tree answers "does the open Dev Session still
@@ -367,15 +372,36 @@ Closing a terminal pane from that pane's own close button kills its tmux session
 separate controls and they are now one: the button asks for confirmation, then ends the remote tmux
 session and removes the pane.
 
-**Nothing else kills.** Only a deliberate press of a terminal pane's own close button ends a remote
-session. Every other way a pane can disappear leaves the tmux session running on the server, to be
-re-attached later: closing the application window or quitting the client, a dropped SSH connection and
-every rung of the reconnect ladder, switching to another Dev Session, a layout being replaced, reloaded
-or repaired from the server, closing a region/group/session from the sidebar, and a terminal region
-destroying a pane for any internal reason. Those paths all end at the pane's destruction handler, which
-DETACHES. This is the point of running the shells under tmux at all, and wiring the kill to pane
-destruction rather than to the button press would silently destroy every long-running remote session
-the moment the user closed the window.
+**Nothing else kills, unless the row that owns the pane is destroyed.** Only a deliberate press of a
+terminal pane's own close button ends a remote session for a pane whose row survives. Every other way
+a pane can disappear leaves the tmux session running on the server, to be re-attached later: closing
+the application window or quitting the client, a dropped SSH connection and every rung of the
+reconnect ladder, switching to another Dev Session, a layout being replaced, reloaded or repaired from
+the server, closing a region from the sidebar, and a terminal region destroying a pane for any
+internal reason. Those paths all end at the pane's destruction handler, which DETACHES. This is the
+point of running the shells under tmux at all, and wiring the kill to pane destruction rather than to
+the button press would silently destroy every long-running remote session the moment the user closed
+the window.
+
+**Deleting the owning row is the one exception.** Deleting a Dev Session — or deleting a group, which
+destroys the Dev Sessions inside it — also kills the tmux sessions of the terminal panes those rows
+own (§4.2). Every path listed above leaves a row behind: the pane's `terminal_panes` row still records
+its server-minted target, so the user can come back and re-attach, and that is exactly what makes not
+killing there the right thing. A DELETED row can never name its session again — nothing in the product
+can, because the server is the only place a target is ever minted — so the session would run forever,
+holding its shell and any agent inside it, killable only by hand over SSH. Not killing there does not
+preserve the user's work, it strands it.
+
+The ordering is delete FIRST, then kill, and **the SERVER says what to kill.** The delete collects the
+tmux target of every terminal pane it is about to destroy inside the same transaction that destroys
+them, and answers with that list; the client kills exactly those. It must not kill from its own last
+workspace read: that is a snapshot, and a pane another client created or retargeted since then is
+destroyed by the same delete, so killing from the snapshot would miss it and strand precisely the
+orphan described above. A delete the server refuses reports no targets and kills nothing. A pane that
+was never attached has no target and the server leaves it out. A kill that fails is reported by name
+so the user can clean up by hand, but it never rolls back or blocks the deletion, which has already
+happened on the server. A client talking to a server too old to report the list kills nothing rather
+than guessing: target names are minted by the server and nowhere else (§5.2).
 
 Possible operations:
 
@@ -391,7 +417,8 @@ wrong guess splits or closes something the user was not looking at. Because
 closing a terminal pane is now irreversible, that guess would destroy running
 remote work, so there is no palette command to kill a terminal at all: the
 palette's "Close Focused Terminal Pane" removes the pane and leaves its session
-running, and only the pane's own button — which names itself — kills. Closing a
+running, and of the terminal region's own controls only the pane's own button —
+which names itself — kills. Closing a
 terminal pane is confirmed before it happens; closing a viewer pane is not,
 because it destroys nothing on the server.
 
@@ -1706,7 +1733,8 @@ Every remaining command — splitting a viewer or terminal pane, closing a focus
 pane, disconnecting from the server, marking agent output seen — is reachable
 through the palette only and carries no key sequence. Killing a terminal's remote
 tmux session is not among them and has no key sequence either: it happens only
-as part of a terminal pane's own confirmed close (§4.4).
+as part of a terminal pane's own confirmed close, or as part of a confirmed
+deletion of the Dev Session or group that owns the pane (§4.4).
 
 Originally suggested defaults, and how they were reconciled:
 

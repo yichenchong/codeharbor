@@ -107,6 +107,71 @@ QJsonObject takeRequest(FakeTransport& transport)
     return QJsonDocument::fromJson(line).object();
 }
 
+// Every JSON-RPC request written since the last drain, in order. takeRequest()
+// reads only the FIRST line, which stops being enough once one acknowledged
+// delete produces a tmux.killSession per destroyed pane before its refresh.
+QVector<QJsonObject> takeRequests(FakeTransport& transport)
+{
+    QVector<QJsonObject> requests;
+    const QList<QByteArray> lines = transport.takeSent().split('\n');
+    for (const QByteArray& line : lines) {
+        if (line.isEmpty())
+            continue;
+        requests.push_back(QJsonDocument::fromJson(line).object());
+    }
+    return requests;
+}
+
+// A workspace.list success frame for one group whose Dev Sessions own the
+// terminal panes described by `sessions`: each entry is a Dev Session id and
+// the tmux targets of its panes, in order. An EMPTY target writes a row with
+// no `tmuxTarget` at all, which is what a pane that has never attached looks
+// like on the wire.
+QByteArray listWithTerminalTargetsFrame(
+    int id, const QString& groupName,
+    const QVector<QPair<QString, QStringList>>& sessions)
+{
+    QJsonArray sessionArray;
+    for (const QPair<QString, QStringList>& entry : sessions) {
+        QJsonArray panes;
+        int index = 0;
+        for (const QString& target : entry.second) {
+            QJsonObject pane{
+                {"id", QStringLiteral("%1-t%2").arg(entry.first).arg(index++)},
+                {"devSessionId", entry.first}};
+            if (!target.isEmpty())
+                pane.insert(QStringLiteral("tmuxTarget"), target);
+            panes.append(pane);
+        }
+        sessionArray.append(QJsonObject{{"id", entry.first},
+                                        {"name", entry.first},
+                                        {"terminalPanes", panes}});
+    }
+    const QJsonObject group{{"id", groupName},
+                            {"name", groupName},
+                            {"sessions", sessionArray}};
+    const QJsonObject resp{{"jsonrpc", "2.0"},
+                           {"id", id},
+                           {"result", QJsonArray{group}}};
+    return QJsonDocument(resp).toJson(QJsonDocument::Compact) + '\n';
+}
+
+// A workspace.deleteSession / deleteGroup success frame, in the shape
+// remote/src/rpc-types.ts DeleteWithTmuxTargetsResult defines: `ok` plus the
+// tmux targets the SERVER reports it destroyed. That list, not the client's
+// cached tree, is what the kills are driven from.
+QByteArray deleteAckFrame(int id, const QStringList& tmuxTargets)
+{
+    QJsonArray targets;
+    for (const QString& target : tmuxTargets)
+        targets.append(target);
+    const QJsonObject resp{
+        {"jsonrpc", "2.0"},
+        {"id", id},
+        {"result", QJsonObject{{"ok", true}, {"tmuxTargets", targets}}}};
+    return QJsonDocument(resp).toJson(QJsonDocument::Compact) + '\n';
+}
+
 // A workspace.list success frame carrying exactly one group of the given name.
 QByteArray listResultFrame(int id, const QString& groupName)
 {
@@ -397,6 +462,10 @@ private slots:
     void deleteGroupSendsRequestAndRefreshes();
     void deleteGroupErrorEmitsErrorWithoutRefresh();
     void deleteSessionErrorEmitsErrorWithoutRefresh();
+    void deletingASessionKillsItsPanesRemoteSessions();
+    void deletingASessionSkipsAPaneThatWasNeverAttached();
+    void aFailedKillIsReportedAndTheDeletionStands();
+    void deletingAGroupKillsEveryPaneOfEverySessionInIt();
     void archiveSessionSendsArchivedAndRefreshes();
     void archiveSessionErrorEmitsErrorWithoutRefresh();
     void setTerminalPaneHarnessWritesTheRowAndRefreshes();
@@ -902,10 +971,12 @@ void TstAppController::deleteGroupSendsRequestAndRefreshes()
                  .toString(),
              QStringLiteral("g1"));
 
-    const QJsonObject ack{{"jsonrpc", "2.0"},
-                          {"id", deleteReq.value(QStringLiteral("id")).toInt()},
-                          {"result", true}};
-    transport.deliver(QJsonDocument(ack).toJson(QJsonDocument::Compact) + '\n');
+    // The real shape: a delete answers with `ok` and the targets it destroyed
+    // (remote/src/rpc-types.ts DeleteWithTmuxTargetsResult). A bare `true` is
+    // not something codeharbord ever sends, and the client now refuses it rather
+    // than reading it as a clean delete of a session with no terminals.
+    transport.deliver(deleteAckFrame(deleteReq.value(QStringLiteral("id")).toInt(),
+                                     QStringList()));
 
     const QJsonObject refreshReq = takeRequest(transport);
     QCOMPARE(refreshReq.value(QStringLiteral("method")).toString(),
@@ -968,6 +1039,202 @@ void TstAppController::deleteSessionErrorEmitsErrorWithoutRefresh()
     QCOMPARE(errors.at(0).at(0).toString(), QStringLiteral("session is locked"));
     QCOMPARE(controller.sessionsModel()->rowCount(), 1);
     QVERIFY(transport.takeSent().isEmpty());
+}
+
+// Destroying a Dev Session's row destroys the only record of its panes' tmux
+// targets, so the deletion also ends those remote sessions (SPEC 4.4).
+//
+// Two things are pinned. The ordering: the delete goes out ALONE and the kills
+// follow only once the server has confirmed it. And the SOURCE of the targets:
+// they are the ones the delete result reports, not the ones this client's last
+// workspace.list happened to hold. The tree below lists one pane; the server
+// answers with two, because another client added one after that read — killing
+// from the snapshot would leave that second shell running under a name nothing
+// can ever produce again.
+void TstAppController::deletingASessionKillsItsPanesRemoteSessions()
+{
+    FakeTransport transport;
+    CodeharbordClient client;
+    AppController controller(&client);
+    client.setTransport(&transport);
+
+    controller.refresh();
+    const int listId = takeRequest(transport).value(QStringLiteral("id")).toInt();
+    transport.deliver(listWithTerminalTargetsFrame(
+        listId, QStringLiteral("g1"),
+        {{QStringLiteral("s1"), {QStringLiteral("ch_s1_a")}}}));
+    transport.takeSent();
+
+    controller.deleteSession(QStringLiteral("s1"));
+    const QVector<QJsonObject> beforeAck = takeRequests(transport);
+    QCOMPARE(beforeAck.size(), 1);
+    QCOMPARE(beforeAck.at(0).value(QStringLiteral("method")).toString(),
+             QStringLiteral("workspace.deleteSession"));
+
+    transport.deliver(deleteAckFrame(
+        beforeAck.at(0).value(QStringLiteral("id")).toInt(),
+        {QStringLiteral("ch_s1_a"), QStringLiteral("ch_s1_late")}));
+
+    const QVector<QJsonObject> afterAck = takeRequests(transport);
+    QCOMPARE(afterAck.size(), 3);
+    QStringList killed;
+    for (int i = 0; i < 2; ++i) {
+        QCOMPARE(afterAck.at(i).value(QStringLiteral("method")).toString(),
+                 QStringLiteral("tmux.killSession"));
+        killed.append(afterAck.at(i).value(QStringLiteral("params")).toObject()
+                          .value(QStringLiteral("name")).toString());
+    }
+    killed.sort();
+    QCOMPARE(killed, QStringList({QStringLiteral("ch_s1_a"),
+                                  QStringLiteral("ch_s1_late")}));
+    // The authoritative re-read still happens, after the kills.
+    QCOMPARE(afterAck.at(2).value(QStringLiteral("method")).toString(),
+             QStringLiteral("workspace.list"));
+}
+
+// A pane that was never attached has no tmux session behind it, and the server
+// leaves it out of the targets it reports. Nothing is killed for it — no kill
+// of an empty name (which the daemon would refuse) and no message about
+// nothing. Same for a server too old to report the field at all: no targets
+// means no kills, never a target this client made up.
+void TstAppController::deletingASessionSkipsAPaneThatWasNeverAttached()
+{
+    FakeTransport transport;
+    CodeharbordClient client;
+    AppController controller(&client);
+    client.setTransport(&transport);
+    QSignalSpy errors(&controller, &AppController::error);
+
+    controller.refresh();
+    const int listId = takeRequest(transport).value(QStringLiteral("id")).toInt();
+    transport.deliver(listWithTerminalTargetsFrame(
+        listId, QStringLiteral("g1"),
+        {{QStringLiteral("s1"), {QStringLiteral("ch_s1_a"), QString()}}}));
+    transport.takeSent();
+
+    controller.deleteSession(QStringLiteral("s1"));
+    const int deleteId = takeRequest(transport).value(QStringLiteral("id")).toInt();
+    transport.deliver(deleteAckFrame(deleteId, {QStringLiteral("ch_s1_a")}));
+
+    const QVector<QJsonObject> afterAck = takeRequests(transport);
+    QCOMPARE(afterAck.size(), 2);
+    QCOMPARE(afterAck.at(0).value(QStringLiteral("method")).toString(),
+             QStringLiteral("tmux.killSession"));
+    QCOMPARE(afterAck.at(0).value(QStringLiteral("params")).toObject()
+                 .value(QStringLiteral("name")).toString(),
+             QStringLiteral("ch_s1_a"));
+    QCOMPARE(afterAck.at(1).value(QStringLiteral("method")).toString(),
+             QStringLiteral("workspace.list"));
+    QCOMPARE(errors.count(), 0);
+
+    // An older server: `ok` and nothing else. The delete still stands and the
+    // refresh still runs; there is simply nothing this client may kill.
+    transport.deliver(listResultFrame(
+        afterAck.at(1).value(QStringLiteral("id")).toInt(), QStringLiteral("g1")));
+    transport.takeSent();
+    controller.deleteSession(QStringLiteral("s1"));
+    const int legacyId = takeRequest(transport).value(QStringLiteral("id")).toInt();
+    const QJsonObject legacyAck{{"jsonrpc", "2.0"},
+                                {"id", legacyId},
+                                {"result", QJsonObject{{"ok", true}}}};
+    transport.deliver(QJsonDocument(legacyAck).toJson(QJsonDocument::Compact) + '\n');
+    const QVector<QJsonObject> afterLegacy = takeRequests(transport);
+    QCOMPARE(afterLegacy.size(), 1);
+    QCOMPARE(afterLegacy.at(0).value(QStringLiteral("method")).toString(),
+             QStringLiteral("workspace.list"));
+    QCOMPARE(errors.count(), 0);
+}
+
+// A kill that fails cannot undo anything: the rows are already gone on the
+// server. The user is told which Dev Session's shell is still running and
+// under what name, because they are now the only one who can end it — and the
+// deletion still stands, so the chained refresh is neither skipped nor retried.
+void TstAppController::aFailedKillIsReportedAndTheDeletionStands()
+{
+    FakeTransport transport;
+    CodeharbordClient client;
+    AppController controller(&client);
+    client.setTransport(&transport);
+
+    controller.refresh();
+    const int listId = takeRequest(transport).value(QStringLiteral("id")).toInt();
+    transport.deliver(listWithTerminalTargetsFrame(
+        listId, QStringLiteral("g1"),
+        {{QStringLiteral("s1"), {QStringLiteral("ch_s1_a")}}}));
+    // SessionsModel is a tree: the group is the top-level row and its Dev
+    // Sessions are its children.
+    SessionsModel* const model = controller.sessionsModel();
+    QCOMPARE(model->rowCount(model->index(0, 0)), 1);
+    transport.takeSent();
+
+    QSignalSpy errors(&controller, &AppController::error);
+    controller.deleteSession(QStringLiteral("s1"));
+    const int deleteId = takeRequest(transport).value(QStringLiteral("id")).toInt();
+    transport.deliver(deleteAckFrame(deleteId, {QStringLiteral("ch_s1_a")}));
+
+    const QVector<QJsonObject> afterAck = takeRequests(transport);
+    QCOMPARE(afterAck.size(), 2);
+    const int killId = afterAck.at(0).value(QStringLiteral("id")).toInt();
+    const int refreshId = afterAck.at(1).value(QStringLiteral("id")).toInt();
+    transport.deliver(errorFrame(killId, -32000,
+                                 QStringLiteral("tmux: server not found")));
+
+    QCOMPARE(errors.count(), 1);
+    const QString reported = errors.at(0).at(0).toString();
+    // The Dev Session is named from the tree we still had when the delete was
+    // issued; the target is the server's own string.
+    QVERIFY(reported.contains(QStringLiteral("s1")));
+    QVERIFY(reported.contains(QStringLiteral("ch_s1_a")));
+    QVERIFY(reported.contains(QStringLiteral("tmux: server not found")));
+
+    // The deletion is not rolled back and nothing is re-sent: the refresh that
+    // was already in flight lands and the row is gone.
+    transport.deliver(listResultFrame(refreshId, QStringLiteral("g1")));
+    QCOMPARE(model->rowCount(model->index(0, 0)), 0);
+    QVERIFY(takeRequests(transport).isEmpty());
+}
+
+// Deleting a group destroys every Dev Session inside it in one server
+// transaction, so every one of their panes' remote sessions is killed too —
+// again exactly the set the server reports, across all of them.
+void TstAppController::deletingAGroupKillsEveryPaneOfEverySessionInIt()
+{
+    FakeTransport transport;
+    CodeharbordClient client;
+    AppController controller(&client);
+    client.setTransport(&transport);
+
+    controller.refresh();
+    const int listId = takeRequest(transport).value(QStringLiteral("id")).toInt();
+    transport.deliver(listWithTerminalTargetsFrame(
+        listId, QStringLiteral("g1"),
+        {{QStringLiteral("s1"), {QStringLiteral("ch_s1_a")}},
+         {QStringLiteral("s2"),
+          {QStringLiteral("ch_s2_a"), QStringLiteral("ch_s2_b")}}}));
+    transport.takeSent();
+
+    controller.deleteGroup(QStringLiteral("g1"));
+    const int deleteId = takeRequest(transport).value(QStringLiteral("id")).toInt();
+    transport.deliver(deleteAckFrame(deleteId,
+                                     {QStringLiteral("ch_s1_a"),
+                                      QStringLiteral("ch_s2_a"),
+                                      QStringLiteral("ch_s2_b")}));
+
+    const QVector<QJsonObject> afterAck = takeRequests(transport);
+    QCOMPARE(afterAck.size(), 4);
+    QStringList killed;
+    for (int i = 0; i < 3; ++i) {
+        QCOMPARE(afterAck.at(i).value(QStringLiteral("method")).toString(),
+                 QStringLiteral("tmux.killSession"));
+        killed.append(afterAck.at(i).value(QStringLiteral("params")).toObject()
+                          .value(QStringLiteral("name")).toString());
+    }
+    killed.sort();
+    QCOMPARE(killed, QStringList({QStringLiteral("ch_s1_a"),
+                                  QStringLiteral("ch_s2_a"),
+                                  QStringLiteral("ch_s2_b")}));
+    QCOMPARE(afterAck.at(3).value(QStringLiteral("method")).toString(),
+             QStringLiteral("workspace.list"));
 }
 // Archiving and unarchiving use the existing workspace.updateSession field,
 // then rebuild the sidebar from the server's authoritative list. The default
@@ -1980,8 +2247,8 @@ void TstAppController::deletingActiveSessionRetiresItThroughChainedRefresh()
     f.controller.deleteSession(QStringLiteral("s1"));
     const int deleteId =
         takeRequest(f.transport).value(QStringLiteral("id")).toInt();
-    const QJsonObject ack{{"jsonrpc", "2.0"}, {"id", deleteId}, {"result", true}};
-    f.transport.deliver(QJsonDocument(ack).toJson(QJsonDocument::Compact) + '\n');
+    // Answered in the shape codeharbord actually sends; see deleteAckFrame.
+    f.transport.deliver(deleteAckFrame(deleteId, QStringList()));
 
     // The success chained a refresh; answer it with the post-delete tree.
     f.transport.deliver(listResultFrame(

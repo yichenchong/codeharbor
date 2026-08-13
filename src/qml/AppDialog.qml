@@ -36,6 +36,38 @@ import CodeHarbor
 Dialog {
     id: control
 
+    // How wide this dialog would like to be, clamped to the window it opens in.
+    //
+    // A dialog is centred on the overlay, so a FIXED width wider than the window
+    // hangs off both sides — and what hangs off is the button box, so the answer
+    // the user is being asked for can be partly or wholly off screen. The
+    // sidebar's own delete confirmation was 400 wide against a 360 window and
+    // did exactly that.
+    //
+    // Set this instead of `width` at the call site. Zero (the default) leaves
+    // `width` completely untouched, which is what an unset width has always
+    // meant: the dialog sizes to its content. The margin keeps a clamped dialog
+    // off the window edge; it is a plain number because nothing in Theme names a
+    // window inset, and inventing a role for one place would be worse.
+    //
+    // A conditional Binding rather than a `width:` binding with a ternary: the
+    // fallback arm of such a ternary has to name `implicitWidth`, and a Dialog's
+    // implicit size is derived from content whose own height depends on the
+    // width it is given — reading it here closed that circle and Qt reported a
+    // binding loop on implicitHeight for every dialog that sizes to its content.
+    property real preferredWidth: 0
+    readonly property real _windowWidth: Overlay.overlay ? Overlay.overlay.width : 0
+
+    Binding {
+        target: control
+        property: "width"
+        when: control.preferredWidth > 0
+        restoreMode: Binding.RestoreBindingOrValue
+        value: control._windowWidth > 0
+               ? Math.min(control.preferredWidth, control._windowWidth - 16)
+               : control.preferredWidth
+    }
+
     palette.window: Theme.surface
     palette.windowText: Theme.text
     // Dialog border and the "checked/highlighted button" fill.

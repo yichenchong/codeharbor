@@ -111,6 +111,55 @@ std::optional<TerminalPane> parseTerminalPane(const QJsonObject& obj)
     return pane;
 }
 
+// The `tmuxTargets` of a delete result (remote/src/rpc-types.ts
+// DeleteWithTmuxTargetsResult): the remote tmux sessions the server reports
+// that delete really destroyed, in the transaction that destroyed them.
+//
+// ONE shape is accepted without the field: `{ "ok": true }` from a codeharbord
+// older than it, which decodes to an empty list — "nothing to kill". That is
+// the safe direction, because the only alternative is for the client to guess
+// target names and the server is the sole minting site (SPEC 5.2).
+//
+// Everything else is a MALFORMED result, not an empty one. A bare `true`, a
+// missing or false `ok`, or a `tmuxTargets` that is not an array of strings all
+// used to decode to "success, nothing to kill", so a response the client did not
+// understand looked exactly like a clean delete of a pane-less session: the
+// sidebar refreshed as though rows had gone, and any session behind that
+// response was stranded with nobody told. Returning nullopt makes the caller
+// report it instead.
+std::optional<QStringList> parseTmuxTargets(const QJsonValue& result)
+{
+    if (!result.isObject())
+        return std::nullopt;
+    const QJsonObject obj = result.toObject();
+    if (!obj.value(QStringLiteral("ok")).isBool()
+        || !obj.value(QStringLiteral("ok")).toBool()) {
+        return std::nullopt;
+    }
+    const QJsonValue reported = obj.value(QStringLiteral("tmuxTargets"));
+    // ABSENT means an older server, which is the one legal omission. An explicit
+    // `null` is not that: the field is declared `string[]`, so a server sending
+    // null is one this client does not understand, and reading it as "nothing to
+    // kill" is the same silent stranding the strictness above exists to stop.
+    if (reported.isUndefined())
+        return QStringList();
+    if (!reported.isArray())
+        return std::nullopt;
+    const QJsonArray array = reported.toArray();
+    QStringList targets;
+    targets.reserve(array.size());
+    for (const QJsonValue& value : array) {
+        if (!value.isString())
+            return std::nullopt;
+        const QString target = value.toString();
+        // The server already omits panes with no target; a blank that reaches
+        // here names nothing and must not become a kill request.
+        if (!target.isEmpty())
+            targets.append(target);
+    }
+    return targets;
+}
+
 // A layout slot is either an inline split-tree object or null/absent; decode the
 // former through SplitNode::tryFromJson and the latter to std::nullopt.
 //
@@ -560,13 +609,23 @@ void WorkspaceDb::updateGroup(const UpdateGroupParams& params, GroupCallback cb)
                                  parseGroup));
 }
 
-void WorkspaceDb::deleteGroup(const GroupId& id, OkCallback cb)
+void WorkspaceDb::deleteGroup(const GroupId& id, DeleteCallback cb)
 {
     const QJsonObject params{{QStringLiteral("id"), id.value}};
     m_client->call(
         QString::fromLatin1(rpc::kMethodWorkspaceDeleteGroup), params,
-        [cb = std::move(cb)](QJsonValue, std::optional<RpcError> error) {
-            cb(std::move(error));
+        [cb = std::move(cb)](QJsonValue result, std::optional<RpcError> error) {
+            if (error) {
+                cb(QStringList(), std::move(error));
+                return;
+            }
+            if (const std::optional<QStringList> targets = parseTmuxTargets(result))
+                cb(*targets, std::nullopt);
+            else
+                cb(QStringList(),
+                   malformedResult(rpc::kMethodWorkspaceDeleteGroup,
+                                   "an object with ok:true and, if present, a "
+                                   "tmuxTargets array of strings"));
         });
 }
 
@@ -603,13 +662,23 @@ void WorkspaceDb::updateSession(const UpdateSessionParams& params,
                                  std::move(cb), parseSession));
 }
 
-void WorkspaceDb::deleteSession(const DevSessionId& id, OkCallback cb)
+void WorkspaceDb::deleteSession(const DevSessionId& id, DeleteCallback cb)
 {
     const QJsonObject params{{QStringLiteral("id"), id.value}};
     m_client->call(
         QString::fromLatin1(rpc::kMethodWorkspaceDeleteSession), params,
-        [cb = std::move(cb)](QJsonValue, std::optional<RpcError> error) {
-            cb(std::move(error));
+        [cb = std::move(cb)](QJsonValue result, std::optional<RpcError> error) {
+            if (error) {
+                cb(QStringList(), std::move(error));
+                return;
+            }
+            if (const std::optional<QStringList> targets = parseTmuxTargets(result))
+                cb(*targets, std::nullopt);
+            else
+                cb(QStringList(),
+                   malformedResult(rpc::kMethodWorkspaceDeleteSession,
+                                   "an object with ok:true and, if present, a "
+                                   "tmuxTargets array of strings"));
         });
 }
 
@@ -732,16 +801,6 @@ void WorkspaceDb::updateTerminalPane(const UpdateTerminalPaneParams& params,
                    serializeUpdateTerminalPane(params),
                    recordHandler(rpc::kMethodWorkspaceUpdateTerminalPane,
                                  std::move(cb), parseTerminalPane));
-}
-
-void WorkspaceDb::deleteTerminalPane(const TerminalId& id, OkCallback cb)
-{
-    const QJsonObject params{{QStringLiteral("id"), id.value}};
-    m_client->call(
-        QString::fromLatin1(rpc::kMethodWorkspaceDeleteTerminalPane), params,
-        [cb = std::move(cb)](QJsonValue, std::optional<RpcError> error) {
-            cb(std::move(error));
-        });
 }
 
 void WorkspaceDb::getLayout(const DevSessionId& devSessionId, Region region,

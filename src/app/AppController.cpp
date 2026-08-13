@@ -2,6 +2,7 @@
 
 #include "AgentEvent.h"
 #include "EditorFactory.h"
+#include "RpcTypes.h"
 #include "TerminalFactory.h"
 #include "UiStateStore.h"
 
@@ -1509,7 +1510,25 @@ void AppController::setGroupCollapsed(QString id, bool collapsed)
 }
 void AppController::deleteGroup(QString id)
 {
-    m_db->deleteGroup(GroupId{std::move(id)}, refreshOnSuccess<>());
+    // Only the LABEL is taken from our tree, and only for a message. The
+    // targets come back from the delete itself, because it is the one thing
+    // that knows what it destroyed (SPEC 4.4).
+    const QString subject = groupLabel(id);
+    QPointer<AppController> self(this);
+    m_db->deleteGroup(
+        GroupId{std::move(id)},
+        [self, subject](QStringList tmuxTargets, std::optional<RpcError> err) {
+            if (!self)
+                return;
+            // A refused delete kills nothing: the sessions are still reachable
+            // from rows that are still there.
+            if (self->reportIfError(err))
+                return;
+            self->killReportedTerminals(tmuxTargets, subject);
+            if (!self)
+                return;
+            self->refresh();
+        });
 }
 
 int AppController::sessionCountForGroup(const QString& id) const
@@ -1612,7 +1631,78 @@ void AppController::moveSession(QString id, QString groupId, int position)
 
 void AppController::deleteSession(QString id)
 {
-    m_db->deleteSession(DevSessionId{std::move(id)}, refreshOnSuccess<>());
+    // See deleteGroup(): the label is ours, the targets are the server's.
+    const QString subject = sessionLabel(id);
+    QPointer<AppController> self(this);
+    m_db->deleteSession(
+        DevSessionId{std::move(id)},
+        [self, subject](QStringList tmuxTargets, std::optional<RpcError> err) {
+            if (!self)
+                return;
+            if (self->reportIfError(err))
+                return;
+            self->killReportedTerminals(tmuxTargets, subject);
+            if (!self)
+                return;
+            self->refresh();
+        });
+}
+
+QString AppController::sessionLabel(const QString& devSessionId) const
+{
+    for (const GroupNode& group : m_lastNodes)
+        for (const SessionNode& session : group.sessions)
+            if (session.session.id.value == devSessionId)
+                return session.session.name;
+    // A row this client has never listed. The id is a poor name but a true
+    // one, and it only ever appears in a failure message.
+    return devSessionId;
+}
+
+QString AppController::groupLabel(const QString& groupId) const
+{
+    for (const GroupNode& group : m_lastNodes)
+        if (group.group.id.value == groupId)
+            return group.group.name;
+    return groupId;
+}
+
+void AppController::killReportedTerminals(const QStringList& tmuxTargets,
+                                          const QString& subject)
+{
+    if (tmuxTargets.isEmpty() || !m_client)
+        return;
+    QPointer<AppController> self(this);
+    for (const QString& target : tmuxTargets) {
+        // A call() that cannot even be written fails its callback
+        // SYNCHRONOUSLY, and `error` reaches slots that are allowed to destroy
+        // this controller. Re-check before dereferencing m_client again.
+        if (!self)
+            return;
+        // `name` is passed through exactly as the server reported it. This
+        // client never composes a tmux target: the server is the only minting
+        // site (SPEC 5.2), and tmux.killSession is idempotent, so a session
+        // that has already ended answers success.
+        m_client->call(
+            QString::fromLatin1(rpc::kMethodKillSession),
+            QJsonObject{{QStringLiteral("name"), target}},
+            [self, target, subject](QJsonValue, std::optional<RpcError> err) {
+                if (!self || !err)
+                    return;
+                // reportIfError() would forward the daemon's message on its
+                // own, which here would read as if the DELETION had failed.
+                // It did not: the rows are gone and staying gone. What the
+                // user needs is the name of the shell still running on the
+                // server, because they are the only one who can end it now.
+                if (self->m_tearingDown)
+                    return;
+                emit self->error(
+                    tr("Deleted \"%1\", but its remote terminal session \"%2\" "
+                       "could not be killed and is still running on the "
+                       "server: %3")
+                        .arg(subject, target, err->message));
+            });
+    }
 }
 
 void AppController::reorderSessions(QString groupId, QStringList orderedIds)

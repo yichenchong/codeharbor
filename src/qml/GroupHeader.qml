@@ -351,9 +351,16 @@ ItemDelegate {
         // Enter cancels rather than deleting: this dialog's affirmative answer
         // destroys a group and everything in it. See SessionRow.qml.
         defaultButton: Dialog.Cancel
-        width: 400
+        preferredWidth: 400
 
         ColumnLayout {
+            // Fill the dialog's content area. A Dialog does NOT lay its
+            // content out: a child declared here keeps its own implicit
+            // width, so without this the layout stayed 360 wide inside a
+            // frame clamped narrower than that and the text painted
+            // outside the sheet (measured: a 529-wide label in a 344-wide
+            // dialog). Anchored, the fillWidth children wrap to fit.
+            anchors.fill: parent
             implicitWidth: 360
 
             Label {
@@ -362,7 +369,7 @@ ItemDelegate {
                 textFormat: Text.PlainText
                 wrapMode: Text.WordWrap
                 text: header.sessionCount > 0
-                      ? qsTr("Delete group \"%1\"? This permanently destroys the group and all %2 %3 inside it. This cannot be undone.")
+                      ? qsTr("Delete group \"%1\"? This permanently destroys the group and all %2 %3 inside it, and kills the remote tmux sessions of their terminal panes. This cannot be undone.")
                             .arg(header.name)
                             .arg(header.sessionCount)
                             .arg(header.sessionCount === 1 ? qsTr("session") : qsTr("sessions"))
