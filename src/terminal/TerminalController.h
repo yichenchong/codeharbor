@@ -234,8 +234,18 @@ public:
     //   tmux new-session -A -s '<target>' -c '<workingDir>' \
     //       -e 'OMP_DEV_SESSION_ID=<dev>' -e 'OMP_TERMINAL_ID=<term>' \; \
     //       set-option -t '=<target>:' mouse on \; \
+    //       set-option -t '=<target>:' destroy-unattached off \; \
     //       set-environment -t '=<target>:' OMP_DEV_SESSION_ID '<dev>' \; \
     //       set-environment -t '=<target>:' OMP_TERMINAL_ID '<term>'
+    //
+    // Both session options are set for THIS SESSION ONLY, never `-g`: they are
+    // set on the user's default tmux server, where a global would change the
+    // behaviour of sessions they started themselves. `destroy-unattached off`
+    // is what keeps SPEC 2.2's promise when the user's own ~/.tmux.conf turns
+    // that option on globally — without it, every disconnect (and every
+    // reconnect, which detaches first) destroys the pane's session and the next
+    // attach silently builds an empty one under the same name. See the
+    // implementation for the one case it cannot reach.
     //
     // `devSessionId` and `terminalId` are this pane's identity — the Dev Session
     // and the `terminal_panes` row id — and they are PARAMETERS on purpose. The
