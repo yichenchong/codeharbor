@@ -118,6 +118,7 @@ private slots:
     void tmuxNewSessionCommandQuotesAwkwardPaneIdentity();
     void tmuxNewSessionCommandOmitsHalfKnownPaneIdentity();
     void tmuxNewSessionCommandEnablesMouseForThisSessionOnly();
+    void tmuxNewSessionCommandKeepsTheSessionAliveWhileUnattached();
     void tmuxNewSessionCommandEscapesShellMetacharacters();
     void tmuxNewSessionCommandEscapesSubstitutionBacktickNewline();
     void tmuxCommandEscapesAdversarialIds();
@@ -544,6 +545,7 @@ void TstTerminalController::tmuxNewSessionCommandFormat()
              QStringLiteral("tmux new-session -A -s 'ch_dev1_term1' -c '/home/dev/project'"
                             " -e 'OMP_DEV_SESSION_ID=dev-1' -e 'OMP_TERMINAL_ID=term-1'"
                             " \\; set-option -t '=ch_dev1_term1:' mouse on"
+                            " \\; set-option -t '=ch_dev1_term1:' destroy-unattached off"
                             " \\; set-environment -t '=ch_dev1_term1:'"
                             " OMP_DEV_SESSION_ID 'dev-1'"
                             " \\; set-environment -t '=ch_dev1_term1:'"
@@ -597,6 +599,7 @@ void TstTerminalController::tmuxNewSessionCommandQuotesAwkwardPaneIdentity()
                             " -e 'OMP_DEV_SESSION_ID=d'\\''; rm -rf ~; '\\'''"
                             " -e 'OMP_TERMINAL_ID=t`whoami`$(id)\nnext'"
                             " \\; set-option -t '=ch_dev1_term1:' mouse on"
+                            " \\; set-option -t '=ch_dev1_term1:' destroy-unattached off"
                             " \\; set-environment -t '=ch_dev1_term1:'"
                             " OMP_DEV_SESSION_ID 'd'\\''; rm -rf ~; '\\'''"
                             " \\; set-environment -t '=ch_dev1_term1:'"
@@ -613,7 +616,8 @@ void TstTerminalController::tmuxNewSessionCommandOmitsHalfKnownPaneIdentity()
 {
     const QString expected =
         QStringLiteral("tmux new-session -A -s 'ch_dev1_term1' -c '/w'"
-                       " \\; set-option -t '=ch_dev1_term1:' mouse on");
+                       " \\; set-option -t '=ch_dev1_term1:' mouse on"
+                       " \\; set-option -t '=ch_dev1_term1:' destroy-unattached off");
     QCOMPARE(TerminalController::tmuxNewSessionCommand(
                  QStringLiteral("ch_dev1_term1"), QStringLiteral("/w"), QString(),
                  QStringLiteral("term-1")),
@@ -636,21 +640,58 @@ void TstTerminalController::tmuxNewSessionCommandOmitsHalfKnownPaneIdentity()
 // somebody else created (SPEC 5.2 hardening).
 void TstTerminalController::tmuxNewSessionCommandEnablesMouseForThisSessionOnly()
 {
-    // No pane identity here: this is about the mouse option, and an unidentified
-    // pane keeps the invocation down to the two commands the count below asserts.
+    // No pane identity here: this is about the session options, and an
+    // unidentified pane keeps the invocation down to the commands counted below.
     const QString command = TerminalController::tmuxNewSessionCommand(
         QStringLiteral("ch_dev1_term1"), QStringLiteral("/w"), QString(), QString());
 
     // The option is set, and it is set on this session's target.
     QVERIFY(command.contains(QStringLiteral("set-option -t '=ch_dev1_term1:' mouse on")));
+    // The survival guard travels with it, on the same target and equally
+    // session-scoped: a global `destroy-unattached on` in the user's own
+    // ~/.tmux.conf would otherwise destroy this session the moment the client
+    // detaches, which every reconnect does.
+    QVERIFY(command.contains(
+        QStringLiteral("set-option -t '=ch_dev1_term1:' destroy-unattached off")));
     // No global scope, in either spelling tmux accepts.
     QVERIFY(!command.contains(QStringLiteral("-g")));
     QVERIFY(!command.contains(QStringLiteral("--global")));
-    // One tmux invocation, two tmux commands: the separator is an ESCAPED
-    // semicolon, so the remote shell hands tmux a literal `;` argument instead
+    // One tmux invocation, three tmux commands: each separator is an ESCAPED
+    // semicolon, so the remote shell hands tmux literal `;` arguments instead
     // of ending the shell command there.
     QVERIFY(command.contains(QStringLiteral(" \\; ")));
-    QCOMPARE(command.count(QLatin1Char(';')), 1);
+    QCOMPARE(command.count(QLatin1Char(';')), 2);
+}
+
+// SPEC 2.2 promises terminal processes survive the application disconnecting,
+// and tmux's `destroy-unattached` is the one setting that quietly breaks that
+// promise from the USER's side: it destroys a session as soon as its last
+// client goes, and `set -g destroy-unattached on` in their own ~/.tmux.conf is
+// inherited by every session made afterwards, including ours. The symptom is
+// nasty precisely because it looks like nothing broke — the work dies, and the
+// next `new-session -A` builds a fresh empty shell under the same name.
+//
+// Not only a dropped connection reaches this: attach() detaches first, so an
+// ordinary reconnect leaves the session unattached for a moment, which is all
+// the option needs.
+//
+// Verified against tmux 3.6: with `-g destroy-unattached on` set, a session
+// created with this override was still listed while unattached, and one created
+// without it was already gone.
+void TstTerminalController::tmuxNewSessionCommandKeepsTheSessionAliveWhileUnattached()
+{
+    const QString command = TerminalController::tmuxNewSessionCommand(
+        QStringLiteral("ch_dev1_term1"), QStringLiteral("/w"), QString(), QString());
+
+    QVERIFY(command.contains(
+        QStringLiteral("set-option -t '=ch_dev1_term1:' destroy-unattached off")));
+    // Session-scoped, like the mouse option beside it: the user set that global
+    // for their own sessions, and nothing here may change what it does to them.
+    QVERIFY(!command.contains(QStringLiteral("-g")));
+    QVERIFY(!command.contains(QStringLiteral("--global")));
+    // The `=` sigil is inside the quotes, so the option cannot fnmatch onto a
+    // session somebody else created (SPEC 5.2).
+    QVERIFY(command.contains(QStringLiteral("-t '=ch_dev1_term1:' destroy-unattached")));
 }
 
 // A workingDir carrying a single quote and shell metacharacters must be safely
@@ -664,7 +705,8 @@ void TstTerminalController::tmuxNewSessionCommandEscapesShellMetacharacters()
     QCOMPARE(command,
              QStringLiteral("tmux new-session -A -s 'ch_dev1_term1' "
                             "-c '/home/dev/it'\\''s here; rm -rf /'"
-                            " \\; set-option -t '=ch_dev1_term1:' mouse on"));
+                            " \\; set-option -t '=ch_dev1_term1:' mouse on"
+                            " \\; set-option -t '=ch_dev1_term1:' destroy-unattached off"));
 }
 
 // Command substitution, backticks, and embedded newlines in the working
@@ -679,7 +721,8 @@ void TstTerminalController::tmuxNewSessionCommandEscapesSubstitutionBacktickNewl
     QCOMPARE(command,
              QStringLiteral("tmux new-session -A -s 'ch_dev1_term1' "
                             "-c '/w/$(rm -rf ~)`whoami`\nnext'"
-                            " \\; set-option -t '=ch_dev1_term1:' mouse on"));
+                            " \\; set-option -t '=ch_dev1_term1:' mouse on"
+                            " \\; set-option -t '=ch_dev1_term1:' destroy-unattached off"));
 }
 
 // An adversarial TARGET — one carrying a quote and shell metacharacters — is
@@ -704,7 +747,9 @@ void TstTerminalController::tmuxCommandEscapesAdversarialIds()
              QStringLiteral("tmux new-session -A -s "
                             "'ch_dev'\\''; rm -rf / #_t`whoami`$(id)' -c '/w'"
                             " \\; set-option -t "
-                            "'=ch_dev'\\''; rm -rf / #_t`whoami`$(id):' mouse on"));
+                            "'=ch_dev'\\''; rm -rf / #_t`whoami`$(id):' mouse on"
+                            " \\; set-option -t "
+                            "'=ch_dev'\\''; rm -rf / #_t`whoami`$(id):' destroy-unattached off"));
 }
 
 // Shell quoting and tmux's `=` exact-match prefix are two DIFFERENT grammars,

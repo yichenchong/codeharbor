@@ -798,6 +798,40 @@ QString TerminalController::tmuxNewSessionCommand(const QString &target,
                                              + terminalId));
     }
     command += QStringLiteral(" \\; set-option -t %1 mouse on").arg(sessionTarget);
+    // SPEC 2.2's promise, defended against the user's own tmux configuration.
+    // `destroy-unattached` destroys a session the moment its last client goes
+    // away, and it is a SESSION option, so a global `set -g destroy-unattached
+    // on` in ~/.tmux.conf is inherited by every session created afterwards —
+    // including these. That turns an ordinary disconnect into data loss: the
+    // work dies mid-task, and the next `new-session -A` silently makes a fresh
+    // empty shell under the same name, so the pane comes back looking wiped
+    // with nothing to say what happened.
+    //
+    // It is not only a dropped connection that exposes this. attach() detaches
+    // first (TerminalFactory.cpp:701), so every ordinary reconnect leaves the
+    // session unattached for a moment, which is all this option needs.
+    //
+    // Turned off for THIS SESSION ONLY, exactly like `mouse on` above: the user
+    // set that global for their own sessions and nothing here may change what
+    // it does to them. Verified on tmux 3.6 — with `-g destroy-unattached on`,
+    // an unattached session carrying this override survived, while one without
+    // it was gone by the next `tmux ls`.
+    //
+    // WHAT THIS CANNOT SAVE. The option is applied by this command, so it takes
+    // hold from the moment a session is created — and, because `set-option` runs
+    // whether `-A` created or merely attached, an EXISTING session that is still
+    // alive is guarded the next time a pane attaches to it. What it cannot reach
+    // is a session made before this existed that inherits the global `on` and is
+    // then left unattached: it is destroyed the instant its last client goes, and
+    // both moments where that happens are out of reach — attach() detaches before
+    // it can run this (TerminalFactory.cpp:701), and an SSH drop detaches when
+    // there is no connection to run anything on. Such a session is lost ONCE;
+    // its replacement carries the guard and is safe from then on. Repairing that
+    // window would mean a separate exec on every attach to set the option while
+    // the old client is still attached, which is a per-attach cost for a
+    // one-time transition, so it is deliberately not done.
+    command += QStringLiteral(" \\; set-option -t %1 destroy-unattached off")
+                   .arg(sessionTarget);
     if (identified) {
         command += QStringLiteral(" \\; set-environment -t %1 OMP_DEV_SESSION_ID %2")
                        .arg(sessionTarget, shellSingleQuote(devSessionId));
