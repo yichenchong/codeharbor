@@ -1083,6 +1083,10 @@ void TstWorkspaceDb::deleteSessionSerializesIdAndForwardsOutcome()
         QJsonValue(QJsonObject{}),                            // no `ok` at all
         QJsonValue(QJsonObject{{"ok", false}}),               // `ok` says no
         QJsonValue(QJsonObject{{"ok", true}, {"tmuxTargets", 7}}),
+        // Declared `string[]`, so an explicit null is a server this client does
+        // not understand — not the older server that omits the field entirely.
+        QJsonValue(QJsonObject{{"ok", true},
+                               {"tmuxTargets", QJsonValue(QJsonValue::Null)}}),
         QJsonValue(QJsonObject{{"ok", true},
                                {"tmuxTargets", QJsonArray{7}}}),
     };

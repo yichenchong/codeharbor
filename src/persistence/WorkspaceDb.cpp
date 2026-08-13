@@ -137,8 +137,12 @@ std::optional<QStringList> parseTmuxTargets(const QJsonValue& result)
         return std::nullopt;
     }
     const QJsonValue reported = obj.value(QStringLiteral("tmuxTargets"));
-    if (reported.isUndefined() || reported.isNull())
-        return QStringList();  // an older server: it destroyed rows, not sessions
+    // ABSENT means an older server, which is the one legal omission. An explicit
+    // `null` is not that: the field is declared `string[]`, so a server sending
+    // null is one this client does not understand, and reading it as "nothing to
+    // kill" is the same silent stranding the strictness above exists to stop.
+    if (reported.isUndefined())
+        return QStringList();
     if (!reported.isArray())
         return std::nullopt;
     const QJsonArray array = reported.toArray();
@@ -797,16 +801,6 @@ void WorkspaceDb::updateTerminalPane(const UpdateTerminalPaneParams& params,
                    serializeUpdateTerminalPane(params),
                    recordHandler(rpc::kMethodWorkspaceUpdateTerminalPane,
                                  std::move(cb), parseTerminalPane));
-}
-
-void WorkspaceDb::deleteTerminalPane(const TerminalId& id, OkCallback cb)
-{
-    const QJsonObject params{{QStringLiteral("id"), id.value}};
-    m_client->call(
-        QString::fromLatin1(rpc::kMethodWorkspaceDeleteTerminalPane), params,
-        [cb = std::move(cb)](QJsonValue, std::optional<RpcError> error) {
-            cb(std::move(error));
-        });
 }
 
 void WorkspaceDb::getLayout(const DevSessionId& devSessionId, Region region,

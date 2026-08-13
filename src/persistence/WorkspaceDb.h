@@ -315,7 +315,12 @@ public:
                              TerminalPaneCallback cb);
     void updateTerminalPane(const UpdateTerminalPaneParams& params,
                             TerminalPaneCallback cb);
-    void deleteTerminalPane(const TerminalId& id, OkCallback cb);
+    // No deleteTerminalPane wrapper: nothing in the client deletes a pane row on
+    // its own. A pane leaves through its region's layout, and closing a pane
+    // kills its tmux session through TerminalFactory first (SPEC 4.4). The
+    // daemon still serves workspace.deleteTerminalPane; when something here
+    // needs it, it should be added with the DeleteCallback shape the other two
+    // deletes use, because that method reports tmux targets too.
 
     // Per-region split layouts. getLayout delivers std::nullopt when the region
     // has no persisted layout (and likewise when the stored tree is unreadable);
