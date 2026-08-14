@@ -128,6 +128,13 @@ int main(int argc, char *argv[])
     // out of connectAndWire(), and a factory registered afterwards would miss
     // the identity it is about to need.
     terminalFactory.setWorkspace(appController.workspaceDb());
+    // And the RPC peer for ONE out-of-band diagnostic: `tmux new-session -A`
+    // creates the pane's session when it is missing and says so nowhere, so
+    // after an attach the factory asks `tmux.listSessions` whether the session
+    // it just joined was in fact created by that attach — which is how a pane
+    // whose remote session died says so instead of handing the user a silently
+    // empty shell.
+    terminalFactory.setRpcClient(&client);
     QObject::connect(&appController, &ch::AppController::serverIdChanged, &terminalFactory,
                      [&appController, &terminalFactory]() {
                          terminalFactory.setServerId(appController.serverId());

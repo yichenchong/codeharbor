@@ -13,6 +13,7 @@
 namespace ch {
 
 class AgentStatusMonitor;
+class CodeharbordClient;
 class SshChannelDevice;
 class SshConnectionPool;
 
@@ -148,6 +149,13 @@ public:
     void setWorkspace(WorkspaceDb* workspace);
     void setServerId(const QString& serverId);
 
+    // The RPC peer the out-of-band `tmux.listSessions` diagnostic is asked
+    // over; injected, not owned, and nullptr simply turns that diagnostic off.
+    // It is deliberately NOT the workspace repository this class already holds:
+    // ch::WorkspaceDb is the `workspace.*` CRUD surface and nothing else, while
+    // `tmux.*` is its own RPC group about the host's tmux server.
+    void setRpcClient(CodeharbordClient* client);
+
 
     // A pane's harness changed on the server, so the remembered answer for it
     // is out of date.
@@ -268,6 +276,16 @@ signals:
     // the leaf already carries this id.
     void paneRowResolved(const QString& devSessionId, const QString& paneName,
                          const QString& terminalPaneId);
+
+    // This pane's remote tmux session was GONE, and the attach that just
+    // succeeded created a new, empty one in its place instead of re-attaching
+    // the old one — so whatever was running in it has stopped. `tmuxTarget` is
+    // the session name involved.
+    //
+    // Emitted only for a RE-attach (see Attachment::everAttached): a pane
+    // attaching for the first time in this process legitimately creates its
+    // session, and so does a brand new pane, and neither has lost anything.
+    void sessionRecreated(ch::TerminalController* controller, const QString& tmuxTarget);
     // Per-pane connection lifecycle, keyed by the server-reported Dev Session
     // and terminal_panes row ids. The server id is included so AppController
     // can reject a queued signal from a pane that belonged to a previous
@@ -275,6 +293,17 @@ signals:
     // labels are valid substitutes for this identity.
     void terminalStateChanged(const QString& serverId, const QString& devSessionId,
                               const QString& terminalId, ch::TerminalState state);
+
+protected:
+    // Open the pane's PTY channel with the tmux attach command. Called only by
+    // attach(), and the ONLY reason it exists as a virtual is the same one
+    // connected() gives: a real channel needs libssh and a real server, so
+    // everything attach() does AFTER a successful open — including the
+    // recreated-session diagnostic, which is the whole point — lived
+    // behind a door no unit test could open. A test subclass answers true and
+    // exercises the real code; nothing in production overrides it.
+    virtual bool openPty(SshChannelDevice* device, int cols, int rows,
+                         const QString& command);
 
 private:
     struct Attachment {
@@ -314,6 +343,26 @@ private:
         // identity would report bytes under a pane id this controller no longer
         // owns.
         QMetaObject::Connection outputConnection;
+        // An attach() has already SUCCEEDED for this pane in this process.
+        // It is what tells "my session died and this attach silently made a
+        // new empty one" apart from "this pane is coming up for the first
+        // time and creating its session is exactly right", which is the whole
+        // reason sessionRecreated() can be trusted. These records survive a
+        // disconnect on purpose (see m_attached), which is precisely why a
+        // RECONNECT can tell the difference at all.
+        //
+        // Held per SESSION, not merely per pane: rememberTarget() clears it
+        // whenever the pane aims at a different target, because a retargeted
+        // pane and a pane whose session the user killed both have nothing they
+        // expect to find, and creating a session for them is not a loss.
+        //
+        // KNOWN LIMITATION, and it is not fixable from here: this memory lives
+        // in the process. A session lost while the application was CLOSED is
+        // therefore not reported on the next launch — the client has no record
+        // that the pane ever had a session, so its first attach of the new
+        // process cannot be distinguished from a pane coming up for the first
+        // time. Reporting on that would mean reporting on every cold start.
+        bool everAttached = false;
     };
 
     // The pane's entry, created (with its destroyed() cleanup) on first use.
@@ -321,6 +370,19 @@ private:
     // a single insert rehashes m_attached and turns a held reference into a
     // dangling write.
     Attachment& entryFor(ch::TerminalController* controller);
+
+    // Ask the host, out of band, whether the attach that just succeeded CREATED
+    // `target` instead of attaching to it, and report sessionRecreated() when it
+    // did. `attachedAtSec` is the wall clock in whole SECONDS taken immediately
+    // before the attach was issued; a session whose tmux `session_created` is at
+    // or after that second cannot be one that was already there.
+    //
+    // Diagnostic only, and silent in every failure: no `tmux.listSessions`
+    // answer, an RPC error, or no entry for this target reports nothing and
+    // emits no error(). A failed diagnostic must never become a user-facing
+    // fault on a pane that is working perfectly well.
+    void probeForRecreatedSession(ch::TerminalController* controller,
+                                  const QString& target, qint64 attachedAtSec);
 
     // Create-or-update the pane's entry with the tmux target it is aiming at.
     void rememberTarget(ch::TerminalController* controller, const QString& target);
@@ -369,6 +431,10 @@ private:
     // AppController declared above it.
     WorkspaceDb* m_workspace = nullptr;
     QString m_serverId;
+    // RPC peer for the `tmux.listSessions` diagnostic; injected, not owned, and
+    // a QPointer because it IS a QObject and nothing here has to be told when
+    // it goes away — a null one simply means no diagnostic.
+    QPointer<CodeharbordClient> m_rpc;
 
     // One resolution's answer, as the server gave it. Everything here names a
     // row on ONE server, so the whole map is dropped by setServerId(): a target
