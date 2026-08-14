@@ -421,6 +421,12 @@ Rectangle {
     // different terminal altogether.
     property bool sessionKilled: false
 
+    // The pane's previous remote session was gone and the attach replaced it
+    // with a new shell, which the notice below reports until it is dismissed.
+    // Only ch::TerminalFactory can know this: `tmux new-session -A` attaches or
+    // creates and never says which, so the factory asks the host afterwards.
+    property bool sessionReplaced: false
+
     // The identity an outstanding resolution was started FOR: Dev Session, slot
     // label and row id. Used to tell an answer meant for what this pane is NOW
     // from one meant for what it was when the question was asked.
@@ -611,6 +617,10 @@ Rectangle {
         // that verdict belongs to the terminal this pane has just left, and
         // keeping it would leave the pane it is now showing permanently inert.
         pane.sessionKilled = false
+        // Nor may "the session you had here was replaced": it is a report about
+        // the terminal this pane has just left, and leaving it up would attach
+        // it to a terminal it was never true of.
+        pane.sessionReplaced = false
         pane.clearIdentityWait()
         pane.attachNow()
     }
@@ -690,6 +700,16 @@ Rectangle {
                 return
             pane.tmuxTarget = target
             pane.attachNow()
+        }
+        // This pane's remote session had DIED, and the attach that just
+        // succeeded silently made a new, empty one in its place — so the work
+        // that was running here is gone. Latched onto the pane rather than shown
+        // from the signal itself: the user is usually somewhere else when it
+        // happens, and a notice that came and went unseen is exactly the silence
+        // this exists to end. They dismiss it when they have read it.
+        function onSessionRecreated(controller) {
+            if (controller === pane.controller)
+                pane.sessionReplaced = true
         }
     }
 
@@ -1333,6 +1353,7 @@ Rectangle {
     // Loaded but not live: a thin banner, so a drop or an attach failure is
     // visible without hiding the scrollback the user still wants to read.
     Rectangle {
+        id: statusBanner
         anchors.left: parent.left
         anchors.right: parent.right
         anchors.top: paneHeader.bottom
@@ -1372,6 +1393,72 @@ Rectangle {
                 text: qsTr("Retry")
                 onClicked: pane.reconnectNow()
             }
+        }
+    }
+
+    // The pane's previous remote session is GONE and what the user is looking at
+    // is a new, empty shell. `tmux new-session -A` attaches or creates and says
+    // which nowhere, so this is the only place the difference is ever surfaced;
+    // ch::TerminalFactory works it out from the host's own session list after
+    // the attach and reports it as sessionRecreated.
+    //
+    // Its own banner rather than `statusText`: that field is overwritten by the
+    // next diagnostic to come along, and this one has to survive until the user
+    // has actually read it. It sits BELOW the not-live banner rather than over
+    // it, because the two are independent — a pane can be replaced and then drop
+    // again — and it disappears entirely once dismissed, so it can never
+    // permanently cover the terminal it is talking about.
+    Rectangle {
+        objectName: "terminalSessionReplacedNotice"
+        anchors.left: parent.left
+        anchors.right: parent.right
+        // Stacked under the not-live banner when there is one, so neither hides
+        // the other.
+        anchors.top: statusBanner.visible ? statusBanner.bottom : paneHeader.bottom
+        anchors.leftMargin: pane.border.width
+        anchors.rightMargin: pane.border.width
+        // Grows to fit: this is two clauses of plain English, and one elided
+        // line of it would tell nobody what happened to their work.
+        height: visible ? Math.max(26, replacedLabel.implicitHeight + 12) : 0
+        color: Theme.warningSurface()
+        visible: pane.sessionReplaced
+
+        // Drawn AND announced. A warning that is only painted is a warning a
+        // screen reader user never hears, which for them is the same silence
+        // this notice exists to end. AlertMessage is this codebase's role for a
+        // notification that is not a dialog (AppErrorBanner.qml, ConnectSheet.qml).
+        Accessible.role: Accessible.AlertMessage
+        Accessible.name: replacedLabel.text
+
+        AppPaneHeader.Action {
+            id: dismissReplacedAction
+            objectName: "terminalSessionReplacedDismissButton"
+            anchors.right: parent.right
+            anchors.rightMargin: 8
+            anchors.verticalCenter: parent.verticalCenter
+            text: qsTr("Dismiss")
+            onClicked: pane.sessionReplaced = false
+        }
+
+        Label {
+            id: replacedLabel
+            objectName: "terminalSessionReplacedLabel"
+            anchors.left: parent.left
+            anchors.leftMargin: 8
+            anchors.right: dismissReplacedAction.left
+            anchors.rightMargin: 8
+            anchors.verticalCenter: parent.verticalCenter
+            wrapMode: Text.WordWrap
+            // Same rule as every other string on this pane: never markup.
+            textFormat: Text.PlainText
+            // Plain language, and deliberately nothing the user cannot act on:
+            // no tmux, no session name, no pane id. What matters is that the
+            // shell in front of them is not the one they left and that their
+            // work stopped.
+            text: qsTr("The remote session this pane was using is gone, so this is a new, "
+                       + "empty shell. Anything that was still running in it has stopped.")
+            color: Theme.warning
+            font.pixelSize: Theme.fontSizeSmall
         }
     }
 

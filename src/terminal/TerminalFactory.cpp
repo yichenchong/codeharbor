@@ -1,9 +1,15 @@
 #include "TerminalFactory.h"
 
+#include <QDateTime>
+#include <QJsonArray>
+#include <QJsonObject>
+#include <QJsonValue>
 #include <QTimer>
 
 #include "AgentStatusMonitor.h"
+#include "CodeharbordClient.h"
 #include "Ids.h"
+#include "RpcTypes.h"
 #include "SessionState.h"
 #include "SshChannelDevice.h"
 #include "SshConnectionPool.h"
@@ -130,6 +136,17 @@ TerminalFactory::Attachment& TerminalFactory::entryFor(TerminalController* contr
 void TerminalFactory::rememberTarget(TerminalController* controller, const QString& target)
 {
     Attachment& entry = entryFor(controller);
+    if (entry.target != target) {
+        // A DIFFERENT session than the one this pane last aimed at, so nothing
+        // is expected to be there and creating it is not a loss. This covers
+        // both directions that matter: a pane retargeted at another terminal
+        // (or another Dev Session), whose new session may legitimately not
+        // exist yet, and a pane whose session the user KILLED on purpose —
+        // kill() clears the recorded target, so the Connect that follows it
+        // starts over here rather than announcing the very session the user
+        // just destroyed.
+        entry.everAttached = false;
+    }
     entry.target = target;
     entry.targetServerId = m_serverId;
 }
@@ -137,6 +154,11 @@ void TerminalFactory::rememberTarget(TerminalController* controller, const QStri
 void TerminalFactory::setAgentMonitor(AgentStatusMonitor* monitor)
 {
     m_agentMonitor = monitor;
+}
+
+void TerminalFactory::setRpcClient(CodeharbordClient* client)
+{
+    m_rpc = client;
 }
 
 void TerminalFactory::beginResolution(TerminalController* controller, const QString& key)
@@ -764,8 +786,11 @@ bool TerminalFactory::attach(TerminalController* controller,
             pane->setState(TerminalState::Ready);
     });
 
-    const bool started =
-        device->startPty(QStringLiteral("xterm-256color"), columns, lines, command);
+    // The moment the attach is issued, in whole seconds, for the recreated-
+    // session check below. Taken BEFORE the command goes out so nothing can be
+    // created in between and read as pre-existing.
+    const qint64 attachedAtSec = QDateTime::currentSecsSinceEpoch();
+    const bool started = openPty(device, columns, lines, command);
     if (!started) {
         const bool stillOurs = pane && pane->transport() == device;
         if (stillOurs)
@@ -817,7 +842,87 @@ bool TerminalFactory::attach(TerminalController* controller,
         if (it != m_attached.constEnd() && !it->terminalId.isEmpty())
             m_agentMonitor->noteTerminalAttached(it->devSessionId, it->terminalId);
     }
+
+    // Did this attach silently CREATE the pane's session instead of finding it?
+    // `tmux new-session -A` does both and says which it did nowhere, so a pane
+    // whose remote session died comes back as a brand new empty shell with the
+    // user's work gone and nothing on screen to say so. Asked out of band, after
+    // the attach, exactly like the kill exec: the pane is already up and working,
+    // and a diagnostic must never delay or gate that.
+    //
+    // Only a RE-attach may report. A pane attaching for the first time in this
+    // process, and a genuinely new pane, both create their session legitimately
+    // and have lost nothing.
+    if (auto it = m_attached.find(pane.data()); it != m_attached.end()) {
+        const bool reattach = it->everAttached;
+        it->everAttached = true;
+        if (reattach)
+            probeForRecreatedSession(pane.data(), tmuxTarget, attachedAtSec);
+    }
     return true;
+}
+
+bool TerminalFactory::openPty(SshChannelDevice* device, int cols, int rows,
+                              const QString& command)
+{
+    return device->startPty(QStringLiteral("xterm-256color"), cols, rows, command);
+}
+
+void TerminalFactory::probeForRecreatedSession(TerminalController* controller,
+                                               const QString& target,
+                                               qint64 attachedAtSec)
+{
+    if (!m_rpc || target.isEmpty())
+        return;
+    QPointer<TerminalFactory> self(this);
+    QPointer<TerminalController> pane(controller);
+    const QString askedOf = m_serverId;
+    // tmux.listSessions takes no parameters (remote/src/tmux.ts) and answers
+    // with the whole listing; an empty one is a NORMAL host (no tmux, or no
+    // server running) rather than a failure, which is the other reason nothing
+    // here is ever reported as an error.
+    m_rpc->call(QString::fromLatin1(rpc::kMethodListSessions), QJsonObject{},
+                [self, pane, target, attachedAtSec, askedOf](QJsonValue result,
+                                                            std::optional<RpcError> error) {
+                    if (!self || !pane || error)
+                        return;
+                    // The listing describes the host the question was asked of; a
+                    // profile switch since then makes it an answer about somebody
+                    // else's tmux server.
+                    if (self->m_serverId != askedOf)
+                        return;
+                    // The pane must still be on this very session. A kill or a
+                    // retarget while the question travelled would turn the notice
+                    // into a report about a terminal the user has already left.
+                    const auto it = self->m_attached.constFind(pane.data());
+                    if (it == self->m_attached.constEnd() || it->target != target)
+                        return;
+                    // Wire shape: an array of TmuxSession objects carrying `name`
+                    // and `created`, tmux's session_created as a UNIX timestamp in
+                    // SECONDS (remote/src/rpc-types.ts). No entry for this target
+                    // reports nothing: the session may have died again since, and a
+                    // diagnostic that cannot see the session cannot say anything
+                    // about it.
+                    const QJsonArray sessions = result.toArray();
+                    for (const QJsonValue& entry : sessions) {
+                        const QJsonObject session = entry.toObject();
+                        if (session.value(QStringLiteral("name")).toString() != target)
+                            continue;
+                        // SECOND granularity is all tmux publishes. A session that
+                        // was already there but happened to be created in the very
+                        // same second as our attach therefore reads as newly
+                        // created, and that is accepted rather than papered over:
+                        // the only alternative is a strictly-later comparison,
+                        // which misses every real loss whose replacement landed in
+                        // the same second as the attach that made it. A missing or
+                        // unreadable field lands below the floor and says nothing.
+                        if (session.value(QStringLiteral("created")).toInteger(-1)
+                            >= attachedAtSec) {
+                            emit self->sessionRecreated(pane.data(), target);
+                        }
+                        return;
+                    }
+                });
 }
 
 void TerminalFactory::detach(TerminalController* controller)

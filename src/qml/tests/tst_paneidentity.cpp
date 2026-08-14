@@ -34,6 +34,7 @@
 
 #include <QtTest>
 
+#include <QAccessible>
 #include <QCoreApplication>
 #include <QElapsedTimer>
 #include <QGuiApplication>
@@ -149,9 +150,11 @@ Window {
         })
     }
 
-    // Accessible.name is an attached QML property with no reachable C++
-    // accessor, so the reading has to be taken from inside the document.
+    // Accessible.name and Accessible.role are attached QML properties with no
+    // reachable C++ accessor, so the reading has to be taken from inside the
+    // document. The role comes back as the plain QAccessible::Role number.
     function accessibleName(item) { return item ? String(item.Accessible.name) : "" }
+    function accessibleRole(item) { return item ? Number(item.Accessible.role) : -1 }
 }
 )QML";
 
@@ -619,6 +622,10 @@ public:
 signals:
     void error(QObject *controller, const QString &message);
     void targetResolved(QObject *controller, const QString &target);
+    // The real factory reports this after an attach it discovers CREATED the
+    // pane's tmux session instead of re-attaching it: the pane's previous remote
+    // session was gone, so the shell on screen is not the one the user left.
+    void sessionRecreated(QObject *controller, const QString &tmuxTarget);
 
 private:
     QObject *m_controller = nullptr;
@@ -898,6 +905,10 @@ private slots:
     // value for that choice against the right pane id.
     void aTerminalPaneWritesTheHarnessTheUserChose();
 
+    // (16) A pane whose remote session died and was silently replaced by a new,
+    // empty shell has to SAY so — once, dismissibly, and to a screen reader too.
+    void aTerminalPaneSaysWhenItsRemoteSessionWasSilentlyReplaced();
+
 private:
     // Load one qrc component into the harness window with `props` as its
     // initial properties, and hand back the loaded item. The region types are
@@ -927,6 +938,9 @@ private:
     // Accessible.name of an item, read from inside the harness document (it is
     // an attached QML property with no C++ accessor).
     QString accessibleNameOf(QObject *item);
+    // Accessible.role of an item, read the same way, as the plain
+    // QAccessible::Role number the attached property carries.
+    int accessibleRoleOf(QObject *item);
 
     ch::CodeharbordClient m_client;
     ch::ViewerProfiles m_profiles{&m_client};
@@ -1905,6 +1919,17 @@ QString TstPaneIdentity::accessibleNameOf(QObject *item)
                                       Q_ARG(QVariant, QVariant::fromValue(item))))
         return QString();
     return name.toString();
+}
+
+int TstPaneIdentity::accessibleRoleOf(QObject *item)
+{
+    QVariant role;
+    if (!item
+        || !QMetaObject::invokeMethod(m_shell.get(), "accessibleRole",
+                                      Q_RETURN_ARG(QVariant, role),
+                                      Q_ARG(QVariant, QVariant::fromValue(item))))
+        return -1;
+    return role.toInt();
 }
 
 void TstPaneIdentity::theAddressBarOpensARemotePath()
@@ -3760,6 +3785,81 @@ void TstPaneIdentity::aTerminalPaneWritesTheHarnessTheUserChose()
     QCOMPARE(write.terminalPaneId, QStringLiteral("row-a"));
     // ...and the wire value, not the words on the button.
     QCOMPARE(write.harness, QStringLiteral("generic"));
+}
+
+// ---------------------------------------------------------------------------
+// (20) A pane whose remote session died and was silently replaced.
+//
+// The attach command is `tmux new-session -A`: it attaches if the session is
+// there and CREATES it if it is not, and it never says which it did. So a pane
+// whose remote session had died handed the user a brand new empty shell — their
+// agent, its work and its scrollback gone — and said nothing at all. That
+// silence is the whole bug: they could not even tell whether anything was lost.
+//
+// ch::TerminalFactory finds it out from the host's own session list and reports
+// it as sessionRecreated. What this covers is the other half: the pane has to
+// SAY it, in words that mean something to a person, without trapping them behind
+// chrome they cannot get rid of, and out loud for a screen reader.
+// ---------------------------------------------------------------------------
+void TstPaneIdentity::aTerminalPaneSaysWhenItsRemoteSessionWasSilentlyReplaced()
+{
+    TerminalFactoryStub factory;
+    QObject *const pane = openInShell(
+        QStringLiteral("TerminalPaneView.qml"),
+        {{QStringLiteral("factory"), QVariant::fromValue<QObject *>(&factory)},
+         {QStringLiteral("paneId"), QStringLiteral("terminal-1")},
+         {QStringLiteral("devSessionId"), QStringLiteral("dev-a")},
+         {QStringLiteral("terminalPaneId"), QStringLiteral("row-a")},
+         {QStringLiteral("workingDir"), QStringLiteral("/srv/a")}});
+    QVERIFY(pane);
+    QTRY_VERIFY(factory.controller());
+
+    QObject *const notice = childNamed(pane, QStringLiteral("terminalSessionReplacedNotice"));
+    QVERIFY2(notice, "the pane has nothing that can report a replaced remote session, so it "
+                     "hands the user an empty shell and says nothing");
+    // Silent until there is something to say: this is the state every working
+    // pane is in.
+    QVERIFY(!notice->property("visible").toBool());
+
+    emit factory.sessionRecreated(factory.controller(), QStringLiteral("ch_dev-a_row-a"));
+    QTRY_VERIFY2(notice->property("visible").toBool(),
+                 "the factory reported that this pane's remote session had been replaced and the "
+                 "pane showed nothing");
+
+    QObject *const label = childNamed(notice, QStringLiteral("terminalSessionReplacedLabel"));
+    QVERIFY(label);
+    const QString said = label->property("text").toString();
+    // Plain language about what happened to their work, and NOTHING they cannot
+    // act on: no tmux, no session name, no row id.
+    QVERIFY2(!said.isEmpty(), "the notice is blank");
+    QVERIFY2(!said.contains(QStringLiteral("tmux")), qPrintable(said));
+    QVERIFY2(!said.contains(QStringLiteral("ch_dev-a_row-a")), qPrintable(said));
+    QVERIFY2(!said.contains(QStringLiteral("row-a")), qPrintable(said));
+
+    // Announced, not merely painted: a notice a screen reader user never hears
+    // is, for them, exactly the silence this exists to end.
+    QCOMPARE(accessibleRoleOf(notice), int(QAccessible::AlertMessage));
+    QCOMPARE(accessibleNameOf(notice), said);
+
+    // ...and it goes away when they have read it. A notice that could not be
+    // dismissed would sit permanently over the terminal it is talking about.
+    QObject *const dismiss =
+        childNamed(notice, QStringLiteral("terminalSessionReplacedDismissButton"));
+    QVERIFY2(dismiss, "the notice cannot be dismissed, so it covers the terminal for good");
+    QVERIFY2(!accessibleNameOf(dismiss).isEmpty(),
+             "the dismiss control announces nothing, so it is reachable by mouse only");
+    QVERIFY(QMetaObject::invokeMethod(dismiss, "clicked"));
+    QTRY_VERIFY(!notice->property("visible").toBool());
+    QVERIFY(!pane->property("sessionReplaced").toBool());
+
+    // Retargeting the pane at another terminal must not carry the verdict over:
+    // it was never true of the terminal the pane is now showing.
+    emit factory.sessionRecreated(factory.controller(), QStringLiteral("ch_dev-a_row-a"));
+    QTRY_VERIFY(notice->property("visible").toBool());
+    pane->setProperty("terminalPaneId", QStringLiteral("row-b"));
+    QTRY_VERIFY2(!notice->property("visible").toBool(),
+                 "the notice followed the pane onto a different terminal, where it is a report "
+                 "about a session that terminal never had");
 }
 
 // QTEST_MAIN cannot be used: registerUrlScheme() and QtWebEngineQuick::initialize()

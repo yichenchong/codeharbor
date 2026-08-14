@@ -14,6 +14,8 @@
 #include <QBuffer>
 #include <QByteArray>
 #include <QCoreApplication>
+#include <QDateTime>
+#include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QJsonValue>
@@ -71,6 +73,21 @@ public:
     bool connected() const override { return true; }
 };
 
+// The SECOND environmental gate, opened for the same reason and no wider.
+// attach() builds a real ch::SshChannelDevice, and startPty() cannot succeed
+// without libssh and a live session, so everything the production attach path
+// does AFTER a successful open was unreachable from a unit test — including the
+// recreated-session diagnostic, which is precisely the code that decides whether
+// a user is told their work is gone. The override answers "the channel came up"
+// and changes nothing else; the pane simply never receives any bytes on it.
+class AttachingFactory : public OfflineFactory {
+public:
+    using OfflineFactory::OfflineFactory;
+
+protected:
+    bool openPty(SshChannelDevice*, int, int, const QString&) override { return true; }
+};
+
 QByteArray jsonLine(const QJsonObject& obj)
 {
     return QJsonDocument(obj).toJson(QJsonDocument::Compact) + '\n';
@@ -104,14 +121,19 @@ public:
     }
 
     WorkspaceDb* db() { return &m_db; }
+    // The same peer the repository speaks over. ch::TerminalFactory's
+    // recreated-session diagnostic is a `tmux.*` call, which is not the
+    // workspace group, so it is asked over the client directly.
+    CodeharbordClient* client() { return &m_client; }
 
-    // The next request frame the repository wrote, or an empty object if none
+    // The next request frame the client wrote, or an empty object if none
     // arrived. Frames are buffered because two lookups can be in flight and the
-    // socket may hand both over in one read.
-    QJsonObject takeRequest()
+    // socket may hand both over in one read. `timeoutMs` is short for the tests
+    // that assert NOTHING was asked.
+    QJsonObject takeRequest(int timeoutMs = 2000)
     {
         m_clientSide.flush();
-        QDeadlineTimer deadline(2000);
+        QDeadlineTimer deadline(timeoutMs);
         while (!m_pending.contains('\n') && !deadline.hasExpired()) {
             if (m_serverSide->bytesAvailable() > 0 || m_serverSide->waitForReadyRead(50))
                 m_pending += m_serverSide->readAll();
@@ -156,6 +178,17 @@ public:
                             {QStringLiteral("message"), message}}}});
     }
 
+    // Answer request `id` with a `tmux.listSessions` listing, in the wire shape
+    // remote/src/tmux.ts returns: the TmuxSession array from
+    // remote/src/rpc-types.ts, `created` being tmux's session_created as a UNIX
+    // timestamp in SECONDS.
+    void answerWithSessions(int id, const QJsonArray& sessions)
+    {
+        write({{QStringLiteral("jsonrpc"), QStringLiteral("2.0")},
+               {QStringLiteral("id"), id},
+               {QStringLiteral("result"), sessions}});
+    }
+
 private:
     void write(const QJsonObject& frame)
     {
@@ -172,6 +205,38 @@ private:
 };
 
 int asInt(AgentState state) { return static_cast<int>(state); }
+
+// One entry of a `tmux.listSessions` answer (remote/src/rpc-types.ts
+// TmuxSession). `created` is tmux's session_created: SECONDS since the epoch.
+QJsonObject tmuxSession(const QString& name, qint64 created)
+{
+    return QJsonObject{{QStringLiteral("name"), name},
+                       {QStringLiteral("windows"), 1},
+                       {QStringLiteral("created"), created},
+                       {QStringLiteral("attached"), true}};
+}
+
+// Bring `controller` up on a server-minted target the way production does:
+// resolve the pane's row, let the factory adopt the answer, then attach. Returns
+// false if any step did not happen, so a test cannot pass by never attaching.
+bool resolveAndAttach(TerminalFactory& factory, RpcPair& rpc,
+                      TerminalController* controller, const QString& target)
+{
+    QSignalSpy resolved(&factory, &TerminalFactory::targetResolved);
+    if (!factory.resolveTarget(controller, QStringLiteral("s1"),
+                               QStringLiteral("terminal-1"), QStringLiteral("row-A"),
+                               QStringLiteral("/repo")))
+        return false;
+    const QJsonObject request = rpc.takeRequest();
+    if (request.value(QStringLiteral("method")).toString()
+        != QString::fromLatin1(rpc::kMethodWorkspaceResolveTerminalPane))
+        return false;
+    rpc.answerWithRow(request.value(QStringLiteral("id")).toInt(), QStringLiteral("row-A"),
+                      QStringLiteral("s1"), QStringLiteral("terminal-1"), target, QString());
+    if (!resolved.wait(2000) || resolved.constFirst().at(1).toString() != target)
+        return false;
+    return factory.attach(controller, target, QStringLiteral("/repo"), 80, 24);
+}
 
 } // namespace
 
@@ -218,6 +283,13 @@ private slots:
     void changingTheWorkspaceServerForgetsRememberedRowIdentities();
     void aChangedHarnessSurvivesTheResolutionCache();
     void repeatingAnUnchangedHarnessDoesNotRestartTheClock();
+
+    // A pane whose remote session died and was silently replaced.
+    void aFirstAttachStaysSilentEvenWhenItCreatedTheSession();
+    void aReattachThatCreatedTheSessionSaysTheOldOneIsGone();
+    void anOrdinaryReconnectToASessionThatWasStillThereStaysSilent();
+    void aFailedOrEmptyListingReportsNothingAndRaisesNoError();
+    void aRetargetWhileTheProbeIsInFlightReportsNothing();
 };
 
 // Every pane owns its controller: it must be parented to the pane so closing
@@ -1234,12 +1306,15 @@ void TstTerminalFactory::attachStallIsReportedAsAPaneMessage()
 // the factory. These four cases cover the join, and specifically the rule that
 // decides WHICH answer a pane is allowed to take its identity from.
 //
-// What they cannot cover: attach() itself. It constructs a real
+// What THESE cases do not cover: attach() itself. It constructs a real
 // ch::SshChannelDevice and startPty() refuses without a live session, so the
 // noteTerminalAttached() call the production attach path makes is reachable
 // only from tst_liveterminalfactory. Where a test needs a pane to be in the
 // attached state it calls noteTerminalAttached() itself — the same call, made
-// by hand — and says so.
+// by hand — and says so. (The recreated-session cases at the end of this file
+// do drive the real attach path, through AttachingFactory's one override of the
+// channel open; nothing was changed here to use it, because a stand-in for a
+// call these tests make directly would only add a layer to read through.)
 
 // The normal path, end to end: ask by the legacy slot label, take the row id,
 // the owning Dev Session and the harness off the server's ANSWER, and report
@@ -1809,6 +1884,234 @@ void TstTerminalFactory::repeatingAnUnchangedHarnessDoesNotRestartTheClock()
     QCOMPARE(states.count(), 1);
     QCOMPARE(monitor.stateFor(QStringLiteral("s1"), QStringLiteral("row-A")),
              asInt(AgentState::Unknown));
+}
+
+// ---- a pane whose remote session died and was silently replaced ------------
+//
+// `tmux new-session -A` attaches to the session if it exists and CREATES it if
+// it does not, and it does not say which it did. So a pane whose remote session
+// had died came back as a brand new empty shell: the user's agent, its work and
+// its scrollback gone, with nothing on screen even hinting that anything had
+// happened. That silence is what made the underlying bug undiagnosable.
+//
+// The check is a `tmux.listSessions` round trip made AFTER the attach, out of
+// band exactly like the kill exec, comparing tmux's own session_created against
+// the second the attach was issued in.
+
+// A pane coming up for the FIRST time creates its session legitimately — that
+// is what a new terminal is — and has lost nothing. It must not be asked about
+// and must not report.
+void TstTerminalFactory::aFirstAttachStaysSilentEvenWhenItCreatedTheSession()
+{
+    RpcPair rpc;
+    QVERIFY(rpc.start());
+
+    AttachingFactory factory(nullptr);
+    factory.setWorkspace(rpc.db());
+    factory.setRpcClient(rpc.client());
+    factory.setServerId(QStringLiteral("srv-1"));
+
+    QObject pane;
+    TerminalController* controller = factory.create(&pane);
+    QSignalSpy recreated(&factory, &TerminalFactory::sessionRecreated);
+    QSignalSpy errors(&factory, &TerminalFactory::error);
+
+    QVERIFY(resolveAndAttach(factory, rpc, controller, QStringLiteral("ch_s1_row-A")));
+
+    // Not even asked: there is no question to put about a pane that has never
+    // had a session for this one to have replaced.
+    QCOMPARE(rpc.takeRequest(250), QJsonObject{});
+    QCOMPARE(recreated.count(), 0);
+    QCOMPARE(errors.count(), 0);
+}
+
+// THE BUG. The pane attached once, the session died while the client was away,
+// and the re-attach silently made a new one — which the listing gives away,
+// because the session it names was created at or after the moment the attach
+// went out.
+void TstTerminalFactory::aReattachThatCreatedTheSessionSaysTheOldOneIsGone()
+{
+    RpcPair rpc;
+    QVERIFY(rpc.start());
+
+    AttachingFactory factory(nullptr);
+    factory.setWorkspace(rpc.db());
+    factory.setRpcClient(rpc.client());
+    factory.setServerId(QStringLiteral("srv-1"));
+
+    QObject pane;
+    TerminalController* controller = factory.create(&pane);
+    const QString target = QStringLiteral("ch_s1_row-A");
+    QVERIFY(resolveAndAttach(factory, rpc, controller, target));
+
+    QSignalSpy recreated(&factory, &TerminalFactory::sessionRecreated);
+    QSignalSpy errors(&factory, &TerminalFactory::error);
+
+    const qint64 before = QDateTime::currentSecsSinceEpoch();
+    QVERIFY(factory.attach(controller, target, QStringLiteral("/repo"), 80, 24));
+
+    const QJsonObject probe = rpc.takeRequest();
+    QCOMPARE(probe.value(QStringLiteral("method")).toString(),
+             QString::fromLatin1(rpc::kMethodListSessions));
+    // A session created after the attach was issued cannot be one that was
+    // already there, so this attach is what made it.
+    rpc.answerWithSessions(probe.value(QStringLiteral("id")).toInt(),
+                           QJsonArray{tmuxSession(QStringLiteral("ch_s1_other"), before - 3600),
+                                      tmuxSession(target, before + 1)});
+
+    QTRY_COMPARE(recreated.count(), 1);
+    QCOMPARE(recreated.constFirst().at(0).value<TerminalController*>(), controller);
+    QCOMPARE(recreated.constFirst().at(1).toString(), target);
+    // A diagnostic, not a fault: the pane itself is working.
+    QCOMPARE(errors.count(), 0);
+}
+
+// The ORDINARY reconnect, which is most of them: the session outlived the
+// disconnect and the attach found it. Nothing was lost, so nothing may be said —
+// a notice here would appear after every reconnect and teach the user to ignore
+// the one that matters.
+void TstTerminalFactory::anOrdinaryReconnectToASessionThatWasStillThereStaysSilent()
+{
+    RpcPair rpc;
+    QVERIFY(rpc.start());
+
+    AttachingFactory factory(nullptr);
+    factory.setWorkspace(rpc.db());
+    factory.setRpcClient(rpc.client());
+    factory.setServerId(QStringLiteral("srv-1"));
+
+    QObject pane;
+    TerminalController* controller = factory.create(&pane);
+    const QString target = QStringLiteral("ch_s1_row-A");
+    QVERIFY(resolveAndAttach(factory, rpc, controller, target));
+
+    QSignalSpy recreated(&factory, &TerminalFactory::sessionRecreated);
+    QSignalSpy errors(&factory, &TerminalFactory::error);
+
+    const qint64 before = QDateTime::currentSecsSinceEpoch();
+    QVERIFY(factory.attach(controller, target, QStringLiteral("/repo"), 80, 24));
+
+    const QJsonObject probe = rpc.takeRequest();
+    QCOMPARE(probe.value(QStringLiteral("method")).toString(),
+             QString::fromLatin1(rpc::kMethodListSessions));
+    // Created yesterday: it was there before this attach, so the attach attached.
+    rpc.answerWithSessions(probe.value(QStringLiteral("id")).toInt(),
+                           QJsonArray{tmuxSession(target, before - 86400)});
+
+    QTest::qWait(150);
+    QCOMPARE(recreated.count(), 0);
+    QCOMPARE(errors.count(), 0);
+}
+
+// Every way the diagnostic can fail to produce a verdict, and the one rule that
+// covers all of them: say nothing. A failed diagnostic must never become a
+// user-facing error, and must never stand in the way of a pane that is working.
+void TstTerminalFactory::aFailedOrEmptyListingReportsNothingAndRaisesNoError()
+{
+    RpcPair rpc;
+    QVERIFY(rpc.start());
+
+    AttachingFactory factory(nullptr);
+    factory.setWorkspace(rpc.db());
+    factory.setRpcClient(rpc.client());
+    factory.setServerId(QStringLiteral("srv-1"));
+
+    QObject pane;
+    TerminalController* controller = factory.create(&pane);
+    const QString target = QStringLiteral("ch_s1_row-A");
+    QVERIFY(resolveAndAttach(factory, rpc, controller, target));
+
+    QSignalSpy recreated(&factory, &TerminalFactory::sessionRecreated);
+    QSignalSpy errors(&factory, &TerminalFactory::error);
+
+    // 1. The host refuses the listing outright.
+    QVERIFY(factory.attach(controller, target, QStringLiteral("/repo"), 80, 24));
+    QJsonObject probe = rpc.takeRequest();
+    QCOMPARE(probe.value(QStringLiteral("method")).toString(),
+             QString::fromLatin1(rpc::kMethodListSessions));
+    rpc.answerWithError(probe.value(QStringLiteral("id")).toInt(),
+                        QStringLiteral("tmux: command not found"));
+    QTest::qWait(150);
+    QCOMPARE(recreated.count(), 0);
+    QCOMPARE(errors.count(), 0);
+
+    // 2. The listing answers, but has no entry for this pane's session — a host
+    // with no tmux server running answers an empty array, and the session may
+    // also have died again since the attach. Either way there is nothing to
+    // compare and therefore nothing to say.
+    QVERIFY(factory.attach(controller, target, QStringLiteral("/repo"), 80, 24));
+    probe = rpc.takeRequest();
+    QCOMPARE(probe.value(QStringLiteral("method")).toString(),
+             QString::fromLatin1(rpc::kMethodListSessions));
+    rpc.answerWithSessions(probe.value(QStringLiteral("id")).toInt(),
+                           QJsonArray{tmuxSession(QStringLiteral("ch_s1_row-B"),
+                                                  QDateTime::currentSecsSinceEpoch())});
+    QTest::qWait(150);
+    QCOMPARE(recreated.count(), 0);
+    QCOMPARE(errors.count(), 0);
+}
+
+// The probe is asked on one channel and answered later, so the pane can move
+// underneath it. A user who retargets a pane at another terminal in that window
+// must not then be told that the terminal they just LEFT is gone: the notice
+// would name a session they never lost, in a pane now showing something else.
+// The answer is matched against the target the pane is on NOW, not the one the
+// question was asked about.
+void TstTerminalFactory::aRetargetWhileTheProbeIsInFlightReportsNothing()
+{
+    RpcPair rpc;
+    QVERIFY(rpc.start());
+
+    AttachingFactory factory(nullptr);
+    factory.setWorkspace(rpc.db());
+    factory.setRpcClient(rpc.client());
+    factory.setServerId(QStringLiteral("srv-1"));
+
+    QObject pane;
+    TerminalController* controller = factory.create(&pane);
+    const QString first = QStringLiteral("ch_s1_row-A");
+    QVERIFY(resolveAndAttach(factory, rpc, controller, first));
+
+    QSignalSpy recreated(&factory, &TerminalFactory::sessionRecreated);
+    QSignalSpy errors(&factory, &TerminalFactory::error);
+
+    // A re-attach, so the probe is armed and would otherwise report.
+    const qint64 before = QDateTime::currentSecsSinceEpoch();
+    QVERIFY(factory.attach(controller, first, QStringLiteral("/repo"), 80, 24));
+    const QJsonObject probe = rpc.takeRequest();
+    QCOMPARE(probe.value(QStringLiteral("method")).toString(),
+             QString::fromLatin1(rpc::kMethodListSessions));
+
+    // The pane moves to another terminal before the listing comes back. Resolved
+    // by hand rather than through resolveAndAttach, which hard-codes row-A: this
+    // needs a DIFFERENT row, and attach() refuses a target the pane has not
+    // resolved.
+    const QString second = QStringLiteral("ch_s1_row-B");
+    QSignalSpy resolved(&factory, &TerminalFactory::targetResolved);
+    QVERIFY(factory.resolveTarget(controller, QStringLiteral("s1"),
+                                  QStringLiteral("terminal-2"), QStringLiteral("row-B"),
+                                  QStringLiteral("/repo")));
+    const QJsonObject lookup = rpc.takeRequest();
+    QCOMPARE(lookup.value(QStringLiteral("method")).toString(),
+             QString::fromLatin1(rpc::kMethodWorkspaceResolveTerminalPane));
+    rpc.answerWithRow(lookup.value(QStringLiteral("id")).toInt(), QStringLiteral("row-B"),
+                      QStringLiteral("s1"), QStringLiteral("terminal-2"), second,
+                      QString());
+    QVERIFY(resolved.wait(2000));
+    QVERIFY(factory.attach(controller, second, QStringLiteral("/repo"), 80, 24));
+    // And it arms NO probe of its own: rememberTarget() forgets that this pane
+    // had ever attached once the target moves, precisely because nothing is
+    // expected to be waiting at a session the pane has not used before. So the
+    // only answer still outstanding is the one for the target the pane has left.
+
+    // The late answer says the FIRST session was created by that earlier attach,
+    // which on its own is exactly what the notice reports.
+    rpc.answerWithSessions(probe.value(QStringLiteral("id")).toInt(),
+                           QJsonArray{tmuxSession(first, before + 1)});
+
+    QTest::qWait(150);
+    QCOMPARE(recreated.count(), 0);
+    QCOMPARE(errors.count(), 0);
 }
 
 QTEST_GUILESS_MAIN(TstTerminalFactory)
