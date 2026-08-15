@@ -796,15 +796,24 @@ Oh My Pi is the highest-priority integration.
 INSTALLING THE OH MY PI PRODUCER. Oh My Pi's extensibility surface loads a
 MODULE that default-exports a factory and registers handlers on the runtime
 event bus; it never runs a shell command for a lifecycle event. The producer is
-therefore `remote/src/hooks/oh-my-pi-extension.ts`, installed by pointing the
-harness at it:
+therefore `remote/src/hooks/oh-my-pi-extension.ts`, and it is installed ONCE per
+machine rather than per pane or per session, by placing it where the harness
+auto-discovers extension modules:
 
 ```bash
-omp --hook=/path/to/codeharbor/remote/src/hooks/oh-my-pi-extension.ts
+mkdir -p ~/.omp/agent/extensions
+ln -s /path/to/codeharbor/remote/src/hooks/oh-my-pi-extension.ts \
+      ~/.omp/agent/extensions/codeharbor.ts
 ```
 
-`--hook` is an alias for `--extension`, and a path in the harness's own
-extension configuration works identically.
+Roots verified by observation against `omp/17.3.4`, by loading a probe module
+and running a real agent with no flags: `~/.omp/agent/extensions/` loads,
+`~/.omp/agent/hooks/pre/` loads, and `~/.omp/hooks/pre/` does NOT — the user
+root is the agent directory, not `~/.omp` itself. `<cwd>/.omp/extensions/` scopes
+it to one project, and `omp --hook=<path>` (an alias for `--extension`) loads it
+for a single run, which is a way to try it rather than a way to install it.
+A symlink is preferred over a copy so the producer cannot silently go stale
+against the wire contract it shares with the bridge.
 
 This is written down because getting it wrong shipped a dead integration. The
 first producer was a CLI script (`remote/src/hooks/oh-my-pi-hook.ts`) whose
