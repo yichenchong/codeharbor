@@ -43,7 +43,8 @@ src/            C++/QML client
   agent/        AgentStatusMonitor: coding-agent status over the bridge
   qml/          shared QML components
   web/          bundled web assets (terminal, editor, markdown)
-remote/         server-side service, agent bridge, harness adapters
+remote/         server-side service, agent bridge, viewer-control channel,
+                harness adapters, the codeharbor-mcp server and codeharbor-view CLI
 docs/           SPEC.md, PLAN.md, DEVELOPMENT.md, plus dated bug-hunt records
 ```
 
@@ -219,6 +220,47 @@ A few things worth knowing about the shipped client:
   pointer towards it made it vanish.
 - **Several servers can be saved** and switched between; closing the app leaves the
   remote tmux sessions running, so a reconnect finds the shells where they were.
+
+## Letting your coding agent drive the viewer panes
+
+An AI agent running in a CodeHarbor terminal pane can put things on your screen —
+a file, a directory listing, a rendered document, a web page — instead of pasting
+them into the terminal. It can also split, focus, reload and close viewer panes.
+
+It works because the agent talks to a Unix socket the server-side service owns,
+and the desktop client picks the command up over the SSH connection it already
+has. Nothing is exposed to the network, and every command goes through the same
+code path a click does, so it lands on the layout that is on screen and persists
+the same way.
+
+Set-up is per assistant. The repository ships the pieces for three:
+
+| Assistant | What to do |
+| --- | --- |
+| **Claude Code** | Nothing. `.mcp.json` and `.claude/skills/codeharbor-viewer` are in the repository; approve the project's MCP server when Claude asks. |
+| **Codex** | Once: `codex mcp add codeharbor -- node /path/to/codeharbor/remote/src/mcp/server.ts`. The skill is at `.agents/skills/codeharbor-viewer`. |
+| **Oh My Pi / pi** | Nothing. `.omp/mcp.json` and `.omp/skills/codeharbor-viewer` are in the repository. |
+
+The tools are `viewer_list`, `viewer_open`, `viewer_split`, `viewer_focus`,
+`viewer_close` and `viewer_reload`. From a shell — for a harness with no MCP
+support, or to check that the path works at all:
+
+```bash
+node remote/src/tools/viewctl.ts list
+node remote/src/tools/viewctl.ts open --url README.md --new-pane
+node remote/src/tools/viewctl.ts close --pane viewer-2
+```
+
+Three things to know:
+
+- **It only drives the Dev Session you are looking at.** A command from a pane of
+  another session is refused by name rather than applied to the wrong layout.
+- **Closing a pane does not ask about unsaved editor changes**, the same as the
+  command palette's Close Pane. The shipped skills tell the agent to ask you first.
+- **It needs a pane CodeHarbor created.** The two variables the path is keyed on,
+  `OMP_DEV_SESSION_ID` and `OMP_TERMINAL_ID`, are exported into each pane's tmux
+  session; a shell that was already running before CodeHarbor attached does not
+  have them. `echo "$OMP_DEV_SESSION_ID"` says which case you are in.
 
 ## Build
 

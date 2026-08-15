@@ -40,7 +40,21 @@ import { TMUX_METHODS } from "./tmux.ts";
 // isInvalidParams recognizes the tagged error the param guards throw, so a
 // malformed request is answered with "Invalid params" instead of a generic
 // internal error that blames the server for the client's bad payload.
-import { isInvalidParams } from "./validate.ts";
+import {
+    InvalidParamsError,
+    isInvalidParams,
+    requireBoolean,
+    requireObject,
+    requireString,
+} from "./validate.ts";
+// isPlainObject lives with the event schema (events.ts) because that is where
+// the JSON-object footgun it guards against was first written down; it is the
+// same check the bridge and the control listener apply to a decoded payload.
+import { isPlainObject } from "./events.ts";
+// Viewer control channel (agent -> desktop). Its socket is bound by runStdio
+// below; the `viewer.commandResult` handler in the static method table settles
+// the producer that is still waiting on it.
+import { startControlListener, type ControlListener } from "./control.ts";
 import {
     RPC_DATABASE_BUSY,
     RPC_INTERNAL_ERROR,
@@ -52,12 +66,16 @@ import {
     RPC_RESOURCE_LIMIT,
     RPC_REVISION_MISMATCH,
     RPC_SERVER_INFO_METHOD,
+    RPC_VIEWER_COMMAND_NOTIFICATION,
+    RPC_VIEWER_COMMAND_RESULT_METHOD,
     RPC_WATCH_EVENT_NOTIFICATION,
     RPC_WATCH_EVENTS_LOST_NOTIFICATION,
 } from "./rpc-types.ts";
 import type {
     PingResult,
     ServerInfoResult,
+    ViewerCommandParams,
+    ViewerCommandResultResult,
     WatchEvent,
     WatchEventsLost,
 } from "./rpc-types.ts";
@@ -76,6 +94,8 @@ export {
     RPC_DATABASE_BUSY,
     RPC_RESOURCE_LIMIT,
     RPC_REVISION_MISMATCH,
+    RPC_VIEWER_COMMAND_NOTIFICATION,
+    RPC_VIEWER_COMMAND_RESULT_METHOD,
     RPC_WATCH_EVENT_NOTIFICATION,
     RPC_WATCH_EVENTS_LOST_NOTIFICATION,
 };
@@ -98,7 +118,11 @@ export const RPC_SERVER_VERSION = "0.1.29";
 // its ROW ID rather than by a layout slot label: a v5 server requires `name`
 // and rejects the `id` this client sends, so every terminal would fail to
 // attach with an invalid-params error instead of at the compatibility gate.
-export const RPC_SCHEMA_VERSION = 6;
+// Bumped 6 -> 7 when the viewer control channel joined the transport
+// (viewer.command / viewer.commandResult): a v6 server binds no control socket,
+// so an agent's pane command would be accepted by its own tooling and then
+// vanish with nothing anywhere saying the server cannot carry it.
+export const RPC_SCHEMA_VERSION = 7;
 
 export interface RpcRequest {
     jsonrpc: "2.0";
@@ -162,6 +186,16 @@ function recoveryBaseDir(): string {
     return pathJoin(homedir(), ".local", "share");
 }
 
+// The live viewer control listener, or null when none is bound — a hand-started
+// daemon that lost the socket race, or one whose stdout has already failed.
+//
+// Module-level rather than a runStdio() local because the `viewer.commandResult`
+// handler below lives in the module's static method table, exactly as
+// fileWatchService is a module singleton for the same reason. runStdio() owns
+// its lifetime and clears it on shutdown, so a retired transport's listener can
+// never settle a live one's producers.
+let activeControlListener: ControlListener | null = null;
+
 // Static method table. Anything outside the three spread-in method groups is
 // declared here; a new group is added to the spread rather than to this literal.
 const methods: Record<string, MethodHandler> = {
@@ -192,6 +226,40 @@ const methods: Record<string, MethodHandler> = {
         serverId: serverIdentity(),
         recoveryDir: pathJoin(recoveryBaseDir(), "codeharbor", "recovery"),
     }),
+    // The desktop's answer to one relayed viewer command (SPEC 4.3). The client
+    // sends it as an ordinary request because the transport carries requests in
+    // that direction already; the listener matches it to the agent's still-open
+    // control socket and writes the reply there.
+    //
+    // An unknown commandId returns SUCCESS on purpose: the daemon may already
+    // have timed the command out, and an error here would surface in the client
+    // as a failure toast for work that merely finished late. `error` and `data`
+    // are forwarded verbatim — the client, not this relay, is the authority on
+    // why a pane command was refused.
+    [RPC_VIEWER_COMMAND_RESULT_METHOD]: (params: unknown): ViewerCommandResultResult => {
+        const p = requireObject(params, RPC_VIEWER_COMMAND_RESULT_METHOD);
+        const commandId = requireString(p, "commandId", RPC_VIEWER_COMMAND_RESULT_METHOD);
+        const ok = requireBoolean(p, "ok", RPC_VIEWER_COMMAND_RESULT_METHOD);
+        let error: { code: string; message: string } | undefined;
+        if (p.error !== undefined) {
+            const raw = requireObject(p.error, `${RPC_VIEWER_COMMAND_RESULT_METHOD}.error`);
+            error = {
+                code: requireString(raw, "code", `${RPC_VIEWER_COMMAND_RESULT_METHOD}.error`),
+                message: requireString(raw, "message", `${RPC_VIEWER_COMMAND_RESULT_METHOD}.error`),
+            };
+        }
+        let data: Record<string, unknown> | undefined;
+        if (p.data !== undefined) {
+            if (!isPlainObject(p.data)) {
+                throw new InvalidParamsError(
+                    `${RPC_VIEWER_COMMAND_RESULT_METHOD}: missing or invalid field 'data'`,
+                );
+            }
+            data = p.data;
+        }
+        activeControlListener?.settle({ commandId, ok, error, data });
+        return { ok: true };
+    },
     ...fileMethods,
     ...WORKSPACE_METHODS,
     ...TMUX_METHODS,
@@ -450,6 +518,13 @@ export function responseLine(response: RpcResponse): string {
 export function createLineFramer(
     onLine: (line: string) => void,
     onOverflow: () => void,
+    // Defaults to the RPC transport's own cap, which is what every existing
+    // caller wants. Parameterized because the MCP server (remote/src/mcp) frames
+    // the same way over a DIFFERENT protocol whose messages are three orders of
+    // magnitude smaller — reusing this framer there is what keeps the two stdio
+    // readers from disagreeing about what a line is, and a 16 MiB bound on a
+    // protocol that never sends more than a few kilobytes is not a bound.
+    maxLineBytes: number = MAX_LINE_BYTES,
 ): (chunk: Buffer) => void {
     let held: Buffer[] = [];
     let heldBytes = 0;
@@ -465,7 +540,7 @@ export function createLineFramer(
                 discarding = false;
             } else {
                 const lineBytes = heldBytes + segment.length;
-                if (lineBytes > MAX_LINE_BYTES) {
+                if (lineBytes > maxLineBytes) {
                     // The newline is in this chunk, so the offending frame is
                     // complete already: report it and discard the whole line,
                     // but resume framing immediately after this newline.
@@ -495,7 +570,7 @@ export function createLineFramer(
         // Checking the held byte count here bounds memory to roughly one chunk
         // beyond the cap, unlike a post-line length check that only fires once
         // the whole oversized line is already resident.
-        if (heldBytes > MAX_LINE_BYTES) {
+        if (heldBytes > maxLineBytes) {
             held = [];
             heldBytes = 0;
             discarding = true;
@@ -885,6 +960,66 @@ export function runStdio(): StdioHandle {
             failOutput();
         }
     };
+    // VIEWER CONTROL (SPEC 4.3). Bind the agent-facing socket and relay each
+    // command it accepts as an id-less notification on this transport.
+    //
+    // The relay goes through writeOut, NOT process.stdout directly: that is the
+    // bounded response path, and a notification written past it would grow
+    // Node's internal writable buffer without limit whenever the SSH channel
+    // stalls. Its return of `!outputFailed` is what turns a dead output into an
+    // immediate `failed` for the waiting agent instead of a five-second wait for
+    // a reply that can never arrive.
+    //
+    // Binding is ASYNCHRONOUS and its failure is a stderr line, never a fault: a
+    // second CodeHarbor window against the same host loses the socket race, and
+    // SshChannelDevice publishes daemon stderr as diagnostics (SessionBootstrap
+    // demotes it deliberately), so that window degrades to "no agent pane
+    // control" instead of failing to connect at all.
+    const relayViewerCommand = (command: {
+        commandId: string;
+        devSessionId: string;
+        terminalId: string;
+        op: string;
+        args: Record<string, unknown>;
+    }): boolean => {
+        if (outputFailed) return false;
+        const params: ViewerCommandParams = {
+            commandId: command.commandId,
+            devSessionId: command.devSessionId,
+            terminalId: command.terminalId,
+            op: command.op,
+            args: command.args,
+        };
+        writeOut(
+            `${JSON.stringify({
+                jsonrpc: "2.0",
+                method: RPC_VIEWER_COMMAND_NOTIFICATION,
+                params,
+            })}\n`,
+        );
+        return !outputFailed;
+    };
+    let controlListener: ControlListener | null = null;
+    void startControlListener(relayViewerCommand).then(
+        (listener) => {
+            // A shutdown that ran while the bind was still in flight must not
+            // leave a live socket behind.
+            if (shuttingDown) {
+                listener.close();
+                return;
+            }
+            controlListener = listener;
+            activeControlListener = listener;
+            process.stderr.write(
+                `codeharbord: viewer control listening on ${listener.socketPath}\n`,
+            );
+        },
+        (err: unknown) => {
+            process.stderr.write(
+                `codeharbord: viewer control disabled: ${err instanceof Error ? err.message : String(err)}\n`,
+            );
+        },
+    );
     const dispatchLine = (line: string): void => {
         // Skip separator lines without copying the line: trim() on a multi-MiB
         // base64 file.writeFile frame duplicates the whole string just to answer
@@ -958,6 +1093,14 @@ export function runStdio(): StdioHandle {
         // was holding for it.
         releaseWatchEvents();
         releaseWatchClosed();
+        // Stop accepting viewer commands and answer every agent still waiting on
+        // one, BEFORE the responses below are flushed: those producers are
+        // blocking an agent's turn, and a socket closed without a reply leaves
+        // that agent waiting for its own client-side timeout instead of being
+        // told the session is going away. Clearing the module-level handle keeps
+        // a retired transport from settling a later one's producers.
+        controlListener?.close();
+        if (activeControlListener === controlListener) activeControlListener = null;
         // Stop reading requests. Answering a new one while shutting down would
         // start work whose reply cannot be guaranteed to reach the wire.
         process.stdin.removeListener("data", feed);

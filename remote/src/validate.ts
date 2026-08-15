@@ -117,6 +117,21 @@ export function optionalBoolean(obj: Record<string, unknown>, field: string, met
 }
 
 /**
+ * A boolean field that must be PRESENT. Distinct from optionalBoolean because
+ * an absent flag and `false` mean the same thing to that guard's callers, while
+ * a caller that reports an OUTCOME (viewer.commandResult's `ok`) cannot treat
+ * "the field is missing" as "it failed" — that would turn a producer bug into a
+ * silent, plausible-looking answer.
+ */
+export function requireBoolean(obj: Record<string, unknown>, field: string, method: string): boolean {
+    const value = obj[field];
+    if (typeof value !== "boolean") {
+        throw new InvalidParamsError(`${method}: missing or invalid field '${field}'`);
+    }
+    return value;
+}
+
+/**
  * A whole-number index into something: a non-negative integer no larger than
  * Number.MAX_SAFE_INTEGER. Two kinds of caller use it — a byte offset or length
  * in the `file.*` group, and a `position` (a row's slot in an ordered scope) in

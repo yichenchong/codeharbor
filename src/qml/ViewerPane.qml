@@ -507,6 +507,28 @@ Item {
         return true;
     }
 
+    // Open `targetUrl` in this pane, letting the handler REGISTRY choose when no
+    // handler is named.
+    //
+    // openUrlWithKind() above is the "Open as" override and REQUIRES a handler:
+    // it refuses an empty one, because a menu entry that named no handler is a
+    // bug. A caller that simply has an address — the address bar, a link, an
+    // agent's `open` command — is the ordinary navigation case and must not be
+    // told "That viewer cannot display this target."; that is what the registry
+    // is for.
+    //
+    // Answers whether the pane accepted the target, so a caller that must report
+    // an outcome (the agent control channel) has one.
+    function openTarget(targetUrl, requestedKind) {
+        const requested = String(requestedKind === undefined || requestedKind === null
+                                 ? "" : requestedKind);
+        if (requested.length > 0)
+            return pane.openUrlWithKind(targetUrl, requested);
+        pane.forcedKind = "";
+        pane.url = targetUrl;
+        return true;
+    }
+
     function requestOpenAs(path, requestedKind, inNewPane) {
         const targetUrl = pane.fileUrlFor(path);
         if (inNewPane) {

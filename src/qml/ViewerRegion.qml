@@ -481,7 +481,31 @@ Rectangle {
             };
             return true;
         }
-        return pane.openUrlWithKind(url, kind);
+        // openTarget, not openUrlWithKind: an EMPTY kind means "let the handler
+        // registry decide", which is the ordinary open. openUrlWithKind refuses
+        // that and would answer a plain "open this file" with the misleading
+        // "That viewer cannot display this target."
+        return pane.openTarget(url, kind);
+    }
+
+    // Reload whatever the pane is currently showing, as its header's Reload
+    // button does. Answers false when the id names no live pane.
+    //
+    // Unlike openPaneTarget there is nothing to QUEUE: a pending "open this
+    // target" is a request that stays meaningful until the Loader catches up,
+    // while "reload what you are showing" describes a pane that is on screen
+    // right now. A pane that does not exist yet has nothing to re-fetch, so the
+    // honest answer is no, and the caller reports it.
+    //
+    // Exists because reloading is otherwise reachable only from the pane's own
+    // header: the layout facade records URLs, it does not re-fetch them, so an
+    // agent (or any host-level command) had no way to ask for one.
+    function reloadPane(paneId) {
+        const pane = region.paneOwner.paneCache[paneId];
+        if (!pane)
+            return false;
+        pane.reloadCurrent();
+        return true;
     }
 
     // A pane reporting WHAT IT IS SHOWING, so the host can persist it and the
@@ -556,7 +580,7 @@ Rectangle {
         const pending = region.paneOwner.pendingOpenTargets[key];
         if (pending) {
             delete region.paneOwner.pendingOpenTargets[key];
-            pane.openUrlWithKind(pending.url, pending.kind);
+            pane.openTarget(pending.url, pending.kind);
         }
     }
 

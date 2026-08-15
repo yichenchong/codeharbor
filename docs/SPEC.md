@@ -961,6 +961,73 @@ Three rules make that safe:
   is working almost always prints, so the window only elapses for a pane that has said
   nothing at all on either channel.
 
+### 6.8 Agent Viewer Control
+
+Agent integration is otherwise observational (6.1). This is the one place it is not: an
+agent running in a terminal pane may DRIVE the viewer region, so it can put a file, a diff,
+a directory or a page in front of the user instead of pasting it into the terminal.
+
+The path exists because the two ends are on different machines. The agent is a remote
+process; the viewer panes are QML objects in the desktop client. It reuses the RPC channel
+the client already owns rather than adding a transport:
+
+```text
+agent tool (codeharbor-mcp / codeharbor-view)
+  -> Unix socket: $XDG_RUNTIME_DIR/codeharbor-control.sock
+     (fallback ~/.cache/codeharbor/control.sock), bound by codeharbord, 0600
+  -> `viewer.command` id-less JSON-RPC notification on the RPC channel
+  -> ch::ViewerCommandService -> Main.qml -> ViewerRegion / SessionLayouts
+  -> `viewer.commandResult` request back to codeharbord
+  -> the answer on the agent's still-open socket connection
+```
+
+The bridge channel (6.3) is deliberately NOT used: it is a one-way status relay whose stdin
+is a lifetime watchdog, so nothing can travel client -> server on it, and a pane command
+that cannot be answered is worse than none.
+
+Operations, all addressed by viewer pane id (`list` reports them; omitting the id targets
+the focused pane):
+
+```text
+list    -> { focusedPaneId, panes: [ { paneId, url, title } ] }
+open    { url, pane?, newPane?, kind? }        -> { paneId, url }
+split   { orientation: horizontal|vertical, pane? } -> { paneId }
+close   { pane? }                              -> { paneId }
+focus   { pane? }                              -> { paneId }
+reload  { pane? }                              -> { paneId }
+```
+
+`url` accepts an `http(s)://` address, a `file://` URL naming a file on the SERVER (2.4), or
+a remote path — relative paths resolve against the Dev Session's repository root (7.1), and
+a trailing slash asks for the directory listing. `codeharbor-internal://` is refused: it is
+an implementation detail of the privileged handlers (7.4). `kind` is the "Open as"
+vocabulary (4.3); omitted, the handler registry chooses.
+
+Refusals are named so an agent can act on them: `bad_request`, `busy`, `timeout`,
+`not_active_session`, `unknown_pane`, `failed`.
+
+Four rules bound what an agent can do:
+
+- **The active Dev Session only.** A command whose `devSessionId` is not the session on
+  screen is refused with `not_active_session`. Only that session's tree is loaded, and
+  applying a command to a layout nobody is looking at is worse than refusing it.
+- **Through the UI's own path.** Every operation goes through the same
+  `ViewerRegion`/`SessionLayouts` calls a click takes, so an agent cannot reach a layout the
+  UI could not produce, and the result persists exactly as a user's edit does.
+- **Bounded and answered.** At most 32 commands may be in flight (further ones are told
+  `busy`), an unanswered command times out after 5 s, and every command receives exactly one
+  answer — an agent's turn is blocked while it waits.
+- **Identified.** A command carries the asking pane's `devSessionId` and `terminalId`, taken
+  from the `OMP_DEV_SESSION_ID`/`OMP_TERMINAL_ID` the client exports into every terminal
+  pane it creates (5.2). A process without them is refused with an explanation.
+
+The agent-facing surface is an MCP server (`codeharbor-mcp`) exposing `viewer_list`,
+`viewer_open`, `viewer_split`, `viewer_focus`, `viewer_close` and `viewer_reload`, plus a
+`codeharbor-view` CLI for shells and diagnostics. Installable skills live in `.claude/skills`
+(Claude Code), `.agents/skills` (Codex, and Oh My Pi's agents provider) and `.omp/skills`
+(Oh My Pi). MCP is the primary surface: a harness may sandbox a spawned shell away from a
+Unix socket while launching its local stdio MCP servers outside that sandbox.
+
 ---
 
 ## 7. Viewer Architecture
@@ -1657,9 +1724,13 @@ remote/
 │   ├── validate.ts           request-parameter validation helpers
 │   ├── events.ts             agent event schema + socket-path resolution
 │   ├── bridge.ts             agent event relay
+│   ├── control.ts            agent viewer-control socket + wire contract (§ 6.8)
+│   ├── control-client.ts     the producer half of that channel
 │   ├── adapters/             pi-family.ts (shared Pi mapping), oh-my-pi.ts,
 │   │                         pi.ts, claude-code.ts, types.ts, index.ts (registry)
-│   └── hooks/                oh-my-pi-hook.ts (the native harness hook)
+│   ├── hooks/                oh-my-pi-hook.ts (the native harness hook)
+│   ├── mcp/                  server.ts (codeharbor-mcp: the viewer_* tools)
+│   └── tools/                viewctl.ts (codeharbor-view: the shell face)
 └── sql/                      schema.sql, indexes.sql
 ```
 

@@ -2,6 +2,10 @@ import QtQuick
 import QtQuick.Controls.Basic
 import QtQuick.Window
 import CodeHarbor
+// The module's one conversion between a remote POSIX path and the file:// URL
+// the viewer stack passes around. runViewerCommand() needs it because an agent
+// names a file the way a shell does, and a viewer pane is addressed by URL.
+import "RemotePath.js" as RemotePath
 
 // The fixed three-region outer layout (SPEC 2.3, 4.1). Region widths are
 // adjustable via the SplitView handles and are persisted per client via
@@ -238,6 +242,17 @@ ApplicationWindow {
         }
         function onViewerTreeChanged() { window.scheduleFocusRestore(); }
         function onTerminalTreeChanged() { window.scheduleFocusRestore(); }
+    }
+
+    // Agent-driven viewer commands (SPEC 4.3). Null until main.cpp injects the
+    // service, which is why this guards on it exactly as the layouts block above
+    // does.
+    Connections {
+        target: app.viewerCommands
+        enabled: app.viewerCommands !== null
+        function onCommandRequested(commandId, devSessionId, op, args) {
+            window.runViewerCommand(commandId, devSessionId, op, args);
+        }
     }
 
     // Persist the current region widths. viewer is the fill region (0 = fill),
@@ -767,6 +782,234 @@ ApplicationWindow {
             return;
         }
         viewerRegion.focusPane(newPaneId);
+    }
+
+    // ---- agent viewer control (SPEC 4.3) -----------------------------------
+    //
+    // ch::ViewerCommandService announces one validated command per signal; this
+    // window answers every one exactly once. It is the ONLY place an agent's
+    // command becomes a pane mutation, and it deliberately reuses the same
+    // helpers a click or a palette command uses — targetPaneId(), treeHasPane(),
+    // openViewerInNewPane(), app.layouts, viewerRegion — so an agent cannot
+    // reach a layout the UI itself could not produce.
+    //
+    // UNSTAMPED layout calls throughout, for the reason the palette states: this
+    // runs synchronously inside the notification's own turn, so "whatever session
+    // and generation are current right now" is the answer, and the session gate
+    // below has already established that the asking agent means this one.
+
+    // The viewer leaves of the active session's tree, as {paneId, url, title}.
+    function viewerInventory(tree, out) {
+        if (!tree)
+            return out;
+        if (!tree.children || tree.children.length === 0) {
+            const id = (tree.paneId === undefined || tree.paneId === null)
+                     ? "" : String(tree.paneId);
+            // The empty placeholder leaf a fully closed region leaves behind is
+            // not a pane an agent can address.
+            if (id.length > 0) {
+                out.push({
+                    paneId: id,
+                    url: tree.url === undefined || tree.url === null ? "" : String(tree.url),
+                    title: tree.customTitle === undefined || tree.customTitle === null
+                         ? "" : String(tree.customTitle)
+                });
+            }
+            return out;
+        }
+        for (var i = 0; i < tree.children.length; ++i)
+            window.viewerInventory(tree.children[i], out);
+        return out;
+    }
+
+    // Turn what an agent typed into an address a viewer pane can open.
+    //
+    // An agent names files the way a shell does — "README.md", "docs/SPEC.md",
+    // "/etc/hosts" — while a pane is addressed by URL, and openPaneTarget()
+    // hands its argument to ViewerPane.openUrlWithKind() verbatim. A bare
+    // relative string left there is a relative QML URL resolved against the QML
+    // module, i.e. a pane showing nothing at all. So a path is joined to the Dev
+    // Session's repository root and percent-encoded per segment, exactly as the
+    // address bar and the directory listing do.
+    //
+    // Returns "" for an address this window refuses: an empty string, or the
+    // internal scheme, which SPEC 7.4 makes an implementation detail of the
+    // privileged handlers rather than an address anyone may hand in.
+    function viewerAddressFor(raw) {
+        const text = String(raw === undefined || raw === null ? "" : raw).trim();
+        if (text.length === 0)
+            return "";
+        const scheme = /^([A-Za-z][A-Za-z0-9+.-]*):/.exec(text);
+        if (scheme) {
+            const name = scheme[1].toLowerCase();
+            if (name === "http" || name === "https" || name === "file")
+                return text;
+            return "";
+        }
+        // A remote POSIX path. A relative one resolves against the active Dev
+        // Session's repository root, which is what SPEC 7.1 says a relative
+        // address means here.
+        var path = text;
+        if (path.charAt(0) !== "/") {
+            const root = String(app.activeSessionRepoRoot);
+            if (root.length === 0)
+                return "";
+            path = root.charAt(root.length - 1) === "/" ? root + path : root + "/" + path;
+        }
+        return RemotePath.pathToFileUrl(path);
+    }
+
+    // Resolve the pane an op should act on: the one named, when the active
+    // tree really holds it; otherwise the focused/first viewer pane. Answers ""
+    // when a name was given and is not in the tree, so the caller can say
+    // "unknown_pane" instead of quietly acting on a different pane.
+    function viewerCommandTarget(tree, requested) {
+        const named = String(requested === undefined || requested === null
+                             ? "" : requested).trim();
+        if (named.length > 0)
+            return window.treeHasPane(tree, named) ? named : "";
+        return window.targetPaneId("viewer");
+    }
+
+    function runViewerCommand(commandId, devSessionId, op, args) {
+        const service = app.viewerCommands;
+        if (!service)
+            return;
+        const params = args ? args : ({});
+        // One exit point per outcome, and a guaranteed answer: an agent's turn is
+        // blocked on this reply, and a swallowed command costs it the daemon's
+        // whole timeout.
+        const ok = function (data) { service.respond(commandId, true, "", "", data ? data : ({})); };
+        const no = function (code, message) { service.respond(commandId, false, code, message, ({})); };
+
+        try {
+            // SESSION GATE, first and unconditional. Only the ACTIVE Dev
+            // Session's tree is loaded into this window, and SessionLayouts drops
+            // writes stamped for any other, so a command from a pane of some
+            // other session cannot be honoured — and must not be silently
+            // applied to the session the user happens to be looking at.
+            if (String(devSessionId) !== String(app.activeSessionId)) {
+                no("not_active_session",
+                   qsTr("That Dev Session is not the one open in CodeHarbor."));
+                return;
+            }
+            if (!app.layouts) {
+                no("failed", qsTr("CodeHarbor is not connected to a server."));
+                return;
+            }
+            const tree = window.regionTree("viewer");
+
+            if (op === "list") {
+                ok({
+                    focusedPaneId: String(viewerRegion.focusedPaneId),
+                    panes: window.viewerInventory(tree, [])
+                });
+                return;
+            }
+
+            if (op === "open") {
+                const address = window.viewerAddressFor(params.url);
+                if (address.length === 0) {
+                    no("bad_request",
+                       qsTr("url must be an http(s) address, a file:// URL, or a remote path."));
+                    return;
+                }
+                const kind = params.kind === undefined || params.kind === null
+                           ? "" : String(params.kind);
+                if (params.newPane === true) {
+                    // openViewerInNewPane splits, opens and focuses, and reports
+                    // its own failures as toasts; ask the layout for the new leaf
+                    // here so the agent learns which pane it got.
+                    const source = window.viewerCommandTarget(tree, params.pane);
+                    if (source.length === 0) {
+                        no("unknown_pane", qsTr("No viewer pane named %1.").arg(String(params.pane)));
+                        return;
+                    }
+                    const created = app.layouts.splitPane("viewer", source, "horizontal");
+                    if (!created) {
+                        no("failed", qsTr("Could not split that viewer pane."));
+                        return;
+                    }
+                    if (!viewerRegion.openPaneTarget(created, address, kind)) {
+                        no("failed", qsTr("Could not open that target in the new pane."));
+                        return;
+                    }
+                    viewerRegion.focusPane(created);
+                    ok({ paneId: created, url: address });
+                    return;
+                }
+                const target = window.viewerCommandTarget(tree, params.pane);
+                if (target.length === 0) {
+                    no("unknown_pane", qsTr("No viewer pane named %1.").arg(String(params.pane)));
+                    return;
+                }
+                if (!viewerRegion.openPaneTarget(target, address, kind)) {
+                    no("failed", qsTr("That viewer cannot display this target."));
+                    return;
+                }
+                ok({ paneId: target, url: address });
+                return;
+            }
+
+            if (op === "split") {
+                const orientation = String(params.orientation === undefined
+                                           || params.orientation === null
+                                           ? "" : params.orientation);
+                if (orientation !== "horizontal" && orientation !== "vertical") {
+                    no("bad_request", qsTr("orientation must be horizontal or vertical."));
+                    return;
+                }
+                const source = window.viewerCommandTarget(tree, params.pane);
+                if (source.length === 0) {
+                    no("unknown_pane", qsTr("No viewer pane named %1.").arg(String(params.pane)));
+                    return;
+                }
+                const created = app.layouts.splitPane("viewer", source, orientation);
+                if (!created) {
+                    no("failed", qsTr("Could not split that viewer pane."));
+                    return;
+                }
+                ok({ paneId: created });
+                return;
+            }
+
+            const target = window.viewerCommandTarget(tree, params.pane);
+            if (target.length === 0) {
+                no("unknown_pane", qsTr("No viewer pane named %1.").arg(String(params.pane)));
+                return;
+            }
+            if (op === "close") {
+                // Deliberately NOT the pane's own unsaved-changes confirmation:
+                // that dialog belongs to a person pressing a button. An agent
+                // closing a dirty editor pane goes through the same layout call
+                // the command palette uses, which is the one close path that has
+                // always been unconfirmed.
+                app.layouts.closePane("viewer", target);
+                ok({ paneId: target });
+                return;
+            }
+            if (op === "focus") {
+                viewerRegion.focusPane(target);
+                ok({ paneId: target });
+                return;
+            }
+            if (op === "reload") {
+                if (!viewerRegion.reloadPane(target)) {
+                    no("unknown_pane",
+                       qsTr("Viewer pane %1 is not on screen yet.").arg(target));
+                    return;
+                }
+                ok({ paneId: target });
+                return;
+            }
+            // ViewerCommandService refuses an unknown op before it gets here, so
+            // this is version skew between the two lists rather than a producer
+            // fault. Answer it anyway: an unanswered command is the one outcome
+            // that costs the agent real time.
+            no("bad_request", qsTr("CodeHarbor does not implement the viewer operation %1.").arg(String(op)));
+        } catch (err) {
+            no("failed", String(err));
+        }
     }
     // Stamped region callbacks are the production path. C++ drops a callback
     // whose session or generation no longer matches, before it can target a

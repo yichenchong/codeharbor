@@ -151,6 +151,32 @@ inline constexpr auto kWatchEventNotification = "file.watchEvent";
 // RPC_WATCH_EVENTS_LOST_NOTIFICATION in remote/src/rpc-types.ts.
 inline constexpr auto kWatchEventsLostNotification = "file.watchEventsLost";
 
+// Server -> client notification carrying ONE viewer-pane command an agent asked
+// for through codeharbord's control socket (remote/src/control.ts). Params:
+// { commandId, devSessionId, terminalId, op, args }. A NOTIFICATION name (no
+// id, no response), deliberately NOT part of the request methods. Mirrors
+// RPC_VIEWER_COMMAND_NOTIFICATION in remote/src/rpc-types.ts.
+//
+// Consumed by ch::ViewerCommandService, which validates it and hands it to
+// Main.qml. It is a notification rather than a server-initiated request because
+// CodeharbordClient has no server-request dispatcher — a message carrying both
+// `method` and `id` is treated as malformed on purpose — and the ANSWER travels
+// back as an ordinary client request instead (kMethodViewerCommandResult).
+inline constexpr auto kNotificationViewerCommand = "viewer.command";
+
+// Client -> server request delivering the outcome of one relayed viewer
+// command. Params: { commandId, ok, error?: {code, message}, data?: {...} }.
+// Mirrors RPC_VIEWER_COMMAND_RESULT_METHOD in remote/src/rpc-types.ts, whose
+// handler lives in codeharbord's static method map beside `ping` and
+// `server.info` — it belongs to the transport's own control channel, not to the
+// file/workspace/tmux domains, so it joins no group.
+//
+// Answering a commandId the daemon no longer holds is NOT an error: it may
+// already have timed the command out, and turning a late answer into a fault
+// would put a toast in front of the user for a command that merely finished
+// slowly.
+inline constexpr auto kMethodViewerCommandResult = "viewer.commandResult";
+
 // --- Server introspection ---------------------------------------------------
 //
 // Mirrors the `server.info` handler in remote/src/codeharbord.ts.

@@ -31,6 +31,8 @@ import {
     RPC_TMUX_METHODS,
     RPC_WORKSPACE_METHODS,
     RPC_PING_METHOD,
+    RPC_VIEWER_COMMAND_NOTIFICATION,
+    RPC_VIEWER_COMMAND_RESULT_METHOD,
     RPC_WATCH_EVENT_NOTIFICATION,
     RPC_WATCH_EVENTS_LOST_NOTIFICATION,
 } from "../src/rpc-types.ts";
@@ -123,6 +125,18 @@ test("singleton wire names match between rpc-types.ts and RpcTypes.h", () => {
     // is not an application method, and belongs to no group — see the comment
     // on kMethodPing in RpcTypes.h for why it keeps its bare, ungrouped name.
     assert.equal(CPP_CONSTANTS.get("kMethodPing"), RPC_PING_METHOD);
+    // The viewer control channel's two names. Both are built-ins of the
+    // transport rather than members of a domain group: the notification carries
+    // an agent's pane command to the client, the request carries the client's
+    // answer back.
+    assert.equal(
+        CPP_CONSTANTS.get("kNotificationViewerCommand"),
+        RPC_VIEWER_COMMAND_NOTIFICATION,
+    );
+    assert.equal(
+        CPP_CONSTANTS.get("kMethodViewerCommandResult"),
+        RPC_VIEWER_COMMAND_RESULT_METHOD,
+    );
 });
 
 // Catches a name added to the C++ header under a prefix no TypeScript table
@@ -136,6 +150,8 @@ test("RpcTypes.h declares no wire name outside a known group", () => {
         RPC_WATCH_EVENTS_LOST_NOTIFICATION,
         RPC_SERVER_INFO_METHOD,
         RPC_PING_METHOD,
+        RPC_VIEWER_COMMAND_NOTIFICATION,
+        RPC_VIEWER_COMMAND_RESULT_METHOD,
     ]);
     const unexpected = [...CPP_CONSTANTS.entries()]
         .filter(([name, value]) => name.startsWith("kMethod") && !known.has(value))

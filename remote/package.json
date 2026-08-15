@@ -6,7 +6,9 @@
   "type": "module",
   "bin": {
     "codeharbord": "dist/codeharbord.js",
-    "codeharbor-bridge": "dist/bridge.js"
+    "codeharbor-bridge": "dist/bridge.js",
+    "codeharbor-mcp": "dist/mcp/server.js",
+    "codeharbor-view": "dist/tools/viewctl.js"
   },
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
