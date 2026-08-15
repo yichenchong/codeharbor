@@ -1,6 +1,6 @@
 {
   "name": "@codeharbor/web-terminal",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "private": true,
   "description": "xterm.js renderer bundle bridged to the C++ TerminalController via Qt WebChannel",
   "type": "module",
