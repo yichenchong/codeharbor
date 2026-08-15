@@ -161,6 +161,15 @@ void TerminalFactory::setRpcClient(CodeharbordClient* client)
     m_rpc = client;
 }
 
+// Deliberately does NOT touch already-attached panes. tmux cannot repair the
+// environment of a process that is already running, so the value reaches a pane
+// the next time it is attached — which is exactly when a new daemon's path
+// becomes relevant, because a reconnect re-attaches every pane.
+void TerminalFactory::setControlSocket(const QString& socketPath)
+{
+    m_controlSocket = socketPath;
+}
+
 void TerminalFactory::beginResolution(TerminalController* controller, const QString& key)
 {
     entryFor(controller);
@@ -751,7 +760,7 @@ bool TerminalFactory::attach(TerminalController* controller,
         paneTerminalId = it->terminalId;
     }
     const QString command = TerminalController::tmuxNewSessionCommand(
-        tmuxTarget, workingDir, paneDevSessionId, paneTerminalId);
+        tmuxTarget, workingDir, paneDevSessionId, paneTerminalId, m_controlSocket);
 
     // Record the tmux target BEFORE anything below can fail. targetFor() is
     // what kill() destroys, and it has to name the session THIS pane is now

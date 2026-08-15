@@ -282,9 +282,15 @@ public:
     // a wheel turn reaches tmux's own scrollback instead of being translated
     // into cursor keys by the renderer. See the implementation for the full
     // reasoning and the tmux 3.6 verification.
+    // `controlSocket` is the viewer control socket THIS window's daemon reported
+    // through server.info (SPEC 6.8), exported as $CODEHARBOR_CONTROL_SOCKET so an
+    // agent in this pane drives the panes of the window that owns it. Empty when
+    // the server reported none (an older server, or one that could not bind);
+    // agents in such a pane are then told so rather than routed to a guessed path.
     static QString tmuxNewSessionCommand(const QString &target, const QString &workingDir,
                                          const QString &devSessionId,
-                                         const QString &terminalId);
+                                         const QString &terminalId,
+                                         const QString &controlSocket = QString());
 
 signals:
     void stateChanged(ch::TerminalState state);

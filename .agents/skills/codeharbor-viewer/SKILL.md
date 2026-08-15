@@ -83,10 +83,12 @@ network proxy enabled it needs the socket allowed explicitly:
 ```toml
 [features.network_proxy]
 enabled = true
-unix_sockets = { "/run/user/1000/codeharbor-control.sock" = "allow" }
+unix_sockets = { "/run/user/1000/codeharbor-control-<token>.sock" = "allow" }
 ```
 
-Prefer the MCP tools and this does not come up.
+The socket name carries a per-window token, so this allowlist entry has to be the
+path from `echo "$CODEHARBOR_CONTROL_SOCKET"` in the pane. Prefer the MCP tools and
+none of this comes up.
 
 ### Oh My Pi
 
@@ -104,8 +106,10 @@ One JSON line on stdout; exit 0 applied, 1 refused, 2 usage.
 
 ## If nothing works at all
 
-Every path needs `OMP_DEV_SESSION_ID` and `OMP_TERMINAL_ID`, which CodeHarbor
-exports into the tmux session of each pane it creates. A shell that was already
-running before CodeHarbor attached does not have them. Check with
-`echo "$OMP_DEV_SESSION_ID"`; if empty, ask the user to start the agent in a
-fresh CodeHarbor terminal pane.
+Every path needs three variables, exported into the tmux session of each pane
+CodeHarbor creates: `OMP_DEV_SESSION_ID` and `OMP_TERMINAL_ID` (which pane) and
+`CODEHARBOR_CONTROL_SOCKET` (which CodeHarbor window owns it). A shell that was
+already running before CodeHarbor attached has none of them. Check with
+`echo "$CODEHARBOR_CONTROL_SOCKET"`; if empty, ask the user to start the agent in
+a fresh CodeHarbor terminal pane. The socket is never guessed — without it a
+command could drive a different window — so a missing one is refused.

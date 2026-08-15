@@ -728,7 +728,8 @@ bool TerminalController::isSafeTmuxTarget(const QString &target)
 QString TerminalController::tmuxNewSessionCommand(const QString &target,
                                                   const QString &workingDir,
                                                   const QString &devSessionId,
-                                                  const QString &terminalId)
+                                                  const QString &terminalId,
+                                                  const QString &controlSocket)
 {
     // SEVERAL tmux commands in ONE invocation, separated by escaped semicolons:
     // the shell unescapes `\;` into a literal `;` argument, which is tmux's own
@@ -790,12 +791,25 @@ QString TerminalController::tmuxNewSessionCommand(const QString &target,
     QString command =
         QStringLiteral("tmux new-session -A -s %1 -c %2")
             .arg(shellSingleQuote(target), shellSingleQuote(workingDir));
+    // The control socket rides with them when the server reported one. It is a
+    // THIRD, separate variable rather than part of the identity pair because it
+    // answers a different question: the pair says WHICH pane this is, and this
+    // says WHICH WINDOW's daemon owns it. A pane may legitimately have the pair
+    // and no socket — an older server, or one whose bind failed — and an agent
+    // there must be told that, not routed to a guessed path where it would drive
+    // somebody else's window.
+    const bool controllable = !controlSocket.isEmpty();
     if (identified) {
         command += QStringLiteral(" -e %1 -e %2")
                        .arg(shellSingleQuote(QStringLiteral("OMP_DEV_SESSION_ID=")
                                              + devSessionId),
                             shellSingleQuote(QStringLiteral("OMP_TERMINAL_ID=")
                                              + terminalId));
+        if (controllable) {
+            command += QStringLiteral(" -e %1")
+                           .arg(shellSingleQuote(QStringLiteral("CODEHARBOR_CONTROL_SOCKET=")
+                                                 + controlSocket));
+        }
     }
     command += QStringLiteral(" \\; set-option -t %1 mouse on").arg(sessionTarget);
     // SPEC 2.2's promise, defended against the user's own tmux configuration.
@@ -837,6 +851,24 @@ QString TerminalController::tmuxNewSessionCommand(const QString &target,
                        .arg(sessionTarget, shellSingleQuote(devSessionId));
         command += QStringLiteral(" \\; set-environment -t %1 OMP_TERMINAL_ID %2")
                        .arg(sessionTarget, shellSingleQuote(terminalId));
+        // The socket is REFRESHED on every attach, and it has to be: the path
+        // belongs to one daemon, and a reconnect (or a relaunch) is a NEW daemon
+        // with a new one. `-e` above is ignored for a session that already exists,
+        // so this is the only thing that corrects it — for agents started after
+        // the attach. One already running keeps the old path, which now resolves
+        // to nothing and is reported as an unreachable server rather than being
+        // silently routed to whatever bound it since; that is why the path carries
+        // a random token rather than a reusable pid.
+        //
+        // UNSET rather than left stale when the server reported no socket, so a
+        // pane cannot keep pointing at a dead daemon's path across a downgrade.
+        if (controllable) {
+            command += QStringLiteral(" \\; set-environment -t %1 CODEHARBOR_CONTROL_SOCKET %2")
+                           .arg(sessionTarget, shellSingleQuote(controlSocket));
+        } else {
+            command += QStringLiteral(" \\; set-environment -u -t %1 CODEHARBOR_CONTROL_SOCKET")
+                           .arg(sessionTarget);
+        }
     }
     return command;
 }

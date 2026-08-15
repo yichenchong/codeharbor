@@ -4,9 +4,10 @@
 //
 // Every case here drives the REAL listener over a real socket in a temp
 // directory. The path from a producer's bytes to a settled promise has four
-// pieces (path resolution, lock, framing/validation, correlation) and a mock at
-// any of those seams would leave the seam itself untested — which is precisely
-// where an agent's command silently vanishing would come from.
+// pieces (socket addressing, framing, validation, correlation) and a mock at any
+// of those seams would leave the seam itself untested — which is precisely where
+// an agent's command silently vanishing, or reaching the wrong window, comes
+// from.
 //
 // No sleeps and no polling: the harness turns each relayed command into a
 // promise, so every case awaits the signal the code itself produces.
@@ -16,17 +17,21 @@ import assert from "node:assert/strict";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { spawnSync } from "node:child_process";
+import { existsSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { spawn } from "node:child_process";
+import { setImmediate as once } from "node:timers/promises";
 
 import {
     CH_CONTROL_VERSION,
     CONTROL_OPS,
+    CONTROL_SOCKET_ENV,
     MAX_CONTROL_INFLIGHT,
     MAX_CONTROL_LINE_BYTES,
+    controlSocketDir,
+    mintControlSocketPath,
     parseControlRequest,
-    resolveControlSocketPath,
     startControlListener,
+    sweepStaleControlSockets,
     type ControlListener,
     type ControlResponse,
     type ViewerCommand,
@@ -51,9 +56,21 @@ interface Harness {
     dispose(): void;
 }
 
-async function harness(options: { emit?: (c: ViewerCommand) => boolean } = {}): Promise<Harness> {
-    const dir = tempDir();
-    const socketPath = path.join(dir, "control.sock");
+async function harness(
+    options: {
+        emit?: (c: ViewerCommand) => boolean;
+        // A directory shared with another harness, so two daemons mint their
+        // sockets side by side exactly as two windows of one remote user do.
+        // Owned by the caller when given: dispose() then leaves it alone.
+        dir?: string;
+        devSessionId?: string;
+    } = {},
+): Promise<Harness> {
+    const owned = options.dir === undefined;
+    const dir = options.dir ?? tempDir();
+    // Minted through the production helper, in the production directory: that is
+    // what proves two daemons under ONE $XDG_RUNTIME_DIR get different paths.
+    const socketPath = mintControlSocketPath({ XDG_RUNTIME_DIR: dir, HOME: dir });
     const relayed: ViewerCommand[] = [];
     // One waiter per ordinal. Registered before or after the command arrives —
     // command() resolves immediately for one already relayed — so no case has to
@@ -71,9 +88,15 @@ async function harness(options: { emit?: (c: ViewerCommand) => boolean } = {}): 
     return {
         listener,
         relayed,
+        // The environment a pane of THIS window carries: the identity pair plus
+        // the socket its own daemon reported. Every case sends with this env and
+        // NO explicit path, because reading the variable is the production
+        // routing — a producer that derived the path is the misrouting this
+        // addressing exists to remove.
         env: {
-            OMP_DEV_SESSION_ID: "dev-1",
+            OMP_DEV_SESSION_ID: options.devSessionId ?? "dev-1",
             OMP_TERMINAL_ID: "term-1",
+            [CONTROL_SOCKET_ENV]: socketPath,
             XDG_RUNTIME_DIR: dir,
             HOME: dir,
         },
@@ -84,7 +107,7 @@ async function harness(options: { emit?: (c: ViewerCommand) => boolean } = {}): 
         },
         dispose() {
             listener.close();
-            rmSync(dir, { recursive: true, force: true });
+            if (owned) rmSync(dir, { recursive: true, force: true });
         },
     };
 }
@@ -109,35 +132,47 @@ function rawExchange(socketPath: string, payload: string): Promise<string> {
 }
 
 // ---------------------------------------------------------------------------
-// Socket path. Both ends resolve through one function, and a relative
-// $XDG_RUNTIME_DIR must be IGNORED rather than joined: joining it makes the path
-// depend on each process's working directory, so the daemon would bind one path
-// and an agent's tool — started wherever the agent happens to run — would look
-// for another. Every command would vanish with nothing reporting it.
+// Socket addressing. ONE SOCKET PER DAEMON, named with a random token — the
+// routing identity, and the whole reason an agent reaches its own window.
 // ---------------------------------------------------------------------------
 
-test("an absolute XDG_RUNTIME_DIR gives the runtime-dir socket", () => {
+test("the socket directory follows the runtime dir, ignoring a relative one", () => {
     assert.equal(
-        resolveControlSocketPath({ XDG_RUNTIME_DIR: "/run/user/1000", HOME: "/home/u" }),
-        "/run/user/1000/codeharbor-control.sock",
+        controlSocketDir({ XDG_RUNTIME_DIR: "/run/user/1000", HOME: "/home/u" }),
+        "/run/user/1000",
+    );
+    // Joining a relative $XDG_RUNTIME_DIR makes the path depend on each
+    // process's working directory, so the daemon would bind one path and an
+    // agent's tool would look for another.
+    assert.equal(
+        controlSocketDir({ XDG_RUNTIME_DIR: "relative/dir", HOME: "/home/u" }),
+        "/home/u/.cache/codeharbor",
     );
 });
 
-test("a relative XDG_RUNTIME_DIR falls back to the home cache path", () => {
-    assert.equal(
-        resolveControlSocketPath({ XDG_RUNTIME_DIR: "relative/dir", HOME: "/home/u" }),
-        "/home/u/.cache/codeharbor/control.sock",
-    );
+test("every minted socket path is distinct and unguessable", () => {
+    // The path IS the routing identity. A pid would be reused — and a live agent
+    // keeps the path it was given, because tmux cannot retrofit a running
+    // process — so a later daemon inheriting that pid would inherit that agent's
+    // commands. A token is never reused: a path that outlives its daemon
+    // resolves to nothing instead of to the wrong window.
+    const env = { XDG_RUNTIME_DIR: "/run/user/1000" };
+    const first = mintControlSocketPath(env);
+    const second = mintControlSocketPath(env);
+    assert.notEqual(first, second);
+    for (const minted of [first, second]) {
+        assert.equal(path.dirname(minted), "/run/user/1000");
+        assert.match(path.basename(minted), /^codeharbor-control-[0-9a-f]{16}\.sock$/);
+    }
 });
 
 test("the control socket is never the agent-status socket", () => {
-    // Two endpoints under one runtime directory. If the basenames ever collided,
-    // a status hook's line would reach the control listener (refused as a bad
-    // request) while pane commands reached the status relay.
-    assert.equal(
-        path.basename(resolveControlSocketPath({ XDG_RUNTIME_DIR: "/run/user/1000" })),
-        "codeharbor-control.sock",
-    );
+    // Two endpoints under one runtime directory. If the names could collide, a
+    // status hook's line would reach the control listener and pane commands would
+    // reach the status relay.
+    const minted = path.basename(mintControlSocketPath({ XDG_RUNTIME_DIR: "/run/user/1000" }));
+    assert.notEqual(minted, "codeharbor.sock");
+    assert.match(minted, /^codeharbor-control-/);
 });
 
 // ---------------------------------------------------------------------------
@@ -212,12 +247,8 @@ test("an ABSENT version means the current revision", () => {
 test("a command reaches the relay and the desktop's answer reaches the caller", async () => {
     const h = await harness();
     try {
-        const pending = sendControlRequest(
-            "open",
-            { url: "file:///tmp/x.md" },
-            h.env,
-            h.listener.socketPath,
-        );
+        // env only, no explicit path: the variable IS the routing.
+        const pending = sendControlRequest("open", { url: "file:///tmp/x.md" }, h.env);
         const relayed = await h.command(1);
         assert.deepEqual(relayed, {
             commandId: "vc-1",
@@ -247,7 +278,7 @@ test("a command reaches the relay and the desktop's answer reaches the caller", 
 test("a refusal from the desktop reaches the caller with its code", async () => {
     const h = await harness();
     try {
-        const pending = sendControlRequest("close", { pane: "viewer-9" }, h.env, h.listener.socketPath);
+        const pending = sendControlRequest("close", { pane: "viewer-9" }, h.env);
         await h.command(1);
         h.listener.settle({
             commandId: "vc-1",
@@ -266,7 +297,7 @@ test("a refusal from the desktop reaches the caller with its code", async () => 
 test("an unrecognized refusal code from a newer client becomes failed, never success", async () => {
     const h = await harness();
     try {
-        const pending = sendControlRequest("focus", { pane: "viewer-1" }, h.env, h.listener.socketPath);
+        const pending = sendControlRequest("focus", { pane: "viewer-1" }, h.env);
         await h.command(1);
         h.listener.settle({
             commandId: "vc-1",
@@ -285,7 +316,7 @@ test("settling an unknown or already-settled command is refused, not thrown", as
     const h = await harness();
     try {
         assert.equal(h.listener.settle({ commandId: "vc-404", ok: true }), false);
-        const pending = sendControlRequest("list", {}, h.env, h.listener.socketPath);
+        const pending = sendControlRequest("list", {}, h.env);
         await h.command(1);
         assert.equal(h.listener.settle({ commandId: "vc-1", ok: true, data: { panes: [] } }), true);
         // A second answer must not reach a socket already closed with the first.
@@ -302,7 +333,7 @@ test("a relay that cannot reach the desktop answers failed immediately", async (
     // worth avoiding.
     const h = await harness({ emit: () => false });
     try {
-        const response = await sendControlRequest("list", {}, h.env, h.listener.socketPath);
+        const response = await sendControlRequest("list", {}, h.env);
         assert.equal(response.ok, false);
         assert.equal(response.error?.code, "failed");
         assert.equal(h.listener.pendingCount(), 0);
@@ -319,7 +350,7 @@ test("a malformed request is refused and the listener keeps serving", async () =
         assert.equal(h.relayed.length, 0);
 
         // Still alive for the next producer, which is the point.
-        const pending = sendControlRequest("list", {}, h.env, h.listener.socketPath);
+        const pending = sendControlRequest("list", {}, h.env);
         await h.command(1);
         h.listener.settle({ commandId: "vc-1", ok: true });
         assert.equal((await pending).ok, true);
@@ -348,12 +379,12 @@ test("past the in-flight bound a producer is told busy instead of being queued",
     try {
         const held: Promise<ControlResponse>[] = [];
         for (let i = 0; i < MAX_CONTROL_INFLIGHT; i += 1) {
-            held.push(sendControlRequest("list", {}, h.env, h.listener.socketPath));
+            held.push(sendControlRequest("list", {}, h.env));
         }
         await h.command(MAX_CONTROL_INFLIGHT);
         assert.equal(h.listener.pendingCount(), MAX_CONTROL_INFLIGHT);
 
-        const overflow = await sendControlRequest("list", {}, h.env, h.listener.socketPath);
+        const overflow = await sendControlRequest("list", {}, h.env);
         assert.equal(overflow.ok, false);
         assert.equal(overflow.error?.code, "busy");
         // The held commands are untouched: back-pressure refuses the NEW one
@@ -368,34 +399,178 @@ test("past the in-flight bound a producer is told busy instead of being queued",
     }
 });
 
-test("a second listener cannot steal a live socket path", async () => {
+// ---------------------------------------------------------------------------
+// TWO WINDOWS. This is the defect the per-daemon socket exists to remove: with
+// one shared path only the first daemon could bind it, so every other window's
+// agent reached the FIRST window's client — told its own plainly-open Dev
+// Session was not active, or, with the same session active there, silently
+// rearranging the wrong window.
+// ---------------------------------------------------------------------------
+
+test("two daemons in ONE runtime directory each serve only their own window", async () => {
+    // The exact shipped defect, reproduced as it really happens: two windows of
+    // one remote user, so both daemons mint under the SAME $XDG_RUNTIME_DIR. With
+    // the old shared path the second could not bind at all and its agents reached
+    // the first window.
+    const dir = tempDir();
+    try {
+        const a = await harness({ dir, devSessionId: "dev-a" });
+        const b = await harness({ dir, devSessionId: "dev-b" });
+        try {
+            assert.equal(path.dirname(a.listener.socketPath), dir);
+            assert.equal(path.dirname(b.listener.socketPath), dir);
+            assert.notEqual(a.listener.socketPath, b.listener.socketPath);
+
+            // NO explicit path: each producer routes purely on the
+            // $CODEHARBOR_CONTROL_SOCKET its own window exported, which is the
+            // production path and the only thing that can misroute.
+            const toA = sendControlRequest("focus", { pane: "viewer-1" }, a.env);
+            const toB = sendControlRequest("focus", { pane: "viewer-9" }, b.env);
+            await a.command(1);
+            await b.command(1);
+
+            // Neither daemon saw the other's command, and each carries its own
+            // window's Dev Session rather than the neighbour's.
+            assert.equal(a.relayed.length, 1);
+            assert.equal(b.relayed.length, 1);
+            assert.equal(a.relayed[0].devSessionId, "dev-a");
+            assert.equal(b.relayed[0].devSessionId, "dev-b");
+            assert.deepEqual(a.relayed[0].args, { pane: "viewer-1" });
+            assert.deepEqual(b.relayed[0].args, { pane: "viewer-9" });
+
+            a.listener.settle({ commandId: "vc-1", ok: true, data: { paneId: "viewer-1" } });
+            b.listener.settle({ commandId: "vc-1", ok: true, data: { paneId: "viewer-9" } });
+            assert.deepEqual((await toA).data, { paneId: "viewer-1" });
+            assert.deepEqual((await toB).data, { paneId: "viewer-9" });
+        } finally {
+            a.dispose();
+            b.dispose();
+        }
+    } finally {
+        rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+test("a window that closes cannot steer the window that is still open", async () => {
+    // The other half of the same defect: an agent whose window is gone keeps the
+    // path it was given. It must reach NOTHING — not the daemon that is still
+    // serving the surviving window from the same directory.
+    const dir = tempDir();
+    try {
+        const survivor = await harness({ dir, devSessionId: "dev-survivor" });
+        try {
+            const closing = await harness({ dir, devSessionId: "dev-closing" });
+            const orphanedEnv = closing.env;
+            closing.dispose(); // that window goes away, socket and all
+
+            const response = await sendControlRequest("close", { pane: "viewer-1" }, orphanedEnv);
+            assert.equal(response.ok, false);
+            assert.equal(response.error?.code, "failed");
+            // The surviving window was never touched.
+            assert.equal(survivor.relayed.length, 0);
+        } finally {
+            survivor.dispose();
+        }
+    } finally {
+        rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+test("a producer with no injected socket is refused, never routed by guesswork", async () => {
+    // The refusal IS the fix. A fallback to a shared or derived path is exactly
+    // how a command reaches the wrong window, so a pane that carries no
+    // $CODEHARBOR_CONTROL_SOCKET is told so instead.
     const h = await harness();
     try {
-        await assert.rejects(
-            () => startControlListener(() => true, h.listener.socketPath),
-            /control address already in use/,
-        );
+        const response = await sendControlRequest("list", {}, {
+            OMP_DEV_SESSION_ID: "dev-1",
+            OMP_TERMINAL_ID: "term-1",
+            XDG_RUNTIME_DIR: path.dirname(h.listener.socketPath),
+        });
+        assert.equal(response.ok, false);
+        assert.equal(response.error?.code, "bad_request");
+        assert.match(response.error?.message ?? "", /CODEHARBOR_CONTROL_SOCKET/);
+        // And nothing reached the daemon that happens to be listening next door.
+        assert.equal(h.relayed.length, 0);
     } finally {
         h.dispose();
     }
 });
 
-test("a crashed owner's lock is reclaimed rather than blocking forever", async () => {
+test("a path whose daemon is gone reports an unreachable server", async () => {
+    // What a long-lived agent sees after its window closed: the token is never
+    // reused, so the stale path resolves to nothing rather than to whichever
+    // daemon started since.
+    const h = await harness();
+    const stale = h.listener.socketPath;
+    const env = { ...h.env, CODEHARBOR_CONTROL_SOCKET: stale };
+    h.dispose();
+
+    const response = await sendControlRequest("list", {}, env);
+    assert.equal(response.ok, false);
+    assert.equal(response.error?.code, "failed");
+    assert.match(response.error?.message ?? "", /cannot reach the CodeHarbor server/);
+});
+
+test("the sweep removes an abandoned socket and keeps a live one", async () => {
     const dir = tempDir();
     try {
-        const socketPath = path.join(dir, "control.sock");
-        // A REAL pid that has really exited, obtained by reaping a child: the
-        // liveness probe is process.kill(pid, 0), and no constant is reliably
-        // dead (pid 0 signals the process group and succeeds; pid 1 is init).
-        const child = spawnSync(process.execPath, ["-e", ""]);
-        assert.equal(child.status, 0);
-        assert.ok(child.pid !== undefined && child.pid > 1);
-        writeFileSync(`${socketPath}.lock`, `${child.pid}\n`);
-        // Without reclamation one crash would leave viewer control dead until a
-        // human deleted the file.
-        const listener = await startControlListener(() => true, socketPath);
-        assert.equal(listener.socketPath, socketPath);
-        listener.close();
+        const env = { XDG_RUNTIME_DIR: dir, HOME: dir };
+        const live = await startControlListener(() => true, mintControlSocketPath(env));
+        try {
+            // A REAL Unix socket whose owner was KILLED, left on disk: exactly
+            // what a SIGKILLed daemon leaves behind, and the reason staleness is
+            // decided by CONNECTING rather than by parsing the name.
+            //
+            // Bound in a CHILD and SIGKILLed, because Node's own server.close()
+            // unlinks the socket — a clean shutdown leaves nothing to sweep, which
+            // is precisely why the sweep exists only for the unclean case.
+            const orphan = mintControlSocketPath(env);
+            const victim = spawn(process.execPath, [
+                "-e",
+                `require("node:net").createServer().listen(${JSON.stringify(orphan)}, () => console.log("up"))`,
+            ]);
+            await new Promise<void>((resolve, reject) => {
+                victim.stdout.on("data", () => resolve());
+                victim.on("error", reject);
+                victim.on("exit", () => reject(new Error("the victim died before binding")));
+            });
+            victim.kill("SIGKILL");
+            await new Promise<void>((resolve) => victim.on("exit", () => resolve()));
+            assert.equal(existsSync(orphan), true, "the orphan socket was not left on disk");
+
+            sweepStaleControlSockets(live.socketPath, env);
+            // The probe answers on a later turn: the sweep is deliberately
+            // asynchronous so it can never delay a session.
+            await once();
+            await once();
+            assert.equal(existsSync(orphan), false, "the orphan survived the sweep");
+            assert.equal(existsSync(live.socketPath), true, "the sweep removed a live socket");
+        } finally {
+            live.close();
+        }
+    } finally {
+        rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+test("the sweep leaves anything that is not a refused socket alone", async () => {
+    // Housekeeping must never be able to break a working session. A probe error
+    // that is NOT "nobody is listening" — a permission problem on another user's
+    // socket, or this process running out of descriptors — says nothing about the
+    // owner, and deleting on it would take a live window's pane control away.
+    const dir = tempDir();
+    try {
+        const env = { XDG_RUNTIME_DIR: dir, HOME: dir };
+        // A DIRECTORY at a control-socket name: connect() fails with ECONNREFUSED
+        // on some platforms and EACCES/ENOTSOCK on others, and either way it is
+        // not a stale socket. rmSync would remove it; the sweep must not.
+        const decoy = mintControlSocketPath(env);
+        mkdirSync(decoy);
+        sweepStaleControlSockets(null, env);
+        await once();
+        await once();
+        assert.equal(existsSync(decoy), true, "the sweep removed something it could not identify");
     } finally {
         rmSync(dir, { recursive: true, force: true });
     }
@@ -404,7 +579,7 @@ test("a crashed owner's lock is reclaimed rather than blocking forever", async (
 test("closing the listener answers the agents still waiting", async () => {
     const h = await harness();
     try {
-        const pending = sendControlRequest("list", {}, h.env, h.listener.socketPath);
+        const pending = sendControlRequest("list", {}, h.env);
         await h.command(1);
         h.listener.close();
         const response = await pending;

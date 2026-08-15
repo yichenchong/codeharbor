@@ -73,23 +73,27 @@ One JSON line on stdout; exit 0 applied, 1 refused, 2 usage.
 
 ## If nothing works at all
 
-Every path needs `OMP_DEV_SESSION_ID` and `OMP_TERMINAL_ID`, which CodeHarbor
-exports into the tmux session of each pane it creates
-(`TerminalController::tmuxNewSessionCommand`). A shell that was already running
-before CodeHarbor attached to its tmux session does not have them. Check with
-`echo "$OMP_DEV_SESSION_ID"`; if empty, ask the user to start the agent in a fresh
-CodeHarbor terminal pane.
+Every path needs three variables, exported into the tmux session of each pane
+CodeHarbor creates (`TerminalController::tmuxNewSessionCommand`):
+`OMP_DEV_SESSION_ID` and `OMP_TERMINAL_ID` say which pane this is, and
+`CODEHARBOR_CONTROL_SOCKET` says which CodeHarbor window owns it. A shell that was
+already running before CodeHarbor attached to its tmux session has none of them.
+Check with `echo "$CODEHARBOR_CONTROL_SOCKET"`; if empty, ask the user to start the
+agent in a fresh CodeHarbor terminal pane. The socket is never derived: several
+windows each have their own, and guessing would drive the wrong one, so a missing
+value is refused instead.
 
 ## How it works, if you need to debug it
 
 ```
 this pane's agent
-  -> $XDG_RUNTIME_DIR/codeharbor-control.sock  (remote/src/control.ts)
+  -> $CODEHARBOR_CONTROL_SOCKET   (this window's daemon; remote/src/control.ts)
   -> codeharbord relays a `viewer.command` JSON-RPC notification to the desktop
   -> ch::ViewerCommandService -> Main.qml -> the real ViewerRegion
   -> `viewer.commandResult` back to the daemon -> the answer on your socket
 ```
 
-If the socket is missing, CodeHarbor is not currently connected to this server, or
-a second CodeHarbor window took the socket first (its daemon prints
-`viewer control disabled: control address already in use` on stderr).
+Each window's daemon owns its own socket, named with a random token, so commands
+cannot land in another window. If the socket path exists in your environment but
+nothing answers, that window has disconnected or been closed — the path is never
+reused, so it resolves to nothing rather than to somebody else's daemon.

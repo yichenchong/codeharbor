@@ -19,7 +19,7 @@ import {
     CONTROL_ERROR_CODES,
     CONTROL_REQUEST_TIMEOUT_MS,
     MAX_CONTROL_LINE_BYTES,
-    resolveControlSocketPath,
+    CONTROL_SOCKET_ENV,
     type ControlErrorCode,
     type ControlOp,
     type ControlResponse,
@@ -60,6 +60,30 @@ export const MISSING_COORDINATES_MESSAGE =
     "say which CodeHarbor pane it belongs to. Start the agent inside a terminal " +
     "pane that CodeHarbor created (an existing tmux session predating CodeHarbor " +
     "does not inherit them).";
+
+/**
+ * The control socket this pane's commands must go to, as CodeHarbor exported it
+ * into the pane's tmux session, or null when the variable is absent.
+ *
+ * NOT derived from a shared path, and that is the whole point. One remote user
+ * may have several CodeHarbor windows connected at once, each with its own
+ * `codeharbord` and its own socket; a guessed path reaches whichever daemon got
+ * there first, so an agent would drive somebody else's window — or be told its
+ * own plainly-open Dev Session is not active. The client is the only thing that
+ * knows which daemon serves this pane, so it says so, and this reads what it
+ * said.
+ */
+export function readControlSocketPath(env: NodeJS.ProcessEnv = process.env): string | null {
+    const value = (env[CONTROL_SOCKET_ENV] ?? "").trim();
+    return value.length > 0 ? value : null;
+}
+
+/** The message shown when the socket variable is missing, said once. */
+export const MISSING_SOCKET_MESSAGE =
+    `${CONTROL_SOCKET_ENV} is not set, so this process cannot tell which CodeHarbor ` +
+    "window owns its pane, and guessing would drive somebody else's window. Open a " +
+    "new terminal pane in the CodeHarbor window you want to control (a pane, or a " +
+    "shell, that started before this feature existed does not carry the variable).";
 
 function refusal(code: ControlErrorCode, message: string): ControlResponse {
     return { version: CH_CONTROL_VERSION, ok: false, error: { code, message } };
@@ -115,12 +139,17 @@ export function sendControlRequest(
     op: ControlOp,
     args: Record<string, unknown> = {},
     env: NodeJS.ProcessEnv = process.env,
-    socketPath: string = resolveControlSocketPath(env),
+    socketPath: string | null = readControlSocketPath(env),
     timeoutMs: number = CONTROL_CLIENT_TIMEOUT_MS,
 ): Promise<ControlResponse> {
     const coordinates = readCoordinates(env);
     if (!coordinates) {
         return Promise.resolve(refusal("bad_request", MISSING_COORDINATES_MESSAGE));
+    }
+    // REFUSED, never guessed. A fallback to a shared path is exactly the
+    // misrouting the per-window socket exists to remove.
+    if (socketPath === null || socketPath.trim().length === 0) {
+        return Promise.resolve(refusal("bad_request", MISSING_SOCKET_MESSAGE));
     }
 
     return new Promise<ControlResponse>((resolve) => {
