@@ -169,6 +169,15 @@ private slots:
     // The data signals are emitted before the notification hook.
     void dataSignalsPrecedeTheNotificationHook();
 
+    // A Dev Session the user switched away from: the pane is destroyed, the PTY
+    // is detached, and the client can no longer see the pane at all.
+    void aDetachedGenericPaneGoesUnknownRatherThanIdle();
+    // ...and the server can, over tmux.paneActivity.
+    void remoteActivityDrivesADetachedGenericPane();
+    void remoteActivityRefutesTheSilenceTimeoutForAnAdapterPane();
+    // Both new inputs obey the same restraint every other derivation here does.
+    void detachAndRemoteActivityPreserveStatesTheClockCannotExpress();
+
 private:
     void makePair();
     // Swap the transport the way SessionBootstrap does on a SPEC 5.6 reconnect:
@@ -2168,6 +2177,197 @@ void TstAgentMonitor::dataSignalsPrecedeTheNotificationHook()
                                QStringLiteral("unseen"),
                                QStringLiteral("notify")};
     QTRY_COMPARE(order, expected);
+}
+
+// Switching Dev Session destroys every pane of the session being left and
+// detaches its PTY. The tmux session on the host is untouched and the agent in
+// it keeps working; what ends is this client's ability to SEE it.
+//
+// Before noteTerminalDetached existed the pane's `attached` flag stayed set, so
+// the fallback clock kept owning a pane nobody was reading: two seconds after
+// the switch it declared the pane Idle, and there it stayed forever, because
+// the silence demotion deliberately skips a generic pane that claims to be
+// attached. The sidebar said "Idle" — which a user reads as finished — about a
+// session that might be halfway through a build.
+void TstAgentMonitor::aDetachedGenericPaneGoesUnknownRatherThanIdle()
+{
+    m_monitor->setFallbackIdleThresholdMs(40);
+    QSignalSpy stateSpy(m_monitor, &AgentStatusMonitor::agentStateChanged);
+
+    m_monitor->setTerminalHarness(QStringLiteral("dD"), QStringLiteral("tD"),
+                                  QStringLiteral("generic"));
+    m_monitor->noteTerminalAttached(QStringLiteral("dD"), QStringLiteral("tD"));
+    m_monitor->noteTerminalOutput(QStringLiteral("dD"), QStringLiteral("tD"));
+    QCOMPARE(m_monitor->stateFor("dD", "tD"), asInt(AgentState::Running));
+
+    // The user switches away.
+    m_monitor->noteTerminalDetached(QStringLiteral("dD"), QStringLiteral("tD"));
+    QCOMPARE(m_monitor->stateFor("dD", "tD"), asInt(AgentState::Unknown));
+    QCOMPARE(stateSpy.count(), 3);  // Starting, Running, Unknown
+
+    // And it STAYS unknown: no amount of waiting turns "we cannot see it" into
+    // the claim that it finished.
+    QTest::qWait(200);
+    QCOMPARE(m_monitor->stateFor("dD", "tD"), asInt(AgentState::Unknown));
+    QCOMPARE(stateSpy.count(), 3);
+
+    // Reattaching restores local observation from scratch.
+    m_monitor->noteTerminalAttached(QStringLiteral("dD"), QStringLiteral("tD"));
+    QCOMPARE(m_monitor->stateFor("dD", "tD"), asInt(AgentState::Starting));
+
+    // A detach reported for a pane nobody registered invents nothing, and a
+    // second detach for an already-detached pane is silent.
+    m_monitor->noteTerminalDetached(QStringLiteral("dD"), QStringLiteral("tD"));
+    const int after = stateSpy.count();
+    m_monitor->noteTerminalDetached(QStringLiteral("dD"), QStringLiteral("tD"));
+    m_monitor->noteTerminalDetached(QStringLiteral("nope"), QStringLiteral("t"));
+    QCOMPARE(stateSpy.count(), after);
+    QCOMPARE(m_monitor->stateFor("nope", "t"), asInt(AgentState::Unknown));
+}
+
+// The other half: with no channel of its own the client asks the HOST how long
+// ago the pane last printed, and derives the same coarse busy/idle state from
+// the answer. The age arrives already differenced against the SERVER's clock,
+// so nothing here reads the local one.
+void TstAgentMonitor::remoteActivityDrivesADetachedGenericPane()
+{
+    m_monitor->setFallbackIdleThresholdMs(40);
+    m_monitor->setRemoteIdleThresholdMs(1000);
+
+    m_monitor->setTerminalHarness(QStringLiteral("dR"), QStringLiteral("tR"),
+                                  QStringLiteral("generic"));
+    m_monitor->noteTerminalAttached(QStringLiteral("dR"), QStringLiteral("tR"));
+    m_monitor->noteTerminalDetached(QStringLiteral("dR"), QStringLiteral("tR"));
+    QCOMPARE(m_monitor->stateFor("dR", "tR"), asInt(AgentState::Unknown));
+
+    QSignalSpy stateSpy(m_monitor, &AgentStatusMonitor::agentStateChanged);
+
+    // Output the server saw a moment ago: the pane is working.
+    m_monitor->noteRemoteActivity(QStringLiteral("dR"), QStringLiteral("tR"), 200);
+    QCOMPARE(m_monitor->stateFor("dR", "tR"), asInt(AgentState::Running));
+    QCOMPARE(stateSpy.count(), 1);
+
+    // A repeat inside the window is not a transition.
+    m_monitor->noteRemoteActivity(QStringLiteral("dR"), QStringLiteral("tR"), 900);
+    QCOMPARE(stateSpy.count(), 1);
+
+    // Sub-second rounding inside one listing can date a pane fractionally ahead
+    // of the `nowMs` it was stamped with. That is "printing right now", not an
+    // age past the window.
+    m_monitor->noteRemoteActivity(QStringLiteral("dR"), QStringLiteral("tR"), -1);
+    QCOMPARE(m_monitor->stateFor("dR", "tR"), asInt(AgentState::Running));
+
+    // Past the remote window: quiet.
+    m_monitor->noteRemoteActivity(QStringLiteral("dR"), QStringLiteral("tR"), 5000);
+    QCOMPARE(m_monitor->stateFor("dR", "tR"), asInt(AgentState::Idle));
+    QCOMPARE(stateSpy.count(), 2);
+
+    // ...and back, because a completion is never inferred from activity.
+    m_monitor->noteRemoteActivity(QStringLiteral("dR"), QStringLiteral("tR"), 0);
+    QCOMPARE(m_monitor->stateFor("dR", "tR"), asInt(AgentState::Running));
+    QVERIFY(!m_monitor->hasUnseen(QStringLiteral("dR")));
+
+    // An ATTACHED generic pane is not re-derived from the server's reading: the
+    // client is watching the very same bytes at millisecond resolution, and a
+    // sample dated to the nearest second would only fight it.
+    m_monitor->noteTerminalAttached(QStringLiteral("dR"), QStringLiteral("tR"));
+    QCOMPARE(m_monitor->stateFor("dR", "tR"), asInt(AgentState::Starting));
+    m_monitor->noteRemoteActivity(QStringLiteral("dR"), QStringLiteral("tR"), 5000);
+    QCOMPARE(m_monitor->stateFor("dR", "tR"), asInt(AgentState::Starting));
+    m_monitor->noteRemoteActivity(QStringLiteral("dR"), QStringLiteral("tR"), 0);
+    QCOMPARE(m_monitor->stateFor("dR", "tR"), asInt(AgentState::Starting));
+
+    // A pane nobody registered gets no row from a server observation either.
+    m_monitor->noteRemoteActivity(QStringLiteral("dR"), QStringLiteral("ghost"), 0);
+    QCOMPARE(m_monitor->stateFor("dR", "ghost"), asInt(AgentState::Unknown));
+}
+
+// The silence demotion asks "has this pane said anything on ANY channel". A
+// server observation is such a channel, and it is the only one left for an
+// adapter-backed pane in a Dev Session the user is not looking at: the adapter
+// is quiet during a long tool call, and the PTY is gone. Without the refutation
+// those panes are demoted to Unknown after fifteen minutes of doing real work.
+void TstAgentMonitor::remoteActivityRefutesTheSilenceTimeoutForAnAdapterPane()
+{
+    makePair();
+    m_monitor->setStaleTimeoutMs(200);
+
+    feed(eventLine("running", QStringLiteral("dM"), QStringLiteral("tM"),
+                   QStringLiteral("oh-my-pi")));
+    QTRY_COMPARE(m_monitor->stateFor("dM", "tM"), asInt(AgentState::Running));
+    m_monitor->setTerminalHarness(QStringLiteral("dM"), QStringLiteral("tM"),
+                                  QStringLiteral("oh-my-pi"));
+
+    // Well past the window in total, but the host keeps reporting fresh output.
+    for (int i = 0; i < 8; ++i) {
+        QTest::qWait(60);
+        m_monitor->noteRemoteActivity(QStringLiteral("dM"), QStringLiteral("tM"), 0);
+        QCOMPARE(m_monitor->stateFor("dM", "tM"), asInt(AgentState::Running));
+    }
+
+    // A STALE reading is not a sign of life, so it refutes nothing: the pane is
+    // still polled, and the window elapses anyway.
+    for (int i = 0; i < 25
+                    && m_monitor->stateFor("dM", "tM") != asInt(AgentState::Unknown);
+         ++i) {
+        QTest::qWait(60);
+        m_monitor->noteRemoteActivity(QStringLiteral("dM"), QStringLiteral("tM"),
+                                      600000);
+    }
+    QCOMPARE(m_monitor->stateFor("dM", "tM"), asInt(AgentState::Unknown));
+}
+
+// Both new inputs are governed by the same rule as every other derivation in
+// this class: the activity clock's vocabulary is Starting/Running/Idle, and a
+// pane parked outside it is carrying knowledge the clock does not have. A
+// blocked agent must not be relabelled "unknown" because the user changed tab,
+// and a finished one must not be resurrected as "running" because its shell
+// printed a prompt the daemon happened to see.
+void TstAgentMonitor::detachAndRemoteActivityPreserveStatesTheClockCannotExpress()
+{
+    makePair();
+    m_monitor->setRemoteIdleThresholdMs(1000);
+
+    struct Case {
+        const char* wire;
+        AgentState state;
+        const char* term;
+    };
+    const Case cases[] = {
+        {"waiting_input", AgentState::WaitingInput, "tW"},
+        {"error", AgentState::Error, "tE"},
+        {"stopped", AgentState::Stopped, "tP"},
+        {"idle_unseen", AgentState::IdleUnseen, "tU"},
+    };
+
+    for (const Case& c : cases) {
+        const QString term = QString::fromLatin1(c.term);
+        m_monitor->setTerminalHarness(QStringLiteral("dC"), term,
+                                      QStringLiteral("generic"));
+        m_monitor->noteTerminalAttached(QStringLiteral("dC"), term);
+        feed(eventLine(QString::fromLatin1(c.wire), QStringLiteral("dC"), term));
+        QTRY_COMPARE(m_monitor->stateFor("dC", term), asInt(c.state));
+    }
+    QVERIFY(m_monitor->hasUnseen(QStringLiteral("dC")));
+
+    for (const Case& c : cases) {
+        const QString term = QString::fromLatin1(c.term);
+        m_monitor->noteTerminalDetached(QStringLiteral("dC"), term);
+        QCOMPARE(m_monitor->stateFor("dC", term), asInt(c.state));
+        m_monitor->noteRemoteActivity(QStringLiteral("dC"), term, 0);
+        QCOMPARE(m_monitor->stateFor("dC", term), asInt(c.state));
+        m_monitor->noteRemoteActivity(QStringLiteral("dC"), term, 600000);
+        QCOMPARE(m_monitor->stateFor("dC", term), asInt(c.state));
+    }
+    // The completion in particular is still pending: it is the whole signal the
+    // sidebar badge is derived from.
+    QVERIFY(m_monitor->hasUnseen(QStringLiteral("dC")));
+
+    // Once the user HAS seen it, the completion stops outranking the clock and
+    // the pane is derivable from the host's reading again.
+    m_monitor->markSeen(QStringLiteral("dC"));
+    m_monitor->noteRemoteActivity(QStringLiteral("dC"), QStringLiteral("tU"), 0);
+    QCOMPARE(m_monitor->stateFor("dC", "tU"), asInt(AgentState::Running));
 }
 
 QTEST_MAIN(TstAgentMonitor)

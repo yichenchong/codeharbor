@@ -21,6 +21,11 @@ import { TerminalInputWriter } from "./input.ts";
 import { installRenderer } from "./renderer.ts";
 // The pane's own right-click menu, and the mouse policy behind it (see menu.ts).
 import { TerminalContextMenu } from "./menu.ts";
+// A plain drag selects locally; the modifier hands the mouse to the program
+// running in the terminal. That inversion of xterm's own rule lives in mouse.ts,
+// which also records exactly which xterm decision it steers.
+import { installInvertedMousePolicy } from "./mouse.ts";
+import { clipboardKeyAction } from "./keys.ts";
 import {
     applyTerminalPreferences,
     followMotionPreference,
@@ -98,12 +103,18 @@ export function mountTerminal(element: HTMLElement, bridge: TerminalBridge): Ter
     // Nothing below may suppress that: no custom wheel handler is registered and
     // no mouse opt-out is passed, so xterm.js forwards the reports itself.
     //
-    // The known cost of mouse reporting is that a plain drag selects inside tmux
-    // instead of selecting the page's text. xterm.js already answers this with
-    // the terminal-emulator convention — holding SHIFT while dragging forces its
-    // own selection — so no override is added here. Paste is unaffected: it
-    // arrives as a browser paste event on xterm.js's hidden textarea, never as a
-    // mouse report.
+    // A plain drag would ordinarily belong to the program in the terminal, and
+    // xterm's escape hatch to the page's own selection would be the modifier.
+    // This pane inverts that pair — a plain drag selects on the page and stays
+    // highlighted, the modifier hands the drag to the program — because the
+    // thing a user reaches for a mouse to do in a pane is copy what is on
+    // screen, and tmux's own default binding for a drag it receives
+    // (`copy-selection-and-cancel` on MouseDragEnd1Pane) throws the highlight
+    // away the instant the button comes up. installInvertedMousePolicy() below
+    // does it; mouse.ts names the exact xterm predicate involved. The wheel is
+    // untouched by that and still reaches tmux. Paste is unaffected too: it
+    // arrives as a browser paste event on xterm.js's hidden textarea, never as
+    // a mouse report.
     let activeTheme: ThemeRoles = { ...defaultThemeRoles };
     const term = new Terminal({
         // cursorBlink is deliberately absent: followMotionPreference() below
@@ -135,14 +146,21 @@ export function mountTerminal(element: HTMLElement, bridge: TerminalBridge): Ter
         // the 5000 it held while xterm.js was believed to own the history:
         // every line costs memory per pane, and there can be many panes.
         scrollback: 500,
-        // macOS: Option and drag must make a local selection even while the
-        // program in the terminal holds the mouse — the counterpart of Shift
-        // and drag everywhere else, and what this page's menu tells a macOS
-        // user to do. xterm.js has the behaviour but leaves it OFF by default,
-        // so without this line there is no way at all to select text in a pane
-        // running tmux on a Mac. Measured on CI's macOS runner: the drag went
-        // to the remote side and the page kept no selection.
+        // macOS: xterm's force-selection predicate reads Option there rather
+        // than Shift, and only when this option is on — with it off there is no
+        // forced selection on a Mac at all, so the inverted policy in mouse.ts
+        // would have nothing to invert and a plain drag could not select. With
+        // it on, and the sense of Option inverted, macOS matches everywhere
+        // else: a plain drag selects on the page, and OPTION and drag is what
+        // hands the mouse to the program.
         macOptionClickForcesSelection: true,
+        // Off because the inverted policy synthesises Option on macOS for every
+        // plain press, and xterm's Alt-click-moves-cursor would then read that
+        // synthetic Option on the release and send a burst of cursor keys to
+        // the remote shell on an ordinary click. The feature is worth little
+        // here in any case: the pane runs tmux on the alternate screen, where
+        // there is no readline cursor to walk to.
+        altClickMovesCursor: false,
         // The host may replace this immediately after page load through
         // window.applyTheme(); these dark roles are the standalone fallback.
         theme: xtermTheme(activeTheme),
@@ -319,52 +337,69 @@ export function mountTerminal(element: HTMLElement, bridge: TerminalBridge): Ter
         if (event.type !== "keydown") {
             return true;
         }
-        const key = event.key?.toLowerCase() ?? "";
-        if (key !== "c") {
-            // Do not intercept paste: the browser emits a trusted paste event
-            // for Ctrl+Shift+V / Cmd+V, and xterm's handler is where bracketed
-            // paste markers are added. Intercepting the key and reading
-            // navigator.clipboard would lose the middle-click selection path.
+        const action = clipboardKeyAction(event, {
+            isMac,
+            hasSelection: term.hasSelection(),
+        });
+        if (action === "pass") {
+            // Ctrl+C with nothing selected, and every other key, is the remote
+            // program's: it reaches the shell as the interrupt character.
             return true;
         }
-        // The explicit copy shortcut, which copies whenever there is anything to
-        // copy and never means anything else.
-        const copyShortcut = isMac
-            ? event.metaKey && !event.ctrlKey && !event.altKey
-            : event.ctrlKey && event.shiftKey && !event.altKey;
-        // ...and the convenient one. Ctrl+C is the interrupt: it is how a shell
-        // user stops a running command, and it MUST keep working. But with text
-        // selected there is nothing to interrupt that the user could have meant
-        // — they just selected something — so Ctrl+C copies instead, as Windows
-        // Terminal does. Copying then CLEARS the selection, which is what makes
-        // this safe: the very next Ctrl+C interrupts, so a forgotten selection
-        // can cost one keypress and never more.
-        //
-        // Not on macOS. There Ctrl+C is the interrupt and Cmd+C is copy — two
-        // separate keys, so there is nothing to disambiguate and a Mac user
-        // pressing Ctrl+C means the interrupt every time.
-        const copyBecauseSomethingIsSelected = !isMac
-            && event.ctrlKey && !event.shiftKey && !event.altKey && !event.metaKey
-            && term.hasSelection();
-        if (copyShortcut || copyBecauseSomethingIsSelected) {
-            copySelection();
-            if (copyBecauseSomethingIsSelected) {
-                term.clearSelection();
-            }
-            // preventDefault() as well as returning false. Returning false only
-            // stops xterm.js from turning the key into PTY input; it does NOT
-            // suppress the browser's own command, so Cmd+C on macOS would still
-            // run Chromium's native copy right after this one and overwrite the
-            // clipboard from the (empty) DOM selection — xterm's selection lives
-            // in its renderer, not in the document.
-            event.preventDefault();
+        if (action === "paste") {
+            // Returning false is the WHOLE mechanism, and preventDefault() must
+            // NOT be called here. xterm's own key handling would turn Ctrl+V
+            // into the 0x16 control byte and preventDefault() the event, which
+            // suppresses the browser's native paste. Bailing out before that
+            // leaves Chromium's default action intact, so the trusted `paste`
+            // ClipboardEvent still fires on the helper textarea and xterm's own
+            // Clipboard handler receives it. THAT handler - not this one - adds
+            // bracketed-paste markers when the remote application asked for
+            // them, and keeps X11 middle-click paste working. Reading
+            // navigator.clipboard here instead would lose both.
             return false;
         }
-        // Ctrl+C with nothing selected, and every other key, is the remote
-        // program's: it reaches the shell as the interrupt character.
-        return true;
+        copySelection();
+        if (action === "copy-and-clear") {
+            term.clearSelection();
+        }
+        // preventDefault() as well as returning false. Returning false only
+        // stops xterm.js from turning the key into PTY input; it does NOT
+        // suppress the browser's own command, so Cmd+C on macOS would still
+        // run Chromium's native copy right after this one and overwrite the
+        // clipboard from the (empty) DOM selection — xterm's selection lives
+        // in its renderer, not in the document.
+        event.preventDefault();
+        return false;
     });
     term.onData((data) => input.write(data));
+    // SCOPE OF THE MOUSE POLICY, stated exactly. A modifier-drag reaches the
+    // remote program only when the negotiated encoding is SGR (`?1006h`), which
+    // travels as ordinary text through onData. That is not a hedge in practice:
+    // every CodeHarbor pane is a tmux session (SPEC 5.2), the remote program
+    // negotiates with tmux rather than with this terminal, and tmux asks its own
+    // outer terminal for SGR.
+    //
+    // With the DEFAULT X10 encoding xterm emits the report through onBinary
+    // instead, because such a report can carry bytes above 0x7f that are not
+    // text (CoreMouseService's triggerBinaryEvent). This page has no
+    // byte-preserving route to the PTY - `sendInput` carries a QString the C++
+    // side encodes as UTF-8, which would mangle exactly those bytes - so such a
+    // report is DROPPED, and this handler does not fix that. It predates the
+    // policy change (a plain drag reached the same dead end before the modifier
+    // did) and forwarding it needs a tagged, order-preserving binary channel
+    // through the WebChannel bridge, which is its own piece of work.
+    //
+    // What this handler buys is that the drop is never silent again: undeliverable
+    // input now says so in the log instead of vanishing, which is how the gap
+    // stayed invisible until a test went looking for it.
+    term.onBinary((data) => {
+        console.warn(
+            "CodeHarbor terminal dropped an X10-encoded mouse report: this pane "
+            + "can only forward the SGR encoding that tmux negotiates "
+            + `(${data.length} bytes discarded)`,
+        );
+    });
 
     // Re-fit the terminal to the surface, but ONLY while the surface actually
     // has a box on screen.
@@ -534,10 +569,12 @@ export function mountTerminal(element: HTMLElement, bridge: TerminalBridge): Ter
     // wheel needs that). Two consequences are deliberate and left alone:
     //   * the wheel scrolls the session's history, and a program that asked for
     //     the mouse (vim, htop) gets the wheel itself;
-    //   * a plain drag belongs to that program, and the page's own selection is
-    //     reached with xterm.js's documented modifier — Alt on macOS, Shift
-    //     everywhere else. That selection stays until it is replaced, and
-    //     nothing is copied without being asked for.
+    //   * a plain drag makes the PAGE's selection and keeps it — the pane
+    //     inverts xterm's rule so that the modifier (Shift, or Option on macOS)
+    //     is what hands a drag to the program instead of the other way round;
+    //     see installInvertedMousePolicy() below and mouse.ts. That selection
+    //     stays until it is replaced, and nothing is copied without being asked
+    //     for.
     //
     // The RIGHT button is the exception, and it is taken away from the remote
     // side entirely. Forwarded, it reaches tmux, whose default binding draws a
@@ -557,6 +594,15 @@ export function mountTerminal(element: HTMLElement, bridge: TerminalBridge): Ter
     for (const type of ["mousedown", "mouseup", "auxclick"] as const) {
         surface.addEventListener(type, swallowRightButton, true);
     }
+    // The inversion itself. It reads the LIVE tracking mode rather than
+    // assuming tmux is up: with no program asking for the mouse, xterm's own
+    // plain drag already selects and Shift still means "extend the selection to
+    // here", which the inversion must not disturb.
+    const removeMousePolicy = installInvertedMousePolicy({
+        surface,
+        mouseReportingActive: () => term.modes.mouseTrackingMode !== "none",
+        isMac,
+    });
 
     const menu = new TerminalContextMenu(element, {
         hasSelection: () => term.hasSelection(),
@@ -658,9 +704,14 @@ export function mountTerminal(element: HTMLElement, bridge: TerminalBridge): Ter
             cols: term.cols,
             rows: term.rows,
             // What the mouse is doing: whether the page holds a selection of
-            // its own, and whether this application's menu is on screen.
+            // its own, whether this application's menu is on screen, and
+            // whether a program on the far end is asking for mouse reports at
+            // all. The last one decides which way a drag goes (see mouse.ts),
+            // so a case about dragging that could not read it would be
+            // asserting against a state it never established.
             hasSelection: term.hasSelection(),
             menuOpen: menu.isOpen,
+            mouseTrackingMode: term.modes.mouseTrackingMode,
             fontCssPixels: term.options.fontSize ?? null,
             surfaceCssPixels: {
                 width: surface.clientWidth,
@@ -738,6 +789,7 @@ export function mountTerminal(element: HTMLElement, bridge: TerminalBridge): Ter
             for (const type of ["mousedown", "mouseup", "auxclick"] as const) {
                 surface.removeEventListener(type, swallowRightButton, true);
             }
+            removeMousePolicy();
             menu.dispose();
             pixelRatio.restore();
             writer.close();

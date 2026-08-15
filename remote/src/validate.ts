@@ -98,6 +98,33 @@ export function requireStringArray(obj: Record<string, unknown>, field: string, 
     return value as string[];
 }
 
+/**
+ * Optional array of NON-EMPTY strings: absent (or explicitly null) is fine, and
+ * present must be an array whose every element is a string with content. Used
+ * for an optional id filter, where absence and presence mean different things —
+ * `tmux.paneActivity` reads an absent `devSessionIds` as "every pane". A blank
+ * element is rejected rather than dropped because it can never name a row: it
+ * would narrow the answer by one entry that silently matched nothing, and the
+ * caller would have no way to tell that from an id whose rows are simply gone.
+ */
+export function optionalStringArray(
+    obj: Record<string, unknown>,
+    field: string,
+    method: string,
+): string[] | undefined {
+    const value = obj[field];
+    if (value === undefined || value === null) return undefined;
+    if (!Array.isArray(value)) {
+        throw new InvalidParamsError(`${method}: missing or invalid field '${field}'`);
+    }
+    for (const item of value) {
+        if (typeof item !== "string" || item.trim() === "") {
+            throw new InvalidParamsError(`${method}: missing or invalid field '${field}'`);
+        }
+    }
+    return value as string[];
+}
+
 export function optionalNumber(obj: Record<string, unknown>, field: string, method: string): number | undefined {
     const value = obj[field];
     if (value === undefined) return undefined;

@@ -364,8 +364,9 @@ belong in `remote/sql/indexes.sql`, which is applied on every open rather than o
 on migration.
 
 The RPC schema is separate and IS the compatibility gate: `RPC_SCHEMA_VERSION` in
-`remote/src/codeharbord.ts` (currently 7 — 6 → 7 added the agent viewer control
-channel, SPEC 6.8) against
+`remote/src/codeharbord.ts` (currently 8 — 6 → 7 added the agent viewer control
+channel, SPEC 6.8; 7 → 8 added `tmux.paneActivity`, the per-pane last-output time
+that keeps a detached pane's sidebar status honest, SPEC 6.6) against
 `AppController::kMinimumServerSchemaVersion`. A client refuses a server whose RPC
 schema is older than it needs, which is the "Server too old" path.
 
@@ -403,6 +404,17 @@ Existing targets that gained coverage in the same period:
   environment: set at session creation, refreshed on every attach (a reconnect is a
   new daemon with a new socket), unset when the server reports none, and never
   exported for a pane with no identity.
+- `tst_agentmonitor` — the sidebar status of a pane the user is NOT looking at: a
+  detached `generic` pane reads `unknown` rather than the false `idle` it used to
+  settle on, a server-observed activity age drives it back to `running` and on to
+  `idle`, that age refutes the silence timeout for an adapter-backed pane too, and
+  an unseen completion, `waiting_input`, `error` and `stopped` all survive both a
+  detach and a remote observation.
+- `tst_tmuxactivity` — the poller: the age is computed from the SERVER's clock, a
+  pane tmux could not date reports nothing at all, and a tick while a request is
+  still in flight issues no second request.
+- `tst_terminalpage` — the inverted mouse policy: a plain drag makes a local
+  selection that survives, and a modifier drag reaches the remote program instead.
 - `tst_sessionlayouts` — pane titles and fast Dev Session switching.
 - `tst_appcontroller` — archiving, deleting a session and a group, and that the
   sidebar's filters never narrow the tree the controller treats as authoritative.
@@ -417,6 +429,27 @@ Existing targets that gained coverage in the same period:
 - `src/web/markdown` — its own `node --test` suite, including the sanitiser cases
   (script tags, event-handler attributes, `javascript:` links, frames) and
   relative image resolution.
+
+**Never separate tmux `-F` fields with a non-printable byte.** tmux passes a
+non-printable character through a format only when the tmux CLIENT invoking it
+considers itself UTF-8-capable; otherwise `utf8_sanitize()` rewrites it to `_`. A
+client is non-UTF-8 when its locale is non-UTF-8 AND it is not itself inside a
+tmux session, and that is exactly how `codeharbord` runs: an SSH exec channel with
+no `LANG` and no `TMUX`. Measured on one private server, one command: client under
+`C` with `TMUX` unset gives `M_1786814684_mx`, the same client under `C` with
+`TMUX` set gives `M\t1786814684\tmx`, and `C.UTF-8` gives the tabs too.
+
+This shipped as a real defect: both listing formats used a TAB, so on any normally
+configured host `tmux.listSessions` answered `[]` and `tmux.paneActivity` dated no
+pane. It hid for a release because every unit fixture hard-coded tab-separated
+bytes that real tmux never produces. The separator is now one exported constant,
+`LIST_FIELD_SEPARATOR` in `remote/src/tmux.ts`, used by both formats, both marker
+anchors and both parsers; the fixtures build their lines from it rather than
+spelling it; and `remote/test/tmux-live.test.ts` drives a REAL tmux on a private
+`-L` server with `LC_ALL=C` and `TMUX` deleted, which is the only guard that
+reproduces the daemon's own environment. Reverting the constant to a tab fails
+that file with `real tmux listing did not parse; got []` — the production symptom.
+Test it by hand from a UTF-8 shell, or from inside tmux, and it will look fine.
 
 `-L desktop` currently holds one target, `tst_notifierlive`, which delivers a real
 notification through `org.freedesktop.Notifications`. It needs a session bus AND a

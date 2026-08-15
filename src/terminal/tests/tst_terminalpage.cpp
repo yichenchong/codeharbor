@@ -303,20 +303,27 @@ constexpr auto kJsRightPress = R"JS(
 )JS";
 
 // Press the left button and then the right one on the same spot, with a spy
-// listening on the document in the BUBBLE phase, and report what got through.
+// listening on xterm.js's own root element in the CAPTURE phase, and report
+// what got through.
 //
 // This is how "the right button never reaches the remote side" is shown without
 // a remote side: the page swallows that button at the surface in the CAPTURE
-// phase, so an event aimed at anything inside the terminal is stopped on its
-// way DOWN and never comes back up to the document. Everything xterm.js listens
-// on is inside the surface, so what the spy cannot see, xterm.js cannot see
-// either — and what xterm.js never sees, it cannot report.
+// phase, one level ABOVE that root, so an event aimed at anything inside the
+// terminal is stopped on its way down and never arrives. What the spy cannot
+// see, xterm.js cannot see either — and what xterm.js never sees, it cannot
+// report.
+//
+// The spy sits there rather than at the document because a press that DOES
+// arrive is then consumed by xterm.js — a plain one starts the page's selection
+// (SelectionService stops it), a handed-over one becomes a mouse report (the
+// terminal cancels it) — so at the document the two buttons would look alike
+// for entirely different reasons.
 //
 // The left button is the control, and it is a control that cannot lie: it is
 // dispatched on the same element, from the same code, and the only difference
 // is which button it claims to be.
 //
-// The reply is "buttonN=<reached the document>,<was cancelled>" for each button.
+// The reply is "buttonN=<reached xterm.js>,<was cancelled>" for each button.
 constexpr auto kJsComparePresses = R"JS(
 (function () {
     try {
@@ -326,9 +333,10 @@ constexpr auto kJsComparePresses = R"JS(
         var rect = target.getBoundingClientRect();
         var x = Math.round(rect.left + rect.width / 3);
         var y = Math.round(rect.top + rect.height / 3);
+        var root = surface.querySelector(".xterm") || surface;
         var seen = 0;
         var spy = function () { seen += 1; };
-        document.addEventListener("mousedown", spy, false);
+        root.addEventListener("mousedown", spy, true);
         var parts = [];
         try {
             [0, 2].forEach(function (button) {
@@ -351,7 +359,7 @@ constexpr auto kJsComparePresses = R"JS(
                 }
             });
         } finally {
-            document.removeEventListener("mousedown", spy, false);
+            root.removeEventListener("mousedown", spy, true);
         }
         return parts.join("|");
     } catch (e) { return "ERR:" + e; }
@@ -360,7 +368,10 @@ constexpr auto kJsComparePresses = R"JS(
 
 // Everything worth knowing about the menu in one delimited reply, read the same
 // way the measurement probe above reads the cell size:
-// "menu=|open=|items=|copyDisabled=|hint=|selection=".
+// "menu=|open=|items=|copyDisabled=|hint=|selection=|mouse=".
+// `mouse` is xterm's mouse tracking mode, which is the precondition for every
+// claim about where a drag goes: "none" means no program is asking for the
+// mouse, and a drag case that ran in that state would prove nothing.
 // `menu` is the DOM element, `open` is the page's own diagnostics; they must
 // always agree, and a case that only asked one of them would miss a menu that
 // was left on screen after being logically closed.
@@ -375,7 +386,8 @@ constexpr auto kJsMenuState = R"JS(
              + "|items=" + (menu ? menu.querySelectorAll("button.ch-terminal-menu-item").length : 0)
              + "|copyDisabled=" + (copy ? (copy.disabled ? 1 : 0) : -1)
              + "|hint=" + (menu && menu.querySelector("div.ch-terminal-menu-hint") ? 1 : 0)
-             + "|selection=" + (d.hasSelection ? 1 : 0);
+             + "|selection=" + (d.hasSelection ? 1 : 0)
+             + "|mouse=" + d.mouseTrackingMode;
     } catch (e) { return "ERR:" + e; }
 })()
 )JS";
@@ -429,6 +441,32 @@ constexpr auto kJsPasteItemGeometry = R"JS(
         return Math.round(point.x) + "|" + Math.round(point.y)
              + "|" + Math.round(rect.left + rect.width / 2)
              + "|" + Math.round(rect.top + rect.height / 2);
+    } catch (e) { return "ERR:" + e; }
+})()
+)JS";
+
+// Where the character grid is in the page's coordinates, together with the
+// point the page saw for the last REAL press: "pointerX|pointerY|left|top|
+// width|height".
+//
+// A press only becomes a mouse report if it lands INSIDE the grid. xterm.js
+// clamps an out-of-range press when it is making a selection but refuses to
+// report one (IMouseService::getMouseReportCoords answers nothing for a point
+// outside the screen element), so a drag aimed at the pane rather than at the
+// grid quietly does neither and a case built on it would be measuring the
+// padding. The window's coordinates are not the page's — the pane's header and
+// borders sit between them — so the offset is taken from a real press whose
+// window position the caller knows.
+constexpr auto kJsGridGeometry = R"JS(
+(function () {
+    try {
+        var point = window.__chLastPoint;
+        var screen = document.querySelector(".xterm-screen");
+        if (!point || !screen) return "NO_GEOMETRY";
+        var rect = screen.getBoundingClientRect();
+        return Math.round(point.x) + "|" + Math.round(point.y)
+             + "|" + Math.round(rect.left) + "|" + Math.round(rect.top)
+             + "|" + Math.round(rect.width) + "|" + Math.round(rect.height);
     } catch (e) { return "ERR:" + e; }
 })()
 )JS";
@@ -969,10 +1007,10 @@ void TstTerminalPage::escapeClosesTheMenu()
 // has asked for them, so silence alone could just mean nobody was asking.
 //
 // The second half is checked in the page: the press is swallowed at the surface
-// in the capture phase, so it never reaches anything inside — which is where
-// all of xterm.js's listeners are — and never comes back up to the document
-// either. A left press dispatched by the same code on the same spot is the
-// control, and it must arrive.
+// in the capture phase, one level above xterm.js's own root element, so it
+// never reaches the element every one of xterm.js's listeners is attached to.
+// A left press dispatched by the same code on the same spot is the control, and
+// it must arrive there.
 //
 // Mouse reporting is switched on for the duration with the DECSET sequence a
 // remote program (tmux, here) sends when it wants the mouse, so the terminal is
@@ -1276,19 +1314,40 @@ void TstTerminalPage::realMouseInputTravelsThroughTheQmlPane()
                                        "the page saw: %1")
                             .arg(evalJs(QString::fromLatin1(kJsReadInputSpy)))));
 
+    // That press is also the ruler for the drags below: it is the one point
+    // whose position is known in BOTH coordinate systems, so it is what turns
+    // the grid's page rectangle into window coordinates to aim at. Measured now
+    // rather than later because every press the page sees — including the
+    // synthetic one below — moves the point the probe reads.
+    const QStringList gridGeometry =
+        evalJs(QString::fromLatin1(kJsGridGeometry)).split(QLatin1Char('|'));
+    QVERIFY2(gridGeometry.size() == 6,
+             qPrintable(QStringLiteral("the grid geometry probe replied %1")
+                            .arg(gridGeometry.join(QLatin1Char('|')))));
+    const QPoint gridOrigin =
+        point - QPoint(gridGeometry.at(0).toInt(), gridGeometry.at(1).toInt());
+    const QRect grid(gridGeometry.at(2).toInt(), gridGeometry.at(3).toInt(),
+                     gridGeometry.at(4).toInt(), gridGeometry.at(5).toInt());
+    QVERIFY2(grid.width() > 80 && grid.height() > 40,
+             qPrintable(QStringLiteral("the character grid is %1x%2, which is too small to drag "
+                                       "across")
+                            .arg(grid.width())
+                            .arg(grid.height())));
 
     // The selection the user asked for, made with real input.
     //
     // Mouse reporting is switched on first, because that is the state that
-    // makes this interesting: with a program holding the mouse, a plain drag is
-    // its business, and the modifier is the documented way to take one drag
-    // back for the page. The screen is filled first so the drag crosses real
+    // makes this interesting: with a program holding the mouse, xterm.js on its
+    // own would give a plain drag to that program and keep the modifier for the
+    // page's selection. This pane inverts exactly that decision (see the page's
+    // mouse.ts), so the plain drag below is the page's and the modified one is
+    // the program's. The screen is filled first so the drag crosses real
     // characters rather than blank cells.
     for (int line = 0; line < 24; ++line) {
         m_controller->ingestOutput(
             QByteArrayLiteral("selectable terminal text on a line of its own\r\n"));
     }
-    m_controller->ingestOutput(QByteArrayLiteral("\x1b[?1000h"));
+    m_controller->ingestOutput(QByteArrayLiteral("\x1b[?1000h\x1b[?1006h"));
     QTest::qWait(500);
     // An earlier case leaves the whole screen selected; a plain press drops it,
     // so what this case observes can only be what this case selected.
@@ -1298,28 +1357,88 @@ void TstTerminalPage::realMouseInputTravelsThroughTheQmlPane()
     QTest::qWait(200);
     QVERIFY2(evalJs(QString::fromLatin1(kJsMenuState)).contains(QStringLiteral("|selection=0")),
              "the terminal still held a selection, so the drag below would prove nothing");
-    m_controller->ingestOutput(QByteArrayLiteral("\x1b[?1000h"));
-    QTest::qWait(300);
+    // Reporting back on, and WAITED FOR rather than slept on: the page only
+    // inverts the drag while a program is actually asking for the mouse, so a
+    // drag dispatched before the DECSET had crossed the bridge would exercise
+    // the plain xterm.js rule and quietly assert the opposite of this case.
+    //
+    // BOTH sequences, because that is what tmux sends and only the pair is
+    // testable: ?1000h alone leaves xterm.js on its default X10 encoding, whose
+    // reports can carry bytes above 127 and therefore leave the emulator as a
+    // BINARY event rather than as data. ?1006h asks for the SGR encoding, which
+    // is plain text and reaches the transport the same way a keystroke does.
+    m_controller->ingestOutput(QByteArrayLiteral("\x1b[?1000h\x1b[?1006h"));
+    QString mouseState;
+    QElapsedTimer mouseClock;
+    mouseClock.start();
+    while (mouseClock.elapsed() < kProbeTimeoutMs) {
+        mouseState = evalJs(QString::fromLatin1(kJsMenuState));
+        if (mouseState.contains(QStringLiteral("|mouse=vt200")))
+            break;
+        QTest::qWait(50);
+    }
+    QVERIFY2(mouseState.contains(QStringLiteral("|mouse=vt200")),
+             qPrintable(QStringLiteral("the program's request for the mouse never reached the "
+                                       "page, so neither drag below would mean anything: %1")
+                            .arg(mouseState)));
+
+    // WriteOnly for the same reason as the cases above: a readable QBuffer
+    // would feed everything written into it back to the controller as terminal
+    // output. It is what proves the modified drag really did reach the program.
+    QBuffer mouseTransport;
+    QVERIFY(mouseTransport.open(QIODevice::WriteOnly));
+    m_controller->setTransport(&mouseTransport);
 
     // The modifier is not the same everywhere, and that is xterm.js's rule, not
-    // this application's: it forces a local selection on Alt (the Option key)
-    // on macOS and on Shift on every other platform. A test that hardcoded
-    // Shift passed on Linux and failed on macOS for the correct reason — the
-    // drag went to the program, exactly as an unmodified drag should.
+    // this application's: its force-selection decision reads Alt (the Option
+    // key) on macOS and Shift on every other platform. The page inverts the
+    // sense of that one flag, so the key that used to be the only way to select
+    // is now the way to hand a drag over. A test that hardcoded Shift would
+    // pass on Linux and fail on macOS for the correct reason.
 #ifdef Q_OS_MACOS
-    constexpr Qt::KeyboardModifier kSelectionModifier = Qt::AltModifier;
+    constexpr Qt::KeyboardModifier kRemoteMouseModifier = Qt::AltModifier;
 #else
-    constexpr Qt::KeyboardModifier kSelectionModifier = Qt::ShiftModifier;
+    constexpr Qt::KeyboardModifier kRemoteMouseModifier = Qt::ShiftModifier;
 #endif
-    const QPoint dragStart(120, window->height() / 2);
-    QTest::mousePress(window, Qt::LeftButton, kSelectionModifier, dragStart);
-    for (int step = 1; step <= 6; ++step) {
-        QTest::mouseMove(window, dragStart + QPoint(step * 60, step * 4));
-        QTest::qWait(30);
-    }
-    const QPoint dragEnd = dragStart + QPoint(360, 24);
-    QTest::mouseRelease(window, Qt::LeftButton, kSelectionModifier, dragEnd);
+    // Both ends are cells of the grid, converted into the window's coordinates.
+    const QPoint dragStart =
+        gridOrigin + QPoint(grid.left() + 6, grid.top() + grid.height() / 3);
+    const QPoint dragEnd =
+        gridOrigin + QPoint(grid.left() + grid.width() * 3 / 4,
+                            grid.top() + grid.height() * 2 / 3);
+    const auto dragAcrossTheScreen = [window, dragStart, dragEnd](
+                                         Qt::KeyboardModifiers modifiers) {
+        QTest::mousePress(window, Qt::LeftButton, modifiers, dragStart);
+        for (int step = 1; step <= 6; ++step) {
+            QTest::mouseMove(window, dragStart + (dragEnd - dragStart) * step / 6);
+            QTest::qWait(30);
+        }
+        QTest::mouseRelease(window, Qt::LeftButton, modifiers, dragEnd);
+    };
 
+    // The modified drag belongs to the program. It has to arrive there as a
+    // mouse report, and it must leave nothing selected on the page: giving the
+    // mouse away is the whole of what the modifier buys.
+    dragAcrossTheScreen(kRemoteMouseModifier);
+    QElapsedTimer reportClock;
+    reportClock.start();
+    while (reportClock.elapsed() < kProbeTimeoutMs && mouseTransport.data().isEmpty())
+        QTest::qWait(50);
+    QVERIFY2(!mouseTransport.data().isEmpty(),
+             qPrintable(QStringLiteral("a real modified drag sent nothing to the remote side, so "
+                                       "the program never got the mouse it was asking for (the "
+                                       "page reports %1)")
+                            .arg(evalJs(QString::fromLatin1(kJsMenuState)))));
+    const QString handedOver = evalJs(QString::fromLatin1(kJsMenuState));
+    QVERIFY2(handedOver.contains(QStringLiteral("|selection=0")),
+             qPrintable(QStringLiteral("a modified drag was meant for the program but selected "
+                                       "on the page as well: %1")
+                            .arg(handedOver)));
+    const qsizetype reportedBytes = mouseTransport.data().size();
+
+    // The plain drag is the page's, and this is the claim the inversion exists
+    // for: it selects here rather than going to the program.
+    dragAcrossTheScreen(Qt::NoModifier);
     QString dragged;
     QElapsedTimer dragClock;
     dragClock.start();
@@ -1330,14 +1449,22 @@ void TstTerminalPage::realMouseInputTravelsThroughTheQmlPane()
         QTest::qWait(50);
     }
     QVERIFY2(dragged.contains(QStringLiteral("|selection=1")),
-             qPrintable(QStringLiteral("a real Shift-drag left no selection behind: %1")
+             qPrintable(QStringLiteral("a real plain drag left no selection behind: %1")
                             .arg(dragged)));
     // The complaint that started this: the selection disappeared the moment the
     // button came up. A second later it must still be there.
     QTest::qWait(1200);
     QVERIFY2(evalJs(QString::fromLatin1(kJsMenuState)).contains(QStringLiteral("|selection=1")),
              "the selection was dropped shortly after the button was released");
-    m_controller->ingestOutput(QByteArrayLiteral("\x1b[?1000l"));
+    // And not one byte of it reached the program, which is the other half of
+    // the same decision.
+    QVERIFY2(mouseTransport.data().size() == reportedBytes,
+             qPrintable(QStringLiteral("a plain drag reported %1 to the remote side instead of "
+                                       "selecting on the page")
+                            .arg(QString::fromLatin1(
+                                mouseTransport.data().mid(reportedBytes).toHex()))));
+    m_controller->setTransport(nullptr);
+    m_controller->ingestOutput(QByteArrayLiteral("\x1b[?1006l\x1b[?1000l"));
     // And the right button opens the page's own menu, from a real press.
     QCOMPARE(evalJs(QString::fromLatin1(kJsInstallInputSpy)), QStringLiteral("SPY"));
     QTest::mouseClick(window, Qt::RightButton, Qt::NoModifier, point);

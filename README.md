@@ -159,7 +159,7 @@ shortcuts SPEC 15 originally suggested, in [`docs/SPEC.md`](docs/SPEC.md) — is
 | `Ctrl+S` | Save the file in the focused editor |
 | `Ctrl+Shift+C` (`⌘C` on macOS) | Copy the selection in the focused terminal |
 | `Ctrl+C` | In a terminal with text selected: copy it and clear the selection. With nothing selected it is the usual interrupt, and on macOS it is always the interrupt |
-| `Ctrl+Shift+V` (`⌘V` on macOS) | Paste into the focused terminal |
+| `Ctrl+V` (`⌘V` on macOS) | Paste into the focused terminal. `Ctrl+Shift+V` does the same. Because `Ctrl+V` pastes, it no longer reaches the shell as `^V` (readline's literal-next); on macOS plain `Ctrl+V` still does |
 | `Ctrl+,` | Settings |
 
 Splitting and closing panes, killing a terminal's remote tmux session, disconnecting,
@@ -195,6 +195,13 @@ A few things worth knowing about the shipped client:
   created, and the gear button in a terminal's header changes it — name the agent
   the pane runs, or pick "Plain shell" to stop CodeHarbor guessing from output. A
   pane whose agent reports its own status still shows it either way.
+- **That keeps working for the sessions you are not looking at**, which is the
+  point of the dot. A supported agent reports over its own channel, so switching
+  away changes nothing. An ordinary terminal is judged from tmux's own record of
+  when each session last printed, asked for on a short poll, so a build or a test
+  run in a session you left behind still goes quiet-then-idle on screen. A pane
+  CodeHarbor cannot date at all reads "unknown" rather than guessing "idle" — the
+  dot never claims a session finished when nobody knows.
 - **Dev Sessions can be pinned**, and the sidebar can be filtered to show only pinned
   ones. Pins live on the server; the filter is local to the machine.
 - **Dev Sessions can be archived** to get them out of the sidebar without losing
@@ -203,16 +210,18 @@ A few things worth knowing about the shipped client:
 - **Sessions and groups can be deleted.** Both ask first and name what they are
   about to destroy; deleting a group also states how many sessions go with it.
   Deleting is permanent — archiving is the reversible option.
-- **The mouse in a terminal mostly belongs to the program you are running.** Each
-  tmux session has mouse reporting on, so the wheel scrolls tmux's history and a
-  program that wants the mouse — vim, htop — gets it, including plain clicks and
-  drags. To select text for yourself instead, hold **Shift and drag** (**Option and
-  drag** on macOS); that selection stays put, and nothing is copied until you ask.
-  Copy with `Ctrl+Shift+C` (`⌘C` on macOS) or, with something selected, plain `Ctrl+C` —
-  which clears the selection, so the next `Ctrl+C` interrupts as usual. (On macOS `Ctrl+C`
-  is always the interrupt.) Paste with `Ctrl+Shift+V` (`⌘V`) or from the right-click menu.
-  (A middle click goes to tmux, which pastes its own last copy rather than the system
-  clipboard.)
+- **Drag to select text; the highlight stays put.** A plain left drag selects in
+  CodeHarbor, exactly as it does in any other desktop application, and the
+  selection survives until you type or select something else. Nothing is copied
+  until you ask: `Ctrl+Shift+C` (`⌘C` on macOS), or plain `Ctrl+C` with something
+  selected — which clears the selection, so the next `Ctrl+C` interrupts as usual.
+  (On macOS `Ctrl+C` is always the interrupt.) Paste with `Ctrl+V` (`⌘V`),
+  `Ctrl+Shift+V`, or the right-click menu.
+- **Hold Shift and drag to give the mouse to the program** (**Option and drag** on
+  macOS). Each tmux session has mouse reporting on, so that is how vim, htop or
+  lazygit see clicks and drags. The wheel is never taken away: it always scrolls
+  tmux's history, which is why mouse reporting is on at all. (A middle click goes
+  to tmux, which pastes its own last copy rather than the system clipboard.)
 - **Right-click opens CodeHarbor's own terminal menu** — Copy, Paste and Select All,
   with Copy greyed out when nothing is selected. The right button is the one button
   that is not passed to the remote side, because tmux's own right-button menu is

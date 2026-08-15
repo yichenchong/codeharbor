@@ -501,6 +501,93 @@ void AgentStatusMonitor::noteTerminalOutput(const QString& devSessionId,
                                static_cast<int>(AgentState::Running));
 }
 
+void AgentStatusMonitor::noteTerminalDetached(const QString& devSessionId,
+                                              const QString& terminalId)
+{
+    TerminalStatus* st = findStatus(devSessionId, terminalId);
+    if (!st || !st->attached)
+        return;
+    st->attached = false;
+    // Everything below the flag is the same restraint noteTerminalAttached()
+    // applies, for the same reason: losing a channel is a TRANSPORT event and
+    // says nothing about the agent, so it may only move the pane inside the
+    // activity clock's own vocabulary. A pane parked at WaitingInput/Error/
+    // Stopped, or holding a completion the user has not seen, keeps that state
+    // — those are things this client learned and did not un-learn by closing a
+    // socket.
+    //
+    // What DOES change is that the client can no longer see this pane at all,
+    // so a generic pane's activity-derived Starting/Running/Idle is now a claim
+    // nothing supports. Unknown is the honest replacement. Leaving it at Idle —
+    // which is where the fallback clock would strand it two seconds from now,
+    // and where it would stay, since the silence demotion deliberately does not
+    // apply to a generic pane — reads as "finished" in the sidebar about a
+    // session that may be working.
+    const bool derivable =
+        activityClockMayOverwrite(st->state)
+        && !(st->state == AgentState::IdleUnseen
+             && m_unseen.contains(devSessionId));
+    const bool changed =
+        st->generic && derivable && st->state != AgentState::Unknown;
+    if (changed)
+        st->state = AgentState::Unknown;
+    // No pointer use past here: the emit below can re-enter and rehash m_states.
+    rearmAgeTimer();
+    if (changed)
+        emit agentStateChanged(devSessionId, terminalId,
+                               static_cast<int>(AgentState::Unknown));
+}
+
+void AgentStatusMonitor::noteRemoteActivity(const QString& devSessionId,
+                                            const QString& terminalId,
+                                            qint64 ageMs)
+{
+    TerminalStatus* st = findStatus(devSessionId, terminalId);
+    if (!st)
+        return;
+
+    // A NEGATIVE age counts as recent. It can only come from the daemon dating
+    // a pane fractionally ahead of the `nowMs` it stamped the same listing with
+    // (tmux publishes whole seconds), so it means "this pane printed just now",
+    // and reading it as an age past the window would say the exact opposite.
+    const bool recent = ageMs < m_remoteIdleThresholdMs;
+
+    // Refute the silence timeout, exactly as noteTerminalOutput does: the
+    // daemon saw this pane print, and where the observation came from makes no
+    // difference to whether the pane is alive.
+    //
+    // Except for a generic pane the client is ATTACHED to, which is the one
+    // case the silence timeout cannot reach anyway (its arm is NOT (generic &&
+    // attached)) and the one case this would do harm: lastOutputMs is also the
+    // activity clock's input, and stamping it from a reading dated to the
+    // nearest second would drag a pane that has been quiet for nine seconds
+    // back to Running on every poll, against a local clock that is watching the
+    // very same bytes at millisecond resolution.
+    if (recent && !(st->generic && st->attached))
+        st->lastOutputMs = m_clock.elapsed();
+
+    // Only a DETACHED generic pane takes its state from here. An attached one
+    // has the better observer already, and an adapter-backed pane's lifecycle
+    // events say what the agent is doing rather than merely that it printed.
+    std::optional<AgentState> next;
+    if (st->generic && !st->attached) {
+        const bool derivable =
+            activityClockMayOverwrite(st->state)
+            && !(st->state == AgentState::IdleUnseen
+                 && m_unseen.contains(devSessionId));
+        if (derivable)
+            next = recent ? AgentState::Running : AgentState::Idle;
+    }
+    const bool changed = next && *next != st->state;
+    if (changed)
+        st->state = *next;
+    // No pointer use past here: the emit below can re-enter and rehash m_states.
+    rearmAgeTimer();
+    if (changed)
+        emit agentStateChanged(devSessionId, terminalId,
+                               static_cast<int>(*next));
+}
+
 void AgentStatusMonitor::setFallbackIdleThresholdMs(int ms)
 {
     m_fallbackIdleThresholdMs = qMax(0, ms);
@@ -511,6 +598,14 @@ void AgentStatusMonitor::setStaleTimeoutMs(int ms)
 {
     m_staleTimeoutMs = qMax(0, ms);
     rearmAgeTimer();
+}
+
+// No rearmAgeTimer() here, unlike its two neighbours: this window is applied at
+// the moment a server observation arrives, never by the passage of time, so no
+// pane's pending transition depends on its value.
+void AgentStatusMonitor::setRemoteIdleThresholdMs(int ms)
+{
+    m_remoteIdleThresholdMs = qMax(0, ms);
 }
 
 // Whether a pane's state can still change with the passage of time alone.

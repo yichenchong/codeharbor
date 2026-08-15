@@ -551,13 +551,13 @@ mount handshake replays the controller's retained output, and one window-change 
 repaint the screen.
 
 **Clipboard.** The pane's tmux session runs with mouse reporting on, so an ordinary drag inside the grid belongs
-to the program in the terminal rather than to the browser. A local selection is therefore made by holding the
-modifier xterm.js reserves for exactly this — Shift and drag, or Option and drag on macOS — and that selection
-stays until it is replaced. Nothing is ever put on the clipboard without being asked for: copying is
+to the program in the terminal rather than to the browser. Selecting text is nonetheless the PLAIN left drag
+(§5.7): the modifier hands the mouse to the program instead, and a local selection stays until it is replaced.
+Nothing is ever put on the clipboard without being asked for: copying is
 `Ctrl+Shift+C` (`⌘C` on macOS), the terminal's own menu, or — with something selected, and outside macOS —
 plain `Ctrl+C`, which then clears the selection so that the next `Ctrl+C` is the interrupt again (§5.7). All
 three put the current selection on the system
-clipboard. Pasting the system clipboard is `Ctrl+Shift+V` (`⌘V` on macOS) or the menu, and sends it to
+clipboard. Pasting the system clipboard is `Ctrl+V` or `Ctrl+Shift+V` (`⌘V` on macOS) or the menu, and sends it to
 the shell, guarded by bracketed paste where the application asked for it. (A middle click is a mouse button like
 any other and is reported to the remote side, where tmux answers it by pasting its OWN most recent copy — which
 is not the system clipboard and is empty until something has been copied inside tmux.) A paste is chunked through the same
@@ -709,22 +709,39 @@ Manual reconnect should bypass the wait.
 
 The pane's tmux session is created with mouse reporting on (§5.2), and that is deliberate: it is what lets the
 wheel scroll tmux's history and lets a program that asked for the mouse — vim, htop, and the like — receive it.
-The consequence is that almost every mouse action inside the grid belongs to the program in the terminal, not to
-CodeHarbor, and the application must not quietly take actions away from it.
+
+Reporting is NOT, however, allowed to take drag-selection away from the user. It used to: a plain drag went to
+tmux, tmux started its copy-mode highlight, and tmux's default `MouseDragEnd1Pane` binding
+(`copy-selection-and-cancel`) cleared that highlight the instant the button came up — so selecting text with the
+mouse visibly did not work, and the documented remedy was a modifier nobody would guess. Selecting text with a
+drag is the single most ordinary thing a terminal does, so it is the PLAIN gesture, and the modifier is what
+hands the mouse to the program:
 
 | Action | Who handles it | What happens |
 |---|---|---|
-| Wheel | The remote program | Scrolls the tmux session's history; a program that asked for the mouse gets the wheel itself. |
-| Left click | The remote program | Reported to whatever is running, which is how you move the cursor or hit a button in a full-screen program. |
-| Left drag | The remote program | Inside tmux this starts tmux's copy-mode highlight, which tmux clears again on release. That is tmux's own default binding, and the application cannot change it for one session because tmux key tables are global. |
-| Shift+drag (Option+drag on macOS) | The application | Makes a local selection in xterm.js, the modifier xterm.js documents for this. The selection stays until it is replaced, and nothing is copied automatically. |
-| Double click, triple click | The remote program | Reported like any other press, so a word or line selection inside tmux is tmux's, with tmux's release behaviour. Hold the same Shift (Option) modifier to select a word or line locally instead. |
+| Wheel | The remote program | Scrolls the tmux session's history; a program that asked for the mouse gets the wheel itself. Never withheld — it is why reporting is on at all. |
+| Left drag | The application | Makes a local selection in xterm.js. It stays until it is replaced or the user types, and nothing is copied automatically. |
+| Shift+drag (Option+drag on macOS) | The remote program | Reported as an ordinary drag, which is how a full-screen program's mouse handling is reached. |
+| Left click | The application | Places the local selection anchor. A click with the modifier is reported to the program, which is how you hit a button in a full-screen program. |
+| Double click, triple click | The application | Selects a word or a line locally. Hold the modifier to report the press to the program instead, so tmux's own word/line selection remains available. |
 | Right click | The application | Never reported to the remote side. It opens CodeHarbor's own menu — see below. |
 | Middle click | The remote program | Reported like any other button. Inside tmux that pastes tmux's own most recent copy, which is not the system clipboard. |
-| `Ctrl+Shift+C` (`⌘C` on macOS) | The application | Copies the local selection to the system clipboard. |
+| `Ctrl+Shift+C` (`⌘C` on macOS) | The application | Copies the local selection to the system clipboard. Consumed even with nothing selected, so a copy key never reaches the program. |
 | `Ctrl+C` with a selection (not macOS) | The application | Copies, and clears the selection. See below. |
 | `Ctrl+C` with nothing selected | The remote program | The interrupt, unchanged. On macOS `Ctrl+C` is always the interrupt. |
-| `Ctrl+Shift+V` (`⌘V` on macOS) | The application | Pastes the clipboard into the shell (§5.1). |
+| `Ctrl+V`, `Ctrl+Shift+V` (`⌘V` on macOS) | The application | Pastes the clipboard into the shell (§5.1). See below. |
+
+**How the inversion is implemented, and its one boundary.** xterm.js decides between "report this to the program"
+and "make a local selection" in a single predicate, `SelectionService.shouldForceSelection()`, which reads the
+Shift flag (the Option flag on macOS). It is not configurable, so the flag's SENSE is flipped on the event before
+xterm.js sees it, in the capture phase, and only while mouse reporting is actually on — with reporting off,
+xterm.js already owns the mouse and Shift keeps its ordinary "extend the selection" meaning. Turning tmux's
+`mouse on` off would have been the naive alternative and is wrong: it takes the wheel away from tmux's
+scrollback. The boundary: a reported drag reaches the program only under the SGR encoding (`?1006h`). Under the
+default X10 encoding xterm.js emits the report as a BINARY event carrying bytes above `0x7f`, and this client has
+no byte-preserving path to the PTY, so such a report is dropped and logged. Every pane is a tmux session (§5.2)
+and tmux negotiates SGR with its own outer terminal, so X10 is not reachable in practice; the log line exists so
+that it cannot become invisible if that ever changes.
 
 **Why the right button is the exception.** tmux's default right-button binding draws a menu inside the terminal
 grid, and that menu closes again on the next mouse report — so simply moving the pointer dismissed it before it
@@ -743,6 +760,15 @@ has just selected something, so there is nothing they could have meant to interr
 selection, and that is what makes the rule safe — the very next `Ctrl+C` is the interrupt again, so a selection
 left behind by accident can cost one keypress and never more. macOS is excluded: copy has a key of its own
 there (`⌘C`), so `Ctrl+C` has nothing to disambiguate and stays the interrupt in every state.
+
+**`Ctrl+V`.** Paste is the plain chord, matching `Ctrl+C` above and every other desktop application; the older
+`Ctrl+Shift+V` keeps working. The cost is named rather than hidden: `Ctrl+V` no longer reaches the program as
+`0x16`, which is readline's `quoted-insert` and vi's literal-next. That byte is what xterm.js would otherwise
+produce, so the key is released to the browser instead — the handler declines it WITHOUT calling
+`preventDefault()`, which is the whole mechanism, because it leaves the native paste command intact and lets
+xterm.js's own clipboard handler add the bracketed-paste markers (§5.1). Intercepting the key and reading the
+clipboard directly would lose both the bracketing and X11 middle-click paste. macOS is excluded: `⌘V` is already
+the paste key there, so plain `Ctrl+V` remains the control byte.
 
 ---
 
@@ -889,6 +915,39 @@ every terminal byte back over SSH. The client already has the bytes —
 object that knows both a pane's `terminal_panes` row id and the PTY channel its bytes
 arrive on, reports the FACT of output (never its content) to the monitor, which derives
 the three states above. The full vocabulary is `AGENT_STATES` in `remote/src/events.ts`.
+
+DETACHED PANES. The bytes only exist while the pane is attached, and a pane is
+detached the moment the user switches Dev Session: the client destroys the other
+session's panes and closes their PTY channels. So the one input this derivation
+has disappears for exactly the sessions the sidebar dot exists to report on. What
+that used to produce was not a gap but a LIE — the quiet window elapsed a couple
+of seconds after the switch and the row settled on `idle`, i.e. "finished",
+about a session that might be running a half-hour build, and it stayed there
+because the silence timeout below deliberately skips a pane the client believes
+it is watching.
+
+Two rules fix it, and neither streams a byte:
+
+- `ch::AgentStatusMonitor::noteTerminalDetached` is reported by
+  `ch::TerminalFactory::detach`. It withdraws the client's claim to be watching:
+  a state that was DERIVED from the activity clock becomes `unknown`, because
+  that is what the client now knows. States the clock cannot express are
+  untouched, on the same rule as everywhere else in this section — an unseen
+  completion, `waiting_input`, `error` and `stopped` all survive a detach,
+  since they are facts somebody reported rather than inferences from output.
+- tmux itself already records when each session last printed, and keeps doing so
+  with no client attached. `tmux.paneActivity` (§ 10.2, "tmux discovery") reports
+  that per pane, and the client polls it while it has panes it cannot see, feeding
+  `noteRemoteActivity`. This is NOT the per-pane tmux tap rejected above: it
+  carries one TIMESTAMP per pane, never output, and it is a poll the client
+  already has an RPC channel for rather than a new stream.
+
+The poll answers in whole seconds and runs every few seconds, so the quiet window
+it drives (`kRemoteIdleThresholdMs`) is deliberately wider than the local one: at
+the local two seconds a pane would flap between `running` and `idle` from
+sampling alone. A pane tmux cannot date — `lastActivityMs` is null, which is also
+what an unknown tmux format string produces — reports NOTHING rather than an age,
+because absence of evidence must never be relayed as evidence of silence.
 
 Only a pane whose `terminal_panes.harness` column is literally `generic` takes its state
 this way. A pane with no harness configured is a plain shell, and treating a shell's
@@ -1428,7 +1487,7 @@ need to remain running between SSH sessions.
 - file watching;
 - directory listings;
 - MIME detection;
-- tmux discovery;
+- tmux discovery, including each pane's last-output time (§ 6.6);
 - agent-status events;
 - session recovery.
 
@@ -1743,7 +1802,7 @@ remote/
 │   ├── rpc-types.ts          request/result shapes shared by the RPC modules
 │   ├── files.ts              file.* methods: stat/readFile/writeFile/resolvePath/watch/unwatch/listDirectory
 │   ├── workspace.ts          workspace.* methods over the SQLite database
-│   ├── tmux.ts               tmux.* session discovery/kill methods
+│   ├── tmux.ts               tmux.* session discovery/kill/pane-activity methods
 │   ├── validate.ts           request-parameter validation helpers
 │   ├── events.ts             agent event schema + socket-path resolution
 │   ├── bridge.ts             agent event relay
@@ -1792,7 +1851,8 @@ Ctrl+Shift+C    Copy the selection (inside the focused terminal; ⌘C on macOS)
 Ctrl+C          Copy the selection, if there is one, and clear it; otherwise the
                 interrupt (inside the focused terminal; never on macOS, where
                 Ctrl+C is always the interrupt)
-Ctrl+Shift+V    Paste the clipboard (inside the focused terminal; ⌘V on macOS)
+Ctrl+V          Paste the clipboard (inside the focused terminal; Ctrl+Shift+V is
+                the same; ⌘V on macOS, where plain Ctrl+V stays the ^V byte)
 ```
 
 `Ctrl+Shift+P` opens the palette (`activationSequence` in
@@ -1802,8 +1862,8 @@ so it is `⌘⇧P` there). `Ctrl+Shift+O`, `Ctrl+Shift+R`, `Ctrl+Shift+W` and `C
 turns into real window-wide `Shortcut` objects, so they fire whether or not the
 palette is open. `Ctrl+S` is registered on the Monaco instance itself in
 `src/web/editor/src/index.ts`, so it applies to the focused editor rather than
-window-wide. `Ctrl+Shift+C` and `Ctrl+Shift+V` are likewise the terminal page's
-own, so they apply to the focused terminal and leave the rest of the window
+window-wide. `Ctrl+Shift+C`, `Ctrl+C`, `Ctrl+V` and `Ctrl+Shift+V` are likewise the terminal
+page's own, so they apply to the focused terminal and leave the rest of the window
 alone; they are the keyboard half of the terminal's mouse and clipboard rules
 (§5.7).
 
