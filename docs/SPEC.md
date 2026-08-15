@@ -793,6 +793,36 @@ claude-code
 
 Oh My Pi is the highest-priority integration.
 
+INSTALLING THE OH MY PI PRODUCER. Oh My Pi's extensibility surface loads a
+MODULE that default-exports a factory and registers handlers on the runtime
+event bus; it never runs a shell command for a lifecycle event. The producer is
+therefore `remote/src/hooks/oh-my-pi-extension.ts`, installed by pointing the
+harness at it:
+
+```bash
+omp --hook=/path/to/codeharbor/remote/src/hooks/oh-my-pi-extension.ts
+```
+
+`--hook` is an alias for `--extension`, and a path in the harness's own
+extension configuration works identically.
+
+This is written down because getting it wrong shipped a dead integration. The
+first producer was a CLI script (`remote/src/hooks/oh-my-pi-hook.ts`) whose
+header documented installing it as `session_start -> node oh-my-pi-hook.ts
+session_start` in a harness "hook config". No such configuration exists, so
+nothing ever invoked the script and no event ever reached the bridge — a pane
+running an agent read "running" in the sidebar indefinitely, including long
+after the agent had finished, because the chain had no producer at its head.
+The mapping (§6.5) and the monitor were correct throughout. The CLI script
+remains for harnesses that genuinely do shell out per event, and for the test
+fixtures that drive it.
+
+A producer must be silent when the pane coordinates (§5.2) are absent: that is
+an agent running outside CodeHarbor, which is the common case, and it must cost
+nothing and print nothing. It must also never block or outlive a firing —
+SPEC 6.4 — and specifically must never throw out of a `tool_call` handler,
+which the harness treats as "block this tool call".
+
 ### 6.3 Remote Agent Bridge
 
 A small remote helper should receive harness events and forward them to the Qt client.
@@ -872,7 +902,7 @@ session_start            → starting
 agent_start              → running
 tool_call: ask           → waiting_input
 tool_result: ask         → running
-agent_end / settled      → idle_unseen
+agent_end / settled      → idle_unseen  (running, when willContinue is set)
 session_shutdown         → stopped
 agent or hook error      → error
 ```
@@ -889,6 +919,15 @@ the harness may set on any firing — so the mapping needs an order, and it is:
 2. Otherwise the **error flag** outranks the native event name: an `agent_end` that blew up
    is an `error`, not a completion.
 3. Otherwise the table above applies.
+
+A COMPLETION MUST ACTUALLY BE ONE. Oh My Pi's `agent_end` carries `willContinue`, and it
+is set when the agent is about to keep going — a turn that ended only so the next one can
+start. Mapping that to `idle_unseen` would announce "Agent finished", arm the Dev Session's
+unseen-completion badge and raise a desktop notification in the middle of work the user is
+still waiting on, then do it again at the next boundary. So `agent_end` with `willContinue`
+set maps to `running`, which is what the agent is doing, and only a final `agent_end` is a
+completion. This is the same rule, for the same reason, as Claude Code's `SubagentStop`
+not being a completion while the main agent is still working.
 
 The same order holds for every adapter, not just Oh My Pi. Pi shares Oh My Pi's mapping
 outright (`remote/src/adapters/pi-family.ts`, used by both) and Claude Code implements the
@@ -1810,7 +1849,9 @@ remote/
 │   ├── control-client.ts     the producer half of that channel
 │   ├── adapters/             pi-family.ts (shared Pi mapping), oh-my-pi.ts,
 │   │                         pi.ts, claude-code.ts, types.ts, index.ts (registry)
-│   ├── hooks/                oh-my-pi-hook.ts (the native harness hook)
+│   ├── hooks/                oh-my-pi-extension.ts (the module Oh My Pi loads),
+│   │                         oh-my-pi-hook.ts (the shell-out CLI form),
+│   │                         bridge-emit.ts (the producer half both share)
 │   ├── mcp/                  server.ts (codeharbor-mcp: the viewer_* tools)
 │   └── tools/                viewctl.ts (codeharbor-view: the shell face)
 └── sql/                      schema.sql, indexes.sql

@@ -8,6 +8,7 @@ import { nativeString, type NativeEvent } from "./types.ts";
 //   tool_call: ask       -> waiting_input
 //   tool_result: ask     -> running
 //   agent_end / settled  -> idle_unseen
+//   agent_end willContinue -> running
 //   session_shutdown     -> stopped
 //   agent or hook error  -> error
 //
@@ -37,6 +38,19 @@ export function mapPiFamilyEvent(native: NativeEvent): AgentState | null {
     // is the one state that must not be maskable.
     if (type === "session_shutdown") return "stopped";
     if (native.error === true) return "error";
+    // PRECEDENCE — an `agent_end` that says it is continuing is not the end.
+    //
+    // Oh My Pi fires `agent_end` at every agent boundary and stamps it with
+    // `willContinue`: true means the harness is about to start more work, so
+    // the run is mid-flight, not over. `idle_unseen` is not a quiet state — it
+    // is the state that announces "Agent finished", arms the unseen-completion
+    // badge on the terminal row and raises a desktop notification. Taking the
+    // event at face value therefore told the user their agent had finished,
+    // repeatedly, while it was still working, and left a badge they had to
+    // clear by hand for output that was not final. `running` is what the flag
+    // literally states, and it costs nothing when it is wrong: the real
+    // `agent_end` (or the `session_shutdown` behind it) still settles the row.
+    if (type === "agent_end" && native.willContinue === true) return "running";
     const tool = nativeString(native.tool);
     switch (type) {
         case "session_start":
