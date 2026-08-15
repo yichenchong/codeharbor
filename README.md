@@ -204,18 +204,25 @@ A few things worth knowing about the shipped client:
   dot never claims a session finished when nobody knows.
 - **A coding agent has to be connected once before it can report anything.** The
   status a supported agent reports comes from a small module you point the agent
-  at, not from CodeHarbor watching it. For Oh My Pi:
+  at, not from CodeHarbor watching it. For Oh My Pi, link it into your agent's
+  extension directory **once per machine** — not per pane, and not per session:
 
   ```bash
-  omp --hook=/path/to/codeharbor/remote/src/hooks/oh-my-pi-extension.ts
+  mkdir -p ~/.omp/agent/extensions
+  ln -s /path/to/codeharbor/remote/src/hooks/oh-my-pi-extension.ts \
+        ~/.omp/agent/extensions/codeharbor.ts
   ```
 
-  (`--hook` is an alias for `--extension`; putting the path in your own extension
-  configuration is the same thing, and makes it permanent.) Until that is done the
-  pane has no agent status at all and falls back to "is it printing?", which cannot
-  tell finished from busy — an agent that redraws a spinner looks like work forever.
-  The module does nothing when it is not running inside a CodeHarbor pane, so it is
-  safe to leave enabled everywhere.
+  Every `omp` you start from then on loads it, including agents you start inside
+  CodeHarbor panes, and a symlink keeps it current when CodeHarbor updates.
+  `~/.omp/agent/hooks/pre/` works the same way; `<project>/.omp/extensions/` limits
+  it to one project. To try it once without installing anything, pass
+  `omp --hook=/path/to/.../oh-my-pi-extension.ts` on a single run.
+
+  Until this is done the pane has no agent status at all and falls back to "is it
+  printing?", which cannot tell finished from busy — an agent that redraws a spinner
+  looks like work forever. The module does nothing when it is not running inside a
+  CodeHarbor pane, so it is safe to leave enabled everywhere.
 - **Dev Sessions can be pinned**, and the sidebar can be filtered to show only pinned
   ones. Pins live on the server; the filter is local to the machine.
 - **Dev Sessions can be archived** to get them out of the sidebar without losing

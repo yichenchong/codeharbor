@@ -1,11 +1,21 @@
 // SPEC 6.2 — the Oh My Pi producer that Oh My Pi can actually load.
 //
-// Installed by pointing the harness at this file:
+// Installed ONCE per machine — not per pane and not per session — by putting it
+// where the harness auto-discovers extension modules:
 //
-//     omp --hook=/path/to/codeharbor/remote/src/hooks/oh-my-pi-extension.ts
+//     mkdir -p ~/.omp/agent/extensions
+//     ln -s <this file> ~/.omp/agent/extensions/codeharbor.ts
 //
-// (`--hook` is an alias for `--extension`; a path placed in the harness's own
-// extension configuration works the same way.) The harness imports the module,
+// Verified against omp/17.3.4 by loading a probe module and running a real agent
+// with no flags: `~/.omp/agent/extensions/` and `~/.omp/agent/hooks/pre/` are
+// both discovered, while `~/.omp/hooks/pre/` is NOT — the user root is the agent
+// directory rather than `~/.omp` itself. `<cwd>/.omp/extensions/` scopes it to one
+// project, and `omp --hook=<path>` (an alias for `--extension`) loads it for a
+// single run, which is how to TRY it rather than how to install it. A symlink
+// beats a copy: a copied producer can go stale against the BridgeMessage contract
+// it shares with ./bridge-emit.ts and the bridge itself.
+//
+// The harness imports the module,
 // calls its default export with its extension API, and the factory registers
 // pi.on(...) handlers on the runtime event bus. Each forwarded firing becomes
 // one BridgeMessage line on the CodeHarbor bridge socket, built by the shared
