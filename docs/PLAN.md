@@ -248,6 +248,28 @@ graph TD
     `terminal_panes` row id and its PTY channel → `ch::AgentStatusMonitor`, which
     derives starting/running/idle for `generic` panes and demotes any silent
     `starting`/`running` pane to `unknown`. Covered by `tst_agentmonitor`.
+  - [x] The same detection for a pane the user has switched AWAY from, which is
+    the case the sidebar dot exists for and the one this originally got wrong.
+    The derivation above has exactly one input, and switching Dev Session
+    destroys the other session's panes and closes their PTY channels, so it went
+    away — leaving the row to settle on `idle` about two seconds later and stay
+    there, claiming "finished" about a session that might be mid-build. Two
+    additions: `noteTerminalDetached` withdraws the client's claim to be watching
+    (a clock-derived state becomes `unknown`; anything somebody REPORTED
+    survives), and `tmux.paneActivity` reports tmux's own per-session
+    last-output time, which tmux keeps with no client attached, polled while the
+    client holds panes it cannot see. One timestamp per pane, never output — not
+    the server-side tmux tap SPEC 6.6 rejects. `RPC_SCHEMA_VERSION` 7 → 8 with
+    the client floor in lockstep. Covered by `tst_agentmonitor`,
+    `tst_tmuxactivity` and `remote/test/tmux.test.ts`.
+  - [x] Fixed a shipped defect the new live gate exposed: both tmux listing
+    formats separated fields with a TAB, which the tmux CLIENT sanitises to `_`
+    unless it is UTF-8-capable — and the daemon's client never is, being an SSH
+    exec with no `LANG` and no `TMUX`. So `tmux.listSessions` answered `[]` on any
+    real host and `tmux.paneActivity` could date no pane. One exported
+    `LIST_FIELD_SEPARATOR` now spells it for both formats and both parsers, and
+    `remote/test/tmux-live.test.ts` drives a REAL tmux under `LC_ALL=C` with
+    `TMUX` deleted so the daemon's own environment is the one under test.
 - **Stop gate:** ✅ MET — `tst_liveagent` runs the REAL hook on the remote side
   (one node process per firing) into the REAL bridge, over an SSH AgentStatus
   channel, and observes the ordered transitions
@@ -256,6 +278,12 @@ graph TD
   sidebar row going FinishedUnseen → Idle. Remote bridge pids are asserted reaped
   (an SSH exec channel sends no SIGHUP). OS desktop notifications remain
   display-deferred: `notify()` fires and is asserted, but nothing renders headless.
+  The same target also gates the DETACHED case end to end: a real pane row, a real
+  tmux session with no client attached, real output proven present on the server
+  with `capture-pane` and never delivered to this client, then a real
+  `TmuxActivityPoller` over a real `codeharbord` moving the sidebar row
+  Unknown → Running and, after real silence, → Idle from the SERVER-measured age
+  (observed 720 ms, then 3680 ms).
 - **Parallel with:** V, E (after U).
 
 ### AV — Agent viewer control — ✅ LANDED
@@ -338,6 +366,15 @@ graph TD
   - [x] Persist region widths + selected pane per client (QSettings, SPEC 4.1); split ratios persist server-side via P layouts.
   - [x] Command palette + keyboard shortcuts (SPEC 15) — `CommandPalette.qml`,
     hosted in Main.qml, with per-command global `Shortcut`s (Wave 6).
+  - [x] Terminal mouse and clipboard, corrected in Wave 8 after use (SPEC 5.7). A
+    plain drag now makes a LOCAL selection instead of being handed to tmux, which
+    started tmux's copy-mode highlight and then cleared it on release via tmux's
+    default `copy-selection-and-cancel` — so drag-selecting text visibly did not
+    work and the remedy was an undiscoverable modifier. The modifier now hands the
+    mouse to the program instead; the wheel is never withheld, since tmux's
+    scrollback is why mouse reporting is on. `Ctrl+V` pastes, matching the existing
+    `Ctrl+C`-copies-a-selection rule, at the stated cost of no longer sending `^V`.
+    Covered by `tst_terminalpage` and the page's own `mouse`/`keys` suites.
 - **Stop gate:** ✅ MET — `tst_liveshell` performs live CRUD through AppController's
   invokables against a real `codeharbord`, then re-reads every mutation through a
   SECOND independent codeharbord process (so a local-only mutation fails), and

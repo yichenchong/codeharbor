@@ -20,7 +20,11 @@ import os from "node:os";
 import path from "node:path";
 
 import { RPC_WORKSPACE_METHODS as M } from "./rpc-types.ts";
-import type { RpcWorkspaceMethodName, DeleteWithTmuxTargetsResult } from "./rpc-types.ts";
+import type {
+    RpcWorkspaceMethodName,
+    DeleteWithTmuxTargetsResult,
+    TerminalPaneTarget,
+} from "./rpc-types.ts";
 import {
     requireObject,
     requireString,
@@ -1908,6 +1912,43 @@ export class Workspace {
         return toTerminalPane(row);
     }
 
+    /**
+     * Every terminal pane that carries a tmux target, optionally narrowed to a
+     * set of Dev Sessions. This is the pane half of `tmux.paneActivity`: the
+     * activity scan needs the target of each pane it is about to ask tmux for,
+     * and nothing else about the row.
+     *
+     * An empty `devSessionIds` means every Dev Session rather than none, which
+     * is the shape the client's periodic sweep asks for. Panes with a NULL
+     * `tmux_target` are excluded because they name no tmux session at all: one
+     * has never been attached, so there is no output history to report and a row
+     * saying so would only invite the caller to invent an age for it.
+     */
+    terminalPaneTargets(devSessionIds: readonly string[] = []): TerminalPaneTarget[] {
+        // The id list is spliced in as PLACEHOLDERS, never as text: a dev session
+        // id is client-supplied and nothing constrains it to a UUID (see
+        // mintTmuxTarget), so interpolating one would be an injection.
+        const filter =
+            devSessionIds.length === 0
+                ? ""
+                : ` AND dev_session_id IN (${devSessionIds.map(() => "?").join(", ")})`;
+        const rows = this.db
+            .prepare(
+                "SELECT dev_session_id, id, tmux_target FROM terminal_panes" +
+                    ` WHERE tmux_target IS NOT NULL${filter} ORDER BY dev_session_id, position, id`,
+            )
+            .all(...devSessionIds) as unknown as Array<{
+            dev_session_id: string;
+            id: string;
+            tmux_target: string;
+        }>;
+        return rows.map((r) => ({
+            devSessionId: r.dev_session_id,
+            terminalId: r.id,
+            target: r.tmux_target,
+        }));
+    }
+
     // Read-modify-write of every column (see updateGroup), hence the transaction.
     updateTerminalPane(params: UpdateTerminalPaneParams): TerminalPane {
         return this.transaction(() => {
@@ -2585,6 +2626,14 @@ export function closeDefaultWorkspace(): void {
 // invite the client to key its workspace by an id the rows do not carry.
 export function serverIdentity(): string {
     return workspace().serverId();
+}
+
+// The pane source `tmux.paneActivity` reads, over the same default database the
+// `workspace.*` handlers use. tmux.ts reaches this through a dynamic import
+// rather than a top-level one: THIS module imports tmux.ts (isSafeTmuxTarget,
+// tmuxSafeName), so a static import back would close a cycle.
+export function terminalPaneTargets(devSessionIds: readonly string[] = []): TerminalPaneTarget[] {
+    return workspace().terminalPaneTargets(devSessionIds);
 }
 
 // RPC handler table for the `workspace.*` method group (P's own group; NOT part

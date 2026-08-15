@@ -74,7 +74,12 @@ AppController::AppController(CodeharbordClient* client, QObject* parent)
     , m_uiState(new UiStateStore(QString(), this))
     , m_settings(new AppSettings(QString(), this))
     , m_logBuffer(new LogBuffer(this))
+    , m_activityPoller(new TmuxActivityPoller(this))
 {
+    // The poller asks the same peer every other collaborator here does. It stays
+    // idle until refresh() hands it the live Dev Sessions, so a controller that
+    // never sees a tree never puts a byte on the wire.
+    m_activityPoller->setRpcClient(client);
     // Once the sidebar has authoritative rows, reopen whatever Dev Session the
     // user was last in (no-op if one is already active or none was remembered).
     connect(this, &AppController::refreshed, this,
@@ -204,9 +209,14 @@ void AppController::setAgentMonitor(AgentStatusMonitor* monitor)
     if (m_agentMonitor == monitor)
         return;
     // Drop any prior wiring so a re-set (or clear) never leaves a dangling
-    // connection firing rebuildRows() from a stale monitor.
-    if (m_agentMonitor)
+    // connection firing rebuildRows() from a stale monitor. The poller's feed
+    // is severed separately because its connection runs poller -> monitor and
+    // never touches `this`, so the sweep below cannot see it; left behind, the
+    // outgoing monitor would keep being told about panes it no longer reports.
+    if (m_agentMonitor) {
         disconnect(m_agentMonitor, nullptr, this, nullptr);
+        disconnect(m_activityPoller, nullptr, m_agentMonitor, nullptr);
+    }
     // Parked observations were produced by the monitor being dropped, off its
     // transport, and they are only ever applied by calling back into the
     // monitor. Carrying them across a swap would let the outgoing monitor's
@@ -234,6 +244,14 @@ void AppController::setAgentMonitor(AgentStatusMonitor* monitor)
                        const QString& harness) {
                     adoptObservedHarness(devSessionId, terminalId, harness);
                 });
+        // The server's view of a pane's last output, for the panes this client
+        // has no channel to. Connected straight through: activityObserved's
+        // trailing `alive` is dropped by Qt's argument matching, because the
+        // monitor derives nothing from it — a pane whose tmux session is gone
+        // stops being reported at all, which the silence timeout already
+        // answers, and no state here means "the session died".
+        connect(m_activityPoller, &TmuxActivityPoller::activityObserved,
+                m_agentMonitor, &AgentStatusMonitor::noteRemoteActivity);
     }
     // Re-merge immediately so a monitor set after the initial load reflects any
     // state it already accumulated, and a clear drops back to bare rows.
@@ -1458,6 +1476,15 @@ void AppController::refresh()
                 }
             }
             self->m_agentMonitor->retainDevSessions(liveDevSessions);
+            // The same walk tells the tmux.paneActivity poller which Dev
+            // Sessions are worth asking the host about. It is deliberately the
+            // WHOLE live set and not just the active session: the panes this
+            // poller exists for are exactly the ones with no channel, i.e. every
+            // Dev Session the user is not currently looking at. A `self` guard
+            // first, because retainDevSessions() above emits.
+            if (!self)
+                return;
+            self->m_activityPoller->setDevSessionIds(liveDevSessions);
             // Guarded BEFORE each dereference, not after it: a check that runs
             // once the call it is meant to guard has already returned has
             // nothing left to protect.

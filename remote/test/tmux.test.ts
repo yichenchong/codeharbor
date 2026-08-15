@@ -5,21 +5,32 @@ import os from "node:os";
 import path from "node:path";
 
 import {
+    LIST_FIELD_SEPARATOR,
     LIST_SESSIONS_FORMAT,
+    LIST_ACTIVITY_FORMAT,
     execFileRunner,
     SPAWN_FAILED,
     TMUX_TARGET_MAX_LENGTH,
     isSafeTmuxTarget,
     tmuxSafeName,
     parseSessions,
+    parseWindowActivity,
     listSessions,
     sessionExists,
     killSession,
+    paneActivity,
     TMUX_METHODS,
 } from "../src/tmux.ts";
-import type { CommandResult, CommandRunner } from "../src/tmux.ts";
+import type { CommandResult, CommandRunner, TerminalPaneSource } from "../src/tmux.ts";
 import { RPC_TMUX_METHODS } from "../src/rpc-types.ts";
-import { dispatch, RPC_METHOD_NOT_FOUND, RPC_SCHEMA_VERSION } from "../src/codeharbord.ts";
+import type { TerminalPaneTarget } from "../src/rpc-types.ts";
+import { isInvalidParams } from "../src/validate.ts";
+import {
+    dispatch,
+    RPC_INVALID_PARAMS,
+    RPC_METHOD_NOT_FOUND,
+    RPC_SCHEMA_VERSION,
+} from "../src/codeharbord.ts";
 
 // Records every argv the code under test hands the runner, so the tests can
 // assert that user input travels as ARGV and is never spliced into a shell
@@ -56,6 +67,14 @@ function listingRunner(records: string[]): { run: CommandRunner; calls: string[]
     };
 }
 
+// Every fixture line below is assembled from the SHIPPED separator rather than
+// spelling one. A fixture that hard-codes bytes real tmux never emits is exactly
+// what hid the tab bug for a release: the parsers agreed with the fixtures and
+// both disagreed with tmux. Change LIST_FIELD_SEPARATOR and these lines follow
+// it; a parser that did not would fail here.
+const SEP = LIST_FIELD_SEPARATOR;
+const rec = (...fields: string[]): string => fields.join(SEP);
+
 // What `tmux list-sessions -F LIST_SESSIONS_FORMAT` actually emits: windows,
 // created (unix seconds), attached flag, then the name — which holds spaces
 // verbatim. The colon here is deliberate parser hardening: tmux 3.6 rewrites
@@ -63,16 +82,16 @@ function listingRunner(records: string[]): { run: CommandRunner; calls: string[]
 // not something the parser may lean on (older tmux, or a name that arrived by
 // another route). A colon must land in `name`, never split a field.
 const REALISTIC_RECORDS = [
-    "3\t1753372800\t1\tcodeharbor",
-    "1\t1753376400\t0\tmy session: staging",
-    "12\t1753380000\t0\tagent-42",
+    rec("3", "1753372800", "1", "codeharbor"),
+    rec("1", "1753376400", "0", "my session: staging"),
+    rec("12", "1753380000", "0", "agent-42"),
 ];
 const REALISTIC_OUTPUT = [...REALISTIC_RECORDS, ""].join("\n");
 
 test("the list format is machine-readable and puts the name last", () => {
     assert.equal(
         LIST_SESSIONS_FORMAT,
-        "#{session_windows}\t#{session_created}\t#{?session_attached,1,0}\t#{session_name}",
+        "#{session_windows} #{session_created} #{?session_attached,1,0} #{session_name}",
     );
 });
 
@@ -85,13 +104,45 @@ test("parses a realistic multi-session listing, names with spaces and colons int
 });
 
 test("a name containing the field delimiter survives, because the name comes last", () => {
-    assert.deepEqual(parseSessions("2\t1753372800\t0\tweird\tname"), [
-        { name: "weird\tname", windows: 2, created: 1753372800, attached: false },
+    assert.deepEqual(parseSessions(rec("2", "1753372800", "0", "weird name")), [
+        { name: "weird name", windows: 2, created: 1753372800, attached: false },
     ]);
 });
 
+// THE LESSON, not merely the fix. Both listing formats used a TAB, and a
+// tab-separated listing is something the tmux we run in production NEVER emits:
+// tmux passes a non-printable byte through a format only when the CLIENT
+// considers itself UTF-8-capable, and replaces it with `_` otherwise
+// (utf8_sanitize). A client is not UTF-8-capable when its locale is not a UTF-8
+// one AND it is not running inside a tmux session — which is exactly the daemon,
+// launched by an SSH exec with neither LANG nor TMUX set. So every record failed
+// its `marker + separator` anchor: parseSessions returned NOTHING for a host
+// full of sessions and paneActivity reported every pane dead. It looked fine by
+// hand because a UTF-8 shell, or any shell inside a tmux window, gets the tabs
+// verbatim. See LIST_FIELD_SEPARATOR for the measurements, and
+// tmux-live.test.ts for the guard that runs real tmux in the production
+// environment.
+//
+// So a TAB-separated line must NOT parse. If someone reintroduces a tab
+// separator, these two assertions are what says no — and the third is the price
+// of a printable separator, paid and pinned: the session name comes LAST, so a
+// name full of separators still round-trips verbatim.
+test("a TAB-separated line is not a record, because a sanitizing tmux never sends one", () => {
+    assert.deepEqual(parseSessions("3\t1753372800\t1\tcodeharbor"), []);
+    assert.equal(parseWindowActivity("1786805795\t0\tch_a_1").size, 0);
+
+    const spaced = parseWindowActivity(rec("1786805795", "0", "my session: staging"));
+    assert.deepEqual([...spaced.keys()], ["my session: staging"]);
+    assert.equal(spaced.get("my session: staging")?.lastActivityMs, 1786805795000);
+});
+
 test("malformed lines are skipped, not fatal", () => {
-    const stdout = ["garbage", "1\tnot-a-number\t0\tbad", "4\t1753372800\t1\tgood", ""].join("\n");
+    const stdout = [
+        "garbage",
+        rec("1", "not-a-number", "0", "bad"),
+        rec("4", "1753372800", "1", "good"),
+        "",
+    ].join("\n");
     assert.deepEqual(parseSessions(stdout), [
         { name: "good", windows: 4, created: 1753372800, attached: true },
     ]);
@@ -105,7 +156,7 @@ test("listSessions invokes tmux with argv and returns parsed sessions", async ()
     const [subcommand, flag, format] = tmux.calls[0];
     assert.equal(subcommand, "list-sessions");
     assert.equal(flag, "-F");
-    assert.ok(format.endsWith("\t" + LIST_SESSIONS_FORMAT), format);
+    assert.ok(format.endsWith(SEP + LIST_SESSIONS_FORMAT), format);
     assert.equal(sessions.length, 3);
     assert.equal(sessions[1].name, "my session: staging");
 });
@@ -126,8 +177,8 @@ test("the record marker is non-empty and different on every listing", async () =
     const a = markerOf(first.calls);
     const b = markerOf(second.calls);
     assert.ok(a.length > 12, `marker too short to be unguessable: ${JSON.stringify(a)}`);
-    assert.ok(a.endsWith("\t"), "the marker must be its own field");
-    assert.ok(!a.slice(0, -1).includes("\t"), "the marker may not contain the field delimiter");
+    assert.ok(a.endsWith(SEP), "the marker must be its own field");
+    assert.ok(!a.slice(0, -1).includes(SEP), "the marker may not contain the field delimiter");
     assert.notEqual(a, b, "the marker must be freshly generated per call");
 });
 
@@ -138,8 +189,10 @@ test("the record marker is non-empty and different on every listing", async () =
 // that: an unmarked line is not a record.
 test("a session name carrying a raw newline cannot forge a listing entry", async () => {
     const tmux = listingRunner([
-        "1\t1753372800\t0\tinnocent\n9\t1753380000\t1\tFORGED-admin-session",
-        "2\t1753372900\t0\treal",
+        rec("1", "1753372800", "0", "innocent")
+            + "\n"
+            + rec("9", "1753380000", "1", "FORGED-admin-session"),
+        rec("2", "1753372900", "0", "real"),
     ]);
     const sessions = await listSessions(tmux.run);
 
@@ -338,11 +391,13 @@ test("the tmux group is registered under its frozen wire names", async () => {
     assert.deepEqual(Object.keys(TMUX_METHODS).sort(), [
         "tmux.killSession",
         "tmux.listSessions",
+        "tmux.paneActivity",
         "tmux.sessionExists",
     ]);
     assert.equal(RPC_TMUX_METHODS.listSessions, "tmux.listSessions");
     assert.equal(RPC_TMUX_METHODS.sessionExists, "tmux.sessionExists");
     assert.equal(RPC_TMUX_METHODS.killSession, "tmux.killSession");
+    assert.equal(RPC_TMUX_METHODS.paneActivity, "tmux.paneActivity");
 
     // Reaches the dispatcher rather than falling through to method-not-found.
     // Deliberately shape-only: this host may or may not have a tmux server, and
@@ -367,7 +422,7 @@ test("the schema version was bumped for the tmux group", () => {
 // the session NAME and every exact-name comparison (sessionExists, adopt, kill)
 // silently stops matching.
 test("a CRLF listing parses the same as an LF one", () => {
-    assert.deepEqual(parseSessions("3\t1753372800\t1\tcodeharbor\r\n"), [
+    assert.deepEqual(parseSessions(rec("3", "1753372800", "1", "codeharbor") + "\r\n"), [
         { name: "codeharbor", windows: 3, created: 1753372800, attached: true },
     ]);
 });
@@ -376,7 +431,10 @@ test("a MARKED line with too few fields is skipped, not half-parsed", async () =
     // The marker proves tmux emitted the line, but a truncated record still has
     // no name to report: it must be dropped rather than yielding an entry with
     // an empty or undefined name that a later kill could act on.
-    const tmux = listingRunner(["1\t1753372800\t0", "2\t1753372900\t0\treal"]);
+    const tmux = listingRunner([
+        rec("1", "1753372800", "0"),
+        rec("2", "1753372900", "0", "real"),
+    ]);
     assert.deepEqual(
         (await listSessions(tmux.run)).map((session) => session.name),
         ["real"],
@@ -392,18 +450,18 @@ test("a MARKED line with too few fields is skipped, not half-parsed", async () =
 test("a partly-numeric field is skipped, not read as its numeric prefix", () => {
     const good = { name: "real", windows: 3, created: 1753372800, attached: true };
     // Sanity: the well-formed record this varies from does parse.
-    assert.deepEqual(parseSessions("3\t1753372800\t1\treal"), [good]);
+    assert.deepEqual(parseSessions(rec("3", "1753372800", "1", "real")), [good]);
 
     for (const line of [
-        "3abc\t1753372800\t1\tsneaky", // trailing garbage on the window count
-        "3\t1753372800junk\t1\tsneaky", // trailing garbage on the timestamp
-        " 3\t1753372800\t1\tsneaky", // leading whitespace parseInt skips
-        "+3\t1753372800\t1\tsneaky", // a sign parseInt accepts
-        "3.7\t1753372800\t1\tsneaky", // a fraction truncated to 3
-        "0x10\t1753372800\t1\tsneaky", // parseInt(_, 10) reads this as 0
-        "\t1753372800\t1\tsneaky", // an empty numeric field
-        "-1\t1753372800\t1\tsneaky", // a negative window count parseInt accepts
-        "3\t-1753372800\t1\tsneaky", // a negative timestamp parseInt accepts
+        rec("3abc", "1753372800", "1", "sneaky"), // trailing garbage on the window count
+        rec("3", "1753372800junk", "1", "sneaky"), // trailing garbage on the timestamp
+        rec("\t3", "1753372800", "1", "sneaky"), // leading whitespace parseInt skips
+        rec("+3", "1753372800", "1", "sneaky"), // a sign parseInt accepts
+        rec("3.7", "1753372800", "1", "sneaky"), // a fraction truncated to 3
+        rec("0x10", "1753372800", "1", "sneaky"), // parseInt(_, 10) reads this as 0
+        rec("", "1753372800", "1", "sneaky"), // an empty numeric field
+        rec("-1", "1753372800", "1", "sneaky"), // a negative window count parseInt accepts
+        rec("3", "-1753372800", "1", "sneaky"), // a negative timestamp parseInt accepts
     ]) {
         assert.deepEqual(parseSessions(line), [], line);
     }
@@ -411,12 +469,12 @@ test("a partly-numeric field is skipped, not read as its numeric prefix", () => 
     // `#{?session_attached,1,0}` emits exactly "1" or "0". Anything else was
     // read as `=== "1"` — false — so a malformed record was reported as a real,
     // detached session that a later kill could act on.
-    assert.deepEqual(parseSessions("3\t1753372800\tyes\tsneaky"), []);
-    assert.deepEqual(parseSessions("3\t1753372800\t\tsneaky"), []);
+    assert.deepEqual(parseSessions(rec("3", "1753372800", "yes", "sneaky")), []);
+    assert.deepEqual(parseSessions(rec("3", "1753372800", "", "sneaky")), []);
 
     // A timestamp past 2^53 passes a digits-only check but rounds to a
     // different instant the moment it becomes a JS number.
-    assert.deepEqual(parseSessions("3\t99999999999999999999\t1\tsneaky"), []);
+    assert.deepEqual(parseSessions(rec("3", "99999999999999999999", "1", "sneaky")), []);
 });
 
 // --- target names (SPEC 5.2) ------------------------------------------------
@@ -540,4 +598,230 @@ test("a tmux that cannot be spawned reports the errno, and lists as empty", asyn
         else process.env.CODEHARBOR_TMUX = previous;
         rmSync(dir, { recursive: true, force: true });
     }
+});
+
+// --- tmux.paneActivity -------------------------------------------------------
+//
+// The method exists because a Dev Session the user is not looking at has no
+// client attached, so the client sees no PTY bytes from it and its panes settle
+// to Idle forever. Everything below therefore turns on one distinction: "tmux
+// says this pane has been quiet since T" versus "we do not know". The second
+// one MUST NOT be reported as the first.
+
+// The panes the workspace would hand the scan. Two Dev Sessions, so the filter
+// has something to narrow.
+const ACTIVITY_PANES: TerminalPaneTarget[] = [
+    { devSessionId: "ds-a", terminalId: "t-a1", target: "ch_a_1" },
+    { devSessionId: "ds-a", terminalId: "t-a2", target: "ch_a_2" },
+    { devSessionId: "ds-b", terminalId: "t-b1", target: "ch_b_1" },
+];
+
+// Stands in for the workspace database, and records the ids it was asked for so
+// a test can prove the filter reached the store rather than being applied (or
+// forgotten) afterwards.
+function paneSource(panes: TerminalPaneTarget[] = ACTIVITY_PANES): {
+    source: TerminalPaneSource;
+    asked: string[][];
+} {
+    const asked: string[][] = [];
+    return {
+        asked,
+        source: (devSessionIds) => {
+            asked.push([...devSessionIds]);
+            if (devSessionIds.length === 0) return panes;
+            return panes.filter((pane) => devSessionIds.includes(pane.devSessionId));
+        },
+    };
+}
+
+test("the activity format asks for window_activity, with the name last", () => {
+    assert.equal(
+        LIST_ACTIVITY_FORMAT,
+        "#{window_activity} #{?session_attached,1,0} #{session_name}",
+    );
+    // `#{pane_activity}` does not exist on tmux 3.6 and expands to nothing in an
+    // otherwise successful listing, which is the silent failure this whole
+    // method is built around. Asking for it would report every pane idle.
+    assert.doesNotMatch(LIST_ACTIVITY_FORMAT, /pane_activity/);
+});
+
+test("one tmux invocation lists every window on the server", async () => {
+    const stub = listingRunner([rec("1786805795", "0", "ch_a_1")]);
+    const panes = paneSource();
+    await paneActivity({}, panes.source, stub.run);
+    assert.equal(stub.calls.length, 1);
+    const argv = stub.calls[0];
+    assert.equal(argv[0], "list-windows");
+    // `-a` is what makes this one call rather than one per session: without it
+    // tmux lists only the current session's windows.
+    assert.ok(argv.includes("-a"));
+    assert.match(argv[argv.indexOf("-F") + 1], /#\{window_activity\}/);
+});
+
+test("activity is reported in milliseconds, taking the newest window", async () => {
+    // ch_a_1 has three windows: tmux lists them in index order, so the answer
+    // must be the MAXIMUM and not the first or the last line seen. A user
+    // working in window 2 of a session whose window 0 is idle is otherwise
+    // reported as idle.
+    const stub = listingRunner([
+        rec("1786805795", "0", "ch_a_1"),
+        rec("1786805999", "0", "ch_a_1"),
+        rec("1786805800", "0", "ch_a_1"),
+        rec("1786800000", "1", "ch_a_2"),
+    ]);
+    const panes = paneSource();
+    const result = await paneActivity({}, panes.source, stub.run);
+    const byTerminal = new Map(result.panes.map((pane) => [pane.terminalId, pane]));
+    assert.deepEqual(byTerminal.get("t-a1"), {
+        devSessionId: "ds-a",
+        terminalId: "t-a1",
+        target: "ch_a_1",
+        lastActivityMs: 1786805999_000,
+        attached: false,
+        alive: true,
+    });
+    // The attached flag rides along, and seconds are scaled here too.
+    assert.deepEqual(byTerminal.get("t-a2"), {
+        devSessionId: "ds-a",
+        terminalId: "t-a2",
+        target: "ch_a_2",
+        lastActivityMs: 1786800000_000,
+        attached: true,
+        alive: true,
+    });
+    // nowMs is the SERVER's clock, read AFTER the listing, and it is the value
+    // the client subtracts a timestamp from. It must be a real wall clock and
+    // not a monotonic counter or a zero, or every age would be nonsense.
+    const spread = Math.abs(result.nowMs - Date.now());
+    assert.ok(spread < 5_000, `nowMs is not a wall clock: off by ${spread}ms`);
+});
+
+// THE advisory case. An unrecognised `#{...}` does not fail a tmux listing: the
+// run succeeds and the field arrives EMPTY. Reporting that as 0 would date the
+// pane to 1970 and mark it permanently idle on any future tmux whose format
+// names differ; reporting it as `now` would mark it permanently busy. Both would
+// be silent. The pane is still ALIVE — we simply have no evidence about it.
+test("an empty activity field is unknown, not the epoch", async () => {
+    const stub = listingRunner([
+        rec("", "0", "ch_a_1"),
+        rec("\t\t", "1", "ch_a_2"),
+        rec("not-a-number", "0", "ch_b_1"),
+    ]);
+    const panes = paneSource();
+    const result = await paneActivity({}, panes.source, stub.run);
+    for (const pane of result.panes) {
+        assert.equal(pane.lastActivityMs, null, `${pane.target} invented a timestamp`);
+        assert.equal(pane.alive, true, `${pane.target} was dropped instead of reported`);
+    }
+    assert.notEqual(result.panes[0].lastActivityMs, 0);
+    // The rest of the record still parses: an unknown activity field costs the
+    // caller the timestamp, not the session.
+    assert.equal(result.panes[1].attached, true);
+});
+
+test("a pane whose target names no live session is reported dead, not idle", async () => {
+    const stub = listingRunner([rec("1786805795", "1", "ch_a_1")]);
+    const panes = paneSource();
+    const result = await paneActivity({}, panes.source, stub.run);
+    const dead = result.panes.filter((pane) => pane.target !== "ch_a_1");
+    assert.equal(dead.length, 2);
+    for (const pane of dead) {
+        assert.deepEqual(
+            { lastActivityMs: pane.lastActivityMs, attached: pane.attached, alive: pane.alive },
+            { lastActivityMs: null, attached: false, alive: false },
+            `${pane.target} was not reported as dead`,
+        );
+    }
+});
+
+// Rule 1 again: absence is not failure. The client polls this on a timer, so a
+// host whose tmux server is simply not running must be ANSWERED — otherwise the
+// user collects one error per tick for having no sessions yet.
+test("no tmux server is answered with dead panes rather than thrown", async () => {
+    const noServer: CommandResult = {
+        code: 1,
+        stdout: "",
+        stderr: "no server running on /tmp/tmux-1000/default\n",
+    };
+    const panes = paneSource();
+    const result = await paneActivity({}, panes.source, stubRunner(noServer).run);
+    assert.equal(result.panes.length, ACTIVITY_PANES.length);
+    assert.ok(result.panes.every((pane) => !pane.alive && pane.lastActivityMs === null));
+
+    // Neither is a host without the binary at all.
+    const missing: CommandResult = { code: SPAWN_FAILED, stdout: "", stderr: "spawn tmux ENOENT" };
+    const absent = await paneActivity({}, paneSource().source, stubRunner(missing).run);
+    assert.ok(absent.panes.every((pane) => !pane.alive));
+
+    // A REAL failure still surfaces: a permission problem must not read as a
+    // server full of dead panes.
+    const denied: CommandResult = { code: 1, stdout: "", stderr: "permission denied" };
+    await assert.rejects(
+        () => paneActivity({}, paneSource().source, stubRunner(denied).run),
+        /tmux list-windows failed: permission denied/,
+    );
+});
+
+test("devSessionIds narrows the answer, and absence means every pane", async () => {
+    const stub = listingRunner([rec("1786805795", "0", "ch_b_1")]);
+    const filtered = paneSource();
+    const result = await paneActivity({ devSessionIds: ["ds-b"] }, filtered.source, stub.run);
+    assert.deepEqual(filtered.asked, [["ds-b"]]);
+    assert.deepEqual(
+        result.panes.map((pane) => pane.terminalId),
+        ["t-b1"],
+    );
+
+    // Absent, null and empty all mean "every pane the workspace knows": the
+    // client's periodic sweep sends no filter at all.
+    for (const params of [undefined, null, {}, { devSessionIds: [] }]) {
+        const all = paneSource();
+        const answer = await paneActivity(params, all.source, listingRunner([]).run);
+        assert.deepEqual(all.asked, [[]], `params ${JSON.stringify(params)} invented a filter`);
+        assert.equal(answer.panes.length, ACTIVITY_PANES.length);
+    }
+});
+
+test("a malformed devSessionIds is invalid params, not an empty filter", async () => {
+    const rejected: unknown[] = [
+        { devSessionIds: "ds-a" },
+        { devSessionIds: [1] },
+        { devSessionIds: ["ds-a", ""] },
+        { devSessionIds: ["   "] },
+        { devSessionIds: {} },
+        [],
+        "ds-a",
+    ];
+    for (const params of rejected) {
+        const panes = paneSource();
+        await assert.rejects(
+            () => paneActivity(params, panes.source, listingRunner([]).run),
+            (err: unknown) => isInvalidParams(err),
+            `${JSON.stringify(params)} was accepted`,
+        );
+        // Validation happens BEFORE anything is listed, so a bad request never
+        // reaches the database or spawns tmux.
+        assert.deepEqual(panes.asked, []);
+    }
+});
+
+test("tmux.paneActivity is dispatchable and reports bad params as -32602", async () => {
+    // Params only: a well-formed call would open the workspace database, which
+    // this unit test has no business creating. The param guard runs before the
+    // pane source, so this exercises the dispatcher's wiring without one.
+    const response = await dispatch({
+        jsonrpc: "2.0",
+        id: 1,
+        method: RPC_TMUX_METHODS.paneActivity,
+        params: { devSessionIds: "ds-a" },
+    });
+    assert.ok(response !== null && "error" in response, JSON.stringify(response));
+    assert.equal(response.error.code, RPC_INVALID_PARAMS);
+});
+
+test("the schema version was bumped for tmux.paneActivity", () => {
+    // A v7 server answers "method not found" and leaves the client with no way
+    // to know an unattended pane is busy, so the mismatch has to be caught at
+    // the compatibility gate instead of showing up as a wrong sidebar badge.
+    assert.ok(RPC_SCHEMA_VERSION >= 8, `expected >= 8, got ${RPC_SCHEMA_VERSION}`);
 });

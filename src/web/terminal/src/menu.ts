@@ -53,16 +53,17 @@ export function terminalMenuItems(hasSelection: boolean): TerminalMenuItem[] {
 /**
  * The hint printed under the items.
  *
- * Selecting with a plain drag is not this application's to give: with mouse
- * reporting on, a drag belongs to the program running in the terminal (tmux, or
- * whatever tmux is showing). xterm.js's own escape hatch is a modifier - Alt on
- * macOS, Shift everywhere else - and the menu is where a user who just tried to
- * select something is looking, so the hint lives here rather than in the manual.
+ * A plain drag selects on this page and the highlight stays: the pane inverts
+ * xterm.js's rule, whose modifier - Alt on macOS, Shift everywhere else - now
+ * hands the drag to the program running in the terminal instead (see
+ * mouse.ts). That is the half a user cannot discover by trying, because the
+ * thing they tried already worked, so the hint names the modifier and what it
+ * gives up rather than how to select.
  */
 export function selectionHintText(isMac: boolean): string {
     return isMac
-        ? "Hold \u2325 Option and drag to select text"
-        : "Hold Shift and drag to select text";
+        ? "Drag to select text; hold \u2325 Option to use the mouse in the terminal"
+        : "Drag to select text; hold Shift to use the mouse in the terminal";
 }
 
 /**

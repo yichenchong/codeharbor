@@ -212,6 +212,14 @@ inline constexpr auto kMethodListSessions = "tmux.listSessions";
 inline constexpr auto kMethodSessionExists = "tmux.sessionExists";
 inline constexpr auto kMethodKillSession = "tmux.killSession";
 
+// Per-pane last-output times for tmux sessions with NO client attached. The
+// client's own agent-status tracking for a plain shell is derived from the PTY
+// bytes it receives, so a Dev Session the user switched away from produces no
+// evidence at all and its panes settle to Idle forever — the sidebar then
+// reports "done" about a pane that may still be busy. tmux keeps tracking
+// output for a detached session, so the SERVER is the only place that knows.
+inline constexpr auto kMethodPaneActivity = "tmux.paneActivity";
+
 // --- workspace persistence (SPEC 4.2, 11.1) ---------------------------------
 //
 // Mirrors the `workspace.*` group in remote/src/rpc-types.ts. This is the

@@ -2,6 +2,7 @@
 
 #include "CodeharbordClient.h"
 #include "AgentStatusMonitor.h"
+#include "TmuxActivityPoller.h"
 #include "Ids.h"
 #include "SessionsModel.h"
 #include "WorkspaceDb.h"
@@ -170,10 +171,15 @@ public:
     // viewer.commandResult), which is the only path an agent in a terminal pane
     // has to this client's viewer panes — a v6 server binds no control socket, so
     // every pane command an agent issued would be accepted by its own tooling
-    // and then vanish. Against anything older the user gets a healthy SSH
+    // and then vanish; 8 is where the tmux group gained `tmux.paneActivity`,
+    // which is the only way this client learns anything at all about a Dev
+    // Session it is not attached to — against a v7 server every generic-harness
+    // pane the user is not looking at reports Unknown forever, since
+    // ch::TmuxActivityPoller's request is refused and nothing else can speak
+    // for a detached pane. Against anything older the user gets a healthy SSH
     // session with a permanently empty sidebar, or terminals that never attach.
     // See adoptServerIdentity().
-    static constexpr int kMinimumServerSchemaVersion = 7;
+    static constexpr int kMinimumServerSchemaVersion = 8;
 
     // Make a Dev Session current: loads both region layouts and remembers it so
     // the next launch reopens the same session.
@@ -384,6 +390,15 @@ private:
     // QPointer turns null if the caller destroys its monitor before this
     // controller, so a late rebuild cannot dereference a dead observer.
     QPointer<AgentStatusMonitor> m_agentMonitor;
+    // The tmux.paneActivity poller (SPEC 6.6), OWNED: it is a pure collaborator
+    // of this controller — the controller already holds the RPC client to ask
+    // with and the authoritative tree that says which Dev Sessions are worth
+    // asking about — and nothing outside needs to reach it. It is what makes a
+    // Dev Session the user is NOT looking at report its agent status at all:
+    // that session's panes are destroyed and their PTYs detached, so the only
+    // remaining evidence lives on the host. Its activityObserved is wired to
+    // AgentStatusMonitor::noteRemoteActivity in setAgentMonitor().
+    TmuxActivityPoller* m_activityPoller = nullptr;
     // The agent-facing viewer control seam, published to QML as
     // `app.viewerCommands`. QPointer for the same reason the monitor is one:
     // main.cpp owns it and may outlive or predecease this controller.

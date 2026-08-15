@@ -36,6 +36,7 @@
 #include "SessionState.h"
 #include "TerminalFactory.h"
 #include "TerminalController.h"
+#include "RpcTypes.h"
 
 using namespace ch;
 
@@ -98,18 +99,7 @@ private:
     QByteArray m_sent;
 };
 
-// Parse the single JSON-RPC request the client just wrote.
-QJsonObject takeRequest(FakeTransport& transport)
-{
-    const QByteArray sent = transport.takeSent();
-    const qsizetype newline = sent.indexOf('\n');
-    const QByteArray line = newline >= 0 ? sent.left(newline) : sent;
-    return QJsonDocument::fromJson(line).object();
-}
-
-// Every JSON-RPC request written since the last drain, in order. takeRequest()
-// reads only the FIRST line, which stops being enough once one acknowledged
-// delete produces a tmux.killSession per destroyed pane before its refresh.
+// Every JSON-RPC request written since the last drain, in order.
 QVector<QJsonObject> takeRequests(FakeTransport& transport)
 {
     QVector<QJsonObject> requests;
@@ -120,6 +110,34 @@ QVector<QJsonObject> takeRequests(FakeTransport& transport)
         requests.push_back(QJsonDocument::fromJson(line).object());
     }
     return requests;
+}
+
+// Every request since the last drain EXCEPT the background pane-activity poll.
+//
+// ch::TmuxActivityPoller runs off the same refresh these cases drive and writes
+// `tmux.paneActivity` on the same wire, so a case whose claim is "this action
+// produced request X" has to say so about X rather than about whatever happened
+// to reach the wire first. A case asserting that NOTHING was written means no
+// request of its OWN kind, and would otherwise fail on unrelated housekeeping.
+QVector<QJsonObject> takeRequestsExcludingPolls(FakeTransport& transport)
+{
+    QVector<QJsonObject> requests;
+    for (const QJsonObject& request : takeRequests(transport)) {
+        if (request.value(QStringLiteral("method")).toString()
+            == QLatin1String(rpc::kMethodPaneActivity))
+            continue;
+        requests.push_back(request);
+    }
+    return requests;
+}
+
+// The one request a case cares about: the first written since the last drain
+// that is not the background poll. Cases that genuinely need every line,
+// including one acknowledged delete's tmux.killSession per destroyed pane, use
+// takeRequests() directly.
+QJsonObject takeRequest(FakeTransport& transport)
+{
+    return takeRequestsExcludingPolls(transport).value(0);
 }
 
 // A workspace.list success frame for one group whose Dev Sessions own the
@@ -859,7 +877,7 @@ void TstAppController::setServerIdUnchangedDoesNotRefresh()
     QVERIFY(!transport.takeSent().isEmpty()); // the first set drove a refresh
 
     controller.setServerId(QStringLiteral("srv-x"));
-    QVERIFY(transport.takeSent().isEmpty()); // unchanged -> no second refresh
+    QVERIFY(takeRequestsExcludingPolls(transport).isEmpty()); // unchanged -> no second refresh
 }
 
 // A plain refresh() maps the server tree into the model and signals refreshed().
@@ -1012,7 +1030,7 @@ void TstAppController::deleteGroupErrorEmitsErrorWithoutRefresh()
     QCOMPARE(errors.count(), 1);
     QCOMPARE(errors.at(0).at(0).toString(), QStringLiteral("group is locked"));
     QCOMPARE(controller.sessionsModel()->rowCount(), 1);
-    QVERIFY(transport.takeSent().isEmpty());
+    QVERIFY(takeRequestsExcludingPolls(transport).isEmpty());
 }
 
 void TstAppController::deleteSessionErrorEmitsErrorWithoutRefresh()
@@ -1038,7 +1056,7 @@ void TstAppController::deleteSessionErrorEmitsErrorWithoutRefresh()
     QCOMPARE(errors.count(), 1);
     QCOMPARE(errors.at(0).at(0).toString(), QStringLiteral("session is locked"));
     QCOMPARE(controller.sessionsModel()->rowCount(), 1);
-    QVERIFY(transport.takeSent().isEmpty());
+    QVERIFY(takeRequestsExcludingPolls(transport).isEmpty());
 }
 
 // Destroying a Dev Session's row destroys the only record of its panes' tmux
@@ -1304,7 +1322,7 @@ void TstAppController::archiveSessionErrorEmitsErrorWithoutRefresh()
 
     QCOMPARE(errors.count(), 1);
     QCOMPARE(errors.at(0).at(0).toString(), QStringLiteral("archive denied"));
-    QVERIFY(transport.takeSent().isEmpty());
+    QVERIFY(takeRequestsExcludingPolls(transport).isEmpty());
 }
 
 // Setting a pane's harness is one workspace.updateTerminalPane carrying just
@@ -1354,7 +1372,7 @@ void TstAppController::setTerminalPaneHarnessRefusesAnUnknownValue()
                                       QStringLiteral("codex"));
     QCOMPARE(errors.count(), 1);
     QVERIFY(errors.at(0).at(0).toString().contains(QStringLiteral("codex")));
-    QVERIFY(transport.takeSent().isEmpty());
+    QVERIFY(takeRequestsExcludingPolls(transport).isEmpty());
 
     // The empty string is legal and IS sent: it is how a pane is put back to
     // being a plain shell, off the output-activity clock.
@@ -1448,7 +1466,7 @@ void TstAppController::observedHarnessUpgradesAGenericPaneOnce()
                                           QStringLiteral("sess-1"),
                                           QStringLiteral("term-1"),
                                           QStringLiteral("oh-my-pi")));
-    QVERIFY(transport.takeSent().isEmpty());
+    QVERIFY(takeRequestsExcludingPolls(transport).isEmpty());
     QCOMPARE(errors.count(), 0);
 }
 
@@ -1542,7 +1560,7 @@ void TstAppController::observedHarnessArrivingBeforeTheTreeIsNotLost()
                                           QStringLiteral("sess-1"),
                                           QStringLiteral("term-1"),
                                           QStringLiteral("oh-my-pi")));
-    QVERIFY(transport.takeSent().isEmpty());
+    QVERIFY(takeRequestsExcludingPolls(transport).isEmpty());
 
     // The tree lands, and the observation parked a moment ago is judged against
     // it exactly as a live one would be.
@@ -1571,7 +1589,7 @@ void TstAppController::observedHarnessArrivingBeforeTheTreeIsNotLost()
         listAgain.value(QStringLiteral("id")).toInt(), QStringLiteral("G"),
         QStringLiteral("sess-1"), QStringLiteral("term-1"),
         QStringLiteral("oh-my-pi")));
-    QVERIFY(transport.takeSent().isEmpty());
+    QVERIFY(takeRequestsExcludingPolls(transport).isEmpty());
 
     // The point of detecting the harness at all. Between the parked event and
     // here the refresh registered this pane as "generic" (the tree still said
@@ -1616,7 +1634,7 @@ void TstAppController::aParkedObservationSurvivesIdsWithSeparators()
     // Before any tree, so the observation has to be parked and re-found.
     agentTransport.deliver(agentEventLine(QStringLiteral("running"), dev, pane,
                                           QStringLiteral("oh-my-pi")));
-    QVERIFY(transport.takeSent().isEmpty());
+    QVERIFY(takeRequestsExcludingPolls(transport).isEmpty());
 
     transport.deliver(listWithTerminalFrame(
         pendingList.value(QStringLiteral("id")).toInt(), QStringLiteral("G"), dev,
@@ -1664,7 +1682,7 @@ void TstAppController::observedHarnessLeavesAPlainShellAlone()
                                           QStringLiteral("term-1"),
                                           QStringLiteral("oh-my-pi")));
 
-    QVERIFY(transport.takeSent().isEmpty());
+    QVERIFY(takeRequestsExcludingPolls(transport).isEmpty());
     QVERIFY(controller.terminalPaneHarness(QStringLiteral("term-1")).isEmpty());
     // The event still shows. That is deliberate, and it is the difference
     // between the column (the user's, untouched above) and the row's state
@@ -1705,7 +1723,7 @@ void TstAppController::observedHarnessLeavesAnExplicitAdapterAlone()
                                           QStringLiteral("term-1"),
                                           QStringLiteral("oh-my-pi")));
 
-    QVERIFY(transport.takeSent().isEmpty());
+    QVERIFY(takeRequestsExcludingPolls(transport).isEmpty());
     QCOMPARE(controller.terminalPaneHarness(QStringLiteral("term-1")),
              QStringLiteral("claude-code"));
     QCOMPARE(errors.count(), 0);
@@ -2026,7 +2044,7 @@ void TstAppController::activationRejectsUnknownOrArchivedSessions()
 
     QCOMPARE(controller.activeSessionId(), QString());
     QCOMPARE(activeSpy.count(), 0);
-    QVERIFY(transport.takeSent().isEmpty());
+    QVERIFY(takeRequestsExcludingPolls(transport).isEmpty());
 }
 
 // AppController's own UiStateStore is the REAL per-user QSettings (it is

@@ -1,15 +1,20 @@
 #include "AgentStatusMonitor.h"
+#include "CodeharbordClient.h"
 #include "KnownHosts.h"
+#include "SessionBootstrap.h"
 #include "SessionState.h"
 #include "SessionsModel.h"
 #include "SshChannelDevice.h"
 #include "SshConnectionPool.h"
+#include "TmuxActivityPoller.h"
 
 #include <QByteArray>
 #include <QDir>
 #include <QElapsedTimer>
 #include <QFile>
 #include <QFileInfo>
+#include <QJsonObject>
+#include <QJsonValue>
 #include <QRegularExpression>
 #include <QRegularExpressionMatch>
 #include <QSignalSpy>
@@ -19,16 +24,21 @@
 #include <QtTest/QtTest>
 
 #include <memory>
+#include <optional>
 
 using ch::AgentState;
 using ch::AgentStatusMonitor;
+using ch::CodeharbordClient;
 using ch::KnownHosts;
+using ch::RpcError;
+using ch::SessionBootstrap;
 using ch::SessionRowState;
 using ch::SessionsModel;
 using ch::SshChannelDevice;
 using ch::SshConnectionPool;
 using ch::TerminalState;
 using ch::TerminalStatus;
+using ch::TmuxActivityPoller;
 
 namespace {
 
@@ -40,6 +50,18 @@ constexpr int kNodeTimeoutMs = 60000;
 // The hook's line only has to cross a Unix socket, the bridge, an SSH channel
 // and the monitor's parser once the hook process has already exited.
 constexpr int kRelayTimeoutMs = 15000;
+// A detached generic pane's state comes from tmux's `#{window_activity}`, which
+// is dated to a whole SECOND. Compressing AgentStatusMonitor's ten-second
+// remote idle window to one second and then demanding this much real silence is
+// what makes the Idle arm decidable: after three seconds of quiet the server's
+// age is at least ~2s even in the worst case, where the last output landed just
+// before a second ticked over, so it is unambiguously past the compressed
+// window. A shorter wait would be measuring the rounding, not the silence.
+constexpr int kCompressedRemoteIdleMs = 1000;
+constexpr int kQuietWindowMs = 3000;
+// Compressed too: the poller's five-second production cadence is policy, and a
+// gate that waited it out three times over would spend its budget sleeping.
+constexpr int kActivityPollIntervalMs = 500;
 
 QString env(const char* key)
 {
@@ -67,6 +89,43 @@ QString stateNames(const QVector<int>& states)
         names << ch::toString(static_cast<AgentState>(s));
     return names.join(QStringLiteral(" -> "));
 }
+
+// One JSON-RPC round trip driven to completion on the caller's event loop, the
+// same shape tst_liveshell's RawRpc has. The workspace rows the activity gate
+// needs are created through the REAL `workspace.*` surface rather than by
+// reaching into the fixture's database, because the daemon answers
+// `tmux.paneActivity` from its OWN view of those rows: a pane written behind its
+// back would not prove the join works.
+struct RawRpc {
+    QJsonValue result;
+    std::optional<RpcError> error;
+    bool done = false;
+
+    bool call(CodeharbordClient& client, const QString& method,
+              const QJsonObject& params, int timeoutMs = kExecTimeoutMs)
+    {
+        client.call(method, params,
+                    [this](QJsonValue value, std::optional<RpcError> err) {
+                        result = value;
+                        error = err;
+                        done = true;
+                    });
+        if (!QTest::qWaitFor([this] { return done; }, timeoutMs))
+            return false;
+        return !error.has_value();
+    }
+
+    QString diagnostic(const QString& method) const
+    {
+        if (!done)
+            return method + QStringLiteral(": no response within timeout");
+        if (error)
+            return method + QStringLiteral(": rpc error %1 %2")
+                                .arg(error->code)
+                                .arg(error->message);
+        return QString();
+    }
+};
 
 } // namespace
 
@@ -99,6 +158,10 @@ private slots:
     void markSeenClearsBadgeAndRow();     // (c) + (d), after markSeen
     void errorAndShutdownReachTheRowState(); // (b) remainder of SPEC 6.5
     void remoteBridgeIsReaped();          // (e)
+    // (f) SPEC 6.6 for the Dev Session nobody is looking at. Ordered LAST: the
+    // slots above share one fixture, one bridge channel and one (m_dev, m_term)
+    // deliberately, and this one opens a second channel and a second pane.
+    void detachedGenericPaneReportsThroughTmuxActivity();
 
 private:
     void connectPool();
@@ -116,8 +179,13 @@ private:
                   bool error = false);
     // Live per-terminal status as the sidebar would carry it.
     QVector<TerminalStatus> liveTerminals() const;
-    // Aggregate row state read back through the real model's RowStateRole.
+    // Aggregate row state read back through the real model's RowStateRole, for
+    // the bridge-driven pane.
     SessionRowState modelRowState(const QVector<TerminalStatus>& terminals);
+    // The same, for any Dev Session: the activity gate below builds its row from
+    // the real pane row the daemon minted rather than from m_dev.
+    SessionRowState modelRowStateFor(const QString& devSessionId,
+                                     const QVector<TerminalStatus>& terminals);
 
     SshConnectionPool m_pool;
     AgentStatusMonitor m_monitor;
@@ -147,6 +215,22 @@ private:
     QString m_bridgeStderr;
     qint64 m_bridgePid = -1;
     qint64 m_wrapperPid = -1;
+
+    // The activity gate's own RPC channel: `codeharbord rpc --stdio`, which the
+    // slots above have no need for. A second channel on the SAME pool, exactly
+    // as production runs the RPC and the AgentStatus channels side by side.
+    SshChannelDevice* m_rpc = nullptr;
+    CodeharbordClient m_client;
+    QString m_rpcStderr;
+    // Rows this gate created on the fixture, remembered by server id so
+    // cleanupTestCase deletes exactly them and never sweeps by name.
+    QString m_activityServerId;
+    QString m_activityGroupId;
+    QString m_activityDev;
+    QString m_activityTerm;
+    // The pane's `terminal_panes.tmux_target`, and therefore the name of the
+    // real tmux session this gate starts on the fixture host.
+    QString m_activityTarget;
 };
 
 void TstLiveAgent::initTestCase()
@@ -196,6 +280,41 @@ void TstLiveAgent::cleanupTestCase()
         m_bridge->closeChannel();
         delete m_bridge;
         m_bridge = nullptr;
+    }
+    // Same rule as the scratch directory below: a failed cleanup is not a test
+    // failure, but it must not be silent. A surviving tmux session keeps the
+    // pane's target bound on the host, and a surviving group keeps its rows —
+    // including the UNIQUE tmux_target — in the fixture database, so the next
+    // run of this gate would be asked to mint a target that is already taken.
+    if (m_pool.state() == SshConnectionPool::State::Connected
+        && !m_activityTarget.isEmpty()) {
+        QByteArray out;
+        QString err;
+        if (!runRemote(QStringLiteral("tmux kill-session -t ")
+                           + q(QStringLiteral("=") + m_activityTarget),
+                       &out, &err, kExecTimeoutMs)) {
+            qWarning("failed to kill remote tmux session %s",
+                     qPrintable(m_activityTarget));
+        }
+    }
+    if (m_client.transport() != nullptr && !m_activityGroupId.isEmpty()) {
+        RawRpc removed;
+        if (!removed.call(m_client, QStringLiteral("workspace.deleteGroup"),
+                          {{QStringLiteral("id"), m_activityGroupId}})) {
+            qWarning("failed to delete live workspace group %s: %s",
+                     qPrintable(m_activityGroupId),
+                     qPrintable(removed.diagnostic(
+                         QStringLiteral("workspace.deleteGroup"))));
+        }
+    }
+    if (m_rpc) {
+        // The order SessionBootstrap::unwire() uses: CLOSE the channel first,
+        // THEN detach the client, so an in-flight call fails through the
+        // transport-error path instead of having its transport pulled away.
+        m_rpc->closeChannel();
+        m_client.setTransport(nullptr);
+        delete m_rpc;
+        m_rpc = nullptr;
     }
     if (m_pool.state() == SshConnectionPool::State::Connected
         && !m_runtimeDir.isEmpty()) {
@@ -357,8 +476,14 @@ QVector<TerminalStatus> TstLiveAgent::liveTerminals() const
 SessionRowState TstLiveAgent::modelRowState(
     const QVector<TerminalStatus>& terminals)
 {
+    return modelRowStateFor(m_dev, terminals);
+}
+
+SessionRowState TstLiveAgent::modelRowStateFor(
+    const QString& devSessionId, const QVector<TerminalStatus>& terminals)
+{
     ch::SessionRow session;
-    session.session.id = ch::DevSessionId{m_dev};
+    session.session.id = ch::DevSessionId{devSessionId};
     session.session.name = QStringLiteral("live agent gate");
     session.terminals = terminals;
 
@@ -630,6 +755,279 @@ void TstLiveAgent::remoteBridgeIsReaped()
     }
     QVERIFY2(after.contains("PROBE_DONE"), after.constData());
     QVERIFY2(!after.contains("ALIVE="), after.constData());
+}
+
+// (f) SPEC 6.6 for the Dev Session the user is NOT looking at, over a chain that
+// is real from end to end:
+//
+//   a REAL tmux session on the fixture host, with NO client attached
+//     -> `tmux.paneActivity` in REAL codeharbord over a REAL SSH RPC channel
+//     -> ch::TmuxActivityPoller                          (client)
+//     -> ch::AgentStatusMonitor::noteRemoteActivity
+//     -> ch::SessionsModel sidebar row state
+//
+// The bug it defends against is the one a user actually hit. Switching Dev
+// Session destroys the pane and detaches its PTY, and for an adapterless
+// `generic` pane those bytes were the ONLY status source there was: no adapter
+// exists for it, so nothing the slots above exercise produces a single event
+// for one. The pane therefore settled to Idle about two seconds after the last
+// byte this client happened to catch and stayed there for the lifetime of the
+// application — the sidebar claiming "done" about a session that might be
+// building the whole time — and the fifteen-minute silence demotion could not
+// correct it either, because its arm requires NOT (generic && attached) and the
+// `attached` flag was never cleared.
+//
+// So the two halves asserted here are the two halves of the fix. First that a
+// detach is honest: Unknown, not a false Idle. Then that the server's own
+// observation of a pane nothing is attached to reaches the sidebar as Running,
+// and that the pane going quiet reaches it as Idle — from the age the DAEMON
+// measured on its own clock, never from this process's.
+//
+// Nothing here is stood in for. The bytes are produced inside the remote tmux
+// session by `send-keys`, so they demonstrably never reach this client: the
+// pane has no channel here at all, which is the entire point.
+void TstLiveAgent::detachedGenericPaneReportsThroughTmuxActivity()
+{
+    connectPool();
+    QCOMPARE(m_pool.state(), SshConnectionPool::State::Connected);
+
+    // The production RPC channel, chosen by the production entry-point ladder:
+    // SessionBootstrap::rpcCommand() is the exact string the shipped client
+    // execs, so this gate cannot pass against a layout the app could not launch.
+    m_rpc = new SshChannelDevice(&m_pool, this);
+    connect(m_rpc, &SshChannelDevice::channelError, this,
+            [this](const QString& text) { m_rpcStderr += text; });
+    QVERIFY(m_rpc->startExec(SessionBootstrap::rpcCommand(m_node, m_repo)));
+    m_client.setTransport(m_rpc);
+
+    // Prove the channel really reaches codeharbord before anything below waits
+    // on an answer from it, and warm the cold node start while we are here.
+    RawRpc info;
+    QVERIFY2(info.call(m_client, QStringLiteral("server.info"), {},
+                       kNodeTimeoutMs),
+             qPrintable(info.diagnostic(QStringLiteral("server.info"))
+                        + m_rpcStderr));
+    const QJsonObject serverInfo = info.result.toObject();
+    QCOMPARE(serverInfo.value(QStringLiteral("name")).toString(),
+             QStringLiteral("codeharbord"));
+    // `tmux.paneActivity` was introduced at schema 8, and a daemon below that
+    // floor would answer the poll with a method-not-found the poller silently
+    // swallows (a failed poll is not evidence about any pane). Without this the
+    // gate would then fail with a timeout that blames the monitor.
+    QVERIFY2(serverInfo.value(QStringLiteral("schemaVersion")).toInt() >= 8,
+             qPrintable(QStringLiteral("remote schemaVersion is %1, need >= 8")
+                            .arg(serverInfo.value(QStringLiteral("schemaVersion"))
+                                     .toInt())));
+
+    // Real rows, through the real `workspace.*` surface: the daemon answers
+    // `tmux.paneActivity` by joining ITS OWN terminal_panes rows against the
+    // tmux server's listing, so a pane written behind its back would prove
+    // nothing about that join. The tmux target is supplied rather than minted so
+    // this test knows the exact session name to start on the host; it is
+    // `[A-Za-z0-9_-]` as TMUX_TARGET_SAFE demands.
+    const QString tag = QString::number(QCoreApplication::applicationPid());
+    m_activityServerId = QStringLiteral("live-agent-activity-") + tag;
+    m_activityTarget = QStringLiteral("ch_live_activity_") + tag;
+
+    RawRpc group;
+    QVERIFY2(group.call(m_client, QStringLiteral("workspace.createGroup"),
+                        {{QStringLiteral("serverId"), m_activityServerId},
+                         {QStringLiteral("name"),
+                          QStringLiteral("live activity ") + tag}}),
+             qPrintable(group.diagnostic(QStringLiteral("workspace.createGroup"))));
+    m_activityGroupId = group.result.toObject().value(QStringLiteral("id")).toString();
+    QVERIFY(!m_activityGroupId.isEmpty());
+
+    RawRpc session;
+    QVERIFY2(session.call(m_client, QStringLiteral("workspace.createSession"),
+                          {{QStringLiteral("serverId"), m_activityServerId},
+                           {QStringLiteral("groupId"), m_activityGroupId},
+                           {QStringLiteral("name"),
+                            QStringLiteral("unwatched ") + tag},
+                           {QStringLiteral("repositoryRoot"), m_repo}}),
+             qPrintable(session.diagnostic(QStringLiteral("workspace.createSession"))));
+    m_activityDev = session.result.toObject().value(QStringLiteral("id")).toString();
+    QVERIFY(!m_activityDev.isEmpty());
+
+    RawRpc pane;
+    QVERIFY2(pane.call(m_client, QStringLiteral("workspace.createTerminalPane"),
+                       {{QStringLiteral("serverId"), m_activityServerId},
+                        {QStringLiteral("devSessionId"), m_activityDev},
+                        {QStringLiteral("name"), QStringLiteral("terminal-1")},
+                        {QStringLiteral("tmuxTarget"), m_activityTarget},
+                        // The adapterless harness, as the pane's row carries it.
+                        {QStringLiteral("harness"), QStringLiteral("generic")}}),
+             qPrintable(pane.diagnostic(
+                 QStringLiteral("workspace.createTerminalPane"))));
+    const QJsonObject paneRow = pane.result.toObject();
+    m_activityTerm = paneRow.value(QStringLiteral("id")).toString();
+    QVERIFY(!m_activityTerm.isEmpty());
+    // The row must carry the target we asked for verbatim: the daemon REJECTS a
+    // target it will not honour rather than quietly substituting another, and a
+    // substituted one would leave this gate starting a tmux session the join
+    // below can never match.
+    QCOMPARE(paneRow.value(QStringLiteral("tmuxTarget")).toString(),
+             m_activityTarget);
+
+    // A real tmux session under that exact name, DETACHED: `new-session -d`
+    // leaves `#{session_attached}` at 0, which is the property the whole
+    // subsystem rests on — tmux keeps dating output for a session no client is
+    // reading.
+    QByteArray out;
+    QString err;
+    // Two target spellings, both anchored with tmux's `=` exact-match prefix so
+    // a FOREIGN session whose name merely contains ours can never be addressed:
+    // `=name` for the commands that take a SESSION (has-session/kill-session,
+    // the same form remote/src/tmux.ts uses), and `=name:` for the ones that
+    // take a PANE. The trailing colon is required there — `-t '=name'` is not a
+    // valid pane target and tmux answers "can't find pane", which is exactly how
+    // this gate first failed.
+    const QString sessionTarget = q(QStringLiteral("=") + m_activityTarget);
+    const QString paneTarget =
+        q(QStringLiteral("=") + m_activityTarget + QLatin1Char(':'));
+    QVERIFY(runRemote(QStringLiteral("tmux new-session -d -s ")
+                          + q(m_activityTarget)
+                          + QStringLiteral("; tmux has-session -t ")
+                          + sessionTarget
+                          + QStringLiteral(" && echo HAVE_SESSION"),
+                      &out, &err, kExecTimeoutMs));
+    QVERIFY2(out.contains("HAVE_SESSION"),
+             qPrintable(QStringLiteral("tmux session %1 not started: %2 %3")
+                            .arg(m_activityTarget,
+                                 QString::fromUtf8(out), err.trimmed())));
+
+    // Output produced INSIDE that session, so the bytes exist only on the host.
+    // capture-pane reads them back from the remote scrollback, which is the
+    // proof that they were printed there and never crossed the wire to us: this
+    // client holds no channel for this pane at all.
+    const QString marker = QStringLiteral("live-activity-") + tag;
+    QVERIFY(runRemote(QStringLiteral("tmux send-keys -t ") + paneTarget
+                          + QLatin1Char(' ')
+                          + q(QStringLiteral("printf '%s\\n' ") + marker)
+                          + QStringLiteral(" Enter"),
+                      &out, &err, kExecTimeoutMs));
+    QByteArray screen;
+    for (int attempt = 0; attempt < 20; ++attempt) {
+        QTest::qWait(100);
+        screen.clear();
+        err.clear();
+        if (!runRemote(QStringLiteral("tmux capture-pane -p -t ") + paneTarget,
+                       &screen, &err, kExecTimeoutMs))
+            continue;
+        if (screen.contains(marker.toUtf8()))
+            break;
+    }
+    QVERIFY2(screen.contains(marker.toUtf8()),
+             qPrintable(QStringLiteral("no remote output in %1: %2")
+                            .arg(m_activityTarget, QString::fromUtf8(screen))));
+
+    // The pane as the client knows it, in the order a pane supplies its three
+    // inputs: the harness from its row, then the PTY channel, then bytes on it.
+    m_monitor.setTerminalHarness(m_activityDev, m_activityTerm,
+                                 QStringLiteral("generic"));
+    QCOMPARE(m_monitor.stateFor(m_activityDev, m_activityTerm),
+             asInt(AgentState::Unknown));
+    m_monitor.noteTerminalAttached(m_activityDev, m_activityTerm);
+    QCOMPARE(m_monitor.stateFor(m_activityDev, m_activityTerm),
+             asInt(AgentState::Starting));
+    // Back to back with the attach on purpose: the local fallback clock parks a
+    // silent generic pane at Idle two seconds after the last byte, so a wait
+    // here would be asserting against that clock instead of this one.
+    m_monitor.noteTerminalOutput(m_activityDev, m_activityTerm);
+    QCOMPARE(m_monitor.stateFor(m_activityDev, m_activityTerm),
+             asInt(AgentState::Running));
+
+    // THE REGRESSION. The user switches Dev Session: the layout destroys the
+    // pane and TerminalFactory::detach() releases its channel. The pane must go
+    // to Unknown — the honest word for "this client can no longer see it" — and
+    // NOT to the Idle the fallback clock used to strand it at and never leave.
+    m_monitor.noteTerminalDetached(m_activityDev, m_activityTerm);
+    QCOMPARE(m_monitor.stateFor(m_activityDev, m_activityTerm),
+             asInt(AgentState::Unknown));
+
+    // Now the only remaining witness: the daemon. Wired exactly as
+    // AppController does it — activityObserved straight into noteRemoteActivity,
+    // whose trailing `alive` Qt drops because the monitor derives nothing from
+    // it. The local collector is connected FIRST so the ages the server reported
+    // can be named in a failure message.
+    TmuxActivityPoller poller;
+    QVector<qint64> ages;
+    bool aliveSeen = false;
+    connect(&poller, &TmuxActivityPoller::activityObserved, &poller,
+            [&](const QString& dev, const QString& term, qint64 ageMs,
+                bool alive) {
+                if (dev != m_activityDev || term != m_activityTerm)
+                    return;
+                ages.append(ageMs);
+                aliveSeen = aliveSeen || alive;
+            });
+    connect(&poller, &TmuxActivityPoller::activityObserved, &m_monitor,
+            &AgentStatusMonitor::noteRemoteActivity);
+    poller.setPollIntervalMs(kActivityPollIntervalMs);
+    poller.setRpcClient(&m_client);
+    // Arming issues the first poll immediately, exactly as a Dev Session switch
+    // does in production.
+    poller.setDevSessionIds({m_activityDev});
+
+    QTRY_VERIFY_WITH_TIMEOUT(!ages.isEmpty(), kRelayTimeoutMs);
+    QVERIFY2(aliveSeen, "the daemon reported the pane's tmux session as dead");
+    QTRY_COMPARE_WITH_TIMEOUT(m_monitor.stateFor(m_activityDev, m_activityTerm),
+                              asInt(AgentState::Running), kRelayTimeoutMs);
+    qInfo("server-observed ages for the detached pane: first %lld ms",
+          ages.constFirst());
+
+    // The row the user actually reads, through the aggregate helper AND the
+    // model role QML binds to. The pane's connection state is Unloaded, not
+    // Ready: this client has no channel for it, which is precisely what
+    // AppController::rebuildRows() leaves in the row for a pane with no live
+    // terminal state. Running outranks that in the precedence ladder, so the
+    // sidebar reports work in progress for a Dev Session nobody is watching.
+    TerminalStatus unwatched;
+    unwatched.id = ch::TerminalId{m_activityTerm};
+    unwatched.connection = TerminalState::Unloaded;
+    unwatched.agent = static_cast<AgentState>(
+        m_monitor.stateFor(m_activityDev, m_activityTerm));
+    QVector<TerminalStatus> terminals{unwatched};
+    QCOMPARE(asInt(SessionsModel::aggregateSessionState(terminals)),
+             asInt(SessionRowState::Running));
+    QCOMPARE(asInt(modelRowStateFor(m_activityDev, terminals)),
+             asInt(SessionRowState::Running));
+
+    // The other half: silence must be reported as silence, and from the age the
+    // SERVER measured. Compressing the window rather than waiting out the real
+    // ten seconds is what keeps this affordable; see kCompressedRemoteIdleMs for
+    // why it cannot be compressed further against a field dated to the second.
+    m_monitor.setRemoteIdleThresholdMs(kCompressedRemoteIdleMs);
+    const int agesBefore = static_cast<int>(ages.size());
+    QTest::qWait(kQuietWindowMs);
+    QTRY_COMPARE_WITH_TIMEOUT(m_monitor.stateFor(m_activityDev, m_activityTerm),
+                              asInt(AgentState::Idle), kRelayTimeoutMs);
+    // Proof of WHERE that Idle came from: a reading taken after the wait, whose
+    // age the daemon measured against its own `nowMs`, past the compressed
+    // window. Nothing in this process's clock takes part in the comparison.
+    QVERIFY2(ages.size() > agesBefore, "no poll landed during the quiet window");
+    QVERIFY2(ages.constLast() >= kCompressedRemoteIdleMs,
+             qPrintable(QStringLiteral("last server-observed age %1 ms is inside "
+                                       "the compressed %2 ms window")
+                            .arg(ages.constLast())
+                            .arg(kCompressedRemoteIdleMs)));
+    qInfo("quiet pane: %lld ms since the server last saw output",
+          ages.constLast());
+
+    // ...and the sidebar follows it down. Idle, with no connection information
+    // at all, is the row a Dev Session nobody is watching should read.
+    terminals[0].agent = static_cast<AgentState>(
+        m_monitor.stateFor(m_activityDev, m_activityTerm));
+    QCOMPARE(asInt(SessionsModel::aggregateSessionState(terminals)),
+             asInt(SessionRowState::Idle));
+    QCOMPARE(asInt(modelRowStateFor(m_activityDev, terminals)),
+             asInt(SessionRowState::Idle));
+
+    // The poller is a stack object whose signals reach a member monitor; drop
+    // its peer before it goes out of scope so no answer can land in a lambda
+    // whose captures are already gone.
+    poller.setDevSessionIds({});
+    poller.setRpcClient(nullptr);
 }
 
 QTEST_GUILESS_MAIN(TstLiveAgent)

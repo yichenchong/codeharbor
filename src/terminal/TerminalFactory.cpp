@@ -971,6 +971,33 @@ void TerminalFactory::detach(TerminalController* controller)
         return;
     if (TerminalController::isLiveState(pane->state()))
         pane->setState(TerminalState::Disconnected);
+
+    // SPEC 6.6 observation ENDS here: the client no longer has a channel to see
+    // this pane's output on, so ch::AgentStatusMonitor must stop treating it as
+    // locally observable. Left un-reported, a generic pane keeps `attached` set
+    // forever, the fallback clock strands it at Idle two seconds after the user
+    // switches Dev Session, and the sidebar reports a working session as done.
+    //
+    // Re-found rather than carried down from the iterator taken at the top of
+    // this function: closeChannel() and setTransport() each walk the
+    // controller's state machine into the WebChannel bridge and QML, and
+    // anything there is free to attach or detach a pane on this factory, which
+    // rehashes m_attached. The identity is COPIED out before the call for the
+    // same reason — noteTerminalDetached() emits, and a slot may rehash the
+    // hash the references would point into.
+    //
+    // Skipped outright if something above re-attached this pane: that pane has
+    // a live channel and its own noteTerminalAttached() already recorded, and
+    // reporting a detach for it would blind the monitor to a pane the user is
+    // watching. Guarded BEFORE each dereference, like the attach path.
+    if (!pane || pane->transport() || !m_agentMonitor)
+        return;
+    const auto entry = m_attached.constFind(pane.data());
+    if (entry == m_attached.constEnd() || entry->terminalId.isEmpty())
+        return;
+    const QString devSessionId = entry->devSessionId;
+    const QString terminalId = entry->terminalId;
+    m_agentMonitor->noteTerminalDetached(devSessionId, terminalId);
 }
 
 void TerminalFactory::kill(TerminalController* controller)

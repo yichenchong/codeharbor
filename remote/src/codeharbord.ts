@@ -127,7 +127,14 @@ export const RPC_SERVER_VERSION = "0.2.1";
 // (viewer.command / viewer.commandResult): a v6 server binds no control socket,
 // so an agent's pane command would be accepted by its own tooling and then
 // vanish with nothing anywhere saying the server cannot carry it.
-export const RPC_SCHEMA_VERSION = 7;
+// Bumped 7 -> 8 when tmux.paneActivity joined the tmux group: it is how the
+// client learns that a Dev Session it is NOT attached to is still producing
+// output. Against a v7 server the call answers "method not found", and the
+// client's only fallback is the PTY bytes it does not receive — every
+// unattended pane reported as Idle, i.e. a sidebar that says "done" about work
+// still running. That must fail at the compatibility gate, where it is
+// explicable, rather than as a wrong badge nobody can trace.
+export const RPC_SCHEMA_VERSION = 8;
 
 export interface RpcRequest {
     jsonrpc: "2.0";

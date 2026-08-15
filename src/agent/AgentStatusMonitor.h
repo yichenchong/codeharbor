@@ -140,8 +140,78 @@ public:
     Q_INVOKABLE void noteTerminalOutput(const QString& devSessionId,
                                         const QString& terminalId);
 
+    // The pane's PTY channel went away — the user switched Dev Session, so the
+    // layout destroyed the pane and ch::TerminalFactory::detach released its
+    // channel. Nothing about the AGENT changed; what changed is that this
+    // client can no longer see the pane's output at all.
+    //
+    // Without this the `attached` flag stays true for a pane nobody is reading,
+    // and the two time-driven rules both misfire on it: the activity clock
+    // flips the pane to Idle kFallbackIdleThresholdMs after the last byte the
+    // client happened to catch and parks it there forever, while the silence
+    // demotion below is skipped entirely because its arm requires NOT (generic
+    // && attached). The sidebar then reports "Idle" — which a user reads as
+    // finished — about a Dev Session that may be working the whole time.
+    //
+    // So a generic pane whose state came from the activity clock drops to
+    // AgentState::Unknown here: with the channel gone the client holds no
+    // evidence about that pane, and Unknown is the honest word for that.
+    // Detaching is a TRANSPORT event exactly as attaching is, so it obeys the
+    // same restraint — WaitingInput, Error, Stopped and a completion the Dev
+    // Session still has unseen all survive it. Only ch::TmuxActivityPoller's
+    // server-side observations (noteRemoteActivity) can speak for the pane
+    // afterwards.
+    Q_INVOKABLE void noteTerminalDetached(const QString& devSessionId,
+                                          const QString& terminalId);
+
+    // The SERVER observed how long ago this pane last produced output, over the
+    // `tmux.paneActivity` RPC: `ageMs` is (server nowMs - the pane's tmux
+    // window activity), already differenced against the server's OWN clock by
+    // ch::TmuxActivityPoller. It is an age, never a timestamp, precisely so
+    // nothing here has to assume the two machines' clocks agree; never mix a
+    // reading of this client's clock into it.
+    //
+    // This is what keeps a Dev Session the user is not looking at honest. A
+    // detached generic pane has no local observable left, so its state comes
+    // from here: output newer than kRemoteIdleThresholdMs is Running, anything
+    // older is Idle. An ATTACHED generic pane is not re-derived — the client
+    // sees every byte of that one itself, in real time and at millisecond
+    // resolution, which is strictly better than a sample dated to the nearest
+    // second — and neither is a pane with an adapter, whose lifecycle events
+    // say more than "it printed".
+    //
+    // For EVERY harness a recent age still refutes the silence timeout, exactly
+    // as noteTerminalOutput does: a pane that is demonstrably printing is alive
+    // whatever its last lifecycle event claimed, and it makes no difference
+    // whether this client or the daemon is the one that saw it print.
+    //
+    // Subject to the same restraint as every other derivation here: a state the
+    // activity clock cannot express, and an unseen completion, are never
+    // overwritten.
+    //
+    // There is deliberately NO call for a pane the server could not date. tmux
+    // renders an unrecognised format as an EMPTY field rather than failing the
+    // listing, so "no activity time" means the daemon does not know — and the
+    // poller reports nothing at all for such a pane instead of inventing an
+    // age. Absence of evidence is never delivered here as evidence of silence.
+    Q_INVOKABLE void noteRemoteActivity(const QString& devSessionId,
+                                        const QString& terminalId,
+                                        qint64 ageMs);
+
     // Quiet window after which a generic pane with no output is Idle (SPEC 6.6).
     static constexpr int kFallbackIdleThresholdMs = 2000;
+
+    // Quiet window after which a pane the SERVER is reporting on is Idle. It is
+    // deliberately five times kFallbackIdleThresholdMs, and the two must not be
+    // unified: the remote reading comes from tmux's `#{window_activity}`, which
+    // has one-SECOND granularity, and ch::TmuxActivityPoller samples it every
+    // five seconds. A two-second window against that pair of resolutions is
+    // narrower than the measurement error, so a pane printing steadily would
+    // read Running or Idle depending on where the poll happened to land in the
+    // second — the sidebar would flap purely from sampling. Ten seconds is
+    // wider than one poll interval plus a second of rounding, so a pane that is
+    // still working is reported as working by every poll.
+    static constexpr int kRemoteIdleThresholdMs = 10000;
 
     // Silence window after which a pane that CLAIMS to be working is demoted to
     // Unknown. A harness that is killed — or whose host reboots — emits no
@@ -167,14 +237,16 @@ public:
     // than being slow to notice a dead one.
     static constexpr int kStaleTimeoutMs = 15 * 60 * 1000;
 
-    // Both windows are policy, not physics; a test compresses them to
+    // All three windows are policy, not physics; a test compresses them to
     // milliseconds instead of spending real minutes of suite time. Values at or
     // below 0 are clamped to 0, which for the silence window means "never
-    // demote" and for the idle threshold means "quiet immediately".
+    // demote" and for either idle threshold means "quiet immediately".
     void setFallbackIdleThresholdMs(int ms);
     int fallbackIdleThresholdMs() const { return m_fallbackIdleThresholdMs; }
     void setStaleTimeoutMs(int ms);
     int staleTimeoutMs() const { return m_staleTimeoutMs; }
+    void setRemoteIdleThresholdMs(int ms);
+    int remoteIdleThresholdMs() const { return m_remoteIdleThresholdMs; }
 
 signals:
     // A terminal's agent state changed. `state` is an int-valued ch::AgentState.
@@ -278,13 +350,15 @@ private:
     // devSessionIds with an unseen completion pending markSeen(). Same
     // eviction: retainDevSessions() drops the flag with its Dev Session subtree.
     QSet<QString> m_unseen;
-    // Monotonic time source for both windows. Started in the constructor and
-    // never restarted: wall-clock readings would let a clock step (NTP, a
-    // suspend/resume) expire or freeze a window.
+    // Monotonic time source for the two LOCAL windows. Started in the
+    // constructor and never restarted: wall-clock readings would let a clock
+    // step (NTP, a suspend/resume) expire or freeze a window. The remote window
+    // is measured against the SERVER's clock instead and never touches this.
     QElapsedTimer m_clock;
     QTimer m_ageTimer;
     int m_fallbackIdleThresholdMs = kFallbackIdleThresholdMs;
     int m_staleTimeoutMs = kStaleTimeoutMs;
+    int m_remoteIdleThresholdMs = kRemoteIdleThresholdMs;
 };
 
 } // namespace ch

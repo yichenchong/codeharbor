@@ -34,8 +34,17 @@ import type {
     SessionExistsResult,
     KillSessionParams,
     KillSessionResult,
+    PaneActivityResult,
+    TerminalPaneTarget,
 } from "./rpc-types.ts";
-import { InvalidParamsError } from "./validate.ts";
+import { InvalidParamsError, optionalStringArray, requireObject } from "./validate.ts";
+// The pane source `tmux.paneActivity` reads in the daemon. This closes a module
+// CYCLE — workspace.ts imports THIS file for isSafeTmuxTarget/tmuxSafeName — and
+// it is safe in both load orders because neither module touches the other's
+// bindings at import time: whichever one the loader starts with evaluates its
+// whole body without reading a half-initialised namespace, and the call itself
+// happens per-request, long after both are live.
+import { terminalPaneTargets } from "./workspace.ts";
 
 /** Outcome of one tmux invocation. `code` is -1 when the binary could not be spawned at all. */
 export interface CommandResult {
@@ -134,13 +143,49 @@ export function tmuxSafeName(name: string): string {
     return name.replace(/[:.]/g, "_");
 }
 
+// Field separator for every `-F` listing this module emits and parses, spelled
+// in exactly ONE place so a format string and the parser reading it can never
+// drift apart.
+//
+// A SPACE, and a tab is NOT usable — this cost a release. tmux passes a
+// non-printable byte through a format only when the tmux CLIENT considers
+// itself UTF-8-capable; otherwise utf8_sanitize() replaces each one with `_`,
+// and a TAB is non-printable. A client is NOT UTF-8-capable when BOTH hold: its
+// locale is not a UTF-8 one (LC_ALL/LC_CTYPE/LANG unset reads as "POSIX"), and
+// it is not itself running inside a tmux session (no `TMUX` in its environment,
+// which is tmux's other route to the same decision). It is a property of the
+// CLIENT invocation, not of the server: the same server answers one way to one
+// client and the other way to another.
+//
+// Production hits both conditions, and every by-hand check misses them. The
+// daemon is launched by an SSH exec — no LANG, no TMUX — so its tmux sanitizes,
+// and then every record here failed its `marker + separator` anchor:
+// parseSessions returned NOTHING for a host full of sessions and paneActivity
+// reported every pane dead. Checked by hand from a normal UTF-8 shell, or from
+// inside a tmux window even in the C locale, the very same command prints a
+// perfectly tab-separated listing. Measured against one private tmux server:
+//   client C, TMUX unset   -> `M_1786814684_mx`     (sanitized)
+//   client C, TMUX present -> `M\t1786814684\tmx`
+//   client C.UTF-8         -> `M\t1786814684\tmx`
+//
+// A space is printable, so it survives sanitize under every client, and it costs
+// nothing to the parse: the NAME COMES LAST (see below), so a name containing
+// spaces is still recovered verbatim from the remainder. Verified on the live
+// fixture — a session called `ch dbg spaced` round-trips through a
+// space-separated listing with no LANG at all.
+export const LIST_FIELD_SEPARATOR = " ";
+
 // Machine-readable listing format. The NAME COMES LAST on purpose: a tmux
 // session name may contain the field delimiter (and spaces, and `:`), so the
 // numeric/boolean fields are parsed positionally from the front and everything
-// after the third tab is the name, verbatim. Screen-scraping tmux's human
+// after the third separator is the name, verbatim. Screen-scraping tmux's human
 // output (`name: 3 windows (created ...)`) would be ambiguous for such names.
-export const LIST_SESSIONS_FORMAT =
-    "#{session_windows}\t#{session_created}\t#{?session_attached,1,0}\t#{session_name}";
+export const LIST_SESSIONS_FORMAT = [
+    "#{session_windows}",
+    "#{session_created}",
+    "#{?session_attached,1,0}",
+    "#{session_name}",
+].join(LIST_FIELD_SEPARATOR);
 
 export const execFileRunner: CommandRunner = (argv) =>
     new Promise<CommandResult>((resolve) => {
@@ -251,7 +296,7 @@ function commandFailure(operation: string, result: CommandResult): Error {
 // the listing, so "one line = one record" is an assumption an attacker gets to
 // attack. tmux 3.6 does escape a newline in a name to the two characters \ and
 // n (session_check_name() vis-encodes VIS_NL|VIS_TAB), which is what stops a
-// name like "x\n9\t0\t1\tforged" from injecting a whole extra record today —
+// name like "x\n9 0 1 forged" from injecting a whole extra record today —
 // but that is the SERVER's normalization, not an invariant this parser may rest
 // on. So every record is prefixed with a per-call, unguessable marker that tmux
 // emits as literal format text: a line that does not start with the marker is
@@ -259,8 +304,9 @@ function commandFailure(operation: string, result: CommandResult): Error {
 // a marker it cannot predict, so forging a record is impossible rather than
 // merely unlikely.
 //
-// listSessions mints the marker with base64url so it can never contain a tab
-// (the field delimiter) or `#` (which tmux would read as a format directive).
+// listSessions mints the marker with base64url so it can never contain
+// LIST_FIELD_SEPARATOR (which would split it into two fields) or `#` (which
+// tmux would read as a format directive).
 
 // A whole numeric field of the listing format: digits only, at least one, no
 // sign, no whitespace, nothing trailing. tmux emits `session_windows` and
@@ -269,18 +315,18 @@ function commandFailure(operation: string, result: CommandResult): Error {
 const INTEGER_FIELD = /^\d+$/;
 
 /**
- * Parse the tab-separated output of `tmux list-sessions -F LIST_SESSIONS_FORMAT`.
- * Unparseable lines are skipped rather than throwing: one odd line must not cost
- * the client the whole listing.
+ * Parse the LIST_FIELD_SEPARATOR-separated output of
+ * `tmux list-sessions -F LIST_SESSIONS_FORMAT`. Unparseable lines are skipped
+ * rather than throwing: one odd line must not cost the client the whole listing.
  *
- * `marker` is the per-call record anchor described above. When it is non-empty
- * a line MUST begin with `<marker>\t` to count as a record, which is what makes
- * a session name unable to forge one. It defaults to empty only so a test (or a
- * caller holding raw tmux output) can parse an unmarked listing; `listSessions`
- * always supplies one.
+ * `marker` is the per-call record anchor described above. When it is non-empty a
+ * line MUST begin with `<marker><separator>` to count as a record, which is what
+ * makes a session name unable to forge one. It defaults to empty only so a test
+ * (or a caller holding raw tmux output) can parse an unmarked listing;
+ * `listSessions` always supplies one.
  */
 export function parseSessions(stdout: string, marker = ""): TmuxSession[] {
-    const anchor = marker === "" ? "" : marker + "\t";
+    const anchor = marker === "" ? "" : marker + LIST_FIELD_SEPARATOR;
     const sessions: TmuxSession[] = [];
     for (const raw of stdout.split("\n")) {
         let line = raw.endsWith("\r") ? raw.slice(0, -1) : raw;
@@ -289,11 +335,11 @@ export function parseSessions(stdout: string, marker = ""): TmuxSession[] {
             line = line.slice(anchor.length);
         }
         if (line === "") continue;
-        const fields = line.split("\t");
+        const fields = line.split(LIST_FIELD_SEPARATOR);
         if (fields.length < 4) continue;
         // STRICT field validation, not Number.parseInt's prefix scan. parseInt
         // stops at the first character it cannot use, so "3abc" parsed as 3,
-        // "1753372800\u0000junk" as a valid timestamp, and " 7" as 7 — a
+        // "1753372800\u0000junk" as a valid timestamp, and "\t7" as 7 — a
         // record whose numeric fields are not numbers was accepted as if they
         // were, with the garbage silently discarded. The whole point of
         // parsing positionally is that fields 0-2 have exactly one shape each;
@@ -311,14 +357,15 @@ export function parseSessions(stdout: string, marker = ""): TmuxSession[] {
         if (fields[2] !== "0" && fields[2] !== "1") continue;
         const windows = Number.parseInt(fields[0], 10);
         const created = Number.parseInt(fields[1], 10);
-        const name = fields.slice(3).join("\t");
+        const name = fields.slice(3).join(LIST_FIELD_SEPARATOR);
         if (
             !Number.isSafeInteger(windows) ||
             !Number.isSafeInteger(created) ||
             name === ""
         ) continue;
         sessions.push({
-            // Everything past the third tab is the name — see LIST_SESSIONS_FORMAT.
+            // Everything past the third separator is the name — see
+            // LIST_SESSIONS_FORMAT.
             name,
             windows,
             created,
@@ -338,7 +385,11 @@ export function parseSessions(stdout: string, marker = ""): TmuxSession[] {
  */
 export async function listSessions(runner: CommandRunner = execFileRunner): Promise<ListSessionsResult> {
     const marker = randomBytes(12).toString("base64url");
-    const result = await run(runner, ["list-sessions", "-F", marker + "\t" + LIST_SESSIONS_FORMAT]);
+    const result = await run(runner, [
+        "list-sessions",
+        "-F",
+        marker + LIST_FIELD_SEPARATOR + LIST_SESSIONS_FORMAT,
+    ]);
     if (result.code === 0) return parseSessions(result.stdout, marker);
     if (isMissingTmux(result) || isNoServer(result)) return [];
     throw commandFailure("list-sessions", result);
@@ -428,10 +479,197 @@ export async function killSession(
     throw commandFailure("kill-session", result);
 }
 
+// --- pane activity (tmux.paneActivity, SPEC 10.2) ----------------------------
+//
+// Why the server has to answer this at all: the client derives a plain shell's
+// agent status from the PTY bytes it receives, so a Dev Session the user has
+// switched away from — whose panes are destroyed and whose PTYs are detached —
+// produces no evidence whatsoever and settles to Idle forever. The sidebar then
+// reports "done" about a pane that may still be building. tmux keeps tracking
+// output for a session with zero clients attached, so it is the only witness.
+//
+// The FIELD choice is load-bearing and was settled empirically against the tmux
+// 3.6 on this host, not from the manual:
+//
+//   * `#{pane_activity}` does NOT exist. It does not fail the listing either —
+//     tmux renders an unknown `#{...}` as an EMPTY field in an otherwise
+//     SUCCESSFUL run, so a parser that trusted it would silently report every
+//     pane as last-active at the epoch. That is the trap the UNKNOWN-FORMAT rule
+//     below exists for.
+//   * `#{window_activity}` does exist, is epoch SECONDS, and advances on output
+//     with `#{session_attached}` == 0. Verified live: 1786805795 -> 1786805799
+//     after a `send-keys` into a detached session.
+//
+// Every CodeHarbor terminal pane is its own tmux SESSION named by the pane's
+// `terminal_panes.tmux_target`, which is what makes a per-session activity field
+// a per-PANE answer.
+
+// Machine-readable listing format for the activity scan, shaped exactly like
+// LIST_SESSIONS_FORMAT and for the same reason: the NAME COMES LAST, so the two
+// leading fields are read positionally from the front and everything after the
+// second separator is the session name verbatim. Every target CodeHarbor stores
+// is `[A-Za-z0-9_-]` (TMUX_TARGET_SAFE, enforced again by
+// remote/src/workspace.ts), but names still arrive from FOREIGN sessions on the
+// same server — spaces included — so the parser must not assume otherwise.
+// LIST_FIELD_SEPARATOR explains why the separator is a space and not a tab.
+export const LIST_ACTIVITY_FORMAT = [
+    "#{window_activity}",
+    "#{?session_attached,1,0}",
+    "#{session_name}",
+].join(LIST_FIELD_SEPARATOR);
+
+/** What the scan learned about one tmux session, across all of its windows. */
+interface SessionActivity {
+    lastActivityMs: number | null;
+    attached: boolean;
+}
+
+/**
+ * Where the pane rows come from: the workspace database in the daemon, a fixture
+ * in the tests. Injected rather than imported because workspace.ts already
+ * imports THIS module (isSafeTmuxTarget, tmuxSafeName, TMUX_TARGET_MAX_LENGTH),
+ * so a static import back would close a module cycle for the sake of the one
+ * tmux method that needs workspace state.
+ */
+export type TerminalPaneSource = (
+    devSessionIds: readonly string[],
+) => TerminalPaneTarget[] | Promise<TerminalPaneTarget[]>;
+
+/**
+ * Parse the LIST_FIELD_SEPARATOR-separated output of
+ * `tmux list-windows -a -F LIST_ACTIVITY_FORMAT` into one record per SESSION.
+ *
+ * `marker` is the same per-call record anchor listSessions uses, and for the
+ * same reason: a session name is remote-controlled data echoed back inside the
+ * listing, so a line that does not begin with a marker the writer could not
+ * predict is not a record tmux produced for this call.
+ *
+ * A session with several windows reports its MOST RECENT window's activity. The
+ * maximum, not the first or last line seen: tmux lists windows in index order,
+ * so an arbitrary pick would report a busy pane as quiet whenever the user
+ * happens to work in a window other than window 0.
+ */
+export function parseWindowActivity(stdout: string, marker = ""): Map<string, SessionActivity> {
+    const anchor = marker === "" ? "" : marker + LIST_FIELD_SEPARATOR;
+    const sessions = new Map<string, SessionActivity>();
+    for (const raw of stdout.split("\n")) {
+        let line = raw.endsWith("\r") ? raw.slice(0, -1) : raw;
+        if (anchor !== "") {
+            if (!line.startsWith(anchor)) continue;
+            line = line.slice(anchor.length);
+        }
+        if (line === "") continue;
+        const fields = line.split(LIST_FIELD_SEPARATOR);
+        if (fields.length < 3) continue;
+        const name = fields.slice(2).join(LIST_FIELD_SEPARATOR);
+        if (name === "") continue;
+        // UNKNOWN-FORMAT RULE. An activity field that is empty, blank or not a
+        // plain non-negative decimal means "we do not know", and it is recorded
+        // as null rather than dropped or defaulted. Dropping the record would
+        // deny that the session exists at all; defaulting to 0 would date it to
+        // 1970 and report the pane permanently idle; defaulting to now would
+        // report it permanently busy. All three are silent, and all three are
+        // what a future tmux whose format names differ from `window_activity`
+        // would produce — the listing SUCCEEDS and the field simply comes back
+        // empty. Only a value tmux actually gave us may become a timestamp.
+        const activity = fields[0];
+        const seconds = INTEGER_FIELD.test(activity) ? Number.parseInt(activity, 10) : Number.NaN;
+        // tmux reports SECONDS; the wire contract is milliseconds. The safe-integer
+        // check is on the SCALED value, because a 16-digit field passes
+        // /^\d+$/ and then loses precision on the multiply.
+        const ms = seconds * 1000;
+        const lastActivityMs = Number.isSafeInteger(ms) ? ms : null;
+        const previous = sessions.get(name);
+        // MAXIMUM across the session's windows, and a known value always beats
+        // an unknown one: "we do not know about window 2" must not erase what
+        // window 1 told us.
+        let best = previous?.lastActivityMs ?? null;
+        if (lastActivityMs !== null && (best === null || lastActivityMs > best)) {
+            best = lastActivityMs;
+        }
+        sessions.set(name, {
+            lastActivityMs: best,
+            // `session_attached` is a property of the session, so every window
+            // repeats it; OR-ing is only defensive against a partial listing.
+            attached: fields[1] === "1" || previous?.attached === true,
+        });
+    }
+    return sessions;
+}
+
+// Params are OPTIONAL here, unlike every other tmux method: an absent (or
+// JSON-RPC `null`) payload asks about every pane, which is what the client's
+// periodic sweep wants. Only a payload that is present and MALFORMED is an
+// error, and it is tagged invalid-params so the dispatcher blames the request.
+function requirePaneActivityIds(params: unknown): string[] {
+    if (params === undefined || params === null) return [];
+    const obj = requireObject(params, RPC_TMUX_METHODS.paneActivity);
+    return optionalStringArray(obj, "devSessionIds", RPC_TMUX_METHODS.paneActivity) ?? [];
+}
+
+/**
+ * Report the last output time of every requested pane's tmux session.
+ *
+ * ONE tmux invocation answers for every pane: `list-windows -a` enumerates the
+ * whole server, and the join is by session name, so the cost does not grow with
+ * the number of Dev Sessions the client asks about.
+ *
+ * Absence is not failure, exactly as rule 1 at the top of this file requires. A
+ * host with no tmux binary, and a tmux with no server running (which exits
+ * non-zero saying "no server running on ..."), are both answered with every
+ * requested pane marked `alive: false` rather than with an RPC error: the client
+ * polls this on a timer, and turning "the user has no tmux sessions yet" into a
+ * fault would put an error in front of them once per tick. Any OTHER non-zero
+ * exit is a real failure and is raised, so a permission problem cannot
+ * masquerade as a server full of dead panes.
+ */
+export async function paneActivity(
+    params: unknown,
+    listPanes: TerminalPaneSource,
+    runner: CommandRunner = execFileRunner,
+): Promise<PaneActivityResult> {
+    const devSessionIds = requirePaneActivityIds(params);
+    const panes = await listPanes(devSessionIds);
+    const marker = randomBytes(12).toString("base64url");
+    const result = await run(runner, [
+        "list-windows",
+        "-a",
+        "-F",
+        marker + LIST_FIELD_SEPARATOR + LIST_ACTIVITY_FORMAT,
+    ]);
+    // Read AFTER the listing, so `nowMs - lastActivityMs` can never come out
+    // negative because the scan took a moment.
+    const nowMs = Date.now();
+    let activity = new Map<string, SessionActivity>();
+    if (result.code === 0) {
+        activity = parseWindowActivity(result.stdout, marker);
+    } else if (!isMissingTmux(result) && !isNoServer(result)) {
+        throw commandFailure("list-windows", result);
+    }
+    return {
+        nowMs,
+        panes: panes.map((pane) => {
+            const live = activity.get(pane.target);
+            return {
+                ...pane,
+                // A pane whose target names no live session is reported as dead
+                // with a null timestamp, never as a session that has been quiet
+                // since the epoch.
+                lastActivityMs: live === undefined ? null : live.lastActivityMs,
+                attached: live?.attached ?? false,
+                alive: live !== undefined,
+            };
+        }),
+    };
+}
+
 // RPC handler table for the `tmux.*` group, keyed by the frozen wire names.
 // codeharbord spreads these into its method map and awaits the returned promise.
 export const TMUX_METHODS: Record<RpcTmuxMethodName, (params: unknown) => unknown | Promise<unknown>> = {
     [RPC_TMUX_METHODS.listSessions]: () => listSessions(),
     [RPC_TMUX_METHODS.sessionExists]: (params) => sessionExists(params as SessionExistsParams),
     [RPC_TMUX_METHODS.killSession]: (params) => killSession(params as KillSessionParams),
+    // The daemon's pane source is workspace.ts's; a caller with its own (the
+    // unit tests) passes one to paneActivity directly.
+    [RPC_TMUX_METHODS.paneActivity]: (params) => paneActivity(params, terminalPaneTargets),
 };

@@ -402,6 +402,53 @@ export interface KillSessionParams {
 // Deliberately empty: kill-session is idempotent and reports no payload.
 export type KillSessionResult = Record<string, never>;
 
+// --- pane activity (tmux.paneActivity) ---------------------------------------
+//
+// The pane identity half of one activity row: what the workspace database
+// already knows before tmux is asked. `terminalId` is the `terminal_panes` row
+// id and `target` its `tmux_target`, i.e. the name of the tmux session that
+// pane drives.
+export interface TerminalPaneTarget {
+    devSessionId: string;
+    terminalId: string;
+    target: string;
+}
+
+export interface PaneActivity extends TerminalPaneTarget {
+    // Last output time of the pane's tmux session in epoch MILLISECONDS, or
+    // null for "we do not know". tmux reports `window_activity` in seconds, so
+    // this is that value scaled; null means either that tmux holds no such
+    // session or that the activity field did not arrive as a number. The
+    // difference between null and 0 is load-bearing: an unrecognised `#{...}`
+    // does not fail a tmux listing, it renders as an EMPTY field, and coercing
+    // that to 0 would date every pane to 1970 and report it permanently idle,
+    // while coercing it to "now" would report it permanently busy. A consumer
+    // must treat null as no evidence rather than as evidence of silence.
+    lastActivityMs: number | null;
+    // tmux `session_attached` > 0.
+    attached: boolean;
+    // tmux still holds a session with this target. A pane can be alive with a
+    // null lastActivityMs — see above.
+    alive: boolean;
+}
+
+export interface PaneActivityParams {
+    // Absent or empty means every terminal pane the workspace knows that has a
+    // tmux target, which is what a periodic client-side sweep asks for.
+    devSessionIds?: string[];
+}
+
+export interface PaneActivityResult {
+    // The SERVER's wall clock in epoch milliseconds, read at listing time. It
+    // is here so the client computes an AGE (`nowMs - lastActivityMs`) instead
+    // of subtracting its own clock from a timestamp the remote host produced —
+    // the two machines' clocks are not the same clock, and a skew of minutes
+    // would otherwise read as minutes of silence (or of activity from the
+    // future).
+    nowMs: number;
+    panes: PaneActivity[];
+}
+
 // Stable wire method names for the tmux group. Mirrored in C++ at
 // src/remote/RpcTypes.h — bump RPC_SCHEMA_VERSION (defined in
 // remote/src/codeharbord.ts, not in this file) when this set changes.
@@ -409,6 +456,7 @@ export const RPC_TMUX_METHODS = {
     listSessions: "tmux.listSessions",
     sessionExists: "tmux.sessionExists",
     killSession: "tmux.killSession",
+    paneActivity: "tmux.paneActivity",
 } as const;
 
 export type RpcTmuxMethodKey = keyof typeof RPC_TMUX_METHODS;
