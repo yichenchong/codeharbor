@@ -399,6 +399,10 @@ Existing targets that gained coverage in the same period:
   It also covers the host's `openPaneTarget()` letting the handler registry choose
   when the caller names no handler — the "Open as" override refuses an empty one,
   which used to answer a plain "open this file" with a refusal.
+- `tst_terminalcontroller` — the viewer control socket exported into a pane's tmux
+  environment: set at session creation, refreshed on every attach (a reconnect is a
+  new daemon with a new socket), unset when the server reports none, and never
+  exported for a pane with no identity.
 - `tst_sessionlayouts` — pane titles and fast Dev Session switching.
 - `tst_appcontroller` — archiving, deleting a session and a group, and that the
   sidebar's filters never narrow the tree the controller treats as authoritative.

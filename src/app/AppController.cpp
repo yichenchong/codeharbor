@@ -1100,6 +1100,16 @@ void AppController::adoptServerIdentity()
                        if (self->m_editorFactory)
                            self->m_editorFactory->setRecoveryDir(
                                info.value(QStringLiteral("recoveryDir")).toString());
+                       // The viewer control socket THIS daemon is listening on
+                       // (SPEC 6.8), handed to the terminal factory so every pane
+                       // it attaches exports it and an agent there drives THIS
+                       // window. Set on every wire, empty included: the path
+                       // belongs to one daemon, so a reconnect must replace it
+                       // rather than leave panes pointing at a dead socket.
+                       if (self->m_terminalFactory) {
+                           self->m_terminalFactory->setControlSocket(
+                               info.value(QStringLiteral("controlSocket")).toString());
+                       }
                        const QString id =
                            info.value(QStringLiteral("serverId")).toString();
                        if (id.isEmpty()) {

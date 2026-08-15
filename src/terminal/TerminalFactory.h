@@ -156,6 +156,17 @@ public:
     // `tmux.*` is its own RPC group about the host's tmux server.
     void setRpcClient(CodeharbordClient* client);
 
+    // The viewer control socket THIS window's daemon reported through
+    // server.info (SPEC 6.8), exported into every pane this factory attaches so
+    // an agent there drives the window that owns it.
+    //
+    // Set on every wire, because it belongs to ONE daemon: a reconnect is a new
+    // daemon with a new path, and a pane that kept the old one would point at a
+    // socket nothing is serving. Empty when the server reported none, which
+    // unsets it in the pane rather than leaving a stale value.
+    void setControlSocket(const QString& socketPath);
+    QString controlSocket() const { return m_controlSocket; }
+
 
     // A pane's harness changed on the server, so the remembered answer for it
     // is out of date.
@@ -431,6 +442,8 @@ private:
     // AppController declared above it.
     WorkspaceDb* m_workspace = nullptr;
     QString m_serverId;
+    // The current daemon's viewer control socket; empty when it reported none.
+    QString m_controlSocket;
     // RPC peer for the `tmux.listSessions` diagnostic; injected, not owned, and
     // a QPointer because it IS a QObject and nothing here has to be told when
     // it goes away — a null one simply means no diagnostic.

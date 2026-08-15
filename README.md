@@ -257,10 +257,16 @@ Three things to know:
   another session is refused by name rather than applied to the wrong layout.
 - **Closing a pane does not ask about unsaved editor changes**, the same as the
   command palette's Close Pane. The shipped skills tell the agent to ask you first.
-- **It needs a pane CodeHarbor created.** The two variables the path is keyed on,
-  `OMP_DEV_SESSION_ID` and `OMP_TERMINAL_ID`, are exported into each pane's tmux
-  session; a shell that was already running before CodeHarbor attached does not
-  have them. `echo "$OMP_DEV_SESSION_ID"` says which case you are in.
+- **It needs a pane CodeHarbor created.** Three variables are exported into each
+  pane's tmux session: `OMP_DEV_SESSION_ID` and `OMP_TERMINAL_ID` say which pane
+  this is, and `CODEHARBOR_CONTROL_SOCKET` says which window owns it. A shell that
+  was already running before CodeHarbor attached has none of them, and an agent
+  without the socket is told so rather than being routed to another window.
+  `echo "$CODEHARBOR_CONTROL_SOCKET"` says which case you are in.
+- **Several windows work independently.** Each CodeHarbor window has its own socket,
+  so an agent drives the window whose pane it runs in. The one exception is a
+  terminal pane you have open in two windows at once — that is one shell shown
+  twice, and the window that attached most recently owns agents started after it.
 
 ## Build
 

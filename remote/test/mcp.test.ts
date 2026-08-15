@@ -15,7 +15,11 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
-import { resolveControlSocketPath, startControlListener } from "../src/control.ts";
+import {
+    CONTROL_SOCKET_ENV,
+    mintControlSocketPath,
+    startControlListener,
+} from "../src/control.ts";
 import {
     MCP_PROTOCOL_VERSION,
     MCP_SERVER_NAME,
@@ -170,17 +174,18 @@ test("a tool call reaches the control socket and returns the desktop's data", as
     // listener -> relay, then the desktop's answer back out as tool text.
     const dir = mkdtempSync(path.join(os.tmpdir(), "ch-mcp-"));
     try {
-        // The MCP server resolves the socket from the ENVIRONMENT (a tool call
-        // carries no path), so the listener must bind exactly where the client
-        // will look. Binding "control.sock" here instead would make every call
-        // fail with ENOENT and prove nothing about the tool path.
+        // The MCP server takes the socket from the ENVIRONMENT (a tool call
+        // carries no path) and refuses when it is absent, so the pane env must
+        // carry the very path this listener bound — which is what the client
+        // exports into each pane of ITS window.
+        const socketPath = mintControlSocketPath({ XDG_RUNTIME_DIR: dir, HOME: dir });
         const env: NodeJS.ProcessEnv = {
             OMP_DEV_SESSION_ID: "dev-1",
             OMP_TERMINAL_ID: "term-1",
+            [CONTROL_SOCKET_ENV]: socketPath,
             XDG_RUNTIME_DIR: dir,
             HOME: dir,
         };
-        const socketPath = resolveControlSocketPath(env);
         let relayedId = "";
         const listener = await startControlListener((command) => {
             relayedId = command.commandId;
@@ -222,13 +227,14 @@ test("a tool call reaches the control socket and returns the desktop's data", as
 test("a refused command becomes an isError tool result carrying the code", async () => {
     const dir = mkdtempSync(path.join(os.tmpdir(), "ch-mcp-"));
     try {
+        const socketPath = mintControlSocketPath({ XDG_RUNTIME_DIR: dir, HOME: dir });
         const env: NodeJS.ProcessEnv = {
             OMP_DEV_SESSION_ID: "dev-other",
             OMP_TERMINAL_ID: "term-1",
+            [CONTROL_SOCKET_ENV]: socketPath,
             XDG_RUNTIME_DIR: dir,
             HOME: dir,
         };
-        const socketPath = resolveControlSocketPath(env);
         const listener = await startControlListener((command) => {
             queueMicrotask(() => {
                 listener.settle({
@@ -332,14 +338,15 @@ test("closing stdin does not discard an answer that is still in flight", async (
     // an in-process handleLine() call cannot see it.
     const dir = mkdtempSync(path.join(os.tmpdir(), "ch-mcp-"));
     try {
+        const socketPath = mintControlSocketPath({ XDG_RUNTIME_DIR: dir, HOME: dir });
         const env: NodeJS.ProcessEnv = {
             ...process.env,
             OMP_DEV_SESSION_ID: "dev-1",
             OMP_TERMINAL_ID: "term-1",
+            [CONTROL_SOCKET_ENV]: socketPath,
             XDG_RUNTIME_DIR: dir,
             HOME: dir,
         };
-        const socketPath = resolveControlSocketPath(env);
         const listener = await startControlListener((command) => {
             // Answer on a LATER turn of the event loop, as the desktop really
             // does: the answer cannot arrive before stdin has already closed.

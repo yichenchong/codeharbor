@@ -78,8 +78,11 @@ tools: they need no quoting and no path to the checkout.
 
 ## If nothing works at all
 
-Every path needs `OMP_DEV_SESSION_ID` and `OMP_TERMINAL_ID`, which CodeHarbor
-exports into the tmux session of each pane it creates. A shell that was already
-running before CodeHarbor attached does not have them. Check with
-`echo "$OMP_DEV_SESSION_ID"`; if it is empty, tell the user to start the agent in
-a fresh CodeHarbor terminal pane.
+Every path needs three variables, exported into the tmux session of each pane
+CodeHarbor creates: `OMP_DEV_SESSION_ID` and `OMP_TERMINAL_ID` (which pane) and
+`CODEHARBOR_CONTROL_SOCKET` (which window owns it). A shell that was already
+running before CodeHarbor attached has none of them. Check with
+`echo "$CODEHARBOR_CONTROL_SOCKET"`; if it is empty, tell the user to start the
+agent in a fresh CodeHarbor terminal pane. The socket is never guessed — without
+it a command would risk driving a different CodeHarbor window — so a missing one
+is refused rather than worked around.

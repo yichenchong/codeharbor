@@ -115,6 +115,7 @@ private slots:
     void unchangedStateDoesNotEmit();
     void tmuxNewSessionCommandFormat();
     void tmuxNewSessionCommandExportsPaneIdentity();
+    void tmuxNewSessionCommandExportsTheControlSocket();
     void tmuxNewSessionCommandQuotesAwkwardPaneIdentity();
     void tmuxNewSessionCommandOmitsHalfKnownPaneIdentity();
     void tmuxNewSessionCommandEnablesMouseForThisSessionOnly();
@@ -541,6 +542,9 @@ void TstTerminalController::tmuxNewSessionCommandFormat()
     const QString command = TerminalController::tmuxNewSessionCommand(
         QStringLiteral("ch_dev1_term1"), QStringLiteral("/home/dev/project"),
         QStringLiteral("dev-1"), QStringLiteral("term-1"));
+    // No control socket given, so the variable is explicitly UNSET rather than
+    // left alone: a pane must never keep pointing at a previous daemon's socket
+    // (SPEC 6.8), which is a path nothing is serving.
     QCOMPARE(command,
              QStringLiteral("tmux new-session -A -s 'ch_dev1_term1' -c '/home/dev/project'"
                             " -e 'OMP_DEV_SESSION_ID=dev-1' -e 'OMP_TERMINAL_ID=term-1'"
@@ -549,7 +553,9 @@ void TstTerminalController::tmuxNewSessionCommandFormat()
                             " \\; set-environment -t '=ch_dev1_term1:'"
                             " OMP_DEV_SESSION_ID 'dev-1'"
                             " \\; set-environment -t '=ch_dev1_term1:'"
-                            " OMP_TERMINAL_ID 'term-1'"));
+                            " OMP_TERMINAL_ID 'term-1'"
+                            " \\; set-environment -u -t '=ch_dev1_term1:'"
+                            " CODEHARBOR_CONTROL_SOCKET"));
 }
 
 // The two variables an agent hook needs to say which pane it is in
@@ -584,6 +590,42 @@ void TstTerminalController::tmuxNewSessionCommandExportsPaneIdentity()
     QVERIFY(!command.contains(QStringLiteral("-g")));
 }
 
+// The viewer control socket (SPEC 6.8) is a THIRD exported variable, and the one
+// that decides WHICH WINDOW an agent in this pane drives. Two CodeHarbor windows
+// against one server each run their own daemon with its own socket, so a pane
+// must carry the path of the daemon that attached it — and must carry NO path
+// when there is none, rather than an inherited one that would reach the wrong
+// window (or a dead socket).
+void TstTerminalController::tmuxNewSessionCommandExportsTheControlSocket()
+{
+    const QString socketPath =
+        QStringLiteral("/run/user/1000/codeharbor-control-0123456789abcdef.sock");
+    const QString command = TerminalController::tmuxNewSessionCommand(
+        QStringLiteral("ch_dev1_term1"), QStringLiteral("/w"), QStringLiteral("dev-1"),
+        QStringLiteral("term-1"), socketPath);
+
+    // Set at creation...
+    QVERIFY(command.contains(QStringLiteral("-e 'CODEHARBOR_CONTROL_SOCKET=") + socketPath
+                             + QLatin1Char('\'')));
+    // ...and again on attach, which is the case that matters: `-e` is ignored for
+    // a session that already exists, and a reconnect is a NEW daemon with a new
+    // socket, so this is the only thing that corrects a pane's path.
+    QVERIFY(command.contains(
+        QStringLiteral("set-environment -t '=ch_dev1_term1:' CODEHARBOR_CONTROL_SOCKET '")
+        + socketPath + QLatin1Char('\'')));
+    // Never unset in the same breath as being set.
+    QVERIFY(!command.contains(QStringLiteral("set-environment -u")));
+    QVERIFY(!command.contains(QStringLiteral("-g")));
+
+    // With no identity there is no pane to attribute a command to, so the socket
+    // is not exported either: an agent that cannot say which pane it is in must
+    // not be handed a channel.
+    const QString anonymous = TerminalController::tmuxNewSessionCommand(
+        QStringLiteral("ch_dev1_term1"), QStringLiteral("/w"), QString(), QString(),
+        socketPath);
+    QVERIFY(!anonymous.contains(QStringLiteral("CODEHARBOR_CONTROL_SOCKET")));
+}
+
 // An awkward id — a space, a single quote, a newline, shell metacharacters —
 // reaches a remote SHELL before tmux ever sees it, so every occurrence goes
 // through the same single-quoting as the target and the working directory. The
@@ -603,7 +645,9 @@ void TstTerminalController::tmuxNewSessionCommandQuotesAwkwardPaneIdentity()
                             " \\; set-environment -t '=ch_dev1_term1:'"
                             " OMP_DEV_SESSION_ID 'd'\\''; rm -rf ~; '\\'''"
                             " \\; set-environment -t '=ch_dev1_term1:'"
-                            " OMP_TERMINAL_ID 't`whoami`$(id)\nnext'"));
+                            " OMP_TERMINAL_ID 't`whoami`$(id)\nnext'"
+                            " \\; set-environment -u -t '=ch_dev1_term1:'"
+                            " CODEHARBOR_CONTROL_SOCKET"));
 }
 
 // BOTH ids or neither. A hook needs both halves to name a pane, so exporting

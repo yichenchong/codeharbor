@@ -973,8 +973,10 @@ the client already owns rather than adding a transport:
 
 ```text
 agent tool (codeharbor-mcp / codeharbor-view)
-  -> Unix socket: $XDG_RUNTIME_DIR/codeharbor-control.sock
-     (fallback ~/.cache/codeharbor/control.sock), bound by codeharbord, 0600
+  -> the Unix socket named by $CODEHARBOR_CONTROL_SOCKET in the pane, which is
+     $XDG_RUNTIME_DIR/codeharbor-control-<token>.sock (or, with no runtime
+     directory, ~/.cache/codeharbor/codeharbor-control-<token>.sock), bound by
+     THIS window's codeharbord at 0600 under a 0700 directory
   -> `viewer.command` id-less JSON-RPC notification on the RPC channel
   -> ch::ViewerCommandService -> Main.qml -> ViewerRegion / SessionLayouts
   -> `viewer.commandResult` request back to codeharbord
@@ -1006,8 +1008,19 @@ vocabulary (4.3); omitted, the handler registry chooses.
 Refusals are named so an agent can act on them: `bad_request`, `busy`, `timeout`,
 `not_active_session`, `unknown_pane`, `failed`.
 
-Four rules bound what an agent can do:
+Five rules bound what an agent can do:
 
+- **One socket per daemon, and never a guessed one.** A remote user may have several
+  CodeHarbor windows connected at once, each with its own `codeharbord`. Each mints a socket
+  whose name carries a RANDOM token, reports it through `server.info.controlSocket`, and the
+  client exports it into every terminal pane it attaches as `$CODEHARBOR_CONTROL_SOCKET`. A
+  producer uses that variable and nothing else: a pane without it is refused, because a
+  derived or shared path reaches whichever daemon bound it first — with a different Dev
+  Session active there the agent is told its own plainly-open session is not active, and with
+  the same one active it silently rearranges the wrong window. The token is random rather
+  than a pid because the path outlives the process (tmux cannot retrofit a live agent's
+  environment) and a reused pid would hand a later daemon an earlier agent's commands. A path
+  whose daemon is gone therefore resolves to nothing and is reported unreachable.
 - **The active Dev Session only.** A command whose `devSessionId` is not the session on
   screen is refused with `not_active_session`. Only that session's tree is loaded, and
   applying a command to a layout nobody is looking at is worse than refusing it.
@@ -1020,6 +1033,16 @@ Four rules bound what an agent can do:
 - **Identified.** A command carries the asking pane's `devSessionId` and `terminalId`, taken
   from the `OMP_DEV_SESSION_ID`/`OMP_TERMINAL_ID` the client exports into every terminal
   pane it creates (5.2). A process without them is refused with an explanation.
+
+ONE CASE IS INHERENTLY AMBIGUOUS, and is documented rather than papered over. A tmux target
+is server-minted and may be attached by two windows at once (5.2), which is the same terminal
+pane shown twice. tmux's environment is per SESSION, so the window that attached LAST owns
+`$CODEHARBOR_CONTROL_SOCKET` for agents started after it, and an agent started earlier keeps
+the socket it was given. There is no "own window" for such a pane — both windows are showing
+it — so last-attach-wins is the rule, not a defect. What the per-window socket does remove is
+the case that IS a defect: a pane belonging to one window's own session reaching another
+window. A deterministic answer for the shared case would need per-client tmux targets, which
+would give up the shared-session behaviour 5.2 exists for.
 
 The agent-facing surface is an MCP server (`codeharbor-mcp`) exposing `viewer_list`,
 `viewer_open`, `viewer_split`, `viewer_focus`, `viewer_close` and `viewer_reload`, plus a

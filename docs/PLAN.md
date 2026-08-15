@@ -263,13 +263,33 @@ graph TD
 - **What it is:** the first NON-observational agent integration (SPEC 6.8). An agent in a
   terminal pane opens/splits/focuses/closes/reloads viewer panes and lists them.
 - **TODO:**
-  - [x] `remote/src/control.ts` — the producer socket
-    (`$XDG_RUNTIME_DIR/codeharbor-control.sock`, fallback
-    `~/.cache/codeharbor/control.sock`, 0600 under a 0700 directory), its PID-lock
-    (the bridge's algorithm, so a crashed owner's path is reclaimed and a live
-    one's is not), request validation, the 32-command in-flight bound and the 5 s
-    answer timeout. Started from `runStdio()`; a lost socket race is a stderr line
-    and degrades that window to no pane control, never a failed connection.
+  - [x] `remote/src/control.ts` — the producer socket, request validation, the
+    32-command in-flight bound and the 5 s answer timeout. Started from
+    `runStdio()`; a bind failure is a stderr line, never a failed connection.
+  - [x] ONE SOCKET PER DAEMON, `codeharbor-control-<token>.sock` under
+    `$XDG_RUNTIME_DIR` (or `~/.cache/codeharbor`), 0600 inside a 0700 directory,
+    reported through `server.info.controlSocket` and exported by the client into
+    every pane it attaches as `$CODEHARBOR_CONTROL_SOCKET`. A producer uses that
+    variable and refuses without it.
+
+    SHIPPED WRONG IN v0.2.0 and fixed here. That release used one SHARED path
+    with a PID lock, so with two windows open only the first daemon could bind:
+    every other window's agent reached the FIRST window's client — told its own
+    plainly-open Dev Session was not active, or, with the same session active
+    there, silently rearranging the wrong window. The lock proved only that a
+    second listener could not bind, which is not the same claim.
+
+    The token is RANDOM rather than a pid because the routing identity outlives
+    the process — tmux cannot retrofit a running agent's environment — so a reused
+    pid would hand a later daemon an earlier agent's commands. A stale path now
+    resolves to nothing and is reported unreachable. Sockets of killed daemons are
+    swept by CONNECTING to them, which is what a Unix socket can actually answer.
+
+    STILL AMBIGUOUS, by nature and documented in SPEC 6.8: a tmux target may be
+    attached by two windows at once (the same pane shown twice), tmux environment
+    is per session, so the window that attached LAST owns agents started after it.
+    A deterministic answer needs per-client tmux targets, which would give up the
+    shared-session behaviour SPEC 5.2 exists for.
   - [x] `viewer.command` (server → client notification) + `viewer.commandResult`
     (client → server request) on the EXISTING RPC channel. No new SSH channel and
     no change to the bridge: its stdin is a lifetime watchdog, so it cannot carry
@@ -296,9 +316,13 @@ graph TD
   shell with a pane's coordinates: `list`/`open`/`split`/`focus`/`reload`/`close`
   all applied to the real window and persisted into `session_layouts`, and every
   refusal (`not_active_session`, `unknown_pane`, `bad_request`) came back named.
-  Unit gates: `remote/test/control.test.ts`, `remote/test/mcp.test.ts`,
-  `tst_viewercommands`, plus `tst_qmlload` (every op answered, the session gate,
-  path normalization, the inventory walk) and `tst_paneidentity`.
+  Unit gates: `remote/test/control.test.ts` (including TWO daemons serving their
+  own windows at once, a producer with no injected socket refused rather than
+  routed, and a stale path reported unreachable), `remote/test/mcp.test.ts`,
+  `tst_viewercommands`, `tst_terminalcontroller` (the socket exported at creation
+  and refreshed on every attach, unset when the server reports none), plus
+  `tst_qmlload` (every op answered, the session gate, path normalization, the
+  inventory walk) and `tst_paneidentity`.
 - **Deliberately NOT done:** no `codex` harness in the STATUS vocabulary
   (`HARNESSES` is untouched) — control messages carry pane coordinates, not a
   harness, so status reporting for Codex remains a separate piece of work.

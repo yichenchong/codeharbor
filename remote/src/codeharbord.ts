@@ -51,10 +51,15 @@ import {
 // the JSON-object footgun it guards against was first written down; it is the
 // same check the bridge and the control listener apply to a decoded payload.
 import { isPlainObject } from "./events.ts";
-// Viewer control channel (agent -> desktop). Its socket is bound by runStdio
-// below; the `viewer.commandResult` handler in the static method table settles
-// the producer that is still waiting on it.
-import { startControlListener, type ControlListener } from "./control.ts";
+// Viewer control channel (agent -> desktop). Its per-daemon socket is bound by
+// runStdio below; the `viewer.commandResult` handler in the static method table
+// settles the producer that is still waiting on it, and server.info reports the
+// path so the client can export it into each terminal pane.
+import {
+    startControlListener,
+    sweepStaleControlSockets,
+    type ControlListener,
+} from "./control.ts";
 import {
     RPC_DATABASE_BUSY,
     RPC_INTERNAL_ERROR,
@@ -219,12 +224,21 @@ const methods: Record<string, MethodHandler> = {
     // 0o700 on the first snapshot. Additive and OPTIONAL: it does not raise the
     // schemaVersion floor, so an older server simply omits it and the client
     // degrades to no-recovery rather than failing the compatibility gate.
+    //
+    // `controlSocket` (SPEC 6.8) is the path THIS daemon is listening on for
+    // viewer commands, which the client exports into every terminal pane it
+    // creates. Read from the live listener rather than recomputed, so a client
+    // can never be handed a path nothing is serving: absent until the bind
+    // succeeds, and absent for good if it never does.
     [RPC_SERVER_INFO_METHOD]: (): ServerInfoResult => ({
         name: RPC_SERVER_NAME,
         version: RPC_SERVER_VERSION,
         schemaVersion: RPC_SCHEMA_VERSION,
         serverId: serverIdentity(),
         recoveryDir: pathJoin(recoveryBaseDir(), "codeharbor", "recovery"),
+        ...(activeControlListener
+            ? { controlSocket: activeControlListener.socketPath }
+            : {}),
     }),
     // The desktop's answer to one relayed viewer command (SPEC 4.3). The client
     // sends it as an ordinary request because the transport carries requests in
@@ -787,6 +801,12 @@ export function createWatchNotificationRelay(
     };
 }
 
+// How long request dispatch waits for the viewer control socket to bind before
+// starting anyway. See beginReading() in runStdio: the wait exists so server.info
+// can report the socket path, and this bound exists so a filesystem that cannot
+// produce one never costs the session its files and terminals.
+export const CONTROL_BIND_GRACE_MS = 2000;
+
 // Signals the daemon treats as "stop cleanly". SIGHUP is in the set because it
 // is what an ending SSH session delivers to the process it launched, which is
 // this daemon's most common way to be told to stop; SIGINT covers a hand-started
@@ -970,11 +990,15 @@ export function runStdio(): StdioHandle {
     // immediate `failed` for the waiting agent instead of a five-second wait for
     // a reply that can never arrive.
     //
-    // Binding is ASYNCHRONOUS and its failure is a stderr line, never a fault: a
-    // second CodeHarbor window against the same host loses the socket race, and
+    // Binding is ASYNCHRONOUS and its failure is a stderr line, never a fault:
     // SshChannelDevice publishes daemon stderr as diagnostics (SessionBootstrap
-    // demotes it deliberately), so that window degrades to "no agent pane
-    // control" instead of failing to connect at all.
+    // demotes it deliberately), so a window whose socket could not be bound
+    // degrades to no agent pane control instead of failing to connect at all.
+    // Its agents are then TOLD that, because the socket path is reported through
+    // server.info and exported into each pane — a pane with no path refuses
+    // rather than falling back to a guessable one and driving another window.
+    //
+    // The path carries this process's pid, so two windows never contend for it.
     const relayViewerCommand = (command: {
         commandId: string;
         devSessionId: string;
@@ -1000,7 +1024,13 @@ export function runStdio(): StdioHandle {
         return !outputFailed;
     };
     let controlListener: ControlListener | null = null;
-    void startControlListener(relayViewerCommand).then(
+    // Guards the one-shot stdin attach below; see beginReading().
+    let readingStarted = false;
+    // Settles when the bind has either succeeded or failed. server.info must not
+    // be answered before then: it carries the socket path the client exports into
+    // every pane, and a client that asked one round trip too early would export
+    // nothing and leave that window's agents refusing for the rest of the session.
+    const controlBound = startControlListener(relayViewerCommand).then(
         (listener) => {
             // A shutdown that ran while the bind was still in flight must not
             // leave a live socket behind.
@@ -1010,6 +1040,9 @@ export function runStdio(): StdioHandle {
             }
             controlListener = listener;
             activeControlListener = listener;
+            // Housekeeping, not a precondition: sockets of daemons that were
+            // killed would otherwise accumulate in the runtime directory forever.
+            sweepStaleControlSockets(listener.socketPath);
             process.stderr.write(
                 `codeharbord: viewer control listening on ${listener.socketPath}\n`,
             );
@@ -1062,7 +1095,24 @@ export function runStdio(): StdioHandle {
         // exit once in-flight work settles.
         process.stdin.destroy();
     });
-    process.stdin.on("data", feed);
+    // REQUESTS WAIT FOR THE BIND. server.info reports the viewer control socket
+    // the client exports into every terminal pane, and the client asks it the
+    // moment the channel is wired — so answering before the bind settles would
+    // hand it a payload with no path and leave that window's agents refusing for
+    // the whole session, with nothing on either side saying why.
+    //
+    // Waiting is safe and short: the bind is one local listen() on a Unix socket,
+    // `controlBound` never rejects (both arms are handled), and nothing is lost
+    // meanwhile because unread bytes stay in the stream's own buffer. The timer is
+    // the backstop for a pathological filesystem: a daemon that cannot bind must
+    // still serve files and terminals.
+    const beginReading = (): void => {
+        if (readingStarted) return;
+        readingStarted = true;
+        process.stdin.on("data", feed);
+    };
+    void controlBound.then(beginReading, beginReading);
+    setTimeout(beginReading, CONTROL_BIND_GRACE_MS).unref();
     // SIGNALS. Until this existed, the ONLY orderly shutdown was stdin closing:
     // a plain `kill` (or the SIGHUP an ending SSH session delivers, or Ctrl-C on
     // a hand-started daemon) hit Node's default disposition and killed the

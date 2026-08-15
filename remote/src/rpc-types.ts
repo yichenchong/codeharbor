@@ -179,6 +179,20 @@ export interface ServerInfoResult {
     // 11.3). Additive and OPTIONAL: an older server omits it and the client
     // degrades to no-recovery rather than failing the compatibility gate.
     recoveryDir?: string;
+    // The per-daemon viewer control socket this process is listening on
+    // (§ 6.8), for the client to export into each terminal pane it creates as
+    // $CODEHARBOR_CONTROL_SOCKET.
+    //
+    // Reported rather than derived because it must not be GUESSABLE: one remote
+    // user may have several CodeHarbor windows connected at once, each with its
+    // own daemon and its own socket, and an agent that guessed a shared path
+    // would reach whichever daemon bound it first — driving another window, or
+    // being told its own plainly-open Dev Session is not active.
+    //
+    // Additive and OPTIONAL: absent when the daemon could not bind one at all,
+    // in which case the client exports nothing and an agent in those panes is
+    // told precisely that instead of being routed somewhere wrong.
+    controlSocket?: string;
 }
 
 // Server -> client notification method name for an active watch subscription

@@ -30,6 +30,7 @@ import fs from "node:fs";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
+import { randomBytes } from "node:crypto";
 
 import { isEventIdentifier, isPlainObject } from "./events.ts";
 
@@ -124,118 +125,129 @@ export const MAX_CONTROL_CONNECTIONS = 64;
 // one. Same guard, same reasoning as BRIDGE_HANDSHAKE_TIMEOUT_MS.
 export const CONTROL_HANDSHAKE_TIMEOUT_MS = 30_000;
 
-const CONTROL_LOCK_SUFFIX = ".lock";
-
 /**
- * Resolve the control socket path: `$XDG_RUNTIME_DIR/codeharbor-control.sock`
- * when the runtime directory is set, otherwise
- * `~/.cache/codeharbor/control.sock`.
+ * Directory the control sockets live in: `$XDG_RUNTIME_DIR` when it is set,
+ * otherwise `~/.cache/codeharbor`.
  *
- * The rules are deliberately identical to resolveSocketPath() in events.ts,
- * including the two branches having DIFFERENT basenames, so the two sockets can
- * never be confused for one another and both ends of each pair resolve through
- * one function.
- *
- * A RELATIVE $XDG_RUNTIME_DIR is ignored rather than honoured: the variable is
+ * A RELATIVE $XDG_RUNTIME_DIR is ignored rather than honoured — the variable is
  * defined to be absolute, and joining a relative one produces a path that
- * depends on the process's working directory — the daemon would bind it under
- * its own directory and an agent's tool, started wherever the agent happens to
- * be running, would look for it under a different one. Every command would
- * silently vanish. The home directory comes from the SAME `env`, so a caller
- * that passes an environment gets a self-consistent answer rather than its own
- * runtime directory and somebody else's home.
+ * depends on the process's working directory. The home directory comes from the
+ * SAME `env`, so a caller that passes an environment gets a self-consistent
+ * answer rather than its own runtime directory and somebody else's home. Both
+ * rules are the ones resolveSocketPath() applies in events.ts.
  */
-export function resolveControlSocketPath(env: NodeJS.ProcessEnv = process.env): string {
+export function controlSocketDir(env: NodeJS.ProcessEnv = process.env): string {
     const runtimeDir = env.XDG_RUNTIME_DIR;
-    if (runtimeDir && path.isAbsolute(runtimeDir)) {
-        return path.join(runtimeDir, "codeharbor-control.sock");
-    }
+    if (runtimeDir && path.isAbsolute(runtimeDir)) return runtimeDir;
     const home = env.HOME;
     const base = home && path.isAbsolute(home) ? home : os.homedir();
-    return path.join(base, ".cache", "codeharbor", "control.sock");
+    return path.join(base, ".cache", "codeharbor");
 }
 
-function controlLockPath(socketPath: string): string {
-    return `${socketPath}${CONTROL_LOCK_SUFFIX}`;
-}
+const CONTROL_SOCKET_PREFIX = "codeharbor-control-";
+const CONTROL_SOCKET_SUFFIX = ".sock";
 
 /**
- * Take exclusive ownership of the control socket path, or throw.
+ * Mint the control socket path for ONE daemon.
  *
- * A stale Unix socket INODE is indistinguishable from a live one: bind() fails
- * with EADDRINUSE either way, and unlinking it unconditionally would let a
- * second daemon steal the path from a first that is serving commands. The lock
- * file carries the owner's PID, so a crashed owner's leftovers can be told from
- * a live one and reclaimed. Same algorithm as acquireBridgeLock in bridge.ts;
- * kept separate rather than shared because the two differ in their message and
- * their lifetime, and that file is under test.
+ * PER-DAEMON, not one shared path, and that is a correctness requirement rather
+ * than tidiness. One remote user may have several CodeHarbor windows connected at
+ * once (each is its own `codeharbord`), and a viewer command must reach THE
+ * WINDOW whose pane asked. With a single shared path only the first daemon can
+ * bind it, so every other window's agent reaches the FIRST window's client: with
+ * a different Dev Session active there it is told its own plainly-open session is
+ * not active, and with the SAME session active it silently rearranges the wrong
+ * window.
+ *
+ * The name carries a RANDOM token, deliberately not the pid. A pid is reused, and
+ * the routing identity outlives the process: an agent already running keeps the
+ * path it was given (tmux does not retrofit a live process's environment), so with
+ * pid names a later daemon that happened to inherit that pid would inherit that
+ * agent's commands too — the same misrouting, harder to see. A token is never
+ * reused, so a path that outlives its daemon resolves to nothing at all and the
+ * agent is told the server is unreachable, which is the truth.
+ *
+ * Unguessable for the same reason. The daemon reports the path through
+ * `server.info`, the client exports it into each pane's tmux environment as
+ * $CODEHARBOR_CONTROL_SOCKET, and the producer reads it from there
+ * (readControlSocketPath). A pane carrying no such variable is refused rather
+ * than sent to a fallback, because a fallback is exactly what this removes.
  */
-function acquireControlLock(socketPath: string): string {
-    const lockPath = controlLockPath(socketPath);
-    for (;;) {
-        const tempPath = `${lockPath}.${process.pid}.${Date.now()}.${Math.random()}`;
-        try {
-            fs.writeFileSync(tempPath, `${process.pid}\n`, {
-                encoding: "utf8",
-                flag: "wx",
-                mode: 0o600,
-            });
+export function mintControlSocketPath(env: NodeJS.ProcessEnv = process.env): string {
+    const token = randomBytes(8).toString("hex");
+    return path.join(
+        controlSocketDir(env),
+        `${CONTROL_SOCKET_PREFIX}${token}${CONTROL_SOCKET_SUFFIX}`,
+    );
+}
+
+/** The environment variable carrying the socket a pane's agent must use. */
+export const CONTROL_SOCKET_ENV = "CODEHARBOR_CONTROL_SOCKET";
+
+/** Cap on sockets one sweep will probe, so housekeeping stays bounded. */
+export const MAX_CONTROL_SWEEP_ENTRIES = 256;
+
+/**
+ * Remove control sockets left behind by daemons that are gone.
+ *
+ * Each daemon unlinks its own socket on an orderly stop, so this only finds the
+ * leavings of one that was killed; without it every SIGKILLed daemon leaves a
+ * file in the runtime directory forever.
+ *
+ * Staleness is decided by CONNECTING, not by reading a pid out of the name. That
+ * is what a Unix socket actually tells you — a socket with no listener refuses
+ * immediately — and it is why the name needs no pid to be swept. `keep` is this
+ * daemon's own path, which is live by definition and must never be probed.
+ *
+ * Best-effort and asynchronous by construction: every failure is skipped rather
+ * than reported. This is housekeeping on the way up, not a precondition for
+ * serving, and it must never delay or fail a session.
+ */
+export function sweepStaleControlSockets(
+    keep: string | null = null,
+    env: NodeJS.ProcessEnv = process.env,
+): void {
+    const dir = controlSocketDir(env);
+    let entries: string[];
+    try {
+        entries = fs.readdirSync(dir);
+    } catch {
+        return;
+    }
+    let probed = 0;
+    for (const entry of entries) {
+        if (!entry.startsWith(CONTROL_SOCKET_PREFIX) || !entry.endsWith(CONTROL_SOCKET_SUFFIX))
+            continue;
+        const candidate = path.join(dir, entry);
+        if (keep !== null && candidate === keep) continue;
+        if (probed >= MAX_CONTROL_SWEEP_ENTRIES) return;
+        probed += 1;
+        const probe = net.createConnection(candidate);
+        probe.unref();
+        probe.on("error", (err: Error) => {
+            // ONLY a definitive "nobody is listening here" is stale:
+            //   ECONNREFUSED — the socket file exists and has no listener, which
+            //                  is exactly what a killed daemon leaves behind;
+            //   ENOENT       — already gone; the unlink below is then a no-op.
+            //
+            // Every OTHER error leaves the file alone, and that distinction is
+            // load-bearing. EACCES/EPERM is somebody else's socket, and EMFILE or
+            // EAGAIN is this process being out of descriptors — a live window's
+            // socket, deleted on a transient local failure, would take that
+            // window's pane control away with nothing to say why. Housekeeping
+            // must never be able to break a working session.
+            const code = "code" in err ? err.code : undefined;
+            if (code !== "ECONNREFUSED" && code !== "ENOENT") return;
             try {
-                // Publishing the fully written PID with linkSync is atomic: no
-                // contender can observe an empty ownership record.
-                fs.linkSync(tempPath, lockPath);
-                fs.unlinkSync(tempPath);
-                return lockPath;
-            } catch (err) {
-                try {
-                    fs.unlinkSync(tempPath);
-                } catch {
-                    // The temporary file may already have been removed.
-                }
-                if (!(err instanceof Error) || !("code" in err) || err.code !== "EEXIST") {
-                    throw err;
-                }
+                fs.unlinkSync(candidate);
+            } catch {
+                // Already gone, or not ours to remove.
             }
-        } catch (err) {
-            if (!(err instanceof Error) || !("code" in err) || err.code !== "EEXIST") {
-                throw err;
-            }
-        }
-        let ownerPid: number;
-        try {
-            ownerPid = Number.parseInt(fs.readFileSync(lockPath, "utf8").trim(), 10);
-        } catch {
-            throw new Error(`codeharbord: control address already in use: ${socketPath}`);
-        }
-        if (!Number.isInteger(ownerPid) || ownerPid <= 0) {
-            throw new Error(`codeharbord: control address already in use: ${socketPath}`);
-        }
-        let ownerAlive = false;
-        try {
-            process.kill(ownerPid, 0);
-            ownerAlive = true;
-        } catch (probeError) {
-            // EPERM means the process exists but belongs to someone else, which
-            // is very much alive. Only ESRCH ("no such process") is stale.
-            ownerAlive =
-                probeError instanceof Error &&
-                "code" in probeError &&
-                probeError.code === "EPERM";
-        }
-        if (ownerAlive) {
-            throw new Error(`codeharbord: control address already in use: ${socketPath}`);
-        }
-        try {
-            fs.unlinkSync(lockPath);
-        } catch (unlinkError) {
-            if (
-                !(unlinkError instanceof Error) ||
-                !("code" in unlinkError) ||
-                unlinkError.code !== "ENOENT"
-            ) {
-                throw unlinkError;
-            }
-        }
+        });
+        probe.on("connect", () => {
+            // Alive, and serving its own window. Leave it alone.
+            probe.destroy();
+        });
     }
 }
 
@@ -339,37 +351,30 @@ export function parseControlRequest(line: string): ControlRequest | ControlRespo
 }
 
 /**
- * Start the control listener on `socketPath`.
+ * Start the control listener on `socketPath`, which defaults to a freshly minted
+ * per-daemon path.
  *
  * `emit` relays one command to the desktop and answers whether it reached the
- * wire; a false return is reported to the producer as `failed` rather than
- * being left to time out, because a dead output is knowable immediately.
+ * wire; a false return is reported to the producer as `failed` rather than being
+ * left to time out, because a dead output is knowable immediately.
+ *
+ * There is no lock and no contention: the path carries a random token, so no two
+ * daemons — and no daemon and any of its predecessors — ever want the same one.
+ * Sockets left behind by daemons that were killed are swept separately
+ * (sweepStaleControlSockets).
  */
 export async function startControlListener(
     emit: (command: ViewerCommand) => boolean,
-    socketPath: string = resolveControlSocketPath(),
+    socketPath: string = mintControlSocketPath(),
 ): Promise<ControlListener> {
-    // `async`, so the directory and lock failures below REJECT rather than
-    // throwing synchronously out of the call. The daemon starts this with
+    // `async`, so a directory or bind failure REJECTS rather than throwing
+    // synchronously out of the call. The daemon starts this with
     // `void startControlListener(...).then(ok, err)`, and a synchronous throw
-    // there is an uncaught exception that kills the whole service — over losing a
-    // socket race with a second CodeHarbor window, which is a degradation, not a
-    // fault.
+    // there is an uncaught exception that kills the whole service — every
+    // terminal and editor of the session with it — over a socket.
     //
-    // The directory comes BEFORE the lock, not with the bind: the lock file is a
-    // SIBLING of the socket, so on a first run — a fresh $XDG_RUNTIME_DIR entry,
-    // or a home with no ~/.cache/codeharbor yet — the lock's temp-file write
-    // fails with ENOENT and the listener never starts at all. 0700 because the
-    // socket it will hold rearranges the user's windows.
+    // 0700, because the socket it will hold rearranges the user's windows.
     fs.mkdirSync(path.dirname(socketPath), { recursive: true, mode: 0o700 });
-    const lockPath = acquireControlLock(socketPath);
-    const releaseLock = (): void => {
-        try {
-            fs.unlinkSync(lockPath);
-        } catch {
-            // Already gone; nothing to release.
-        }
-    };
 
     interface Pending {
         socket: net.Socket;
@@ -512,14 +517,14 @@ export async function startControlListener(
     return new Promise<ControlListener>((resolve, reject) => {
         const fail = (err: Error): void => {
             server.close();
-            releaseLock();
             reject(err);
         };
         server.once("error", fail);
-        // A STALE socket inode from a crashed owner: the lock above already
-        // proved that owner is gone, so the path is ours to reclaim. Without
-        // this, listen() fails with EADDRINUSE against a file nobody is serving
-        // and viewer control stays dead until someone deletes it by hand.
+        // A leftover file at THIS path can only be a dead daemon that happened to
+        // hold the same pid: a live one is this very process. Unlink it, or
+        // listen() fails with EADDRINUSE against a socket nobody is serving and
+        // viewer control stays dead for this window until someone deletes it by
+        // hand.
         try {
             fs.unlinkSync(socketPath);
         } catch {
@@ -556,7 +561,6 @@ export async function startControlListener(
                     } catch {
                         // Already gone.
                     }
-                    releaseLock();
                 },
                 settle(outcome) {
                     const entry = forget(outcome.commandId);
