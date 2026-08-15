@@ -451,6 +451,16 @@ reproduces the daemon's own environment. Reverting the constant to a tab fails
 that file with `real tmux listing did not parse; got []` — the production symptom.
 Test it by hand from a UTF-8 shell, or from inside tmux, and it will look fine.
 
+**The producer at the head of a chain needs its own gate.** The oh-my-pi status
+integration shipped unusable because every test drove the CLI script directly, so
+the whole chain was green while the harness itself invoked nothing. Two tests now
+run the REAL binaries: `remote/test/oh-my-pi-live.test.ts` runs an actual `omp`
+with the extension loaded and asserts the bridge receives
+`starting → running → idle_unseen → stopped`, and `remote/test/tmux-live.test.ts`
+does the same job for tmux. Both skip cleanly when the binary is absent. Prefer
+one of these over another fixture-fed unit test whenever the thing that could be
+wrong is an assumption about an external program's interface.
+
 `-L desktop` currently holds one target, `tst_notifierlive`, which delivers a real
 notification through `org.freedesktop.Notifications`. It needs a session bus AND a
 running notification daemon; without them it reports **Skipped**, never Passed, and

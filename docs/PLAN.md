@@ -270,6 +270,20 @@ graph TD
     `LIST_FIELD_SEPARATOR` now spells it for both formats and both parsers, and
     `remote/test/tmux-live.test.ts` drives a REAL tmux under `LC_ALL=C` with
     `TMUX` deleted so the daemon's own environment is the one under test.
+  - [x] A producer Oh My Pi can actually load. The original was a CLI script whose
+    header documented `session_start -> node oh-my-pi-hook.ts session_start` in a
+    harness "hook config" that does not exist — Oh My Pi loads a MODULE that
+    default-exports a factory and never shells out per event. So nothing invoked
+    it, no event reached the bridge, and a pane running an agent read "running"
+    indefinitely after it finished, which is exactly how a user found it. The
+    mapping and the monitor were right all along; the chain had no producer at its
+    head. `remote/src/hooks/oh-my-pi-extension.ts` is that producer, sharing its
+    wire construction with the CLI form through `bridge-emit.ts`. Two further
+    defects it exposed: the harness spells the tool `toolName` while the mapping
+    read `tool`, so `waiting_input` could never fire; and `agent_end` carries
+    `willContinue`, so a mid-run turn boundary would have announced "finished".
+    Gated by `remote/test/oh-my-pi-live.test.ts`, which runs a REAL `omp` and
+    asserts the bridge receives `starting → running → idle_unseen → stopped`.
 - **Stop gate:** ✅ MET — `tst_liveagent` runs the REAL hook on the remote side
   (one node process per firing) into the REAL bridge, over an SSH AgentStatus
   channel, and observes the ordered transitions

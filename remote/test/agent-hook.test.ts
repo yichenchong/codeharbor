@@ -8,13 +8,15 @@ import { spawn } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { fileURLToPath } from "node:url";
 import {
-    emitHookEvent,
     main,
+    readHookInput,
+} from "../src/hooks/oh-my-pi-hook.ts";
+import {
+    emitHookEvent,
     missingCoordinates,
     toBridgeMessage,
-    readHookInput,
     type HookInput,
-} from "../src/hooks/oh-my-pi-hook.ts";
+} from "../src/hooks/bridge-emit.ts";
 import { PassThrough } from "node:stream";
 import { resolveSocketPath, type AgentEvent } from "../src/events.ts";
 import {
