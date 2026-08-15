@@ -7,6 +7,7 @@
 #include "ViewerModel.h"
 #include "ViewerProfiles.h"
 #include "AgentStatusMonitor.h"
+#include "ViewerCommandService.h"
 #include "EditorFactory.h"
 #include "TerminalFactory.h"
 #include "Notifier.h"
@@ -73,6 +74,14 @@ int main(int argc, char *argv[])
     // dedicated SSH agent-status channel wired later; fed AgentEvent JSONL.
     ch::AgentStatusMonitor agentMonitor;
 
+    // Viewer control channel (SPEC 4.3): the client end of the path an AI agent
+    // running in a terminal pane uses to drive this window's viewer panes. It
+    // rides the SAME RPC client as everything else — the daemon relays each
+    // command as an id-less `viewer.command` notification and reads the answer
+    // back as a `viewer.commandResult` request — so it needs no transport of its
+    // own and is live the moment a session is wired.
+    ch::ViewerCommandService viewerCommands(&client);
+
     // Remote session spine (workstream S): the SSH connection pool plus the
     // bootstrap that opens the RPC and agent-status channels and hands each one
     // to the consumer above as a QIODevice.
@@ -89,6 +98,7 @@ int main(int argc, char *argv[])
     // WebEngineViews and the internal scheme handler use one security context.
     ch::AppController appController(&client);
     appController.setAgentMonitor(&agentMonitor);
+    appController.setViewerCommands(&viewerCommands);
     ch::ViewerProfiles profiles(&client);
     ch::ViewerModel viewers(&client);
     viewers.setProfiles(&profiles);

@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "codeharbor": {
+      "type": "stdio",
+      "command": "node",
+      "args": ["${CLAUDE_PROJECT_DIR:-.}/remote/src/mcp/server.ts"]
+    }
+  }
+}

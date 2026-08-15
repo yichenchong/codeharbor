@@ -752,6 +752,9 @@ private slots:
     void theAddressBarOpensARemotePath();
     void theAddressBarOpensAUrlAsGiven();
     void theAddressBarPercentEncodesADelimiterInAFileName();
+    // The host's "show this address in that pane" entry point must let the handler
+    // registry choose when the caller names no handler.
+    void openPaneTargetWithNoKindLetsTheRegistryDecide();
     void navigationTruncatesForwardHistoryAfterFreshAddress();
     void navigationButtonsAreDisabledAtHistoryEnds();
     void reloadRefreshesNonWebContent();
@@ -2008,6 +2011,61 @@ void TstPaneIdentity::theAddressBarPercentEncodesADelimiterInAFileName()
     // ...and it decodes back to the path the user typed, which is what the RPC
     // layer is handed.
     QCOMPARE(pane->property("url").toUrl().toLocalFile(), QStringLiteral("/tmp/notes#1.txt"));
+}
+
+// REGRESSION. openPaneTarget() is the host's one "show this address in that
+// pane" entry point, and it used to go straight to ViewerPane.openUrlWithKind(),
+// which is the "Open as" OVERRIDE and refuses an empty handler. So every caller
+// that merely had an address — an agent's `open` command, and any future host
+// command — was answered with "That viewer cannot display this target." and the
+// pane never navigated. Deciding the handler is the registry's job; an empty kind
+// means "you decide", not "no handler".
+void TstPaneIdentity::openPaneTargetWithNoKindLetsTheRegistryDecide()
+{
+    QVERIFY(openRegion(QStringLiteral("ViewerRegion.qml"), leafNode(QStringLiteral("viewer-1")),
+                       /*terminal=*/false));
+    const auto panes = [this] { return collect(m_region, isLeafPane); };
+    QTRY_VERIFY(panes().size() == 1);
+    QTest::qWait(kSettleMs);
+    QObject *const pane = panes().constFirst();
+
+    // A refusal arrives as the pane's own message request, so watch for it: an
+    // "accepted" return with a toast behind it would be a false pass.
+    QSignalSpy refused(pane, SIGNAL(messageRequested(QString)));
+    QVERIFY(refused.isValid());
+
+    QVariant accepted;
+    QVERIFY(QMetaObject::invokeMethod(
+        m_region, "openPaneTarget", Q_RETURN_ARG(QVariant, accepted),
+        Q_ARG(QVariant, QStringLiteral("viewer-1")),
+        Q_ARG(QVariant, QStringLiteral("file:///srv/repos/app/README.md")),
+        Q_ARG(QVariant, QString())));
+    QVERIFY2(accepted.toBool(), "the pane refused an address that named no handler");
+    QTRY_COMPARE(pane->property("url").toUrl(),
+                 QUrl(QStringLiteral("file:///srv/repos/app/README.md")));
+    // The REGISTRY chose, which is the whole point: a .md file lands on the
+    // rendered Markdown handler without anyone naming it.
+    QCOMPARE(pane->property("kind").toString(), QStringLiteral("markdown"));
+    QCOMPARE(refused.size(), 0);
+
+    // An explicit kind still overrides it, so the "Open as" path is untouched.
+    QVERIFY(QMetaObject::invokeMethod(
+        m_region, "openPaneTarget", Q_RETURN_ARG(QVariant, accepted),
+        Q_ARG(QVariant, QStringLiteral("viewer-1")),
+        Q_ARG(QVariant, QStringLiteral("file:///srv/repos/app/README.md")),
+        Q_ARG(QVariant, QStringLiteral("editor"))));
+    QVERIFY(accepted.toBool());
+    QTRY_COMPARE(pane->property("kind").toString(), QStringLiteral("text"));
+
+    // And an UNKNOWN kind is still refused: that spelling can only come from a
+    // caller naming a handler that does not exist.
+    QVERIFY(QMetaObject::invokeMethod(
+        m_region, "openPaneTarget", Q_RETURN_ARG(QVariant, accepted),
+        Q_ARG(QVariant, QStringLiteral("viewer-1")),
+        Q_ARG(QVariant, QStringLiteral("file:///srv/repos/app/README.md")),
+        Q_ARG(QVariant, QStringLiteral("hologram"))));
+    QVERIFY2(!accepted.toBool(), "an unknown handler name was accepted");
+    QTRY_COMPARE(refused.size(), 1);
 }
 
 void TstPaneIdentity::navigationTruncatesForwardHistoryAfterFreshAddress()

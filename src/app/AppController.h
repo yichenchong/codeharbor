@@ -10,6 +10,7 @@
 #include "AppSettings.h"
 #include "ServerProfiles.h"
 #include "SessionLayouts.h"
+#include "ViewerCommandService.h"
 #include "SessionBootstrap.h"
 #include "SshConnectionPool.h"
 #include "LogBuffer.h"
@@ -59,6 +60,10 @@ class AppController : public QObject {
     Q_PROPERTY(QString sshDiagnostics READ sshDiagnostics NOTIFY connectionDiagnosticsChanged)
     Q_PROPERTY(QString activeSessionId READ activeSessionId NOTIFY activeSessionChanged)
     Q_PROPERTY(QString activeSessionRepoRoot READ activeSessionRepoRoot NOTIFY activeSessionChanged)
+    // Null until setViewerCommands() injects it (main.cpp), so a test building a
+    // bare AppController keeps working and QML binds through a null guard.
+    Q_PROPERTY(ch::ViewerCommandService* viewerCommands READ viewerCommands
+                   NOTIFY viewerCommandsChanged)
 
 public:
     explicit AppController(CodeharbordClient* client, QObject* parent = nullptr);
@@ -92,6 +97,17 @@ public:
     // server's recovery directory (server.info.recoveryDir) so crash-recovery
     // snapshots land under a server-chosen path (SPEC 11.3).
     void setEditorFactory(EditorFactory* factory);
+
+    // Wire the viewer control channel (SPEC 4.3): the seam an AI agent running
+    // in a terminal pane drives this window's viewer panes through. Ownership
+    // stays with main.cpp; nullptr is safe and leaves `app.viewerCommands` null,
+    // which is exactly what the QML Connections block guards on.
+    //
+    // AppController does not act on the commands itself — it has no viewer tree.
+    // It only PUBLISHES the service so Main.qml, which owns the region and the
+    // layout facade, can answer them.
+    void setViewerCommands(ViewerCommandService* commands);
+    ViewerCommandService* viewerCommands() const { return m_viewerCommands; }
 
     // Inject the connection spine. Ownership stays with main.cpp; any of these
     // may be null (tests). Mirrors setAgentMonitor's injection style rather than
@@ -149,10 +165,15 @@ public:
     // `workspace.resolveTerminalPane`, without which no terminal pane can learn
     // which remote tmux session is its own (SPEC 5.2); 6 is where that call
     // began addressing a pane by its `terminal_panes` row id, which is what the
-    // layout leaf now carries and what every terminal here asks with. Against
-    // anything older the user gets a healthy SSH session with a permanently
-    // empty sidebar, or terminals that never attach. See adoptServerIdentity().
-    static constexpr int kMinimumServerSchemaVersion = 6;
+    // layout leaf now carries and what every terminal here asks with; 7 is where
+    // the transport gained the viewer control channel (viewer.command /
+    // viewer.commandResult), which is the only path an agent in a terminal pane
+    // has to this client's viewer panes — a v6 server binds no control socket, so
+    // every pane command an agent issued would be accepted by its own tooling
+    // and then vanish. Against anything older the user gets a healthy SSH
+    // session with a permanently empty sidebar, or terminals that never attach.
+    // See adoptServerIdentity().
+    static constexpr int kMinimumServerSchemaVersion = 7;
 
     // Make a Dev Session current: loads both region layouts and remembers it so
     // the next launch reopens the same session.
@@ -219,6 +240,10 @@ signals:
     void error(QString message);
     void refreshed();
     void connectionChanged();
+    // The viewer control service was injected (or withdrawn). Its own lifetime is
+    // main.cpp's, so this fires at most once in production; QML re-evaluates the
+    // `enabled:` guard on its Connections block from it.
+    void viewerCommandsChanged();
     void connectionStateChanged();
     void connectionDiagnosticsChanged();
     void activeSessionChanged();
@@ -359,6 +384,10 @@ private:
     // QPointer turns null if the caller destroys its monitor before this
     // controller, so a late rebuild cannot dereference a dead observer.
     QPointer<AgentStatusMonitor> m_agentMonitor;
+    // The agent-facing viewer control seam, published to QML as
+    // `app.viewerCommands`. QPointer for the same reason the monitor is one:
+    // main.cpp owns it and may outlive or predecease this controller.
+    QPointer<ViewerCommandService> m_viewerCommands;
     // Per-pane terminal lifecycle reported by TerminalFactory. The outer key is
     // the server's Dev Session id and the inner key is the server's
     // terminal_panes row id; both are cleared on a server switch so an old

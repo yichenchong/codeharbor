@@ -239,6 +239,18 @@ void AppController::setAgentMonitor(AgentStatusMonitor* monitor)
     // state it already accumulated, and a clear drops back to bare rows.
     rebuildRows();
 }
+
+// Publish the viewer control seam. Deliberately does nothing but hold and
+// announce it: this controller owns no viewer tree, and every pane mutation must
+// go through Main.qml's existing region/layout path so an agent's command lands
+// exactly where a user's click does.
+void AppController::setViewerCommands(ViewerCommandService* commands)
+{
+    if (m_viewerCommands == commands)
+        return;
+    m_viewerCommands = commands;
+    emit viewerCommandsChanged();
+}
 void AppController::setTerminalFactory(TerminalFactory* factory)
 {
     if (m_terminalFactory == factory)

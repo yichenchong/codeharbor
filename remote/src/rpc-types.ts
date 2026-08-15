@@ -227,6 +227,61 @@ export interface WatchEventsLost {
     subscriptionIds: string[];
 }
 
+// Server -> client notification carrying ONE viewer-pane command an agent asked
+// for through the control socket (remote/src/control.ts). A NOTIFICATION name
+// (no id, no response), so like the two watch names above it is deliberately
+// absent from RPC_METHODS.
+//
+// Why a notification and not a server-initiated REQUEST: the C++ client has no
+// server-request dispatcher — CodeharbordClient treats a message carrying both
+// `method` and `id` as malformed on purpose — and giving it one for this would
+// be a second inbound shape for a single feature. The answer travels back as an
+// ordinary client request instead (RPC_VIEWER_COMMAND_RESULT_METHOD), which the
+// transport already carries in that direction.
+export const RPC_VIEWER_COMMAND_NOTIFICATION = "viewer.command";
+
+// Params of RPC_VIEWER_COMMAND_NOTIFICATION.
+//
+// `commandId` correlates the answer; it is minted by the daemon and opaque to
+// the client. `devSessionId` is the Dev Session the ASKING terminal belongs to,
+// and the client refuses a command for any session other than the one on screen
+// — the QML viewer tree only ever holds the active session, so applying it
+// anywhere else would edit a layout nobody is looking at. `terminalId` is
+// provenance: which pane's agent asked. `op` is one of control.ts's CONTROL_OPS
+// and `args` is that op's free-form argument object, both validated by the
+// daemon before relay and re-validated by the client.
+export interface ViewerCommandParams {
+    commandId: string;
+    devSessionId: string;
+    terminalId: string;
+    op: string;
+    args: Record<string, unknown>;
+}
+
+// Client -> server request delivering the outcome of one relayed viewer
+// command. Registered in codeharbord's static method table next to `ping` and
+// `server.info` rather than in a spread-in group: it belongs to the transport's
+// own control channel, not to the file/workspace/tmux domains.
+//
+// Answering an id the daemon no longer holds is NOT an error — it may already
+// have timed the command out — so the handler succeeds either way and the
+// client needs no special case for a late answer.
+export const RPC_VIEWER_COMMAND_RESULT_METHOD = "viewer.commandResult";
+
+// Params of RPC_VIEWER_COMMAND_RESULT_METHOD. `error` is present only when
+// `ok` is false and its `code` is one of control.ts's CONTROL_ERROR_CODES;
+// `data` is the op's result payload (a pane id, an inventory) when it has one.
+export interface ViewerCommandResultParams {
+    commandId: string;
+    ok: boolean;
+    error?: { code: string; message: string };
+    data?: Record<string, unknown>;
+}
+
+export interface ViewerCommandResultResult {
+    ok: true;
+}
+
 // Implementation-defined server error code (JSON-RPC 2.0 reserves -32000..-32099
 // for such errors) for a writeFile whose expectedRevision no longer matches the
 // file's current revision. The server rejects the write rather than silently

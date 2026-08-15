@@ -7,6 +7,19 @@ target_link_libraries(tst_appcontroller PRIVATE
 )
 add_test(NAME tst_appcontroller COMMAND tst_appcontroller)
 
+# The client end of the viewer control channel (SPEC 4.3): a `viewer.command`
+# notification off the wire becomes a validated signal, and an answer becomes a
+# `viewer.commandResult` request. Driven through the real CodeharbordClient over
+# an in-process QIODevice, so it needs no display, no server and no fixture.
+qt_add_executable(tst_viewercommands tst_viewercommands.cpp)
+target_link_libraries(tst_viewercommands PRIVATE
+    ch_app
+    Qt6::Test
+    Qt6::Core
+    Qt6::Gui
+)
+add_test(NAME tst_viewercommands COMMAND tst_viewercommands)
+
 # Client-local user preferences (the Settings window's model). Pure QSettings
 # over a scratch .ini per case, so it needs no display, no server and no
 # fixture.

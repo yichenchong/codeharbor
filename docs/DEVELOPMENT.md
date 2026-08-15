@@ -364,7 +364,8 @@ belong in `remote/sql/indexes.sql`, which is applied on every open rather than o
 on migration.
 
 The RPC schema is separate and IS the compatibility gate: `RPC_SCHEMA_VERSION` in
-`remote/src/codeharbord.ts` (currently 6) against
+`remote/src/codeharbord.ts` (currently 7 — 6 → 7 added the agent viewer control
+channel, SPEC 6.8) against
 `AppController::kMinimumServerSchemaVersion`. A client refuses a server whose RPC
 schema is older than it needs, which is the "Server too old" path.
 
@@ -386,6 +387,7 @@ default (portable) suite:
 | `tst_logview` | The log surface, including a message emitted while it was closed still being there when it opens |
 | `tst_openas` | The explorer's "Open as" menu: only applicable handlers offered, and "open in new pane" leaving the first pane alone |
 | `tst_ui_polish` | The shared scrollbar's fit/overflow states and the viewer pane's cursor neutrality |
+| `tst_viewercommands` | The client end of the agent viewer control channel (SPEC 6.8): a `viewer.command` notification off the wire becoming a validated signal, an answer becoming one `viewer.commandResult` request, a double answer dropped, and the in-flight bound refusing past it |
 
 Existing targets that gained coverage in the same period:
 
@@ -394,6 +396,9 @@ Existing targets that gained coverage in the same period:
   actions naming their own pane, the kill confirmation, and restoring the pane the
   user was last working in (including the stale-stamp drop and the missing-pane
   fallback).
+  It also covers the host's `openPaneTarget()` letting the handler registry choose
+  when the caller names no handler — the "Open as" override refuses an empty one,
+  which used to answer a plain "open this file" with a refusal.
 - `tst_sessionlayouts` — pane titles and fast Dev Session switching.
 - `tst_appcontroller` — archiving, deleting a session and a group, and that the
   sidebar's filters never narrow the tree the controller treats as authoritative.

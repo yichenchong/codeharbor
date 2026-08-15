@@ -18,6 +18,8 @@
 #include "EditorFactory.h"
 #include "ViewerModel.h"
 #include "ViewerProfiles.h"
+#include "ViewerCommandService.h"
+#include "RpcTypes.h"
 
 #include <QtTest>
 
@@ -33,6 +35,8 @@
 #include <QQmlApplicationEngine>
 #include <QQmlComponent>
 #include <QQmlContext>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QQmlError>
 #include <QQuickItem>
 #include <QSet>
@@ -394,20 +398,32 @@ private:
     ch::ViewerProfiles m_profiles;
     ch::ViewerModel m_viewers;
     ch::EditorFactory m_editorFactory;
+    // The agent-facing viewer control seam. Injected exactly as main.cpp injects
+    // it, so `app.viewerCommands` is non-null and Main.qml's Connections block is
+    // live — without it the block is disabled and every agent command in this
+    // file would be a silent no-op that still passed.
+    ch::ViewerCommandService m_viewerCommands;
 
 public:
     QStringList engineWarnings;
     QQmlApplicationEngine engine;
+
+    // The agent-facing control seam, so a case can announce a command exactly as
+    // codeharbord's notification does.
+    ch::ViewerCommandService &viewerCommands() { return m_viewerCommands; }
+    ch::CodeharbordClient &client() { return m_client; }
 
     ShellFixture()
         : m_controller(&m_client)
         , m_profiles(&m_client)
         , m_viewers(&m_client)
         , m_editorFactory(&m_client)
+        , m_viewerCommands(&m_client)
     {
         m_controller.setAgentMonitor(&m_monitor);
         m_viewers.setProfiles(&m_profiles);
 
+        m_controller.setViewerCommands(&m_viewerCommands);
         engine.rootContext()->setContextProperty(QStringLiteral("app"), &m_controller);
         engine.rootContext()->setContextProperty(QStringLiteral("viewers"), &m_viewers);
         engine.rootContext()->setContextProperty(QStringLiteral("agentMonitor"), &m_monitor);
@@ -537,6 +553,22 @@ private slots:
     //    them belongs to the host, which has to be listening. Nothing else in
     //    the suite notices when it is not.
     void regionRequestsReachTheHost();
+
+    // AGENT VIEWER CONTROL (SPEC 4.3). An AI agent in a terminal pane reaches the
+    // viewer region through ch::ViewerCommandService -> Main.qml. Three things are
+    // worth defending here, all of them properties of the real Main.qml:
+    //
+    //   * every command is ANSWERED — an arm that returns without responding
+    //     blocks the agent's turn until the daemon times it out;
+    //   * a command for another Dev Session is refused rather than applied to the
+    //     one on screen;
+    //   * a remote path becomes an absolute file:// URL. openPaneTarget() hands
+    //     its argument to WebEngine verbatim, so a bare "README.md" left alone is
+    //     a relative QML URL and the pane shows nothing.
+    void everyAgentCommandIsAnswered();
+    void anAgentCommandForAnotherSessionIsRefused();
+    void agentPathsBecomeAbsoluteRemoteFileUrls();
+    void theAgentPaneInventoryReadsTheLayoutTree();
 };
 
 void TstQmlLoad::init()
@@ -938,6 +970,305 @@ void TstQmlLoad::regionRequestsReachTheHost()
             Q_ARG(QVariant, QVariant(QVariantList{0.25, 0.75}))));
     }
     settle(80);
+
+    QVERIFY2(fixture.allWarnings().isEmpty(), qPrintable(fixture.warningReport()));
+}
+
+// ---------------------------------------------------------------------------
+// Agent viewer control (SPEC 4.3)
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// In-process stand-in for the RPC transport, so an agent command can be driven
+// the way production drives it — a `viewer.command` notification off the wire —
+// and the ANSWER read back off that same wire. Unbuffered keeps dispatch
+// synchronous, so no case needs to guess at a delay.
+class AgentTransport : public QIODevice
+{
+public:
+    explicit AgentTransport(QObject *parent = nullptr) : QIODevice(parent)
+    {
+        open(QIODevice::ReadWrite | QIODevice::Unbuffered);
+    }
+
+    bool isSequential() const override { return true; }
+
+    qint64 bytesAvailable() const override
+    {
+        return m_incoming.size() + QIODevice::bytesAvailable();
+    }
+
+    void deliver(const QByteArray &frame)
+    {
+        m_incoming.append(frame);
+        emit readyRead();
+    }
+
+    QByteArray takeSent()
+    {
+        const QByteArray sent = m_sent;
+        m_sent.clear();
+        return sent;
+    }
+
+protected:
+    qint64 readData(char *data, qint64 maxSize) override
+    {
+        const qint64 n = qMin<qint64>(maxSize, m_incoming.size());
+        if (n > 0) {
+            memcpy(data, m_incoming.constData(), static_cast<size_t>(n));
+            m_incoming.remove(0, n);
+        }
+        return n;
+    }
+
+    qint64 writeData(const char *data, qint64 len) override
+    {
+        m_sent.append(data, len);
+        return len;
+    }
+
+private:
+    QByteArray m_incoming;
+    QByteArray m_sent;
+};
+
+// What Main.qml answered one command with.
+struct AgentAnswer {
+    bool answered = false;
+    bool ok = false;
+    QString code;
+    QVariantMap data;
+};
+
+// Announce one command exactly as codeharbord does and read back the answer.
+//
+// Driven through the REAL notification path, not by emitting the service's signal
+// by hand: only the notification registers the command as in flight, and without
+// that registration a duplicate or missing answer would be indistinguishable from
+// a correct one.
+AgentAnswer askViewer(AgentTransport &transport, const QString &devSessionId,
+                      const QString &op, const QVariantMap &args)
+{
+    static int counter = 0;
+    const QString commandId = QStringLiteral("qml-vc-%1").arg(++counter);
+    transport.takeSent();
+
+    QJsonObject params;
+    params.insert(QStringLiteral("commandId"), commandId);
+    params.insert(QStringLiteral("devSessionId"), devSessionId);
+    params.insert(QStringLiteral("terminalId"), QStringLiteral("term-1"));
+    params.insert(QStringLiteral("op"), op);
+    params.insert(QStringLiteral("args"), QJsonObject::fromVariantMap(args));
+    QJsonObject frame;
+    frame.insert(QStringLiteral("jsonrpc"), QStringLiteral("2.0"));
+    frame.insert(QStringLiteral("method"),
+                 QString::fromLatin1(ch::rpc::kNotificationViewerCommand));
+    frame.insert(QStringLiteral("params"), params);
+    transport.deliver(QJsonDocument(frame).toJson(QJsonDocument::Compact) + '\n');
+    settle(80);
+
+    AgentAnswer answer;
+    for (const QByteArray &line : transport.takeSent().split('\n')) {
+        if (line.trimmed().isEmpty())
+            continue;
+        const QJsonObject request = QJsonDocument::fromJson(line).object();
+        if (request.value(QStringLiteral("method")).toString()
+            != QString::fromLatin1(ch::rpc::kMethodViewerCommandResult)) {
+            continue;
+        }
+        const QJsonObject result = request.value(QStringLiteral("params")).toObject();
+        if (result.value(QStringLiteral("commandId")).toString() != commandId)
+            continue;
+        // A SECOND answer for the same command would mean a QML arm fell through;
+        // the service drops it, but this catches it here where the arm lives.
+        Q_ASSERT(!answer.answered);
+        answer.answered = true;
+        answer.ok = result.value(QStringLiteral("ok")).toBool();
+        answer.code = result.value(QStringLiteral("error")).toObject()
+                          .value(QStringLiteral("code")).toString();
+        answer.data = result.value(QStringLiteral("data")).toObject().toVariantMap();
+    }
+    return answer;
+}
+
+} // namespace
+
+void TstQmlLoad::everyAgentCommandIsAnswered()
+{
+    ShellFixture fixture;
+    AgentTransport transport;
+    fixture.client().setTransport(&transport);
+    fixture.engine.load(moduleUrl(QStringLiteral("Main.qml")));
+    QVERIFY(!fixture.engine.rootObjects().isEmpty());
+    settle();
+
+    ch::ViewerCommandService &service = fixture.viewerCommands();
+    // Every op, and both the well-formed and the malformed argument shapes. The
+    // contract under test is not that any of them SUCCEEDS — this fixture has no
+    // server, so none can — but that each produces exactly one answer. An arm
+    // that returns without answering blocks the agent's turn until the daemon
+    // times it out, and nothing else in the suite would notice.
+    const QVector<QPair<QString, QVariantMap>> cases = {
+        {QStringLiteral("list"), {}},
+        {QStringLiteral("open"), {{QStringLiteral("url"), QStringLiteral("README.md")}}},
+        {QStringLiteral("open"), {{QStringLiteral("url"), QStringLiteral("/srv/a.md")}}},
+        {QStringLiteral("open"), {}}, // no url at all
+        {QStringLiteral("open"), {{QStringLiteral("url"), QStringLiteral("/srv/a.md")},
+                                  {QStringLiteral("newPane"), true}}},
+        {QStringLiteral("split"), {{QStringLiteral("orientation"), QStringLiteral("vertical")}}},
+        {QStringLiteral("split"), {{QStringLiteral("orientation"), QStringLiteral("sideways")}}},
+        {QStringLiteral("split"), {}},
+        {QStringLiteral("close"), {}},
+        {QStringLiteral("focus"), {{QStringLiteral("pane"), QStringLiteral("viewer-1")}}},
+        {QStringLiteral("reload"), {}},
+        {QStringLiteral("reload"), {{QStringLiteral("pane"), QStringLiteral("viewer-404")}}},
+    };
+    for (const auto &testCase : cases) {
+        // activeSessionId is empty in this fixture, so a command naming the empty
+        // session passes the session gate and reaches the real handler.
+        const AgentAnswer answer = askViewer(transport, QString(), testCase.first,
+                                             testCase.second);
+        QVERIFY2(answer.answered,
+                 qPrintable(QStringLiteral("the '%1' command was never answered; an agent "
+                                           "would stall until the server timed it out")
+                                .arg(testCase.first)));
+        QVERIFY2(!answer.code.isEmpty() || answer.ok,
+                 qPrintable(QStringLiteral("the '%1' refusal carried no code")
+                                .arg(testCase.first)));
+    }
+    // Nothing left announced-but-unanswered.
+    QCOMPARE(service.inFlightCount(), 0);
+
+    // The two argument faults are refused by NAME, not merely refused: an agent
+    // branches on these codes.
+    QCOMPARE(askViewer(transport, QString(), QStringLiteral("open"), {}).code,
+             QStringLiteral("bad_request"));
+    QCOMPARE(askViewer(transport, QString(), QStringLiteral("split"),
+                       {{QStringLiteral("orientation"), QStringLiteral("sideways")}})
+                 .code,
+             QStringLiteral("bad_request"));
+
+    QVERIFY2(fixture.allWarnings().isEmpty(), qPrintable(fixture.warningReport()));
+}
+
+void TstQmlLoad::anAgentCommandForAnotherSessionIsRefused()
+{
+    // The QML tree only ever holds the ACTIVE Dev Session, and SessionLayouts
+    // drops writes stamped for any other, so a command from a pane of a different
+    // session must be refused BY NAME rather than applied to whatever is on
+    // screen. The gate runs first, before the no-server check, which is what makes
+    // the answer this specific code rather than "failed".
+    ShellFixture fixture;
+    AgentTransport transport;
+    fixture.client().setTransport(&transport);
+    fixture.engine.load(moduleUrl(QStringLiteral("Main.qml")));
+    QVERIFY(!fixture.engine.rootObjects().isEmpty());
+    settle();
+
+    const AgentAnswer answer = askViewer(transport, QStringLiteral("some-other-session"),
+                                         QStringLiteral("split"),
+                                         {{QStringLiteral("orientation"),
+                                           QStringLiteral("horizontal")}});
+    QVERIFY2(answer.answered, "a foreign-session command was swallowed instead of refused");
+    QVERIFY(!answer.ok);
+    QCOMPARE(answer.code, QStringLiteral("not_active_session"));
+    QVERIFY2(fixture.allWarnings().isEmpty(), qPrintable(fixture.warningReport()));
+}
+
+void TstQmlLoad::agentPathsBecomeAbsoluteRemoteFileUrls()
+{
+    // The highest-risk piece of the executor. An agent names files the way a
+    // shell does; openPaneTarget() hands its argument to WebEngine verbatim. A
+    // relative string left alone resolves against the QML module, i.e. a pane
+    // showing nothing, with no error anywhere.
+    ShellFixture fixture;
+    fixture.engine.load(moduleUrl(QStringLiteral("Main.qml")));
+    QVERIFY(!fixture.engine.rootObjects().isEmpty());
+    QObject *root = fixture.engine.rootObjects().constFirst();
+    settle();
+
+    const auto address = [root](const QString &raw) {
+        QVariant out;
+        const bool called = QMetaObject::invokeMethod(
+            root, "viewerAddressFor", Q_RETURN_ARG(QVariant, out), Q_ARG(QVariant, raw));
+        return called ? out.toString() : QStringLiteral("<not callable>");
+    };
+
+    // No Dev Session, so a RELATIVE path has no root to resolve against and is
+    // refused rather than guessed at.
+    QCOMPARE(address(QStringLiteral("README.md")), QString());
+
+    // Absolute remote paths, web addresses and file URLs need no session.
+    QCOMPARE(address(QStringLiteral("/srv/project/README.md")),
+             QStringLiteral("file:///srv/project/README.md"));
+    // A directory keeps its trailing slash: that is what the handler registry
+    // reads to pick the listing view instead of a file view.
+    QCOMPARE(address(QStringLiteral("/srv/project/src/")),
+             QStringLiteral("file:///srv/project/src/"));
+    // Every segment is percent-encoded individually, so a space or a '#' in a
+    // file name cannot be read as a URL delimiter and silently address a
+    // different file.
+    QCOMPARE(address(QStringLiteral("/srv/a b/c#d.md")),
+             QStringLiteral("file:///srv/a%20b/c%23d.md"));
+    QCOMPARE(address(QStringLiteral("https://example.com/x?y=1#z")),
+             QStringLiteral("https://example.com/x?y=1#z"));
+    QCOMPARE(address(QStringLiteral("file:///srv/already.md")),
+             QStringLiteral("file:///srv/already.md"));
+    QCOMPARE(address(QStringLiteral("  /srv/padded.md  ")),
+             QStringLiteral("file:///srv/padded.md"));
+
+    // Refused: nothing to open, and the internal scheme, which SPEC 7.4 makes an
+    // implementation detail of the privileged handlers rather than an address
+    // anyone may hand in.
+    QCOMPARE(address(QString()), QString());
+    QCOMPARE(address(QStringLiteral("   ")), QString());
+    QCOMPARE(address(QStringLiteral("codeharbor-internal://file/abc")), QString());
+    QCOMPARE(address(QStringLiteral("javascript:alert(1)")), QString());
+    QCOMPARE(address(QStringLiteral("data:text/html,<b>x</b>")), QString());
+
+    QVERIFY2(fixture.allWarnings().isEmpty(), qPrintable(fixture.warningReport()));
+}
+
+void TstQmlLoad::theAgentPaneInventoryReadsTheLayoutTree()
+{
+    // `list` is how an agent learns which panes exist before naming one, so the
+    // walk must find every leaf, skip the empty placeholder a fully closed region
+    // leaves behind, and carry each leaf's url and title.
+    ShellFixture fixture;
+    fixture.engine.load(moduleUrl(QStringLiteral("Main.qml")));
+    QVERIFY(!fixture.engine.rootObjects().isEmpty());
+    QObject *root = fixture.engine.rootObjects().constFirst();
+    settle();
+
+    const QVariantMap leafA{{QStringLiteral("paneId"), QStringLiteral("viewer-1")},
+                            {QStringLiteral("url"), QStringLiteral("file:///srv/a.md")},
+                            {QStringLiteral("customTitle"), QStringLiteral("Notes")}};
+    const QVariantMap leafB{{QStringLiteral("paneId"), QStringLiteral("viewer-2")}};
+    const QVariantMap placeholder{{QStringLiteral("paneId"), QString()}};
+    const QVariantMap tree{
+        {QStringLiteral("orientation"), QStringLiteral("horizontal")},
+        {QStringLiteral("children"), QVariantList{leafA, leafB, placeholder}},
+    };
+
+    QVariant out;
+    QVERIFY(QMetaObject::invokeMethod(root, "viewerInventory", Q_RETURN_ARG(QVariant, out),
+                                      Q_ARG(QVariant, QVariant(tree)),
+                                      Q_ARG(QVariant, QVariant(QVariantList{}))));
+    const QVariantList panes = out.toList();
+    QCOMPARE(panes.size(), 2);
+    QCOMPARE(panes.at(0).toMap().value(QStringLiteral("paneId")).toString(),
+             QStringLiteral("viewer-1"));
+    QCOMPARE(panes.at(0).toMap().value(QStringLiteral("url")).toString(),
+             QStringLiteral("file:///srv/a.md"));
+    QCOMPARE(panes.at(0).toMap().value(QStringLiteral("title")).toString(),
+             QStringLiteral("Notes"));
+    QCOMPARE(panes.at(1).toMap().value(QStringLiteral("paneId")).toString(),
+             QStringLiteral("viewer-2"));
+    // A leaf with no url/title reports empty strings rather than `undefined`,
+    // which would reach the agent as a missing JSON field.
+    QCOMPARE(panes.at(1).toMap().value(QStringLiteral("url")).toString(), QString());
 
     QVERIFY2(fixture.allWarnings().isEmpty(), qPrintable(fixture.warningReport()));
 }

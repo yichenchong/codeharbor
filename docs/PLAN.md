@@ -37,7 +37,11 @@ contract so downstream work can build against it before it is fully implemented.
   - `bridge.ts` — Unix-socket → JSONL relay (dir-create, stale-socket guard,
     bounded input and output back-pressure).
   - `codeharbord.ts` — JSON-RPC 2.0 `--stdio` dispatch (`ping`, `server.info`,
-    file/workspace/tmux methods).
+    file/workspace/tmux methods, and `viewer.commandResult` for the agent viewer
+    control channel).
+  - `control.ts` / `control-client.ts`, `mcp/server.ts`, `tools/viewctl.ts` — the
+    agent viewer-control socket, its producer half, the `codeharbor-mcp` server and
+    the `codeharbor-view` CLI (workstream AV).
   - The bootstrap smoke suite passed; its early test count is intentionally not
     recorded because the workspace suite has grown. RPC stdio + bridge socket
     smoke-tested.
@@ -253,6 +257,51 @@ graph TD
   (an SSH exec channel sends no SIGHUP). OS desktop notifications remain
   display-deferred: `notify()` fires and is asserted, but nothing renders headless.
 - **Parallel with:** V, E (after U).
+
+### AV — Agent viewer control — ✅ LANDED
+- **Start gate:** [x] A (agent coordinates in every pane's tmux environment) · [x] V/U (ViewerRegion + SessionLayouts) · [x] C1/R (RPC notifications and requests).
+- **What it is:** the first NON-observational agent integration (SPEC 6.8). An agent in a
+  terminal pane opens/splits/focuses/closes/reloads viewer panes and lists them.
+- **TODO:**
+  - [x] `remote/src/control.ts` — the producer socket
+    (`$XDG_RUNTIME_DIR/codeharbor-control.sock`, fallback
+    `~/.cache/codeharbor/control.sock`, 0600 under a 0700 directory), its PID-lock
+    (the bridge's algorithm, so a crashed owner's path is reclaimed and a live
+    one's is not), request validation, the 32-command in-flight bound and the 5 s
+    answer timeout. Started from `runStdio()`; a lost socket race is a stderr line
+    and degrades that window to no pane control, never a failed connection.
+  - [x] `viewer.command` (server → client notification) + `viewer.commandResult`
+    (client → server request) on the EXISTING RPC channel. No new SSH channel and
+    no change to the bridge: its stdin is a lifetime watchdog, so it cannot carry
+    an answer. `RPC_SCHEMA_VERSION` 6 → 7 with the client floor in lockstep.
+  - [x] `ch::ViewerCommandService` — validates the notification, emits one signal,
+    answers exactly once, drops a double answer, refuses past 32 in flight.
+    Published as `app.viewerCommands`; it owns no layout state.
+  - [x] `Main.qml runViewerCommand()` — the ONLY place a command becomes a pane
+    mutation, through the same helpers a click uses. Refuses a command for any
+    Dev Session but the active one, normalizes a remote path to an absolute
+    `file://` URL through `RemotePath.js`, and answers every arm.
+  - [x] `ViewerRegion.reloadPane()` and `ViewerPane.openTarget()` — reload had no
+    host-reachable entry point at all, and `openPaneTarget()` went to the "Open as"
+    OVERRIDE, which refuses an empty handler: a plain "open this file" was answered
+    "That viewer cannot display this target." Covered by `tst_paneidentity`.
+  - [x] `codeharbor-mcp` (hand-rolled stdio MCP, zero dependencies — the remote
+        runs from a checkout over SSH) exposing the six `viewer_*` tools, plus the
+        `codeharbor-view` CLI for shells and diagnostics.
+  - [x] Installable skills for Claude Code (`.claude/skills` + `.mcp.json`), Codex
+        (`.agents/skills`, one `codex mcp add`) and Oh My Pi (`.omp/skills` +
+        `.omp/mcp.json`). MCP is primary: a harness may sandbox a spawned shell
+        away from a Unix socket while launching its stdio MCP servers outside it.
+- **Stop gate:** ✅ MET — driven end to end against the live SSH fixture from a
+  shell with a pane's coordinates: `list`/`open`/`split`/`focus`/`reload`/`close`
+  all applied to the real window and persisted into `session_layouts`, and every
+  refusal (`not_active_session`, `unknown_pane`, `bad_request`) came back named.
+  Unit gates: `remote/test/control.test.ts`, `remote/test/mcp.test.ts`,
+  `tst_viewercommands`, plus `tst_qmlload` (every op answered, the session gate,
+  path normalization, the inventory walk) and `tst_paneidentity`.
+- **Deliberately NOT done:** no `codex` harness in the STATUS vocabulary
+  (`HARNESSES` is untouched) — control messages carry pane coordinates, not a
+  harness, so status reporting for Codex remains a separate piece of work.
 
 ### U — UI shell & persistence — ✅ LANDED (Wave 3); live gate MET (Wave 5)
 - **Start gate:** [x] M models · [x] P (for layout persistence).

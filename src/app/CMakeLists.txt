@@ -9,6 +9,8 @@ qt_add_library(ch_app STATIC
     ServerProfiles.cpp
     SessionLayouts.h
     SessionLayouts.cpp
+    ViewerCommandService.h
+    ViewerCommandService.cpp
     UiStateStore.h
     UiStateStore.cpp
     AppSettings.h
