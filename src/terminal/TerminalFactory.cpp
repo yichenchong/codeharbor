@@ -952,7 +952,34 @@ void TerminalFactory::probeForRecreatedSession(TerminalController* controller,
                     // here and stay silent. An UNCHANGED creation time is the
                     // ordinary reconnect: the very same session, whatever either
                     // clock reads.
-                    if (confirmed >= 0 && created > confirmed)
+                    const bool replaced = confirmed >= 0 && created > confirmed;
+                    // Recorded either way, and this is the whole reason it is
+                    // here: when a user reports that a pane came back empty
+                    // after a dropped network, the question is which of these
+                    // two lines the log holds. Without it the incident leaves no
+                    // trace at all — the notice is latched on a QML property, so
+                    // a dismissed banner is indistinguishable from one that never
+                    // appeared, and nothing else says whether the attach found
+                    // the session or made a new one. One line per attach, at info
+                    // level, so ch::LogBuffer keeps it in the in-app log.
+                    if (replaced) {
+                        qInfo("terminal %s: the remote session was REPLACED "
+                              "(tmux created %lld, previously %lld)",
+                              qUtf8Printable(target),
+                              static_cast<long long>(created),
+                              static_cast<long long>(confirmed));
+                    } else if (confirmed >= 0) {
+                        qInfo("terminal %s: re-attached to the SAME remote session "
+                              "(tmux created %lld)",
+                              qUtf8Printable(target),
+                              static_cast<long long>(created));
+                    } else {
+                        qInfo("terminal %s: first sighting of this remote session "
+                              "(tmux created %lld); nothing to compare it with yet",
+                              qUtf8Printable(target),
+                              static_cast<long long>(created));
+                    }
+                    if (replaced)
                         emit self->sessionRecreated(pane.data(), target);
                 });
 }
