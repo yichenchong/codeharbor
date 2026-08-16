@@ -524,6 +524,16 @@ void TstLiveTerminalFactory::anUncleanNetworkDropKeepsTheSessionItsWorkAndSaysNo
                             .arg(m_marker, m_rendered.right(400))));
 
     // 4. Nothing was claimed about lost work, because nothing was lost.
+    //
+    // WEAK ON PURPOSE, and worth saying so rather than letting the name of this
+    // case imply more than it holds: this fixture wires no CodeharbordClient, so
+    // probeForRecreatedSession() returns at its first guard and the signal could
+    // not have fired whatever the session did. The verdict itself is held by
+    // tst_terminalfactory, which drives the real `tmux.listSessions` round trip
+    // through an RPC pair (aFirstAttachStaysSilentEvenWhenItCreatedTheSession,
+    // aReattachThatCreatedTheSessionSaysTheOldOneIsGone). What THIS case
+    // uniquely proves is the part no unit test can: that a real severed
+    // connection leaves the real session and the real process inside it running.
     QCOMPARE(recreated.count(), 0);
     QVERIFY2(m_factoryErrors.isEmpty() || !m_factoryErrors.contains(QStringLiteral("gone")),
              qPrintable(m_factoryErrors));
