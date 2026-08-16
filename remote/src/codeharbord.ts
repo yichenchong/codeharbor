@@ -112,7 +112,7 @@ export const RPC_SERVER_NAME = "codeharbord";
 // (.omp/skills/bump-version/bump.sh) rewrites; this constant is NOT one of that
 // script's version files, which is how it sat at 0.1.0 while the tag said
 // 0.1.8 and every server reported a version three releases stale.
-export const RPC_SERVER_VERSION = "0.3.2";
+export const RPC_SERVER_VERSION = "0.3.3";
 // Bumped 1 -> 2 when file.listDirectory joined the C1 catalog (SPEC 7.5).
 // Bumped 2 -> 3 when the tmux.* discovery group joined the catalog (SPEC 10.2).
 // Bumped 3 -> 4 when server.info gained `serverId` (SPEC 3.5).
