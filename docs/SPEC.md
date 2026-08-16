@@ -705,6 +705,33 @@ Suggested retry delays:
 
 Manual reconnect should bypass the wait.
 
+A DROPPED NETWORK MUST COST NOTHING. `tmux new-session -A` attaches to the pane's session when it exists and
+creates it when it does not, and it says which it did nowhere. So a reconnect is silent about the one thing that
+matters: whether the user's shell — and whatever was running in it — is still there.
+
+What the client owes the user here is a notice when the session it was using is gone, and SILENCE otherwise. The
+notice is worth getting right in both directions: staying quiet about destroyed work leaves the user typing into
+a shell that has lost their build, and crying wolf tells them their work is gone when it is sitting right there,
+which is worse — it is the most alarming thing a terminal can say, and saying it on a guess destroys trust in
+every later report.
+
+It is therefore raised ONLY on positive evidence from tmux, never inferred from a failure or from our own clock:
+
+- On every attach the client records tmux's `session_created` for the target, as tmux reported it.
+- A later attach reports the session lost only when the value it sees is STRICTLY GREATER than the one recorded.
+  tmux never changes a session's creation time, so a later one is necessarily a different session wearing the
+  same name.
+- Nothing recorded means nothing to report: a brand new pane, a first attach, and a pane whose earlier attach
+  opened a channel but never got a session all stay silent, because none of them can have lost anything.
+- An unchanged value is the ordinary reconnect, whatever either machine's clock reads. A probe that cannot see
+  the session answers nothing and forgets nothing.
+
+The first version compared tmux's timestamp against the CLIENT's wall clock at the moment it issued the attach,
+and gated that on "has this pane attached before in this process". Both halves are guesses. Two machines' clocks
+need not agree, so a session that was already there could read as newly created and announce destroyed work that
+was never destroyed. `tst_liveterminalfactory` holds the corrected contract against a real severed connection:
+the session survives, the process running inside it keeps running, and the notice stays silent.
+
 ### 5.7 Mouse Behaviour
 
 The pane's tmux session is created with mouse reporting on (§5.2), and that is deliberate: it is what lets the
@@ -731,17 +758,36 @@ hands the mouse to the program:
 | `Ctrl+C` with nothing selected | The remote program | The interrupt, unchanged. On macOS `Ctrl+C` is always the interrupt. |
 | `Ctrl+V`, `Ctrl+Shift+V` (`⌘V` on macOS) | The application | Pastes the clipboard into the shell (§5.1). See below. |
 
-**How the inversion is implemented, and its one boundary.** xterm.js decides between "report this to the program"
+**How the inversion is implemented.** xterm.js decides between "report this to the program"
 and "make a local selection" in a single predicate, `SelectionService.shouldForceSelection()`, which reads the
 Shift flag (the Option flag on macOS). It is not configurable, so the flag's SENSE is flipped on the event before
 xterm.js sees it, in the capture phase, and only while mouse reporting is actually on — with reporting off,
 xterm.js already owns the mouse and Shift keeps its ordinary "extend the selection" meaning. Turning tmux's
 `mouse on` off would have been the naive alternative and is wrong: it takes the wheel away from tmux's
-scrollback. The boundary: a reported drag reaches the program only under the SGR encoding (`?1006h`). Under the
-default X10 encoding xterm.js emits the report as a BINARY event carrying bytes above `0x7f`, and this client has
-no byte-preserving path to the PTY, so such a report is dropped and logged. Every pane is a tmux session (§5.2)
-and tmux negotiates SGR with its own outer terminal, so X10 is not reachable in practice; the log line exists so
-that it cannot become invisible if that ever changes.
+scrollback.
+
+BOTH MOUSE ENCODINGS REACH THE PROGRAM. Under SGR (`?1006h`) a report is ordinary text and travels the same way
+a keystroke does. Under the DEFAULT X10 encoding it is not text at all: the column and the row are single bytes,
+so a click past column 95 carries a byte above `0x7f`, and xterm.js hands such a report to `Terminal.onBinary`
+rather than `onData` precisely because it must not be mangled. That path was unhandled and the report was simply
+dropped, which made a documented promise — a modifier-drag reaches the program — quietly false for any program
+that negotiated X10.
+
+It is forwarded now, and TWO properties are load-bearing:
+
+- BYTES SURVIVE. `sendInput` carries a `QString` the client encodes as UTF-8, which rewrites exactly the bytes
+  that made xterm.js choose the binary path: a column byte of `0xAB` would arrive as `0xC2 0xAB`, one click at
+  the wrong column plus a stray byte in the program's input. So binary travels base64 through its own slot,
+  `ch::TerminalBridge::sendBinaryInput`, decoded with strict validation — a malformed payload is refused rather
+  than written to the shell as garbage.
+- ORDER SURVIVES. Binary goes through the SAME input queue as text rather than straight to the bridge. A mouse
+  report sent past a queue still holding a paste would overtake it, and the program would see the click before
+  the text typed ahead of it. For the same reason the two kinds are never coalesced into one call: they go to
+  different slots, and one call can only be one of them.
+
+In practice every pane is a tmux session (§5.2) and tmux negotiates SGR with its own outer terminal, so X10 is
+the rarer path — which is exactly why it went unnoticed, and why `tst_terminalpage` now drives a drag with ONLY
+`?1000h` enabled and asserts the encoded bytes arrive.
 
 **Why the right button is the exception.** tmux's default right-button binding draws a menu inside the terminal
 grid, and that menu closes again on the next mouse report — so simply moving the pointer dismissed it before it

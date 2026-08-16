@@ -389,6 +389,33 @@ graph TD
     scrollback is why mouse reporting is on. `Ctrl+V` pastes, matching the existing
     `Ctrl+C`-copies-a-selection rule, at the stated cost of no longer sending `^V`.
     Covered by `tst_terminalpage` and the page's own `mouse`/`keys` suites.
+  - [x] Wave 8, found by use: two keyboard-containing surfaces fighting. The
+    connect sheet and the settings window each pull the keyboard back into
+    themselves, and a cold start puts BOTH on screen, so they pulled against each
+    other until the JS stack was exhausted. It surfaced as
+    `RangeError: Maximum call stack size exceeded` blamed on unrelated bindings at
+    fabricated line numbers, and it had been failing `tst_coldstart` — the
+    headline live gate — since long before this wave. The rule now matches what
+    the user sees: the surface in FRONT owns the keyboard. Covered fast by
+    `tst_uxshell::theSheetInFrontKeepsTheKeyboard`, which fails without the fix.
+  - [x] Wave 8, reported by a user who lost a shell to a dropped network: the
+    "the remote session this pane was using is gone" notice was a GUESS. It fired
+    when a pane had attached before in this process and tmux's `session_created`
+    was at or after the client's own wall clock reading from just before the
+    attach — two machines' clocks need not agree, so a session that was sitting
+    right there could be announced as destroyed. It now reports only when tmux's
+    own `session_created` for the target is STRICTLY GREATER than the value tmux
+    itself reported earlier for it, and stays silent with nothing recorded (a new
+    pane, a first attach). Gated by
+    `tst_liveterminalfactory::anUncleanNetworkDropKeepsTheSessionItsWorkAndSaysNothing`,
+    which severs a real connection and asserts the session survives, the process
+    inside it keeps running, and nothing is claimed.
+  - [x] Wave 8: X10-encoded mouse reports reach the program. xterm.js emits those
+    through `onBinary` because they carry bytes above `0x7f`, that path was
+    unhandled, and the reports were dropped — so "a modifier-drag reaches the
+    program" was false for any program negotiating X10. Forwarded now through the
+    SAME input queue as text so order holds, as base64 through a byte-safe bridge
+    slot so the bytes hold. `tst_terminalpage` drives a drag with only `?1000h`.
 - **Stop gate:** ✅ MET — `tst_liveshell` performs live CRUD through AppController's
   invokables against a real `codeharbord`, then re-reads every mutation through a
   SECOND independent codeharbord process (so a local-only mutation fails), and

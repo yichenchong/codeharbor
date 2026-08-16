@@ -1,6 +1,5 @@
 #include "TerminalFactory.h"
 
-#include <QDateTime>
 #include <QJsonArray>
 #include <QJsonObject>
 #include <QJsonValue>
@@ -145,7 +144,7 @@ void TerminalFactory::rememberTarget(TerminalController* controller, const QStri
         // kill() clears the recorded target, so the Connect that follows it
         // starts over here rather than announcing the very session the user
         // just destroyed.
-        entry.everAttached = false;
+        entry.confirmedCreatedSec = -1;
     }
     entry.target = target;
     entry.targetServerId = m_serverId;
@@ -795,10 +794,10 @@ bool TerminalFactory::attach(TerminalController* controller,
             pane->setState(TerminalState::Ready);
     });
 
-    // The moment the attach is issued, in whole seconds, for the recreated-
-    // session check below. Taken BEFORE the command goes out so nothing can be
-    // created in between and read as pre-existing.
-    const qint64 attachedAtSec = QDateTime::currentSecsSinceEpoch();
+    // Nothing is timed against our own clock here: the recreated-session check
+    // below compares tmux's session_created against the value tmux itself
+    // reported earlier for the same name, which is exact and needs no wall time
+    // of ours (see probeForRecreatedSession).
     const bool started = openPty(device, columns, lines, command);
     if (!started) {
         const bool stillOurs = pane && pane->transport() == device;
@@ -852,22 +851,20 @@ bool TerminalFactory::attach(TerminalController* controller,
             m_agentMonitor->noteTerminalAttached(it->devSessionId, it->terminalId);
     }
 
-    // Did this attach silently CREATE the pane's session instead of finding it?
-    // `tmux new-session -A` does both and says which it did nowhere, so a pane
-    // whose remote session died comes back as a brand new empty shell with the
-    // user's work gone and nothing on screen to say so. Asked out of band, after
-    // the attach, exactly like the kill exec: the pane is already up and working,
-    // and a diagnostic must never delay or gate that.
+    // Did this attach silently CREATE the pane's session instead of finding it,
+    // and had the pane ever had one to find? `tmux new-session -A` does both and
+    // says which it did nowhere, so a pane whose remote session died comes back
+    // as a brand new empty shell with the user's work gone and nothing on screen
+    // to say so. Asked out of band, after the attach, exactly like the kill exec:
+    // the pane is already up and working, and a diagnostic must never delay or
+    // gate that.
     //
-    // Only a RE-attach may report. A pane attaching for the first time in this
-    // process, and a genuinely new pane, both create their session legitimately
-    // and have lost nothing.
-    if (auto it = m_attached.find(pane.data()); it != m_attached.end()) {
-        const bool reattach = it->everAttached;
-        it->everAttached = true;
-        if (reattach)
-            probeForRecreatedSession(pane.data(), tmuxTarget, attachedAtSec);
-    }
+    // Asked on every attach, including the first. The first answer cannot report
+    // anything — there is no earlier observation to compare it with — but it is
+    // what RECORDS that this pane's session exists, and without that record any
+    // later report would be an inference from "a channel came up once" rather
+    // than something the host actually said.
+    probeForRecreatedSession(pane.data(), tmuxTarget);
     return true;
 }
 
@@ -878,8 +875,7 @@ bool TerminalFactory::openPty(SshChannelDevice* device, int cols, int rows,
 }
 
 void TerminalFactory::probeForRecreatedSession(TerminalController* controller,
-                                               const QString& target,
-                                               qint64 attachedAtSec)
+                                               const QString& target)
 {
     if (!m_rpc || target.isEmpty())
         return;
@@ -891,8 +887,8 @@ void TerminalFactory::probeForRecreatedSession(TerminalController* controller,
     // server running) rather than a failure, which is the other reason nothing
     // here is ever reported as an error.
     m_rpc->call(QString::fromLatin1(rpc::kMethodListSessions), QJsonObject{},
-                [self, pane, target, attachedAtSec, askedOf](QJsonValue result,
-                                                            std::optional<RpcError> error) {
+                [self, pane, target, askedOf](QJsonValue result,
+                                              std::optional<RpcError> error) {
                     if (!self || !pane || error)
                         return;
                     // The listing describes the host the question was asked of; a
@@ -903,34 +899,61 @@ void TerminalFactory::probeForRecreatedSession(TerminalController* controller,
                     // The pane must still be on this very session. A kill or a
                     // retarget while the question travelled would turn the notice
                     // into a report about a terminal the user has already left.
-                    const auto it = self->m_attached.constFind(pane.data());
-                    if (it == self->m_attached.constEnd() || it->target != target)
+                    const auto found = self->m_attached.constFind(pane.data());
+                    if (found == self->m_attached.constEnd() || found->target != target)
                         return;
+                    const qint64 confirmed = found->confirmedCreatedSec;
                     // Wire shape: an array of TmuxSession objects carrying `name`
                     // and `created`, tmux's session_created as a UNIX timestamp in
                     // SECONDS (remote/src/rpc-types.ts). No entry for this target
-                    // reports nothing: the session may have died again since, and a
-                    // diagnostic that cannot see the session cannot say anything
-                    // about it.
+                    // reports nothing and forgets nothing: the session may have
+                    // died again since, and a diagnostic that cannot see the
+                    // session cannot say anything about it — while what this pane
+                    // already observed about the session it HAD stays true.
+                    qint64 created = -1;
                     const QJsonArray sessions = result.toArray();
                     for (const QJsonValue& entry : sessions) {
                         const QJsonObject session = entry.toObject();
                         if (session.value(QStringLiteral("name")).toString() != target)
                             continue;
-                        // SECOND granularity is all tmux publishes. A session that
-                        // was already there but happened to be created in the very
-                        // same second as our attach therefore reads as newly
-                        // created, and that is accepted rather than papered over:
-                        // the only alternative is a strictly-later comparison,
-                        // which misses every real loss whose replacement landed in
-                        // the same second as the attach that made it. A missing or
-                        // unreadable field lands below the floor and says nothing.
-                        if (session.value(QStringLiteral("created")).toInteger(-1)
-                            >= attachedAtSec) {
-                            emit self->sessionRecreated(pane.data(), target);
-                        }
-                        return;
+                        // A missing or unreadable field is no observation at all.
+                        created = session.value(QStringLiteral("created")).toInteger(-1);
+                        break;
                     }
+                    if (created < 0)
+                        return;
+
+                    // Record what the host said BEFORE reporting anything: the
+                    // signal below re-enters QML, where anything is free to
+                    // attach, retarget or close a pane on this factory, and this
+                    // observation must not be lost to that. Re-found rather than
+                    // written through the iterator above for the same reason
+                    // every other write in this class re-finds: an insert from a
+                    // re-entrant call rehashes m_attached.
+                    if (auto it = self->m_attached.find(pane.data());
+                        it != self->m_attached.end() && it->target == target) {
+                        it->confirmedCreatedSec = created;
+                    }
+
+                    // THE VERDICT, and it rests on two things the HOST said
+                    // rather than on anything this client inferred: a session of
+                    // this name was observed alive at `confirmed`, and the session
+                    // of this name alive now was created later than that. tmux
+                    // never changes a session's creation time, so a later one is
+                    // necessarily a different session under the same name — the
+                    // one the pane was using ended, and everything running in it
+                    // stopped with it.
+                    //
+                    // Nothing confirmed (`confirmed < 0`) means this pane has
+                    // never been observed to have a session under this name, so
+                    // there is no work it can claim was destroyed: a brand new
+                    // pane, a first attach, and a pane whose earlier attach opened
+                    // a channel but never got a tmux session out of it all land
+                    // here and stay silent. An UNCHANGED creation time is the
+                    // ordinary reconnect: the very same session, whatever either
+                    // clock reads.
+                    if (confirmed >= 0 && created > confirmed)
+                        emit self->sessionRecreated(pane.data(), target);
                 });
 }
 

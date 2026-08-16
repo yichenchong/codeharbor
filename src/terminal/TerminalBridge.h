@@ -99,6 +99,28 @@ public:
 public slots:
     // ---- the TerminalBridge contract (called by the page) ----
     void sendInput(const QString& data);
+    // Input the RENDERER produced as raw bytes rather than as text, carried as
+    // base64 in the QString a WebChannel slot can take.
+    //
+    // WHY a second slot instead of sendInput(): xterm emits a mouse report as a
+    // binary event whenever the negotiated encoding is the default X10 one,
+    // because that encoding writes the column and the row as single bytes which
+    // can exceed 0x7f (see src/web/terminal/src/index.ts, and CoreMouseService's
+    // triggerBinaryEvent in @xterm/xterm). Those bytes cannot survive
+    // sendInput(): the QString it takes is encoded as UTF-8 here, so a 0xAB
+    // column would reach the PTY as 0xC2 0xAB — one click at the wrong column
+    // plus a stray byte on the remote program's input.
+    //
+    // A malformed payload is REFUSED rather than partially written: it can only
+    // mean the page and this slot disagree about the encoding, and writing
+    // whatever survived a lenient decode would type bytes the user never
+    // produced into their shell.
+    //
+    // Ordering with sendInput() is the PAGE's responsibility and is kept there:
+    // both slots are fed from the single input queue in
+    // src/web/terminal/src/input.ts, so a report cannot overtake the keystrokes
+    // queued ahead of it.
+    void sendBinaryInput(const QString& base64);
     // Bounded: see kMaxDimension. Anything at or below it is passed through
     // untouched, including the non-positive values an unmounted renderer
     // reports (the controller rejects those).

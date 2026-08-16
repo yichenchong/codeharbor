@@ -638,6 +638,10 @@ private slots:
     // pane, because that path has an input-sniffing MouseArea over the whole
     // pane and a WebEngineView with a context menu of its own.
     void realMouseInputTravelsThroughTheQmlPane();
+    // The same promise under the OTHER mouse encoding. With ?1000h alone
+    // xterm.js stays on its default X10 encoding, whose reports are BINARY data
+    // rather than text and used to be dropped by the page outright.
+    void x10MouseReportsReachTheRemoteSideAsBytes();
     // Declared last: it takes the pane live and leaves it attached to a real
     // remote shell.
     void livePaneRendersARealRemoteShell();
@@ -1362,11 +1366,11 @@ void TstTerminalPage::realMouseInputTravelsThroughTheQmlPane()
     // drag dispatched before the DECSET had crossed the bridge would exercise
     // the plain xterm.js rule and quietly assert the opposite of this case.
     //
-    // BOTH sequences, because that is what tmux sends and only the pair is
-    // testable: ?1000h alone leaves xterm.js on its default X10 encoding, whose
-    // reports can carry bytes above 127 and therefore leave the emulator as a
-    // BINARY event rather than as data. ?1006h asks for the SGR encoding, which
-    // is plain text and reaches the transport the same way a keystroke does.
+    // BOTH sequences, because that is what tmux sends: ?1000h asks for the
+    // reports and ?1006h asks for them in the SGR encoding, which is plain text
+    // and reaches the transport the same way a keystroke does. The other half of
+    // that choice — ?1000h alone, leaving xterm.js on its default X10 encoding,
+    // whose reports leave the emulator as BINARY data — is the case below.
     m_controller->ingestOutput(QByteArrayLiteral("\x1b[?1000h\x1b[?1006h"));
     QString mouseState;
     QElapsedTimer mouseClock;
@@ -1524,6 +1528,190 @@ void TstTerminalPage::realMouseInputTravelsThroughTheQmlPane()
                             .arg(pasteItem.y())));
 
     closeTerminalMenu();
+}
+
+// (13) THE OTHER MOUSE ENCODING, with REAL input again.
+//
+// The case above negotiates ?1000h AND ?1006h, which is what tmux does, and a
+// report in the SGR encoding ?1006h asks for is plain text: it leaves the
+// emulator through the same data path a keystroke takes. This case negotiates
+// ?1000h ALONE and deliberately leaves the encoding at xterm.js's default X10,
+// where a report is CSI M followed by three single bytes that can each exceed
+// 0x7f. xterm.js hands those to the page as a BINARY event instead
+// (CoreMouseService's triggerBinaryEvent), and the page used to have nowhere to
+// put them, so a modifier-drag under this encoding reached the remote program as
+// nothing at all. The promise the pane makes — the modifier hands the mouse to
+// the program — must not depend on which encoding that program asked for.
+//
+// The bytes are asserted, not merely counted: the byte-safe route exists because
+// the text route would UTF-8 encode a coordinate above 0x7f into two bytes, and
+// a report of the expected length with the expected coordinate byte is what
+// rules that out.
+void TstTerminalPage::x10MouseReportsReachTheRemoteSideAsBytes()
+{
+    auto* window = qobject_cast<QQuickWindow*>(m_window.get());
+    QVERIFY2(window != nullptr, "the test shell is not a QQuickWindow");
+    if (!QTest::qWaitForWindowExposed(window))
+        QSKIP("the window was never exposed, so real input cannot be delivered");
+
+    // Widened for the length of this case, then restored. The POINT of the
+    // byte-safe route is a coordinate byte above 0x7f, and the encoding puts one
+    // there only past column 95: the shell window's default 900 px is 85 columns
+    // wide, so at that size the report would be all-ASCII and would have
+    // survived the text path too. A machine whose cell metrics still leave the
+    // grid narrower than that is handled below rather than failed, since the
+    // dropped report is proven either way.
+    const int windowWidth = window->width();
+    const int windowHeight = window->height();
+    window->resize(1200, windowHeight);
+    QElapsedTimer fitClock;
+    fitClock.start();
+    while (fitClock.elapsed() < kProbeTimeoutMs && m_controller->columns() <= 97)
+        QTest::qWait(50);
+
+    // Start from no reporting at all. ?1006l is the load-bearing half: it puts
+    // the encoding back to DEFAULT after the case above negotiated SGR, and
+    // without it this case would quietly re-test that same text path.
+    m_controller->ingestOutput(QByteArrayLiteral("\x1b[?1000l\x1b[?1006l"));
+    QVERIFY2(waitForJs(QString::fromLatin1(kJsMenuState), QStringLiteral("|mouse=none"),
+                       kProbeTimeoutMs),
+             "the page never gave the mouse back, so this case could not start from a known "
+             "encoding");
+
+    QCOMPARE(evalJs(QString::fromLatin1(kJsInstallInputSpy)), QStringLiteral("SPY"));
+
+    // One real press, for the same two reasons as the case above: it is the only
+    // point whose position is known in BOTH the window's and the page's
+    // coordinates, and with reporting off it also drops whatever selection an
+    // earlier case left behind.
+    const QPoint point(window->width() / 2, window->height() / 2 + 40);
+    QTest::mouseClick(window, Qt::LeftButton, Qt::NoModifier, point);
+    QVERIFY2(waitForJs(QString::fromLatin1(kJsReadInputSpy), QStringLiteral("mousedown:0"),
+                       kProbeTimeoutMs),
+             qPrintable(QStringLiteral("a real left click never reached the terminal page; "
+                                       "the page saw: %1")
+                            .arg(evalJs(QString::fromLatin1(kJsReadInputSpy)))));
+
+    const QStringList gridGeometry =
+        evalJs(QString::fromLatin1(kJsGridGeometry)).split(QLatin1Char('|'));
+    QVERIFY2(gridGeometry.size() == 6,
+             qPrintable(QStringLiteral("the grid geometry probe replied %1")
+                            .arg(gridGeometry.join(QLatin1Char('|')))));
+    const QPoint gridOrigin =
+        point - QPoint(gridGeometry.at(0).toInt(), gridGeometry.at(1).toInt());
+    const QRect grid(gridGeometry.at(2).toInt(), gridGeometry.at(3).toInt(),
+                     gridGeometry.at(4).toInt(), gridGeometry.at(5).toInt());
+    QVERIFY2(grid.width() > 80 && grid.height() > 40,
+             qPrintable(QStringLiteral("the character grid is %1x%2, which is too small to drag "
+                                       "across")
+                            .arg(grid.width())
+                            .arg(grid.height())));
+
+    // Reporting on, and WAITED FOR: the page only inverts the drag while a
+    // program is actually asking for the mouse, so a drag dispatched before the
+    // DECSET had crossed the bridge would exercise the plain xterm.js rule.
+    // ONLY ?1000h — no ?1006h anywhere in this case.
+    m_controller->ingestOutput(QByteArrayLiteral("\x1b[?1000h"));
+    QVERIFY2(waitForJs(QString::fromLatin1(kJsMenuState), QStringLiteral("|mouse=vt200"),
+                       kProbeTimeoutMs),
+             "the program's request for the mouse never reached the page, so the drag below "
+             "would mean nothing");
+
+    // WriteOnly for the same reason as everywhere else here: a readable QBuffer
+    // feeds everything written into it back to the controller as output.
+    QBuffer mouseTransport;
+    QVERIFY(mouseTransport.open(QIODevice::WriteOnly));
+    m_controller->setTransport(&mouseTransport);
+
+    // xterm.js's own force-selection decision reads Alt on macOS and Shift
+    // everywhere else, and this page inverts the sense of that one flag, so the
+    // modifier below is what hands the gesture to the program.
+#ifdef Q_OS_MACOS
+    constexpr Qt::KeyboardModifier kRemoteMouseModifier = Qt::AltModifier;
+#else
+    constexpr Qt::KeyboardModifier kRemoteMouseModifier = Qt::ShiftModifier;
+#endif
+    // Straight across one row, and as far right as the grid goes: the column is
+    // what puts a byte above 0x7f into the report on any pane wider than 95
+    // cells, which is the byte a UTF-8 encode would have split in two. Six
+    // pixels of slack at each end keep the press and the release inside the
+    // screen element — xterm.js refuses to report a point outside it.
+    const QPoint dragStart = gridOrigin + QPoint(grid.left() + 6, grid.top() + grid.height() / 2);
+    const QPoint dragEnd =
+        gridOrigin + QPoint(grid.left() + grid.width() - 6, grid.top() + grid.height() / 2);
+    QTest::mousePress(window, Qt::LeftButton, kRemoteMouseModifier, dragStart);
+    for (int step = 1; step <= 6; ++step) {
+        QTest::mouseMove(window, dragStart + (dragEnd - dragStart) * step / 6);
+        QTest::qWait(30);
+    }
+    QTest::mouseRelease(window, Qt::LeftButton, kRemoteMouseModifier, dragEnd);
+
+    QElapsedTimer reportClock;
+    reportClock.start();
+    while (reportClock.elapsed() < kProbeTimeoutMs && mouseTransport.data().size() < 12)
+        QTest::qWait(50);
+    const QByteArray reports = mouseTransport.data();
+    m_controller->setTransport(nullptr);
+    m_controller->ingestOutput(QByteArrayLiteral("\x1b[?1000l"));
+    // Read the width the reports were produced at BEFORE handing the window
+    // back: the restore re-fits the grid, and the assertions below are about the
+    // pane the drag actually crossed.
+    const int reportedColumns = m_controller->columns();
+    window->resize(windowWidth, windowHeight);
+    qInfo().noquote() << "X10 reports on the transport:" << reports.toHex(' ') << "from a"
+                      << reportedColumns << "column pane";
+    QVERIFY2(!reports.isEmpty(),
+             qPrintable(QStringLiteral("a real modified drag under the X10 encoding sent nothing "
+                                       "to the remote side: the report was dropped between the "
+                                       "emulator and the PTY (the page reports %1)")
+                            .arg(evalJs(QString::fromLatin1(kJsMenuState)))));
+
+    // Exactly the press and the release, six bytes each. The VT200 protocol
+    // ?1000h selects reports neither movement nor drag, so there is nothing else
+    // this gesture may have produced — and twelve bytes is also what proves the
+    // coordinates were not UTF-8 encoded on the way out.
+    QCOMPARE(reports.size(), 12);
+    const QByteArray press = reports.left(6);
+    const QByteArray release = reports.mid(6);
+    // CSI M, then the event code: 0x20 is button 1 with no modifier (the page
+    // spent the modifier on reaching the program and does not pass it on), and
+    // 0x23 is the release, which this encoding cannot attribute to a button.
+    QCOMPARE(press.left(4), QByteArrayLiteral("\x1b[M\x20"));
+    QCOMPARE(release.left(4), QByteArrayLiteral("\x1b[M\x23"));
+    const auto column = [](const QByteArray& report) {
+        return static_cast<int>(static_cast<unsigned char>(report.at(4)));
+    };
+    const auto row = [](const QByteArray& report) {
+        return static_cast<int>(static_cast<unsigned char>(report.at(5)));
+    };
+    // 0x21 is column/row 1; anything below it is not a cell of the grid.
+    QVERIFY2(column(press) >= 0x21 && row(press) >= 0x21 && column(release) >= 0x21
+                 && row(release) >= 0x21,
+             qPrintable(QStringLiteral("the reports carry coordinates outside the grid: %1")
+                            .arg(QString::fromLatin1(reports.toHex(' ')))));
+    // The drag ran left to right along one row, and the reports have to say so.
+    QVERIFY2(column(release) > column(press),
+             qPrintable(QStringLiteral("the release was reported at column %1, at or left of the "
+                                       "press at %2, so this was not the drag that was performed")
+                            .arg(column(release) - 0x20)
+                            .arg(column(press) - 0x20)));
+    QCOMPARE(row(release), row(press));
+    // And the point of the byte-safe route, on any pane wide enough to reach a
+    // coordinate the text route would have mangled: the drag ends within two
+    // columns of the right edge, so a pane of 98 columns or more must report a
+    // column byte above 0x7f — which arrived as ONE byte, since the whole report
+    // is six.
+    if (reportedColumns > 97) {
+        QVERIFY2(column(release) > 0x7f,
+                 qPrintable(QStringLiteral("a drag to the right edge of a %1 column pane reported "
+                                           "column byte 0x%2, which is inside ASCII: the report "
+                                           "did not come from the far side of the grid")
+                                .arg(reportedColumns)
+                                .arg(column(release), 2, 16, QLatin1Char('0'))));
+    } else {
+        qInfo("the pane is only %d columns wide, too narrow for a coordinate byte above 0x7f",
+              reportedColumns);
+    }
 }
 
 bool TstTerminalPage::pasteUntilScreenContains(const QString& line, const QString& needle,

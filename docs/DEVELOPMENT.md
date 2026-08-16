@@ -415,6 +415,28 @@ Existing targets that gained coverage in the same period:
   still in flight issues no second request.
 - `tst_terminalpage` — the inverted mouse policy: a plain drag makes a local
   selection that survives, and a modifier drag reaches the remote program instead.
+- `tst_uxshell` — `theSheetInFrontKeepsTheKeyboard`: the connect sheet and the
+  settings window are both keyboard-containing surfaces and Main.qml can have both
+  up at once, so each has to yield to the one in front. They used to pull against
+  each other — every pull emits `activeFocusItemChanged` synchronously, so the
+  other sheet's handler ran nested inside the first's — until the JS stack was
+  exhausted. That reported as `RangeError: Maximum call stack size exceeded`
+  against whatever unrelated binding the cascade happened to reach, which is why
+  the failure named `LogView.qml` and `SettingsWindow.qml` at line numbers that
+  were not line numbers at all. It took `tst_coldstart` down with it, and only
+  under `-L live`, because a cold start is what puts both surfaces on screen.
+- `tst_terminalpage` — `x10MouseReportsReachTheRemoteSideAsBytes`: a drag with
+  ONLY `?1000h` enabled, i.e. the X10 encoding whose reports xterm.js emits as a
+  binary event. Those were dropped outright before; the case asserts the encoded
+  bytes arrive on the transport.
+- `tst_liveterminalfactory` — `anUncleanNetworkDropKeepsTheSessionItsWorkAndSaysNothing`:
+  the fixture sshd's descendants are killed so the transport dies with no orderly
+  close, then the client reconnects. Asserts tmux's `session_created` is unchanged
+  (same session), that a marker process inside the pane kept writing across the
+  whole drop, and that no lost-session notice was raised. The marker assertion
+  WAITS for the count to grow rather than sampling once: it writes a line a
+  second, a reconnect can finish inside that second, and a one-shot read would
+  fail at random by claiming the user's work had died.
 - `tst_sessionlayouts` — pane titles and fast Dev Session switching.
 - `tst_appcontroller` — archiving, deleting a session and a group, and that the
   sidebar's filters never narrow the tree the controller treats as authoritative.

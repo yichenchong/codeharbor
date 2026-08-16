@@ -457,6 +457,36 @@ Rectangle {
         return false;
     }
 
+    // Whether some OTHER sheet, stacked above this one, is the one holding the
+    // keyboard right now.
+    //
+    // This exists because two sheets can be up at once: on a cold start the
+    // connect sheet stays behind the settings window, since it was the only
+    // thing that offered a way in at all. Both sheets watch the window's
+    // activeFocusItem and both pull the keyboard back into themselves when it
+    // is outside — so with both visible they pulled it back and forth, each
+    // pull firing the other's handler synchronously, until the JS stack was
+    // exhausted and the step died with "Maximum call stack size exceeded". The
+    // guarded loops below do not help: the recursion is BETWEEN the two sheets
+    // through the signal, not inside either one's walk.
+    //
+    // The rule is that the top-most sheet owns the keyboard, which is also what
+    // the user sees: it is the one drawn over everything else. Comparing `z`
+    // among siblings is exactly how Main.qml stacks them (the connect sheet
+    // below, the settings window above), so a holder inside a visible sibling
+    // with a higher `z` means "not mine", and yielding there breaks the cycle —
+    // the sheet above pulls once and nothing pulls against it.
+    function keyboardOwnedByHigherSheet(holder) {
+        for (var walk = holder; walk; walk = walk.parent) {
+            if (walk === root)
+                return false;
+            if (walk.parent === root.parent && walk !== root
+                && walk.visible && walk.z > root.z)
+                return true;
+        }
+        return false;
+    }
+
     function containKeyboard() {
         var holder = root.Window.activeFocusItem;
         if (!holder)
@@ -472,6 +502,10 @@ Rectangle {
         // overlay, which is not a child of this sheet. It owns the keyboard
         // while it is up and must not be fought for it.
         if (root.itemWithin(Overlay.overlay, holder))
+            return;
+        // A sheet stacked above this one owns the keyboard while it is up, for
+        // the same reason and on the same terms as the overlay above.
+        if (root.keyboardOwnedByHigherSheet(holder))
             return;
         var boundary = root.focusBoundary();
         if (root.itemWithin(boundary, holder)) {
