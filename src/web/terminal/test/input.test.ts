@@ -1,10 +1,21 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { chunkTerminalInput, TerminalInputWriter } from "../src/input.ts";
+import {
+    chunkTerminalInput,
+    type TerminalInputSink,
+    TerminalInputWriter,
+} from "../src/input.ts";
 
 function utf8ByteLength(text: string): number {
     return new TextEncoder().encode(text).byteLength;
+}
+
+// The byte-safe half of the sink for the cases that only send text. Reaching it
+// from one of those would mean the writer routed a keystroke through the wrong
+// slot, so it fails instead of quietly accepting the call.
+function noBinaryInput(): never {
+    assert.fail("this case produces no binary input");
 }
 
 function assertEscapeSequencesStayInOneChunk(
@@ -120,6 +131,7 @@ test("a throwing sink retains the failed chunk for a later retry", async () => {
             }
             sent.push(data);
         },
+        sendBinaryInput: noBinaryInput,
     }, 2);
 
     assert.throws(() => writer.write("abcdefgh"), /bridge temporarily unavailable/);
@@ -136,7 +148,10 @@ test("a throwing sink retains the failed chunk for a later retry", async () => {
 
 test("fractional chunk bounds are rejected", () => {
     assert.throws(() => chunkTerminalInput("data", 1.5), RangeError);
-    assert.throws(() => new TerminalInputWriter({ sendInput() {} }, 1.5), RangeError);
+    assert.throws(
+        () => new TerminalInputWriter({ sendInput() {}, sendBinaryInput: noBinaryInput }, 1.5),
+        RangeError,
+    );
 });
 
 test("a paste larger than one flow-control window drains in order", async () => {
@@ -145,6 +160,7 @@ test("a paste larger than one flow-control window drains in order", async () => 
         sendInput(data) {
             sent.push(data);
         },
+        sendBinaryInput: noBinaryInput,
     }, 128);
     const payload = ("界-".repeat(1024) + "\x1b[?2004h")
         + "middle"
@@ -162,5 +178,126 @@ test("a paste larger than one flow-control window drains in order", async () => 
 
 test("invalid chunk bounds are rejected instead of disabling pacing", () => {
     assert.throws(() => chunkTerminalInput("data", 0), RangeError);
-    assert.throws(() => new TerminalInputWriter({ sendInput() {} }, Number.NaN), RangeError);
+    assert.throws(
+        () => new TerminalInputWriter(
+            { sendInput() {}, sendBinaryInput: noBinaryInput },
+            Number.NaN,
+        ),
+        RangeError,
+    );
+});
+
+// Every call the writer makes, in call order, tagged with the slot it used.
+// Both the tag and the order are contract: a mouse report and a keystroke must
+// reach the PTY in the order the user produced them, and neither slot may end up
+// carrying the other's payload.
+interface RecordedInputCall {
+    readonly kind: "text" | "binary";
+    readonly payload: string;
+}
+
+function recordingSink(): { sink: TerminalInputSink; calls: RecordedInputCall[] } {
+    const calls: RecordedInputCall[] = [];
+    return {
+        calls,
+        sink: {
+            sendInput(data) {
+                calls.push({ kind: "text", payload: data });
+            },
+            sendBinaryInput(base64) {
+                calls.push({ kind: "binary", payload: base64 });
+            },
+        },
+    };
+}
+
+function decodeBase64(payload: string): number[] {
+    return Array.from(Buffer.from(payload, "base64").values());
+}
+
+// The bytes that make xterm choose the binary path in the first place: an X10
+// mouse report encodes the column and the row as single bytes, and past column
+// 95 that byte is above 0x7f. Those are exactly the bytes the text slot would
+// lose to a UTF-8 encode on the C++ side, so the whole point of the byte-safe
+// slot is that they arrive unchanged.
+test("a binary chunk round-trips its exact bytes through the byte-safe slot", async () => {
+    const { sink, calls } = recordingSink();
+    const writer = new TerminalInputWriter(sink);
+    // CSI M, button 0 (0x20), column 0xAB, row 0xFF.
+    const report = "\x1b[M\x20\xab\xff";
+
+    writer.writeBinary(report);
+    while (writer.backlogSize > 0) {
+        await new Promise<void>((resolve) => setImmediate(resolve));
+    }
+
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0]?.kind, "binary");
+    assert.deepEqual(decodeBase64(calls[0]?.payload ?? ""), [0x1b, 0x5b, 0x4d, 0x20, 0xab, 0xff]);
+});
+
+// ORDER is the hard requirement, and it is why the binary route goes through
+// this queue instead of calling the bridge directly. A report sent past a queue
+// that still holds a keystroke would arrive at the PTY before it, and the remote
+// program would see the click ahead of the text the user typed first.
+test("interleaved text and binary reach the sink in the order produced", async () => {
+    const { sink, calls } = recordingSink();
+    // A bound of two bytes so the text writes are split and the binary write has
+    // to wait behind several queued calls rather than the one in flight.
+    const writer = new TerminalInputWriter(sink, 2);
+
+    writer.write("ls -l");
+    writer.writeBinary("\x1b[M\x20\xab\xff");
+    writer.write("\r");
+    while (writer.backlogSize > 0) {
+        await new Promise<void>((resolve) => setImmediate(resolve));
+    }
+
+    assert.deepEqual(calls.map((call) => call.kind), [
+        "text", "text", "text", "binary", "binary", "binary", "text",
+    ]);
+    assert.deepEqual(
+        calls.filter((call) => call.kind === "text").map((call) => call.payload),
+        ["ls", " -", "l", "\r"],
+    );
+    // Reassembled in arrival order, the three binary calls are the one report.
+    assert.deepEqual(
+        calls.filter((call) => call.kind === "binary").flatMap((call) => decodeBase64(call.payload)),
+        [0x1b, 0x5b, 0x4d, 0x20, 0xab, 0xff],
+    );
+});
+
+// A binary chunk may never be merged into a text chunk: the two go to different
+// bridge slots, and a merged call could only be one of them — which would mean
+// either the report's high bytes going through the UTF-8-encoded text slot, or a
+// keystroke arriving base64-encoded.
+test("a binary chunk is never coalesced into a neighbouring text chunk", async () => {
+    const { sink, calls } = recordingSink();
+    const writer = new TerminalInputWriter(sink);
+
+    writer.write("a");
+    writer.writeBinary("\x1b[M\x20\xab\xff");
+    writer.write("b");
+    while (writer.backlogSize > 0) {
+        await new Promise<void>((resolve) => setImmediate(resolve));
+    }
+
+    // Three calls under a 64 KiB bound that could have held all of it: the
+    // boundaries are the kinds, not the size.
+    assert.deepEqual(calls, [
+        { kind: "text", payload: "a" },
+        { kind: "binary", payload: Buffer.from([0x1b, 0x5b, 0x4d, 0x20, 0xab, 0xff]).toString("base64") },
+        { kind: "text", payload: "b" },
+    ]);
+});
+
+// The caller promised bytes. A code unit above 0xff is not one, and masking it
+// down would send a plausible-looking mouse report for a column the user never
+// clicked.
+test("a binary write of something that is not bytes is refused", () => {
+    const { sink, calls } = recordingSink();
+    const writer = new TerminalInputWriter(sink);
+
+    assert.throws(() => writer.writeBinary("\u0100"), RangeError);
+    assert.deepEqual(calls, []);
 });

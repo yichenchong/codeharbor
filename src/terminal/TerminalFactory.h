@@ -293,9 +293,14 @@ signals:
     // the old one — so whatever was running in it has stopped. `tmuxTarget` is
     // the session name involved.
     //
-    // Emitted only for a RE-attach (see Attachment::everAttached): a pane
-    // attaching for the first time in this process legitimately creates its
-    // session, and so does a brand new pane, and neither has lost anything.
+    // Emitted ONLY on POSITIVE EVIDENCE of both halves of that sentence, and
+    // both halves come from tmux itself (see probeForRecreatedSession and
+    // Attachment::confirmedCreatedSec): a session with this name was observed
+    // alive earlier, and the session with this name that the host reports NOW
+    // was created later than the one that was observed. A pane that never had a
+    // session — a brand new pane, or one whose earlier attach opened a channel
+    // but never got a tmux session out of it — reports nothing, because nothing
+    // it can observe says any work was lost.
     void sessionRecreated(ch::TerminalController* controller, const QString& tmuxTarget);
     // Per-pane connection lifecycle, keyed by the server-reported Dev Session
     // and terminal_panes row ids. The server id is included so AppController
@@ -354,13 +359,28 @@ private:
         // identity would report bytes under a pane id this controller no longer
         // owns.
         QMetaObject::Connection outputConnection;
-        // An attach() has already SUCCEEDED for this pane in this process.
-        // It is what tells "my session died and this attach silently made a
-        // new empty one" apart from "this pane is coming up for the first
-        // time and creating its session is exactly right", which is the whole
-        // reason sessionRecreated() can be trusted. These records survive a
-        // disconnect on purpose (see m_attached), which is precisely why a
-        // RECONNECT can tell the difference at all.
+        // tmux's own `session_created` (UNIX seconds) for `target`, as last
+        // OBSERVED in a `tmux.listSessions` answer, or -1 when this pane has
+        // never had a session confirmed to exist under that name.
+        //
+        // This is the whole basis of sessionRecreated(), and it is deliberately
+        // an observation rather than an inference. The predecessor was a bool
+        // meaning "an attach() has already succeeded for this pane", i.e. "a PTY
+        // channel came up once" — which is NOT evidence that a tmux session ever
+        // existed. `tmux new-session -A` can fail to create one for reasons the
+        // channel open knows nothing about (no tmux on the host, an unusable
+        // working directory, or the transport dying between the exec request and
+        // the command actually running, which is exactly what a dropped network
+        // does), and the pane would then announce that the user's work had been
+        // destroyed the first time an attach really did create the session —
+        // about a session that had never existed and work that was never lost.
+        //
+        // Comparing session_created values rather than racing tmux's clock
+        // against ours is also what makes the verdict exact: a session whose
+        // creation time is unchanged IS the session we saw before, whatever
+        // either clock says, so neither clock skew between client and host nor
+        // tmux's one-second granularity can turn an ordinary reconnect into a
+        // false report of lost work.
         //
         // Held per SESSION, not merely per pane: rememberTarget() clears it
         // whenever the pane aims at a different target, because a retargeted
@@ -371,9 +391,9 @@ private:
         // in the process. A session lost while the application was CLOSED is
         // therefore not reported on the next launch — the client has no record
         // that the pane ever had a session, so its first attach of the new
-        // process cannot be distinguished from a pane coming up for the first
-        // time. Reporting on that would mean reporting on every cold start.
-        bool everAttached = false;
+        // process has nothing to compare against. Reporting on that would mean
+        // guessing, which is the failure this field exists to end.
+        qint64 confirmedCreatedSec = -1;
     };
 
     // The pane's entry, created (with its destroyed() cleanup) on first use.
@@ -382,18 +402,29 @@ private:
     // dangling write.
     Attachment& entryFor(ch::TerminalController* controller);
 
-    // Ask the host, out of band, whether the attach that just succeeded CREATED
-    // `target` instead of attaching to it, and report sessionRecreated() when it
-    // did. `attachedAtSec` is the wall clock in whole SECONDS taken immediately
-    // before the attach was issued; a session whose tmux `session_created` is at
-    // or after that second cannot be one that was already there.
+    // Ask the host, out of band, what it knows about `target` right now, record
+    // the session_created it reports, and report sessionRecreated() when that
+    // value proves the session this pane had is gone: a creation time STRICTLY
+    // LATER than one previously confirmed for the same name is a different
+    // session wearing it, so the one the pane was using ended and everything
+    // running in it stopped.
+    //
+    // Asked on EVERY attach, not only a re-attach, because the answer is also
+    // the only way the first attach can record what it found: without that
+    // observation a later report would be an inference, which is what this
+    // replaced. An attach that CREATED the session on a pane with nothing
+    // confirmed therefore stays silent and merely remembers.
     //
     // Diagnostic only, and silent in every failure: no `tmux.listSessions`
     // answer, an RPC error, or no entry for this target reports nothing and
     // emits no error(). A failed diagnostic must never become a user-facing
-    // fault on a pane that is working perfectly well.
+    // fault on a pane that is working perfectly well. A listing with no entry
+    // for this target also leaves the confirmation ALONE rather than clearing
+    // it: the pane's evidence that a session once existed is still good, and
+    // discarding it would silence the very report that matters if the session
+    // comes back under the same name.
     void probeForRecreatedSession(ch::TerminalController* controller,
-                                  const QString& target, qint64 attachedAtSec);
+                                  const QString& target);
 
     // Create-or-update the pane's entry with the tmux target it is aiming at.
     void rememberTarget(ch::TerminalController* controller, const QString& target);

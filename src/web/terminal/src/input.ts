@@ -174,8 +174,36 @@ export function chunkTerminalInput(
     return chunks;
 }
 
+/**
+ * Reject a "binary string" that is not one, BEFORE any of it is queued.
+ *
+ * `Terminal.onBinary` hands over one byte per UTF-16 code unit; a code unit
+ * above 0xff cannot be a byte. Masking it down to eight bits would send a
+ * plausible-looking mouse report for a column the user never clicked, and
+ * checking the whole payload up front keeps a later chunk's rejection from
+ * leaving the earlier ones half-queued.
+ */
+function assertBinaryString(bytes: string): void {
+    for (let index = 0; index < bytes.length; index += 1) {
+        if (bytes.charCodeAt(index) > 0xff) {
+            throw new RangeError("binary terminal input must hold one byte per code unit");
+        }
+    }
+}
+
 export interface TerminalInputSink {
     sendInput(data: string): void;
+    /** Byte-safe counterpart of sendInput(): `base64` decodes to the exact
+     *  bytes the terminal produced (see writeBinary() below and
+     *  ch::TerminalBridge::sendBinaryInput). */
+    sendBinaryInput(base64: string): void;
+}
+
+/** One queued call: which slot it belongs to, and the payload for that slot. */
+interface TerminalInputChunk {
+    /** True when `payload` is base64 destined for sendBinaryInput(). */
+    readonly binary: boolean;
+    readonly payload: string;
 }
 
 /**
@@ -184,11 +212,18 @@ export interface TerminalInputSink {
  * chunks is the honest pacing point: it lets Chromium flush the current call
  * and lets a large paste yield to output/resize events without reordering the
  * bytes. The chunker, rather than this queue, owns sequence integrity.
+ *
+ * Text and binary share this ONE queue, and that is the point of routing binary
+ * through here at all rather than calling the bridge directly. A mouse report
+ * sent past a queue that still holds a paste would overtake it, and the remote
+ * program would see the click before the text the user typed ahead of it. For
+ * the same reason the two kinds are never merged into one call: they go to
+ * different slots, and one call can only be one of them.
  */
 export class TerminalInputWriter {
     private readonly sink: TerminalInputSink;
     private readonly maxBytes: number;
-    private readonly backlog: string[] = [];
+    private readonly backlog: TerminalInputChunk[] = [];
     private inFlight = false;
     private closed = false;
     constructor(sink: TerminalInputSink, maxBytes = kTerminalInputChunkBytes) {
@@ -200,7 +235,7 @@ export class TerminalInputWriter {
     }
 
     get backlogSize(): number {
-        return this.backlog.reduce((total, chunk) => total + chunk.length, 0);
+        return this.backlog.reduce((total, chunk) => total + chunk.payload.length, 0);
     }
 
     write(data: string): void {
@@ -212,7 +247,40 @@ export class TerminalInputWriter {
         // thousands, which a small maxBytes reaches easily) makes the spread
         // form throw RangeError and lose the whole paste.
         for (const chunk of chunkTerminalInput(data, this.maxBytes)) {
-            this.backlog.push(chunk);
+            this.backlog.push({ binary: false, payload: chunk });
+        }
+        this.pump();
+    }
+
+    /**
+     * Queue `bytes` — a binary string as delivered by `Terminal.onBinary` — for
+     * the byte-safe slot, behind whatever text is already waiting.
+     *
+     * WHY the payload is base64 rather than the bytes themselves: the text slot
+     * carries a QString that the C++ side encodes as UTF-8, and that rewrites
+     * exactly the bytes above 0x7f which made xterm choose the binary path in
+     * the first place. A mouse report whose column byte is 0xAB would reach the
+     * PTY as 0xC2 0xAB — one click at the wrong column plus a stray byte on the
+     * remote program's input. Base64 is plain ASCII and survives that encode.
+     *
+     * Bounded the same way text is, but by raw byte count: one code unit is one
+     * byte here, so there is no multi-byte character to cut in half, and no ANSI
+     * token structure to respect either — xterm emits one complete mouse report
+     * per event. The bound exists so that a caller handing over an unexpectedly
+     * large payload cannot turn it into a single unbounded WebChannel call.
+     * Each chunk is encoded on its own, so each decodes on its own on the C++
+     * side and the bytes are concatenated there in arrival order.
+     */
+    writeBinary(bytes: string): void {
+        if (this.closed || bytes.length === 0) {
+            return;
+        }
+        assertBinaryString(bytes);
+        for (let offset = 0; offset < bytes.length; offset += this.maxBytes) {
+            this.backlog.push({
+                binary: true,
+                payload: btoa(bytes.slice(offset, offset + this.maxBytes)),
+            });
         }
         this.pump();
     }
@@ -233,7 +301,11 @@ export class TerminalInputWriter {
         this.inFlight = true;
         let sent = false;
         try {
-            this.sink.sendInput(chunk);
+            if (chunk.binary) {
+                this.sink.sendBinaryInput(chunk.payload);
+            } else {
+                this.sink.sendInput(chunk.payload);
+            }
             sent = true;
         } catch (error) {
             // A transient WebChannel failure must not silently lose a key or

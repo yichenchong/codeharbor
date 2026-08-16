@@ -581,6 +581,33 @@ Rectangle {
         return false;
     }
 
+    // Whether some OTHER sheet, stacked above this one, holds the keyboard.
+    // Symmetric with the identical rule in ConnectSheet.qml, and the reason both
+    // need it is that two sheets can be up at once: on a cold start the connect
+    // sheet stays behind this window. Both watch the window's activeFocusItem
+    // and both pull the keyboard into themselves when it is outside, so with
+    // both visible they pulled against each other, each pull firing the other's
+    // handler synchronously, until the JS stack was exhausted — "Maximum call
+    // stack size exceeded", which took `tst_coldstart` down with it. The guarded
+    // walk below cannot catch that: the recursion is BETWEEN the sheets through
+    // the signal, not inside one sheet's loop.
+    //
+    // Top-most sheet owns the keyboard, matching what the user sees. This window
+    // is the upper of the two, so in the pair above it is the one that does NOT
+    // yield; the rule still belongs here because nothing guarantees this stays
+    // the top-most sheet forever, and a rule only one side honours is exactly
+    // how the cycle came back.
+    function keyboardOwnedByHigherSheet(holder) {
+        for (var walk = holder; walk; walk = walk.parent) {
+            if (walk === root)
+                return false;
+            if (walk.parent === root.parent && walk !== root
+                && walk.visible && walk.z > root.z)
+                return true;
+        }
+        return false;
+    }
+
     function containKeyboard() {
         var holder = root.Window.activeFocusItem;
         if (!holder)
@@ -596,6 +623,10 @@ Rectangle {
         // overlay, which is not a child of this sheet. It owns the keyboard
         // while it is up and must not be fought for it.
         if (root.itemWithin(Overlay.overlay, holder))
+            return;
+        // A sheet stacked above this one owns the keyboard while it is up, on
+        // the same terms as the overlay above.
+        if (root.keyboardOwnedByHigherSheet(holder))
             return;
         if (root.itemWithin(root, holder)) {
             root.lastInsideFocus = holder;

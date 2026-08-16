@@ -3,6 +3,8 @@
 #include "SessionState.h"
 #include "TerminalController.h"
 
+#include <QByteArray>
+
 namespace ch {
 
 TerminalBridge::TerminalBridge(TerminalController* controller, QObject* parent)
@@ -75,6 +77,30 @@ void TerminalBridge::sendInput(const QString& data)
     // the user typed minutes ago at whatever prompt happens to be there.
     if (m_controller)
         m_controller->sendInput(data.toUtf8());
+}
+
+void TerminalBridge::sendBinaryInput(const QString& base64)
+{
+    if (!m_controller)
+        return;
+    // STRICT decoding, with the abort flag rather than Qt's default tolerance.
+    // Base64's alphabet is entirely ASCII, so toLatin1() is lossless for every
+    // legitimate payload while anything outside it (a page sending UTF-16 text
+    // by mistake, or an injected value) becomes '?' — which is not in the
+    // alphabet either and is therefore rejected by the same check. Without
+    // AbortOnBase64DecodingErrors Qt would silently skip the offending
+    // characters and hand back a shorter byte string, which is exactly the
+    // "write garbage to the shell" outcome this slot must not produce.
+    const QByteArray::FromBase64Result decoded =
+        QByteArray::fromBase64Encoding(base64.toLatin1(),
+                                       QByteArray::Base64Encoding
+                                           | QByteArray::AbortOnBase64DecodingErrors);
+    if (!decoded)
+        return;
+    // Same refusal handling as sendInput(): the page contract returns nothing,
+    // and a keystroke dropped by a dead channel is already visible in the
+    // pane's status strip.
+    m_controller->sendInput(decoded.decoded);
 }
 
 void TerminalBridge::resize(int cols, int rows)

@@ -238,6 +238,27 @@ bool resolveAndAttach(TerminalFactory& factory, RpcPair& rpc,
     return factory.attach(controller, target, QStringLiteral("/repo"), 80, 24);
 }
 
+// Answer the `tmux.listSessions` probe that every attach now asks, reporting
+// `target` with tmux's `session_created` set to `created`. A NEGATIVE `created`
+// answers a listing that does not mention `target` at all — what a host says
+// when no such session exists, which is also what a channel that came up
+// without ever getting a tmux session out of it leaves behind. Returns false if
+// the request was not the probe, so a test cannot pass by never being asked.
+bool answerSessionProbe(RpcPair& rpc, const QString& target, qint64 created)
+{
+    const QJsonObject probe = rpc.takeRequest();
+    if (probe.value(QStringLiteral("method")).toString()
+        != QString::fromLatin1(rpc::kMethodListSessions))
+        return false;
+    // Somebody else's session is always in the listing: the verdict must come
+    // from the entry that NAMES this pane's target and from nothing else.
+    QJsonArray listing{tmuxSession(QStringLiteral("ch_s1_somebody-else"), 1000)};
+    if (created >= 0)
+        listing.append(tmuxSession(target, created));
+    rpc.answerWithSessions(probe.value(QStringLiteral("id")).toInt(), listing);
+    return true;
+}
+
 } // namespace
 
 class TstTerminalFactory : public QObject {
@@ -260,6 +281,10 @@ private slots:
     void bridgeClampsAbsurdGeometryFromThePage();
     void bridgeExposesNoRemoteTargetingSlots();
     void bridgeForwardsInputResizeAndVisibility();
+    // The byte-safe input slot: bytes the page could not send as text (an X10
+    // mouse report) must reach the PTY unchanged, and a payload that is not
+    // valid base64 must reach it not at all.
+    void bridgeDecodesBinaryInputAndRefusesMalformedBase64();
     void bridgeHoldsOutputUntilTheRendererIsReady();
     void bridgeIgnoresAVisibleReportFromAPaneWithNoRenderer();
     void bridgePreservesHiddenReportBeforeReady();
@@ -290,6 +315,7 @@ private slots:
     void anOrdinaryReconnectToASessionThatWasStillThereStaysSilent();
     void aFailedOrEmptyListingReportsNothingAndRaisesNoError();
     void aRetargetWhileTheProbeIsInFlightReportsNothing();
+    void aPaneThatNeverHadASessionStaysSilentWhenOneIsFinallyCreated();
 };
 
 // Every pane owns its controller: it must be parented to the pane so closing
@@ -837,7 +863,8 @@ void TstTerminalFactory::bridgeExposesNoRemoteTargetingSlots()
     callable.sort();
 
     // The contract, and nothing else. requestClear() is Q_INVOKABLE for the app
-    // side and is a view-only operation; the rest is this pane's own input,
+    // side and is a view-only operation; the rest is this pane's own input (in
+    // two shapes, text and raw bytes, both landing on this pane's own PTY),
     // geometry, visibility, mount handshake and output-consumption report. No
     // attach, no kill, no detach, no tmux target, no working directory, no
     // session id.
@@ -845,7 +872,7 @@ void TstTerminalFactory::bridgeExposesNoRemoteTargetingSlots()
              QStringList({QStringLiteral("notifyOutputConsumed"),
                           QStringLiteral("notifyViewVisible"), QStringLiteral("ready"),
                           QStringLiteral("requestClear"), QStringLiteral("resize"),
-                          QStringLiteral("sendInput")}));
+                          QStringLiteral("sendBinaryInput"), QStringLiteral("sendInput")}));
 
     // Nor can the page read one back out and act on it: the properties are the
     // renderer's own view state.
@@ -902,6 +929,46 @@ void TstTerminalFactory::bridgeForwardsInputResizeAndVisibility()
     QVERIFY(!controller->viewVisible());
     bridge->notifyViewVisible(true);
     QVERIFY(controller->viewVisible());
+}
+
+void TstTerminalFactory::bridgeDecodesBinaryInputAndRefusesMalformedBase64()
+{
+    QObject pane;
+    TerminalFactory factory(nullptr);
+    TerminalController* controller = factory.create(&pane);
+    TerminalBridge* bridge = factory.createBridge(controller, &pane);
+
+    FakeTransport transport;
+    controller->setTransport(&transport);
+
+    // An X10 mouse report for a click past column 95: CSI M, button byte 0x20,
+    // column 0xAB, row 0xFF. These are the bytes that made xterm.js emit the
+    // report as a binary event in the first place, and they are exactly what
+    // sendInput() would destroy — its QString is encoded as UTF-8, so 0xAB would
+    // arrive as the two bytes 0xC2 0xAB.
+    const QByteArray report = QByteArrayLiteral("\x1b[M\x20\xAB\xFF");
+    bridge->sendBinaryInput(QString::fromLatin1(report.toBase64()));
+    QCOMPARE(transport.data(), report);
+
+    // Malformed payloads are REFUSED, not partially written: a lenient decode
+    // would type bytes the user never produced into their shell. One payload per
+    // way of being malformed — a character outside the alphabet, a length that
+    // cannot be a whole number of bytes, and a non-Latin-1 string that only a
+    // page confused about the encoding would send.
+    bridge->sendBinaryInput(QStringLiteral("****"));
+    bridge->sendBinaryInput(QStringLiteral("QUJD*g=="));
+    bridge->sendBinaryInput(QStringLiteral("A"));
+    bridge->sendBinaryInput(QString::fromUtf8("héllo!!"));
+    QCOMPARE(transport.data(), report);
+
+    // Nothing to send is not an error, and it must not disturb the stream.
+    bridge->sendBinaryInput(QString());
+    QCOMPARE(transport.data(), report);
+
+    // Still the same pane afterwards: a refused payload leaves the input path
+    // working rather than wedged.
+    bridge->sendInput(QStringLiteral("ls\n"));
+    QCOMPARE(transport.data(), report + QByteArrayLiteral("ls\n"));
 }
 
 // The page mounts asynchronously; output produced while it loads must reach the
@@ -1894,13 +1961,20 @@ void TstTerminalFactory::repeatingAnUnchangedHarnessDoesNotRestartTheClock()
 // its scrollback gone, with nothing on screen even hinting that anything had
 // happened. That silence is what made the underlying bug undiagnosable.
 //
-// The check is a `tmux.listSessions` round trip made AFTER the attach, out of
-// band exactly like the kill exec, comparing tmux's own session_created against
-// the second the attach was issued in.
+// The check is a `tmux.listSessions` round trip made AFTER every attach, out of
+// band exactly like the kill exec. It reports only on POSITIVE EVIDENCE, and the
+// evidence is tmux's own session_created for the pane's target: a session of
+// that name was seen alive with one creation time, and the session of that name
+// alive now was created LATER. Since tmux never changes a session's creation
+// time, a later one is a different session wearing the same name.
+//
+// What that rules out is the class of lie these cases exist to prevent: a pane
+// telling the user their work was destroyed when the client only ever inferred
+// that a session had existed.
 
 // A pane coming up for the FIRST time creates its session legitimately — that
-// is what a new terminal is — and has lost nothing. It must not be asked about
-// and must not report.
+// is what a new terminal is — and has lost nothing. It is asked (the answer is
+// what records the session it now has) and must not report.
 void TstTerminalFactory::aFirstAttachStaysSilentEvenWhenItCreatedTheSession()
 {
     RpcPair rpc;
@@ -1913,22 +1987,26 @@ void TstTerminalFactory::aFirstAttachStaysSilentEvenWhenItCreatedTheSession()
 
     QObject pane;
     TerminalController* controller = factory.create(&pane);
+    const QString target = QStringLiteral("ch_s1_row-A");
     QSignalSpy recreated(&factory, &TerminalFactory::sessionRecreated);
     QSignalSpy errors(&factory, &TerminalFactory::error);
 
-    QVERIFY(resolveAndAttach(factory, rpc, controller, QStringLiteral("ch_s1_row-A")));
+    QVERIFY(resolveAndAttach(factory, rpc, controller, target));
 
-    // Not even asked: there is no question to put about a pane that has never
-    // had a session for this one to have replaced.
-    QCOMPARE(rpc.takeRequest(250), QJsonObject{});
+    // Created by this very attach, one second in the future for good measure:
+    // there is still nothing to report, because nothing this pane ever observed
+    // says it had a session for this one to have replaced.
+    QVERIFY(answerSessionProbe(rpc, target,
+                               QDateTime::currentSecsSinceEpoch() + 1));
+    QTest::qWait(150);
     QCOMPARE(recreated.count(), 0);
     QCOMPARE(errors.count(), 0);
 }
 
-// THE BUG. The pane attached once, the session died while the client was away,
-// and the re-attach silently made a new one — which the listing gives away,
-// because the session it names was created at or after the moment the attach
-// went out.
+// THE BUG. The pane attached once and its session was seen alive; the session
+// then died while the client was away, and the re-attach silently made a new
+// one — which the listing gives away, because the session now wearing the name
+// was created later than the one that was observed.
 void TstTerminalFactory::aReattachThatCreatedTheSessionSaysTheOldOneIsGone()
 {
     RpcPair rpc;
@@ -1942,22 +2020,19 @@ void TstTerminalFactory::aReattachThatCreatedTheSessionSaysTheOldOneIsGone()
     QObject pane;
     TerminalController* controller = factory.create(&pane);
     const QString target = QStringLiteral("ch_s1_row-A");
+    const qint64 born = QDateTime::currentSecsSinceEpoch() - 3600;
     QVERIFY(resolveAndAttach(factory, rpc, controller, target));
+    // The session the pane is working in, observed alive: this is the evidence
+    // that there is something to lose.
+    QVERIFY(answerSessionProbe(rpc, target, born));
 
     QSignalSpy recreated(&factory, &TerminalFactory::sessionRecreated);
     QSignalSpy errors(&factory, &TerminalFactory::error);
 
-    const qint64 before = QDateTime::currentSecsSinceEpoch();
     QVERIFY(factory.attach(controller, target, QStringLiteral("/repo"), 80, 24));
-
-    const QJsonObject probe = rpc.takeRequest();
-    QCOMPARE(probe.value(QStringLiteral("method")).toString(),
-             QString::fromLatin1(rpc::kMethodListSessions));
-    // A session created after the attach was issued cannot be one that was
-    // already there, so this attach is what made it.
-    rpc.answerWithSessions(probe.value(QStringLiteral("id")).toInt(),
-                           QJsonArray{tmuxSession(QStringLiteral("ch_s1_other"), before - 3600),
-                                      tmuxSession(target, before + 1)});
+    // A DIFFERENT session under the same name: the pane's shell, and everything
+    // that was running in it, ended.
+    QVERIFY(answerSessionProbe(rpc, target, born + 60));
 
     QTRY_COMPARE(recreated.count(), 1);
     QCOMPARE(recreated.constFirst().at(0).value<TerminalController*>(), controller);
@@ -1983,29 +2058,88 @@ void TstTerminalFactory::anOrdinaryReconnectToASessionThatWasStillThereStaysSile
     QObject pane;
     TerminalController* controller = factory.create(&pane);
     const QString target = QStringLiteral("ch_s1_row-A");
-    QVERIFY(resolveAndAttach(factory, rpc, controller, target));
-
     QSignalSpy recreated(&factory, &TerminalFactory::sessionRecreated);
     QSignalSpy errors(&factory, &TerminalFactory::error);
 
-    const qint64 before = QDateTime::currentSecsSinceEpoch();
-    QVERIFY(factory.attach(controller, target, QStringLiteral("/repo"), 80, 24));
+    // Deliberately a creation time in the FUTURE by this client's clock, which
+    // is what a host whose clock runs ahead reports. The verdict compares tmux's
+    // answer with tmux's earlier answer and never with our own wall time, so
+    // skew — and tmux's one-second granularity, which no clock race can survive
+    // either — cannot manufacture a report of lost work.
+    const qint64 born = QDateTime::currentSecsSinceEpoch() + 86400;
+    QVERIFY(resolveAndAttach(factory, rpc, controller, target));
+    QVERIFY(answerSessionProbe(rpc, target, born));
 
-    const QJsonObject probe = rpc.takeRequest();
-    QCOMPARE(probe.value(QStringLiteral("method")).toString(),
-             QString::fromLatin1(rpc::kMethodListSessions));
-    // Created yesterday: it was there before this attach, so the attach attached.
-    rpc.answerWithSessions(probe.value(QStringLiteral("id")).toInt(),
-                           QJsonArray{tmuxSession(target, before - 86400)});
-
-    QTest::qWait(150);
+    // Two more reconnects to the very same session.
+    for (int i = 0; i < 2; ++i) {
+        QVERIFY(factory.attach(controller, target, QStringLiteral("/repo"), 80, 24));
+        QVERIFY(answerSessionProbe(rpc, target, born));
+        QTest::qWait(50);
+    }
     QCOMPARE(recreated.count(), 0);
+    QCOMPARE(errors.count(), 0);
+}
+
+// THE LIE THIS REPLACED, and the regression that keeps it gone. An attach that
+// opens a PTY channel is NOT evidence that a tmux session exists: the command
+// runs on the far side of a transport that can die between the exec request and
+// tmux actually running, and `tmux new-session` can also fail on its own (no
+// tmux on the host, an unusable working directory). The predecessor recorded
+// "this pane attached once" and treated the next attach that created the
+// session as proof that a session had been destroyed — so a pane that had never
+// had a session at all announced that the user's work was gone.
+//
+// The pane here comes up, gets a channel, and the host says there is no such
+// session. The next attach really does create it, for the first time. Nothing
+// was lost and nothing may be claimed.
+void TstTerminalFactory::aPaneThatNeverHadASessionStaysSilentWhenOneIsFinallyCreated()
+{
+    RpcPair rpc;
+    QVERIFY(rpc.start());
+
+    AttachingFactory factory(nullptr);
+    factory.setWorkspace(rpc.db());
+    factory.setRpcClient(rpc.client());
+    factory.setServerId(QStringLiteral("srv-1"));
+
+    QObject pane;
+    TerminalController* controller = factory.create(&pane);
+    const QString target = QStringLiteral("ch_s1_row-A");
+    QSignalSpy recreated(&factory, &TerminalFactory::sessionRecreated);
+    QSignalSpy errors(&factory, &TerminalFactory::error);
+
+    // The channel came up; the session did not. A negative `created` is a
+    // listing with no entry for this target, which is exactly what the host
+    // reports when the command never made one.
+    QVERIFY(resolveAndAttach(factory, rpc, controller, target));
+    QVERIFY(answerSessionProbe(rpc, target, -1));
+    QTest::qWait(50);
+
+    // The retry works, and this is the session's real birth.
+    QVERIFY(factory.attach(controller, target, QStringLiteral("/repo"), 80, 24));
+    QVERIFY(answerSessionProbe(rpc, target,
+                               QDateTime::currentSecsSinceEpoch()));
+    QTest::qWait(150);
+    QVERIFY2(recreated.count() == 0,
+             "a pane that was never observed to have a session told the user their work "
+             "had been destroyed");
+    QCOMPARE(errors.count(), 0);
+
+    // And the silence above is not a diagnostic that has been switched off: the
+    // session just recorded, replaced, is reported.
+    QVERIFY(factory.attach(controller, target, QStringLiteral("/repo"), 80, 24));
+    QVERIFY(answerSessionProbe(rpc, target,
+                               QDateTime::currentSecsSinceEpoch() + 300));
+    QTRY_COMPARE(recreated.count(), 1);
+    QCOMPARE(recreated.constFirst().at(1).toString(), target);
     QCOMPARE(errors.count(), 0);
 }
 
 // Every way the diagnostic can fail to produce a verdict, and the one rule that
 // covers all of them: say nothing. A failed diagnostic must never become a
-// user-facing error, and must never stand in the way of a pane that is working.
+// user-facing error, must never stand in the way of a pane that is working, and
+// must not throw away what the pane already knows — the report that matters
+// comes after the failures, not instead of them.
 void TstTerminalFactory::aFailedOrEmptyListingReportsNothingAndRaisesNoError()
 {
     RpcPair rpc;
@@ -2019,7 +2153,9 @@ void TstTerminalFactory::aFailedOrEmptyListingReportsNothingAndRaisesNoError()
     QObject pane;
     TerminalController* controller = factory.create(&pane);
     const QString target = QStringLiteral("ch_s1_row-A");
+    const qint64 born = QDateTime::currentSecsSinceEpoch() - 3600;
     QVERIFY(resolveAndAttach(factory, rpc, controller, target));
+    QVERIFY(answerSessionProbe(rpc, target, born));
 
     QSignalSpy recreated(&factory, &TerminalFactory::sessionRecreated);
     QSignalSpy errors(&factory, &TerminalFactory::error);
@@ -2040,14 +2176,25 @@ void TstTerminalFactory::aFailedOrEmptyListingReportsNothingAndRaisesNoError()
     // also have died again since the attach. Either way there is nothing to
     // compare and therefore nothing to say.
     QVERIFY(factory.attach(controller, target, QStringLiteral("/repo"), 80, 24));
-    probe = rpc.takeRequest();
-    QCOMPARE(probe.value(QStringLiteral("method")).toString(),
-             QString::fromLatin1(rpc::kMethodListSessions));
-    rpc.answerWithSessions(probe.value(QStringLiteral("id")).toInt(),
-                           QJsonArray{tmuxSession(QStringLiteral("ch_s1_row-B"),
-                                                  QDateTime::currentSecsSinceEpoch())});
+    QVERIFY(answerSessionProbe(rpc, target, -1));
     QTest::qWait(150);
     QCOMPARE(recreated.count(), 0);
+    QCOMPARE(errors.count(), 0);
+
+    // 3. The session is back in the listing, unchanged: the same session all
+    // along, and the two silences above did not lose the observation that says
+    // so.
+    QVERIFY(factory.attach(controller, target, QStringLiteral("/repo"), 80, 24));
+    QVERIFY(answerSessionProbe(rpc, target, born));
+    QTest::qWait(150);
+    QCOMPARE(recreated.count(), 0);
+
+    // 4. ...and the observation really did survive them, because a genuinely
+    // newer session is still reported afterwards. Without this the three
+    // silences above could be a diagnostic that had simply given up.
+    QVERIFY(factory.attach(controller, target, QStringLiteral("/repo"), 80, 24));
+    QVERIFY(answerSessionProbe(rpc, target, born + 60));
+    QTRY_COMPARE(recreated.count(), 1);
     QCOMPARE(errors.count(), 0);
 }
 
@@ -2070,13 +2217,15 @@ void TstTerminalFactory::aRetargetWhileTheProbeIsInFlightReportsNothing()
     QObject pane;
     TerminalController* controller = factory.create(&pane);
     const QString first = QStringLiteral("ch_s1_row-A");
+    const qint64 born = QDateTime::currentSecsSinceEpoch() - 3600;
     QVERIFY(resolveAndAttach(factory, rpc, controller, first));
+    QVERIFY(answerSessionProbe(rpc, first, born));
 
     QSignalSpy recreated(&factory, &TerminalFactory::sessionRecreated);
     QSignalSpy errors(&factory, &TerminalFactory::error);
 
-    // A re-attach, so the probe is armed and would otherwise report.
-    const qint64 before = QDateTime::currentSecsSinceEpoch();
+    // A re-attach on a pane that HAS an observed session, so this probe would
+    // otherwise report.
     QVERIFY(factory.attach(controller, first, QStringLiteral("/repo"), 80, 24));
     const QJsonObject probe = rpc.takeRequest();
     QCOMPARE(probe.value(QStringLiteral("method")).toString(),
@@ -2099,15 +2248,17 @@ void TstTerminalFactory::aRetargetWhileTheProbeIsInFlightReportsNothing()
                       QString());
     QVERIFY(resolved.wait(2000));
     QVERIFY(factory.attach(controller, second, QStringLiteral("/repo"), 80, 24));
-    // And it arms NO probe of its own: rememberTarget() forgets that this pane
-    // had ever attached once the target moves, precisely because nothing is
-    // expected to be waiting at a session the pane has not used before. So the
-    // only answer still outstanding is the one for the target the pane has left.
+    // That attach asks its own question, and its answer says the new session was
+    // created just now — which reports nothing either, because rememberTarget()
+    // forgot what this pane had observed the moment the target moved: nothing is
+    // expected to be waiting at a session the pane has not used before.
+    QVERIFY(answerSessionProbe(rpc, second,
+                               QDateTime::currentSecsSinceEpoch()));
 
-    // The late answer says the FIRST session was created by that earlier attach,
-    // which on its own is exactly what the notice reports.
+    // The late answer says the FIRST session was replaced, which on a pane still
+    // sitting on it is exactly what the notice reports.
     rpc.answerWithSessions(probe.value(QStringLiteral("id")).toInt(),
-                           QJsonArray{tmuxSession(first, before + 1)});
+                           QJsonArray{tmuxSession(first, born + 60)});
 
     QTest::qWait(150);
     QCOMPARE(recreated.count(), 0);

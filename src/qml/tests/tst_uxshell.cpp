@@ -644,6 +644,46 @@ Item {
     return qml;
 }
 
+// The two sheets Main.qml can have on screen AT THE SAME TIME, stacked the same
+// way it stacks them: the cold-start connect sheet at z 900 and, on top of it,
+// the settings window at z 910 — the sheet stays up behind it because on a cold
+// start it is the only thing that offered a way in at all. The TextField stands
+// in for the workspace control that holds the keyboard before either sheet
+// opens, so containment has somewhere real to hand focus back to.
+QByteArray stackedSheetsHarness()
+{
+    return R"QML(
+import QtQuick
+import QtQuick.Controls.Basic
+import CodeHarbor
+
+Item {
+    id: harness
+    width: 900
+    height: 560
+
+    TextField {
+        objectName: "behindField"
+        anchors.centerIn: parent
+    }
+
+    ConnectSheet {
+        objectName: "connectSheet"
+        anchors.fill: parent
+        z: 900
+        visible: false
+    }
+
+    SettingsWindow {
+        objectName: "settingsWindow"
+        anchors.fill: parent
+        z: 910
+        visible: shown
+    }
+}
+)QML";
+}
+
 // The split handle only exists inside a SplitView: the view instantiates it,
 // parents it to itself and stretches it across the split, so a handle on its
 // own is not the thing that ships. Three panes, therefore two handles — the
@@ -1137,6 +1177,11 @@ private slots:
     // one of their controls fell straight through to the pane behind them.
     void overlaySheetsSwallowClicksToTheWorkspace_data();
     void overlaySheetsSwallowClicksToTheWorkspace();
+
+    // Two of those sheets can be up at once, and both of them contain the
+    // keyboard. Whichever one is in FRONT has to keep it, because two surfaces
+    // reclaiming it from each other never settles.
+    void theSheetInFrontKeepsTheKeyboard();
 
     // The Settings server pane lays its fields out in a two-column grid; one
     // over-wide entry pushes the whole second column off the pane.
@@ -2359,6 +2404,81 @@ void TstUxShell::overlaySheetsSwallowClicksToTheWorkspace()
     QVERIFY2(surface.root()->property("behindClicks").toInt() == 1,
              "a click on the sheet reached the workspace behind it");
 
+    QVERIFY2(surface.warnings.isEmpty(), qPrintable(surface.warningReport()));
+}
+
+// Both the connect sheet and the settings window keep the keyboard inside
+// themselves: each watches Window.activeFocusItem and, when the keyboard turns
+// up outside its own subtree, pulls it back with forceActiveFocus(). Main.qml
+// can have BOTH of them on screen — the settings window is how a cold-start
+// user creates the first server, so it opens on top of the connect sheet while
+// the sheet stays up behind it — and the two used to pull against each other:
+// the pull emits activeFocusItemChanged synchronously inside the pull, so the
+// other sheet's handler ran nested inside the first one's, and the ping-pong
+// recursed until the JS engine gave up with "RangeError: Maximum call stack
+// size exceeded" — reported, unhelpfully, against whatever unrelated binding
+// the focus notification cascade happened to reach.
+//
+// The rule that settles it is the one a user already sees: the surface in FRONT
+// owns the keyboard, and the one behind it does not fight for it.
+void TstUxShell::theSheetInFrontKeepsTheKeyboard()
+{
+    Surface surface(stackedSheetsHarness(), QSize(900, 560),
+                    QStringLiteral("unusedContext"), nullptr);
+    QVERIFY2(surface.root(), qPrintable(surface.componentError()));
+    QVERIFY(surface.expose());
+
+    auto *behind = qobject_cast<QQuickItem *>(surface.child(QStringLiteral("behindField")));
+    auto *sheet = qobject_cast<QQuickItem *>(surface.child(QStringLiteral("connectSheet")));
+    auto *settings = qobject_cast<QQuickItem *>(surface.child(QStringLiteral("settingsWindow")));
+    QVERIFY(behind && sheet && settings);
+
+    // The workspace holds the keyboard first, which is the reading each sheet
+    // takes so that closing it can put the user back.
+    behind->forceActiveFocus();
+    settle(60);
+    QCOMPARE(surface.view.activeFocusItem(), behind);
+
+    // Cold start: the connect sheet comes up and takes the keyboard. This is
+    // also what gives it something inside itself to defend.
+    sheet->setProperty("visible", true);
+    settle(120);
+    QQuickItem *holder = surface.view.activeFocusItem();
+    QVERIFY2(holder && sheet->isAncestorOf(holder),
+             "the connect sheet did not take the keyboard when it opened");
+
+    // The settings window opens ON TOP of it, exactly as the sheet's own
+    // "Server settings…" button does it, and takes the keyboard in turn. Before
+    // the fix this single step was already enough to blow the JS stack.
+    settings->setProperty("shown", true);
+    settle(200);
+    QVERIFY2(surface.warnings.isEmpty(), qPrintable(surface.warningReport()));
+    holder = surface.view.activeFocusItem();
+    // The sheet ITSELF counts as holding the keyboard, not just its children:
+    // SettingsWindow's own show handler calls root.forceActiveFocus(), so the
+    // holder is the sheet root, and QQuickItem::isAncestorOf() is false for an
+    // item against itself.
+    QVERIFY2(holder && (holder == settings || settings->isAncestorOf(holder)),
+             "the sheet behind pulled the keyboard out of the settings window");
+
+    // And a control inside the front sheet keeps it, which is every click and
+    // every Tab the user makes while that window is up.
+    auto *closeButton =
+            qobject_cast<QQuickItem *>(surface.child(QStringLiteral("settingsCloseButton")));
+    QVERIFY(closeButton);
+    closeButton->forceActiveFocus();
+    settle(200);
+    QVERIFY2(surface.warnings.isEmpty(), qPrintable(surface.warningReport()));
+    QCOMPARE(surface.view.activeFocusItem(), closeButton);
+
+    // Yielding is not the same as giving up: with the front sheet gone the one
+    // behind contains the keyboard again, so this cannot pass by having
+    // switched containment off.
+    settings->setProperty("shown", false);
+    settle(200);
+    holder = surface.view.activeFocusItem();
+    QVERIFY2(holder && sheet->isAncestorOf(holder),
+             "closing the front sheet left the keyboard outside the sheet still up");
     QVERIFY2(surface.warnings.isEmpty(), qPrintable(surface.warningReport()));
 }
 

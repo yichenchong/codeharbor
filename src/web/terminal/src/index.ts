@@ -47,6 +47,13 @@ import {
 export interface TerminalBridge {
     /** Forward user keystrokes to the remote PTY (SPEC 5.1). */
     sendInput(data: string): void;
+    /** Forward input the terminal produced as raw BYTES rather than text, with
+     *  `base64` decoding to those exact bytes (SPEC 5.1). xterm emits a mouse
+     *  report this way when the negotiated encoding is the default X10 one,
+     *  because such a report can carry bytes above 0x7f; sendInput() would lose
+     *  them to the C++ side's UTF-8 encode. Both slots feed the same PTY through
+     *  the same queue, so ordering between a report and a keystroke is kept. */
+    sendBinaryInput(base64: string): void;
     /** Notify the controller of a renderer resize (SPEC 5.1). */
     resize(cols: number, rows: number): void;
     /** Report view visibility so the controller can suspend/resume the
@@ -290,6 +297,7 @@ export function mountTerminal(element: HTMLElement, bridge: TerminalBridge): Ter
 
     const input = new TerminalInputWriter({
         sendInput: (data) => bridge.sendInput(data),
+        sendBinaryInput: (base64) => bridge.sendBinaryInput(base64),
     });
 
 
@@ -373,33 +381,21 @@ export function mountTerminal(element: HTMLElement, bridge: TerminalBridge): Ter
         return false;
     });
     term.onData((data) => input.write(data));
-    // SCOPE OF THE MOUSE POLICY, stated exactly. A modifier-drag reaches the
-    // remote program only when the negotiated encoding is SGR (`?1006h`), which
-    // travels as ordinary text through onData. That is not a hedge in practice:
-    // every CodeHarbor pane is a tmux session (SPEC 5.2), the remote program
-    // negotiates with tmux rather than with this terminal, and tmux asks its own
-    // outer terminal for SGR.
+    // WHY THERE ARE TWO ROUTES OUT OF THE EMULATOR. xterm emits a mouse report
+    // as ordinary data when the negotiated encoding is SGR (`?1006h`), and as a
+    // BINARY event when it is the default X10 one, because an X10 report encodes
+    // the column and the row as single bytes that can exceed 0x7f and therefore
+    // are not text (CoreMouseService's triggerBinaryEvent).
     //
-    // With the DEFAULT X10 encoding xterm emits the report through onBinary
-    // instead, because such a report can carry bytes above 0x7f that are not
-    // text (CoreMouseService's triggerBinaryEvent). This page has no
-    // byte-preserving route to the PTY - `sendInput` carries a QString the C++
-    // side encodes as UTF-8, which would mangle exactly those bytes - so such a
-    // report is DROPPED, and this handler does not fix that. It predates the
-    // policy change (a plain drag reached the same dead end before the modifier
-    // did) and forwarding it needs a tagged, order-preserving binary channel
-    // through the WebChannel bridge, which is its own piece of work.
-    //
-    // What this handler buys is that the drop is never silent again: undeliverable
-    // input now says so in the log instead of vanishing, which is how the gap
-    // stayed invisible until a test went looking for it.
-    term.onBinary((data) => {
-        console.warn(
-            "CodeHarbor terminal dropped an X10-encoded mouse report: this pane "
-            + "can only forward the SGR encoding that tmux negotiates "
-            + `(${data.length} bytes discarded)`,
-        );
-    });
+    // In practice every CodeHarbor pane is a tmux session (SPEC 5.2), the remote
+    // program negotiates with tmux rather than with this terminal, and tmux asks
+    // its own outer terminal for SGR — so the data route is the one that carries
+    // real traffic. The binary route is still wired up, through the SAME input
+    // queue and out through the byte-safe bridge slot: the promise that a
+    // modifier-drag reaches the remote program must not depend on which encoding
+    // the program happened to ask for, and a report that took the second route
+    // must not overtake the keystrokes queued ahead of it.
+    term.onBinary((data) => input.writeBinary(data));
 
     // Re-fit the terminal to the surface, but ONLY while the surface actually
     // has a box on screen.
