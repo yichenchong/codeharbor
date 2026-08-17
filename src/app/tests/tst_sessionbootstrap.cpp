@@ -2420,12 +2420,39 @@ void TstSessionBootstrap::anInstallThatFailedFallsBackToWhatSurvivedOnTheServer(
 // real files — the only way to know that a rollback written as shell text
 // actually puts a tree back. The root carries a space and a single quote, so the
 // quoting is exercised by the shell rather than by a substring assertion.
+//
+// POSIX HOSTS ONLY, and deliberately so. This is a script for the SERVER, which
+// runs codeharbord under Node on a POSIX box; the machine running these tests is
+// the CLIENT, and on Windows it is not a host this script can execute. Windows CI
+// proved the point the expensive way: the case aborted, and MSVC's CRT turns any
+// abort into a fail-fast that takes the whole binary down, so one unsupported
+// fixture cost the other 55 cases their results too. The decision tree above is
+// pinned on every platform; the SCRIPT is pinned here on POSIX and, against a
+// real server, by the live gate (tst_livereconnect).
 void TstSessionBootstrap::theProvisionScriptStagesTheArchiveAndRollsBackUnderARealShell()
 {
+#ifdef Q_OS_WIN
+    QSKIP("the provisioning script targets a POSIX server; a Windows client host "
+          "cannot run it (tst_livereconnect covers it on a real server)");
+#else
     const QString shell = QStandardPaths::findExecutable(QStringLiteral("sh"));
     const QString tarTool = QStandardPaths::findExecutable(QStringLiteral("tar"));
     if (shell.isEmpty() || tarTool.isEmpty())
         QSKIP("a POSIX sh and a tar are needed to run the provisioning script");
+    {
+        QProcess probe;
+        probe.start(shell,
+                    {QStringLiteral("-c"),
+                     QStringLiteral("for c in rm mv cp tar printf; do command -v "
+                                    "\"$c\" >/dev/null 2>&1 || exit 1; done; "
+                                    "echo TOOLCHAIN_OK")});
+        if (!probe.waitForFinished(30000)
+            || !QString::fromUtf8(probe.readAllStandardOutput())
+                    .contains(QStringLiteral("TOOLCHAIN_OK"))) {
+            QSKIP("this sh cannot reach the utilities the provisioning script "
+                  "uses; the live gate covers it against a real server");
+        }
+    }
 
     QTemporaryDir dir;
     QVERIFY(dir.isValid());
@@ -2433,11 +2460,12 @@ void TstSessionBootstrap::theProvisionScriptStagesTheArchiveAndRollsBackUnderARe
     const QString marker = SessionBootstrap::releaseMarkerPath(root);
     const QString scratch = root + QStringLiteral("/.codeharbor-provision");
 
+    // Fixture writes go through Qt, not the shell, so a failure here is a broken
+    // test rather than an unsupported host — and a value-returning lambda cannot
+    // host QVERIFY.
     const auto put = [](const QString& path, const QString& text) {
         QDir().mkpath(QFileInfo(path).absolutePath());
         QFile file(path);
-        // A value-returning lambda cannot host QVERIFY, and a fixture that
-        // cannot be created makes every later check meaningless.
         if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate))
             qFatal("could not create fixture file %s", qUtf8Printable(path));
         file.write(text.toUtf8());
@@ -2453,13 +2481,20 @@ void TstSessionBootstrap::theProvisionScriptStagesTheArchiveAndRollsBackUnderARe
         QString out;
         QString err;
     };
+    // A script that hangs is reported as a failed assertion on `code`, never as
+    // an abort: taking the whole binary down would throw away every other case's
+    // result along with it.
     const auto install = [&shell](const QString& script) {
         QProcess sh;
         sh.start(shell, {QStringLiteral("-c"), script});
-        if (!sh.waitForFinished(60000))
-            qFatal("the provisioning script never finished");
-        return Run{sh.exitCode(), QString::fromUtf8(sh.readAllStandardOutput()),
-                   QString::fromUtf8(sh.readAllStandardError())};
+        const bool finished = sh.waitForFinished(60000);
+        if (!finished)
+            sh.kill();
+        return Run{finished ? sh.exitCode() : -1,
+                   QString::fromUtf8(sh.readAllStandardOutput()),
+                   finished ? QString::fromUtf8(sh.readAllStandardError())
+                            : QStringLiteral("the provisioning script never "
+                                             "finished")};
     };
 
     // A real codeharbor-remote.tar.gz: dist/, package.json and sql/ at the top
@@ -2479,8 +2514,10 @@ void TstSessionBootstrap::theProvisionScriptStagesTheArchiveAndRollsBackUnderARe
         QProcess tar;
         tar.setWorkingDirectory(stage);
         tar.start(tarTool, QStringList{QStringLiteral("-czf"), tarball} + top);
+        // Empty rather than fatal: the caller turns it into a failed assertion
+        // naming the archive, which is a test result instead of a dead binary.
         if (!tar.waitForFinished(60000) || tar.exitCode() != 0)
-            qFatal("could not pack the fixture archive %s", qUtf8Printable(tarball));
+            return QString();
         return tarball;
     };
     // A staged tarball (a bare absolute path) is copied rather than downloaded,
@@ -2489,9 +2526,11 @@ void TstSessionBootstrap::theProvisionScriptStagesTheArchiveAndRollsBackUnderARe
         pack(QStringLiteral("release"),
              {QStringLiteral("dist/codeharbord.js"), QStringLiteral("dist/bridge.js"),
               QStringLiteral("package.json"), QStringLiteral("sql/schema.sql")});
+    QVERIFY2(!release.isEmpty(), "could not pack the release fixture archive");
     // Something that unpacks perfectly well and is not a remote release.
     const QString notARelease =
         pack(QStringLiteral("junk"), {QStringLiteral("package.json")});
+    QVERIFY2(!notARelease.isEmpty(), "could not pack the non-release fixture archive");
 
     // (1) A bare server. The entry point lands where entryCandidates() looks and
     // the marker records what was installed.
@@ -2649,6 +2688,7 @@ void TstSessionBootstrap::theProvisionScriptStagesTheArchiveAndRollsBackUnderARe
              QStringLiteral("not the daemon's"));
     QCOMPARE(slurp(root + QStringLiteral("/dist/codeharbord.js")),
              QStringLiteral("old daemon"));
+#endif
 }
 
 // Guiless: nothing here needs a display, and QTEST_MAIN would pull in
