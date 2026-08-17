@@ -530,8 +530,17 @@ QString SessionBootstrap::remoteProvisionScript(const QString& repoRoot,
                  + QStringLiteral(" || __ch_undone=; elif [ -f ") + markerAbsent
                  + QStringLiteral(" ]; then rm -f ") + marker
                  + QStringLiteral(" || __ch_undone=; fi; if [ -z \"$__ch_undone\" ]; "
-                                  "then return 1; fi; rm -rf ")
-                 + scratch + QStringLiteral("; }");
+                                  "then return 1; fi; rm -f ")
+                 + ready
+                 // The sentinel goes FIRST, and `rm -f` is one unlink, so the
+                 // authorisation to act on this plan is revoked before the plan
+                 // and the backup start disappearing. Deleting the scratch first
+                 // is a recursive walk that a kill can stop halfway, and the
+                 // sentinel surviving beside a pruned backup is the one state
+                 // that would make the NEXT undo destructive: every planned
+                 // member would then look like one this install had brought in
+                 // with no predecessor, which is the case that deletes.
+                 + QStringLiteral("; rm -rf ") + scratch + QStringLiteral("; }");
 
     // A swap interrupted by something no shell can trap left its plan and its
     // sentinel behind. Finish that undo before starting a fresh install: the
@@ -676,6 +685,14 @@ QString SessionBootstrap::remoteProvisionScript(const QString& repoRoot,
                  + QLatin1Char(' ') + shellQuote(artifactUrl)
                  + QStringLiteral(" > ") + marker;
     steps << QStringLiteral("__ch_state=ok");
+    // Same ordering rule as ch_undo's tail, and load-bearing for the same
+    // reason: the install is committed, so nothing may undo it any more. One
+    // unlink revokes that, and only then does the recursive delete start — a
+    // kill inside `rm -rf` must not be able to leave the sentinel standing over
+    // a half-deleted backup, because the next install's undo would read that as
+    // "these members are mine and have no predecessor" and delete the very
+    // installation this run just put there.
+    steps << QStringLiteral("rm -f ") + ready;
     steps << QStringLiteral("rm -rf ") + scratch;
     // $__ch_entry is deliberately OUTSIDE the quoted literal: it is the entry
     // point the install produced, and echo joins its two arguments with a

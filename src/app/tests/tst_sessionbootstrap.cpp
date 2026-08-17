@@ -2034,6 +2034,47 @@ void TstSessionBootstrap::provisioningStaysInsideTheChosenDirectory()
     QVERIFY(script.indexOf(QStringLiteral("tar -xzf")) < verdict);
     QVERIFY(verdict < markerWrite);
 
+    // EVERY cleanup revokes the undo's authorisation before it starts deleting.
+    // `rm -f <ready>` is one unlink; `rm -rf <scratch>` is a recursive walk a
+    // kill can stop halfway, and the sentinel left standing over a half-deleted
+    // backup is the one state that would make the NEXT undo delete a live
+    // installation: every planned member would look like one this install had
+    // brought in with no predecessor, which is the case that deletes.
+    const QString revoke =
+        QStringLiteral("rm -f '/srv/co de'\\''harbor/.codeharbor-provision/ready'");
+    const QString sweep =
+        QStringLiteral("rm -rf '/srv/co de'\\''harbor/.codeharbor-provision'");
+    // Exactly one sweep is allowed to stand alone: the fresh-start wipe, which is
+    // identified by what FOLLOWS it — it is the one that goes on to create the
+    // staging tree. Identifying it by position instead would pick the wrong one,
+    // because ch_undo() is DEFINED before that wipe and its guarded sweep is
+    // therefore the first in the text. Standing alone is correct there: no
+    // sentinel of this run exists yet, and a kill inside it leaves a scratch no
+    // undo will ever act on.
+    const QString create =
+        QStringLiteral("; mkdir -p '/srv/co de'\\''harbor/.codeharbor-provision/"
+                       "stage' '/srv/co de'\\''harbor/.codeharbor-provision/"
+                       "backup'");
+    int guarded = 0;
+    int exempt = 0;
+    for (qsizetype at = script.indexOf(sweep); at >= 0;
+         at = script.indexOf(sweep, at + 1)) {
+        if (script.mid(at + sweep.size(), create.size()) == create) {
+            ++exempt;
+            continue;
+        }
+        const QString before = script.mid(at - revoke.size() - 2, revoke.size() + 2);
+        QVERIFY2(before == revoke + QStringLiteral("; "),
+                 qPrintable(QStringLiteral("a scratch cleanup is not preceded by "
+                                           "revoking the sentinel; found \"%1\"")
+                                .arg(before)));
+        ++guarded;
+    }
+    // ch_undo's tail and the commit point. A drop to one means a cleanup lost its
+    // guard rather than the loop having had nothing to check.
+    QCOMPARE(guarded, 2);
+    QCOMPARE(exempt, 1);
+
     // Same rule for the inspection, which interpolates the node path too.
     const QString inspect = SessionBootstrap::remoteInspectScript(
         QStringLiteral("/opt/no de/bin/node"), root);
@@ -2688,6 +2729,37 @@ void TstSessionBootstrap::theProvisionScriptStagesTheArchiveAndRollsBackUnderARe
              QStringLiteral("not the daemon's"));
     QCOMPARE(slurp(root + QStringLiteral("/dist/codeharbord.js")),
              QStringLiteral("old daemon"));
+
+    // (9) The state the ordering above exists to make harmless: a run that
+    // COMMITTED and was then killed inside its own `rm -rf`, leaving a plan and a
+    // pruned backup behind. Because the sentinel is unlinked before that walk
+    // begins, what survives cannot authorise an undo — and it must not, because
+    // every planned member now has neither a backup nor a staged copy, which is
+    // precisely the shape an undo DELETES. Without the ordering this is a
+    // successful install that the next attempt takes back out.
+    const Run committed =
+        install(SessionBootstrap::remoteProvisionScript(root, release,
+                                                       QStringLiteral("curl")));
+    QCOMPARE(committed.code, 0);
+    put(root + QStringLiteral("/notes.txt"), QStringLiteral("mine"));
+    // The scratch as a killed cleanup leaves it: plan intact, backup gone,
+    // sentinel already unlinked.
+    put(scratch + QStringLiteral("/plan"),
+        QStringLiteral("dist\npackage.json\nsql\n"));
+    put(scratch + QStringLiteral("/release.prev"), release + QLatin1Char('\n'));
+    const Run afterCommit = install(SessionBootstrap::remoteProvisionScript(
+        root, dir.filePath(QStringLiteral("gone.tar.gz")), QStringLiteral("curl")));
+    QVERIFY2(afterCommit.code != 0, qPrintable(afterCommit.out));
+    QVERIFY2(!afterCommit.err.contains(QStringLiteral("an earlier install was "
+                                                      "interrupted")),
+             qPrintable(afterCommit.err));
+    // The committed installation is untouched, and so is the user's own file.
+    QCOMPARE(slurp(root + QStringLiteral("/dist/codeharbord.js")),
+             QStringLiteral("release dist/codeharbord.js"));
+    QCOMPARE(slurp(root + QStringLiteral("/sql/schema.sql")),
+             QStringLiteral("release sql/schema.sql"));
+    QCOMPARE(slurp(root + QStringLiteral("/notes.txt")), QStringLiteral("mine"));
+    QCOMPARE(slurp(marker), release + QLatin1Char('\n'));
 #endif
 }
 
