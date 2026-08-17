@@ -424,16 +424,25 @@ QString SessionBootstrap::remoteProvisionScript(const QString& repoRoot,
     // Whatever the swap displaces, kept until the swap has finished so
     // ch_restore() can put it back.
     const QString backup = shellQuote(remoteJoin(scratchDir, QStringLiteral("backup")));
-    // One line per top-level name the swap has taken over, in the order it took
-    // them. A file rather than a shell variable because an archive member may
-    // contain spaces and POSIX sh has no arrays.
-    const QString moved = shellQuote(remoteJoin(scratchDir, QStringLiteral("moved")));
+    // Every top-level name the swap will take over, one per line, written in
+    // full BEFORE the swap touches anything. A file rather than a shell variable
+    // because an archive member may contain spaces and POSIX sh has no arrays.
+    const QString plan = shellQuote(remoteJoin(scratchDir, QStringLiteral("plan")));
+    // Created only once `plan` is complete, and the ONLY thing that authorises an
+    // undo to act on it. `set -e` aborts the run if any line of the plan cannot
+    // be written, so this file existing means every line in that file is whole —
+    // which is what stops an undo from ever reasoning about a half-written name.
+    const QString ready = shellQuote(remoteJoin(scratchDir, QStringLiteral("ready")));
     const QString marker = shellQuote(releaseMarkerPath(repoRoot));
     // The marker is not in the archive, so it is not part of the swap and needs
-    // its own copy: losing it would make the next connect read an install of
-    // ours as one a human manages and never update it again.
+    // its own record: losing it would make the next connect read an install of
+    // ours as one a human manages and never update it again, while inventing one
+    // would make it overwrite a directory nobody asked us to touch. Which of
+    // these two files exists says which case an undo is putting back.
     const QString markerPrev =
         shellQuote(remoteJoin(scratchDir, QStringLiteral("release.prev")));
+    const QString markerAbsent =
+        shellQuote(remoteJoin(scratchDir, QStringLiteral("release.none")));
 
     const QString staged = stagedArtifactPath(artifactUrl);
     QString fetch;
@@ -461,16 +470,101 @@ QString SessionBootstrap::remoteProvisionScript(const QString& repoRoot,
                  + shellQuote(progressPrefix()
                               + QStringLiteral("preparing %1").arg(repoRoot));
     steps << QStringLiteral("mkdir -p ") + root;
+
+    // ---- the undo ---------------------------------------------------------
+    //
+    // Everything it needs is ON DISK, not in shell variables, so it is equally
+    // usable by the trap below and by the leftover check that follows it: a run
+    // killed outright (SIGKILL, a machine that went down mid-swap) never reaches
+    // its own trap, and the next attempt is then the only thing left that can
+    // put the installation back together.
+    //
+    //   plan          every top-level name the swap will take over
+    //   ready         present only once `plan` is COMPLETE, and the sole
+    //                 authorisation to act on it
+    //   release.prev  the marker as it was, when there was one
+    //   release.none  present when there was NO marker to keep
+    //
+    // `ready` is what makes the plan trustworthy rather than merely present. The
+    // plan is written before anything is touched and `set -e` stops the run if
+    // any line of it fails, so a plan that was interrupted mid-write has no
+    // sentinel beside it and is ignored entirely — which is correct, because a
+    // run that could not finish writing its plan had not yet moved anything. An
+    // undo must never reason about a name it cannot prove it wrote in full: a
+    // truncated one could name something of the user's that this install never
+    // touched.
+    //
+    // The two marker files are exclusive and one of them always exists once the
+    // swap can run, which is what stops an undo from either deleting a marker it
+    // did not write or resurrecting one that was never there.
+    //
+    // Per planned member, three states have to be told apart, and `backup` alone
+    // cannot do it — a member with no old counterpart leaves that directory
+    // empty whether it was swapped in or not. The STAGE is the discriminator,
+    // because the swap empties it one rename at a time:
+    //
+    //   backup/<b> exists      the old one was displaced: put it back, dropping
+    //                          whatever is at root/<b> now (swapped in or not)
+    //   else stage/<b> exists  the swap never reached this member, so root/<b> is
+    //                          untouched — LEAVE IT ALONE
+    //   else                   it was moved in and had no old counterpart, so
+    //                          root/<b> is new and belongs to the failed install
+    //
+    // Every step is guarded rather than trusted, and a failure anywhere makes the
+    // whole undo report failure WITHOUT removing the scratch directory: the
+    // backup is then the only copy of the user's files left and deleting it is
+    // the one thing that could turn a recoverable state into a lost one.
+    steps << QStringLiteral("ch_undo() { __ch_undone=1; if [ -f ") + ready
+                 + QStringLiteral(" ]; then while IFS= read -r __ch_b; do "
+                                  "if [ -n \"$__ch_b\" ]; then if [ -e ")
+                 + backup + QStringLiteral("/\"$__ch_b\" ]; then rm -rf ") + root
+                 + QStringLiteral("/\"$__ch_b\" || __ch_undone=; mv ") + backup
+                 + QStringLiteral("/\"$__ch_b\" ") + root
+                 + QStringLiteral("/\"$__ch_b\" || __ch_undone=; elif [ -e ")
+                 + stage + QStringLiteral("/\"$__ch_b\" ]; then :; else rm -rf ")
+                 + root + QStringLiteral("/\"$__ch_b\" || __ch_undone=; fi; fi; "
+                                        "done < ")
+                 + plan + QStringLiteral(" || __ch_undone=; fi; if [ -f ")
+                 + markerPrev + QStringLiteral(" ]; then cp ") + markerPrev
+                 + QLatin1Char(' ') + marker
+                 + QStringLiteral(" || __ch_undone=; elif [ -f ") + markerAbsent
+                 + QStringLiteral(" ]; then rm -f ") + marker
+                 + QStringLiteral(" || __ch_undone=; fi; if [ -z \"$__ch_undone\" ]; "
+                                  "then return 1; fi; rm -rf ")
+                 + scratch + QStringLiteral("; }");
+
+    // A swap interrupted by something no shell can trap left its plan and its
+    // sentinel behind. Finish that undo before starting a fresh install: the
+    // alternative is `rm -rf` over the only copy of the displaced files, which
+    // would turn a recoverable half-swapped tree into a permanently lost one.
+    //
+    // Best-effort under `set +e` — an undo that stops at its first failed rename
+    // leaves MORE of the tree wrong, not less — and then judged: the scratch
+    // directory still being there is ch_undo() reporting that it could not
+    // finish, and there is nothing safe to do after that but stop and say where
+    // the files are. This runs before the trap is armed, so stopping here rolls
+    // nothing back; nothing has been touched yet either.
+    steps << QStringLiteral("if [ -f ") + ready + QStringLiteral(" ]; then echo ")
+                 + shellQuote(QStringLiteral(
+                       "codeharbor: an earlier install was interrupted; putting "
+                       "that installation back before starting"))
+                 + QStringLiteral(" >&2; set +e; ch_undo; set -e; if [ -e ")
+                 + scratch + QStringLiteral(" ]; then echo ")
+                 + shellQuote(QStringLiteral(
+                       "codeharbor: could not put the interrupted install back; "
+                       "the displaced files are still under "
+                       ".codeharbor-provision/backup and nothing further was "
+                       "changed"))
+                 + QStringLiteral(" >&2; exit 1; fi; fi");
+
     steps << QStringLiteral("rm -rf ") + scratch;
     steps << QStringLiteral("mkdir -p ") + stage + QLatin1Char(' ') + backup;
-
-    // Saved BEFORE the trap is armed: a restore that ran without knowing
-    // whether a marker was there would either delete the user's or resurrect
-    // one this run never wrote.
-    steps << QStringLiteral("__ch_marker_kept=");
+    // Recorded BEFORE the trap is armed, so every path that can reach the undo
+    // finds the marker's previous state already on disk.
     steps << QStringLiteral("if [ -f ") + marker + QStringLiteral(" ]; then cp ")
                  + marker + QLatin1Char(' ') + markerPrev
-                 + QStringLiteral("; __ch_marker_kept=1; fi");
+                 + QStringLiteral("; else : > ") + markerAbsent
+                 + QStringLiteral("; fi");
 
     // ---- the rollback -----------------------------------------------------
     //
@@ -482,8 +576,13 @@ QString SessionBootstrap::remoteProvisionScript(const QString& repoRoot,
     // `set +e` first, because a best-effort restore must not abandon the
     // remaining members when one `rm` fails. The __ch_state guard makes it
     // idempotent: a trapped signal exits, which fires the EXIT trap a second
-    // time, and a second pass over `moved` would delete the very files the
-    // first pass put back.
+    // time, and a second pass over `moved` would take the very files the first
+    // pass put back for a failed install's own leftovers.
+    //
+    // A rollback that cannot finish says so on stderr, which runRemoteScript()
+    // carries back into the error the user is shown: the client re-reads the
+    // directory afterwards either way, but "what is left is not what was there"
+    // is not something to leave unsaid.
     steps << QStringLiteral("__ch_state=work");
     steps << QStringLiteral("ch_restore() { __ch_status=$?; set +e; ")
                  + QStringLiteral("if [ \"$__ch_state\" != work ]; then exit "
@@ -491,18 +590,12 @@ QString SessionBootstrap::remoteProvisionScript(const QString& repoRoot,
                  + shellQuote(QStringLiteral(
                        "codeharbor: the install failed; putting the previous "
                        "installation back"))
-                 + QStringLiteral(" >&2; if [ -f ") + moved
-                 + QStringLiteral(" ]; then while IFS= read -r __ch_b; do "
-                                  "if [ -n \"$__ch_b\" ]; then rm -rf ")
-                 + root + QStringLiteral("/\"$__ch_b\"; if [ -e ") + backup
-                 + QStringLiteral("/\"$__ch_b\" ]; then mv ") + backup
-                 + QStringLiteral("/\"$__ch_b\" ") + root
-                 + QStringLiteral("/\"$__ch_b\"; fi; fi; done < ") + moved
-                 + QStringLiteral("; fi; if [ -n \"$__ch_marker_kept\" ]; then cp ")
-                 + markerPrev + QLatin1Char(' ') + marker
-                 + QStringLiteral("; else rm -f ") + marker
-                 + QStringLiteral("; fi; rm -rf ") + scratch
-                 + QStringLiteral("; exit $__ch_status; }");
+                 + QStringLiteral(" >&2; if ch_undo; then :; else echo ")
+                 + shellQuote(QStringLiteral(
+                       "codeharbor: the previous installation could not be fully "
+                       "restored; what it had is under "
+                       ".codeharbor-provision/backup"))
+                 + QStringLiteral(" >&2; fi; exit $__ch_status; }");
     steps << QStringLiteral("trap ch_restore EXIT HUP INT TERM PIPE");
 
     steps << QStringLiteral("echo ")
@@ -530,7 +623,17 @@ QString SessionBootstrap::remoteProvisionScript(const QString& repoRoot,
     // repoRoot, the displaced one going to `backup` first so it can come back.
     // Renames within one directory tree, so the window in which repoRoot is
     // neither wholly old nor wholly new is a handful of syscalls wide — and
-    // even that window is covered by the rollback above.
+    // every state inside that window is one ch_undo() can read back.
+    //
+    // Planned in FULL, and only then declared ready, before a single member is
+    // touched. Journalling each member as the swap claimed it was the obvious
+    // alternative and is weaker in both directions: an append that failed after
+    // its member had been displaced would hide that member from the undo, and an
+    // append that failed PARTWAY would leave the undo reading a fragment of a
+    // name — which, being neither in `backup` nor in `stage`, is exactly the
+    // shape it would delete from the user's directory. Neither state can arise
+    // when the whole plan precedes the whole swap: `set -e` stops the run before
+    // the sentinel exists, and an undo without the sentinel does nothing.
     //
     // A running codeharbord is unaffected: node holds its entry file open, and
     // renaming a directory out from under an open file descriptor does not
@@ -539,18 +642,21 @@ QString SessionBootstrap::remoteProvisionScript(const QString& repoRoot,
                  + shellQuote(progressPrefix()
                               + QStringLiteral("replacing the previous "
                                                "installation"));
-    steps << QStringLiteral(": > ") + moved;
+    steps << QStringLiteral(": > ") + plan;
     steps << QStringLiteral("for __ch_m in ") + stage + QStringLiteral("/* ")
                  + stage + QStringLiteral("/.[!.]* ") + stage
-                 + QStringLiteral("/..?*; do if [ -e \"$__ch_m\" ]; then "
-                                  "__ch_b=${__ch_m##*/}; if [ -e ")
+                 + QStringLiteral("/..?*; do if [ -e \"$__ch_m\" ]; then printf ")
+                 + shellQuote(QStringLiteral("%s\\n"))
+                 + QStringLiteral(" \"${__ch_m##*/}\" >> ") + plan
+                 + QStringLiteral("; fi; done");
+    steps << QStringLiteral(": > ") + ready;
+    steps << QStringLiteral("while IFS= read -r __ch_b; do if [ -n \"$__ch_b\" ]; "
+                            "then if [ -e ")
                  + root + QStringLiteral("/\"$__ch_b\" ]; then mv ") + root
                  + QStringLiteral("/\"$__ch_b\" ") + backup
-                 + QStringLiteral("/\"$__ch_b\"; fi; printf ")
-                 + shellQuote(QStringLiteral("%s\\n"))
-                 + QStringLiteral(" \"$__ch_b\" >> ") + moved
-                 + QStringLiteral("; mv \"$__ch_m\" ") + root
-                 + QStringLiteral("/\"$__ch_b\"; fi; done");
+                 + QStringLiteral("/\"$__ch_b\"; fi; mv ") + stage
+                 + QStringLiteral("/\"$__ch_b\" ") + root
+                 + QStringLiteral("/\"$__ch_b\"; fi; done < ") + plan;
 
     // What the client will actually launch, read back from repoRoot rather than
     // inferred from the stage: this is the sentence the user is shown, and it

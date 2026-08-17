@@ -234,11 +234,13 @@ public:
     // this automates the published procedure instead of inventing a second one.
     //
     // The cost of that choice is a server with outbound network access and
-    // either curl or wget. When that does not hold, provisioning fails with a
-    // message naming the URL and the tools it looked for, and the escape hatch
-    // is remoteArtifactUrl(): point it at a tarball already staged on the
-    // server (a plain path or a file:// URL, copied with `cp` and needing no
-    // network at all).
+    // either curl or wget. When that does not hold, the INSTALL fails with a
+    // message naming the URL and the tools it looked for — and no more than the
+    // install: with a usable service already under repoRoot the session connects
+    // to it anyway (keepExistingService()). The escape hatch is
+    // remoteArtifactUrl(): point it at a tarball already staged on the server (a
+    // plain path or a file:// URL, copied with `cp` and needing no network at
+    // all).
 
     // The codeharbor-remote tarball provisioning installs. Defaults to
     // defaultRemoteArtifactUrl(); setting it empty restores that default.

@@ -2028,9 +2028,11 @@ void TstSessionBootstrap::provisioningStaysInsideTheChosenDirectory()
         script.indexOf(QStringLiteral("> '/srv/co de'\\''harbor/"
                                       ".codeharbor-release'"));
     QVERIFY(markerWrite >= 0);
-    QVERIFY(script.indexOf(QStringLiteral("tar -xzf"))
-            < script.indexOf(QStringLiteral("exit 1")));
-    QVERIFY(script.indexOf(QStringLiteral("exit 1")) < markerWrite);
+    const qsizetype verdict =
+        script.indexOf(QStringLiteral("not a codeharbor-remote release"));
+    QVERIFY(verdict >= 0);
+    QVERIFY(script.indexOf(QStringLiteral("tar -xzf")) < verdict);
+    QVERIFY(verdict < markerWrite);
 
     // Same rule for the inspection, which interpolates the node path too.
     const QString inspect = SessionBootstrap::remoteInspectScript(
@@ -2561,6 +2563,90 @@ void TstSessionBootstrap::theProvisionScriptStagesTheArchiveAndRollsBackUnderARe
         root, notARelease, QStringLiteral("curl")));
     QVERIFY(unmarked.code != 0);
     QVERIFY2(!QFileInfo::exists(marker), qPrintable(slurp(marker)));
+    QCOMPARE(slurp(root + QStringLiteral("/dist/codeharbord.js")),
+             QStringLiteral("old daemon"));
+
+    // (6) The state no trap can catch: a run killed outright (SIGKILL, or the
+    // machine going down) partway through the swap. Its `moved` list and its
+    // backup are still on disk, and the NEXT attempt is the only thing left that
+    // can finish the undo — so it does that first, before its own `rm -rf` would
+    // take the sole copy of the displaced files with it.
+    //
+    // Set up by hand because a real kill cannot be timed reliably; the state is
+    // exactly what the swap loop leaves between its two `mv`s.
+    put(marker, QStringLiteral("https://example.invalid/v8/codeharbor-remote.tar.gz\n"));
+    put(root + QStringLiteral("/dist/codeharbord.js"), QStringLiteral("half-new daemon"));
+    put(scratch + QStringLiteral("/backup/dist/codeharbord.js"),
+        QStringLiteral("old daemon"));
+    put(scratch + QStringLiteral("/plan"), QStringLiteral("dist\n"));
+    put(scratch + QStringLiteral("/ready"), QString());
+    put(scratch + QStringLiteral("/release.prev"),
+        QStringLiteral("https://example.invalid/v8/codeharbor-remote.tar.gz\n"));
+    // This attempt then fails at the fetch, so nothing of its own lands: what is
+    // left is purely what the interrupted run had before it started.
+    const Run resumed = install(SessionBootstrap::remoteProvisionScript(
+        root, dir.filePath(QStringLiteral("gone.tar.gz")), QStringLiteral("curl")));
+    QVERIFY2(resumed.code != 0, qPrintable(resumed.out));
+    QVERIFY2(resumed.err.contains(QStringLiteral("an earlier install was "
+                                                 "interrupted")),
+             qPrintable(resumed.err));
+    QCOMPARE(slurp(root + QStringLiteral("/dist/codeharbord.js")),
+             QStringLiteral("old daemon"));
+    QCOMPARE(slurp(marker),
+             QStringLiteral("https://example.invalid/v8/codeharbor-remote.tar.gz\n"));
+    QVERIFY(!QFileInfo::exists(scratch));
+
+    // ...and the recovered tree is installable again: the next attempt with a
+    // real archive completes, which is what makes this recoverable rather than
+    // merely intact.
+    const Run afterResume =
+        install(SessionBootstrap::remoteProvisionScript(root, release,
+                                                       QStringLiteral("curl")));
+    QCOMPARE(afterResume.code, 0);
+    QCOMPARE(slurp(root + QStringLiteral("/dist/codeharbord.js")),
+             QStringLiteral("release dist/codeharbord.js"));
+    QCOMPARE(slurp(marker), release + QLatin1Char('\n'));
+
+    // (7) The other two states the swap loop can be interrupted in. A member is
+    // CLAIMED before it is touched, so the claim alone says nothing about what
+    // happened to it, and the undo has to read the difference off the disk.
+    put(root + QStringLiteral("/dist/codeharbord.js"), QStringLiteral("old daemon"));
+    put(root + QStringLiteral("/sql/schema.sql"), QStringLiteral("new schema"));
+    // `dist` was claimed and never touched — its staged copy is still waiting —
+    // so what is under the root is the user's and must be left alone. `sql` was
+    // claimed, moved in, and had no old counterpart: it belongs to the failed
+    // install and goes.
+    put(scratch + QStringLiteral("/stage/dist/codeharbord.js"),
+        QStringLiteral("release dist/codeharbord.js"));
+    put(scratch + QStringLiteral("/release.none"), QString());
+    put(scratch + QStringLiteral("/plan"), QStringLiteral("sql\ndist\n"));
+    put(scratch + QStringLiteral("/ready"), QString());
+    const Run partial = install(SessionBootstrap::remoteProvisionScript(
+        root, dir.filePath(QStringLiteral("gone.tar.gz")), QStringLiteral("curl")));
+    QVERIFY2(partial.code != 0, qPrintable(partial.out));
+    QCOMPARE(slurp(root + QStringLiteral("/dist/codeharbord.js")),
+             QStringLiteral("old daemon"));
+    QVERIFY(!QFileInfo::exists(root + QStringLiteral("/sql")));
+    // release.none said there was no marker, so the undo must not invent one.
+    QVERIFY(!QFileInfo::exists(marker));
+    QVERIFY(!QFileInfo::exists(scratch));
+
+    // (8) A plan with NO sentinel beside it. That is a run which died while
+    // writing the plan, before it had touched anything, so the plan may hold a
+    // fragment of a name — and a fragment is precisely what must never reach the
+    // undo, because it can name something of the user's that no install touched.
+    // Ignoring the whole plan is both safe and correct: nothing had moved.
+    put(root + QStringLiteral("/dist/codeharbord.js"), QStringLiteral("old daemon"));
+    put(root + QStringLiteral("/di"), QStringLiteral("not the daemon's"));
+    put(scratch + QStringLiteral("/plan"), QStringLiteral("di"));
+    const Run unsealed = install(SessionBootstrap::remoteProvisionScript(
+        root, dir.filePath(QStringLiteral("gone.tar.gz")), QStringLiteral("curl")));
+    QVERIFY2(unsealed.code != 0, qPrintable(unsealed.out));
+    QVERIFY2(!unsealed.err.contains(QStringLiteral("an earlier install was "
+                                                   "interrupted")),
+             qPrintable(unsealed.err));
+    QCOMPARE(slurp(root + QStringLiteral("/di")),
+             QStringLiteral("not the daemon's"));
     QCOMPARE(slurp(root + QStringLiteral("/dist/codeharbord.js")),
              QStringLiteral("old daemon"));
 }
