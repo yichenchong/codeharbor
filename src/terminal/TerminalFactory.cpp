@@ -889,8 +889,20 @@ void TerminalFactory::probeForRecreatedSession(TerminalController* controller,
     m_rpc->call(QString::fromLatin1(rpc::kMethodListSessions), QJsonObject{},
                 [self, pane, target, askedOf](QJsonValue result,
                                               std::optional<RpcError> error) {
-                    if (!self || !pane || error)
+                    if (!self || !pane)
                         return;
+                    if (error) {
+                        // Logged rather than swallowed. This is the branch that
+                        // fires when the connection is still unwell, which is
+                        // exactly the situation a lost-pane report comes from, so
+                        // "we could not ask" has to be distinguishable from "we
+                        // asked and the session was fine". It is not an error the
+                        // user must act on, hence info and not the error signal.
+                        qInfo("terminal %s: could not ask the host which session "
+                              "this pane attached to (%s)",
+                              qUtf8Printable(target), qUtf8Printable(error->message));
+                        return;
+                    }
                     // The listing describes the host the question was asked of; a
                     // profile switch since then makes it an answer about somebody
                     // else's tmux server.
@@ -920,8 +932,22 @@ void TerminalFactory::probeForRecreatedSession(TerminalController* controller,
                         created = session.value(QStringLiteral("created")).toInteger(-1);
                         break;
                     }
-                    if (created < 0)
+                    if (created < 0) {
+                        // tmux does not list this target at all, moments after an
+                        // attach that believed it had one. Nothing can be CLAIMED
+                        // from that — the session may have died again since, and
+                        // this diagnostic cannot see what it cannot see — but it
+                        // is the single most suspicious thing this probe can
+                        // observe, so it is the last thing that should be silent.
+                        // `confirmed` is included because "we had one and now the
+                        // host lists none" is a different story from "we never
+                        // saw one".
+                        qInfo("terminal %s: the host lists no session under this "
+                              "name (previously observed created %lld)",
+                              qUtf8Printable(target),
+                              static_cast<long long>(confirmed));
                         return;
+                    }
 
                     // Record what the host said BEFORE reporting anything: the
                     // signal below re-enters QML, where anything is free to

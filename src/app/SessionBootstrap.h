@@ -234,11 +234,13 @@ public:
     // this automates the published procedure instead of inventing a second one.
     //
     // The cost of that choice is a server with outbound network access and
-    // either curl or wget. When that does not hold, provisioning fails with a
-    // message naming the URL and the tools it looked for, and the escape hatch
-    // is remoteArtifactUrl(): point it at a tarball already staged on the
-    // server (a plain path or a file:// URL, copied with `cp` and needing no
-    // network at all).
+    // either curl or wget. When that does not hold, the INSTALL fails with a
+    // message naming the URL and the tools it looked for — and no more than the
+    // install: with a usable service already under repoRoot the session connects
+    // to it anyway (keepExistingService()). The escape hatch is
+    // remoteArtifactUrl(): point it at a tarball already staged on the server (a
+    // plain path or a file:// URL, copied with `cp` and needing no network at
+    // all).
 
     // The codeharbor-remote tarball provisioning installs. Defaults to
     // defaultRemoteArtifactUrl(); setting it empty restores that default.
@@ -310,11 +312,20 @@ public:
     static QString remoteInspectScript(const QString& nodePath,
                                        const QString& repoRoot);
 
-    // POSIX sh that fetches `artifactUrl`, unpacks it into `repoRoot`, proves a
-    // codeharbord entry point exists afterwards and only then writes the
-    // release marker. `fetcher` is the RemoteInspection::fetcher value. Every
-    // scratch file lives under `repoRoot`, so provisioning never writes outside
-    // the directory the user chose.
+    // POSIX sh that fetches `artifactUrl`, unpacks it into a STAGING directory
+    // under `repoRoot`, proves a codeharbord entry point exists in the staged
+    // tree, and only then moves each top-level member into place — keeping what
+    // it displaces, so any failure from the fetch onwards (including a killed
+    // channel: the rollback is a trap on EXIT/HUP/INT/TERM/PIPE) puts the
+    // previous installation and its release marker back. The marker is written
+    // last and only on success. `fetcher` is the RemoteInspection::fetcher
+    // value. Every scratch file lives under `repoRoot`, so provisioning never
+    // writes outside the directory the user chose.
+    //
+    // Unpacking straight over the live installation was the original design,
+    // and it is what turned a failed update into a lost workspace: a truncated
+    // download or a Node too old to run what landed left a tree half old and
+    // half new, with nothing to go back to.
     static QString remoteProvisionScript(const QString& repoRoot,
                                          const QString& artifactUrl,
                                          const QString& fetcher);
@@ -466,6 +477,18 @@ private:
     // Same teardown as fail(), but marks a server/configuration prerequisite
     // failure as non-retryable. The reconnect ladder stops after this attempt.
     void failFatal(const QString& message);
+    // Report an install that did NOT happen while a usable installation is
+    // still in place at `entry`, and let the connect proceed on it. `reason` is
+    // the prerequisite failure, in full; the message adds what was kept.
+    // Returns true, so every caller is `return keepExistingService(...)`.
+    //
+    // Which signal it uses is the whole subtlety: upgradeFailed() when the user
+    // asked for the update (error() is held for the duration of a connect
+    // attempt and discarded when it succeeds, so it cannot report a failure on
+    // an attempt that then connects), and channelDiagnostic() when nothing but
+    // a stale release marker prompted the install.
+    bool keepExistingService(const QString& reason, bool forced,
+                             const QString& entry);
     // `message` with the most recent channelDiagnostic() of the exec attempt
     // appended, so a setup failure carries the remote side's own explanation.
     QString withLastDiagnostic(const QString& message) const;

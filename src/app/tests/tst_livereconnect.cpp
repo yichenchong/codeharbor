@@ -145,10 +145,13 @@ private:
     AgentStatusMonitor m_monitor;
     std::unique_ptr<SessionBootstrap> m_bootstrap;
     QStringList m_bootstrapErrors;
-    // Members rather than locals in the case body: both are appended to from
-    // lambdas whose connection lives as long as m_bootstrap, which outlives the
-    // slot that made it, so a captured local would dangle.
+    // Members rather than locals in the case body: all three are appended to
+    // from lambdas whose connection lives as long as m_bootstrap, which outlives
+    // the slot that made it, so a captured local would dangle.
     QStringList m_provisioningReports;
+    // An update that did not happen on an attempt that CONNECTS reports itself
+    // here and nowhere else — error() is the wrong channel for it by design.
+    QStringList m_upgradeFailures;
     bool m_live = false;
 };
 
@@ -378,9 +381,14 @@ void TstLiveReconnect::provisionsAnEmptyLocationThenWires()
     connect(m_bootstrap.get(), &SessionBootstrap::error, this,
             [this](const QString& message) { m_bootstrapErrors.append(message); });
     m_provisioningReports.clear();
+    m_upgradeFailures.clear();
     connect(m_bootstrap.get(), &SessionBootstrap::provisioning, this,
             [this](const QString& message) {
                 m_provisioningReports.append(message);
+            });
+    connect(m_bootstrap.get(), &SessionBootstrap::upgradeFailed, this,
+            [this](const QString& message) {
+                m_upgradeFailures.append(message);
             });
 
     const auto why = [this] { return m_bootstrapErrors.join(QStringLiteral(" | ")); };
@@ -498,6 +506,10 @@ void TstLiveReconnect::provisionsAnEmptyLocationThenWires()
     // unpacking a release beside a checkout leaves the checkout in place but no
     // longer the thing that runs.
     //
+    // The refusal must NOT take the session with it: nothing was written, so the
+    // checkout still runs, and the session comes up on it with the failed
+    // upgrade reported through upgradeFailed().
+    //
     // Proven against a real server rather than only in the unit gate because
     // the entry point being compared is the one the server's own sh reported.
     // The marker is what says "this install is ours". Removing it makes this
@@ -517,13 +529,18 @@ void TstLiveReconnect::provisionsAnEmptyLocationThenWires()
     m_bootstrap->disconnectSession();
     m_bootstrapErrors.clear();
     m_provisioningReports.clear();
+    m_upgradeFailures.clear();
 
     m_bootstrap->requestRemoteUpgrade();
-    QVERIFY2(!m_bootstrap->connectAndWire(host, port, user, node, target,
-                                          identity),
-             "a requested upgrade overwrote a source-layout installation");
-    QCOMPARE(m_bootstrapErrors.size(), 1);
-    const QString refusal = m_bootstrapErrors.at(0);
+    QVERIFY2(m_bootstrap->connectAndWire(host, port, user, node, target,
+                                         identity),
+             qPrintable(QStringLiteral("a refused upgrade also refused the "
+                                       "session: %1")
+                            .arg(why())));
+    QCOMPARE(m_bootstrap->state(), State::Wired);
+    QVERIFY2(m_bootstrapErrors.isEmpty(), qPrintable(why()));
+    QCOMPARE(m_upgradeFailures.size(), 1);
+    const QString refusal = m_upgradeFailures.at(0);
     QVERIFY2(refusal.contains(QStringLiteral("source checkout")),
              qPrintable(refusal));
     QVERIFY2(refusal.contains(QStringLiteral("Nothing was changed")),
@@ -532,13 +549,11 @@ void TstLiveReconnect::provisionsAnEmptyLocationThenWires()
              qPrintable(m_provisioningReports.join(QStringLiteral(" | "))));
     // Spent, so the next connect is an ordinary one.
     QVERIFY(!m_bootstrap->remoteUpgradeRequested());
+    // The checkout the upgrade would not touch is what this session is talking
+    // to, and it works.
+    QVERIFY2(serverInfoAnswers(&detail), qPrintable(detail));
 
     // Nothing was written: no release layout appeared and no marker came back.
-    m_pool.disconnectFromHost();
-    m_bootstrapErrors.clear();
-    QVERIFY2(m_bootstrap->connectAndWire(host, port, user, node, target,
-                                         identity),
-             qPrintable(why()));
     execOk = false;
     const QString after =
         runExec(m_pool,
@@ -550,7 +565,6 @@ void TstLiveReconnect::provisionsAnEmptyLocationThenWires()
     QVERIFY(execOk);
     QVERIFY2(!after.contains(QStringLiteral("RELEASE_LAYOUT")), qPrintable(after));
     QVERIFY2(!after.contains(QStringLiteral("MARKER_BACK")), qPrintable(after));
-    QVERIFY2(serverInfoAnswers(&detail), qPrintable(detail));
 
     QVERIFY2(m_bootstrapErrors.isEmpty(), qPrintable(why()));
 }

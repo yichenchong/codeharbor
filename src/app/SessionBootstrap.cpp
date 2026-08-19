@@ -44,30 +44,46 @@ QString remoteJoin(const QString& root, const QString& relative)
     return base + QLatin1Char('/') + relative;
 }
 
-// POSIX sh that leaves the first existing candidate in $__ch_entry, or names
-// every path it tried on stderr and exits 127. The selection happens on the
-// SERVER, inside the exec we were going to issue anyway: a client-side probe
-// would cost an extra round trip on every connect and would still be a guess
-// (the probe and the exec are two different moments), and a per-profile
-// "layout" field would make every user answer a question about our build
-// system. `stem` is the entry name and doubles as the label in the error.
-QString selectEntry(const QString& repoRoot, const QString& stem)
+// POSIX sh that leaves the first existing candidate for `stem` under `root` in
+// $__ch_entry, or the empty string when none of them exists. No verdict of its
+// own: the launch commands turn "none" into a fatal exec failure, while the
+// provisioning script turns it into a rejected archive.
+//
+// The selection happens on the SERVER, inside the exec we were going to issue
+// anyway: a client-side probe would cost an extra round trip on every connect
+// and would still be a guess (the probe and the exec are two different
+// moments), and a per-profile "layout" field would make every user answer a
+// question about our build system.
+QString findEntry(const QString& root, const QString& stem)
 {
     const QStringList candidates =
-        SessionBootstrap::entryCandidates(repoRoot, stem);
+        SessionBootstrap::entryCandidates(root, stem);
     QStringList quoted;
     quoted.reserve(candidates.size());
     for (const QString& candidate : candidates)
         quoted << shellQuote(candidate);
 
+    // One complete command list, with NO trailing separator: callers append
+    // their own, and a stray `;` ahead of another one is `;;` — a syntax error
+    // outside a `case`, which would break every script this appears in.
     return QStringLiteral("__ch_entry=; for __ch_c in ")
            + quoted.join(QLatin1Char(' '))
            + QStringLiteral("; do if [ -f \"$__ch_c\" ]; then "
-                            "__ch_entry=\"$__ch_c\"; break; fi; done; "
-                            "if [ -z \"$__ch_entry\" ]; then echo ")
+                            "__ch_entry=\"$__ch_c\"; break; fi; done");
+}
+
+// findEntry() plus the launch commands' verdict: name every path that was tried
+// on stderr and refuse to exec, so "it does not launch" is answerable without
+// an SSH session of your own. `stem` doubles as the label in the error.
+QString selectEntry(const QString& repoRoot, const QString& stem)
+{
+    return findEntry(repoRoot, stem)
+           + QStringLiteral("; if [ -z \"$__ch_entry\" ]; then echo ")
            + shellQuote(QStringLiteral("codeharbor: no %1 entry point on this "
                                        "server. Tried: %2")
-                            .arg(stem, candidates.join(QStringLiteral(", "))))
+                            .arg(stem,
+                                 SessionBootstrap::entryCandidates(repoRoot, stem)
+                                     .join(QStringLiteral(", "))))
            + QStringLiteral(" >&2; exit 127; fi; ");
 }
 
@@ -389,14 +405,44 @@ QString SessionBootstrap::remoteProvisionScript(const QString& repoRoot,
 {
     const QString root = shellQuote(repoRoot);
     // Scratch space INSIDE the directory the user chose. Nothing this script
-    // touches — not the download, not a temporary — lives anywhere else, so a
-    // failed install cannot leave litter on a machine that is not ours.
-    const QString scratch = shellQuote(
-        remoteJoin(repoRoot, QStringLiteral(".codeharbor-provision")));
-    const QString tarball = shellQuote(remoteJoin(
-        repoRoot,
-        QStringLiteral(".codeharbor-provision/codeharbor-remote.tar.gz")));
+    // touches — not the download, not the staged tree, not the displaced old
+    // install — lives anywhere else, so a failed install cannot leave litter on
+    // a machine that is not ours.
+    const QString scratchDir =
+        remoteJoin(repoRoot, QStringLiteral(".codeharbor-provision"));
+    const QString scratch = shellQuote(scratchDir);
+    const QString tarball = shellQuote(
+        remoteJoin(scratchDir, QStringLiteral("codeharbor-remote.tar.gz")));
+    // The archive is unpacked HERE, never over the live install: nothing under
+    // repoRoot moves until a codeharbord entry point has been proven to exist
+    // inside this directory. An in-place `tar -xzf -C <root>` was the original
+    // design and is what made a failed update destroy a working service —
+    // a truncated download, a full disk or a killed channel left the tree half
+    // old and half new, with no way back.
+    const QString stageDir = remoteJoin(scratchDir, QStringLiteral("stage"));
+    const QString stage = shellQuote(stageDir);
+    // Whatever the swap displaces, kept until the swap has finished so
+    // ch_restore() can put it back.
+    const QString backup = shellQuote(remoteJoin(scratchDir, QStringLiteral("backup")));
+    // Every top-level name the swap will take over, one per line, written in
+    // full BEFORE the swap touches anything. A file rather than a shell variable
+    // because an archive member may contain spaces and POSIX sh has no arrays.
+    const QString plan = shellQuote(remoteJoin(scratchDir, QStringLiteral("plan")));
+    // Created only once `plan` is complete, and the ONLY thing that authorises an
+    // undo to act on it. `set -e` aborts the run if any line of the plan cannot
+    // be written, so this file existing means every line in that file is whole —
+    // which is what stops an undo from ever reasoning about a half-written name.
+    const QString ready = shellQuote(remoteJoin(scratchDir, QStringLiteral("ready")));
     const QString marker = shellQuote(releaseMarkerPath(repoRoot));
+    // The marker is not in the archive, so it is not part of the swap and needs
+    // its own record: losing it would make the next connect read an install of
+    // ours as one a human manages and never update it again, while inventing one
+    // would make it overwrite a directory nobody asked us to touch. Which of
+    // these two files exists says which case an undo is putting back.
+    const QString markerPrev =
+        shellQuote(remoteJoin(scratchDir, QStringLiteral("release.prev")));
+    const QString markerAbsent =
+        shellQuote(remoteJoin(scratchDir, QStringLiteral("release.none")));
 
     const QString staged = stagedArtifactPath(artifactUrl);
     QString fetch;
@@ -413,51 +459,248 @@ QString SessionBootstrap::remoteProvisionScript(const QString& repoRoot,
                 + shellQuote(artifactUrl);
     }
 
-    QStringList quoted;
-    const QStringList candidates =
-        entryCandidates(repoRoot, QStringLiteral("codeharbord"));
-    quoted.reserve(candidates.size());
-    for (const QString& candidate : candidates)
-        quoted << shellQuote(candidate);
+    // `set -e`: every step is load-bearing, and with the rollback below in
+    // place the first failure is also where the old installation is put back.
+    // Each "codeharbor: " line is republished to the user by runRemoteScript()
+    // as it lands, which is what keeps a multi-megabyte download from looking
+    // like a hung application.
+    QStringList steps;
+    steps << QStringLiteral("set -e");
+    steps << QStringLiteral("echo ")
+                 + shellQuote(progressPrefix()
+                              + QStringLiteral("preparing %1").arg(repoRoot));
+    steps << QStringLiteral("mkdir -p ") + root;
 
-    // `set -e`: every step is load-bearing and a half-unpacked directory is
-    // worse than an untouched one. Each "codeharbor: " line is republished to
-    // the user by runRemoteScript() as it lands, which is what keeps a
-    // multi-megabyte download from looking like a hung application.
-    return QStringLiteral("set -e; echo ")
-           + shellQuote(progressPrefix()
-                        + QStringLiteral("preparing %1").arg(repoRoot))
-           + QStringLiteral("; mkdir -p ") + root + QStringLiteral("; rm -rf ")
-           + scratch + QStringLiteral("; mkdir -p ") + scratch
-           + QStringLiteral("; echo ")
-           + shellQuote(progressPrefix()
-                        + QStringLiteral("fetching %1").arg(artifactUrl))
-           + QStringLiteral("; ") + fetch + QStringLiteral("; echo ")
-           + shellQuote(progressPrefix()
-                        + QStringLiteral("unpacking codeharbor-remote"))
-           + QStringLiteral("; tar -xzf ") + tarball + QStringLiteral(" -C ")
-           + root + QStringLiteral("; rm -rf ") + scratch
-           + QStringLiteral("; __ch_entry=; for __ch_c in ")
-           + quoted.join(QLatin1Char(' '))
-           + QStringLiteral("; do if [ -f \"$__ch_c\" ]; then "
-                            "__ch_entry=\"$__ch_c\"; break; fi; done; "
-                            "if [ -z \"$__ch_entry\" ]; then echo ")
-           + shellQuote(QStringLiteral(
-                 "codeharbor: the archive unpacked but holds no codeharbord "
-                 "entry point; it is not a codeharbor-remote release"))
-           + QStringLiteral(" >&2; exit 1; fi; "
-                            // The marker is the LAST thing written and only on
-                            // success, so an install that died halfway is
-                            // retried on the next connect instead of being
-                            // mistaken for a current one.
-                            "printf ")
-           + shellQuote(QStringLiteral("%s\\n")) + QLatin1Char(' ')
-           + shellQuote(artifactUrl) + QStringLiteral(" > ") + marker
-           // $__ch_entry is deliberately OUTSIDE the quoted literal: it is the
-           // entry point the install produced, and echo joins its two arguments
-           // with a space.
-           + QStringLiteral("; echo ") + shellQuote(installedMarker())
-           + QStringLiteral(" \"$__ch_entry\"");
+    // ---- the undo ---------------------------------------------------------
+    //
+    // Everything it needs is ON DISK, not in shell variables, so it is equally
+    // usable by the trap below and by the leftover check that follows it: a run
+    // killed outright (SIGKILL, a machine that went down mid-swap) never reaches
+    // its own trap, and the next attempt is then the only thing left that can
+    // put the installation back together.
+    //
+    //   plan          every top-level name the swap will take over
+    //   ready         present only once `plan` is COMPLETE, and the sole
+    //                 authorisation to act on it
+    //   release.prev  the marker as it was, when there was one
+    //   release.none  present when there was NO marker to keep
+    //
+    // `ready` is what makes the plan trustworthy rather than merely present. The
+    // plan is written before anything is touched and `set -e` stops the run if
+    // any line of it fails, so a plan that was interrupted mid-write has no
+    // sentinel beside it and is ignored entirely — which is correct, because a
+    // run that could not finish writing its plan had not yet moved anything. An
+    // undo must never reason about a name it cannot prove it wrote in full: a
+    // truncated one could name something of the user's that this install never
+    // touched.
+    //
+    // The two marker files are exclusive and one of them always exists once the
+    // swap can run, which is what stops an undo from either deleting a marker it
+    // did not write or resurrecting one that was never there.
+    //
+    // Per planned member, three states have to be told apart, and `backup` alone
+    // cannot do it — a member with no old counterpart leaves that directory
+    // empty whether it was swapped in or not. The STAGE is the discriminator,
+    // because the swap empties it one rename at a time:
+    //
+    //   backup/<b> exists      the old one was displaced: put it back, dropping
+    //                          whatever is at root/<b> now (swapped in or not)
+    //   else stage/<b> exists  the swap never reached this member, so root/<b> is
+    //                          untouched — LEAVE IT ALONE
+    //   else                   it was moved in and had no old counterpart, so
+    //                          root/<b> is new and belongs to the failed install
+    //
+    // Every step is guarded rather than trusted, and a failure anywhere makes the
+    // whole undo report failure WITHOUT removing the scratch directory: the
+    // backup is then the only copy of the user's files left and deleting it is
+    // the one thing that could turn a recoverable state into a lost one.
+    steps << QStringLiteral("ch_undo() { __ch_undone=1; if [ -f ") + ready
+                 + QStringLiteral(" ]; then while IFS= read -r __ch_b; do "
+                                  "if [ -n \"$__ch_b\" ]; then if [ -e ")
+                 + backup + QStringLiteral("/\"$__ch_b\" ]; then rm -rf ") + root
+                 + QStringLiteral("/\"$__ch_b\" || __ch_undone=; mv ") + backup
+                 + QStringLiteral("/\"$__ch_b\" ") + root
+                 + QStringLiteral("/\"$__ch_b\" || __ch_undone=; elif [ -e ")
+                 + stage + QStringLiteral("/\"$__ch_b\" ]; then :; else rm -rf ")
+                 + root + QStringLiteral("/\"$__ch_b\" || __ch_undone=; fi; fi; "
+                                        "done < ")
+                 + plan + QStringLiteral(" || __ch_undone=; fi; if [ -f ")
+                 + markerPrev + QStringLiteral(" ]; then cp ") + markerPrev
+                 + QLatin1Char(' ') + marker
+                 + QStringLiteral(" || __ch_undone=; elif [ -f ") + markerAbsent
+                 + QStringLiteral(" ]; then rm -f ") + marker
+                 + QStringLiteral(" || __ch_undone=; fi; if [ -z \"$__ch_undone\" ]; "
+                                  "then return 1; fi; rm -f ")
+                 + ready
+                 // The sentinel goes FIRST, and `rm -f` is one unlink, so the
+                 // authorisation to act on this plan is revoked before the plan
+                 // and the backup start disappearing. Deleting the scratch first
+                 // is a recursive walk that a kill can stop halfway, and the
+                 // sentinel surviving beside a pruned backup is the one state
+                 // that would make the NEXT undo destructive: every planned
+                 // member would then look like one this install had brought in
+                 // with no predecessor, which is the case that deletes.
+                 + QStringLiteral("; rm -rf ") + scratch + QStringLiteral("; }");
+
+    // A swap interrupted by something no shell can trap left its plan and its
+    // sentinel behind. Finish that undo before starting a fresh install: the
+    // alternative is `rm -rf` over the only copy of the displaced files, which
+    // would turn a recoverable half-swapped tree into a permanently lost one.
+    //
+    // Best-effort under `set +e` — an undo that stops at its first failed rename
+    // leaves MORE of the tree wrong, not less — and then judged: the scratch
+    // directory still being there is ch_undo() reporting that it could not
+    // finish, and there is nothing safe to do after that but stop and say where
+    // the files are. This runs before the trap is armed, so stopping here rolls
+    // nothing back; nothing has been touched yet either.
+    steps << QStringLiteral("if [ -f ") + ready + QStringLiteral(" ]; then echo ")
+                 + shellQuote(QStringLiteral(
+                       "codeharbor: an earlier install was interrupted; putting "
+                       "that installation back before starting"))
+                 + QStringLiteral(" >&2; set +e; ch_undo; set -e; if [ -e ")
+                 + scratch + QStringLiteral(" ]; then echo ")
+                 + shellQuote(QStringLiteral(
+                       "codeharbor: could not put the interrupted install back; "
+                       "the displaced files are still under "
+                       ".codeharbor-provision/backup and nothing further was "
+                       "changed"))
+                 + QStringLiteral(" >&2; exit 1; fi; fi");
+
+    steps << QStringLiteral("rm -rf ") + scratch;
+    steps << QStringLiteral("mkdir -p ") + stage + QLatin1Char(' ') + backup;
+    // Recorded BEFORE the trap is armed, so every path that can reach the undo
+    // finds the marker's previous state already on disk.
+    steps << QStringLiteral("if [ -f ") + marker + QStringLiteral(" ]; then cp ")
+                 + marker + QLatin1Char(' ') + markerPrev
+                 + QStringLiteral("; else : > ") + markerAbsent
+                 + QStringLiteral("; fi");
+
+    // ---- the rollback -----------------------------------------------------
+    //
+    // Runs on ANY exit before the install is committed, including the signals a
+    // dropped SSH channel produces (PIPE when the client stops reading, TERM
+    // when the session is torn down): a swap left half done is the one state
+    // that would cost the user a service that worked a moment ago.
+    //
+    // `set +e` first, because a best-effort restore must not abandon the
+    // remaining members when one `rm` fails. The __ch_state guard makes it
+    // idempotent: a trapped signal exits, which fires the EXIT trap a second
+    // time, and a second pass over `moved` would take the very files the first
+    // pass put back for a failed install's own leftovers.
+    //
+    // A rollback that cannot finish says so on stderr, which runRemoteScript()
+    // carries back into the error the user is shown: the client re-reads the
+    // directory afterwards either way, but "what is left is not what was there"
+    // is not something to leave unsaid.
+    steps << QStringLiteral("__ch_state=work");
+    steps << QStringLiteral("ch_restore() { __ch_status=$?; set +e; ")
+                 + QStringLiteral("if [ \"$__ch_state\" != work ]; then exit "
+                                  "$__ch_status; fi; __ch_state=undo; echo ")
+                 + shellQuote(QStringLiteral(
+                       "codeharbor: the install failed; putting the previous "
+                       "installation back"))
+                 + QStringLiteral(" >&2; if ch_undo; then :; else echo ")
+                 + shellQuote(QStringLiteral(
+                       "codeharbor: the previous installation could not be fully "
+                       "restored; what it had is under "
+                       ".codeharbor-provision/backup"))
+                 + QStringLiteral(" >&2; fi; exit $__ch_status; }");
+    steps << QStringLiteral("trap ch_restore EXIT HUP INT TERM PIPE");
+
+    steps << QStringLiteral("echo ")
+                 + shellQuote(progressPrefix()
+                              + QStringLiteral("fetching %1").arg(artifactUrl));
+    steps << fetch;
+    steps << QStringLiteral("echo ")
+                 + shellQuote(progressPrefix()
+                              + QStringLiteral("unpacking codeharbor-remote"));
+    steps << QStringLiteral("tar -xzf ") + tarball + QStringLiteral(" -C ") + stage;
+
+    // The archive is judged where it landed. Every path under repoRoot is still
+    // the one the user has been running when this check decides.
+    steps << findEntry(stageDir, QStringLiteral("codeharbord"));
+    steps << QStringLiteral("if [ -z \"$__ch_entry\" ]; then echo ")
+                 + shellQuote(QStringLiteral(
+                       "codeharbor: the archive unpacked but holds no "
+                       "codeharbord entry point; it is not a codeharbor-remote "
+                       "release"))
+                 + QStringLiteral(" >&2; exit 1; fi");
+
+    // ---- the swap ---------------------------------------------------------
+    //
+    // Every top-level member of the staged tree replaces its namesake under
+    // repoRoot, the displaced one going to `backup` first so it can come back.
+    // Renames within one directory tree, so the window in which repoRoot is
+    // neither wholly old nor wholly new is a handful of syscalls wide — and
+    // every state inside that window is one ch_undo() can read back.
+    //
+    // Planned in FULL, and only then declared ready, before a single member is
+    // touched. Journalling each member as the swap claimed it was the obvious
+    // alternative and is weaker in both directions: an append that failed after
+    // its member had been displaced would hide that member from the undo, and an
+    // append that failed PARTWAY would leave the undo reading a fragment of a
+    // name — which, being neither in `backup` nor in `stage`, is exactly the
+    // shape it would delete from the user's directory. Neither state can arise
+    // when the whole plan precedes the whole swap: `set -e` stops the run before
+    // the sentinel exists, and an undo without the sentinel does nothing.
+    //
+    // A running codeharbord is unaffected: node holds its entry file open, and
+    // renaming a directory out from under an open file descriptor does not
+    // disturb it.
+    steps << QStringLiteral("echo ")
+                 + shellQuote(progressPrefix()
+                              + QStringLiteral("replacing the previous "
+                                               "installation"));
+    steps << QStringLiteral(": > ") + plan;
+    steps << QStringLiteral("for __ch_m in ") + stage + QStringLiteral("/* ")
+                 + stage + QStringLiteral("/.[!.]* ") + stage
+                 + QStringLiteral("/..?*; do if [ -e \"$__ch_m\" ]; then printf ")
+                 + shellQuote(QStringLiteral("%s\\n"))
+                 + QStringLiteral(" \"${__ch_m##*/}\" >> ") + plan
+                 + QStringLiteral("; fi; done");
+    steps << QStringLiteral(": > ") + ready;
+    steps << QStringLiteral("while IFS= read -r __ch_b; do if [ -n \"$__ch_b\" ]; "
+                            "then if [ -e ")
+                 + root + QStringLiteral("/\"$__ch_b\" ]; then mv ") + root
+                 + QStringLiteral("/\"$__ch_b\" ") + backup
+                 + QStringLiteral("/\"$__ch_b\"; fi; mv ") + stage
+                 + QStringLiteral("/\"$__ch_b\" ") + root
+                 + QStringLiteral("/\"$__ch_b\"; fi; done < ") + plan;
+
+    // What the client will actually launch, read back from repoRoot rather than
+    // inferred from the stage: this is the sentence the user is shown, and it
+    // has to name a path that exists now.
+    steps << findEntry(repoRoot, QStringLiteral("codeharbord"));
+    steps << QStringLiteral("if [ -z \"$__ch_entry\" ]; then echo ")
+                 + shellQuote(QStringLiteral(
+                       "codeharbor: nothing launchable under the installation "
+                       "directory after unpacking the archive"))
+                 + QStringLiteral(" >&2; exit 1; fi");
+
+    // The marker, then the commit point, then the cleanup. Written only once
+    // there is something launchable to attribute it to, and rolled back with
+    // everything else when there is not, so a marker never names a release the
+    // directory does not hold.
+    steps << QStringLiteral("printf ") + shellQuote(QStringLiteral("%s\\n"))
+                 + QLatin1Char(' ') + shellQuote(artifactUrl)
+                 + QStringLiteral(" > ") + marker;
+    steps << QStringLiteral("__ch_state=ok");
+    // Same ordering rule as ch_undo's tail, and load-bearing for the same
+    // reason: the install is committed, so nothing may undo it any more. One
+    // unlink revokes that, and only then does the recursive delete start — a
+    // kill inside `rm -rf` must not be able to leave the sentinel standing over
+    // a half-deleted backup, because the next install's undo would read that as
+    // "these members are mine and have no predecessor" and delete the very
+    // installation this run just put there.
+    steps << QStringLiteral("rm -f ") + ready;
+    steps << QStringLiteral("rm -rf ") + scratch;
+    // $__ch_entry is deliberately OUTSIDE the quoted literal: it is the entry
+    // point the install produced, and echo joins its two arguments with a
+    // space. This line is the script's success verdict (installedMarker()).
+    steps << QStringLiteral("echo ") + shellQuote(installedMarker())
+                 + QStringLiteral(" \"$__ch_entry\"");
+
+    return steps.join(QStringLiteral("; "));
 }
 
 SessionBootstrap::RemoteInspection
@@ -1056,6 +1299,29 @@ bool SessionBootstrap::runRemoteScript(const QString& script, int timeoutMs,
     return true;
 }
 
+bool SessionBootstrap::keepExistingService(const QString& reason, bool forced,
+                                           const QString& entry)
+{
+    const QString message =
+        tr("%1 The CodeHarbor remote service already installed at %2 on %3 was "
+           "left exactly as it was, and this session is using it.")
+            .arg(reason, entry, m_host);
+    if (forced) {
+        // The user asked for this update, so its failure is the news — and
+        // error() cannot carry that news, because it is HELD while a connect
+        // attempt is in flight and then dropped when the attempt succeeds,
+        // which is precisely what this attempt is about to do.
+        emit upgradeFailed(message);
+    } else {
+        // Nobody asked: the client merely noticed that the release it would
+        // install is not the one that is there. That is a log line, not a toast
+        // on a session which is coming up fine — the same treatment an old node
+        // under an installation that needs no update already gets.
+        emit channelDiagnostic(QStringLiteral("codeharbor-provision"), message);
+    }
+    return true;
+}
+
 bool SessionBootstrap::ensureRemoteService()
 {
     const QString role = QStringLiteral("codeharbor-provision");
@@ -1177,26 +1443,49 @@ bool SessionBootstrap::ensureRemoteService()
     const QString releaseEntry =
         entryCandidates(m_repoRoot, QStringLiteral("codeharbord")).at(0);
     if (forced && !info.entry.isEmpty() && info.entry != releaseEntry) {
-        failFatal(tr("\"%1\" on %2 is a source checkout, not an installed release: it "
-                "runs %3. Update it there (git pull, then build), or point this "
-                "profile's repository root at a directory of its own to install "
-                "releases into. Nothing was changed.")
-                .arg(m_repoRoot, m_host, info.entry));
-        return false;
+        // Reported, not fatal. Nothing was written, so the checkout the user
+        // maintains is still there and still runnable; refusing the session as
+        // well would answer a mistaken click by taking their workspace away.
+        return keepExistingService(
+            tr("\"%1\" on %2 is a source checkout, not an installed release: it "
+               "runs %3. Update it there (git pull, then build), or point this "
+               "profile's repository root at a directory of its own to install "
+               "releases into. Nothing was changed.")
+                .arg(m_repoRoot, m_host, info.entry),
+            forced, info.entry);
     }
 
     // ---- everything below writes to somebody else's machine ---------------
+    //
+    // A prerequisite of INSTALLING that the server does not meet is not a
+    // reason to refuse the session. Every one of the checks below therefore
+    // ends in declineInstall(): when something launchable is already under
+    // repoRoot the user is told what did not happen — loudly when they asked
+    // for it — and the session comes up on the copy that was working before.
+    // Only a server with NOTHING installed is refused, because there is then
+    // nothing to fall back to.
+    //
+    // That distinction is the whole point: "your update did not happen" is a
+    // toast, while "your workspace is unreachable until you upgrade Node on the
+    // server" is what this client used to do to a working installation the
+    // moment a client upgrade made the release marker stale.
+    const auto declineInstall = [this, &info, forced](const QString& reason) {
+        if (!info.entry.isEmpty())
+            return keepExistingService(reason, forced, info.entry);
+        failFatal(reason);
+        return false;
+    };
 
     if (!nodeOk) {
-        failFatal(tr("Node %1 on %2 is too old to run the CodeHarbor remote service, "
-                "which needs %3.%4 or newer. Install a current Node.js there and "
-                "point the profile's node path at it. Nothing was written to "
-                "\"%5\".")
+        return declineInstall(
+            tr("Node %1 on %2 is too old to run the CodeHarbor remote service, "
+               "which needs %3.%4 or newer. Install a current Node.js there and "
+               "point the profile's node path at it. Nothing was written to "
+               "\"%5\".")
                 .arg(info.nodeVersion, m_host)
                 .arg(kMinimumRemoteNodeMajor)
                 .arg(kMinimumRemoteNodeMinor)
                 .arg(m_repoRoot));
-        return false;
     }
     if (m_repoRoot.isEmpty() || m_repoRoot == QLatin1String("/")
         || m_repoRoot.startsWith(QLatin1Char('~'))) {
@@ -1205,12 +1494,12 @@ bool SessionBootstrap::ensureRemoteService()
         // tilde would create a directory literally named "~" and install into
         // it. Reading such a path merely fails; WRITING to it makes a mess in
         // the user's home.
-        failFatal(tr("Cannot install the CodeHarbor remote service into \"%1\". Give "
-                "the profile an absolute directory of its own on %2, for example "
-                "/home/<user>/codeharbor; \"~\" is not expanded because every "
-                "path sent to the server is quoted.")
+        return declineInstall(
+            tr("Cannot install the CodeHarbor remote service into \"%1\". Give "
+               "the profile an absolute directory of its own on %2, for example "
+               "/home/<user>/codeharbor; \"~\" is not expanded because every "
+               "path sent to the server is quoted.")
                 .arg(m_repoRoot, m_host));
-        return false;
     }
     // "has no service" is a lie during an upgrade, where one is running right
     // now; the missing prerequisite is the same either way, so only the lead-in
@@ -1223,27 +1512,27 @@ bool SessionBootstrap::ensureRemoteService()
                  "updated")
                   .arg(m_host, m_repoRoot);
     if (url.isEmpty()) {
-        failFatal(tr("%1, and this build cannot tell which release matches it (it "
-                "reports no version). Unpack codeharbor-remote.tar.gz there "
-                "yourself, or set CH_REMOTE_ARTIFACT_URL to the tarball to "
-                "install.")
+        return declineInstall(
+            tr("%1, and this build cannot tell which release matches it (it "
+               "reports no version). Unpack codeharbor-remote.tar.gz there "
+               "yourself, or set CH_REMOTE_ARTIFACT_URL to the tarball to "
+               "install.")
                 .arg(lacks));
-        return false;
     }
     const QString staged = stagedArtifactPath(url);
     if (staged.isEmpty() && info.fetcher == QLatin1String("none")) {
-        failFatal(tr("%1, and neither curl nor wget is installed there to download "
-                "%2. Install one of them, or unpack codeharbor-remote.tar.gz "
-                "into \"%3\" by hand, or stage the tarball on the server and set "
-                "CH_REMOTE_ARTIFACT_URL to its path.")
+        return declineInstall(
+            tr("%1, and neither curl nor wget is installed there to download "
+               "%2. Install one of them, or unpack codeharbor-remote.tar.gz "
+               "into \"%3\" by hand, or stage the tarball on the server and set "
+               "CH_REMOTE_ARTIFACT_URL to its path.")
                 .arg(lacks, url, m_repoRoot));
-        return false;
     }
     if (!info.tar) {
-        failFatal(tr("%1: there is no `tar` there to unpack one. Install tar, or "
-                "unpack codeharbor-remote.tar.gz into \"%2\" by hand.")
+        return declineInstall(
+            tr("%1: there is no `tar` there to unpack one. Install tar, or "
+               "unpack codeharbor-remote.tar.gz into \"%2\" by hand.")
                 .arg(lacks, m_repoRoot));
-        return false;
     }
 
     setState(State::Provisioning);
@@ -1268,12 +1557,32 @@ bool SessionBootstrap::ensureRemoteService()
         return false;
     setState(resume);
     if (!ran || !installLog.contains(installedMarker())) {
-        fail(tr("Could not install the CodeHarbor remote service into \"%1\" on "
-                "%2 from %3: %4")
+        const QString reason =
+            tr("Could not install the CodeHarbor remote service into \"%1\" on "
+               "%2 from %3: %4")
                 .arg(m_repoRoot, m_host, url,
                      installError.isEmpty()
                          ? tr("the install did not report success")
-                         : installError));
+                         : installError);
+        // remoteProvisionScript() stages the archive, proves it holds an entry
+        // point and only then swaps it in, undoing the swap on any failure — so
+        // repoRoot SHOULD now hold exactly what it held before. "Should" is not
+        // something to connect on: a script killed outright (channel dropped,
+        // budget spent) never reaches its own rollback. So the survivor is READ
+        // BACK, and only a directory that really still holds a launchable entry
+        // point is treated as a fallback.
+        QString leftReport;
+        QString leftError;
+        const RemoteInspection left =
+            runRemoteScript(remoteInspectScript(m_nodePath, m_repoRoot),
+                            kInspectTimeoutMs, &leftReport, &leftError)
+                ? parseInspection(leftReport)
+                : RemoteInspection{};
+        if (m_cancelRequested)
+            return false;
+        if (!left.entry.isEmpty())
+            return keepExistingService(reason, forced, left.entry);
+        fail(reason);
         return false;
     }
 

@@ -400,10 +400,19 @@ private slots:
     void provisioningStaysInsideTheChosenDirectory();
     void theReportIsReadBackFieldForField();
     void aRequestedUpgradeReplacesAnInstallWeDidNotMake();
-    void aRequestedUpgradeRefusesASourceCheckout();
+    void aRequestedUpgradeRefusesASourceCheckoutAndKeepsUsingIt();
     void aRequestedUpgradeAppliesToOneAttemptOnly();
     void aRequestedUpgradeThatCannotInspectSaysSo();
     void anArmedUpgradeIsSpentOrWithdrawnNeverForgotten();
+    // A failed UPDATE must cost the user nothing but the update: the
+    // installation that was working before has to still be there, and this
+    // session has to come up on it.
+    void anUpdateBlockedByAPrerequisiteKeepsTheOldServiceUsable();
+    void anInstallThatFailedFallsBackToWhatSurvivedOnTheServer();
+    // The provisioning script itself, executed by a real POSIX sh against real
+    // files: staging, the swap, and the rollback that keeps a failed update from
+    // costing the user the service they had.
+    void theProvisionScriptStagesTheArchiveAndRollsBackUnderARealShell();
 };
 
 // A cold wire walks Disconnected -> Connecting -> Wired exactly once and hands
@@ -1994,12 +2003,77 @@ void TstSessionBootstrap::provisioningStaysInsideTheChosenDirectory()
              qPrintable(script));
     // Nothing is put in a shared temporary directory.
     QVERIFY2(!script.contains(QStringLiteral("/tmp")), qPrintable(script));
-    // The marker is written only AFTER the entry-point check, so an install
-    // that died halfway is retried instead of being mistaken for a current one.
-    QVERIFY(script.indexOf(QStringLiteral("tar -xzf"))
-            < script.indexOf(QStringLiteral("exit 1")));
-    QVERIFY(script.indexOf(QStringLiteral("exit 1"))
-            < script.indexOf(QStringLiteral(".codeharbor-release'")));
+    // The archive is unpacked into the STAGING directory, never over the live
+    // installation: until the swap below, every path the running service uses
+    // is still the one it was launched from.
+    QVERIFY2(script.contains(QStringLiteral(
+                 "tar -xzf '/srv/co de'\\''harbor/.codeharbor-provision/"
+                 "codeharbor-remote.tar.gz' -C '/srv/co de'\\''harbor/"
+                 ".codeharbor-provision/stage'")),
+             qPrintable(script));
+    // The rollback is armed before the first byte is fetched, so every failure
+    // from there on puts the previous installation back...
+    const qsizetype armed = script.indexOf(QStringLiteral("trap ch_restore EXIT"));
+    QVERIFY(armed >= 0);
+    QVERIFY(armed < script.indexOf(QStringLiteral("curl -fsSL")));
+    // ...out of the backup the swap displaced it into, and back under the root.
+    QVERIFY2(script.contains(QStringLiteral(
+                 "mv '/srv/co de'\\''harbor/.codeharbor-provision/backup'/"
+                 "\"$__ch_b\" '/srv/co de'\\''harbor'/\"$__ch_b\"")),
+             qPrintable(script));
+    // The marker is WRITTEN only after the staged tree has been proven to hold
+    // an entry point, so an install that died halfway is retried instead of
+    // being mistaken for a current one.
+    const qsizetype markerWrite =
+        script.indexOf(QStringLiteral("> '/srv/co de'\\''harbor/"
+                                      ".codeharbor-release'"));
+    QVERIFY(markerWrite >= 0);
+    const qsizetype verdict =
+        script.indexOf(QStringLiteral("not a codeharbor-remote release"));
+    QVERIFY(verdict >= 0);
+    QVERIFY(script.indexOf(QStringLiteral("tar -xzf")) < verdict);
+    QVERIFY(verdict < markerWrite);
+
+    // EVERY cleanup revokes the undo's authorisation before it starts deleting.
+    // `rm -f <ready>` is one unlink; `rm -rf <scratch>` is a recursive walk a
+    // kill can stop halfway, and the sentinel left standing over a half-deleted
+    // backup is the one state that would make the NEXT undo delete a live
+    // installation: every planned member would look like one this install had
+    // brought in with no predecessor, which is the case that deletes.
+    const QString revoke =
+        QStringLiteral("rm -f '/srv/co de'\\''harbor/.codeharbor-provision/ready'");
+    const QString sweep =
+        QStringLiteral("rm -rf '/srv/co de'\\''harbor/.codeharbor-provision'");
+    // Exactly one sweep is allowed to stand alone: the fresh-start wipe, which is
+    // identified by what FOLLOWS it — it is the one that goes on to create the
+    // staging tree. Identifying it by position instead would pick the wrong one,
+    // because ch_undo() is DEFINED before that wipe and its guarded sweep is
+    // therefore the first in the text. Standing alone is correct there: no
+    // sentinel of this run exists yet, and a kill inside it leaves a scratch no
+    // undo will ever act on.
+    const QString create =
+        QStringLiteral("; mkdir -p '/srv/co de'\\''harbor/.codeharbor-provision/"
+                       "stage' '/srv/co de'\\''harbor/.codeharbor-provision/"
+                       "backup'");
+    int guarded = 0;
+    int exempt = 0;
+    for (qsizetype at = script.indexOf(sweep); at >= 0;
+         at = script.indexOf(sweep, at + 1)) {
+        if (script.mid(at + sweep.size(), create.size()) == create) {
+            ++exempt;
+            continue;
+        }
+        const QString before = script.mid(at - revoke.size() - 2, revoke.size() + 2);
+        QVERIFY2(before == revoke + QStringLiteral("; "),
+                 qPrintable(QStringLiteral("a scratch cleanup is not preceded by "
+                                           "revoking the sentinel; found \"%1\"")
+                                .arg(before)));
+        ++guarded;
+    }
+    // ch_undo's tail and the commit point. A drop to one means a cleanup lost its
+    // guard rather than the loop having had nothing to check.
+    QCOMPARE(guarded, 2);
+    QCOMPARE(exempt, 1);
 
     // Same rule for the inspection, which interpolates the node path too.
     const QString inspect = SessionBootstrap::remoteInspectScript(
@@ -2103,7 +2177,12 @@ void TstSessionBootstrap::aRequestedUpgradeReplacesAnInstallWeDidNotMake()
 // ...and the one place it stops. A service running out of a source checkout is
 // not replaced: unpacking a release beside it would leave the checkout in place
 // but no longer running, inside a directory its owner maintains.
-void TstSessionBootstrap::aRequestedUpgradeRefusesASourceCheckout()
+//
+// Refusing the INSTALL is not refusing the session. Nothing was written, so the
+// checkout is still there and still runnable, and dropping the connect as well
+// would answer a mistaken click by taking the user's workspace away until they
+// undid something the client never did.
+void TstSessionBootstrap::aRequestedUpgradeRefusesASourceCheckoutAndKeepsUsingIt()
 {
     Harness h;
     h.boot.setRemoteArtifactUrl(artifactUrl());
@@ -2112,13 +2191,23 @@ void TstSessionBootstrap::aRequestedUpgradeRefusesASourceCheckout()
     h.boot.fakeScript(true,
                       inspectionReport(QStringLiteral("v24.16.0"), checkout));
     QSignalSpy errorSpy(&h.boot, &SessionBootstrap::error);
+    QSignalSpy upgradeSpy(&h.boot, &SessionBootstrap::upgradeFailed);
 
     h.boot.requestRemoteUpgrade();
-    QVERIFY(!h.wire());
-    QCOMPARE(errorSpy.size(), 1);
-    const QString message = errorSpy.at(0).at(0).toString();
+    QVERIFY(h.wire());
+    QCOMPARE(h.boot.state(), State::Wired);
+    QVERIFY(h.boot.rpcDevice() != nullptr);
+    // The user asked for the upgrade, so the refusal reaches them through the
+    // one signal a successful connect does not swallow.
+    QVERIFY(errorSpy.isEmpty());
+    QCOMPARE(upgradeSpy.size(), 1);
+    const QString message = upgradeSpy.at(0).at(0).toString();
     QVERIFY2(message.contains(checkout), qPrintable(message));
     QVERIFY2(message.contains(QStringLiteral("Nothing was changed")),
+             qPrintable(message));
+    // ...and it names what is still running, because that is what the session
+    // the user is now looking at is talking to.
+    QVERIFY2(message.contains(QStringLiteral("left exactly as it was")),
              qPrintable(message));
     // Refused after the inspection and before anything was written.
     QCOMPARE(h.boot.scriptsRun.size(), 1);
@@ -2228,6 +2317,450 @@ void TstSessionBootstrap::anArmedUpgradeIsSpentOrWithdrawnNeverForgotten()
                                 .arg(progressSpy.value(0).value(0).toString())));
         QCOMPARE(h.boot.scriptsRun.size(), 1);
     }
+}
+
+// The bug this pair exists for, in the reporter's words: an update failed
+// because the server's Node was too old, and after that the remote service
+// could not be used AT ALL until Node had been upgraded there. Two independent
+// defects produced that, and both are pinned here.
+//
+// Defect one: a prerequisite of INSTALLING ended the connect. A client upgrade
+// alone is enough to reach the install path — the release marker then names a
+// tarball this client would no longer install — so a server that had been
+// working for months became unreachable the moment the desktop was updated,
+// with the only way out being a change on the server.
+void TstSessionBootstrap::anUpdateBlockedByAPrerequisiteKeepsTheOldServiceUsable()
+{
+    { // The ordinary connect that decided to update: the marker is ours and
+      // names an older release, and the node there cannot run the new one.
+      // Nothing is written, and the session comes up on what is installed.
+        Harness h;
+        h.boot.setRemoteArtifactUrl(artifactUrl());
+        h.boot.fakeScript(
+            true, inspectionReport(QStringLiteral("v22.11.0"), installedEntry(),
+                                   QStringLiteral("https://example.invalid/v8/"
+                                                  "codeharbor-remote.tar.gz")));
+        QSignalSpy errorSpy(&h.boot, &SessionBootstrap::error);
+        QSignalSpy diagSpy(&h.boot, &SessionBootstrap::channelDiagnostic);
+        QSignalSpy upgradeSpy(&h.boot, &SessionBootstrap::upgradeFailed);
+
+        QVERIFY(h.wire());
+        QCOMPARE(h.boot.state(), State::Wired);
+        QVERIFY(h.boot.rpcDevice() != nullptr);
+        QVERIFY2(errorSpy.isEmpty(),
+                 qPrintable(errorSpy.value(0).value(0).toString()));
+        // Nobody asked for this update, so it is a log line rather than a toast
+        // on a session that is coming up fine.
+        QVERIFY(upgradeSpy.isEmpty());
+        QCOMPARE(diagSpy.size(), 1);
+        const QString note = diagSpy.at(0).at(1).toString();
+        QVERIFY2(note.contains(QStringLiteral("22.11.0")), qPrintable(note));
+        QVERIFY2(note.contains(QStringLiteral("23.6")), qPrintable(note));
+        QVERIFY2(note.contains(installedEntry()), qPrintable(note));
+        // The inspection, and NOTHING else: the install never started.
+        QCOMPARE(h.boot.scriptsRun.size(), 1);
+    }
+    { // The same server with the upgrade explicitly requested. Same outcome for
+      // the service; the difference is that the user is told, through the one
+      // signal a successful connect does not discard.
+        Harness h;
+        h.boot.setRemoteArtifactUrl(artifactUrl());
+        h.boot.fakeScript(true, inspectionReport(QStringLiteral("v22.11.0"),
+                                                 installedEntry()));
+        QSignalSpy errorSpy(&h.boot, &SessionBootstrap::error);
+        QSignalSpy upgradeSpy(&h.boot, &SessionBootstrap::upgradeFailed);
+
+        h.boot.requestRemoteUpgrade();
+        QVERIFY(h.wire());
+        QCOMPARE(h.boot.state(), State::Wired);
+        QVERIFY(errorSpy.isEmpty());
+        QCOMPARE(upgradeSpy.size(), 1);
+        const QString message = upgradeSpy.at(0).at(0).toString();
+        QVERIFY2(message.contains(QStringLiteral("22.11.0")), qPrintable(message));
+        QVERIFY2(message.contains(QStringLiteral("Nothing was written")),
+                 qPrintable(message));
+        QVERIFY2(message.contains(installedEntry()), qPrintable(message));
+        QCOMPARE(h.boot.scriptsRun.size(), 1);
+    }
+    { // ...and the line that must NOT move: with nothing installed there is
+      // nothing to fall back to, so an install onto a node that cannot run the
+      // result is still refused outright rather than deferred to a dead channel.
+        Harness h;
+        h.boot.setRemoteArtifactUrl(artifactUrl());
+        h.boot.fakeScript(true, inspectionReport(QStringLiteral("v22.11.0")));
+        QSignalSpy errorSpy(&h.boot, &SessionBootstrap::error);
+
+        QVERIFY(!h.wire());
+        QCOMPARE(h.boot.state(), State::Failed);
+        QCOMPARE(errorSpy.size(), 1);
+        QCOMPARE(h.boot.scriptsRun.size(), 1);
+    }
+}
+
+// Defect two: the install itself. It unpacked straight over the live tree, so a
+// failure halfway left a directory half old and half new; now the archive is
+// staged and swapped in, and a failed swap is rolled back on the server.
+//
+// The client does not TRUST that rollback, because a script that was killed
+// outright never runs it: it re-reads the directory and connects only to an
+// entry point that is really still there.
+void TstSessionBootstrap::anInstallThatFailedFallsBackToWhatSurvivedOnTheServer()
+{
+    const QString oldRelease =
+        QStringLiteral("https://example.invalid/v8/codeharbor-remote.tar.gz");
+    { // The install dies partway. The re-read finds the previous release intact
+      // — marker and entry point both — so the session comes up on it.
+        Harness h;
+        h.boot.setRemoteArtifactUrl(artifactUrl());
+        h.boot.fakeScript(true, inspectionReport(QStringLiteral("v24.16.0"),
+                                                 installedEntry(), oldRelease));
+        h.boot.fakeScript(false, QString(),
+                          QStringLiteral("curl: (23) Failed writing body"));
+        // What the server still holds afterwards: the rolled-back install.
+        h.boot.fakeScript(true, inspectionReport(QStringLiteral("v24.16.0"),
+                                                 installedEntry(), oldRelease));
+        QSignalSpy errorSpy(&h.boot, &SessionBootstrap::error);
+        QSignalSpy diagSpy(&h.boot, &SessionBootstrap::channelDiagnostic);
+
+        QVERIFY(h.wire());
+        QCOMPARE(h.boot.state(), State::Wired);
+        QVERIFY(h.boot.rpcDevice() != nullptr);
+        QVERIFY2(errorSpy.isEmpty(),
+                 qPrintable(errorSpy.value(0).value(0).toString()));
+        // Inspect, install, re-inspect: the survivor is READ, never assumed.
+        QCOMPARE(h.boot.scriptsRun.size(), 3);
+        QCOMPARE(diagSpy.size(), 1);
+        const QString note = diagSpy.at(0).at(1).toString();
+        QVERIFY2(note.contains(QStringLiteral("Failed writing body")),
+                 qPrintable(note));
+        QVERIFY2(note.contains(installedEntry()), qPrintable(note));
+    }
+    { // ...and when the re-read finds nothing launchable, there is nothing to
+      // fall back to and the attempt fails, loudly. Connecting here would hand
+      // the user "codeharbord channel closed" a moment later instead.
+        Harness h;
+        h.boot.setRemoteArtifactUrl(artifactUrl());
+        h.boot.fakeScript(true, inspectionReport(QStringLiteral("v24.16.0"),
+                                                 installedEntry(), oldRelease));
+        h.boot.fakeScript(false, QString(), QStringLiteral("tar: unexpected EOF"));
+        h.boot.fakeScript(true, inspectionReport(QStringLiteral("v24.16.0")));
+        QSignalSpy errorSpy(&h.boot, &SessionBootstrap::error);
+
+        QVERIFY(!h.wire());
+        QVERIFY(h.boot.rpcDevice() == nullptr);
+        QCOMPARE(errorSpy.size(), 1);
+        const QString message = errorSpy.at(0).at(0).toString();
+        QVERIFY2(message.contains(QStringLiteral("unexpected EOF")),
+                 qPrintable(message));
+        QCOMPARE(h.boot.scriptsRun.size(), 3);
+    }
+}
+
+// Everything above drives the DECISION tree with canned server answers. This
+// case runs the script that decision produces, under a real POSIX sh, against
+// real files — the only way to know that a rollback written as shell text
+// actually puts a tree back. The root carries a space and a single quote, so the
+// quoting is exercised by the shell rather than by a substring assertion.
+//
+// POSIX HOSTS ONLY, and deliberately so. This is a script for the SERVER, which
+// runs codeharbord under Node on a POSIX box; the machine running these tests is
+// the CLIENT, and on Windows it is not a host this script can execute. Windows CI
+// proved the point the expensive way: the case aborted, and MSVC's CRT turns any
+// abort into a fail-fast that takes the whole binary down, so one unsupported
+// fixture cost the other 55 cases their results too. The decision tree above is
+// pinned on every platform; the SCRIPT is pinned here on POSIX and, against a
+// real server, by the live gate (tst_livereconnect).
+void TstSessionBootstrap::theProvisionScriptStagesTheArchiveAndRollsBackUnderARealShell()
+{
+#ifdef Q_OS_WIN
+    QSKIP("the provisioning script targets a POSIX server; a Windows client host "
+          "cannot run it (tst_livereconnect covers it on a real server)");
+#else
+    const QString shell = QStandardPaths::findExecutable(QStringLiteral("sh"));
+    const QString tarTool = QStandardPaths::findExecutable(QStringLiteral("tar"));
+    if (shell.isEmpty() || tarTool.isEmpty())
+        QSKIP("a POSIX sh and a tar are needed to run the provisioning script");
+    {
+        QProcess probe;
+        probe.start(shell,
+                    {QStringLiteral("-c"),
+                     QStringLiteral("for c in rm mv cp tar printf; do command -v "
+                                    "\"$c\" >/dev/null 2>&1 || exit 1; done; "
+                                    "echo TOOLCHAIN_OK")});
+        if (!probe.waitForFinished(30000)
+            || !QString::fromUtf8(probe.readAllStandardOutput())
+                    .contains(QStringLiteral("TOOLCHAIN_OK"))) {
+            QSKIP("this sh cannot reach the utilities the provisioning script "
+                  "uses; the live gate covers it against a real server");
+        }
+    }
+
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QString root = dir.filePath(QStringLiteral("srv/co de'harbor"));
+    const QString marker = SessionBootstrap::releaseMarkerPath(root);
+    const QString scratch = root + QStringLiteral("/.codeharbor-provision");
+
+    // Fixture writes go through Qt, not the shell, so a failure here is a broken
+    // test rather than an unsupported host — and a value-returning lambda cannot
+    // host QVERIFY.
+    const auto put = [](const QString& path, const QString& text) {
+        QDir().mkpath(QFileInfo(path).absolutePath());
+        QFile file(path);
+        if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate))
+            qFatal("could not create fixture file %s", qUtf8Printable(path));
+        file.write(text.toUtf8());
+    };
+    const auto slurp = [](const QString& path) {
+        QFile file(path);
+        return file.open(QIODevice::ReadOnly)
+                   ? QString::fromUtf8(file.readAll())
+                   : QString();
+    };
+    struct Run {
+        int code = -1;
+        QString out;
+        QString err;
+    };
+    // A script that hangs is reported as a failed assertion on `code`, never as
+    // an abort: taking the whole binary down would throw away every other case's
+    // result along with it.
+    const auto install = [&shell](const QString& script) {
+        QProcess sh;
+        sh.start(shell, {QStringLiteral("-c"), script});
+        const bool finished = sh.waitForFinished(60000);
+        if (!finished)
+            sh.kill();
+        return Run{finished ? sh.exitCode() : -1,
+                   QString::fromUtf8(sh.readAllStandardOutput()),
+                   finished ? QString::fromUtf8(sh.readAllStandardError())
+                            : QStringLiteral("the provisioning script never "
+                                             "finished")};
+    };
+
+    // A real codeharbor-remote.tar.gz: dist/, package.json and sql/ at the top
+    // level, exactly as .github/workflows/release.yml packs them.
+    const auto pack = [&dir, &tarTool, &put](const QString& name,
+                                             const QStringList& members) {
+        const QString stage = dir.filePath(name);
+        for (const QString& member : members)
+            put(stage + QLatin1Char('/') + member, name + QLatin1Char(' ') + member);
+        QStringList top;
+        for (const QString& member : members) {
+            const QString first = member.section(QLatin1Char('/'), 0, 0);
+            if (!top.contains(first))
+                top << first;
+        }
+        const QString tarball = dir.filePath(name + QStringLiteral(".tar.gz"));
+        QProcess tar;
+        tar.setWorkingDirectory(stage);
+        tar.start(tarTool, QStringList{QStringLiteral("-czf"), tarball} + top);
+        // Empty rather than fatal: the caller turns it into a failed assertion
+        // naming the archive, which is a test result instead of a dead binary.
+        if (!tar.waitForFinished(60000) || tar.exitCode() != 0)
+            return QString();
+        return tarball;
+    };
+    // A staged tarball (a bare absolute path) is copied rather than downloaded,
+    // so this needs no network — the fetch step is otherwise identical.
+    const QString release =
+        pack(QStringLiteral("release"),
+             {QStringLiteral("dist/codeharbord.js"), QStringLiteral("dist/bridge.js"),
+              QStringLiteral("package.json"), QStringLiteral("sql/schema.sql")});
+    QVERIFY2(!release.isEmpty(), "could not pack the release fixture archive");
+    // Something that unpacks perfectly well and is not a remote release.
+    const QString notARelease =
+        pack(QStringLiteral("junk"), {QStringLiteral("package.json")});
+    QVERIFY2(!notARelease.isEmpty(), "could not pack the non-release fixture archive");
+
+    // (1) A bare server. The entry point lands where entryCandidates() looks and
+    // the marker records what was installed.
+    const Run first =
+        install(SessionBootstrap::remoteProvisionScript(root, release,
+                                                       QStringLiteral("curl")));
+    QCOMPARE(first.code, 0);
+    QVERIFY2(first.out.contains(QStringLiteral("codeharbor: installed ")
+                                + root + QStringLiteral("/dist/codeharbord.js")),
+             qPrintable(first.out + first.err));
+    QCOMPARE(slurp(root + QStringLiteral("/dist/codeharbord.js")),
+             QStringLiteral("release dist/codeharbord.js"));
+    QCOMPARE(slurp(marker), release + QLatin1Char('\n'));
+    // Nothing is left behind: the staging tree, the backup and the download all
+    // lived under one scratch directory that the script removes.
+    QVERIFY(!QFileInfo::exists(scratch));
+
+    // (2) An update over that install. Files the archive does not carry belong
+    // to the user and must survive the swap.
+    put(root + QStringLiteral("/dist/codeharbord.js"), QStringLiteral("old daemon"));
+    put(root + QStringLiteral("/notes.txt"), QStringLiteral("mine"));
+    const Run second =
+        install(SessionBootstrap::remoteProvisionScript(root, release,
+                                                       QStringLiteral("curl")));
+    QCOMPARE(second.code, 0);
+    QCOMPARE(slurp(root + QStringLiteral("/dist/codeharbord.js")),
+             QStringLiteral("release dist/codeharbord.js"));
+    QCOMPARE(slurp(root + QStringLiteral("/notes.txt")), QStringLiteral("mine"));
+
+    // (3) THE BUG. The fetch fails halfway — here because the tarball is not
+    // there at all — and the installation that was working is still working,
+    // byte for byte, marker included.
+    put(root + QStringLiteral("/dist/codeharbord.js"), QStringLiteral("old daemon"));
+    put(marker, QStringLiteral("https://example.invalid/v8/codeharbor-remote.tar.gz\n"));
+    const Run absent = install(SessionBootstrap::remoteProvisionScript(
+        root, dir.filePath(QStringLiteral("gone.tar.gz")), QStringLiteral("curl")));
+    QVERIFY2(absent.code != 0, qPrintable(absent.out));
+    QVERIFY2(absent.err.contains(
+                 QStringLiteral("putting the previous installation back")),
+             qPrintable(absent.err));
+    QCOMPARE(slurp(root + QStringLiteral("/dist/codeharbord.js")),
+             QStringLiteral("old daemon"));
+    QCOMPARE(slurp(marker),
+             QStringLiteral("https://example.invalid/v8/codeharbor-remote.tar.gz\n"));
+    QVERIFY(!QFileInfo::exists(scratch));
+
+    // (4) An archive that unpacks and is not a release. Judged in the staging
+    // directory, so the live tree never sees it: the old daemon and the old
+    // manifest are both untouched.
+    put(root + QStringLiteral("/package.json"), QStringLiteral("old manifest"));
+    const Run junk = install(SessionBootstrap::remoteProvisionScript(
+        root, notARelease, QStringLiteral("curl")));
+    QVERIFY2(junk.code != 0, qPrintable(junk.out));
+    QVERIFY2(junk.err.contains(QStringLiteral("not a codeharbor-remote release")),
+             qPrintable(junk.err));
+    QCOMPARE(slurp(root + QStringLiteral("/dist/codeharbord.js")),
+             QStringLiteral("old daemon"));
+    QCOMPARE(slurp(root + QStringLiteral("/package.json")),
+             QStringLiteral("old manifest"));
+    QCOMPARE(slurp(marker),
+             QStringLiteral("https://example.invalid/v8/codeharbor-remote.tar.gz\n"));
+
+    // (5) The marker is part of what is rolled back, in both directions. A
+    // failed install over a hand-unpacked tree must not leave a marker claiming
+    // the directory as ours: the next connect would read that as "our install,
+    // wrong release" and overwrite what a person put there.
+    QVERIFY(QFile::remove(marker));
+    const Run unmarked = install(SessionBootstrap::remoteProvisionScript(
+        root, notARelease, QStringLiteral("curl")));
+    QVERIFY(unmarked.code != 0);
+    QVERIFY2(!QFileInfo::exists(marker), qPrintable(slurp(marker)));
+    QCOMPARE(slurp(root + QStringLiteral("/dist/codeharbord.js")),
+             QStringLiteral("old daemon"));
+
+    // (6) The state no trap can catch: a run killed outright (SIGKILL, or the
+    // machine going down) partway through the swap. Its `moved` list and its
+    // backup are still on disk, and the NEXT attempt is the only thing left that
+    // can finish the undo — so it does that first, before its own `rm -rf` would
+    // take the sole copy of the displaced files with it.
+    //
+    // Set up by hand because a real kill cannot be timed reliably; the state is
+    // exactly what the swap loop leaves between its two `mv`s.
+    put(marker, QStringLiteral("https://example.invalid/v8/codeharbor-remote.tar.gz\n"));
+    put(root + QStringLiteral("/dist/codeharbord.js"), QStringLiteral("half-new daemon"));
+    put(scratch + QStringLiteral("/backup/dist/codeharbord.js"),
+        QStringLiteral("old daemon"));
+    put(scratch + QStringLiteral("/plan"), QStringLiteral("dist\n"));
+    put(scratch + QStringLiteral("/ready"), QString());
+    put(scratch + QStringLiteral("/release.prev"),
+        QStringLiteral("https://example.invalid/v8/codeharbor-remote.tar.gz\n"));
+    // This attempt then fails at the fetch, so nothing of its own lands: what is
+    // left is purely what the interrupted run had before it started.
+    const Run resumed = install(SessionBootstrap::remoteProvisionScript(
+        root, dir.filePath(QStringLiteral("gone.tar.gz")), QStringLiteral("curl")));
+    QVERIFY2(resumed.code != 0, qPrintable(resumed.out));
+    QVERIFY2(resumed.err.contains(QStringLiteral("an earlier install was "
+                                                 "interrupted")),
+             qPrintable(resumed.err));
+    QCOMPARE(slurp(root + QStringLiteral("/dist/codeharbord.js")),
+             QStringLiteral("old daemon"));
+    QCOMPARE(slurp(marker),
+             QStringLiteral("https://example.invalid/v8/codeharbor-remote.tar.gz\n"));
+    QVERIFY(!QFileInfo::exists(scratch));
+
+    // ...and the recovered tree is installable again: the next attempt with a
+    // real archive completes, which is what makes this recoverable rather than
+    // merely intact.
+    const Run afterResume =
+        install(SessionBootstrap::remoteProvisionScript(root, release,
+                                                       QStringLiteral("curl")));
+    QCOMPARE(afterResume.code, 0);
+    QCOMPARE(slurp(root + QStringLiteral("/dist/codeharbord.js")),
+             QStringLiteral("release dist/codeharbord.js"));
+    QCOMPARE(slurp(marker), release + QLatin1Char('\n'));
+
+    // (7) The other two states the swap loop can be interrupted in. A member is
+    // CLAIMED before it is touched, so the claim alone says nothing about what
+    // happened to it, and the undo has to read the difference off the disk.
+    put(root + QStringLiteral("/dist/codeharbord.js"), QStringLiteral("old daemon"));
+    put(root + QStringLiteral("/sql/schema.sql"), QStringLiteral("new schema"));
+    // `dist` was claimed and never touched — its staged copy is still waiting —
+    // so what is under the root is the user's and must be left alone. `sql` was
+    // claimed, moved in, and had no old counterpart: it belongs to the failed
+    // install and goes.
+    put(scratch + QStringLiteral("/stage/dist/codeharbord.js"),
+        QStringLiteral("release dist/codeharbord.js"));
+    put(scratch + QStringLiteral("/release.none"), QString());
+    put(scratch + QStringLiteral("/plan"), QStringLiteral("sql\ndist\n"));
+    put(scratch + QStringLiteral("/ready"), QString());
+    const Run partial = install(SessionBootstrap::remoteProvisionScript(
+        root, dir.filePath(QStringLiteral("gone.tar.gz")), QStringLiteral("curl")));
+    QVERIFY2(partial.code != 0, qPrintable(partial.out));
+    QCOMPARE(slurp(root + QStringLiteral("/dist/codeharbord.js")),
+             QStringLiteral("old daemon"));
+    QVERIFY(!QFileInfo::exists(root + QStringLiteral("/sql")));
+    // release.none said there was no marker, so the undo must not invent one.
+    QVERIFY(!QFileInfo::exists(marker));
+    QVERIFY(!QFileInfo::exists(scratch));
+
+    // (8) A plan with NO sentinel beside it. That is a run which died while
+    // writing the plan, before it had touched anything, so the plan may hold a
+    // fragment of a name — and a fragment is precisely what must never reach the
+    // undo, because it can name something of the user's that no install touched.
+    // Ignoring the whole plan is both safe and correct: nothing had moved.
+    put(root + QStringLiteral("/dist/codeharbord.js"), QStringLiteral("old daemon"));
+    put(root + QStringLiteral("/di"), QStringLiteral("not the daemon's"));
+    put(scratch + QStringLiteral("/plan"), QStringLiteral("di"));
+    const Run unsealed = install(SessionBootstrap::remoteProvisionScript(
+        root, dir.filePath(QStringLiteral("gone.tar.gz")), QStringLiteral("curl")));
+    QVERIFY2(unsealed.code != 0, qPrintable(unsealed.out));
+    QVERIFY2(!unsealed.err.contains(QStringLiteral("an earlier install was "
+                                                   "interrupted")),
+             qPrintable(unsealed.err));
+    QCOMPARE(slurp(root + QStringLiteral("/di")),
+             QStringLiteral("not the daemon's"));
+    QCOMPARE(slurp(root + QStringLiteral("/dist/codeharbord.js")),
+             QStringLiteral("old daemon"));
+
+    // (9) The state the ordering above exists to make harmless: a run that
+    // COMMITTED and was then killed inside its own `rm -rf`, leaving a plan and a
+    // pruned backup behind. Because the sentinel is unlinked before that walk
+    // begins, what survives cannot authorise an undo — and it must not, because
+    // every planned member now has neither a backup nor a staged copy, which is
+    // precisely the shape an undo DELETES. Without the ordering this is a
+    // successful install that the next attempt takes back out.
+    const Run committed =
+        install(SessionBootstrap::remoteProvisionScript(root, release,
+                                                       QStringLiteral("curl")));
+    QCOMPARE(committed.code, 0);
+    put(root + QStringLiteral("/notes.txt"), QStringLiteral("mine"));
+    // The scratch as a killed cleanup leaves it: plan intact, backup gone,
+    // sentinel already unlinked.
+    put(scratch + QStringLiteral("/plan"),
+        QStringLiteral("dist\npackage.json\nsql\n"));
+    put(scratch + QStringLiteral("/release.prev"), release + QLatin1Char('\n'));
+    const Run afterCommit = install(SessionBootstrap::remoteProvisionScript(
+        root, dir.filePath(QStringLiteral("gone.tar.gz")), QStringLiteral("curl")));
+    QVERIFY2(afterCommit.code != 0, qPrintable(afterCommit.out));
+    QVERIFY2(!afterCommit.err.contains(QStringLiteral("an earlier install was "
+                                                      "interrupted")),
+             qPrintable(afterCommit.err));
+    // The committed installation is untouched, and so is the user's own file.
+    QCOMPARE(slurp(root + QStringLiteral("/dist/codeharbord.js")),
+             QStringLiteral("release dist/codeharbord.js"));
+    QCOMPARE(slurp(root + QStringLiteral("/sql/schema.sql")),
+             QStringLiteral("release sql/schema.sql"));
+    QCOMPARE(slurp(root + QStringLiteral("/notes.txt")), QStringLiteral("mine"));
+    QCOMPARE(slurp(marker), release + QLatin1Char('\n'));
+#endif
 }
 
 // Guiless: nothing here needs a display, and QTEST_MAIN would pull in

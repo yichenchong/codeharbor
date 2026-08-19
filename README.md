@@ -92,6 +92,17 @@ URL-based automatic or on-demand updates need `tar` and either `curl` or `wget` 
 A **git checkout** is never overwritten by either path. **Update server** on one
 says so and changes nothing: update it with `git pull` and a build instead.
 
+**A failed update costs you nothing but the update.** The archive is unpacked
+into a staging directory beside the installation and only swapped in once it has
+been proven to hold a service this client can launch, with whatever it displaces
+kept until the swap has finished — so a truncated download, a full disk or a
+dropped connection puts the previous installation back, release marker included.
+A prerequisite the server does not meet (a Node older than the service needs, no
+`tar`, no downloader) is reported the same way: the update does not happen, the
+copy that was working stays exactly where it was, and the session connects to it.
+You are only refused outright when there is nothing installed there to fall back
+to.
+
 ### 2. The client
 
 | Platform | Asset | Notes |
