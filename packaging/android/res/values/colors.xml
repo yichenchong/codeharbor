@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  #181825 is the same background the shared artwork uses (packaging/codeharbor.svg,
+  the rounded rect behind the anchor) and the same base the mobile Material theme
+  is built on, so the adaptive icon's background plate matches the app it opens
+  instead of being an approximation of it.
+-->
+<resources>
+    <color name="ic_launcher_background">#181825</color>
+</resources>

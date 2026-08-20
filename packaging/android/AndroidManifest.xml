@@ -1,0 +1,148 @@
+<?xml version="1.0"?>
+<!--
+  Qt-for-Android package manifest for the CodeHarbor mobile client.
+
+  This file REPLACES the template Qt would otherwise copy out of
+  qtbase/src/android/templates/. androiddeployqt still rewrites the four
+  `%%INSERT_...%%` placeholders below (each written in the exact
+  `dash dash space %%INSERT_X%% space dash dash` form androiddeployqt matches),
+  so they must survive verbatim; every other value here is ours and is left
+  alone.
+
+  The Qt pieces that are not optional, and why each one is here:
+    * application android:name — QtApplication loads the Qt runtime before any
+      of our code runs.
+    * activity android:name — QtActivity is the single Activity; Qt Quick draws
+      into its surface. There is no second Activity and no Service.
+    * meta-data android.app.lib_name — the name of the shared library
+      androiddeployqt built from the `codeharbor_mobile` target. It MUST stay a
+      placeholder: renaming the CMake target changes it.
+    * meta-data android.app.arguments — argv handed to main().
+    * the FileProvider — QtActivity's content-sharing path. Its
+      @xml/qtprovider_paths resource comes from Qt's own android res directory,
+      which the generated build.gradle puts on res.srcDirs ahead of this one.
+
+  Attribute-level notes (XML forbids comments inside a start tag, so they are
+  collected here):
+
+    application/@allowBackup=false is a security decision, not an oversight.
+      This app's private storage holds imported SSH private keys and the
+      known_hosts file (ch::MobileKeyStore). Android's auto-backup would copy
+      that directory to the user's Google Drive, moving key material off the
+      device into a place the user never chose.
+    application/@usesCleartextTraffic=false — nothing here speaks plaintext
+      HTTP. Remote bytes arrive over SSH, which is a raw socket and unaffected.
+    application/@enableOnBackInvokedCallback=false — this is Qt's own template
+      value and it must not be dropped. For a package targeting SDK 34 or
+      higher the flag defaults to TRUE, and when it is on the platform stops
+      calling Activity.onBackPressed() and instead invokes the registered
+      OnBackInvokedCallback — of which Qt registers none, so the system default
+      applies and the back gesture finishes the Activity. Qt turns the back key
+      into a Qt::Key_Back event out of onBackPressed(); MobileMain.qml's
+      Shortcut on StandardKey.Back (which QKeySequence maps to Qt::Key_Back on
+      every platform) is what pops the shell one stage. With the flag left to
+      its default, back would kill the app - dropping the SSH connection and the
+      attached tmux pane - instead of navigating from a pane to the pane picker.
+    manifest/@package is the application id, spelled literally because
+      androiddeployqt reads it out of this file (it becomes androidPackageName
+      in the generated gradle.properties) and no CMake property can supply it.
+      It is the SAME identifier the iOS bundle uses, which comes from the
+      CODEHARBOR_MOBILE_BUNDLE_ID cache variable; src/mobile/CMakeLists.txt
+      fails an Android configure if the two ever stop matching.
+    activity/@screenOrientation=fullUser — both orientations. A terminal is
+      genuinely more usable in landscape (80 columns fit), a file viewer in
+      portrait, and the single-pane shell re-lays-out for either. fullUser
+      rather than fullSensor so the system rotation lock is still respected.
+    activity/@windowSoftInputMode=adjustResize, NOT the default pan. When the
+      soft keyboard opens over a terminal, panning would slide the prompt
+      off-screen and leave the emulator convinced it still has the full row
+      count. Resizing shrinks the surface, which the terminal turns into a real
+      resize so the remote pty's row count matches what is visible.
+    activity/@configChanges — Qt handles every one of these itself; letting
+      Android restart the Activity instead would tear down the QML engine, the
+      SSH connection and the attached tmux pane on every rotation.
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="dev.codeharbor.mobile"
+    android:installLocation="auto"
+    android:versionCode="-- %%INSERT_VERSION_CODE%% --"
+    android:versionName="-- %%INSERT_VERSION_NAME%% --">
+
+    <!-- The ONLY permission this client needs. Everything it does - RPC and
+         terminal bytes alike - travels over one outbound SSH connection it
+         opens itself. It reads no contacts, no location, no external storage,
+         and no camera or microphone; remote files are fetched over that same
+         SSH connection and never written outside app-private storage. -->
+    <uses-permission android:name="android.permission.INTERNET" />
+
+    <!-- androiddeployqt substitutes QT_ANDROID_PERMISSIONS / QT_ANDROID_FEATURES
+         here. src/mobile deliberately sets neither, so both expand to nothing;
+         the markers stay so that a future target property is not silently
+         dropped. -->
+    <!-- %%INSERT_PERMISSIONS -->
+    <!-- %%INSERT_FEATURES -->
+
+    <!-- API 28 is Qt 6.10's floor; androiddeployqt refuses anything lower, and
+         it is what the android-arm64 preset passes as ANDROID_PLATFORM.
+         targetSdkVersion is pinned to 35 here AND as QT_ANDROID_TARGET_SDK_VERSION
+         in src/mobile/CMakeLists.txt - deliberately, not by inheriting a default
+         (androiddeployqt's own default in Qt 6.10 is 36). The two spellings must
+         agree, because androiddeployqt writes the CMake value into the Gradle
+         defaultConfig, which overrides this element; when they disagree the
+         manifest is the one that loses, silently. -->
+    <uses-sdk
+        android:minSdkVersion="28"
+        android:targetSdkVersion="35" />
+
+    <supports-screens
+        android:anyDensity="true"
+        android:largeScreens="true"
+        android:normalScreens="true"
+        android:smallScreens="true" />
+
+    <application
+        android:name="org.qtproject.qt.android.bindings.QtApplication"
+        android:hardwareAccelerated="true"
+        android:label="@string/app_name"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:usesCleartextTraffic="false"
+        android:supportsRtl="true"
+        android:allowBackup="false"
+        android:fullBackupOnly="false"
+        android:enableOnBackInvokedCallback="false">
+
+        <activity
+            android:name="org.qtproject.qt.android.bindings.QtActivity"
+            android:label="@string/app_name"
+            android:launchMode="singleTop"
+            android:exported="true"
+            android:screenOrientation="fullUser"
+            android:windowSoftInputMode="adjustResize"
+            android:configChanges="orientation|uiMode|screenLayout|screenSize|smallestScreenSize|layoutDirection|locale|fontScale|keyboard|keyboardHidden|navigation|mcc|mnc|density">
+
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+
+            <meta-data
+                android:name="android.app.lib_name"
+                android:value="-- %%INSERT_APP_LIB_NAME%% --" />
+
+            <meta-data
+                android:name="android.app.arguments"
+                android:value="-- %%INSERT_APP_ARGUMENTS%% --" />
+        </activity>
+
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.qtprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/qtprovider_paths" />
+        </provider>
+    </application>
+</manifest>

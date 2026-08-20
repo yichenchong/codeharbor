@@ -276,6 +276,81 @@ QString SshConnectionPool::lookupHostFor(const QString& host, quint16 port)
     return port == 22 ? host : QStringLiteral("[%1]:%2").arg(host).arg(port);
 }
 
+QString SshConnectionPool::identityFilePathFor(const QString& identity,
+                                               QString* ignoredScheme)
+{
+    if (ignoredScheme)
+        ignoredScheme->clear();
+    const QString trimmed = identity.trimmed();
+
+    // A CONFIGURED IDENTITY IS NOT ALWAYS A PATH.
+    //
+    // ch::ServerProfiles has one identity field and the mobile client reuses it
+    // for something that is not a filename: a durable REFERENCE to a key file the
+    // user manages (SPEC 11.2's "credential-store reference") — an Android
+    // document URI, "content://...", or an Apple security-scoped bookmark,
+    // "chbookmark:<base64>". Those must stay in the profile verbatim, because the
+    // connect page reads them back on the next launch to recover which key a
+    // remembered server uses, and blanking one would send the user back through
+    // the document picker. But handing one to ssh_options_set(SSH_OPTIONS_IDENTITY)
+    // or to ssh_pki_import_privkey_file() names a file that cannot exist, so the
+    // guard belongs HERE, at the one point where the stored string becomes a path.
+    // Dropping it leaves the ladder in exactly the state it is in when no identity
+    // is configured, which is right: on mobile the real credential is the
+    // in-memory identity, installed separately by ch::MobileKeyStore.
+    //
+    // The rule is deliberately SCHEME-AGNOSTIC and knows nothing about
+    // ch::keyref::kBookmarkScheme. src/mobile depends on src/ssh and never the
+    // other way round, so including the mobile header here would invert the build
+    // graph; the two spellings are independent ON PURPOSE, and the mobile side
+    // says so as well (MobileKeyReference.h, next to kBookmarkScheme). Nothing
+    // drifts, because this test is about SHAPE — "is this a URI?" — not about
+    // which schemes the client happens to mint.
+    //
+    // TWO OR MORE letters before the colon, and that bound is the whole point:
+    // "C:\Users\me\.ssh\id_ed25519" is a perfectly ordinary Windows identity path
+    // whose one-letter drive prefix would otherwise read as a URI scheme and get
+    // this key silently ignored on every Windows desktop. RFC 3986 requires a
+    // scheme to start with a letter and be at least one character long, so a
+    // real single-letter scheme is legal in theory — and is a trade taken
+    // knowingly, because no scheme this client produces is one letter long while
+    // Windows drive letters all are.
+    //
+    // What this can misread is narrow, and worth stating so nobody has to work it
+    // out again: the scheme must be LETTERS ONLY, so every absolute path is immune
+    // ("/home/…" begins with a separator, and "C:\…" has its one-letter prefix).
+    // The only path shape it would drop is a RELATIVE one whose first segment is
+    // all letters and is followed by a colon, e.g. "keys:2024/id_ed25519" — legal
+    // on Unix, impossible on Windows, and never something CodeHarbor writes. That
+    // is the residue of using the standard URI heuristic instead of a list of
+    // schemes, and it is preferred precisely because a list would have to be kept
+    // in step with a library it must not include.
+    const qsizetype colon = trimmed.indexOf(QLatin1Char(':'));
+    if (colon >= 2) {
+        bool schemeIsLetters = true;
+        for (qsizetype i = 0; i < colon && schemeIsLetters; ++i) {
+            const QChar c = trimmed.at(i);
+            schemeIsLetters = (c >= u'a' && c <= u'z') || (c >= u'A' && c <= u'Z');
+        }
+        if (schemeIsLetters) {
+            if (ignoredScheme)
+                *ignoredScheme = trimmed.left(colon);
+            return QString();
+        }
+    }
+
+    // Everything below is what this client has always done with an identity
+    // string, unchanged: libssh does not expand a leading tilde, so it is
+    // expanded here, and the rest is normalised.
+    if (trimmed == QLatin1String("~"))
+        return QDir::homePath();
+    if (trimmed.startsWith(QLatin1String("~/"))
+        || trimmed.startsWith(QLatin1String("~\\"))) {
+        return QDir::home().filePath(trimmed.sliced(2));
+    }
+    return QDir::cleanPath(trimmed);
+}
+
 
 bool SshConnectionPool::isWindowsNamedPipeAgentSocket(const QString& socket)
 {
@@ -347,6 +422,10 @@ SshConnectionPool::~SshConnectionPool()
     // header for why that one is safe).
     if (m_state != State::NotAvailable)
         m_state = State::Disconnected;
+    // Key material must not survive this object in freed heap memory. Done here
+    // rather than left to QByteArray's destructor, which only releases the
+    // block. Never emits anything, so it is safe this late.
+    clearInMemoryIdentity();
 }
 
 bool SshConnectionPool::libsshAvailable()
@@ -356,6 +435,26 @@ bool SshConnectionPool::libsshAvailable()
 #else
     return false;
 #endif
+}
+
+void SshConnectionPool::setInMemoryIdentity(const QByteArray& privateKeyPem)
+{
+    // Overwrite whatever was there before adopting the new key: switching
+    // credentials must not leave the previous one behind.
+    clearInMemoryIdentity();
+    m_inMemoryIdentity = privateKeyPem;
+    // Force a private copy. QByteArray is reference-counted, so without this the
+    // buffer clearInMemoryIdentity() later fills with zeroes could be shared
+    // with the caller's own array — the fill would then either be refused
+    // (detaching instead) or corrupt a value the caller still holds.
+    m_inMemoryIdentity.detach();
+}
+
+void SshConnectionPool::clearInMemoryIdentity()
+{
+    if (!m_inMemoryIdentity.isEmpty())
+        m_inMemoryIdentity.fill('\0');
+    m_inMemoryIdentity.clear();
 }
 
 void SshConnectionPool::setKnownHosts(const KnownHosts& hosts)
@@ -531,18 +630,6 @@ namespace {
 // SessionBootstrap.
 constexpr long kHandshakeTimeoutSeconds = 15;
 
-QString resolveIdentityFilePath(QString identityFile)
-{
-    identityFile = identityFile.trimmed();
-    if (identityFile == QLatin1String("~"))
-        return QDir::homePath();
-    if (identityFile.startsWith(QLatin1String("~/"))
-        || identityFile.startsWith(QLatin1String("~\\"))) {
-        return QDir::home().filePath(identityFile.sliced(2));
-    }
-    return QDir::cleanPath(identityFile);
-}
-
 bool usesUnsupportedWindowsAgent()
 {
 #ifdef Q_OS_WIN
@@ -705,6 +792,48 @@ SshConnectionPool::AuthOutcome authenticateIdentityFiles(
     return SshConnectionPool::AuthOutcome::Refused;
 }
 
+// The same public-key step as authenticateIdentityFile() above, for a key that
+// exists only in memory (SshConnectionPool::setInMemoryIdentity). libssh's
+// ssh_pki_import_privkey_base64() parses the armoured PEM text directly, so the
+// key never has to be written to a file to be usable — which is the whole point
+// on a phone, where nothing about an imported key is ever persisted.
+//
+// An encrypted key with the wrong (or no) passphrase fails the IMPORT, before
+// any packet is sent, so a wrong passphrase costs nothing against the server's
+// MaxAuthTries. declineLibsshPassphrase is passed for the same reason the file
+// variant passes it: libssh must never fall back to a terminal prompt.
+//
+// `*importFailed` distinguishes those two refusals for the diagnostic log. They
+// are the same AuthOutcome but they are opposite problems: "this key needs a
+// passphrase we do not have" is fixed by typing one, and "the server does not
+// accept this key" is fixed by putting the key in authorized_keys. Telling a
+// user with an unencrypted key to supply a passphrase sends them after the wrong
+// one.
+SshConnectionPool::AuthOutcome authenticateInMemoryIdentity(
+    ssh_session session, const QByteArray& privateKeyPem,
+    const QString& passphrase, bool* importFailed)
+{
+    *importFailed = false;
+    QByteArray passphraseUtf8 = passphrase.toUtf8();
+    ssh_key privateKey = nullptr;
+    const int importResult = ssh_pki_import_privkey_base64(
+        privateKeyPem.constData(),
+        passphrase.isEmpty() ? nullptr : passphraseUtf8.constData(),
+        declineLibsshPassphrase, nullptr, &privateKey);
+    wipeSecret(passphraseUtf8);
+    if (importResult != SSH_OK || !privateKey) {
+        if (privateKey)
+            ssh_key_free(privateKey);
+        *importFailed = true;
+        return SshConnectionPool::AuthOutcome::Refused;
+    }
+
+    const int authenticationResult =
+        ssh_userauth_publickey(session, nullptr, privateKey);
+    ssh_key_free(privateKey);
+    return SshConnectionPool::classifyAuthResult(authenticationResult);
+}
+
 } // namespace
 
 SshConnectionPool::AuthMethods SshConnectionPool::methodsFromMask(
@@ -832,7 +961,18 @@ bool SshConnectionPool::connectToHost(const QString& host, quint16 port,
     // the identity path is what authenticationFailure() reports on. The host
     // and user are parameters of this one handshake and are not retained.
     m_port = port;
-    m_identityFile = resolveIdentityFilePath(identityFile);
+    QString ignoredIdentityScheme;
+    m_identityFile = identityFilePathFor(identityFile, &ignoredIdentityScheme);
+    if (!ignoredIdentityScheme.isEmpty()) {
+        // Said out loud rather than dropped silently: a user whose mobile profile
+        // carries a document-URI reference should be able to see in the transcript
+        // why no key file was tried, and a developer should be able to see that
+        // the ladder is running on the in-memory identity alone.
+        appendDiagnostic(
+            QStringLiteral("The configured identity is a \"%1:\" reference, not a "
+                           "key file path, so it was not offered as one.")
+                .arg(ignoredIdentityScheme));
+    }
 
     setState(State::Connecting);
     if (abortRequested())
@@ -1292,7 +1432,40 @@ bool SshConnectionPool::authenticate(const QString& user,
         AuthOutcome outcome = AuthOutcome::Refused;
 
         switch (rung) {
-        case AuthRung::KeyFile:
+        case AuthRung::KeyFile: {
+            // An in-memory key first, when there is one. Empty on every desktop
+            // build (nothing there calls setInMemoryIdentity), so this branch
+            // does not exist for them and the rung behaves exactly as before.
+            // A Refused outcome falls through to the agent/file route, which is
+            // what keeps a mobile client that ALSO has a stored identity file
+            // working.
+            //
+            // Braced because of the declaration below: a `switch` shares one
+            // scope, and an initialised local in an unbraced case makes every
+            // later case label a jump across its initialisation.
+            if (!m_inMemoryIdentity.isEmpty()) {
+                bool importFailed = false;
+                outcome = authenticateInMemoryIdentity(m_session,
+                                                       m_inMemoryIdentity,
+                                                       QString(), &importFailed);
+                if (outcome != AuthOutcome::Refused)
+                    break;
+                if (cancelled())
+                    return false;
+                // Two different problems, so two different sentences: an import
+                // that failed is a key needing a passphrase, and an import that
+                // succeeded followed by a refusal is a key the server does not
+                // know. Saying "passphrase" for the second sends a user with an
+                // unencrypted key after a secret that does not exist.
+                appendDiagnostic(
+                    importFailed
+                        ? QStringLiteral("The imported private key could not be "
+                                         "read without a passphrase.")
+                        : QStringLiteral("The server did not accept the imported "
+                                         "private key."));
+                if (cancelled())
+                    return false;
+            }
             outcome =
                 unsupportedWindowsAgent
                     ? authenticateIdentityFiles(m_session, identityFiles,
@@ -1300,11 +1473,15 @@ bool SshConnectionPool::authenticate(const QString& user,
                     : classifyAuthResult(ssh_userauth_publickey_auto(
                           m_session, nullptr, nullptr));
             break;
+        }
 
         case AuthRung::KeyPassphrase: {
             // With no key to unlock there is nothing a passphrase could do, and
             // asking for one would be a prompt the user cannot satisfy.
-            if (unsupportedWindowsAgent && identityFiles.isEmpty())
+            // ... unless the key lives in memory, which is a key to unlock even
+            // when there is no file anywhere.
+            if (m_inMemoryIdentity.isEmpty() && unsupportedWindowsAgent
+                && identityFiles.isEmpty())
                 break;
             // A passphrase is used ONLY for public-key authentication: handing
             // it to ssh_userauth_password() would disclose a local key secret to
@@ -1325,6 +1502,36 @@ bool SshConnectionPool::authenticate(const QString& user,
             }
             if (passphrase.secret.isEmpty())
                 break;
+            // The in-memory key gets the passphrase first, for the same reason
+            // it goes first on the rung above: it is the credential the user
+            // explicitly chose for this attempt. A Refused outcome still falls
+            // through, so an imported key with the wrong passphrase does not
+            // shadow a working agent identity.
+            if (!m_inMemoryIdentity.isEmpty()) {
+                bool importFailed = false;
+                outcome = authenticateInMemoryIdentity(m_session,
+                                                       m_inMemoryIdentity,
+                                                       passphrase.secret,
+                                                       &importFailed);
+                if (outcome != AuthOutcome::Refused)
+                    break;
+                if (cancelled())
+                    return false;
+                // The rung above already said the key needs a passphrase, so the
+                // useful thing to say here is which of the two remaining answers
+                // it was: the passphrase did not unlock the key, or it did and
+                // the server refused the key. Without this the log for a
+                // mistyped passphrase and for a key missing from
+                // authorized_keys is the same silence.
+                appendDiagnostic(
+                    importFailed
+                        ? QStringLiteral("The passphrase did not unlock the "
+                                         "imported private key.")
+                        : QStringLiteral("The server did not accept the imported "
+                                         "private key."));
+                if (cancelled())
+                    return false;
+            }
             if (unsupportedWindowsAgent) {
                 outcome = authenticateIdentityFiles(m_session, identityFiles,
                                                     passphrase.secret);

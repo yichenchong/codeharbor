@@ -38,12 +38,139 @@
       "cacheVariables": {
         "CODEHARBOR_BUILD_TESTS": "ON"
       }
+    },
+    {
+      "name": "mobile-desktop",
+      "displayName": "Mobile shell on the workstation (Debug, both clients)",
+      "description": "Builds the desktop client AND the mobile client (src/vt, src/mobile, codeharbor_mobile) for this workstation. This is how the mobile shell is developed and validated: it is plain Qt Quick with no device-only API, so it runs on a Linux/macOS/Windows desktop, and its tst_* targets run headless in the ordinary ctest suite. An NDK or an iPhone is needed to SHIP the mobile client, never to compile or test it.",
+      "inherits": "base",
+      "binaryDir": "${sourceDir}/build/mobile-desktop",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CODEHARBOR_BUILD_TESTS": "ON",
+        "CODEHARBOR_BUILD_DESKTOP": "ON",
+        "CODEHARBOR_BUILD_MOBILE": "ON"
+      }
+    },
+    {
+      "name": "mobile-base",
+      "hidden": true,
+      "inherits": "base",
+      "description": "Shared cross-compile settings for the Android and iOS clients. Qt ships no WebEngine for either platform, so the desktop client is off; the mobile presets do not build the web bundles either, because src/qml is never added. Tests are off because every tst_* target is a host executable that ctest would have to run, and a cross-compiled one cannot run here. CMAKE_PREFIX_PATH carries two entries: the Qt-for-<platform> prefix and CH_LIBSSH_PREFIX, the per-ABI libssh built from the in-tree vcpkg overlay (packaging/vcpkg-ports). An unset CH_LIBSSH_PREFIX degrades to the documented CH_HAVE_LIBSSH=0 warning rather than a configure error.",
+      "cacheVariables": {
+        "CODEHARBOR_BUILD_TESTS": "OFF",
+        "CODEHARBOR_BUILD_DESKTOP": "OFF",
+        "CODEHARBOR_BUILD_MOBILE": "ON",
+        "QT_HOST_PATH": "$env{QT_HOST_PATH}"
+      }
+    },
+    {
+      "name": "android-base",
+      "hidden": true,
+      "inherits": "mobile-base",
+      "description": "Shared Android cross-compile settings. Two entries here look redundant and are not, because this configure chainloads the NDK's own android.toolchain.cmake rather than Qt's qt.toolchain.cmake (which is what CH_LIBSSH_PREFIX-on-CMAKE_PREFIX_PATH buys us): the NDK toolchain sets neither. ANDROID_SDK_ROOT must exist as a CMAKE variable, not just an environment variable - Qt's deployment-settings generation globs <sdk>/build-tools/* out of that variable at CONFIGURE time and aborts with 'Could not locate Android SDK build tools' when it is empty. ANDROID_STL must be c++_shared because that is what Qt for Android itself is built against and what androiddeployqt bundles (libc++_shared.so); the NDK toolchain defaults to c++_static, which would put a second C++ runtime in the same process.",
+      "cacheVariables": {
+        "CMAKE_SYSTEM_NAME": "Android",
+        "CMAKE_ANDROID_ARCH_ABI": "arm64-v8a",
+        "ANDROID_ABI": "arm64-v8a",
+        "ANDROID_PLATFORM": "android-28",
+        "CMAKE_SYSTEM_VERSION": "28",
+        "ANDROID_STL": "c++_shared",
+        "ANDROID_SDK_ROOT": "$env{ANDROID_SDK_ROOT}",
+        "CMAKE_TOOLCHAIN_FILE": "$env{ANDROID_NDK_ROOT}/build/cmake/android.toolchain.cmake",
+        "CMAKE_PREFIX_PATH": "$env{QT_ANDROID_PATH};$env{CH_LIBSSH_PREFIX}"
+      }
+    },
+    {
+      "name": "android-arm64",
+      "displayName": "Android arm64-v8a (Release)",
+      "description": "Release APK/AAB for 64-bit ARM devices. Needs ANDROID_NDK_ROOT, ANDROID_SDK_ROOT, QT_HOST_PATH (the host Qt, for moc/rcc/qmlcachegen) and QT_ANDROID_PATH (the Qt-for-Android prefix, e.g. .../6.10.0/android_arm64_v8a). API 28 is Qt 6.10's floor.",
+      "inherits": "android-base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release"
+      }
+    },
+    {
+      "name": "android-arm64-debug",
+      "displayName": "Android arm64-v8a (Debug)",
+      "description": "Same toolchain as android-arm64 but a Debug build, in its own binary directory so a debuggable APK and a release APK can coexist.",
+      "inherits": "android-base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug"
+      }
+    },
+    {
+      "name": "ios-base",
+      "hidden": true,
+      "inherits": "mobile-base",
+      "generator": "Xcode",
+      "description": "Xcode, not Ninja: Qt's iOS deployment, bundle assembly and code signing are all driven through Xcode build settings, and a single-config Ninja tree cannot express the per-configuration SDK the simulator needs.",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Darwin"
+      },
+      "cacheVariables": {
+        "CMAKE_SYSTEM_NAME": "iOS",
+        "CMAKE_OSX_ARCHITECTURES": "arm64",
+        "CMAKE_OSX_DEPLOYMENT_TARGET": "17.0",
+        "CMAKE_PREFIX_PATH": "$env{QT_IOS_PATH};$env{CH_LIBSSH_PREFIX}"
+      }
+    },
+    {
+      "name": "ios-arm64",
+      "displayName": "iOS device (arm64)",
+      "description": "Device build. Signing is deliberately left to the machine that runs it: set the development team through Xcode or -DCMAKE_XCODE_ATTRIBUTE_DEVELOPMENT_TEAM=<id>, so no team identifier is baked into the repository.",
+      "inherits": "ios-base",
+      "cacheVariables": {
+        "CMAKE_OSX_SYSROOT": "iphoneos"
+      }
+    },
+    {
+      "name": "ios-simulator",
+      "displayName": "iOS simulator (arm64)",
+      "description": "Simulator build for Apple Silicon hosts. Code signing is turned off outright: the simulator does not check it, and requiring it would make an unsigned CI machine unable to compile the client at all.",
+      "inherits": "ios-base",
+      "cacheVariables": {
+        "CMAKE_OSX_SYSROOT": "iphonesimulator",
+        "CMAKE_XCODE_ATTRIBUTE_CODE_SIGNING_ALLOWED": "NO",
+        "CMAKE_XCODE_ATTRIBUTE_CODE_SIGNING_REQUIRED": "NO",
+        "CMAKE_XCODE_ATTRIBUTE_CODE_SIGN_IDENTITY": ""
+      }
     }
   ],
   "buildPresets": [
     { "name": "dev", "configurePreset": "dev" },
     { "name": "release", "configurePreset": "release" },
-    { "name": "release-tests", "configurePreset": "release-tests" }
+    { "name": "release-tests", "configurePreset": "release-tests" },
+    { "name": "mobile-desktop", "configurePreset": "mobile-desktop" },
+    { "name": "android-arm64", "configurePreset": "android-arm64" },
+    {
+      "name": "android-arm64-apk",
+      "configurePreset": "android-arm64",
+      "targets": ["apk"]
+    },
+    {
+      "name": "android-arm64-aab",
+      "configurePreset": "android-arm64",
+      "targets": ["aab"]
+    },
+    { "name": "android-arm64-debug", "configurePreset": "android-arm64-debug" },
+    {
+      "name": "android-arm64-debug-apk",
+      "configurePreset": "android-arm64-debug",
+      "targets": ["apk"]
+    },
+    {
+      "name": "ios-arm64",
+      "configurePreset": "ios-arm64",
+      "configuration": "Release"
+    },
+    {
+      "name": "ios-simulator",
+      "configurePreset": "ios-simulator",
+      "configuration": "Debug"
+    }
   ],
   "testPresets": [
     {
@@ -55,6 +182,12 @@
     {
       "name": "release-tests",
       "configurePreset": "release-tests",
+      "output": { "outputOnFailure": true },
+      "execution": { "noTestsAction": "error" }
+    },
+    {
+      "name": "mobile-desktop",
+      "configurePreset": "mobile-desktop",
       "output": { "outputOnFailure": true },
       "execution": { "noTestsAction": "error" }
     }

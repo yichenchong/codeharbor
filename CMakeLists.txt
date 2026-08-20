@@ -23,6 +23,72 @@ endif()
 
 option(CODEHARBOR_BUILD_TESTS "Build C++ unit tests" ON)
 
+# Which presentation layer(s) this tree produces.
+#
+# The desktop client is a Qt WebEngine application: every rich surface it has -
+# terminal, editor, Markdown/image/PDF/web viewers - is a Chromium page driven
+# over QWebChannel. Qt ships NO WebEngine for Android and NO WebEngine for iOS,
+# and that is not a packaging gap that a flag can close. So the mobile client is
+# a genuinely different presentation layer (src/vt + src/mobile, native Qt
+# Quick) over the SAME portable backend (models, remote, persistence, ssh,
+# terminal, editor, agent, app).
+#
+# CODEHARBOR_BUILD_DESKTOP is forced OFF on Android/iOS rather than merely
+# defaulted off: a mobile configure that found some WebEngine on the host prefix
+# path and tried to link it would fail deep in the link step instead of here.
+option(CODEHARBOR_BUILD_DESKTOP "Build the desktop WebEngine client (src/qml, src/viewers, codeharbor)" ON)
+
+# ON everywhere, deliberately including desktop Linux/macOS/Windows. The mobile
+# shell is plain Qt Quick with no device-only API, so building and testing it on
+# a workstation is the fast loop; requiring an NDK or an iPhone to compile
+# src/mobile would mean it only ever got compiled on a release runner.
+option(CODEHARBOR_BUILD_MOBILE "Build the mobile client (src/vt, src/mobile, codeharbor_mobile)" ON)
+
+if(ANDROID OR IOS)
+    if(CODEHARBOR_BUILD_DESKTOP)
+        message(STATUS "Qt WebEngine does not exist for Android or iOS;"
+                       " forcing CODEHARBOR_BUILD_DESKTOP=OFF")
+    endif()
+    set(CODEHARBOR_BUILD_DESKTOP OFF CACHE BOOL
+        "Build the desktop WebEngine client (src/qml, src/viewers, codeharbor)" FORCE)
+endif()
+
+if(NOT CODEHARBOR_BUILD_DESKTOP AND NOT CODEHARBOR_BUILD_MOBILE)
+    message(FATAL_ERROR
+        "Both CODEHARBOR_BUILD_DESKTOP and CODEHARBOR_BUILD_MOBILE are OFF; "
+        "this configure would build backend libraries and no client at all.")
+endif()
+
+# Every tst_* target in this tree is a HOST executable that ctest launches
+# locally, and a cross-compiled one cannot run here. Leaving tests ON for a
+# device configure therefore produces nothing runnable AND actively breaks the
+# packaging targets on Android: Qt gives every executable its own
+# androiddeployqt/APK target and adds it to the global `apk` target, so
+# `cmake --build --preset android-arm64-apk` would build a dozen packages
+# instead of one, and the seven test executables that share
+# src/mobile/tests/CMakeLists.txt would all deploy into the same
+# `android-build` directory (Qt warns about exactly this and the artifacts mix).
+#
+# Forced rather than defaulted, for the same reason CODEHARBOR_BUILD_DESKTOP is:
+# the mobile presets already pass OFF, so the only way to reach this is an
+# explicit -DCODEHARBOR_BUILD_TESTS=ON on a cross configure, where the honest
+# answer is that the request cannot be satisfied.
+if(ANDROID OR IOS)
+    if(CODEHARBOR_BUILD_TESTS)
+        message(STATUS "Cross-compiling for ${CMAKE_SYSTEM_NAME}; the tst_* targets are"
+                       " host executables ctest cannot run there - forcing"
+                       " CODEHARBOR_BUILD_TESTS=OFF")
+    endif()
+    set(CODEHARBOR_BUILD_TESTS OFF CACHE BOOL "Build C++ unit tests" FORCE)
+endif()
+
+# Bundle identifier for the mobile client. Declared here (not buried in
+# src/mobile) because packaging/ios/Info.plist.in and packaging/android/
+# AndroidManifest.xml must agree with it, and because a fork shipping its own
+# build needs one place to change.
+set(CODEHARBOR_MOBILE_BUNDLE_ID "dev.codeharbor.mobile" CACHE STRING
+    "Application/bundle identifier for the Android and iOS clients")
+
 # Escape hatch used by src/qml/CMakeLists.txt: build a client whose editor and
 # terminal panes have no page to load. Declared here as a real option (rather
 # than only being read where it is used) so it shows up in `cmake -LH`, ccmake
@@ -105,19 +171,77 @@ option(CODEHARBOR_TEST_MINIMAL_DEBUGINFO
 #    prevent it - so the floor is the fix. 6.10 is clean in Debug, Release and
 #    under AddressSanitizer.
 #
-# The list is exactly what the tree links. Qt6::Sql is deliberately absent: all
-# persistence goes through codeharbord over RPC (SPEC 11.2), so the client owns
-# no local database and nothing links Qt6::Sql (see src/persistence/CMakeLists.txt).
+# The unconditional list is exactly what the portable backend and BOTH clients
+# link. Qt6::Sql is deliberately absent: all persistence goes through
+# codeharbord over RPC (SPEC 11.2), so the client owns no local database and
+# nothing links Qt6::Sql (see src/persistence/CMakeLists.txt).
+#
+# WebEngineCore/WebEngineQuick/WebChannel are requested SEPARATELY, and only for
+# a desktop configure. They are not merely unused on Android and iOS - Qt ships
+# no such modules for those platforms at all, so leaving them in the REQUIRED
+# list would abort a mobile configure before it produced a single target. The
+# 6.10 floor above is a WebEngine floor, and it stays as the project-wide
+# minimum anyway: 6.10 is also the version whose Qt Quick, Android and iOS
+# support the mobile client is written against, and keeping one floor for the
+# whole tree means a single Qt install serves every preset.
 find_package(Qt6 6.10 REQUIRED COMPONENTS
     Core
     Gui
     Quick
     Qml
     QuickControls2
-    WebEngineCore
-    WebEngineQuick
-    WebChannel
     Network)
+
+if(CODEHARBOR_BUILD_DESKTOP)
+    find_package(Qt6 6.10 REQUIRED COMPONENTS
+        WebEngineCore
+        WebEngineQuick
+        WebChannel)
+endif()
+
+# Optional mobile-only viewer backends, discovered the same way libssh (below)
+# and QtDBus (src/app/CMakeLists.txt) are: absent module must still build.
+#
+# The mobile client has no Chromium to fall back on, so a missing module is a
+# missing capability rather than a missing optimisation - which is why the
+# result is published to QML through ch::MobileCapabilities instead of being
+# silently compiled out. Without Qt6::Pdf the PDF page says so and offers to
+# open the file as bytes; without Qt6::WebView an http(s) link is shown as
+# plain text and is never handed to an external browser (SPEC 7.5).
+#
+# QUIET, not REQUIRED: neither module is part of a default Qt install. Both
+# default to 0 so src/mobile can use the values unconditionally, and the probe
+# itself is skipped entirely for a desktop-only configure, which links neither.
+set(CH_HAVE_QTPDF 0)
+set(CH_HAVE_QTWEBVIEW 0)
+if(CODEHARBOR_BUILD_MOBILE)
+    # PdfQuick as well as Pdf: the page is QML, so the C++ library alone is not
+    # enough to render anything.
+    find_package(Qt6 6.10 QUIET COMPONENTS Pdf PdfQuick)
+    if(Qt6Pdf_FOUND AND Qt6PdfQuick_FOUND)
+        set(CH_HAVE_QTPDF 1)
+        message(STATUS "Qt PDF: found; the mobile PDF viewer renders pages natively")
+    else()
+        message(STATUS "Qt PDF: not found; the mobile PDF viewer is unavailable (CH_HAVE_QTPDF=0)")
+    endif()
+
+    # WebViewQuick as well as WebView, for exactly the reason PdfQuick is
+    # required above: Qt6::WebView is the C++ platform-web-view wrapper, while
+    # the `QtWebView` QML module the page imports lives in the SEPARATE
+    # Qt6::WebViewQuick target (qtwebview's src/quick declares
+    # URI "QtWebView"). Reporting the capability on WebView alone would tell
+    # QML the page is available and then fail its import at runtime - and on a
+    # static Qt (which is what Qt for iOS is, the one platform where this
+    # module is actually present) that failure is a blank page, not a warning
+    # anybody sees at build time.
+    find_package(Qt6 6.10 QUIET COMPONENTS WebView WebViewQuick)
+    if(Qt6WebView_FOUND AND Qt6WebViewQuick_FOUND)
+        set(CH_HAVE_QTWEBVIEW 1)
+        message(STATUS "Qt WebView: found; the mobile web viewer uses the system web view")
+    else()
+        message(STATUS "Qt WebView: not found; the mobile web viewer is unavailable (CH_HAVE_QTWEBVIEW=0)")
+    endif()
+endif()
 
 # Qt Test is used ONLY by the per-module test targets, every one of which sits
 # behind `if(CODEHARBOR_BUILD_TESTS)`. Requiring it unconditionally made the
@@ -197,6 +321,22 @@ if(NOT TARGET ch_libssh)
         "docs/DEVELOPMENT.md for install instructions.")
 endif()
 
+# A cross-compile has no system package manager to fall back on, and neither the
+# NDK toolchain file nor the Qt-for-Android/iOS prefix carries libssh. So the
+# generic warning above ("install libssh-dev") is actively misleading there: the
+# fix is a second prefix path, not an apt package. Says so explicitly, because a
+# mobile client with CH_HAVE_LIBSSH=0 builds, installs, launches, and then
+# cannot connect to anything - a failure that only shows up on a device.
+if((ANDROID OR IOS) AND NOT TARGET ch_libssh)
+    message(STATUS
+        "libssh: cross-compiling for ${CMAKE_SYSTEM_NAME} and nothing was found. "
+        "Build it for this ABI with vcpkg using the in-tree overlay "
+        "(packaging/vcpkg-ports, triplet arm64-android or arm64-ios) and point "
+        "the configure at it by exporting CH_LIBSSH_PREFIX - the mobile presets "
+        "append it to CMAKE_PREFIX_PATH. See docs/DEVELOPMENT.md "
+        "'Mobile clients (Android / iOS)'.")
+endif()
+
 # Enable CTest before adding subdirectories so module test targets register.
 if(CODEHARBOR_BUILD_TESTS)
     enable_testing()
@@ -206,7 +346,7 @@ if(CODEHARBOR_BUILD_TESTS)
     # is added unconditionally below.
     #
     # Every one of them carries an explicit TIMEOUT, as every other test in this
-    # tree does. CTest's default is 1500 s, and all three of these can hang
+    # tree does. CTest's default is 1500 s, and every one of these can hang
     # rather than fail: the scaffolding scan walks the whole worktree, and the
     # bump-version test runs git and node inside a throwaway repository, where a
     # git subprocess waiting on a credential or editor prompt would otherwise
@@ -240,6 +380,16 @@ if(CODEHARBOR_BUILD_TESTS)
                  COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/vcpkg_patches.sh
                          ${CMAKE_CURRENT_SOURCE_DIR})
         set_tests_properties(tst_vcpkg_patches PROPERTIES TIMEOUT 60)
+        # Guards the parser that names every release artifact
+        # (.github/scripts/release-version.sh). Like the vcpkg patch check, it
+        # covers something no ordinary build reads: the script runs only on a
+        # release runner, where a version it failed to parse would name every
+        # asset after an empty string and fail the publish job after the whole
+        # cross-OS build - with the tag already permanent.
+        add_test(NAME tst_release_version
+                 COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/release_version.sh
+                         ${CMAKE_CURRENT_SOURCE_DIR})
+        set_tests_properties(tst_release_version PROPERTIES TIMEOUT 60)
     endif()
 
     add_subdirectory(tests)

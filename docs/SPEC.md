@@ -1728,6 +1728,14 @@ remote Node path, repository root, and an optional local identity-file path) but
 never stores a password, passphrase, private-key bytes, repository, or project
 file.
 
+The mobile clients store strictly less. They reuse this same profile store and the
+same client-local keys (§4.5 last-open session and last-used pane, via
+`ch::UiStateStore`), and they add nothing to the list above: an imported SSH key
+is held in memory for the session or referenced where the user keeps it, never
+copied into app storage — see the mobile note in §12.1. The identity-file entry a
+mobile profile records is that reference, which is the "SSH-agent or
+credential-store reference" this section already allows and not key material.
+
 ### 11.3 Unsaved Recovery
 
 Unsaved buffers must be recoverable after client failure.
@@ -1803,6 +1811,26 @@ Requirements:
 > reach disk even by accident. The requirement above is therefore met in its
 > strong form — no secret is persisted at all — at the cost of retyping it each
 > connection.
+>
+> **On Android and iOS** the same rule extends from the passphrase to the key
+> itself, because a phone has no `~/.ssh` to have put one in and no ssh-agent to
+> ask: `SSH_AUTH_SOCK` is unset, `QDir::homePath()` is the app sandbox, and the
+> platform pickers hand an app a document rather than a directory it may
+> enumerate. `ch::MobileKeyStore` (`src/mobile/MobileKeyStore.h`) therefore
+> offers exactly two credential paths and no third. A key pasted or picked for
+> the session is held in memory, handed to libssh through
+> `SshConnectionPool::setInMemoryIdentity()`, and wiped — nothing is written, not
+> even temporarily, because a temporary file is still client-stored key bytes.
+> Alternatively the key stays in the user's OWN storage and the client persists
+> only a REFERENCE to it (an Android persistable document-URI grant, an Apple
+> security-scoped bookmark, or a plain path), in the existing `identityFile`
+> field §11.2 already permits; the bytes are re-read into memory at connect time.
+> An explicit disconnect drops all of it —
+> `MobileAppController::disconnect()` calls `MobileKeyStore::forgetSession()`,
+> which wipes in-memory keys, any armed passphrase and the pool's installed
+> identity. No keychain or Keystore integration is faked: with nothing persisted
+> there is nothing for one to protect, and the cost is the same retyping the
+> desktop already accepts.
 
 ### 12.2 Viewer Isolation
 

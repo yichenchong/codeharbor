@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  The launcher label and the Activity label both resolve here rather than
+  through androiddeployqt's `%%INSERT_APP_NAME%%` placeholder, which would
+  otherwise hardcode the CMake target name ("codeharbor_mobile") into the home
+  screen. A string resource is also the only spelling a translation can reach.
+-->
+<resources>
+    <string name="app_name">CodeHarbor</string>
+</resources>

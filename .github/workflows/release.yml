@@ -12,7 +12,8 @@ on:
         required: false
 
 # Only `publish` needs write access, and it grants itself `contents: write`
-# below. Everything else (three OS builders + the remote packager) is read-only.
+# below. Everything else (three desktop OS builders, the remote packager, the
+# Android builder and the iOS simulator builder) is read-only.
 permissions:
   contents: read
 
@@ -65,24 +66,9 @@ jobs:
       # so the AppImage and the disk image could not be checked at all.
       - name: Resolve the release version
         shell: bash
-        run: |
-          set -euo pipefail
-          # Anchored on the project() call, exactly like the check in
-          # .bumpversion.json, so an unrelated `VERSION` elsewhere in the file
-          # can never be picked up. No pipe: `set -o pipefail` plus a `head`
-          # that closes early is a SIGPIPE waiting to happen.
-          version=$(sed -n '/^project(CodeHarbor/,/)/ s/^[[:space:]]*VERSION[[:space:]]\{1,\}\([0-9][0-9.]*\).*$/\1/p' CMakeLists.txt)
-          version=${version%%$'\n'*}
-          case "$version" in
-            [0-9]*.[0-9]*.[0-9]*) ;;
-            *)
-              echo "could not parse the project() VERSION out of CMakeLists.txt (got '$version');" >&2
-              echo "the release refuses to name its artifacts after a guess." >&2
-              exit 1
-              ;;
-          esac
-          echo "Release version (from CMakeLists.txt): $version"
-          echo "CH_VERSION=$version" >> "$GITHUB_ENV"
+        # One parser for every job, so the Android and iOS builders below stamp
+        # their artifacts from the same value as the desktop ones.
+        run: bash .github/scripts/release-version.sh
 
       # Pinned to an exact release for the same reason as get-cmake below: `@v4`
       # is a tag this third-party action's author moves, so the Qt installer that
@@ -512,6 +498,531 @@ jobs:
           path: artifact/
           if-no-files-found: error
 
+  # The Android client. A cross-compile, so it needs four pinned things to agree:
+  # Qt for Android arm64, the same-version host Qt (moc/rcc/androiddeployqt run
+  # on the runner), the NDK those Qt binaries were built with, and a libssh built
+  # for the device ABI. ci.yml's `android` job is this job minus the version
+  # stamping and the AAB; keeping them in step is deliberate, exactly as the
+  # desktop `build` job mirrors ci.yml's `client` matrix.
+  #
+  # SIGNING: both assets are UNSIGNED, and their names say so. CI holds no
+  # keystore and must not: signing with an ad-hoc key would produce an artifact
+  # that looks installable while having nothing to do with the release identity,
+  # which is worse than one that plainly is not signed. Signing an APK for
+  # sideloading, or an AAB for Play upload, happens on a machine that owns the
+  # upload key - a release-time concern with credentials this repository does not
+  # have.
+  android:
+    name: android (arm64)
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      # Qt 6.10's Android binaries are built with NDK r27c == 27.2.12479018 and
+      # Qt documents JDK 17 (doc.qt.io/qt-6.10/android.html). The runner image
+      # preinstalls a different r27 patch release and rotates it, so the pinned
+      # NDK is installed through sdkmanager: a published APK must not be linked
+      # by whatever toolchain the image happened to carry that week.
+      ANDROID_NDK_VERSION: "27.2.12479018"
+      # Qt 6.10's mandatory SDK packages, from
+      # doc.qt.io/qt-6.10/android-getting-started.html. android-36 is the COMPILE
+      # platform; the app's min/target SDK levels (28/35) live in
+      # src/mobile/CMakeLists.txt. The step below is what makes this value
+      # actually decide the compile SDK, and a later step asserts it did.
+      ANDROID_SDK_PACKAGES: "platform-tools platforms;android-36 build-tools;36.0.0"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Resolve the release version
+        run: bash .github/scripts/release-version.sh
+
+      # SPEC 7.5 / 2.4, re-checked here and not merely on the commit: a tag can
+      # be pushed at a tree ci.yml never gated, and the two rules this script
+      # enforces (no rich text for server-controlled strings, no WebEngine /
+      # WebChannel / QtWidgets / QtDBus) are the ones that must never reach a
+      # published client. It runs before the twenty-minute cross-compile because
+      # it costs seconds, and once in the Android job is enough: `publish`
+      # depends on this job, so a red run here publishes nothing.
+      - name: Mobile sources must not use rich text, WebEngine, WebChannel, QtWidgets or QtDBus
+        run: bash .github/scripts/mobile-source-rules.sh
+
+      # androiddeployqt shells out to Gradle, which needs a JDK, and finds it
+      # through JAVA_HOME - which this action sets. Qt 6.10 documents JDK 17.
+      # v5, not v4: v4 carries a deprecationMessage and no longer gets updates.
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install the Android SDK, the Qt-mandated packages and the pinned NDK
+        uses: android-actions/setup-android@v4.0.1
+        with:
+          packages: "${{ env.ANDROID_SDK_PACKAGES }} ndk;${{ env.ANDROID_NDK_VERSION }}"
+          accept-android-sdk-licenses: true
+
+      # Installing the pinned platform and build tools does NOT pin them. This
+      # project sets no QT_ANDROID_COMPILE_SDK_VERSION, so androiddeployqt calls
+      # detectLatestAndroidPlatform(), which sorts $ANDROID_SDK_ROOT/platforms
+      # with quasiLexicographicalReverseLessThan - "longest directory name first,
+      # ties broken lexicographically" - and takes the first entry
+      # (qtbase/src/tools/androiddeployqt/main.cpp). Qt's CMake picks the build
+      # tools the same way, the highest revision present
+      # (Qt6AndroidMacros.cmake, _qt_internal_android_get_sdk_build_tools_revision).
+      #
+      # The runner image ships many platforms, preview ones included
+      # (android-37.2-beta2, android-36-ext19, ...), and rotates them with the
+      # image - so a PUBLISHED APK was compiled against whatever beta platform
+      # the image carried that week. Making the pinned packages the only ones
+      # present is what turns "the latest installed" into the pin. Nothing else
+      # in this job touches the Android SDK.
+      - name: Make the pinned compile SDK and build tools the only ones installed
+        run: |
+          set -euo pipefail
+          platform=${ANDROID_SDK_PACKAGES#*platforms;}
+          platform=${platform%% *}
+          tools=${ANDROID_SDK_PACKAGES#*build-tools;}
+          tools=${tools%% *}
+          for dir in "platforms/$platform" "build-tools/$tools"; do
+            if [ ! -d "$ANDROID_SDK_ROOT/$dir" ]; then
+              echo "$ANDROID_SDK_ROOT/$dir is missing: the SDK install step did" >&2
+              echo "not provide the pinned package." >&2
+              exit 1
+            fi
+          done
+          find "$ANDROID_SDK_ROOT/platforms" -mindepth 1 -maxdepth 1 \
+               ! -name "$platform" -exec rm -rf {} +
+          find "$ANDROID_SDK_ROOT/build-tools" -mindepth 1 -maxdepth 1 \
+               ! -name "$tools" -exec rm -rf {} +
+          ls -1 "$ANDROID_SDK_ROOT/platforms" "$ANDROID_SDK_ROOT/build-tools"
+
+      - name: Point CMake and vcpkg at the pinned NDK
+        run: |
+          set -euo pipefail
+          ndk="$ANDROID_SDK_ROOT/ndk/$ANDROID_NDK_VERSION"
+          if [ ! -f "$ndk/build/cmake/android.toolchain.cmake" ]; then
+            echo "the pinned NDK $ANDROID_NDK_VERSION is not installed." >&2
+            ls -1 "$ANDROID_SDK_ROOT/ndk" >&2 || true
+            exit 1
+          fi
+          # The android-arm64 preset reads ANDROID_NDK_ROOT; vcpkg's android
+          # wrapper reads ANDROID_NDK_HOME and nothing else. Both name the same
+          # NDK so the app and libssh are built by one toolchain.
+          echo "ANDROID_NDK_ROOT=$ndk" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_HOME=$ndk" >> "$GITHUB_ENV"
+
+      - name: Install Qt ${{ env.QT_VERSION }} for Android arm64 (with host Qt)
+        uses: jurplel/install-qt-action@v4.3.1
+        with:
+          version: ${{ env.QT_VERSION }}
+          # Since Qt 6.8 the Android packages live under the `all_os` host, not
+          # `linux`, whose Android listing stops at 6.7.3.
+          host: all_os
+          target: android
+          arch: android_arm64_v8a
+          # qtwebview only: qtpdf is not published for android_arm64_v8a in 6.10,
+          # and both are probed as optional capabilities, so CH_HAVE_QTPDF is 0
+          # on Android by construction rather than by accident.
+          modules: qtwebview
+          cache: true
+
+      - name: Record the Qt prefixes the preset reads
+        run: |
+          set -euo pipefail
+          if [ -z "${QT_ROOT_DIR:-}" ]; then
+            echo "QT_ROOT_DIR is unset; the Qt install step did not run." >&2
+            exit 1
+          fi
+          if [ -z "${QT_HOST_PATH:-}" ]; then
+            echo "QT_HOST_PATH is unset: aqtinstall did not install the parallel" >&2
+            echo "desktop Qt, and moc/rcc/androiddeployqt cannot run without it." >&2
+            exit 1
+          fi
+          echo "QT_ANDROID_PATH=$QT_ROOT_DIR" >> "$GITHUB_ENV"
+
+      - name: Install CMake + Ninja
+        uses: lukka/get-cmake@v4.2.3
+
+      # libssh for the device ABI, from the same audited overlay port (0.12.2)
+      # every other platform uses. Cached because openssl and libssh are source
+      # builds; the key carries the image version, the pinned libssh, the NDK that
+      # compiled the tree and a hash of the overlay port, so a patch edit without
+      # a version bump still forces a rebuild.
+      #
+      # SCOPING, as for the Windows leg: a run can only restore a cache written by
+      # its own ref or by the DEFAULT BRANCH, so a tag build reuses what a push to
+      # main seeded - never another tag's entry.
+      - name: Resolve libssh cache key
+        id: libssh
+        run: |
+          set -euo pipefail
+          if [ -z "${VCPKG_INSTALLATION_ROOT:-}" ]; then
+            echo "VCPKG_INSTALLATION_ROOT is unset; this image no longer ships" >&2
+            echo "vcpkg, which is how libssh is built for the device ABI." >&2
+            exit 1
+          fi
+          echo "vcpkg=$VCPKG_INSTALLATION_ROOT" >> "$GITHUB_OUTPUT"
+          echo "image=${ImageVersion:-unknown}" >> "$GITHUB_OUTPUT"
+          echo "pin=$(jq -r .version packaging/vcpkg-ports/libssh/vcpkg.json)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache vcpkg libssh (arm64-android)
+        id: libssh_cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ steps.libssh.outputs.vcpkg }}/installed
+          key: vcpkg-libssh-${{ steps.libssh.outputs.pin }}-arm64-android-ndk${{ env.ANDROID_NDK_VERSION }}-${{ steps.libssh.outputs.image }}-${{ hashFiles('packaging/vcpkg-ports/libssh/**') }}
+
+      - name: Install libssh via vcpkg (arm64-android)
+        env:
+          LIBSSH_PIN: ${{ steps.libssh.outputs.pin }}
+          VCPKG_ROOT_DIR: ${{ steps.libssh.outputs.vcpkg }}
+        run: |
+          set -euo pipefail
+          prefix="$VCPKG_ROOT_DIR/installed/arm64-android"
+          header="$prefix/include/libssh/libssh_version.h"
+          installed_libssh() {
+            [ -f "$header" ] || return 0
+            # No `head`: with pipefail an early-closing reader is a SIGPIPE.
+            sed -n 's/^#define LIBSSH_VERSION_\(MAJOR\|MINOR\|MICRO\)[[:space:]]\{1,\}\([0-9]\{1,\}\).*$/\2/p' \
+                "$header" | paste -sd. -
+          }
+          # A cache entry from before a port bump must not survive as an
+          # already-installed tree that `vcpkg install` treats as a no-op.
+          present=$(installed_libssh)
+          if [ -n "$present" ] && [ "$present" != "$LIBSSH_PIN" ]; then
+            echo "Removing cached libssh $present (pin is $LIBSSH_PIN)"
+            vcpkg remove libssh:arm64-android --recurse
+          fi
+          vcpkg install libssh:arm64-android \
+            "--overlay-ports=$PWD/packaging/vcpkg-ports"
+          got=$(installed_libssh)
+          if [ "$got" != "$LIBSSH_PIN" ]; then
+            echo "libssh $got installed, expected $LIBSSH_PIN." >&2
+            exit 1
+          fi
+          echo "libssh $got for arm64-android"
+          echo "CH_LIBSSH_PREFIX=$prefix" >> "$GITHUB_ENV"
+
+      # Save immediately: a later packaging failure must not throw away the
+      # dependency build that made this cache entry.
+      - name: Save vcpkg libssh cache (arm64-android)
+        if: steps.libssh_cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ steps.libssh.outputs.vcpkg }}/installed
+          key: vcpkg-libssh-${{ steps.libssh.outputs.pin }}-arm64-android-ndk${{ env.ANDROID_NDK_VERSION }}-${{ steps.libssh.outputs.image }}-${{ hashFiles('packaging/vcpkg-ports/libssh/**') }}
+
+      # A libssh that was not found is only a WARNING (CH_HAVE_LIBSSH=0), and on a
+      # cross-compile there is no system package to fall back on - so a release
+      # that shipped it would install, launch, and then connect to nothing. The
+      # success line is asserted rather than assumed.
+      - name: Configure (android-arm64 preset)
+        run: |
+          set -euo pipefail
+          cmake --preset android-arm64 \
+            -DANDROID_SDK_ROOT="$ANDROID_SDK_ROOT" 2>&1 | tee configure-android.log
+          if ! grep -q "libssh: found via" configure-android.log; then
+            echo "libssh was not found for arm64-android: the APK would carry a" >&2
+            echo "client built with CH_HAVE_LIBSSH=0, which cannot connect." >&2
+            exit 1
+          fi
+
+      # The APK is what a person sideloads; the AAB is what Play consumes. Both
+      # come out of the same configured tree, so building both here costs one
+      # extra Gradle pass and no extra C++.
+      - name: Build the APK
+        run: cmake --build --preset android-arm64-apk
+
+      # What actually compiled the package, read back out of the Gradle project
+      # androiddeployqt generated rather than assumed from the steps above: it
+      # writes the compile SDK, the build tools revision and the NDK revision it
+      # used into gradle.properties (main.cpp, buildAndroidProject). A published
+      # APK must be able to say which toolchain produced it. Qt's build.gradle
+      # template consumes androidCompileSdkVersion as a string, so the value is
+      # of the form `android-36`.
+      - name: The package must have been built with the pinned toolchain
+        run: |
+          set -euo pipefail
+          props=build/android-arm64/src/mobile/android-build/gradle.properties
+          if [ ! -f "$props" ]; then
+            echo "$props does not exist; androiddeployqt did not generate a" >&2
+            echo "Gradle project, so the APK above came from somewhere else." >&2
+            exit 1
+          fi
+          cat "$props"
+          # No pipe, so no SIGPIPE to reason about under `set -o pipefail`.
+          val() { awk -F= -v k="$1" '$1 == k { print $2; exit }' "$props"; }
+          want_platform=${ANDROID_SDK_PACKAGES#*platforms;}
+          want_platform=${want_platform%% *}
+          want_tools=${ANDROID_SDK_PACKAGES#*build-tools;}
+          want_tools=${want_tools%% *}
+          compile=$(val androidCompileSdkVersion)
+          tools=$(val androidBuildToolsVersion)
+          ndk=$(val androidNdkVersion)
+          target=$(val qtTargetSdkVersion)
+          fail=0
+          if [ "${compile#android-}" != "${want_platform#android-}" ]; then
+            echo "compile SDK is '$compile', expected '$want_platform'." >&2
+            fail=1
+          fi
+          if [ "$tools" != "$want_tools" ]; then
+            echo "build tools are '$tools', expected '$want_tools'." >&2
+            fail=1
+          fi
+          if [ "$ndk" != "$ANDROID_NDK_VERSION" ]; then
+            echo "NDK is '$ndk', expected '$ANDROID_NDK_VERSION'." >&2
+            fail=1
+          fi
+          # The one rule Gradle itself only warns about: an app whose target SDK
+          # is newer than the platform it was compiled against.
+          case "${compile#android-}$target" in
+            *[!0-9]*|"")
+              echo "compile SDK '$compile' and target SDK '$target' are not both" >&2
+              echo "plain API levels, so their ordering cannot be checked." >&2
+              fail=1
+              ;;
+            *)
+              if [ "${compile#android-}" -lt "$target" ]; then
+                echo "compile SDK ${compile#android-} is older than the app's" >&2
+                echo "target SDK $target." >&2
+                fail=1
+              fi
+              ;;
+          esac
+          if [ "$fail" -ne 0 ]; then
+            echo "the package was not built with the toolchain this job pins," >&2
+            echo "and a release must not ship a toolchain nobody chose." >&2
+            exit 1
+          fi
+          echo "APK toolchain: compile SDK $compile, build tools $tools, NDK $ndk,"
+          echo "app target SDK $target."
+
+      - name: Build the AAB
+        run: cmake --build --preset android-arm64-aab
+
+      # One deterministic name per asset, carrying the version, so `publish` can
+      # require it to equal the tag - the same reason the AppImage and the disk
+      # image are renamed. androiddeployqt's own names carry the Gradle project
+      # name and the signing state, so match exactly one file and rename it.
+      - name: Collect the APK and the AAB
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          mkdir -p artifact
+          out=build/android-arm64/src/mobile/android-build/build/outputs
+          apks=("$out"/apk/release/*.apk)
+          if [ "${#apks[@]}" -ne 1 ]; then
+            echo "expected exactly one release APK, found ${#apks[@]}: ${apks[*]-}" >&2
+            find "$out" -name '*.apk' >&2 || true
+            exit 1
+          fi
+          aabs=("$out"/bundle/release/*.aab)
+          if [ "${#aabs[@]}" -ne 1 ]; then
+            echo "expected exactly one release AAB, found ${#aabs[@]}: ${aabs[*]-}" >&2
+            find "$out" -name '*.aab' >&2 || true
+            exit 1
+          fi
+          cp "${apks[0]}" "artifact/CodeHarbor-$CH_VERSION-android-arm64-unsigned.apk"
+          cp "${aabs[0]}" "artifact/CodeHarbor-$CH_VERSION-android-arm64-unsigned.aab"
+          ls -la artifact
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: codeharbor-android-arm64
+          path: artifact/
+          if-no-files-found: error
+
+  # The iOS client, SIMULATOR slice only.
+  #
+  # A simulator build needs no code signing - the simulator runs the binary on the
+  # host CPU and checks no signature - so the ios-simulator preset turns signing
+  # off and this job needs no secrets. That is the whole reason it can run here.
+  #
+  # A DEVICE build (the ios-arm64 preset) and any App Store submission need a
+  # provisioning profile, a development team and a distribution certificate.
+  # Those are credentials this repository does not hold and CI must not hold, so
+  # device builds and submission are explicitly OUT OF SCOPE for the release
+  # workflow: they happen on a machine that owns them. The asset published here
+  # is named `-ios-simulator` for exactly that reason - it is a build proof and a
+  # simulator-testable app, not something a phone can install.
+  ios-simulator:
+    name: ios (simulator)
+    runs-on: macos-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Resolve the release version
+        run: bash .github/scripts/release-version.sh
+
+      # Xcode is selected rather than inherited from the image default so the run
+      # records its toolchain. Not pinned to an exact version the way Qt and CMake
+      # are: Apple's images rotate Xcode and drop old versions, so an exact pin
+      # would fail a release for a reason unrelated to the release.
+      - name: Select Xcode
+        uses: maxim-lobanov/setup-xcode@v1.6.0
+        with:
+          xcode-version: latest-stable
+
+      - name: Record the toolchain
+        id: toolchain
+        run: |
+          set -euo pipefail
+          xcodebuild -version
+          # No `head`: with pipefail an early-closing reader is a SIGPIPE.
+          echo "xcode=$(xcodebuild -version | sed -n '1s/^Xcode //p')" >> "$GITHUB_OUTPUT"
+          echo "iphonesimulator SDK $(xcrun --sdk iphonesimulator --show-sdk-version)"
+
+      - name: Install Qt ${{ env.QT_VERSION }} for iOS (with host Qt)
+        uses: jurplel/install-qt-action@v4.3.1
+        with:
+          version: ${{ env.QT_VERSION }}
+          host: mac
+          target: ios
+          # The only iOS architecture aqtinstall publishes; it carries the device
+          # and simulator slices both.
+          arch: ios
+          # Both optional capabilities exist natively on iOS: Qt WebView is a
+          # WKWebView (no WebEngine anywhere), and Qt PDF is published for ios.
+          modules: qtpdf qtwebview
+          cache: true
+
+      - name: Record the Qt prefixes the preset reads
+        run: |
+          set -euo pipefail
+          if [ -z "${QT_ROOT_DIR:-}" ]; then
+            echo "QT_ROOT_DIR is unset; the Qt install step did not run." >&2
+            exit 1
+          fi
+          if [ -z "${QT_HOST_PATH:-}" ]; then
+            echo "QT_HOST_PATH is unset: aqtinstall did not install the parallel" >&2
+            echo "desktop Qt, and moc/rcc/qmlcachegen cannot run without it." >&2
+            exit 1
+          fi
+          echo "QT_IOS_PATH=$QT_ROOT_DIR" >> "$GITHUB_ENV"
+
+      # Pinned like every other leg: the CMake that configures a published tree
+      # must not drift. The Ninja it also installs is unused here, because the
+      # iOS presets generate for Xcode.
+      - name: Install CMake
+        uses: lukka/get-cmake@v4.2.3
+
+      # arm64-ios-SIMULATOR, not arm64-ios: both are arm64, but the device triplet
+      # builds against the iphoneos sysroot and its static library cannot be
+      # linked into a simulator binary. arm64-ios is what a device build uses.
+      - name: Resolve libssh cache key
+        id: libssh
+        run: |
+          set -euo pipefail
+          # The macOS images ship vcpkg but, unlike Ubuntu and Windows, do not put
+          # VCPKG_INSTALLATION_ROOT in the Actions environment (it is written to
+          # ~/.bashrc, which a non-interactive step never reads). Fall back to the
+          # documented location and fail loudly if neither is there, rather than
+          # quietly producing an app that cannot connect.
+          root="${VCPKG_INSTALLATION_ROOT:-/usr/local/share/vcpkg}"
+          if [ ! -x "$root/vcpkg" ]; then
+            echo "no vcpkg at $root; libssh cannot be built for the iOS ABI." >&2
+            exit 1
+          fi
+          echo "vcpkg=$root" >> "$GITHUB_OUTPUT"
+          echo "image=${ImageVersion:-unknown}" >> "$GITHUB_OUTPUT"
+          echo "pin=$(jq -r .version packaging/vcpkg-ports/libssh/vcpkg.json)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache vcpkg libssh (arm64-ios-simulator)
+        id: libssh_cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ steps.libssh.outputs.vcpkg }}/installed
+          key: vcpkg-libssh-${{ steps.libssh.outputs.pin }}-arm64-ios-simulator-xcode${{ steps.toolchain.outputs.xcode }}-${{ steps.libssh.outputs.image }}-${{ hashFiles('packaging/vcpkg-ports/libssh/**') }}
+
+      - name: Install libssh via vcpkg (arm64-ios-simulator)
+        env:
+          LIBSSH_PIN: ${{ steps.libssh.outputs.pin }}
+          VCPKG_ROOT_DIR: ${{ steps.libssh.outputs.vcpkg }}
+        run: |
+          set -euo pipefail
+          prefix="$VCPKG_ROOT_DIR/installed/arm64-ios-simulator"
+          header="$prefix/include/libssh/libssh_version.h"
+          installed_libssh() {
+            [ -f "$header" ] || return 0
+            sed -n 's/^#define LIBSSH_VERSION_\(MAJOR\|MINOR\|MICRO\)[[:space:]]\{1,\}\([0-9]\{1,\}\).*$/\2/p' \
+                "$header" | paste -sd. -
+          }
+          present=$(installed_libssh)
+          if [ -n "$present" ] && [ "$present" != "$LIBSSH_PIN" ]; then
+            echo "Removing cached libssh $present (pin is $LIBSSH_PIN)"
+            "$VCPKG_ROOT_DIR/vcpkg" remove libssh:arm64-ios-simulator --recurse
+          fi
+          # arm64-ios-simulator is a COMMUNITY triplet, so vcpkg prints a
+          # not-guaranteed warning; it ships with vcpkg and needs no overlay.
+          "$VCPKG_ROOT_DIR/vcpkg" install libssh:arm64-ios-simulator \
+            "--overlay-ports=$PWD/packaging/vcpkg-ports"
+          got=$(installed_libssh)
+          if [ "$got" != "$LIBSSH_PIN" ]; then
+            echo "libssh $got installed, expected $LIBSSH_PIN." >&2
+            exit 1
+          fi
+          echo "libssh $got for arm64-ios-simulator"
+          echo "CH_LIBSSH_PREFIX=$prefix" >> "$GITHUB_ENV"
+
+      - name: Save vcpkg libssh cache (arm64-ios-simulator)
+        if: steps.libssh_cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ steps.libssh.outputs.vcpkg }}/installed
+          key: vcpkg-libssh-${{ steps.libssh.outputs.pin }}-arm64-ios-simulator-xcode${{ steps.toolchain.outputs.xcode }}-${{ steps.libssh.outputs.image }}-${{ hashFiles('packaging/vcpkg-ports/libssh/**') }}
+
+      - name: Configure (ios-simulator preset)
+        run: |
+          set -euo pipefail
+          cmake --preset ios-simulator 2>&1 | tee configure-ios.log
+          if ! grep -q "libssh: found via" configure-ios.log; then
+            echo "libssh was not found for arm64-ios-simulator: the app would" >&2
+            echo "carry a client built with CH_HAVE_LIBSSH=0." >&2
+            exit 1
+          fi
+
+      # --config Release, overriding the build preset's Debug. The preset is
+      # Debug because its everyday job is the fast compile-and-link proof
+      # ci.yml's `ios` job runs; a PUBLISHED asset has to be the same
+      # configuration as every other artifact on the release page, and shipping a
+      # debug build under a version number would be a difference nobody
+      # downloading it could see. Xcode's default configuration list carries
+      # Release, and the preset's signing-off cache variables are configuration
+      # independent.
+      - name: Build the simulator app
+        run: cmake --build --preset ios-simulator --config Release
+
+      - name: Archive the simulator app
+        run: |
+          set -euo pipefail
+          # Xcode writes into <target-binary-dir>/<CONFIG><EFFECTIVE_PLATFORM_NAME>,
+          # so the configuration above is part of this path.
+          app=build/ios-simulator/src/mobile/Release-iphonesimulator/codeharbor_mobile.app
+          if [ ! -d "$app" ]; then
+            echo "$app was not produced by the build." >&2
+            find build/ios-simulator -maxdepth 5 -name '*.app' >&2 || true
+            exit 1
+          fi
+          mkdir -p artifact
+          # ditto, not `zip -r`: an .app is a bundle whose symlinks and executable
+          # bits matter, and a bundle the simulator refuses to launch is worse
+          # than no asset at all. The name carries the version so `publish` can
+          # require it to equal the tag.
+          ditto -c -k --keepParent "$app" \
+            "artifact/CodeHarbor-$CH_VERSION-ios-simulator.zip"
+          ls -la artifact
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: codeharbor-ios-simulator
+          path: artifact/
+          if-no-files-found: error
+
   # The build/remote jobs only upload workflow ARTIFACTS, which expire and are
   # invisible to logged-out users. This job is what actually puts binaries on the
   # Releases page, and it runs for PUSHED TAGS only - a manual workflow_dispatch
@@ -525,7 +1036,7 @@ jobs:
   # branch's binaries to the v1.2.3 release page.
   publish:
     name: publish release
-    needs: [build, remote]
+    needs: [build, remote, android, ios-simulator]
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -569,6 +1080,12 @@ jobs:
       #
       # The macOS image is matched by a pattern only because its architecture is
       # whatever the `macos-latest` runner is; its version is still pinned.
+      #
+      # The two Android assets and the iOS one are asserted for the same reason as
+      # the desktop ones, and their names say what they are: unsigned, and (for
+      # iOS) a simulator build. Signing an APK/AAB and producing a device IPA
+      # need credentials this workflow does not have and must not have, so those
+      # assets do not exist rather than existing half-built - see the job notes.
       - name: Verify every asset is present and versioned like the tag
         run: |
           set -euo pipefail
@@ -581,6 +1098,9 @@ jobs:
           CodeHarbor-$version-windows-x64-setup.exe
           CodeHarbor-$version-x86_64.AppImage
           CodeHarbor-$version-macos-*.dmg
+          CodeHarbor-$version-android-arm64-unsigned.apk
+          CodeHarbor-$version-android-arm64-unsigned.aab
+          CodeHarbor-$version-ios-simulator.zip
           codeharbor-remote.tar.gz
           "
           missing=0
@@ -602,7 +1122,9 @@ jobs:
       # is the only place that sees every artifact at once, and it runs AFTER
       # the verification above so the file can never list a partial release.
       # `cd dist` keeps the names in the file bare, which is what
-      # `sha256sum -c SHA256SUMS.txt` expects next to the downloads.
+      # `sha256sum -c SHA256SUMS.txt` expects next to the downloads. The glob is
+      # why the mobile assets needed no change here: anything the verification
+      # step above accepted is checksummed by construction.
       - name: Generate checksums
         run: |
           set -euo pipefail

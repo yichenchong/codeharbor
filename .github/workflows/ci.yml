@@ -287,6 +287,716 @@ jobs:
         shell: bash
         continue-on-error: true
 
+  # --- mobile clients ------------------------------------------------------
+  # The mobile client (src/vt, src/mobile, codeharbor_mobile) is plain Qt Quick
+  # with no device-only API, so it COMPILES AND TESTS on an ordinary Linux
+  # runner - an NDK or an iPhone is needed to ship it, never to prove it works.
+  # `-DCODEHARBOR_BUILD_DESKTOP=OFF` on top of the mobile-desktop preset leaves
+  # exactly the portable half of the tree: no Qt WebEngine find_package, no
+  # src/qml, no web bundles, and (because the desktop-only test directories are
+  # gated on the same option) a test set that is the mobile and portable-module
+  # tests alone.
+  #
+  # That configuration is also the strongest available proof of the mobile
+  # client's central rule (SPEC 7.5): the mobile binary must not reach WebEngine
+  # at all. It is asserted with ldd below rather than trusted, and the QML that
+  # renders server-controlled strings is checked for the banned rich-text modes.
+  #
+  # Deliberately NOT continue-on-error: this job is what decides whether the
+  # mobile client builds and its logic passes, and it needs no device to say so.
+  mobile-shell:
+    name: mobile shell (linux, no WebEngine)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Qt ${{ env.QT_VERSION }}
+        uses: jurplel/install-qt-action@v4.3.1
+        with:
+          version: ${{ env.QT_VERSION }}
+          # qtpdf, and deliberately NOT qtwebengine/qtwebchannel: the point of
+          # this job is that the mobile client compiles without them, and having
+          # them on the runner would let an accidental dependency pass unnoticed.
+          #
+          # qtwebview is left out for the same reason, not by oversight: on a
+          # DESKTOP host Qt WebView is implemented on top of Qt WebEngine, so it
+          # could only be satisfied by the very library this job excludes.
+          # CH_HAVE_QTWEBVIEW is therefore 0 here, and that code path is
+          # compiled by the `ios` job below, where Qt WebView is a native
+          # WKWebView.
+          modules: qtpdf
+          cache: true
+
+      - name: Install CMake + Ninja
+        uses: lukka/get-cmake@v4.2.3
+
+      - name: Install libssh (Linux)
+        run: sudo apt-get update && sudo apt-get install -y libssh-dev
+
+      # SPEC 7.5 / 2.4: every server-controlled string rendered by the mobile
+      # client must be Text.PlainText, and no mobile surface may pull in
+      # WebEngine, WebChannel, QtWidgets or QtDBus. Both rules are one grep, and
+      # both are the kind of rule that decays the moment nothing checks them.
+      #
+      # The check itself lives in the script because the RELEASE workflow runs it
+      # too: a tag can be pushed at a tree this workflow never saw, and these two
+      # rules are the ones that must not reach a published client.
+      - name: Mobile sources must not use rich text, WebEngine, WebChannel, QtWidgets or QtDBus
+        run: bash .github/scripts/mobile-source-rules.sh
+
+      # One extra -D on top of the preset, which is how the mobile client is
+      # meant to be checked without a device (docs/DEVELOPMENT.md, 'Mobile
+      # clients'). CODEHARBOR_BUILD_TESTS stays ON: with the desktop half off,
+      # the test targets that link ch_viewers are gated out with it.
+      #
+      # The configure output is kept because a libssh that was not found is only
+      # a WARNING (CH_HAVE_LIBSSH=0, by design: a workstation without it must
+      # still be able to compile the tree). A mobile client built that way
+      # compiles, launches, and then cannot connect to anything, so the success
+      # line is asserted here as it is on the cross-compiling legs below.
+      - name: Configure (mobile-desktop preset, desktop half off)
+        run: |
+          set -euo pipefail
+          cmake --preset mobile-desktop -DCODEHARBOR_BUILD_DESKTOP=OFF 2>&1 |
+            tee configure-mobile.log
+          if ! grep -q "libssh: found via" configure-mobile.log; then
+            echo "libssh was not found, so this build has CH_HAVE_LIBSSH=0 and" >&2
+            echo "the SSH stack it is supposed to exercise is stubbed out." >&2
+            exit 1
+          fi
+      - name: Build
+        run: cmake --build --preset mobile-desktop
+
+      # The mobile client's central rule (SPEC 7.5), checked against the linked
+      # binary rather than trusted: Qt WebEngine exists on neither Android nor
+      # iOS, so a mobile executable that reaches it is broken on both.
+      - name: The mobile client must not link Qt WebEngine
+        run: |
+          set -euo pipefail
+          exe=build/mobile-desktop/src/mobile/codeharbor_mobile
+          if [ ! -x "$exe" ]; then
+            echo "$exe was not built; the mobile executable is the artifact this" >&2
+            echo "job exists to produce." >&2
+            exit 1
+          fi
+          # ldd's own exit status is captured first. Inside `if ldd ... | grep`,
+          # a failing ldd (a static or unreadable binary) turns the pipeline
+          # non-zero, which the `if` reads as "no match" - the check would have
+          # PASSED without ever inspecting a library list.
+          libs=$(ldd "$exe")
+          # Only WebEngine and WebChannel are asserted absent. The rest of Qt's
+          # transitive closure legitimately varies between images (a platform
+          # plugin can drag in D-Bus at RUNTIME, which ldd on the executable does
+          # not even show), so a wider blacklist would only invent failures.
+          if printf '%s\n' "$libs" | grep -iE 'webengine|webchannel'; then
+            echo "the mobile client links Qt WebEngine/WebChannel, which exists" >&2
+            echo "on neither Android nor iOS (SPEC 7.5)." >&2
+            exit 1
+          fi
+          echo "codeharbor_mobile links no WebEngine."
+
+      # Which tests are "the mobile ones" is DERIVED from the build tree, not
+      # written out here. A hand-maintained `-R tst_(a|b|c)` list is a permanent
+      # footgun: the failure mode of forgetting to add a new test to it is a
+      # test that never runs and a job that stays green, which is the one
+      # failure mode CI must not have. ctest already knows what each build
+      # directory declares, so it is asked - and src/vt/tests and
+      # src/mobile/tests are the only two directories where a mobile or
+      # terminal-engine test is registered, so nothing outside them can be
+      # picked up either.
+      #
+      # Deliberately NOT the whole suite: the portable modules (models, remote,
+      # persistence, ssh, agent) are also configured with the desktop half off,
+      # and the `client` matrix already runs their tests on all three OSes.
+      - name: Resolve the mobile and VT test set
+        id: mobiletests
+        run: |
+          set -euo pipefail
+          names=""
+          for dir in src/vt/tests src/mobile/tests; do
+            found=$(ctest --test-dir "build/mobile-desktop/$dir" \
+                          --show-only=json-v1 | jq -r '.tests[].name')
+            if [ -z "$found" ]; then
+              echo "no tests are configured in build/mobile-desktop/$dir;" >&2
+              echo "a derivation that came up empty would otherwise run a" >&2
+              echo "partial set and report a green job." >&2
+              exit 1
+            fi
+            names="$names$found"$'\n'
+          done
+          names=$(printf '%s' "$names" | sort -u)
+          count=$(printf '%s\n' "$names" | wc -l)
+          # A FLOOR as well as a non-empty check: a derivation that half broke
+          # and produced two names would run two tests and still be green. This
+          # number is how many tests those two directories declared when this
+          # was written. Adding a test never touches it; deleting one on
+          # purpose means lowering it on purpose, which is the point.
+          if [ "$count" -lt 8 ]; then
+            echo "only $count mobile/VT tests were derived, expected >= 8:" >&2
+            printf '%s\n' "$names" >&2
+            exit 1
+          fi
+          printf '%s\n' "$names"
+          echo "filter=^($(printf '%s\n' "$names" | paste -sd'|' -))\$" >> "$GITHUB_OUTPUT"
+          echo "count=$count" >> "$GITHUB_OUTPUT"
+
+      # The test preset sets output-on-failure and noTestsAction=error, so a
+      # filter that matches nothing fails the job instead of reporting a green
+      # run over zero tests. The filter is passed through the environment rather
+      # than interpolated into the script, so no expression value is ever
+      # spliced into shell source.
+      - name: Test (mobile and VT only)
+        id: test
+        env:
+          # No display on the runner, and the mobile tests instantiate QML items
+          # (MobileTerminalView paints through QQuickPaintedItem).
+          QT_QPA_PLATFORM: offscreen
+          CH_TEST_FILTER: ${{ steps.mobiletests.outputs.filter }}
+          CH_TEST_COUNT: ${{ steps.mobiletests.outputs.count }}
+        run: |
+          set -euo pipefail
+          # The derived names go into a regex, so count what the regex actually
+          # selects before running anything: this is what turns "the filter and
+          # the derivation agree" from an assumption into a checked fact, and it
+          # would catch both a name the alternation missed and one it matched by
+          # accident.
+          selected=$(ctest --preset mobile-desktop -R "$CH_TEST_FILTER" -N |
+                     sed -n 's/^Total Tests: //p')
+          if [ "$selected" != "$CH_TEST_COUNT" ]; then
+            echo "the filter selects $selected tests but $CH_TEST_COUNT were" >&2
+            echo "derived from src/vt/tests and src/mobile/tests." >&2
+            exit 1
+          fi
+          ctest --preset mobile-desktop -R "$CH_TEST_FILTER"
+      # Same reasoning as the client matrix: a test that CRASHES prints nothing
+      # through ctest, and the failures worth diagnosing are the intermittent
+      # ones, so repeat the failed targets until one fails again.
+      - name: Diagnose failed tests
+        if: failure() && steps.test.conclusion == 'failure'
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: ctest --preset mobile-desktop --rerun-failed --repeat until-fail:20 --output-on-failure --verbose
+        continue-on-error: true
+
+  # Android is a real CROSS-COMPILE, and four things have to agree for it to
+  # work: Qt for Android arm64, the SAME-VERSION host Qt (moc, rcc, qmlcachegen
+  # and androiddeployqt run on the runner, not on the phone), the NDK those Qt
+  # binaries were built with, and a libssh built for the device ABI. Every one of
+  # them is pinned below, because a mismatch here does not fail at configure - it
+  # fails at link, or on a device.
+  #
+  # Nothing about this job is optional or best-effort: it produces the APK, and
+  # if a prerequisite is missing it says so and goes red.
+  android:
+    name: android (arm64 APK)
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      # Qt 6.10's Android binaries are built with NDK r27c == 27.2.12479018, and
+      # Qt documents JDK 17 (doc.qt.io/qt-6.10/android.html). The ubuntu-latest
+      # image preinstalls a DIFFERENT r27 patch release (27.3.13750724 today)
+      # and rotates it with the image, so the pinned NDK is installed through
+      # sdkmanager rather than taking whatever ANDROID_NDK_ROOT happens to name.
+      ANDROID_NDK_VERSION: "27.2.12479018"
+      # Qt 6.10's mandatory SDK packages, from
+      # doc.qt.io/qt-6.10/android-getting-started.html. android-36 is the COMPILE
+      # platform (the app's min/target SDK levels are 28/35 and live in
+      # src/mobile/CMakeLists.txt, not here); the step below is what makes this
+      # value actually decide the compile SDK.
+      ANDROID_SDK_PACKAGES: "platform-tools platforms;android-36 build-tools;36.0.0"
+    steps:
+      - uses: actions/checkout@v4
+
+      # androiddeployqt shells out to Gradle, which needs a JDK, and finds it
+      # through JAVA_HOME - which this action sets. Qt 6.10 documents JDK 17.
+      # v5, not v4: v4 carries a deprecationMessage and no longer gets updates.
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install the Android SDK, the Qt-mandated packages and the pinned NDK
+        uses: android-actions/setup-android@v4.0.1
+        with:
+          packages: "${{ env.ANDROID_SDK_PACKAGES }} ndk;${{ env.ANDROID_NDK_VERSION }}"
+          accept-android-sdk-licenses: true
+
+      # Installing the pinned platform and build tools is NOT enough to pin them.
+      # This project sets no QT_ANDROID_COMPILE_SDK_VERSION, so androiddeployqt
+      # calls detectLatestAndroidPlatform(), which sorts $ANDROID_SDK_ROOT/
+      # platforms with quasiLexicographicalReverseLessThan - "longest directory
+      # name first, ties broken lexicographically" - and takes the first entry
+      # (qtbase/src/tools/androiddeployqt/main.cpp). Qt's CMake picks the build
+      # tools the same way, by taking the highest revision present
+      # (Qt6AndroidMacros.cmake, _qt_internal_android_get_sdk_build_tools_revision).
+      #
+      # The runner image ships MANY platforms, including preview ones
+      # (android-37.2-beta2, android-36-ext19, ...), and rotates them with the
+      # image. That sort therefore picked a beta platform - the APK was compiled
+      # against whatever the image happened to carry, and the pin above bought
+      # nothing. So the pinned packages are made the ONLY ones present: with a
+      # single platform and a single build-tools revision, "the latest installed"
+      # IS the pin. Nothing else in this job touches the Android SDK.
+      - name: Make the pinned compile SDK and build tools the only ones installed
+        run: |
+          set -euo pipefail
+          platform=${ANDROID_SDK_PACKAGES#*platforms;}
+          platform=${platform%% *}
+          tools=${ANDROID_SDK_PACKAGES#*build-tools;}
+          tools=${tools%% *}
+          for dir in "platforms/$platform" "build-tools/$tools"; do
+            if [ ! -d "$ANDROID_SDK_ROOT/$dir" ]; then
+              echo "$ANDROID_SDK_ROOT/$dir is missing: the SDK install step did" >&2
+              echo "not provide the pinned package." >&2
+              exit 1
+            fi
+          done
+          find "$ANDROID_SDK_ROOT/platforms" -mindepth 1 -maxdepth 1 \
+               ! -name "$platform" -exec rm -rf {} +
+          find "$ANDROID_SDK_ROOT/build-tools" -mindepth 1 -maxdepth 1 \
+               ! -name "$tools" -exec rm -rf {} +
+          ls -1 "$ANDROID_SDK_ROOT/platforms" "$ANDROID_SDK_ROOT/build-tools"
+
+      - name: Point CMake and vcpkg at the pinned NDK
+        run: |
+          set -euo pipefail
+          ndk="$ANDROID_SDK_ROOT/ndk/$ANDROID_NDK_VERSION"
+          toolchain="$ndk/build/cmake/android.toolchain.cmake"
+          if [ ! -f "$toolchain" ]; then
+            echo "the pinned NDK $ANDROID_NDK_VERSION is not installed:" >&2
+            echo "$toolchain is missing. Installed NDKs:" >&2
+            ls -1 "$ANDROID_SDK_ROOT/ndk" >&2 || true
+            exit 1
+          fi
+          # Two variables for two consumers, both naming the same NDK on purpose:
+          # the android-arm64 preset reads ANDROID_NDK_ROOT for the toolchain
+          # file, while vcpkg's android wrapper reads ANDROID_NDK_HOME and
+          # NOTHING else (microsoft/vcpkg scripts/toolchains/android.cmake). If
+          # they disagreed, the app and libssh would be built by two toolchains.
+          echo "ANDROID_NDK_ROOT=$ndk" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_HOME=$ndk" >> "$GITHUB_ENV"
+          "$ndk/toolchains/llvm/prebuilt/linux-x86_64/bin/clang" --version
+
+      - name: Install Qt ${{ env.QT_VERSION }} for Android arm64 (with host Qt)
+        uses: jurplel/install-qt-action@v4.3.1
+        with:
+          version: ${{ env.QT_VERSION }}
+          # Since Qt 6.8 the Android packages live under the `all_os` host, not
+          # `linux`: `aqt list-qt linux android` stops at 6.7.3, while
+          # `aqt list-qt all_os android --arch 6.10.0` lists android_arm64_v8a.
+          host: all_os
+          target: android
+          arch: android_arm64_v8a
+          # qtwebview only. qtpdf is NOT published for android_arm64_v8a in 6.10
+          # (checked with `aqt list-qt all_os android --modules 6.10.0
+          # android_arm64_v8a`), and the mobile build probes both as OPTIONAL
+          # capabilities, so CH_HAVE_QTPDF is simply 0 on Android.
+          modules: qtwebview
+          cache: true
+
+      - name: Record the Qt prefixes the preset reads
+        run: |
+          set -euo pipefail
+          # install-qt-action exports QT_ROOT_DIR for the CROSS prefix, and for a
+          # mobile install it also exports QT_HOST_PATH, pointing at the parallel
+          # desktop Qt aqtinstall pulls in with --autodesktop. The presets read
+          # QT_ANDROID_PATH and QT_HOST_PATH, so only the first has to be
+          # derived - but both are asserted, because a silently empty prefix path
+          # produces a find_package failure fifty lines into the configure log.
+          if [ -z "${QT_ROOT_DIR:-}" ]; then
+            echo "QT_ROOT_DIR is unset; the Qt install step did not run." >&2
+            exit 1
+          fi
+          if [ -z "${QT_HOST_PATH:-}" ]; then
+            echo "QT_HOST_PATH is unset: aqtinstall did not install the parallel" >&2
+            echo "desktop Qt, and moc/rcc/androiddeployqt cannot run without it." >&2
+            exit 1
+          fi
+          echo "QT_ANDROID_PATH=$QT_ROOT_DIR" >> "$GITHUB_ENV"
+          echo "Qt for Android: $QT_ROOT_DIR"
+          echo "host Qt:        $QT_HOST_PATH"
+
+      - name: Install CMake + Ninja
+        uses: lukka/get-cmake@v4.2.3
+
+      # libssh for the DEVICE ABI. Neither the NDK nor the Qt-for-Android prefix
+      # carries it, and there is no apt package for arm64-v8a, so it is built
+      # from the same in-tree overlay port (0.12.2) the Windows leg uses - one
+      # audited libssh for every platform this project ships.
+      #
+      # Cached for the same reason as the Windows leg: openssl and libssh are
+      # source builds. The key carries the runner image version, the pinned
+      # libssh, the NDK (the compiler that produced the tree) and a hash of the
+      # overlay port, so a patch edit without a version bump still rebuilds.
+      - name: Resolve libssh cache key
+        id: libssh
+        run: |
+          set -euo pipefail
+          if [ -z "${VCPKG_INSTALLATION_ROOT:-}" ]; then
+            echo "VCPKG_INSTALLATION_ROOT is unset; this image no longer ships" >&2
+            echo "vcpkg, which is how libssh is built for the device ABI." >&2
+            exit 1
+          fi
+          echo "vcpkg=$VCPKG_INSTALLATION_ROOT" >> "$GITHUB_OUTPUT"
+          echo "image=${ImageVersion:-unknown}" >> "$GITHUB_OUTPUT"
+          echo "pin=$(jq -r .version packaging/vcpkg-ports/libssh/vcpkg.json)" >> "$GITHUB_OUTPUT"
+
+      # cache/restore + an explicit save, not the combined action, for the same
+      # reason as the Windows leg: the combined one registers a post-job save
+      # under the same key and collides with the explicit one.
+      - name: Restore vcpkg libssh cache (arm64-android)
+        id: libssh_cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ steps.libssh.outputs.vcpkg }}/installed
+          key: vcpkg-libssh-${{ steps.libssh.outputs.pin }}-arm64-android-ndk${{ env.ANDROID_NDK_VERSION }}-${{ steps.libssh.outputs.image }}-${{ hashFiles('packaging/vcpkg-ports/libssh/**') }}
+
+      - name: Install libssh via vcpkg (arm64-android)
+        env:
+          LIBSSH_PIN: ${{ steps.libssh.outputs.pin }}
+          VCPKG_ROOT_DIR: ${{ steps.libssh.outputs.vcpkg }}
+        run: |
+          set -euo pipefail
+          prefix="$VCPKG_ROOT_DIR/installed/arm64-android"
+          header="$prefix/include/libssh/libssh_version.h"
+          installed_libssh() {
+            [ -f "$header" ] || return 0
+            # No `head`: with pipefail an early-closing reader is a SIGPIPE.
+            sed -n 's/^#define LIBSSH_VERSION_\(MAJOR\|MINOR\|MICRO\)[[:space:]]\{1,\}\([0-9]\{1,\}\).*$/\2/p' \
+                "$header" | paste -sd. -
+          }
+          # A cache entry from before a port bump must not survive as an
+          # already-installed tree that `vcpkg install` treats as a no-op.
+          present=$(installed_libssh)
+          if [ -n "$present" ] && [ "$present" != "$LIBSSH_PIN" ]; then
+            echo "Removing cached libssh $present (pin is $LIBSSH_PIN)"
+            vcpkg remove libssh:arm64-android --recurse
+          fi
+          vcpkg install libssh:arm64-android \
+            "--overlay-ports=$PWD/packaging/vcpkg-ports"
+          got=$(installed_libssh)
+          if [ "$got" != "$LIBSSH_PIN" ]; then
+            echo "libssh $got installed, expected $LIBSSH_PIN." >&2
+            exit 1
+          fi
+          echo "libssh $got for arm64-android"
+          # The mobile presets append CH_LIBSSH_PREFIX to CMAKE_PREFIX_PATH.
+          echo "CH_LIBSSH_PREFIX=$prefix" >> "$GITHUB_ENV"
+
+      - name: Save vcpkg libssh cache (arm64-android)
+        if: steps.libssh_cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ steps.libssh.outputs.vcpkg }}/installed
+          key: vcpkg-libssh-${{ steps.libssh.outputs.pin }}-arm64-android-ndk${{ env.ANDROID_NDK_VERSION }}-${{ steps.libssh.outputs.image }}-${{ hashFiles('packaging/vcpkg-ports/libssh/**') }}
+
+      # ANDROID_SDK_ROOT is passed as a CACHE variable rather than left in the
+      # environment because Qt writes it into the deployment settings file that
+      # androiddeployqt consumes; the preset deliberately does not hard-code a
+      # machine-specific SDK path.
+      #
+      # The configure output is kept: a libssh that was not found is only a
+      # WARNING (CH_HAVE_LIBSSH=0, so the client builds and then cannot connect
+      # to anything), and on a cross-compile there is no system package manager
+      # to fall back on. So the success line is asserted.
+      - name: Configure (android-arm64 preset)
+        run: |
+          set -euo pipefail
+          cmake --preset android-arm64 \
+            -DANDROID_SDK_ROOT="$ANDROID_SDK_ROOT" 2>&1 | tee configure-android.log
+          if ! grep -q "libssh: found via" configure-android.log; then
+            echo "libssh was not found for arm64-android: the APK would carry a" >&2
+            echo "client built with CH_HAVE_LIBSSH=0, which cannot connect." >&2
+            exit 1
+          fi
+
+      - name: Build the APK
+        run: cmake --build --preset android-arm64-apk
+
+      # What actually compiled the APK, read back out of the Gradle project
+      # androiddeployqt generated, rather than assumed from the steps above.
+      # androiddeployqt writes the compile SDK, the build tools revision and the
+      # NDK revision it used into gradle.properties (main.cpp,
+      # buildAndroidProject), so this is the one place that can say whether the
+      # pins held. Qt's build.gradle template consumes androidCompileSdkVersion
+      # as a string, so the value is of the form `android-36`.
+      - name: The APK must have been built with the pinned toolchain
+        run: |
+          set -euo pipefail
+          props=build/android-arm64/src/mobile/android-build/gradle.properties
+          if [ ! -f "$props" ]; then
+            echo "$props does not exist; androiddeployqt did not generate a" >&2
+            echo "Gradle project, so the APK above came from somewhere else." >&2
+            exit 1
+          fi
+          cat "$props"
+          # No pipe, so no SIGPIPE to reason about under `set -o pipefail`.
+          val() { awk -F= -v k="$1" '$1 == k { print $2; exit }' "$props"; }
+          want_platform=${ANDROID_SDK_PACKAGES#*platforms;}
+          want_platform=${want_platform%% *}
+          want_tools=${ANDROID_SDK_PACKAGES#*build-tools;}
+          want_tools=${want_tools%% *}
+          compile=$(val androidCompileSdkVersion)
+          tools=$(val androidBuildToolsVersion)
+          ndk=$(val androidNdkVersion)
+          target=$(val qtTargetSdkVersion)
+          fail=0
+          if [ "${compile#android-}" != "${want_platform#android-}" ]; then
+            echo "compile SDK is '$compile', expected '$want_platform'." >&2
+            fail=1
+          fi
+          if [ "$tools" != "$want_tools" ]; then
+            echo "build tools are '$tools', expected '$want_tools'." >&2
+            fail=1
+          fi
+          if [ "$ndk" != "$ANDROID_NDK_VERSION" ]; then
+            echo "NDK is '$ndk', expected '$ANDROID_NDK_VERSION'." >&2
+            fail=1
+          fi
+          # The one rule Gradle itself only warns about: an app whose target SDK
+          # is newer than the platform it was compiled against.
+          case "${compile#android-}$target" in
+            *[!0-9]*|"")
+              echo "compile SDK '$compile' and target SDK '$target' are not both" >&2
+              echo "plain API levels, so their ordering cannot be checked." >&2
+              fail=1
+              ;;
+            *)
+              if [ "${compile#android-}" -lt "$target" ]; then
+                echo "compile SDK ${compile#android-} is older than the app's" >&2
+                echo "target SDK $target." >&2
+                fail=1
+              fi
+              ;;
+          esac
+          if [ "$fail" -ne 0 ]; then
+            echo "the APK was not built with the toolchain this job pins." >&2
+            exit 1
+          fi
+          echo "APK toolchain: compile SDK $compile, build tools $tools, NDK $ndk,"
+          echo "app target SDK $target."
+
+      - name: Collect the APK
+        run: |
+          set -euo pipefail
+          out=build/android-arm64/src/mobile/android-build/build/outputs/apk/release
+          shopt -s nullglob
+          built=("$out"/*.apk)
+          if [ "${#built[@]}" -ne 1 ]; then
+            echo "expected exactly one APK in $out, found ${#built[@]}: ${built[*]-}" >&2
+            find build/android-arm64/src/mobile/android-build -name '*.apk' >&2 || true
+            exit 1
+          fi
+          mkdir -p artifact
+          # UNSIGNED on purpose: CI holds no keystore, and a release APK signed
+          # with an ad-hoc key would be worse than an unsigned one - it would
+          # look installable while being unrelated to the release signing
+          # identity. This artifact proves the client compiles, links and
+          # packages for a device; installing it needs a signature (release-time
+          # concern, with credentials CI does not have).
+          cp "${built[0]}" artifact/codeharbor-android-arm64-unsigned.apk
+          ls -la artifact
+
+      - name: Upload the APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: codeharbor-android-arm64
+          path: artifact/
+          if-no-files-found: error
+
+  # iOS, like Android, is a cross-compile against a host Qt - and unlike
+  # Android it can only be built on macOS, because the SDK, the linker and the
+  # bundle assembly are all Xcode's.
+  #
+  # This job builds the SIMULATOR slice, which needs no code signing: the
+  # simulator runs the binary on the host CPU and does not check a signature, so
+  # the ios-simulator preset turns signing off outright. A DEVICE build (the
+  # ios-arm64 preset) needs a provisioning profile and a development team, and
+  # an App Store submission needs a distribution certificate - credentials this
+  # repository does not have and CI must not hold. Device builds and signing are
+  # therefore a release-time concern on a machine that owns those credentials;
+  # they are deliberately absent here rather than half-wired.
+  ios:
+    name: ios (simulator app)
+    runs-on: macos-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      # Xcode is SELECTED rather than left to whatever the image defaults to, so
+      # the run records its toolchain. It is not pinned to an exact version the
+      # way Qt and CMake are: Apple's images rotate Xcode continuously and drop
+      # old ones, so an exact pin would turn every image refresh into a red run
+      # on a commit that changed nothing. `latest-stable` plus the version print
+      # below is the honest compromise.
+      - name: Select Xcode
+        uses: maxim-lobanov/setup-xcode@v1.6.0
+        with:
+          xcode-version: latest-stable
+
+      - name: Record the toolchain
+        id: toolchain
+        run: |
+          set -euo pipefail
+          xcodebuild -version
+          # No `head`: with pipefail an early-closing reader is a SIGPIPE.
+          xcode=$(xcodebuild -version | sed -n '1s/^Xcode //p')
+          sdk=$(xcrun --sdk iphonesimulator --show-sdk-version)
+          echo "iphonesimulator SDK $sdk"
+          echo "xcode=$xcode" >> "$GITHUB_OUTPUT"
+
+      - name: Install Qt ${{ env.QT_VERSION }} for iOS (with host Qt)
+        uses: jurplel/install-qt-action@v4.3.1
+        with:
+          version: ${{ env.QT_VERSION }}
+          host: mac
+          target: ios
+          # The only iOS architecture aqtinstall publishes; it carries both the
+          # device and the simulator slices.
+          arch: ios
+          # Both optional mobile capabilities really exist on iOS, so both are
+          # installed and both code paths are compiled here: Qt WebView is a
+          # native WKWebView (no WebEngine), and Qt PDF is published for ios.
+          modules: qtpdf qtwebview
+          cache: true
+
+      - name: Record the Qt prefixes the preset reads
+        run: |
+          set -euo pipefail
+          if [ -z "${QT_ROOT_DIR:-}" ]; then
+            echo "QT_ROOT_DIR is unset; the Qt install step did not run." >&2
+            exit 1
+          fi
+          if [ -z "${QT_HOST_PATH:-}" ]; then
+            echo "QT_HOST_PATH is unset: aqtinstall did not install the parallel" >&2
+            echo "desktop Qt, and moc/rcc/qmlcachegen cannot run without it." >&2
+            exit 1
+          fi
+          echo "QT_IOS_PATH=$QT_ROOT_DIR" >> "$GITHUB_ENV"
+          echo "Qt for iOS: $QT_ROOT_DIR"
+          echo "host Qt:    $QT_HOST_PATH"
+
+      # Pinned for the same reason as everywhere else: the CMake that configures
+      # the tree must not drift. The Ninja it also installs is unused here - the
+      # iOS presets generate for Xcode - but the version pin is the point.
+      - name: Install CMake
+        uses: lukka/get-cmake@v4.2.3
+
+      # libssh for the simulator slice. The triplet is arm64-ios-SIMULATOR, not
+      # arm64-ios: both are arm64, but the device triplet builds against the
+      # iphoneos sysroot and its static library cannot be linked into a
+      # simulator binary. arm64-ios is what a device build would use.
+      #
+      # Same overlay port (0.12.2) as every other platform, and cached for the
+      # same reason - openssl and libssh are source builds here too. The key
+      # carries the Xcode version because it selects the SDK that compiled the
+      # tree.
+      - name: Resolve libssh cache key
+        id: libssh
+        run: |
+          set -euo pipefail
+          # The macOS images ship vcpkg but, unlike the Ubuntu and Windows ones,
+          # do not put VCPKG_INSTALLATION_ROOT in the Actions environment (it is
+          # only written to ~/.bashrc, which a non-interactive step never reads).
+          # Fall back to the documented install location, and fail loudly rather
+          # than silently skipping libssh if neither is there.
+          root="${VCPKG_INSTALLATION_ROOT:-/usr/local/share/vcpkg}"
+          if [ ! -x "$root/vcpkg" ]; then
+            echo "no vcpkg at $root; libssh cannot be built for the iOS ABI." >&2
+            exit 1
+          fi
+          echo "vcpkg=$root" >> "$GITHUB_OUTPUT"
+          echo "image=${ImageVersion:-unknown}" >> "$GITHUB_OUTPUT"
+          echo "pin=$(jq -r .version packaging/vcpkg-ports/libssh/vcpkg.json)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore vcpkg libssh cache (arm64-ios-simulator)
+        id: libssh_cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ steps.libssh.outputs.vcpkg }}/installed
+          key: vcpkg-libssh-${{ steps.libssh.outputs.pin }}-arm64-ios-simulator-xcode${{ steps.toolchain.outputs.xcode }}-${{ steps.libssh.outputs.image }}-${{ hashFiles('packaging/vcpkg-ports/libssh/**') }}
+
+      - name: Install libssh via vcpkg (arm64-ios-simulator)
+        env:
+          LIBSSH_PIN: ${{ steps.libssh.outputs.pin }}
+          VCPKG_ROOT_DIR: ${{ steps.libssh.outputs.vcpkg }}
+        run: |
+          set -euo pipefail
+          prefix="$VCPKG_ROOT_DIR/installed/arm64-ios-simulator"
+          header="$prefix/include/libssh/libssh_version.h"
+          installed_libssh() {
+            [ -f "$header" ] || return 0
+            sed -n 's/^#define LIBSSH_VERSION_\(MAJOR\|MINOR\|MICRO\)[[:space:]]\{1,\}\([0-9]\{1,\}\).*$/\2/p' \
+                "$header" | paste -sd. -
+          }
+          present=$(installed_libssh)
+          if [ -n "$present" ] && [ "$present" != "$LIBSSH_PIN" ]; then
+            echo "Removing cached libssh $present (pin is $LIBSSH_PIN)"
+            "$VCPKG_ROOT_DIR/vcpkg" remove libssh:arm64-ios-simulator --recurse
+          fi
+          # arm64-ios-simulator is a COMMUNITY triplet, so vcpkg prints a
+          # not-guaranteed warning; it ships with vcpkg and needs no overlay.
+          "$VCPKG_ROOT_DIR/vcpkg" install libssh:arm64-ios-simulator \
+            "--overlay-ports=$PWD/packaging/vcpkg-ports"
+          got=$(installed_libssh)
+          if [ "$got" != "$LIBSSH_PIN" ]; then
+            echo "libssh $got installed, expected $LIBSSH_PIN." >&2
+            exit 1
+          fi
+          echo "libssh $got for arm64-ios-simulator"
+          echo "CH_LIBSSH_PREFIX=$prefix" >> "$GITHUB_ENV"
+
+      - name: Save vcpkg libssh cache (arm64-ios-simulator)
+        if: steps.libssh_cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ steps.libssh.outputs.vcpkg }}/installed
+          key: vcpkg-libssh-${{ steps.libssh.outputs.pin }}-arm64-ios-simulator-xcode${{ steps.toolchain.outputs.xcode }}-${{ steps.libssh.outputs.image }}-${{ hashFiles('packaging/vcpkg-ports/libssh/**') }}
+
+      - name: Configure (ios-simulator preset)
+        run: |
+          set -euo pipefail
+          cmake --preset ios-simulator 2>&1 | tee configure-ios.log
+          if ! grep -q "libssh: found via" configure-ios.log; then
+            echo "libssh was not found for arm64-ios-simulator: the app would" >&2
+            echo "carry a client built with CH_HAVE_LIBSSH=0." >&2
+            exit 1
+          fi
+
+      # --config Release, overriding the build preset's Debug, for the same
+      # reason this job exists at all: the release workflow publishes the Release
+      # configuration of this app, and a configuration CI never compiles is a
+      # configuration whose release is a guess. The preset stays Debug because
+      # that is the right default for a local device-less loop.
+      - name: Build the simulator app
+        run: cmake --build --preset ios-simulator --config Release
+
+      - name: Archive the simulator app
+        run: |
+          set -euo pipefail
+          # Xcode writes into <target-binary-dir>/<CONFIG><EFFECTIVE_PLATFORM_NAME>,
+          # so the configuration above is part of this path.
+          app=build/ios-simulator/src/mobile/Release-iphonesimulator/codeharbor_mobile.app
+          if [ ! -d "$app" ]; then
+            echo "$app was not produced by the build." >&2
+            find build/ios-simulator -maxdepth 5 -name '*.app' >&2 || true
+            exit 1
+          fi
+          mkdir -p artifact
+          # ditto, not `zip -r`: an .app is a bundle whose symlinks and
+          # executable bits matter, and zip does not preserve them faithfully -
+          # a round-tripped bundle the simulator refuses to launch is worse than
+          # no artifact at all.
+          ditto -c -k --keepParent "$app" artifact/codeharbor-ios-simulator.zip
+          ls -la artifact
+
+      - name: Upload the simulator app
+        uses: actions/upload-artifact@v4
+        with:
+          name: codeharbor-ios-simulator
+          path: artifact/
+          if-no-files-found: error
+
   # The Windows installer script is compiled ONLY by the release workflow, at the
   # very end of a twenty-minute Windows build, and only for a pushed tag. A typo
   # in it therefore could not be discovered until after a release tag existed —

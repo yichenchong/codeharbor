@@ -155,9 +155,17 @@ matrix over `ubuntu-latest`, `windows-latest` and `macos-latest`: Qt via
 `jurplel/install-qt-action`, CMake and Ninja via `lukka/get-cmake`, and libssh via
 `apt` on Linux, Homebrew on macOS and vcpkg (in-tree overlay port) on Windows —
 the same per-OS provisioning `release.yml` uses, so a green run means the release
-build compiles on every platform it ships to. What CI does *not* do is package:
-`linuxdeploy`/`windeployqt`/`macdeployqt` and the Inno Setup installer stay
-release-only.
+build compiles on every platform it ships to. What CI does *not* do for the
+desktop client is package: `linuxdeploy`/`windeployqt`/`macdeployqt` and the Inno
+Setup installer stay release-only.
+
+CI also has three MOBILE jobs, which provision a deliberately smaller Qt:
+`mobile shell (linux, no WebEngine)` builds and tests the mobile client on an
+ordinary Linux runner with `qtwebengine` and `qtwebchannel` absent from the
+image — that is the job that proves the client compiles and its logic passes,
+since no phone is available in CI — while `android (arm64 APK)` and
+`ios (simulator app)` cross-build the real packages. Unlike the desktop legs,
+those two DO package, because for a mobile client packaging is the build.
 
 ## Build & run
 
@@ -234,6 +242,11 @@ and `release-tests` (Release **with** tests, also `build/release/` — it is wha
 CI and the release workflow configure, build, and `ctest` against, so the tree
 that is packaged is the tree that was tested). `release` and `release-tests`
 deliberately share one binary directory; switching between them reconfigures it.
+
+The mobile presets — `mobile-desktop`, `android-arm64`, `android-arm64-debug`,
+`ios-arm64` and `ios-simulator` — are covered in
+§ *Mobile clients (Android / iOS)*. The iOS pair carries a Darwin `condition`,
+so `cmake --list-presets` does not offer them on Linux or Windows.
 
 > Running the GUI needs a display. On a headless box use an X/Wayland session or
 > `xvfb-run ./build/dev/src/app/codeharbor`. WebEngine may need
@@ -369,6 +382,292 @@ channel, SPEC 6.8; 7 → 8 added `tmux.paneActivity`, the per-pane last-output t
 that keeps a detached pane's sidebar status honest, SPEC 6.6) against
 `AppController::kMinimumServerSchemaVersion`. A client refuses a server whose RPC
 schema is older than it needs, which is the "Server too old" path.
+
+## Mobile clients (Android / iOS)
+
+The Android and iOS clients are a second presentation layer over the same
+backend, not a second application. `ch_models`, `ch_remote`, `ch_persistence`,
+`ch_ssh`, `ch_terminal`, `ch_editor`, `ch_agent` and `ch_app` are linked
+unchanged; the daemon protocol is unchanged; `codeharbord` cannot tell the two
+clients apart. What is replaced is everything the desktop draws with Qt
+WebEngine — Qt ships **no WebEngine for Android and none for iOS**, so the
+terminal, the editor and every viewer are native Qt Quick in `src/vt` and
+`src/mobile` instead of Chromium pages.
+
+Two CMake options decide what a tree contains:
+
+| Option | Default | Builds |
+|---|---|---|
+| `CODEHARBOR_BUILD_DESKTOP` | `ON`, forced `OFF` on Android/iOS | `src/qml`, the WebEngine `ch_viewers`, the `codeharbor` executable |
+| `CODEHARBOR_BUILD_MOBILE` | `ON` everywhere | `src/vt`, `src/mobile`, the `CodeHarbor.Mobile` (QML) and `CodeHarbor.Mobile.Core` (C++ types) QML modules, `codeharbor_mobile` |
+
+`CODEHARBOR_BUILD_MOBILE` is on for desktop Linux/macOS/Windows **on purpose**.
+The mobile shell is plain Qt Quick with no device-only API, so it compiles and
+its `tst_*` targets run headless on a workstation; needing an NDK or an iPhone
+to compile it would mean it only ever got compiled on a release runner. It is on
+in the ordinary `dev` preset too, so `cmake --build --preset dev` already
+produces `codeharbor_mobile` and `ctest --preset dev` already runs the mobile
+and `src/vt` suites — the `mobile-desktop` preset below is the same content in
+its own build tree, which is what lets a mobile experiment run without
+disturbing `build/dev/`.
+
+A third option interacts with these: `CODEHARBOR_BUILD_TESTS` is **forced
+`OFF`** for an Android or iOS configure, with a status line saying so. Every
+`tst_*` target is a host executable `ctest` launches locally, so a
+cross-compiled one cannot run; on Android it would additionally get its own
+`androiddeployqt` package target and join the global `apk` target, so building
+the APK would build a dozen packages that all deploy into the same
+`android-build` directory. Test the mobile client on the host, with
+`mobile-desktop`.
+
+### Developing the mobile shell without a device
+
+```bash
+cmake --preset mobile-desktop        # Debug, tests ON, BOTH clients (build/mobile-desktop/)
+cmake --build --preset mobile-desktop
+ctest --preset mobile-desktop
+./build/mobile-desktop/src/mobile/codeharbor_mobile
+```
+
+This is the loop to use for anything that is not packaging. It builds the
+desktop client too, which is what catches the mistake that matters most here:
+a change to a shared backend module that suits one client and breaks the other.
+To prove the mobile client has no WebEngine dependency at all — with the option
+off, no `find_package` for it is issued anywhere, and no web bundle is built
+because `src/qml` is never added — configure the same tree without the desktop
+half:
+
+```bash
+cmake --preset mobile-desktop -DCODEHARBOR_BUILD_DESKTOP=OFF
+cmake --build build/mobile-desktop
+ctest --test-dir build/mobile-desktop
+```
+
+Tests stay ON there and still run. The test directories that drive the real
+Chromium panes link `ch_viewers` and `codeharbor_qmlplugin` by name, so they are
+desktop-only by construction and disappear with the desktop half:
+`src/app/tests`, `src/editor/tests` and `src/terminal/tests` are each gated on
+`CODEHARBOR_BUILD_DESKTOP` alongside `CODEHARBOR_BUILD_TESTS`;
+`src/viewers/tests` sits inside the `ch_viewers` branch of
+`src/viewers/CMakeLists.txt`, and `src/qml/tests` needs no gate of its own
+because `src/qml` itself is only added for a desktop build.
+Everything else, the mobile suites included, is unaffected. This is the
+configuration CI uses to prove the mobile client links without WebEngine, and it
+costs minutes rather than the desktop client's hour.
+
+### Environment
+
+Cross-compiling needs the SDKs on the machine; the presets read them from the
+environment rather than hardcoding a layout:
+
+| Variable | Used by | What it points at |
+|---|---|---|
+| `ANDROID_NDK_ROOT` | Android | NDK root; the preset uses `$ANDROID_NDK_ROOT/build/cmake/android.toolchain.cmake` |
+| `ANDROID_SDK_ROOT` | Android | SDK root. Needed at **configure** time, not just at package time: the preset copies it into the cache variable of the same name, and Qt's deployment-settings generation globs `<sdk>/build-tools/*` while CMake is still running — an empty value aborts the configure with "Could not locate Android SDK build tools" |
+| `QT_HOST_PATH` | both | the **host** Qt (`.../6.10.0/gcc_64`, `.../macos`). `moc`, `rcc`, `qmlcachegen` and `androiddeployqt` are host binaries |
+| `QT_ANDROID_PATH` | Android | the Qt-for-Android prefix, e.g. `.../6.10.0/android_arm64_v8a` |
+| `QT_IOS_PATH` | iOS | the Qt-for-iOS prefix, e.g. `.../6.10.0/ios` |
+| `CH_LIBSSH_PREFIX` | both | a libssh built for that ABI (see below). Appended to `CMAKE_PREFIX_PATH` |
+
+`QT_HOST_PATH` and the target Qt must be the **same Qt version**; a mismatch
+fails at `qmlcachegen` with an unhelpful bytecode error.
+
+The Android preset also pins `ANDROID_STL=c++_shared`. Qt for Android is built
+against the shared C++ runtime and `androiddeployqt` bundles `libc++_shared.so`,
+while the NDK's own toolchain file defaults to `c++_static`; taking that default
+would load two C++ runtimes into one process. It is pinned in the preset because
+this tree chainloads the NDK toolchain directly rather than Qt's
+`qt.toolchain.cmake` (which would set it, but would also take over
+`CMAKE_TOOLCHAIN_FILE` and the prefix-path handling `CH_LIBSSH_PREFIX` relies
+on).
+
+### Android
+
+```bash
+export ANDROID_NDK_ROOT=$HOME/Android/Sdk/ndk/27.2.12479018
+export ANDROID_SDK_ROOT=$HOME/Android/Sdk
+export QT_HOST_PATH=$HOME/Qt/6.10.0/gcc_64
+export QT_ANDROID_PATH=$HOME/Qt/6.10.0/android_arm64_v8a
+export CH_LIBSSH_PREFIX=$HOME/vcpkg/installed/arm64-android
+
+cmake --preset android-arm64                       # Release, build/android-arm64/
+cmake --build --preset android-arm64-apk           # -> APK
+cmake --build --preset android-arm64-aab           # -> AAB, for Play upload
+```
+
+`android-arm64-debug` is the same toolchain in Debug, in its own binary
+directory so a debuggable and a release package can coexist. The artefacts land
+where `androiddeployqt` puts them:
+
+```text
+build/android-arm64/src/mobile/android-build/build/outputs/apk/release/android-build-release-unsigned.apk
+build/android-arm64/src/mobile/android-build/build/outputs/bundle/release/android-build-release.aab
+build/android-arm64-debug/src/mobile/android-build/build/outputs/apk/debug/android-build-debug.apk
+```
+
+`androiddeployqt` also copies whichever APK it just built to the path CMake asked
+it for, so the stable name to hand to `adb install` is
+`build/android-arm64/src/mobile/android-build/codeharbor_mobile.apk` (the Gradle
+paths above are named after the `android-build` directory, not after the target).
+
+Only `arm64-v8a` is configured. Every Android device shipped in the last several
+years is arm64, and a multi-ABI package multiplies build time by the number of
+ABIs; add one by copying the preset rather than by making the existing one
+multi-ABI.
+
+That NDK revision is Qt 6.10's own, and it is worth pinning rather than taking
+whatever is installed: Qt for Android is built against one NDK, and a different
+one links but produces subtle STL and unwinder mismatches. `ubuntu-latest`
+preinstalls a *newer* revision (27.3.13750724), so CI installs the pinned one
+through `sdkmanager` and points `ANDROID_NDK_ROOT` at it. Note also that Qt 6.10
+for Android is published under aqt's `all_os` host, not `linux`, whose Android
+builds stop at 6.7.3, and that its Gradle plugin needs JDK 17.
+
+Qt PDF is **not** an installable module for `android_arm64_v8a` in 6.10.0 (it is
+for iOS), so `CH_HAVE_QTPDF` is 0 on Android. That is a clean capability-off,
+never a build error: the PDF page reports that the platform cannot render one
+and offers the file as bytes.
+
+`packaging/android/` is the `ANDROID_PACKAGE_SOURCE_DIR` the `codeharbor_mobile`
+target points at. It holds `AndroidManifest.xml` (application id
+`dev.codeharbor.mobile`, `INTERNET` and no other permission, min SDK 28 —
+Qt 6.10's floor and the preset's `ANDROID_PLATFORM` — target SDK 35) and
+`res/`, whose adaptive launcher icon is a vector transcription of
+`packaging/codeharbor.svg`.
+
+It contains **no `build.gradle` and no `gradle.properties`**, and that is
+deliberate rather than an omission. Qt copies its own `build.gradle` template
+and `androiddeployqt` writes `gradle.properties` from the deployment settings on
+every build; the only reason to add either file would be to override a default,
+and this client overrides none. The two values a project usually reaches for
+them for — min and target SDK — are target properties
+(`QT_ANDROID_MIN_SDK_VERSION`, `QT_ANDROID_TARGET_SDK_VERSION`), set in
+`src/mobile/CMakeLists.txt`, and Qt's template already puts our `res/` on
+`res.srcDirs` alongside its own. Adding a stale copy of Qt's `build.gradle`
+would silently pin the Android Gradle Plugin version to whatever Qt shipped the
+day it was copied.
+
+### iOS
+
+```bash
+export QT_HOST_PATH=$HOME/Qt/6.10.0/macos
+export QT_IOS_PATH=$HOME/Qt/6.10.0/ios
+export CH_LIBSSH_PREFIX=$HOME/vcpkg/installed/arm64-ios
+
+cmake --preset ios-simulator                       # build/ios-simulator/
+cmake --build --preset ios-simulator
+
+cmake --preset ios-arm64                           # device build
+cmake --build --preset ios-arm64
+```
+
+Both presets use the **Xcode** generator, not Ninja: Qt's iOS deployment, bundle
+assembly and code signing are all Xcode build settings, and a single-config
+Ninja tree cannot express the per-configuration SDK the simulator needs. Both
+carry a `condition` on a Darwin host, so they simply do not appear in
+`cmake --list-presets` on Linux.
+
+`ios-simulator` turns code signing off outright — the simulator does not check
+it, and requiring it would stop an unsigned CI machine from compiling the client
+at all. `ios-arm64` leaves signing to the machine that runs it: pass
+`-DCMAKE_XCODE_ATTRIBUTE_DEVELOPMENT_TEAM=<team id>` or set it in Xcode, so no
+team identifier is committed. Bundles land at
+`build/ios-simulator/src/mobile/Debug-iphonesimulator/codeharbor_mobile.app` and
+`build/ios-arm64/src/mobile/Release-iphoneos/codeharbor_mobile.app`.
+
+`packaging/ios/Info.plist.in` is a `configure_file` template
+(`@ONLY`, so Xcode's own `$(VAR)` settings survive):
+`CFBundleIdentifier` comes from the `CODEHARBOR_MOBILE_BUNDLE_ID` cache variable
+(the same string the Android manifest spells literally — an Android configure
+fails if the two disagree), and both
+`CFBundleShortVersionString` and `CFBundleVersion` come from `PROJECT_VERSION`,
+so the bump-version drill covers iOS with no extra step.
+`ITSAppUsesNonExemptEncryption` is declared **true**, honestly: this client's
+whole purpose is an SSH connection. An App Store submission therefore needs
+export compliance documentation (a self-classification report under US EAR
+740.17) — a release-time task, and the reason the key is answered in the plist
+rather than left for App Store Connect to ask on every upload.
+
+The plist also declares the launch screen (an empty `UILaunchScreen`
+dictionary — the key-only form, no storyboard), and `src/mobile/CMakeLists.txt`
+sets `QT_NO_SET_DEFAULT_IOS_LAUNCH_SCREEN` so Qt does not additionally copy its
+own `LaunchScreen.storyboard` into a bundle that never references it. There is
+no asset catalog and no app-icon set here — Android's `res/` has an adaptive
+launcher icon, iOS has no counterpart — so an iOS build shows Xcode's
+placeholder icon, which App Store review rejects; that is a release-time gap,
+not a build one.
+
+### libssh per mobile ABI
+
+There is no `apt` or `brew` inside a cross-compile, and neither the NDK nor the
+Qt-for-Android/iOS prefix carries libssh. Build it from the in-tree overlay,
+which is already mobile-aware: `packaging/vcpkg-ports/libssh` carries
+`android-glob-tilde.diff` (Bionic has no `GLOB_TILDE`) and
+`0004-file-permissions-constants.patch` (Bionic has no `S_IWRITE`), and its
+`vcpkg.json` drops the `pcap` and `server` default features on Android.
+
+```bash
+$VCPKG_ROOT/vcpkg install libssh \
+    --overlay-ports=packaging/vcpkg-ports \
+    --triplet arm64-android          # or arm64-ios
+export CH_LIBSSH_PREFIX=$VCPKG_ROOT/installed/arm64-android
+```
+
+vcpkg's own `arm64-android` triplet needs `ANDROID_NDK_HOME` exported (it is the
+same path as `ANDROID_NDK_ROOT`). The presets append `CH_LIBSSH_PREFIX` to
+`CMAKE_PREFIX_PATH` rather than chainloading vcpkg's toolchain, because the NDK
+toolchain file is already occupying `CMAKE_TOOLCHAIN_FILE`.
+
+Leaving `CH_LIBSSH_PREFIX` unset is not a configure error — it degrades to the
+usual `CH_HAVE_LIBSSH=0` warning, plus an Android/iOS-specific `-- libssh:
+cross-compiling for …` status line pointing back here. That combination builds,
+installs and launches, and then cannot connect to anything, which on a device is
+a slow thing to diagnose; read the configure output.
+
+### The single-pane UX contract
+
+The desktop client shows three regions and arbitrary splits. The mobile client
+shows **exactly one pane at a time — one viewer or one terminal** — and reaches
+it through a two-step selection: pick a Dev Session, then pick the pane inside
+it. There is no split, no region resize, and no window chrome.
+
+This is not a subset that will be filled in later. It follows from the same
+server-authoritative layout tree the desktop reads: the mobile client flattens
+`viewerTree` and `terminalTree` depth-first into a flat list
+(`ch::PaneListModel`) and shows one leaf, so a pane keeps its server-minted
+identity (`terminalPaneId` for terminals) and both clients can be attached to
+the same Dev Session at once without either one rewriting the other's layout.
+
+Two rules constrain every mobile QML file, and both are security rules
+(SPEC 7.5, 2.4, 7.4):
+
+- Every server-controlled string is rendered with `textFormat: Text.PlainText`.
+  `Text.MarkdownText`, `Text.StyledText`, `Text.RichText` and `Text.AutoText`
+  are **banned** in `src/mobile/qml`. Markdown is rendered by parsing it into a
+  block model (`ch::MarkdownModel`) and drawing plain-text blocks; raw HTML in a
+  document is shown as literal text and never interpreted.
+- A remote `file://` or internal URL is never handed to `QDesktopServices`, an
+  OS handler, or any other app, and no mobile surface performs network access on
+  behalf of remote content. Remote bytes reach the screen only through the
+  daemon's `file.readFile`.
+
+Two viewer backends are optional, discovered at configure time exactly as
+libssh and QtDBus are, and reported as `CH_HAVE_QTPDF` / `CH_HAVE_QTWEBVIEW`
+(visible to QML through `ch::MobileCapabilities`): Qt PDF for the PDF page and
+Qt WebView for the web page. Neither is in a default Qt install. Without them
+the corresponding page says so; nothing is silently opened elsewhere, and the
+page's `.qml` file is not even added to the QML module (an `import QtQuick.Pdf`
+in a compiled module fails the whole module, not just that file).
+
+Each capability needs BOTH halves of its module, and the configure requires
+both: `Qt6::Pdf` **and** `Qt6::PdfQuick`, `Qt6::WebView` **and**
+`Qt6::WebViewQuick`. The plain target is the C++ library; the `*Quick` target is
+the one that carries the QML module (`QtQuick.Pdf`, `QtWebView`) the page
+imports, and on a static Qt — which is what Qt for iOS is — an import whose
+module was never linked is a blank page at runtime. On Ubuntu/Debian the
+packages are `qt6-pdf-dev` and `qt6-webview-dev`; they are not in the apt list
+above because a desktop build never links either, so a stock workstation
+configure reports both capabilities off.
 
 ## Test suites
 
@@ -616,13 +915,23 @@ git push --tags`) or via the **Run workflow** button (manual `workflow_dispatch`
 | `windows` | `windows-latest` | `codeharbor-windows/` (`codeharbor.exe` + Qt/libssh DLLs) and `CodeHarbor-<version>-windows-x64-setup.exe` | `windeployqt`, then Inno Setup (`packaging/windows/codeharbor.iss`) |
 | `macos` | `macos-latest` | `CodeHarbor-<version>-macos-<arch>.dmg` (bundled `.app`; `<arch>` is the runner's `uname -m`) | `macdeployqt` |
 | `remote` | `ubuntu-latest` | `codeharbor-remote.tar.gz` (`dist/` + `sql/` + `package.json`) | `tsc` + tar |
+| `android` | `ubuntu-latest` | `CodeHarbor-<version>-android-arm64-unsigned.apk` and `…-unsigned.aab` | `androiddeployqt` (Qt's `apk`/`aab` targets) |
+| `ios-simulator` | `macos-latest` | `CodeHarbor-<version>-ios-simulator.zip` (a Release `.app` bundle, `ditto`-archived) | Xcode, no code signing |
+
+All three mobile assets are **unsigned**, and their names say so: CI holds no Android
+keystore and no Apple certificate, and signing with an ad-hoc key would produce
+something that looks installable while having nothing to do with the release
+identity. An iOS *device* build (`ios-arm64`) and any App Store submission need a
+provisioning profile and a distribution certificate, so they happen on a machine
+that owns those credentials and are deliberately not part of this workflow.
 
 The `publish` job zips the Windows directory into `codeharbor-windows.zip`, then
-refuses to publish unless both Windows assets are present **and** the
-installer's filename carries exactly the tag's version. The installer takes its
-version from `project(CodeHarbor VERSION …)` in the top-level `CMakeLists.txt`,
-so that second check is what stops a `v0.2.0` tag on an un-bumped tree from
-publishing an installer that calls itself 0.1.8.
+refuses to publish unless **every** expected asset is present exactly once and
+every versioned filename carries exactly the tag's version. Those names are
+stamped from `project(CodeHarbor VERSION …)` in the top-level `CMakeLists.txt`
+(one parser, `.github/scripts/release-version.sh`, shared by all five build
+jobs), so that second check is what stops a `v0.2.0` tag on an un-bumped tree
+from publishing an installer that calls itself 0.1.8.
 
 A raw Qt/WebEngine executable is **not** runnable off the build machine; the
 deploy tools bundle the Qt libraries, plugins, and the WebEngine runtime so the
@@ -635,8 +944,8 @@ other version lands, because vcpkg's registry port is the unusable 0.12.0.
 ### The release drill (do not skip the dry run)
 
 1. **Dispatch `release.yml` on `main`** ("Run workflow"). The `publish` job is
-   gated on `refs/tags/v*`, so this is a genuine dry run: it exercises all three
-   OS builders and publishes nothing.
+   gated on `refs/tags/v*`, so this is a genuine dry run: it exercises all five
+   builders — three desktop, Android, iOS simulator — and publishes nothing.
 2. **Cut and push the tag only after the dry run.**
    `bash .omp/skills/bump-version/bump.sh --set X.Y.Z --push` syncs the version
    files, commits them, runs the local Debug build, ctest, all workspace npm
@@ -653,9 +962,11 @@ reason — Linux could not resolve `libQt6SerialPort.so.6` while packaging, and
 Windows both failed to build the web bundle and looked for the executable in the
 wrong directory. A tag that fails leaves a permanent public tag with no release
 attached; a dispatch costs nothing. CI now compiles and tests the client on all
-three platforms per commit, so the *build* half of that class of failure is
-caught long before a tag — but packaging is still release-only, and packaging is
-where two of those three failures actually were.
+three desktop platforms per commit, and cross-builds the Android and iOS
+packages, so the *build* half of that class of failure is caught long before a
+tag. Desktop packaging (`linuxdeploy`/`windeployqt`/`macdeployqt` and the Inno
+Setup installer) is still release-only, and that is where two of those three
+failures actually were.
 
 The dry run also **refreshes the Windows vcpkg cache** from a ref a tag can read.
 GitHub only lets a run restore a cache written by its own ref or by the default

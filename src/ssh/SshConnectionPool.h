@@ -386,10 +386,69 @@ public:
                        const QString& identityFile = QString());
     void disconnectFromHost();
 
+    // ---- in-memory identity (mobile clients; SPEC 12.1) --------------------
+    //
+    // An imported private key held ONLY in RAM, never on the filesystem, tried
+    // on the two public-key rungs of the ladder above BEFORE the file/agent
+    // route. `privateKeyPem` is the armoured key text exactly as the user
+    // imported it ("-----BEGIN OPENSSH PRIVATE KEY-----" ...); it is handed to
+    // ssh_pki_import_privkey_base64(), which parses that armour, so nothing is
+    // ever written out to be read back by ssh_pki_import_privkey_file().
+    //
+    // WHY THIS EXISTS. On Android and iOS there is no ssh-agent (SSH_AUTH_SOCK
+    // is unset and no process could serve it) and no ~/.ssh for the scan in
+    // identityFileCandidates() to find, so the only credential a client can
+    // have is one the user explicitly imported. ch::MobileKeyStore never writes
+    // that import ANYWHERE — SPEC 11.2 (docs/SPEC.md:1710-1729) is an exhaustive
+    // allowlist of client-stored state and private-key bytes are not on it, so
+    // there is no keys directory inside the sandbox, not even a temporary file
+    // during a handshake. A key held for one run therefore needs a way into
+    // libssh that does not touch a file, and this is it.
+    //
+    // DESKTOP IS UNAFFECTED, and that is structural rather than a promise:
+    // nothing on the desktop side calls this, so m_inMemoryIdentity stays
+    // empty, and both new branches in authenticate() are skipped on an empty
+    // key. The rung ORDER, the number of ssh-agent walks, and every existing
+    // diagnostic are therefore identical to what they were.
+    //
+    // The passphrase is NOT stored here: an encrypted in-memory key is refused
+    // on the KeyFile rung exactly like an encrypted file is, and the
+    // KeyPassphrase rung then retries this same key with the secret the
+    // credential callback supplies — one attempt, then the caller discards it.
+    void setInMemoryIdentity(const QByteArray& privateKeyPem);
+    // Forget it, overwriting the bytes first: this is key material, and a
+    // client that switches to a different credential must not leave the old one
+    // in freed heap memory for the rest of the run.
+    void clearInMemoryIdentity();
+    bool hasInMemoryIdentity() const { return !m_inMemoryIdentity.isEmpty(); }
+
     // The known-hosts lookup token for an endpoint: the bare host on the
     // default port, OpenSSH's "[host]:port" form otherwise. Host-key
     // verification must use this same canonical endpoint.
     static QString lookupHostFor(const QString& host, quint16 port);
+
+    // The filesystem path to use for a configured identity string — tilde
+    // expanded and normalised, exactly as this client has always done — or an
+    // EMPTY string when the string is not a path at all.
+    //
+    // It is not always a path: ch::ServerProfiles has ONE identity field, and the
+    // mobile client stores a durable REFERENCE to a user-managed key file in it
+    // (an Android "content://" document URI, an Apple "chbookmark:<base64>"
+    // security-scoped bookmark). Those have to stay in the profile verbatim — the
+    // connect page reads them back to recover which key a remembered server uses
+    // — but they name no file, so they are dropped HERE, at the one place the
+    // stored string turns into a path. With none, the ladder behaves as it does
+    // with no identity configured, which is correct on mobile: the real
+    // credential is the in-memory identity installed by ch::MobileKeyStore.
+    //
+    // The rule is shape-based (a scheme of two or more letters, then a colon) and
+    // deliberately knows nothing about the mobile side's own scheme constant:
+    // src/mobile depends on src/ssh, never the reverse. `*ignoredScheme`, when
+    // given, receives the scheme that caused a value to be dropped and is empty
+    // for every value that WAS a path — the caller uses it to say so in its
+    // diagnostics. Public because the rule is worth testing without a server.
+    static QString identityFilePathFor(const QString& identity,
+                                       QString* ignoredScheme = nullptr);
 
 
     // True only for the Windows OpenSSH named-pipe spelling. This is a pure
@@ -518,6 +577,12 @@ private:
     // authenticationFailure(). Host and user are not retained: nothing outside
     // connectToHost() reads them.
     QString m_identityFile;
+    // The armoured text of an imported key held in RAM only, empty on desktop
+    // (nothing there calls setInMemoryIdentity). Declared OUTSIDE the
+    // CH_HAVE_LIBSSH block on purpose: the setters are compiled in both builds
+    // so a mobile caller needs no #if of its own, and a libssh-less build simply
+    // never has a session to offer the key to.
+    QByteArray m_inMemoryIdentity;
     QString m_diagnosticLog;
 #if CH_HAVE_LIBSSH
     ssh_session m_session = nullptr;

@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Adaptive launcher icon: a flat background plate plus the vector anchor, which
+  is what lets every launcher apply its own mask (circle, squircle, rounded
+  square) and its own parallax without the artwork degrading.
+
+  -anydpi-v26 is the only density bucket present, and it is sufficient here:
+  minSdkVersion is 28, so every device that can install this package supports
+  adaptive icons, and a vector needs no per-density raster.
+-->
+<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+    <background android:drawable="@color/ic_launcher_background" />
+    <foreground android:drawable="@drawable/ic_launcher_foreground" />
+    <monochrome android:drawable="@drawable/ic_launcher_foreground" />
+</adaptive-icon>

@@ -1,0 +1,68 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  The CodeHarbor anchor, transcribed from packaging/codeharbor.svg into an
+  Android VectorDrawable. Same geometry, same palette (#89b4fa anchor, #585b70
+  water), so the launcher icon is the project's real artwork rather than a
+  stand-in; the SVG's rounded background rect becomes the adaptive icon's
+  background layer (@color/ic_launcher_background) instead of being drawn here.
+
+  The viewport stays at the SVG's own 256x256 so the coordinates below are the
+  SVG's coordinates unchanged and the two files can be diffed by eye. The
+  enclosing group scales the drawing to 66% about the centre, which is the
+  adaptive-icon safe zone (72dp of the 108dp canvas): anything outside it may be
+  clipped by a launcher's mask, and the anchor's fluke arc reaches the edges.
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="256"
+    android:viewportHeight="256">
+
+    <group
+        android:pivotX="128"
+        android:pivotY="128"
+        android:scaleX="0.66"
+        android:scaleY="0.66">
+
+        <!-- Anchor ring. -->
+        <path
+            android:pathData="M112,66 A16,16 0 1,1 144,66 A16,16 0 1,1 112,66 Z"
+            android:strokeColor="#89b4fa"
+            android:strokeWidth="12"
+            android:strokeLineCap="round"
+            android:strokeLineJoin="round" />
+        <!-- Shank. -->
+        <path
+            android:pathData="M128,82 L128,184"
+            android:strokeColor="#89b4fa"
+            android:strokeWidth="12"
+            android:strokeLineCap="round"
+            android:strokeLineJoin="round" />
+        <!-- Stock. -->
+        <path
+            android:pathData="M96,114 L160,114"
+            android:strokeColor="#89b4fa"
+            android:strokeWidth="12"
+            android:strokeLineCap="round"
+            android:strokeLineJoin="round" />
+        <!-- Flukes. -->
+        <path
+            android:pathData="M72,140 A56,56 0 0,0 184,140"
+            android:strokeColor="#89b4fa"
+            android:strokeWidth="12"
+            android:strokeLineCap="round"
+            android:strokeLineJoin="round" />
+
+        <!-- Water. -->
+        <path
+            android:pathData="M40,210 L216,210"
+            android:strokeColor="#585b70"
+            android:strokeWidth="10"
+            android:strokeLineCap="round" />
+        <path
+            android:pathData="M64,230 L192,230"
+            android:strokeColor="#585b70"
+            android:strokeWidth="10"
+            android:strokeLineCap="round" />
+    </group>
+</vector>

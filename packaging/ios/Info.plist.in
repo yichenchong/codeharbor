@@ -1,0 +1,146 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Info.plist template for the CodeHarbor iOS client.
+
+  src/mobile/CMakeLists.txt runs configure_file(... @ONLY) over this file and
+  points MACOSX_BUNDLE_INFO_PLIST at the result, so the at-sign-delimited
+  placeholders below are CMake's, not Xcode's, and the $(VAR) forms are Xcode's
+  and survive configure untouched. @ONLY matters: an Xcode setting written
+  ${VAR} would otherwise be eaten by CMake before Xcode ever saw it. It is also
+  why this comment does not spell a placeholder out - configure_file would
+  substitute one written here too, and an undefined name becomes an empty
+  string.
+
+  Qt does not require a hand-written plist - it will synthesise one - but the
+  synthesised plist carries a Qt-derived bundle identifier, no orientation
+  policy, and no encryption declaration, all three of which App Store submission
+  or the client's own behaviour depends on.
+-->
+<plist version="1.0">
+<dict>
+    <key>CFBundleDevelopmentRegion</key>
+    <string>en</string>
+
+    <key>CFBundleDisplayName</key>
+    <string>CodeHarbor</string>
+    <key>CFBundleName</key>
+    <string>CodeHarbor</string>
+
+    <!-- The identifier is a CMake cache variable (CODEHARBOR_MOBILE_BUNDLE_ID,
+         declared in the top-level CMakeLists.txt) and NOT a literal, so a fork
+         can retarget from one place. The Android manifest cannot be substituted
+         the same way - androiddeployqt reads its `package` attribute as text -
+         so it spells the identifier literally and src/mobile/CMakeLists.txt
+         fails an Android configure when the two disagree. -->
+    <key>CFBundleIdentifier</key>
+    <string>@CODEHARBOR_MOBILE_BUNDLE_ID@</string>
+
+    <key>CFBundleExecutable</key>
+    <string>$(EXECUTABLE_NAME)</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+
+    <!-- Both come from project(CodeHarbor VERSION ...). Keeping them wired to
+         PROJECT_VERSION is what makes the bump-version drill cover iOS too:
+         a released build cannot claim a version the tree does not carry.
+         CFBundleVersion must increase per upload; the project version does that
+         for every release, and a resubmission of the same version overrides it
+         on the command line rather than by editing this file. -->
+    <key>CFBundleShortVersionString</key>
+    <string>@PROJECT_VERSION@</string>
+    <key>CFBundleVersion</key>
+    <string>@PROJECT_VERSION@</string>
+
+    <!-- iPhone and iPad, one universal binary. -->
+    <key>UIDeviceFamily</key>
+    <array>
+        <integer>1</integer>
+        <integer>2</integer>
+    </array>
+
+    <key>MinimumOSVersion</key>
+    <string>@CMAKE_OSX_DEPLOYMENT_TARGET@</string>
+    <key>LSRequiresIPhoneOS</key>
+    <true/>
+
+    <!-- A storyboard-less launch screen. Its presence is what tells iOS the app
+         supports the full screen on every device; without it the app is
+         letterboxed at a legacy aspect ratio and the terminal loses rows to
+         black bars. The dictionary is empty on purpose: an empty UILaunchScreen
+         is a valid, complete declaration that yields the system background, and
+         a UIColorName or UIImageName here would name an asset-catalog entry
+         this package does not ship, which iOS resolves to nothing.
+
+         src/mobile/CMakeLists.txt sets QT_NO_SET_DEFAULT_IOS_LAUNCH_SCREEN so
+         Qt does not also copy its own LaunchScreen.storyboard into the bundle:
+         this plist declares no UILaunchStoryboardName and carries no
+         placeholder for Qt to substitute one into, so that storyboard would
+         ship unreferenced.
+
+         The first real frame is the shell's connect page, which paints its own
+         background, so there is nothing worth drawing in the fraction of a
+         second before it. -->
+    <key>UILaunchScreen</key>
+    <dict/>
+
+    <!-- False, deliberately: this must run in Split View and Slide Over on
+         iPad. A terminal beside a browser or a set of notes is the ordinary way
+         this client gets used on a tablet, and UIRequiresFullScreen true would
+         forbid it. -->
+    <key>UIRequiresFullScreen</key>
+    <false/>
+
+    <!-- Both orientations, matching the Android manifest: landscape for a
+         terminal wide enough for 80 columns, portrait for a file viewer.
+         Upside-down is offered on iPad only, as Apple's own apps do. -->
+    <key>UISupportedInterfaceOrientations</key>
+    <array>
+        <string>UIInterfaceOrientationPortrait</string>
+        <string>UIInterfaceOrientationLandscapeLeft</string>
+        <string>UIInterfaceOrientationLandscapeRight</string>
+    </array>
+    <key>UISupportedInterfaceOrientations~ipad</key>
+    <array>
+        <string>UIInterfaceOrientationPortrait</string>
+        <string>UIInterfaceOrientationPortraitUpsideDown</string>
+        <string>UIInterfaceOrientationLandscapeLeft</string>
+        <string>UIInterfaceOrientationLandscapeRight</string>
+    </array>
+
+    <!-- The status bar is drawn by the Qt Quick shell, which owns its own
+         appearance per page. -->
+    <key>UIViewControllerBasedStatusBarAppearance</key>
+    <true/>
+
+    <!-- True, and that is the honest answer. This client's entire purpose is an
+         SSH connection: it performs a key exchange, authenticates with a
+         private key and encrypts every byte of both the RPC channel and the
+         terminal pty. Declaring false would say the app uses no encryption
+         beyond the exempt categories, which for a general-purpose SSH client is
+         simply untrue.
+
+         The consequence is real and is a release-time task, not a build-time
+         one: an App Store submission then needs export compliance
+         documentation (a CCATS/ERN self-classification report under US EAR
+         740.17). That is recorded in docs/DEVELOPMENT.md. Stating it in the
+         plist rather than leaving the key out means App Store Connect stops
+         asking the same question on every upload, and means nobody is tempted
+         to answer it wrongly under time pressure. -->
+    <key>ITSAppUsesNonExemptEncryption</key>
+    <true/>
+
+    <!-- No cleartext networking of any kind. The client speaks SSH over a raw
+         socket, which App Transport Security does not govern, and nothing in
+         the mobile shell may fetch a URL on behalf of remote content
+         (SPEC 7.5), so every ATS exception stays off. -->
+    <key>NSAppTransportSecurity</key>
+    <dict>
+        <key>NSAllowsArbitraryLoads</key>
+        <false/>
+    </dict>
+
+</dict>
+</plist>

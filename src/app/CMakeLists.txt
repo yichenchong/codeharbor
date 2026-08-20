@@ -58,40 +58,53 @@ else()
     message(STATUS "QtDBus: not found; desktop notifications disabled (CH_HAVE_DBUS=0)")
 endif()
 
-qt_add_executable(codeharbor
-    main.cpp
-)
+# The desktop executable. ch_app above stays unconditional: it is portable Qt
+# Core/Gui/Network/Quick and the mobile client links it for the very same
+# session, layout, settings and bootstrap logic. Only this binary - which links
+# WebEngine and the src/qml module that embeds the Chromium pages - is
+# desktop-only.
+if(CODEHARBOR_BUILD_DESKTOP)
+    qt_add_executable(codeharbor
+        main.cpp
+    )
 
-target_link_libraries(codeharbor PRIVATE
-    Qt6::Core
-    Qt6::Gui
-    Qt6::Quick
-    Qt6::Qml
-    Qt6::QuickControls2
-    Qt6::WebEngineQuick
-    Qt6::WebChannel
-    # QML module (src/qml); linking the generated plugin registers the module.
-    codeharbor_qmlplugin
-    ch_app
-    ch_models
-    ch_persistence
-    ch_ssh
-    ch_terminal
-    ch_viewers
-    ch_remote
-    ch_editor
-    ch_agent
-)
+    target_link_libraries(codeharbor PRIVATE
+        Qt6::Core
+        Qt6::Gui
+        Qt6::Quick
+        Qt6::Qml
+        Qt6::QuickControls2
+        Qt6::WebEngineQuick
+        Qt6::WebChannel
+        # QML module (src/qml); linking the generated plugin registers the module.
+        codeharbor_qmlplugin
+        ch_app
+        ch_models
+        ch_persistence
+        ch_ssh
+        ch_terminal
+        ch_viewers
+        ch_remote
+        ch_editor
+        ch_agent
+    )
 
-target_compile_definitions(codeharbor PRIVATE
-    CODEHARBOR_VERSION="${PROJECT_VERSION}"
-)
+    target_compile_definitions(codeharbor PRIVATE
+        CODEHARBOR_VERSION="${PROJECT_VERSION}"
+    )
 
-set_target_properties(codeharbor PROPERTIES
-    WIN32_EXECUTABLE ON
-    MACOSX_BUNDLE ON
-)
+    set_target_properties(codeharbor PROPERTIES
+        WIN32_EXECUTABLE ON
+        MACOSX_BUNDLE ON
+    )
+endif()
 
-if(CODEHARBOR_BUILD_TESTS)
+# CODEHARBOR_BUILD_DESKTOP as well as CODEHARBOR_BUILD_TESTS: this directory's
+# test targets link ch_viewers and codeharbor_qmlplugin BY NAME - they drive the
+# real Chromium panes - and neither target exists in a mobile configure. Gating
+# the whole directory is what makes `-DCODEHARBOR_BUILD_DESKTOP=OFF` a
+# configuration that can still be tested, instead of one that fails at generate
+# time. A desktop build is unaffected: both variables default ON.
+if(CODEHARBOR_BUILD_TESTS AND CODEHARBOR_BUILD_DESKTOP)
     add_subdirectory(tests)
 endif()
