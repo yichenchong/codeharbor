@@ -661,9 +661,18 @@ jobs:
           header="$prefix/include/libssh/libssh_version.h"
           installed_libssh() {
             [ -f "$header" ] || return 0
-            # No `head`: with pipefail an early-closing reader is a SIGPIPE.
-            sed -n 's/^#define LIBSSH_VERSION_\(MAJOR\|MINOR\|MICRO\)[[:space:]]\{1,\}\([0-9]\{1,\}\).*$/\2/p' \
-                "$header" | paste -sd. -
+            # awk, not sed: the previous spelling used GNU BRE alternation
+            # (\(MAJOR\|MINOR\|MICRO\)), which macOS's BSD sed does not support - it
+            # matched nothing there, so this function answered EMPTY and the pin
+            # comparison below was made against an empty string. That is exactly how
+            # the first release dry run failed, with "libssh  installed, expected
+            # 0.12.2", on the one leg of the four that runs on macOS. awk's ERE and
+            # field handling are the same on both platforms.
+            awk '$1 == "#define" && $2 == "LIBSSH_VERSION_MAJOR" { maj = $3 }
+                 $1 == "#define" && $2 == "LIBSSH_VERSION_MINOR" { min = $3 }
+                 $1 == "#define" && $2 == "LIBSSH_VERSION_MICRO" { mic = $3 }
+                 END { if (maj != "" && min != "" && mic != "")
+                           printf "%s.%s.%s\n", maj, min, mic }' "$header"
           }
           # A cache entry from before a port bump must not survive as an
           # already-installed tree that `vcpkg install` treats as a no-op.
@@ -675,6 +684,16 @@ jobs:
           vcpkg install libssh:arm64-android \
             "--overlay-ports=$PWD/packaging/vcpkg-ports"
           got=$(installed_libssh)
+          # An EMPTY answer after an install that reported success is its own
+          # failure and is reported as one, rather than falling into the mismatch
+          # message below with nothing on the left: it means the header could not be
+          # read, so the pin was never actually verified.
+          if [ -z "$got" ]; then
+            echo "libssh installed for arm64-android but no version could be read" >&2
+            echo "from $header; the pin was NOT verified." >&2
+            ls -la "$prefix/include/libssh" >&2 || true
+            exit 1
+          fi
           if [ "$got" != "$LIBSSH_PIN" ]; then
             echo "libssh $got installed, expected $LIBSSH_PIN." >&2
             exit 1
@@ -926,8 +945,18 @@ jobs:
           header="$prefix/include/libssh/libssh_version.h"
           installed_libssh() {
             [ -f "$header" ] || return 0
-            sed -n 's/^#define LIBSSH_VERSION_\(MAJOR\|MINOR\|MICRO\)[[:space:]]\{1,\}\([0-9]\{1,\}\).*$/\2/p' \
-                "$header" | paste -sd. -
+            # awk, not sed: the previous spelling used GNU BRE alternation
+            # (\(MAJOR\|MINOR\|MICRO\)), which macOS's BSD sed does not support - it
+            # matched nothing there, so this function answered EMPTY and the pin
+            # comparison below was made against an empty string. That is exactly how
+            # the first release dry run failed, with "libssh  installed, expected
+            # 0.12.2", on the one leg of the four that runs on macOS. awk's ERE and
+            # field handling are the same on both platforms.
+            awk '$1 == "#define" && $2 == "LIBSSH_VERSION_MAJOR" { maj = $3 }
+                 $1 == "#define" && $2 == "LIBSSH_VERSION_MINOR" { min = $3 }
+                 $1 == "#define" && $2 == "LIBSSH_VERSION_MICRO" { mic = $3 }
+                 END { if (maj != "" && min != "" && mic != "")
+                           printf "%s.%s.%s\n", maj, min, mic }' "$header"
           }
           present=$(installed_libssh)
           if [ -n "$present" ] && [ "$present" != "$LIBSSH_PIN" ]; then
@@ -939,6 +968,16 @@ jobs:
           "$VCPKG_ROOT_DIR/vcpkg" install libssh:arm64-ios-simulator \
             "--overlay-ports=$PWD/packaging/vcpkg-ports"
           got=$(installed_libssh)
+          # An EMPTY answer after an install that reported success is its own
+          # failure and is reported as one, rather than falling into the mismatch
+          # message below with nothing on the left: it means the header could not be
+          # read, so the pin was never actually verified.
+          if [ -z "$got" ]; then
+            echo "libssh installed for arm64-ios-simulator but no version could be read" >&2
+            echo "from $header; the pin was NOT verified." >&2
+            ls -la "$prefix/include/libssh" >&2 || true
+            exit 1
+          fi
           if [ "$got" != "$LIBSSH_PIN" ]; then
             echo "libssh $got installed, expected $LIBSSH_PIN." >&2
             exit 1

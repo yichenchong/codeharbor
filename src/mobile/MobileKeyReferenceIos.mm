@@ -98,10 +98,15 @@ QByteArray readIosBookmark(const QString& reference, qint64 maxBytes,
 
     // kBookmarkScheme.size() directly: QString(kBookmarkScheme) allocated a
     // throwaway copy of a literal just to ask its length.
-    const QByteArray::FromBase64Result decoded = QByteArray::fromBase64Encoding(
+    //
+    // fromBase64Encoding() answers a small result STRUCT, not a QByteArray and
+    // not a pointer: it converts to bool for "did it decode" and carries the
+    // bytes in its `decoded` member. It has no operator->, so the bytes have to
+    // be taken from that member by name.
+    const QByteArray::FromBase64Result result = QByteArray::fromBase64Encoding(
         reference.sliced(kBookmarkScheme.size()).toLatin1(),
         QByteArray::Base64Encoding | QByteArray::AbortOnBase64DecodingErrors);
-    if (!decoded || decoded->isEmpty()) {
+    if (!result || result.decoded.isEmpty()) {
         if (errorOut) {
             *errorOut = QCoreApplication::translate(
                 "ch::keyref",
@@ -110,12 +115,13 @@ QByteArray readIosBookmark(const QString& reference, qint64 maxBytes,
         }
         return {};
     }
+    const QByteArray &decoded = result.decoded;
 
     QByteArray contents;
     QString failure;
     @autoreleasepool {
-        NSData* bookmark = [NSData dataWithBytes:decoded->constData()
-                                         length:NSUInteger(decoded->size())];
+        NSData* bookmark = [NSData dataWithBytes:decoded.constData()
+                                         length:NSUInteger(decoded.size())];
         BOOL stale = NO;
         NSError* error = nil;
         NSURL* url = [NSURL URLByResolvingBookmarkData:bookmark

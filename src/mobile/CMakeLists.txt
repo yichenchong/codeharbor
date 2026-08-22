@@ -130,11 +130,18 @@ endif()
 
 # Resolving a persisted key reference back to bytes is platform work: an Android
 # SAF document URI and an Apple security-scoped bookmark are the two ways to
-# READ a user-managed file without copying it into app storage. The Apple half
-# is Objective-C++ (Security.framework/NSURL bookmarks), so it only joins the
-# build on Apple platforms; MobileKeyReference.cpp carries the generic path and
-# the Android implementation.
-if(APPLE)
+# READ a user-managed file without copying it into app storage. The Apple half is
+# Objective-C++ (Foundation/NSURL bookmarks), so it is a separate .mm file;
+# MobileKeyReference.cpp carries the generic path and the Android implementation.
+#
+# IOS, not APPLE. Every function in that file is reached only under Q_OS_IOS —
+# MobileKeyReference.cpp guards all three call sites — because a security-scoped
+# bookmark is how a sandboxed iOS app keeps access to a document the user picked.
+# On a macOS desktop build of this shell a reference is an ordinary path and the
+# generic implementation handles it, so compiling this file for macOS built
+# Objective-C++ that nothing could call. It is also how a real compile error in
+# it first surfaced in the macOS DESKTOP job instead of in an iOS one.
+if(IOS)
     target_sources(ch_mobile PRIVATE MobileKeyReferenceIos.mm)
     set_source_files_properties(MobileKeyReferenceIos.mm
                                PROPERTIES COMPILE_FLAGS "-fobjc-arc")
