@@ -55,10 +55,14 @@ QString makeIosBookmark(const QUrl& pickedUrl, QString* errorOut)
         // stopAccessingSecurityScopedResource must not be called for access that
         // was never granted.
         //
-        // NSURLBookmarkCreationWithSecurityScope is deliberately NOT passed: that
-        // option is macOS-only. On iOS a bookmark made from a URL whose access is
-        // open is resolvable later WITH security scope, which is what
-        // readIosBookmark() asks for.
+        // NSURLBookmarkCreationWithSecurityScope is deliberately NOT passed, and
+        // neither is its resolution counterpart in readIosBookmark(): BOTH of
+        // those options are macOS-only, and naming either one here is a compile
+        // error on iOS rather than a portability wart. The iOS model is different:
+        // a bookmark is made from a URL whose access is currently open, it is
+        // resolved later with plain options, and the access is reopened by
+        // -startAccessingSecurityScopedResource on the resolved URL. That call is
+        // available on iOS and is the only thing that grants access there.
         const bool started = [url startAccessingSecurityScopedResource];
         NSError* error = nil;
         NSData* bookmark =
@@ -124,8 +128,18 @@ QByteArray readIosBookmark(const QString& reference, qint64 maxBytes,
                                          length:NSUInteger(decoded.size())];
         BOOL stale = NO;
         NSError* error = nil;
+        // NSURLBookmarkResolutionWithoutUI, NOT
+        // NSURLBookmarkResolutionWithSecurityScope: that option is macOS-only and
+        // is a hard compile error here ("unavailable: not available on iOS"). On
+        // iOS the security scope does not come from a resolution flag at all — a
+        // bookmark made from a document the picker handed over resolves with plain
+        // options, and access is opened by -startAccessingSecurityScopedResource
+        // on the resolved URL, which IS available on iOS and is what the code
+        // below calls. WithoutUI is used because this runs on the UI thread while
+        // the user waits for a connection: it forbids the system from putting up
+        // any of its own dialogs to resolve the reference.
         NSURL* url = [NSURL URLByResolvingBookmarkData:bookmark
-                                              options:NSURLBookmarkResolutionWithSecurityScope
+                                              options:NSURLBookmarkResolutionWithoutUI
                                         relativeToURL:nil
                                   bookmarkDataIsStale:&stale
                                                 error:&error];
