@@ -109,7 +109,6 @@
       },
       "cacheVariables": {
         "CMAKE_SYSTEM_NAME": "iOS",
-        "CMAKE_OSX_ARCHITECTURES": "arm64",
         "CMAKE_OSX_DEPLOYMENT_TARGET": "17.0",
         "CMAKE_TOOLCHAIN_FILE": "$env{QT_IOS_PATH}/lib/cmake/Qt6/qt.toolchain.cmake",
         "QT_ADDITIONAL_PACKAGES_PREFIX_PATH": "$env{CH_LIBSSH_PREFIX}",
@@ -122,7 +121,8 @@
       "description": "Device build. Signing is deliberately left to the machine that runs it: set the development team through Xcode or -DCMAKE_XCODE_ATTRIBUTE_DEVELOPMENT_TEAM=<id>, so no team identifier is baked into the repository.",
       "inherits": "ios-base",
       "cacheVariables": {
-        "CMAKE_OSX_SYSROOT": "iphoneos"
+        "CMAKE_OSX_SYSROOT": "iphoneos",
+        "CMAKE_OSX_ARCHITECTURES": "arm64"
       }
     },
     {
@@ -132,6 +132,7 @@
       "inherits": "ios-base",
       "cacheVariables": {
         "CMAKE_OSX_SYSROOT": "iphonesimulator",
+        "CMAKE_OSX_ARCHITECTURES": "x86_64",
         "CMAKE_XCODE_ATTRIBUTE_CODE_SIGNING_ALLOWED": "NO",
         "CMAKE_XCODE_ATTRIBUTE_CODE_SIGNING_REQUIRED": "NO",
         "CMAKE_XCODE_ATTRIBUTE_CODE_SIGN_IDENTITY": ""

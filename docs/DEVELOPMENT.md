@@ -554,7 +554,7 @@ day it was copied.
 ```bash
 export QT_HOST_PATH=$HOME/Qt/6.10.0/macos
 export QT_IOS_PATH=$HOME/Qt/6.10.0/ios
-export CH_LIBSSH_PREFIX=$HOME/vcpkg/installed/arm64-ios
+export CH_LIBSSH_PREFIX=$HOME/vcpkg/installed/x64-ios      # simulator; arm64-ios for a device build
 
 cmake --preset ios-simulator                       # build/ios-simulator/
 cmake --build --preset ios-simulator
@@ -569,12 +569,25 @@ Ninja tree cannot express the per-configuration SDK the simulator needs. Both
 carry a `condition` on a Darwin host, so they simply do not appear in
 `cmake --list-presets` on Linux.
 
+The simulator build is **x86_64**, and that is not a choice. The official Qt for
+iOS package ships fat binaries carrying a device `arm64` slice and an `x86_64`
+simulator slice, and no `arm64` simulator slice at all; asking for `arm64` with
+the simulator SDK therefore selects the device slice and the link fails with
+`building for 'iOS-simulator', but linking in object file ... built for 'iOS'`.
+So `ios-simulator` sets `CMAKE_OSX_ARCHITECTURES=x86_64` and `ios-arm64` sets
+`arm64`, which is also why the simulator's libssh comes from vcpkg's `x64-ios`
+triplet (vcpkg selects the `iphonesimulator` sysroot for its x64/x86 iOS
+architectures) while a device build uses `arm64-ios`. On an Apple silicon Mac the
+resulting simulator app runs under Rosetta. A native `arm64` simulator build
+needs a Qt built from source with `-sdk iphonesimulator`, which this project does
+not require of anyone.
+
 `ios-simulator` turns code signing off outright — the simulator does not check
 it, and requiring it would stop an unsigned CI machine from compiling the client
 at all. `ios-arm64` leaves signing to the machine that runs it: pass
 `-DCMAKE_XCODE_ATTRIBUTE_DEVELOPMENT_TEAM=<team id>` or set it in Xcode, so no
 team identifier is committed. Bundles land at
-`build/ios-simulator/src/mobile/Debug-iphonesimulator/codeharbor_mobile.app` and
+`build/ios-simulator/src/mobile/Release-iphonesimulator/codeharbor_mobile.app` and
 `build/ios-arm64/src/mobile/Release-iphoneos/codeharbor_mobile.app`.
 
 `packaging/ios/Info.plist.in` is a `configure_file` template

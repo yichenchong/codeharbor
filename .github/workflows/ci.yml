@@ -928,20 +928,20 @@ jobs:
           echo "image=${ImageVersion:-unknown}" >> "$GITHUB_OUTPUT"
           echo "pin=$(jq -r .version packaging/vcpkg-ports/libssh/vcpkg.json)" >> "$GITHUB_OUTPUT"
 
-      - name: Restore vcpkg libssh cache (arm64-ios-simulator)
+      - name: Restore vcpkg libssh cache (x64-ios)
         id: libssh_cache
         uses: actions/cache/restore@v4
         with:
           path: ${{ steps.libssh.outputs.vcpkg }}/installed
-          key: vcpkg-libssh-${{ steps.libssh.outputs.pin }}-arm64-ios-simulator-xcode${{ steps.toolchain.outputs.xcode }}-${{ steps.libssh.outputs.image }}-${{ hashFiles('packaging/vcpkg-ports/libssh/**') }}
+          key: vcpkg-libssh-${{ steps.libssh.outputs.pin }}-x64-ios-xcode${{ steps.toolchain.outputs.xcode }}-${{ steps.libssh.outputs.image }}-${{ hashFiles('packaging/vcpkg-ports/libssh/**') }}
 
-      - name: Install libssh via vcpkg (arm64-ios-simulator)
+      - name: Install libssh via vcpkg (x64-ios)
         env:
           LIBSSH_PIN: ${{ steps.libssh.outputs.pin }}
           VCPKG_ROOT_DIR: ${{ steps.libssh.outputs.vcpkg }}
         run: |
           set -euo pipefail
-          prefix="$VCPKG_ROOT_DIR/installed/arm64-ios-simulator"
+          prefix="$VCPKG_ROOT_DIR/installed/x64-ios"
           header="$prefix/include/libssh/libssh_version.h"
           installed_libssh() {
             [ -f "$header" ] || return 0
@@ -961,11 +961,17 @@ jobs:
           present=$(installed_libssh)
           if [ -n "$present" ] && [ "$present" != "$LIBSSH_PIN" ]; then
             echo "Removing cached libssh $present (pin is $LIBSSH_PIN)"
-            "$VCPKG_ROOT_DIR/vcpkg" remove libssh:arm64-ios-simulator --recurse
+            "$VCPKG_ROOT_DIR/vcpkg" remove libssh:x64-ios --recurse
           fi
-          # arm64-ios-simulator is a COMMUNITY triplet, so vcpkg prints a
+          # x64-ios is a COMMUNITY triplet, so vcpkg prints a
           # not-guaranteed warning; it ships with vcpkg and needs no overlay.
-          "$VCPKG_ROOT_DIR/vcpkg" install libssh:arm64-ios-simulator \
+          # x64-ios, not arm64-ios-simulator: vcpkg's ios toolchain selects the
+          # iphonesimulator sysroot for the x64/x86 architectures, so x64-ios IS
+          # the x86_64 simulator triplet - and x86_64 is what the app is built
+          # for, because the official Qt for iOS package ships device arm64 plus
+          # x86_64 simulator slices and no arm64 simulator slice. An arm64
+          # simulator libssh would fail to link against it.
+          "$VCPKG_ROOT_DIR/vcpkg" install libssh:x64-ios \
             "--overlay-ports=$PWD/packaging/vcpkg-ports"
           got=$(installed_libssh)
           # An EMPTY answer after an install that reported success is its own
@@ -973,7 +979,7 @@ jobs:
           # message below with nothing on the left: it means the header could not be
           # read, so the pin was never actually verified.
           if [ -z "$got" ]; then
-            echo "libssh installed for arm64-ios-simulator but no version could be read" >&2
+            echo "libssh installed for x64-ios but no version could be read" >&2
             echo "from $header; the pin was NOT verified." >&2
             ls -la "$prefix/include/libssh" >&2 || true
             exit 1
@@ -982,22 +988,22 @@ jobs:
             echo "libssh $got installed, expected $LIBSSH_PIN." >&2
             exit 1
           fi
-          echo "libssh $got for arm64-ios-simulator"
+          echo "libssh $got for x64-ios"
           echo "CH_LIBSSH_PREFIX=$prefix" >> "$GITHUB_ENV"
 
-      - name: Save vcpkg libssh cache (arm64-ios-simulator)
+      - name: Save vcpkg libssh cache (x64-ios)
         if: steps.libssh_cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
           path: ${{ steps.libssh.outputs.vcpkg }}/installed
-          key: vcpkg-libssh-${{ steps.libssh.outputs.pin }}-arm64-ios-simulator-xcode${{ steps.toolchain.outputs.xcode }}-${{ steps.libssh.outputs.image }}-${{ hashFiles('packaging/vcpkg-ports/libssh/**') }}
+          key: vcpkg-libssh-${{ steps.libssh.outputs.pin }}-x64-ios-xcode${{ steps.toolchain.outputs.xcode }}-${{ steps.libssh.outputs.image }}-${{ hashFiles('packaging/vcpkg-ports/libssh/**') }}
 
       - name: Configure (ios-simulator preset)
         run: |
           set -euo pipefail
           cmake --preset ios-simulator 2>&1 | tee configure-ios.log
           if ! grep -q "libssh: found via" configure-ios.log; then
-            echo "libssh was not found for arm64-ios-simulator: the app would" >&2
+            echo "libssh was not found for x64-ios: the app would" >&2
             echo "carry a client built with CH_HAVE_LIBSSH=0." >&2
             exit 1
           fi

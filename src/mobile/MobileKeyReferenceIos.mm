@@ -63,6 +63,17 @@ QString makeIosBookmark(const QUrl& pickedUrl, QString* errorOut)
         // resolved later with plain options, and the access is reopened by
         // -startAccessingSecurityScopedResource on the resolved URL. That call is
         // available on iOS and is the only thing that grants access there.
+        //
+        // Verified against the SDK rather than the documentation, because the two
+        // disagree: Foundation's NSURL.h annotates both constants
+        // API_AVAILABLE(macos, macCatalyst) API_UNAVAILABLE(ios, watchos, tvos),
+        // while Apple's per-constant documentation pages show iOS badges. The
+        // header is what the compiler enforces. Apple's current iOS article on
+        // providing access to directories describes exactly the sequence used
+        // here - picker URL, minimal bookmark, resolve with default options,
+        // startAccessingSecurityScopedResource on the resolved URL - and the
+        // creation documentation additionally forbids combining the scope option
+        // with a minimal bookmark, so the minimal form is not a compromise.
         const bool started = [url startAccessingSecurityScopedResource];
         NSError* error = nil;
         NSData* bookmark =
