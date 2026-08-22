@@ -462,24 +462,26 @@ environment rather than hardcoding a layout:
 
 | Variable | Used by | What it points at |
 |---|---|---|
-| `ANDROID_NDK_ROOT` | Android | NDK root; the preset uses `$ANDROID_NDK_ROOT/build/cmake/android.toolchain.cmake` |
+| `ANDROID_NDK_ROOT` | Android | NDK root. Qt's own toolchain file reads it and chainloads `$ANDROID_NDK_ROOT/build/cmake/android.toolchain.cmake` for you; the preset does **not** name the NDK toolchain directly, because that file restricts `find_package` to the device sysroot and Qt would then be invisible (see below) |
 | `ANDROID_SDK_ROOT` | Android | SDK root. Needed at **configure** time, not just at package time: the preset copies it into the cache variable of the same name, and Qt's deployment-settings generation globs `<sdk>/build-tools/*` while CMake is still running — an empty value aborts the configure with "Could not locate Android SDK build tools" |
 | `QT_HOST_PATH` | both | the **host** Qt (`.../6.10.0/gcc_64`, `.../macos`). `moc`, `rcc`, `qmlcachegen` and `androiddeployqt` are host binaries |
 | `QT_ANDROID_PATH` | Android | the Qt-for-Android prefix, e.g. `.../6.10.0/android_arm64_v8a` |
 | `QT_IOS_PATH` | iOS | the Qt-for-iOS prefix, e.g. `.../6.10.0/ios` |
-| `CH_LIBSSH_PREFIX` | both | a libssh built for that ABI (see below). Appended to `CMAKE_PREFIX_PATH` |
+| `CH_LIBSSH_PREFIX` | both | a libssh built for that ABI (see below). On Android it is passed as `QT_ADDITIONAL_PACKAGES_PREFIX_PATH`, on iOS appended to `CMAKE_PREFIX_PATH` |
 
 `QT_HOST_PATH` and the target Qt must be the **same Qt version**; a mismatch
 fails at `qmlcachegen` with an unhelpful bytecode error.
 
-The Android preset also pins `ANDROID_STL=c++_shared`. Qt for Android is built
-against the shared C++ runtime and `androiddeployqt` bundles `libc++_shared.so`,
-while the NDK's own toolchain file defaults to `c++_static`; taking that default
-would load two C++ runtimes into one process. It is pinned in the preset because
-this tree chainloads the NDK toolchain directly rather than Qt's
-`qt.toolchain.cmake` (which would set it, but would also take over
-`CMAKE_TOOLCHAIN_FILE` and the prefix-path handling `CH_LIBSSH_PREFIX` relies
-on).
+The Android build uses the shared C++ runtime (`c++_shared`). Qt for Android is
+built against it and `androiddeployqt` bundles `libc++_shared.so`, while the
+NDK's own toolchain file defaults to `c++_static`; taking that default would load
+two C++ runtimes into one process, which makes exceptions and `dynamic_cast`
+across the app/Qt boundary undefined and crashes only on a device. Nothing in the
+preset pins it, because Qt's `qt.toolchain.cmake` — which the preset does use —
+sets it before chainloading the NDK toolchain. That is one of two reasons the Qt
+toolchain is used rather than the NDK one directly; the other, and the one that
+makes it mandatory, is that the NDK toolchain restricts `find_package` to the
+device sysroot, so Qt itself cannot be found through it.
 
 ### Android
 
@@ -614,9 +616,15 @@ export CH_LIBSSH_PREFIX=$VCPKG_ROOT/installed/arm64-android
 ```
 
 vcpkg's own `arm64-android` triplet needs `ANDROID_NDK_HOME` exported (it is the
-same path as `ANDROID_NDK_ROOT`). The presets append `CH_LIBSSH_PREFIX` to
-`CMAKE_PREFIX_PATH` rather than chainloading vcpkg's toolchain, because the NDK
-toolchain file is already occupying `CMAKE_TOOLCHAIN_FILE`.
+same path as `ANDROID_NDK_ROOT`). On **Android** the preset hands
+`CH_LIBSSH_PREFIX` to Qt as `QT_ADDITIONAL_PACKAGES_PREFIX_PATH` rather than
+putting it on `CMAKE_PREFIX_PATH`: the NDK toolchain that Qt's toolchain
+chainloads sets `CMAKE_FIND_ROOT_PATH` to the device sysroot and
+`CMAKE_FIND_ROOT_PATH_MODE_PACKAGE` to `ONLY`, so a package outside that sysroot
+is not found however `CMAKE_PREFIX_PATH` is spelled. Qt's toolchain prepends
+every entry of `QT_ADDITIONAL_PACKAGES_PREFIX_PATH` to both variables, which is
+what makes an out-of-sysroot libssh findable. On **iOS** there is no such
+restriction, so `CMAKE_PREFIX_PATH` is used directly.
 
 Leaving `CH_LIBSSH_PREFIX` unset is not a configure error — it degrades to the
 usual `CH_HAVE_LIBSSH=0` warning, plus an Android/iOS-specific `-- libssh:

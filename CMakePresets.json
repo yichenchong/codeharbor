@@ -56,7 +56,7 @@
       "name": "mobile-base",
       "hidden": true,
       "inherits": "base",
-      "description": "Shared cross-compile settings for the Android and iOS clients. Qt ships no WebEngine for either platform, so the desktop client is off; the mobile presets do not build the web bundles either, because src/qml is never added. Tests are off because every tst_* target is a host executable that ctest would have to run, and a cross-compiled one cannot run here. CMAKE_PREFIX_PATH carries two entries: the Qt-for-<platform> prefix and CH_LIBSSH_PREFIX, the per-ABI libssh built from the in-tree vcpkg overlay (packaging/vcpkg-ports). An unset CH_LIBSSH_PREFIX degrades to the documented CH_HAVE_LIBSSH=0 warning rather than a configure error.",
+      "description": "Shared cross-compile settings for the Android and iOS clients. Qt ships no WebEngine for either platform, so the desktop client is off; the mobile presets do not build the web bundles either, because src/qml is never added. Tests are off because every tst_* target is a host executable that ctest would have to run, and a cross-compiled one cannot run here. Each platform preset names the Qt-for-<platform> prefix and CH_LIBSSH_PREFIX, the per-ABI libssh built from the in-tree vcpkg overlay (packaging/vcpkg-ports); how they are named differs per platform, because Android reaches Qt through Qt's own toolchain file and iOS through CMAKE_PREFIX_PATH - see each preset's own description. An unset CH_LIBSSH_PREFIX degrades to the documented CH_HAVE_LIBSSH=0 warning rather than a configure error.",
       "cacheVariables": {
         "CODEHARBOR_BUILD_TESTS": "OFF",
         "CODEHARBOR_BUILD_DESKTOP": "OFF",
@@ -68,17 +68,13 @@
       "name": "android-base",
       "hidden": true,
       "inherits": "mobile-base",
-      "description": "Shared Android cross-compile settings. Two entries here look redundant and are not, because this configure chainloads the NDK's own android.toolchain.cmake rather than Qt's qt.toolchain.cmake (which is what CH_LIBSSH_PREFIX-on-CMAKE_PREFIX_PATH buys us): the NDK toolchain sets neither. ANDROID_SDK_ROOT must exist as a CMAKE variable, not just an environment variable - Qt's deployment-settings generation globs <sdk>/build-tools/* out of that variable at CONFIGURE time and aborts with 'Could not locate Android SDK build tools' when it is empty. ANDROID_STL must be c++_shared because that is what Qt for Android itself is built against and what androiddeployqt bundles (libc++_shared.so); the NDK toolchain defaults to c++_static, which would put a second C++ runtime in the same process.",
+      "description": "Shared Android cross-compile settings. The toolchain is Qt's qt.toolchain.cmake, NOT the NDK's android.toolchain.cmake directly, and that choice is load-bearing rather than stylistic: the NDK toolchain sets CMAKE_FIND_ROOT_PATH to the device sysroot and CMAKE_FIND_ROOT_PATH_MODE_PACKAGE to ONLY, so find_package() cannot see anything outside that sysroot no matter what CMAKE_PREFIX_PATH says - Qt itself included. A configure with the NDK toolchain therefore fails at find_package(Qt6) with 'Could not find a package configuration file provided by Qt6' while Qt is installed and CMAKE_PREFIX_PATH names it. Qt's toolchain chainloads the NDK one and then prepends the Qt prefix to CMAKE_FIND_ROOT_PATH, which is what makes the search work; it also sets ANDROID_STL to c++_shared, which is what Qt for Android is built against and what androiddeployqt bundles (libc++_shared.so), so the NDK's c++_static default cannot put two C++ runtimes in one process. Non-Qt packages outside the sysroot need the same treatment, which is why the per-ABI libssh is passed as QT_ADDITIONAL_PACKAGES_PREFIX_PATH rather than on CMAKE_PREFIX_PATH: Qt's toolchain prepends every entry of that variable to BOTH CMAKE_PREFIX_PATH and CMAKE_FIND_ROOT_PATH. An unset CH_LIBSSH_PREFIX degrades to the documented CH_HAVE_LIBSSH=0 warning rather than a configure error. ANDROID_SDK_ROOT must exist as a CMAKE variable and not only in the environment, because Qt's deployment-settings generation globs <sdk>/build-tools/* out of that variable at CONFIGURE time and aborts with 'Could not locate Android SDK build tools' when it is empty.",
       "cacheVariables": {
-        "CMAKE_SYSTEM_NAME": "Android",
-        "CMAKE_ANDROID_ARCH_ABI": "arm64-v8a",
         "ANDROID_ABI": "arm64-v8a",
         "ANDROID_PLATFORM": "android-28",
-        "CMAKE_SYSTEM_VERSION": "28",
-        "ANDROID_STL": "c++_shared",
         "ANDROID_SDK_ROOT": "$env{ANDROID_SDK_ROOT}",
-        "CMAKE_TOOLCHAIN_FILE": "$env{ANDROID_NDK_ROOT}/build/cmake/android.toolchain.cmake",
-        "CMAKE_PREFIX_PATH": "$env{QT_ANDROID_PATH};$env{CH_LIBSSH_PREFIX}"
+        "CMAKE_TOOLCHAIN_FILE": "$env{QT_ANDROID_PATH}/lib/cmake/Qt6/qt.toolchain.cmake",
+        "QT_ADDITIONAL_PACKAGES_PREFIX_PATH": "$env{CH_LIBSSH_PREFIX}"
       }
     },
     {
