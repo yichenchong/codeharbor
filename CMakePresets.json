@@ -101,7 +101,7 @@
       "hidden": true,
       "inherits": "mobile-base",
       "generator": "Xcode",
-      "description": "Xcode, not Ninja: Qt's iOS deployment, bundle assembly and code signing are all driven through Xcode build settings, and a single-config Ninja tree cannot express the per-configuration SDK the simulator needs.",
+      "description": "Shared iOS cross-compile settings. The toolchain is Qt's qt.toolchain.cmake for the same reason the Android preset uses it: CMAKE_SYSTEM_NAME=iOS puts CMake into cross-compile mode, where it points find_package at the SDK sysroot only, so Qt sitting outside that sysroot is not found and the configure dies at find_package(Qt6) with Qt installed and named on CMAKE_PREFIX_PATH. Qt's toolchain prepends its own prefix to CMAKE_FIND_ROOT_PATH; the per-ABI libssh is named both as QT_ADDITIONAL_PACKAGES_PREFIX_PATH (which reaches CMAKE_FIND_ROOT_PATH) and on CMAKE_PREFIX_PATH (the plain prefix, which is what find_package(ssh CONFIG) resolves through, because vcpkg installs the package configuration under <prefix>/share/libssh while Qt appends /lib/cmake to the former). Deployment target 17.0 is Qt 6.10's supported floor. Each concrete preset picks its own sysroot, and the simulator one additionally turns code signing off - a simulator runs the binary on the host CPU and checks no signature, which is what lets it build with no Apple credentials at all.",
       "condition": {
         "type": "equals",
         "lhs": "${hostSystemName}",
@@ -111,7 +111,9 @@
         "CMAKE_SYSTEM_NAME": "iOS",
         "CMAKE_OSX_ARCHITECTURES": "arm64",
         "CMAKE_OSX_DEPLOYMENT_TARGET": "17.0",
-        "CMAKE_PREFIX_PATH": "$env{QT_IOS_PATH};$env{CH_LIBSSH_PREFIX}"
+        "CMAKE_TOOLCHAIN_FILE": "$env{QT_IOS_PATH}/lib/cmake/Qt6/qt.toolchain.cmake",
+        "QT_ADDITIONAL_PACKAGES_PREFIX_PATH": "$env{CH_LIBSSH_PREFIX}",
+        "CMAKE_PREFIX_PATH": "$env{CH_LIBSSH_PREFIX}"
       }
     },
     {
