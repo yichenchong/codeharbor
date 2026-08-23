@@ -21,6 +21,29 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
     set(CMAKE_BUILD_TYPE Debug CACHE STRING "Build type" FORCE)
 endif()
 
+# Bound how many links run at once on Windows.
+#
+# This tree links a lot of executables: the desktop client, the mobile client,
+# and (with tests on) more than thirty tst_* binaries, seven of which the mobile
+# client added. Under Ninja they all link concurrently, and on Windows that
+# repeatedly failed in CI inside cmake's own `-E vs_link_exe` step with "Access
+# is denied." or "The process cannot access the file because it is being used by
+# another process" -- a different target each time. That is file contention on a
+# freshly written .exe, which on a Windows runner is characteristically the
+# on-access malware scanner opening the new image while the linker still needs
+# it. It cost the v0.4.0 release two re-runs of an otherwise green job.
+#
+# A link job pool serialises the link steps without slowing compilation, which
+# shrinks the window in which two new executables are being written at once.
+# Stated honestly: this REDUCES the collision probability, it does not remove
+# the cause, because a scanner can still open a single new binary at the wrong
+# moment. It is set only for Windows, where the failures happen; POSIX linkers
+# do not have this problem and the parallelism is worth keeping there.
+if(WIN32)
+    set_property(GLOBAL PROPERTY JOB_POOLS codeharbor_link_pool=2)
+    set(CMAKE_JOB_POOL_LINK codeharbor_link_pool)
+endif()
+
 option(CODEHARBOR_BUILD_TESTS "Build C++ unit tests" ON)
 
 # Which presentation layer(s) this tree produces.
