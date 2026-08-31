@@ -807,13 +807,56 @@ jobs:
             exit 1
           fi
           mkdir -p artifact
-          # UNSIGNED on purpose: CI holds no keystore, and a release APK signed
-          # with an ad-hoc key would be worse than an unsigned one - it would
-          # look installable while being unrelated to the release signing
-          # identity. This artifact proves the client compiles, links and
-          # packages for a device; installing it needs a signature (release-time
-          # concern, with credentials CI does not have).
-          cp "${built[0]}" artifact/codeharbor-android-arm64-unsigned.apk
+          cp "${built[0]}" artifact/codeharbor-android-arm64-debug-signed.apk
+          ls -la artifact
+
+      # Sign with a THROWAWAY key generated here, for two reasons.
+      #
+      # 1. An unsigned APK cannot be installed by anyone - Android's installer
+      #    rejects it at verification with "package appears to be invalid" - so
+      #    an unsigned CI artifact could never be smoke-tested on a device. It
+      #    proved the client compiles and packages, and nothing beyond that.
+      # 2. The release job signs with the project's real upload key, which lives
+      #    in repository secrets and therefore cannot be used from a pull
+      #    request. Signing here with a throwaway exercises the SAME
+      #    sign-android.sh on every run, so the code that signs a release is
+      #    continuously tested instead of being first run when a tag is cut.
+      #
+      # The key is different on every run, which is exactly why the artifact is
+      # named `debug-signed` and is not a release asset: Android identifies an
+      # installed app by its signing certificate, so this APK cannot be upgraded
+      # in place by a real release - it must be uninstalled first.
+      - name: Sign the APK for installability
+        env:
+          CH_KEYSTORE_PASSWORD: ci-throwaway-not-a-secret
+        run: |
+          set -euo pipefail
+          ks="$RUNNER_TEMP/ci-debug.keystore"
+          keytool -genkeypair -v \
+            -keystore "$ks" -alias ci \
+            -storepass "$CH_KEYSTORE_PASSWORD" -keypass "$CH_KEYSTORE_PASSWORD" \
+            -keyalg RSA -keysize 2048 -validity 3650 \
+            -dname "CN=CodeHarbor CI, OU=CI, O=CodeHarbor, C=GB" >/dev/null
+          .github/scripts/sign-android.sh "$ks" ci 28 \
+            artifact/codeharbor-android-arm64-debug-signed.apk
+
+          # Exercise the .aab branch too. This job does not build a bundle (the
+          # release job does, and a second Gradle run to prove a signing rule is
+          # not worth the minutes), so sign a synthetic one: jarsigner neither
+          # knows nor cares that a bundle is a zip with different entry names.
+          # Without this, the AAB half of sign-android.sh would first execute
+          # when a tag is cut, which is exactly the class of "release-only code
+          # path" this script exists to avoid. It caught a real bug: the verify
+          # originally used `jarsigner -verify -strict`, and an Android upload
+          # key is self-signed, which -strict reports as a severe warning.
+          probe="$RUNNER_TEMP/probe.aab"
+          mkdir -p "$RUNNER_TEMP/bundle/base/manifest"
+          echo probe > "$RUNNER_TEMP/bundle/base/manifest/AndroidManifest.xml"
+          (cd "$RUNNER_TEMP/bundle" && zip -qr "$probe" base)
+          .github/scripts/sign-android.sh "$ks" ci 28 "$probe"
+
+          shred -u "$ks" 2>/dev/null || rm -f "$ks"
+          rm -f "$probe"
           ls -la artifact
 
       - name: Upload the APK
