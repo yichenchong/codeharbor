@@ -512,6 +512,21 @@ it for, so the stable name to hand to `adb install` is
 `build/android-arm64/src/mobile/android-build/codeharbor_mobile.apk` (the Gradle
 paths above are named after the `android-build` directory, not after the target).
 
+Note the `-unsigned` in that release filename: Gradle does not sign a release
+build, and `adb install` will refuse it with *"package appears to be invalid"*.
+For a package to put on a device, either use the **debug** preset (Gradle signs
+those with its own debug key) or sign the release one yourself:
+
+```bash
+CH_KEYSTORE_PASSWORD=... .github/scripts/sign-android.sh \
+  ~/keys/codeharbor-release.jks codeharbor 28 \
+  build/android-arm64/src/mobile/android-build/codeharbor_mobile.apk
+```
+
+That is the same script the release job runs, so it verifies the signature the
+same way. Remember an app signed with a different key cannot upgrade one already
+installed - uninstall first when switching between debug and release keys.
+
 Only `arm64-v8a` is configured. Every Android device shipped in the last several
 years is arm64, and a multi-ABI package multiplies build time by the number of
 ABIs; add one by copying the preset rather than by making the existing one

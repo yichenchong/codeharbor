@@ -1194,11 +1194,17 @@ jobs:
       # The macOS image is matched by a pattern only because its architecture is
       # whatever the `macos-latest` runner is; its version is still pinned.
       #
-      # The two Android assets and the iOS one are asserted for the same reason as
-      # the desktop ones, and their names say what they are: unsigned, and (for
-      # iOS) a simulator build. Signing an APK/AAB and producing a device IPA
-      # need credentials this workflow does not have and must not have, so those
-      # assets do not exist rather than existing half-built - see the job notes.
+      # The two Android assets are asserted for the same reason as the desktop
+      # ones, and their names no longer say "unsigned" because they no longer
+      # are: the android job signs both from repository secrets and fails rather
+      # than publish an APK no device can install. The next step re-checks that
+      # on the bytes about to be uploaded.
+      #
+      # The iOS asset IS still unsigned and its name says so - it is the
+      # simulator slice, which checks no signature. A device IPA needs a
+      # provisioning profile and a distribution certificate, credentials this
+      # workflow does not have, so that asset does not exist rather than
+      # existing half-built - see the job notes.
       - name: Verify every asset is present and versioned like the tag
         run: |
           set -euo pipefail
