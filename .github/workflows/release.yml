@@ -1219,19 +1219,24 @@ jobs:
       # The APK must actually be installable. v0.4.0 published an unsigned one,
       # which every device rejects at verification with "package appears to be
       # invalid", and nothing in this workflow noticed - the asset was present,
-      # correctly named and correctly checksummed. So check the property that
-      # matters, structurally and with no tooling dependency:
+      # correctly named and correctly checksummed, because every check asked
+      # about naming and none asked about installability.
       #
-      #   - an APK Signature Scheme v2+ block, which is the 16-byte magic
-      #     "APK Sig Block 42" immediately before the zip central directory, and
-      #     is MANDATORY for installing on API 30 and above; and
-      #   - a v1 JAR signature, which older devices down to the app's minSdk 28
-      #     still use.
+      # The property to check is the APK Signing Block: the 16-byte magic
+      # "APK Sig Block 42" immediately before the zip central directory. Both
+      # Signature Scheme v2 and v3 live in that block, and one of them is
+      # MANDATORY to install on API 30 and above.
       #
-      # The signing job verifies the same two things with apksigner, which is
-      # authoritative. This repeats it on the published bytes because that is a
-      # different question: it proves what is about to be uploaded is signed,
-      # not that some file on the build machine was.
+      # Deliberately NOT checked: a v1 (META-INF/*.RSA) JAR signature. v1 is
+      # only consulted below API 24, so at this app's minSdk 28 apksigner omits
+      # it by design - an earlier version of this guard demanded it and would
+      # have rejected a correctly signed APK. A v1-only package would not
+      # install on a modern device anyway, so its absence is not a risk here.
+      #
+      # The signing job already verified this with apksigner, which is
+      # authoritative. Repeating it here answers a different question: that the
+      # bytes about to be uploaded are signed, not that some file on a build
+      # machine was. Structural, so it needs no Android tooling in this job.
       - name: The APK must be signed well enough to install
         run: |
           set -euo pipefail
@@ -1249,18 +1254,19 @@ jobs:
           if eocd < 0:
               sys.exit(f"{path}: no end-of-central-directory record; not a zip")
           central = struct.unpack('<I', data[eocd + 16:eocd + 20])[0]
-          has_v2 = data[central - 16:central] == b'APK Sig Block 42'
+          signing_block = data[central - 16:central] == b'APK Sig Block 42'
 
           names = zipfile.ZipFile(path).namelist()
           v1 = [n for n in names
                 if n.upper().startswith('META-INF/')
                 and n.upper().endswith(('.RSA', '.DSA', '.EC'))]
 
-          print(f"{path}: v2+ signing block {'present' if has_v2 else 'ABSENT'}, "
-                f"v1 certificates {v1 or 'ABSENT'}")
-          if not has_v2 or not v1:
-              sys.exit("this APK cannot be installed: Android rejects an "
-                       "unsigned or v1-only package with 'package appears to be "
+          print(f"{path}: APK Signing Block (v2/v3) "
+                f"{'present' if signing_block else 'ABSENT'}; "
+                f"v1 certificates {v1 or 'absent (expected at minSdk 28)'}")
+          if not signing_block:
+              sys.exit("this APK cannot be installed: with no v2/v3 signature "
+                       "block Android rejects it as 'package appears to be "
                        "invalid' on API 30+. Refusing to publish it.")
           PY
 

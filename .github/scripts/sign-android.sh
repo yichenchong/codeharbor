@@ -133,21 +133,55 @@ for file in "$@"; do
             --min-sdk-version "$min_sdk" \
             "$file"
 
-        # Verification is the point of the exercise. apksigner exits non-zero on
-        # a bad signature, but it also exits ZERO while printing warnings, and
-        # "signed, but not with a scheme this device requires" is precisely the
-        # failure that shipped an uninstallable APK before. So assert the v2
-        # line explicitly rather than trusting the exit status.
+        # Verification is the point of the exercise, and the exit status is not
+        # enough: apksigner exits ZERO while printing warnings, and "signed, but
+        # not with a scheme this device requires" is precisely the failure that
+        # shipped an uninstallable APK. So assert the report.
+        #
+        # WHICH schemes must be present depends on min-sdk, and demanding a
+        # fixed set is wrong - an earlier version of this script required v1 and
+        # v2 and failed on a correctly signed APK:
+        #
+        #   v1 (JAR signing) is only consulted below API 24. apksigner omits it
+        #     at higher min-sdk deliberately, so requiring it fails a good APK -
+        #     and v1 ALONE would not install on API 30+ anyway.
+        #   v2 (API 24+) and v3 (API 28+) both live in the APK Signing Block,
+        #     and v3 supersedes v2. At min-sdk 28 apksigner emits v3 only,
+        #     which every device that can run this app understands.
+        #
+        # So the real rule: apksigner must say it verifies, at least one block
+        # scheme must be present, and v1 is required only when a device too old
+        # for v2 is in range.
         report=$("$apksigner" verify --min-sdk-version "$min_sdk" --verbose --print-certs "$file")
         echo "$report"
-        for scheme in "Verified using v1 scheme (JAR signing): true" \
-                      "Verified using v2 scheme (APK Signature Scheme v2): true"; do
-            if ! printf '%s\n' "$report" | grep -qF "$scheme"; then
-                echo "$(basename "$file"): '$scheme' is absent from the verify" >&2
-                echo "report above, so this package is not installable." >&2
-                exit 1
+
+        if ! printf '%s\n' "$report" | grep -qE '^Verifies$'; then
+            echo "$(basename "$file"): apksigner did not report 'Verifies'." >&2
+            exit 1
+        fi
+
+        block_scheme=0
+        for scheme in v2 v3 v3.1; do
+            if printf '%s\n' "$report" \
+                | grep -qE "^Verified using $scheme scheme \(APK Signature Scheme $scheme\): true$"; then
+                echo "  -> signed with APK Signature Scheme $scheme"
+                block_scheme=1
             fi
         done
+        if [ "$block_scheme" -ne 1 ]; then
+            echo "$(basename "$file"): no v2/v3 signature block, so devices on" >&2
+            echo "API 30 and above will refuse to install it." >&2
+            exit 1
+        fi
+
+        if [ "$min_sdk" -lt 24 ]; then
+            if ! printf '%s\n' "$report" \
+                | grep -qF 'Verified using v1 scheme (JAR signing): true'; then
+                echo "$(basename "$file"): min-sdk $min_sdk includes devices" >&2
+                echo "older than API 24, which need a v1 signature." >&2
+                exit 1
+            fi
+        fi
         ;;
     *.aab)
         CH_KEY_PASSWORD="$key_password" \
