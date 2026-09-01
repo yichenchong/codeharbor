@@ -570,6 +570,71 @@ jobs:
           distribution: temurin
           java-version: "17"
 
+      # Prove the signing credentials work BEFORE the twenty-minute
+      # cross-compile, for the same reason the source-rule check above runs
+      # early: it costs seconds. The first signed dry run failed with
+      # "keystore password was incorrect" after five minutes of Android build,
+      # and every retry of a wrong secret would cost that again.
+      #
+      # keytool -list needs only the store password, so this also distinguishes
+      # the three failure modes that otherwise look alike at signing time: a
+      # corrupt base64 blob (keytool cannot parse the file), a wrong password,
+      # and an alias that is not in the keystore. The last one matters because
+      # ANDROID_KEY_ALIAS is a name a human typed, and nothing else checks it.
+      - name: Signing credentials must work
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          STORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+        run: |
+          set -euo pipefail
+          # No step-level `if:` here on purpose: that expression cannot see the
+          # `secrets` context, nor this step's own `env:`, so it would evaluate
+          # empty and skip the check forever. Decide in the script instead - the
+          # signing step makes the same call on the same three variables.
+          if [ -z "${KEYSTORE_BASE64:-}" ] || [ -z "${STORE_PASSWORD:-}" ] \
+             || [ -z "${KEY_ALIAS:-}" ]; then
+            echo "no complete signing secrets; nothing to pre-check. The signing"
+            echo "step decides what that means for this trigger."
+            exit 0
+          fi
+          ks="$RUNNER_TEMP/probe.keystore"
+          # Strip whitespace: a base64 secret pasted through a UI or piped from
+          # a shell can carry a trailing newline, and `base64 -d` would then
+          # produce a truncated file that fails much later as a mystery.
+          printf '%s' "$KEYSTORE_BASE64" | tr -d '\n\r \t' | base64 -d > "$ks"
+          echo "decoded keystore: $(stat -c%s "$ks") bytes"
+
+          if ! out=$(keytool -list -keystore "$ks" \
+                      -storepass:env STORE_PASSWORD 2>&1); then
+            case "$out" in
+              *"password was incorrect"*|*UnrecoverableKeyException*)
+                echo "ANDROID_KEYSTORE_PASSWORD does not open this keystore." >&2
+                echo "Check it locally with:" >&2
+                echo "  keytool -list -keystore <your.jks>" >&2
+                echo "and re-set the secret. A trailing space or newline in the" >&2
+                echo "secret value is the usual cause." >&2
+                ;;
+              *)
+                echo "the keystore could not be read at all, which points at" >&2
+                echo "ANDROID_KEYSTORE_BASE64 rather than the password:" >&2
+                ;;
+            esac
+            printf '%s\n' "$out" >&2
+            shred -u "$ks" 2>/dev/null || rm -f "$ks"
+            exit 1
+          fi
+
+          if ! printf '%s\n' "$out" | grep -qiE "^$KEY_ALIAS," ; then
+            echo "ANDROID_KEY_ALIAS='$KEY_ALIAS' is not in this keystore." >&2
+            echo "Aliases present:" >&2
+            printf '%s\n' "$out" | grep -iE '^[^,]+, .*(PrivateKeyEntry|trustedCertEntry)' >&2 || true
+            shred -u "$ks" 2>/dev/null || rm -f "$ks"
+            exit 1
+          fi
+          echo "keystore opens and contains alias '$KEY_ALIAS'"
+          shred -u "$ks" 2>/dev/null || rm -f "$ks"
+
       - name: Install the Android SDK, the Qt-mandated packages and the pinned NDK
         uses: android-actions/setup-android@v4.0.1
         with:
@@ -906,7 +971,9 @@ jobs:
             exit 0
           fi
           ks="$RUNNER_TEMP/release.keystore"
-          printf '%s' "$KEYSTORE_BASE64" | base64 -d > "$ks"
+          # Same whitespace strip as the pre-check above: a secret can carry a
+          # trailing newline, and base64 -d would write a truncated keystore.
+          printf '%s' "$KEYSTORE_BASE64" | tr -d '\n\r \t' | base64 -d > "$ks"
           .github/scripts/sign-android.sh "$ks" "$KEY_ALIAS" 28 \
             "artifact/CodeHarbor-$CH_VERSION-android-arm64.apk" \
             "artifact/CodeHarbor-$CH_VERSION-android-arm64.aab"
