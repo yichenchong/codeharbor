@@ -1006,9 +1006,20 @@ other version lands, because vcpkg's registry port is the unusable 0.12.0.
 
 ### The release drill (do not skip the dry run)
 
-1. **Dispatch `release.yml` on `main`** ("Run workflow"). The `publish` job is
-   gated on `refs/tags/v*`, so this is a genuine dry run: it exercises all five
-   builders — three desktop, Android, iOS simulator — and publishes nothing.
+1. **Dispatch `release.yml` on `main`** ("Run workflow"). `publish` is gated on
+   `github.event_name == 'push'` **and** `refs/tags/v*`, so this is a genuine
+   dry run: it exercises all five builders — three desktop, Android, iOS
+   simulator — and publishes nothing. Signing secrets ARE available to a
+   dispatch, so the Android packages get really signed here; that is the point,
+   because a wrong keystore password should surface before a tag exists.
+
+   Dispatch on `main`, **never** `--ref <a tag>`. GitHub runs the workflow file
+   *as defined at the ref you dispatch*, so aiming a dispatch at an old tag
+   silently runs that tag's workflow and tests nothing you just changed - a
+   green result there is vacuous. To dry-run the CURRENT workflow against an
+   older tree, dispatch on `main` and pass the tag through the `ref` input
+   (`gh workflow run release.yml --ref main -f ref=refs/tags/v0.4.0`), which is
+   what the build jobs check out.
 2. **Cut and push the tag only after the dry run.**
    `bash .omp/skills/bump-version/bump.sh --set X.Y.Z --push` syncs the version
    files, commits them, runs the local Debug build, ctest, all workspace npm
