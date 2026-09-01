@@ -121,8 +121,16 @@ for file in "$@"; do
 
         # --min-sdk-version drives which schemes are emitted. At 28 apksigner
         # writes v1+v2+v3; letting it read minSdk from the manifest would work
-        # too, but stating it means a manifest change cannot silently drop v2
-        # and produce a package that API 30+ devices refuse.
+        # too, but stating it means a manifest change cannot silently drop a
+        # scheme and produce a package that API 30+ devices refuse.
+        #
+        # v4 is switched OFF deliberately. A v4 signature is not stored inside
+        # the APK: apksigner writes a SEPARATE <name>.apk.idsig beside it, which
+        # only `adb install --incremental` consumes. Left on, that file lands in
+        # the artifact directory, and the release would upload and checksum a
+        # half-megabyte asset nobody asked for next to every APK, against this
+        # workflow's one-deterministic-name-per-asset rule. Sideloading and Play
+        # both ignore v4, so nothing is lost.
         CH_KEYSTORE_PASSWORD="$CH_KEYSTORE_PASSWORD" \
         CH_KEY_PASSWORD="$key_password" \
         "$apksigner" sign \
@@ -131,27 +139,34 @@ for file in "$@"; do
             --ks-pass env:CH_KEYSTORE_PASSWORD \
             --key-pass env:CH_KEY_PASSWORD \
             --min-sdk-version "$min_sdk" \
+            --v4-signing-enabled false \
             "$file"
+
+        # Belt and braces: if a future build-tools writes one anyway, it must
+        # not reach an artifact directory.
+        rm -f "$file.idsig"
 
         # Verification is the point of the exercise, and the exit status is not
         # enough: apksigner exits ZERO while printing warnings, and "signed, but
         # not with a scheme this device requires" is precisely the failure that
         # shipped an uninstallable APK. So assert the report.
         #
-        # WHICH schemes must be present depends on min-sdk, and demanding a
-        # fixed set is wrong - an earlier version of this script required v1 and
-        # v2 and failed on a correctly signed APK:
+        # Read that report carefully, because it does NOT list what the file
+        # contains - it lists which scheme apksigner USED to verify at the
+        # min-sdk it was given. At min-sdk 28 it reports
         #
-        #   v1 (JAR signing) is only consulted below API 24. apksigner omits it
-        #     at higher min-sdk deliberately, so requiring it fails a good APK -
-        #     and v1 ALONE would not install on API 30+ anyway.
-        #   v2 (API 24+) and v3 (API 28+) both live in the APK Signing Block,
-        #     and v3 supersedes v2. At min-sdk 28 apksigner emits v3 only,
-        #     which every device that can run this app understands.
+        #   v1: false   v2: false   v3: true
         #
-        # So the real rule: apksigner must say it verifies, at least one block
-        # scheme must be present, and v1 is required only when a device too old
-        # for v2 is in range.
+        # for an APK whose bytes carry a v1 META-INF/*.RSA, a v2 block AND a v3
+        # block (checked by hand on a CI-signed APK). v3 wins for API 28+, so
+        # the others are not consulted and are reported false.
+        #
+        # An earlier version of this script demanded "v1: true" and "v2: true"
+        # and therefore rejected a perfectly signed package. The rule that
+        # matters: apksigner must say it verifies; at least one APK Signing
+        # Block scheme must have been used, since one is mandatory to install on
+        # API 30+; and v1 matters only when min-sdk reaches below API 24, where
+        # devices predate v2 entirely.
         report=$("$apksigner" verify --min-sdk-version "$min_sdk" --verbose --print-certs "$file")
         echo "$report"
 

@@ -936,15 +936,57 @@ git push --tags`) or via the **Run workflow** button (manual `workflow_dispatch`
 | `windows` | `windows-latest` | `codeharbor-windows/` (`codeharbor.exe` + Qt/libssh DLLs) and `CodeHarbor-<version>-windows-x64-setup.exe` | `windeployqt`, then Inno Setup (`packaging/windows/codeharbor.iss`) |
 | `macos` | `macos-latest` | `CodeHarbor-<version>-macos-<arch>.dmg` (bundled `.app`; `<arch>` is the runner's `uname -m`) | `macdeployqt` |
 | `remote` | `ubuntu-latest` | `codeharbor-remote.tar.gz` (`dist/` + `sql/` + `package.json`) | `tsc` + tar |
-| `android` | `ubuntu-latest` | `CodeHarbor-<version>-android-arm64-unsigned.apk` and `…-unsigned.aab` | `androiddeployqt` (Qt's `apk`/`aab` targets) |
+| `android` | `ubuntu-latest` | `CodeHarbor-<version>-android-arm64.apk` and `…-android-arm64.aab` | `androiddeployqt` (Qt's `apk`/`aab` targets), then `.github/scripts/sign-android.sh` |
 | `ios-simulator` | `macos-latest` | `CodeHarbor-<version>-ios-simulator.zip` (a Release `.app` bundle, `ditto`-archived) | Xcode, no code signing |
 
-All three mobile assets are **unsigned**, and their names say so: CI holds no Android
-keystore and no Apple certificate, and signing with an ad-hoc key would produce
-something that looks installable while having nothing to do with the release
-identity. An iOS *device* build (`ios-arm64`) and any App Store submission need a
-provisioning profile and a distribution certificate, so they happen on a machine
-that owns those credentials and are deliberately not part of this workflow.
+#### Android signing (required to publish)
+
+The Android assets are **signed** by the release job, and this is not optional:
+Android's installer rejects a package with no signature, so an unsigned APK
+fails on every device with *"App not installed as package appears to be
+invalid"*. v0.4.0 shipped exactly that - a 72 MB asset nobody could install -
+because the workflow checked that assets were present, named and checksummed,
+and never that one could be installed.
+
+Signing needs four repository secrets (**Settings -> Secrets and variables ->
+Actions**):
+
+| Secret | Contents |
+|---|---|
+| `ANDROID_KEYSTORE_BASE64` | the keystore file, base64-encoded |
+| `ANDROID_KEYSTORE_PASSWORD` | store password |
+| `ANDROID_KEY_ALIAS` | key alias inside the keystore |
+| `ANDROID_KEY_PASSWORD` | key password (optional; defaults to the store password) |
+
+Create the key **once** and keep it forever. Android identifies an installed app
+by its signing certificate, so a later release signed with a different key
+cannot upgrade an installed one in place - users would have to uninstall first,
+losing their data. Back the file up somewhere you will still have in five years;
+losing it is unrecoverable for anyone who has the app installed.
+
+```bash
+keytool -genkeypair -v \
+  -keystore codeharbor-release.jks -alias codeharbor \
+  -keyalg RSA -keysize 4096 -validity 10000 \
+  -dname "CN=CodeHarbor, O=CodeHarbor, C=GB"
+
+base64 -w0 codeharbor-release.jks   # the value for ANDROID_KEYSTORE_BASE64
+```
+
+`-validity 10000` (~27 years) matters: Play rejects an upload key expiring
+before 2033, and an expired key cannot sign an update.
+
+On a **tag** run the secrets are mandatory - the job fails rather than publish
+an uninstallable asset. A `workflow_dispatch` dry run without them still builds
+and appends `-unsigned` to both names, so the drill works on a fork with no
+credentials. `publish` independently re-checks the uploaded APK for an APK
+Signing Block and refuses to release one without it.
+
+The **iOS** asset is still unsigned, and its name says so: it is the simulator
+slice, which checks no signature. A device build (`ios-arm64`) and any App Store
+submission need a provisioning profile and a distribution certificate, so they
+happen on a machine that owns those credentials and are deliberately not part of
+this workflow.
 
 The `publish` job zips the Windows directory into `codeharbor-windows.zip`, then
 refuses to publish unless **every** expected asset is present exactly once and
