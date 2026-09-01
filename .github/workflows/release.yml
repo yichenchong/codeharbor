@@ -599,9 +599,13 @@ jobs:
             exit 0
           fi
           ks="$RUNNER_TEMP/probe.keystore"
-          # Strip whitespace: a base64 secret pasted through a UI or piped from
-          # a shell can carry a trailing newline, and `base64 -d` would then
-          # produce a truncated file that fails much later as a mystery.
+          # Normalise the blob before decoding. To be accurate about what this
+          # does and does not buy: GNU `base64 -d` tolerates newlines, so a
+          # trailing one decodes correctly and does NOT truncate - measured,
+          # 4320 bytes either way. What it does NOT tolerate is other embedded
+          # whitespace, e.g. a space-wrapped or CRLF paste, where it fails with
+          # a bare "invalid input" naming nothing. Stripping first makes the
+          # decode insensitive to how the secret was pasted.
           printf '%s' "$KEYSTORE_BASE64" | tr -d '\n\r \t' | base64 -d > "$ks"
           echo "decoded keystore: $(stat -c%s "$ks") bytes"
 
@@ -971,8 +975,8 @@ jobs:
             exit 0
           fi
           ks="$RUNNER_TEMP/release.keystore"
-          # Same whitespace strip as the pre-check above: a secret can carry a
-          # trailing newline, and base64 -d would write a truncated keystore.
+          # Same normalisation as the pre-check above, and for the same reason:
+          # insensitivity to how the secret was pasted, not newline paranoia.
           printf '%s' "$KEYSTORE_BASE64" | tr -d '\n\r \t' | base64 -d > "$ks"
           .github/scripts/sign-android.sh "$ks" "$KEY_ALIAS" 28 \
             "artifact/CodeHarbor-$CH_VERSION-android-arm64.apk" \
