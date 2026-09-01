@@ -613,11 +613,31 @@ jobs:
                       -storepass:env STORE_PASSWORD 2>&1); then
             case "$out" in
               *"password was incorrect"*|*UnrecoverableKeyException*)
-                echo "ANDROID_KEYSTORE_PASSWORD does not open this keystore." >&2
-                echo "Check it locally with:" >&2
-                echo "  keytool -list -keystore <your.jks>" >&2
-                echo "and re-set the secret. A trailing space or newline in the" >&2
-                echo "secret value is the usual cause." >&2
+                # A password carrying stray whitespace fails IDENTICALLY to a
+                # typo - measured: keytool rejects $'pw\n' exactly as it rejects
+                # a wrong password. `echo pw | gh secret set` produces precisely
+                # that, and it is invisible in the UI. So distinguish the two
+                # instead of leaving the reader to guess, and do NOT silently
+                # strip: a password is opaque, and quietly trimming it here
+                # while local signing does not would be a worse trap.
+                CH_TRIMMED=$(printf '%s' "$STORE_PASSWORD" | tr -d '\n\r \t')
+                if CH_TRIMMED="$CH_TRIMMED" keytool -list -keystore "$ks" \
+                     -storepass:env CH_TRIMMED >/dev/null 2>&1; then
+                  echo "ANDROID_KEYSTORE_PASSWORD opens this keystore ONLY after" >&2
+                  echo "stripping whitespace, so the secret carries a stray" >&2
+                  echo "newline, space or tab. That is what a piped" >&2
+                  echo "  echo mypassword | gh secret set ..." >&2
+                  echo "produces, and it is invisible in the UI. Re-set it with" >&2
+                  echo "the interactive prompt, which sends no newline:" >&2
+                  echo "  gh secret set ANDROID_KEYSTORE_PASSWORD" >&2
+                  echo "or pipe without one: printf %s 'mypassword' | gh secret set ..." >&2
+                else
+                  echo "ANDROID_KEYSTORE_PASSWORD does not open this keystore," >&2
+                  echo "with or without surrounding whitespace, so it is simply" >&2
+                  echo "the wrong password. Confirm the one that works locally:" >&2
+                  echo "  keytool -list -keystore <your.jks>" >&2
+                  echo "then re-set the secret." >&2
+                fi
                 ;;
               *)
                 echo "the keystore could not be read at all, which points at" >&2
