@@ -607,7 +607,13 @@ jobs:
           # a bare "invalid input" naming nothing. Stripping first makes the
           # decode insensitive to how the secret was pasted.
           printf '%s' "$KEYSTORE_BASE64" | tr -d '\n\r \t' | base64 -d > "$ks"
+          # Print the digest, not just the size. A keystore regenerated with the
+          # same keytool flags is byte-DIFFERENT but the SAME SIZE, so a stale
+          # ANDROID_KEYSTORE_BASE64 next to a freshly set password looks exactly
+          # like a wrong password - which is what happened, and cost two runs to
+          # find. Compare this against `sha256sum <your.jks>` locally.
           echo "decoded keystore: $(stat -c%s "$ks") bytes"
+          echo "keystore sha256:  $(sha256sum "$ks" | cut -d' ' -f1)"
 
           if ! out=$(keytool -list -keystore "$ks" \
                       -storepass:env STORE_PASSWORD 2>&1); then
@@ -632,11 +638,23 @@ jobs:
                   echo "  gh secret set ANDROID_KEYSTORE_PASSWORD" >&2
                   echo "or pipe without one: printf %s 'mypassword' | gh secret set ..." >&2
                 else
-                  echo "ANDROID_KEYSTORE_PASSWORD does not open this keystore," >&2
-                  echo "with or without surrounding whitespace, so it is simply" >&2
-                  echo "the wrong password. Confirm the one that works locally:" >&2
+                  echo "ANDROID_KEYSTORE_PASSWORD does not open the keystore in" >&2
+                  echo "ANDROID_KEYSTORE_BASE64, with or without surrounding" >&2
+                  echo "whitespace. TWO things produce this, and they are easy to" >&2
+                  echo "confuse:" >&2
+                  echo "  1. the password is wrong; or" >&2
+                  echo "  2. the BLOB is stale - the keystore was regenerated" >&2
+                  echo "     after the base64 secret was set, so the password is" >&2
+                  echo "     right for a file CI does not have. Regenerating with" >&2
+                  echo "     the same flags gives a byte-different keystore of" >&2
+                  echo "     IDENTICAL size, so size proves nothing." >&2
+                  echo "Check 2 first - compare the sha256 printed above with" >&2
+                  echo "  sha256sum <your.jks>" >&2
+                  echo "If they differ, re-upload the blob:" >&2
+                  echo "  base64 -w0 <your.jks> | gh secret set ANDROID_KEYSTORE_BASE64" >&2
+                  echo "If they match, it is the password: confirm with" >&2
                   echo "  keytool -list -keystore <your.jks>" >&2
-                  echo "then re-set the secret." >&2
+                  echo "and re-set ANDROID_KEYSTORE_PASSWORD." >&2
                 fi
                 ;;
               *)
