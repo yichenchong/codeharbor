@@ -66,9 +66,18 @@ Page {
         var trimmed = root.portText.trim()
         return trimmed.length === 0 ? 22 : Number(trimmed)
     }
+    // The node path is REQUIRED, not merely conventional. README documents it as
+    // an absolute path and states it is deliberately not looked up on `PATH`,
+    // "because a non-interactive SSH session often does not have the one you
+    // expect". Submitting blank therefore fails on the server, several seconds
+    // and one SSH handshake later, with a prerequisite report about the remote
+    // rather than about this field. Checking it here fails immediately and says
+    // what to type.
+    readonly property bool nodePathValid: root.nodePathText.trim().length > 0
     readonly property bool formValid: EndpointField.isUsable(root.hostText)
                                       && EndpointField.isUsable(root.userText)
                                       && root.portValid
+                                      && root.nodePathValid
 
     readonly property string validationMessage: {
         if (root.formValid)
@@ -79,7 +88,14 @@ Page {
             return qsTr("The user name cannot contain spaces, line breaks or control characters.")
         if (!root.portValid)
             return qsTr("The port must be a whole number between 1 and 65535.")
-        return qsTr("Fill in a host and a login name to connect.")
+        if (!root.nodePathValid) {
+            // Names the command that produces the answer, the same one README
+            // gives, because "required" without it just moves the guesswork.
+            return qsTr("The remote Node path is required. Find it with: ssh %1 command -v node")
+                       .arg(root.hostText.trim().length > 0
+                            ? root.hostText.trim() : "<host>")
+        }
+        return qsTr("Fill in a host, a login name and the remote Node path to connect.")
     }
 
     readonly property string connectionState: root.mobileController
@@ -564,11 +580,16 @@ Page {
                 }
             }
 
-            // ---- optional server details ---------------------------------
+            // ---- server details ------------------------------------------
+            //
+            // The node path is in this group but is REQUIRED; the repository
+            // root below it genuinely is optional. Grouping them together while
+            // labelling only one "(optional)" was the misleading part: leaving
+            // the node path blank looked sanctioned and then failed remotely.
             Label {
                 Layout.fillWidth: true
                 Layout.leftMargin: 16
-                text: qsTr("Remote node path (optional)")
+                text: qsTr("Remote node path")
                 textFormat: Text.PlainText
             }
             TextField {
@@ -578,6 +599,10 @@ Page {
                 Layout.rightMargin: 16
                 Layout.minimumHeight: 48
                 text: root.nodePathText
+                // An ABSOLUTE path, as README documents: it is deliberately not
+                // looked up on `PATH`, because a non-interactive SSH session
+                // often has a shorter PATH than a login one, so an nvm- or
+                // fnm-installed node is not on it.
                 placeholderText: qsTr("/usr/bin/node")
                 inputMethodHints: Qt.ImhNoAutoUppercase | Qt.ImhNoPredictiveText
                 onTextEdited: root.nodePathText = text

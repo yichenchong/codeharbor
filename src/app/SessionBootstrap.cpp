@@ -354,6 +354,16 @@ bool SessionBootstrap::nodeVersionIsSupported(const QString& version)
     return minor >= kMinimumRemoteNodeMinor;
 }
 
+QString SessionBootstrap::resolveNodePath(const QString& nodePath)
+{
+    // trimmed() only DECIDES; a non-blank value is returned untouched, because
+    // the remote path is the user's string to get right and this function is not
+    // the place to silently rewrite it.
+    if (nodePath.trimmed().isEmpty())
+        return QStringLiteral("node");
+    return nodePath;
+}
+
 QString SessionBootstrap::remoteInspectScript(const QString& nodePath,
                                               const QString& repoRoot)
 {
@@ -2013,7 +2023,12 @@ bool SessionBootstrap::connectAndWire(const QString& host, quint16 port,
     m_host = host;
     m_port = port;
     m_user = user;
-    m_nodePath = nodePath;
+    // Blank means "find it on the PATH", not "use the empty string" - see
+    // resolveNodePath(). Defaulting rather than rejecting: requiring the field
+    // would force every user to know an absolute remote path, and when the
+    // fallback is genuinely absent the existing prerequisite report already
+    // says so, naming the path it tried.
+    m_nodePath = resolveNodePath(nodePath);
     m_repoRoot = repoRoot;
     m_identityFile = identityFile;
 

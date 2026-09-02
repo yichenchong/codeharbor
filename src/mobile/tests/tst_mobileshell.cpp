@@ -327,6 +327,7 @@ private slots:
     void initTestCase();
 
     void theFirstScreenIsTheConnectPage();
+    void aBlankNodePathBlocksConnecting();
     void theSessionPickerListsEverySessionTheServerReported();
     void thePanePickerListsBothRegionsOfTheSelectedSession();
     void aTerminalLeafLoadsTheTerminalPage();
@@ -551,6 +552,50 @@ void TstMobileShell::theFirstScreenIsTheConnectPage()
     QCOMPARE(stackDepth(window), 1);
     QCOMPARE(qmlTypeName(currentPage(window)), QStringLiteral("ConnectPage"));
     grabFrame(shell, QStringLiteral("01-connect"));
+}
+
+// A blank remote Node path used to sail through this form and fail on the
+// server, one SSH handshake later, with a prerequisite report about the remote
+// instead of about the field the user left empty. README documents the value as
+// an absolute path and states it is deliberately NOT looked up on `PATH`, so
+// blank is not a sanctioned shortcut and the form is where it must be caught.
+void TstMobileShell::aBlankNodePathBlocksConnecting()
+{
+    Shell shell;
+    QQuickWindow *window = shell.window();
+    QVERIFY2(window, "MobileMain.qml did not produce a window");
+
+    QQuickItem *page = currentPage(window);
+    QCOMPARE(qmlTypeName(page), QStringLiteral("ConnectPage"));
+
+    // A host and user alone are NOT enough any more.
+    page->setProperty("hostText", QStringLiteral("box.local"));
+    page->setProperty("userText", QStringLiteral("someone"));
+    page->setProperty("nodePathText", QString());
+    QVERIFY2(!page->property("formValid").toBool(),
+             "a blank node path still counted as a valid form");
+
+    // And the reason names the field AND the command that answers it, so
+    // "required" does not just relocate the guesswork.
+    const QString blankMessage = page->property("validationMessage").toString();
+    QVERIFY2(blankMessage.contains(QStringLiteral("Node path")),
+             qPrintable(blankMessage));
+    QVERIFY2(blankMessage.contains(QStringLiteral("command -v node")),
+             qPrintable(blankMessage));
+    // The host the user already typed is spliced in, not a placeholder.
+    QVERIFY2(blankMessage.contains(QStringLiteral("ssh box.local")),
+             qPrintable(blankMessage));
+
+    // Whitespace is not a value.
+    page->setProperty("nodePathText", QStringLiteral("   "));
+    QVERIFY2(!page->property("formValid").toBool(),
+             "whitespace counted as a node path");
+
+    // A real path completes the form.
+    page->setProperty("nodePathText", QStringLiteral("/usr/bin/node"));
+    QVERIFY2(page->property("formValid").toBool(),
+             "a complete form was still rejected");
+    QCOMPARE(page->property("validationMessage").toString(), QString());
 }
 
 void TstMobileShell::theSessionPickerListsEverySessionTheServerReported()

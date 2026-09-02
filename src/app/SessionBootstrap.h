@@ -193,6 +193,15 @@ public:
     // bound that actually decides.
     static constexpr int kDefaultConnectTimeoutMs = 5000;
 
+    // What a profile's `nodePath` means when it is blank. ServerProfiles treats
+    // the field as legitimately empty ("may be filled in later"), and
+    // remoteInspectScript() probes it with `command -v`, which resolves a bare
+    // name on the login PATH exactly as it resolves an absolute path - so blank
+    // resolves to `node` rather than probing the empty string and reporting the
+    // remote as having no Node at all. Public so the rule is asserted directly
+    // instead of inferred from a whole connect attempt.
+    static QString resolveNodePath(const QString& nodePath);
+
     // Remote command lines, exposed so tests and diagnostics assert the exact
     // strings that are executed rather than reconstructing them.
     static QString rpcCommand(const QString& nodePath, const QString& repoRoot);

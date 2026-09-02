@@ -396,6 +396,7 @@ private slots:
     void anInstallThatDidNotLandFailsLoudly();
     void anInspectionThatCannotRunStillConnects();
     void nodeVersionFloorMatchesTheRemotePackageEngine();
+    void aBlankNodePathFallsBackToABareName();
     void theInstalledReleaseIsTiedToTheClientVersion();
     void provisioningStaysInsideTheChosenDirectory();
     void theReportIsReadBackFieldForField();
@@ -1954,6 +1955,39 @@ void TstSessionBootstrap::nodeVersionFloorMatchesTheRemotePackageEngine()
     QVERIFY(SessionBootstrap::nodeVersionIsSupported(QStringLiteral("v24.16.0")));
     // A string comparison would call 30 older than 4.
     QVERIFY(SessionBootstrap::nodeVersionIsSupported(QStringLiteral("v30.0.0")));
+}
+
+// A profile may legitimately carry a blank nodePath (ServerProfiles says the
+// field "may be filled in later"), and a blank one used to be spliced straight
+// into `command -v ''`, which fails and reports the SERVER as having no Node -
+// naming neither the field nor the fix. The mobile connect form now requires
+// the value, so this is the guard behind it: an already-saved blank profile
+// probes a bare `node` instead of the empty string, and the prerequisite report
+// then names something a user can act on.
+//
+// Note this is a FALLBACK, not a lookup policy: README documents an absolute
+// path precisely because a non-interactive SSH session often has a shorter PATH.
+void TstSessionBootstrap::aBlankNodePathFallsBackToABareName()
+{
+    QCOMPARE(SessionBootstrap::resolveNodePath(QString()),
+             QStringLiteral("node"));
+    QCOMPARE(SessionBootstrap::resolveNodePath(QStringLiteral("   ")),
+             QStringLiteral("node"));
+    QCOMPARE(SessionBootstrap::resolveNodePath(QStringLiteral("\t\n")),
+             QStringLiteral("node"));
+
+    // A supplied value is returned untouched - including one whose own spacing
+    // is wrong. Rewriting a remote path is not this function's business, and a
+    // silent trim would make a typo unreportable.
+    QCOMPARE(SessionBootstrap::resolveNodePath(QStringLiteral("/usr/bin/node")),
+             QStringLiteral("/usr/bin/node"));
+    QCOMPARE(SessionBootstrap::resolveNodePath(QStringLiteral("node")),
+             QStringLiteral("node"));
+    QCOMPARE(
+        SessionBootstrap::resolveNodePath(QStringLiteral("/opt/node 22/bin/node")),
+        QStringLiteral("/opt/node 22/bin/node"));
+    QCOMPARE(SessionBootstrap::resolveNodePath(QStringLiteral(" /usr/bin/node ")),
+             QStringLiteral(" /usr/bin/node "));
 }
 
 // "Versions must match" without a second version constant to keep in sync: the

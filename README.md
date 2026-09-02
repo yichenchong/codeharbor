@@ -121,7 +121,11 @@ Launch it, add a server in the connect sheet, and fill in:
   use. CodeHarbor also reads `~/.ssh/config`, including `IdentityFile` entries.
 - **Node path** — absolute path to `node` on the server (`ssh <host> command -v node`).
   It is not looked up on `PATH`, because a non-interactive SSH session often
-  does not have the one you expect.
+  does not have the one you expect. **Required**: the mobile connect form
+  refuses to submit without it rather than letting the failure surface as a
+  server-side "no Node" report a handshake later. A profile saved blank by an
+  older build falls back to a bare `node` so it probes something runnable, but
+  that fallback is a guard, not a substitute for the path.
 - **Repository root** — where you unpacked the tarball (`~/codeharbor` above).
   A git checkout of this repo works too.
 
