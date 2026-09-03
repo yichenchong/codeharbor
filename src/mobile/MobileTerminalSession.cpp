@@ -304,6 +304,35 @@ void MobileTerminalSession::paste(const QString &text)
     m_controller->sendInput(vt::encodePaste(text, m_screen && m_screen->bracketedPaste()));
 }
 
+bool MobileTerminalSession::sendMouseWheel(int notches, int column, int row)
+{
+    if (!m_controller || !m_screen || notches == 0)
+        return false;
+
+    // The screen decides, not a "mouse is on" boolean: 1006 selects an encoding
+    // and is independent of the modes that ask for events, so this must read the
+    // resolved form. None means the program wants no mouse events, and the
+    // caller keeps its own scrollback behaviour.
+    const VtMouseEncoding encoding = m_screen->mouseEncoding();
+    if (encoding == VtMouseEncoding::None)
+        return false;
+
+    // One report per notch. A wheel has no "distance" field: three notches is
+    // three events, which is exactly how tmux advances its copy-mode scroll.
+    const bool up = notches > 0;
+    const int count = qMin(qAbs(notches), kMaxWheelNotchesPerGesture);
+    QByteArray payload;
+    for (int sent = 0; sent < count; ++sent)
+        payload += vt::encodeMouseWheel(up, column, row, encoding);
+    if (payload.isEmpty())
+        return false;
+
+    // One write, not one per notch: these go through the same flow-controlled
+    // channel as typing, and a flick can produce a dozen notches at once.
+    m_controller->sendInput(payload);
+    return true;
+}
+
 void MobileTerminalSession::resize(int cols, int rows)
 {
     if (cols <= 0 || rows <= 0)

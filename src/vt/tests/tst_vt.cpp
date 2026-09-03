@@ -124,6 +124,8 @@ private slots:
     void encodesEditingAndFunctionKeys();
     void encodesControlAndAltKeys();
     void encodesPasteInBothModes();
+    void reportsWheelInTheEncodingTheProgramSelected();
+    void sgrModeIsIndependentOfTheModesThatAskForEvents();
 };
 
 // --- the byte-split gate ----------------------------------------------------
@@ -1474,6 +1476,90 @@ void TstVt::encodesPasteInBothModes()
     QVERIFY(screen.bracketedPaste());
     QCOMPARE(vt::encodePaste(QStringLiteral("z"), screen.bracketedPaste()),
              QByteArrayLiteral("\x1b[200~z\x1b[201~"));
+}
+
+// A wheel notch is the ONLY way to scroll a program that owns its own history,
+// and tmux is exactly that: it runs on the alternate screen, where this engine
+// deliberately feeds no scrollback, so a client cannot scroll it by moving a
+// local view offset. These are the bytes that do the work.
+void TstVt::reportsWheelInTheEncodingTheProgramSelected()
+{
+    // Nothing asked for events: send nothing, so the caller can fall back to
+    // whatever local scrollback it has.
+    QCOMPARE(vt::encodeMouseWheel(true, 1, 1, VtMouseEncoding::None),
+             QByteArray());
+
+    // SGR (1006). Button 64 is wheel up, 65 is wheel down, and both are a PRESS
+    // ('M'); a wheel has no release, so the lower-case 'm' form never appears.
+    QCOMPARE(vt::encodeMouseWheel(true, 12, 34, VtMouseEncoding::Sgr),
+             QByteArrayLiteral("\x1b[<64;12;34M"));
+    QCOMPARE(vt::encodeMouseWheel(false, 12, 34, VtMouseEncoding::Sgr),
+             QByteArrayLiteral("\x1b[<65;12;34M"));
+    // SGR is decimal text, so a coordinate past the legacy ceiling is exact.
+    QCOMPARE(vt::encodeMouseWheel(true, 300, 999, VtMouseEncoding::Sgr),
+             QByteArrayLiteral("\x1b[<64;300;999M"));
+
+    // Legacy: CSI M then three bytes, each offset by 32. 32+64 = 96 = '`',
+    // 32+1 = 33 = '!'.
+    QCOMPARE(vt::encodeMouseWheel(true, 1, 1, VtMouseEncoding::Legacy),
+             QByteArrayLiteral("\x1b[M`!!"));
+    QCOMPARE(vt::encodeMouseWheel(false, 1, 1, VtMouseEncoding::Legacy),
+             QByteArrayLiteral("\x1b[Ma!!"));
+
+    // A coordinate that cannot survive the packing is CLAMPED to 223, not
+    // wrapped. A wrapped column reports the wheel at a different cell, which in
+    // a split tmux window scrolls the wrong pane - silently.
+    const QByteArray clamped =
+        vt::encodeMouseWheel(true, 400, 400, VtMouseEncoding::Legacy);
+    QCOMPARE(clamped.size(), 6);
+    QCOMPARE(static_cast<unsigned char>(clamped.at(4)), 255u);  // 32 + 223
+    QCOMPARE(static_cast<unsigned char>(clamped.at(5)), 255u);
+
+    // Coordinates are 1-based on the wire; a caller that computed 0 or a
+    // negative from a press above the grid must not emit row 0.
+    QCOMPARE(vt::encodeMouseWheel(true, 0, -3, VtMouseEncoding::Sgr),
+             QByteArrayLiteral("\x1b[<64;1;1M"));
+}
+
+// DECSET 1006 selects an ENCODING; 1000/1002/1003 are what ask for events at
+// all. Conflating them - "any mouse bit is set" - would send SGR to a program in
+// the legacy mode, which receives no wheel whatsoever, and would report events
+// to a program that set only 1006 and asked for none.
+void TstVt::sgrModeIsIndependentOfTheModesThatAskForEvents()
+{
+    VtScreen screen;
+    screen.resize(80, 24);
+    QCOMPARE(screen.mouseEncoding(), VtMouseEncoding::None);
+
+    // 1006 ALONE: an encoding was chosen, but nothing was requested.
+    screen.write(csi("?1006h"));
+    QVERIFY(screen.mouseTrackingEnabled());  // the aggregate is true...
+    QCOMPARE(screen.mouseEncoding(), VtMouseEncoding::None);  // ...this is not
+
+    // Now a program asks for events, and the earlier 1006 decides the form.
+    screen.write(csi("?1000h"));
+    QCOMPARE(screen.mouseEncoding(), VtMouseEncoding::Sgr);
+
+    // Turning SGR off leaves the request standing, in the legacy form.
+    screen.write(csi("?1006l"));
+    QCOMPARE(screen.mouseEncoding(), VtMouseEncoding::Legacy);
+
+    // Any of the three request modes is enough on its own.
+    screen.write(csi("?1000l") + csi("?1002h"));
+    QCOMPARE(screen.mouseEncoding(), VtMouseEncoding::Legacy);
+    screen.write(csi("?1002l") + csi("?1003h"));
+    QCOMPARE(screen.mouseEncoding(), VtMouseEncoding::Legacy);
+    screen.write(csi("?1003l"));
+    QCOMPARE(screen.mouseEncoding(), VtMouseEncoding::None);
+
+    // This is what tmux actually sets, and it must resolve to SGR.
+    screen.write(csi("?1000h") + csi("?1002h") + csi("?1006h"));
+    QCOMPARE(screen.mouseEncoding(), VtMouseEncoding::Sgr);
+
+    // A reset clears the lot, so a program that exits without tidying up does
+    // not leave the next one being reported to.
+    screen.write(QByteArrayLiteral("\x1b" "c"));
+    QCOMPARE(screen.mouseEncoding(), VtMouseEncoding::None);
 }
 
 QTEST_GUILESS_MAIN(TstVt)

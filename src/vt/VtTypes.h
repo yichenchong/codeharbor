@@ -39,6 +39,19 @@ enum VtAttr : quint16 {
 inline constexpr QRgb VtDefaultForeground = 0x00000001u;
 inline constexpr QRgb VtDefaultBackground = 0x00000002u;
 
+// How a program wants mouse events reported, decided by the DECSET modes it has
+// turned on. This is deliberately NOT the aggregate "is any mouse mode set":
+// 1006 (SGR) selects an ENCODING and is independent of the modes that ask for
+// events at all (1000 click, 1002 drag, 1003 motion), so a program may set 1006
+// alone - in which case nothing should be reported - or ask for events without
+// it and require the legacy form. Sending SGR to a program in the legacy mode
+// yields no wheel at all, which is exactly the bug this type exists to prevent.
+enum class VtMouseEncoding {
+    None,    // no 1000/1002/1003: the program is not asking for mouse events
+    Legacy,  // CSI M with byte-packed, 1-based, offset-by-32 coordinates
+    Sgr      // CSI < b ; col ; row M (DECSET 1006)
+};
+
 // One character cell.
 //
 // `text` is a single code point, never a QString: the parser writes a cell for

@@ -14,6 +14,8 @@
 #include <QString>
 #include <Qt>
 
+#include "VtTypes.h"  // VtMouseEncoding
+
 namespace ch::vt {
 
 // Encode one key press.
@@ -44,5 +46,29 @@ QByteArray encodeKey(int qtKey, Qt::KeyboardModifiers mods, const QString &text,
 // early and have the rest of itself executed, and a paste containing a bare ESC
 // could inject any escape sequence at all.
 QByteArray encodePaste(const QString &text, bool bracketedPaste);
+
+// Encode ONE mouse-wheel notch as a button report.
+//
+// A wheel notch is reported as a button press with no matching release: xterm
+// assigns 64 to wheel-up and 65 to wheel-down, and nothing sends a release for
+// them. `column` and `row` are 1-based cell coordinates.
+//
+// Why this exists at all: tmux runs on the ALTERNATE screen, which has no
+// scrollback of its own, so a client cannot scroll it by moving a local view
+// offset - there is nothing above the screen to move to. tmux owns that history
+// and only reveals it when it receives a wheel event, which is why the session
+// turns `mouse on`. So scrolling an attached tmux means SENDING these bytes.
+//
+// `encoding` must come from VtScreen::mouseEncoding(), not from a "mouse is on"
+// boolean:
+//   None   -> returns empty. The program asked for no events; the caller should
+//             fall back to whatever local scrollback it has.
+//   Legacy -> CSI M followed by three bytes, each a coordinate or button offset
+//             by 32. Coordinates are CLAMPED to 223, the largest value that
+//             survives that packing, because a byte cannot carry more and a
+//             wrapped value would report a wheel somewhere else entirely.
+//   Sgr    -> CSI < b ; col ; row M, which has no coordinate ceiling.
+QByteArray encodeMouseWheel(bool up, int column, int row,
+                            VtMouseEncoding encoding);
 
 } // namespace ch::vt

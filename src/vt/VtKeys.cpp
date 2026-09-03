@@ -256,4 +256,51 @@ QByteArray encodePaste(const QString &text, bool bracketedPaste)
     return out;
 }
 
+QByteArray encodeMouseWheel(bool up, int column, int row,
+                            VtMouseEncoding encoding)
+{
+    if (encoding == VtMouseEncoding::None)
+        return {};
+
+    // xterm's wheel buttons. There is no release event for either.
+    const int button = up ? 64 : 65;
+
+    // A cell coordinate is 1-based on the wire. A caller that computed 0 from a
+    // press above the first row would otherwise report row 0, which no program
+    // expects.
+    const int col = column < 1 ? 1 : column;
+    const int line = row < 1 ? 1 : row;
+
+    if (encoding == VtMouseEncoding::Sgr) {
+        QByteArray out;
+        out.reserve(16);
+        out += "\x1b[<";
+        out += QByteArray::number(button);
+        out += ';';
+        out += QByteArray::number(col);
+        out += ';';
+        out += QByteArray::number(line);
+        // 'M' is press. SGR spells release 'm', and a wheel has none, so this
+        // is always the upper case form.
+        out += 'M';
+        return out;
+    }
+
+    // Legacy: every field is a single byte carrying value + 32, so the largest
+    // representable coordinate is 223 (255 - 32). Clamp rather than wrap: a
+    // wrapped column reports the wheel at a different cell, which in a pane-
+    // splitting program like tmux means scrolling the WRONG pane.
+    constexpr int kLegacyMax = 223;
+    const int packedCol = col > kLegacyMax ? kLegacyMax : col;
+    const int packedRow = line > kLegacyMax ? kLegacyMax : line;
+
+    QByteArray out;
+    out.reserve(6);
+    out += "\x1b[M";
+    out += static_cast<char>(static_cast<unsigned char>(32 + button));
+    out += static_cast<char>(static_cast<unsigned char>(32 + packedCol));
+    out += static_cast<char>(static_cast<unsigned char>(32 + packedRow));
+    return out;
+}
+
 } // namespace ch::vt

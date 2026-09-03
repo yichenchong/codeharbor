@@ -95,6 +95,15 @@ public:
         VtScreen::kMaxColumns < 2048 ? VtScreen::kMaxColumns : 2048;
     static constexpr int kMaxRows = VtScreen::kMaxRows < 2048 ? VtScreen::kMaxRows : 2048;
 
+    // Most notches one gesture may turn into reports.
+    //
+    // A flick over a tall pane can compute dozens, and each is a separate
+    // three-to-eight byte report on the same flow-controlled channel as typing.
+    // Capping keeps one enthusiastic swipe from queueing a kilobyte of input the
+    // user then has to wait out; the gesture continues, so a longer drag still
+    // scrolls further, it simply cannot burst.
+    static constexpr int kMaxWheelNotchesPerGesture = 24;
+
     // `factory` is the application's ch::TerminalFactory (the `terminalFactory`
     // QML context property); not owned, and a null one leaves this session inert
     // chrome that explains itself instead of crashing, exactly like the desktop
@@ -146,6 +155,23 @@ public:
     // Clipboard content, wrapped in the bracketed-paste guards when the remote
     // program has asked for them, so a shell can tell pasted text from typing.
     Q_INVOKABLE void paste(const QString &text);
+
+    // Scroll the REMOTE program by turning a gesture into wheel reports.
+    //
+    // This is the only way to scroll an attached tmux. tmux runs on the
+    // alternate screen, which has no scrollback of its own, so moving a local
+    // view offset has nothing to move to - ch::VtScreen deliberately feeds
+    // history only from the primary screen. tmux owns that history and reveals
+    // it on a wheel event, which is why the session turns `mouse on`.
+    //
+    // `notches` is positive for scrolling UP into older output and negative for
+    // down, `column`/`row` are 1-based cell coordinates under the gesture, which
+    // decide WHICH tmux pane scrolls when the window is split.
+    //
+    // Returns false when the remote program asked for no mouse events, so the
+    // caller can fall back to its own scrollback - which on the primary screen
+    // is real, and is the right behaviour for a bare shell.
+    Q_INVOKABLE bool sendMouseWheel(int notches, int column, int row);
 
     // The view's cell grid changed. Resizes the screen AND pushes an SSH
     // window-change, and is remembered so a later attach opens at this size.

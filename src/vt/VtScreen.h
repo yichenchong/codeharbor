@@ -94,6 +94,12 @@ public:
     bool applicationCursorKeys() const { return m_applicationCursorKeys; }
     bool bracketedPaste() const { return m_bracketedPaste; }
     bool mouseTrackingEnabled() const { return m_mouseTracking != 0; }
+    // Which report form a wheel or click must take, if any. Kept separate from
+    // mouseTrackingEnabled() above, which is the aggregate "any mouse bit set"
+    // that drives the modesChanged signal: that aggregate is true for a program
+    // which set only 1006, and such a program is selecting an encoding without
+    // asking for events. Reporting to it would be wrong, so this returns None.
+    VtMouseEncoding mouseEncoding() const;
     bool autowrap() const { return m_autowrap; }
 
     // Change the grid size.

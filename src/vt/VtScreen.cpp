@@ -1121,6 +1121,18 @@ void VtScreen::applySgr(const int *params, const bool *isSubParam, int count)
 
 // --- reports and modes ------------------------------------------------------
 
+VtMouseEncoding VtScreen::mouseEncoding() const
+{
+    // 1000/1002/1003 are the modes that ASK for events; 1006 only picks how
+    // they are written. A program with 1006 and nothing else wants no events.
+    const bool reports =
+        (m_mouseTracking & (MouseClick | MouseDrag | MouseMotion)) != 0;
+    if (!reports)
+        return VtMouseEncoding::None;
+    return (m_mouseTracking & MouseSgr) ? VtMouseEncoding::Sgr
+                                        : VtMouseEncoding::Legacy;
+}
+
 void VtScreen::deviceStatusReport(int mode)
 {
     switch (mode) {

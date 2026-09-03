@@ -128,6 +128,7 @@ private slots:
     void aHiddenReplayLargerThanTheCreditWindowArrivesInOrder();
     void sendKeyEncodesControlAndArrowsInBothCursorModes();
     void pasteBracketsOnlyWhenTheRemoteAskedForIt();
+    void aSwipeScrollsAnAttachedTmuxThroughWheelReports();
     void answerbackFromTheScreenReachesThePty();
     void closeStopsFlushingAndNeverExposesKill();
     void anAnswerThisPaneIsNotWaitingForIsNeverAttached();
@@ -331,6 +332,83 @@ void TstMobileTerminal::pasteBracketsOnlyWhenTheRemoteAskedForIt()
     QCOMPARE(channel.written(), QByteArray("\x1b[200~echo hi\x1b[201~"));
 }
 
+// The bug this feature exists for, reproduced at the layer that has it.
+//
+// tmux runs on the ALTERNATE screen. VtScreen deliberately feeds no scrollback
+// from there, so totalLines() never exceeds the visible rows, MobileTerminalView
+// clamps its offset to 0, and a swipe moved nothing at all - which is exactly
+// what "scrolling does not work on the phone" was. tmux owns that history and
+// reveals it only on a wheel event, which is why the session enables `mouse on`.
+//
+// A synthetic PRIMARY-screen fixture would pass while proving none of this, so
+// this test puts the screen where the real one is: alt active, tmux's own modes
+// set, and history provably empty.
+void TstMobileTerminal::aSwipeScrollsAnAttachedTmuxThroughWheelReports()
+{
+    MobileTerminalSession session(nullptr);
+    FakeChannel channel;
+    session.controller()->setTransport(&channel);
+    session.resize(80, 24);
+
+    // Before any program asks: no reports, so the caller keeps its local
+    // scrollback behaviour and we say so by returning false.
+    QVERIFY(!session.sendMouseWheel(1, 5, 5));
+    QCOMPARE(channel.written(), QByteArray());
+
+    // What `tmux attach` actually does: alternate screen, mouse on, SGR.
+    session.controller()->ingestOutput(QByteArrayLiteral(
+        "\x1b[?1049h\x1b[?1000h\x1b[?1002h\x1b[?1006h"));
+    QTRY_VERIFY(session.screen()->altScreenActive());
+    QCOMPARE(session.screen()->mouseEncoding(), VtMouseEncoding::Sgr);
+
+    // Fill the screen and then some. On the alt screen NONE of it becomes
+    // history: this is the assertion that pins why a local offset cannot work.
+    for (int line = 0; line < 200; ++line)
+        session.controller()->ingestOutput(QByteArrayLiteral("filler\r\n"));
+    QTRY_COMPARE(session.screen()->historyLines(), 0);
+    QCOMPARE(session.screen()->totalLines(), 24);
+
+    // A swipe up by three notches, at a cell inside the pane.
+    channel.clearWritten();
+    QVERIFY(session.sendMouseWheel(3, 7, 9));
+    QCOMPARE(channel.written(),
+             QByteArray("\x1b[<64;7;9M\x1b[<64;7;9M\x1b[<64;7;9M"));
+
+    // And down, which is the other button.
+    channel.clearWritten();
+    QVERIFY(session.sendMouseWheel(-2, 7, 9));
+    QCOMPARE(channel.written(), QByteArray("\x1b[<65;7;9M\x1b[<65;7;9M"));
+
+    // A program in the legacy mode gets the legacy bytes, not SGR - sending SGR
+    // there produces no wheel at all.
+    session.controller()->ingestOutput(QByteArrayLiteral("\x1b[?1006l"));
+    QTRY_COMPARE(session.screen()->mouseEncoding(), VtMouseEncoding::Legacy);
+    channel.clearWritten();
+    QVERIFY(session.sendMouseWheel(1, 1, 1));
+    QCOMPARE(channel.written(), QByteArray("\x1b[M`!!"));
+
+    // Zero notches is not an event.
+    channel.clearWritten();
+    QVERIFY(!session.sendMouseWheel(0, 1, 1));
+    QCOMPARE(channel.written(), QByteArray());
+
+    // One flick cannot queue an unbounded burst on the same channel as typing.
+    channel.clearWritten();
+    QVERIFY(session.sendMouseWheel(10000, 1, 1));
+    QCOMPARE(channel.written().size(),
+             MobileTerminalSession::kMaxWheelNotchesPerGesture * 6);
+
+    // When tmux detaches and the shell is back on the primary screen, reporting
+    // stops and the local scrollback - which is real there - takes over again.
+    session.controller()->ingestOutput(
+        QByteArrayLiteral("\x1b[?1000l\x1b[?1002l\x1b[?1049l"));
+    QTRY_VERIFY(!session.screen()->altScreenActive());
+    QCOMPARE(session.screen()->mouseEncoding(), VtMouseEncoding::None);
+    channel.clearWritten();
+    QVERIFY(!session.sendMouseWheel(2, 1, 1));
+    QCOMPARE(channel.written(), QByteArray());
+}
+
 // A Device Status Report is a QUESTION, and a terminal that never answers hangs
 // the asker. The screen produces the answer and the session is what puts it on
 // the PTY.
@@ -394,6 +472,13 @@ void TstMobileTerminal::closeStopsFlushingAndNeverExposesKill()
                           QStringLiteral("pasteFromClipboard"),
                           QStringLiteral("resize"),
                           QStringLiteral("sendKey"),
+                          // Scrolls the remote by writing WHEEL REPORTS. It is
+                          // on this list because it writes to the PTY, and it is
+                          // safe for the same reason paste() is: the page
+                          // supplies a notch count and a cell, never bytes.
+                          // Sorted between sendKey and sendText: the list is
+                          // compared against a sorted enumeration.
+                          QStringLiteral("sendMouseWheel"),
                           QStringLiteral("sendText"),
                           QStringLiteral("setVisible")}));
 }

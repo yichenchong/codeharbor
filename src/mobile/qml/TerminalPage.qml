@@ -317,17 +317,45 @@ Page {
     // Above the TextInput on purpose: a tap must focus the terminal and raise the
     // keyboard, not place a caret in an invisible text field. Focus is independent
     // of stacking, so the input below still receives every key.
+    //
+    // A vertical drag scrolls in ONE of two ways, and the difference is not
+    // cosmetic:
+    //
+    //   * If the remote program asked for mouse events, the drag becomes WHEEL
+    //     REPORTS sent to it. This is the only thing that scrolls an attached
+    //     tmux: tmux runs on the alternate screen, which has no scrollback of
+    //     its own, so `view.scrollOffset` has nothing to move to - VtScreen
+    //     feeds history from the primary screen only. tmux owns that history and
+    //     reveals it on a wheel event. Moving the local offset here was the
+    //     original bug: the offset clamped to 0 every time and nothing moved.
+    //
+    //   * Otherwise the drag moves the LOCAL offset, which is right for a bare
+    //     shell on the primary screen where the scrollback really is ours.
+    //
+    // The choice is remade on every delivery rather than latched at press,
+    // because a program can turn mouse reporting on or off mid-gesture and the
+    // session answers false the moment it does.
     MouseArea {
         id: gestures
         anchors.fill: view
 
+        // Three lines per notch, matching what a wheel notch conventionally
+        // scrolls, so content roughly follows the finger instead of racing it.
+        readonly property int linesPerNotch: 3
+
         property real pressY: 0
         property int pressOffset: 0
         property bool dragging: false
+        // Travel not yet converted into a notch. Kept as a remainder so a slow
+        // drag accumulates instead of rounding every delivery to zero.
+        property real wheelTravel: 0
+        property real lastY: 0
 
         onPressed: (mouse) => {
             gestures.pressY = mouse.y
+            gestures.lastY = mouse.y
             gestures.pressOffset = view.scrollOffset
+            gestures.wheelTravel = 0
             gestures.dragging = false
         }
         onPositionChanged: (mouse) => {
@@ -335,9 +363,34 @@ Page {
             if (!gestures.dragging && Math.abs(dy) < Qt.styleHints.startDragDistance)
                 return
             gestures.dragging = true
-            // Dragging DOWN pulls older lines into view, which is the direction
-            // the content moves under the finger.
-            view.scrollOffset = gestures.pressOffset + Math.round(dy / view.lineHeight)
+
+            const lineHeight = view.lineHeight
+            if (lineHeight <= 0)
+                return
+
+            gestures.wheelTravel += mouse.y - gestures.lastY
+            gestures.lastY = mouse.y
+
+            const step = lineHeight * gestures.linesPerNotch
+            // Math.trunc, not round: a partial notch must stay in the remainder.
+            const notches = Math.trunc(gestures.wheelTravel / step)
+            if (notches !== 0) {
+                gestures.wheelTravel -= notches * step
+                // 1-based CELL under the finger. It decides which tmux pane
+                // scrolls when the window is split, so it is the finger's
+                // position, not the pane's origin.
+                const cellWidth = Math.max(1, view.cellWidth)
+                const column = Math.floor(mouse.x / cellWidth) + 1
+                const row = Math.floor(mouse.y / lineHeight) + 1
+                // Dragging DOWN reveals OLDER output, which is a wheel UP.
+                if (page.session
+                        && page.session.sendMouseWheel(notches, column, row))
+                    return
+            }
+
+            // Local fallback, unchanged: absolute from the press, so a drag
+            // back up returns exactly where it started.
+            view.scrollOffset = gestures.pressOffset + Math.round(dy / lineHeight)
         }
         onClicked: {
             if (gestures.dragging)
