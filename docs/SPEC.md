@@ -1719,22 +1719,32 @@ The client may store only:
 - whether the sidebar's pin filter is on, and whether archived sessions are shown;
 - which handler opens which file type (§4.6);
 - SSH-agent or credential-store references;
+- one copy of an SSH private key, per key the user has explicitly asked to keep, and only within every
+  limit stated in this entry: the copy is made by a user action and is opt-in for that one key, never a
+  default and never implied by saving a profile; it is written only into storage private to this
+  application, in a file whose permissions permit the owner to read and write it and nobody else; it is
+  excluded from operating-system backup, so keeping it on this device does not copy it off the device; and
+  the surface that offers to keep it also offers to delete it, which removes the file. Anything the user
+  has not asked to keep is not kept;
 - browser cookies and cache;
 - temporary reconnect state.
 
 The client must not store project repositories or project files.
 The current profile store records connection metadata (including host, port, user,
 remote Node path, repository root, and an optional local identity-file path) but
-never stores a password, passphrase, private-key bytes, repository, or project
-file.
+never stores a password, passphrase, repository, or project file. Private-key
+bytes are stored only by the per-key copy the list above permits, under all of
+that entry's limits, and never as a side effect of saving a profile.
 
-The mobile clients store strictly less. They reuse this same profile store and the
-same client-local keys (§4.5 last-open session and last-used pane, via
-`ch::UiStateStore`), and they add nothing to the list above: an imported SSH key
-is held in memory for the session or referenced where the user keeps it, never
-copied into app storage — see the mobile note in §12.1. The identity-file entry a
-mobile profile records is that reference, which is the "SSH-agent or
-credential-store reference" this section already allows and not key material.
+The mobile clients store less than the desktop, with one exception. They reuse
+this same profile store and the same client-local keys (§4.5 last-open session
+and last-used pane, via `ch::UiStateStore`), and the exception is the private-key
+copy: an imported SSH key is held in memory for the session, or referenced where
+the user keeps it, or — if the user asks for that one key — copied into
+app-private storage under the limits of that entry. See the mobile note in §12.1.
+The identity-file entry a mobile profile records is the reference case, which is
+the "SSH-agent or credential-store reference" this section already allows and not
+key material.
 
 ### 11.3 Unsaved Recovery
 
@@ -1805,32 +1815,74 @@ Requirements:
 
 > **Implementation status.** No credential store is integrated. A password or
 > key passphrase is prompted for, handed straight to libssh for that one
-> authentication attempt, and then discarded; nothing is written anywhere. The
-> profile store (`src/app/ServerProfiles.h`) applies a field whitelist that
-> drops a stray `password`/`passphrase` key before writing, so a secret cannot
-> reach disk even by accident. The requirement above is therefore met in its
-> strong form — no secret is persisted at all — at the cost of retyping it each
-> connection.
+> authentication attempt, and then discarded; nothing about it is written
+> anywhere. The profile store (`src/app/ServerProfiles.h`) applies a field
+> whitelist that drops a stray `password`/`passphrase` key before writing, so a
+> secret cannot reach disk even by accident. For passwords and passphrases the
+> requirement above is therefore met in its strong form — no secret is persisted
+> at all — at the cost of retyping it each connection.
 >
-> **On Android and iOS** the same rule extends from the passphrase to the key
-> itself, because a phone has no `~/.ssh` to have put one in and no ssh-agent to
-> ask: `SSH_AUTH_SOCK` is unset, `QDir::homePath()` is the app sandbox, and the
-> platform pickers hand an app a document rather than a directory it may
-> enumerate. `ch::MobileKeyStore` (`src/mobile/MobileKeyStore.h`) therefore
-> offers exactly two credential paths and no third. A key pasted or picked for
-> the session is held in memory, handed to libssh through
-> `SshConnectionPool::setInMemoryIdentity()`, and wiped — nothing is written, not
-> even temporarily, because a temporary file is still client-stored key bytes.
-> Alternatively the key stays in the user's OWN storage and the client persists
-> only a REFERENCE to it (an Android persistable document-URI grant, an Apple
-> security-scoped bookmark, or a plain path), in the existing `identityFile`
-> field §11.2 already permits; the bytes are re-read into memory at connect time.
-> An explicit disconnect drops all of it —
-> `MobileAppController::disconnect()` calls `MobileKeyStore::forgetSession()`,
-> which wipes in-memory keys, any armed passphrase and the pool's installed
-> identity. No keychain or Keystore integration is faked: with nothing persisted
-> there is nothing for one to protect, and the cost is the same retyping the
-> desktop already accepts.
+> **On Android and iOS** the passphrase rule is unchanged, but the KEY has a
+> third path, because a phone has no `~/.ssh` to have put one in and no ssh-agent
+> to ask: `SSH_AUTH_SOCK` is unset, `QDir::homePath()` is the app sandbox, and
+> the platform pickers hand an app a document rather than a directory it may
+> enumerate. `ch::MobileKeyStore` (`src/mobile/MobileKeyStore.h`) offers exactly
+> these three credential paths and no fourth:
+>
+> 1. **In memory for the session** — the default, and what an import does unless
+>    the user asks for more. A key pasted or picked is held in memory, handed to
+>    libssh through `SshConnectionPool::setInMemoryIdentity()`, and wiped;
+>    nothing is written, not even temporarily: an unasked-for temporary file is
+>    exactly the copy §11.2 does not permit, since it is neither something the
+>    user chose to keep nor something the UI can offer to delete.
+> 2. **A reference to the key where the user keeps it** — the key stays in the
+>    user's OWN storage and the client persists only a REFERENCE to it (an
+>    Android persistable document-URI grant, an Apple security-scoped bookmark,
+>    or a plain path), in the existing `identityFile` field §11.2 already
+>    permits; the bytes are re-read into memory at connect time.
+> 3. **A copy on this device** — `saveKeyOnDevice(name)` writes the already
+>    imported in-memory key into app-private storage, `isSavedOnDevice(name)`
+>    reports whether a key is there, and `forgetSavedKey(name)` deletes the file
+>    and drops the in-memory copy. This is opt-in for the one named key: an
+>    import never saves by itself, and `keyInfo(name)` carries a `saved` bool so
+>    the UI can only ever offer it as a deliberate extra step.
+>
+> The copy lives in `QStandardPaths::AppDataLocation` + `/keys`, a directory
+> created owner-accessible only, one file per key, written with `QSaveFile` so a
+> half-written key never replaces a good one and with permissions restricted to
+> owner read/write (0600). It is kept out of operating-system backup at both
+> ends: Android sets `android:allowBackup="false"`
+> (`packaging/android/AndroidManifest.xml:111`), and on iOS the file gets
+> `NSURLIsExcludedFromBackupKey`, so a saved key does not ride an iCloud or
+> adb backup off the device. Nothing about it reaches QSettings, a log line, or
+> a `Q_PROPERTY` QML can read — QML sees names and the `saved` flag, never bytes.
+>
+> A saved key deliberately outlives the session: `forgetSession()` still wipes
+> in-memory keys, any armed passphrase and the pool's installed identity —
+> `MobileAppController::disconnect()` calls it — but it does not touch the files,
+> because a key the user asked this device to keep is not session state. Removing
+> it is `forgetSavedKey()`, from the UI. `allKeyNames` therefore lists saved keys
+> alongside the session's, so a key kept on a previous launch is there to select
+> without importing it again.
+>
+> **What this costs.** For a saved key the strong property above is gone: there
+> IS now a secret on disk. The sandbox is the whole of the protection, so an
+> attacker holding the unlocked, and on Android an unlocked-and-rooted, device
+> gets that key; the storage rules — app-private, 0600, no backup, delete from
+> the UI — bound the exposure, and encryption would not change the answer here,
+> since a key usable without retyping anything must be decryptable without the
+> user, which means the decryption material sits in the same sandbox as the
+> ciphertext. No keychain or Keystore integration is faked to suggest otherwise.
+> Passphrases are still never persisted, so an encrypted key saved on the device
+> is only as usable as the passphrase the user retypes.
+>
+> **The alternative that needs no relaxation** stays available and is the
+> recommended one for a pasted key: export it, on the user's action, to a
+> document location the USER chooses through the platform picker, and keep only
+> the reference (path 2). That is compliant by construction — the bytes live in
+> the user's own storage under the user's own management, exactly as on the
+> desktop, and §11.2 needed no new entry for it. Path 3 exists for the user who
+> wants no second store to manage; it does not replace this one.
 
 ### 12.2 Viewer Isolation
 

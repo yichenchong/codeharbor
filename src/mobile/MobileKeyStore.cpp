@@ -9,6 +9,7 @@
 #include <QFile>
 #include <QFileInfo>
 #include <QRegularExpression>
+#include <QSaveFile>
 #include <QStandardPaths>
 #include <QVariantList>
 
@@ -355,17 +356,43 @@ MobileKeyStore::KeyDescription MobileKeyStore::describeKeyText(const QString& te
 MobileKeyStore::MobileKeyStore(QString rootDirectory, QObject* parent)
     : QObject(parent)
 {
-    // The ONLY path this class derives, and it is not for key material: the
-    // trusted-host store, at exactly the location SessionBootstrap's constructor
-    // already derives, so handing this value to setKnownHostsPath() changes
-    // nothing and documents everything. There is deliberately no keys directory
-    // anywhere in this class — see the header for why.
+    // The trusted-host store, at exactly the location SessionBootstrap's
+    // constructor already derives, so handing this value to
+    // setKnownHostsPath() changes nothing and documents everything.
     m_knownHostsPath =
         rootDirectory.isEmpty()
             ? QDir(QStandardPaths::writableLocation(
                        QStandardPaths::AppConfigLocation))
                   .filePath(QStringLiteral("known_hosts"))
             : QDir(rootDirectory).filePath(QStringLiteral("known_hosts"));
+
+    // The saved-key directory (path 3). AppDataLocation and not
+    // AppConfigLocation: this holds key material rather than configuration, and
+    // the two are the same directory on Android anyway — the distinction that
+    // matters is that both are private to this application. NOT created here;
+    // ensureSavedKeyDirectory() creates it on the first save, so a user who never
+    // saves a key leaves no keys directory behind at all.
+    m_savedKeysDirectory =
+        rootDirectory.isEmpty()
+            ? QDir(QStandardPaths::writableLocation(
+                       QStandardPaths::AppDataLocation))
+                  .filePath(QStringLiteral("keys"))
+            : QDir(rootDirectory).filePath(QStringLiteral("keys"));
+
+    // Adopt what the last launch saved: NAMES only. The bytes are read when a
+    // connect or a keyInfo() asks for them, so a store with ten saved keys holds
+    // none of them in memory — and an entry whose name would not pass
+    // isUsableKeyName() is ignored rather than offered, because this class never
+    // wrote it and cannot build a path back to it through savedKeyPath().
+    const QFileInfoList entries =
+        QDir(m_savedKeysDirectory)
+            .entryInfoList(QDir::Files | QDir::Hidden, QDir::Name);
+    for (const QFileInfo& entry : entries) {
+        const QString name = entry.fileName();
+        if (isUsableKeyName(name))
+            m_savedNames.append(name);
+    }
+    m_savedNames.sort();
 }
 
 MobileKeyStore::~MobileKeyStore()
@@ -397,8 +424,18 @@ void MobileKeyStore::setConnectionPool(SshConnectionPool* pool)
 
 QStringList MobileKeyStore::allKeyNames() const
 {
+    // Referenced first, then saved, then session-only: the credentials that
+    // survived the last launch come before the one that has to be pasted again.
     QStringList names = m_referenceNames;
-    names += m_keyNames;
+    names += m_savedNames;
+    // A saved key is usually ALSO in m_keyNames — saveKeyOnDevice() keeps the
+    // imported copy in memory — so the in-memory list is filtered rather than
+    // appended wholesale. Two entries for one credential would let the connect
+    // page offer the same key twice and let a "remove" act on the wrong one.
+    for (const QString& name : m_keyNames) {
+        if (!m_savedNames.contains(name))
+            names += name;
+    }
     return names;
 }
 
@@ -417,7 +454,8 @@ bool MobileKeyStore::claimName(const QString& name)
                         "dashes or underscores."));
         return false;
     }
-    if (m_memoryKeys.contains(name) || m_references.contains(name)) {
+    if (m_memoryKeys.contains(name) || m_references.contains(name)
+        || m_savedNames.contains(name)) {
         setLastError(tr("A key named \"%1\" is already loaded. Remove it first "
                         "if you mean to replace it.")
                          .arg(name));
@@ -598,20 +636,262 @@ QString MobileKeyStore::referenceFor(QString name) const
 }
 
 // ---------------------------------------------------------------------------
+// path 3: saved on this device (opt-in, per key)
+// ---------------------------------------------------------------------------
+
+QString MobileKeyStore::savedKeyPath(const QString& name) const
+{
+    // The name reaches the FILENAME verbatim, so validating it and building the
+    // path are one act with one spelling. A name that fails here — "../evil",
+    // "a/b", ".hidden", 400 characters — yields an empty string, and every caller
+    // treats that as "refuse", so no unvalidated name can ever become a path.
+    // QDir::filePath() would happily resolve "../evil" into a write outside the
+    // app's own data directory.
+    if (!isUsableKeyName(name))
+        return {};
+    return QDir(m_savedKeysDirectory).filePath(name);
+}
+
+bool MobileKeyStore::ensureSavedKeyDirectory()
+{
+    QDir directory(m_savedKeysDirectory);
+    if (!directory.exists() && !directory.mkpath(QStringLiteral("."))) {
+        setLastError(tr("Could not create the folder for saved keys, so the key "
+                        "was not saved."));
+        return false;
+    }
+
+    // mkpath() has no permissions argument and applies the process umask, so the
+    // mode is set afterwards rather than at creation. That is a window, and it is
+    // an acceptable one: the directory is empty until the write below, and the
+    // FILE is what carries the key — its own permissions are set while it is
+    // still the unnamed temporary QSaveFile holds.
+    const QFile::Permissions ownerOnlyDirectory =
+        QFileDevice::ReadOwner | QFileDevice::WriteOwner
+        | QFileDevice::ExeOwner;
+    QFile::setPermissions(m_savedKeysDirectory, ownerOnlyDirectory);
+#ifdef Q_OS_UNIX
+    // VERIFIED, not assumed: setPermissions() can fail silently on a filesystem
+    // that does not carry POSIX modes, and a directory anyone can list is not
+    // where a private key goes. Only the group and other bits are checked, so a
+    // platform that adds owner bits of its own is not treated as a failure.
+    //
+    // Unix only, and Android and iOS are both Unix. On Windows QFile::permissions()
+    // synthesises the POSIX bits from an ACL and reports the group/other read bits
+    // set for an ordinary user directory, so the same check there would refuse
+    // every save on the desktop build this shell is developed against — while
+    // saying nothing true about the ACL that actually governs access.
+    const QFile::Permissions leaked =
+        QFile::permissions(m_savedKeysDirectory)
+        & ~(ownerOnlyDirectory | QFileDevice::ReadUser | QFileDevice::WriteUser
+            | QFileDevice::ExeUser);
+    if (leaked != QFile::Permissions()) {
+        setLastError(tr("The folder for saved keys cannot be made private on "
+                        "this device, so the key was not saved."));
+        return false;
+    }
+#endif
+    return true;
+}
+
+bool MobileKeyStore::saveKeyOnDevice(QString name)
+{
+    name = name.trimmed();
+    // Validated BEFORE any filesystem call, and through the one function that
+    // both validates and builds the path.
+    const QString path = savedKeyPath(name);
+    if (path.isEmpty()) {
+        setLastError(tr("Give the key a name of 1 to 64 letters, digits, dots, "
+                        "dashes or underscores."));
+        return false;
+    }
+    if (m_savedNames.contains(name)) {
+        setLastError(tr("\"%1\" is already saved on this device.").arg(name));
+        return false;
+    }
+    if (!m_memoryKeys.contains(name)) {
+        // A referenced key is refused rather than copied: path 2's whole promise
+        // is that the key stays in the user's own storage, and duplicating it into
+        // app storage behind a "save" switch would quietly break it.
+        setLastError(m_references.contains(name)
+                         ? tr("\"%1\" is a key file you manage yourself, which "
+                              "is already remembered without copying it.")
+                               .arg(name)
+                         : tr("There is no loaded key by that name."));
+        return false;
+    }
+    if (!ensureSavedKeyDirectory())
+        return false;
+
+    // QSaveFile: the bytes go to a temporary file in the same directory and are
+    // renamed into place by commit(), so an interrupted save leaves no file
+    // rather than half a key that fails to parse at the next launch.
+    //
+    // Permissions are set on the OPEN temporary file, before a single byte of key
+    // material is written to it, and survive the rename — rather than on the
+    // final path afterwards, which would leave the key readable for however long
+    // the second call took.
+    QSaveFile out(path);
+    if (!out.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+        setLastError(tr("Could not save the key (%1).").arg(out.errorString()));
+        return false;
+    }
+    const QFile::Permissions ownerOnlyFile =
+        QFileDevice::ReadOwner | QFileDevice::WriteOwner;
+    if (!out.setPermissions(ownerOnlyFile)) {
+        out.cancelWriting();
+        setLastError(tr("The saved key cannot be made private on this device, "
+                        "so it was not saved."));
+        return false;
+    }
+
+    // `material` shares the buffer this object keeps under `name`, so
+    // wipeKeyMaterial() detaches before filling: the copy in m_memoryKeys is the
+    // key the session is still using and must survive. What is scrubbed is this
+    // function's own reference, and the detach makes that a real erase of a real
+    // buffer rather than a no-op on a shared one.
+    QByteArray material = m_memoryKeys.value(name);
+    const qint64 written = out.write(material);
+    const bool complete = (written == qint64(material.size()));
+    wipeKeyMaterial(material);
+    if (!complete || !out.commit()) {
+        // commit() failed -> nothing was renamed into place. A partial write that
+        // was never committed leaves the temporary file removed by QSaveFile
+        // itself, so there is nothing here to clean up.
+        out.cancelWriting();
+        setLastError(tr("Could not save the key (%1).").arg(out.errorString()));
+        return false;
+    }
+
+#ifdef Q_OS_UNIX
+    // The same verification the directory gets, for the same reason and with the
+    // same platform caveat: a key file the group or the world can read is worse
+    // than a save the user has to be told did not happen, so a wider mode deletes
+    // the file instead of leaving it there.
+    const QFile::Permissions leaked =
+        QFile::permissions(path)
+        & ~(ownerOnlyFile | QFileDevice::ReadUser | QFileDevice::WriteUser);
+    if (leaked != QFile::Permissions()) {
+        QFile::remove(path);
+        setLastError(tr("The saved key cannot be made private on this device, "
+                        "so it was not saved."));
+        return false;
+    }
+#endif
+
+#ifdef Q_OS_IOS
+    // iOS backs up the whole app container except <Caches> and <tmp>, so the file
+    // has to opt out by name. A failure here deletes the file: a key that would
+    // be copied into iCloud is not what the user agreed to keep on this device.
+    QString backupError;
+    if (!excludeFromDeviceBackup(path, &backupError)) {
+        QFile::remove(path);
+        setLastError(backupError.isEmpty()
+                         ? tr("The key could not be kept out of the device "
+                              "backup, so it was not saved.")
+                         : backupError);
+        return false;
+    }
+#endif
+
+    m_savedNames.append(name);
+    m_savedNames.sort();
+    setLastError(QString());
+    emit keyNamesChanged();
+    return true;
+}
+
+bool MobileKeyStore::isSavedOnDevice(QString name) const
+{
+    return m_savedNames.contains(name.trimmed());
+}
+
+bool MobileKeyStore::deleteSavedKeyFile(const QString& name)
+{
+    if (!m_savedNames.contains(name))
+        return false;
+    // The name came out of m_savedNames, which only ever admits names that pass
+    // isUsableKeyName(), so this cannot be empty — the check is here because a
+    // path built from a name is the one thing in this class that must never be
+    // done without it.
+    const QString path = savedKeyPath(name);
+    const bool removed = !path.isEmpty() && QFile::remove(path);
+    // Dropped from the list whatever the unlink did. A name whose file could not
+    // be removed is not a credential this store should keep offering, and the next
+    // launch's directory scan is the authority on what is actually there.
+    m_savedNames.removeAll(name);
+    return removed;
+}
+
+bool MobileKeyStore::forgetSavedKey(QString name)
+{
+    name = name.trimmed();
+    if (!m_savedNames.contains(name)) {
+        setLastError(tr("There is no key by that name saved on this device."));
+        return false;
+    }
+    const bool deleted = deleteSavedKeyFile(name);
+
+    // The in-memory copy goes too: "delete the key from this device" that left it
+    // usable for the rest of the run would be a lie the user cannot see through.
+    const auto inMemory = m_memoryKeys.find(name);
+    if (inMemory != m_memoryKeys.end()) {
+        wipeKeyMaterial(inMemory.value());
+        m_memoryKeys.erase(inMemory);
+        m_keyNames.removeAll(name);
+    }
+    // And the pool's copy, when this is the credential it is holding — same
+    // reasoning as removeKey(), and the same restriction to the INSTALLED name so
+    // deleting one key does not disarm the live session's other one.
+    if (m_installedIdentityName == name) {
+        if (m_pool)
+            m_pool->clearInMemoryIdentity();
+        m_installedIdentityName.clear();
+    }
+    if (m_armedPassphraseName == name)
+        forgetPassphrase();
+
+    if (!deleted) {
+        setLastError(tr("The saved copy of \"%1\" could not be deleted from "
+                        "this device.")
+                         .arg(name));
+        emit keyNamesChanged();
+        emit keyRemoved(name);
+        return false;
+    }
+    setLastError(QString());
+    emit keyNamesChanged();
+    emit keyRemoved(name);
+    return true;
+}
+
+// ---------------------------------------------------------------------------
 // using and forgetting a key
 // ---------------------------------------------------------------------------
 
 bool MobileKeyStore::removeKey(QString name)
 {
     name = name.trimmed();
+    // A saved key is removed from the DEVICE, not just from the list: leaving the
+    // file behind would resurrect at the next launch the very credential the user
+    // just told this client to forget. The saved copy and the in-memory copy are
+    // independent — saveKeyOnDevice() keeps both — so these are separate checks
+    // rather than the either/or chain this function used to be.
+    const bool wasSaved = m_savedNames.contains(name);
+    const bool savedFileDeleted = wasSaved && deleteSavedKeyFile(name);
+    bool known = wasSaved;
+
     const auto inMemory = m_memoryKeys.find(name);
     if (inMemory != m_memoryKeys.end()) {
         wipeKeyMaterial(inMemory.value());
         m_memoryKeys.erase(inMemory);
         m_keyNames.removeAll(name);
+        known = true;
     } else if (m_references.remove(name) > 0) {
         m_referenceNames.removeAll(name);
-    } else {
+        known = true;
+    }
+    if (!known) {
         setLastError(tr("There is no loaded key by that name."));
         return false;
     }
@@ -634,6 +914,17 @@ bool MobileKeyStore::removeKey(QString name)
     // authentication attempt for nothing.
     if (m_armedPassphraseName == name)
         forgetPassphrase();
+    // Everything above happened either way; the only thing that can still have
+    // failed is the unlink, and that is the one failure the user has to know
+    // about, because it is the one that leaves key material on the device.
+    if (wasSaved && !savedFileDeleted) {
+        setLastError(tr("The saved copy of \"%1\" could not be deleted from "
+                        "this device.")
+                         .arg(name));
+        emit keyNamesChanged();
+        emit keyRemoved(name);
+        return false;
+    }
     setLastError(QString());
     emit keyNamesChanged();
     emit keyRemoved(name);
@@ -646,21 +937,53 @@ QByteArray MobileKeyStore::keyMaterial(const QString& name)
     if (inMemory != m_memoryKeys.constEnd())
         return inMemory.value();
 
+    // Not loaded, so the bytes come from whichever durable source this name has —
+    // the user's own file through its reference, or the copy saved on this device.
+    // Both are read HERE and nowhere else, and both are read afresh every time:
+    // caching them would turn a durable credential into a session-long copy in
+    // memory, which is the thing paths 2 and 3 are careful not to be.
+    QByteArray raw;
     const auto reference = m_references.constFind(name);
-    if (reference == m_references.constEnd())
-        return {};
-
-    QString referenceError;
-    QByteArray raw =
-        keyref::readReference(reference.value(), kMaxKeyBytes, &referenceError);
-    if (raw.isEmpty()) {
-        setLastError(referenceError.isEmpty()
-                         ? tr("The referenced key file could not be read.")
-                         : referenceError);
-        return {};
+    if (reference != m_references.constEnd()) {
+        QString referenceError;
+        raw = keyref::readReference(reference.value(), kMaxKeyBytes,
+                                    &referenceError);
+        if (raw.isEmpty()) {
+            setLastError(referenceError.isEmpty()
+                             ? tr("The referenced key file could not be read.")
+                             : referenceError);
+            return {};
+        }
+    } else if (m_savedNames.contains(name)) {
+        const QString path = savedKeyPath(name);
+        QFile in(path);
+        if (path.isEmpty() || !in.open(QIODevice::ReadOnly)) {
+            setLastError(tr("The key saved on this device could not be read, so "
+                            "it cannot be used. Remove it and save it again."));
+            return {};
+        }
+        // The same one-byte-past-the-bound read every other entry point does. The
+        // file was written by this class, but the directory is not immutable and a
+        // bound that is only enforced on input this class trusts is not a bound.
+        raw = in.read(kMaxKeyBytes + 1);
+        in.close();
+        if (raw.size() > kMaxKeyBytes) {
+            wipeKeyMaterial(raw);
+            setLastError(tr("The key saved on this device is far too large to be "
+                            "a private key, so it was not used."));
+            return {};
+        }
+        if (raw.isEmpty()) {
+            setLastError(tr("The key saved on this device is empty, so it cannot "
+                            "be used. Remove it and save it again."));
+            return {};
+        }
+    } else {
+        return {};  // an unknown name: nothing to produce and nothing to explain
     }
+
     // Normalise through the same describeKeyText() the paste path uses, so a
-    // reference whose file has been replaced with something that is not a key is
+    // source whose file has been replaced with something that is not a key is
     // caught here rather than inside libssh.
     //
     // The UTF-16 conversion is a SECOND copy of the whole key, in a buffer this
@@ -697,7 +1020,8 @@ bool MobileKeyStore::applyIdentityForConnect(QString name)
         setLastError(QString());
         return true;  // password / keyboard-interactive only, deliberately
     }
-    if (!m_memoryKeys.contains(name) && !m_references.contains(name)) {
+    if (!m_memoryKeys.contains(name) && !m_references.contains(name)
+        && !m_savedNames.contains(name)) {
         setLastError(tr("There is no loaded key by that name."));
         return false;
     }
@@ -706,12 +1030,13 @@ bool MobileKeyStore::applyIdentityForConnect(QString name)
     if (material.isEmpty())
         return false;  // keyMaterial() already said why
     m_pool->setInMemoryIdentity(material);
-    // For a REFERENCED key this is the only copy outside the pool (the pool
-    // detaches its own), so the wipe erases the real characters. For an
-    // in-memory key `material` still shares the buffer this object keeps under
-    // that name, and wipeKeyMaterial() detaches before filling — deliberately:
-    // scrubbing here would destroy the very key the session is meant to keep,
-    // and forgetSession() is what erases that one.
+    // For a REFERENCED or SAVED key this is the only copy outside the pool (the
+    // pool detaches its own), so the wipe erases the real characters — which is
+    // what keeps a key that lives on the device from also living in memory
+    // between connects. For an in-memory key `material` still shares the buffer
+    // this object keeps under that name, and wipeKeyMaterial() detaches before
+    // filling — deliberately: scrubbing here would destroy the very key the
+    // session is meant to keep, and forgetSession() is what erases that one.
     wipeKeyMaterial(material);
     // Remembered so removeKey() knows whether dropping a key also has to disarm
     // the pool. It is a NAME, not key material.
@@ -730,8 +1055,12 @@ void MobileKeyStore::forgetSession()
     m_installedIdentityName.clear();
     if (m_pool)
         m_pool->clearInMemoryIdentity();
-    // References survive: they are not secrets, and dropping them would force a
-    // fresh pick after every disconnect.
+    // Two things survive, and neither is a session secret. References: dropping
+    // them would force a fresh pick after every disconnect. Saved key FILES: the
+    // user asked this device to keep those, and "disconnect" is not "delete my
+    // key" — m_savedNames therefore stays as it is, and the names it holds are
+    // still offered by allKeyNames() with their bytes still on disk and no longer
+    // anywhere in memory.
     emit keyNamesChanged();
 }
 
@@ -746,7 +1075,8 @@ QVariantMap MobileKeyStore::keyInfo(QString name)
 {
     name = name.trimmed();
     const bool referenced = m_references.contains(name);
-    if (!referenced && !m_memoryKeys.contains(name))
+    const bool saved = m_savedNames.contains(name);
+    if (!referenced && !saved && !m_memoryKeys.contains(name))
         return {};
     QByteArray material = keyMaterial(name);
     if (material.isEmpty())
@@ -763,6 +1093,7 @@ QVariantMap MobileKeyStore::keyInfo(QString name)
     return QVariantMap{
         {QStringLiteral("name"), name},
         {QStringLiteral("referenced"), referenced},
+        {QStringLiteral("saved"), saved},
         {QStringLiteral("reference"), m_references.value(name)},
         {QStringLiteral("format"), described.format},
         {QStringLiteral("keyType"), described.keyType},

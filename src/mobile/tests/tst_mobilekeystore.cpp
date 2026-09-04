@@ -1,20 +1,27 @@
 // Credential handling for the mobile client (SPEC 11.2, 12.1).
 //
-// The central assertion here is a NEGATIVE one, and it is the reason this file
-// exists at all: docs/SPEC.md:1710-1729 is an exhaustive allowlist of what the
-// client may store locally, private-key bytes are not on it, and the only
-// credential entry is "SSH-agent or credential-store references"
-// (docs/SPEC.md:1721). So every test below that imports, authenticates with, or
-// forgets a key finishes by walking the store's whole storage root and proving
-// that no file under it contains any part of the key or of the passphrase, and
+// Most of this file asserts a NEGATIVE, and that is why it exists: SPEC 11.2 is
+// an exhaustive allowlist of what the client may store locally, and the only key
+// material on it is "an opt-in, per-key copy in app-private storage, owner-only
+// and excluded from OS backup" — a copy made by an explicit
+// saveKeyOnDevice(name) and by nothing else. So every test below that imports,
+// authenticates with, or forgets a key WITHOUT asking for it to be saved
+// finishes by walking the store's whole storage root and proving that no file
+// under it contains any part of the key or of the passphrase, and
 // nothingReachesThePerAppSandboxEither() extends that walk to the per-app
 // QStandardPaths directories — the place a mobile client would naturally put a
 // keys directory, and a place a check confined to the store's own rootDirectory
 // would never have looked.
 //
 // A positive-only suite would pass just as happily against an implementation
-// that cached the key "just for this attempt" in a temp file, which is exactly
-// the compliance failure worth testing for.
+// that cached the key "just for this attempt" in a temp file, or that saved
+// every imported key without being asked, which are exactly the compliance
+// failures worth testing for.
+//
+// The saved-key cases in the last section are the mirror image: they use their
+// OWN temporary app-data directory, precisely so that the file they expect to
+// exist cannot make the leak scans elsewhere in this file — which share one
+// m_root across the whole run — report it as a leak.
 //
 // The key material below is a throwaway ed25519 pair generated for this file
 // alone; it authenticates nothing. Its fingerprint is `ssh-keygen -lf`'s own
@@ -30,6 +37,7 @@
 #include <QDir>
 #include <QDirIterator>
 #include <QFile>
+#include <QSettings>
 #include <QStandardPaths>
 #include <QTemporaryDir>
 
@@ -167,6 +175,43 @@ void assertNoFileContainsAnywhere(const QStringList &roots,
         assertNoFileContains(root, needle, what);
 }
 
+// The saved-key directory as SPEC 11.2 and MobileKeyStore.h document it:
+// <app data>/keys, one file per key named exactly as the key is. Spelled out
+// here rather than asked of the store, so a change to the layout has to be a
+// deliberate change to this expectation too — a test that asked the store where
+// it put the key could not catch it putting it somewhere else.
+QString savedKeysDirectory(const QString &appData)
+{
+    return QDir(appData).filePath(QStringLiteral("keys"));
+}
+
+QString savedKeyPath(const QString &appData, const QString &name)
+{
+    return QDir(savedKeysDirectory(appData)).filePath(name);
+}
+
+// assertNoFileContains(), minus the files the key is ALLOWED to be in. Used by
+// the saved-key cases to make the strong claim rather than the weak one: not
+// merely "the key is in the saved file", but "the saved file is the ONLY place
+// under this app's storage that the key reached" — which is what covers
+// QSettings, a log, a cache and a stray temporary in one assertion.
+void assertNoFileOutsideContains(const QString &root, const QString &allowedDir,
+                                 const QByteArray &needle, const char *what)
+{
+    const QStringList files = filesUnder(root);
+    for (const QString &path : files) {
+        if (path.startsWith(allowedDir + QLatin1Char('/')))
+            continue;
+        QFile file(path);
+        if (!file.open(QIODevice::ReadOnly))
+            continue;
+        if (file.readAll().contains(needle)) {
+            QFAIL(qPrintable(QStringLiteral("%1 reached disk at %2")
+                                 .arg(QString::fromLatin1(what), path)));
+        }
+    }
+}
+
 }  // namespace
 
 class TestMobileKeyStore : public QObject
@@ -230,6 +275,19 @@ private slots:
     void keyInfoForAnUnknownNameIsEmpty();
     void sessionOnlyFallbackIsOfferedOnlyForADurabilityFailure();
     void nothingReachesThePerAppSandboxEither();
+
+    // Path 3: saved on this device, opt-in per key. Each of these uses its own
+    // temporary app-data directory, so a file that is SUPPOSED to exist is never
+    // seen by the leak scans above.
+    void savesAPastedKeyForTheNextLaunch();
+    void aSavedKeyIsOwnerOnlyAndSoIsItsFolder();
+    void savingIsNeverImplicit();
+    void refusesToSaveAKeyItWouldHaveToBuildAPathFor();
+    void refusesToSaveAReferencedKey();
+    void forgetSessionKeepsASavedKeyAndWipesTheSessionOne();
+    void forgetSavedKeyDeletesTheFileFromDisk();
+    void removeKeyDeletesTheSavedFileToo();
+    void savingAKeyPutsNothingInQSettings();
 
 private:
     // Storage root the store is confined to, so the leak checks have a closed
@@ -1006,6 +1064,357 @@ void TestMobileKeyStore::nothingReachesThePerAppSandboxEither()
     assertNoFileContainsAnywhere(roots, keyNeedle(), "an imported key");
     assertNoFileContainsAnywhere(roots, QByteArray(kPassphrase), "a passphrase");
     assertNoFileContains(root(), keyNeedle(), "an imported key");
+}
+
+// ---------------------------------------------------------------------------
+// path 3: saved on this device (opt-in, per key)
+// ---------------------------------------------------------------------------
+
+void TestMobileKeyStore::savesAPastedKeyForTheNextLaunch()
+{
+    // The whole point of the third path: a key that was PASTED once is offered
+    // again by a store built from scratch over the same app-data directory —
+    // which is what a relaunch is — and can still authenticate.
+    QTemporaryDir appData;
+    QVERIFY(appData.isValid());
+
+    {
+        MobileKeyStore store(appData.path());
+        QVERIFY(store.importKeyFromText(QStringLiteral("kept"),
+                                        QString::fromLatin1(kPlainKey)));
+        QVERIFY(!store.isSavedOnDevice(QStringLiteral("kept")));
+
+        QSignalSpy changed(&store, &MobileKeyStore::keyNamesChanged);
+        QVERIFY2(store.saveKeyOnDevice(QStringLiteral("kept")),
+                 qPrintable(store.lastError()));
+        QVERIFY(store.lastError().isEmpty());
+        QCOMPARE(changed.count(), 1);
+        QVERIFY(store.isSavedOnDevice(QStringLiteral("kept")));
+        // The in-memory copy is untouched: saving adds durability to the key the
+        // session is already using rather than replacing it.
+        QCOMPARE(store.keyNames(), QStringList{QStringLiteral("kept")});
+        // And it is ONE entry in the list the connect page renders, not two.
+        QCOMPARE(store.allKeyNames(), QStringList{QStringLiteral("kept")});
+        QVERIFY(QFile::exists(savedKeyPath(appData.path(),
+                                           QStringLiteral("kept"))));
+    }
+
+    // A FRESH store over the same directory: this is the relaunch.
+    ch::SshConnectionPool pool;
+    MobileKeyStore reopened(appData.path());
+    reopened.setConnectionPool(&pool);
+    QCOMPARE(reopened.savedKeyNames(), QStringList{QStringLiteral("kept")});
+    QCOMPARE(reopened.allKeyNames(), QStringList{QStringLiteral("kept")});
+    QVERIFY(reopened.hasKeys());
+    QVERIFY(reopened.isSavedOnDevice(QStringLiteral("kept")));
+    // Nothing is loaded in memory: the bytes are read when they are needed.
+    QVERIFY(reopened.keyNames().isEmpty());
+
+    const QVariantMap info = reopened.keyInfo(QStringLiteral("kept"));
+    QCOMPARE(info.value(QStringLiteral("saved")).toBool(), true);
+    QCOMPARE(info.value(QStringLiteral("referenced")).toBool(), false);
+    QVERIFY(info.value(QStringLiteral("reference")).toString().isEmpty());
+    QCOMPARE(info.value(QStringLiteral("fingerprint")).toString(),
+             QString::fromLatin1(kPlainFingerprint));
+    // The saved bytes are the same key, byte for byte, so it still authenticates.
+    QVERIFY2(reopened.applyIdentityForConnect(QStringLiteral("kept")),
+             qPrintable(reopened.lastError()));
+    QVERIFY(pool.hasInMemoryIdentity());
+}
+
+void TestMobileKeyStore::aSavedKeyIsOwnerOnlyAndSoIsItsFolder()
+{
+#ifndef Q_OS_UNIX
+    QSKIP("POSIX modes only: QFile::permissions() synthesises these bits from an "
+          "ACL on Windows, so the same assertion would describe nothing real.");
+#else
+    // A private key readable by the group or by the world is the failure this
+    // path could most easily ship with and nobody would notice, because
+    // everything else about it would still work. The directory matters as much as
+    // the file: a listable keys directory tells another process which keys exist
+    // and under what names.
+    QTemporaryDir appData;
+    QVERIFY(appData.isValid());
+    MobileKeyStore store(appData.path());
+    QVERIFY(store.importKeyFromText(QStringLiteral("kept"),
+                                    QString::fromLatin1(kPlainKey)));
+    QVERIFY2(store.saveKeyOnDevice(QStringLiteral("kept")),
+             qPrintable(store.lastError()));
+
+    const QFile::Permissions others =
+        QFileDevice::ReadGroup | QFileDevice::WriteGroup | QFileDevice::ExeGroup
+        | QFileDevice::ReadOther | QFileDevice::WriteOther
+        | QFileDevice::ExeOther;
+
+    const QFile::Permissions file =
+        QFile::permissions(savedKeyPath(appData.path(), QStringLiteral("kept")));
+    QVERIFY(file.testFlag(QFileDevice::ReadOwner));
+    QVERIFY(file.testFlag(QFileDevice::WriteOwner));
+    QCOMPARE(file & others, QFile::Permissions());
+
+    const QFile::Permissions directory =
+        QFile::permissions(savedKeysDirectory(appData.path()));
+    QVERIFY(directory.testFlag(QFileDevice::ReadOwner));
+    QVERIFY(directory.testFlag(QFileDevice::WriteOwner));
+    QVERIFY(directory.testFlag(QFileDevice::ExeOwner));
+    QCOMPARE(directory & others, QFile::Permissions());
+#endif
+}
+
+void TestMobileKeyStore::savingIsNeverImplicit()
+{
+    // SPEC 11.2 admits the copy only for a key the user explicitly asked to keep.
+    // So an ordinary import — the default path, and the one nearly every user
+    // takes — must leave the device with no keys directory at all, never mind a
+    // key in it.
+    QTemporaryDir appData;
+    QVERIFY(appData.isValid());
+    ch::SshConnectionPool pool;
+    MobileKeyStore store(appData.path());
+    store.setConnectionPool(&pool);
+    QVERIFY(store.importKeyFromText(QStringLiteral("pasted"),
+                                    QString::fromLatin1(kPlainKey)));
+    // Using the key for a connection is not asking for it to be kept, so a whole
+    // authenticate cycle must still leave nothing on the device.
+    QVERIFY(store.applyIdentityForConnect(QStringLiteral("pasted")));
+    QVERIFY(pool.hasInMemoryIdentity());
+    QVERIFY(!store.isSavedOnDevice(QStringLiteral("pasted")));
+    QVERIFY(store.savedKeyNames().isEmpty());
+    QVERIFY(!QFile::exists(savedKeysDirectory(appData.path())));
+    assertNoFileContains(appData.path(), keyNeedle(), "an unsaved key");
+
+    // Same for a store constructed over a directory that has never seen a save:
+    // construction reads, it does not create.
+    MobileKeyStore reopened(appData.path());
+    QVERIFY(reopened.savedKeyNames().isEmpty());
+    QVERIFY(!reopened.hasKeys());
+    QVERIFY(!QFile::exists(savedKeysDirectory(appData.path())));
+}
+
+void TestMobileKeyStore::refusesToSaveAKeyItWouldHaveToBuildAPathFor()
+{
+    // The name reaches the FILENAME, so an unvalidated one is a write outside the
+    // app's own data directory. "../evil" is the case that matters: it is a name
+    // no import path would accept, but saveKeyOnDevice() is reachable from QML
+    // with whatever string a caller passes, so it has to refuse it itself — and
+    // refuse it BEFORE any filesystem call, which is what "no file was created"
+    // below actually checks.
+    QTemporaryDir appData;
+    QVERIFY(appData.isValid());
+    MobileKeyStore store(appData.path());
+    QVERIFY(store.importKeyFromText(QStringLiteral("kept"),
+                                    QString::fromLatin1(kPlainKey)));
+
+    for (const QString &name : {QStringLiteral("../evil"),
+                                QStringLiteral("../../evil"),
+                                QStringLiteral("sub/evil"),
+                                QStringLiteral(".hidden"),
+                                QStringLiteral("has space"),
+                                QString(65, QLatin1Char('a')),
+                                QString()}) {
+        QVERIFY2(!store.saveKeyOnDevice(name), qPrintable(name));
+        QVERIFY(!store.lastError().isEmpty());
+        QVERIFY2(!store.isSavedOnDevice(name), qPrintable(name));
+    }
+    QVERIFY(store.savedKeyNames().isEmpty());
+
+    // Nothing was created anywhere: not the keys directory, not the traversal
+    // target one level up from it, and no file under the app-data root at all.
+    QVERIFY(!QFile::exists(savedKeysDirectory(appData.path())));
+    QVERIFY(!QFile::exists(QDir(appData.path()).filePath(QStringLiteral("evil"))));
+    QVERIFY(filesUnder(appData.path()).isEmpty());
+
+    // The refusal is about the NAME, not about the key: the same store still
+    // saves the key it does have.
+    QVERIFY2(store.saveKeyOnDevice(QStringLiteral("kept")),
+             qPrintable(store.lastError()));
+}
+
+void TestMobileKeyStore::refusesToSaveAReferencedKey()
+{
+    // Path 2's promise is that the key stays in the user's own storage. Copying a
+    // referenced key into app storage behind the same switch would quietly break
+    // it, so this is refused with something to read rather than silently doing
+    // the more surprising of the two possible things.
+    QTemporaryDir appData;
+    QVERIFY(appData.isValid());
+    MobileKeyStore store(appData.path());
+    QCOMPARE(store.addReferenceFromFile(QUrl::fromLocalFile(m_userKeyPath),
+                                        QStringLiteral("mine")),
+             QStringLiteral("mine"));
+
+    QVERIFY(!store.saveKeyOnDevice(QStringLiteral("mine")));
+    QVERIFY(!store.lastError().isEmpty());
+    QVERIFY(!store.isSavedOnDevice(QStringLiteral("mine")));
+    QVERIFY(!QFile::exists(savedKeysDirectory(appData.path())));
+    // An unknown name is refused too, and neither refusal creates anything.
+    QVERIFY(!store.saveKeyOnDevice(QStringLiteral("never-loaded")));
+    QVERIFY(filesUnder(appData.path()).isEmpty());
+}
+
+void TestMobileKeyStore::forgetSessionKeepsASavedKeyAndWipesTheSessionOne()
+{
+    // "Disconnect" is not "delete my key". A saved key survives it — that is what
+    // saving means — while the session-only key beside it is wiped, which is what
+    // NOT saving means.
+    QTemporaryDir appData;
+    QVERIFY(appData.isValid());
+    ch::SshConnectionPool pool;
+    MobileKeyStore store(appData.path());
+    store.setConnectionPool(&pool);
+
+    QVERIFY(store.importKeyFromText(QStringLiteral("kept"),
+                                    QString::fromLatin1(kPlainKey)));
+    QVERIFY(store.importKeyFromText(QStringLiteral("session-only"),
+                                    QString::fromLatin1(kEncryptedKey)));
+    QVERIFY2(store.saveKeyOnDevice(QStringLiteral("kept")),
+             qPrintable(store.lastError()));
+    store.armPassphrase(QStringLiteral("session-only"),
+                        QString::fromLatin1(kPassphrase));
+    QVERIFY(store.applyIdentityForConnect(QStringLiteral("kept")));
+
+    store.forgetSession();
+
+    // The session secrets are gone, including the loaded copy of the saved key.
+    QVERIFY(store.keyNames().isEmpty());
+    QVERIFY(!store.hasArmedPassphrase(QStringLiteral("session-only")));
+    QVERIFY(!pool.hasInMemoryIdentity());
+    // The saved key is still there, still listed, and still usable without a
+    // fresh paste — which is the only reason the user saved it.
+    QCOMPARE(store.savedKeyNames(), QStringList{QStringLiteral("kept")});
+    QCOMPARE(store.allKeyNames(), QStringList{QStringLiteral("kept")});
+    QVERIFY(QFile::exists(savedKeyPath(appData.path(), QStringLiteral("kept"))));
+    QVERIFY2(store.applyIdentityForConnect(QStringLiteral("kept")),
+             qPrintable(store.lastError()));
+    QVERIFY(pool.hasInMemoryIdentity());
+    // The one that was not saved is gone from the device's point of view too.
+    QVERIFY(!store.applyIdentityForConnect(QStringLiteral("session-only")));
+    QVERIFY(store.keyInfo(QStringLiteral("session-only")).isEmpty());
+    // And the encrypted key's passphrase never reached the disk, saved key or no
+    // saved key.
+    assertNoFileContains(appData.path(), QByteArray(kPassphrase),
+                         "a passphrase");
+}
+
+void TestMobileKeyStore::forgetSavedKeyDeletesTheFileFromDisk()
+{
+    // The surface that offers to keep a key also offers to delete it, and
+    // "delete" has to mean the file is gone — not merely dropped from a list that
+    // the next launch's directory scan would repopulate.
+    QTemporaryDir appData;
+    QVERIFY(appData.isValid());
+    ch::SshConnectionPool pool;
+    MobileKeyStore store(appData.path());
+    store.setConnectionPool(&pool);
+
+    QVERIFY(store.importKeyFromText(QStringLiteral("kept"),
+                                    QString::fromLatin1(kPlainKey)));
+    QVERIFY2(store.saveKeyOnDevice(QStringLiteral("kept")),
+             qPrintable(store.lastError()));
+    QVERIFY(store.applyIdentityForConnect(QStringLiteral("kept")));
+    QVERIFY(pool.hasInMemoryIdentity());
+
+    const QString path = savedKeyPath(appData.path(), QStringLiteral("kept"));
+    QVERIFY(QFile::exists(path));
+
+    QSignalSpy removed(&store, &MobileKeyStore::keyRemoved);
+    QVERIFY2(store.forgetSavedKey(QStringLiteral("kept")),
+             qPrintable(store.lastError()));
+    QCOMPARE(removed.count(), 1);
+
+    // Gone from disk, from the lists, from memory, and from the pool.
+    QVERIFY(!QFile::exists(path));
+    QVERIFY(store.savedKeyNames().isEmpty());
+    QVERIFY(store.keyNames().isEmpty());
+    QVERIFY(store.allKeyNames().isEmpty());
+    QVERIFY(!store.hasKeys());
+    QVERIFY(!store.isSavedOnDevice(QStringLiteral("kept")));
+    QVERIFY(!pool.hasInMemoryIdentity());
+    assertNoFileContains(appData.path(), keyNeedle(), "a deleted saved key");
+
+    // And it stays gone across a relaunch, which is the claim a list-only
+    // deletion would have failed.
+    MobileKeyStore reopened(appData.path());
+    QVERIFY(reopened.savedKeyNames().isEmpty());
+    QVERIFY(!reopened.hasKeys());
+
+    // A second deletion is refused rather than silently reported as a success.
+    QVERIFY(!store.forgetSavedKey(QStringLiteral("kept")));
+    QVERIFY(!store.lastError().isEmpty());
+}
+
+void TestMobileKeyStore::removeKeyDeletesTheSavedFileToo()
+{
+    // removeKey() is the general "forget this key". Leaving the saved file behind
+    // would resurrect at the next launch exactly the credential the user just
+    // removed, which is the worst possible reading of "forget".
+    QTemporaryDir appData;
+    QVERIFY(appData.isValid());
+    MobileKeyStore store(appData.path());
+    QVERIFY(store.importKeyFromText(QStringLiteral("kept"),
+                                    QString::fromLatin1(kPlainKey)));
+    QVERIFY2(store.saveKeyOnDevice(QStringLiteral("kept")),
+             qPrintable(store.lastError()));
+
+    const QString path = savedKeyPath(appData.path(), QStringLiteral("kept"));
+    QVERIFY(QFile::exists(path));
+    QVERIFY2(store.removeKey(QStringLiteral("kept")),
+             qPrintable(store.lastError()));
+    QVERIFY(!QFile::exists(path));
+    QVERIFY(store.savedKeyNames().isEmpty());
+
+    MobileKeyStore reopened(appData.path());
+    QVERIFY(reopened.savedKeyNames().isEmpty());
+}
+
+void TestMobileKeyStore::savingAKeyPutsNothingInQSettings()
+{
+    // SPEC 11.2 permits the copy in ONE place: a file in app-private storage that
+    // the user asked for. A profile still carries a reference or nothing, and no
+    // key byte may reach the settings store, a cache or a stray temporary. So the
+    // assertion is the strong one — the saved file is the ONLY file under this
+    // app's storage that contains any part of the key — which covers every one of
+    // those at once.
+    QTemporaryDir appData;
+    QVERIFY(appData.isValid());
+    ch::SshConnectionPool pool;
+    MobileKeyStore store(appData.path());
+    store.setConnectionPool(&pool);
+
+    QVERIFY(store.importKeyFromText(QStringLiteral("kept"),
+                                    QString::fromLatin1(kPlainKey)));
+    QVERIFY2(store.saveKeyOnDevice(QStringLiteral("kept")),
+             qPrintable(store.lastError()));
+    QVERIFY(store.applyIdentityForConnect(QStringLiteral("kept")));
+    QVERIFY(!store.keyInfo(QStringLiteral("kept")).isEmpty());
+    // referenceFor() is the only value that ever leaves this class for a profile,
+    // and a saved key has no reference to record: what the profile would carry is
+    // an empty string, not the key and not even the path to it.
+    QVERIFY(store.referenceFor(QStringLiteral("kept")).isEmpty());
+    store.forgetSession();
+
+    const QString keysDirectory = savedKeysDirectory(appData.path());
+    assertNoFileOutsideContains(appData.path(), keysDirectory, keyNeedle(),
+                                "a saved key");
+    // The per-app sandbox as well, which is where QSettings actually writes: the
+    // store under test was pointed at its own temporary directory, so nothing
+    // here is exempt at all.
+    assertNoFileContainsAnywhere(sandboxRoots(), keyNeedle(), "a saved key");
+
+    // And the settings file by name, with the exact constructor the client uses,
+    // so this does not depend on the scan above having found it. QStandardPaths
+    // test mode puts it inside the test's own tree.
+    QSettings settings(QStringLiteral("CodeHarbor"), QStringLiteral("CodeHarbor"));
+    settings.sync();
+    QFile ini(settings.fileName());
+    if (ini.open(QIODevice::ReadOnly))
+        QVERIFY(!ini.readAll().contains(keyNeedle()));
+
+    // The saved file, meanwhile, does hold the key — otherwise the assertions
+    // above would pass against a save that wrote nothing at all.
+    QFile saved(savedKeyPath(appData.path(), QStringLiteral("kept")));
+    QVERIFY(saved.open(QIODevice::ReadOnly));
+    QVERIFY(saved.readAll().contains(keyNeedle()));
 }
 
 // Guiless: nothing here draws, and a credential test must not depend on a

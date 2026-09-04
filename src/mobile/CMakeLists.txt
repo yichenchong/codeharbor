@@ -40,10 +40,10 @@ qt_add_library(ch_mobile STATIC
     MobileImageProvider.cpp
     MarkdownModel.h
     MarkdownModel.cpp
-    # Credentials. MobileKeyStore holds key material in memory for exactly one
-    # authentication attempt and persists only a REFERENCE to a file the user
-    # manages, because SPEC 11.2 (docs/SPEC.md:1710-1729) is an exhaustive
-    # allowlist of client-stored state on which private-key bytes do not appear.
+    # Credentials. MobileKeyStore holds key material in memory by default,
+    # persists only a REFERENCE to a file the user manages, and — for the keys the
+    # user explicitly asks it to — keeps one owner-only copy in app-private
+    # storage, which is the shape SPEC 11.2's allowlist admits.
     MobileKeyStore.h
     MobileKeyStore.cpp
     MobileKeyReference.h
@@ -144,6 +144,17 @@ endif()
 if(IOS)
     target_sources(ch_mobile PRIVATE MobileKeyReferenceIos.mm)
     set_source_files_properties(MobileKeyReferenceIos.mm
+                               PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+
+    # The other half of the Apple-only credential work, gated on IOS for exactly
+    # the reasons above: NSURLIsExcludedFromBackupKey on a saved key file. Only
+    # iOS needs it — Android excludes its whole sandbox through
+    # android:allowBackup="false" in packaging/android/AndroidManifest.xml, and a
+    # macOS desktop build of this shell is a development host rather than a
+    # client whose backups matter — so compiling it anywhere else would build
+    # Objective-C++ nothing could call.
+    target_sources(ch_mobile PRIVATE MobileKeyStoreIos.mm)
+    set_source_files_properties(MobileKeyStoreIos.mm
                                PROPERTIES COMPILE_FLAGS "-fobjc-arc")
 endif()
 

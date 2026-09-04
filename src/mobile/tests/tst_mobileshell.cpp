@@ -184,6 +184,24 @@ QQuickItem *findItemShowing(QQuickItem *root, const QString &text)
     });
 }
 
+// The KeyImportSheet ConnectPage HOSTS, found by type rather than by id.
+//
+// A standalone instance would be a sheet nobody uses: ConnectPage is what hands
+// the sheet its safe-area insets and its keyStoreRef, so a bare one is wired to
+// nothing. It is a Popup, so it is not in the item tree - hence findChildren on
+// the QObject tree rather than findItem.
+QObject *hostedKeySheet(QQuickItem *connectPage)
+{
+    for (QObject *child : connectPage->findChildren<QObject *>()) {
+        if (child->inherits("QQuickPopup")
+            && QString::fromLatin1(child->metaObject()->className())
+                   .contains(QStringLiteral("KeyImportSheet"))) {
+            return child;
+        }
+    }
+    return nullptr;
+}
+
 // Every key sequence a QML Shortcut is really bound to, expanded exactly as
 // QQuickShortcut expands it: a string is parsed as a sequence, and an integer is
 // a QKeySequence::StandardKey standing for EVERY platform binding of that
@@ -361,6 +379,7 @@ private slots:
     void aBlankNodePathBlocksConnecting();
     void aDragOverTheTerminalSendsWheelReports();
     void theKeySheetFitsTheScreenAndScrolls();
+    void theKeySheetOffersSavingOnDeviceOnlyAsASeparateTap();
     void theSessionPickerListsEverySessionTheServerReported();
     void thePanePickerListsBothRegionsOfTheSelectedSession();
     void aTerminalLeafLoadsTheTerminalPage();
@@ -874,21 +893,10 @@ void TstMobileShell::theKeySheetFitsTheScreenAndScrolls()
     QVERIFY(QTest::qWaitForWindowExposed(window));
     QTRY_COMPARE(window->contentItem()->height(), 480.0);
 
-    // The sheet the APP hosts, opened the way the app opens it. Instantiating
-    // KeyImportSheet standalone would test a sheet nobody uses: the insets are
-    // handed to it by ConnectPage, so a bare instance sees zero and the whole
-    // point of this test evaporates.
+    // The sheet the APP hosts, opened the way the app opens it.
     QQuickItem *connectPage = currentPage(window);
     QCOMPARE(qmlTypeName(connectPage), QStringLiteral("ConnectPage"));
-    QObject *sheet = nullptr;
-    for (QObject *child : connectPage->findChildren<QObject *>()) {
-        if (child->inherits("QQuickPopup")
-            && QString::fromLatin1(child->metaObject()->className())
-                   .contains(QStringLiteral("KeyImportSheet"))) {
-            sheet = child;
-            break;
-        }
-    }
+    QObject *sheet = hostedKeySheet(connectPage);
     QVERIFY2(sheet, "ConnectPage does not host a KeyImportSheet");
     QVERIFY(QMetaObject::invokeMethod(sheet, "open"));
     QTRY_VERIFY(sheet->property("visible").toBool());
@@ -990,6 +998,169 @@ void TstMobileShell::theKeySheetFitsTheScreenAndScrolls()
     // to the end - it is the last thing the sheet shows about a pasted key.
     flick->setProperty("contentY", contentHeight - flick->height());
     QVERIFY(flick->property("contentY").toReal() > 0.0);
+}
+
+// Saving a pasted key on the device is permitted, and it is opt-in: the sheet
+// must not save one on the way past. This case pins the three properties that
+// make it opt-in rather than a default - the offer is off screen and the control
+// is inert until an import produces something to save, the control is a BUTTON
+// and not a tick box that could arrive pre-ticked, and the warning next to it
+// names the cost in plain words - plus the fact that the list tells the three
+// storage states apart.
+//
+// The harness deliberately installs no `keyStore` context property, so the sheet
+// runs its degraded path with keyStoreRef == null. That is exactly the state
+// "before any import", which is what "not active by default" has to be measured
+// in. What it cannot reach is behaviour that needs a live store: that the offer
+// APPEARS after a paste import, that tapping the button calls
+// saveKeyOnDevice()/writes the file, and that a saved row grows a "Delete file"
+// button. Those belong to the store's own case; the presentation branch they
+// would exercise is checked here directly through keyStateLabel(), which is why
+// that branch lives on the sheet as a function instead of inline in a delegate
+// no model ever instantiates.
+void TstMobileShell::theKeySheetOffersSavingOnDeviceOnlyAsASeparateTap()
+{
+    Shell shell;
+    QQuickWindow *window = shell.window();
+    QVERIFY(window);
+    window->resize(412, 800);
+    window->show();
+    QVERIFY(QTest::qWaitForWindowExposed(window));
+
+    QQuickItem *connectPage = currentPage(window);
+    QCOMPARE(qmlTypeName(connectPage), QStringLiteral("ConnectPage"));
+    QObject *sheet = hostedKeySheet(connectPage);
+    QVERIFY2(sheet, "ConnectPage does not host a KeyImportSheet");
+    QVERIFY(QMetaObject::invokeMethod(sheet, "open"));
+    QTRY_VERIFY(sheet->property("visible").toBool());
+
+    auto *body = sheet->property("contentItem").value<QQuickItem *>();
+    QVERIFY2(body, "the sheet has no contentItem");
+    const auto byName = [body](const char *name) {
+        const QString wanted = QString::fromLatin1(name);
+        return findItem(body, [&wanted](QQuickItem *item) {
+            return item->objectName() == wanted;
+        });
+    };
+
+    // Nothing to save, so nothing offered. Freshly opened is the state a user
+    // who only ever reads this sheet is in, and it must write nothing.
+    QCOMPARE(sheet->property("savableName").toString(), QString());
+    QQuickItem *frame = byName("saveKeyOnDeviceFrame");
+    QVERIFY2(frame, "the sheet offers no way to save a key on the device");
+    QVERIFY2(!frame->property("visible").toBool(),
+             "the save offer is on screen before anything has been imported");
+
+    QQuickItem *save = byName("saveKeyOnDeviceButton");
+    QVERIFY2(save, "the sheet has no save-on-device button");
+    QVERIFY2(!save->property("enabled").toBool(),
+             "the save control is live with nothing imported to save");
+    // A Button, not a CheckBox or a checkable Button: a tick box is the shape
+    // that can be pre-ticked, and asserting it is not checkable is what keeps a
+    // later edit from turning this into one.
+    QVERIFY2(!save->property("checkable").toBool(),
+             "the save control is checkable, so it could arrive pre-ticked");
+    QVERIFY2(!save->property("checked").toBool(), "the save control is pre-armed");
+
+    // The cost, unhedged. Asserted by the substrings that carry the meaning, so
+    // rewording the sentence around them is free but dropping the facts is not.
+    QQuickItem *warning = byName("saveKeyWarningLabel");
+    QVERIFY2(warning, "the save offer has no warning");
+    const QString warningText = warning->property("text").toString();
+    QVERIFY2(warningText.contains(QStringLiteral("not encrypted")),
+             qPrintable(QStringLiteral("warning does not say the file is "
+                                       "unencrypted: %1").arg(warningText)));
+    QVERIFY2(warningText.contains(QStringLiteral("unlock this phone")),
+             qPrintable(QStringLiteral("warning does not say who can read it: %1")
+                            .arg(warningText)));
+    QVERIFY2(warningText.contains(QStringLiteral("private storage")),
+             qPrintable(QStringLiteral("warning does not say where it goes: %1")
+                            .arg(warningText)));
+    // Plain text everywhere on mobile (SPEC 7.5): the warning is the last string
+    // that should ever be able to render as markup. The enum value is read off
+    // the Label's own metaobject rather than written as a literal, because
+    // QQuickText::TextFormat only exists in a private header.
+    {
+        const QMetaObject *meta = warning->metaObject();
+        const int index = meta->indexOfEnumerator("TextFormat");
+        QVERIFY2(index >= 0, "the warning is not a Text-derived item");
+        QCOMPARE(warning->property("textFormat").toInt(),
+                 meta->enumerator(index).keyToValue("PlainText"));
+    }
+
+    // The standing explanation must no longer claim the client never stores a
+    // private key, because with this control on screen that is false.
+    QQuickItem *intro = findItem(body, [](QQuickItem *item) {
+        return item->property("text").toString().contains(
+            QStringLiteral("no ssh-agent"));
+    });
+    QVERIFY2(intro, "the sheet lost its explanation");
+    const QString introText = intro->property("text").toString();
+    QVERIFY2(!introText.contains(QStringLiteral("never stores a private key")),
+             qPrintable(QStringLiteral("the explanation still claims no key is "
+                                       "ever stored: %1").arg(introText)));
+    QVERIFY2(introText.contains(QStringLiteral("unencrypted")),
+             qPrintable(QStringLiteral("the explanation does not mention the "
+                                       "unencrypted third option: %1")
+                            .arg(introText)));
+
+    // Three storage states, three different rows. Driven through the sheet's own
+    // keyStateLabel(), which is the single place the list decides that text.
+    const auto stateLabel = [sheet](const QVariantMap &info) {
+        QVariant out;
+        const bool called = QMetaObject::invokeMethod(
+            sheet, "keyStateLabel", Q_RETURN_ARG(QVariant, out),
+            Q_ARG(QVariant, QVariant::fromValue(info)));
+        return called ? out.toString() : QStringLiteral("<not called>");
+    };
+    const QVariantMap sessionOnly{{QStringLiteral("name"), QStringLiteral("k")},
+                                  {QStringLiteral("referenced"), false},
+                                  {QStringLiteral("saved"), false},
+                                  {QStringLiteral("encrypted"), false},
+                                  {QStringLiteral("fingerprintAvailable"), false}};
+    QVariantMap savedOnDevice = sessionOnly;
+    savedOnDevice[QStringLiteral("saved")] = true;
+    QVariantMap referenced = sessionOnly;
+    referenced[QStringLiteral("referenced")] = true;
+
+    const QString sessionText = stateLabel(sessionOnly);
+    const QString savedText = stateLabel(savedOnDevice);
+    const QString referencedText = stateLabel(referenced);
+    QVERIFY2(savedText != sessionText,
+             qPrintable(QStringLiteral("a saved key reads the same as a "
+                                       "session-only one: %1").arg(savedText)));
+    QVERIFY2(savedText != referencedText,
+             qPrintable(QStringLiteral("a saved key reads the same as a file "
+                                       "reference: %1").arg(savedText)));
+    QVERIFY2(savedText.contains(QStringLiteral("saved on this device")),
+             qPrintable(savedText));
+    QVERIFY2(sessionText.contains(QStringLiteral("this session")),
+             qPrintable(sessionText));
+    QVERIFY2(referencedText.contains(QStringLiteral("referenced")),
+             qPrintable(referencedText));
+
+    // And the two deletions do not share a sentence. "Remove" has always only
+    // forgotten a reference; deleting a saved key unlinks a file, and the
+    // confirmation has to say so before the tap that does it.
+    QQuickItem *confirm = byName("deleteConfirmLabel");
+    QVERIFY2(confirm, "the sheet has no delete confirmation");
+    sheet->setProperty("pendingDeleteName", QStringLiteral("k"));
+    sheet->setProperty("pendingDeleteFile", false);
+    const QString forgetText = confirm->property("text").toString();
+    QVERIFY2(forgetText.contains(QStringLiteral("is not deleted")),
+             qPrintable(forgetText));
+    sheet->setProperty("pendingDeleteFile", true);
+    const QString deleteText = confirm->property("text").toString();
+    QVERIFY2(deleteText != forgetText, qPrintable(deleteText));
+    QVERIFY2(deleteText.contains(QStringLiteral("saved key file")),
+             qPrintable(QStringLiteral("the file deletion does not say a file is "
+                                       "being deleted: %1").arg(deleteText)));
+    QQuickItem *confirmButton = byName("deleteConfirmButton");
+    QVERIFY2(confirmButton, "the sheet has no delete confirmation button");
+    QCOMPARE(confirmButton->property("text").toString(),
+             QStringLiteral("Delete file"));
+    sheet->setProperty("pendingDeleteName", QString());
+    sheet->setProperty("pendingDeleteFile", false);
 }
 
 void TstMobileShell::aMarkdownLeafLoadsTheMarkdownPage()

@@ -9,6 +9,8 @@
 #include <QUrl>
 #include <QVariantMap>
 
+#include <QtGlobal>
+
 namespace ch {
 
 class SshConnectionPool;
@@ -50,23 +52,26 @@ class SshConnectionPool;
 //     for the reason immediately below.
 //
 // ---------------------------------------------------------------------------
-// THIS CLASS STORES NO KEY MATERIAL. AT ALL.
+// THREE CREDENTIAL PATHS. ONLY ONE STORES KEY BYTES, AND ONLY WHEN ASKED.
 // ---------------------------------------------------------------------------
 //
-// SPEC 11.2 (docs/SPEC.md:1710-1729) is an EXHAUSTIVE allowlist — "The client
-// may store only:" — of what the client may keep locally. Private-key bytes are
-// not on it. The single credential entry is "SSH-agent or credential-store
-// references" (docs/SPEC.md:1721), and the profile-store sentence that follows
-// (docs/SPEC.md:1726-1729) permits "an optional local identity-file path" and
-// forbids "private-key bytes" by name.
+// SPEC 11.2 is an EXHAUSTIVE allowlist — "The client may store only:" — of what
+// this client may keep locally, and it is what decides this file's shape. It
+// admits "SSH-agent or credential-store references", it lets a server profile
+// carry an optional local identity-file path and forbids private-key bytes in a
+// profile by name, and — since the amendment that path 3 below exists for — it
+// admits one copy of a private key per key the user has explicitly asked to
+// keep: "an opt-in, per-key copy in app-private storage, owner-only and
+// excluded from OS backup" (docs/SPEC.md §11.2), whose every clause is a
+// requirement path 3 has to meet rather than a description of what it happens to
+// do.
 //
-// So there are exactly TWO compliant credential paths, and this class implements
-// both. There is no third one, and in particular there is no
-// <AppDataLocation>/keys: not as a default, not as an opt-in, and not as a
-// temporary file during a handshake — a temp file is still client-stored key
-// bytes.
+// Nothing about that third path is implicit. A key is session-only unless
+// saveKeyOnDevice() was called for it by name, no import path calls it, the UI
+// that offers to keep a key also offers to delete it (forgetSavedKey), and a
+// profile still carries a reference or nothing — never key bytes.
 //
-//   1. IN-MEMORY IMPORT (the default and the primary path).
+//   1. IN-MEMORY IMPORT (the DEFAULT, and still the primary path).
 //      importKeyFromText() validates a pasted key and holds its armoured bytes in
 //      a member for the session. applyIdentityForConnect() hands them to
 //      SshConnectionPool::setInMemoryIdentity(), which parses the armour directly
@@ -75,15 +80,15 @@ class SshConnectionPool;
 //
 //      The cost is real and is stated rather than hidden: the key has to be
 //      pasted or re-picked on every launch. That is the SAME trade SPEC 12.1
-//      already accepts for passphrases (docs/SPEC.md:1798-1805: "No credential
-//      store is integrated. A password or key passphrase is prompted for, handed
-//      straight to libssh for that one authentication attempt, and then
-//      discarded... The requirement above is therefore met in its strong form —
-//      no secret is persisted at all — at the cost of retyping it each
-//      connection."). On mobile the same reasoning extends from the passphrase to
-//      the key itself, because a phone has no ~/.ssh to have put it in.
+//      already accepts for passphrases ("No credential store is integrated. A
+//      password or key passphrase is prompted for, handed straight to libssh for
+//      that one authentication attempt, and then discarded... The requirement
+//      above is therefore met in its strong form — no secret is persisted at all
+//      — at the cost of retyping it each connection."). On mobile the same
+//      reasoning extends from the passphrase to the key itself, because a phone
+//      has no ~/.ssh to have put it in.
 //
-//   2. A REFERENCE TO A USER-MANAGED KEY FILE (the durable path).
+//   2. A REFERENCE TO A USER-MANAGED KEY FILE (durable, and copies nothing).
 //      The key stays in the user's OWN storage — a document provider on Android,
 //      a Files document on iOS, an ordinary path on the desktop builds of this
 //      shell. addReferenceFromFile() turns a pick into a durable reference
@@ -91,26 +96,63 @@ class SshConnectionPool;
 //      iOS security-scoped bookmark, or an absolute path), and the ONLY thing the
 //      client persists is that reference string, in ch::ServerProfiles' EXISTING
 //      identityFile field. No new profile field, no change to its whitelist, and
-//      no key bytes in the profile — which is exactly the shape
-//      docs/SPEC.md:1721 and :1727 allow.
+//      no key bytes in the profile.
 //
 //      The bytes are read on demand, into memory, at connect time
 //      (applyIdentityForConnect) and never copied into app storage.
+//
+//   3. SAVED ON THIS DEVICE (opt-in per key, never a default).
+//      saveKeyOnDevice(name) writes an already-imported in-memory key to
+//      <AppDataLocation>/keys/<name> and nowhere else, so the user who has no
+//      document provider to keep a key in — and no way to get one onto a phone
+//      except by pasting it — can stop pasting it once per launch. The file is
+//      the only client-stored key material this class will ever produce, and it
+//      exists for exactly the keys named in an explicit call.
+//
+//      What that file gets, and why each part is not optional:
+//        * ATOMICALLY WRITTEN (QSaveFile), so an interrupted save leaves the
+//          previous file or no file, never half a key that fails to parse.
+//        * PERMISSIONS 0600, in a 0700 directory, VERIFIED after the fact — a
+//          save that cannot prove owner-only permissions deletes the file and
+//          fails, because a world-readable private key is worse than an
+//          inconvenience the user would have accepted.
+//        * EXCLUDED FROM OS BACKUP. Android has android:allowBackup="false" in
+//          packaging/android/AndroidManifest.xml, so the whole sandbox is already
+//          out; iOS has no such switch, so the file carries
+//          NSURLIsExcludedFromBackupKey (MobileKeyStoreIos.mm). Without that a
+//          saved key would be copied into iCloud and then onto every device the
+//          user restores, which is not the decision they made.
+//        * READ ON DEMAND, never held. The bytes are loaded when a connect or a
+//          keyInfo() needs them and wiped when it is done; only the NAME lives in
+//          memory between uses.
+//
+//      The cost, stated rather than buried: the key is at rest on the device,
+//      protected by the app sandbox and the file mode and nothing else. A saved
+//      key survives forgetSession() by design — that is what saving means — so
+//      "Disconnect" no longer removes it from the device; forgetSavedKey() is
+//      what does. An encrypted key is the strictly better thing to save, because
+//      its passphrase is still never stored (see below) and the file on its own
+//      is useless without it.
 //
 // PASSPHRASES ARE NEVER PERSISTED AND NEVER REUSED. armPassphrase() parks one
 // secret for one attempt; takePassphrase() hands it over AND erases it in the
 // same call, so a second attempt must ask again. There is no code path from a
 // passphrase to QSettings, to a file, to a log line, or to a Q_PROPERTY a QML
-// sheet could keep alive.
+// sheet could keep alive. This is what keeps a saved encrypted key encrypted at
+// rest: saving stores the armour exactly as it was pasted, sealed section and
+// all.
 //
 // NO KEYCHAIN OR KEYSTORE INTEGRATION, and none is faked. Qt 6.10 ships no
 // keychain API, so it would mean per-platform JNI and Objective-C plus a
-// biometric-unlock flow — and with nothing persisted there is nothing for a
-// keychain to protect. What the durable path relies on instead is the platform's
-// own permission model: an Android persistable URI grant and an iOS
-// security-scoped bookmark are both per-app, revocable by the user, and useless
-// to another app or device. The at-rest protection of the key itself is whatever
-// the user chose for their own storage, which is where the key stays.
+// biometric-unlock flow. What the two durable paths rely on instead is the
+// platform's own model: for a reference, an Android persistable URI grant or an
+// iOS security-scoped bookmark — both per-app, revocable by the user, useless to
+// another app or device, with the key's at-rest protection being whatever the
+// user chose for their own storage. For a saved key, the app-private data
+// directory plus mode 0600 plus backup exclusion — which stops another app and a
+// restore onto another device, and does NOT stop anyone who has unlocked this
+// device and can read this app's files. That is the whole of the protection, and
+// it is why saving is a per-key decision the user makes rather than a default.
 //
 // ---------------------------------------------------------------------------
 // THREADING
@@ -123,17 +165,25 @@ class MobileKeyStore : public QObject {
     Q_PROPERTY(QStringList keyNames READ keyNames NOTIFY keyNamesChanged)
     Q_PROPERTY(QStringList referenceNames READ referenceNames NOTIFY keyNamesChanged)
     Q_PROPERTY(QStringList allKeyNames READ allKeyNames NOTIFY keyNamesChanged)
+    Q_PROPERTY(QStringList savedKeyNames READ savedKeyNames NOTIFY keyNamesChanged)
     Q_PROPERTY(bool hasKeys READ hasKeys NOTIFY keyNamesChanged)
     Q_PROPERTY(QString knownHostsPath READ knownHostsPath CONSTANT)
     Q_PROPERTY(QString lastError READ lastError NOTIFY lastErrorChanged)
 
 public:
-    // Empty `rootDirectory` -> the real per-app sandbox, whose only use here is
-    // the trusted-host store at QStandardPaths::AppConfigLocation/known_hosts —
-    // byte-for-byte the path SessionBootstrap already derives. A non-empty
-    // rootDirectory puts it under that directory instead and exists for
-    // tst_mobilekeystore, which asserts that NOTHING under it ever contains key
-    // material.
+    // Empty `rootDirectory` -> the real per-app sandbox: the trusted-host store
+    // at QStandardPaths::AppConfigLocation/known_hosts — byte-for-byte the path
+    // SessionBootstrap already derives — and the saved-key directory at
+    // QStandardPaths::AppDataLocation/keys. A non-empty rootDirectory puts both
+    // under that directory instead and exists for tst_mobilekeystore, which
+    // asserts both that saved keys land where they are documented to and that
+    // NOTHING ELSE under it ever contains key material.
+    //
+    // Constructing this object READS the saved-key directory's entry names, and
+    // nothing else: a name that survived the last launch is offered immediately,
+    // while its bytes are read only when a connect or a keyInfo() needs them. No
+    // directory is created here — only saveKeyOnDevice() creates one, so a user
+    // who never saves a key leaves no keys directory behind at all.
     explicit MobileKeyStore(QString rootDirectory = QString(),
                             QObject* parent = nullptr);
     ~MobileKeyStore() override;
@@ -144,16 +194,23 @@ public:
     // dereferencing nothing.
     Q_INVOKABLE void setConnectionPool(ch::SshConnectionPool* pool);
 
-    // Names of keys imported IN MEMORY this session, sorted.
+    // Names of keys held IN MEMORY right now, sorted. A saved key appears here
+    // only while a copy of it happens to be loaded — after the launch that saved
+    // it, saveKeyOnDevice() having kept the imported copy in memory as well.
     QStringList keyNames() const { return m_keyNames; }
     // Names of user-managed key files this session knows a reference for, sorted.
     QStringList referenceNames() const { return m_referenceNames; }
-    // Referenced keys first, then in-memory ones: what the connect page offers.
-    // Referenced first because those are the ones that survived the last launch.
+    // Names of keys saved on THIS device, sorted. Survives forgetSession().
+    QStringList savedKeyNames() const { return m_savedNames; }
+    // Referenced keys, then saved ones, then session-only in-memory ones: what
+    // the connect page offers, with the credentials that survived the last launch
+    // first. Each name appears exactly once, so a saved key that is also loaded
+    // in memory is one entry rather than two.
     QStringList allKeyNames() const;
     bool hasKeys() const
     {
-        return !m_keyNames.isEmpty() || !m_referenceNames.isEmpty();
+        return !m_keyNames.isEmpty() || !m_referenceNames.isEmpty()
+               || !m_savedNames.isEmpty();
     }
 
     // The trusted-host store this client uses. NOT owned here and never written
@@ -222,30 +279,73 @@ public:
     // class for persistence, and it is never key material.
     Q_INVOKABLE QString referenceFor(QString name) const;
 
+    // ---- path 3: saved on this device (opt-in, per key) --------------------
+
+    // Persist the ALREADY-IMPORTED in-memory key `name` to app-private storage,
+    // so it is offered again after a relaunch without being pasted again. The
+    // in-memory copy stays exactly as it was: this adds durability to a key the
+    // session is already using rather than replacing it.
+    //
+    // Deliberately takes a NAME rather than key text: the bytes written are the
+    // ones importKeyFromText() already validated and normalised, so a save cannot
+    // store something the session would refuse, and there is no second entry
+    // point through which key text could reach the filesystem.
+    //
+    // Returns false with lastError() set for an unusable name, a name that is not
+    // an in-memory key (a referenced key is ALREADY durable and copying it into
+    // app storage would be the one thing path 2 exists not to do), a name already
+    // saved, or any filesystem failure — including permissions that came back
+    // wider than owner-only, after which the file is deleted rather than left
+    // readable.
+    Q_INVOKABLE bool saveKeyOnDevice(QString name);
+
+    // Is there a file for `name` in this device's saved-key directory? What the
+    // UI shows the per-key switch from, and what tells "saved" apart from "loaded
+    // for this session".
+    Q_INVOKABLE bool isSavedOnDevice(QString name) const;
+
+    // Delete the saved file for `name` AND drop the in-memory copy, so the one
+    // action the UI offers beside "keep this key" really does remove it from the
+    // device rather than only from the list. Also clears the pool's copy when
+    // this is the installed credential, and drops an armed passphrase for it —
+    // the same reach removeKey() has, for the same reason. Returns false with
+    // lastError() set for a name that is not saved on this device.
+    Q_INVOKABLE bool forgetSavedKey(QString name);
+
     // ---- using and forgetting a key ----------------------------------------
 
-    // Forget `name`: an in-memory key's bytes are overwritten, a reference is
-    // dropped, an armed passphrase for it is dropped, and — when this is the key
-    // whose material is currently installed on the pool — the pool's copy is
-    // cleared too, so "forget" means forgotten everywhere rather than everywhere
-    // except the one place that would re-authenticate with it. Returns false with
-    // lastError() set for an unknown name.
+    // Forget `name` everywhere it exists: an in-memory key's bytes are
+    // overwritten, a reference is dropped, a SAVED key's file is deleted, an
+    // armed passphrase for it is dropped, and — when this is the key whose
+    // material is currently installed on the pool — the pool's copy is cleared
+    // too, so "forget" means forgotten everywhere rather than everywhere except
+    // the one place that would re-authenticate with it. The saved file is deleted
+    // rather than orphaned: leaving it would resurrect the credential the user
+    // just removed at the next launch. Returns false with lastError() set for an
+    // unknown name.
     Q_INVOKABLE bool removeKey(QString name);
 
     // Install the credential for `name` on the pool for the NEXT connect attempt,
     // and return whether that succeeded:
     //   * in-memory name -> SshConnectionPool::setInMemoryIdentity(armoured PEM)
     //   * referenced name -> resolve the reference to bytes, then the same
+    //   * saved name -> read the saved file, then the same; the bytes are wiped
+    //     again as soon as the pool has them, so a saved key is not held in
+    //     memory between connects merely because it is on the device
     //   * empty name -> clearInMemoryIdentity(); the ladder falls back to
     //     password / keyboard-interactive
     // Always clears first, so a previous attempt's key can never leak into a
     // connection the user aimed at a different credential.
     Q_INVOKABLE bool applyIdentityForConnect(QString name);
 
-    // Drop EVERY secret this object holds: in-memory keys, resolved reference
-    // bytes, the armed passphrase, and the pool's in-memory identity. Called on
-    // explicit disconnect and from the destructor. References themselves (which
-    // are not secrets) survive, so reconnecting does not need a fresh pick.
+    // Drop EVERY secret this object holds IN MEMORY: imported keys, resolved
+    // reference bytes, a saved key's loaded copy, the armed passphrase, and the
+    // pool's in-memory identity. Called on explicit disconnect and from the
+    // destructor. Two things survive because neither is a session secret:
+    // references (dropping them would force a fresh pick after every disconnect)
+    // and SAVED KEY FILES, which the user asked this device to keep and which
+    // only removeKey()/forgetSavedKey() delete. What is wiped for a saved key is
+    // the copy in memory, not the file.
     Q_INVOKABLE void forgetSession();
 
     // OpenSSH's own fingerprint of the key's PUBLIC half, "SHA256:<unpadded
@@ -265,8 +365,9 @@ public:
 
     // Everything the UI needs about a key, in one call:
     //   name                  as known
-    //   referenced            true for a user-managed file, false for a paste
-    //   reference             referenceFor() — empty for an in-memory import
+    //   referenced            true for a user-managed file, false otherwise
+    //   saved                 true when a copy is kept on THIS device (path 3)
+    //   reference             referenceFor() — empty unless `referenced`
     //   format                "openssh-key-v1" | "pem"
     //   keyType               "ssh-ed25519", "ecdsa-sha2-nistp256", ... ; empty
     //                         for a legacy PEM, whose type is not readable
@@ -374,23 +475,50 @@ private:
     // derivation have exactly one spelling. Returns false with lastError() set.
     bool readPickedFile(const QUrl& fileUrl, QString requestedName,
                         QString* textOut, QString* nameOut);
-    // The armoured key text for `name`: the in-memory copy, or a fresh read of
-    // its reference. Empty for an unknown name or an unresolvable reference, with
-    // lastError() set in the latter case. The one place that produces key
-    // material, and the caller wipes what it gets.
+    // The armoured key text for `name`: the in-memory copy, a fresh read of its
+    // reference, or a fresh read of its saved file — in that order, so a key that
+    // is both loaded and saved costs no I/O. Empty for an unknown name or a
+    // source that no longer yields a usable key, with lastError() set in the
+    // latter case. The one place that produces key material, and the caller wipes
+    // what it gets.
     QByteArray keyMaterial(const QString& name);
     // Refuse a name that is malformed or already in use, with the message for it.
     bool claimName(const QString& name);
 
+    // The file a saved key lives in, or an EMPTY string for a name that fails
+    // isUsableKeyName(). Every caller checks for empty before touching the
+    // filesystem: the name reaches the filename verbatim, so an unvalidated one
+    // ("../evil") would be a path-traversal write into the app sandbox. Building
+    // the path is therefore the same act as validating the name, and there is no
+    // other spelling of it in this class.
+    QString savedKeyPath(const QString& name) const;
+    // Create the saved-key directory if it is missing and leave it owner-only.
+    // Returns false with lastError() set when it cannot be created, or when the
+    // permissions that came back are wider than owner-only — which is a refusal
+    // to write a key into a directory anyone else can list.
+    bool ensureSavedKeyDirectory();
+    // Delete the saved file for `name` and drop it from m_savedNames. Returns
+    // false when there was no saved file to delete or the unlink failed; the
+    // name is dropped either way, because a name whose file is gone is not a
+    // saved key whatever the reason. Shared by removeKey() and forgetSavedKey().
+    bool deleteSavedKeyFile(const QString& name);
+
     QString m_knownHostsPath;
-    // Name -> armoured PEM, in memory, this session only. Overwritten before
-    // release.
+    // <AppDataLocation>/keys, or <rootDirectory>/keys. A PATH, not a secret, and
+    // not created until the first saveKeyOnDevice().
+    QString m_savedKeysDirectory;
+    // Name -> armoured PEM, in memory. Overwritten before release. A saved key
+    // has an entry here only while a copy is loaded.
     QHash<QString, QByteArray> m_memoryKeys;
     QStringList m_keyNames;
     // Name -> durable reference string. NOT a secret: it names a file, it carries
     // no key material, and it is what ends up in the profile's identityFile.
     QHash<QString, QString> m_references;
     QStringList m_referenceNames;
+    // Names with a file in m_savedKeysDirectory, sorted. NAMES only: the bytes
+    // stay on disk until something needs them, so this list is not key material
+    // and survives forgetSession() exactly as the files do.
+    QStringList m_savedNames;
     QString m_lastError;
     // See lastFailureAllowsSessionOnly(). Reset by every file entry point, set in
     // exactly one place.
@@ -411,5 +539,25 @@ private:
     // forgetSession() and ~MobileKeyStore() touch it.
     QPointer<SshConnectionPool> m_pool;
 };
+
+#ifdef Q_OS_IOS
+// Mark a saved key file as "do not back this up", implemented in
+// MobileKeyStoreIos.mm because it needs Foundation. Declared here so no
+// Objective-C include leaks into MobileKeyStore.cpp.
+//
+// WHY iOS NEEDS A CALL AT ALL, when Android needs none: Android has one switch
+// for the whole sandbox, android:allowBackup="false" in
+// packaging/android/AndroidManifest.xml, and it is already set. iOS has no such
+// switch — everything in the app container except <Caches> and <tmp> is backed
+// up to iCloud and to iTunes by default — and the per-file opt-out is
+// NSURLIsExcludedFromBackupKey, set on the URL after the file exists. Without it
+// a key the user asked to keep on THIS device would be copied off it, and then
+// onto every device they restore from that backup.
+//
+// Returns false with *errorOut set, and the caller then deletes the file it just
+// wrote: a saved key that would be backed up is not the thing the user agreed
+// to, so it is not kept at all.
+bool excludeFromDeviceBackup(const QString& path, QString* errorOut);
+#endif
 
 }  // namespace ch

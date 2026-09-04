@@ -10,24 +10,32 @@ import QtQuick.Layouts
 // they are about to use it in. A modal Dialog keeps that context on screen; a
 // second page would lose it and would need its own way back.
 //
-// NOTHING HERE WRITES A PRIVATE KEY ANYWHERE. SPEC 11.2 (docs/SPEC.md:1710-1729)
-// is an exhaustive allowlist of client-stored local state and private-key bytes
-// are not on it; its only credential entry is "SSH-agent or credential-store
-// references" (:1721) plus "an optional local identity-file path" (:1727). So the
-// sheet offers exactly the two compliant shapes, and no third one:
+// THREE SHAPES, AND SAVING IS THE ONLY ONE THAT WRITES BYTES. SPEC 11.2 is an
+// exhaustive allowlist of client-stored local state; it used to exclude
+// private-key bytes outright, and was amended to permit them under one
+// explicitly opt-in shape. So the sheet offers exactly three, and no fourth:
 //
 //   PASTE  -> the bytes live in memory for this session and are gone when the app
-//             closes. The cost is retyping/re-pasting per launch, which is the
-//             same trade SPEC 12.1 (docs/SPEC.md:1798-1805) already accepts for
-//             passphrases in exchange for persisting no secret at all.
+//             closes. This stays the DEFAULT for a pasted key: importing never
+//             writes anything. The cost is retyping/re-pasting per launch, which
+//             is the same trade SPEC 12.1 (docs/SPEC.md:1798-1805) already
+//             accepts for passphrases in exchange for persisting no secret.
 //   CHOOSE -> the key stays in the USER's storage and the client remembers only a
 //             REFERENCE to it (an Android persistable read grant, an iOS
 //             security-scoped bookmark, or a plain path), stored in the server
 //             profile's existing identity-file field. The bytes are read on
 //             demand at connect time and never copied into app storage.
+//   SAVE   -> after a paste has been imported, and only on a separate deliberate
+//             tap, ch::MobileKeyStore::saveKeyOnDevice() copies it into this
+//             app's private storage so it survives a relaunch. There is no
+//             pre-ticked box and no implicit path into this: a user who never
+//             taps the button is in exactly the pre-amendment situation.
 //
-// There is deliberately no "remember this key on this device" option, because
-// there is nowhere compliant to remember it.
+// THE SAVE WARNING IS NOT SOFTENED. The file is NOT encrypted - the store has no
+// passphrase of its own to encrypt it with, and inventing one would be a lock
+// whose key sits next to it. Anyone holding the unlocked phone can read it. The
+// sheet says that, in those words, next to the button, because a user cannot
+// weigh "survives a relaunch" against a risk nobody named.
 //
 // THE PASTED TEXT IS NEVER ECHOED BACK. On a successful import the text area is
 // cleared and the sheet shows the FINGERPRINT instead — a digest of the public
@@ -70,6 +78,26 @@ Dialog {
     // dropping a credential is not undoable for a pasted key, so it never happens
     // on one tap.
     property string pendingDeleteName: ""
+    // Which of the two deletions is pending, because they are not the same act
+    // and must not share one sentence: forgetting a REFERENCE leaves the user's
+    // own file alone, while forgetting a SAVED key erases the copy this app
+    // wrote. The confirmation says which one it is about to do.
+    property bool pendingDeleteFile: false
+
+    // The just-imported in-memory key that can still be offered for saving, or
+    // empty when there is nothing to offer. A NAME, never key material: the
+    // bytes stay in the store, and saving asks the store to write its own copy.
+    //
+    // Only set for a paste. A referenced key has nothing to save - its bytes are
+    // in the user's file by construction - and a key already on the device has
+    // nothing left to do.
+    property string savableName: ""
+
+    // Bumped whenever a save or a forget changes what keyInfo() would answer
+    // WITHOUT changing allKeyNames. The delegate reads keyInfo() imperatively,
+    // so nothing else would invalidate that binding and a row would keep
+    // describing the state it had before the tap.
+    property int keyInfoRevision: 0
 
     // Empty the paste box WITHOUT leaving the key recoverable.
     //
@@ -92,6 +120,8 @@ Dialog {
         root.clearInput()
         root.message = ""
         root.pendingDeleteName = ""
+        root.pendingDeleteFile = false
+        root.savableName = ""
         root.pickedUrl = ""
         root.pickedNeedsFallback = false
         nameField.clear()
@@ -158,6 +188,49 @@ Dialog {
             root.message = root.keyStoreRef.lastError
     }
 
+    // The one-line description of WHERE a key lives, and the only place that
+    // decides it. Lifted out of the list delegate so the three states are named
+    // once - a ListView with no model creates no delegate, so inlined branches
+    // there could not be checked without a live store behind them.
+    //
+    // Ordered by how much of the key sits on this device: none of it (a
+    // reference to the user's own file), this session only (a paste), or a file
+    // this app wrote and will read again (a save).
+    function keyStateLabel(info) {
+        if (!info || !info.name)
+            return qsTr("unavailable")
+        var parts = []
+        if (info.referenced)
+            parts.push(qsTr("your file, referenced"))
+        else if (info.saved)
+            parts.push(qsTr("saved on this device"))
+        else
+            parts.push(qsTr("in memory, this session"))
+        if (info.encrypted)
+            parts.push(qsTr("encrypted"))
+        if (info.fingerprintAvailable)
+            parts.push(String(info.fingerprint))
+        return parts.join("  \u00b7  ")
+    }
+
+    // Write the already-imported key to app-private storage. Reached only from
+    // the button below, which is only on screen after an import the user asked
+    // for - there is no code path that saves a key the user did not tap to save.
+    function doSaveOnDevice(name) {
+        if (!root.keyStoreRef)
+            return
+        if (!root.keyStoreRef.saveKeyOnDevice(name)) {
+            root.message = root.keyStoreRef.lastError
+            return
+        }
+        // The offer goes away rather than staying to be tapped twice: the row in
+        // the list above now reads "saved on this device", which is the standing
+        // answer, and the only remaining action on it is deleting the file.
+        root.savableName = ""
+        root.keyInfoRevision += 1
+        root.message = qsTr("Saved \"%1\" on this device. The file is not encrypted; anyone who can unlock this phone can read it.").arg(name)
+    }
+
     Connections {
         target: root.keyStoreRef
         ignoreUnknownSignals: true
@@ -168,6 +241,13 @@ Dialog {
             root.clearInput()
             nameField.clear()
             root.pickedNeedsFallback = false
+            // A paste, and only a paste, leaves something to offer. A referenced
+            // key already lives in the user's own file, and an import that came
+            // back already saved (a re-import of a name the store has on disk)
+            // has nothing left to write.
+            var info = root.keyStoreRef ? root.keyStoreRef.keyInfo(name) : null
+            root.savableName = (referenced || (info && info.saved === true)) ? "" : name
+            root.keyInfoRevision += 1
             root.message = referenced
                 ? qsTr("Remembered the location of \"%1\". The key file stays where you keep it; CodeHarbor stored only a reference to it.").arg(name)
                 : qsTr("Loaded \"%1\" for this session. Nothing was written to storage.").arg(name)
@@ -255,9 +335,11 @@ Dialog {
                 textFormat: Text.PlainText
                 font.pixelSize: 12
                 text: qsTr("There is no ssh-agent and no ~/.ssh on this device. "
-                           + "CodeHarbor never stores a private key: paste one to use "
-                           + "it for this session, or point it at a key file you keep "
-                           + "yourself and only its location is remembered.")
+                           + "Three ways to give CodeHarbor a key: paste one and use "
+                           + "it only until the app closes, point it at a key file you "
+                           + "keep yourself so only the location is remembered, or - "
+                           + "after pasting - save the key on this device, which "
+                           + "writes it to storage unencrypted.")
             }
 
             // ---- keys currently available ------------------------------------
@@ -284,8 +366,13 @@ Dialog {
                     // has its own control, so tapping the row itself does nothing.
                     enabled: false
 
-                    readonly property var info: root.keyStoreRef
-                                                ? root.keyStoreRef.keyInfo(String(modelData)) : null
+                    // keyInfoRevision is read for its side effect on this
+                    // binding: saving or deleting a file changes what keyInfo()
+                    // answers while leaving allKeyNames alone, and nothing else
+                    // here would make this re-evaluate.
+                    readonly property var info: (root.keyInfoRevision,
+                                                 root.keyStoreRef
+                                                 ? root.keyStoreRef.keyInfo(String(modelData)) : null)
 
                     contentItem: RowLayout {
                         spacing: 8
@@ -304,29 +391,40 @@ Dialog {
                                 elide: Text.ElideMiddle
                                 font.pixelSize: 11
                                 font.family: "monospace"
-                                text: {
-                                    if (!keyRow.info || !keyRow.info.name)
-                                        return qsTr("unavailable")
-                                    var parts = []
-                                    parts.push(keyRow.info.referenced
-                                               ? qsTr("your file, referenced")
-                                               : qsTr("in memory, this session"))
-                                    if (keyRow.info.encrypted)
-                                        parts.push(qsTr("encrypted"))
-                                    if (keyRow.info.fingerprintAvailable)
-                                        parts.push(String(keyRow.info.fingerprint))
-                                    return parts.join("  \u00b7  ")
-                                }
+                                text: root.keyStateLabel(keyRow.info)
                             }
                         }
+                        // Two different acts, so two different buttons, and never
+                        // both at once. "Remove" forgets what this app knows and
+                        // leaves every file where it is; "Delete file" erases the
+                        // copy this app wrote, which is the only case where a tap
+                        // here destroys a file. Naming them the same would let a
+                        // user reach for the familiar one and lose the key.
                         Button {
                             objectName: "deleteKeyButton"
                             Layout.minimumHeight: 48
                             Layout.minimumWidth: 48
                             enabled: true
                             flat: true
+                            visible: !(keyRow.info && keyRow.info.saved === true)
                             text: qsTr("Remove")
-                            onClicked: root.pendingDeleteName = String(keyRow.modelData)
+                            onClicked: {
+                                root.pendingDeleteFile = false
+                                root.pendingDeleteName = String(keyRow.modelData)
+                            }
+                        }
+                        Button {
+                            objectName: "deleteSavedKeyFileButton"
+                            Layout.minimumHeight: 48
+                            Layout.minimumWidth: 48
+                            enabled: true
+                            flat: true
+                            visible: keyRow.info && keyRow.info.saved === true
+                            text: qsTr("Delete file")
+                            onClicked: {
+                                root.pendingDeleteFile = true
+                                root.pendingDeleteName = String(keyRow.modelData)
+                            }
                         }
                     }
                 }
@@ -334,7 +432,8 @@ Dialog {
 
             // Removal confirmation, inline so the row it refers to is still visible.
             // Never a one-tap action: a pasted key cannot be recovered from here at
-            // all, and a reference has to be re-picked through the system dialog.
+            // all, a reference has to be re-picked through the system dialog, and a
+            // saved key's file is gone for good once the file is unlinked.
             Frame {
                 Layout.fillWidth: true
                 visible: root.pendingDeleteName.length > 0
@@ -342,11 +441,15 @@ Dialog {
                     anchors.fill: parent
                     spacing: 8
                     Label {
+                        objectName: "deleteConfirmLabel"
                         Layout.fillWidth: true
                         wrapMode: Text.WordWrap
                         textFormat: Text.PlainText
-                        text: qsTr("Remove the key \"%1\"? Your own key file is not deleted, but CodeHarbor will forget it.")
-                              .arg(root.pendingDeleteName)
+                        text: root.pendingDeleteFile
+                              ? qsTr("Delete the saved key file for \"%1\"? The copy CodeHarbor wrote to this device is erased and cannot be recovered here.")
+                                .arg(root.pendingDeleteName)
+                              : qsTr("Remove the key \"%1\"? Your own key file is not deleted, but CodeHarbor will forget it.")
+                                .arg(root.pendingDeleteName)
                     }
                     RowLayout {
                         Layout.fillWidth: true
@@ -357,20 +460,33 @@ Dialog {
                             Layout.minimumHeight: 48
                             flat: true
                             text: qsTr("Keep")
-                            onClicked: root.pendingDeleteName = ""
+                            onClicked: {
+                                root.pendingDeleteName = ""
+                                root.pendingDeleteFile = false
+                            }
                         }
                         Button {
                             objectName: "deleteConfirmButton"
                             Layout.fillWidth: true
                             Layout.minimumHeight: 48
-                            text: qsTr("Remove")
+                            text: root.pendingDeleteFile ? qsTr("Delete file")
+                                                         : qsTr("Remove")
                             onClicked: {
                                 var name = root.pendingDeleteName
+                                var deleteFile = root.pendingDeleteFile
                                 root.pendingDeleteName = ""
+                                root.pendingDeleteFile = false
                                 if (!root.keyStoreRef)
                                     return
-                                if (root.keyStoreRef.removeKey(name)) {
-                                    root.message = qsTr("Removed \"%1\".").arg(name)
+                                if (name === root.savableName)
+                                    root.savableName = ""
+                                var ok = deleteFile ? root.keyStoreRef.forgetSavedKey(name)
+                                                    : root.keyStoreRef.removeKey(name)
+                                root.keyInfoRevision += 1
+                                if (ok) {
+                                    root.message = deleteFile
+                                        ? qsTr("Deleted the saved key file for \"%1\".").arg(name)
+                                        : qsTr("Removed \"%1\".").arg(name)
                                     root.removed(name)
                                 } else {
                                     root.message = root.keyStoreRef.lastError
@@ -508,6 +624,72 @@ Dialog {
                 wrapMode: Text.WordWrap
                 textFormat: Text.PlainText
                 text: root.message
+            }
+
+            // ---- keep it after this session ----------------------------------
+            //
+            // A SEPARATE, SECOND tap, after the import already succeeded. Not a
+            // checkbox on the import button: a box next to "Use pasted key"
+            // would be armed before the user has seen the fingerprint or read
+            // what saving costs, and a box is the shape people tick without
+            // reading. Not a default either - the section is not even on screen
+            // until there is a session-only key to offer, and the store writes
+            // nothing unless this button is pressed.
+            //
+            // It stays INSIDE sheetColumn so it scrolls with the rest; the
+            // Dialog's height cap and its pinned footer are untouched.
+            Frame {
+                objectName: "saveKeyOnDeviceFrame"
+                Layout.fillWidth: true
+                visible: root.savableName.length > 0
+                ColumnLayout {
+                    anchors.fill: parent
+                    spacing: 8
+                    Label {
+                        Layout.fillWidth: true
+                        wrapMode: Text.WordWrap
+                        textFormat: Text.PlainText
+                        text: qsTr("Keep \"%1\" after this session?").arg(root.savableName)
+                    }
+                    Label {
+                        objectName: "saveKeyWarningLabel"
+                        Layout.fillWidth: true
+                        wrapMode: Text.WordWrap
+                        textFormat: Text.PlainText
+                        font.pixelSize: 12
+                        // Every clause here is a fact about what the store does,
+                        // and none of it is hedged. The passphrase sentence is
+                        // included because otherwise saving looks like it removes
+                        // the per-launch prompt, and it does not.
+                        text: qsTr("The key is written to this app's private storage. "
+                                   + "It is not encrypted: anyone who can unlock this "
+                                   + "phone can read it, and so can anyone who can read "
+                                   + "this app's files. A passphrase, if the key has one, "
+                                   + "is still never stored and is still asked for every "
+                                   + "time you connect.")
+                    }
+                    Button {
+                        objectName: "saveKeyOnDeviceButton"
+                        Layout.fillWidth: true
+                        Layout.minimumHeight: 48
+                        // Never pre-armed and never the default action: the
+                        // enabled state comes from there being a session-only key
+                        // and a live store, nothing else.
+                        enabled: root.keyStoreRef !== null && root.savableName.length > 0
+                        text: qsTr("Save this key on this device")
+                        onClicked: root.doSaveOnDevice(root.savableName)
+                    }
+                    Button {
+                        objectName: "keepSessionOnlyButton"
+                        Layout.fillWidth: true
+                        Layout.minimumHeight: 48
+                        flat: true
+                        // Dismisses the OFFER, not the key: the import already
+                        // happened and the key stays usable for this session.
+                        text: qsTr("No, this session only")
+                        onClicked: root.savableName = ""
+                    }
+                }
             }
         }
     }
