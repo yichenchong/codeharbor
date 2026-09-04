@@ -38,8 +38,10 @@
 
 #include "EditorFactory.h"
 #include "MobileNavFixture.h"
+#include "MobileTerminalSession.h"
 #include "MobileTerminalView.h"
 #include "MobileViewerService.h"
+#include "TerminalController.h"
 
 using namespace ch;
 using namespace chtest;
@@ -128,6 +130,35 @@ int listCount(QQuickItem *page)
     QQuickItem *view = findByType(page, QStringLiteral("ListView"));
     return view ? view->property("count").toInt() : -1;
 }
+
+// Captures what the pane WRITES to its PTY, and nothing else.
+//
+// tst_mobileterminal and tst_terminalcontroller each carry a full FakeChannel
+// with a read side; this test needs no read side at all, because remote output
+// is injected straight through TerminalController::ingestOutput(). So this is
+// deliberately not a third copy of that class - it is the smaller thing the
+// question here needs. NOT a QBuffer, for the same reason those two say: a
+// QBuffer makes written bytes readable, so every report this test sends would
+// come back as terminal output.
+class CapturingPty : public QIODevice {
+public:
+    CapturingPty() { open(QIODevice::ReadWrite | QIODevice::Unbuffered); }
+
+    bool isSequential() const override { return true; }
+    const QByteArray &written() const { return m_written; }
+    void clearWritten() { m_written.clear(); }
+
+protected:
+    qint64 readData(char *, qint64) override { return 0; }
+    qint64 writeData(const char *data, qint64 maxSize) override
+    {
+        m_written.append(data, maxSize);
+        return maxSize;
+    }
+
+private:
+    QByteArray m_written;
+};
 
 // The pane host's single Loader, and what it has loaded.
 QQuickItem *findByQmlTypeIn(QQuickItem *root, const QString &typeName)
@@ -328,6 +359,7 @@ private slots:
 
     void theFirstScreenIsTheConnectPage();
     void aBlankNodePathBlocksConnecting();
+    void aDragOverTheTerminalSendsWheelReports();
     void theSessionPickerListsEverySessionTheServerReported();
     void thePanePickerListsBothRegionsOfTheSelectedSession();
     void aTerminalLeafLoadsTheTerminalPage();
@@ -684,6 +716,138 @@ void TstMobileShell::aTerminalLeafLoadsTheTerminalPage()
     // And it is wired to a screen, which is what the renderer draws from.
     QVERIFY(session->property("screen").value<QObject *>());
     grabFrame(shell, QStringLiteral("04-terminal-pane"));
+}
+
+// The QML half of the tmux scroll fix, driven through the real MouseArea.
+//
+// tst_mobileterminal asserts the BYTES for a given notch count by calling
+// sendMouseWheel() directly. That leaves the part the user actually touches
+// unproven: the travel-to-notch arithmetic, the swipe direction, and the
+// pixel-to-cell conversion could each be wrong and that test would still pass.
+// So this one synthesises a drag on the page and reads what reached the PTY.
+void TstMobileShell::aDragOverTheTerminalSendsWheelReports()
+{
+    Shell shell;
+    QQuickWindow *window = shell.window();
+    QVERIFY(window);
+    shell.fixture.listSessions({QStringLiteral("s1")});
+    shell.fixture.openSession(QStringLiteral("s1"), QStringLiteral("viewer-1"),
+                              QStringLiteral("terminal-1"));
+    shell.fixture.mobile.selectPane(QStringLiteral("terminal:terminal-1"));
+
+    // Let the StackView push FINISH before touching anything. Mid-transition the
+    // page is still sliding horizontally, so a synthesised press lands at a
+    // different cell than the arithmetic here predicts, and the item moving
+    // under a stationary finger generates extra positionChanged deliveries -
+    // which is an extra notch. Both were observed while writing this.
+    QQuickItem *stack = findByType(window->contentItem(), QStringLiteral("StackView"));
+    QVERIFY(stack);
+    QTRY_VERIFY(!stack->property("busy").toBool());
+
+    QQuickItem *page = currentPage(window);
+    QQuickItem *terminal = findByQmlTypeIn(page, QStringLiteral("TerminalPage"));
+    QVERIFY(terminal);
+    auto *session = qobject_cast<MobileTerminalSession *>(
+        terminal->property("session").value<QObject *>());
+    QVERIFY(session);
+
+    CapturingPty pty;
+    session->controller()->setTransport(&pty);
+
+    // Put the pane where a real attached tmux puts it: alternate screen, mouse
+    // reporting on, SGR encoding.
+    session->controller()->ingestOutput(QByteArrayLiteral(
+        "\x1b[?1049h\x1b[?1000h\x1b[?1002h\x1b[?1006h"));
+    QTRY_VERIFY(session->screen()->altScreenActive());
+    QCOMPARE(session->screen()->mouseEncoding(), VtMouseEncoding::Sgr);
+
+    // By C++ type, not by QML type name: qmlTypeName() reports the class name,
+    // which for this one is namespace-qualified ("ch::MobileTerminalView").
+    auto *view = qobject_cast<MobileTerminalView *>(
+        findItem(page, [](QQuickItem *item) {
+            return qobject_cast<MobileTerminalView *>(item) != nullptr;
+        }));
+    QVERIFY(view);
+    const qreal lineHeight = view->lineHeight();
+    const qreal cellWidth = view->cellWidth();
+    QVERIFY2(lineHeight > 0.0 && cellWidth > 0.0,
+             "the view reported no cell metric, so the drag maths cannot run");
+
+    // Three lines per notch, as TerminalPage's gesture defines.
+    const qreal step = lineHeight * 3.0;
+    const QPointF origin = view->mapToScene(QPointF(0.0, 0.0));
+
+    // Local coordinates inside the view, then the same point in the window.
+    const QPointF startLocal(cellWidth * 6.0 + 1.0, lineHeight * 4.0 + 1.0);
+    // Two notches DOWN the screen, plus a sliver that must stay a remainder.
+    const QPointF endLocal(startLocal.x(), startLocal.y() + step * 2.0 + 2.0);
+    const QPoint start = (origin + startLocal).toPoint();
+    const QPoint end = (origin + endLocal).toPoint();
+
+    pty.clearWritten();
+    QTest::mousePress(window, Qt::LeftButton, Qt::NoModifier, start);
+    QTest::mouseMove(window, end);
+    QTest::mouseRelease(window, Qt::LeftButton, Qt::NoModifier, end);
+
+    // The cell is the one UNDER THE FINGER at the moment the notch fires, which
+    // is what decides which tmux pane scrolls in a split window.
+    //
+    // Derived from the point the event actually carried, mapped back into the
+    // item: a synthesised press takes INTEGER window coordinates, and the item's
+    // scene origin is fractional, so predicting from the ideal float lands on
+    // the neighbouring row whenever the rounding goes the other way.
+    const auto cellOf = [&](const QPoint &windowPoint) {
+        const QPointF local = view->mapFromScene(QPointF(windowPoint));
+        return QPoint(int(local.x() / cellWidth) + 1,
+                      int(local.y() / lineHeight) + 1);
+    };
+    const QPoint cell = cellOf(end);
+    const QByteArray up = "\x1b[<64;" + QByteArray::number(cell.x()) + ';'
+                          + QByteArray::number(cell.y()) + 'M';
+    // Dragging DOWN reveals OLDER output, so this is wheel UP (64) - and the
+    // sliver past two full notches did NOT become a third.
+    QCOMPARE(pty.written(), up + up);
+
+    // The local offset is untouched: on the alternate screen it has nowhere to
+    // go, and moving it was the original bug.
+    QCOMPARE(view->scrollOffset(), 0);
+
+    // The other direction is the other button.
+    const QPointF backLocal(startLocal.x(), startLocal.y() - step - 1.0);
+    const QPoint back = (origin + backLocal).toPoint();
+    pty.clearWritten();
+    QTest::mousePress(window, Qt::LeftButton, Qt::NoModifier, start);
+    QTest::mouseMove(window, back);
+    QTest::mouseRelease(window, Qt::LeftButton, Qt::NoModifier, back);
+    const QPoint backCell = cellOf(back);
+    const int backColumn = backCell.x();
+    const int backRow = backCell.y();
+    QCOMPARE(pty.written(),
+             QByteArray("\x1b[<65;" + QByteArray::number(backColumn) + ';'
+                        + QByteArray::number(backRow) + 'M'));
+
+    // A TAP is not a scroll: it raises the keyboard and writes nothing.
+    pty.clearWritten();
+    QTest::mouseClick(window, Qt::LeftButton, Qt::NoModifier, start);
+    QCOMPARE(pty.written(), QByteArray());
+
+    // And when the program stops asking for mouse events, the same drag falls
+    // back to the local offset instead of writing to the PTY. Leave the alt
+    // screen too, so there is real scrollback to move through.
+    session->controller()->ingestOutput(QByteArrayLiteral(
+        "\x1b[?1000l\x1b[?1002l\x1b[?1006l\x1b[?1049l"));
+    QTRY_COMPARE(session->screen()->mouseEncoding(), VtMouseEncoding::None);
+    for (int line = 0; line < 200; ++line)
+        session->controller()->ingestOutput(QByteArrayLiteral("filler\r\n"));
+    QTRY_VERIFY(view->maxScrollOffset() > 0);
+
+    pty.clearWritten();
+    QTest::mousePress(window, Qt::LeftButton, Qt::NoModifier, start);
+    QTest::mouseMove(window, end);
+    QTest::mouseRelease(window, Qt::LeftButton, Qt::NoModifier, end);
+    QCOMPARE(pty.written(), QByteArray());
+    QVERIFY2(view->scrollOffset() > 0,
+             "with no mouse reporting the drag must move the local offset");
 }
 
 void TstMobileShell::aMarkdownLeafLoadsTheMarkdownPage()
