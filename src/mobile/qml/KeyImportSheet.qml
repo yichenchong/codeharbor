@@ -357,14 +357,20 @@ Dialog {
                 visible: count > 0
                 clip: true
                 model: root.keyStoreRef ? root.keyStoreRef.allKeyNames : []
-                delegate: ItemDelegate {
+                delegate: Item {
                     id: keyRow
                     required property var modelData
                     width: keyList.width
                     height: 56
-                    // A row is not a button: dropping a key is the only action and it
-                    // has its own control, so tapping the row itself does nothing.
-                    enabled: false
+                    // A row is not a button. It must NOT express that as an
+                    // ItemDelegate with `enabled: false`, which is what it used
+                    // to be: Qt propagates EFFECTIVE enabled down the item tree,
+                    // so a disabled row disables the Remove and Delete file
+                    // buttons inside it however they set their own `enabled`.
+                    // That made every action in this list dead on a device while
+                    // still rendering, and it hid a real bug behind a comment.
+                    // A plain Item has no click of its own to suppress, so the
+                    // only tappable things in a row are the two buttons.
 
                     // keyInfoRevision is read for its side effect on this
                     // binding: saving or deleting a file changes what keyInfo()
@@ -374,7 +380,10 @@ Dialog {
                                                  root.keyStoreRef
                                                  ? root.keyStoreRef.keyInfo(String(modelData)) : null)
 
-                    contentItem: RowLayout {
+                    RowLayout {
+                        anchors.fill: parent
+                        anchors.leftMargin: 8
+                        anchors.rightMargin: 8
                         spacing: 8
                         ColumnLayout {
                             Layout.fillWidth: true
@@ -404,7 +413,6 @@ Dialog {
                             objectName: "deleteKeyButton"
                             Layout.minimumHeight: 48
                             Layout.minimumWidth: 48
-                            enabled: true
                             flat: true
                             visible: !(keyRow.info && keyRow.info.saved === true)
                             text: qsTr("Remove")
@@ -417,7 +425,6 @@ Dialog {
                             objectName: "deleteSavedKeyFileButton"
                             Layout.minimumHeight: 48
                             Layout.minimumWidth: 48
-                            enabled: true
                             flat: true
                             visible: keyRow.info && keyRow.info.saved === true
                             text: qsTr("Delete file")

@@ -34,9 +34,11 @@
 #include <QQuickWindow>
 #include <QSignalSpy>
 #include <QStandardPaths>
+#include <QTemporaryDir>
 #include <QVariant>
 
 #include "EditorFactory.h"
+#include "MobileKeyStore.h"
 #include "MobileNavFixture.h"
 #include "MobileTerminalSession.h"
 #include "MobileTerminalView.h"
@@ -47,6 +49,17 @@ using namespace ch;
 using namespace chtest;
 
 namespace {
+
+// ssh-keygen -t ed25519 -N '' -C ch-test. A real key, because the store parses
+// what it is handed before it will save it.
+constexpr auto kShellPlainKey = R"(-----BEGIN OPENSSH PRIVATE KEY-----
+b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW
+QyNTUxOQAAACCFPLr0I6E8+7CRLJi8cjh4SciVWMEXlHzF/IIDXFBLIwAAAJDD6ACHw+gA
+hwAAAAtzc2gtZWQyNTUxOQAAACCFPLr0I6E8+7CRLJi8cjh4SciVWMEXlHzF/IIDXFBLIw
+AAAEB/HxJkLwbaZm48TCAx96WJuyrDUfAUyv9wZzQGfttws4U8uvQjoTz7sJEsmLxyOHhJ
+yJVYwReUfMX8ggNcUEsjAAAAB2NoLXRlc3QBAgMEBQY=
+-----END OPENSSH PRIVATE KEY-----
+)";
 
 // The QML type name of an object, without the engine's instance suffix:
 // "PanePickerPage_QMLTYPE_57" -> "PanePickerPage". That suffix is an engine
@@ -380,6 +393,7 @@ private slots:
     void aDragOverTheTerminalSendsWheelReports();
     void theKeySheetFitsTheScreenAndScrolls();
     void theKeySheetOffersSavingOnDeviceOnlyAsASeparateTap();
+    void aSavedKeyRowsDeleteButtonIsReachableAndErasesTheFile();
     void theSessionPickerListsEverySessionTheServerReported();
     void thePanePickerListsBothRegionsOfTheSelectedSession();
     void aTerminalLeafLoadsTheTerminalPage();
@@ -1161,6 +1175,172 @@ void TstMobileShell::theKeySheetOffersSavingOnDeviceOnlyAsASeparateTap()
              QStringLiteral("Delete file"));
     sheet->setProperty("pendingDeleteName", QString());
     sheet->setProperty("pendingDeleteFile", false);
+}
+
+// A row's buttons are the only way to drop a key, and this case exists because
+// they were unreachable while looking entirely normal. The row was an
+// ItemDelegate carrying `enabled: false` to express "a row is not a button",
+// and Qt propagates EFFECTIVE enabled down the item tree: both buttons inside
+// it were disabled however each set its own `enabled: true`. Nothing looked
+// wrong - the rows rendered, the store's own tests passed, and every tap did
+// nothing at all.
+//
+// Reachability cannot be measured without a live store, because a button only
+// exists for a row and a row only exists for a key. So this drives a REAL
+// ch::MobileKeyStore over a temporary app-data root, and takes the saved file's
+// ABSENCE from disk at the end as the proof: asserting that a press landed
+// would still pass if a disabled ancestor swallowed the click.
+void TstMobileShell::aSavedKeyRowsDeleteButtonIsReachableAndErasesTheFile()
+{
+    QTemporaryDir root;
+    QVERIFY(root.isValid());
+
+    ch::MobileKeyStore store(root.path());
+    QVERIFY(store.importKeyFromText(QStringLiteral("phone"),
+                                    QString::fromLatin1(kShellPlainKey)));
+    QVERIFY(store.saveKeyOnDevice(QStringLiteral("phone")));
+    const QString saved =
+        QDir(root.path()).filePath(QStringLiteral("keys/phone"));
+    QVERIFY2(QFile::exists(saved), qPrintable(saved));
+
+    Shell shell;
+    QQuickWindow *window = shell.window();
+    QVERIFY(window);
+    window->resize(412, 800);
+    window->show();
+    QVERIFY(QTest::qWaitForWindowExposed(window));
+
+    QQmlComponent component(
+        &shell.engine,
+        QUrl(QStringLiteral("qrc:/qt/qml/CodeHarbor/Mobile/KeyImportSheet.qml")));
+    QVERIFY2(!component.isError(), qPrintable(component.errorString()));
+    const std::unique_ptr<QObject> sheet(component.create());
+    QVERIFY(sheet);
+    sheet->setProperty("parent",
+                       QVariant::fromValue(window->contentItem()));
+    sheet->setProperty("keyStoreRef",
+                       QVariant::fromValue(static_cast<QObject *>(&store)));
+    QVERIFY(QMetaObject::invokeMethod(sheet.get(), "open"));
+    QTRY_VERIFY(sheet->property("visible").toBool());
+
+    auto *body = sheet->property("contentItem").value<QQuickItem *>();
+    QVERIFY(body);
+    const auto visibleByName = [body](const QString &name) {
+        return findItem(body, [&name](QQuickItem *item) {
+            return item->objectName() == name && item->isVisible();
+        });
+    };
+
+    // The ORDER here is load bearing, and two separate faults hid behind it.
+    // The list starts 0x0 and is sized by a later layout pass: a row outside
+    // its parent's clip rect receives no mouse events however visible and
+    // enabled it reports itself to be, so waiting only for `visible` made this
+    // test fail against a working button. And sizing the list RECYCLES its
+    // delegates, so a Button resolved while the list was still 0x0 is a
+    // dangling pointer by the time it has a size - which crashed this test
+    // outright. Size the list first, then resolve the row that survived.
+    QQuickItem *list = visibleByName(QStringLiteral("keyList"));
+    QVERIFY(list);
+    QTRY_VERIFY(list->width() > 0 && list->height() > 0);
+
+    // The saved key produced a row, and that row offers the file deletion
+    // rather than the reference "Remove".
+    QQuickItem *deleteFile = nullptr;
+    QTRY_VERIFY(
+        (deleteFile = visibleByName(QStringLiteral("deleteSavedKeyFileButton")))
+        && deleteFile->width() > 0 && deleteFile->height() > 0);
+    QVERIFY2(!visibleByName(QStringLiteral("deleteKeyButton")),
+             "a saved row offers \"Remove\", which does not delete the file it "
+             "is being tapped for");
+
+    // The regression, named exactly: QQuickItem::isEnabled() is the EFFECTIVE
+    // value, so this is false whenever any ancestor is disabled.
+    QVERIFY2(deleteFile->isEnabled(),
+             "the row's \"Delete file\" button is disabled by an ancestor, so no "
+             "tap can ever reach it");
+
+    // Tapping is only meaningful where a finger could land, so this scrolls the
+    // target into the sheet's viewport and CONFIRMS it arrived before clicking.
+    // Two separate faults made the naive version flaky, both worth naming: the
+    // confirmation appears INLINE in a capped, scrolling column, so whether it
+    // fell inside the clip rect depended on layout timing and a clipped item
+    // silently receives nothing; and the scroll bound has to come from the
+    // Flickable's contentHeight, because its contentItem's own height is not
+    // the scrollable extent and clamped every scroll back to zero.
+    auto *flick = findByType(body, QStringLiteral("Flickable"));
+    QVERIFY(flick);
+    auto *content = flick->property("contentItem").value<QQuickItem *>();
+    QVERIFY(content);
+
+    const auto rectOf = [](QQuickItem *item) {
+        return QRectF(item->mapToScene(QPointF(0, 0)),
+                      QSizeF(item->width(), item->height()));
+    };
+
+    // Scrolls `item` into view and clicks its centre. False if it never became
+    // reachable, which is a product fault rather than a slow machine: a control
+    // the sheet cannot scroll to is one a user cannot tap.
+    const auto tapWhenOnScreen = [&](QQuickItem *item) -> bool {
+        for (int attempt = 0; attempt < 100; ++attempt) {
+            const qreal extent =
+                qMax(0.0, flick->property("contentHeight").toReal()
+                              - flick->height());
+            const qreal room = qMax(0.0, flick->height() - item->height());
+            flick->setProperty(
+                "contentY",
+                qBound(0.0, content->mapFromItem(item, QPointF(0, 0)).y()
+                                - room / 2.0,
+                       extent));
+
+            // Inside the CLIP RECT and inside the WINDOW, recomputed every
+            // attempt. The viewport check alone is not enough: mid-layout this
+            // sheet has produced a RowLayout of width -16 and rows placed at
+            // x=417 in a 412-wide window, and a click posted outside the
+            // window is either dropped with a warning or lands on whatever is
+            // at the clamped point - which could pass against the wrong item.
+            // So this is a REQUIREMENT and never a clamp: an unreachable
+            // control fails the test instead of being tapped somewhere else.
+            const QRectF windowRect(QPointF(0, 0), QSizeF(window->size()));
+            if (item->height() > 0 && item->width() > 0
+                && rectOf(flick).contains(rectOf(item))
+                && windowRect.contains(rectOf(item))) {
+                const QPointF centre = item->mapToScene(
+                    QPointF(item->width() / 2.0, item->height() / 2.0));
+                QTest::mouseClick(window, Qt::LeftButton, Qt::NoModifier,
+                                  centre.toPoint());
+                return true;
+            }
+            QTest::qWait(20);
+        }
+        // Both rectangles in full, so a failure names the axis rather than
+        // leaving the reader to guess which edge was missed.
+        qWarning() << "unreachable:" << item->objectName() << rectOf(item)
+                   << "viewport" << rectOf(flick) << "window" << window->size();
+        return false;
+    };
+
+    QVERIFY2(tapWhenOnScreen(deleteFile),
+             "the \"Delete file\" button never became reachable");
+    QTRY_COMPARE(sheet->property("pendingDeleteName").toString(),
+                 QStringLiteral("phone"));
+    QVERIFY(sheet->property("pendingDeleteFile").toBool());
+
+    // Deleting a file is never one tap.
+    QVERIFY(QFile::exists(saved));
+
+    // Re-resolved after the layout the confirmation just changed.
+    QQuickItem *confirm = nullptr;
+    QTRY_VERIFY(
+        (confirm = visibleByName(QStringLiteral("deleteConfirmButton")))
+        && confirm->width() > 0 && confirm->height() > 0);
+    QVERIFY2(confirm->isEnabled(), "the confirmation button is unreachable too");
+    QVERIFY2(tapWhenOnScreen(confirm),
+             "the delete confirmation never became reachable");
+
+    // The file is gone from disk, and the store agrees it is gone - the whole
+    // path from a tap to forgetSavedKey() ran.
+    QTRY_VERIFY(!QFile::exists(saved));
+    QVERIFY(!store.allKeyNames().contains(QStringLiteral("phone")));
 }
 
 void TstMobileShell::aMarkdownLeafLoadsTheMarkdownPage()
