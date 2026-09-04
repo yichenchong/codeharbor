@@ -190,268 +190,303 @@ Dialog {
         onAccepted: root.doReference(selectedFile)
     }
 
-    contentItem: ColumnLayout {
-        spacing: 12
+    // Scrollable, and CAPPED.
+    //
+    // Without a height cap the ColumnLayout's implicit height wins and the
+    // Dialog grows past the window; the footer is pinned to the dialog, so the
+    // Close button goes with it - off the bottom of the screen, and on Android
+    // underneath the navigation bar where nothing can reach it. This sheet is
+    // the longest surface in the client (explanation, key list, file pick, name,
+    // paste box, preview, fingerprint), so it is the one that overflows first.
+    //
+    // The cap leaves the content taller than the space available, hence the
+    // Flickable: the body scrolls while the footer stays put.
+    //
+    // 16 above and below, mirroring the 32 this dialog already subtracts from
+    // the parent WIDTH. Literals rather than MobileTheme because every other
+    // metric in this file is one, and importing the module for a single margin
+    // would put two spacing vocabularies in one sheet.
+    readonly property real maxSheetHeight:
+        Math.max(240, (parent ? parent.height : 640) - 32)
+    height: Math.min(implicitHeight, maxSheetHeight)
 
-        Label {
-            Layout.fillWidth: true
-            wrapMode: Text.WordWrap
-            textFormat: Text.PlainText
-            font.pixelSize: 12
-            text: qsTr("There is no ssh-agent and no ~/.ssh on this device. "
-                       + "CodeHarbor never stores a private key: paste one to use "
-                       + "it for this session, or point it at a key file you keep "
-                       + "yourself and only its location is remembered.")
-        }
+    contentItem: Flickable {
+        id: sheetFlick
 
-        // ---- keys currently available ------------------------------------
-        Label {
-            Layout.fillWidth: true
-            textFormat: Text.PlainText
-            text: qsTr("Available keys")
-            visible: keyList.count > 0
-        }
-        ListView {
-            id: keyList
-            objectName: "keyList"
-            Layout.fillWidth: true
-            Layout.preferredHeight: Math.min(count * 56, 168)
-            visible: count > 0
-            clip: true
-            model: root.keyStoreRef ? root.keyStoreRef.allKeyNames : []
-            delegate: ItemDelegate {
-                id: keyRow
-                required property var modelData
-                width: keyList.width
-                height: 56
-                // A row is not a button: dropping a key is the only action and it
-                // has its own control, so tapping the row itself does nothing.
-                enabled: false
+        clip: true
+        // Reported to the Dialog so implicitHeight still describes the content
+        // it WANTS; the cap above is what decides the height it gets.
+        implicitHeight: sheetColumn.implicitHeight
+        contentWidth: width
+        contentHeight: sheetColumn.implicitHeight
+        boundsBehavior: Flickable.StopAtBounds
+        ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
 
-                readonly property var info: root.keyStoreRef
-                                            ? root.keyStoreRef.keyInfo(String(modelData)) : null
+        ColumnLayout {
+            id: sheetColumn
+            width: sheetFlick.width
+            spacing: 12
 
-                contentItem: RowLayout {
-                    spacing: 8
-                    ColumnLayout {
-                        Layout.fillWidth: true
-                        spacing: 0
-                        Label {
-                            Layout.fillWidth: true
-                            textFormat: Text.PlainText
-                            elide: Text.ElideRight
-                            text: String(keyRow.modelData)
-                        }
-                        Label {
-                            Layout.fillWidth: true
-                            textFormat: Text.PlainText
-                            elide: Text.ElideMiddle
-                            font.pixelSize: 11
-                            font.family: "monospace"
-                            text: {
-                                if (!keyRow.info || !keyRow.info.name)
-                                    return qsTr("unavailable")
-                                var parts = []
-                                parts.push(keyRow.info.referenced
-                                           ? qsTr("your file, referenced")
-                                           : qsTr("in memory, this session"))
-                                if (keyRow.info.encrypted)
-                                    parts.push(qsTr("encrypted"))
-                                if (keyRow.info.fingerprintAvailable)
-                                    parts.push(String(keyRow.info.fingerprint))
-                                return parts.join("  \u00b7  ")
-                            }
-                        }
-                    }
-                    Button {
-                        objectName: "deleteKeyButton"
-                        Layout.minimumHeight: 48
-                        Layout.minimumWidth: 48
-                        enabled: true
-                        flat: true
-                        text: qsTr("Remove")
-                        onClicked: root.pendingDeleteName = String(keyRow.modelData)
-                    }
-                }
+            Label {
+                Layout.fillWidth: true
+                wrapMode: Text.WordWrap
+                textFormat: Text.PlainText
+                font.pixelSize: 12
+                text: qsTr("There is no ssh-agent and no ~/.ssh on this device. "
+                           + "CodeHarbor never stores a private key: paste one to use "
+                           + "it for this session, or point it at a key file you keep "
+                           + "yourself and only its location is remembered.")
             }
-        }
 
-        // Removal confirmation, inline so the row it refers to is still visible.
-        // Never a one-tap action: a pasted key cannot be recovered from here at
-        // all, and a reference has to be re-picked through the system dialog.
-        Frame {
-            Layout.fillWidth: true
-            visible: root.pendingDeleteName.length > 0
-            ColumnLayout {
-                anchors.fill: parent
-                spacing: 8
-                Label {
-                    Layout.fillWidth: true
-                    wrapMode: Text.WordWrap
-                    textFormat: Text.PlainText
-                    text: qsTr("Remove the key \"%1\"? Your own key file is not deleted, but CodeHarbor will forget it.")
-                          .arg(root.pendingDeleteName)
-                }
-                RowLayout {
-                    Layout.fillWidth: true
-                    spacing: 8
-                    Button {
-                        objectName: "deleteCancelButton"
-                        Layout.fillWidth: true
-                        Layout.minimumHeight: 48
-                        flat: true
-                        text: qsTr("Keep")
-                        onClicked: root.pendingDeleteName = ""
-                    }
-                    Button {
-                        objectName: "deleteConfirmButton"
-                        Layout.fillWidth: true
-                        Layout.minimumHeight: 48
-                        text: qsTr("Remove")
-                        onClicked: {
-                            var name = root.pendingDeleteName
-                            root.pendingDeleteName = ""
-                            if (!root.keyStoreRef)
-                                return
-                            if (root.keyStoreRef.removeKey(name)) {
-                                root.message = qsTr("Removed \"%1\".").arg(name)
-                                root.removed(name)
-                            } else {
-                                root.message = root.keyStoreRef.lastError
+            // ---- keys currently available ------------------------------------
+            Label {
+                Layout.fillWidth: true
+                textFormat: Text.PlainText
+                text: qsTr("Available keys")
+                visible: keyList.count > 0
+            }
+            ListView {
+                id: keyList
+                objectName: "keyList"
+                Layout.fillWidth: true
+                Layout.preferredHeight: Math.min(count * 56, 168)
+                visible: count > 0
+                clip: true
+                model: root.keyStoreRef ? root.keyStoreRef.allKeyNames : []
+                delegate: ItemDelegate {
+                    id: keyRow
+                    required property var modelData
+                    width: keyList.width
+                    height: 56
+                    // A row is not a button: dropping a key is the only action and it
+                    // has its own control, so tapping the row itself does nothing.
+                    enabled: false
+
+                    readonly property var info: root.keyStoreRef
+                                                ? root.keyStoreRef.keyInfo(String(modelData)) : null
+
+                    contentItem: RowLayout {
+                        spacing: 8
+                        ColumnLayout {
+                            Layout.fillWidth: true
+                            spacing: 0
+                            Label {
+                                Layout.fillWidth: true
+                                textFormat: Text.PlainText
+                                elide: Text.ElideRight
+                                text: String(keyRow.modelData)
                             }
+                            Label {
+                                Layout.fillWidth: true
+                                textFormat: Text.PlainText
+                                elide: Text.ElideMiddle
+                                font.pixelSize: 11
+                                font.family: "monospace"
+                                text: {
+                                    if (!keyRow.info || !keyRow.info.name)
+                                        return qsTr("unavailable")
+                                    var parts = []
+                                    parts.push(keyRow.info.referenced
+                                               ? qsTr("your file, referenced")
+                                               : qsTr("in memory, this session"))
+                                    if (keyRow.info.encrypted)
+                                        parts.push(qsTr("encrypted"))
+                                    if (keyRow.info.fingerprintAvailable)
+                                        parts.push(String(keyRow.info.fingerprint))
+                                    return parts.join("  \u00b7  ")
+                                }
+                            }
+                        }
+                        Button {
+                            objectName: "deleteKeyButton"
+                            Layout.minimumHeight: 48
+                            Layout.minimumWidth: 48
+                            enabled: true
+                            flat: true
+                            text: qsTr("Remove")
+                            onClicked: root.pendingDeleteName = String(keyRow.modelData)
                         }
                     }
                 }
             }
-        }
 
-        MenuSeparator { Layout.fillWidth: true }
+            // Removal confirmation, inline so the row it refers to is still visible.
+            // Never a one-tap action: a pasted key cannot be recovered from here at
+            // all, and a reference has to be re-picked through the system dialog.
+            Frame {
+                Layout.fillWidth: true
+                visible: root.pendingDeleteName.length > 0
+                ColumnLayout {
+                    anchors.fill: parent
+                    spacing: 8
+                    Label {
+                        Layout.fillWidth: true
+                        wrapMode: Text.WordWrap
+                        textFormat: Text.PlainText
+                        text: qsTr("Remove the key \"%1\"? Your own key file is not deleted, but CodeHarbor will forget it.")
+                              .arg(root.pendingDeleteName)
+                    }
+                    RowLayout {
+                        Layout.fillWidth: true
+                        spacing: 8
+                        Button {
+                            objectName: "deleteCancelButton"
+                            Layout.fillWidth: true
+                            Layout.minimumHeight: 48
+                            flat: true
+                            text: qsTr("Keep")
+                            onClicked: root.pendingDeleteName = ""
+                        }
+                        Button {
+                            objectName: "deleteConfirmButton"
+                            Layout.fillWidth: true
+                            Layout.minimumHeight: 48
+                            text: qsTr("Remove")
+                            onClicked: {
+                                var name = root.pendingDeleteName
+                                root.pendingDeleteName = ""
+                                if (!root.keyStoreRef)
+                                    return
+                                if (root.keyStoreRef.removeKey(name)) {
+                                    root.message = qsTr("Removed \"%1\".").arg(name)
+                                    root.removed(name)
+                                } else {
+                                    root.message = root.keyStoreRef.lastError
+                                }
+                            }
+                        }
+                    }
+                }
+            }
 
-        // ---- add ---------------------------------------------------------
-        Label {
-            Layout.fillWidth: true
-            textFormat: Text.PlainText
-            text: qsTr("Name")
-        }
-        TextField {
-            id: nameField
-            objectName: "keyNameField"
-            Layout.fillWidth: true
-            Layout.minimumHeight: 48
-            placeholderText: qsTr("letters, digits, dots, dashes, underscores")
-            inputMethodHints: Qt.ImhNoAutoUppercase | Qt.ImhNoPredictiveText
-        }
+            MenuSeparator { Layout.fillWidth: true }
 
-        Button {
-            objectName: "pickKeyFileButton"
-            Layout.fillWidth: true
-            Layout.minimumHeight: 48
-            text: qsTr("Choose a key file I keep\u2026")
-            onClicked: filePicker.open()
-        }
-        Label {
-            Layout.fillWidth: true
-            wrapMode: Text.WordWrap
-            textFormat: Text.PlainText
-            font.pixelSize: 11
-            text: qsTr("The file stays in your storage. CodeHarbor remembers only "
-                       + "where it is and reads it when you connect.")
-        }
-        Button {
-            objectName: "useFileOnceButton"
-            Layout.fillWidth: true
-            Layout.minimumHeight: 48
-            flat: true
-            visible: root.pickedNeedsFallback
-            text: qsTr("Use that file just for this session")
-            onClicked: root.doSessionOnlyFile()
-        }
+            // ---- add ---------------------------------------------------------
+            Label {
+                Layout.fillWidth: true
+                textFormat: Text.PlainText
+                text: qsTr("Name")
+            }
+            TextField {
+                id: nameField
+                objectName: "keyNameField"
+                Layout.fillWidth: true
+                Layout.minimumHeight: 48
+                placeholderText: qsTr("letters, digits, dots, dashes, underscores")
+                inputMethodHints: Qt.ImhNoAutoUppercase | Qt.ImhNoPredictiveText
+            }
 
-        MenuSeparator { Layout.fillWidth: true }
+            Button {
+                objectName: "pickKeyFileButton"
+                Layout.fillWidth: true
+                Layout.minimumHeight: 48
+                text: qsTr("Choose a key file I keep\u2026")
+                onClicked: filePicker.open()
+            }
+            Label {
+                Layout.fillWidth: true
+                wrapMode: Text.WordWrap
+                textFormat: Text.PlainText
+                font.pixelSize: 11
+                text: qsTr("The file stays in your storage. CodeHarbor remembers only "
+                           + "where it is and reads it when you connect.")
+            }
+            Button {
+                objectName: "useFileOnceButton"
+                Layout.fillWidth: true
+                Layout.minimumHeight: 48
+                flat: true
+                visible: root.pickedNeedsFallback
+                text: qsTr("Use that file just for this session")
+                onClicked: root.doSessionOnlyFile()
+            }
 
-        Label {
-            Layout.fillWidth: true
-            textFormat: Text.PlainText
-            text: qsTr("Or paste the private key")
-        }
-        ScrollView {
-            Layout.fillWidth: true
-            Layout.preferredHeight: 140
-            TextArea {
-                id: keyText
-                objectName: "keyTextArea"
-                wrapMode: TextEdit.WrapAnywhere
+            MenuSeparator { Layout.fillWidth: true }
+
+            Label {
+                Layout.fillWidth: true
+                textFormat: Text.PlainText
+                text: qsTr("Or paste the private key")
+            }
+            ScrollView {
+                Layout.fillWidth: true
+                Layout.preferredHeight: 140
+                TextArea {
+                    id: keyText
+                    objectName: "keyTextArea"
+                    wrapMode: TextEdit.WrapAnywhere
+                    font.family: "monospace"
+                    font.pixelSize: 11
+                    // PlainText on an EDITOR too: TextEdit.AutoText would interpret a
+                    // pasted "<" as markup and silently alter the very bytes being
+                    // validated (SPEC 7.5 bans AutoText outright on mobile).
+                    textFormat: TextEdit.PlainText
+                    placeholderText: "-----BEGIN OPENSSH PRIVATE KEY-----"
+                    inputMethodHints: Qt.ImhSensitiveData | Qt.ImhNoAutoUppercase
+                                      | Qt.ImhNoPredictiveText
+                    onTextChanged: root.refreshPreview()
+                }
+            }
+
+            // What the pasted text actually is, or why it was refused. Straight from
+            // ch::MobileKeyStore::describeText().
+            Label {
+                objectName: "previewLabel"
+                Layout.fillWidth: true
+                visible: text.length > 0
+                wrapMode: Text.WordWrap
+                textFormat: Text.PlainText
+                font.pixelSize: 12
+                text: {
+                    if (!root.preview)
+                        return ""
+                    if (!root.preview.valid)
+                        return String(root.preview.error)
+                    var parts = [String(root.preview.format)]
+                    if (String(root.preview.keyType).length > 0)
+                        parts.push(String(root.preview.keyType))
+                    parts.push(root.preview.encrypted
+                               ? qsTr("passphrase required")
+                               : qsTr("no passphrase"))
+                    return parts.join("  \u00b7  ")
+                }
+            }
+            Label {
+                objectName: "previewFingerprintLabel"
+                Layout.fillWidth: true
+                visible: text.length > 0
+                wrapMode: Text.WrapAnywhere
+                textFormat: Text.PlainText
                 font.family: "monospace"
                 font.pixelSize: 11
-                // PlainText on an EDITOR too: TextEdit.AutoText would interpret a
-                // pasted "<" as markup and silently alter the very bytes being
-                // validated (SPEC 7.5 bans AutoText outright on mobile).
-                textFormat: TextEdit.PlainText
-                placeholderText: "-----BEGIN OPENSSH PRIVATE KEY-----"
-                inputMethodHints: Qt.ImhSensitiveData | Qt.ImhNoAutoUppercase
-                                  | Qt.ImhNoPredictiveText
-                onTextChanged: root.refreshPreview()
+                // The PUBLIC half's digest. Safe to show, and the only thing about the
+                // key this sheet ever displays.
+                text: (root.preview && root.preview.valid)
+                      ? String(root.preview.fingerprint) : ""
             }
-        }
 
-        // What the pasted text actually is, or why it was refused. Straight from
-        // ch::MobileKeyStore::describeText().
-        Label {
-            objectName: "previewLabel"
-            Layout.fillWidth: true
-            visible: text.length > 0
-            wrapMode: Text.WordWrap
-            textFormat: Text.PlainText
-            font.pixelSize: 12
-            text: {
-                if (!root.preview)
-                    return ""
-                if (!root.preview.valid)
-                    return String(root.preview.error)
-                var parts = [String(root.preview.format)]
-                if (String(root.preview.keyType).length > 0)
-                    parts.push(String(root.preview.keyType))
-                parts.push(root.preview.encrypted
-                           ? qsTr("passphrase required")
-                           : qsTr("no passphrase"))
-                return parts.join("  \u00b7  ")
+            // Deliberately NOT a DialogButtonBox AcceptRole button: that closes the
+            // dialog, and a refused import would then report its reason to a sheet the
+            // user can no longer see. Importing leaves the sheet open, so the
+            // fingerprint of what just landed — or the reason nothing did — is on
+            // screen next to the box it came from.
+            Button {
+                objectName: "importButton"
+                Layout.fillWidth: true
+                Layout.minimumHeight: 48
+                text: qsTr("Use pasted key for this session")
+                enabled: root.preview !== null && root.preview.valid === true
+                onClicked: root.doPasteImport()
             }
-        }
-        Label {
-            objectName: "previewFingerprintLabel"
-            Layout.fillWidth: true
-            visible: text.length > 0
-            wrapMode: Text.WrapAnywhere
-            textFormat: Text.PlainText
-            font.family: "monospace"
-            font.pixelSize: 11
-            // The PUBLIC half's digest. Safe to show, and the only thing about the
-            // key this sheet ever displays.
-            text: (root.preview && root.preview.valid)
-                  ? String(root.preview.fingerprint) : ""
-        }
 
-        // Deliberately NOT a DialogButtonBox AcceptRole button: that closes the
-        // dialog, and a refused import would then report its reason to a sheet the
-        // user can no longer see. Importing leaves the sheet open, so the
-        // fingerprint of what just landed — or the reason nothing did — is on
-        // screen next to the box it came from.
-        Button {
-            objectName: "importButton"
-            Layout.fillWidth: true
-            Layout.minimumHeight: 48
-            text: qsTr("Use pasted key for this session")
-            enabled: root.preview !== null && root.preview.valid === true
-            onClicked: root.doPasteImport()
-        }
-
-        Label {
-            objectName: "importMessageLabel"
-            Layout.fillWidth: true
-            visible: text.length > 0
-            wrapMode: Text.WordWrap
-            textFormat: Text.PlainText
-            text: root.message
+            Label {
+                objectName: "importMessageLabel"
+                Layout.fillWidth: true
+                visible: text.length > 0
+                wrapMode: Text.WordWrap
+                textFormat: Text.PlainText
+                text: root.message
+            }
         }
     }
 

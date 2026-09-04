@@ -360,6 +360,7 @@ private slots:
     void theFirstScreenIsTheConnectPage();
     void aBlankNodePathBlocksConnecting();
     void aDragOverTheTerminalSendsWheelReports();
+    void theKeySheetFitsTheScreenAndScrolls();
     void theSessionPickerListsEverySessionTheServerReported();
     void thePanePickerListsBothRegionsOfTheSelectedSession();
     void aTerminalLeafLoadsTheTerminalPage();
@@ -848,6 +849,91 @@ void TstMobileShell::aDragOverTheTerminalSendsWheelReports()
     QCOMPARE(pty.written(), QByteArray());
     QVERIFY2(view->scrollOffset() > 0,
              "with no mouse reporting the drag must move the local offset");
+}
+
+// The key sheet is the longest surface in the client - explanation, key list,
+// file pick, name field, paste box, preview, fingerprint - so it is the first
+// to outgrow a phone. It used to size itself to that content, and because the
+// Close button lives in the Dialog's pinned FOOTER, the dialog growing past the
+// window took the only way out with it: on Android the button landed under the
+// navigation bar, unreachable.
+void TstMobileShell::theKeySheetFitsTheScreenAndScrolls()
+{
+    Shell shell;
+    QQuickWindow *window = shell.window();
+    QVERIFY(window);
+
+    // A short window, which is the whole point: 480 is shorter than this sheet's
+    // natural height, so the cap and the Flickable both have to do their job.
+    // Phone-width but deliberately SHORT, and shown, exactly as grabFrame()
+    // does: an unexposed window lays nothing out, so its content item has zero
+    // height and the sheet would fall back to its own minimum instead of being
+    // constrained by the screen this test is meant to simulate.
+    window->resize(412, 480);
+    window->show();
+    QVERIFY(QTest::qWaitForWindowExposed(window));
+    QTRY_COMPARE(window->contentItem()->height(), 480.0);
+
+    QQmlComponent component(&shell.engine,
+                            QUrl(QStringLiteral(
+                                "qrc:/qt/qml/CodeHarbor/Mobile/KeyImportSheet.qml")));
+    QVERIFY2(!component.isError(), qPrintable(component.errorString()));
+    // A Dialog is a Popup, NOT a QQuickItem: it has height/contentItem/footer as
+    // properties but no parentItem(), so it is driven through the metaobject and
+    // its `parent` is set to the window's content item the way QML would.
+    std::unique_ptr<QObject> sheet(component.create());
+    QVERIFY(sheet);
+    QVERIFY(sheet->inherits("QQuickPopup"));
+    sheet->setProperty("parent",
+                       QVariant::fromValue(window->contentItem()));
+    QVERIFY(QMetaObject::invokeMethod(sheet.get(), "open"));
+    QTRY_VERIFY(sheet->property("visible").toBool());
+
+    // It fits, with the margin the dialog reserves.
+    const qreal available = window->contentItem()->height();
+    const qreal sheetHeight = sheet->property("height").toReal();
+    QVERIFY2(sheetHeight <= available - 32.0 + 0.5,
+             qPrintable(QStringLiteral("sheet is %1 tall in a %2 window")
+                            .arg(sheetHeight)
+                            .arg(available)));
+
+    // The footer button is inside the window, which is the user-visible claim.
+    auto *footer = sheet->property("footer").value<QQuickItem *>();
+    QVERIFY2(footer, "the sheet has no footer");
+    QQuickItem *close = findItem(footer, [](QQuickItem *item) {
+        return item->objectName() == QStringLiteral("importCloseButton");
+    });
+    QVERIFY2(close, "the sheet has no Close button");
+    const QPointF closeBottom =
+        close->mapToScene(QPointF(0.0, close->height()));
+    QVERIFY2(closeBottom.y() <= available + 0.5,
+             qPrintable(QStringLiteral("Close button bottom is at %1 in a %2 "
+                                       "window")
+                            .arg(closeBottom.y())
+                            .arg(available)));
+
+    // And the body scrolls, so capping the height hid nothing. The content is
+    // genuinely taller than the viewport, and flicking moves it.
+    auto *body = sheet->property("contentItem").value<QQuickItem *>();
+    QVERIFY2(body, "the sheet has no contentItem");
+    QQuickItem *flick = qobject_cast<QQuickItem *>(body->inherits("QQuickFlickable")
+                                                       ? body
+                                                       : findByType(body, QStringLiteral("Flickable")));
+    QVERIFY(flick);
+    const qreal contentHeight = flick->property("contentHeight").toReal();
+    QVERIFY2(contentHeight > flick->height(),
+             qPrintable(QStringLiteral("content %1 fits viewport %2, so this "
+                                       "test proves nothing")
+                            .arg(contentHeight)
+                            .arg(flick->height())));
+    QCOMPARE(flick->property("contentY").toReal(), 0.0);
+    flick->setProperty("contentY", 40.0);
+    QCOMPARE(flick->property("contentY").toReal(), 40.0);
+
+    // The fingerprint at the very bottom of the body is reachable by scrolling
+    // to the end - it is the last thing the sheet shows about a pasted key.
+    flick->setProperty("contentY", contentHeight - flick->height());
+    QVERIFY(flick->property("contentY").toReal() > 0.0);
 }
 
 void TstMobileShell::aMarkdownLeafLoadsTheMarkdownPage()
