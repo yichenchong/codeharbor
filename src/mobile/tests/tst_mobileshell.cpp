@@ -897,7 +897,7 @@ void TstMobileShell::theKeySheetFitsTheScreenAndScrolls()
     //
     // SafeArea attaches to a Window as well as to an Item, and
     // additionalMargins is writable for exactly this purpose, so the shell can
-    // be told it has a 96px navigation bar and every consumer must follow.
+    // be told it has a 200px navigation bar and every consumer must follow.
     // Measured along the way, and worth keeping: a Popup and a Popup's
     // contentItem report ZERO whatever the window says, which is why the sheet
     // is handed its insets by ConnectPage rather than asking SafeArea itself -
@@ -920,23 +920,23 @@ void TstMobileShell::theKeySheetFitsTheScreenAndScrolls()
         QVERIFY(injector);
         injector->setProperty("target", QVariant::fromValue(window));
         QVERIFY(QMetaObject::invokeMethod(injector.get(), "apply",
-                                          QVariant(96.0)));
-        QCOMPARE(injector->property("applied").toReal(), 96.0);
+                                          QVariant(200.0)));
+        QCOMPARE(injector->property("applied").toReal(), 200.0);
     }
 
     // The window published it and ConnectPage handed it down. Both halves of the
     // chain are load bearing, so both are asserted.
-    QTRY_COMPARE(window->property("safeAreaBottom").toReal(), 96.0);
-    QTRY_COMPARE(sheet->property("safeBottomInset").toReal(), 96.0);
+    QTRY_COMPARE(window->property("safeAreaBottom").toReal(), 200.0);
+    QTRY_COMPARE(sheet->property("safeBottomInset").toReal(), 200.0);
 
     const qreal safeTop = sheet->property("safeTop").toReal();
     const qreal safeBottom = sheet->property("safeBottom").toReal();
-    QCOMPARE(safeBottom, 96.0);
+    QCOMPARE(safeBottom, 200.0);
     QCOMPARE(safeTop, window->property("safeAreaTop").toReal());
     QCOMPARE(sheet->property("topMargin").toReal(), safeTop);
-    QCOMPARE(sheet->property("bottomMargin").toReal(), 96.0);
+    QCOMPARE(sheet->property("bottomMargin").toReal(), 200.0);
 
-    // Everything below runs WITH the 96px inset in place - restoring it first
+    // Everything below runs WITH the 200px inset in place - restoring it first
     // would leave these assertions describing a case they never exercised.
     //
     // It fits the window minus the navigation bar, minus its own breathing room.
@@ -951,7 +951,7 @@ void TstMobileShell::theKeySheetFitsTheScreenAndScrolls()
                             .arg(safeBottom)));
 
     // The button must clear the NAVIGATION BAR, not merely the window edge, and
-    // with a 96px inset injected above that is a real distinction rather than a
+    // with a 200px inset injected above that is a real distinction rather than a
     // restatement. This is what the report was about: a Close button inside the
     // window but underneath the bar cannot be tapped.
     auto *footer = sheet->property("footer").value<QQuickItem *>();
