@@ -202,12 +202,34 @@ Dialog {
     // The cap leaves the content taller than the space available, hence the
     // Flickable: the body scrolls while the footer stays put.
     //
-    // 16 above and below, mirroring the 32 this dialog already subtracts from
-    // the parent WIDTH. Literals rather than MobileTheme because every other
-    // metric in this file is one, and importing the module for a single margin
-    // would put two spacing vocabularies in one sheet.
+    // The reserved space is the SYSTEM's, not a number picked here. This matters
+    // on Android 15: the app targets SDK 35, where edge-to-edge is enforced, so
+    // the window extends BEHIND the navigation bar and "inside the window" is
+    // not the same as "reachable". A fixed margin would keep the footer inside
+    // the window and still under the bar.
+    //
+    // Taken from the HOST, not from SafeArea here, and that is not a preference
+    // - it is measured. With a bottom inset present, a plain Item in the
+    // window's tree reports it while a Popup and a Popup's contentItem both
+    // report zero, and `Window.window` is documented for Items only: on a
+    // Dialog it warns and yields null. So the item that opens this sheet reads
+    // the value and passes it in; ConnectPage does exactly that.
+    property real safeTopInset: 0
+    property real safeBottomInset: 0
+
+    readonly property real safeTop: safeTopInset
+    readonly property real safeBottom: safeBottomInset
+
+    // Keep the popup's own box out of the insets, so the footer cannot be
+    // positioned into the navigation bar even when the content is short.
+    topMargin: safeTop
+    bottomMargin: safeBottom
+
+    // The 16-above-and-below breathing room is ON TOP of the insets, mirroring
+    // the 32 this dialog already subtracts from the parent WIDTH. Literals
+    // rather than MobileTheme because every other metric in this file is one.
     readonly property real maxSheetHeight:
-        Math.max(240, (parent ? parent.height : 640) - 32)
+        Math.max(240, (parent ? parent.height : 640) - safeTop - safeBottom - 32)
     height: Math.min(implicitHeight, maxSheetHeight)
 
     contentItem: Flickable {

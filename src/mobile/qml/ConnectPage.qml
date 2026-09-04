@@ -335,6 +335,16 @@ Page {
         id: keyImport
         anchors.centerIn: Overlay.overlay
         keyStoreRef: root.keys
+        // The system-bar insets, handed DOWN from here.
+        //
+        // A Popup cannot read them itself: measured, a plain Item in the window
+        // tree reports a bottom inset while a Popup and a Popup's contentItem
+        // both report zero, and `Window.window` is documented for Items only -
+        // on a Dialog it warns and yields null. This page IS an Item, so it can
+        // ask, and the sheet needs the number to keep its Close button clear of
+        // Android's navigation bar.
+        safeTopInset: root.Window.window ? root.Window.window.safeAreaTop : 0
+        safeBottomInset: root.Window.window ? root.Window.window.safeAreaBottom : 0
         onImported: (name) => root.selectedKeyName = name
         onRemoved: (name) => {
             if (root.selectedKeyName === name)

@@ -874,30 +874,86 @@ void TstMobileShell::theKeySheetFitsTheScreenAndScrolls()
     QVERIFY(QTest::qWaitForWindowExposed(window));
     QTRY_COMPARE(window->contentItem()->height(), 480.0);
 
-    QQmlComponent component(&shell.engine,
-                            QUrl(QStringLiteral(
-                                "qrc:/qt/qml/CodeHarbor/Mobile/KeyImportSheet.qml")));
-    QVERIFY2(!component.isError(), qPrintable(component.errorString()));
-    // A Dialog is a Popup, NOT a QQuickItem: it has height/contentItem/footer as
-    // properties but no parentItem(), so it is driven through the metaobject and
-    // its `parent` is set to the window's content item the way QML would.
-    std::unique_ptr<QObject> sheet(component.create());
-    QVERIFY(sheet);
-    QVERIFY(sheet->inherits("QQuickPopup"));
-    sheet->setProperty("parent",
-                       QVariant::fromValue(window->contentItem()));
-    QVERIFY(QMetaObject::invokeMethod(sheet.get(), "open"));
+    // The sheet the APP hosts, opened the way the app opens it. Instantiating
+    // KeyImportSheet standalone would test a sheet nobody uses: the insets are
+    // handed to it by ConnectPage, so a bare instance sees zero and the whole
+    // point of this test evaporates.
+    QQuickItem *connectPage = currentPage(window);
+    QCOMPARE(qmlTypeName(connectPage), QStringLiteral("ConnectPage"));
+    QObject *sheet = nullptr;
+    for (QObject *child : connectPage->findChildren<QObject *>()) {
+        if (child->inherits("QQuickPopup")
+            && QString::fromLatin1(child->metaObject()->className())
+                   .contains(QStringLiteral("KeyImportSheet"))) {
+            sheet = child;
+            break;
+        }
+    }
+    QVERIFY2(sheet, "ConnectPage does not host a KeyImportSheet");
+    QVERIFY(QMetaObject::invokeMethod(sheet, "open"));
     QTRY_VERIFY(sheet->property("visible").toBool());
 
-    // It fits, with the margin the dialog reserves.
+    // A REAL non-zero bottom inset, injected on the WINDOW.
+    //
+    // SafeArea attaches to a Window as well as to an Item, and
+    // additionalMargins is writable for exactly this purpose, so the shell can
+    // be told it has a 96px navigation bar and every consumer must follow.
+    // Measured along the way, and worth keeping: a Popup and a Popup's
+    // contentItem report ZERO whatever the window says, which is why the sheet
+    // is handed its insets by ConnectPage rather than asking SafeArea itself -
+    // wiring `SafeArea.margins` onto the Dialog would have been dead code on a
+    // device as much as here.
+    {
+        QQmlComponent inj(&shell.engine);
+        inj.setData("import QtQuick\n"
+                    "QtObject {\n"
+                    "    property var target: null\n"
+                    "    property real applied: -1\n"
+                    "    function apply(px) {\n"
+                    "        target.SafeArea.additionalMargins.bottom = px\n"
+                    "        applied = target.SafeArea.additionalMargins.bottom\n"
+                    "    }\n"
+                    "}\n",
+                    QUrl(QStringLiteral("qrc:/tst_mobileshell/inject.qml")));
+        QVERIFY2(!inj.isError(), qPrintable(inj.errorString()));
+        std::unique_ptr<QObject> injector(inj.create());
+        QVERIFY(injector);
+        injector->setProperty("target", QVariant::fromValue(window));
+        QVERIFY(QMetaObject::invokeMethod(injector.get(), "apply",
+                                          QVariant(96.0)));
+        QCOMPARE(injector->property("applied").toReal(), 96.0);
+    }
+
+    // The window published it and ConnectPage handed it down. Both halves of the
+    // chain are load bearing, so both are asserted.
+    QTRY_COMPARE(window->property("safeAreaBottom").toReal(), 96.0);
+    QTRY_COMPARE(sheet->property("safeBottomInset").toReal(), 96.0);
+
+    const qreal safeTop = sheet->property("safeTop").toReal();
+    const qreal safeBottom = sheet->property("safeBottom").toReal();
+    QCOMPARE(safeBottom, 96.0);
+    QCOMPARE(safeTop, window->property("safeAreaTop").toReal());
+    QCOMPARE(sheet->property("topMargin").toReal(), safeTop);
+    QCOMPARE(sheet->property("bottomMargin").toReal(), 96.0);
+
+    // Everything below runs WITH the 96px inset in place - restoring it first
+    // would leave these assertions describing a case they never exercised.
+    //
+    // It fits the window minus the navigation bar, minus its own breathing room.
     const qreal available = window->contentItem()->height();
     const qreal sheetHeight = sheet->property("height").toReal();
-    QVERIFY2(sheetHeight <= available - 32.0 + 0.5,
-             qPrintable(QStringLiteral("sheet is %1 tall in a %2 window")
+    QVERIFY2(sheetHeight <= available - safeTop - safeBottom - 32.0 + 0.5,
+             qPrintable(QStringLiteral("sheet is %1 tall in a %2 window with "
+                                       "insets %3/%4")
                             .arg(sheetHeight)
-                            .arg(available)));
+                            .arg(available)
+                            .arg(safeTop)
+                            .arg(safeBottom)));
 
-    // The footer button is inside the window, which is the user-visible claim.
+    // The button must clear the NAVIGATION BAR, not merely the window edge, and
+    // with a 96px inset injected above that is a real distinction rather than a
+    // restatement. This is what the report was about: a Close button inside the
+    // window but underneath the bar cannot be tapped.
     auto *footer = sheet->property("footer").value<QQuickItem *>();
     QVERIFY2(footer, "the sheet has no footer");
     QQuickItem *close = findItem(footer, [](QQuickItem *item) {
@@ -906,11 +962,11 @@ void TstMobileShell::theKeySheetFitsTheScreenAndScrolls()
     QVERIFY2(close, "the sheet has no Close button");
     const QPointF closeBottom =
         close->mapToScene(QPointF(0.0, close->height()));
-    QVERIFY2(closeBottom.y() <= available + 0.5,
-             qPrintable(QStringLiteral("Close button bottom is at %1 in a %2 "
-                                       "window")
+    QVERIFY2(closeBottom.y() <= available - safeBottom + 0.5,
+             qPrintable(QStringLiteral("Close button bottom is at %1, but the "
+                                       "reachable area ends at %2")
                             .arg(closeBottom.y())
-                            .arg(available)));
+                            .arg(available - safeBottom)));
 
     // And the body scrolls, so capping the height hid nothing. The content is
     // genuinely taller than the viewport, and flicking moves it.

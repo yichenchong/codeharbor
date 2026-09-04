@@ -39,6 +39,19 @@ ApplicationWindow {
     title: qsTr("CodeHarbor")
     color: MobileTheme.surface
 
+    // The system-bar insets, read HERE and published.
+    //
+    // SafeArea attaches to a Window, so this asks directly - no probe item. What
+    // it does NOT work on is a Popup: measured, a Popup and a Popup's
+    // contentItem both report zero, so a dialog cannot ask for its own insets
+    // and has to be handed them. ConnectPage does that for the key sheet.
+    //
+    // This matters because the app targets SDK 35, where Android 15 enforces
+    // edge-to-edge: the window extends BEHIND the navigation bar, so "inside the
+    // window" is not "reachable".
+    readonly property real safeAreaTop: SafeArea.margins.top
+    readonly property real safeAreaBottom: SafeArea.margins.bottom
+
     // The platform back gesture, half one: the window close.
     //
     // On Android the back press arrives as a Qt::Key_Back KEY PRESS, and the
