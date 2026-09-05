@@ -395,16 +395,16 @@ void MobileAppController::onLayoutsLoaded(const QString& devSessionId)
     selectPane(remembered);
 }
 
-void MobileAppController::connectToServer(QVariantMap profile)
+QString MobileAppController::storeProfile(const QVariantMap& profile)
 {
     if (!m_app) {
         setStatusText(tr("This shell has no connection spine to dial with."));
-        return;
+        return {};
     }
     ServerProfiles* profiles = m_app->serverProfiles();
     if (!profiles) {
         setStatusText(tr("This shell has no connection spine to dial with."));
-        return;
+        return {};
     }
 
     QVariantMap fields;
@@ -415,8 +415,8 @@ void MobileAppController::connectToServer(QVariantMap profile)
     }
 
     // An `id` the store knows is an EDIT of that profile, not a new one: a
-    // reconnect from the same page must not leave a duplicate entry behind on
-    // every attempt.
+    // reconnect from the same page - or a second tap on Save - must not leave a
+    // duplicate entry behind on every attempt.
     QString id = profile.value(QStringLiteral("id")).toString();
     if (!id.isEmpty() && !profiles->profile(id).isEmpty()) {
         profiles->updateProfile(id, fields);
@@ -430,21 +430,72 @@ void MobileAppController::connectToServer(QVariantMap profile)
         if (!storedProfileTook(profiles->profile(id), fields)) {
             setStatusText(tr("That server needs at least a host name and a user "
                              "name, and a port between 1 and 65535."));
-            return;
+            return {};
         }
-    } else {
-        id = profiles->addProfile(fields);
+        return id;
     }
+
+    id = profiles->addProfile(fields);
     if (id.isEmpty()) {
         // ServerProfiles refuses a profile that could never connect rather than
         // storing it, so this is the one place the user learns why.
         setStatusText(tr("That server needs at least a host name and a user "
                          "name, and a port between 1 and 65535."));
+    }
+    return id;
+}
+
+void MobileAppController::connectToServer(QVariantMap profile)
+{
+    const QString id = storeProfile(profile);
+    if (id.isEmpty())
+        return;
+
+    m_app->serverProfiles()->setActiveId(id);
+    m_app->connectToProfile(id);
+}
+
+QString MobileAppController::saveServer(QVariantMap profile)
+{
+    const QString id = storeProfile(profile);
+    if (id.isEmpty())
+        return {};
+
+    // The name the STORE kept, not the one that was submitted: a blank name is
+    // filled in with the host on the way in, so reading it back is the only way
+    // to name the entry the user will actually see in the list.
+    const QString name =
+        m_app->serverProfiles()->profile(id).value(QStringLiteral("name")).toString();
+    // The one confirmation this page can give. A save that says nothing is
+    // indistinguishable from the refusal above, which is exactly the complaint
+    // that produced this entry point.
+    setStatusText(tr("Saved \u201c%1\u201d.").arg(name));
+    return id;
+}
+
+void MobileAppController::forgetServer(QString id)
+{
+    if (!m_app || !m_app->serverProfiles()) {
+        setStatusText(tr("This shell has no connection spine to dial with."));
+        return;
+    }
+    ServerProfiles* profiles = m_app->serverProfiles();
+    const QVariantMap stored = profiles->profile(id);
+    if (stored.isEmpty()) {
+        // Not a fault: the form may still be holding an id another writer of the
+        // same ini has since removed.
+        setStatusText(tr("That server is no longer in the remembered list."));
         return;
     }
 
-    profiles->setActiveId(id);
-    m_app->connectToProfile(id);
+    // Only the RECORD goes. A live connection is not affected: it is already
+    // dialled, and nothing about it is re-read from the profile - so forgetting
+    // the entry a session was opened from does not end that session, and
+    // pretending otherwise by disconnecting here would throw away work the user
+    // did not ask to lose.
+    profiles->removeProfile(id);
+    setStatusText(tr("Forgot \u201c%1\u201d.")
+                      .arg(stored.value(QStringLiteral("name")).toString()));
 }
 
 void MobileAppController::setTerminalFactory(TerminalFactory* factory)

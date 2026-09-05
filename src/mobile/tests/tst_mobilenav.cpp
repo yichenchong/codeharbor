@@ -1,6 +1,15 @@
 #include <QtTest/QtTest>
 
+#include <QFile>
+#include <QGuiApplication>
 #include <QJsonObject>
+#include <QPointF>
+#include <QQmlApplicationEngine>
+#include <QQmlContext>
+#include <QQuickItem>
+#include <QQuickStyle>
+#include <QQuickWindow>
+#include <QRectF>
 #include <QSignalSpy>
 #include <QStandardPaths>
 #include <QStringList>
@@ -16,6 +25,97 @@
 
 using namespace ch;
 using namespace chtest;
+
+namespace {
+
+// ---- finding an item in the real shell -------------------------------------
+//
+// The two cases at the end of this file drive the REAL QML pages, because the
+// question they ask - "is there something on this screen the user can tap to get
+// back to the server form" - is exactly the one a C++-only case cannot answer:
+// ch::MobileAppController::back() has always done the right thing, and the
+// session picker still had no affordance bound to it.
+//
+// Everything is found STRUCTURALLY, by walking the item tree, for the reason
+// tst_mobileshell spells out: a compiled QML module's ids are local to the
+// component and unreachable from outside it, and adding objectNames to a page
+// purely so a test can find it puts scaffolding into production QML. These are
+// deliberately private copies of that approach rather than a reach into the
+// other gate's file.
+QString qmlTypeName(QObject* object)
+{
+    if (!object)
+        return {};
+    QString name = QString::fromLatin1(object->metaObject()->className());
+    const qsizetype marker = name.indexOf(QLatin1String("_QMLTYPE_"));
+    if (marker >= 0)
+        name.truncate(marker);
+    return name;
+}
+
+template <typename Predicate>
+QQuickItem* findItem(QQuickItem* item, Predicate matches)
+{
+    if (!item)
+        return nullptr;
+    if (matches(item))
+        return item;
+    const QList<QQuickItem*> children = item->childItems();
+    for (QQuickItem* child : children) {
+        if (QQuickItem* found = findItem(child, matches))
+            return found;
+    }
+    return nullptr;
+}
+
+// Match either spelling of a Quick type: an unstyled type is C++
+// ("QQuickStackView"), while a styled Controls type is QML-defined and arrives
+// as "StackView_QMLTYPE_55_QML_63".
+QQuickItem* findByType(QQuickItem* root, const QString& name)
+{
+    const QString cppName = QStringLiteral("QQuick") + name;
+    return findItem(root, [&name, &cppName](QQuickItem* item) {
+        const QString className =
+            QString::fromLatin1(item->metaObject()->className());
+        return className == cppName || className == name
+               || qmlTypeName(item) == name;
+    });
+}
+
+// The page the StackView is showing, through its public `currentItem` property
+// rather than its id.
+QQuickItem* currentPage(QQuickWindow* window)
+{
+    QQuickItem* stack =
+        findByType(window->contentItem(), QStringLiteral("StackView"));
+    return stack ? stack->property("currentItem").value<QQuickItem*>() : nullptr;
+}
+
+// The first item under `root` whose `text` property reads exactly `text`. It is
+// how a case checks what the header is SHOWING rather than which property it
+// happens to be bound to.
+QQuickItem* findItemShowing(QQuickItem* root, const QString& text)
+{
+    return findItem(root, [&text](QQuickItem* candidate) {
+        const QVariant value = candidate->property("text");
+        return value.isValid() && value.toString() == text;
+    });
+}
+
+// The button `item` is the content of, if any. A glyph in a header is a Text
+// INSIDE an AbstractButton, and it is the button that has to be tapped and that
+// carries `enabled` - a Text is not clickable and would report nothing.
+QQuickItem* enclosingButton(QQuickItem* item)
+{
+    for (QQuickItem* candidate = item; candidate;
+         candidate = candidate->parentItem()) {
+        if (candidate->inherits("QQuickAbstractButton"))
+            return candidate;
+    }
+    return nullptr;
+}
+
+}  // namespace
 
 // ch::MobileAppController is the whole of the mobile client's navigation: the
 // two-step selection (which Dev Session, then which pane), the single-live-pane
@@ -49,6 +149,49 @@ private slots:
     void aSettledConnectionStopsClaimingToBeBusy();
     void aRefusedProfileEditIsReportedRatherThanDiallingTheOldOne();
     void anOwnerlessTerminalSessionIsRefused();
+
+    // ---- the server form: reachable, and editable ------------------------
+    void theSessionPickerOffersATapBackToTheServerForm();
+    void steppingBackToTheServerFormKeepsTheConnectionAndItsCredential();
+    void theConnectFormSavesTheServerItIsShowingOnATap();
+    void anEditedProfileRoundTripsThroughTheSharedStore();
+    void nothingSecretInTheFormReachesTheProfileStore();
+
+private:
+    // The real shell over the same fake codeharbord, for the cases that have
+    // to tap a real page. One engine per case: the shell keeps per-session
+    // state, so a case that inherited another's stack would be asserting on
+    // somebody else's walk.
+    //
+    // No type registration and no hand-written pages: ch_mobile's own QML module
+    // registers every C++ type QML names, so this host loads exactly the module
+    // a device loads. terminalFactory, keyStore and viewerService are
+    // deliberately NOT installed - every page guards its context properties, and
+    // their absence exercises that degraded path rather than a configuration no
+    // real host uses.
+    struct Shell {
+        Fixture fixture;
+        QQmlApplicationEngine engine;
+
+        Shell()
+        {
+            engine.rootContext()->setContextProperty(QStringLiteral("mobile"),
+                                                     &fixture.mobile);
+            engine.rootContext()->setContextProperty(QStringLiteral("app"),
+                                                     &fixture.controller);
+            engine.rootContext()->setContextProperty(QStringLiteral("layouts"),
+                                                     &fixture.layouts);
+            engine.loadFromModule(QStringLiteral("CodeHarbor.Mobile"),
+                                  QStringLiteral("MobileMain"));
+        }
+
+        QQuickWindow* window() const
+        {
+            if (engine.rootObjects().isEmpty())
+                return nullptr;
+            return qobject_cast<QQuickWindow*>(engine.rootObjects().first());
+        }
+    };
 };
 
 // AppController's UiStateStore is the real per-user QSettings (constructed with
@@ -393,8 +536,10 @@ void TstMobileNav::theActiveSessionIsRecordedUnderTheExistingUiStateKey()
              QStringLiteral("s2"));
 }
 
-// Guiless: everything here is QtCore/QtNetwork-free state over an in-process
-// QIODevice, so the target runs identically on a headless CI machine.
+// HEADLESS, not guiless: every case here is state over an in-process QIODevice
+// and needs no network and no server, but the last two load the real QML shell
+// to tap a real button, so the target runs under QGuiApplication on the
+// offscreen platform. Nothing about it needs a display or a device.
 
 // SPEC 12.1 keeps a secret for ONE authentication attempt. ch::MobileKeyStore's
 // forgetSession() is the only thing that wipes imported key bytes, an armed
@@ -715,5 +860,352 @@ void TstMobileNav::anOwnerlessTerminalSessionIsRefused()
     QVERIFY(f.mobile.findChildren<MobileTerminalSession*>().isEmpty());
 }
 
-QTEST_GUILESS_MAIN(TstMobileNav)
+// ---- the server form: reachable, and editable ------------------------------
+
+// The user's report was "there is no option anywhere to go back to the server
+// settings". back() was never the broken half - this very file has asserted the
+// Sessions -> Servers step since the beginning - so the case has to be driven
+// through the real page and a real tap, which is the only thing that can tell
+// "the controller can do it" from "the user can ask for it".
+void TstMobileNav::theSessionPickerOffersATapBackToTheServerForm()
+{
+    Shell shell;
+    QQuickWindow* window = shell.window();
+    QVERIFY(window);
+    window->show();
+    QVERIFY(QTest::qWaitForWindowExposed(window));
+
+    shell.fixture.listSessions({QStringLiteral("s1")});
+    // Opened and then stepped back to the list, rather than left mid-load: a
+    // pending layout raises the busy veil over the whole window, and a tap on a
+    // veiled page proves nothing about the page.
+    shell.fixture.openSession(QStringLiteral("s1"), QStringLiteral("viewer-1"),
+                              QStringLiteral("terminal-1"));
+    shell.fixture.mobile.back();
+    QVERIFY(!shell.fixture.mobile.layoutPending());
+    QQuickItem* page = currentPage(window);
+    QCOMPARE(qmlTypeName(page), QStringLiteral("SessionPickerPage"));
+
+    // The affordance the rest of the shell uses: the "\u2039" glyph in the
+    // header, in the same place PanePickerPage and PaneHostPage put it.
+    QQuickItem* glyph = findItemShowing(page, QStringLiteral("\u2039"));
+    QVERIFY2(glyph != nullptr,
+             "the session picker header shows no back glyph, so the connect "
+             "form is reachable only by Android's hardware key");
+    QQuickItem* button = enclosingButton(glyph);
+    QVERIFY2(button != nullptr, "the back glyph is not inside a button");
+    QVERIFY2(button->isEnabled(), "the back button is disabled");
+
+    // Inside the window, or the click is dropped by the platform and the case
+    // would pass on a button no thumb can reach.
+    const QPointF centre = button->mapToScene(
+        QPointF(button->width() / 2.0, button->height() / 2.0));
+    QVERIFY2(QRectF(0, 0, window->width(), window->height()).contains(centre),
+             "the back button is outside the window");
+
+    // Wait out the stack transition first. StackView refuses pointer input while
+    // it is animating a page in or out - measured: a click sent with `busy` true
+    // never reaches the button and the stage does not move - so a case that
+    // tapped immediately would report "no affordance" for a button that works.
+    QQuickItem* stack =
+        findByType(window->contentItem(), QStringLiteral("StackView"));
+    QVERIFY(stack != nullptr);
+    QTRY_VERIFY(!stack->property("busy").toBool());
+
+    QTest::mouseClick(window, Qt::LeftButton, Qt::NoModifier, centre.toPoint());
+
+    QTRY_COMPARE(shell.fixture.mobile.navStage(), MobileAppController::Servers);
+    // And the shell really shows the form, rather than only recording the
+    // stage: the whole complaint was about what is on the screen.
+    QTRY_COMPARE(qmlTypeName(currentPage(window)), QStringLiteral("ConnectPage"));
+}
+
+// The editable half, tapped rather than invoked: the store round trip below
+// proves the WRITE is right, and this proves the form is wired to it. A page
+// whose Save button called nothing would pass every store-level case in this
+// file, which is precisely the shape of the defect being fixed.
+void TstMobileNav::theConnectFormSavesTheServerItIsShowingOnATap()
+{
+    Shell shell;
+    QTemporaryDir storeRoot;
+    QVERIFY(storeRoot.isValid());
+    ServerProfiles profiles(storeRoot.filePath(QStringLiteral("servers.ini")));
+    shell.fixture.controller.setConnection(nullptr, nullptr, &profiles,
+                                           &shell.fixture.layouts);
+
+    QQuickWindow* window = shell.window();
+    QVERIFY(window);
+    window->show();
+    QVERIFY(QTest::qWaitForWindowExposed(window));
+
+    QQuickItem* page = currentPage(window);
+    QCOMPARE(qmlTypeName(page), QStringLiteral("ConnectPage"));
+
+    // The form's own state properties, which are what its fields write on every
+    // keystroke (onTextEdited). Typing character by character would be testing
+    // TextField.
+    page->setProperty("nameText", QStringLiteral("Prod box"));
+    page->setProperty("hostText", QStringLiteral("box.example"));
+    page->setProperty("userText", QStringLiteral("dev"));
+    page->setProperty("portText", QStringLiteral("2222"));
+    page->setProperty("nodePathText", QStringLiteral("/usr/bin/node"));
+    page->setProperty("repoRootText", QStringLiteral("/srv/codeharbor"));
+    QTRY_VERIFY(page->property("formValid").toBool());
+
+    // Found by objectName, which is THIS page's own convention - every control
+    // on it already carries one - rather than the structural search the
+    // objectName-free pages need.
+    QQuickItem* save = page->findChild<QQuickItem*>(QStringLiteral("saveServerButton"));
+    QVERIFY2(save != nullptr, "the connect form has no save control at all");
+    QTRY_VERIFY(save->isEnabled());
+
+    // It sits at the bottom of a scrolling column, so it has to be scrolled to
+    // before it can be tapped: a click outside the window is dropped, and one
+    // sent while the stack is still animating never arrives.
+    QQuickItem* flick = findByType(page, QStringLiteral("Flickable"));
+    QVERIFY(flick != nullptr);
+    flick->setProperty("contentY",
+                       qMax(0.0, flick->property("contentHeight").toReal()
+                                     - flick->height()));
+    QQuickItem* stack =
+        findByType(window->contentItem(), QStringLiteral("StackView"));
+    QVERIFY(stack != nullptr);
+    QTRY_VERIFY(!stack->property("busy").toBool());
+
+    const QRectF inside(0, 0, window->width(), window->height());
+    QTRY_VERIFY(inside.contains(save->mapToScene(
+        QPointF(save->width() / 2.0, save->height() / 2.0))));
+    const QPointF centre =
+        save->mapToScene(QPointF(save->width() / 2.0, save->height() / 2.0));
+    QTest::mouseClick(window, Qt::LeftButton, Qt::NoModifier, centre.toPoint());
+
+    // One profile, holding what the form was showing - and nothing was dialled.
+    QTRY_COMPARE(profiles.profiles().size(), 1);
+    const QString id = profiles.profiles().first().toMap()
+                           .value(QStringLiteral("id")).toString();
+    const QVariantMap stored = profiles.profile(id);
+    QCOMPARE(stored.value(QStringLiteral("name")).toString(),
+             QStringLiteral("Prod box"));
+    QCOMPARE(stored.value(QStringLiteral("host")).toString(),
+             QStringLiteral("box.example"));
+    QCOMPARE(stored.value(QStringLiteral("port")).toInt(), 2222);
+    QCOMPARE(stored.value(QStringLiteral("user")).toString(),
+             QStringLiteral("dev"));
+    QCOMPARE(stored.value(QStringLiteral("nodePath")).toString(),
+             QStringLiteral("/usr/bin/node"));
+    QCOMPARE(stored.value(QStringLiteral("repoRoot")).toString(),
+             QStringLiteral("/srv/codeharbor"));
+    QCOMPARE(shell.fixture.mobile.navStage(), MobileAppController::Servers);
+
+    // The page adopted the new id, so the NEXT save edits this entry instead of
+    // adding a second one - which is the difference between a save button and a
+    // duplicate factory.
+    QTRY_COMPARE(page->property("profileId").toString(), id);
+    QTest::mouseClick(window, Qt::LeftButton, Qt::NoModifier, centre.toPoint());
+    QTRY_COMPARE(profiles.profiles().size(), 1);
+
+    // Unwired before the store leaves scope: it is declared after the shell, so
+    // it dies FIRST.
+    shell.fixture.controller.setConnection(nullptr, nullptr, nullptr,
+                                           &shell.fixture.layouts);
+}
+
+// WHAT THAT TAP COSTS, pinned so the choice is recorded rather than remembered.
+//
+// The button calls back(), NOT disconnect(): the stage moves to Servers and
+// nothing else happens, so the SSH session stays up, the credential the store
+// holds stays live, and the active Dev Session is still active - going back to
+// the list costs no second handshake. disconnect() is the other thing entirely,
+// and this case drives both so the difference is not a matter of opinion.
+void TstMobileNav::steppingBackToTheServerFormKeepsTheConnectionAndItsCredential()
+{
+    Fixture f;
+    QTemporaryDir storeRoot;
+    QVERIFY(storeRoot.isValid());
+    MobileKeyStore keys(storeRoot.path());
+    keys.setConnectionPool(&f.pool);
+    f.mobile.setKeyStore(&keys);
+
+    // ssh-keygen -t ed25519 -N '' — the same throwaway pair the disconnect case
+    // uses; it authenticates nothing.
+    static const char* kKey =
+        "-----BEGIN OPENSSH PRIVATE KEY-----\n"
+        "b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW\n"
+        "QyNTUxOQAAACCFPLr0I6E8+7CRLJi8cjh4SciVWMEXlHzF/IIDXFBLIwAAAJDD6ACHw+gA\n"
+        "hwAAAAtzc2gtZWQyNTUxOQAAACCFPLr0I6E8+7CRLJi8cjh4SciVWMEXlHzF/IIDXFBLIw\n"
+        "AAAEB/HxJkLwbaZm48TCAx96WJuyrDUfAUyv9wZzQGfttws4U8uvQjoTz7sJEsmLxyOHhJ\n"
+        "yJVYwReUfMX8ggNcUEsjAAAAB2NoLXRlc3QBAgMEBQY=\n"
+        "-----END OPENSSH PRIVATE KEY-----\n";
+    QVERIFY(keys.importKeyFromText(QStringLiteral("pasted"),
+                                   QString::fromLatin1(kKey)));
+    QVERIFY(keys.applyIdentityForConnect(QStringLiteral("pasted")));
+
+    f.listSessions({QStringLiteral("s1")});
+    f.openSession(QStringLiteral("s1"), QStringLiteral("viewer-1"),
+                  QStringLiteral("terminal-1"));
+    f.mobile.back();
+    QCOMPARE(f.mobile.navStage(), MobileAppController::Sessions);
+
+    f.mobile.back();
+
+    QCOMPARE(f.mobile.navStage(), MobileAppController::Servers);
+    // Nothing was torn down: the identity is still installed on the pool, the
+    // key is still in the store, and the workspace still has a session active.
+    QVERIFY(f.pool.hasInMemoryIdentity());
+    QCOMPARE(keys.keyNames(), QStringList({QStringLiteral("pasted")}));
+    QCOMPARE(f.controller.activeSessionId(), QStringLiteral("s1"));
+
+    // The contrast, in the same case: disconnect() DOES take all of it.
+    f.mobile.disconnect();
+    QVERIFY(!f.pool.hasInMemoryIdentity());
+    QVERIFY(keys.keyNames().isEmpty());
+}
+
+// The other half of the report: the mobile connect form could select a
+// remembered server and edit its fields in memory, and nothing ever wrote them
+// back. saveServer() is that write, through the SAME ch::ServerProfiles the
+// connect path uses, so a saved profile is one the form can offer again - which
+// is only true if every field the form needs survives a trip to disk.
+void TstMobileNav::anEditedProfileRoundTripsThroughTheSharedStore()
+{
+    Fixture f;
+    QTemporaryDir storeRoot;
+    QVERIFY(storeRoot.isValid());
+    const QString ini = storeRoot.filePath(QStringLiteral("servers.ini"));
+    ServerProfiles profiles(ini);
+    f.controller.setConnection(nullptr, nullptr, &profiles, &f.layouts);
+
+    QVariantMap form{
+        {QStringLiteral("name"), QStringLiteral("Prod box")},
+        {QStringLiteral("host"), QStringLiteral("box.example")},
+        {QStringLiteral("port"), 2222},
+        {QStringLiteral("user"), QStringLiteral("dev")},
+        {QStringLiteral("identityFile"),
+         QStringLiteral("/home/dev/.ssh/id_ed25519")},
+        // REQUIRED by the form's own validation, so a save that dropped it would
+        // remember a server that cannot connect.
+        {QStringLiteral("nodePath"), QStringLiteral("/usr/bin/node")},
+        {QStringLiteral("repoRoot"), QStringLiteral("/srv/codeharbor")}};
+
+    const QString id = f.mobile.saveServer(form);
+    QVERIFY(!id.isEmpty());
+    // Saved WITHOUT dialling: this is the entry point the phone lacked, and a
+    // save that connected would be a second connect path.
+    QVERIFY(f.takeLayoutRequests().isEmpty());
+    QCOMPARE(f.mobile.connectionState(), QStringLiteral("disconnected"));
+    // The one confirmation the page can give, naming the entry as stored.
+    QCOMPARE(f.mobile.statusText(), QStringLiteral("Saved \u201cProd box\u201d."));
+
+    // A rename and an edit of the same profile, which is what the form does on
+    // a second Save: an EDIT in place, never a second entry.
+    form.insert(QStringLiteral("id"), id);
+    form.insert(QStringLiteral("name"), QStringLiteral("Prod"));
+    form.insert(QStringLiteral("repoRoot"), QStringLiteral("/srv/other"));
+    QCOMPARE(f.mobile.saveServer(form), id);
+    QCOMPARE(profiles.profiles().size(), 1);
+
+    // Re-read through a SECOND store on the same file: an in-memory list would
+    // agree with itself even if nothing reached disk.
+    {
+        ServerProfiles reread(ini);
+        QCOMPARE(reread.profiles().size(), 1);
+        const QVariantMap stored = reread.profile(id);
+        QCOMPARE(stored.value(QStringLiteral("name")).toString(),
+                 QStringLiteral("Prod"));
+        QCOMPARE(stored.value(QStringLiteral("host")).toString(),
+                 QStringLiteral("box.example"));
+        QCOMPARE(stored.value(QStringLiteral("port")).toInt(), 2222);
+        QCOMPARE(stored.value(QStringLiteral("user")).toString(),
+                 QStringLiteral("dev"));
+        QCOMPARE(stored.value(QStringLiteral("identityFile")).toString(),
+                 QStringLiteral("/home/dev/.ssh/id_ed25519"));
+        QCOMPARE(stored.value(QStringLiteral("nodePath")).toString(),
+                 QStringLiteral("/usr/bin/node"));
+        QCOMPARE(stored.value(QStringLiteral("repoRoot")).toString(),
+                 QStringLiteral("/srv/other"));
+    }
+
+    // And forgetting one really removes it, on disk as well as in the list.
+    f.mobile.forgetServer(id);
+    QVERIFY(profiles.profile(id).isEmpty());
+    QCOMPARE(f.mobile.statusText(), QStringLiteral("Forgot \u201cProd\u201d."));
+    {
+        ServerProfiles reread(ini);
+        QVERIFY(reread.profiles().isEmpty());
+    }
+
+    // An id nothing holds any more is reported rather than silently ignored: the
+    // form can be showing one another writer of the same file has removed.
+    f.mobile.forgetServer(id);
+    QCOMPARE(f.mobile.statusText(),
+             QStringLiteral("That server is no longer in the remembered list."));
+
+    // Unwired before the store leaves scope: it is declared after the fixture,
+    // so it dies FIRST, and a controller still holding it would be pointing at
+    // freed memory for the rest of the teardown.
+    f.controller.setConnection(nullptr, nullptr, nullptr, &f.layouts);
+}
+
+// SPEC 11.2 permits a profile to record connection metadata and never a secret,
+// and ServerProfiles' whitelist is what enforces it. The new save path must not
+// be a way around that: the connect form holds a passphrase field, and the map a
+// page hands over is the kind of place a secret ends up by accident.
+void TstMobileNav::nothingSecretInTheFormReachesTheProfileStore()
+{
+    Fixture f;
+    QTemporaryDir storeRoot;
+    QVERIFY(storeRoot.isValid());
+    const QString ini = storeRoot.filePath(QStringLiteral("servers.ini"));
+    ServerProfiles profiles(ini);
+    f.controller.setConnection(nullptr, nullptr, &profiles, &f.layouts);
+
+    const QVariantMap form{
+        {QStringLiteral("name"), QStringLiteral("box")},
+        {QStringLiteral("host"), QStringLiteral("box.example")},
+        {QStringLiteral("port"), 22},
+        {QStringLiteral("user"), QStringLiteral("dev")},
+        {QStringLiteral("identityFile"), QString()},
+        {QStringLiteral("nodePath"), QStringLiteral("/usr/bin/node")},
+        {QStringLiteral("repoRoot"), QStringLiteral("/srv/codeharbor")},
+        // Three shapes of the same accident.
+        {QStringLiteral("password"), QStringLiteral("hunter2")},
+        {QStringLiteral("passphrase"), QStringLiteral("hunter2")},
+        {QStringLiteral("privateKey"), QStringLiteral("hunter2")}};
+
+    const QString id = f.mobile.saveServer(form);
+    QVERIFY(!id.isEmpty());
+
+    const QVariantMap stored = profiles.profile(id);
+    QVERIFY(!stored.contains(QStringLiteral("password")));
+    QVERIFY(!stored.contains(QStringLiteral("passphrase")));
+    QVERIFY(!stored.contains(QStringLiteral("privateKey")));
+
+    // And the file itself, because "not in the map we read back" is not the same
+    // claim as "not on disk".
+    QFile file(ini);
+    QVERIFY(file.open(QIODevice::ReadOnly));
+    const QByteArray contents = file.readAll();
+    QVERIFY(!contents.isEmpty());
+    QVERIFY2(!contents.contains("hunter2"),
+             qPrintable(QStringLiteral("a secret handed to saveServer() reached "
+                                       "%1").arg(ini)));
+    // The metadata SPEC 11.2 does allow is there, so the check above is not
+    // passing on an empty file.
+    QVERIFY(contents.contains("box.example"));
+
+    f.controller.setConnection(nullptr, nullptr, nullptr, &f.layouts);
+}
+
+// The Material style and a QGuiApplication rather than QTEST_GUILESS_MAIN: the
+// two shell cases load the real QML module, and Controls needs a style resolved
+// before the first component is created. Everything else in this file is
+// unaffected - a QGuiApplication on the offscreen platform is still headless.
+int main(int argc, char* argv[])
+{
+    QQuickStyle::setStyle(QStringLiteral("Material"));
+    QGuiApplication app(argc, argv);
+    TstMobileNav test;
+    return QTest::qExec(&test, argc, argv);
+}
+
 #include "tst_mobilenav.moc"

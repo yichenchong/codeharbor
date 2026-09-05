@@ -394,6 +394,8 @@ private slots:
     void theKeySheetFitsTheScreenAndScrolls();
     void theKeySheetOffersSavingOnDeviceOnlyAsASeparateTap();
     void aSavedKeyRowsDeleteButtonIsReachableAndErasesTheFile();
+    void theSaveOfferIsScrolledOnScreenAfterAPasteImport();
+    void editingThePasteBoxKeepsTheCursorInView();
     void theSessionPickerListsEverySessionTheServerReported();
     void thePanePickerListsBothRegionsOfTheSelectedSession();
     void aTerminalLeafLoadsTheTerminalPage();
@@ -2086,6 +2088,304 @@ void TstMobileShell::aNavigationToANonHttpAddressIsRefusedAndSaidSo()
     QCOMPARE(page->property("refusedNavigation").toString(), QString());
     QVERIFY(!banner->isVisible());
 #endif
+}
+
+// The save offer appears at the BOTTOM of a capped, scrolling column, below the
+// paste box and the import button - which is where it belongs, because it is
+// about the key that button just loaded. What was reported is that tapping
+// import appeared to do nothing at all: the offer was rendered off the bottom of
+// the viewport and nothing scrolled to it.
+//
+// So this measures GEOMETRY, not `visible`. `visible == true` was already true
+// when the report was made, which is exactly why it is not the assertion: the
+// question is whether a finger and a pair of eyes can find the thing.
+//
+// Driven through a REAL ch::MobileKeyStore over a temporary app-data root, and
+// through the sheet's OWN paste box and import button rather than by calling the
+// store: the offer is raised by the store's keyImported() signal, so an import
+// that skipped the sheet would skip the code path under test.
+void TstMobileShell::theSaveOfferIsScrolledOnScreenAfterAPasteImport()
+{
+    QTemporaryDir appData;
+    QVERIFY(appData.isValid());
+    ch::MobileKeyStore store(appData.path());
+
+    Shell shell;
+    QQuickWindow *window = shell.window();
+    QVERIFY(window);
+    // A phone, at the size a phone actually is: this sheet's content after an
+    // import is ~994px against a ~712px viewport here, so the offer really is
+    // below the fold and the case is not a tautology.
+    window->resize(412, 892);
+    window->show();
+    QVERIFY(QTest::qWaitForWindowExposed(window));
+
+    QQuickItem *connectPage = currentPage(window);
+    QCOMPARE(qmlTypeName(connectPage), QStringLiteral("ConnectPage"));
+    QObject *sheet = hostedKeySheet(connectPage);
+    QVERIFY2(sheet, "ConnectPage does not host a KeyImportSheet");
+    sheet->setProperty("keyStoreRef",
+                       QVariant::fromValue(static_cast<QObject *>(&store)));
+
+    // Waiting for `opened` and not for `visible`: the Material Dialog runs an
+    // enter transition, `visible` turns true when it STARTS, and onOpened -
+    // which calls clearInput() - fires when it ends. A paste written in between
+    // is wiped, which is a fault of this harness and not of the sheet.
+    QSignalSpy openedSpy(sheet, SIGNAL(opened()));
+    QVERIFY(QMetaObject::invokeMethod(sheet, "open"));
+    QTRY_VERIFY(openedSpy.count() > 0);
+
+    auto *body = sheet->property("contentItem").value<QQuickItem *>();
+    QVERIFY(body);
+    const auto byName = [body](const char *name) {
+        const QString wanted = QString::fromLatin1(name);
+        return findItem(body, [&wanted](QQuickItem *item) {
+            return item->objectName() == wanted;
+        });
+    };
+    auto *flick = findByType(body, QStringLiteral("Flickable"));
+    QVERIFY(flick);
+    auto *content = flick->property("contentItem").value<QQuickItem *>();
+    QVERIFY(content);
+
+    const auto rectOf = [](QQuickItem *item) {
+        return QRectF(item->mapToScene(QPointF(0, 0)),
+                      QSizeF(item->width(), item->height()));
+    };
+
+    // Same requirement as the delete case: inside the clip rect AND inside the
+    // window, re-checked every attempt, because a click outside the window is
+    // dropped or lands on whatever the clamped point hits.
+    const auto tapWhenOnScreen = [&](QQuickItem *item) -> bool {
+        for (int attempt = 0; attempt < 100; ++attempt) {
+            const qreal extent =
+                qMax(0.0, flick->property("contentHeight").toReal()
+                              - flick->height());
+            const qreal room = qMax(0.0, flick->height() - item->height());
+            flick->setProperty(
+                "contentY",
+                qBound(0.0, content->mapFromItem(item, QPointF(0, 0)).y()
+                                - room / 2.0,
+                       extent));
+
+            const QRectF windowRect(QPointF(0, 0), QSizeF(window->size()));
+            if (item->height() > 0 && item->width() > 0
+                && rectOf(flick).contains(rectOf(item))
+                && windowRect.contains(rectOf(item))) {
+                const QPointF centre = item->mapToScene(
+                    QPointF(item->width() / 2.0, item->height() / 2.0));
+                QTest::mouseClick(window, Qt::LeftButton, Qt::NoModifier,
+                                  centre.toPoint());
+                return true;
+            }
+            QTest::qWait(20);
+        }
+        qWarning() << "unreachable:" << item->objectName() << rectOf(item)
+                   << "viewport" << rectOf(flick) << "window" << window->size();
+        return false;
+    };
+
+    // The paste, into the sheet's own box. Assigning `text` is what a paste
+    // reaches - QQuickTextArea has no separate paste entry point that a test
+    // could drive without a system clipboard - and it is the same assignment
+    // clearInput() relies on.
+    QQuickItem *keyText = byName("keyTextArea");
+    QVERIFY(keyText);
+    keyText->setProperty("text", QString::fromLatin1(kShellPlainKey));
+    QTRY_COMPARE(keyText->property("text").toString().size(),
+                 qsizetype(QString::fromLatin1(kShellPlainKey).size()));
+
+    // The button only arms once the sheet's own preview agrees the text is a
+    // key, so this also pins that the paste really landed as one.
+    QQuickItem *importButton = byName("importButton");
+    QVERIFY(importButton);
+    QTRY_VERIFY(importButton->property("enabled").toBool());
+    QVERIFY2(tapWhenOnScreen(importButton),
+             "the import button never became reachable");
+
+    // The store took it, and the sheet raised the offer.
+    QTRY_COMPARE(store.allKeyNames().size(), 1);
+    QTRY_VERIFY(!sheet->property("savableName").toString().isEmpty());
+    QQuickItem *frame = byName("saveKeyOnDeviceFrame");
+    QVERIFY2(frame, "the sheet offers no way to save a key on the device");
+    QTRY_VERIFY(frame->isVisible() && frame->height() > 0);
+
+    // The whole point. QTRY because a ColumnLayout settles over several passes
+    // and the sheet re-asserts the reveal on each of them; what must not happen
+    // is that it settles OFF screen.
+    const QRectF windowRect(QPointF(0, 0), QSizeF(window->size()));
+    QTRY_VERIFY2(rectOf(flick).contains(rectOf(frame))
+                     && windowRect.contains(rectOf(frame)),
+                 qPrintable(QStringLiteral("the save offer settled at %1, "
+                                           "viewport %2, window %3x%4")
+                                .arg(QDebug::toString(rectOf(frame)),
+                                     QDebug::toString(rectOf(flick)))
+                                .arg(window->width())
+                                .arg(window->height())));
+
+    // And it was reached by SCROLLING, not by the content happening to fit -
+    // otherwise this case would pass on a sheet that never scrolls to anything.
+    QVERIFY2(flick->property("contentHeight").toReal() > flick->height(),
+             qPrintable(QStringLiteral("content %1 fits viewport %2, so this "
+                                       "case proves nothing")
+                            .arg(flick->property("contentHeight").toReal())
+                            .arg(flick->height())));
+    QVERIFY2(flick->property("contentY").toReal() > 0.0,
+             "the offer was already on screen without scrolling");
+
+    // The button inside it is the one the user has to be able to reach, so it
+    // is checked separately rather than inferred from the Frame.
+    QQuickItem *save = byName("saveKeyOnDeviceButton");
+    QVERIFY(save);
+    QVERIFY(save->isEnabled());
+    QVERIFY2(rectOf(flick).contains(rectOf(save))
+                 && windowRect.contains(rectOf(save)),
+             qPrintable(QStringLiteral("the save button is at %1, viewport %2")
+                            .arg(QDebug::toString(rectOf(save)),
+                                 QDebug::toString(rectOf(flick)))));
+}
+
+// Putting the cursor in the paste box while the sheet is scrolled must bring the
+// cursor into view, and must not throw the user back to the top of the sheet.
+//
+// WHY THE TOP IS WHERE IT ENDED UP. Nothing in the sheet assigns contentY.
+// sheetFlick's HEIGHT is a function of its own CONTENT height - it reports
+// sheetColumn.implicitHeight as implicitHeight and the Dialog takes
+// Math.min(implicitHeight, maxSheetHeight) - so both scroll bounds move whenever
+// the column does. QQuickFlickablePrivate::fixup() returns an out-of-bounds
+// Flickable to minYExtent, i.e. contentY 0, as soon as the content fits the
+// viewport, and it runs from setContentHeight() and geometryChange(): every
+// content change and every resize. Measured while writing this: with the sheet
+// scrolled to contentY 68, growing the window from 412x892 to 412x1400 lifts the
+// cap, makes height == contentHeight == 780 and leaves contentY at 0. On Android
+// that resize is the soft keyboard under adjustResize, which is precisely what
+// happens when a user touches this box.
+//
+// The sheet now follows the cursor instead, which both keeps it visible as the
+// text grows and brings it back after any of those bounds resets. The scroll
+// position this case starts the edit from is therefore contentY 0 - the place
+// the fault leaves the user - and it asserts the cursor arrives inside the
+// viewport without the reveal running to either extreme.
+void TstMobileShell::editingThePasteBoxKeepsTheCursorInView()
+{
+    QTemporaryDir appData;
+    QVERIFY(appData.isValid());
+    ch::MobileKeyStore store(appData.path());
+
+    Shell shell;
+    QQuickWindow *window = shell.window();
+    QVERIFY(window);
+    // Deliberately SHORT, the same 480 theKeySheetFitsTheScreenAndScrolls uses:
+    // the sheet is then genuinely capped and the paste box genuinely leaves the
+    // viewport, which is the state the report was made in.
+    window->resize(412, 480);
+    window->show();
+    QVERIFY(QTest::qWaitForWindowExposed(window));
+
+    QQuickItem *connectPage = currentPage(window);
+    QCOMPARE(qmlTypeName(connectPage), QStringLiteral("ConnectPage"));
+    QObject *sheet = hostedKeySheet(connectPage);
+    QVERIFY(sheet);
+    sheet->setProperty("keyStoreRef",
+                       QVariant::fromValue(static_cast<QObject *>(&store)));
+    QSignalSpy openedSpy(sheet, SIGNAL(opened()));
+    QVERIFY(QMetaObject::invokeMethod(sheet, "open"));
+    QTRY_VERIFY(openedSpy.count() > 0);
+
+    auto *body = sheet->property("contentItem").value<QQuickItem *>();
+    QVERIFY(body);
+    auto *flick = findByType(body, QStringLiteral("Flickable"));
+    QVERIFY(flick);
+    QQuickItem *keyText = findItem(body, [](QQuickItem *item) {
+        return item->objectName() == QStringLiteral("keyTextArea");
+    });
+    QVERIFY(keyText);
+
+    // A pasted key, so the box holds more than one line and the cursor has
+    // somewhere to be.
+    keyText->setProperty("text", QString::fromLatin1(kShellPlainKey));
+    QTRY_VERIFY(flick->property("contentHeight").toReal() > flick->height());
+
+    const auto cursorSceneRect = [&] {
+        const QRectF local = keyText->property("cursorRectangle").toRectF();
+        return QRectF(keyText->mapToScene(local.topLeft()), local.size());
+    };
+    const auto viewportRect = [&] {
+        return QRectF(flick->mapToScene(QPointF(0, 0)),
+                      QSizeF(flick->width(), flick->height()));
+    };
+
+    // The state the report describes: the paste box is somewhere the viewport is
+    // not. contentY 0 is chosen because it is where Qt's fixup() leaves this
+    // sheet - see above - so this is the recovery being tested and not a
+    // hypothetical scroll position.
+    const qreal extent = flick->property("contentHeight").toReal()
+                         - flick->height();
+    QVERIFY(extent > 0.0);
+    flick->setProperty("contentY", extent);
+    QTRY_COMPARE(flick->property("contentY").toReal(), extent);
+    flick->setProperty("contentY", 0.0);
+    QTRY_COMPARE(flick->property("contentY").toReal(), 0.0);
+
+    // The setup has to be real: if the box were already on screen at the top,
+    // everything below would pass without the sheet scrolling anywhere.
+    QVERIFY2(!viewportRect().intersects(
+                 QRectF(keyText->mapToScene(QPointF(0, 0)),
+                        QSizeF(keyText->width(), keyText->height()))),
+             "the paste box is already in view at the top of the sheet, so this "
+             "case cannot tell a scroll from a no-op");
+
+    // Now the user touches the box. forceActiveFocus() plus a cursor position is
+    // what a tap resolves to, and it is the only way to place the cursor while
+    // the box is off screen - which is exactly the situation being fixed.
+    QVERIFY(QMetaObject::invokeMethod(keyText, "forceActiveFocus"));
+    keyText->setProperty("cursorPosition", 0);
+    QTRY_VERIFY(keyText->property("activeFocus").toBool());
+
+    QTRY_VERIFY2(viewportRect().contains(cursorSceneRect()),
+                 qPrintable(QStringLiteral("the cursor is at %1, outside the "
+                                           "viewport %2 (contentY %3)")
+                                .arg(QDebug::toString(cursorSceneRect()),
+                                     QDebug::toString(viewportRect()))
+                                .arg(flick->property("contentY").toReal())));
+
+    // Far enough and NO FURTHER, at both ends: a reveal that slammed to the
+    // bottom would satisfy the check above while throwing away everything the
+    // user had in view.
+    const qreal revealed = flick->property("contentY").toReal();
+    QVERIFY2(revealed > 0.0, "revealing the cursor moved nothing");
+    QVERIFY2(revealed < extent,
+             qPrintable(QStringLiteral("the reveal ran to the very bottom "
+                                       "(contentY %1 of %2)")
+                            .arg(revealed)
+                            .arg(extent)));
+
+    // Typing keeps it visible. Each key grows the text, which changes
+    // sheetColumn.implicitHeight and so re-runs Qt's fixup on both bounds; the
+    // cursor has to survive that, every time.
+    for (int i = 0; i < 5; ++i) {
+        QTest::keyClick(window, Qt::Key_X);
+        QTRY_VERIFY2(viewportRect().contains(cursorSceneRect()),
+                     qPrintable(QStringLiteral("after keystroke %1 the cursor "
+                                               "is at %2, outside viewport %3")
+                                    .arg(i)
+                                    .arg(QDebug::toString(cursorSceneRect()),
+                                         QDebug::toString(viewportRect()))));
+    }
+
+    // And a cursor that is already visible moves nothing: a view that re-scrolls
+    // on every keystroke fights the user as badly as one that jumps to the top.
+    const qreal settled = flick->property("contentY").toReal();
+    QTest::keyClick(window, Qt::Key_X);
+    QTest::qWait(50);
+    QCOMPARE(flick->property("contentY").toReal(), settled);
+
+    // The cap and the pinned footer are what theKeySheetFitsTheScreenAndScrolls
+    // guards; restated here because the cursor following is new code in the same
+    // Flickable and it must not have started sizing the sheet.
+    QVERIFY2(sheet->property("height").toReal()
+                 <= window->contentItem()->height() - 32.0 + 0.5,
+             "the sheet outgrew the screen while following the cursor");
 }
 
 // A QGuiApplication is required (this loads and renders real QML), and the style

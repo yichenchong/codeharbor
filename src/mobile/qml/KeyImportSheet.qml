@@ -99,6 +99,116 @@ Dialog {
     // describing the state it had before the tap.
     property int keyInfoRevision: 0
 
+    // Armed while the save offer below still has to be brought on screen.
+    //
+    // WHY THE SHEET HAS TO SCROLL AT ALL, AND WHY contentY IS NOT SAFE TO
+    // ASSUME. sheetFlick's HEIGHT is a function of its own CONTENT height: it
+    // reports sheetColumn.implicitHeight as its implicitHeight, and the Dialog
+    // takes height: Math.min(implicitHeight, maxSheetHeight). Both scroll
+    // bounds therefore move whenever the column does.
+    // QQuickFlickablePrivate::fixup() (qquickflickable.cpp) returns an
+    // out-of-bounds Flickable to minYExtent - contentY 0 - as soon as the
+    // content fits the viewport, and it is called from setContentHeight() and
+    // from geometryChange(), i.e. on every content change and every resize.
+    // Measured in tst_mobileshell: with the sheet scrolled to contentY 68,
+    // growing the window from 412x892 to 412x1400 lifts the cap, makes
+    // height == contentHeight == 780, and leaves contentY at 0. On Android that
+    // resize is the soft keyboard opening and closing under adjustResize, which
+    // is exactly when a user is typing in the paste box.
+    //
+    // That reset is Qt doing the right thing with the bounds it was handed - a
+    // scroll position into content that now fits is meaningless - so nothing
+    // here suppresses it. What was missing is anything that puts the part the
+    // user is looking at back on screen afterwards, and that is what the two
+    // reveals below are.
+    property bool pendingSaveReveal: false
+
+    // The ONE scrolling rule in this file: reveal [top, top + revealHeight) in
+    // sheetFlick.contentItem coordinates, moving no further than it takes, and
+    // not moving at all when it is already visible. Nothing else here assigns
+    // contentY, so there is no second scroll for this one to fight.
+    function revealInSheet(top, revealHeight) {
+        if (sheetFlick.height <= 0 || revealHeight <= 0)
+            return
+        var y = sheetFlick.contentY
+        if (top < y) {
+            y = top
+        } else if (top + revealHeight > y + sheetFlick.height) {
+            // Math.min pins the TOP of anything taller than the viewport: the
+            // save offer leads with the question it is asking, and scrolling to
+            // its bottom edge would show two buttons and no question.
+            y = Math.min(top, top + revealHeight - sheetFlick.height)
+        } else {
+            return
+        }
+        sheetFlick.contentY =
+            Math.max(0, Math.min(y, Math.max(0, sheetFlick.contentHeight
+                                                - sheetFlick.height)))
+    }
+
+    function revealItemInSheet(item) {
+        if (!item || !item.visible || item.height <= 0)
+            return
+        root.revealInSheet(sheetFlick.contentItem.mapFromItem(item, 0, 0).y,
+                           item.height)
+    }
+
+    // Bring the save offer on screen, and keep it there until the user has
+    // answered it or moved on.
+    //
+    // It appears at the BOTTOM of a capped, scrolling column, which is where it
+    // belongs: it is about the key that was just pasted, so it has to come after
+    // the paste box and the import button. Off screen is where that put it, and
+    // the report was that tapping import appeared to do nothing at all.
+    //
+    // Re-run on every layout pass rather than done once, because a ColumnLayout
+    // settles over several passes and the geometry the Frame reports on the
+    // first one is not its final one. Measured: the Frame reports its full
+    // 253px height while still sitting at its pre-layout y, which is why an
+    // earlier version of this that disarmed as soon as the Frame LOOKED visible
+    // stopped one pass early and left the offer 77px below the fold.
+    //
+    // So arming is ended by the USER instead - a drag of the sheet, or putting
+    // the cursor back in the paste box, or answering the offer - and never by a
+    // geometry that a later pass can contradict. Once the offer really is on
+    // screen every further pass is a no-op, because revealInSheet() does not
+    // move a rectangle that is already visible.
+    function revealSaveOffer() {
+        if (!root.pendingSaveReveal)
+            return
+        root.revealItemInSheet(saveKeyOnDeviceFrame)
+    }
+
+    // Keep the text cursor on screen while the paste box is being typed into.
+    //
+    // cursorRectangle is in keyText's OWN coordinates, and keyText is as tall as
+    // the key it holds - keyTextScroll is the 140px window onto it. So the
+    // cursor is mapped into the sheet and then clamped to that window: an inner
+    // view that has not caught up with the cursor yet must not be able to ask
+    // the sheet to scroll to a place the box does not occupy.
+    function revealKeyCursor() {
+        if (!keyText.activeFocus || root.pendingSaveReveal)
+            return
+        var box = sheetFlick.contentItem.mapFromItem(keyTextScroll, 0, 0).y
+        var rect = keyText.cursorRectangle
+        var y = sheetFlick.contentItem.mapFromItem(keyText, 0, rect.y).y
+        root.revealInSheet(Math.max(box, Math.min(y, box + keyTextScroll.height
+                                                     - rect.height)),
+                           rect.height)
+    }
+
+    // After any bounds change the position Qt left the Flickable at may show
+    // neither of the two things that matter, so re-assert them in priority
+    // order: the offer the user has just been asked about, otherwise the cursor
+    // they are typing at.
+    function revealWhatMatters() {
+        if (root.pendingSaveReveal) {
+            root.revealSaveOffer()
+            return
+        }
+        root.revealKeyCursor()
+    }
+
     // Empty the paste box WITHOUT leaving the key recoverable.
     //
     // TextArea.clear() reaches QQuickTextControl::clear(), which selects the whole
@@ -122,6 +232,7 @@ Dialog {
         root.pendingDeleteName = ""
         root.pendingDeleteFile = false
         root.savableName = ""
+        root.pendingSaveReveal = false
         root.pickedUrl = ""
         root.pickedNeedsFallback = false
         nameField.clear()
@@ -247,6 +358,9 @@ Dialog {
             // has nothing left to write.
             var info = root.keyStoreRef ? root.keyStoreRef.keyInfo(name) : null
             root.savableName = (referenced || (info && info.saved === true)) ? "" : name
+            // Armed here rather than off the Frame's own visibility, so a
+            // referenced import - which offers nothing - never scrolls anywhere.
+            root.pendingSaveReveal = root.savableName.length > 0
             root.keyInfoRevision += 1
             root.message = referenced
                 ? qsTr("Remembered the location of \"%1\". The key file stays where you keep it; CodeHarbor stored only a reference to it.").arg(name)
@@ -322,6 +436,20 @@ Dialog {
         contentWidth: width
         contentHeight: sheetColumn.implicitHeight
         boundsBehavior: Flickable.StopAtBounds
+
+        // These two are the layout passes the save offer's geometry settles
+        // over, and they are also the passes Qt's own fixup() zeroes contentY
+        // in. Re-asserting here is what makes the offer arrive on screen
+        // whichever pass lands last, and what puts the cursor back after a
+        // keyboard-driven resize; both reveals no-op when nothing is pending.
+        onContentHeightChanged: root.revealWhatMatters()
+        onHeightChanged: root.revealWhatMatters()
+
+        // The user taking the sheet somewhere else ends the offer's claim on the
+        // scroll position. movementStarted covers a drag and a flick and NOT a
+        // programmatic contentY, which is what the reveals themselves use.
+        onMovementStarted: root.pendingSaveReveal = false
+
         ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
 
         ColumnLayout {
@@ -554,6 +682,7 @@ Dialog {
                 text: qsTr("Or paste the private key")
             }
             ScrollView {
+                id: keyTextScroll
                 Layout.fillWidth: true
                 Layout.preferredHeight: 140
                 TextArea {
@@ -570,6 +699,17 @@ Dialog {
                     inputMethodHints: Qt.ImhSensitiveData | Qt.ImhNoAutoUppercase
                                       | Qt.ImhNoPredictiveText
                     onTextChanged: root.refreshPreview()
+                    // Follow the cursor, and only while this box is the thing
+                    // being typed into: the signal also fires when clearInput()
+                    // empties the box after an import, and following it then
+                    // would drag the view off the save offer that import just
+                    // raised.
+                    onCursorRectangleChanged: root.revealKeyCursor()
+                    // Going back to the box is the other way the user ends the
+                    // save offer's claim on the scroll position: from here on
+                    // the cursor is the thing that has to stay visible.
+                    onActiveFocusChanged: if (activeFocus)
+                                              root.pendingSaveReveal = false
                 }
             }
 
@@ -643,12 +783,24 @@ Dialog {
             // until there is a session-only key to offer, and the store writes
             // nothing unless this button is pressed.
             //
-            // It stays INSIDE sheetColumn so it scrolls with the rest; the
-            // Dialog's height cap and its pinned footer are untouched.
+            // It stays INSIDE sheetColumn so it scrolls with the rest, and it
+            // stays AFTER the import button because it is about the key that
+            // button just loaded; the sheet scrolls to it instead of moving it
+            // somewhere it would read out of order. The Dialog's height cap and
+            // its pinned footer are untouched.
             Frame {
+                id: saveKeyOnDeviceFrame
                 objectName: "saveKeyOnDeviceFrame"
                 Layout.fillWidth: true
                 visible: root.savableName.length > 0
+                // The frame's own settling passes, which the Flickable's two
+                // signals do not necessarily cover: a Frame that grows inside an
+                // already-tall enough column changes no scroll bound at all.
+                onHeightChanged: root.revealSaveOffer()
+                onYChanged: root.revealSaveOffer()
+                // Answered, or dropped with the key it referred to: nothing left
+                // to scroll to, and the cursor may have the position back.
+                onVisibleChanged: if (!visible) root.pendingSaveReveal = false
                 ColumnLayout {
                     anchors.fill: parent
                     spacing: 8

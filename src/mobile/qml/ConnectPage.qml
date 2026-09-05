@@ -10,12 +10,17 @@ import "EndpointField.js" as EndpointField
 // WHY THIS IS NOT ConnectSheet.qml. The desktop sheet is a CONNECTOR only —
 // profiles are created and edited in the settings window's Server pane, and the
 // sheet displays what is stored. A phone has no settings window and no second
-// surface to send the user to, so this page does both jobs: it edits the one
-// profile it is about and connects with it. What it deliberately does NOT do is
-// keep its own profile store — every field goes into the existing
-// ch::ServerProfiles through mobile.connectToServer(), whose seven-field
-// whitelist is the reason a passphrase typed on this page cannot reach disk even
-// by accident (ServerProfiles.h, "NO SECRET IS EVER STORED").
+// surface to send the user to, so this page does both jobs: it names, saves,
+// forgets and connects with the one profile it is about. Editing the fields in
+// memory and never writing them back was the earlier state of this page, and it
+// left a remembered server unchangeable on a device with no other surface.
+//
+// What it deliberately does NOT do is keep its own profile store — every field
+// goes into the existing ch::ServerProfiles through mobile.connectToServer() and
+// mobile.saveServer(), which are the same write with and without the dial, and
+// whose seven-field whitelist is the reason a passphrase typed on this page
+// cannot reach disk even by accident (ServerProfiles.h, "NO SECRET IS EVER
+// STORED").
 //
 // VALIDATION IS NOT RE-DERIVED HERE either. Host and user go through
 // EndpointField.js — the module's single copy of
@@ -47,6 +52,13 @@ Page {
 
     // ---- form state --------------------------------------------------------
     property string profileId: ""
+    // The profile's own name, editable here because this page is the only place
+    // a mobile user can rename one. Blank is legal: ServerProfiles fills a blank
+    // name in with the host.
+    property string nameText: ""
+    // Whether "Forget" has been armed by a first tap. Forgetting is not
+    // undoable and the button sits a thumb's width from Save, so it takes two.
+    property bool pendingForget: false
     property string hostText: ""
     property string portText: "22"
     property string userText: ""
@@ -129,6 +141,7 @@ Page {
                 continue
             var entry = list[i]
             root.profileId = id
+            root.nameText = root.textOf(entry, "name")
             root.hostText = root.textOf(entry, "host")
             root.portText = root.textOf(entry, "port")
             root.userText = root.textOf(entry, "user")
@@ -238,17 +251,17 @@ Page {
             root.keys.forgetPassphrase()
     }
 
-    function connectNow() {
-        if (!root.formValid || !root.mobileController)
-            return
-        // Resolve the credential and install it on the SSH pool for THIS attempt.
-        // Both credential paths end up as in-memory key material — a pasted key
-        // already is, and a reference is read on demand — because nothing on this
-        // client writes a key file for libssh to open.
-        if (root.keys && !root.keys.applyIdentityForConnect(root.selectedKeyName))
-            return
+    // Selecting another profile - or landing on an unsaved form after a delete -
+    // must not leave a delete armed for the entry that is now on screen.
+    onProfileIdChanged: root.pendingForget = false
+
+    // The form as a profile map, in ONE place: the connect and the save write
+    // the same seven fields through the same store, so a field added to the form
+    // cannot reach one path and miss the other.
+    function formProfile() {
         var profile = {
-            "name": EndpointField.trim(root.hostText),
+            "name": root.nameText.trim().length > 0
+                    ? root.nameText.trim() : EndpointField.trim(root.hostText),
             "host": EndpointField.trim(root.hostText),
             "port": root.portNumber,
             "user": EndpointField.trim(root.userText),
@@ -259,10 +272,50 @@ Page {
             "nodePath": root.nodePathText.trim(),
             "repoRoot": root.repoRootText.trim()
         }
+        // An id makes the write an EDIT of that stored profile rather than a new
+        // entry, so reconnecting or saving twice does not accumulate duplicates.
         if (root.profileId.length > 0)
             profile.id = root.profileId
-        root.mobileController.connectToServer(profile)
+        return profile
+    }
+
+    function connectNow() {
+        if (!root.formValid || !root.mobileController)
+            return
+        // Resolve the credential and install it on the SSH pool for THIS attempt.
+        // Both credential paths end up as in-memory key material — a pasted key
+        // already is, and a reference is read on demand — because nothing on this
+        // client writes a key file for libssh to open.
+        if (root.keys && !root.keys.applyIdentityForConnect(root.selectedKeyName))
+            return
+        root.mobileController.connectToServer(root.formProfile())
         root.connected()
+    }
+
+    // Write the form back to the store WITHOUT dialling it. Gated on formValid,
+    // and that gate is not redundant with the store's own: the remote node path
+    // is required by this client (see nodePathValid) and is not part of
+    // ServerProfiles' write-boundary validation, so saving an incomplete form
+    // would remember a server that cannot connect.
+    function saveServer() {
+        if (!root.formValid || !root.mobileController)
+            return
+        var id = root.mobileController.saveServer(root.formProfile())
+        // A brand new profile now has an id, so the NEXT save edits this entry
+        // instead of adding a second one. An empty id means the store refused
+        // the write and has already said why through statusText.
+        if (id.length > 0)
+            root.profileId = id
+    }
+
+    function forgetServer() {
+        if (root.profileId.length === 0 || !root.mobileController)
+            return
+        root.mobileController.forgetServer(root.profileId)
+        // The fields stay - the user can still connect with them, or save them
+        // again - but this form is no longer an edit of anything stored, so the
+        // id goes with the entry it named.
+        root.profileId = ""
     }
 
     // ---- credential prompts ------------------------------------------------
@@ -419,6 +472,27 @@ Page {
                         root.loadProfile(root.textOf(modelData, "id"))
                     }
                 }
+            }
+
+            Label {
+                Layout.fillWidth: true
+                Layout.leftMargin: 16
+                text: qsTr("Name")
+                textFormat: Text.PlainText
+            }
+            TextField {
+                id: nameField
+                objectName: "nameField"
+                Layout.fillWidth: true
+                Layout.leftMargin: 16
+                Layout.rightMargin: 16
+                Layout.minimumHeight: 48
+                text: root.nameText
+                // What the list above shows. Blank is legal and means the host,
+                // which is what the store writes for an empty name.
+                placeholderText: qsTr("Same as the host")
+                inputMethodHints: Qt.ImhNoPredictiveText
+                onTextEdited: root.nameText = text
             }
 
             Label {
@@ -670,6 +744,44 @@ Page {
                 text: root.keys ? root.keys.lastError : ""
             }
 
+            // ---- remembering this server ---------------------------------
+            //
+            // The phone's stand-in for the desktop settings window's Server
+            // pane, which does not exist here (see the header comment). Nothing
+            // else on this client can write a profile, so the save and the
+            // delete live beside the connect - through ch::ServerProfiles, the
+            // same store and the same whitelist the connect uses.
+            RowLayout {
+                Layout.fillWidth: true
+                Layout.leftMargin: 16
+                Layout.rightMargin: 16
+                spacing: 12
+                Button {
+                    objectName: "saveServerButton"
+                    Layout.fillWidth: true
+                    Layout.minimumHeight: 48
+                    enabled: root.formValid && root.mobileController !== null
+                    text: root.profileId.length > 0
+                          ? qsTr("Save changes") : qsTr("Remember this server")
+                    onClicked: root.saveServer()
+                }
+                Button {
+                    objectName: "forgetServerButton"
+                    Layout.fillWidth: true
+                    Layout.minimumHeight: 48
+                    visible: root.profileId.length > 0
+                    enabled: root.mobileController !== null
+                    text: root.pendingForget ? qsTr("Tap again to forget")
+                                             : qsTr("Forget this server")
+                    onClicked: {
+                        if (!root.pendingForget) {
+                            root.pendingForget = true
+                            return
+                        }
+                        root.forgetServer()
+                    }
+                }
+            }
             Button {
                 objectName: "connectButton"
                 Layout.fillWidth: true

@@ -25,16 +25,53 @@ Page {
         implicitHeight: MobileTheme.touchTarget
         color: MobileTheme.surfaceRaised
 
-        Text {
+        Row {
             anchors.fill: parent
-            anchors.leftMargin: MobileTheme.spacingLarge
-            anchors.rightMargin: MobileTheme.spacingLarge
-            text: qsTr("Dev Sessions")
-            textFormat: Text.PlainText
-            color: MobileTheme.text
-            font.pixelSize: MobileTheme.fontSizeTitle
-            verticalAlignment: Text.AlignVCenter
-            elide: Text.ElideRight
+            spacing: 0
+
+            // The way back to the server form, in the same place and with the
+            // same glyph PanePickerPage and PaneHostPage put it. Without it this
+            // page had NO on-screen exit at all: Android's hardware back key was
+            // the only route, and iOS has no such key, so the connect form - the
+            // only surface on this client that can edit a server - was
+            // unreachable once a session list was up.
+            //
+            // ctl.back(), NOT ctl.disconnect(). back() from Sessions moves the
+            // stage to Servers and nothing else, so the SSH session, the
+            // credential the store holds and the pane the user was in all
+            // survive: coming back here re-lists the same workspace without a
+            // second handshake. disconnect() would tear the session down and
+            // wipe every held secret (MobileAppController::disconnect), which is
+            // not what "go and look at the server settings" asks for - and it is
+            // why this button is not worded as one that leaves the server.
+            AbstractButton {
+                anchors.verticalCenter: parent.verticalCenter
+                implicitWidth: MobileTheme.touchTarget
+                implicitHeight: MobileTheme.touchTarget
+                enabled: page.ctl !== null
+                onClicked: page.ctl.back()
+
+                contentItem: Text {
+                    text: "\u2039"
+                    textFormat: Text.PlainText
+                    color: MobileTheme.accent
+                    font.pixelSize: MobileTheme.fontSizeTitle
+                    horizontalAlignment: Text.AlignHCenter
+                    verticalAlignment: Text.AlignVCenter
+                }
+            }
+
+            Text {
+                anchors.verticalCenter: parent.verticalCenter
+                width: parent.width - MobileTheme.touchTarget
+                       - MobileTheme.spacingLarge
+                text: qsTr("Dev Sessions")
+                textFormat: Text.PlainText
+                color: MobileTheme.text
+                font.pixelSize: MobileTheme.fontSizeTitle
+                verticalAlignment: Text.AlignVCenter
+                elide: Text.ElideRight
+            }
         }
 
         Rectangle {

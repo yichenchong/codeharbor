@@ -207,6 +207,28 @@ if(NOT DEFINED CODEHARBOR_MOBILE_BUNDLE_ID OR CODEHARBOR_MOBILE_BUNDLE_ID STREQU
     set(CODEHARBOR_MOBILE_BUNDLE_ID dev.codeharbor.mobile)
 endif()
 
+# Android's two version fields, derived from the project version so they cannot
+# drift from the tag. Without these, androiddeployqt substitutes its own
+# defaults into the manifest's %%INSERT_VERSION_CODE%%/%%INSERT_VERSION_NAME%%
+# placeholders, and 0.4.1 and 0.4.2 both shipped as versionCode 1 /
+# versionName 1.0 - verified by decoding the published APKs. The consequences
+# are not cosmetic: Play rejects an upload whose versionCode has not increased,
+# so the store route was blocked at the first update, and the phone's own
+# application list reported 1.0 for every build ever made.
+#
+# The code must be a single monotonically increasing integer, so it is packed
+# as major*10000 + minor*100 + patch (0.4.2 -> 402). That ordering holds for as
+# long as minor and patch stay below 100, which is asserted rather than assumed
+# because the failure is a release that cannot be superseded.
+if(PROJECT_VERSION_MINOR GREATER_EQUAL 100 OR PROJECT_VERSION_PATCH GREATER_EQUAL 100)
+    message(FATAL_ERROR
+        "Version ${PROJECT_VERSION} breaks the Android versionCode packing: "
+        "major*10000 + minor*100 + patch stops increasing once minor or patch "
+        "reaches 100. Widen the packing before releasing this version.")
+endif()
+math(EXPR CODEHARBOR_ANDROID_VERSION_CODE
+     "${PROJECT_VERSION_MAJOR} * 10000 + ${PROJECT_VERSION_MINOR} * 100 + ${PROJECT_VERSION_PATCH}")
+
 if(ANDROID)
     # AndroidManifest.xml and res/ live here (packaging/android). Qt copies the
     # directory over its own generated template, so the manifest in the tree is
@@ -219,6 +241,8 @@ if(ANDROID)
         QT_ANDROID_PACKAGE_SOURCE_DIR ${CMAKE_SOURCE_DIR}/packaging/android
         QT_ANDROID_MIN_SDK_VERSION 28
         QT_ANDROID_TARGET_SDK_VERSION 35
+        QT_ANDROID_VERSION_NAME ${PROJECT_VERSION}
+        QT_ANDROID_VERSION_CODE ${CODEHARBOR_ANDROID_VERSION_CODE}
     )
 
     # The manifest carries the application id LITERALLY: androiddeployqt reads

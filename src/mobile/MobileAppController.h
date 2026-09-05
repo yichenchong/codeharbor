@@ -138,6 +138,27 @@ public:
     // is refused by ServerProfiles' own write-boundary validation; this reports
     // that through statusText rather than dialling nothing.
     Q_INVOKABLE void connectToServer(QVariantMap profile);
+
+    // Write `profile` (the same map connectToServer takes, `id` included for an
+    // edit) into ch::ServerProfiles WITHOUT dialling it, and return the id it is
+    // stored under - empty when the store refused it, with the reason already in
+    // statusText.
+    //
+    // This exists because the phone has no settings window: the desktop edits
+    // profiles in the settings window's Server pane and its connect sheet only
+    // displays them, so on mobile the connect form is the only surface there is,
+    // and without this it could edit a profile in memory and never write it
+    // back. It is deliberately the SAME store and the same whitelist the connect
+    // path uses - a second persistence path is how "saved" turns into a profile
+    // the connect page never offers.
+    Q_INVOKABLE QString saveServer(QVariantMap profile);
+
+    // Drop a remembered server. Only the stored RECORD goes: a session already
+    // dialled from it is untouched, because nothing about a live connection is
+    // re-read from the profile. An unknown id is reported rather than ignored -
+    // the form can be holding one another writer of the same ini has removed.
+    Q_INVOKABLE void forgetServer(QString id);
+
     // Deliberately SHADOWS QObject::disconnect(), whose three-argument form is
     // also callable with none. That is why there is no `using
     // QObject::disconnect;` here: it would make an unqualified `disconnect()`
@@ -228,6 +249,12 @@ signals:
     void sessionReady(QString devSessionId);
 
 private:
+    // The ONE write into ch::ServerProfiles, shared by connectToServer() and
+    // saveServer(). Returns the id the profile is stored under, or an empty
+    // string when the store refused it - having put the reason in statusText, so
+    // both callers report a refusal identically and neither re-derives the rule
+    // that decided.
+    QString storeProfile(const QVariantMap& profile);
     // The one writer of m_navStage. Clearing the pane selection on the way out
     // of Pane lives HERE rather than in back(), because back() is not the only
     // exit: disconnecting, switching Dev Session, and a session disappearing

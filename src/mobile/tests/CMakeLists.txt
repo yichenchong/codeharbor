@@ -17,19 +17,40 @@ add_test(NAME tst_panelist COMMAND tst_panelist)
 
 # The two-step navigation itself: Servers -> Sessions -> Panes -> one pane, the
 # stale-load discard on rapid session switching, the single-live-pane invariant,
-# and the UiStateStore round trip. Driven against the REAL AppController and
-# SessionLayouts over an in-process QIODevice standing in for the RPC transport,
-# so it deliberately does NOT link Qt6::Network: an in-process device dispatches
-# synchronously, which makes response ordering a decision rather than a race.
-# Same reasoning (and the same FakeTransport shape) as src/app/tests.
+# the UiStateStore round trip, and the server profile store the connect form
+# writes through. Driven against the REAL AppController and SessionLayouts over
+# an in-process QIODevice standing in for the RPC transport, so it deliberately
+# does NOT link Qt6::Network: an in-process device dispatches synchronously,
+# which makes response ordering a decision rather than a race. Same reasoning
+# (and the same FakeTransport shape) as src/app/tests.
+#
+# It DOES link the QML module, for two cases only: the affordance that takes the
+# user from the Dev Session list back to the connect form is a button on a real
+# page, and "the controller's back() moves the stage" says nothing about whether
+# anything on screen is bound to it - which is exactly the defect those cases
+# were written for. That is also why the target runs offscreen rather than
+# guiless; nothing here needs a display or a device.
 qt_add_executable(tst_mobilenav tst_mobilenav.cpp)
 target_link_libraries(tst_mobilenav PRIVATE
+    # Registers CodeHarbor.Mobile (the QML pages), exactly as the executable
+    # does; without it loadFromModule() would find nothing.
+    codeharbor_mobile_qmlplugin
+    # Registers CodeHarbor.Mobile.Core (the C++ types QML names).
+    ch_mobileplugin
     ch_mobile
+    ch_vt
     Qt6::Test
     Qt6::Core
     Qt6::Gui
+    Qt6::Qml
+    Qt6::Quick
+    Qt6::QuickControls2
 )
 add_test(NAME tst_mobilenav COMMAND tst_mobilenav)
+# Offscreen and the software renderer, for the same reason tst_mobileshell needs
+# them: a headless box has no GPU to render a real Quick scene through.
+set_tests_properties(tst_mobilenav PROPERTIES
+    ENVIRONMENT "QT_QPA_PLATFORM=offscreen;QT_QUICK_BACKEND=software")
 
 # The native mobile terminal pane: byte-exact acknowledgeOutput() accounting
 # across split flushes (the flow-control contract ch::TerminalBridge used to
