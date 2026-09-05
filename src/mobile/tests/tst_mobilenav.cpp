@@ -154,6 +154,7 @@ private slots:
     void theSessionPickerOffersATapBackToTheServerForm();
     void steppingBackToTheServerFormKeepsTheConnectionAndItsCredential();
     void theConnectFormSavesTheServerItIsShowingOnATap();
+    void steppingBackToTheFormEditsTheServerRatherThanDuplicatingIt();
     void anEditedProfileRoundTripsThroughTheSharedStore();
     void nothingSecretInTheFormReachesTheProfileStore();
 
@@ -1010,6 +1011,106 @@ void TstMobileNav::theConnectFormSavesTheServerItIsShowingOnATap()
                                            &shell.fixture.layouts);
 }
 
+// The whole reported journey in one case: get back to the server form, change
+// something, connect. Each half was covered separately and the join was not,
+// which is where the remaining defect lived - the way back reached a BLANK
+// form, so a user who retyped their server and connected got a second copy of
+// it rather than an edited one. A profile is only updated in place when the
+// form carries its id, and nothing put the id there on the way back.
+void TstMobileNav::steppingBackToTheFormEditsTheServerRatherThanDuplicatingIt()
+{
+    QTemporaryDir storeRoot;
+    QVERIFY(storeRoot.isValid());
+    const QString ini = storeRoot.filePath(QStringLiteral("servers.ini"));
+
+    Shell shell;
+    ServerProfiles profiles(ini);
+    shell.fixture.controller.setConnection(nullptr, nullptr, &profiles,
+                                           &shell.fixture.layouts);
+
+    QQuickWindow* window = shell.window();
+    QVERIFY(window);
+    window->show();
+    QVERIFY(QTest::qWaitForWindowExposed(window));
+
+    // A remembered server, stored the way connecting stores it. Setup, not the
+    // assertion: connectToServer() persisting is covered on its own above.
+    shell.fixture.mobile.connectToServer(
+        {{QStringLiteral("name"), QStringLiteral("Prod")},
+         {QStringLiteral("host"), QStringLiteral("box.example")},
+         {QStringLiteral("port"), 22},
+         {QStringLiteral("user"), QStringLiteral("dev")},
+         {QStringLiteral("nodePath"), QStringLiteral("/usr/bin/node")}});
+    const QString id = profiles.activeId();
+    QVERIFY(!id.isEmpty());
+    QCOMPARE(profiles.profiles().size(), 1);
+
+    // Out to the Dev Session list and back through the header glyph, which is
+    // the route the user has. Opened and then stepped back rather than left
+    // mid-load, exactly as the reachability case does: a pending layout raises
+    // the busy veil, and a tap on a veiled page proves nothing.
+    shell.fixture.listSessions({QStringLiteral("s1")});
+    shell.fixture.openSession(QStringLiteral("s1"), QStringLiteral("viewer-1"),
+                              QStringLiteral("terminal-1"));
+    shell.fixture.mobile.back();
+    QVERIFY(!shell.fixture.mobile.layoutPending());
+    QTRY_COMPARE(shell.fixture.mobile.navStage(), MobileAppController::Sessions);
+    QQuickItem* picker = currentPage(window);
+    QCOMPARE(qmlTypeName(picker), QStringLiteral("SessionPickerPage"));
+
+    QQuickItem* glyph = findItemShowing(picker, QStringLiteral("\u2039"));
+    QVERIFY(glyph != nullptr);
+    QQuickItem* back = enclosingButton(glyph);
+    QVERIFY(back != nullptr);
+    QQuickItem* stack =
+        findByType(window->contentItem(), QStringLiteral("StackView"));
+    QVERIFY(stack != nullptr);
+    QTRY_VERIFY(!stack->property("busy").toBool());
+    QTest::mouseClick(window, Qt::LeftButton, Qt::NoModifier,
+                      back->mapToScene(QPointF(back->width() / 2.0,
+                                               back->height() / 2.0)).toPoint());
+
+    QTRY_COMPARE(qmlTypeName(currentPage(window)), QStringLiteral("ConnectPage"));
+    QQuickItem* form = currentPage(window);
+
+    // The form is an EDIT of the server just left, not an empty one.
+    QTRY_COMPARE(form->property("profileId").toString(), id);
+    QCOMPARE(form->property("hostText").toString(),
+             QStringLiteral("box.example"));
+    QCOMPARE(form->property("userText").toString(), QStringLiteral("dev"));
+
+    // Change something and connect, which is what the user came back to do.
+    form->setProperty("hostText", QStringLiteral("moved.example"));
+    QTRY_VERIFY(form->property("formValid").toBool());
+
+    QQuickItem* connect =
+        form->findChild<QQuickItem*>(QStringLiteral("connectButton"));
+    QVERIFY2(connect != nullptr, "the connect form has no connect button");
+    QQuickItem* flick = findByType(form, QStringLiteral("Flickable"));
+    QVERIFY(flick != nullptr);
+    flick->setProperty("contentY",
+                       qMax(0.0, flick->property("contentHeight").toReal()
+                                     - flick->height()));
+    QTRY_VERIFY(!stack->property("busy").toBool());
+    const QRectF inside(0, 0, window->width(), window->height());
+    QTRY_VERIFY(connect->isEnabled()
+                && inside.contains(connect->mapToScene(
+                    QPointF(connect->width() / 2.0, connect->height() / 2.0))));
+    QTest::mouseClick(window, Qt::LeftButton, Qt::NoModifier,
+                      connect->mapToScene(
+                          QPointF(connect->width() / 2.0,
+                                  connect->height() / 2.0)).toPoint());
+
+    // ONE profile, carrying the edit. Two would mean the id never made it back
+    // to the form - the defect this case exists for.
+    QTRY_COMPARE(profiles.profile(id).value(QStringLiteral("host")).toString(),
+                 QStringLiteral("moved.example"));
+    QCOMPARE(profiles.profiles().size(), 1);
+
+    shell.fixture.controller.setConnection(nullptr, nullptr, nullptr,
+                                           &shell.fixture.layouts);
+}
+
 // WHAT THAT TAP COSTS, pinned so the choice is recorded rather than remembered.
 //
 // The button calls back(), NOT disconnect(): the stage moves to Servers and
@@ -1124,21 +1225,6 @@ void TstMobileNav::anEditedProfileRoundTripsThroughTheSharedStore()
         QCOMPARE(stored.value(QStringLiteral("repoRoot")).toString(),
                  QStringLiteral("/srv/other"));
     }
-
-    // And forgetting one really removes it, on disk as well as in the list.
-    f.mobile.forgetServer(id);
-    QVERIFY(profiles.profile(id).isEmpty());
-    QCOMPARE(f.mobile.statusText(), QStringLiteral("Forgot \u201cProd\u201d."));
-    {
-        ServerProfiles reread(ini);
-        QVERIFY(reread.profiles().isEmpty());
-    }
-
-    // An id nothing holds any more is reported rather than silently ignored: the
-    // form can be showing one another writer of the same file has removed.
-    f.mobile.forgetServer(id);
-    QCOMPARE(f.mobile.statusText(),
-             QStringLiteral("That server is no longer in the remembered list."));
 
     // Unwired before the store leaves scope: it is declared after the fixture,
     // so it dies FIRST, and a controller still holding it would be pointing at

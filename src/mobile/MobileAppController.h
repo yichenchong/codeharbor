@@ -153,12 +153,6 @@ public:
     // the connect page never offers.
     Q_INVOKABLE QString saveServer(QVariantMap profile);
 
-    // Drop a remembered server. Only the stored RECORD goes: a session already
-    // dialled from it is untouched, because nothing about a live connection is
-    // re-read from the profile. An unknown id is reported rather than ignored -
-    // the form can be holding one another writer of the same ini has removed.
-    Q_INVOKABLE void forgetServer(QString id);
-
     // Deliberately SHADOWS QObject::disconnect(), whose three-argument form is
     // also callable with none. That is why there is no `using
     // QObject::disconnect;` here: it would make an unqualified `disconnect()`

@@ -56,9 +56,6 @@ Page {
     // a mobile user can rename one. Blank is legal: ServerProfiles fills a blank
     // name in with the host.
     property string nameText: ""
-    // Whether "Forget" has been armed by a first tap. Forgetting is not
-    // undoable and the button sits a thumb's width from Save, so it takes two.
-    property bool pendingForget: false
     property string hostText: ""
     property string portText: "22"
     property string userText: ""
@@ -165,6 +162,37 @@ Page {
         }
     }
 
+    // The form ARRIVES showing the server this client is on, rather than blank.
+    //
+    // It has to happen on ACTIVATION, not construction. MobileMain holds this
+    // page as the StackView's `initialItem` and returns to the Servers stage by
+    // POPPING (see its syncToStage), which reveals this same instance instead of
+    // building a new one - so Component.onCompleted fires once at launch, when
+    // there is usually nothing connected yet, and never again on the way back
+    // from the Dev Session list. StackView.onActivated fires both times.
+    //
+    // This is what makes "go back and change the settings" land on an EDIT of
+    // the current entry. Without it the way back reached an empty form, and
+    // retyping the same server and connecting stored a SECOND copy of it,
+    // because a profile is only updated in place when the form carries its id.
+    //
+    // ServerProfiles::activeId is set by the connect itself (storeProfile), so
+    // it names the entry the live session was dialled from. An empty one - a
+    // first run with nothing remembered - leaves the form blank as before, and
+    // a form already showing that entry is left alone so a re-activation cannot
+    // discard an edit in progress.
+    function adoptActiveProfile() {
+        if (!root.profileStore)
+            return
+        var active = root.profileStore.activeId
+        if (active.length === 0 || active === root.profileId)
+            return
+        root.loadProfile(active)
+    }
+
+    Component.onCompleted: root.adoptActiveProfile()
+    StackView.onActivated: root.adoptActiveProfile()
+
     // (No path lookup: a key is identified by the reference the store hands back,
     // and registerReference() above is what turns a stored reference into a name.)
 
@@ -251,10 +279,6 @@ Page {
             root.keys.forgetPassphrase()
     }
 
-    // Selecting another profile - or landing on an unsaved form after a delete -
-    // must not leave a delete armed for the entry that is now on screen.
-    onProfileIdChanged: root.pendingForget = false
-
     // The form as a profile map, in ONE place: the connect and the save write
     // the same seven fields through the same store, so a field added to the form
     // cannot reach one path and miss the other.
@@ -306,16 +330,6 @@ Page {
         // the write and has already said why through statusText.
         if (id.length > 0)
             root.profileId = id
-    }
-
-    function forgetServer() {
-        if (root.profileId.length === 0 || !root.mobileController)
-            return
-        root.mobileController.forgetServer(root.profileId)
-        // The fields stay - the user can still connect with them, or save them
-        // again - but this form is no longer an edit of anything stored, so the
-        // id goes with the entry it named.
-        root.profileId = ""
     }
 
     // ---- credential prompts ------------------------------------------------
@@ -746,41 +760,24 @@ Page {
 
             // ---- remembering this server ---------------------------------
             //
-            // The phone's stand-in for the desktop settings window's Server
-            // pane, which does not exist here (see the header comment). Nothing
-            // else on this client can write a profile, so the save and the
-            // delete live beside the connect - through ch::ServerProfiles, the
-            // same store and the same whitelist the connect uses.
-            RowLayout {
+            // Connecting already stores the form (MobileAppController::
+            // connectToServer -> storeProfile), so this button is not the only
+            // way a profile is written: it is the way to keep an edit WITHOUT
+            // dialling, which is what the connect path cannot do. Same store,
+            // same whitelist, one persistence path. There is deliberately no
+            // delete here - removing a remembered server is not something this
+            // client has been asked to do, and a destructive control is not
+            // worth guessing at.
+            Button {
+                objectName: "saveServerButton"
                 Layout.fillWidth: true
                 Layout.leftMargin: 16
                 Layout.rightMargin: 16
-                spacing: 12
-                Button {
-                    objectName: "saveServerButton"
-                    Layout.fillWidth: true
-                    Layout.minimumHeight: 48
-                    enabled: root.formValid && root.mobileController !== null
-                    text: root.profileId.length > 0
-                          ? qsTr("Save changes") : qsTr("Remember this server")
-                    onClicked: root.saveServer()
-                }
-                Button {
-                    objectName: "forgetServerButton"
-                    Layout.fillWidth: true
-                    Layout.minimumHeight: 48
-                    visible: root.profileId.length > 0
-                    enabled: root.mobileController !== null
-                    text: root.pendingForget ? qsTr("Tap again to forget")
-                                             : qsTr("Forget this server")
-                    onClicked: {
-                        if (!root.pendingForget) {
-                            root.pendingForget = true
-                            return
-                        }
-                        root.forgetServer()
-                    }
-                }
+                Layout.minimumHeight: 48
+                enabled: root.formValid && root.mobileController !== null
+                text: root.profileId.length > 0
+                      ? qsTr("Save changes") : qsTr("Remember this server")
+                onClicked: root.saveServer()
             }
             Button {
                 objectName: "connectButton"

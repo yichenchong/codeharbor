@@ -473,31 +473,6 @@ QString MobileAppController::saveServer(QVariantMap profile)
     return id;
 }
 
-void MobileAppController::forgetServer(QString id)
-{
-    if (!m_app || !m_app->serverProfiles()) {
-        setStatusText(tr("This shell has no connection spine to dial with."));
-        return;
-    }
-    ServerProfiles* profiles = m_app->serverProfiles();
-    const QVariantMap stored = profiles->profile(id);
-    if (stored.isEmpty()) {
-        // Not a fault: the form may still be holding an id another writer of the
-        // same ini has since removed.
-        setStatusText(tr("That server is no longer in the remembered list."));
-        return;
-    }
-
-    // Only the RECORD goes. A live connection is not affected: it is already
-    // dialled, and nothing about it is re-read from the profile - so forgetting
-    // the entry a session was opened from does not end that session, and
-    // pretending otherwise by disconnecting here would throw away work the user
-    // did not ask to lose.
-    profiles->removeProfile(id);
-    setStatusText(tr("Forgot \u201c%1\u201d.")
-                      .arg(stored.value(QStringLiteral("name")).toString()));
-}
-
 void MobileAppController::setTerminalFactory(TerminalFactory* factory)
 {
     m_terminalFactory = factory;
