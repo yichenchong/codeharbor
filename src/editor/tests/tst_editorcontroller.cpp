@@ -249,6 +249,7 @@ private slots:
     void permissionOnlyReadOnlyKeepsRecoverableEdits();
     void dirtyPropertySurvivesErrorsAndDisconnection();
     void immediateDirtyObservationProtectsTheDebounceWindow();
+    void immediateDirtyObservationForMissingFileSupportsCreateOnlySave();
 
     // Out-of-order / superseded replies must never land on the file now open.
     void staleLoadReplyNeverWins();
@@ -4353,6 +4354,67 @@ void TstEditorController::immediateDirtyObservationProtectsTheDebounceWindow()
     QVERIFY(!m_controller->dirty());
     QCOMPARE(dirtySpy.count(), 2);
     QVERIFY(nextRequest(100).isEmpty());
+}
+
+void TstEditorController::immediateDirtyObservationForMissingFileSupportsCreateOnlySave()
+{
+    makePair();
+    m_controller->ready();
+    const QString path = QStringLiteral("/foo/new-file.txt");
+    const QString text = QStringLiteral("new file contents\n");
+    m_controller->open(path);
+    const QJsonObject read = nextRequest();
+    QCOMPARE(method(read), kReadFile);
+    QCOMPARE(reqPath(read), path);
+    respondError(reqId(read), -32002, QStringLiteral("ENOENT"));
+    QTRY_COMPARE(m_controller->fileState(), QStringLiteral("error"));
+    QCOMPARE(m_controller->revision(), QString());
+    QVERIFY(!m_controller->readOnly());
+    QVERIFY(!m_controller->dirty());
+
+    // The first keystroke must protect navigation before the full-text
+    // recovery debounce runs, even though no existing revision was readable.
+    QSignalSpy dirtySpy(m_controller, &EditorController::dirtyChanged);
+    m_controller->reportDirty(true, QString());
+    QVERIFY(m_controller->dirty());
+    QCOMPARE(dirtySpy.count(), 1);
+    QVERIFY2(nextRequest(100).isEmpty(),
+             "immediate dirty observation wrote a debounced recovery snapshot");
+    m_controller->reportDirty(false, QStringLiteral("stale-page-revision"));
+    QVERIFY2(m_controller->dirty(),
+             "a stale page baseline cleared the new file's unsaved text");
+    QCOMPARE(dirtySpy.count(), 1);
+
+    m_controller->reportContent(text);
+    const QJsonObject snapshot = nextRequest();
+    QCOMPARE(method(snapshot), kWriteFile);
+    QCOMPARE(reqPath(snapshot), recoveryFilePath());
+    QCOMPARE(snapshotPathOf(snapshot), path);
+    QCOMPARE(snapshotContentOf(snapshot), text);
+    QCOMPARE(reqExpectedRevision(snapshot), QString());
+    QCOMPARE(reqMode(snapshot), 0600);
+    respondResult(reqId(snapshot), {{"revision", "rec-created"}});
+    QTRY_COMPARE(m_client->pendingCount(), 0);
+
+    QSignalSpy savedSpy(m_controller, &EditorController::saved);
+    m_controller->save(text, QString());
+    const QJsonObject save = nextRequest();
+    QCOMPARE(method(save), kWriteFile);
+    QCOMPARE(reqPath(save), path);
+    QCOMPARE(reqContent(save), text);
+    QCOMPARE(reqExpectedRevision(save), QString());
+    QVERIFY(m_controller->dirty());
+    respondResult(reqId(save), {{"revision", "file-created"}});
+    QTRY_COMPARE(savedSpy.count(), 1);
+    QCOMPARE(m_controller->revision(), QStringLiteral("file-created"));
+    QVERIFY(!m_controller->dirty());
+    QCOMPARE(m_controller->fileState(), QStringLiteral("clean"));
+
+    const QJsonObject clear = nextRequest();
+    QCOMPARE(method(clear), kWriteFile);
+    QCOMPARE(reqPath(clear), recoveryFilePath());
+    QCOMPARE(reqContent(clear), QString());
+    QCOMPARE(reqExpectedRevision(clear), QStringLiteral("rec-created"));
 }
 
 QTEST_GUILESS_MAIN(TstEditorController)

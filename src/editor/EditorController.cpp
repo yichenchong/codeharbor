@@ -1145,9 +1145,11 @@ void EditorController::issueSave(QString content, QString expectedRevision)
 
 void EditorController::reportDirty(bool dirty, QString baselineRevision)
 {
-    if (m_path.isEmpty() || m_revision.isEmpty() || m_bufferReadOnly
+    if (m_path.isEmpty() || m_bufferReadOnly
         || m_fileState == FileState::Loading)
         return;
+    // An empty revision is the valid create-only baseline after an initial read
+    // failed (for example ENOENT). Such an editable buffer still owns real edits.
     ++m_editSerial;
     // During a save, even the old baseline is unsaved against the bytes on the
     // wire. A stale page baseline likewise cannot prove the current file clean.
