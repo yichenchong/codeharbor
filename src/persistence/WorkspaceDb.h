@@ -180,13 +180,12 @@ struct UpdateTerminalPaneParams {
 // is failed with the reserved code -32603, because decoding it would manufacture
 // a record with an empty id that the rest of the client cannot tell from a real
 // one. Concretely, a result that is not the expected JSON kind (an object per
-// record, an array for list()), and, for setLayout, a SessionLayout row whose
-// `tree` is missing or fails split-tree validation. getLayout is the sole method
-// for which a JSON null result is legitimate — it means "this region has no
-// persisted layout" and delivers std::nullopt with no error; it is also the sole
-// method that maps an unreadable stored tree to that same "no layout" verdict
-// rather than to an error, because a region whose layout cannot be loaded must
-// stay empty instead of inviting the user to edit a fabricated one.
+// record, an array for list()), and, for getLayout/setLayout, a SessionLayout row
+// whose `tree` is missing or fails split-tree validation. getLayout is the sole
+// method for which a JSON null result is legitimate — it means "this region has
+// no persisted layout" and delivers std::nullopt with no error. An existing but
+// unreadable tree must fail instead: treating it as absent would let callers
+// overwrite the server's layout with a newly seeded default.
 //
 // Two failures are detected here rather than received, and both are the
 // CALLER's mistake, not the server's: an addressing-mode violation in

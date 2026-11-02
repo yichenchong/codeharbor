@@ -76,6 +76,8 @@ export interface EditorBridge {
     /** Push the current buffer so the host can snapshot it for crash recovery
      *  (SPEC 11.3). Call debounced on edits; never blocks. */
     reportContent(content: string): void;
+    /** Immediate dirty-state observation; full recovery text stays debounced. */
+    reportDirty(dirty: boolean, baselineRevision: string): void;
     /** Ask the host to re-fetch the file from the server (SPEC 8.7). */
     requestReload(): void;
 
@@ -731,7 +733,7 @@ export function mountEditor(
         ++editSerial;
         dirty = bufferText(editor) !== baselineContent;
         renderState();
-        reporter.schedule(dirty);
+        reporter.observeEdit(dirty, loadedRevision);
     });
 
     // Cancel only; the pending snapshot is NOT flushed here. It is flushed in
@@ -867,7 +869,7 @@ function missingBridgeMember(bridge: EditorBridge): string | null {
             return name;
         }
     }
-    for (const name of ["save", "reportContent", "requestReload"]) {
+    for (const name of ["save", "reportContent", "reportDirty", "requestReload"]) {
         if (typeof proxy[name] !== "function") {
             return name;
         }
@@ -885,7 +887,7 @@ export function connectEditor(element: HTMLElement, options: MountOptions = {}):
         showFatal(element, "This page requires the CodeHarbor host: no WebChannel transport.");
         return;
     }
-    new QWebChannel(qt.webChannelTransport, (channel: QWebChannelInstance) => {
+    const onChannel = (channel: QWebChannelInstance): void => {
         const bridge = channel.objects.editor as EditorBridge | undefined;
         if (!bridge) {
             showFatal(element, "The editor bridge is missing from this window.");
@@ -902,7 +904,14 @@ export function connectEditor(element: HTMLElement, options: MountOptions = {}):
         // crash-recovery snapshot has to reach the host before the page dies,
         // and Monaco has to be released (SPEC 11.3).
         window.addEventListener("pagehide", () => host.dispose(), { once: true });
-    });
+    };
+    try {
+        // qwebchannel.js sends the handshake from its constructor. A closed
+        // transport can reject that send before there is any editor to report it.
+        new QWebChannel(qt.webChannelTransport, onChannel);
+    } catch {
+        showFatal(element, "This page could not reach the CodeHarbor host.");
+    }
 }
 
 // The packaged page (dist/index.html) carries no inline script — its CSP

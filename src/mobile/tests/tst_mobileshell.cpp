@@ -26,6 +26,7 @@
 #include <QJsonArray>
 #include <QJsonObject>
 #include <QKeySequence>
+#include <QJSValue>
 #include <QQmlApplicationEngine>
 #include <QQmlComponent>
 #include <QQmlContext>
@@ -400,6 +401,8 @@ private slots:
     void thePanePickerListsBothRegionsOfTheSelectedSession();
     void aTerminalLeafLoadsTheTerminalPage();
     void aMarkdownLeafLoadsTheMarkdownPage();
+    void paneNavigationPreservesReservedFilenameCharacters();
+    void aWebLeafLoadsItsAddressAndClosesBackToThePicker();
     void anUnknownKindLandsOnTheUnsupportedPage();
     void onlyOnePaneIsEverLoaded();
     void backFromThePaneUnloadsIt();
@@ -420,6 +423,8 @@ private slots:
     void theFirstKeystrokeIsReportedWithoutWaitingForTheDebounce();
     void aCrlfFileIsSplitWithoutCarriageReturns();
     void anOrderedListItemIsNotDrawnAsABullet();
+    void markdownImageAliasesShareCompletion_data();
+    void markdownImageAliasesShareCompletion();
     void retargetingTheImagePaneHandsBackTheBytes();
     // Declared unconditionally and SKIPPED inside when the optional Qt module is
     // absent, rather than compiled out: a slot behind a preprocessor conditional
@@ -1369,6 +1374,67 @@ void TstMobileShell::aMarkdownLeafLoadsTheMarkdownPage()
     grabFrame(shell, QStringLiteral("05-markdown-pane"));
 }
 
+void TstMobileShell::paneNavigationPreservesReservedFilenameCharacters()
+{
+    Shell shell;
+    QQuickWindow *window = shell.window();
+    QVERIFY(window);
+    shell.fixture.listSessions({QStringLiteral("s1")});
+    shell.fixture.openSession(QStringLiteral("s1"), QStringLiteral("viewer-1"),
+                              QStringLiteral("terminal-1"));
+    shell.fixture.mobile.selectPane(QStringLiteral("viewer:viewer-1"));
+    QQuickItem *host = currentPage(window);
+    QVERIFY(host);
+
+    const QString path = QStringLiteral("/srv/s1/notes%2F#draft?.md");
+    QVERIFY(callQmlFunction(host, "navigateTo", path));
+    const QUrl persisted = host->property("currentUrl").toUrl();
+    QCOMPARE(shell.viewers.remotePathFor(persisted), path);
+    QVERIFY(persisted.fragment().isEmpty());
+    QVERIFY(persisted.query().isEmpty());
+
+    // Going through the picker re-reads the quiet layout update. The new page
+    // must decode exactly once, not turn the literal "%2F" into a separator.
+    shell.fixture.mobile.back();
+    shell.fixture.mobile.selectPane(QStringLiteral("viewer:viewer-1"));
+    host = currentPage(window);
+    QVERIFY(host);
+    QQuickItem *markdown =
+        findByQmlTypeIn(host, QStringLiteral("ViewerMarkdownPage"));
+    QVERIFY(markdown);
+    QCOMPARE(markdown->property("remotePath").toString(), path);
+    QCOMPARE(host->property("currentUrl").toUrl(), persisted);
+}
+
+void TstMobileShell::aWebLeafLoadsItsAddressAndClosesBackToThePicker()
+{
+#if !CH_HAVE_QTWEBVIEW
+    QSKIP("this build has no Qt WebView, so ViewerWebPage is not in the QML module");
+#else
+    Shell shell;
+    QQuickWindow *window = shell.window();
+    QVERIFY(window);
+    shell.fixture.listSessions({QStringLiteral("s1")});
+    shell.fixture.mobile.selectSession(QStringLiteral("s1"));
+    const QString address = QStringLiteral("https://example.invalid/docs");
+    shell.fixture.answerLayouts(
+        shell.fixture.takeLayoutRequests(),
+        viewerTreeFor(QStringLiteral("viewer-1"), address),
+        terminalTreeFor(QStringLiteral("terminal-1"), QStringLiteral("row-1")));
+    shell.fixture.mobile.selectPane(QStringLiteral("viewer:viewer-1"));
+    QQuickItem *web =
+        findByQmlTypeIn(currentPage(window), QStringLiteral("ViewerWebPage"));
+    QVERIFY(web);
+    QCOMPARE(web->property("webUrl").toString(), address);
+    QVERIFY(web->property("schemeAllowed").toBool());
+    QQuickItem *close = findItemShowing(web, QStringLiteral("Close"));
+    QVERIFY(close);
+    QVERIFY(QMetaObject::invokeMethod(close, "clicked"));
+    QCOMPARE(shell.fixture.mobile.navStage(), MobileAppController::Panes);
+    QCOMPARE(qmlTypeName(currentPage(window)), QStringLiteral("PanePickerPage"));
+#endif
+}
+
 void TstMobileShell::anUnknownKindLandsOnTheUnsupportedPage()
 {
     // componentFor() is total by contract. A kind nothing recognises must land on
@@ -1948,6 +2014,55 @@ void TstMobileShell::anOrderedListItemIsNotDrawnAsABullet()
                  "the unordered item is not drawn with a bullet");
     QTRY_VERIFY2(findItemShowing(page, QString::fromUtf8("\u2013")),
                  "the ordered item is not drawn with a dash");
+}
+
+void TstMobileShell::markdownImageAliasesShareCompletion_data()
+{
+    QTest::addColumn<bool>("fail");
+    QTest::newRow("success") << false;
+    QTest::newRow("failure") << true;
+}
+
+void TstMobileShell::markdownImageAliasesShareCompletion()
+{
+    QFETCH(bool, fail);
+    PageHost host(QStringLiteral("ViewerMarkdownPage"),
+                  QStringLiteral("remotePath: \"/repo/notes.md\"\n"
+                                 "        repoRoot: \"/repo\""));
+    QVERIFY(showPage(host));
+    QQuickItem *page = host.page();
+    host.requests();
+    QVERIFY(callQmlFunction(page, "requestImage", QStringLiteral("a.png")));
+    QVERIFY(callQmlFunction(page, "requestImage", QStringLiteral("./a.png")));
+    const QVector<QJsonObject> resolves =
+        requestsFor(host.requests(), rpc::kMethodResolvePath);
+    QCOMPARE(resolves.size(), 2);
+    for (const QJsonObject &request : resolves)
+        host.deliver(resolveFrame(requestId(request), QStringLiteral("/repo/a.png"),
+                                  true));
+    const QVector<QJsonObject> reads =
+        requestsFor(host.requests(), rpc::kMethodReadFile);
+    QVERIFY(!reads.isEmpty());
+    for (const QJsonObject &request : reads) {
+        if (fail)
+            host.deliver(errorFrame(requestId(request), QStringLiteral("image unavailable")));
+        else
+            host.deliver(byteReadFrame(requestId(request), pngBytes()));
+    }
+
+    const QJSValue pending = page->property("imagePending").value<QJSValue>();
+    QVERIFY(pending.property(QStringLiteral("a.png")).isUndefined());
+    QVERIFY(pending.property(QStringLiteral("./a.png")).isUndefined());
+    const QJSValue results =
+        page->property(fail ? "imageRefused" : "imageSources").value<QJSValue>();
+    const QString first = results.property(QStringLiteral("a.png")).toString();
+    const QString second = results.property(QStringLiteral("./a.png")).toString();
+    QVERIFY(!first.isEmpty());
+    QCOMPARE(second, first);
+    if (fail)
+        QCOMPARE(first, QStringLiteral("image unavailable"));
+    else
+        QCOMPARE(QUrl(first), host.viewers.imageUrl(QStringLiteral("/repo/a.png")));
 }
 
 // An image pane hands its bytes back when it moves on. The cache is LRU-bounded

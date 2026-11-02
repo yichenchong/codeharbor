@@ -162,6 +162,10 @@ signals:
     // controller-side size change would re-enter attach() from inside attach().
     void geometryChanged();
 
+    // Nonfatal input refusal. A prefix may already have reached the peer;
+    // the factory reports it in pane chrome without replaying any input.
+    void inputRejected();
+
 private:
     void onFlushReady(const QByteArray& batch);
     // Push `m_viewVisible && m_rendererReady` at the controller.

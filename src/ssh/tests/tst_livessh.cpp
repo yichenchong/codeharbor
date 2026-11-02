@@ -4,12 +4,14 @@
 #include "SshConnectionPool.h"
 
 #include <QByteArray>
+#include <QCoreApplication>
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
 #include <QJsonObject>
 #include <QJsonValue>
 #include <QProcess>
+#include <QProcessEnvironment>
 #include <QScopeGuard>
 #include <QStandardPaths>
 #include <QTemporaryDir>
@@ -74,7 +76,10 @@ private slots:
     void ptyChannelRunsWithTheRequestedTerminalType();
     void rpcServerInfoOverSshChannel();
     void stderrStaysOutOfReadStream();
+    void execChannelDrainsLargeStdoutBeforeReportingEof();
+    void stderrDecoderPreservesACharacterAcrossPumpPasses();
     void encryptedIdentityUsesPassphraseFromCallback();
+    void encryptedPemIdentityNeverPromptsOnTheControllingTerminal();
     void missingAgentAndKeyExplainAuthenticationFailure();
     void multiStepServerAcceptsKeyThenPassword();
     void keyboardInteractiveOnlyServerAuthenticatesWithPassword();
@@ -370,6 +375,50 @@ void TstLiveSsh::stderrStaysOutOfReadStream()
     device.closeChannel();
 }
 
+// The stdout drain is bounded per pass. EOF on the empty stderr stream must
+// not finish the device while another pass still owes the consumer stdout.
+void TstLiveSsh::execChannelDrainsLargeStdoutBeforeReportingEof()
+{
+    ensureConnected();
+    QCOMPARE(m_pool.state(), SshConnectionPool::State::Connected);
+    SshChannelDevice device(&m_pool);
+    ChannelSink sink;
+    sink.attach(&device);
+
+    QVERIFY2(device.startExec(
+                 QStringLiteral("dd if=/dev/zero bs=16384 count=40 2>/dev/null")),
+             qPrintable(sink.err));
+    QTRY_VERIFY_WITH_TIMEOUT(sink.finished, kExecTimeoutMs);
+    QCOMPARE(sink.out, QByteArray(16 * 1024 * 40, '\0'));
+    QVERIFY2(sink.err.isEmpty(), qPrintable(sink.err));
+}
+
+void TstLiveSsh::stderrDecoderPreservesACharacterAcrossPumpPasses()
+{
+    ensureConnected();
+    QCOMPARE(m_pool.state(), SshConnectionPool::State::Connected);
+    SshChannelDevice device(&m_pool);
+    ChannelSink sink;
+    sink.attach(&device);
+    bool acknowledged = false;
+    connect(&device, &SshChannelDevice::readyRead, &device, [&] {
+        if (!acknowledged)
+            acknowledged = device.write("\n", 1) == 1;
+    });
+
+    // The peer writes the first UTF-8 byte before its stdout marker, then waits
+    // for our acknowledgement before writing the rest. pump() drains stderr
+    // before emitting readyRead(), so that acknowledgement forces the codepoint
+    // to straddle two passes without relying on sleeps or packet boundaries.
+    QVERIFY2(device.startExec(QStringLiteral(
+                 "printf '\\342' >&2; printf staged; read ack; printf '\\202\\254' >&2")),
+             qPrintable(sink.err));
+    QTRY_VERIFY_WITH_TIMEOUT(sink.finished, kExecTimeoutMs);
+    QVERIFY(acknowledged);
+    QCOMPARE(sink.out, QByteArrayLiteral("staged"));
+    QCOMPARE(sink.err, QStringLiteral("€"));
+}
+
 // Full key-unlock path against a real sshd. The fixture's unencrypted key is
 // copied and encrypted at runtime, so no private material or passphrase enters
 // the repository. CH_LIVE_IDENTITY identifies the fixture key; live runs that
@@ -559,6 +608,96 @@ void TstLiveSsh::windowsNamedPipeAgentFallsBackToIdentityFile()
     QVERIFY2(pool.connectToHost(m_host, m_port, m_user, m_identityFile),
              qPrintable(failure));
     pool.disconnectFromHost();
+}
+
+// An encrypted legacy PEM key takes OpenSSL's default console-prompt path when
+// publickey_auto() has no auth callback. A normal headless run cannot reveal it:
+// there is no controlling tty to block on. Run one isolated attempt under a
+// pseudo-terminal and never answer that tty; only our credential callback may
+// supply the passphrase.
+void TstLiveSsh::encryptedPemIdentityNeverPromptsOnTheControllingTerminal()
+{
+#ifndef Q_OS_LINUX
+    QSKIP("the controlling-terminal regression uses util-linux script");
+#else
+    static const QString passphrase = QStringLiteral("codeharbor-live-pem-passphrase");
+    if (env("CH_LIVE_PEM_PROMPT_CHILD") == QLatin1String("1")) {
+        const QString key = env("CH_LIVE_PEM_PROMPT_KEY");
+        QVERIFY(!key.isEmpty());
+        SshConnectionPool pool;
+        pool.setHostKeyCallback([](const QString&, const QString&,
+                                   const QByteArray&, KnownHosts::Verdict) {
+            return SshConnectionPool::HostKeyDecision::Accept;
+        });
+        int passphraseRequests = 0;
+        pool.setCredentialCallback(
+            [&](const QString&, SshConnectionPool::CredentialKind kind) {
+                if (kind == SshConnectionPool::CredentialKind::KeyPassphrase) {
+                    ++passphraseRequests;
+                    return SshConnectionPool::CredentialReply{passphrase, false};
+                }
+                return SshConnectionPool::CredentialReply{};
+            });
+        // The generated key is intentionally not in authorized_keys. It must
+        // be unlocked through our callback and then refused by the server.
+        QVERIFY(!pool.connectToHost(m_host, m_port, m_user, key));
+        QCOMPARE(passphraseRequests, 1);
+        QVERIFY(!pool.diagnosticLog().contains(passphrase));
+        return;
+    }
+
+    const QString script = QStandardPaths::findExecutable(QStringLiteral("script"));
+    const QString keygen = QStandardPaths::findExecutable(QStringLiteral("ssh-keygen"));
+    if (script.isEmpty() || keygen.isEmpty())
+        QSKIP("script and ssh-keygen are required for the controlling-terminal regression");
+
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QString key = dir.filePath(QStringLiteral("id_rsa"));
+    QProcess generate;
+    generate.start(keygen, {QStringLiteral("-q"), QStringLiteral("-t"),
+                            QStringLiteral("rsa"), QStringLiteral("-b"),
+                            QStringLiteral("2048"), QStringLiteral("-m"),
+                            QStringLiteral("PEM"), QStringLiteral("-N"),
+                            passphrase, QStringLiteral("-f"), key});
+    QVERIFY2(generate.waitForFinished(kExecTimeoutMs), qPrintable(generate.errorString()));
+    QCOMPARE(generate.exitStatus(), QProcess::NormalExit);
+    QCOMPARE(generate.exitCode(), 0);
+    // With no .pub file, libssh must import the key before offering it to the
+    // server, so even this deliberately unauthorized key exercises the prompt.
+    QVERIFY(QFile::remove(key + QStringLiteral(".pub")));
+
+    QProcessEnvironment childEnvironment = QProcessEnvironment::systemEnvironment();
+    childEnvironment.insert(QStringLiteral("HOME"), dir.path());
+    childEnvironment.insert(QStringLiteral("SSH_AUTH_SOCK"), QString());
+    childEnvironment.insert(QStringLiteral("CH_LIVE_PEM_PROMPT_CHILD"), QStringLiteral("1"));
+    childEnvironment.insert(QStringLiteral("CH_LIVE_PEM_PROMPT_KEY"), key);
+    QString executable = QCoreApplication::applicationFilePath();
+    executable.replace(QLatin1Char('\''), QStringLiteral("'\\''"));
+    const QString command =
+        QLatin1Char('\'') + executable
+        + QStringLiteral("' encryptedPemIdentityNeverPromptsOnTheControllingTerminal");
+    QProcess child;
+    child.setProcessEnvironment(childEnvironment);
+    child.start(script, {QStringLiteral("-q"), QStringLiteral("-e"),
+                         QStringLiteral("-c"), command, QStringLiteral("/dev/null")});
+    const bool completed = child.waitForFinished(kExecTimeoutMs);
+    if (!completed) {
+        // script handles SIGTERM by terminating its shell and PTY child too.
+        child.terminate();
+        if (!child.waitForFinished(5000)) {
+            child.kill();
+            child.waitForFinished(5000);
+        }
+    }
+    const QByteArray output = child.readAllStandardOutput() + child.readAllStandardError();
+    QVERIFY2(completed, qPrintable(QStringLiteral(
+        "encrypted-key authentication waited for terminal input: %1")
+                                       .arg(QString::fromUtf8(output))));
+    QCOMPARE(child.exitStatus(), QProcess::NormalExit);
+    QVERIFY2(child.exitCode() == 0, output.constData());
+    QVERIFY2(!output.contains("Enter PEM pass phrase"), output.constData());
+#endif
 }
 
 // A desktop-launched client may not inherit SSH_AUTH_SOCK. The failure must

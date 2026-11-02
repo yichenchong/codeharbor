@@ -86,7 +86,9 @@ private:
                                const QString& message);
     void appendQtMessage(QtMsgType type, const QMessageLogContext& context,
                          const QString& message);
-    void appendEntry(Entry entry);
+    // Qt's message handler holds a lifetime lease during the append. Its
+    // notification must be queued so a receiver may safely destroy the buffer.
+    void appendEntry(Entry entry, bool queueNotification = false);
 
     static QString truncateUtf8(const QString& value, qsizetype byteLimit);
     static int entryBytes(const Entry& entry);
@@ -102,6 +104,8 @@ private:
     mutable QMutex m_mutex;
     QVector<StoredEntry> m_entries;
     int m_totalBytes = 0;
+    // Protected by m_mutex: a burst retains at most one queued Qt-log change.
+    bool m_notificationPending = false;
     const int m_maxEntries;
     const int m_maxBytes;
 };

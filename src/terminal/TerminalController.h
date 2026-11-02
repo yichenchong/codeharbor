@@ -161,8 +161,11 @@ public:
     void setTransport(QIODevice *transport);
     QIODevice *transport() const;
 
-    // Forward renderer keystrokes to the remote PTY (SPEC 5.1). False when no
-    // writable transport is attached or the write was short.
+    // Forward renderer keystrokes to the remote PTY (SPEC 5.1), resuming
+    // successful short writes. False means the complete input was not sent;
+    // a prefix may already have reached the peer. The unsent suffix is not
+    // buffered or replayed on another transport. Callers must report failure
+    // and warn the user to inspect the terminal before retrying.
     bool sendInput(const QByteArray &bytes);
 
     // Record the renderer geometry and push it to the remote PTY (SPEC 5.1).

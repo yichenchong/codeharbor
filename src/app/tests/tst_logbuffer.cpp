@@ -1,7 +1,9 @@
 #include <QtTest/QtTest>
 
+#include <QEvent>
 #include <QMutex>
 #include <QMutexLocker>
+#include <QPointer>
 #include <QSignalSpy>
 #include <QThread>
 
@@ -29,6 +31,19 @@ void quietHandler(QtMsgType, const QMessageLogContext&, const QString&)
 {
 }
 
+class MetaCallCounter final : public QObject {
+public:
+    int calls = 0;
+
+protected:
+    bool eventFilter(QObject*, QEvent* event) override
+    {
+        if (event->type() == QEvent::MetaCall)
+            ++calls;
+        return false;
+    }
+};
+
 class TstLogBuffer final : public QObject {
     Q_OBJECT
 
@@ -39,6 +54,8 @@ private slots:
     void remoteTextIsSplitPerLineAndClearAnnouncesItselfOnce();
     void zeroCapacityBufferKeepsNothing();
     void destructionRacesWithLogging();
+    void qtLogNotificationMayDestroyTheBuffer();
+    void qtLogBurstKeepsOnePendingNotification();
 };
 
 void TstLogBuffer::entryAndByteCaps()
@@ -232,6 +249,83 @@ void TstLogBuffer::destructionRacesWithLogging()
     QVERIFY(writer->wait(3000));
     delete writer;
     qInstallMessageHandler(previous);
+}
+
+void TstLogBuffer::qtLogNotificationMayDestroyTheBuffer()
+{
+    const QtMessageHandler previous = qInstallMessageHandler(&quietHandler);
+    QPointer<LogBuffer> buffer = new LogBuffer(8, 4096);
+    bool notified = false;
+    connect(buffer, &LogBuffer::entriesChanged, this, [&] {
+        notified = true;
+        delete buffer.data();
+    });
+
+    qWarning("log-buffer receiver deletion marker");
+    // Storage is immediate, but the notification may not run inside the
+    // global message handler's active lifetime lease.
+    const bool stored = buffer && buffer->count() == 1;
+    const bool deferred = !notified;
+    QCoreApplication::processEvents();
+    const bool deleted = buffer.isNull();
+    delete buffer.data();
+    qInstallMessageHandler(previous);
+
+    QVERIFY(stored);
+    QVERIFY(deferred);
+    QVERIFY(notified);
+    QVERIFY(deleted);
+}
+
+void TstLogBuffer::qtLogBurstKeepsOnePendingNotification()
+{
+    const QtMessageHandler previous = qInstallMessageHandler(&quietHandler);
+    LogBuffer buffer(8, 4096);
+    MetaCallCounter events;
+    buffer.installEventFilter(&events);
+    QSignalSpy changed(&buffer, &LogBuffer::entriesChanged);
+    for (int i = 0; i < 1000; ++i)
+        qWarning("queued log-buffer burst marker %d", i);
+    QThread* writer = QThread::create([] {
+        for (int i = 0; i < 1000; ++i)
+            qWarning("worker log-buffer burst marker %d", i);
+    });
+    writer->start();
+    writer->wait();
+    delete writer;
+    const int stored = buffer.count();
+    const int beforeDelivery = changed.count();
+    QCoreApplication::sendPostedEvents(&buffer, QEvent::MetaCall);
+    const int afterBurst = changed.count();
+    const int burstEvents = events.calls;
+
+    // Clearing the pending bit before emitting also preserves notifications
+    // for a new Qt message appended reentrantly by a receiver.
+    bool appendAgain = true;
+    connect(&buffer, &LogBuffer::entriesChanged, this, [&] {
+        if (appendAgain) {
+            appendAgain = false;
+            qWarning("reentrant log-buffer marker");
+        }
+    });
+    qWarning("log-buffer rearm marker");
+    QCoreApplication::sendPostedEvents(&buffer, QEvent::MetaCall);
+    QCoreApplication::sendPostedEvents(&buffer, QEvent::MetaCall);
+    const int afterReentry = changed.count();
+    const int reentryEvents = events.calls;
+    buffer.append(QtInfoMsg, QStringLiteral("test"), QStringLiteral("unit"),
+                  QStringLiteral("explicit append remains synchronous"));
+    const int afterExplicitAppend = changed.count();
+    qInstallMessageHandler(previous);
+
+    QCOMPARE(stored, 8);
+    QCOMPARE(beforeDelivery, 0);
+    QCOMPARE(afterBurst, 1);
+    QCOMPARE(burstEvents, 1);
+    QCOMPARE(afterReentry, 3);
+    QCOMPARE(reentryEvents, 3);
+    QCOMPARE(afterExplicitAppend, 4);
+    QVERIFY(buffer.totalBytes() <= buffer.maxBytes());
 }
 
 } // namespace

@@ -609,18 +609,24 @@ QString MobileKeyStore::registerReference(QString reference, QString name)
         if (!isUsableKeyName(name))
             name = QStringLiteral("saved-key");
     }
-    // A derived name may already be taken by an unrelated key; make it unique
-    // rather than refusing to load the profile's credential.
-    if (m_memoryKeys.contains(name) || m_references.contains(name)) {
+    // Names are shared by all three storage paths, including saved keys whose
+    // bytes have not been loaded since launch. Keep suffixes within the same
+    // 64-character bound as a name entered by the user.
+    const auto nameTaken = [this](const QString& candidate) {
+        return m_memoryKeys.contains(candidate) || m_references.contains(candidate)
+               || m_savedNames.contains(candidate);
+    };
+    if (nameTaken(name)) {
         const QString base = name;
         for (int suffix = 2; suffix < 1000; ++suffix) {
-            name = base + QStringLiteral("-") + QString::number(suffix);
-            if (!m_memoryKeys.contains(name) && !m_references.contains(name))
+            const QString tail = QStringLiteral("-") + QString::number(suffix);
+            name = base.left(64 - tail.size()) + tail;
+            if (!nameTaken(name))
                 break;
         }
-        if (!claimName(name))
-            return QString();
     }
+    if (!claimName(name))
+        return QString();
 
     m_references.insert(name, reference);
     m_referenceNames.append(name);

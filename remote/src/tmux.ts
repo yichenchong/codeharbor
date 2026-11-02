@@ -196,11 +196,17 @@ export const execFileRunner: CommandRunner = (argv) =>
             // at import time, so a value exported after this module was loaded
             // is honoured instead of silently ignored.
             process.env.CODEHARBOR_TMUX ?? "tmux",
-            argv,
+            // SSH exec commonly has a C locale and no TMUX variable. Without
+            // -u, tmux sanitizes Unicode names into underscores, which can turn
+            // a discovered name into a DIFFERENT session's exact kill target.
+            ["-u", ...argv],
             {
                 encoding: "utf8",
                 maxBuffer: TMUX_MAX_OUTPUT_BYTES,
                 timeout: TMUX_TIMEOUT_MS,
+                // SIGTERM can be ignored; execFile then waits forever and may
+                // even report success if the child eventually exits with 0.
+                killSignal: "SIGKILL",
             },
             (err, stdout, stderr) => {
                 if (err === null) {

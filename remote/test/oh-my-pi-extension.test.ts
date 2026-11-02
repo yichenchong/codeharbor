@@ -240,6 +240,26 @@ test("a dead bridge socket never throws into the agent (SPEC 6.4)", async () => 
     }
 });
 
+test("a throwing native payload cannot block a tool or poison forwarding (BH26-BRIDGE-03)", async () => {
+    const bridge = await startFakeBridge();
+    try {
+        const forwarder = createForwarder(
+            { OMP_DEV_SESSION_ID: "s", OMP_TERMINAL_ID: "t" },
+            bridge.socketPath,
+        );
+        assert.ok(forwarder);
+        assert.doesNotThrow(() => forwarder.forward("tool_call", {
+            get toolName(): string { throw new Error("native getter failed"); },
+        }));
+        forwarder.forward("agent_end", {});
+        await forwarder.flush();
+        await bridge.waitForLines(1);
+        assert.deepEqual(statesOf(bridge.lines), ["idle_unseen"]);
+    } finally {
+        await bridge.close();
+    }
+});
+
 test("toHookInput normalizes the harness's own event shape", () => {
     // Both spellings are accepted so a harness that renames the field in either
     // direction cannot silently take waiting_input away, and exactly one of

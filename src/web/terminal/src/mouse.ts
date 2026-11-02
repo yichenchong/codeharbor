@@ -65,10 +65,10 @@ export interface InvertedMousePolicyOptions {
  * that extension. Reporting off is also the case where a plain drag already
  * selects, so there is nothing to invert there in the first place.
  *
- * The move and up of an inverted gesture are flipped too, on the document so
- * that they are still caught when the pointer leaves the surface mid-drag. That
- * keeps the modifier bits of a handed-over drag consistent from press to
- * release: the modifier is the chord this page spends to reach the program, and
+ * The move and up of an inverted gesture use the press's selection decision,
+ * on the document so that they are still caught when the pointer leaves the
+ * surface mid-drag. Releasing the modifier early must not change ownership:
+ * the modifier is the chord this page spends to reach the program, and
  * a report stream whose press said "no modifier" and whose drag said "Shift"
  * would be looked up in two different tmux key tables (`MouseDrag1Pane` versus
  * `S-MouseDrag1Pane`, which has no default binding), so the drag would do
@@ -83,44 +83,41 @@ export function installInvertedMousePolicy(
     // everywhere else.
     const modifier = options.isMac ? "altKey" : "shiftKey";
     const doc = surface.ownerDocument;
-    // Set on a mousedown this policy inverted, so the rest of that one gesture
-    // is inverted with it and no other pointer traffic is touched.
-    let gestureIsInverted = false;
+    // Latch ownership at the press, rather than following modifier changes
+    // mid-drag and leaving the remote program with a press but no release.
+    let forceSelection: boolean | null = null;
 
-    const invert = (event: MouseEvent): void => {
-        // `shiftKey` / `altKey` are accessors on MouseEvent.prototype; an own
-        // data property on the instance shadows them for every later reader,
-        // which is the whole trick. It is configurable so a second pass could
-        // never wedge the event in an inverted state.
+    const rewrite = (event: MouseEvent): void => {
+        // An own property shadows the MouseEvent prototype's modifier accessor.
         Object.defineProperty(event, modifier, {
-            value: !event[modifier],
+            value: forceSelection,
             configurable: true,
             enumerable: true,
         });
     };
 
     const onMouseDown = (event: MouseEvent): void => {
-        gestureIsInverted = false;
-        // Only the primary button carries the selection-versus-report choice.
-        // The right button is taken away from the remote side wholesale in
-        // index.ts, and the middle button pastes on the remote side.
-        if (event.button !== 0 || !mouseReportingActive()) {
+        if (event.button !== 0) {
+            return; // another button cannot change a primary gesture's owner
+        }
+        forceSelection = null;
+        if (!mouseReportingActive()) {
             return;
         }
-        gestureIsInverted = true;
-        invert(event);
+        forceSelection = !event[modifier];
+        rewrite(event);
     };
     const onMouseMove = (event: MouseEvent): void => {
-        if (gestureIsInverted) {
-            invert(event);
+        if (forceSelection !== null) {
+            rewrite(event);
         }
     };
     const onMouseUp = (event: MouseEvent): void => {
-        if (!gestureIsInverted) {
+        if (event.button !== 0 || forceSelection === null) {
             return;
         }
-        invert(event);
-        gestureIsInverted = false;
+        rewrite(event);
+        forceSelection = null;
     };
 
     surface.addEventListener("mousedown", onMouseDown, true);

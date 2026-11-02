@@ -9,4 +9,14 @@ if(UNIX)
     set_tests_properties(tst_live_fixture_isolation PROPERTIES
         FIXTURES_SETUP codeharbor_live_fixture
         TIMEOUT 30)
+    add_test(
+        NAME tst_live_fixture_isolation_paths
+        COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/live_fixture_isolation.sh
+                ${PROJECT_SOURCE_DIR})
+    set_tests_properties(tst_live_fixture_isolation_paths PROPERTIES TIMEOUT 30)
+    add_test(
+        NAME tst_vcpkg_patch_validation
+        COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/vcpkg_patch_validation.sh
+                ${PROJECT_SOURCE_DIR})
+    set_tests_properties(tst_vcpkg_patch_validation PROPERTIES TIMEOUT 30)
 endif()

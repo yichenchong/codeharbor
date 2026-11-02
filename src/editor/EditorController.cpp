@@ -306,14 +306,19 @@ void EditorController::reconcileAfterReconnect()
     // save() or reload() that settles before this stat answers is authoritative
     // and must not be undone by a snapshot taken before it ran.
     const QString baseline = m_revision;
+    const quint64 loadGeneration = m_loadGeneration;
+    const quint64 watchGeneration = m_watchGeneration;
 
     QPointer<EditorController> self(this);
     m_client->call(
         QString::fromLatin1(rpc::kMethodStat), readParams(path),
-        [self, path, baseline](QJsonValue statRes, std::optional<RpcError> statErr) {
+        [self, path, baseline, loadGeneration, watchGeneration](
+            QJsonValue statRes, std::optional<RpcError> statErr) {
             if (!self)
                 return;
-            if (self->m_path != path || self->m_revision != baseline)
+            if (self->m_path != path || self->m_revision != baseline
+                || self->m_loadGeneration != loadGeneration
+                || self->m_watchGeneration != watchGeneration)
                 return;  // superseded
 
             if (statErr.has_value()) {
@@ -397,6 +402,14 @@ void EditorController::setFileState(FileState state)
     emit fileStateChanged(toString(state));
 }
 
+void EditorController::setDirty(bool dirty)
+{
+    if (m_dirty == dirty)
+        return;
+    m_dirty = dirty;
+    emit dirtyChanged();
+}
+
 void EditorController::setReadOnly(bool readOnly)
 {
     if (m_readOnly == readOnly)
@@ -404,14 +417,10 @@ void EditorController::setReadOnly(bool readOnly)
     m_readOnly = readOnly;
     emit readOnlyChanged(readOnly);
 
-    // Becoming read-only retires any recovery snapshot we are still holding
-    // (SPEC 11.3). A snapshot only pays off if it can be SAVED back one day;
-    // for a file the user can no longer write it is dead weight that re-prompts
-    // "unsaved changes" on every reopen and can never be applied. This normally
-    // has nothing to do — the snapshot is written by reportContent(), which the
-    // guard below refuses once read-only — but a debounced report from the page
-    // can land in the round trip before the derivation completes.
-    if (readOnly)
+    // Binary/truncated buffers cannot be written back safely. A permission-only
+    // restriction is different: chmod or reconnect may restore writability, so
+    // the recovery copy of real unsaved edits must survive it.
+    if (readOnly && m_bufferReadOnly)
         clearRecovery();
 }
 
@@ -430,15 +439,20 @@ void EditorController::refreshPermissions(std::function<void()> then)
     }
 
     const QString path = m_path;
+    const quint64 loadGeneration = m_loadGeneration;
+    const quint64 watchGeneration = m_watchGeneration;
     QPointer<EditorController> self(this);
     m_client->call(
         QString::fromLatin1(rpc::kMethodStat), readParams(path),
-        [self, path, then](QJsonValue res, std::optional<RpcError> err) {
+        [self, path, loadGeneration, watchGeneration, then](
+            QJsonValue res, std::optional<RpcError> err) {
             if (!self)
                 return;
-            // Superseded by a file switch: this answer describes the old file
-            // and must not decide the new one's editability.
-            if (self->m_path != path)
+            // A same-path reopen or transport replacement also supersedes this
+            // stat: path equality alone cannot identify the buffer it describes.
+            if (self->m_path != path
+                || self->m_loadGeneration != loadGeneration
+                || self->m_watchGeneration != watchGeneration)
                 return;
             // A stat that failed says nothing; keep the last derivation rather
             // than guessing in either direction.
@@ -616,7 +630,7 @@ void EditorController::open(QString path)
     m_revision.clear();
 
     m_loadedContent.clear();
-    m_dirty = false;
+    setDirty(false);
     // A clear intended for the file being left behind is not owed to the new one,
     // and no reply from that file may touch this bookkeeping again.
     resetRecoverySlot();
@@ -665,6 +679,10 @@ void EditorController::open(QString path)
                            return;
                        }
                        const QJsonObject obj = result.toObject();
+                       if (!obj.value(QStringLiteral("truncated")).isBool()) {
+                           self->setFileState(FileState::Error);
+                           return;
+                       }
                        // base64 means the daemon's STRICT UTF-8 decode refused
                        // these bytes and sent them exactly as they are
                        // (remote/src/files.ts). Decode before showing anything:
@@ -830,6 +848,7 @@ void EditorController::checkRecovery(const QString& loadedContent, quint64 gener
                     QString recovered;
                     const bool parsed =
                         payload.has_value()
+                        && snapshot.value(QStringLiteral("truncated")).isBool()
                         && !snapshot.value(QStringLiteral("truncated")).toBool()
                         && parseRecovery(*payload, snapshotPath, recovered);
                     // This pane's single slot is REUSED as it switches files,
@@ -948,7 +967,7 @@ void EditorController::issueSave(QString content, QString expectedRevision)
     // nowhere else, and a buffer wrongly believed clean is silently
     // auto-reloaded over by the next external change (SPEC 8.7). Only the reply
     // below clears it, and only if nothing was typed in the meantime.
-    m_dirty = true;
+    setDirty(true);
     const quint64 editSerial = m_editSerial;
 
     setFileState(FileState::Saving);
@@ -1042,7 +1061,7 @@ void EditorController::issueSave(QString content, QString expectedRevision)
                 // change auto-reload straight over them.
                 const bool editedDuringSave = self->m_editSerial != editSerial;
                 if (!editedDuringSave) {
-                    self->m_dirty = false;
+                    self->setDirty(false);
                     // The file on the server now IS the buffer, so the recovery
                     // snapshot is obsolete: drop it before anything can reopen
                     // the file and be offered a stale copy (SPEC 11.3).
@@ -1124,16 +1143,34 @@ void EditorController::issueSave(QString content, QString expectedRevision)
         });
 }
 
+void EditorController::reportDirty(bool dirty, QString baselineRevision)
+{
+    if (m_path.isEmpty() || m_revision.isEmpty() || m_bufferReadOnly
+        || m_fileState == FileState::Loading)
+        return;
+    ++m_editSerial;
+    // During a save, even the old baseline is unsaved against the bytes on the
+    // wire. A stale page baseline likewise cannot prove the current file clean.
+    const bool unsaved =
+        dirty || m_saveInFlight || baselineRevision != m_revision;
+    setDirty(unsaved);
+    if (unsaved) {
+        m_recoveryClearPending = false;
+        if (m_fileState == FileState::Clean)
+            setFileState(FileState::Modified);
+    } else {
+        if (m_fileState == FileState::Modified)
+            setFileState(FileState::Clean);
+        clearRecovery();
+    }
+}
+
 void EditorController::reportContent(QString content)
 {
-    // A read-only buffer can never be saved, so a recovery snapshot of it could
-    // never be applied — it would only pile up on the server and re-offer
-    // "unsaved changes" on every reopen (SPEC 11.3). Monaco stops producing the
-    // edits that drive this call once readOnlyChanged lands, but the bridge is
-    // fire-and-forget and the page debounces by 500ms, so a report from just
-    // before the derivation can still arrive. Drop it whole: the buffer is not
-    // dirty in any sense the user can act on.
-    if (m_readOnly)
+    // Binary/truncated bytes are not an editable buffer. A permission change,
+    // however, can race the page's debounced last edit: preserve that text in
+    // recovery even while saving the main file is temporarily forbidden.
+    if (m_bufferReadOnly)
         return;
 
     // A load is in flight, so the page is still showing the buffer of whatever
@@ -1150,13 +1187,13 @@ void EditorController::reportContent(QString content)
 
     // Do not use the old baseline as a clean shortcut while a write is pending.
     if (!m_saveInFlight && content == m_loadedContent) {
-        m_dirty = false;
+        setDirty(false);
         if (m_fileState == FileState::Modified)
             setFileState(FileState::Clean);
         clearRecovery();
         return;
     }
-    m_dirty = true;
+    setDirty(true);
     if (m_fileState == FileState::Clean)
         setFileState(FileState::Modified);
     writeRecovery(content, /*retryOnMismatch=*/true);
@@ -1175,6 +1212,7 @@ void EditorController::writeRecovery(const QString& content, bool retryOnMismatc
     // open() bumps that generation, and it also covers the two changes a path
     // comparison cannot see — a new recovery directory and a new pane id.
     const quint64 recoveryGeneration = m_recoveryGeneration;
+    const quint64 editSerial = m_editSerial;
     const QString payload = serializeRecovery(m_path, content);
 
     // See m_recoveryWritesInFlight: until this answers, clearRecovery() cannot know
@@ -1190,7 +1228,8 @@ void EditorController::writeRecovery(const QString& content, bool retryOnMismatc
     m_client->call(
         QString::fromLatin1(rpc::kMethodWriteFile),
         writeParams(recoveryPath, payload, m_recoveryRevision, kRecoveryFileMode),
-        [self, content, recoveryPath, retryOnMismatch, recoveryGeneration](
+        [self, content, recoveryPath, retryOnMismatch, recoveryGeneration,
+         editSerial](
             QJsonValue result, std::optional<RpcError> error) {
             // The pane switched files while this was in flight: open() has already
             // reset the recovery bookkeeping for the new file, so neither this
@@ -1219,7 +1258,8 @@ void EditorController::writeRecovery(const QString& content, bool retryOnMismatc
             // best-effort — other errors are swallowed (never surfaced as a
             // save failure).
             if (!(retryOnMismatch && self->m_client
-                  && error->code == rpc::kRevisionMismatch)) {
+                  && error->code == rpc::kRevisionMismatch)
+                || self->m_editSerial != editSerial) {
                 // THIS snapshot never landed. Whether there is anything left to
                 // truncate depends on an earlier write having succeeded, which
                 // m_recoveryHasContent already records — so run the same check
@@ -1235,7 +1275,7 @@ void EditorController::writeRecovery(const QString& content, bool retryOnMismatc
             ++self->m_recoveryWritesInFlight;
             self->m_client->call(
                 QString::fromLatin1(rpc::kMethodStat), readParams(recoveryPath),
-                [self, content, recoveryGeneration](
+                [self, content, recoveryGeneration, editSerial](
                     QJsonValue statRes, std::optional<RpcError> statErr) {
                     // File switched: open() reset the recovery bookkeeping including
                     // any deferred truncate, so nothing is owed to the file being
@@ -1244,6 +1284,12 @@ void EditorController::writeRecovery(const QString& content, bool retryOnMismatc
                         return;
                     if (self->m_recoveryWritesInFlight > 0)
                         --self->m_recoveryWritesInFlight;
+                    // A newer report already owns this slot. Retrying these
+                    // older bytes would overwrite its crash-recovery snapshot.
+                    if (self->m_editSerial != editSerial) {
+                        self->honourDeferredRecoveryClear();
+                        return;
+                    }
                     if (statErr.has_value()) {
                         // The chain ends here without a snapshot of its own; a
                         // truncate deferred meanwhile is still owed an answer.
@@ -1417,6 +1463,10 @@ void EditorController::reload(FileState transitional, bool discardLocalEdits)
                 return;
             }
             const QJsonObject obj = result.toObject();
+            if (!obj.value(QStringLiteral("truncated")).isBool()) {
+                self->setFileState(FileState::Error);
+                return;
+            }
             // Same rule as open(): a base64 reply is the file's exact bytes,
             // sent that way because the daemon's strict decoder refused them,
             // and it is decoded before it is shown. Decided BEFORE anything is
@@ -1437,7 +1487,7 @@ void EditorController::reload(FileState transitional, bool discardLocalEdits)
             }
             self->m_revision = revision;
             self->m_loadedContent = content;
-            self->m_dirty = false;
+            self->setDirty(false);
             // This load has taken the buffer over, so the save chain it found
             // running belongs to bytes the pane no longer holds. Retire it the
             // way open() does. Only an EXPLICIT reload can get here with a write

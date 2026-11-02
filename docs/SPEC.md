@@ -981,8 +981,8 @@ start. Mapping that to `idle_unseen` would announce "Agent finished", arm the De
 unseen-completion badge and raise a desktop notification in the middle of work the user is
 still waiting on, then do it again at the next boundary. So `agent_end` with `willContinue`
 set maps to `running`, which is what the agent is doing, and only a final `agent_end` is a
-completion. This is the same rule, for the same reason, as Claude Code's `SubagentStop`
-not being a completion while the main agent is still working.
+completion. Claude Code's `SubagentStop` does not change the main terminal's status:
+it describes a child agent, not whether the main agent is working or finished.
 
 The same order holds for every adapter, not just Oh My Pi. Pi shares Oh My Pi's mapping
 outright (`remote/src/adapters/pi-family.ts`, used by both) and Claude Code implements the

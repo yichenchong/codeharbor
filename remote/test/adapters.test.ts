@@ -195,9 +195,9 @@ test("claude-code adapter maps its lifecycle hook names", () => {
     assert.equal(claudeCodeAdapter.map({ hook: "PostToolBatch" }), "running");
     assert.equal(claudeCodeAdapter.map({ hook: "PreCompact" }), "running");
     assert.equal(claudeCodeAdapter.map({ hook: "PostCompact" }), "running");
-    assert.equal(claudeCodeAdapter.map({ hook: "SubagentStart" }), "running");
-    assert.equal(claudeCodeAdapter.map({ hook: "SubagentStop" }), "running");
-    assert.equal(claudeCodeAdapter.map({ hook: "TeammateIdle" }), "running");
+    assert.equal(claudeCodeAdapter.map({ hook: "SubagentStart" }), null);
+    assert.equal(claudeCodeAdapter.map({ hook: "SubagentStop" }), null);
+    assert.equal(claudeCodeAdapter.map({ hook: "TeammateIdle" }), null);
     assert.equal(claudeCodeAdapter.map({ hook: "TaskCreated" }), "running");
     assert.equal(claudeCodeAdapter.map({ hook: "TaskCompleted" }), "running");
     assert.equal(claudeCodeAdapter.map({ hook: "MessageDisplay" }), "running");
@@ -246,15 +246,52 @@ test("claude-code adapter maps its lifecycle hook names", () => {
         null,
     );
     assert.equal(claudeCodeAdapter.map({ hook: "Stop" }), "idle_unseen");
-    // SubagentStop fires when a Task-tool subagent finishes while the MAIN agent
-    // is still working. It is covered above and must map to running rather than
-    // a completion, which would arm the unseen-completion badge mid-turn.
     assert.equal(claudeCodeAdapter.map({ hook: "SessionEnd" }), "stopped");
     assert.equal(claudeCodeAdapter.map({ hook: "Anything", error: true }), "error");
     assert.equal(claudeCodeAdapter.map({ hook: "Unrecognized" }), null);
     // Claude Code names its events under `hook`; `type` is the Oh My Pi / Pi
     // key, so a type-keyed event is not a Claude Code event and maps to nothing.
     assert.equal(claudeCodeAdapter.map({ type: "SessionStart" }), null);
+});
+
+test("auxiliary Claude lifecycle events cannot overwrite main-agent status (BH26-BRIDGE-04)", () => {
+    const coordinates = {
+        harness: "claude-code",
+        devSessionId: "s",
+        terminalId: "t",
+    };
+    const completion = processBridgeLine(JSON.stringify({
+        ...coordinates,
+        native: { hook: "Stop" },
+    }));
+    assert.equal(completion?.state, "idle_unseen");
+    for (const hook of ["SubagentStart", "SubagentStop", "TeammateIdle"]) {
+        for (const error of [false, true]) {
+            const auxiliary = processBridgeLine(JSON.stringify({
+                ...coordinates,
+                native: {
+                    hook,
+                    agent_id: "suggestion-agent",
+                    agent_type: "",
+                    error,
+                },
+            }));
+            // Explicit error is a producer's session-error marker, not a child
+            // lifecycle state; preserve the documented cross-adapter precedence.
+            if (error) assert.equal(auxiliary?.state, "error");
+            else assert.equal(auxiliary, null, `${hook} is not a main-agent state change`);
+        }
+    }
+});
+
+test("Claude URL elicitation notifications request user input (BH26-BRIDGE-05)", () => {
+    const event = processBridgeLine(JSON.stringify({
+        harness: "claude-code",
+        devSessionId: "s",
+        terminalId: "t",
+        native: { hook: "Notification", notification_type: "elicitation_url_dialog" },
+    }));
+    assert.equal(event?.state, "waiting_input");
 });
 
 // pi.ts and oh-my-pi.ts used to be byte-for-byte copies of one mapping, kept in

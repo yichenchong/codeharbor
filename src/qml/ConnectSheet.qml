@@ -198,7 +198,7 @@ Rectangle {
         root.pendingSelectionId = "";
         Qt.callLater(root.applyCurrentIndex);
         if (!hadSelection && root.selectedId !== "")
-            profileSelector.forceActiveFocus();
+            root.focusWhenStillOurs(profileSelector);
     }
 
     function connectNow() {
@@ -365,6 +365,8 @@ Rectangle {
         const holder = root.Window.activeFocusItem;
         if (holder && root.itemWithin(Overlay.overlay, holder))
             return;
+        if (root.keyboardOwnedByHigherSheet(holder))
+            return;
         item.forceActiveFocus();
     }
 
@@ -480,9 +482,21 @@ Rectangle {
         for (var walk = holder; walk; walk = walk.parent) {
             if (walk === root)
                 return false;
-            if (walk.parent === root.parent && walk !== root
-                && walk.visible && walk.z > root.z)
-                return true;
+            if (walk.parent === root.parent && walk !== root && walk.visible) {
+                if (walk.z > root.z)
+                    return true;
+                // Equal-z siblings are painted in child order. The log sheet
+                // intentionally shares z=900 and is declared after this one.
+                if (walk.z === root.z) {
+                    let afterRoot = false;
+                    for (const sibling of root.parent.children) {
+                        if (sibling === root)
+                            afterRoot = true;
+                        else if (sibling === walk)
+                            return afterRoot;
+                    }
+                }
+            }
         }
         return false;
     }

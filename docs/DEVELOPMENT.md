@@ -19,7 +19,7 @@ This stack has been confirmed to configure, build, and link the full tree
 | Ninja | 1.13.2 | any |
 | Qt 6 | 6.10.2 | 6.10 |
 | libssh | 0.11.3 (verified runtime) | audited runtime floor 0.11.2; exactly 0.12.0 is warned about and worked around |
-| Node.js | 24.16 | 23.6 (native TS type-stripping) |
+| Node.js | 24.16 | 23.6 (unflagged `node:sqlite` runtime and native TS type-stripping) |
 
 The Windows release uses the separate in-tree vcpkg overlay, pinned to libssh
 0.12.2. That overlay pin does not change the runtime floor for ordinary Linux
@@ -119,16 +119,31 @@ in the top-level `CMakeLists.txt`):
 
 ### 2. Node.js (remote workspace)
 
-Node **23.6+** is required — the remote tests run TypeScript directly via Node's
-native type stripping (no ts-node/tsx). If your distro's Node is older, install a
-current one (e.g. via [nodesource](https://github.com/nodesource/distributions)
-or `nvm`):
+Node **23.6+** is required for the remote service, including compiled releases:
+the workspace database uses the built-in `node:sqlite` module without an
+experimental command-line flag. The remote tests also run TypeScript directly
+via Node's native type stripping (no ts-node/tsx). If your distro's Node is older,
+install a current one (e.g. via
+[nodesource](https://github.com/nodesource/distributions) or `nvm`):
 
 ```bash
 # nvm example
 curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh | bash
 nvm install 24
 ```
+
+The remote automatic installer/updater also requires `flock` and `tar`; URL
+downloads need `curl` or `wget`. This is separate from running the service or
+building a checkout, neither of which requires `flock`. A server without it can
+still run a manually installed release. The updater fails before changing the
+installation when `flock` is missing or another updater owns the lock, retaining
+the existing-service fallback when that service is usable.
+
+The installer keeps `.codeharbor-provision.lock` in the installation directory.
+Its kernel lock, not the file's existence or a stored process ID, proves
+ownership. The last holder's exit releases ownership automatically. Do not
+unlink the file to clear contention; an active process may still hold its old
+inode, allowing another installer to acquire a different file at the same path.
 
 ## Other platforms (reference)
 
@@ -1112,10 +1127,13 @@ apply to the GUI client and is out of scope today.
   `CMAKE_PREFIX_PATH` in the environment) when Qt is not on the default path.
 - **Remote sessions that vanish on disconnect.** SPEC 2.2 promises terminal
   processes outlive a disconnect, and tmux delivers that — but two things on the
-  REMOTE host can break it, neither of them visible from the client. A session
-  that dies this way is not reported: the next attach runs
-  `tmux new-session -A`, which silently creates a fresh empty session under the
-  same name, so the pane simply comes back blank.
+  REMOTE host can break it. Reconnect runs `tmux new-session -A`, which creates a
+  fresh empty session when the old one has gone. If the running client previously
+  observed that target's creation time and the server now reports a later one,
+  the pane shows a remote-session-replaced notice and records the replacement in
+  the log. It cannot prove replacement without that earlier observation (for
+  example after restarting the app), when the listing is unavailable, or when
+  both sessions were created within the same second.
   - `destroy-unattached on` in the user's `~/.tmux.conf` destroys a session as
     soon as its last client leaves. CodeHarbor turns it off per session at
     creation (`tmuxNewSessionCommand`), which covers every session it makes and

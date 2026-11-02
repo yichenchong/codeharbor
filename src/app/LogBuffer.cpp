@@ -309,11 +309,13 @@ void LogBuffer::appendQtMessage(QtMsgType type,
     // but never QML credential fields or callback arguments.
     const QString category = context.category ? QString::fromUtf8(context.category)
                                               : QString();
-    append(type, category, messageSource(context), message,
-           QStringLiteral("client"));
+    appendEntry(Entry{QDateTime::currentDateTimeUtc(), type,
+                      QStringLiteral("client"), category.trimmed(),
+                      messageSource(context).trimmed(), message},
+                true);
 }
 
-void LogBuffer::appendEntry(Entry entry)
+void LogBuffer::appendEntry(Entry entry, bool queueNotification)
 {
     // Keep the timestamp and severity for every retained row. If metadata fills
     // the entire byte budget, the message is truncated rather than violating
@@ -340,6 +342,7 @@ void LogBuffer::appendEntry(Entry entry)
         return;
 
     bool accepted = false;
+    bool postNotification = false;
     {
         QMutexLocker locker(&m_mutex);
         while (!m_entries.isEmpty()
@@ -352,10 +355,36 @@ void LogBuffer::appendEntry(Entry entry)
             m_entries.push_back(StoredEntry{std::move(entry), bytes});
             m_totalBytes += bytes;
             accepted = true;
+            if (queueNotification && !m_notificationPending) {
+                m_notificationPending = true;
+                postNotification = true;
+            }
         }
     }
-    if (accepted)
-        emit entriesChanged();
+    if (accepted) {
+        if (queueNotification) {
+            // Do not run user slots while messageHandler still holds its
+            // lease: deleting the buffer there would wait for this very call.
+            // The QObject context also cancels delivery after destruction.
+            if (postNotification) {
+                QMetaObject::invokeMethod(
+                    this,
+                    [this] {
+                        {
+                            QMutexLocker locker(&m_mutex);
+                            m_notificationPending = false;
+                        }
+                        // Clear before delivery: a receiver may append another
+                        // Qt message (which needs a new notification) or delete
+                        // this object. No member access follows the signal.
+                        emit entriesChanged();
+                    },
+                    Qt::QueuedConnection);
+            }
+        } else {
+            emit entriesChanged();
+        }
+    }
 }
 
 QString LogBuffer::truncateUtf8(const QString& value, qsizetype byteLimit)

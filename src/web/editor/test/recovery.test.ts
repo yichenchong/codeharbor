@@ -39,23 +39,61 @@ class FakeClock {
     }
 }
 
-// A fake editor bridge recording the two calls RecoveryReporter makes.
+// A fake editor bridge recording every call RecoveryReporter makes.
 function fakeBridge(): {
     bridge: ReportBridge;
     reports: string[];
     saves: Array<{ content: string; revision: string }>;
+    dirtyReports: Array<{ dirty: boolean; revision: string }>;
 } {
     const reports: string[] = [];
     const saves: Array<{ content: string; revision: string }> = [];
+    const dirtyReports: Array<{ dirty: boolean; revision: string }> = [];
     return {
         reports,
         saves,
+        dirtyReports,
         bridge: {
             reportContent: (content) => reports.push(content),
             save: (content, revision) => saves.push({ content, revision }),
+            reportDirty: (dirty, revision) => dirtyReports.push({ dirty, revision }),
         },
     };
 }
+
+test("edit observations mark the host dirty before reading or snapshotting text", () => {
+    const clock = new FakeClock();
+    const { bridge, reports, dirtyReports } = fakeBridge();
+    let reads = 0;
+    const reporter = new RecoveryReporter(bridge, () => {
+        ++reads;
+        return "edited";
+    }, clock.timers);
+
+    reporter.observeEdit(true, "r1");
+    assert.deepEqual(dirtyReports, [{ dirty: true, revision: "r1" }]);
+    assert.equal(reads, 0);
+    assert.deepEqual(reports, []);
+    assert.equal(clock.armed, 1);
+    clock.fire();
+    assert.equal(reads, 1);
+    assert.deepEqual(reports, ["edited"]);
+});
+
+test("undo reports clean immediately and cancels its pending recovery text", () => {
+    const clock = new FakeClock();
+    const { bridge, reports, dirtyReports } = fakeBridge();
+    const reporter = new RecoveryReporter(bridge, () => "original", clock.timers);
+    reporter.observeEdit(true, "r1");
+    reporter.observeEdit(false, "r1");
+    assert.deepEqual(dirtyReports, [
+        { dirty: true, revision: "r1" },
+        { dirty: false, revision: "r1" },
+    ]);
+    assert.equal(clock.armed, 0);
+    clock.fire();
+    assert.deepEqual(reports, []);
+});
 
 test("a save cancels the pending snapshot so no stale report fires afterwards", () => {
     const clock = new FakeClock();

@@ -41,6 +41,7 @@ Page {
     readonly property var ctl: (typeof mobile !== "undefined") ? mobile : null
     readonly property var host: (typeof app !== "undefined") ? app : null
     readonly property var layoutStore: (typeof layouts !== "undefined") ? layouts : null
+    readonly property var service: (typeof viewerService !== "undefined") ? viewerService : null
 
     readonly property var pane: page.ctl ? page.ctl.selectedPane : ({})
     readonly property string paneKind: pane && pane.kind ? String(pane.kind) : ""
@@ -75,20 +76,10 @@ Page {
         const text = String(u ? u : "");
         if (text.length === 0)
             return page.repoRoot;
-        if (text.indexOf("file://") !== 0)
-            return "";
-        const encoded = text.substring(7);
-        // decodeURIComponent THROWS on a stray '%' ("/srv/repo/100%.txt" is a
-        // perfectly legal remote file name, and the layout stores the url the
-        // server gave us verbatim). An exception here would escape reload() and
-        // leave the Loader unloaded — a blank pane with no message, for a file
-        // whose only sin is its name. Undecodable text is passed through as it
-        // stands, which is what it already was.
-        try {
-            return decodeURIComponent(encoded);
-        } catch (e) {
-            return encoded;
-        }
+        // The service owns the URL/path conversion in both directions. Decoding
+        // the entire URL as text would treat a literal "%2F" in a filename as a
+        // separator and would retain URL query/fragment syntax in remote paths.
+        return page.service ? page.service.remotePathFor(u) : "";
     }
 
     // The fixed kind -> page table. The vocabulary is closed and comes from ONE
@@ -176,9 +167,9 @@ Page {
     // SAME item is reconfigured rather than reloaded, so the page keeps its scroll
     // position and, for a directory browser, its own history.
     function navigateTo(path) {
-        if (!paneLoader.item || String(path).length === 0)
+        if (!paneLoader.item || !page.service || String(path).length === 0)
             return;
-        const target = "file://" + path;
+        const target = page.service.fileUrlFor(path);
         page.currentUrl = target;
         if (paneLoader.item.hasOwnProperty("remotePath"))
             paneLoader.item.remotePath = path;
@@ -266,13 +257,17 @@ Page {
         onLoaded: {
             if (!item)
                 return;
-            // Both signals are optional: a page that has nothing to navigate to
-            // and no title to report simply does not declare them.
+            // Signals are optional: pages declare only the actions they offer.
             if (item.openRequested)
                 item.openRequested.connect(page.navigateTo);
             if (item.titleRequested)
                 item.titleRequested.connect(function(title) {
                     page.titleOverride = String(title);
+                });
+            if (item.closeRequested)
+                item.closeRequested.connect(function() {
+                    if (page.ctl)
+                        page.ctl.back();
                 });
         }
     }

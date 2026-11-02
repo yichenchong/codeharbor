@@ -61,6 +61,31 @@ public:
     FakeTransport() { open(QIODevice::WriteOnly); }
 };
 
+class PrefixThenFailTransport : public QIODevice {
+public:
+    explicit PrefixThenFailTransport(qint64 failure) : m_failure(failure)
+    {
+        open(QIODevice::WriteOnly | QIODevice::Unbuffered);
+    }
+    const QByteArray& written() const { return m_written; }
+
+protected:
+    qint64 readData(char*, qint64) override { return -1; }
+    qint64 writeData(const char* data, qint64 size) override
+    {
+        constexpr qint64 prefixBytes = 3;
+        if (m_written.size() >= prefixBytes)
+            return m_failure;
+        const qint64 accepted = qMin(size, prefixBytes - m_written.size());
+        m_written.append(data, accepted);
+        return accepted;
+    }
+
+private:
+    QByteArray m_written;
+    qint64 m_failure;
+};
+
 // resolveTarget() refuses unless the SSH pool reports Connected, and a pool
 // cannot reach that state without a real handshake against a real server. That
 // one gate is what kept every rule about which answer a pane may adopt as its
@@ -220,7 +245,8 @@ QJsonObject tmuxSession(const QString& name, qint64 created)
 // resolve the pane's row, let the factory adopt the answer, then attach. Returns
 // false if any step did not happen, so a test cannot pass by never attaching.
 bool resolveAndAttach(TerminalFactory& factory, RpcPair& rpc,
-                      TerminalController* controller, const QString& target)
+                      TerminalController* controller, const QString& target,
+                      const QString& harness = QString())
 {
     QSignalSpy resolved(&factory, &TerminalFactory::targetResolved);
     if (!factory.resolveTarget(controller, QStringLiteral("s1"),
@@ -232,7 +258,7 @@ bool resolveAndAttach(TerminalFactory& factory, RpcPair& rpc,
         != QString::fromLatin1(rpc::kMethodWorkspaceResolveTerminalPane))
         return false;
     rpc.answerWithRow(request.value(QStringLiteral("id")).toInt(), QStringLiteral("row-A"),
-                      QStringLiteral("s1"), QStringLiteral("terminal-1"), target, QString());
+                      QStringLiteral("s1"), QStringLiteral("terminal-1"), target, harness);
     if (!resolved.wait(2000) || resolved.constFirst().at(1).toString() != target)
         return false;
     return factory.attach(controller, target, QStringLiteral("/repo"), 80, 24);
@@ -285,6 +311,8 @@ private slots:
     // mouse report) must reach the PTY unchanged, and a payload that is not
     // valid base64 must reach it not at all.
     void bridgeDecodesBinaryInputAndRefusesMalformedBase64();
+    void bridgeReportsPartialInputWithoutDisconnectingOrReplaying_data();
+    void bridgeReportsPartialInputWithoutDisconnectingOrReplaying();
     void bridgeHoldsOutputUntilTheRendererIsReady();
     void bridgeIgnoresAVisibleReportFromAPaneWithNoRenderer();
     void bridgePreservesHiddenReportBeforeReady();
@@ -308,6 +336,9 @@ private slots:
     void changingTheWorkspaceServerForgetsRememberedRowIdentities();
     void aChangedHarnessSurvivesTheResolutionCache();
     void repeatingAnUnchangedHarnessDoesNotRestartTheClock();
+    void outputDuringChannelOpenIsNotResetToStarting();
+    void endedTerminalObservationAcceptsRemoteActivity_data();
+    void endedTerminalObservationAcceptsRemoteActivity();
 
     // A pane whose remote session died and was silently replaced.
     void aFirstAttachStaysSilentEvenWhenItCreatedTheSession();
@@ -971,6 +1002,53 @@ void TstTerminalFactory::bridgeDecodesBinaryInputAndRefusesMalformedBase64()
     QCOMPARE(transport.data(), report + QByteArrayLiteral("ls\n"));
 }
 
+void TstTerminalFactory::bridgeReportsPartialInputWithoutDisconnectingOrReplaying_data()
+{
+    QTest::addColumn<bool>("binary");
+    QTest::addColumn<qint64>("failure");
+    QTest::newRow("text-no-progress") << false << qint64{0};
+    QTest::newRow("text-write-error") << false << qint64{-1};
+    QTest::newRow("binary-no-progress") << true << qint64{0};
+    QTest::newRow("binary-write-error") << true << qint64{-1};
+}
+
+void TstTerminalFactory::bridgeReportsPartialInputWithoutDisconnectingOrReplaying()
+{
+    QFETCH(bool, binary);
+    QFETCH(qint64, failure);
+    TerminalFactory factory(nullptr);
+    TerminalController* controller = factory.create();
+    TerminalBridge* bridge = factory.createBridge(controller);
+    PrefixThenFailTransport transport(failure);
+    controller->setTransport(&transport);
+    controller->setState(TerminalState::Ready);
+    QSignalSpy rejected(bridge, &TerminalBridge::inputRejected);
+    QSignalSpy errors(&factory, &TerminalFactory::error);
+    const QByteArray input = binary ? QByteArray::fromHex("1b5b4d20abff")
+                                   : QByteArrayLiteral("echo command\n");
+    if (binary)
+        bridge->sendBinaryInput(QString::fromLatin1(input.toBase64()));
+    else
+        bridge->sendInput(QString::fromUtf8(input));
+    QCOMPARE(transport.written(), input.left(3));
+    QCOMPARE(rejected.count(), 1);
+    QCOMPARE(errors.count(), 1);
+    QCOMPARE(errors.first().at(0).value<TerminalController*>(), controller);
+    const QString message = errors.first().at(1).toString();
+    QVERIFY(message.contains(QStringLiteral("Part of it may have reached")));
+    QVERIFY(message.contains(QStringLiteral("Inspect the terminal before retrying")));
+    QVERIFY(controller->state() == TerminalState::Ready);
+    QVERIFY(transport.isWritable());
+
+    FakeTransport replacement;
+    controller->setTransport(&replacement);
+    QCoreApplication::processEvents();
+    QVERIFY(replacement.data().isEmpty());
+    bridge->sendInput(QStringLiteral("fresh"));
+    QCOMPARE(replacement.data(), QByteArrayLiteral("fresh"));
+    QCOMPARE(errors.count(), 1);
+}
+
 // The page mounts asynchronously; output produced while it loads must reach the
 // renderer once, in order, rather than being flushed into the void (SPEC 5.4).
 void TstTerminalFactory::bridgeHoldsOutputUntilTheRendererIsReady()
@@ -1604,9 +1682,6 @@ void TstTerminalFactory::aFailedResolutionLeavesThePaneWithNoIdentity()
     QVERIFY(rpc.start());
 
     AgentStatusMonitor monitor;
-    // Short, because this case DOES wait the quiet window out: "silent" is the
-    // observable that proves nothing is being reported any more.
-    monitor.setFallbackIdleThresholdMs(50);
 
     OfflineFactory factory(nullptr);
     factory.setWorkspace(rpc.db());
@@ -1645,18 +1720,20 @@ void TstTerminalFactory::aFailedResolutionLeavesThePaneWithNoIdentity()
     QTRY_COMPARE(resolved.count(), 2);
     QVERIFY(resolved.at(1).at(1).toString().isEmpty());
 
-    // row-A falls quiet on its own...
-    QTRY_COMPARE(monitor.stateFor(QStringLiteral("s1"), QStringLiteral("row-A")),
-                 asInt(AgentState::Idle));
-
-    // ...and the pane's output is not attributed to it any more. Checked with
-    // no wait at all: a report reaches the monitor synchronously and would move
-    // row-A to Running on the spot. Waiting first would prove nothing, because
-    // the quiet window would demote it back to Idle while the test slept.
+    // Identity removal ended local observation, so server observations can
+    // speak for row-A again.
+    monitor.noteRemoteActivity(QStringLiteral("s1"), QStringLiteral("row-A"), 0);
+    QCOMPARE(monitor.stateFor(QStringLiteral("s1"), QStringLiteral("row-A")),
+             asInt(AgentState::Running));
+    // Make the old row locally observable again, as a separate pane could.
+    // Otherwise a stale forwarding connection could be hidden by the monitor's
+    // detached guard and this identity test would pass for the wrong reason.
+    monitor.noteTerminalAttached(QStringLiteral("s1"), QStringLiteral("row-A"));
+    const int previous = monitor.stateFor(QStringLiteral("s1"), QStringLiteral("row-A"));
+    QVERIFY(previous != asInt(AgentState::Running));
     QSignalSpy transitions(&monitor, &AgentStatusMonitor::agentStateChanged);
     controller->ingestOutput(QByteArrayLiteral("still printing"));
-    QCOMPARE(monitor.stateFor(QStringLiteral("s1"), QStringLiteral("row-A")),
-             asInt(AgentState::Idle));
+    QCOMPARE(monitor.stateFor(QStringLiteral("s1"), QStringLiteral("row-A")), previous);
     QCOMPARE(transitions.count(), 0);
 }
 
@@ -1766,7 +1843,6 @@ void TstTerminalFactory::changingTheWorkspaceServerForgetsRememberedRowIdentitie
     QVERIFY(rpc.start());
 
     AgentStatusMonitor monitor;
-    monitor.setFallbackIdleThresholdMs(50);
 
     OfflineFactory factory(nullptr);
     factory.setWorkspace(rpc.db());
@@ -1792,10 +1868,14 @@ void TstTerminalFactory::changingTheWorkspaceServerForgetsRememberedRowIdentitie
     first->ingestOutput(QByteArrayLiteral("srv-1 output"));
     QCOMPARE(monitor.stateFor(QStringLiteral("s1"), QStringLiteral("row-A")),
              asInt(AgentState::Running));
-    QTRY_COMPARE(monitor.stateFor(QStringLiteral("s1"), QStringLiteral("row-A")),
-                 asInt(AgentState::Idle));
 
     factory.setServerId(QStringLiteral("srv-2"));
+    monitor.noteRemoteActivity(QStringLiteral("s1"), QStringLiteral("row-A"), 0);
+    QCOMPARE(monitor.stateFor(QStringLiteral("s1"), QStringLiteral("row-A")),
+             asInt(AgentState::Running));
+    monitor.noteTerminalAttached(QStringLiteral("s1"), QStringLiteral("row-A"));
+    const int oldState = monitor.stateFor(QStringLiteral("s1"), QStringLiteral("row-A"));
+    QVERIFY(oldState != asInt(AgentState::Running));
 
     // A pane on the new server asks about the SAME slot label.
     TerminalController* second = factory.create(&pane);
@@ -1814,8 +1894,8 @@ void TstTerminalFactory::changingTheWorkspaceServerForgetsRememberedRowIdentitie
     // the failed-resolution case above — a report would land synchronously.
     QSignalSpy transitions(&monitor, &AgentStatusMonitor::agentStateChanged);
     second->ingestOutput(QByteArrayLiteral("srv-2 output, before the answer"));
-    QCOMPARE(monitor.stateFor(QStringLiteral("s1"), QStringLiteral("row-A")),
-             asInt(AgentState::Idle));
+    first->ingestOutput(QByteArrayLiteral("retiring srv-1 pane output"));
+    QCOMPARE(monitor.stateFor(QStringLiteral("s1"), QStringLiteral("row-A")), oldState);
     QCOMPARE(transitions.count(), 0);
 
     // The new server's own row is what it ends up reporting under.
@@ -1828,8 +1908,7 @@ void TstTerminalFactory::changingTheWorkspaceServerForgetsRememberedRowIdentitie
     second->ingestOutput(QByteArrayLiteral("srv-2 output"));
     QCOMPARE(monitor.stateFor(QStringLiteral("s1"), QStringLiteral("row-Z")),
              asInt(AgentState::Running));
-    QCOMPARE(monitor.stateFor(QStringLiteral("s1"), QStringLiteral("row-A")),
-             asInt(AgentState::Idle));
+    QCOMPARE(monitor.stateFor(QStringLiteral("s1"), QStringLiteral("row-A")), oldState);
 }
 
 // The resolution cache outlives a disconnect on purpose, and a remembered
@@ -2265,5 +2344,77 @@ void TstTerminalFactory::aRetargetWhileTheProbeIsInFlightReportsNothing()
     QCOMPARE(errors.count(), 0);
 }
 
+
+void TstTerminalFactory::outputDuringChannelOpenIsNotResetToStarting()
+{
+    RpcPair rpc;
+    QVERIFY(rpc.start());
+    AgentStatusMonitor monitor;
+    AttachingFactory factory(nullptr);
+    factory.setWorkspace(rpc.db());
+    factory.setServerId(QStringLiteral("srv-1"));
+    factory.setAgentMonitor(&monitor);
+    TerminalController* controller = factory.create();
+    connect(controller, &TerminalController::stateChanged, controller,
+            [controller](TerminalState state) {
+                if (state == TerminalState::OpeningChannel)
+                    controller->ingestOutput(QByteArrayLiteral("first screen"));
+            });
+    QVERIFY(resolveAndAttach(factory, rpc, controller, QStringLiteral("ch_s1_row-A"),
+                             QStringLiteral("generic")));
+    QCOMPARE(monitor.stateFor(QStringLiteral("s1"), QStringLiteral("row-A")),
+             asInt(AgentState::Running));
+}
+
+void TstTerminalFactory::endedTerminalObservationAcceptsRemoteActivity_data()
+{
+    QTest::addColumn<QString>("ending");
+    QTest::newRow("remote-eof") << QStringLiteral("eof");
+    QTest::newRow("attach-error") << QStringLiteral("error");
+    QTest::newRow("destroyed-pane") << QStringLiteral("destroy");
+    QTest::newRow("retargeted-pane") << QStringLiteral("retarget");
+    QTest::newRow("server-switch") << QStringLiteral("server");
+}
+
+void TstTerminalFactory::endedTerminalObservationAcceptsRemoteActivity()
+{
+    QFETCH(QString, ending);
+    RpcPair rpc;
+    QVERIFY(rpc.start());
+    AgentStatusMonitor monitor;
+    AttachingFactory factory(nullptr);
+    factory.setWorkspace(rpc.db());
+    factory.setServerId(QStringLiteral("srv-1"));
+    factory.setAgentMonitor(&monitor);
+    TerminalController* controller = factory.create();
+    QVERIFY(resolveAndAttach(factory, rpc, controller, QStringLiteral("ch_s1_row-A"),
+                             QStringLiteral("generic")));
+    controller->ingestOutput(QByteArrayLiteral("working"));
+    QCOMPARE(monitor.stateFor(QStringLiteral("s1"), QStringLiteral("row-A")),
+             asInt(AgentState::Running));
+    QSignalSpy states(&factory, &TerminalFactory::terminalStateChanged);
+    if (ending == QLatin1String("eof")) {
+        QVERIFY(QMetaObject::invokeMethod(controller->transport(), "readChannelFinished",
+                                         Qt::DirectConnection));
+        QVERIFY(controller->state() == TerminalState::Disconnected);
+    } else if (ending == QLatin1String("error")) {
+        controller->setState(TerminalState::Error);
+    } else if (ending == QLatin1String("destroy")) {
+        delete controller;
+        QVERIFY(!states.isEmpty());
+        QVERIFY(states.last().at(3).value<TerminalState>() == TerminalState::Unloaded);
+    } else if (ending == QLatin1String("retarget")) {
+        QVERIFY(factory.resolveTarget(controller, QStringLiteral("s1"),
+                                      QStringLiteral("terminal-2"), QStringLiteral("row-B"),
+                                      QStringLiteral("/repo")));
+    } else {
+        factory.setServerId(QStringLiteral("srv-2"));
+    }
+    QCOMPARE(monitor.stateFor(QStringLiteral("s1"), QStringLiteral("row-A")),
+             asInt(AgentState::Unknown));
+    monitor.noteRemoteActivity(QStringLiteral("s1"), QStringLiteral("row-A"), 0);
+    QCOMPARE(monitor.stateFor(QStringLiteral("s1"), QStringLiteral("row-A")),
+             asInt(AgentState::Running));
+}
 QTEST_GUILESS_MAIN(TstTerminalFactory)
 #include "tst_terminalfactory.moc"

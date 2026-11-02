@@ -671,7 +671,11 @@ jobs:
             exit 1
           fi
 
-          if ! printf '%s\n' "$out" | grep -qiE "^$KEY_ALIAS," ; then
+          # Let keytool resolve the literal alias. Aliases may contain regular
+          # expression characters (for example release[1]), and its formatted
+          # listing is not an alias lookup API.
+          if ! keytool -list -keystore "$ks" -storepass:env STORE_PASSWORD \
+               -alias "$KEY_ALIAS" >/dev/null 2>&1; then
             echo "ANDROID_KEY_ALIAS='$KEY_ALIAS' is not in this keystore." >&2
             echo "Aliases present:" >&2
             printf '%s\n' "$out" | grep -iE '^[^,]+, .*(PrivateKeyEntry|trustedCertEntry)' >&2 || true
@@ -1110,9 +1114,8 @@ jobs:
       - name: Install CMake
         uses: lukka/get-cmake@v4.2.3
 
-      # arm64-ios-SIMULATOR, not arm64-ios: both are arm64, but the device triplet
-      # builds against the iphoneos sysroot and its static library cannot be
-      # linked into a simulator binary. arm64-ios is what a device build uses.
+      # Qt for iOS supplies an x86_64 simulator slice, so libssh must use
+      # x64-ios (iphonesimulator), not arm64-ios (the iphoneos device ABI).
       - name: Resolve libssh cache key
         id: libssh
         run: |

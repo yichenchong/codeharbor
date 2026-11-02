@@ -59,6 +59,8 @@ The tool result names a reason:
   do not retry. Only the session on screen can be driven.
 - `unknown_pane` — re-run `viewer_list`; the pane was closed or the layout moved.
 - `bad_request` — the address or argument was rejected; the message says which.
+- `unsaved_changes` — save the editor or open a separate new pane. Do not close
+  the unsaved editor to bypass the refusal.
 - `timeout` / `failed` — CodeHarbor is not reachable (the user disconnected, or
   the desktop is busy). Fall back to the terminal and mention it once.
 

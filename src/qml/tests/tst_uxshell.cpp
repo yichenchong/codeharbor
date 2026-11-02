@@ -674,6 +674,13 @@ Item {
         visible: false
     }
 
+    LogView {
+        objectName: "logSheet"
+        anchors.fill: parent
+        z: 900
+        visible: shown
+    }
+
     SettingsWindow {
         objectName: "settingsWindow"
         anchors.fill: parent
@@ -1182,6 +1189,8 @@ private slots:
     // keyboard. Whichever one is in FRONT has to keep it, because two surfaces
     // reclaiming it from each other never settles.
     void theSheetInFrontKeepsTheKeyboard();
+    void profileArrivalDoesNotStealTheKeyboard();
+    void logSheetContainsAndReturnsTheKeyboard();
 
     // The Settings server pane lays its fields out in a two-column grid; one
     // over-wide entry pushes the whole second column off the pane.
@@ -2479,6 +2488,93 @@ void TstUxShell::theSheetInFrontKeepsTheKeyboard()
     holder = surface.view.activeFocusItem();
     QVERIFY2(holder && sheet->isAncestorOf(holder),
              "closing the front sheet left the keyboard outside the sheet still up");
+    QVERIFY2(surface.warnings.isEmpty(), qPrintable(surface.warningReport()));
+}
+
+void TstUxShell::profileArrivalDoesNotStealTheKeyboard()
+{
+    Surface surface(stackedSheetsHarness(), QSize(900, 560),
+                    QStringLiteral("unusedContext"), nullptr);
+    QVERIFY2(surface.root(), qPrintable(surface.componentError()));
+    QVERIFY(surface.expose());
+    auto *behind = qobject_cast<QQuickItem *>(surface.child(QStringLiteral("behindField")));
+    auto *sheet = qobject_cast<QQuickItem *>(surface.child(QStringLiteral("connectSheet")));
+    auto *settings = qobject_cast<QQuickItem *>(surface.child(QStringLiteral("settingsWindow")));
+    QVERIFY(behind && sheet && settings);
+
+    behind->forceActiveFocus();
+    sheet->setProperty("profiles", twoProfiles());
+    settle(120);
+    QCOMPARE(surface.view.activeFocusItem(), behind);
+    QCOMPARE(sheet->property("selectedId").toString(), QStringLiteral("id-a"));
+
+    // First-profile arrival is also common while the settings sheet is open.
+    // The connector stays visible behind it but must not grab its focus.
+    sheet->setProperty("profiles", QVariantList());
+    settle(120);
+    sheet->setProperty("visible", true);
+    settle(120);
+    settings->setProperty("shown", true);
+    settle(120);
+    auto *closeButton =
+            qobject_cast<QQuickItem *>(surface.child(QStringLiteral("settingsCloseButton")));
+    QVERIFY(closeButton);
+    closeButton->forceActiveFocus();
+    sheet->setProperty("profiles", twoProfiles());
+    settle(120);
+    QCOMPARE(surface.view.activeFocusItem(), closeButton);
+    QCOMPARE(sheet->property("selectedId").toString(), QStringLiteral("id-a"));
+    QVERIFY2(surface.warnings.isEmpty(), qPrintable(surface.warningReport()));
+}
+
+void TstUxShell::logSheetContainsAndReturnsTheKeyboard()
+{
+    Surface surface(stackedSheetsHarness(), QSize(900, 560),
+                    QStringLiteral("unusedContext"), nullptr);
+    QVERIFY2(surface.root(), qPrintable(surface.componentError()));
+    QVERIFY(surface.expose());
+    auto *behind = qobject_cast<QQuickItem *>(surface.child(QStringLiteral("behindField")));
+    auto *sheet = qobject_cast<QQuickItem *>(surface.child(QStringLiteral("connectSheet")));
+    auto *log = qobject_cast<QQuickItem *>(surface.child(QStringLiteral("logSheet")));
+    auto *settings = qobject_cast<QQuickItem *>(surface.child(QStringLiteral("settingsWindow")));
+    QVERIFY(behind && sheet && log && settings);
+
+    behind->forceActiveFocus();
+    log->setProperty("shown", true);
+    settle(120);
+    for (int step = 0; step < 24; ++step) {
+        QTest::keyClick(&surface.view, Qt::Key_Tab,
+                        step < 12 ? Qt::NoModifier : Qt::ShiftModifier);
+        settle(10);
+        auto *holder = surface.view.activeFocusItem();
+        QVERIFY(holder && (holder == log || log->isAncestorOf(holder)));
+    }
+    log->setProperty("shown", false);
+    settle(120);
+    QCOMPARE(surface.view.activeFocusItem(), behind);
+
+    // The connector and log have equal z in Main.qml. Declaration order puts
+    // the log above the connector, so only the log may contain the keyboard.
+    sheet->setProperty("visible", true);
+    settle(120);
+    log->setProperty("shown", true);
+    settle(120);
+    auto *holder = surface.view.activeFocusItem();
+    QVERIFY(holder && (holder == log || log->isAncestorOf(holder)));
+
+    // The settings sheet is higher than both and must not be fought for focus.
+    settings->setProperty("shown", true);
+    settle(120);
+    holder = surface.view.activeFocusItem();
+    QVERIFY(holder && (holder == settings || settings->isAncestorOf(holder)));
+    settings->setProperty("shown", false);
+    settle(120);
+    holder = surface.view.activeFocusItem();
+    QVERIFY(holder && (holder == log || log->isAncestorOf(holder)));
+    log->setProperty("shown", false);
+    settle(120);
+    holder = surface.view.activeFocusItem();
+    QVERIFY(holder && (holder == sheet || sheet->isAncestorOf(holder)));
     QVERIFY2(surface.warnings.isEmpty(), qPrintable(surface.warningReport()));
 }
 

@@ -80,7 +80,7 @@ private slots:
     void setLayoutSerializesInlineTree();
     void duplicateSessionParsesNestedNode();
     void reorderGroupsSerializesIdArray();
-    void getLayoutMalformedTreeDeliversNullopt();
+    void getLayoutMalformedTreeDeliversRpcError();
     void listSkipsNonObjectEntries();
     void schemaVersionMatchesTheRemoteSchema();
     void malformedResultsDeliverRpcErrorInsteadOfBlankRecords();
@@ -697,13 +697,10 @@ void TstWorkspaceDb::liveCreateAndListOverProcess()
     QCOMPARE(listed[0].group.name, QStringLiteral("Live"));
 }
 
-// A layout row whose tree fails SplitNode validation must arrive as "no layout",
-// not as a valid-looking single blank pane: SessionLayouts leaves a region null
-// when its layout cannot be loaded, precisely so the user is never invited to
-// edit a fabricated layout over the real one the server still holds. A tree that
-// genuinely IS an empty leaf (which is what closing a region's last pane
-// persists) must still arrive as a present layout.
-void TstWorkspaceDb::getLayoutMalformedTreeDeliversNullopt()
+// An existing layout row with an unreadable tree must fail, not look absent:
+// SessionLayouts is allowed to seed defaults only for a genuine null response.
+// A stored empty leaf is valid and must still arrive as a present layout.
+void TstWorkspaceDb::getLayoutMalformedTreeDeliversRpcError()
 {
     makePair();
 
@@ -742,13 +739,17 @@ void TstWorkspaceDb::getLayoutMalformedTreeDeliversNullopt()
                               {"children", QJsonArray{leafA, leafB}},
                               {"ratios", QJsonArray{1.0}}});
     QTRY_VERIFY(fired);
-    QVERIFY(!err.has_value());
+    QVERIFY(err.has_value());
+    QCOMPARE(err->code, -32603);
+    QVERIFY(err->message.contains(QStringLiteral("workspace.getLayout")));
     QVERIFY(!hasLayout);
 
     // An unknown node type is likewise rejected.
     requestLayout(QJsonObject{{"type", "gadget"}});
     QTRY_VERIFY(fired);
-    QVERIFY(!err.has_value());
+    QVERIFY(err.has_value());
+    QCOMPARE(err->code, -32603);
+    QVERIFY(err->message.contains(QStringLiteral("valid tree")));
     QVERIFY(!hasLayout);
 
     // A stored empty leaf is a legitimate layout and must survive.

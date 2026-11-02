@@ -498,15 +498,26 @@ export function makeStreamSink(out: NodeJS.WritableStream): EventSink {
             source.destroy();
             return;
         }
-        // The shared predicate, not a second copy of the arithmetic: it
-        // measures the payload without the framing newline, exactly as the
-        // framer on the input side does.
+        // Mapping adds the output timestamp/state envelope, so a producer line
+        // that fits exactly can become too large here. Preserve the state
+        // transition by shedding optional decoration, as the producers do.
         if (!bridgeLineFits(payload)) {
-            process.stderr.write(
-                `codeharbor-bridge: dropping an event that exceeds the ${MAX_BRIDGE_LINE_BYTES}-byte frame bound\n`,
-            );
-            source.destroy();
-            return;
+            const compact = { ...event };
+            if (compact.metadata !== undefined) {
+                delete compact.metadata;
+                payload = JSON.stringify(compact);
+            }
+            if (!bridgeLineFits(payload) && compact.summary !== undefined) {
+                delete compact.summary;
+                payload = JSON.stringify(compact);
+            }
+            if (!bridgeLineFits(payload)) {
+                process.stderr.write(
+                    `codeharbor-bridge: dropping an event that exceeds the ${MAX_BRIDGE_LINE_BYTES}-byte frame bound\n`,
+                );
+                source.destroy();
+                return;
+            }
         }
         const line = `${payload}\n`;
         let ok: boolean;

@@ -520,6 +520,11 @@ void InternalUrlSchemeHandler::requestStarted(QWebEngineUrlRequestJob *job)
         QString::fromLatin1(rpc::kMethodReadFile), params,
         [guard, self, requestUrl,
          path](QJsonValue result, std::optional<RpcError> error) {
+            // A cancelled job no longer has a consumer, including for errors.
+            // Reporting its late failure by URL could mark a newer request for
+            // that same URL as failed after a pane reload.
+            if (!guard)
+                return;
             const auto refuseLate = [&guard, &self, &requestUrl](
                                         Failure reason,
                                         const QString &detail = QString()) {

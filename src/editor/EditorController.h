@@ -44,6 +44,9 @@ class EditorController : public QObject {
     // Editor read-only state (SPEC 8.2). DERIVED, never set from outside: see
     // refreshPermissions() / applyStatPermissions() below.
     Q_PROPERTY(bool readOnly READ readOnly NOTIFY readOnlyChanged)
+    // Unsaved work survives Error/Disconnected states; lifecycle labels alone
+    // cannot decide whether closing or navigating away would discard edits.
+    Q_PROPERTY(bool dirty READ dirty NOTIFY dirtyChanged)
 public:
     explicit EditorController(CodeharbordClient* client, QString recoveryId,
                               QObject* parent = nullptr);
@@ -53,6 +56,7 @@ public:
 
     QString fileState() const { return toString(m_fileState); }
     bool readOnly() const { return m_readOnly; }
+    bool dirty() const { return m_dirty; }
 
     // Currently open remote path and the revision the buffer is guarded at.
     // Exposed for host/tests; not part of the JS bridge surface.
@@ -106,6 +110,10 @@ public slots:
     // edits with the file now opening and mark a buffer that nobody has edited
     // dirty.
     Q_INVOKABLE void reportContent(QString content);
+    // Lightweight edit observation, sent immediately while reportContent stays
+    // debounced. The page's baseline prevents an undo against stale bytes from
+    // clearing unsaved work after a host-side reload or save.
+    Q_INVOKABLE void reportDirty(bool dirty, QString baselineRevision);
     // Re-fetch the file from the server (SPEC 8.7).
     Q_INVOKABLE void requestReload();
     // The WebChannel editor page is live and has attached its signal handlers.
@@ -143,6 +151,7 @@ signals:
     // was found on open (SPEC 11.3); the UI may offer to restore it. Not part
     // of the frozen EditorBridge JS interface — an additive host->UI signal.
     void recoveryAvailable(QString recoveredContent);
+    void dirtyChanged();
 
 private slots:
     void onNotification(const QString& method, const QJsonValue& params);
@@ -164,6 +173,7 @@ private slots:
 
 private:
     void setFileState(FileState state);
+    void setDirty(bool dirty);
     // Publish m_pathReadOnly || m_bufferReadOnly, emitting readOnlyChanged on a
     // transition. The ONLY writer of m_readOnly.
     void setReadOnly(bool readOnly);
@@ -176,10 +186,10 @@ private:
     void applyExternalChange();
     // Ask the server what the current path looks like and re-derive
     // m_pathReadOnly from the answer, then run `then` — whether the stat
-    // succeeded or not, so a caller can chain work behind it. The one case that
-    // does NOT run `then` is a file switch landing while the stat is in flight:
-    // the answer describes the previous file and everything chained behind it
-    // would too. Read-only-ness is DERIVED on every load and every reconnect,
+    // succeeded or not, so a caller can chain work behind it. A superseding
+    // load (including a same-path reopen) or transport replacement drops the
+    // answer and continuation: they describe a buffer no longer current.
+    // Read-only-ness is DERIVED on every load and every reconnect,
     // never latched from the first open: a chmod is an ordinary external change.
     void refreshPermissions(std::function<void()> then = {});
     // Fold a file.stat result into m_pathReadOnly.
@@ -301,13 +311,12 @@ private:
     //                      which for a prefix is simply false.
     bool m_pathReadOnly = false;
     bool m_bufferReadOnly = false;
-    // True once reportContent has been seen since the last load/save, or once a
-    // save has been issued and not yet confirmed: the buffer holds bytes that
-    // are not on the server, so external changes must NOT auto-reload
-    // (SPEC 8.7).
+    // True once reportDirty/reportContent observes unsaved text, or once a save
+    // has been issued and not yet confirmed: the buffer holds bytes that are not
+    // on the server, so external changes must NOT auto-reload (SPEC 8.7).
     bool m_dirty = false;
-    // Bumped by every reportContent(). save() captures it and the write's reply
-    // compares: a report that arrived DURING the save means the buffer moved on
+    // Bumped by every reportDirty()/reportContent(). save() captures it and the
+    // write's reply compares: an observation DURING the save means the buffer moved on
     // after the bytes now on the server, so the buffer is still dirty and its
     // recovery snapshot must survive. Without this an edit typed during a save
     // round trip is treated as saved and the next external change silently

@@ -66,6 +66,7 @@ export type ControlOp = (typeof CONTROL_OPS)[number];
  *   timeout             the desktop never answered; it may be gone
  *   not_active_session  the pane's Dev Session is not the one on screen
  *   unknown_pane        no such viewer pane in that session's layout
+ *   unsaved_changes     save or discard the pane's edits before replacing/reloading it
  *   failed              the desktop tried and could not
  */
 export const CONTROL_ERROR_CODES = [
@@ -74,6 +75,7 @@ export const CONTROL_ERROR_CODES = [
     "timeout",
     "not_active_session",
     "unknown_pane",
+    "unsaved_changes",
     "failed",
 ] as const;
 export type ControlErrorCode = (typeof CONTROL_ERROR_CODES)[number];
@@ -120,9 +122,9 @@ export const MAX_CONTROL_INFLIGHT = 32;
 // only symptom is that agent pane control silently stops working.
 export const MAX_CONTROL_CONNECTIONS = 64;
 
-// How long a freshly accepted producer may stay completely silent. Disarmed by
-// the FIRST byte, so a producer still writing is never mistaken for an idle
-// one. Same guard, same reasoning as BRIDGE_HANDSHAKE_TIMEOUT_MS.
+// How long a freshly accepted producer may take to supply its complete request.
+// A first byte alone must not reserve a connection forever: abandoned partial
+// lines consume the same connection limit as completely silent peers.
 export const CONTROL_HANDSHAKE_TIMEOUT_MS = 30_000;
 
 /**
@@ -220,6 +222,13 @@ export function sweepStaleControlSockets(
             continue;
         const candidate = path.join(dir, entry);
         if (keep !== null && candidate === keep) continue;
+        let stat: fs.Stats;
+        try {
+            stat = fs.lstatSync(candidate);
+        } catch {
+            continue;
+        }
+        if (!stat.isSocket()) continue;
         if (probed >= MAX_CONTROL_SWEEP_ENTRIES) return;
         probed += 1;
         const probe = net.createConnection(candidate);
@@ -239,7 +248,10 @@ export function sweepStaleControlSockets(
             const code = "code" in err ? err.code : undefined;
             if (code !== "ECONNREFUSED" && code !== "ENOENT") return;
             try {
-                fs.unlinkSync(candidate);
+                const current = fs.lstatSync(candidate);
+                if (current.isSocket() && current.dev === stat.dev && current.ino === stat.ino) {
+                    fs.unlinkSync(candidate);
+                }
             } catch {
                 // Already gone, or not ours to remove.
             }
@@ -269,7 +281,7 @@ export interface ViewerCommandOutcome {
 }
 
 export interface ControlListener {
-    /** Stop accepting, answer pending producers, and remove socket and lock. */
+    /** Stop accepting, answer pending producers, and remove this socket. */
     close(): void;
     /**
      * Deliver the desktop's answer for a pending command. Returns false when
@@ -391,6 +403,7 @@ export async function startControlListener(
         // the daemon and with it every terminal and editor of the session.
         try {
             socket.end(responseLine(response));
+            socket.destroySoon();
         } catch {
             socket.destroy();
         }
@@ -405,16 +418,22 @@ export async function startControlListener(
     };
 
     const server = net.createServer();
+    const connections = new Set<net.Socket>();
     server.maxConnections = MAX_CONTROL_CONNECTIONS;
 
     server.on("connection", (socket) => {
+        if (closed) {
+            socket.destroy();
+            return;
+        }
+        connections.add(socket);
         socket.setEncoding("utf8");
         // Errors on a producer socket are the producer's problem, never the
         // daemon's: swallow them so a reset connection cannot become an
         // uncaught exception.
         socket.on("error", () => socket.destroy());
 
-        let answered = false;
+        let received = false;
         let buffer = "";
         let handshake: NodeJS.Timeout | null = setTimeout(() => {
             handshake = null;
@@ -423,16 +442,12 @@ export async function startControlListener(
         handshake.unref();
 
         const finish = (response: ControlResponse): void => {
-            answered = true;
+            received = true;
             answer(socket, response);
         };
 
         socket.on("data", (chunk: string) => {
-            if (answered) return;
-            if (handshake) {
-                clearTimeout(handshake);
-                handshake = null;
-            }
+            if (received) return;
             buffer += chunk;
             if (Buffer.byteLength(buffer) > MAX_CONTROL_LINE_BYTES) {
                 finish(
@@ -445,6 +460,11 @@ export async function startControlListener(
             }
             const newline = buffer.indexOf("\n");
             if (newline < 0) return;
+            received = true;
+            if (handshake) {
+                clearTimeout(handshake);
+                handshake = null;
+            }
             // ONE request per connection: everything after the first newline is
             // ignored rather than dispatched. The response is written on this
             // same socket, so a second command on it would have no way back.
@@ -501,6 +521,7 @@ export async function startControlListener(
         });
 
         socket.on("close", () => {
+            connections.delete(socket);
             if (handshake) {
                 clearTimeout(handshake);
                 handshake = null;
@@ -520,16 +541,9 @@ export async function startControlListener(
             reject(err);
         };
         server.once("error", fail);
-        // A leftover file at THIS path can only be a dead daemon that happened to
-        // hold the same pid: a live one is this very process. Unlink it, or
-        // listen() fails with EADDRINUSE against a socket nobody is serving and
-        // viewer control stays dead for this window until someone deletes it by
-        // hand.
-        try {
-            fs.unlinkSync(socketPath);
-        } catch {
-            // Nothing there, which is the normal case.
-        }
+        // The normal path has a fresh random token and cannot need replacement.
+        // An explicit path may belong to a live listener or a regular file;
+        // let listen() refuse it rather than unlinking somebody else's endpoint.
         server.listen(socketPath, () => {
             server.removeListener("error", fail);
             // Past listen() a server error is not a startup failure and must not
@@ -554,6 +568,12 @@ export async function startControlListener(
                                 refusal("failed", "the CodeHarbor session is shutting down"),
                             );
                         }
+                    }
+                    for (const socket of connections) {
+                        // Pending producers were answered above. Their queued
+                        // replies flush via destroySoon(); partial requests have
+                        // no reply to preserve and must not keep the server alive.
+                        if (!socket.writableEnded) socket.destroy();
                     }
                     server.close();
                     try {

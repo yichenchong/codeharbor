@@ -45,8 +45,9 @@ target_link_libraries(tst_sshchanneldevice PRIVATE
 
 add_test(NAME tst_sshchanneldevice COMMAND tst_sshchanneldevice)
 
-# libssh's diagnostic logging is process-global. SshLogRouter owns that state on
-# behalf of every pool; this covers the half of it that needs no SSH server:
+# libssh's diagnostic logging is thread-local rather than session-local.
+# SshLogRouter owns that state on behalf of every pool; this covers the half
+# of it that needs no SSH server:
 # install/restore refcounting, out-of-order release, per-thread attribution, and
 # the transcript cap.
 qt_add_executable(tst_sshlogrouter tst_sshlogrouter.cpp)

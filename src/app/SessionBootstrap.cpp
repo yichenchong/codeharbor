@@ -96,7 +96,7 @@ QString progressPrefix()
 }
 
 // The one line remoteProvisionScript() prints only after the archive is
-// unpacked AND a codeharbord entry point has been proven to exist, so its
+// unpacked AND both service entry points have been proven to exist, so its
 // presence is the script's success verdict.
 QString installedMarker()
 {
@@ -157,6 +157,19 @@ SessionBootstrap::SessionBootstrap(SshConnectionPool* pool,
             scheduleReconnect();
         }
     });
+
+    if (m_client) {
+        // The RPC client can lose the logical stream without a device EOF:
+        // heartbeat expiry, a partial write, or an oversized frame all close
+        // its protocol state while the SSH channel itself remains open.
+        connect(m_client, &CodeharbordClient::transportClosed, this, [this] {
+            if (m_rpcDevice && m_client
+                && m_client->transport() == m_rpcDevice) {
+                handleConnectionLost(
+                    QStringLiteral("codeharbord RPC transport closed"));
+            }
+        });
+    }
 
     if (m_pool) {
         // Session-level death. Only Disconnected/Error matter: the transient
@@ -226,7 +239,7 @@ QStringList SessionBootstrap::entryCandidates(const QString& repoRoot,
     //                                 node >= 23.6.
     //
     // Built output is preferred over source: it is what `package.json` bin
-    // points at, and it drops the node >= 23.6 requirement.
+    // points at. Both layouts still require Node >= 23.6 for node:sqlite.
     return {
         remoteJoin(repoRoot, QStringLiteral("dist/") + stem + QStringLiteral(".js")),
         remoteJoin(repoRoot, QStringLiteral("remote/dist/") + stem + QStringLiteral(".js")),
@@ -255,18 +268,33 @@ QString SessionBootstrap::bridgeCommand(const QString& nodePath,
     // AgentEvent JSONL on stdout; its "listening on ..." banner goes to stderr,
     // which SshChannelDevice keeps out of the monitor's byte stream.
     //
-    // The bridge is wrapped in a stdin watchdog because it must not outlive the
-    // session. An SSH exec channel has no controlling terminal, so closing it
-    // sends no SIGHUP: it only closes the pipes. codeharbord exits on stdin EOF
-    // by itself, but the bridge holds a listening Unix socket and would idle
-    // forever, leaking one orphan per app launch. `cat` reaching EOF is the
-    // channel-closed signal; it then kills the relay. Only the bridge gets this
-    // — codeharbord needs its stdin for the JSON-RPC request stream.
+    // One launcher owns both lifetimes. A shell waiting in `cat` hid an early
+    // bridge exit forever, while plain exec cannot stop older bridges on stdin
+    // EOF. The launcher uses the configured Node for both processes, forwards
+    // output unchanged, and reaps the child on EOF or a signal. Escalation keeps
+    // a stuck bridge from outliving its SSH channel indefinitely.
+    const QString launcher = QStringLiteral(
+        "const { spawn } = require('node:child_process'); "
+        "const { constants } = require('node:os'); "
+        "const child = spawn(process.execPath, [process.argv[1]], "
+        "{ stdio: ['ignore', 'inherit', 'inherit'] }); "
+        "let stopping = false; let deadline; "
+        "const stop = () => { if (stopping) return; stopping = true; "
+        "process.stdin.pause(); child.kill('SIGTERM'); "
+        "deadline = setTimeout(() => child.kill('SIGKILL'), 2000); "
+        "deadline.unref(); }; "
+        "child.once('error', error => { console.error(error.message); "
+        "process.exit(127); }); "
+        "child.once('exit', (code, signal) => { clearTimeout(deadline); "
+        "process.exit(code ?? (128 + (constants.signals[signal] ?? 0))); }); "
+        "process.stdin.on('end', stop); process.stdin.on('close', stop); "
+        "process.stdin.on('error', stop); "
+        "for (const signal of ['SIGHUP', 'SIGINT', 'SIGTERM']) "
+        "process.on(signal, stop); process.stdin.resume();");
     const QString script =
-        selectEntry(repoRoot, QStringLiteral("bridge")) + shellQuote(nodePath)
-        + QStringLiteral(" \"$__ch_entry\""
-                         " & __ch_bridge=$!; cat >/dev/null;"
-                         " kill $__ch_bridge 2>/dev/null");
+        selectEntry(repoRoot, QStringLiteral("bridge")) + QStringLiteral("exec ")
+        + shellQuote(nodePath) + QStringLiteral(" -e ") + shellQuote(launcher)
+        + QStringLiteral(" \"$__ch_entry\"");
     // Quoted as one argument to `sh -c` so the script only relies on POSIX sh,
     // whatever login shell the remote account happens to use.
     return QStringLiteral("sh -c ") + shellQuote(script);
@@ -421,10 +449,16 @@ QString SessionBootstrap::remoteProvisionScript(const QString& repoRoot,
     const QString scratchDir =
         remoteJoin(repoRoot, QStringLiteral(".codeharbor-provision"));
     const QString scratch = shellQuote(scratchDir);
+    // Never unlink this file: all contenders must lock the same inode, even
+    // while a predecessor is finishing cleanup. FD 9 is inherited by commands,
+    // so a killed shell cannot abandon a still-running mutation outside the
+    // lock. The kernel releases ownership when the final holder exits.
+    const QString installLock =
+        shellQuote(remoteJoin(repoRoot, QStringLiteral(".codeharbor-provision.lock")));
     const QString tarball = shellQuote(
         remoteJoin(scratchDir, QStringLiteral("codeharbor-remote.tar.gz")));
     // The archive is unpacked HERE, never over the live install: nothing under
-    // repoRoot moves until a codeharbord entry point has been proven to exist
+    // repoRoot moves until both service entry points have been proven to exist
     // inside this directory. An in-place `tar -xzf -C <root>` was the original
     // design and is what made a failed update destroy a working service —
     // a truncated download, a full disk or a killed channel left the tree half
@@ -479,7 +513,28 @@ QString SessionBootstrap::remoteProvisionScript(const QString& repoRoot,
     steps << QStringLiteral("echo ")
                  + shellQuote(progressPrefix()
                               + QStringLiteral("preparing %1").arg(repoRoot));
+    steps << QStringLiteral("if ! command -v flock >/dev/null 2>&1; then echo ")
+                 + shellQuote(QStringLiteral(
+                       "codeharbor: flock is required to install safely; install "
+                       "flock or unpack the remote release manually"))
+                 + QStringLiteral(" >&2; exit 1; fi");
     steps << QStringLiteral("mkdir -p ") + root;
+    // Acquire before reading/recovering ANY shared journal. A ready sentinel
+    // proves completeness, not that the process which wrote it has died.
+    steps << QStringLiteral("if [ -L ") + installLock
+                 + QStringLiteral(" ] || { [ -e ") + installLock
+                 + QStringLiteral(" ] && [ ! -f ") + installLock
+                 + QStringLiteral(" ]; }; then echo ")
+                 + shellQuote(QStringLiteral(
+                       "codeharbor: unsafe installation lock path; expected a "
+                       "regular file, not a symlink or special file"))
+                 + QStringLiteral(" >&2; exit 1; fi");
+    steps << QStringLiteral("exec 9>> ") + installLock;
+    steps << QStringLiteral("if ! flock -n 9; then echo ")
+                 + shellQuote(QStringLiteral(
+                       "codeharbor: cannot acquire the installation lock; "
+                       "another installer may own this directory"))
+                 + QStringLiteral(" >&2; exit 1; fi");
 
     // ---- the undo ---------------------------------------------------------
     //
@@ -520,6 +575,11 @@ QString SessionBootstrap::remoteProvisionScript(const QString& repoRoot,
     //   else                   it was moved in and had no old counterpart, so
     //                          root/<b> is new and belongs to the failed install
     //
+    // Before restoring a backup, retain its staged name (or create an empty
+    // placeholder there). A later recovery then knows that the restored member
+    // is NOT a new member to delete, even if this undo is interrupted or another
+    // member fails. Broken relative symlinks also count as existing members:
+    // moving one into backup may make its target temporarily unreachable.
     // Every step is guarded rather than trusted, and a failure anywhere makes the
     // whole undo report failure WITHOUT removing the scratch directory: the
     // backup is then the only copy of the user's files left and deleting it is
@@ -527,11 +587,18 @@ QString SessionBootstrap::remoteProvisionScript(const QString& repoRoot,
     steps << QStringLiteral("ch_undo() { __ch_undone=1; if [ -f ") + ready
                  + QStringLiteral(" ]; then while IFS= read -r __ch_b; do "
                                   "if [ -n \"$__ch_b\" ]; then if [ -e ")
-                 + backup + QStringLiteral("/\"$__ch_b\" ]; then rm -rf ") + root
-                 + QStringLiteral("/\"$__ch_b\" || __ch_undone=; mv ") + backup
-                 + QStringLiteral("/\"$__ch_b\" ") + root
+                 + backup + QStringLiteral("/\"$__ch_b\" ] || [ -L ") + backup
+                 + QStringLiteral("/\"$__ch_b\" ]; then if [ ! -e ") + stage
+                 + QStringLiteral("/\"$__ch_b\" ] && [ ! -L ") + stage
+                 + QStringLiteral("/\"$__ch_b\" ]; then mkdir -p ") + stage
+                 + QStringLiteral("/\"$__ch_b\" || { __ch_undone=; continue; }; fi; "
+                                  "rm -rf ")
+                 + root
+                 + QStringLiteral("/\"$__ch_b\" || { __ch_undone=; continue; }; mv ")
+                 + backup + QStringLiteral("/\"$__ch_b\" ") + root
                  + QStringLiteral("/\"$__ch_b\" || __ch_undone=; elif [ -e ")
-                 + stage + QStringLiteral("/\"$__ch_b\" ]; then :; else rm -rf ")
+                 + stage + QStringLiteral("/\"$__ch_b\" ] || [ -L ") + stage
+                 + QStringLiteral("/\"$__ch_b\" ]; then :; else rm -rf ")
                  + root + QStringLiteral("/\"$__ch_b\" || __ch_undone=; fi; fi; "
                                         "done < ")
                  + plan + QStringLiteral(" || __ch_undone=; fi; if [ -f ")
@@ -541,7 +608,7 @@ QString SessionBootstrap::remoteProvisionScript(const QString& repoRoot,
                  + QStringLiteral(" ]; then rm -f ") + marker
                  + QStringLiteral(" || __ch_undone=; fi; if [ -z \"$__ch_undone\" ]; "
                                   "then return 1; fi; rm -f ")
-                 + ready
+                 + ready + QStringLiteral(" || return 1")
                  // The sentinel goes FIRST, and `rm -f` is one unlink, so the
                  // authorisation to act on this plan is revoked before the plan
                  // and the backup start disappearing. Deleting the scratch first
@@ -635,6 +702,13 @@ QString SessionBootstrap::remoteProvisionScript(const QString& repoRoot,
                        "codeharbord entry point; it is not a codeharbor-remote "
                        "release"))
                  + QStringLiteral(" >&2; exit 1; fi");
+    steps << findEntry(stageDir, QStringLiteral("bridge"));
+    steps << QStringLiteral("if [ -z \"$__ch_entry\" ]; then echo ")
+                 + shellQuote(QStringLiteral(
+                       "codeharbor: the archive unpacked but holds no "
+                       "bridge entry point; it is not a codeharbor-remote "
+                       "release"))
+                 + QStringLiteral(" >&2; exit 1; fi");
 
     // ---- the swap ---------------------------------------------------------
     //
@@ -662,16 +736,27 @@ QString SessionBootstrap::remoteProvisionScript(const QString& repoRoot,
                               + QStringLiteral("replacing the previous "
                                                "installation"));
     steps << QStringLiteral(": > ") + plan;
+    // The journal is newline-delimited and the scratch/marker names are ours,
+    // not archive payload. Reject those collisions before sealing the plan or
+    // touching any live member.
     steps << QStringLiteral("for __ch_m in ") + stage + QStringLiteral("/* ")
                  + stage + QStringLiteral("/.[!.]* ") + stage
-                 + QStringLiteral("/..?*; do if [ -e \"$__ch_m\" ]; then printf ")
+                 + QStringLiteral("/..?*; do if [ -e \"$__ch_m\" ] || "
+                                  "[ -L \"$__ch_m\" ]; then "
+                                  "__ch_b=${__ch_m##*/}; case \"$__ch_b\" in "
+                                  ".codeharbor-provision|.codeharbor-provision.lock|"
+                                  ".codeharbor-release|*'\n'*) "
+                                  "echo 'codeharbor: the archive contains a "
+                                  "reserved or unjournalable top-level name' "
+                                  ">&2; exit 1;; esac; printf ")
                  + shellQuote(QStringLiteral("%s\\n"))
-                 + QStringLiteral(" \"${__ch_m##*/}\" >> ") + plan
+                 + QStringLiteral(" \"$__ch_b\" >> ") + plan
                  + QStringLiteral("; fi; done");
     steps << QStringLiteral(": > ") + ready;
     steps << QStringLiteral("while IFS= read -r __ch_b; do if [ -n \"$__ch_b\" ]; "
                             "then if [ -e ")
-                 + root + QStringLiteral("/\"$__ch_b\" ]; then mv ") + root
+                 + root + QStringLiteral("/\"$__ch_b\" ] || [ -L ") + root
+                 + QStringLiteral("/\"$__ch_b\" ]; then mv ") + root
                  + QStringLiteral("/\"$__ch_b\" ") + backup
                  + QStringLiteral("/\"$__ch_b\"; fi; mv ") + stage
                  + QStringLiteral("/\"$__ch_b\" ") + root
@@ -852,7 +937,7 @@ void SessionBootstrap::cancelReconnect()
 
 void SessionBootstrap::abortAttempt()
 {
-    if (!m_attempting)
+    if (!m_attempting && !m_connectRequested)
         return;
     m_cancelRequested = true;
     if (m_nestedLoop)
@@ -895,10 +980,17 @@ void SessionBootstrap::scheduleReconnect()
 
 void SessionBootstrap::handleConnectionLost(const QString& reason)
 {
-    // Our own connect/teardown steps make the pool and the devices emit; those
-    // are not losses. Neither is anything that arrives when there is no live
-    // session to lose.
-    if (m_attempting || m_tearingDown || m_state != State::Wired)
+    if (m_tearingDown)
+        return;
+    if (m_attempting) {
+        // Once a channel exists, a close is a failed setup, not routine
+        // handshake churn. Signal delivery during setTransport()/wired() can
+        // reach here before the wire attempt has returned.
+        if (m_rpcDevice || m_agentDevice)
+            m_attemptLoss = reason;
+        return;
+    }
+    if (m_state != State::Wired)
         return;
 
     // A rung can be armed even here: a tick that fired while the previous
@@ -1421,9 +1513,9 @@ bool SessionBootstrap::ensureRemoteService()
 
     if (!needsInstall) {
         if (!nodeOk) {
-            // Deliberately not a refusal: entryCandidates() prefers built
-            // dist/*.js, which an older node runs fine, so a server that works
-            // today must keep working. Only PROVISIONING demands the floor.
+            // Do not rewrite an existing install merely because this client's
+            // runtime floor is newer. Its launch will decide compatibility;
+            // compiled output still needs node:sqlite on supported releases.
             emit channelDiagnostic(
                 role, QStringLiteral("node %1 on %2 is older than the %3.%4 the "
                                      "remote service declares; using the "
@@ -1702,6 +1794,7 @@ bool SessionBootstrap::attemptWire()
     m_attempting = true;
     m_cancelRequested = false;
     m_attemptFatal = false;
+    m_attemptLoss.clear();
     m_lastDiagnostic.clear();
     QElapsedTimer clock;
     clock.start();
@@ -1711,6 +1804,21 @@ bool SessionBootstrap::attemptWire()
     });
 
     unwire();
+    const int attempt = m_attempt;
+    const auto interrupted = [this, attempt] {
+        if (m_cancelRequested) {
+            unwire();
+            return true;
+        }
+        if (!m_attemptLoss.isEmpty()) {
+            m_attempt = attempt;
+            fail(std::exchange(m_attemptLoss, QString()));
+            return true;
+        }
+        return false;
+    };
+    if (interrupted())
+        return false;
 
     // Bounded liveness check BEFORE the blocking libssh handshake, so an
     // unreachable or mute endpoint costs connectTimeoutMs() of responsive UI
@@ -1947,6 +2055,8 @@ bool SessionBootstrap::attemptWire()
 
     m_rpcDevice = openChannelDevice(rpcCommand(m_nodePath, m_repoRoot),
                                     QStringLiteral("codeharbord"));
+    if (interrupted())
+        return false;
     if (!m_rpcDevice) {
         fail(withLastDiagnostic(
             QStringLiteral("could not start codeharbord over SSH")));
@@ -1968,9 +2078,13 @@ bool SessionBootstrap::attemptWire()
         m_client->enableHeartbeat();
         m_client->setTransport(m_rpcDevice);
     }
+    if (interrupted())
+        return false;
 
     m_agentDevice = openChannelDevice(bridgeCommand(m_nodePath, m_repoRoot),
                                       QStringLiteral("codeharbor-bridge"));
+    if (interrupted())
+        return false;
     if (!m_agentDevice) {
         fail(withLastDiagnostic(
             QStringLiteral("could not start codeharbor-bridge over SSH")));
@@ -1979,10 +2093,16 @@ bool SessionBootstrap::attemptWire()
     wireChannelSignals(m_agentDevice, QStringLiteral("codeharbor-bridge"));
     if (m_monitor)
         m_monitor->setTransport(m_agentDevice);
+    if (interrupted())
+        return false;
 
     m_attempt = 0;
     setState(State::Wired);
+    if (interrupted() || m_state != State::Wired)
+        return false;
     emit wired();
+    if (interrupted())
+        return false;
     // A stateChanged()/wired() handler is allowed to tear this session down
     // again — AppController runs its identity handshake from wired() and a
     // Disconnect can land while these signals are being delivered. Reporting
@@ -2036,7 +2156,10 @@ bool SessionBootstrap::connectAndWire(const QString& host, quint16 port,
     m_attempt = 0;
     // The user asked for this one, so the ladder switch may not abandon it.
     m_attemptIsRetry = false;
+    m_cancelRequested = false;
     setState(State::Connecting);
+    if (m_cancelRequested)
+        return false;
 
     if (attemptWire())
         return true;

@@ -112,11 +112,12 @@ for file in "$@"; do
     *.apk)
         # Align BEFORE signing: zipalign rewrites offsets, which would
         # invalidate a signature, and apksigner refuses to align afterwards.
-        # -p aligns .so files to the page size so the loader can mmap them
-        # straight out of the APK, which is what Qt's libraries want.
+        # Native libraries must be 16 KiB-aligned for mmap on both 16 KiB and
+        # 4 KiB Android devices. Deprecated -p only guarantees 4 KiB alignment
+        # and can undo the 16 KiB alignment Gradle already produced.
         aligned="$file.aligned"
-        "$zipalign" -p -f 4 "$file" "$aligned"
-        "$zipalign" -c -p 4 "$aligned"
+        "$zipalign" -P 16 -f 4 "$file" "$aligned"
+        "$zipalign" -c -P 16 4 "$aligned"
         mv "$aligned" "$file"
 
         # --min-sdk-version drives which schemes are emitted. At 28 apksigner

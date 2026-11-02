@@ -153,13 +153,14 @@ Item {
         return "";
     }
 
-    function resolvedKeyFor(absolutePath) {
+    function resolvedKeysFor(absolutePath) {
+        const keys = [];
         const resolved = root.imageResolved;
         for (const key in resolved) {
             if (resolved[key] === absolutePath)
-                return key;
+                keys.push(key);
         }
-        return "";
+        return keys;
     }
 
     Connections {
@@ -213,20 +214,23 @@ Item {
         }
 
         function onImageReady(path, url) {
-            const key = root.resolvedKeyFor(path);
-            if (key.length === 0)
+            // Different written paths (for example "a.png" and "./a.png") may
+            // resolve to one file. Its shared completion belongs to all of them.
+            const keys = root.resolvedKeysFor(path);
+            if (keys.length === 0)
                 return;
-            const sources = root.imageSources;
-            sources[key] = url;
+            const sources = Object.assign({}, root.imageSources);
+            const pending = Object.assign({}, root.imagePending);
+            for (const key of keys) {
+                sources[key] = url;
+                delete pending[key];
+            }
             root.imageSources = sources;
-            const pending = root.imagePending;
-            delete pending[key];
             root.imagePending = pending;
         }
 
         function onImageError(path, message) {
-            const key = root.resolvedKeyFor(path);
-            if (key.length > 0)
+            for (const key of root.resolvedKeysFor(path))
                 root.refuseImage(key, message);
         }
     }

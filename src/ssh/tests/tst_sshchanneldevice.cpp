@@ -47,6 +47,7 @@ private slots:
     void startingWithoutAConnectionPoolExplainsItself();
     void startingOnADisconnectedPoolExplainsItself();
     void closeChannelIsIdempotentAndReportsTheEndExactlyOnce();
+    void closingFromAboutToCloseDoesNotReenterOrReopenTheChannel();
     void resizeIsRefusedWhenThereIsNoPty();
     void aFinishedStreamReadsAsMinusOneNotZero();
     void waitingForBytesFailsFastWhenNoneCanArrive();
@@ -126,6 +127,34 @@ void TstSshChannelDevice::closeChannelIsIdempotentAndReportsTheEndExactlyOnce()
 
     device.closeChannel();
     device.close();  // the QIODevice spelling routes to the same place
+    QCOMPARE(finished.size(), 1);
+}
+
+void TstSshChannelDevice::closingFromAboutToCloseDoesNotReenterOrReopenTheChannel()
+{
+    OpenedChannelDevice device;
+    QSignalSpy closing(&device, &QIODevice::aboutToClose);
+    QSignalSpy finished(&device, &QIODevice::readChannelFinished);
+    bool restarted = false;
+    connect(&device, &QIODevice::aboutToClose, &device, [&] {
+        // Bound the regression path so the old implementation fails an
+        // assertion instead of recursing until its stack is exhausted.
+        if (closing.size() == 1) {
+            device.close();
+            restarted = device.startExec(QStringLiteral("echo replacement"));
+        }
+    });
+
+    device.closeChannel();
+
+    QCOMPARE(closing.size(), 1);
+    QCOMPARE(finished.size(), 1);
+    QVERIFY(!restarted);
+    QVERIFY(!device.isOpen());
+#if CH_HAVE_LIBSSH
+    QCOMPARE(device.errorString(), QStringLiteral("channel is closing"));
+#endif
+    device.closeChannel();
     QCOMPARE(finished.size(), 1);
 }
 

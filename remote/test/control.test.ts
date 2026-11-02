@@ -15,9 +15,10 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import net from "node:net";
+import { once as eventOnce } from "node:events";
 import os from "node:os";
 import path from "node:path";
-import { existsSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { setImmediate as once } from "node:timers/promises";
 
@@ -25,6 +26,7 @@ import {
     CH_CONTROL_VERSION,
     CONTROL_OPS,
     CONTROL_SOCKET_ENV,
+    CONTROL_HANDSHAKE_TIMEOUT_MS,
     MAX_CONTROL_INFLIGHT,
     MAX_CONTROL_LINE_BYTES,
     controlSocketDir,
@@ -374,6 +376,77 @@ test("a line past the byte bound is refused rather than buffered", async () => {
     }
 });
 
+test("a later packet on one socket cannot dispatch a second command", async () => {
+    const h = await harness();
+    const socket = net.createConnection(h.listener.socketPath);
+    socket.on("error", () => {});
+    socket.resume();
+    try {
+        await eventOnce(socket, "connect");
+        const line = `${JSON.stringify({ devSessionId: "d", terminalId: "t", op: "split" })}\n`;
+        socket.write(line);
+        await h.command(1);
+        assert.equal(h.listener.pendingCount(), 1);
+        const closed = eventOnce(socket, "close");
+        // FIN follows the second packet, so close proves the server consumed
+        // that packet rather than merely not having scheduled its read yet.
+        socket.end(line);
+        await closed;
+        assert.equal(h.relayed.length, 1);
+    } finally {
+        socket.destroy();
+        h.dispose();
+    }
+});
+
+test("closing the listener also closes silent and partial producers", { timeout: 2000 }, async () => {
+    const h = await harness();
+    const silent = net.createConnection(h.listener.socketPath);
+    const partial = net.createConnection(h.listener.socketPath);
+    silent.on("error", () => {});
+    partial.on("error", () => {});
+    silent.resume();
+    partial.resume();
+    try {
+        await Promise.all([eventOnce(silent, "connect"), eventOnce(partial, "connect")]);
+        partial.write("{");
+        // A real command provides a server-side accept/read barrier.
+        const pending = sendControlRequest("list", {}, h.env);
+        await h.command(1);
+        const closed = Promise.all([eventOnce(silent, "close"), eventOnce(partial, "close")]);
+        h.listener.close();
+        await closed;
+        assert.equal((await pending).error?.code, "failed");
+    } finally {
+        silent.destroy();
+        partial.destroy();
+        h.dispose();
+    }
+});
+
+test("a partial request still expires at the handshake deadline", { timeout: 2000 }, async (t) => {
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    const h = await harness();
+    const partial = net.createConnection(h.listener.socketPath);
+    partial.on("error", () => {});
+    partial.resume();
+    try {
+        await eventOnce(partial, "connect");
+        partial.write("{");
+        const pending = sendControlRequest("list", {}, h.env);
+        const command = await h.command(1);
+        h.listener.settle({ commandId: command.commandId, ok: true });
+        await pending;
+        const closed = eventOnce(partial, "close");
+        t.mock.timers.tick(CONTROL_HANDSHAKE_TIMEOUT_MS);
+        await closed;
+        assert.equal(h.relayed.length, 1);
+    } finally {
+        partial.destroy();
+        h.dispose();
+    }
+});
+
 test("past the in-flight bound a producer is told busy instead of being queued", async () => {
     const h = await harness();
     try {
@@ -623,4 +696,83 @@ test("the op vocabulary is exactly what the client implements", () => {
     // the same list. Pinning the daemon's copy keeps an op from being added on one
     // side alone and reaching a client that cannot answer it.
     assert.deepEqual([...CONTROL_OPS], ["list", "open", "close", "split", "focus", "reload"]);
+});
+
+test("the producer refuses oversized complete replies and unknown response versions", async () => {
+    const dir = tempDir();
+    const socketPath = path.join(dir, "peer.sock");
+    let response = "";
+    const server = net.createServer((socket) => {
+        socket.on("error", () => {});
+        socket.once("data", () => socket.end(response));
+    });
+    try {
+        server.listen(socketPath);
+        await eventOnce(server, "listening");
+        const env = { OMP_DEV_SESSION_ID: "d", OMP_TERMINAL_ID: "t" };
+        response = `${JSON.stringify({ version: CH_CONTROL_VERSION, ok: true })}${" ".repeat(MAX_CONTROL_LINE_BYTES)}\n`;
+        const oversized = await sendControlRequest("list", {}, env, socketPath);
+        assert.equal(oversized.ok, false);
+        assert.equal(oversized.error?.code, "failed");
+        assert.match(oversized.error?.message ?? "", /bound/);
+        for (const version of [undefined, 99, "1"]) {
+            response = `${JSON.stringify({ version, ok: true })}\n`;
+            const unknownVersion = await sendControlRequest("list", {}, env, socketPath);
+            assert.equal(unknownVersion.ok, false);
+            assert.match(unknownVersion.error?.message ?? "", /version/);
+        }
+        response = `${JSON.stringify({ version: CH_CONTROL_VERSION, ok: true })}\n`;
+        assert.equal((await sendControlRequest("list", {}, env, socketPath)).ok, true);
+    } finally {
+        server.close();
+        rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+test("invalid socket paths and unserializable requests resolve with refusals", async () => {
+    const env = { OMP_DEV_SESSION_ID: "d", OMP_TERMINAL_ID: "t" };
+    const invalidPath = await sendControlRequest("list", {}, env, "invalid\0socket");
+    assert.equal(invalidPath.ok, false);
+    assert.equal(invalidPath.error?.code, "failed");
+    const circular: Record<string, unknown> = {};
+    circular.self = circular;
+    for (const args of [circular, { value: 1n }]) {
+        const response = await sendControlRequest("list", args, env, "/not-used.sock");
+        assert.equal(response.ok, false);
+        assert.equal(response.error?.code, "bad_request");
+        assert.match(response.error?.message ?? "", /serialized/);
+    }
+});
+
+test("binding an occupied control path cannot replace a live listener", async () => {
+    const h = await harness();
+    try {
+        await assert.rejects(
+            startControlListener(() => true, h.listener.socketPath),
+            { code: "EADDRINUSE" },
+        );
+        const pending = sendControlRequest("list", {}, h.env);
+        const command = await h.command(1);
+        h.listener.settle({ commandId: command.commandId, ok: true });
+        assert.equal((await pending).ok, true);
+    } finally {
+        h.dispose();
+    }
+});
+
+test("startup and stale-socket sweeping preserve regular files at socket-like names", async () => {
+    const dir = tempDir();
+    const env = { XDG_RUNTIME_DIR: dir, HOME: dir };
+    const file = mintControlSocketPath(env);
+    writeFileSync(file, "user data");
+    try {
+        await assert.rejects(startControlListener(() => true, file), { code: "EADDRINUSE" });
+        assert.equal(readFileSync(file, "utf8"), "user data");
+        sweepStaleControlSockets(null, env);
+        await once();
+        await once();
+        assert.equal(readFileSync(file, "utf8"), "user data");
+    } finally {
+        rmSync(dir, { recursive: true, force: true });
+    }
 });

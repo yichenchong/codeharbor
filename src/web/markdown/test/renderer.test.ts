@@ -169,6 +169,33 @@ test("relative images and links resolve against the document directory", () => {
     );
 });
 
+test("URL-escaped destinations resolve once against raw POSIX document paths", () => {
+    const dom = new JSDOM("");
+    const { window } = dom;
+    const html = renderMarkdown(
+        "[space](notes%20one.md?raw=1#intro)\n\n"
+        + "[hash](image%23one.png)\n\n[percent](literal%2520.md)",
+        sanitizerFor(window),
+    );
+    const root = parse(window, rewriteRelativeUrls(
+        html, "/docs#archive?/README.md", window.document,
+    ));
+    assert.deepEqual(
+        Array.from(root.querySelectorAll("a"), (link) => link.getAttribute("href")),
+        [
+            "file:///docs%23archive%3F/notes%20one.md?raw=1#intro",
+            "file:///docs%23archive%3F/image%23one.png",
+            "file:///docs%23archive%3F/literal%2520.md",
+        ],
+    );
+    assert.equal(
+        resolveRemotePath("/docs#archive?/README.md", "logo%20one.png"),
+        "/docs#archive?/logo one.png",
+    );
+    assert.equal(resolveRemotePath("/docs/README.md", "%2e%2e/a.png"), "/a.png");
+    assert.equal(resolveRemotePath("/docs/README.md", "bad%ZZ.png"), "/docs/bad%ZZ.png");
+});
+
 test("no image can carry a source the host did not mint", () => {
     const dom = new JSDOM("");
     const { window } = dom;

@@ -263,7 +263,9 @@ export function isRelativeResource(value: string): boolean {
 }
 
 function pathDirectory(documentPath: string): string {
-    const path = documentPath.split(/[?#]/, 1)[0];
+    // documentPath is already a decoded POSIX path, not a URL. A '?' or '#'
+    // in a directory name is ordinary filename content.
+    const path = documentPath;
     if (path.endsWith("/")) {
         return path.slice(0, -1) || "/";
     }
@@ -273,7 +275,16 @@ function pathDirectory(documentPath: string): string {
 
 /** Resolve a Markdown-relative path using remote POSIX path semantics. */
 export function resolveRemotePath(documentPath: string, relativePath: string): string {
-    const candidate = relativePath.split(/[?#]/, 1)[0];
+    const urlPath = relativePath.split(/[?#]/, 1)[0];
+    let candidate: string;
+    try {
+        // Markdown destinations are URLs; decode once before resolving so an
+        // escaped space/hash names the real file instead of a literal "%20".
+        candidate = decodeURIComponent(urlPath);
+    } catch {
+        // A malformed escape can still be part of a real POSIX filename.
+        candidate = urlPath;
+    }
     const combined = candidate.startsWith("/")
         ? candidate
         : `${pathDirectory(documentPath)}/${candidate}`;

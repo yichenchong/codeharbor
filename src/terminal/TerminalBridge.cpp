@@ -68,15 +68,11 @@ void TerminalBridge::requestClear()
 
 void TerminalBridge::sendInput(const QString& data)
 {
-    // The controller reports a refused write (no channel, or a closed one), but
-    // there is nowhere to send that: the page-side contract is
-    // `sendInput(data): void` and it is frozen. Dropping the keystroke is the
-    // right outcome anyway — the pane's status strip is already showing
-    // "disconnected" or "error", which is what the user needs to see, and
-    // buffering keystrokes to replay into a future shell would type a command
-    // the user typed minutes ago at whatever prompt happens to be there.
-    if (m_controller)
-        m_controller->sendInput(data.toUtf8());
+    // A partial write can leave a command prefix at the remote prompt even
+    // while the channel is still open. The page's void slot cannot return that
+    // failure, so report it through pane chrome; never replay old keystrokes.
+    if (m_controller && !data.isEmpty() && !m_controller->sendInput(data.toUtf8()))
+        emit inputRejected();
 }
 
 void TerminalBridge::sendBinaryInput(const QString& base64)
@@ -97,10 +93,8 @@ void TerminalBridge::sendBinaryInput(const QString& base64)
                                            | QByteArray::AbortOnBase64DecodingErrors);
     if (!decoded)
         return;
-    // Same refusal handling as sendInput(): the page contract returns nothing,
-    // and a keystroke dropped by a dead channel is already visible in the
-    // pane's status strip.
-    m_controller->sendInput(decoded.decoded);
+    if (!decoded.decoded.isEmpty() && !m_controller->sendInput(decoded.decoded))
+        emit inputRejected();
 }
 
 void TerminalBridge::resize(int cols, int rows)

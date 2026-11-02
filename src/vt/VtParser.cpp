@@ -597,13 +597,12 @@ void VtParser::handleByte(quint8 byte)
             m_stringEscape = true;
             return;
         }
-        if (byte == kBel) {
-            // xterm's BEL terminator, which is what almost every program still
-            // uses for OSC 0/2 window titles. Ground first, string cleared after
-            // the dispatch that reads it, as above.
+        if (byte == kBel && dispatches) {
+            // BEL terminates OSC only. In DCS, SOS, PM and APC it is payload
+            // (or an ignored control), never permission to execute the rest of
+            // the string as ordinary terminal output.
             m_state = State::Ground;
-            if (dispatches)
-                dispatchOsc();
+            dispatchOsc();
             m_string.clear();
             return;
         }
@@ -693,6 +692,11 @@ void VtParser::dispatchPrivateMode(quint8 finalByte)
 
 void VtParser::dispatchCsi(quint8 finalByte)
 {
+    // A separator opens one more parameter even when no digit follows it.
+    // Preserve that omitted final slot: SGR 31;m means 31;0m, not 31m.
+    if (m_paramSlot < 0 && m_paramCount > 0)
+        nextParam(false);
+
     if (m_intermediateOverflow)
         return;
 
@@ -865,8 +869,13 @@ void VtParser::dispatchOsc()
     // server-controlled string reaches the QML chrome intact otherwise. See
     // isForbiddenTitleChar for what each class does there.
     title.removeIf(isForbiddenTitleChar);
-    if (title.size() > kMaxTitleChars)
-        title.truncate(kMaxTitleChars);
+    if (title.size() > kMaxTitleChars) {
+        // QString counts UTF-16 units; do not split a supplementary character
+        // into an unpaired surrogate at the title limit.
+        const int limit = title.at(kMaxTitleChars - 1).isHighSurrogate()
+            ? kMaxTitleChars - 1 : kMaxTitleChars;
+        title.truncate(limit);
+    }
     m_screen->setWindowTitle(title);
 }
 

@@ -139,6 +139,10 @@ private:
     // A window-change request is only meaningful on a channel that really has a
     // PTY, so resizePty() can honour its documented "false if no PTY" contract.
     bool m_hasPty = false;
+    // QIODevice::close() emits aboutToClose() before changing its open mode.
+    // A handler may ask to close again, but cannot close or reopen this device
+    // until that outer close has finished.
+    bool m_closing = false;
     // Incremented whenever a channel is acquired or released. A pump pass
     // captures it before reading and checks it after emitting a signal, so a
     // re-entrant close/start cannot finish or publish bytes for a new channel.

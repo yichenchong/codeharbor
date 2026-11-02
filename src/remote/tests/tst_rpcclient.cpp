@@ -257,6 +257,8 @@ private slots:
     void decodeFileContentRejectsInvalidBase64();
     void frameCapMeasuresThePayloadNotTheNewline();
     void aDeviceAdvertisingBytesItNeverDeliversDoesNotSpin();
+    void heartbeatWarningRebindDoesNotCloseTheReplacement();
+    void heartbeatWarningTrafficCancelsTheStaleVerdict();
 
 private:
     void makePair();
@@ -271,6 +273,70 @@ private:
     CodeharbordClient* m_client = nullptr;
     static int s_seq;
 };
+
+void TstRpcClient::heartbeatWarningRebindDoesNotCloseTheReplacement()
+{
+    ScriptedDevice silent;
+    ScriptedDevice replacement;
+    m_client->enableHeartbeat(1000000, 1);
+    m_client->setTransport(&silent);
+    QSignalSpy closedSpy(m_client, &CodeharbordClient::transportClosed);
+    bool rebound = false;
+    bool replacementAnswered = false;
+    qint64 replacementId = 0;
+    connect(m_client, &CodeharbordClient::protocolWarning, m_client,
+            [&](const QString& message) {
+                if (!message.startsWith(QStringLiteral("heartbeat:")))
+                    return;
+                rebound = true;
+                m_client->setTransport(&replacement);
+                replacementId = m_client->call(
+                    QStringLiteral("ping"), QJsonValue(),
+                    [&](QJsonValue, std::optional<RpcError> error) {
+                        QVERIFY(!error.has_value());
+                        replacementAnswered = true;
+                    });
+            });
+
+    // Drive the production timer slot without relying on wall-clock timing.
+    QVERIFY(QMetaObject::invokeMethod(m_client, "onHeartbeatTick",
+                                     Qt::DirectConnection));
+    QVERIFY(QMetaObject::invokeMethod(m_client, "onHeartbeatTick",
+                                     Qt::DirectConnection));
+    QVERIFY(rebound);
+    QCOMPARE(m_client->transport(), &replacement);
+    QCOMPARE(closedSpy.count(), 0);
+    QCOMPARE(m_client->pendingCount(), 1);
+    answerPing(replacement, replacementId);
+    QVERIFY(replacementAnswered);
+    QCOMPARE(m_client->pendingCount(), 0);
+    m_client->setTransport(nullptr);
+}
+
+void TstRpcClient::heartbeatWarningTrafficCancelsTheStaleVerdict()
+{
+    ScriptedDevice device;
+    m_client->enableHeartbeat(1000000, 1);
+    m_client->setTransport(&device);
+    QSignalSpy closedSpy(m_client, &CodeharbordClient::transportClosed);
+    QVERIFY(QMetaObject::invokeMethod(m_client, "onHeartbeatTick",
+                                     Qt::DirectConnection));
+    const QList<qint64> probes = takePingIds(device);
+    QCOMPARE(probes.size(), 1);
+    connect(m_client, &CodeharbordClient::protocolWarning, m_client,
+            [&](const QString& warning) {
+                if (warning.startsWith(QStringLiteral("heartbeat:")))
+                    answerPing(device, probes.first());
+            });
+    QVERIFY(QMetaObject::invokeMethod(m_client, "onHeartbeatTick",
+                                     Qt::DirectConnection));
+    QCOMPARE(closedSpy.count(), 0);
+    QCOMPARE(m_client->pendingCount(), 0);
+    QVERIFY(QMetaObject::invokeMethod(m_client, "onHeartbeatTick",
+                                     Qt::DirectConnection));
+    QCOMPARE(takePingIds(device).size(), 1);
+    m_client->setTransport(nullptr);
+}
 
 int TstRpcClient::s_seq = 0;
 

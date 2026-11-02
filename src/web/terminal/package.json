@@ -16,8 +16,10 @@
     "@xterm/xterm": "^5.5.0"
   },
   "devDependencies": {
+    "@types/jsdom": "^21.1.7",
     "@types/node": "^24.0.0",
-    "esbuild": "^0.23.0",
+    "esbuild": "^0.25.12",
+    "jsdom": "^30.0.1",
     "typescript": "^5.5.0"
   },
   "engines": {

@@ -99,12 +99,42 @@ test("a Shift press is handed to the program with the Shift spent", () => {
     // The rest of the gesture is rewritten with it, wherever the pointer goes,
     // so the reports tmux receives are one consistent unmodified drag.
     const move = policy.dispatch(policy.doc, "mousemove", { shiftKey: true });
-    const up = policy.dispatch(policy.doc, "mouseup", { shiftKey: true });
+    const up = policy.dispatch(policy.doc, "mouseup", { button: 0, shiftKey: true });
     assert.equal(move.shiftKey, false);
     assert.equal(up.shiftKey, false);
     // ...and only for that gesture: the move after the release is untouched.
     const after = policy.dispatch(policy.doc, "mousemove", { shiftKey: true });
     assert.equal(after.shiftKey, true);
+});
+
+test("a remote drag keeps its owner when the modifier is released first", () => {
+    for (const isMac of [false, true]) {
+        const modifier = isMac ? "altKey" : "shiftKey";
+        const policy = install({ isMac, reporting: () => true });
+        policy.dispatch(policy.surface, "mousedown", { button: 0, [modifier]: true });
+        const move = policy.dispatch(policy.doc, "mousemove", {
+            buttons: 1, [modifier]: false,
+        });
+        const up = policy.dispatch(policy.doc, "mouseup", {
+            button: 0, [modifier]: false,
+        });
+        assert.equal(move[modifier], false);
+        assert.equal(up[modifier], false, "the remote press gets a matching release");
+    }
+});
+
+test("secondary buttons and modifier changes cannot steal a local drag", () => {
+    const policy = install({ isMac: false, reporting: () => true });
+    policy.dispatch(policy.surface, "mousedown", { button: 0, shiftKey: false });
+    policy.dispatch(policy.surface, "mousedown", { button: 1, shiftKey: true });
+    const middleUp = policy.dispatch(policy.doc, "mouseup", { button: 1, shiftKey: false });
+    assert.equal(middleUp.shiftKey, false, "the middle release is untouched");
+    const move = policy.dispatch(policy.doc, "mousemove", { buttons: 1, shiftKey: true });
+    const up = policy.dispatch(policy.doc, "mouseup", { button: 0, shiftKey: true });
+    assert.equal(move.shiftKey, true);
+    assert.equal(up.shiftKey, true);
+    const after = policy.dispatch(policy.doc, "mousemove", { shiftKey: false });
+    assert.equal(after.shiftKey, false);
 });
 
 test("macOS inverts Option, the flag xterm reads there", () => {

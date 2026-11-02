@@ -47,7 +47,33 @@ set -- -o BatchMode=yes \
 if [ -n "$identity" ]; then
     set -- "$@" -i "$identity"
 fi
-set -- "$@" "$user@$host" 'printf '\''DB=%s\nHOME=%s\n'\'' "${CODEHARBOR_DB-}" "${HOME-}"'
+remote_probe=$(cat <<'SH'
+db=${CODEHARBOR_DB-}
+home=${HOME-}
+default_db="$home/.local/share/codeharbor/codeharbor.sqlite"
+# Resolve on the server, not this client's filesystem. The fixture directory
+# must exist, but codeharbord is allowed to create the database on first use.
+case "$db" in
+    /*)
+        if [ -L "$db" ]; then
+            echo "refusing a symlink CODEHARBOR_DB ($db)" >&2
+            exit 1
+        fi
+        if [ -e "$default_db" ] && [ "$db" -ef "$default_db" ]; then
+            echo "CODEHARBOR_DB aliases the real workspace database ($db)" >&2
+            exit 1
+        fi
+        parent=$(CDPATH= cd -- "$(dirname -- "$db")" && pwd -P) || exit 1
+        db="$parent/$(basename -- "$db")"
+        ;;
+esac
+if parent=$(CDPATH= cd -- "$(dirname -- "$default_db")" 2>/dev/null && pwd -P); then
+    default_db="$parent/$(basename -- "$default_db")"
+fi
+printf 'DB=%s\nHOME=%s\nDEFAULT_DB=%s\n' "$db" "$home" "$default_db"
+SH
+)
+set -- "$@" "$user@$host" "$remote_probe"
 
 if ! reported=$(ssh "$@" 2>&1); then
     fail "could not ask the fixture what CODEHARBOR_DB is set to: $reported"
@@ -59,7 +85,7 @@ fi
 # this gate with no message at all - a live-fixture check that silently stops
 # checking is worse than one that fails.
 db=$(awk 'index($0, "DB=") == 1 { print substr($0, 4); exit }' <<<"$reported")
-home=$(awk 'index($0, "HOME=") == 1 { print substr($0, 6); exit }' <<<"$reported")
+default_db=$(awk 'index($0, "DEFAULT_DB=") == 1 { print substr($0, 12); exit }' <<<"$reported")
 if [ -z "$db" ]; then
     fail "the fixture session returned an empty CODEHARBOR_DB"
 fi
@@ -70,9 +96,12 @@ case "$db" in
         ;;
 esac
 
-# Reject the exact default and the equivalent path under any remote HOME. The
-# latter catches a remote shell that reports a different HOME than this client.
-default_db="$home/.local/share/codeharbor/codeharbor.sqlite"
+# The remote probe canonicalizes both parents, catching ../ and directory
+# symlink aliases even before either database exists. The suffix check also
+# rejects another account's conventional workspace path.
+if [ -z "$default_db" ]; then
+    fail "the fixture session did not report its default workspace database"
+fi
 case "$db" in
     "$default_db"|*/.local/share/codeharbor/codeharbor.sqlite)
         fail "the fixture session points CODEHARBOR_DB at the real workspace database ($db)"

@@ -87,17 +87,17 @@ while IFS= read -r -d '' patch; do
             c = substr($0, 1, 1)
             if (c == " " || $0 == "") {
                 old++; new++
-                if (old >= oldwant && new >= newwant) { inhunk = 0; completed = 1 }
+                if (old >= oldwant && new >= newwant) flush()
                 next
             }
             if (c == "-") {
                 old++
-                if (old >= oldwant && new >= newwant) { inhunk = 0; completed = 1 }
+                if (old >= oldwant && new >= newwant) flush()
                 next
             }
             if (c == "+") {
                 new++
-                if (old >= oldwant && new >= newwant) { inhunk = 0; completed = 1 }
+                if (old >= oldwant && new >= newwant) flush()
                 next
             }
             printf "%s:%d: body line starts with %s, not a space, + or -\n",

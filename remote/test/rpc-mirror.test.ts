@@ -16,10 +16,11 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { spawn } from "node:child_process";
 
 import {
     RPC_DATABASE_BUSY,
@@ -45,6 +46,7 @@ import {
     createLineFramer,
     createWatchNotificationRelay,
     dispatch,
+    handleLine,
 } from "../src/codeharbord.ts";
 import { WORKSPACE_METHODS } from "../src/workspace.ts";
 import { fileMethods } from "../src/files.ts";
@@ -195,6 +197,18 @@ test("the keepalive method really dispatches to a success result", async () => {
         id: 1,
         result: { pong: true },
     });
+});
+
+test("numeric ids that cannot round-trip through JSON are invalid requests", async () => {
+    const response = await handleLine('{"jsonrpc":"2.0","id":1e400,"method":"ping"}');
+    assert.ok(response && "error" in response);
+    assert.equal(response.error.code, -32600);
+    assert.equal(response.id, null);
+    for (const id of [NaN, Infinity, -Infinity]) {
+        const decoded = await dispatch({ jsonrpc: "2.0", id, method: RPC_PING_METHOD });
+        assert.ok(decoded && "error" in decoded);
+        assert.equal(decoded.error.code, -32600);
+    }
 });
 
 // Method names are not the only duplicated contract: the application-level
@@ -441,6 +455,8 @@ test("an over-cap response is refused instead of written as a doomed frame", () 
     assert.equal(decoded.id, 7);
     assert.equal(decoded.error.code, RPC_RESOURCE_LIMIT);
     assert.match(decoded.error.message, /transport frame limit/);
+    assert.match(decoded.error.message, /may already have completed/);
+    assert.doesNotMatch(decoded.error.message, /Nothing was changed/);
 });
 test("an oversized response id is replaced with null in the bounded refusal", () => {
     const line = responseLine({
@@ -558,5 +574,124 @@ test("server.info reports an absolute recoveryDir even for a relative XDG_DATA_H
         if (previousDataHome === undefined) delete process.env.XDG_DATA_HOME;
         else process.env.XDG_DATA_HOME = previousDataHome;
         rmSync(dbDir, { recursive: true, force: true });
+    }
+});
+
+test("closing a watch relay releases its stream listener and queued events", () => {
+    const lines: string[] = [];
+    const out = Object.assign(new EventEmitter(), {
+        write(line: string): boolean {
+            lines.push(line);
+            return true;
+        },
+    }) as unknown as NodeJS.WritableStream;
+    const emitter = out as unknown as EventEmitter;
+    const before = emitter.listenerCount("drain");
+    const relay = createWatchNotificationRelay(out, () => true);
+    relay.stall();
+    relay.deliver({ subscriptionId: "sub", path: "/file", event: "modified" });
+    assert.equal(relay.pendingCount(), 1);
+    relay.close();
+    relay.close();
+    assert.equal(emitter.listenerCount("drain"), before);
+    assert.equal(relay.pendingCount(), 0);
+    emitter.emit("drain");
+    relay.deliver({ subscriptionId: "sub", path: "/file", event: "modified" });
+    assert.deepEqual(lines, []);
+});
+
+test("daemon EOF preserves late responses and releases stdout drain listeners", { timeout: 10000 }, async () => {
+    const dir = mkdtempSync(path.join(os.tmpdir(), "ch-rpc-eof-"));
+    const file = path.join(dir, "data.txt");
+    writeFileSync(file, "x".repeat(1000000));
+    const serverUrl = new URL("../src/codeharbord.ts", import.meta.url).href;
+    const child = spawn(process.execPath, [
+        "--input-type=module",
+        "-e",
+        `import { runStdio } from ${JSON.stringify(serverUrl)};
+         const before = process.stdout.listenerCount("drain");
+         runStdio();
+         process.stdin.once("close", () => {
+             process.send({ before, after: process.stdout.listenerCount("drain") });
+             process.disconnect();
+         });`,
+    ], {
+        env: { ...process.env, XDG_RUNTIME_DIR: dir, CODEHARBOR_DB: path.join(dir, "workspace.sqlite") },
+        stdio: ["pipe", "pipe", "pipe", "ipc"],
+    });
+    let output = "";
+    let errors = "";
+    child.stdout!.setEncoding("utf8");
+    child.stdout!.on("data", (chunk: string) => { output += chunk; });
+    child.stdout!.pause();
+    child.stderr!.setEncoding("utf8");
+    child.stderr!.on("data", (chunk: string) => { errors += chunk; });
+    const inputClosed = Promise.withResolvers<unknown>();
+    child.once("message", inputClosed.resolve);
+    child.once("error", inputClosed.reject);
+    child.once("exit", () => inputClosed.reject(new Error("daemon exited before announcing stdin EOF")));
+    const exited = Promise.withResolvers<number | null>();
+    child.once("close", exited.resolve);
+    try {
+        child.stdin!.end(
+            JSON.stringify({ jsonrpc: "2.0", id: "x".repeat(1000000), method: "ping" }) + "\n" +
+            JSON.stringify({ jsonrpc: "2.0", id: 2, method: "file.readFile", params: { path: file } }) + "\n",
+        );
+        const listeners = await inputClosed.promise;
+        child.stdout!.resume();
+        assert.equal(await exited.promise, 0, errors);
+        assert.deepEqual(listeners, { before: 0, after: 0 });
+        const replies = output.trim().split("\n").map((line) => JSON.parse(line));
+        assert.equal(replies.length, 2);
+        assert.equal(replies.find((reply) => reply.id === 2)?.result?.content, "x".repeat(1000000));
+    } finally {
+        child.kill();
+        rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+test("an overflow cannot dispatch a following request from the same input chunk", { timeout: 10000 }, async () => {
+    const dir = mkdtempSync(path.join(os.tmpdir(), "ch-rpc-overflow-"));
+    const serverUrl = new URL("../src/codeharbord.ts", import.meta.url).href;
+    const child = spawn(process.execPath, [
+        "--input-type=module",
+        "-e",
+        `import { runStdio, MAX_LINE_BYTES } from ${JSON.stringify(serverUrl)};
+         runStdio();
+         process.once("message", () => {
+             const newline = String.fromCharCode(10);
+             process.stdin.emit("data", Buffer.from("x".repeat(MAX_LINE_BYTES + 1) + newline +
+                 JSON.stringify({ jsonrpc: "2.0", id: 9, method: "ping" }) + newline));
+             process.disconnect();
+         });`,
+    ], {
+        env: { ...process.env, XDG_RUNTIME_DIR: dir, CODEHARBOR_DB: path.join(dir, "workspace.sqlite") },
+        stdio: ["pipe", "pipe", "pipe", "ipc"],
+    });
+    let output = "";
+    let errors = "";
+    const ready = Promise.withResolvers<void>();
+    child.stdout!.setEncoding("utf8");
+    child.stdout!.on("data", (chunk: string) => {
+        output += chunk;
+        if (output.includes("\n")) ready.resolve();
+    });
+    child.stderr!.setEncoding("utf8");
+    child.stderr!.on("data", (chunk: string) => { errors += chunk; });
+    child.once("error", ready.reject);
+    child.once("exit", () => ready.reject(new Error("daemon exited before the initial ping")));
+    const exited = Promise.withResolvers<number | null>();
+    child.once("close", exited.resolve);
+    try {
+        child.stdin!.write('{"jsonrpc":"2.0","id":1,"method":"ping"}\n');
+        await ready.promise;
+        child.send("inject-overflow");
+        assert.equal(await exited.promise, 0, errors);
+        const replies = output.trim().split("\n").map((line) => JSON.parse(line));
+        assert.deepEqual(replies.map((reply) => reply.id), [1]);
+        assert.match(errors, /input line exceeded/);
+    } finally {
+        child.kill();
+        rmSync(dir, { recursive: true, force: true });
     }
 });

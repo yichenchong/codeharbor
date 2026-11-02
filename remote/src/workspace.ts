@@ -477,8 +477,11 @@ function removePaneFromTree(node: unknown, paneId: string): unknown | null {
         });
         if (keptChildren.length === 0) return null;
         if (keptChildren.length === 1) return keptChildren[0];
-        const sum = keptRatios.reduce((a, b) => a + b, 0);
-        const normalized = keptRatios.map((r) => r / sum);
+        // Scale before summing so finite ratios cannot overflow their total.
+        // Clamp underflow too: a zero ratio makes the repaired tree unloadable.
+        const largest = keptRatios.reduce((max, r) => Math.max(max, r), 0);
+        const sum = keptRatios.reduce((total, r) => total + r / largest, 0);
+        const normalized = keptRatios.map((r) => Math.max((r / largest) / sum, Number.MIN_VALUE));
         return { ...n, children: keptChildren, ratios: normalized };
     }
     return node;
@@ -876,20 +879,25 @@ function migrateTerminalPaneIdentity(db: DatabaseSync): void {
     }>;
     const assignTarget = db.prepare("UPDATE terminal_panes SET tmux_target = ? WHERE rowid = ?");
     const takenTargets = new Set<string>();
+    // A generated replacement must not take a later row's existing shell.
+    const reservedTargets = new Set(targeted.map((row) => tmuxSafeName(row.tmux_target)));
     for (const row of targeted) {
         const repaired = tmuxSafeName(row.tmux_target);
         let next: string | null = repaired;
         if (takenTargets.has(repaired)) {
             // The canonical mint, spelled out here rather than delegated to
             // mintTmuxTarget, because this loop needs the one thing that
-            // function cannot know: whether the name is already claimed by an
-            // earlier row in this same upgrade. Nothing ever constrained a
-            // legacy `terminal_panes.id` or `dev_session_id` to a UUID, so
+            // function cannot know: whether the name belongs to any other row
+            // in this upgrade, including a row the loop has not reached yet.
+            // Legacy terminal_panes.id and dev_session_id need not be UUIDs, so
             // `ch_<dev_session_id>_<id>` can itself be unusable as a tmux
             // session name. Falling back to NULL costs the pane only its stored
             // session name; it mints a fresh one on its next attach.
             const minted = `ch_${row.dev_session_id}_${row.id}`;
-            next = isSafeTmuxTarget(minted) && !takenTargets.has(minted) ? minted : null;
+            next =
+                isSafeTmuxTarget(minted) && !reservedTargets.has(minted) && !takenTargets.has(minted)
+                    ? minted
+                    : null;
         }
         if (next !== null) takenTargets.add(next);
         if (next !== row.tmux_target) assignTarget.run(next, row.rowid);
@@ -906,20 +914,28 @@ function migrateTerminalPaneIdentity(db: DatabaseSync): void {
         name: string;
     }>;
     const assignName = db.prepare("UPDATE terminal_panes SET name = ? WHERE rowid = ?");
-    const takenNames = new Set<string>();
+    const reservedNames = new Map<string, Set<string>>();
     for (const row of named) {
-        const address = `${row.dev_session_id}/${row.name}`;
-        if (!takenNames.has(address)) {
-            takenNames.add(address);
+        let names = reservedNames.get(row.dev_session_id);
+        if (names === undefined) reservedNames.set(row.dev_session_id, (names = new Set()));
+        names.add(row.name);
+    }
+    const takenNames = new Map<string, Set<string>>();
+    for (const row of named) {
+        let names = takenNames.get(row.dev_session_id);
+        if (names === undefined) takenNames.set(row.dev_session_id, (names = new Set()));
+        if (!names.has(row.name)) {
+            names.add(row.name);
             continue;
         }
-        // The row id is a UUID, so its first segment is unique among these rows
-        // in every practical sense; the loop below closes even that gap.
+        // Reserve every original label before generating one: otherwise this
+        // duplicate could take a later row's label and redirect its legacy leaf.
+        const reserved = reservedNames.get(row.dev_session_id)!;
         let renamed = `${row.name}-dup-${row.id.slice(0, 8)}`;
-        for (let n = 2; takenNames.has(`${row.dev_session_id}/${renamed}`); n++) {
+        for (let n = 2; names.has(renamed) || reserved.has(renamed); n++) {
             renamed = `${row.name}-dup-${row.id.slice(0, 8)}-${n}`;
         }
-        takenNames.add(`${row.dev_session_id}/${renamed}`);
+        names.add(renamed);
         assignName.run(renamed, row.rowid);
     }
 
@@ -1881,7 +1897,12 @@ export class Workspace {
                           .get(params.devSessionId, name) as TerminalPaneRow | undefined);
             if (existing) {
                 if (existing.tmux_target !== null) return toTerminalPane(existing);
-                const minted = mintTmuxTarget(existing.dev_session_id, existing.id);
+                let minted = mintTmuxTarget(existing.dev_session_id, existing.id);
+                // A caller may have adopted this canonical target after the
+                // pane was unbound. Keep that pane's shell and mint a new one
+                // here; retrying the same occupied name can never heal the row.
+                const holder = this.db.prepare("SELECT 1 FROM terminal_panes WHERE tmux_target = ?");
+                while (holder.get(minted) !== undefined) minted = `ch_${randomUUID()}`;
                 this.db
                     .prepare(
                         "UPDATE terminal_panes SET tmux_target = ?, updated_at = ? WHERE id = ?",

@@ -167,6 +167,8 @@ Item {
     function goBack() {
         if (!pane.canGoBack)
             return;
+        if (!pane.allowContentReplacement())
+            return;
         const targetIndex = pane.navigationIndex - 1;
         const target = pane.navigationHistory[targetIndex];
         pane.navigationMoveInProgress = true;
@@ -178,6 +180,8 @@ Item {
 
     function goForward() {
         if (!pane.canGoForward)
+            return;
+        if (!pane.allowContentReplacement())
             return;
         const targetIndex = pane.navigationIndex + 1;
         const target = pane.navigationHistory[targetIndex];
@@ -197,6 +201,8 @@ Item {
         const target = pane.defaultAddressForRoot(pane.sessionRoot);
         if (pane.currentNavigationAddress() === target && pane.url.toString().length === 0)
             return;
+        if (!pane.allowContentReplacement())
+            return;
         pane.forcedKind = "";
         pane.url = "";
     }
@@ -206,15 +212,16 @@ Item {
     // object. The Loader fallback covers every other content kind, including
     // internal image/PDF resources and the binary metadata view.
     function reloadCurrent() {
-        if (!pane.canReload)
-            return;
+        if (!pane.canReload || !pane.allowContentReplacement())
+            return false;
         const handler = contentLoader.item;
         if (handler && typeof handler.reload === "function") {
             handler.reload();
-            return;
+            return true;
         }
         pane.contentActive = false;
         reloadTimer.restart();
+        return true;
     }
 
 
@@ -430,6 +437,7 @@ Item {
     // to be asked about first), and leaving that fragment sitting in the bar
     // would have the pane claim to be showing something it is not.
     onUrlChanged: {
+        pane.probePath = "";
         pane.recordNavigation(pane.currentNavigationAddress());
         pane.reportUrl();
         pane.syncAddressField(true);
@@ -456,6 +464,8 @@ Item {
     // Open a remote path in THIS pane. A trailing slash means a directory, which
     // is what ViewerHandlerRegistry::resolve() reads to pick the listing view.
     function openRemotePath(path) {
+        if (!pane.allowContentReplacement())
+            return;
         pane.forcedKind = "";
         pane.url = pane.fileUrlFor(path);
     }
@@ -467,6 +477,8 @@ Item {
         if (target === pane.url.toString())
             return;
         if (/^file:\/\//i.test(target) || /^https?:\/\//i.test(target)) {
+            if (!pane.allowContentReplacement())
+                return;
             pane.forcedKind = "";
             pane.url = target;
         }
@@ -502,6 +514,8 @@ Item {
             pane.messageRequested(qsTr("That viewer cannot display this target."));
             return false;
         }
+        if (!pane.allowContentReplacement())
+            return false;
         pane.forcedKind = selected;
         pane.url = targetUrl;
         return true;
@@ -524,6 +538,8 @@ Item {
                                  ? "" : requestedKind);
         if (requested.length > 0)
             return pane.openUrlWithKind(targetUrl, requested);
+        if (!pane.allowContentReplacement())
+            return false;
         pane.forcedKind = "";
         pane.url = targetUrl;
         return true;
@@ -595,10 +611,44 @@ Item {
 
     readonly property bool contentDirty:
         contentLoader.item && contentLoader.item.dirty === true
+    property string dirtyHandlerKind: ""
+    onContentDirtyChanged: {
+        // A background change to viewer defaults/capabilities must not unload
+        // a dirty editor. Apply the new registry choice only once it is clean.
+        if (pane.contentDirty) {
+            if (pane.dirtyHandlerKind.length === 0)
+                pane.dirtyHandlerKind = pane.kind;
+        } else {
+            // Releasing the pin can replace the Loader item, which itself
+            // refreshes contentDirty. Wait until this binding notification has
+            // completed before changing the handler, and recheck for new edits.
+            Qt.callLater(() => {
+                if (!pane.contentDirty)
+                    pane.dirtyHandlerKind = "";
+            });
+        }
+    }
+
+    // Replacing a handler or reloading its Chromium page can lose edits that
+    // have not reached the debounced recovery snapshot. Do not queue a delayed
+    // navigation here: agent commands need an immediate, truthful outcome.
+    // Closing keeps its separate discard confirmation (requestClose()).
+    function allowContentReplacement() {
+        if (pane.contentDirty) {
+            pane.messageRequested(qsTr("This editor has unsaved changes. Save your changes or close this pane before navigating or reloading."));
+            return false;
+        }
+        // A newer navigation/reload supersedes an address probe, even when
+        // its target equals the current URL and urlChanged will not fire.
+        pane.probePath = "";
+        return true;
+    }
 
     // View kind for the current URL: "web" | "markdown" | "text" | "image" |
     // "pdf" | "directory" | "binary" (nothing to show -> a neutral placeholder).
     property string kind: {
+        if (pane.dirtyHandlerKind.length > 0)
+            return pane.dirtyHandlerKind;
         if (pane.forcedKind.length > 0)
             return pane.forcedKind;
         if (pane.effectiveUrl.toString().length === 0 || !pane.viewerModel)
@@ -765,6 +815,8 @@ Item {
     // Resolve whatever is in the address field and open it.
     function submitAddress() {
         const text = addressField.text.trim();
+        if (!pane.allowContentReplacement())
+            return;
         if (text.length === 0) {
             // Emptying the address clears the pane, which is how a user gets
             // back to the session-root default.
@@ -987,10 +1039,15 @@ Item {
     // palette already was.
     Rectangle {
         id: addressBar
+        // Use expanded-marker metrics and fixed compact-button metrics here;
+        // measuring the compact labels themselves would create a layout loop.
+        readonly property bool compact: width < 160 + 4 * 22 + 3 * 2
+                                              + (outsideMarker.visible
+                                                 ? outsideTextMetrics.advanceWidth + 12 : 0) + 14
         anchors.left: parent.left
         anchors.right: parent.right
         anchors.top: header.bottom
-        height: Theme.paneHeaderHeight
+        height: Theme.paneHeaderHeight * (compact ? 2 : 1)
         color: Theme.surfaceDeep
 
         Rectangle {
@@ -1007,10 +1064,10 @@ Item {
 
             anchors.left: parent.left
             anchors.leftMargin: 6
-            anchors.right: outsideMarker.left
-            anchors.rightMargin: 4
-            anchors.verticalCenter: parent.verticalCenter
-            height: parent.height - 6
+            anchors.right: addressBar.compact ? parent.right : outsideMarker.left
+            anchors.rightMargin: addressBar.compact ? 6 : 4
+            y: addressBar.compact ? 3 : (parent.height - height) / 2
+            height: Theme.paneHeaderHeight - 6
 
             placeholderText: qsTr("Remote path (/srv/repos/app/README.md) or https:// address")
             placeholderTextColor: Theme.textDim
@@ -1073,8 +1130,9 @@ Item {
 
             visible: pane.outsideRepository
             anchors.right: navigationControls.left
-            anchors.verticalCenter: parent.verticalCenter
-            width: visible ? outsideLabel.implicitWidth + 12 : 0
+            y: navigationControls.y + (navigationControls.height - height) / 2
+            width: visible ? Math.min(addressBar.compact ? 18 : outsideTextMetrics.advanceWidth + 12,
+                                     Math.max(0, parent.width - navigationControls.width - 8)) : 0
             height: 18
             radius: Theme.radiusSmall
             color: "transparent"
@@ -1090,11 +1148,20 @@ Item {
 
             HoverHandler { id: outsideHover }
 
+            TextMetrics {
+                id: outsideTextMetrics
+                font: outsideLabel.font
+                text: qsTr("outside project")
+            }
+
             Label {
                 id: outsideLabel
                 anchors.centerIn: parent
+                width: Math.max(0, parent.width - 4)
+                horizontalAlignment: Text.AlignHCenter
+                elide: Text.ElideRight
                 textFormat: Text.PlainText
-                text: qsTr("outside project")
+                text: addressBar.compact ? "!" : qsTr("outside project")
                 color: Theme.warning
                 font.pixelSize: Theme.fontSizeSmall
             }
@@ -1119,7 +1186,9 @@ Item {
             objectName: "viewerNavigationControls"
             anchors.right: parent.right
             anchors.rightMargin: 4
-            anchors.verticalCenter: parent.verticalCenter
+            y: addressBar.compact
+               ? Theme.paneHeaderHeight + (Theme.paneHeaderHeight - height) / 2
+               : (parent.height - height) / 2
             spacing: 2
 
             Repeater {
@@ -1128,6 +1197,7 @@ Item {
 
                 delegate: Loader {
                     required property string modelData
+                    width: addressBar.compact ? 22 : implicitWidth
                     sourceComponent: {
                         switch (modelData) {
                         case "nav.back": return backAction;

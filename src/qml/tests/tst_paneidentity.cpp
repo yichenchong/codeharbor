@@ -53,6 +53,7 @@
 #include <QQmlEngine>
 #include <QQuickItem>
 #include <QQuickWindow>
+#include <QRectF>
 #include <QScopeGuard>
 #include <QSet>
 #include <QSignalSpy>
@@ -642,9 +643,18 @@ class EditorControllerStub : public QObject
 {
     Q_OBJECT
     Q_PROPERTY(QString fileState READ fileState NOTIFY fileStateChanged)
+    Q_PROPERTY(bool dirty READ dirty NOTIFY dirtyChanged)
 
 public:
     QString fileState() const { return m_fileState; }
+    bool dirty() const { return m_dirty; }
+    void setDirty(bool dirty)
+    {
+        if (m_dirty == dirty)
+            return;
+        m_dirty = dirty;
+        emit dirtyChanged();
+    }
 
     // ch::EditorController leaves the file in "disconnected" when the SSH
     // transport drops and in "conflict" when a save was refused; both are
@@ -660,6 +670,7 @@ public:
     Q_INVOKABLE void open(const QString &path) { m_opened.append(path); }
     Q_INVOKABLE void save(const QString &, const QString &) { }
     Q_INVOKABLE void reportContent(const QString &content) { m_reported.append(content); }
+    Q_INVOKABLE void reportDirty(bool dirty, const QString &) { setDirty(dirty); }
     Q_INVOKABLE void requestReload() { }
     Q_INVOKABLE void ready() { }
     Q_INVOKABLE void setRecoveryId(const QString &id) { m_recoveryId = id; }
@@ -670,6 +681,7 @@ public:
 
 signals:
     void contentLoaded(const QString &content, const QString &revision);
+    void dirtyChanged();
     void fileStateChanged(const QString &state);
     void readOnlyChanged(bool readOnly);
     void saved(const QString &revision);
@@ -679,6 +691,7 @@ signals:
 
 private:
     QString m_fileState = QStringLiteral("clean");
+    bool m_dirty = false;
     QStringList m_opened;
     QStringList m_reported;
     QString m_recoveryId;
@@ -759,6 +772,11 @@ private slots:
     void navigationButtonsAreDisabledAtHistoryEnds();
     void reloadRefreshesNonWebContent();
     void reloadKeepsTheEditorHandlerAlive();
+    void dirtyEditorRejectsNavigationAndReload();
+    void narrowViewerKeepsItsAddressUsable_data();
+    void narrowViewerKeepsItsAddressUsable();
+    void supersededAddressProbesCannotNavigate();
+    void liveTerminalDiagnosticsRemainVisibleWithoutDisconnecting();
     void homeUsesTheActiveSessionRootAndDisablesWithoutOne();
     // The field's VALUE is a path that changes with every navigation, so
     // without a name of its own a screen reader announces the address and never
@@ -2204,6 +2222,178 @@ void TstPaneIdentity::reloadKeepsTheEditorHandlerAlive()
     QCOMPARE(asObject(original->property("controller")), controller);
 }
 
+void TstPaneIdentity::dirtyEditorRejectsNavigationAndReload()
+{
+    EditorControllerStub controller;
+    QSignalSpy warnings(m_engine.get(), &QQmlEngine::warnings);
+    QVERIFY(warnings.isValid());
+    m_viewers.setDefaultKinds({{QStringLiteral("md"), QStringLiteral("text")}});
+    const auto restoreDefaults = qScopeGuard([this] { m_viewers.setDefaultKinds({}); });
+    m_app.setActiveSessionRepoRoot(QStringLiteral("/srv/repos/app"));
+    const QUrl originalUrl(QStringLiteral("file:///tmp/unsaved.md"));
+    QVERIFY(openRegion(QStringLiteral("ViewerRegion.qml"),
+                       leafNode(QStringLiteral("viewer-1"), originalUrl.toString()),
+                       /*terminal=*/false));
+    QTRY_COMPARE(collect(m_region, isLeafPane).size(), 1);
+    QTRY_COMPARE(collect(m_region, isEditorPane).size(), 1);
+    QObject *const pane = collect(m_region, isLeafPane).constFirst();
+    QObject *const editor = collect(m_region, isEditorPane).constFirst();
+    auto *const address = qobject_cast<QQuickItem *>(
+        childNamed(pane, QStringLiteral("viewerAddressField")));
+    QVERIFY(address);
+    // Loader completion precedes the first window layout. Wait for the real
+    // address field to be clickable before exercising its mouse/Return path.
+    QTRY_VERIFY(address->width() > 4 && address->height() > 4);
+    editor->setProperty("controller", QVariant::fromValue<QObject *>(&controller));
+    controller.setDirty(true);
+    QTRY_VERIFY(pane->property("contentDirty").toBool());
+    m_viewers.setDefaultKinds({});
+    QTRY_COMPARE(pane->property("kind").toString(), QStringLiteral("text"));
+    QCOMPARE(collect(m_region, isEditorPane).constFirst(), editor);
+    pane->setProperty("navigationHistory",
+                      QVariantList{QStringLiteral("file:///before.bin"),
+                                   originalUrl.toString(),
+                                   QStringLiteral("file:///after.bin")});
+    pane->setProperty("navigationIndex", 1);
+
+    for (const QString &state : {QStringLiteral("modified"), QStringLiteral("saving"),
+                                 QStringLiteral("conflict"), QStringLiteral("disconnected"),
+                                 QStringLiteral("error"), QStringLiteral("read_only")}) {
+        controller.setFileState(state);
+        QTRY_VERIFY(pane->property("contentDirty").toBool());
+        for (const char *action : {"goBack", "goForward", "goHome", "reloadCurrent"}) {
+            QVERIFY(QMetaObject::invokeMethod(pane, action));
+            QCOMPARE(pane->property("url").toUrl(), originalUrl);
+            QCOMPARE(pane->property("navigationIndex").toInt(), 1);
+        }
+        QVERIFY(QMetaObject::invokeMethod(pane, "openRemotePath",
+                                          Q_ARG(QVariant, QStringLiteral("/next.bin"))));
+        QVERIFY(QMetaObject::invokeMethod(pane, "openWebNavigation",
+                                          Q_ARG(QVariant, QStringLiteral("https://example.com"))));
+        QVariant accepted;
+        QVERIFY(QMetaObject::invokeMethod(pane, "openTarget", Q_RETURN_ARG(QVariant, accepted),
+                                          Q_ARG(QVariant, QStringLiteral("file:///next.bin")),
+                                          Q_ARG(QVariant, QString())));
+        QVERIFY(!accepted.toBool());
+        QVERIFY(QMetaObject::invokeMethod(pane, "openUrlWithKind",
+                                          Q_RETURN_ARG(QVariant, accepted),
+                                          Q_ARG(QVariant, QStringLiteral("file:///next.bin")),
+                                          Q_ARG(QVariant, QStringLiteral("binary"))));
+        QVERIFY(!accepted.toBool());
+        enterAddress(pane, QStringLiteral("https://example.com"));
+        QCOMPARE(pane->property("url").toUrl(), originalUrl);
+        QCOMPARE(pane->property("navigationIndex").toInt(), 1);
+        QVERIFY(controller.dirty());
+        QCOMPARE(pane->property("forcedKind").toString(), QString());
+        QCOMPARE(collect(m_region, isEditorPane).constFirst(), editor);
+        QVERIFY(pane->property("contentActive").toBool());
+    }
+
+    // The agent-facing region must propagate refusal, not acknowledge a reload
+    // which never happened.
+    QVariant reloaded;
+    QVERIFY(QMetaObject::invokeMethod(m_region, "reloadPane",
+                                      Q_RETURN_ARG(QVariant, reloaded),
+                                      Q_ARG(QVariant, QStringLiteral("viewer-1"))));
+    QVERIFY(!reloaded.toBool());
+    controller.setDirty(false);
+    QTRY_VERIFY(!pane->property("contentDirty").toBool());
+    QTRY_COMPARE(pane->property("kind").toString(), QStringLiteral("markdown"));
+    QVariant accepted;
+    QVERIFY(QMetaObject::invokeMethod(pane, "openTarget", Q_RETURN_ARG(QVariant, accepted),
+                                      Q_ARG(QVariant, QStringLiteral("file:///next.bin")),
+                                      Q_ARG(QVariant, QString())));
+    QVERIFY(accepted.toBool());
+    QTRY_COMPARE(pane->property("url").toUrl(), QUrl(QStringLiteral("file:///next.bin")));
+    QVERIFY2(warnings.isEmpty(), "dirty-editor replacement emitted QML warnings");
+}
+
+void TstPaneIdentity::supersededAddressProbesCannotNavigate()
+{
+    const QUrl initial(QStringLiteral("file:///tmp/current.bin"));
+    const QUrl newer(QStringLiteral("file:///tmp/newer.bin"));
+    QVERIFY(openRegion(QStringLiteral("ViewerRegion.qml"),
+                       leafNode(QStringLiteral("viewer-1"), initial.toString()),
+                       /*terminal=*/false));
+    QTRY_COMPARE(collect(m_region, isLeafPane).size(), 1);
+    QObject *const pane = collect(m_region, isLeafPane).constFirst();
+    const QString oldProbe = QStringLiteral("/tmp/old");
+    pane->setProperty("probePath", oldProbe);
+    QVariant accepted;
+    QVERIFY(QMetaObject::invokeMethod(pane, "openTarget", Q_RETURN_ARG(QVariant, accepted),
+                                      Q_ARG(QVariant, newer.toString()),
+                                      Q_ARG(QVariant, QString())));
+    QVERIFY(accepted.toBool());
+    QCOMPARE(pane->property("probePath").toString(), QString());
+    emit m_viewers.directoryListed(oldProbe, {});
+    emit m_viewers.directoryError(oldProbe, QStringLiteral("late failure"));
+    QCOMPARE(pane->property("url").toUrl(), newer);
+
+    // Same-URL navigation must retire the probe too: urlChanged cannot do it.
+    pane->setProperty("probePath", oldProbe);
+    QVERIFY(QMetaObject::invokeMethod(pane, "openTarget", Q_RETURN_ARG(QVariant, accepted),
+                                      Q_ARG(QVariant, newer.toString()),
+                                      Q_ARG(QVariant, QString())));
+    QVERIFY(accepted.toBool());
+    QCOMPARE(pane->property("probePath").toString(), QString());
+    emit m_viewers.directoryListed(oldProbe, {});
+    QCOMPARE(pane->property("url").toUrl(), newer);
+
+    // A direct host URL publication is another newer intent.
+    pane->setProperty("probePath", oldProbe);
+    pane->setProperty("url", initial);
+    QCOMPARE(pane->property("probePath").toString(), QString());
+    emit m_viewers.directoryError(oldProbe, QStringLiteral("late failure"));
+    QCOMPARE(pane->property("url").toUrl(), initial);
+}
+
+void TstPaneIdentity::liveTerminalDiagnosticsRemainVisibleWithoutDisconnecting()
+{
+    QObject *const pane = openInShell(
+        QStringLiteral("TerminalPaneView.qml"),
+        {{QStringLiteral("factory"), QVariant::fromValue<QObject *>(nullptr)}});
+    QVERIFY(pane);
+    QQmlComponent bridgeComponent(m_engine.get());
+    bridgeComponent.setData(R"QML(
+        import QtQuick
+        QtObject {
+            property string connectionState: "ready"
+            signal geometryChanged()
+            function notifyViewVisible(visible) {}
+        }
+    )QML", QUrl());
+    QVERIFY2(bridgeComponent.isReady(), qPrintable(bridgeComponent.errorString()));
+    std::unique_ptr<QObject> bridge(bridgeComponent.create());
+    QVERIFY(bridge);
+    pane->setProperty("bridge", QVariant::fromValue(bridge.get()));
+    pane->setProperty("attached", true);
+    pane->setProperty("pageLoaded", true);
+    pane->setProperty("statusText", QString());
+    QTRY_VERIFY(pane->property("live").toBool());
+
+    auto *banner = qobject_cast<QQuickItem *>(
+        childNamed(pane, QStringLiteral("terminalStatusBanner")));
+    QObject *const label = childNamed(pane, QStringLiteral("paneBannerLabel"));
+    QObject *const dismiss = childNamed(pane, QStringLiteral("terminalDiagnosticDismissButton"));
+    QObject *const retry = childNamed(pane, QStringLiteral("terminalRetryButton"));
+    QVERIFY(banner && label && dismiss && retry);
+    QVERIFY(!banner->isVisible());
+    const QString warning = QStringLiteral(
+        "Terminal input could not be sent completely. Part of it may have reached "
+        "the remote program. Inspect the terminal before retrying.");
+    pane->setProperty("statusText", warning);
+    QTRY_VERIFY(banner->isVisible());
+    QCOMPARE(label->property("text").toString(), warning);
+    QVERIFY(banner->height() > 22);
+    QVERIFY(dismiss->property("visible").toBool());
+    QVERIFY(!retry->property("visible").toBool());
+    QVERIFY(pane->property("live").toBool());
+    QVERIFY(QMetaObject::invokeMethod(dismiss, "clicked"));
+    QTRY_VERIFY(!banner->isVisible());
+    QVERIFY(pane->property("live").toBool());
+    QVERIFY(pane->property("attached").toBool());
+}
+
 
 void TstPaneIdentity::homeUsesTheActiveSessionRootAndDisablesWithoutOne()
 {
@@ -2727,10 +2917,17 @@ void TstPaneIdentity::aSplitPaneAttachesOnceItsRowIdArrives()
     // backed by an unconnected pool, which refuses every attach before the
     // identity path is reached at all.
     TerminalFactoryStub factory;
+    QSignalSpy warnings(m_engine.get(), &QQmlEngine::warnings);
+    QVERIFY(warnings.isValid());
     m_engine->rootContext()->setContextProperty(QStringLiteral("terminalFactory"), &factory);
-    const auto restore = qScopeGuard([this] {
+    const auto restore = qScopeGuard([this, &warnings] {
+        // Retire stub-backed panes before restoring the real factory. Otherwise
+        // onFactoryChanged offers their plain QObject controllers to the real
+        // createBridge(TerminalController*), raising a QML TypeError.
+        cleanup();
         m_engine->rootContext()->setContextProperty(QStringLiteral("terminalFactory"),
                                                     &m_terminalFactory);
+        QVERIFY2(warnings.isEmpty(), "terminal factory fixture lifecycle raised QML warnings");
     });
 
     // The Dev Session default: two stacked panes, both already bound to rows.
@@ -3457,6 +3654,26 @@ void TstPaneIdentity::theMarkdownImagePathResolverAgreesWithTheRendererBundle_da
                            << QStringLiteral("/srv/repos/app/docs/img.png");
     QTest::newRow("fragment") << doc << QStringLiteral("img.png#frag")
                               << QStringLiteral("/srv/repos/app/docs/img.png");
+    QTest::newRow("document-hash")
+        << QStringLiteral("/srv/docs#archive/guide.md") << QStringLiteral("img.png")
+        << QStringLiteral("/srv/docs#archive/img.png");
+    QTest::newRow("document-question")
+        << QStringLiteral("/srv/docs?archive/guide.md") << QStringLiteral("img.png")
+        << QStringLiteral("/srv/docs?archive/img.png");
+    QTest::newRow("encoded-space") << doc << QStringLiteral("img%20one.png")
+                                   << QStringLiteral("/srv/repos/app/docs/img one.png");
+    QTest::newRow("encoded-hash") << doc << QStringLiteral("img%23one.png")
+                                  << QStringLiteral("/srv/repos/app/docs/img#one.png");
+    QTest::newRow("encoded-question") << doc << QStringLiteral("img%3Fone.png")
+                                      << QStringLiteral("/srv/repos/app/docs/img?one.png");
+    QTest::newRow("encoded-percent") << doc << QStringLiteral("img%25one.png")
+                                     << QStringLiteral("/srv/repos/app/docs/img%one.png");
+    QTest::newRow("decode-once") << doc << QStringLiteral("img%2520one.png")
+                                 << QStringLiteral("/srv/repos/app/docs/img%20one.png");
+    QTest::newRow("encoded-parent") << doc << QStringLiteral("%2e%2e/img.png")
+                                    << QStringLiteral("/srv/repos/app/img.png");
+    QTest::newRow("malformed-escape") << doc << QStringLiteral("img%2Xone.png")
+                                      << QStringLiteral("/srv/repos/app/docs/img%2Xone.png");
 
     // A backslash is an ORDINARY CHARACTER in a POSIX remote path — not a
     // separator — on both sides, so a name containing one stays one segment.
@@ -3508,8 +3725,7 @@ void TstPaneIdentity::theMarkdownImagePathResolverAgreesWithTheRendererBundle()
         QStringLiteral("ViewerMarkdownView.qml"),
         {{QStringLiteral("markdownBundleUrl"), QString()},
          {QStringLiteral("url"),
-          documentPath.isEmpty() ? QString()
-                                 : QStringLiteral("file://") + documentPath}});
+          documentPath.isEmpty() ? QUrl() : QUrl::fromLocalFile(documentPath)}});
     QVERIFY(view);
 
     QVariant resolved;
@@ -3918,6 +4134,61 @@ void TstPaneIdentity::aTerminalPaneSaysWhenItsRemoteSessionWasSilentlyReplaced()
     QTRY_VERIFY2(!notice->property("visible").toBool(),
                  "the notice followed the pane onto a different terminal, where it is a report "
                  "about a session that terminal never had");
+}
+
+void TstPaneIdentity::narrowViewerKeepsItsAddressUsable_data()
+{
+    QTest::addColumn<int>("paneWidth");
+    QTest::addColumn<bool>("outside");
+    for (int width : {120, 220, 960}) {
+        for (bool outside : {false, true}) {
+            const QByteArray name = QByteArray::number(width) + (outside ? "-outside" : "-inside");
+            QTest::newRow(name.constData()) << width << outside;
+        }
+    }
+}
+
+void TstPaneIdentity::narrowViewerKeepsItsAddressUsable()
+{
+    QFETCH(int, paneWidth);
+    QFETCH(bool, outside);
+    QSignalSpy warnings(m_engine.get(), &QQmlEngine::warnings);
+    QVERIFY(warnings.isValid());
+    m_app.setActiveSessionRepoRoot(QStringLiteral("/srv/repos/app"));
+    QObject *const pane = openInShell(
+        QStringLiteral("ViewerPane.qml"),
+        {{QStringLiteral("url"), QUrl(QStringLiteral("file:///tmp/original.bin"))}});
+    QVERIFY(pane);
+    auto *const window = qobject_cast<QQuickWindow *>(m_shell.get());
+    auto *const paneItem = qobject_cast<QQuickItem *>(pane);
+    auto *const address = qobject_cast<QQuickItem *>(
+        childNamed(pane, QStringLiteral("viewerAddressField")));
+    auto *const navigation = qobject_cast<QQuickItem *>(
+        childNamed(pane, QStringLiteral("viewerNavigationControls")));
+    auto *const marker = qobject_cast<QQuickItem *>(
+        childNamed(pane, QStringLiteral("viewerOutsideRepoMarker")));
+    QVERIFY(window && paneItem && address && navigation && marker);
+    window->resize(paneWidth, 640);
+    QTRY_COMPARE(qRound(paneItem->width()), paneWidth);
+    pane->setProperty("repoRootState", outside ? QStringLiteral("outside")
+                                              : QStringLiteral("inside"));
+    QTRY_COMPARE(marker->isVisible(), outside);
+    QTRY_VERIFY(address->width() > 4 && address->height() > 4);
+    const QRectF fieldRect(address->mapToItem(paneItem, QPointF()), address->size());
+    const QRectF navigationRect(navigation->mapToItem(paneItem, QPointF()), navigation->size());
+    const QRectF paneRect(0, 0, paneItem->width(), paneItem->height());
+    QVERIFY(paneRect.contains(fieldRect));
+    QVERIFY(paneRect.contains(navigationRect));
+    QVERIFY(!fieldRect.intersects(navigationRect));
+    if (outside) {
+        const QRectF markerRect(marker->mapToItem(paneItem, QPointF()), marker->size());
+        QVERIFY(paneRect.contains(markerRect));
+        QVERIFY(!fieldRect.intersects(markerRect));
+    }
+    enterAddress(pane, QStringLiteral("file:///tmp/next.bin"));
+    QTRY_COMPARE(pane->property("url").toUrl(), QUrl(QStringLiteral("file:///tmp/next.bin")));
+    QVERIFY(address->hasActiveFocus());
+    QVERIFY2(warnings.isEmpty(), "responsive viewer emitted QML warnings");
 }
 
 // QTEST_MAIN cannot be used: registerUrlScheme() and QtWebEngineQuick::initialize()

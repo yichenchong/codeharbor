@@ -127,8 +127,8 @@
     },
     {
       "name": "ios-simulator",
-      "displayName": "iOS simulator (arm64)",
-      "description": "Simulator build for Apple Silicon hosts. Code signing is turned off outright: the simulator does not check it, and requiring it would make an unsigned CI machine unable to compile the client at all.",
+      "displayName": "iOS simulator (x86_64)",
+      "description": "Simulator build using the x86_64 simulator slice in the official Qt for iOS package. The package has no arm64 simulator slice. Code signing is turned off outright: the simulator does not check it, and requiring it would make an unsigned CI machine unable to compile the client at all.",
       "inherits": "ios-base",
       "cacheVariables": {
         "CMAKE_OSX_SYSROOT": "iphonesimulator",

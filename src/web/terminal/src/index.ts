@@ -889,7 +889,7 @@ export function connectTerminal(element: HTMLElement): void {
         showFatal(element, "This page requires the CodeHarbor host: no WebChannel transport.");
         return;
     }
-    new QWebChannel(qt.webChannelTransport, (channel: QWebChannelInstance) => {
+    const onChannel = (channel: QWebChannelInstance): void => {
         const bridge = channel.objects.terminal as TerminalChannelObject | undefined;
         if (!bridge) {
             connectingElements.delete(element);
@@ -943,7 +943,15 @@ export function connectTerminal(element: HTMLElement): void {
         // has been buffering output since the channel opened and replays it into
         // a renderer that is now listening (SPEC 5.4).
         bridge.ready?.();
-    });
+    };
+    try {
+        // The constructor sends the handshake immediately and can throw if the
+        // WebChannel transport has already closed.
+        new QWebChannel(qt.webChannelTransport, onChannel);
+    } catch {
+        connectingElements.delete(element);
+        showFatal(element, "This page could not reach the CodeHarbor host.");
+    }
 }
 
 // The packaged page (dist/index.html) carries no inline script — its CSP

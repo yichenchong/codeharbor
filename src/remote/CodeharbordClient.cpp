@@ -1014,6 +1014,8 @@ void CodeharbordClient::onHeartbeatTick()
     // disconnect does and what SessionBootstrap's reconnect ladder already
     // handles. onTransportClosed() stops this timer on the way through, via
     // restartHeartbeat().
+    const QPointer<QIODevice> silentTransport = m_transport;
+    const quint64 silentGeneration = m_heartbeatGeneration;
     emit protocolWarning(
         QStringLiteral("heartbeat: no response from peer for %1 consecutive "
                        "intervals of %2 ms; treating transport as dead")
@@ -1021,7 +1023,13 @@ void CodeharbordClient::onHeartbeatTick()
             .arg(m_heartbeatIntervalMs));
     if (!self)
         return; // the warning slot deleted us; there is nothing left to tear down
-    onTransportClosed();
+    // Warning handlers may reconnect or re-arm the heartbeat. This verdict
+    // belongs only to the transport and heartbeat generation measured above.
+    if (m_transport == silentTransport
+        && m_heartbeatGeneration == silentGeneration && !m_closed
+        && m_heartbeatMisses >= m_heartbeatMissTolerance) {
+        onTransportClosed();
+    }
 }
 
 bool CodeharbordClient::sendHeartbeatPing()

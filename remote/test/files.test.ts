@@ -2242,3 +2242,142 @@ test("listDirectory answers an empty directory with no entries", async () => {
 
     await fs.rm(dir, { recursive: true, force: true });
 });
+
+test("writeFile resolves a dangling link's parent symlinks before '..'", async () => {
+    const dir = await tmpDir();
+    const elsewhere = path.join(dir, "elsewhere");
+    const nested = path.join(elsewhere, "nested");
+    const link = path.join(dir, "link.txt");
+    const target = path.join(elsewhere, "target.txt");
+    await fs.mkdir(nested, { recursive: true });
+    await fs.symlink(nested, path.join(dir, "hop"));
+    await fs.symlink("hop/../target.txt", link);
+
+    try {
+        const saved = await writeFile({ path: link, content: "through", expectedRevision: "" });
+        assert.equal(await fs.readFile(target, "utf-8"), "through");
+        assert.equal(await fs.readFile(link, "utf-8"), "through");
+        assert.equal(saved.revision, (await stat({ path: target })).revision);
+        assert.equal(await fs.readlink(link), "hop/../target.txt");
+        await assert.rejects(fs.stat(path.join(dir, "target.txt")), { code: "ENOENT" });
+        assert.deepEqual((await fs.readdir(dir)).sort(), ["elsewhere", "hop", "link.txt"]);
+    } finally {
+        await fs.rm(dir, { recursive: true, force: true });
+    }
+});
+
+test("watch reports a looping symlink as deleted and observes its repair", async () => {
+    const dir = await tmpDir();
+    const file = path.join(dir, "watched.txt");
+    const replacement = path.join(dir, "replacement");
+    await fs.writeFile(file, "original");
+    const service = new FileWatchService();
+    service.pollIntervalMs = 25;
+
+    try {
+        const { subscriptionId } = await service.watch({ path: file });
+        const deleted = firstWatchEvent(service);
+        await fs.symlink(path.basename(file), replacement);
+        await fs.rename(replacement, file);
+        assert.deepEqual(await withTimeout(deleted, 5000), {
+            subscriptionId,
+            path: file,
+            event: "deleted",
+        });
+
+        const created = firstWatchEvent(service);
+        await fs.writeFile(replacement, "repaired");
+        await fs.rename(replacement, file);
+        const event = await withTimeout(created, 5000);
+        assert.equal(event.event, "created");
+        assert.equal(event.revision, (await stat({ path: file })).revision);
+    } finally {
+        service.closeAll();
+        await fs.rm(dir, { recursive: true, force: true });
+    }
+});
+
+test("file methods reject unpaired surrogate paths instead of aliasing U+FFFD", async () => {
+    const dir = await tmpDir();
+    const actual = path.join(dir, "\uFFFD.txt");
+    await fs.writeFile(actual, "unchanged");
+
+    try {
+        for (const half of ["\uD800", "\uDC00"]) {
+            const malformed = path.join(dir, `${half}.txt`);
+            for (const method of [
+                "file.stat",
+                "file.readFile",
+                "file.writeFile",
+                "file.resolvePath",
+                "file.watch",
+                "file.listDirectory",
+            ]) {
+                const error = await callFile(method, {
+                    path: malformed,
+                    content: "must not overwrite",
+                    expectedRevision: (await stat({ path: actual })).revision,
+                });
+                assert.equal(error.code, RPC_INVALID_PARAMS, `${method}: ${JSON.stringify(half)}`);
+                assert.match(error.message, /field 'path'.*unpaired surrogate/);
+            }
+            const baseError = await callFile("file.resolvePath", { path: "file", base: malformed });
+            assert.equal(baseError.code, RPC_INVALID_PARAMS);
+            assert.match(baseError.message, /field 'base'.*unpaired surrogate/);
+        }
+        assert.equal(await fs.readFile(actual, "utf-8"), "unchanged");
+        const valid = path.join(dir, "\u{1F642}.txt");
+        await writeFile({ path: valid, content: "valid pair", expectedRevision: "" });
+        assert.equal((await readFile({ path: valid })).content, "valid pair");
+    } finally {
+        await fs.rm(dir, { recursive: true, force: true });
+    }
+});
+
+test("writeFile does not turn a dangling directory-shaped link target into a file", async () => {
+    const dir = await tmpDir();
+    try {
+        for (const suffix of ["/", "/."]) {
+            const link = path.join(dir, "link");
+            await fs.symlink(`missing${suffix}`, link);
+            await assert.rejects(
+                writeFile({ path: link, content: "must not create", expectedRevision: "" }),
+                (error: unknown) =>
+                    error !== null &&
+                    typeof error === "object" &&
+                    "code" in error &&
+                    (error.code === "ENOENT" || error.code === "ENOTDIR"),
+            );
+            await assert.rejects(fs.lstat(path.join(dir, "missing")), { code: "ENOENT" });
+            assert.equal((await fs.lstat(link)).isSymbolicLink(), true);
+            assert.deepEqual(await fs.readdir(dir), ["link"]);
+            await fs.unlink(link);
+        }
+    } finally {
+        await fs.rm(dir, { recursive: true, force: true });
+    }
+});
+
+test("writeFile refuses a FIFO directly or through a symlink without replacing it", async () => {
+    const dir = await tmpDir();
+    const fifo = path.join(dir, "pipe");
+    const link = path.join(dir, "pipe-link");
+    await makeFifo(fifo);
+    await fs.symlink(path.basename(fifo), link);
+    try {
+        for (const target of [fifo, link]) {
+            const revision = (await stat({ path: target })).revision;
+            for (const expectedRevision of ["", revision]) {
+                await assert.rejects(
+                    writeFile({ path: target, content: "must not replace", expectedRevision }),
+                    { code: "EINVAL" },
+                );
+                assert.equal((await fs.lstat(fifo)).isFIFO(), true);
+                assert.equal((await fs.lstat(link)).isSymbolicLink(), true);
+                assert.deepEqual((await fs.readdir(dir)).sort(), ["pipe", "pipe-link"]);
+            }
+        }
+    } finally {
+        await fs.rm(dir, { recursive: true, force: true });
+    }
+});

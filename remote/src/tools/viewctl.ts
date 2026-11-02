@@ -42,6 +42,15 @@ export interface ParsedArgv {
     args: Record<string, unknown>;
 }
 
+const OP_OPTIONS: Record<ControlOp, readonly string[]> = {
+    list: [],
+    open: ["--url", "--pane", "--kind", "--new-pane"],
+    close: ["--pane"],
+    split: ["--orientation", "--pane"],
+    focus: ["--pane"],
+    reload: ["--pane"],
+};
+
 /**
  * Parse the argument vector after the program name. Throws a plain Error whose
  * message is the usage complaint; main() turns that into exit 2.
@@ -55,6 +64,9 @@ export function parseArgv(argv: readonly string[]): ParsedArgv {
     const args: Record<string, unknown> = {};
     for (let i = 0; i < rest.length; i += 1) {
         const flag = rest[i];
+        if (!OP_OPTIONS[op as ControlOp].includes(flag)) {
+            throw new Error(`option '${flag}' is not valid for ${op}`);
+        }
         switch (flag) {
             case "--new-pane":
                 args.newPane = true;
@@ -77,6 +89,12 @@ export function parseArgv(argv: readonly string[]): ParsedArgv {
             default:
                 throw new Error(`unknown option '${flag}'`);
         }
+    }
+    if (op === "open" && args.url === undefined) {
+        throw new Error("open requires --url");
+    }
+    if (op === "split" && args.orientation !== "horizontal" && args.orientation !== "vertical") {
+        throw new Error("split requires --orientation horizontal or vertical");
     }
     return { op: op as ControlOp, args };
 }

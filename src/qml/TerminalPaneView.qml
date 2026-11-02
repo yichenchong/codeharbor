@@ -1350,31 +1350,37 @@ Rectangle {
         }
     }
 
-    // Loaded but not live: a thin banner, so a drop or an attach failure is
-    // visible without hiding the scrollback the user still wants to read.
+    // A drop/attach failure or a live nonfatal diagnostic must remain visible
+    // without hiding the scrollback. In particular, rejected input must not be
+    // mistaken for input successfully delivered to the remote program.
     Rectangle {
         id: statusBanner
+        objectName: "terminalStatusBanner"
         anchors.left: parent.left
         anchors.right: parent.right
         anchors.top: paneHeader.bottom
         anchors.leftMargin: pane.border.width
         anchors.rightMargin: pane.border.width
-        height: 22
+        height: visible ? Math.max(26, statusLabel.implicitHeight + 12) : 0
         // #45222c / #3a2f1e are dim FILLS behind danger/warning text and have no
         // Theme role (Theme.danger and Theme.warning are the text colours, far
         // too bright to fill with).
         color: pane.connectionState === "error" ? Theme.errorSurface() : Theme.warningSurface()
-        visible: pane.pageLoaded && !pane.live
+        visible: pane.pageLoaded && (!pane.live || pane.statusText.length > 0)
+        Accessible.role: Accessible.AlertMessage
+        Accessible.name: statusLabel.text
 
-        Row {
-            anchors.left: parent.left
-            anchors.leftMargin: 8
-            anchors.verticalCenter: parent.verticalCenter
-            spacing: 8
+        Item {
+            anchors.fill: parent
+            anchors.margins: 6
 
             Label {
+                id: statusLabel
                 objectName: "paneBannerLabel"
-                anchors.verticalCenter: parent.verticalCenter
+                anchors.left: parent.left
+                anchors.right: bannerActions.left
+                anchors.rightMargin: 8
+                wrapMode: Text.WordWrap
                 // Same rule as the placeholder chrome above: never markup.
                 textFormat: Text.PlainText
                 text: pane.statusText.length > 0
@@ -1383,15 +1389,23 @@ Rectangle {
                 color: Theme.warning
                 font.pixelSize: Theme.fontSizeSmall
             }
-            // Sized and coloured to sit INSIDE a 22-pixel banner. The Basic
-            // style's default is a light plate at its own metrics, which both
-            // overflowed the banner and read as somebody else's chrome.
-            AppPaneHeader.Action {
-                objectName: "terminalRetryButton"
+            Row {
+                id: bannerActions
+                anchors.right: parent.right
                 anchors.verticalCenter: parent.verticalCenter
-                visible: pane.factory !== null && !pane.attached
-                text: qsTr("Retry")
-                onClicked: pane.reconnectNow()
+                spacing: 8
+                AppPaneHeader.Action {
+                    objectName: "terminalRetryButton"
+                    visible: pane.factory !== null && !pane.attached
+                    text: qsTr("Retry")
+                    onClicked: pane.reconnectNow()
+                }
+                AppPaneHeader.Action {
+                    objectName: "terminalDiagnosticDismissButton"
+                    visible: pane.live && pane.statusText.length > 0
+                    text: qsTr("Dismiss")
+                    onClicked: pane.statusText = ""
+                }
             }
         }
     }

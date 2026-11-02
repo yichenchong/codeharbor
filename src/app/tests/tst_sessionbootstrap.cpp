@@ -32,6 +32,7 @@
 #include <QScopeGuard>
 #include <QSignalSpy>
 #include <QStringList>
+#include <QStringView>
 #include <QTcpServer>
 #include <QTcpSocket>
 #include <QTemporaryDir>
@@ -383,6 +384,9 @@ private slots:
     // Remote command construction from attacker-influenced profile fields.
     void remoteCommandsQuoteHostileProfileFields();
     void remoteEntryPointsSupportBothReleaseAndCheckoutLayouts();
+    void bridgeExitIsNotHiddenByAStdinWatchdog();
+    void bridgeLauncherStopsItsChildOnStdinEof_data();
+    void bridgeLauncherStopsItsChildOnStdinEof();
 
     // Provisioning a bare server on first connect.
     void anExistingInstallIsLeftAlone();
@@ -414,7 +418,151 @@ private slots:
     // files: staging, the swap, and the rollback that keeps a failed update from
     // costing the user the service they had.
     void theProvisionScriptStagesTheArchiveAndRollsBackUnderARealShell();
+    void logicalRpcCloseReconnectsTheSession();
+    void synchronousDisconnectDuringWiringIsHonored_data();
+    void synchronousDisconnectDuringWiringIsHonored();
+    void synchronousChannelLossFailsWiring_data();
+    void synchronousChannelLossFailsWiring();
+    void synchronousChannelLossDuringRetryHonorsTheAttemptCap();
 };
+
+void TstSessionBootstrap::logicalRpcCloseReconnectsTheSession()
+{
+    Harness h;
+    QVERIFY(h.wire());
+    QPointer<SshChannelDevice> oldRpc = h.boot.rpcDevice();
+    QPointer<SshChannelDevice> oldAgent = h.boot.agentDevice();
+    QSignalSpy scheduleSpy(&h.boot, &SessionBootstrap::reconnectScheduled);
+    QSignalSpy errorSpy(&h.boot, &SessionBootstrap::error);
+    bool failed = false;
+    h.client.call(QStringLiteral("workspace.list"), QJsonValue(),
+                  [&](QJsonValue, std::optional<RpcError> error) {
+                      QVERIFY(error.has_value());
+                      failed = true;
+                  });
+
+    // Heartbeat expiry closes only the RPC protocol state, not the device.
+    // Exercise its real timer slot with no SSH EOF and no timing dependency.
+    h.client.enableHeartbeat(1000000, 1);
+    QVERIFY(QMetaObject::invokeMethod(&h.client, "onHeartbeatTick",
+                                     Qt::DirectConnection));
+    QVERIFY(QMetaObject::invokeMethod(&h.client, "onHeartbeatTick",
+                                     Qt::DirectConnection));
+    QVERIFY(failed);
+    QCOMPARE(h.boot.state(), State::Reconnecting);
+    QVERIFY(h.boot.rpcDevice() == nullptr);
+    QVERIFY(h.boot.agentDevice() == nullptr);
+    QVERIFY(h.client.transport() == nullptr);
+    QVERIFY(h.monitor.transport() == nullptr);
+    QCOMPARE(scheduleSpy.count(), 1);
+    QCOMPARE(errorSpy.count(), 1);
+    QVERIFY(errorSpy.at(0).at(0).toString().contains(
+        QStringLiteral("RPC transport closed")));
+    QTRY_COMPARE_WITH_TIMEOUT(h.boot.state(), State::Wired, 1000);
+    QCOMPARE(h.boot.connectCalls, 2);
+    QVERIFY(h.boot.rpcDevice() != oldRpc);
+    QVERIFY(h.boot.agentDevice() != oldAgent);
+}
+
+void TstSessionBootstrap::synchronousDisconnectDuringWiringIsHonored_data()
+{
+    QTest::addColumn<int>("phase");
+    QTest::newRow("connecting-state") << 0;
+    QTest::newRow("rpc-bound") << 1;
+    QTest::newRow("wired-state") << 2;
+    QTest::newRow("wired-signal") << 3;
+}
+
+void TstSessionBootstrap::synchronousDisconnectDuringWiringIsHonored()
+{
+    QFETCH(int, phase);
+    Harness h;
+    QSignalSpy wiredSpy(&h.boot, &SessionBootstrap::wired);
+    QSignalSpy errorSpy(&h.boot, &SessionBootstrap::error);
+    connect(&h.boot, &SessionBootstrap::stateChanged, &h.boot,
+            [&](State state) {
+                if ((phase == 0 && state == State::Connecting)
+                    || (phase == 2 && state == State::Wired)) {
+                    h.boot.disconnectSession();
+                }
+            });
+    connect(&h.client, &CodeharbordClient::transportBound, &h.boot, [&] {
+        if (phase == 1)
+            h.boot.disconnectSession();
+    });
+    connect(&h.boot, &SessionBootstrap::wired, &h.boot, [&] {
+        if (phase == 3)
+            h.boot.disconnectSession();
+    });
+
+    QVERIFY(!h.wire());
+    QCOMPARE(h.boot.state(), State::Disconnected);
+    QVERIFY(!h.boot.reconnectPending());
+    QVERIFY(h.boot.rpcDevice() == nullptr);
+    QVERIFY(h.boot.agentDevice() == nullptr);
+    QVERIFY(h.client.transport() == nullptr);
+    QVERIFY(h.monitor.transport() == nullptr);
+    QCOMPARE(h.boot.connectCalls, phase == 0 ? 0 : 1);
+    QCOMPARE(wiredSpy.count(), phase == 3 ? 1 : 0);
+    QCOMPARE(errorSpy.count(), 0);
+}
+
+void TstSessionBootstrap::synchronousChannelLossFailsWiring_data()
+{
+    QTest::addColumn<int>("phase");
+    QTest::newRow("rpc-bound-logical-close") << 0;
+    QTest::newRow("wired-state-rpc-eof") << 1;
+    QTest::newRow("wired-signal-agent-eof") << 2;
+}
+
+void TstSessionBootstrap::synchronousChannelLossFailsWiring()
+{
+    QFETCH(int, phase);
+    Harness h;
+    QSignalSpy wiredSpy(&h.boot, &SessionBootstrap::wired);
+    QSignalSpy errorSpy(&h.boot, &SessionBootstrap::error);
+    connect(&h.client, &CodeharbordClient::transportBound, &h.boot, [&] {
+        if (phase == 0) {
+            QVERIFY(QMetaObject::invokeMethod(&h.client, "onTransportClosed",
+                                             Qt::DirectConnection));
+        }
+    });
+    connect(&h.boot, &SessionBootstrap::stateChanged, &h.boot,
+            [&](State state) {
+                if (phase == 1 && state == State::Wired)
+                    h.boot.rpcChannel()->dropRemote();
+            });
+    connect(&h.boot, &SessionBootstrap::wired, &h.boot, [&] {
+        if (phase == 2)
+            static_cast<FakeChannel*>(h.boot.agentDevice())->dropRemote();
+    });
+
+    QVERIFY(!h.wire());
+    QCOMPARE(h.boot.state(), State::Failed);
+    QVERIFY(!h.boot.reconnectPending());
+    QVERIFY(h.boot.rpcDevice() == nullptr);
+    QVERIFY(h.boot.agentDevice() == nullptr);
+    QVERIFY(h.client.transport() == nullptr);
+    QVERIFY(h.monitor.transport() == nullptr);
+    QCOMPARE(wiredSpy.count(), phase == 2 ? 1 : 0);
+    QCOMPARE(errorSpy.count(), 1);
+}
+
+void TstSessionBootstrap::synchronousChannelLossDuringRetryHonorsTheAttemptCap()
+{
+    Harness h;
+    QVERIFY(h.wire());
+    h.boot.setMaxReconnectAttempts(1);
+    connect(&h.boot, &SessionBootstrap::wired, &h.boot, [&] {
+        h.boot.rpcChannel()->dropRemote();
+    });
+    h.boot.rpcChannel()->dropRemote();
+    QTRY_COMPARE_WITH_TIMEOUT(h.boot.state(), State::Failed, 1000);
+    QCOMPARE(h.boot.connectCalls, 2);
+    QCOMPARE(h.boot.reconnectAttempt(), 1);
+    QVERIFY(!h.boot.reconnectPending());
+    QVERIFY(h.client.transport() == nullptr);
+}
 
 // A cold wire walks Disconnected -> Connecting -> Wired exactly once and hands
 // both transports over.
@@ -1634,13 +1782,11 @@ void TstSessionBootstrap::remoteEntryPointsSupportBothReleaseAndCheckoutLayouts(
 
     // Run one command exactly as the remote login shell would — no rewriting.
     // `node` is the argv echo, so the entry the shell SELECTED is observable.
-    const auto choose = [&root, &shell](const QString& command, bool waitForOutput = false) {
+    const auto choose = [&root, &shell](const QString& command) {
         QProcess sh;
         sh.setWorkingDirectory(root);
         sh.start(shell, {QStringLiteral("-c"), command});
-        if (waitForOutput)
-            sh.waitForReadyRead(15000);
-        sh.closeWriteChannel();  // releases bridgeCommand's `cat` watchdog
+        sh.closeWriteChannel();
         sh.waitForFinished(15000);
         return QStringList{QString::fromUtf8(sh.readAllStandardOutput()),
                            QString::fromUtf8(sh.readAllStandardError())};
@@ -1662,8 +1808,8 @@ void TstSessionBootstrap::remoteEntryPointsSupportBothReleaseAndCheckoutLayouts(
     QCOMPARE(choose(SessionBootstrap::rpcCommand(node, root)).at(0),
              QStringLiteral("[%1][rpc][--stdio]").arg(src));
 
-    // (3) That checkout, built: dist wins over src. It is what package.json bin
-    // points at, and it drops the node >= 23.6 requirement.
+    // (3) That checkout, built: dist wins over src. Both layouts still need
+    // Node >= 23.6 because the runtime imports node:sqlite.
     const QString built = place(QStringLiteral("remote/dist/codeharbord.js"));
     QCOMPARE(choose(SessionBootstrap::rpcCommand(node, root)).at(0),
              QStringLiteral("[%1][rpc][--stdio]").arg(built));
@@ -1675,9 +1821,106 @@ void TstSessionBootstrap::remoteEntryPointsSupportBothReleaseAndCheckoutLayouts(
              QStringLiteral("[%1][rpc][--stdio]").arg(release));
 
     const QString bridge = place(QStringLiteral("dist/bridge.js"));
-    // The bridge resolves through the same ladder and keeps its stdin watchdog.
-    QCOMPARE(choose(SessionBootstrap::bridgeCommand(node, root), true).at(0),
-             QStringLiteral("[%1]").arg(bridge));
+    // The launcher receives the selected bridge entry as its final argument.
+    const QString bridgeArgs =
+        choose(SessionBootstrap::bridgeCommand(node, root)).at(0);
+    QVERIFY(bridgeArgs.startsWith(QStringLiteral("[-e]")));
+    QVERIFY(bridgeArgs.endsWith(QStringLiteral("[%1]").arg(bridge)));
+}
+
+void TstSessionBootstrap::bridgeExitIsNotHiddenByAStdinWatchdog()
+{
+#ifdef Q_OS_WIN
+    QSKIP("the remote bridge launch command targets a POSIX server");
+#else
+    const QString shell = QStandardPaths::findExecutable(QStringLiteral("sh"));
+    const QString node = QStandardPaths::findExecutable(QStringLiteral("node"));
+    if (shell.isEmpty() || node.isEmpty())
+        QSKIP("a POSIX sh and Node are needed to exercise the bridge launcher");
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QString entry = dir.filePath(QStringLiteral("dist/bridge.js"));
+    QVERIFY(QDir().mkpath(QFileInfo(entry).absolutePath()));
+    QFile file(entry);
+    QVERIFY(file.open(QIODevice::WriteOnly));
+    const QByteArray childScript("process.exit(23);\n");
+    QCOMPARE(file.write(childScript), qint64(childScript.size()));
+    file.close();
+    QProcess bridge;
+    bridge.start(shell,
+                 {QStringLiteral("-c"),
+                  SessionBootstrap::bridgeCommand(node, dir.path())});
+    QVERIFY(bridge.waitForStarted(5000));
+    // Intentionally keep the SSH-like stdin pipe OPEN. The old cat watchdog
+    // waited on it forever after its bridge child had already exited.
+    const bool finished = bridge.waitForFinished(5000);
+    if (!finished) {
+        bridge.closeWriteChannel();
+        if (!bridge.waitForFinished(5000)) {
+            bridge.kill();
+            bridge.waitForFinished(5000);
+        }
+    }
+    QVERIFY2(finished, "an exited bridge was hidden behind its stdin watchdog");
+    QCOMPARE(bridge.exitStatus(), QProcess::NormalExit);
+    QCOMPARE(bridge.exitCode(), 23);
+#endif
+}
+
+void TstSessionBootstrap::bridgeLauncherStopsItsChildOnStdinEof_data()
+{
+    QTest::addColumn<bool>("ignoreTerm");
+    QTest::newRow("cooperative-bridge") << false;
+    QTest::newRow("wedged-bridge") << true;
+}
+
+void TstSessionBootstrap::bridgeLauncherStopsItsChildOnStdinEof()
+{
+#ifdef Q_OS_WIN
+    QSKIP("the remote bridge launch command targets a POSIX server");
+#else
+    QFETCH(bool, ignoreTerm);
+    const QString shell = QStandardPaths::findExecutable(QStringLiteral("sh"));
+    const QString node = QStandardPaths::findExecutable(QStringLiteral("node"));
+    if (shell.isEmpty() || node.isEmpty())
+        QSKIP("a POSIX sh and Node are needed to exercise the bridge launcher");
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QString entry = dir.filePath(QStringLiteral("dist/bridge.js"));
+    QVERIFY(QDir().mkpath(QFileInfo(entry).absolutePath()));
+    QFile file(entry);
+    QVERIFY(file.open(QIODevice::WriteOnly));
+    // This child intentionally has no stdin handler or new CLI option: it
+    // models both the current bridge and a failed-update fallback release.
+    // Its own deadline prevents an old broken launcher leaking a test child.
+    const QByteArray childScript =
+        QByteArray("const fs = require('node:fs'); "
+                   "process.on('SIGTERM', () => { "
+                   "fs.writeFileSync(__filename + '.stopped', 'stopped'); ")
+        + (ignoreTerm ? QByteArray() : QByteArray("process.exit(0); "))
+        + QByteArray("}); setTimeout(() => process.exit(99), 10000); "
+                     "process.stdout.write('READY\\n');");
+    QCOMPARE(file.write(childScript), qint64(childScript.size()));
+    file.close();
+    QProcess bridge;
+    bridge.start(shell,
+                 {QStringLiteral("-c"),
+                  SessionBootstrap::bridgeCommand(node, dir.path())});
+    QVERIFY(bridge.waitForStarted(5000));
+    QVERIFY2(bridge.waitForReadyRead(5000),
+             qPrintable(QString::fromUtf8(bridge.readAllStandardError())));
+    QVERIFY(bridge.readAllStandardOutput().contains("READY"));
+    bridge.closeWriteChannel();
+    const bool finished = bridge.waitForFinished(8000);
+    if (!finished) {
+        bridge.kill();
+        bridge.waitForFinished(5000);
+    }
+    QVERIFY2(finished, "SSH stdin EOF left the bridge launcher running");
+    QCOMPARE(bridge.exitStatus(), QProcess::NormalExit);
+    QCOMPARE(bridge.exitCode(), ignoreTerm ? 137 : 0);
+    QVERIFY(QFileInfo::exists(entry + QStringLiteral(".stopped")));
+#endif
 }
 
 // ---------------------------------------------------------------------------
@@ -2097,11 +2340,12 @@ void TstSessionBootstrap::provisioningStaysInsideTheChosenDirectory()
             ++exempt;
             continue;
         }
-        const QString before = script.mid(at - revoke.size() - 2, revoke.size() + 2);
-        QVERIFY2(before == revoke + QStringLiteral("; "),
+        const QStringView before = QStringView(script).first(at);
+        QVERIFY2(before.endsWith(revoke + QStringLiteral("; "))
+                     || before.endsWith(revoke + QStringLiteral(" || return 1; ")),
                  qPrintable(QStringLiteral("a scratch cleanup is not preceded by "
                                            "revoking the sentinel; found \"%1\"")
-                                .arg(before)));
+                                .arg(before.last(revoke.size() + 14).toString())));
         ++guarded;
     }
     // ch_undo's tail and the commit point. A drop to one means a cleanup lost its
@@ -2518,7 +2762,7 @@ void TstSessionBootstrap::theProvisionScriptStagesTheArchiveAndRollsBackUnderARe
         QProcess probe;
         probe.start(shell,
                     {QStringLiteral("-c"),
-                     QStringLiteral("for c in rm mv cp tar printf; do command -v "
+                     QStringLiteral("for c in rm mv cp tar printf mkdir ln flock mkfifo; do command -v "
                                     "\"$c\" >/dev/null 2>&1 || exit 1; done; "
                                     "echo TOOLCHAIN_OK")});
         if (!probe.waitForFinished(30000)
@@ -2606,6 +2850,10 @@ void TstSessionBootstrap::theProvisionScriptStagesTheArchiveAndRollsBackUnderARe
     const QString notARelease =
         pack(QStringLiteral("junk"), {QStringLiteral("package.json")});
     QVERIFY2(!notARelease.isEmpty(), "could not pack the non-release fixture archive");
+    const QString noBridge =
+        pack(QStringLiteral("no-bridge"),
+             {QStringLiteral("dist/codeharbord.js"), QStringLiteral("package.json")});
+    QVERIFY2(!noBridge.isEmpty(), "could not pack the daemon-only fixture archive");
 
     // (1) A bare server. The entry point lands where entryCandidates() looks and
     // the marker records what was installed.
@@ -2667,6 +2915,41 @@ void TstSessionBootstrap::theProvisionScriptStagesTheArchiveAndRollsBackUnderARe
              QStringLiteral("old manifest"));
     QCOMPARE(slurp(marker),
              QStringLiteral("https://example.invalid/v8/codeharbor-remote.tar.gz\n"));
+
+    const Run daemonOnly = install(SessionBootstrap::remoteProvisionScript(
+        root, noBridge, QStringLiteral("curl")));
+    QVERIFY2(daemonOnly.code != 0, qPrintable(daemonOnly.out));
+    QVERIFY2(daemonOnly.err.contains(QStringLiteral("holds no bridge entry point")),
+             qPrintable(daemonOnly.err));
+    QCOMPARE(slurp(root + QStringLiteral("/dist/codeharbord.js")),
+             QStringLiteral("old daemon"));
+    QCOMPARE(slurp(root + QStringLiteral("/dist/bridge.js")),
+             QStringLiteral("release dist/bridge.js"));
+
+    const QStringList unsafeNames{
+        QStringLiteral(".codeharbor-provision/unexpected"),
+        QStringLiteral(".codeharbor-provision.lock"),
+        QStringLiteral(".codeharbor-release"),
+        QStringLiteral("dist\nnotes.txt")};
+    for (qsizetype i = 0; i < unsafeNames.size(); ++i) {
+        const QString unsafe = pack(
+            QStringLiteral("unsafe-%1").arg(i),
+            {QStringLiteral("dist/codeharbord.js"), QStringLiteral("dist/bridge.js"),
+             unsafeNames.at(i)});
+        QVERIFY2(!unsafe.isEmpty(), "could not pack the unsafe-name fixture archive");
+        const Run rejected = install(SessionBootstrap::remoteProvisionScript(
+            root, unsafe, QStringLiteral("curl")));
+        QVERIFY2(rejected.code != 0, qPrintable(rejected.out));
+        QVERIFY2(rejected.err.contains(
+                     QStringLiteral("reserved or unjournalable top-level name")),
+                 qPrintable(rejected.err));
+        QCOMPARE(slurp(root + QStringLiteral("/dist/codeharbord.js")),
+                 QStringLiteral("old daemon"));
+        QCOMPARE(slurp(root + QStringLiteral("/notes.txt")), QStringLiteral("mine"));
+        QCOMPARE(slurp(marker),
+                 QStringLiteral("https://example.invalid/v8/codeharbor-remote.tar.gz\n"));
+        QVERIFY(!QFileInfo::exists(scratch));
+    }
 
     // (5) The marker is part of what is rolled back, in both directions. A
     // failed install over a hand-unpacked tree must not leave a marker claiming
@@ -2794,6 +3077,262 @@ void TstSessionBootstrap::theProvisionScriptStagesTheArchiveAndRollsBackUnderARe
              QStringLiteral("release sql/schema.sql"));
     QCOMPARE(slurp(root + QStringLiteral("/notes.txt")), QStringLiteral("mine"));
     QCOMPARE(slurp(marker), release + QLatin1Char('\n'));
+
+    // (10) Recovery itself can fail after restoring an earlier member. The
+    // second recovery must not mistake that restored member for a new file
+    // introduced by the failed install and delete it.
+    put(root + QStringLiteral("/dist/codeharbord.js"), QStringLiteral("half-new daemon"));
+    put(root + QStringLiteral("/sql/schema.sql"), QStringLiteral("half-new schema"));
+    put(scratch + QStringLiteral("/backup/dist/codeharbord.js"),
+        QStringLiteral("old daemon"));
+    put(scratch + QStringLiteral("/backup/sql/schema.sql"), QStringLiteral("old schema"));
+    put(scratch + QStringLiteral("/plan"), QStringLiteral("dist\nsql\n"));
+    put(scratch + QStringLiteral("/ready"), QString());
+    put(scratch + QStringLiteral("/release.prev"), release + QLatin1Char('\n'));
+    const QString retryScript = SessionBootstrap::remoteProvisionScript(
+        root, dir.filePath(QStringLiteral("gone.tar.gz")), QStringLiteral("curl"));
+    const Run failedRecovery = install(
+        QStringLiteral("mv() { case \"$1\" in */backup/sql) return 1;; esac; "
+                       "command mv \"$@\"; }; ")
+        + retryScript);
+    QVERIFY2(failedRecovery.code != 0, qPrintable(failedRecovery.out));
+    QCOMPARE(slurp(root + QStringLiteral("/dist/codeharbord.js")),
+             QStringLiteral("old daemon"));
+    QCOMPARE(slurp(scratch + QStringLiteral("/backup/sql/schema.sql")),
+             QStringLiteral("old schema"));
+    QVERIFY(QFileInfo::exists(scratch + QStringLiteral("/ready")));
+    const Run retriedRecovery = install(retryScript);
+    QVERIFY2(retriedRecovery.code != 0, qPrintable(retriedRecovery.out));
+    QCOMPARE(slurp(root + QStringLiteral("/dist/codeharbord.js")),
+             QStringLiteral("old daemon"));
+    QCOMPARE(slurp(root + QStringLiteral("/sql/schema.sql")),
+             QStringLiteral("old schema"));
+    QVERIFY(!QFileInfo::exists(scratch));
+
+    // (11) A failed removal must not let mv nest the old directory inside
+    // the still-present replacement and consume its sole backup.
+    put(root + QStringLiteral("/dist/codeharbord.js"), QStringLiteral("half-new daemon"));
+    put(scratch + QStringLiteral("/backup/dist/codeharbord.js"),
+        QStringLiteral("old daemon"));
+    put(scratch + QStringLiteral("/plan"), QStringLiteral("dist\n"));
+    put(scratch + QStringLiteral("/ready"), QString());
+    put(scratch + QStringLiteral("/release.prev"), release + QLatin1Char('\n'));
+    const Run blockedRemoval = install(
+        QStringLiteral("rm() { case \"$2\" in */dist) return 1;; esac; "
+                       "command rm \"$@\"; }; ")
+        + retryScript);
+    QVERIFY2(blockedRemoval.code != 0, qPrintable(blockedRemoval.out));
+    QCOMPARE(slurp(root + QStringLiteral("/dist/codeharbord.js")),
+             QStringLiteral("half-new daemon"));
+    QCOMPARE(slurp(scratch + QStringLiteral("/backup/dist/codeharbord.js")),
+             QStringLiteral("old daemon"));
+    const Run afterBlockedRemoval = install(retryScript);
+    QVERIFY(afterBlockedRemoval.code != 0);
+    QCOMPARE(slurp(root + QStringLiteral("/dist/codeharbord.js")),
+             QStringLiteral("old daemon"));
+
+    // (12) A relative symlink can become dangling when displaced into backup.
+    // It is still the user's old member and must be restored, not discarded.
+    put(root + QStringLiteral("/manifests/previous.json"), QStringLiteral("old manifest"));
+    put(root + QStringLiteral("/package.json"), QStringLiteral("new manifest"));
+    QVERIFY(QDir().mkpath(scratch + QStringLiteral("/backup")));
+    QCOMPARE(QProcess::execute(
+                 QStringLiteral("ln"),
+                 {QStringLiteral("-s"), QStringLiteral("manifests/previous.json"),
+                  scratch + QStringLiteral("/backup/package.json")}),
+             0);
+    QVERIFY(QFileInfo(scratch + QStringLiteral("/backup/package.json")).isSymLink());
+    QVERIFY(!QFileInfo::exists(scratch + QStringLiteral("/backup/package.json")));
+    put(scratch + QStringLiteral("/plan"), QStringLiteral("package.json\n"));
+    put(scratch + QStringLiteral("/ready"), QString());
+    put(scratch + QStringLiteral("/release.prev"), release + QLatin1Char('\n'));
+    const Run symlinkRecovery = install(retryScript);
+    QVERIFY2(symlinkRecovery.code != 0, qPrintable(symlinkRecovery.out));
+    QVERIFY(QFileInfo(root + QStringLiteral("/package.json")).isSymLink());
+    QCOMPARE(slurp(root + QStringLiteral("/package.json")), QStringLiteral("old manifest"));
+    QVERIFY(!QFileInfo::exists(scratch));
+
+    // The forward swap must also preserve a dangling old member in backup.
+    // A relative dist link becomes dangling there until restored at repoRoot.
+    QVERIFY(QDir(root + QStringLiteral("/dist")).removeRecursively());
+    put(root + QStringLiteral("/previous/codeharbord.js"), QStringLiteral("linked daemon"));
+    QCOMPARE(QProcess::execute(
+                 QStringLiteral("ln"),
+                 {QStringLiteral("-s"), QStringLiteral("previous"),
+                  root + QStringLiteral("/dist")}),
+             0);
+    const QString failAfterSwap = SessionBootstrap::remoteProvisionScript(
+        root, release, QStringLiteral("curl"));
+    // Make the final marker write fail after all members have been swapped.
+    // The shell function affects printf only at this exact destination.
+    const QString oldMarker = release + QLatin1Char('\n');
+    const Run linkRollback = install(
+        QStringLiteral("printf() { case \"$2\" in *.tar.gz) return 1;; esac; "
+                       "command printf \"$@\"; }; ")
+        + failAfterSwap);
+    QVERIFY2(linkRollback.code != 0, qPrintable(linkRollback.out));
+    QVERIFY(QFileInfo(root + QStringLiteral("/dist")).isSymLink());
+    QCOMPARE(slurp(root + QStringLiteral("/dist/codeharbord.js")),
+             QStringLiteral("linked daemon"));
+    QCOMPARE(slurp(marker), oldMarker);
+
+    // (13) A live owner's journal is not an interrupted transaction. Hold the
+    // first installer at a real rename boundary while a second targets the
+    // same root; the second must refuse without recovering or deleting it.
+    const QString concurrentRoot = dir.filePath(QStringLiteral("concurrent-root"));
+    const QString concurrentScratch =
+        concurrentRoot + QStringLiteral("/.codeharbor-provision");
+    const QString concurrentRelease = pack(
+        QStringLiteral("concurrent"),
+        {QStringLiteral("dist/codeharbord.js"), QStringLiteral("dist/bridge.js"),
+         QStringLiteral("extras/keep.txt")});
+    QVERIFY(!concurrentRelease.isEmpty());
+    put(concurrentRoot + QStringLiteral("/dist/codeharbord.js"),
+        QStringLiteral("original daemon"));
+    put(concurrentRoot + QStringLiteral("/dist/bridge.js"),
+        QStringLiteral("original bridge"));
+    put(concurrentRoot + QStringLiteral("/extras/keep.txt"),
+        QStringLiteral("original asset"));
+    put(concurrentRoot + QStringLiteral("/notes.txt"), QStringLiteral("mine"));
+    put(SessionBootstrap::releaseMarkerPath(concurrentRoot),
+        QStringLiteral("original release\n"));
+    // Preserve the process's original stdin on FD 3: the swap's while loop
+    // redirects FD 0 to the journal. Pause only the live extras displacement,
+    // not the following stage/extras promotion (or a backup restoration).
+    const QString pauseBeforeExtras = QStringLiteral(
+        "exec 3<&0; mv() { case \"$1\" in */.codeharbor-provision/*) ;; */extras) "
+        "printf 'INSTALLER_PAUSED\\n'; IFS= read -r __gate <&3;; esac; "
+        "command mv \"$@\"; }; ");
+    const QString concurrentScript = SessionBootstrap::remoteProvisionScript(
+        concurrentRoot, concurrentRelease, QStringLiteral("curl"));
+    const auto awaitBarrier = [](QProcess& process) {
+        QByteArray output;
+        QElapsedTimer budget;
+        budget.start();
+        while (!output.contains("INSTALLER_PAUSED\n") && budget.elapsed() < 5000) {
+            process.waitForReadyRead(qMax(1, 5000 - int(budget.elapsed())));
+            output += process.readAllStandardOutput();
+            if (process.state() == QProcess::NotRunning)
+                break;
+        }
+        return output.contains("INSTALLER_PAUSED\n");
+    };
+    QProcess owner;
+    const auto stopOwner = qScopeGuard([&owner] {
+        if (owner.state() != QProcess::NotRunning) {
+            owner.closeWriteChannel();
+            if (!owner.waitForFinished(5000)) {
+                owner.kill();
+                owner.waitForFinished(5000);
+            }
+        }
+    });
+    owner.start(shell, {QStringLiteral("-c"), pauseBeforeExtras + concurrentScript});
+    QVERIFY(owner.waitForStarted(5000));
+    QVERIFY2(awaitBarrier(owner),
+             qPrintable(QString::fromUtf8(owner.readAllStandardError())));
+    const Run contender = install(SessionBootstrap::remoteProvisionScript(
+        concurrentRoot, release, QStringLiteral("curl")));
+    QVERIFY2(contender.code != 0, qPrintable(contender.out));
+    QVERIFY2(contender.err.contains(QStringLiteral("another installer")),
+             qPrintable(contender.err));
+    QCOMPARE(slurp(concurrentScratch + QStringLiteral("/backup/dist/codeharbord.js")),
+             QStringLiteral("original daemon"));
+    QCOMPARE(slurp(concurrentScratch + QStringLiteral("/stage/extras/keep.txt")),
+             QStringLiteral("concurrent extras/keep.txt"));
+    QCOMPARE(slurp(concurrentRoot + QStringLiteral("/extras/keep.txt")),
+             QStringLiteral("original asset"));
+    QVERIFY(QFileInfo::exists(concurrentScratch + QStringLiteral("/ready")));
+    QCOMPARE(owner.write("\n"), qint64(1));
+    owner.closeWriteChannel(); // flush the release byte, then close the gate
+    QVERIFY(owner.waitForFinished(5000));
+    QCOMPARE(owner.exitCode(), 0);
+    QCOMPARE(slurp(concurrentRoot + QStringLiteral("/extras/keep.txt")),
+             QStringLiteral("concurrent extras/keep.txt"));
+    QCOMPARE(slurp(concurrentRoot + QStringLiteral("/notes.txt")), QStringLiteral("mine"));
+    QVERIFY(!QFileInfo::exists(concurrentScratch));
+
+    // (14) A hard kill cannot run a trap. Kernel-owned serialization must still
+    // release ownership so the next process can recover the existing journal.
+    owner.start(shell, {QStringLiteral("-c"), pauseBeforeExtras + concurrentScript});
+    QVERIFY(owner.waitForStarted(5000));
+    QVERIFY(awaitBarrier(owner));
+    owner.kill();
+    QVERIFY(owner.waitForFinished(5000));
+    const Run afterKilledOwner = install(SessionBootstrap::remoteProvisionScript(
+        concurrentRoot, dir.filePath(QStringLiteral("gone.tar.gz")),
+        QStringLiteral("curl")));
+    QVERIFY(afterKilledOwner.code != 0);
+    QVERIFY2(afterKilledOwner.err.contains(QStringLiteral("an earlier install was "
+                                                         "interrupted")),
+             qPrintable(afterKilledOwner.err));
+    QVERIFY2(!afterKilledOwner.err.contains(QStringLiteral("another installer")),
+             qPrintable(afterKilledOwner.err));
+    QCOMPARE(slurp(concurrentRoot + QStringLiteral("/dist/codeharbord.js")),
+             QStringLiteral("concurrent dist/codeharbord.js"));
+    QCOMPARE(slurp(concurrentRoot + QStringLiteral("/extras/keep.txt")),
+             QStringLiteral("concurrent extras/keep.txt"));
+    QCOMPARE(slurp(concurrentRoot + QStringLiteral("/notes.txt")), QStringLiteral("mine"));
+    QCOMPARE(slurp(SessionBootstrap::releaseMarkerPath(concurrentRoot)),
+             concurrentRelease + QLatin1Char('\n'));
+    QVERIFY(!QFileInfo::exists(concurrentScratch));
+    QVERIFY(QFileInfo::exists(
+        concurrentRoot + QStringLiteral("/.codeharbor-provision.lock")));
+
+    // (15) A server without flock must fail closed before changing anything.
+    // Already-installed services remain available for the existing fallback.
+    const Run missingFlock = install(QStringLiteral("PATH=/nonexistent; ")
+                                     + concurrentScript);
+    QVERIFY(missingFlock.code != 0);
+    QVERIFY2(missingFlock.err.contains(QStringLiteral("flock is required")),
+             qPrintable(missingFlock.err));
+    QCOMPARE(slurp(concurrentRoot + QStringLiteral("/dist/codeharbord.js")),
+             QStringLiteral("concurrent dist/codeharbord.js"));
+    QCOMPARE(slurp(concurrentRoot + QStringLiteral("/extras/keep.txt")),
+             QStringLiteral("concurrent extras/keep.txt"));
+    QCOMPARE(slurp(concurrentRoot + QStringLiteral("/notes.txt")), QStringLiteral("mine"));
+    QCOMPARE(slurp(SessionBootstrap::releaseMarkerPath(concurrentRoot)),
+             concurrentRelease + QLatin1Char('\n'));
+    QVERIFY(!QFileInfo::exists(concurrentScratch));
+
+    // (16) Never follow a pre-existing lock symlink or block opening a FIFO.
+    const QString unsafeRoot = dir.filePath(QStringLiteral("unsafe-lock-root"));
+    const QString unsafeLock =
+        unsafeRoot + QStringLiteral("/.codeharbor-provision.lock");
+    put(unsafeRoot + QStringLiteral("/dist/codeharbord.js"),
+        QStringLiteral("untouched daemon"));
+    put(unsafeRoot + QStringLiteral("/notes.txt"), QStringLiteral("mine"));
+    for (const bool fifo : {false, true}) {
+        if (fifo) {
+            QCOMPARE(QProcess::execute(QStringLiteral("mkfifo"), {unsafeLock}), 0);
+        } else {
+            QCOMPARE(QProcess::execute(
+                         QStringLiteral("ln"),
+                         {QStringLiteral("-s"), QStringLiteral("notes.txt"), unsafeLock}),
+                     0);
+        }
+        QProcess unsafe;
+        unsafe.start(shell,
+                     {QStringLiteral("-c"),
+                      SessionBootstrap::remoteProvisionScript(
+                          unsafeRoot, release, QStringLiteral("curl"))});
+        const bool finished = unsafe.waitForFinished(5000);
+        if (!finished) {
+            unsafe.kill();
+            unsafe.waitForFinished(5000);
+        }
+        QVERIFY2(finished, "opening a special lock file blocked the installer");
+        QVERIFY(unsafe.exitCode() != 0);
+        const QString diagnostic = QString::fromUtf8(unsafe.readAllStandardError());
+        QVERIFY2(diagnostic.contains(QStringLiteral("unsafe installation lock")),
+                 qPrintable(diagnostic));
+        QCOMPARE(slurp(unsafeRoot + QStringLiteral("/dist/codeharbord.js")),
+                 QStringLiteral("untouched daemon"));
+        QCOMPARE(slurp(unsafeRoot + QStringLiteral("/notes.txt")), QStringLiteral("mine"));
+        QVERIFY(!QFileInfo::exists(
+            unsafeRoot + QStringLiteral("/.codeharbor-provision")));
+        QVERIFY(QFile::remove(unsafeLock));
+    }
 #endif
 }
 

@@ -267,6 +267,8 @@ private slots:
     // References that are not what they claim.
     void refusesADirectoryReference();
     void registerReferenceRepairsAnUnusableName();
+    void registerReferenceDoesNotShadowASavedKey();
+    void registerReferenceSuffixFitsAMaximumLengthName();
     void registerReferenceRefusesAnEmptyReference();
     void refusesAReferenceWhoseFileStoppedBeingAKey();
 
@@ -928,6 +930,45 @@ void TestMobileKeyStore::registerReferenceRepairsAnUnusableName()
     QCOMPARE(store.referenceNames(), QStringList{name});
     QCOMPARE(store.referenceFor(name), m_userKeyPath);
     QCOMPARE(store.keyFingerprint(name), QString::fromLatin1(kPlainFingerprint));
+}
+
+void TestMobileKeyStore::registerReferenceDoesNotShadowASavedKey()
+{
+    QTemporaryDir appData;
+    QVERIFY(appData.isValid());
+    {
+        MobileKeyStore store(appData.path());
+        QVERIFY(store.importKeyFromText(QStringLiteral("kept"),
+                                       QString::fromLatin1(kPlainKey)));
+        QVERIFY2(store.saveKeyOnDevice(QStringLiteral("kept")),
+                 qPrintable(store.lastError()));
+    }
+
+    MobileKeyStore reopened(appData.path());
+    QVERIFY(reopened.keyNames().isEmpty());
+    const QString adopted =
+        reopened.registerReference(m_userKeyPath, QStringLiteral("kept"));
+    QCOMPARE(adopted, QStringLiteral("kept-2"));
+    QCOMPARE(reopened.allKeyNames(),
+             (QStringList{QStringLiteral("kept-2"), QStringLiteral("kept")}));
+    QVERIFY(reopened.referenceFor(QStringLiteral("kept")).isEmpty());
+    QVERIFY(reopened.removeKey(adopted));
+    QVERIFY(reopened.isSavedOnDevice(QStringLiteral("kept")));
+    QVERIFY(QFile::exists(savedKeyPath(appData.path(), QStringLiteral("kept"))));
+    QCOMPARE(reopened.keyFingerprint(QStringLiteral("kept")),
+             QString::fromLatin1(kPlainFingerprint));
+}
+
+void TestMobileKeyStore::registerReferenceSuffixFitsAMaximumLengthName()
+{
+    MobileKeyStore store(root());
+    const QString name(64, QLatin1Char('k'));
+    QVERIFY(store.importKeyFromText(name, QString::fromLatin1(kPlainKey)));
+    const QString adopted = store.registerReference(m_userKeyPath, name);
+    QCOMPARE(adopted, name.left(62) + QStringLiteral("-2"));
+    QVERIFY(MobileKeyStore::isUsableKeyName(adopted));
+    QCOMPARE(store.referenceFor(adopted), m_userKeyPath);
+    QCOMPARE(store.keyNames(), QStringList{name});
 }
 
 void TestMobileKeyStore::registerReferenceRefusesAnEmptyReference()

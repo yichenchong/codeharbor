@@ -22,16 +22,12 @@ set -euo pipefail
 # an unrelated `VERSION` elsewhere in the file can never be picked up. No pipe:
 # `set -o pipefail` plus a `head` that closes early is a SIGPIPE waiting to
 # happen.
-version=$(sed -n '/^project(CodeHarbor/,/)/ s/^[[:space:]]*VERSION[[:space:]]\{1,\}\([0-9][0-9.]*\).*$/\1/p' CMakeLists.txt)
-version=${version%%$'\n'*}
-case "$version" in
-  [0-9]*.[0-9]*.[0-9]*) ;;
-  *)
-    echo "could not parse the project() VERSION out of CMakeLists.txt (got '$version');" >&2
-    echo "the release refuses to name its artifacts after a guess." >&2
-    exit 1
-    ;;
-esac
+version=$(sed -n '/^project(CodeHarbor/,/)/ s/^[[:space:]]*VERSION[[:space:]]\{1,\}\([^[:space:])]*\).*$/\1/p' CMakeLists.txt)
+if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+  echo "could not parse the project() VERSION out of CMakeLists.txt (got '$version');" >&2
+  echo "the release refuses to name its artifacts after a guess." >&2
+  exit 1
+fi
 echo "Release version (from CMakeLists.txt): $version" >&2
 echo "$version"
 if [ -n "${GITHUB_ENV:-}" ]; then

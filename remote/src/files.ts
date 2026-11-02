@@ -537,61 +537,69 @@ function assertRevisionMatches(filePath: string, expectedRevision: string, curre
 // lock (flock is non-portable and unavailable via fs/promises) to fence it out.
 const writeLocks = new Map<string, Promise<void>>();
 
-// Follow a symbolic-link chain by hand and return the path it ENDS at — the
-// node an ordinary open(..., O_CREAT) through `p` would create or truncate.
+// Resolve links component by component, including links in parent directories.
+// realpath cannot resolve a dangling chain, and normalizing its text with
+// path.resolve first is wrong: in `hop/../file`, a symlink named `hop` must be
+// followed BEFORE `..` is evaluated. Otherwise a create can write an unrelated
+// file beside the link instead of the file the kernel would open.
 //
-// fsp.realpath cannot do this: it fails with ENOENT the moment a component of
-// the chain is missing, and a DANGLING link is exactly the case that matters
-// here. Because the status check below follows links, a link whose target does
-// not exist reads as "no file at this path", so the atomic save took its create
-// path and renamed a fresh regular file OVER THE LINK — silently destroying a
-// symlink the user made, where a plain create through that same path would have
-// created the link's TARGET. Resolving the chain first makes the save write
-// through the link, matching open()'s semantics and leaving the link intact.
-//
-// The depth cap mirrors the kernel's own (Linux SYMLOOP_MAX is 40). A link cycle
-// (`ln -s a b; ln -s b a`) would otherwise spin this loop forever inside an RPC
-// handler; hitting the cap reports ELOOP, the same errno the kernel produces.
+// The depth cap mirrors the kernel's own (Linux SYMLOOP_MAX is 40), counting
+// links in parent directories as well as the final component.
 const MAX_SYMLINK_DEPTH = 40;
 
 async function resolveLinkChain(p: string): Promise<string> {
-    let current = p;
-    for (let depth = 0; depth <= MAX_SYMLINK_DEPTH; depth += 1) {
+    try {
+        return await fsp.realpath(p);
+    } catch (err) {
+        if (!err || typeof err !== "object" || !("code" in err) || err.code !== "ENOENT") {
+            throw err;
+        }
+    }
+    let current = path.isAbsolute(p) ? path.parse(p).root : process.cwd();
+    let pending = p.split(path.sep);
+    let depth = 0;
+    const lastComponent = pending.at(-1);
+    let directoryTarget =
+        lastComponent === "" || lastComponent === "." || lastComponent === "..";
+    while (pending.length > 0) {
+        const component = pending.shift()!;
+        if (component === "" || component === ".") continue;
+        if (component === "..") {
+            current = path.dirname(current);
+            continue;
+        }
+        const candidate = path.join(current, component);
         let link: string;
         try {
-            link = await fsp.readlink(current);
-        } catch {
-            // Not a symlink (EINVAL), or nothing at this path at all (ENOENT):
-            // either way this is the end of the chain and the node to write.
-            return current;
+            link = await fsp.readlink(candidate);
+        } catch (err) {
+            if (
+                !err ||
+                typeof err !== "object" ||
+                !("code" in err) ||
+                (err.code !== "EINVAL" && err.code !== "ENOENT")
+            ) {
+                throw err;
+            }
+            // A regular component, or a directory/file the create will bring
+            // into being. Real errors (EACCES, ENOTDIR, EIO) must not be hidden.
+            current = candidate;
+            continue;
         }
-        // A link's body is relative to the directory HOLDING the link, not to
-        // the process cwd.
-        current = path.resolve(path.dirname(current), link);
-    }
-    throw Object.assign(new Error(`Too many levels of symbolic links: ${p}`), {
-        code: "ELOOP",
-    });
-}
-
-async function resolveWriteKey(p: string): Promise<string> {
-    // Key on the node the write will actually touch. That is where the symlink
-    // chain ends, because writeFileLocked writes THROUGH a link — so a write
-    // addressed to a link and a write addressed to its target serialize against
-    // each other instead of racing under two different keys.
-    const end = await resolveLinkChain(p).catch(() => p);
-    try {
-        return await fsp.realpath(end);
-    } catch {
-        // Create-only (file absent) or a missing component: key on the real
-        // directory + basename so concurrent creates of the same new path still
-        // serialize; fall back to a lexically resolved path if even that fails.
-        try {
-            return path.join(await fsp.realpath(path.dirname(end)), path.basename(end));
-        } catch {
-            return path.resolve(end);
+        if (++depth > MAX_SYMLINK_DEPTH) {
+            throw Object.assign(new Error(`Too many levels of symbolic links: ${p}`), {
+                code: "ELOOP",
+            });
         }
+        const components = link.split(path.sep);
+        if (pending.length === 0) {
+            const last = components.at(-1);
+            if (last === "" || last === "." || last === "..") directoryTarget = true;
+        }
+        if (path.isAbsolute(link)) current = path.parse(link).root;
+        pending = components.concat(pending);
     }
+    return directoryTarget ? current + path.sep : current;
 }
 
 async function withWriteLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
@@ -606,7 +614,8 @@ async function withWriteLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
 }
 
 export async function writeFile(params: WriteFileParams): Promise<WriteFileResult> {
-    const key = await resolveWriteKey(params.path);
+    // Canonicalize even absent targets so a link and its target share one lock.
+    const key = await resolveLinkChain(params.path);
     return withWriteLock(key, () => writeFileLocked(params));
 }
 
@@ -691,6 +700,15 @@ async function writeFileLocked(params: WriteFileParams): Promise<WriteFileResult
         throw Object.assign(
             new Error(`EISDIR: illegal operation on a directory, write '${params.path}'`),
             { code: "EISDIR" },
+        );
+    }
+    // Like readFile, saves only accept regular files. Renaming a temp file over
+    // a FIFO, socket or device silently destroys that node rather than writing
+    // its contents, potentially disconnecting another process's live endpoint.
+    if (existing && !existing.isFile()) {
+        throw Object.assign(
+            new Error(`EINVAL: not a regular file, write '${params.path}'`),
+            { code: "EINVAL" },
         );
     }
 
@@ -984,9 +1002,9 @@ export class FileWatchService {
         this.subscriptions.set(id, sub);
         let existing: Stats | undefined;
         try {
-            existing = await statOrUndefined(params.path);
+            existing = await statLinkTarget(params.path);
         } catch (err) {
-            // An unreadable path (EACCES, ELOOP) must not leave the reservation
+            // An unreadable path (EACCES, EIO) must not leave the reservation
             // behind: the caller gets the error and no subscription exists.
             this.subscriptions.delete(id);
             throw err;
@@ -1111,7 +1129,9 @@ export class FileWatchService {
     }
 
     private async diffAndEmit(sub: Subscription): Promise<void> {
-        const stats = await statOrUndefined(sub.path);
+        // A looping link has no readable target, just like a dangling one.
+        // Treat it as absent so a formerly live file cannot remain stale forever.
+        const stats = await statLinkTarget(sub.path);
         // The subscription may have been unwatched while we awaited stat above;
         // emitting now would deliver an event for a released subscription.
         if (sub.closed || !this.subscriptions.has(sub.id)) return;
@@ -1301,7 +1321,7 @@ const FILE_ENCODINGS = ["utf-8", "base64"] as const;
 // writeFile keeps (`mode & 0o7777`).
 const MAX_FILE_MODE = 0o7777;
 
-// A path field, rejected for an embedded NUL.
+// Reject path text that cannot name the exact bytes the client supplied.
 //
 // A filesystem path is a NUL-terminated byte string, so no name can contain
 // one. Node enforces that deep inside fs with a TypeError
@@ -1311,11 +1331,18 @@ const MAX_FILE_MODE = 0o7777;
 // it answered a NUL-bearing path with a perfectly ordinary-looking result that
 // then failed at every later use. Catch it here, where the answer is -32602
 // and names the field.
+// An unpaired UTF-16 surrogate is equally invalid: Node silently encodes it as
+// U+FFFD, redirecting a read or save onto a different, perfectly valid filename.
 function requirePath(obj: Record<string, unknown>, field: string, method: string): string {
     const value = requireString(obj, field, method);
     if (value.includes("\0")) {
         throw new InvalidParamsError(
             `${method}: field '${field}' must not contain a NUL character`,
+        );
+    }
+    if (UNPAIRED_SURROGATE.test(value)) {
+        throw new InvalidParamsError(
+            `${method}: field '${field}' must not contain an unpaired surrogate code unit`,
         );
     }
     return value;
@@ -1358,12 +1385,7 @@ function resolvePathParams(params: unknown, method: string): ResolvePathParams {
     const result: ResolvePathParams = { path: requirePath(obj, "path", method) };
     const base = optionalString(obj, "base", method);
     if (typeof base === "string") {
-        if (base.includes("\0")) {
-            throw new InvalidParamsError(
-                `${method}: field 'base' must not contain a NUL character`,
-            );
-        }
-        result.base = base;
+        result.base = requirePath(obj, "base", method);
     }
     return result;
 }

@@ -49,6 +49,7 @@ export const MAX_MCP_LINE_BYTES = 1024 * 1024;
 // contract: this is a DIFFERENT protocol that happens to share an envelope, and
 // coupling the two would invite a future change to one to silently alter the
 // other.
+const MCP_PARSE_ERROR = -32700;
 const MCP_INVALID_REQUEST = -32600;
 const MCP_METHOD_NOT_FOUND = -32601;
 const MCP_INVALID_PARAMS = -32602;
@@ -176,6 +177,33 @@ function toolByName(name: unknown): ToolSpec | undefined {
     return TOOLS.find((tool) => tool.name === name);
 }
 
+// The catalog uses flat object schemas. Validate against that same catalog,
+// rather than silently treating malformed arguments as an empty object: for
+// viewer_close that would close the focused pane instead of refusing the call.
+function invalidToolArguments(tool: ToolSpec, args: unknown): string | null {
+    if (typeof args !== "object" || args === null || Array.isArray(args)) {
+        return "Tool arguments must be an object";
+    }
+    const values = args as Record<string, unknown>;
+    const properties = tool.inputSchema.properties as Record<
+        string,
+        { type: string; enum?: readonly unknown[] }
+    >;
+    const required = (tool.inputSchema.required ?? []) as readonly string[];
+    for (const name of required) {
+        if (!Object.hasOwn(values, name)) return `Missing tool argument: ${name}`;
+    }
+    for (const [name, value] of Object.entries(values)) {
+        if (!Object.hasOwn(properties, name)) return `Unknown tool argument: ${name}`;
+        const property = properties[name];
+        if (typeof value !== property.type) return `Invalid tool argument: ${name}`;
+        if (property.enum && !property.enum.includes(value)) {
+            return `Invalid tool argument: ${name}`;
+        }
+    }
+    return null;
+}
+
 /** A tool result carrying text. `isError` is how MCP reports a failed call. */
 function textResult(text: string, isError: boolean): Record<string, unknown> {
     return { content: [{ type: "text", text }], isError };
@@ -211,12 +239,25 @@ export async function handleMessage(
         return failure(null, MCP_INVALID_REQUEST, "Invalid Request");
     }
     const message = value as Record<string, unknown>;
-    if (message.jsonrpc !== "2.0" || typeof message.method !== "string") {
+    if (
+        message.jsonrpc !== "2.0" ||
+        typeof message.method !== "string" ||
+        (message.id !== undefined &&
+            message.id !== null &&
+            typeof message.id !== "string" &&
+            !(typeof message.id === "number" && Number.isFinite(message.id)))
+    ) {
         return failure(null, MCP_INVALID_REQUEST, "Invalid Request");
     }
     const id =
         typeof message.id === "string" || typeof message.id === "number" ? message.id : null;
     const isNotification = message.id === undefined;
+    if (
+        message.params !== undefined &&
+        (typeof message.params !== "object" || message.params === null)
+    ) {
+        return isNotification ? null : failure(id, MCP_INVALID_PARAMS, "Invalid params");
+    }
 
     switch (message.method) {
         case "initialize":
@@ -265,12 +306,9 @@ export async function handleMessage(
             if (!tool) {
                 return failure(id, MCP_INVALID_PARAMS, `Unknown tool: ${String(params.name)}`);
             }
-            const args =
-                typeof params.arguments === "object" &&
-                params.arguments !== null &&
-                !Array.isArray(params.arguments)
-                    ? (params.arguments as Record<string, unknown>)
-                    : {};
+            const args = params.arguments === undefined ? {} : params.arguments;
+            const argumentError = invalidToolArguments(tool, args);
+            if (argumentError) return failure(id, MCP_INVALID_PARAMS, argumentError);
             if (!readCoordinates(env)) {
                 return success(id, textResult(MISSING_COORDINATES_MESSAGE, true));
             }
@@ -278,7 +316,7 @@ export async function handleMessage(
             // isError — that is the MCP contract, and it is what lets the model
             // read the reason and try something else instead of seeing its tool
             // provider error out.
-            const response = await sendControlRequest(tool.op, args, env);
+            const response = await sendControlRequest(tool.op, args as Record<string, unknown>, env);
             if (response.ok) {
                 return success(id, textResult(JSON.stringify(response.data ?? {}), false));
             }
@@ -307,7 +345,7 @@ export async function handleLine(
     try {
         decoded = JSON.parse(line);
     } catch {
-        return failure(null, MCP_INVALID_REQUEST, "Parse error");
+        return failure(null, MCP_PARSE_ERROR, "Parse error");
     }
     try {
         return await handleMessage(decoded, env);
@@ -346,9 +384,12 @@ export function runStdio(): void {
     // round trip was still outstanding, so the tool calls silently produced
     // nothing at all.
     let inFlight = 0;
+    let pendingWrites = 0;
     let inputClosed = false;
     const finishIfDone = (): void => {
-        if (inputClosed && inFlight === 0) process.exit(process.exitCode ?? 0);
+        if (inputClosed && inFlight === 0 && pendingWrites === 0) {
+            process.exit(process.exitCode ?? 0);
+        }
     };
     const feed = createLineFramer(
         (line) => {
@@ -358,9 +399,14 @@ export function runStdio(): void {
                     inFlight -= 1;
                     if (response) {
                         try {
-                            process.stdout.write(`${JSON.stringify(response)}\n`);
+                            pendingWrites += 1;
+                            process.stdout.write(`${JSON.stringify(response)}\n`, () => {
+                                pendingWrites -= 1;
+                                finishIfDone();
+                            });
                         } catch {
                             // The peer is gone; nothing left to answer.
+                            pendingWrites -= 1;
                         }
                     }
                     finishIfDone();

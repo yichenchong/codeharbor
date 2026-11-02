@@ -36,9 +36,10 @@ class SshChannelDevice;
 // channel and exec the codeharbor-bridge relay -> monitor->setTransport().
 // Any failure emits error() and returns false, leaving nothing half-wired.
 //
-// Reconnect (SPEC 5.6): once wired, an EOF on either channel or a pool-level
-// fault means the remote session is gone. Both devices are torn down and a
-// retry is scheduled on the project's standard backoff ladder — 1, 2, 5, 10,
+// Reconnect (SPEC 5.6): once wired, an EOF on either channel, a logical RPC
+// transport close (including heartbeat expiry), or a pool-level fault means
+// the remote session is gone. Both devices are torn down and a retry is
+// scheduled on the project's standard backoff ladder — 1, 2, 5, 10,
 // 30 then 60 seconds — until the attempt cap is reached. See
 // reconnectDelaySeconds().
 class SessionBootstrap : public QObject {
@@ -322,14 +323,18 @@ public:
                                        const QString& repoRoot);
 
     // POSIX sh that fetches `artifactUrl`, unpacks it into a STAGING directory
-    // under `repoRoot`, proves a codeharbord entry point exists in the staged
-    // tree, and only then moves each top-level member into place — keeping what
-    // it displaces, so any failure from the fetch onwards (including a killed
+    // under `repoRoot`, proves both daemon and bridge entry points exist, and
+    // rejects reserved/newline-containing top-level names before swapping.
+    // Each displaced member is retained so a failed install (including a killed
     // channel: the rollback is a trap on EXIT/HUP/INT/TERM/PIPE) puts the
     // previous installation and its release marker back. The marker is written
     // last and only on success. `fetcher` is the RemoteInspection::fetcher
     // value. Every scratch file lives under `repoRoot`, so provisioning never
     // writes outside the directory the user chose.
+    // Installs/updates require flock and refuse a busy installation lock.
+    // Kernel ownership covers recovery too and disappears after the final
+    // process holding it exits. The persistent .codeharbor-provision.lock file
+    // must not be removed; using an existing service needs no flock.
     //
     // Unpacking straight over the live installation was the original design,
     // and it is what turned a failed update into a lost workspace: a truncated
@@ -352,9 +357,9 @@ public:
     // escape hatch for an air-gapped or curl-less server.
     static QString stagedArtifactPath(const QString& url);
 
-    // remote/package.json: "engines": { "node": ">=23.6" }. The remote service
-    // is run straight from TypeScript by Node's native type stripping, which
-    // 23.6 is the first release to provide.
+    // remote/package.json: "engines": { "node": ">=23.6" }. Native type
+    // stripping supports source checkouts; the node:sqlite dependency also
+    // imposes the runtime floor on compiled JavaScript installations.
     static constexpr int kMinimumRemoteNodeMajor = 23;
     static constexpr int kMinimumRemoteNodeMinor = 6;
 
@@ -389,9 +394,9 @@ signals:
     // reporting that it had started correctly.
     //
     // A channel that really died reaches the user through the paths that can
-    // actually tell: startExec() failing during wiring (fail()), and EOF on a
-    // live channel (handleConnectionLost()). stderr on its own proves nothing —
-    // which is exactly why readChannelFinished(), not this, drives reconnect.
+    // actually tell: startExec() failing during wiring (fail()), and EOF or a
+    // logical RPC close (handleConnectionLost()). stderr on its own proves
+    // nothing and never drives reconnect.
     void channelDiagnostic(const QString& role, const QString& text);
     // Progress of a provisioning install, one line per step ("fetching ...",
     // "unpacking ...", "installed ..."). NOT a failure: this is what stops a
@@ -572,6 +577,9 @@ private:
     // Set while we are inside our own connect/teardown, so the pool and device
     // signals those steps provoke are not mistaken for a fresh loss.
     bool m_attempting = false;
+    // A channel can close synchronously while its transport is being bound or
+    // wired() is being delivered. Fail that setup instead of dropping the loss.
+    QString m_attemptLoss;
     // Whether the attempt m_attempting refers to is a rung of the reconnect
     // ladder rather than a connectAndWire() the user asked for. Only a rung may
     // be abandoned by setReconnectEnabled(false); see there.

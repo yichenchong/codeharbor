@@ -87,6 +87,8 @@ private slots:
     void nestedRoutesRestoreTheOuterRouteWhenTheInnerGoes();
     void concurrentRoutesOnTwoThreadsNeverSeeEachOthersLines();
     void releasingARouteFromTheWrongThreadStopsItRoutingAnyway();
+    void wrongThreadReleaseWaitsForAnInFlightSink();
+    void aSinkCanReleaseItsOwnRouteDuringDispatch();
     void wrongThreadReleaseIsRepairedBeforeNextRoute();
     void aLogLineAfterAWrongThreadReleaseRestoresTheThreadState();
     void routeOutlivingOwnerThreadIsStillWrongThread();
@@ -529,6 +531,84 @@ void TstSshLogRouter::releasingARouteFromTheWrongThreadStopsItRoutingAnyway()
     // No double decrement from the owning thread's later release(), and that
     // thread's libssh state went back with its own last route.
     QCOMPARE(SshLogRouter::activeRouteCount(), 0);
+}
+
+void TstSshLogRouter::wrongThreadReleaseWaitsForAnInFlightSink()
+{
+    QSemaphore entered;
+    QSemaphore leave;
+    QSemaphore releaseStarted;
+    QSemaphore releaseFinished;
+    QSemaphore ownerMayExit;
+    std::unique_ptr<SshLogRouter::Route> route;
+    bool sinkFinished = false;
+
+    QThread* const owner = QThread::create([&] {
+        route = std::make_unique<SshLogRouter::Route>(
+            [&](int, const char*, const char*) {
+                entered.release();
+                leave.acquire();
+                sinkFinished = true;
+            });
+        emitLibsshLine(QStringLiteral("blocked-sink"));
+        ownerMayExit.acquire();
+    });
+    owner->start();
+    entered.acquire();
+
+    QTest::ignoreMessage(
+        QtWarningMsg,
+        QRegularExpression(QStringLiteral(
+            "route taken on another thread was released")));
+    QThread* const releaser = QThread::create([&] {
+        releaseStarted.release();
+        route->release();
+        releaseFinished.release();
+    });
+    releaser->start();
+    releaseStarted.acquire();
+    const bool returnedWhileSinkBlocked = releaseFinished.tryAcquire(1, 250);
+    leave.release();
+    const bool releaseCompleted = releaser->wait(60000);
+    ownerMayExit.release();
+    const bool ownerCompleted = owner->wait(60000);
+    delete releaser;
+    delete owner;
+    route.reset();
+
+    QVERIFY(releaseCompleted);
+    QVERIFY(ownerCompleted);
+    QVERIFY2(!returnedWhileSinkBlocked,
+             "release() returned while a sink still used its captured owner");
+    QVERIFY(sinkFinished);
+    QCOMPARE(SshLogRouter::activeRouteCount(), 0);
+}
+
+void TstSshLogRouter::aSinkCanReleaseItsOwnRouteDuringDispatch()
+{
+    QStringList outerLines;
+    SshLogRouter::Route outer(
+        [&](int, const char*, const char* buffer) {
+            outerLines << QString::fromUtf8(buffer ? buffer : "");
+        });
+    std::unique_ptr<SshLogRouter::Route> inner;
+    int innerCalls = 0;
+    inner = std::make_unique<SshLogRouter::Route>(
+        [&](int, const char*, const char*) {
+            ++innerCalls;
+            inner.reset();
+            // Releasing the inner route cannot deadlock its own invocation,
+            // and nested diagnostics must now belong to the outer route.
+            emitLibsshLine(QStringLiteral("after-self-release"));
+        });
+
+    emitLibsshLine(QStringLiteral("inner"));
+
+    QCOMPARE(innerCalls, 1);
+    QVERIFY(!inner);
+    QCOMPARE(outerLines.size(), 1);
+    QVERIFY(outerLines.constFirst().contains(QStringLiteral("after-self-release")));
+    QCOMPARE(SshLogRouter::activeRouteCount(), 1);
 }
 
 void TstSshLogRouter::wrongThreadReleaseIsRepairedBeforeNextRoute()

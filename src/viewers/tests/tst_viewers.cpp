@@ -18,16 +18,22 @@
 #include <QList>
 #include <QLocalServer>
 #include <QLocalSocket>
+#include <QPointer>
+#include <QQmlComponent>
+#include <QQmlContext>
+#include <QQmlEngine>
 #include <QRegularExpression>
 #include <QSet>
 #include <QString>
 #include <QStringList>
 #include <QUrl>
 #include <QWebEngineUrlScheme>
+#include <QWebEngineUrlRequestJob>
 #include <QtTest/QtTest>
 #include <QtWebEngineQuick/QtWebEngineQuick>
 
 #include <optional>
+#include <memory>
 
 using ch::CodeharbordClient;
 using ch::InternalUrlMap;
@@ -147,6 +153,19 @@ QJsonObject readResult(const QString &path, const QString &content,
                        {QStringLiteral("truncated"), truncated}};
 }
 
+// Observe the real Chromium-owned job so cancellation is deterministic rather
+// than a sleep followed by a guessed callback order.
+class ObservedSchemeHandler : public InternalUrlSchemeHandler {
+public:
+    using InternalUrlSchemeHandler::InternalUrlSchemeHandler;
+    void requestStarted(QWebEngineUrlRequestJob *job) override
+    {
+        pendingJob = job;
+        InternalUrlSchemeHandler::requestStarted(job);
+    }
+    QPointer<QWebEngineUrlRequestJob> pendingJob;
+};
+
 } // namespace
 
 // Unit tests for the viewer handler registry (SPEC 7.5), the file <-> internal
@@ -196,6 +215,8 @@ private slots:
     void refusalMessagesExplainThemselves();
     void internalRequestFailuresReachQml();
     void viewerModelRecoversAfterInjectedProfilesDestroyed();
+    void cancelledInternalRequestDoesNotReportALateFailure_data();
+    void cancelledInternalRequestDoesNotReportALateFailure();
 };
 
 void TstViewers::resolveByExtensionTable()
@@ -1728,6 +1749,63 @@ void TstViewers::viewerModelRecoversAfterInjectedProfilesDestroyed()
     delete profiles;
     QVERIFY(viewers.externalProfile() != nullptr);
     QVERIFY(viewers.internalProfile() != nullptr);
+}
+
+void TstViewers::cancelledInternalRequestDoesNotReportALateFailure_data()
+{
+    QTest::addColumn<bool>("rpcError");
+    QTest::newRow("rpc-error") << true;
+    QTest::newRow("malformed-reply") << false;
+}
+
+void TstViewers::cancelledInternalRequestDoesNotReportALateFailure()
+{
+    QFETCH(bool, rpcError);
+    RpcPair pair;
+    QVERIFY(pair.listen());
+    InternalUrlMap map;
+    ObservedSchemeHandler handler(pair.client(), &map);
+    QQuickWebEngineProfile profile(QString{});
+    profile.installUrlSchemeHandler(QByteArrayLiteral("codeharbor-internal"),
+                                    &handler);
+    QSignalSpy failures(&handler, &InternalUrlSchemeHandler::requestFailed);
+    QQmlEngine engine;
+    engine.rootContext()->setContextProperty(QStringLiteral("probeProfile"),
+                                             &profile);
+    engine.rootContext()->setContextProperty(
+        QStringLiteral("probeUrl"),
+        QUrl(map.internalUrlFor(QUrl(QStringLiteral("file:///cancelled.txt")))));
+    QQmlComponent component(&engine);
+    component.setData(R"QML(
+import QtQuick
+import QtQuick.Window
+import QtWebEngine
+Window {
+    width: 100
+    height: 100
+    visible: true
+    WebEngineView {
+        anchors.fill: parent
+        profile: probeProfile
+        url: probeUrl
+    }
+}
+)QML", QUrl());
+    std::unique_ptr<QObject> window(component.create());
+    QVERIFY2(window, qPrintable(component.errorString()));
+    const QJsonObject request = pair.nextRequest(15000);
+    QCOMPARE(request.value(QStringLiteral("method")).toString(),
+             QString::fromLatin1(ch::rpc::kMethodReadFile));
+    QVERIFY(handler.pendingJob);
+    window.reset();
+    QTRY_VERIFY(handler.pendingJob.isNull());
+    if (rpcError)
+        pair.respondError(request, -32002, QStringLiteral("late read failure"));
+    else
+        pair.respondResult(request, QJsonObject{});
+    // Pump through the RPC completion after the browser's cancellation.
+    QVERIFY(pair.nextRequest(100).isEmpty());
+    QCOMPARE(failures.count(), 0);
 }
 
 int main(int argc, char *argv[])

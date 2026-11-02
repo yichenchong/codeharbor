@@ -1660,6 +1660,43 @@ test("resolveTerminalPane creates a slot's row once and answers with it for ever
     await cleanup(dbPath);
 });
 
+test("resolving an unbound terminal does not reuse another pane's adopted target", () => {
+    const ws = openWorkspace(":memory:");
+    try {
+        const group = ws.createGroup({ serverId: SERVER, name: "G" });
+        const session = ws.createSession({
+            serverId: SERVER, groupId: group.id, name: "S", repositoryRoot: "/r",
+        });
+        const otherSession = ws.createSession({
+            serverId: SERVER, groupId: group.id, name: "Other", repositoryRoot: "/r",
+        });
+        for (const mode of ["id", "name"] as const) {
+            const pane = ws.createTerminalPane({
+                serverId: SERVER, devSessionId: session.id, name: mode,
+            });
+            ws.updateTerminalPane({ id: pane.id, tmuxTarget: null });
+            const holder = ws.createTerminalPane({
+                serverId: SERVER,
+                devSessionId: otherSession.id,
+                name: mode,
+                tmuxTarget: pane.tmuxTarget,
+            });
+            const params = {
+                serverId: SERVER, devSessionId: session.id, [mode]: pane[mode],
+            };
+            const healed = ws.resolveTerminalPane(params);
+            assert.equal(healed.id, pane.id);
+            assert.match(healed.tmuxTarget ?? "", /^ch_[0-9a-f-]{36}$/);
+            assert.notEqual(healed.tmuxTarget, holder.tmuxTarget);
+            assert.equal(ws.getTerminalPane(holder.id).tmuxTarget, holder.tmuxTarget);
+            assert.deepEqual(ws.resolveTerminalPane(params), healed);
+        }
+        assert.equal(ws.list(SERVER)[0].sessions[0].terminalPanes.length, 2);
+    } finally {
+        ws.close();
+    }
+});
+
 // THE regression this whole scheme exists to remove, at the storage layer.
 // Closing a terminal pane deliberately leaves its row and its remote tmux
 // session alive, so the slot LABEL it wore is free in the layout while the old
@@ -1801,6 +1838,77 @@ test("the v3 migration de-duplicates slot names, and v4 drops the index again", 
     upgraded.close();
 
     await cleanup(dbPath);
+});
+
+test("the v3 migration reserves later panes' targets and legacy labels", async () => {
+    const dbPath = await tmpDbPath();
+    const legacy = openWorkspace(dbPath);
+    const group = legacy.createGroup({ serverId: SERVER, name: "G" });
+    const session = legacy.createSession({
+        serverId: SERVER, groupId: group.id, name: "S", repositoryRoot: "/r",
+    });
+    const panes = ["a", "b", "c"].map((name) =>
+        legacy.createTerminalPane({ serverId: SERVER, devSessionId: session.id, name }),
+    );
+    downgradeToV2(legacy);
+    const reservedTarget = `ch_${session.id}_${panes[1].id}`;
+    const reservedName = `terminal-1-dup-${panes[1].id.slice(0, 8)}`;
+    const set = legacy.db.prepare("UPDATE terminal_panes SET tmux_target = ?, name = ? WHERE id = ?");
+    set.run("ch_shared", "terminal-1", panes[0].id);
+    set.run("ch_shared", "terminal-1", panes[1].id);
+    set.run(reservedTarget, reservedName, panes[2].id);
+    legacy.close();
+
+    const upgraded = openWorkspace(dbPath);
+    try {
+        assert.equal(upgraded.getTerminalPane(panes[0].id).tmuxTarget, "ch_shared");
+        assert.equal(upgraded.getTerminalPane(panes[1].id).tmuxTarget, null);
+        assert.equal(upgraded.getTerminalPane(panes[1].id).name, `${reservedName}-2`);
+        assert.equal(upgraded.getTerminalPane(panes[2].id).tmuxTarget, reservedTarget);
+        assert.equal(upgraded.getTerminalPane(panes[2].id).name, reservedName);
+        assert.equal(upgraded.resolveTerminalPane({
+            serverId: SERVER, devSessionId: session.id, name: reservedName,
+        }).id, panes[2].id);
+        const healed = upgraded.resolveTerminalPane({
+            serverId: SERVER, devSessionId: session.id, id: panes[1].id,
+        });
+        assert.notEqual(healed.tmuxTarget, reservedTarget);
+        assert.notEqual(healed.tmuxTarget, "ch_shared");
+        assert.equal(upgraded.list(SERVER)[0].sessions[0].terminalPanes.length, 3);
+    } finally {
+        upgraded.close();
+        await cleanup(dbPath);
+    }
+});
+
+test("the v3 migration keeps legacy label tuples distinct across sessions", async () => {
+    const dbPath = await tmpDbPath();
+    const legacy = openWorkspace(dbPath);
+    const group = legacy.createGroup({ serverId: SERVER, name: "G" });
+    const insertSession = legacy.db.prepare(
+        "INSERT INTO dev_sessions (id, server_id, group_id, name, repository_root, created_at, updated_at) VALUES (?, ?, ?, 'S', '/r', 1, 1)",
+    );
+    insertSession.run("legacy/a", SERVER, group.id);
+    insertSession.run("legacy", SERVER, group.id);
+    const first = legacy.createTerminalPane({
+        serverId: SERVER, devSessionId: "legacy/a", name: "b",
+    });
+    const second = legacy.createTerminalPane({
+        serverId: SERVER, devSessionId: "legacy", name: "a/b",
+    });
+    downgradeToV2(legacy);
+    legacy.close();
+    const upgraded = openWorkspace(dbPath);
+    try {
+        assert.equal(upgraded.getTerminalPane(first.id).name, "b");
+        assert.equal(upgraded.getTerminalPane(second.id).name, "a/b");
+        assert.equal(upgraded.resolveTerminalPane({
+            serverId: SERVER, devSessionId: "legacy", name: "a/b",
+        }).id, second.id);
+    } finally {
+        upgraded.close();
+        await cleanup(dbPath);
+    }
 });
 
 // A v3 database in the shape v4 has to REBUILD: the address rule arrived as a
@@ -3904,6 +4012,45 @@ test("RW13: removing one pane of a three-way split renormalizes the survivors", 
 
     ws.close();
     await cleanup(dbPath);
+});
+
+test("pane deletion keeps extreme surviving layout ratios positive and finite", () => {
+    const ws = openWorkspace(":memory:");
+    try {
+        const { session } = seed(ws);
+        for (const ratios of [
+            [1, Number.MIN_VALUE, Number.MAX_VALUE],
+            [1, Number.MAX_VALUE, Number.MAX_VALUE],
+            [1, Number.MIN_VALUE, Number.MIN_VALUE],
+        ]) {
+            const panes = ["a", "b", "c"].map((url) => ws.createViewerPane({
+                serverId: SERVER, devSessionId: session.id, url,
+            }));
+            ws.setLayout({
+                serverId: SERVER,
+                devSessionId: session.id,
+                region: "viewer",
+                tree: {
+                    type: "split",
+                    orientation: "horizontal",
+                    ratios,
+                    children: panes.map((pane) => ({ type: "leaf", paneId: pane.id })),
+                },
+            });
+            ws.deleteViewerPane({ id: panes[0].id });
+            const tree = ws.getLayout({ devSessionId: session.id, region: "viewer" })?.tree as {
+                ratios: number[];
+                children: Array<{ paneId: string }>;
+            };
+            assert.deepEqual(tree.children.map((child) => child.paneId), panes.slice(1).map((pane) => pane.id));
+            assert.equal(tree.ratios.length, 2);
+            assert.equal(tree.ratios.every((ratio) => Number.isFinite(ratio) && ratio > 0), true);
+            assert.equal(tree.ratios.reduce((a, b) => a + b, 0), 1);
+            if (ratios[1] === ratios[2]) assert.deepEqual(tree.ratios, [0.5, 0.5]);
+        }
+    } finally {
+        ws.close();
+    }
 });
 
 // A split tree is free-form client JSON and used to have no size bound at all,

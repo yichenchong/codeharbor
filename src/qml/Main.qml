@@ -943,6 +943,12 @@ ApplicationWindow {
                     no("unknown_pane", qsTr("No viewer pane named %1.").arg(String(params.pane)));
                     return;
                 }
+                const pane = viewerRegion.paneCache[target];
+                if (pane && pane.contentDirty) {
+                    no("unsaved_changes",
+                       qsTr("Save the editor's changes or close the pane before navigating."));
+                    return;
+                }
                 if (!viewerRegion.openPaneTarget(target, address, kind)) {
                     no("failed", qsTr("That viewer cannot display this target."));
                     return;
@@ -980,10 +986,8 @@ ApplicationWindow {
             }
             if (op === "close") {
                 // Deliberately NOT the pane's own unsaved-changes confirmation:
-                // that dialog belongs to a person pressing a button. An agent
-                // closing a dirty editor pane goes through the same layout call
-                // the command palette uses, which is the one close path that has
-                // always been unconfirmed.
+                // that dialog belongs to a person pressing a button. The viewer
+                // control API intentionally closes without confirmation.
                 app.layouts.closePane("viewer", target);
                 ok({ paneId: target });
                 return;
@@ -994,6 +998,12 @@ ApplicationWindow {
                 return;
             }
             if (op === "reload") {
+                const pane = viewerRegion.paneCache[target];
+                if (pane && pane.contentDirty) {
+                    no("unsaved_changes",
+                       qsTr("Save the editor's changes or close the pane before reloading."));
+                    return;
+                }
                 if (!viewerRegion.reloadPane(target)) {
                     no("unknown_pane",
                        qsTr("Viewer pane %1 is not on screen yet.").arg(target));

@@ -186,13 +186,16 @@ export function createForwarder(
     let queue: Promise<void> = Promise.resolve();
     return {
         forward(eventName, payload) {
-            const input = toHookInput(eventName, payload, devSessionId, terminalId);
-            queue = queue.then(
-                () => emitHookEvent(input, socketPath, timeoutMs).then(
-                    () => {},
-                    () => {},
-                ),
-            );
+            try {
+                const input = toHookInput(eventName, payload, devSessionId, terminalId);
+                queue = queue.then(
+                    () => emitHookEvent(input, socketPath, timeoutMs),
+                ).then(() => {}, () => {});
+            } catch {
+                // Native payloads belong to the harness. Even a throwing
+                // property accessor must not escape a tool_call handler and
+                // block the agent's tool execution.
+            }
         },
         flush() {
             return queue;

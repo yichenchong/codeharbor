@@ -113,6 +113,9 @@ public:
     // Concurrent/repeated calls are safe: each load is stamped with a monotonic
     // generation and only the newest one may touch the trees, so a late reply
     // for an abandoned Dev Session is dropped (errors are still surfaced).
+    // Synchronous signal handlers may also select another session or destroy
+    // this object. Loading, publishing and queued-edit replay stop at those
+    // boundaries rather than continuing work against the new selection.
     Q_INVOKABLE void load(QString devSessionId);
 
     // Every DELAYED gesture MUST come in through the stamped entry points

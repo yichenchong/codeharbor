@@ -98,7 +98,7 @@ Item {
     // arrives, while the page's document path is the `?path=` query navigate()
     // wrote below.
     function documentDirectory() {
-        const path = String(root.remotePath).split(/[?#]/, 1)[0]
+        const path = String(root.remotePath)
         if (path.length === 0)
             return ""
         if (path.charAt(path.length - 1) === "/")
@@ -118,7 +118,14 @@ Item {
         const directory = root.documentDirectory()
         if (directory.length === 0)
             return ""
-        const candidate = value.split(/[?#]/, 1)[0]
+        let candidate = value.split(/[?#]/, 1)[0]
+        // References are URL paths, but the document path is already a raw
+        // POSIX path. Decode only the reference, exactly once.
+        try {
+            candidate = decodeURIComponent(candidate)
+        } catch (error) {
+            // A malformed escape names its literal spelling.
+        }
         if (candidate.length === 0)
             return ""
         const combined = candidate.charAt(0) === "/"

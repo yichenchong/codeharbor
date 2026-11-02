@@ -55,7 +55,8 @@ They come from the `codeharbor` MCP server: `viewer_list`, `viewer_open`,
 
 `not_active_session` (the user is on a different Dev Session — say so, do not
 retry), `unknown_pane` (re-list), `bad_request` (the message says what was
-wrong), `timeout` / `failed` (CodeHarbor is not reachable).
+wrong), `unsaved_changes` (save the editor or open a separate new pane; do not
+close it to bypass the refusal), `timeout` / `failed` (CodeHarbor is not reachable).
 
 ## One-time setup
 

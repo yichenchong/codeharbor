@@ -12,6 +12,8 @@ export interface ReportBridge {
     reportContent(content: string): void;
     /** Persist the buffer guarded by the revision it was loaded at. */
     save(content: string, expectedRevision: string): void;
+    /** Lightweight edit observation, independent of the full-text debounce. */
+    reportDirty(dirty: boolean, baselineRevision: string): void;
 }
 
 /** Timer seam so tests can drive the debounce deterministically. Defaults to
@@ -64,6 +66,14 @@ export class RecoveryReporter {
             this.timers.clear(this.timer);
             this.timer = undefined;
         }
+    }
+
+    /** Publish whether this edit is unsaved immediately, so host-side close and
+     *  navigation guards cannot miss the debounce window. No full buffer read
+     *  or remote snapshot write is needed until the timer fires. */
+    observeEdit(dirty: boolean, baselineRevision: string): void {
+        this.bridge.reportDirty(dirty, baselineRevision);
+        this.schedule(dirty);
     }
 
     /** Arm the debounced snapshot, but only when the buffer is dirty: snapshotting

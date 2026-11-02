@@ -292,7 +292,8 @@ function isRpcRequest(value: unknown): value is RpcRequest {
     return (
         r.jsonrpc === "2.0" &&
         typeof r.method === "string" &&
-        (r.id === undefined || typeof r.id === "string" || typeof r.id === "number" || r.id === null)
+        (r.id === undefined || typeof r.id === "string" ||
+            (typeof r.id === "number" && Number.isFinite(r.id)) || r.id === null)
     );
 }
 
@@ -496,7 +497,8 @@ export function responseLine(response: RpcResponse): string {
             code: RPC_RESOURCE_LIMIT,
             message:
                 `The answer to this request is larger than the ${MAX_LINE_BYTES}-byte ` +
-                "transport frame limit, so it was refused. Nothing was changed.",
+                "transport frame limit and could not be sent. The operation may already have " +
+                "completed; read the current state before retrying.",
         };
     } catch {
         refusal = { code: RPC_INTERNAL_ERROR, message: "Response could not be serialized" };
@@ -636,6 +638,8 @@ export interface WatchNotificationRelay {
     // an internal buffer with no bound — the exact failure the queue below
     // exists to prevent. Cleared by the stream's next 'drain'.
     stall(): void;
+    // Release the stream listener and any queued notifications on shutdown.
+    close(): void;
     // Queue depth, for tests asserting the bound actually holds.
     pendingCount(): number;
 }
@@ -687,6 +691,7 @@ export function createWatchNotificationRelay(
     const lost = new Set<string>();
     let pendingBytes = 0;
     let stalled = false;
+    let closed = false;
 
     const notificationLine = (event: WatchEvent): string =>
         `${JSON.stringify({
@@ -735,7 +740,7 @@ export function createWatchNotificationRelay(
         );
     };
 
-    out.on("drain", () => {
+    const drain = (): void => {
         onDrain();
         stalled = false;
         for (const [key, entry] of pending) {
@@ -747,10 +752,12 @@ export function createWatchNotificationRelay(
             if (stalled) return;
         }
         flushLost();
-    });
+    };
+    out.on("drain", drain);
 
     return {
         deliver(event) {
+            if (closed) return;
             if (!hasSubscription(event.subscriptionId)) return;
             const line = notificationLine(event);
             if (!stalled) {
@@ -801,8 +808,17 @@ export function createWatchNotificationRelay(
             lost.delete(subscriptionId);
         },
         stall() {
+            if (closed) return;
             stalled = true;
             onStall();
+        },
+        close() {
+            if (closed) return;
+            closed = true;
+            out.removeListener("drain", drain);
+            pending.clear();
+            lost.clear();
+            pendingBytes = 0;
         },
         pendingCount: () => pending.size,
     };
@@ -965,7 +981,11 @@ export function runStdio(): StdioHandle {
             failOutput();
             return;
         }
-        if (outputStalled) {
+        // Shutdown has detached the drain listeners. Late in-flight responses
+        // must go directly to stdout, whose own buffer is still allowed to
+        // flush within the shutdown grace period, rather than enter a queue
+        // that nobody can ever drain.
+        if (outputStalled && !shuttingDown) {
             const queuedCount = pendingResponses.length - pendingResponseIndex;
             if (
                 queuedCount >= MAX_PENDING_RPC_RESPONSES ||
@@ -1005,7 +1025,7 @@ export function runStdio(): StdioHandle {
     // server.info and exported into each pane — a pane with no path refuses
     // rather than falling back to a guessable one and driving another window.
     //
-    // The path carries this process's pid, so two windows never contend for it.
+    // The path carries a random per-daemon token, so windows never contend for it.
     const relayViewerCommand = (command: {
         commandId: string;
         devSessionId: string;
@@ -1033,6 +1053,7 @@ export function runStdio(): StdioHandle {
     let controlListener: ControlListener | null = null;
     // Guards the one-shot stdin attach below; see beginReading().
     let readingStarted = false;
+    let inputFailed = false;
     // Settles when the bind has either succeeded or failed. server.info must not
     // be answered before then: it carries the socket path the client exports into
     // every pane, and a client that asked one round trip too early would export
@@ -1061,6 +1082,7 @@ export function runStdio(): StdioHandle {
         },
     );
     const dispatchLine = (line: string): void => {
+        if (inputFailed || shuttingDown) return;
         // Skip separator lines without copying the line: trim() on a multi-MiB
         // base64 file.writeFile frame duplicates the whole string just to answer
         // "is this blank?". The C++ reader avoids the same copy deliberately.
@@ -1094,6 +1116,7 @@ export function runStdio(): StdioHandle {
     // Replaces Node's readline, which buffers a line without any upper bound
     // (RR13). The framer drops the connection past MAX_LINE_BYTES.
     const feed = createLineFramer(dispatchLine, () => {
+        inputFailed = true;
         process.stderr.write(
             `codeharbord: input line exceeded ${MAX_LINE_BYTES} bytes without a newline; closing connection\n`,
         );
@@ -1114,7 +1137,7 @@ export function runStdio(): StdioHandle {
     // the backstop for a pathological filesystem: a daemon that cannot bind must
     // still serve files and terminals.
     const beginReading = (): void => {
-        if (readingStarted) return;
+        if (readingStarted || shuttingDown || inputFailed) return;
         readingStarted = true;
         process.stdin.on("data", feed);
     };
@@ -1191,6 +1214,7 @@ export function runStdio(): StdioHandle {
         // become an uncaught exception, and a no-op listener can do no harm.
         process.stdout.removeListener("drain", flushResponses);
         process.stdout.removeListener("error", failOutput);
+        watchRelay.close();
         // Exit 0 rather than re-raising a clean signal. Preserve a non-zero
         // status when the output transport itself failed.
         process.exitCode = outputFailed ? 1 : 0;

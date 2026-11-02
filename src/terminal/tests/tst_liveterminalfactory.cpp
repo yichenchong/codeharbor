@@ -29,6 +29,7 @@
 #include <QFile>
 #include <QFileInfo>
 #include <QProcess>
+#include <QRegularExpression>
 #include <QString>
 #include <QtTest/QtTest>
 
@@ -64,6 +65,18 @@ QString env(const char* key)
     return qEnvironmentVariable(key);
 }
 
+bool fixtureListenerCommandMatches(QString commandLine, const QString& configPath)
+{
+    // OpenSSH can replace argv with one listener title. Accept either form,
+    // but only the fixture's exact -f path and the documented -D/-e flags.
+    commandLine.replace(QChar(u'\0'), QLatin1Char(' '));
+    const QRegularExpression expected(
+        QStringLiteral("^(?:sshd: )?(?:\\S*/)?sshd (?:(?:-D|-e) )*-f %1"
+                       "(?: (?:-D|-e))*(?: \\[listener\\](?: .*)?)?$")
+            .arg(QRegularExpression::escape(configPath)));
+    return expected.match(commandLine.trimmed()).hasMatch();
+}
+
 } // namespace
 
 class TstLiveTerminalFactory : public QObject {
@@ -72,6 +85,8 @@ private slots:
     void initTestCase();
     void cleanupTestCase();
 
+    void fixtureListenerMatchingPinsTheGeneratedConfig_data();
+    void fixtureListenerMatchingPinsTheGeneratedConfig();
     void factoryAttachDeliversRemoteMarkerThroughTheBridge();
     void detachReleasesTheChannelButKeepsTheRemoteSession();
     void anUncleanNetworkDropKeepsTheSessionItsWorkAndSaysNothing();
@@ -314,29 +329,112 @@ bool TstLiveTerminalFactory::severTheNetwork()
     // has something to come back to. No disconnectFromHost(), no tmux detach,
     // no orderly channel close — the client is told nothing, which is the whole
     // point of the case.
-    //
-    // `ssh[d]` rather than `sshd` so this script's OWN command line cannot match
-    // the pattern it passes to pgrep, which would send the kill at the shell
-    // running it.
-    const QString fixtureDir = QFileInfo(env("CH_LIVE_IDENTITY")).absolutePath();
-    if (fixtureDir.isEmpty() || !QFile::exists(fixtureDir + QStringLiteral("/sshd_config")))
+    // Identify the generated fixture, not an arbitrary daemon matching a
+    // command-line substring. The generator supports custom directories and
+    // puts its key, config and listener PID beside one another.
+    const QString identity = env("CH_LIVE_IDENTITY");
+    QString fixtureDir;
+    if (!identity.isEmpty()) {
+        fixtureDir = QFileInfo(identity).canonicalPath();
+        if (QFileInfo(identity).canonicalFilePath() != fixtureDir + QStringLiteral("/id"))
+            return false;
+    } else {
+        const QString generator = QFINDTESTDATA("../../../tests/live/generate-fixture.sh");
+        if (generator.isEmpty())
+            return false;
+        fixtureDir = QDir(QFileInfo(generator).dir().filePath(QStringLiteral(".fixture")))
+                         .canonicalPath();
+    }
+    if (fixtureDir.isEmpty() || m_host != QLatin1String("127.0.0.1"))
         return false;
+    const QString configPath = fixtureDir + QStringLiteral("/sshd_config");
+    const QString pidPath = fixtureDir + QStringLiteral("/sshd.pid");
+    if (QFileInfo(configPath).isSymLink() || QFileInfo(pidPath).isSymLink())
+        return false;
+    QFile config(configPath);
+    if (!config.open(QIODevice::ReadOnly))
+        return false;
+    const QStringList lines = QString::fromUtf8(config.readAll()).split(QLatin1Char('\n'));
+    const QStringList required{
+        QStringLiteral("Port %1").arg(m_port),
+        QStringLiteral("ListenAddress 127.0.0.1"),
+        QStringLiteral("HostKey \"%1/hostkey\"").arg(fixtureDir),
+        QStringLiteral("AuthorizedKeysFile \"%1/authorized_keys\"").arg(fixtureDir),
+        QStringLiteral("PidFile \"%1/sshd.pid\"").arg(fixtureDir),
+        QStringLiteral("SetEnv \"CODEHARBOR_DB=%1/workspace.sqlite\"").arg(fixtureDir),
+    };
+    for (const QString& line : required) {
+        if (!lines.contains(line))
+            return false;
+    }
+    QFile pidFile(pidPath);
+    if (!pidFile.open(QIODevice::ReadOnly))
+        return false;
+    bool validPid = false;
+    const int listener = pidFile.readAll().trimmed().toInt(&validPid);
+    if (!validPid || listener <= 1)
+        return false;
+    QFile command(QStringLiteral("/proc/%1/cmdline").arg(listener));
+    QFile comm(QStringLiteral("/proc/%1/comm").arg(listener));
+    if (!command.open(QIODevice::ReadOnly) || !comm.open(QIODevice::ReadOnly)
+        || comm.readAll().trimmed() != QByteArrayLiteral("sshd")
+        || !fixtureListenerCommandMatches(QString::fromLocal8Bit(command.readAll()), configPath))
+        return false;
+
+    // Only the validated listener's descendants are signalled; the listener
+    // itself stays alive for reconnect. No filesystem path enters the shell.
     const QString script =
         QStringLiteral("set -e\n"
-                       "listeners=$(pgrep -f \"ssh[d] -f %1/sshd_config\" || true)\n"
-                       "[ -n \"$listeners\" ] || exit 1\n"
-                       "for l in $listeners; do\n"
-                       "  for c in $(pgrep -P \"$l\" || true); do\n"
-                       "    for g in $(pgrep -P \"$c\" || true); do kill -9 \"$g\" || true; done\n"
-                       "    kill -9 \"$c\" || true\n"
-                       "  done\n"
-                       "done\n")
-            .arg(fixtureDir);
+                       "children=$(pgrep -P \"$1\" || true)\n"
+                       "[ -n \"$children\" ] || exit 1\n"
+                       "for c in $children; do\n"
+                       "  for g in $(pgrep -P \"$c\" || true); do kill -9 \"$g\" || true; done\n"
+                       "  kill -9 \"$c\" || true\n"
+                       "done\n");
     QProcess sh;
-    sh.start(QStringLiteral("/bin/sh"), {QStringLiteral("-c"), script});
+    sh.start(QStringLiteral("/bin/sh"),
+             {QStringLiteral("-c"), script, QStringLiteral("fixture-disconnect"),
+              QString::number(listener)});
     if (!sh.waitForFinished(10000))
         return false;
     return sh.exitStatus() == QProcess::NormalExit && sh.exitCode() == 0;
+}
+
+void TstLiveTerminalFactory::fixtureListenerMatchingPinsTheGeneratedConfig_data()
+{
+    QTest::addColumn<QString>("command");
+    QTest::addColumn<bool>("matches");
+    QTest::newRow("documented-order")
+        << QStringLiteral("sshd: /usr/sbin/sshd -f /fixture/a.[x]/sshd_config -D [listener] 0 of 10-100 startups")
+        << true;
+    QTest::newRow("foreground-logging-first")
+        << QStringLiteral("sshd: /usr/sbin/sshd -D -e -f /fixture/a.[x]/sshd_config [listener] 0 of 10-100 startups")
+        << true;
+    QTest::newRow("raw-argv")
+        << QString::fromLatin1(QByteArray("/usr/sbin/sshd\0-D\0-e\0-f\0/fixture/a.[x]/sshd_config\0",
+                                        sizeof("/usr/sbin/sshd\0-D\0-e\0-f\0/fixture/a.[x]/sshd_config\0") - 1))
+        << true;
+    QTest::newRow("different-config")
+        << QStringLiteral("sshd: /usr/sbin/sshd -D -e -f /etc/ssh/sshd_config [listener]")
+        << false;
+    QTest::newRow("path-is-not-a-regex")
+        << QStringLiteral("sshd: /usr/sbin/sshd -D -f /fixture/aZx/sshd_config [listener]")
+        << false;
+    QTest::newRow("port-override")
+        << QStringLiteral("sshd: /usr/sbin/sshd -D -f /fixture/a.[x]/sshd_config -p22 [listener]")
+        << false;
+    QTest::newRow("not-a-listener")
+        << QStringLiteral("sh -c pgrep sshd -f /fixture/a.[x]/sshd_config")
+        << false;
+}
+
+void TstLiveTerminalFactory::fixtureListenerMatchingPinsTheGeneratedConfig()
+{
+    QFETCH(QString, command);
+    QFETCH(bool, matches);
+    QCOMPARE(fixtureListenerCommandMatches(command,
+                                          QStringLiteral("/fixture/a.[x]/sshd_config")),
+             matches);
 }
 
 // (a) The production attach: no hand-rolled channel anywhere. The factory opens

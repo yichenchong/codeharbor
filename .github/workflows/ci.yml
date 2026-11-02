@@ -944,10 +944,9 @@ jobs:
       - name: Install CMake
         uses: lukka/get-cmake@v4.2.3
 
-      # libssh for the simulator slice. The triplet is arm64-ios-SIMULATOR, not
-      # arm64-ios: both are arm64, but the device triplet builds against the
-      # iphoneos sysroot and its static library cannot be linked into a
-      # simulator binary. arm64-ios is what a device build would use.
+      # libssh for the x86_64 simulator slice supplied by Qt for iOS.
+      # x64-ios selects the iphonesimulator sysroot; arm64-ios selects the
+      # iphoneos device sysroot and cannot be linked into this simulator app.
       #
       # Same overlay port (0.12.2) as every other platform, and cached for the
       # same reason - openssl and libssh are source builds here too. The key

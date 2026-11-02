@@ -336,6 +336,33 @@ test("main survives a closed stderr stream without rejecting", async () => {
     }
 });
 
+test("hook diagnostics survive an asynchronous EPIPE on stderr (BH26-BRIDGE-01)", async () => {
+    const moduleUrl = new URL("../src/hooks/bridge-emit.ts", import.meta.url).href;
+    const child = spawn(process.execPath, ["--input-type=module", "-e", `
+        import { writeStderr } from ${JSON.stringify(moduleUrl)};
+        process.stdin.once("data", () => {
+            writeStderr("diagnostic\\n");
+            setImmediate(() => console.log("survived"));
+        });
+    `], { stdio: ["pipe", "pipe", "pipe"] });
+    const exited = Promise.withResolvers<number | null>();
+    child.on("error", exited.reject);
+    child.on("close", exited.resolve);
+    let stdout = "";
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (chunk: string) => { stdout += chunk; });
+    // Close the reader before asking the child to write, so EPIPE is real and
+    // deterministic rather than a mock that throws synchronously.
+    child.stderr.destroy();
+    child.stdin.end("write");
+    try {
+        assert.equal(await exited.promise, 0);
+        assert.equal(stdout, "survived\n");
+    } finally {
+        child.kill("SIGKILL");
+    }
+});
+
 
 // AG-N4. Unusable metadata never blocks the event, but a silently dropped bag
 // is invisible — and the person who wrote the JSON is standing in the shell the
@@ -582,23 +609,63 @@ test("makeStreamSink refuses an event whose envelope exceeds the desktop frame",
     const source = fakeSource();
     const oversized = {
         ...RELAY_EVENT,
-        summary: "x".repeat(MAX_BRIDGE_LINE_BYTES),
+        event: "x".repeat(MAX_BRIDGE_LINE_BYTES),
     } as AgentEvent;
     sink(oversized, source.socket);
     assert.equal(source.destroyed, true);
     assert.equal(out.read(), null);
 });
-// A sink can tear a producer down mid-chunk: makeStreamSink destroys the source
-// when a mapped event would exceed the desktop's frame limit. Everything after
-// that point in the SAME write must be abandoned, otherwise a producer that has
-// already been disconnected still gets its later lines relayed.
+
+test("mapping envelope growth sheds summary rather than the state (BH26-BRIDGE-02)", () => {
+    const message = {
+        version: BRIDGE_MESSAGE_VERSION,
+        harness: "oh-my-pi",
+        devSessionId: "s",
+        terminalId: "t",
+        native: { type: "agent_end" },
+        summary: "",
+    };
+    message.summary = "x".repeat(
+        MAX_BRIDGE_LINE_BYTES - Buffer.byteLength(JSON.stringify(message)),
+    );
+    const payload = JSON.stringify(message);
+    assert.equal(Buffer.byteLength(payload), MAX_BRIDGE_LINE_BYTES);
+    const event = processBridgeLine(payload);
+    assert.ok(event);
+    assert.equal(bridgeLineFits(JSON.stringify(event)), false);
+    const out = new PassThrough();
+    const source = fakeSource();
+    makeStreamSink(out)(event, source.socket);
+    const relayed = JSON.parse(out.read().toString()) as AgentEvent;
+    assert.equal(source.destroyed, false);
+    assert.equal(relayed.state, "idle_unseen");
+    assert.equal(relayed.summary, undefined);
+    assert.equal(event.summary, message.summary, "compaction must not mutate the source event");
+});
+
+test("relay compaction drops metadata before readable summary (BH26-BRIDGE-02)", () => {
+    const out = new PassThrough();
+    const source = fakeSource();
+    makeStreamSink(out)({
+        ...RELAY_EVENT,
+        summary: "finished",
+        metadata: { blob: "x".repeat(MAX_BRIDGE_LINE_BYTES) },
+    }, source.socket);
+    const relayed = JSON.parse(out.read().toString()) as AgentEvent;
+    assert.equal(source.destroyed, false);
+    assert.equal(relayed.summary, "finished");
+    assert.equal(relayed.metadata, undefined);
+});
+// A sink can tear a producer down mid-chunk. Everything after that point in the
+// SAME write must be abandoned, otherwise a producer that has already been
+// disconnected still gets its later lines relayed.
 test("a producer destroyed by the sink has the rest of its chunk abandoned", async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ch-bridge-destroy-"));
     const socketPath = path.join(dir, "bridge.sock");
     const relayed: AgentEvent[] = [];
     const server = await startBridge(socketPath, (event, source) => {
         relayed.push(event);
-        // Stand in for the oversized-event refusal, which destroys the source.
+        // Stand in for an output failure, which destroys the source.
         source.destroy();
     });
     try {

@@ -11,13 +11,13 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "dompurify": "^3.4.13",
+    "dompurify": "^3.4.17",
     "marked": "^18.0.7"
   },
   "devDependencies": {
     "@types/jsdom": "^21.1.7",
     "@types/node": "^24.0.0",
-    "esbuild": "^0.23.0",
+    "esbuild": "^0.25.12",
     "jsdom": "^30.0.1",
     "typescript": "^5.5.0"
   },

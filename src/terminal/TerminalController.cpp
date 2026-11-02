@@ -462,9 +462,15 @@ void TerminalController::flush()
     if (batch.size() > allowance) {
         const qsizetype cut =
             safePrefixBoundary(batch, static_cast<qsizetype>(allowance));
-        // cut == 0 means a single indivisible control sequence longer than the
-        // whole window. Splitting it would corrupt the renderer's parser, so it
-        // goes out whole — the same last resort releaseRetained() takes.
+        // No complete character/sequence fits the remaining credit. Existing
+        // debt will produce another acknowledgement, so retain rather than
+        // overrunning the window merely because the next character is UTF-8.
+        // With no debt, releaseRetained() handles a genuinely oversized atom.
+        if (cut == 0) {
+            appendHidden(batch);
+            releaseRetained();
+            return;
+        }
         if (cut > 0) {
             QByteArray head = batch.left(cut);
             batch.remove(0, cut);
@@ -505,10 +511,13 @@ void TerminalController::releaseRetained()
                               ? m_hidden.size()
                               : safePrefixBoundary(m_hidden, static_cast<qsizetype>(allowance));
     if (cut <= 0) {
-        // A single complete escape sequence can itself be larger than the
-        // remaining window. It cannot be split without corrupting the
-        // renderer's parser, so release that indivisible sequence as a last
-        // resort rather than deadlocking with no acknowledgement possible.
+        // A nearly full window may not even fit the next UTF-8 character.
+        // Wait for the bytes already sent to be acknowledged before deciding
+        // that the next sequence is larger than the entire credit window.
+        if (m_unacknowledged > 0)
+            return;
+        // With the full window available, a single escape sequence may still
+        // be indivisible. Release only that sequence to avoid deadlock.
         const qsizetype indivisible =
             resyncBoundary(m_hidden, static_cast<qsizetype>(allowance));
         if (indivisible <= 0)

@@ -93,8 +93,29 @@ TerminalController* TerminalFactory::create(QObject* owner)
                 if (it == m_attached.constEnd() || it->serverId.isEmpty()
                     || it->devSessionId.isEmpty() || it->terminalId.isEmpty())
                     return;
-                emit terminalStateChanged(it->serverId, it->devSessionId,
-                                           it->terminalId, state);
+                const QString serverId = it->serverId;
+                const QString devSessionId = it->devSessionId;
+                const QString terminalId = it->terminalId;
+                QPointer<TerminalFactory> self(this);
+                QPointer<TerminalController> pane(controller);
+                // Begin observation before opening the PTY: its first redraw
+                // can arrive synchronously from openPty(). Every terminal
+                // outcome ends it, including remote EOF and attach timeout,
+                // not only an explicit detach() from QML.
+                if (m_agentMonitor) {
+                    if (state == TerminalState::OpeningChannel)
+                        m_agentMonitor->noteTerminalAttached(devSessionId, terminalId);
+                    else if (!TerminalController::isLiveState(state))
+                        m_agentMonitor->noteTerminalDetached(devSessionId, terminalId);
+                }
+                if (!self || !pane || pane->state() != state)
+                    return;
+                const auto current = m_attached.constFind(controller);
+                if (current == m_attached.constEnd() || current->serverId != serverId
+                    || current->devSessionId != devSessionId
+                    || current->terminalId != terminalId)
+                    return;
+                emit terminalStateChanged(serverId, devSessionId, terminalId, state);
             });
 
     return controller;
@@ -104,7 +125,16 @@ TerminalBridge* TerminalFactory::createBridge(TerminalController* controller, QO
 {
     if (!controller)
         return nullptr;
-    return new TerminalBridge(controller, owner ? owner : controller);
+    auto* bridge = new TerminalBridge(controller, owner ? owner : controller);
+    const QPointer<TerminalController> pane(controller);
+    connect(bridge, &TerminalBridge::inputRejected, this, [this, pane]() {
+        if (pane)
+            emit error(pane,
+                       QStringLiteral("Terminal input could not be sent completely. "
+                                      "Part of it may have reached the remote program. "
+                                      "Inspect the terminal before retrying."));
+    });
+    return bridge;
 }
 
 bool TerminalFactory::connected() const
@@ -126,8 +156,19 @@ TerminalFactory::Attachment& TerminalFactory::entryFor(TerminalController* contr
     if (it == m_attached.end()) {
         it = m_attached.insert(controller, Attachment{});
         // The key must never dangle: entries die with their pane.
-        connect(controller, &QObject::destroyed, this,
-                [this](QObject* dead) { m_attached.remove(dead); });
+        connect(controller, &QObject::destroyed, this, [this](QObject* dead) {
+            const Attachment entry = m_attached.take(dead);
+            if (entry.serverId.isEmpty() || entry.devSessionId.isEmpty()
+                || entry.terminalId.isEmpty())
+                return;
+            QPointer<TerminalFactory> self(this);
+            if (m_agentMonitor)
+                m_agentMonitor->noteTerminalDetached(entry.devSessionId, entry.terminalId);
+            if (!self)
+                return;
+            emit terminalStateChanged(entry.serverId, entry.devSessionId,
+                                      entry.terminalId, TerminalState::Unloaded);
+        });
     }
     return it.value();
 }
@@ -185,6 +226,8 @@ void TerminalFactory::beginResolution(TerminalController* controller, const QStr
     const QString oldTerminalId = it->terminalId;
     if (!oldServerId.isEmpty() && !oldDevSessionId.isEmpty()
         && !oldTerminalId.isEmpty()) {
+        if (m_agentMonitor)
+            m_agentMonitor->noteTerminalDetached(oldDevSessionId, oldTerminalId);
         emit terminalStateChanged(oldServerId, oldDevSessionId, oldTerminalId,
                                   TerminalState::Unloaded);
     }
@@ -215,6 +258,8 @@ void TerminalFactory::clearAgentIdentity(TerminalController* controller)
     const QString oldTerminalId = it->terminalId;
     if (!oldServerId.isEmpty() && !oldDevSessionId.isEmpty()
         && !oldTerminalId.isEmpty()) {
+        if (m_agentMonitor)
+            m_agentMonitor->noteTerminalDetached(oldDevSessionId, oldTerminalId);
         emit terminalStateChanged(oldServerId, oldDevSessionId, oldTerminalId,
                                   TerminalState::Unloaded);
     }
@@ -671,8 +716,10 @@ void TerminalFactory::noteHarnessChanged(const QString& terminalPaneId,
     };
     QVector<LivePane> live;
     for (auto it = m_attached.constBegin(); it != m_attached.constEnd(); ++it) {
+        auto* pane = static_cast<TerminalController*>(it.key());
         if (it->terminalId == terminalPaneId && !it->devSessionId.isEmpty())
-            live.push_back({it->devSessionId, it->terminalId, it->device != nullptr});
+            live.push_back({it->devSessionId, it->terminalId,
+                            it->device && TerminalController::isLiveState(pane->state())});
     }
     for (const LivePane& pane : live) {
         if (!m_agentMonitor)
@@ -839,17 +886,6 @@ bool TerminalFactory::attach(TerminalController* controller,
     // dangling write (the same rule kill() follows).
     if (auto it = m_attached.find(pane.data()); it != m_attached.end())
         it->device = device;
-
-    // The pane now has a live channel, so SPEC 6.6 observation starts here: for
-    // a generic-harness pane this is "attached and silent", and any output age
-    // remembered from the channel this attach replaced is discarded with it.
-    // Read back out of the entry rather than carried down, for the same reason
-    // the device is written back above.
-    if (m_agentMonitor) {
-        const auto it = m_attached.constFind(pane.data());
-        if (it != m_attached.constEnd() && !it->terminalId.isEmpty())
-            m_agentMonitor->noteTerminalAttached(it->devSessionId, it->terminalId);
-    }
 
     // Did this attach silently CREATE the pane's session instead of finding it,
     // and had the pane ever had one to find? `tmux new-session -A` does both and

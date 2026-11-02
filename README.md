@@ -87,21 +87,39 @@ release that matches it. Two things keep them in step:
   `curl … | tar -xz` above), which the automatic path deliberately never
   overwrites, or after a client update if you want to force the issue.
 
-URL-based automatic or on-demand updates need `tar` and either `curl` or `wget` on the server. For an air-gapped install, stage `codeharbor-remote.tar.gz` on the server and set `CH_REMOTE_ARTIFACT_URL` to its local path; that mode copies the tarball and needs `tar` but no downloader. Set the same variable to an internal mirror URL when downloading from a mirror.
+Automatic installation and on-demand updates require `flock` and `tar` on the
+server. URL-based downloads also require either `curl` or `wget`. For an air-gapped
+install, stage `codeharbor-remote.tar.gz` on the server and set
+`CH_REMOTE_ARTIFACT_URL` to its local path; that mode copies the tarball and needs
+no downloader. Set the same variable to an internal mirror URL when downloading
+from a mirror.
+
+Only one updater may modify an installation at a time. A second updater refuses
+rather than changing the first updater's recovery files. The kernel releases the
+lock when its last holder exits, including after a crash. The persistent
+`.codeharbor-provision.lock` file is intentional: **do not delete it to clear a
+busy message**, because removing it can defeat an active lock.
+
+`flock` is not needed to run an existing service or to unpack a release manually.
+If it is unavailable, automatic installation/update refuses without changing the
+installation; an existing usable service remains available as the fallback.
 
 A **git checkout** is never overwritten by either path. **Update server** on one
 says so and changes nothing: update it with `git pull` and a build instead.
 
-**A failed update costs you nothing but the update.** The archive is unpacked
-into a staging directory beside the installation and only swapped in once it has
-been proven to hold a service this client can launch, with whatever it displaces
-kept until the swap has finished — so a truncated download, a full disk or a
-dropped connection puts the previous installation back, release marker included.
-A prerequisite the server does not meet (a Node older than the service needs, no
-`tar`, no downloader) is reported the same way: the update does not happen, the
-copy that was working stays exactly where it was, and the session connects to it.
-You are only refused outright when there is nothing installed there to fall back
-to.
+**Failed updates preserve recovery data for the previous installation.** The
+archive is unpacked into a staging directory beside the installation and checked
+before any live files are replaced. Displaced files and the release marker stay
+in the recovery directory until the swap succeeds. If the swap is interrupted,
+rollback restores them; a later attempt resumes an interrupted rollback. If the
+filesystem prevents restoration, recovery data is retained for another attempt
+rather than deleted. Resolve that filesystem failure before retrying.
+
+Missing prerequisites (an unsupported Node version, no `flock`, no `tar`, or no
+required downloader) stop the update before it changes the installation. An
+existing usable service remains the fallback. Connection is refused when no
+usable installation is available, including when filesystem repair is needed
+before rollback can finish.
 
 ### 2. The client
 
@@ -199,6 +217,8 @@ A few things worth knowing about the shipped client:
   typing in a terminal, you can keep typing without clicking first.
 - **Viewer panes navigate like a browser**: Back, Forward, Reload and Home beside the
   address field, with a history per pane. The address field opens on Enter.
+  An editor with unsaved changes refuses navigation and reload; save it or close
+  the pane first. Opening another pane leaves the unsaved editor in place.
 - **The explorer can open a file with a specific viewer** ("Open as"), in place or in
   a new pane, and can hand it to a local application by `<appName>://` scheme.
 - **Terminal panes can be renamed** from their header, and the name travels with the
@@ -334,7 +354,10 @@ macOS builds an app bundle (`build/dev/src/app/codeharbor.app`) and Windows puts
 
 ### Remote service (Node)
 
-Requires Node 23.6+ (tests run TypeScript via native type stripping).
+Requires Node 23.6+ for both source and compiled releases. The service uses the
+built-in `node:sqlite` module without an experimental command-line flag; compiling
+TypeScript to JavaScript does not remove that runtime requirement. Tests also use
+Node's native TypeScript type stripping.
 
 ```bash
 cd remote

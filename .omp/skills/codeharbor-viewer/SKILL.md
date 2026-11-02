@@ -45,8 +45,8 @@ provides:
   Session, and are recycled; omitting `pane` targets the focused pane.
 - **`viewer_open` with `newPane: true`** when the user should see the new thing
   alongside what is already open.
-- **Never close a pane you did not open** without asking: `viewer_close` takes the
-  palette's unconfirmed close path and will not warn about unsaved editor changes.
+- **Never close a pane you did not open** without asking: `viewer_close` does not
+  warn about unsaved editor changes.
 - **After writing a file the user has open**, `viewer_reload` that pane — the
   server-side watch refreshes clean buffers, but a rendered view that missed it
   needs the nudge.
@@ -57,7 +57,8 @@ provides:
 `not_active_session` (the user is looking at a different Dev Session — say so, do
 not retry; only the session on screen can be driven), `unknown_pane` (re-list),
 `busy` (too many commands in flight — slow down), `bad_request` (the message names
-the bad field), `timeout` / `failed` (CodeHarbor is not reachable).
+the bad field), `unsaved_changes` (save the editor or open a separate new pane;
+do not close it to bypass the refusal), `timeout` / `failed` (CodeHarbor is not reachable).
 
 ## Shell fallback
 

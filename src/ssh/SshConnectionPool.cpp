@@ -170,6 +170,13 @@ void SshLogRouter::release(Route* route)
     // skips the entry whichever thread looks at it.
     entry->active.store(false, std::memory_order_release);
     g_activeRoutes.fetch_sub(1, std::memory_order_relaxed);
+    // The flag prevents a NEW call, but does not finish a callback that already
+    // passed dispatch()'s check. Drain that callback before release() returns:
+    // its caller may immediately destroy the object captured by the sink.
+    // Recursive locking also permits release() from inside the sink itself.
+    {
+        const std::lock_guard<std::recursive_mutex> lock(entry->invocationMutex);
+    }
 
     const bool sameThread = t_threadIdentity != 0
         && t_threadIdentity == route->m_threadIdentity;
@@ -251,7 +258,8 @@ void SshLogRouter::dispatch(int priority, const char* function,
     // has gone.
     for (auto it = s_threadRoutes->crbegin();
          it != s_threadRoutes->crend(); ++it) {
-        const Route::Entry& entry = **it;
+        Route::Entry& entry = **it;
+        const std::lock_guard<std::recursive_mutex> lock(entry.invocationMutex);
         if (!entry.active.load(std::memory_order_acquire))
             continue;
         if (entry.sink)
@@ -985,9 +993,22 @@ bool SshConnectionPool::connectToHost(const QString& host, quint16 port,
         return false;
     }
 
-    // libssh's logging state is process-global, so it is owned by SshLogRouter
-    // rather than installed here: two pools handshaking at once would otherwise
-    // overwrite each other's callback and cross-contaminate their transcripts.
+    // publickey_auto() passes this callback to its private-key importer. Without
+    // it, encrypted PEM keys fall back to OpenSSL's controlling-terminal prompt
+    // on the silent KeyFile rung, blocking the GUI before our own credential
+    // callback can be reached. Only CodeHarbor may request credentials.
+    m_sessionCallbacks = {};
+    ssh_callbacks_init(&m_sessionCallbacks);
+    m_sessionCallbacks.auth_function = declineLibsshPassphrase;
+    if (ssh_set_callbacks(m_session, &m_sessionCallbacks) != SSH_OK) {
+        emit errorOccurred(QStringLiteral("Could not install SSH authentication callbacks"));
+        failHandshake();
+        return false;
+    }
+
+    // libssh's logging hook is thread-local rather than session-local. The
+    // router owns it so nested handshakes restore their enclosing route and
+    // pools on separate threads cannot cross-contaminate their transcripts.
     // The route lives only for this synchronous attempt — the scope guard below
     // drops it before every return path, so the raised log level is never left
     // behind — and the pool's destructor drops it too, should the pool die

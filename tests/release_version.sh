@@ -103,6 +103,24 @@ run_case 'project(CodeHarbor
 [ "$status" -ne 0 ] || fail "a two-component VERSION was accepted"
 [ -z "$out" ] || fail "printed '$out' for a two-component VERSION"
 
+# Reject the entire malformed token rather than silently truncating a suffix.
+# CMake accepts a fourth numeric component, but this project's release tags do
+# not; neither that nor duplicate VERSION lines may name release artifacts.
+for invalid in 1.2.3junk 1.2.3.4 1.2.3. 1.2..3; do
+    run_case "project(CodeHarbor
+    VERSION $invalid
+    LANGUAGES CXX)"
+    [ "$status" -ne 0 ] || fail "malformed VERSION '$invalid' was accepted"
+    [ -z "$out" ] || fail "printed '$out' for malformed VERSION '$invalid'"
+    [ ! -s "$work/case/env" ] || fail "exported malformed VERSION '$invalid'"
+done
+run_case 'project(CodeHarbor
+    VERSION 1.2.3
+    VERSION 4.5.6
+    LANGUAGES CXX)'
+[ "$status" -ne 0 ] || fail "duplicate VERSION lines were accepted"
+[ -z "$out" ] || fail "printed '$out' for duplicate VERSION lines"
+
 # --- no project() call -----------------------------------------------------
 run_case 'cmake_minimum_required(VERSION 3.25)
 # not a project file at all'

@@ -156,7 +156,7 @@ test("an unknown method is method-not-found", async () => {
 test("a non-JSON line is a parse error rather than a crash", async () => {
     const response = await handleLine("{not json", NO_ENV);
     assert.ok(response);
-    assert.equal(response.error?.code, -32600);
+    assert.equal(response.error?.code, -32700);
 });
 
 test("a blank line is ignored", async () => {
@@ -167,6 +167,45 @@ test("ping answers, so a harness health check succeeds", async () => {
     const response = await handleLine(request(7, "ping"), NO_ENV);
     assert.ok(response);
     assert.deepEqual(response.result, {});
+});
+
+test("malformed request ids are refused before tool dispatch", async () => {
+    for (const id of [true, false, {}, [], 1e400]) {
+        const line = id === Infinity
+            ? '{"jsonrpc":"2.0","id":1e400,"method":"tools/call","params":{"name":"viewer_close"}}'
+            : JSON.stringify({ jsonrpc: "2.0", id, method: "tools/call", params: { name: "viewer_close" } });
+        const response = await handleLine(line, NO_ENV);
+        assert.equal(response?.error?.code, -32600);
+        assert.equal(response?.id, null);
+    }
+});
+
+test("tool arguments are checked against the advertised schema before dispatch", async () => {
+    const cases: { name: string; arguments?: unknown }[] = [
+        { name: "viewer_close", arguments: [] },
+        { name: "viewer_close", arguments: null },
+        { name: "viewer_close", arguments: "viewer-1" },
+        { name: "viewer_close", arguments: { pane: 1 } },
+        { name: "viewer_close", arguments: { panes: "viewer-1" } },
+        { name: "viewer_open" },
+        { name: "viewer_open", arguments: { url: "README.md", newPane: "false" } },
+        { name: "viewer_open", arguments: { url: false } },
+        { name: "viewer_focus", arguments: {} },
+        { name: "viewer_split", arguments: { orientation: "diagonal" } },
+    ];
+    for (const params of cases) {
+        const response = await handleLine(request(42, "tools/call", params), NO_ENV);
+        assert.equal(response?.error?.code, -32602, JSON.stringify(params));
+        assert.equal(response?.id, 42);
+    }
+});
+
+test("primitive envelope params are invalid even for parameterless methods", async () => {
+    for (const params of [null, true, 42, "hello"]) {
+        const response = await handleLine(request(42, "ping", params), NO_ENV);
+        assert.equal(response?.error?.code, -32602);
+        assert.equal(response?.id, 42);
+    }
 });
 
 test("a tool call reaches the control socket and returns the desktop's data", async () => {
@@ -235,30 +274,36 @@ test("a refused command becomes an isError tool result carrying the code", async
             XDG_RUNTIME_DIR: dir,
             HOME: dir,
         };
+        let refusalCode = "not_active_session";
         const listener = await startControlListener((command) => {
             queueMicrotask(() => {
                 listener.settle({
                     commandId: command.commandId,
                     ok: false,
                     error: {
-                        code: "not_active_session",
-                        message: "That Dev Session is not the one open in CodeHarbor.",
+                        code: refusalCode,
+                        message: refusalCode === "unsaved_changes"
+                            ? "That pane has unsaved edits."
+                            : "That Dev Session is not the one open in CodeHarbor.",
                     },
                 });
             });
             return true;
         }, socketPath);
         try {
-            const response = await handleLine(
-                request(9, "tools/call", { name: "viewer_focus", arguments: { pane: "viewer-1" } }),
-                env,
-            );
-            assert.ok(response);
-            const { text, isError } = toolText(response.result);
-            assert.equal(isError, true);
-            // The CODE is what a skill tells the model to branch on, so it must
-            // survive into the text.
-            assert.match(text, /not_active_session/);
+            for (const code of ["not_active_session", "unsaved_changes"]) {
+                refusalCode = code;
+                const response = await handleLine(
+                    request(9, "tools/call", { name: "viewer_reload", arguments: { pane: "viewer-1" } }),
+                    env,
+                );
+                assert.ok(response);
+                const { text, isError } = toolText(response.result);
+                assert.equal(isError, true);
+                // The CODE is what a skill tells the model to branch on, so it
+                // must survive both control-channel validators and MCP text.
+                assert.match(text, new RegExp(code));
+            }
         } finally {
             listener.close();
         }
@@ -385,5 +430,45 @@ test("closing stdin does not discard an answer that is still in flight", async (
         }
     } finally {
         rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+test("stdin EOF waits for backpressured stdout responses to flush", { timeout: 10000 }, async () => {
+    const serverUrl = new URL("../src/mcp/server.ts", import.meta.url).href;
+    const child = spawn(process.execPath, [
+        "--input-type=module",
+        "-e",
+        `import { runStdio } from ${JSON.stringify(serverUrl)};
+         process.stdin.once("close", () => process.send("input-closed"));
+         runStdio();`,
+    ], { stdio: ["pipe", "pipe", "pipe", "ipc"] });
+    let output = "";
+    let errors = "";
+    child.stdout!.setEncoding("utf8");
+    child.stdout!.on("data", (chunk: string) => { output += chunk; });
+    child.stdout!.pause();
+    child.stderr!.setEncoding("utf8");
+    child.stderr!.on("data", (chunk: string) => { errors += chunk; });
+    const inputClosed = Promise.withResolvers<void>();
+    child.once("message", () => inputClosed.resolve());
+    child.once("error", inputClosed.reject);
+    child.once("exit", () => inputClosed.reject(new Error("MCP exited before announcing stdin EOF")));
+    const exited = Promise.withResolvers<number | null>();
+    child.once("close", exited.resolve);
+    try {
+        const count = 2000;
+        child.stdin!.end(
+            Array.from({ length: count }, (_, id) => request(id, "tools/list")).join("\n") + "\n",
+        );
+        // A real EOF notification over IPC is the barrier: all requests have
+        // been read, while stdout is deliberately still blocked.
+        await inputClosed.promise;
+        child.stdout!.resume();
+        assert.equal(await exited.promise, 0, errors);
+        const replies = output.trim().split("\n").map((line) => JSON.parse(line));
+        assert.equal(replies.length, count);
+        assert.equal(new Set(replies.map((reply) => reply.id)).size, count);
+    } finally {
+        child.kill();
     }
 });

@@ -84,6 +84,31 @@ void SshChannelDevice::close()
     closeChannel();
 }
 
+void SshChannelDevice::closeChannel()
+{
+    if (m_closing)
+        return;
+    m_closing = true;
+    m_pump->stop();
+#if CH_HAVE_LIBSSH
+    if (m_channel) {
+        const ssh_channel channel = m_channel;
+        m_channel = nullptr;
+        ++m_channelGeneration;
+        // Detach first: libssh diagnostics may reach a re-entrant teardown.
+        if (m_pool)
+            m_pool->releaseChannel(channel);
+    }
+#endif
+    m_hasPty = false;
+    m_readBuffer.clear();
+    m_readOffset = 0;
+    if (isOpen())
+        QIODevice::close();
+    m_closing = false;
+    finishReadChannel();
+}
+
 bool SshChannelDevice::open(OpenMode mode)
 {
     Q_UNUSED(mode);
@@ -236,20 +261,6 @@ bool SshChannelDevice::resizePty(int cols, int rows)
     return false;
 }
 
-void SshChannelDevice::closeChannel()
-{
-    m_pump->stop();
-    m_hasPty = false;
-    m_readBuffer.clear();
-    m_readOffset = 0;
-    if (isOpen())
-        QIODevice::close();
-    // Same contract as the libssh build: the end of the read channel is
-    // reported exactly once. A consumer that keys its teardown on this signal
-    // (CodeharbordClient fails every pending call from it) must not behave
-    // differently just because the client was built without libssh.
-    finishReadChannel();
-}
 
 qint64 SshChannelDevice::writeData(const char* data, qint64 maxSize)
 {
@@ -274,6 +285,10 @@ void SshChannelDevice::pump() {}
 
 bool SshChannelDevice::acquireChannel()
 {
+    if (m_closing) {
+        failWith(QStringLiteral("channel is closing"));
+        return false;
+    }
     if (m_channel) {
         failWith(QStringLiteral("channel already started"));
         return false;
@@ -377,31 +392,6 @@ bool SshChannelDevice::resizePty(int cols, int rows)
            == SSH_OK;
 }
 
-void SshChannelDevice::closeChannel()
-{
-    m_pump->stop();
-
-    if (m_channel) {
-        // Hand the channel back: the pool owns it (SshConnectionPool.h) and
-        // freeing it here would double-free. Closing alone is not enough —
-        // an already-EOF channel is not even closable, and its slot on the SSH
-        // connection would stay consumed until the whole session went down.
-        if (m_pool)
-            m_pool->releaseChannel(m_channel);
-        m_channel = nullptr;
-        ++m_channelGeneration;
-    }
-    m_hasPty = false;
-
-    // Drop anything still buffered: bytesAvailable() must not advertise
-    // readable bytes on a device that has been closed.
-    m_readBuffer.clear();
-    m_readOffset = 0;
-    if (isOpen())
-        QIODevice::close();
-
-    finishReadChannel();
-}
 
 qint64 SshChannelDevice::writeData(const char* data, qint64 maxSize)
 {

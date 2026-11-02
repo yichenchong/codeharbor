@@ -5,12 +5,10 @@ import { nativeString, type HarnessAdapter, type NativeEvent } from "./types.ts"
 // (SPEC 6.3). Hook names map onto CodeHarbor states; the Notification hook that
 // requests user input maps to waiting_input. See docs/PLAN.md workstream A.
 //
-// Only `Stop` is a completion. `SubagentStop` fires when a Task-tool subagent
-// finishes WHILE THE MAIN AGENT IS STILL WORKING, so treating it as a
-// completion would arm the Dev Session's unseen-completion badge and pop an
-// "Agent finished" desktop notification for a turn that has not finished —
-// once per subagent, on a turn that may spawn a dozen. The main agent is
-// running at that moment, and that is what the state says.
+// Helper and teammate lifecycle events say nothing about the main agent's
+// activity. In particular, SubagentStop also fires for internal prompt-suggestion
+// agents after the main turn finished. None may overwrite the main terminal's
+// state in either direction (completion OR running).
 export const claudeCodeAdapter = {
     harness: "claude-code",
     map(native: NativeEvent): AgentState | null {
@@ -22,6 +20,9 @@ export const claudeCodeAdapter = {
         // least of all by a producer that set the flag once and never unset it.
         if (hook === "SessionEnd") return "stopped";
         if (native.error === true) return "error";
+        if (hook === "SubagentStart" || hook === "SubagentStop" || hook === "TeammateIdle") {
+            return null;
+        }
         switch (hook) {
             case "SessionStart":
                 return "starting";
@@ -33,11 +34,8 @@ export const claudeCodeAdapter = {
             case "PostToolBatch":
             case "PreCompact":
             case "PostCompact":
-            case "SubagentStart":
-            case "SubagentStop":
             case "TaskCreated":
             case "TaskCompleted":
-            case "TeammateIdle":
             case "MessageDisplay":
             case "ElicitationResult":
                 return "running";
@@ -74,6 +72,7 @@ export const claudeCodeAdapter = {
                 return notificationType === "permission_prompt"
                     || notificationType === "idle_prompt"
                     || notificationType === "elicitation_dialog"
+                    || notificationType === "elicitation_url_dialog"
                     || notificationType === "agent_needs_input"
                     ? "waiting_input"
                     : null;

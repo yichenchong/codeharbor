@@ -103,9 +103,11 @@ private slots:
     void altScreenLeavesPrimaryAndHistoryIntact();
     void appliesIndexedAndTruecolourSgr();
     void appliesColonSeparatedSgr();
+    void trailingOmittedSgrParameterResetsRendition();
     void answersDeviceStatusReports();
     void setsWindowTitleFromOsc();
     void discardsUnknownOscAndDcsPayloads();
+    void bellDoesNotTerminateNonOscStrings();
     void textRangeSpansWrappedWideCharacters();
     void tabStopsAndBackspaceMoveCursor();
     void insertsAndDeletesCharacters();
@@ -631,6 +633,18 @@ void TstVt::appliesIndexedAndTruecolourSgr()
     QCOMPARE(cellAt(screen, 0, 7).attrs, quint16(0));
 }
 
+void TstVt::trailingOmittedSgrParameterResetsRendition()
+{
+    for (const QByteArray &sequence : {csi("31;m"), csi("31;;m"), csi("31;1;m")}) {
+        VtScreen screen;
+        screen.resize(20, 3);
+        feedByte(screen, csi("44;4m") + sequence + QByteArrayLiteral("X"));
+        QCOMPARE(cellAt(screen, 0, 0).fg, VtScreen::defaultForeground());
+        QCOMPARE(cellAt(screen, 0, 0).bg, VtScreen::defaultBackground());
+        QCOMPARE(cellAt(screen, 0, 0).attrs, quint16(0));
+    }
+}
+
 void TstVt::appliesColonSeparatedSgr()
 {
     VtScreen screen;
@@ -733,6 +747,11 @@ void TstVt::setsWindowTitleFromOsc()
     screen.write(QByteArrayLiteral("\x1b]2;") + QByteArray(4096, 'x')
                  + QByteArrayLiteral("\x07"));
     QVERIFY(screen.windowTitle().size() <= 256);
+
+    // A supplementary character straddling the UTF-16 limit is omitted whole.
+    screen.write(QByteArrayLiteral("\x1b]2;") + QByteArray(255, 'x')
+                 + QByteArrayLiteral("\xf0\x9f\x98\x80\x07"));
+    QCOMPARE(screen.windowTitle(), QString(255, u'x'));
 }
 
 void TstVt::discardsUnknownOscAndDcsPayloads()
@@ -771,6 +790,25 @@ void TstVt::discardsUnknownOscAndDcsPayloads()
                  + QByteArrayLiteral("Z"));
     QCOMPARE(lineText(screen, 0), QStringLiteral("Z"));
     QCOMPARE(cellAt(screen, 0, 0).fg, vt::xterm256Color(1));
+}
+
+void TstVt::bellDoesNotTerminateNonOscStrings()
+{
+    const QList<QByteArray> introducers = {
+        QByteArrayLiteral("\x1bPq"), // DCS passthrough
+        QByteArrayLiteral("\x1bP?"), // malformed DCS ignored to ST
+        QByteArrayLiteral("\x1bX"),  // SOS
+        QByteArrayLiteral("\x1b^"),  // PM
+        QByteArrayLiteral("\x1b_"),  // APC
+    };
+    for (const QByteArray &introducer : introducers) {
+        VtScreen screen;
+        screen.resize(20, 3);
+        QSignalSpy bellSpy(&screen, &VtScreen::bell);
+        feedByte(screen, introducer + QByteArrayLiteral("before\x07""hidden\x1b\\shown"));
+        QCOMPARE(lineText(screen, 0), QStringLiteral("shown"));
+        QCOMPARE(bellSpy.count(), 0);
+    }
 }
 
 // --- text extraction --------------------------------------------------------

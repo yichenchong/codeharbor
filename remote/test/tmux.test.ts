@@ -825,3 +825,29 @@ test("the schema version was bumped for tmux.paneActivity", () => {
     // the compatibility gate instead of showing up as a wrong sidebar badge.
     assert.ok(RPC_SCHEMA_VERSION >= 8, `expected >= 8, got ${RPC_SCHEMA_VERSION}`);
 });
+
+test("the tmux timeout terminates a child that ignores SIGTERM", async () => {
+    // This exercises execFile's real child-process deadline; fake timers cannot
+    // advance the spawned process's clock or drive native signal termination.
+    const dir = mkdtempSync(path.join(os.tmpdir(), "ch-tmux-timeout-"));
+    const fake = path.join(dir, "tmux");
+    // Exit eventually even under the old implementation, so a regression fails
+    // instead of leaving the suite hung on an unkillable fixture.
+    writeFileSync(
+        fake,
+        `#!${process.execPath}\nprocess.on("SIGTERM", () => {});\n` +
+            `setTimeout(() => process.exit(0), 11000);\n`,
+        { mode: 0o755 },
+    );
+    const previous = process.env.CODEHARBOR_TMUX;
+    process.env.CODEHARBOR_TMUX = fake;
+    try {
+        const result = await execFileRunner(["list-sessions"]);
+        assert.equal(result.code, SPAWN_FAILED);
+        assert.match(result.stderr, /did not respond within 10000ms/);
+    } finally {
+        if (previous === undefined) delete process.env.CODEHARBOR_TMUX;
+        else process.env.CODEHARBOR_TMUX = previous;
+        rmSync(dir, { recursive: true, force: true });
+    }
+});

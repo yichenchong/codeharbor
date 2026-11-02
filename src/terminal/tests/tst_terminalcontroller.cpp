@@ -56,6 +56,11 @@ public:
     // and reports the short write rather than failing. 0 = accept everything;
     // a negative limit accepts nothing, i.e. a channel making no progress.
     void setWriteLimit(qint64 bytes) { m_writeLimit = bytes; }
+    void setWriteFailureAfter(qint64 accepted, qint64 result)
+    {
+        m_failureAfter = accepted;
+        m_failureResult = result;
+    }
     // How many write() calls the transport has seen, so a test can tell one
     // whole-buffer write from a resumed sequence of short ones.
     int writeCalls() const { return m_writeCalls; }
@@ -79,9 +84,13 @@ protected:
     qint64 writeData(const char* data, qint64 maxSize) override
     {
         ++m_writeCalls;
-        const qint64 accepted = m_writeLimit == 0
+        if (m_failureAfter >= 0 && m_written.size() >= m_failureAfter)
+            return m_failureResult;
+        qint64 accepted = m_writeLimit == 0
             ? maxSize
             : qMax<qint64>(0, qMin(m_writeLimit, maxSize));
+        if (m_failureAfter >= 0)
+            accepted = qMin(accepted, m_failureAfter - m_written.size());
         m_written.append(data, accepted);
         return accepted;
     }
@@ -91,6 +100,8 @@ private:
     QByteArray m_written;
     qint64 m_writeLimit = 0;
     int m_writeCalls = 0;
+    qint64 m_failureAfter = -1;
+    qint64 m_failureResult = 0;
 };
 
 } // namespace
@@ -135,6 +146,8 @@ private slots:
     void silentAttachIsBoundedAndReportedAsAnError();
     void sendInputNeedsAWritableTransport();
     void sendInputResumesAShortWrite();
+    void sendInputReportsAnUnsentSuffix_data();
+    void sendInputReportsAnUnsentSuffix();
     void resizeRejectsNonPositiveGeometry();
     void hiddenEvictionResumesOnACleanBoundary();
     void flushBoundariesNeverSplitAMultiByteCharacter();
@@ -144,6 +157,8 @@ private slots:
     void cancelAndSubstituteEndASequenceAsTheRendererDoes();
     void releasingRetainedOutputStaysInsideTheCreditWindow();
     void aFlushBiggerThanTheCreditWindowIsCutNotEmittedWhole();
+    void aSmallCreditRemainderDoesNotBypassFlowControl_data();
+    void aSmallCreditRemainderDoesNotBypassFlowControl();
 };
 
 // A single ingest at or above the size cap flushes synchronously (SPEC 5.5).
@@ -1174,6 +1189,37 @@ void TstTerminalController::sendInputResumesAShortWrite()
     QVERIFY(stuck.written().isEmpty());
 }
 
+void TstTerminalController::sendInputReportsAnUnsentSuffix_data()
+{
+    QTest::addColumn<qint64>("failure");
+    QTest::newRow("no-progress") << qint64{0};
+    QTest::newRow("write-error") << qint64{-1};
+}
+
+void TstTerminalController::sendInputReportsAnUnsentSuffix()
+{
+    QFETCH(qint64, failure);
+    TerminalController controller;
+    FakeChannel channel;
+    channel.setWriteLimit(3);
+    channel.setWriteFailureAfter(5, failure);
+    controller.setTransport(&channel);
+    controller.setState(TerminalState::Ready);
+    const QByteArray input = QByteArrayLiteral("echo command\n");
+    QVERIFY(!controller.sendInput(input));
+    QCOMPARE(channel.written(), input.left(5));
+    QCOMPARE(channel.writeCalls(), 3);
+    QVERIFY(channel.isWritable());
+    QVERIFY(controller.state() == TerminalState::Ready);
+
+    FakeChannel replacement;
+    controller.setTransport(&replacement);
+    QCoreApplication::processEvents();
+    QVERIFY(replacement.written().isEmpty());
+    QVERIFY(controller.sendInput(QByteArrayLiteral("fresh")));
+    QCOMPARE(replacement.written(), QByteArrayLiteral("fresh"));
+}
+
 // A renderer that has not been laid out yet reports 0 rows and columns. Taking
 // that at face value would resize the remote grid to nothing, so it is refused
 // and the last real geometry is kept — that is the size a reconnect re-applies.
@@ -1745,5 +1791,45 @@ void TstTerminalController::aFlushBiggerThanTheCreditWindowIsCutNotEmittedWhole(
     }
 }
 
+
+void TstTerminalController::aSmallCreditRemainderDoesNotBypassFlowControl_data()
+{
+    QTest::addColumn<QByteArray>("prefix");
+    QTest::addColumn<bool>("retainedFirst");
+    const QByteArray utf8 = QByteArray::fromHex("f09f9880");
+    const QByteArray csi = QByteArrayLiteral("\x1b[31m");
+    QTest::newRow("flush-utf8") << utf8 << false;
+    QTest::newRow("flush-csi") << csi << false;
+    QTest::newRow("replay-utf8") << utf8 << true;
+    QTest::newRow("replay-csi") << csi << true;
+}
+
+void TstTerminalController::aSmallCreditRemainderDoesNotBypassFlowControl()
+{
+    QFETCH(QByteArray, prefix);
+    QFETCH(bool, retainedFirst);
+    TerminalController controller;
+    QSignalSpy emitted(&controller, &TerminalController::flushReady);
+    const qint64 limit = TerminalController::kMaxUnacknowledgedBytes;
+    const qint64 initial = retainedFirst ? limit : limit - 1;
+    controller.ingestOutput(QByteArray(initial, 'A'));
+    QCOMPARE(emitted.count(), 1);
+    const QByteArray batch = prefix + QByteArray(TerminalController::kFlushSizeBytes, 'B');
+    controller.ingestOutput(batch);
+    QCOMPARE(emitted.count(), 1);
+    QCOMPARE(controller.hiddenBuffer(), batch);
+    if (retainedFirst) {
+        // Releasing one byte of credit cannot accommodate either atom.
+        controller.acknowledgeOutput(1);
+        QCOMPARE(emitted.count(), 1);
+        QCOMPARE(controller.hiddenBuffer(), batch);
+    }
+    QCOMPARE(controller.unacknowledgedBytes(), limit - 1);
+    controller.acknowledgeOutput(limit - 1);
+    QCOMPARE(emitted.count(), 2);
+    QCOMPARE(emitted.at(1).at(0).toByteArray(), batch);
+    QCOMPARE(controller.unacknowledgedBytes(), batch.size());
+    QVERIFY(controller.hiddenBuffer().isEmpty());
+}
 QTEST_GUILESS_MAIN(TstTerminalController)
 #include "tst_terminalcontroller.moc"

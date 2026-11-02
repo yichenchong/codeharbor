@@ -489,7 +489,7 @@ Rectangle {
     }
 
     // Reload whatever the pane is currently showing, as its header's Reload
-    // button does. Answers false when the id names no live pane.
+    // button does. Answers false for no live pane or unsaved editor changes.
     //
     // Unlike openPaneTarget there is nothing to QUEUE: a pending "open this
     // target" is a request that stays meaningful until the Loader catches up,
@@ -504,8 +504,7 @@ Rectangle {
         const pane = region.paneOwner.paneCache[paneId];
         if (!pane)
             return false;
-        pane.reloadCurrent();
-        return true;
+        return pane.reloadCurrent();
     }
 
     // A pane reporting WHAT IT IS SHOWING, so the host can persist it and the

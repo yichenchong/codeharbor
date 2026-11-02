@@ -162,15 +162,9 @@ std::optional<QStringList> parseTmuxTargets(const QJsonValue& result)
 
 // A layout slot is either an inline split-tree object or null/absent; decode the
 // former through SplitNode::tryFromJson and the latter to std::nullopt.
-//
-// tryFromJson rather than fromJson: fromJson reports "not a valid split tree" by
-// returning its default empty-leaf value, which is also exactly what a genuinely
-// stored empty leaf parses to (closing a region's last pane persists one; see
-// src/app/SessionLayouts.cpp). A rejected tree must read as "no layout", not as
-// a perfectly valid single blank pane: SessionLayouts deliberately leaves a
-// region null when its layout cannot be loaded (SessionLayouts.h), because a
-// fabricated one-pane layout is something the user would edit over, silently
-// overwriting the layout the server still holds.
+// Nested workspace.list layouts are display metadata; getLayout separately
+// checks that an existing row has a valid tree, because its nullopt success
+// means "no row exists" and permits SessionLayouts to seed a default.
 std::optional<SplitNode> parseLayoutTree(const QJsonValue& value)
 {
     if (!value.isObject())
@@ -830,7 +824,14 @@ void WorkspaceDb::getLayout(const DevSessionId& devSessionId, Region region,
                                    "a SessionLayout object or null"));
                 return;
             }
-            cb(parseLayoutRow(result.toObject()), std::nullopt);
+            std::optional<SplitNode> tree = parseLayoutRow(result.toObject());
+            if (!tree) {
+                cb(std::nullopt,
+                   malformedResult(rpc::kMethodWorkspaceGetLayout,
+                                   "a SessionLayout object with a valid tree"));
+                return;
+            }
+            cb(std::move(tree), std::nullopt);
         });
 }
 

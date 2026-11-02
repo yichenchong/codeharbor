@@ -200,7 +200,7 @@ Window {
 
     function openPane(remoteUrl) {
         paneLoader.setSource("qrc:/qt/qml/CodeHarbor/EditorPaneView.qml",
-                             { fileUrl: remoteUrl, paneId: "viewer-1" });
+                             { fileUrl: remoteUrl, recoveryPaneId: liveRecoveryPaneId });
         return paneLoader.status === Loader.Ready
             ? "ready" : ("loader-status=" + paneLoader.status);
     }
@@ -384,6 +384,8 @@ private slots:
 
     // (2) The remote file's bytes are in Monaco's model, read from the page.
     void remoteFileLoadsIntoRealMonaco();
+    // A rejected WebChannel handshake must render an error, not an empty pane.
+    void rejectedEditorHandshakeShowsAnActionableError();
     // (3) An edit made inside the page, saved with Ctrl+S, lands on the server.
     void pageEditSavesToRemoteDisk();
     // (4) SPEC 8.6 live: stale revision refused, page's Reload recovers.
@@ -427,6 +429,7 @@ private:
     // captured in initTestCase and forwarded to the factory exactly as
     // AppController::adoptServerIdentity does in production (SPEC 11.3).
     QString m_recoveryDir;
+    QString m_recoveryId;
     std::unique_ptr<SessionBootstrap> m_bootstrap;
     std::unique_ptr<QQmlEngine> m_engine;
     // The host Window (kShellQml). Named for what it is, so it is never confused
@@ -515,6 +518,7 @@ void TstLiveEditor::initTestCase()
                             .arg(m_execErr)));
     const QString token = QUuid::createUuid().toString(QUuid::WithoutBraces).left(12);
     m_remoteDir = QStringLiteral("/tmp/ch-live-editor-%1").arg(token);
+    m_recoveryId = QStringLiteral("live-editor-%1").arg(token);
     m_filePath = m_remoteDir + QStringLiteral("/note.txt");
     m_marker = QStringLiteral("CH_LIVE_EDITOR_%1").arg(token.toUpper());
     m_initialContent = m_marker + QStringLiteral("\n")
@@ -549,6 +553,8 @@ void TstLiveEditor::initTestCase()
     m_engine->rootContext()->setContextProperty(QStringLiteral("viewers"), &m_viewers);
     m_engine->rootContext()->setContextProperty(QStringLiteral("editorFactory"),
                                                 &m_editorFactory);
+    m_engine->rootContext()->setContextProperty(QStringLiteral("liveRecoveryPaneId"),
+                                                m_recoveryId);
 
     QQmlComponent component(m_engine.get());
     component.setData(QByteArray(kShellQml), QUrl(QStringLiteral("qrc:/tst_liveeditor/shell.qml")));
@@ -573,12 +579,23 @@ void TstLiveEditor::cleanupTestCase()
     // the server-side file.watch through the still-live transport (SPEC 8.7).
     m_window.reset();
     m_engine.reset();
+    // Pane teardown can flush a final recovery write. Let every outstanding RPC
+    // settle before deleting the fixture's slot so a late write cannot recreate it.
+    const bool drained = waitFor([&] { return m_client.pendingCount() == 0; },
+                                 kRpcTimeoutMs);
+    if (!drained)
+        qWarning("live editor RPCs did not settle before recovery cleanup");
 
     if (m_live && !m_remoteDir.isEmpty()) {
         QByteArray out;
         QString err;
-        const bool ok = remoteExec(QStringLiteral("rm -rf ") + sq(m_remoteDir)
-                                       + QStringLiteral(" && echo CLEANUP_OK"),
+        QString cleanup = QStringLiteral("rm -rf -- ") + sq(m_remoteDir);
+        // The slot is unique to this test run. Never remove the recovery base
+        // or any other pane's snapshot, which may hold the user's unsaved work.
+        if (!m_recoveryDir.isEmpty() && !m_recoveryId.isEmpty())
+            cleanup += QStringLiteral(" && rm -f -- ")
+                + sq(m_recoveryDir + QLatin1Char('/') + m_recoveryId);
+        const bool ok = remoteExec(cleanup + QStringLiteral(" && echo CLEANUP_OK"),
                                    &out, &err);
         if (!ok || !out.contains("CLEANUP_OK")) {
             qWarning("remote cleanup of %s may have failed: out=%s err=%s",
@@ -777,6 +794,7 @@ void TstLiveEditor::remoteFileLoadsIntoRealMonaco()
     QVERIFY2(m_controller != nullptr,
              "EditorPaneView did not expose a ch::EditorController");
     QCOMPARE(m_controller->path(), m_filePath);
+    QCOMPARE(m_controller->recoveryId(), m_recoveryId);
 
     QSignalSpy contentSpy(m_controller, &EditorController::contentLoaded);
 
@@ -818,6 +836,45 @@ void TstLiveEditor::remoteFileLoadsIntoRealMonaco()
           qPrintable(oneLine(onDisk)));
     qInfo("loaded revision = %s   page status = \"%s\"", qPrintable(m_loadedRevision),
           qPrintable(pageStatus()));
+}
+
+void TstLiveEditor::rejectedEditorHandshakeShowsAnActionableError()
+{
+    const QString before = monacoValue();
+    const QString result = runJs(QStringLiteral(R"JS(
+(function () {
+    var original = QWebChannel;
+    var root = document.createElement("div");
+    document.body.appendChild(root);
+    var escaped = "";
+    try {
+        globalThis.QWebChannel = function () {
+            throw new Error("transport rejected initialization");
+        };
+        try {
+            CodeHarborEditor.connectEditor(root);
+        } catch (error) {
+            escaped = String(error);
+        }
+        return JSON.stringify({
+            escaped: escaped,
+            message: root.textContent,
+            statuses: root.querySelectorAll(".ch-editor-status").length
+        });
+    } finally {
+        globalThis.QWebChannel = original;
+        root.remove();
+    }
+})()
+)JS"));
+    const QJsonDocument reply = QJsonDocument::fromJson(result.toUtf8());
+    QVERIFY2(reply.isObject(), qPrintable(result));
+    const QJsonObject outcome = reply.object();
+    QCOMPARE(outcome.value(QStringLiteral("escaped")).toString(), QString());
+    QCOMPARE(outcome.value(QStringLiteral("message")).toString(),
+             QStringLiteral("This page could not reach the CodeHarbor host."));
+    QCOMPARE(outcome.value(QStringLiteral("statuses")).toInt(), 1);
+    QCOMPARE(monacoValue(), before);
 }
 
 // ---------------------------------------------------------------------------
@@ -1048,7 +1105,7 @@ void TstLiveEditor::unwritableRemoteFileIsReadOnlyInMonaco()
     const QString lockedPath = m_remoteDir + QStringLiteral("/locked.txt");
     const QString lockedContent =
         QStringLiteral("read-only fixture %1\n").arg(m_marker);
-    const QString recoveryPath = m_recoveryDir + QStringLiteral("/viewer-1");
+    const QString recoveryPath = m_recoveryDir + QLatin1Char('/') + m_recoveryId;
 
     QVERIFY2(remoteExec(QStringLiteral("printf '%s\\n' ")
                             + sq(QStringLiteral("read-only fixture ") + m_marker)
@@ -1119,17 +1176,21 @@ void TstLiveEditor::unwritableRemoteFileIsReadOnlyInMonaco()
              qPrintable(errorSpy.at(0).at(0).toString()));
     QCOMPARE(savedSpy.count(), 0);
 
-    // Nothing was written, and nothing was left behind: no crash-recovery
-    // snapshot can accumulate for a buffer that could never be saved (SPEC 11.3).
-    m_controller->reportContent(QStringLiteral("not a snapshot\n"));
-    QTest::qWait(1000);
+    // A final report can race a permission change reaching the page. Keep the
+    // genuine text in recovery without writing the currently locked main file.
+    const QString lateEdits = QStringLiteral("last edits before permission loss\n");
+    m_controller->reportContent(lateEdits);
     QVERIFY(remoteExec(QStringLiteral("cat -- ") + sq(lockedPath), &out, &err));
     QCOMPARE(QString::fromUtf8(out), lockedContent);
-    QVERIFY(remoteExec(QStringLiteral("test -s ") + sq(recoveryPath)
-                           + QStringLiteral(" && echo SNAPSHOT || echo NO_SNAPSHOT"),
-                       &out, &err));
-    QVERIFY2(out.contains("NO_SNAPSHOT"),
-             "a read-only buffer left a recovery snapshot that could never be applied");
+    QVERIFY2(waitFor([&] {
+                 if (!remoteExec(QStringLiteral("cat -- ") + sq(recoveryPath),
+                                 &out, &err))
+                     return false;
+                 const QJsonObject snapshot = QJsonDocument::fromJson(out).object();
+                 return snapshot.value(QStringLiteral("path")).toString() == lockedPath
+                     && snapshot.value(QStringLiteral("content")).toString() == lateEdits;
+             }, kSignalTimeoutMs),
+             "permission-only read-only dropped the final unsaved recovery text");
 
     qInfo("chmod 444 %s -> monaco readOnly=%s, save refused, disk untouched",
           qPrintable(lockedPath), qPrintable(ro));

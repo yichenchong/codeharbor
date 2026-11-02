@@ -2,6 +2,7 @@ pragma ComponentBehavior: Bound
 
 import QtQuick
 import QtQuick.Controls.Basic
+import QtQuick.Window
 import QtQuick.Layouts
 import CodeHarbor
 
@@ -18,6 +19,8 @@ Rectangle {
     property string textFilter: ""
     property bool followTail: true
     property var filteredEntries: []
+    property var focusReturnItem: null
+    property var lastInsideFocus: null
     property bool _movingTail: false
     readonly property string visibleText: {
         var lines = [];
@@ -106,10 +109,71 @@ Rectangle {
     }
 
     onLogBufferChanged: root.rebuild()
+    function itemWithin(scope, item) {
+        for (var walk = item; walk; walk = walk.parent) {
+            if (walk === scope)
+                return true;
+        }
+        return false;
+    }
+
+    function keyboardOwnedByHigherSheet(holder) {
+        for (var walk = holder; walk; walk = walk.parent) {
+            if (walk === root)
+                return false;
+            if (walk.parent === root.parent && walk.visible && walk.z > root.z)
+                return true;
+        }
+        return false;
+    }
+
+    function containKeyboard() {
+        const holder = root.Window.activeFocusItem;
+        if (!holder)
+            return;
+        if (!root.shown) {
+            if (!root.itemWithin(root, holder))
+                root.focusReturnItem = holder;
+            return;
+        }
+        if (root.itemWithin(Overlay.overlay, holder)
+                || root.keyboardOwnedByHigherSheet(holder))
+            return;
+        if (root.itemWithin(root, holder)) {
+            root.lastInsideFocus = holder;
+            return;
+        }
+        const previous = root.lastInsideFocus;
+        if (!previous)
+            return;
+        const forward = previous.nextItemInFocusChain(true) === holder;
+        let step = holder;
+        for (let guard = 0; guard < 500; ++guard) {
+            step = step.nextItemInFocusChain(forward);
+            if (!step || step === holder)
+                break;
+            if (root.itemWithin(root, step)) {
+                step.forceActiveFocus(forward ? Qt.TabFocusReason : Qt.BacktabFocusReason);
+                return;
+            }
+        }
+        previous.forceActiveFocus();
+    }
+
+    Connections {
+        target: root.Window.window
+        function onActiveFocusItemChanged() { root.containKeyboard(); }
+    }
+
     onSeverityFilterChanged: root.rebuild()
     onTextFilterChanged: root.rebuild()
     onShownChanged: {
         if (root.shown) {
+            if (!root.focusReturnItem) {
+                const holder = root.Window.activeFocusItem;
+                if (holder && !root.itemWithin(root, holder))
+                    root.focusReturnItem = holder;
+            }
             root.followTail = true;
             root.scrollToTail();
             // DEFERRED. `shown` is what the host binds its own `visible` to,
@@ -119,9 +183,18 @@ Rectangle {
             // the arrow keys did nothing until the user clicked in the well.
             // One turn later the sheet is on screen and the focus sticks.
             Qt.callLater(function () {
-                if (root.shown)
+                const holder = root.Window.activeFocusItem;
+                if (root.shown && root.visible
+                        && !root.itemWithin(Overlay.overlay, holder)
+                        && !root.keyboardOwnedByHigherSheet(holder))
                     logText.forceActiveFocus();
             });
+        } else {
+            const previous = root.focusReturnItem;
+            root.focusReturnItem = null;
+            root.lastInsideFocus = null;
+            if (previous && previous.visible && previous.enabled)
+                previous.forceActiveFocus(Qt.OtherFocusReason);
         }
     }
 

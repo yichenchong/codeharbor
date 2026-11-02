@@ -35,7 +35,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFile, execFileSync } from "node:child_process";
 
-import { listSessions, paneActivity, SPAWN_FAILED } from "../src/tmux.ts";
+import { execFileRunner, killSession, listSessions, paneActivity, SPAWN_FAILED } from "../src/tmux.ts";
 import type { CommandResult, CommandRunner } from "../src/tmux.ts";
 import type { TerminalPaneTarget } from "../src/rpc-types.ts";
 
@@ -173,5 +173,44 @@ test(
         );
         assert.equal(absent.panes[0].alive, false);
         assert.equal(absent.panes[0].lastActivityMs, null);
+    },
+);
+
+test(
+    "the production runner preserves Unicode session identity in the C locale",
+    { skip: SKIP },
+    async (t) => {
+        const unicode = "日本語";
+        const underscores = "______";
+        t.after(async () => {
+            await runner(["kill-server"]);
+        });
+        // These names collide in tmux's sanitized C-locale output.
+        for (const name of [unicode, underscores]) {
+            const created = await runner(["-u", "new-session", "-d", "-s", name]);
+            assert.equal(created.code, 0, created.stderr);
+        }
+
+        const keys = ["LC_ALL", "LANG", "TMUX", "TMUX_PANE", "CODEHARBOR_TMUX"];
+        const previous = new Map(keys.map((key) => [key, process.env[key]]));
+        process.env.LC_ALL = "C";
+        process.env.LANG = "C";
+        process.env.CODEHARBOR_TMUX = "tmux";
+        delete process.env.TMUX;
+        delete process.env.TMUX_PANE;
+        const productionRunner: CommandRunner = (argv) =>
+            execFileRunner(["-L", SOCKET, ...argv]);
+        try {
+            const sessions = await listSessions(productionRunner);
+            assert.deepEqual(sessions.map((session) => session.name).sort(), [underscores, unicode]);
+            await killSession({ name: unicode }, productionRunner);
+            const remaining = await listSessions(productionRunner);
+            assert.deepEqual(remaining.map((session) => session.name), [underscores]);
+        } finally {
+            for (const [key, value] of previous) {
+                if (value === undefined) delete process.env[key];
+                else process.env[key] = value;
+            }
+        }
     },
 );

@@ -29,7 +29,9 @@ Item {
     // property: a url property normalises and would happily accept the very
     // schemes this page exists to refuse, which makes the assertion below read as
     // if it had already passed.
-    property string webUrl: ""
+    // Direct pane hosts provide paneUrl; the Markdown overlay overrides webUrl
+    // explicitly. Keep the default bound so both entry points load an address.
+    property string webUrl: String(root.paneUrl)
 
     // The page interface, for a host that loads this like any other viewer page.
     property string remotePath: ""

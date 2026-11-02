@@ -231,14 +231,10 @@ Item {
         }
     }
 
-    // A close can destroy this delegate immediately, so expose the controller's
-    // unsaved states to ViewerPane before it forwards a close request. Saving
-    // remains dirty until the confirmation arrives; conflict also means the
-    // buffer cannot be discarded silently.
-    readonly property bool dirty: root.fileState === "modified"
-                                  || root.fileState === "saving"
-                                  || root.fileState === "conflict"
-                                  || root.fileState === "externally_modified"
+    // Page replacement and close can discard this delegate immediately. Dirty
+    // is independent of fileState: an outage, failed save or permission change
+    // must not make unsaved work appear safe to discard.
+    readonly property bool dirty: root.controller ? root.controller.dirty : false
     readonly property string fileState: root.controller ? root.controller.fileState : ""
     readonly property bool loading: (!root.pageReady && root.pageError.length === 0)
                                     || root.fileState === "loading"

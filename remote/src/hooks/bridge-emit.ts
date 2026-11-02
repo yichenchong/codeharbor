@@ -260,8 +260,10 @@ export function writeStderr(message: string): void {
     const onError = (): void => {};
     try {
         process.stderr.once("error", onError);
-        process.stderr.write(message, () => {
-            process.stderr.off("error", onError);
+        process.stderr.write(message, (error) => {
+            // Node invokes a failed write's callback BEFORE emitting 'error'.
+            // Keep the once-listener until that event consumes it.
+            if (!error) process.stderr.off("error", onError);
         });
     } catch {
         // Remove only this write's guard if write() failed synchronously.

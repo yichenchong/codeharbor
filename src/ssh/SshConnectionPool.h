@@ -11,9 +11,11 @@
 #include <atomic>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <utility>
 
 #if CH_HAVE_LIBSSH
+#include <libssh/callbacks.h>
 #include <libssh/libssh.h>
 #endif
 
@@ -71,19 +73,20 @@ namespace ch {
 //   * A Route MUST be taken and dropped on the same thread. That thread is the
 //     only one whose libssh lines it receives, and the only one whose libssh
 //     state it saves and restores. ENFORCED at runtime in release(), not merely
-//     asserted: a release from another thread is refused with a warning, and
-//     the route is deactivated so no further line can reach a sink whose owner
-//     is going away. What cannot be repaired from the wrong thread is the
-//     OWNING thread's libssh state, which is thread-local and unreachable from
-//     anywhere else; it stays as it is until that thread drops its own last
-//     route, which costs verbosity and nothing else.
+//     asserted: a release from another thread reports a warning, deactivates
+//     the route, and waits for an in-flight sink call to finish before returning.
+//     The sink's owner can then be destroyed safely. What cannot be repaired
+//     there is the OWNING thread's libssh state; it is restored when that thread
+//     next acquires/releases a route or emits a libssh log line.
 //   * A Route's sink is invoked synchronously from inside libssh on that same
 //     thread and never on any other, so a sink needs no locking of its own —
 //     which is what lets a pool mutate its QString transcript and emit a Qt
 //     signal from it exactly as it did before this router existed.
-//   * All routing state is thread-local, so routes on different threads cannot
-//     race. The only cross-thread data are the process-wide route count kept
-//     for the test seam below and each route's active flag, both atomic.
+//   * The owning thread alone mutates its route stack. An entry's atomic active
+//     flag stops new calls, and its recursive invocation mutex drains a call
+//     already running during a wrong-thread release. Releasing a route from
+//     inside its own sink remains safe; the sink must not wait for another
+//     thread that is synchronously releasing that same route.
 class SshLogRouter {
 public:
     // Receives one libssh log line: libssh's priority, the emitting libssh
@@ -117,6 +120,11 @@ public:
         struct Entry {
             explicit Entry(Sink s) : sink(std::move(s)) {}
             Sink sink;
+            // Held across each sink call, and briefly by release() after
+            // deactivation so a wrong-thread release cannot return while the
+            // sink still accesses an owner that is about to be destroyed.
+            // Recursive because a sink may release its own route.
+            std::recursive_mutex invocationMutex;
             // Cleared by whichever thread releases the route — possibly not the
             // owning one — and read by the owning thread's dispatch(), which is
             // also the only thread that removes the entry from its stack.
@@ -586,6 +594,9 @@ private:
     QString m_diagnosticLog;
 #if CH_HAVE_LIBSSH
     ssh_session m_session = nullptr;
+    // libssh retains this pointer rather than copying the callback structure.
+    // Keep it alive for the session, including after connectToHost() returns.
+    ssh_callbacks_struct m_sessionCallbacks{};
     QList<ssh_channel> m_channels;
     // Held only for the duration of one synchronous connectToHost(), so the
     // raised libssh log level is never left behind. Destroying the pool

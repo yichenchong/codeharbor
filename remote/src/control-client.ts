@@ -100,6 +100,9 @@ function parseResponse(line: string): ControlResponse {
         return refusal("failed", "the server answered with something other than an object");
     }
     const value = decoded as Record<string, unknown>;
+    if (value.version !== CH_CONTROL_VERSION) {
+        return refusal("failed", "the server's answer carried an unsupported control version");
+    }
     if (typeof value.ok !== "boolean") {
         return refusal("failed", "the server's answer carried no ok flag");
     }
@@ -151,8 +154,26 @@ export function sendControlRequest(
     if (socketPath === null || socketPath.trim().length === 0) {
         return Promise.resolve(refusal("bad_request", MISSING_SOCKET_MESSAGE));
     }
+    let payload: string;
+    try {
+        payload = `${JSON.stringify({
+            version: CH_CONTROL_VERSION,
+            devSessionId: coordinates.devSessionId,
+            terminalId: coordinates.terminalId,
+            op,
+            args,
+        })}\n`;
+    } catch {
+        return Promise.resolve(refusal("bad_request", "the request could not be serialized as JSON"));
+    }
+    if (Buffer.byteLength(payload) > MAX_CONTROL_LINE_BYTES) {
+        return Promise.resolve(
+            refusal("bad_request", `the request is larger than the ${MAX_CONTROL_LINE_BYTES}-byte limit`),
+        );
+    }
 
     return new Promise<ControlResponse>((resolve) => {
+        const socket = new net.Socket();
         let settled = false;
         const finish = (response: ControlResponse): void => {
             if (settled) return;
@@ -171,7 +192,6 @@ export function sendControlRequest(
             );
         }, timeoutMs);
 
-        const socket = net.createConnection(socketPath);
         socket.setEncoding("utf8");
 
         socket.on("error", (err: Error) => {
@@ -187,22 +207,6 @@ export function sendControlRequest(
         });
 
         socket.on("connect", () => {
-            const payload = `${JSON.stringify({
-                version: CH_CONTROL_VERSION,
-                devSessionId: coordinates.devSessionId,
-                terminalId: coordinates.terminalId,
-                op,
-                args,
-            })}\n`;
-            if (Buffer.byteLength(payload) > MAX_CONTROL_LINE_BYTES) {
-                finish(
-                    refusal(
-                        "bad_request",
-                        `the request is larger than the ${MAX_CONTROL_LINE_BYTES}-byte limit`,
-                    ),
-                );
-                return;
-            }
             socket.write(payload);
         });
 
@@ -218,7 +222,12 @@ export function sendControlRequest(
                 }
                 return;
             }
-            finish(parseResponse(buffer.slice(0, newline)));
+            const line = buffer.slice(0, newline);
+            if (Buffer.byteLength(line) > MAX_CONTROL_LINE_BYTES) {
+                finish(refusal("failed", "the server's answer exceeded its byte bound"));
+                return;
+            }
+            finish(parseResponse(line));
         });
 
         socket.on("close", () => {
@@ -226,5 +235,16 @@ export function sendControlRequest(
             // command was accepted by a daemon whose stdout had already failed.
             finish(refusal("failed", "the CodeHarbor server closed the connection without answering"));
         });
+        // Invalid paths can fail synchronously rather than emitting an error.
+        try {
+            socket.connect(socketPath);
+        } catch (err) {
+            finish(
+                refusal(
+                    "failed",
+                    `cannot reach the CodeHarbor server at ${socketPath}: ${err instanceof Error ? err.message : String(err)}`,
+                ),
+            );
+        }
     });
 }
